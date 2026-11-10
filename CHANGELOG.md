@@ -157,6 +157,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   record with the host's statement, and check the head out without the file, instead of failing
   with `content_withheld`. A cache never fetches it when a head move needs the file, and `heal`
   finishes an interrupted `lower` without it, removing the file's old version.
+- **`consolidate` and `pick` take a file whose content is withheld.** A merge or pick that takes
+  the other side's version of a file whose content this warehouse does not hold because the
+  remote's host withholds it no longer fails reading it: the file is left out, its old version is
+  removed, and it is staged as not checked out. A merge that would have to read that content, to
+  merge both sides' changes or to keep a version in conflict, refuses with `content_withheld`
+  before changing any file. `abort` and `heal` put back the file's old version.
 
 - **`remote move` knows what the new origin withholds.** A cache or sparse warehouse moving to a
   server whose host withholds content it relies on its origin for no longer counts that content as

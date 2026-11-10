@@ -120,14 +120,16 @@ pub(crate) async fn abort(kind: MergeKind, confirm: bool, command: &str) -> Resu
     }
 
     let our_tree = object_utils::load_parcel(&recorded.our_head)?.tree_hash;
-    let (written, their_tree) = merge_output(&recorded, &our_tree).map_err(|e| format!(
+    let (written, unknown, their_tree) = merge_output(&recorded, &our_tree).map_err(|e| format!(
         "Cannot abort the {}: what it wrote cannot be worked out ({}). Nothing was aborted. To abandon it \
         and leave every file as it is, {}.",
         kind.noun(), e, removal_hint(kind)
     ))?;
 
-    // Every path the merge wrote, and every conflict it left staged whatever the recompute says.
+    // Every path the merge wrote, every path whose output needs content this warehouse leaves out,
+    // and every conflict it left staged whatever the recompute says.
     let mut touched: BTreeSet<String> = written.keys().cloned().collect();
+    touched.extend(unknown);
     touched.extend(inventory_utils::list_conflict_paths()?);
 
     let anchor = file_utils::take_stat_anchor()?;
@@ -152,13 +154,18 @@ pub(crate) async fn abort(kind: MergeKind, confirm: bool, command: &str) -> Resu
         if !shards.contains_key(dir) {
             shards.insert(dir.to_string(), stocktake_utils::load_shard_or_empty(dir)?);
         }
-        let entry = shards[dir].get_item_by_name(name)
-            .filter(|item| item.state != InventoryItemState::Deleted)
-            .map(|item| (item.hash.clone(), item.item_type));
+        let staged = shards[dir].get_item_by_name(name).filter(|item| item.state != InventoryItemState::Deleted);
+        let entry = staged.as_ref().map(|item| (item.hash.clone(), item.item_type));
 
+        // An entry staged `Unavailable` stands for a file left out, whatever the store now holds:
+        // the merge wrote nothing at the path, so what it left there is absence.
+        let left_out = staged.is_some_and(|item| item.state == InventoryItemState::Unavailable);
         let working_kept = is_folder
-            || holds(path, ours.as_ref(), anchor)
-            || output.is_some_and(|output| holds(path, output.working.as_ref(), anchor));
+            || match left_out {
+                true => holds(path, None, anchor) || holds(path, ours.as_ref(), anchor),
+                false => holds(path, ours.as_ref(), anchor)
+                    || output.is_some_and(|output| holds(path, output.working.as_ref(), anchor)),
+            };
         let entry_kept = entry == ours || output.is_some_and(|output| entry == output.entry);
 
         if !(working_kept && entry_kept) {
@@ -287,8 +294,9 @@ struct Written {
 }
 
 /// Recompute the merge `recorded` describes on `our_tree`, as `consolidate` and `pick` built it,
-/// and return what it wrote at each in-scope path it touched.
-fn merge_output(recorded: &Recorded, our_tree: &str) -> Result<(BTreeMap<String, Written>, String), String> {
+/// and return what it wrote at each in-scope path it touched, beside the paths whose output needs
+/// content this warehouse now leaves out (each still touched, its output unknown).
+fn merge_output(recorded: &Recorded, our_tree: &str) -> Result<(BTreeMap<String, Written>, Vec<String>, String), String> {
     let (base_tree, their_tree, label, scope) = match &recorded.source {
         Source::Pallet(their_head) => {
             let their_tree = object_utils::load_parcel(their_head)?.tree_hash;
@@ -315,13 +323,24 @@ fn merge_output(recorded: &Recorded, our_tree: &str) -> Result<(BTreeMap<String,
         },
     };
 
-    let mut actions = merge_utils::compute_merge_actions(&base_tree, our_tree, &their_tree, &recorded.our_pallet, &label, &scope)?;
+    let mut unknown = Vec::new();
+    let mut actions = merge_utils::compute_merge_actions_with(
+        &base_tree, our_tree, &their_tree, &recorded.our_pallet, &label, &scope, merge_utils::WithheldReads::Unknown(&mut unknown)
+    )?;
     consolidate::keep_aliased_files(&mut actions, our_tree, &scope)?;
 
     let blob_hash = |content: &[u8]| LooseObjectBuilder::build_blob(&Blob { content: content.to_vec() }).hash;
+    let written = actions.into_iter().filter_map(|action| written_by(action, blob_hash)).collect();
 
-    let written = actions.into_iter().filter_map(|action| match action {
-        MergeAction::TakeTheirs { path, hash, item_type, .. } => {
+    Ok((written, unknown, their_tree))
+}
+
+/// What `action` wrote at its path; `None` for an action that touches no in-scope path. A file left
+/// out is modelled as the write it stands for: the abort judges absence from its staged entry, since
+/// whether the store holds the content may have changed since the merge.
+fn written_by(action: MergeAction, blob_hash: impl Fn(&[u8]) -> String) -> Option<(String, Written)> {
+    match action {
+        MergeAction::TakeTheirs { path, hash, item_type, .. } | MergeAction::LeaveOut { path, hash, item_type, .. } => {
             Some((path, Written { working: Some((hash.clone(), item_type)), entry: Some((hash, item_type)) }))
         },
         MergeAction::Delete { path } => Some((path, Written { working: None, entry: None })),
@@ -339,9 +358,7 @@ fn merge_output(recorded: &Recorded, our_tree: &str) -> Result<(BTreeMap<String,
             Some((path, Written { working, entry: Some((entry_hash, item_type)) }))
         },
         MergeAction::ResolveOutOfScope { .. } => None,
-    }).collect();
-
-    Ok((written, their_tree))
+    }
 }
 
 /// Whether the working file at `path` holds `expected`: its content and kind, or absence.

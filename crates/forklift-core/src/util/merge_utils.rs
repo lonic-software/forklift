@@ -5,7 +5,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::model::remote::{HoldAnswer, MAX_HOLDS_CANDIDATES};
 use crate::globals::bay_root;
 use crate::util::scope_utils::{self, PathScope, ScopeClass};
-use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, lcs, object_utils, pallet_utils, record_utils};
+use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, lcs, object_utils, pallet_utils, record_utils, shift_utils};
 
 /// The name of the consolidation-state file (inside the forklift root folder). While a
 /// consolidation is in progress, it holds the head parcel hash of the pallet being
@@ -855,6 +855,18 @@ pub enum MergeAction {
         is_new: bool,
     },
 
+    /// Take their version of the file, whose content this warehouse leaves out
+    /// ([`shift_utils::NotCheckedOut`]): nothing is written, the file our side had there is
+    /// removed, and the entry is staged `Unavailable` at `hash`. Decided once, when the actions
+    /// are computed, so every later step reads it from here rather than from the store.
+    LeaveOut {
+        path: String,
+        hash: String,
+        item_type: crate::enums::dir_entry_type::DirEntryType,
+        /// As on [`MergeAction::TakeTheirs`].
+        is_new: bool,
+    },
+
     /// Remove the file (they removed it; ours is unchanged since the base).
     Delete { path: String },
 
@@ -956,6 +968,29 @@ pub fn compute_merge_actions(base_hash: &str,
                              ours_label: &str,
                              theirs_label: &str,
                              scope: &PathScope) -> Result<Vec<MergeAction>, String> {
+    compute_merge_actions_with(base_hash, ours_hash, theirs_hash, ours_label, theirs_label, scope, WithheldReads::Refuse)
+}
+
+/// What [`compute_merge_actions_with`] does with a file both sides changed whose merge would read
+/// content this warehouse leaves out ([`shift_utils::NotCheckedOut`]).
+pub enum WithheldReads<'a> {
+    /// Refuse the merge with `content_withheld`, before any blob is read.
+    Refuse,
+
+    /// Leave the file out of the actions and push its path here: what the merge does there cannot
+    /// be worked out without the content.
+    Unknown(&'a mut Vec<String>),
+}
+
+/// [`compute_merge_actions`], with `withheld` deciding what a merge that would read content this
+/// warehouse leaves out does instead.
+pub fn compute_merge_actions_with(base_hash: &str,
+                                  ours_hash: &str,
+                                  theirs_hash: &str,
+                                  ours_label: &str,
+                                  theirs_label: &str,
+                                  scope: &PathScope,
+                                  withheld: WithheldReads) -> Result<Vec<MergeAction>, String> {
     cache_miss::prefetch_trees(&[Some(base_hash), Some(ours_hash), Some(theirs_hash)], |path, sides| {
         !merge_skips_subtree(sides[0], sides[1], sides[2]) && scope.classify(path) != ScopeClass::OutOfScope
     });
@@ -977,6 +1012,8 @@ pub fn compute_merge_actions(base_hash: &str,
         &mut pending
     )?;
 
+    sort_withheld(&mut pending, withheld)?;
+
     // The blobs phase 2 reads, fetched in one batch in a cache warehouse.
     cache_miss::ensure_files_present(pending.iter().flat_map(|entry| match entry {
         PendingAction::Ready(_) => Vec::new(),
@@ -993,6 +1030,72 @@ pub fn compute_merge_actions(base_hash: &str,
     // Phase 2 — run the deferred three-way merges across the cores and reassemble the
     // actions in walk order.
     resolve_pending(pending, ours_label, theirs_label)
+}
+
+/// Settle, before any blob is read, every entry that names content this warehouse leaves out
+/// ([`shift_utils::NotCheckedOut`]). A one-sided take of it becomes a [`MergeAction::LeaveOut`]:
+/// no read. A file both sides changed is handed to `withheld`: a line merge, or a version put back
+/// in conflict, would have to read bytes the remote's host withholds, and a version kept in conflict
+/// would stand at a path holding no file.
+fn sort_withheld(pending: &mut Vec<PendingAction>, withheld: WithheldReads) -> Result<(), String> {
+    let not_checked_out = shift_utils::NotCheckedOut::read()?;
+    let mut unknown = Vec::new();
+
+    for (index, entry) in pending.iter_mut().enumerate() {
+        let (path, hashes): (&str, Vec<&str>) = match entry {
+            PendingAction::Ready(MergeAction::TakeTheirs { path, hash, item_type, is_new }) => {
+                if not_checked_out.holds(hash)? {
+                    *entry = PendingAction::Ready(MergeAction::LeaveOut {
+                        path: std::mem::take(path), hash: std::mem::take(hash), item_type: *item_type, is_new: *is_new,
+                    });
+                }
+                continue;
+            }
+            PendingAction::Merge(job) => {
+                (job.path.as_str(), job.base_hash.iter().map(String::as_str).chain([job.our_hash.as_str(), job.their_hash.as_str()]).collect())
+            }
+            PendingAction::PutBack { path, hash, .. } => (path.as_str(), vec![hash.as_str()]),
+            PendingAction::Ready(MergeAction::Conflict { path, entry_hash, .. }) => (path.as_str(), vec![entry_hash.as_str()]),
+            PendingAction::Ready(_) => continue,
+        };
+
+        let mut left_out = None;
+        for hash in hashes {
+            if not_checked_out.holds(hash)? {
+                left_out = Some(hash);
+                break;
+            }
+        }
+        let Some(hash) = left_out else { continue };
+
+        match &withheld {
+            WithheldReads::Refuse => {
+                let statement = not_checked_out.statement(hash).unwrap_or_default();
+
+                return Err(crate::error::CoreError::refusal_with_details(
+                    crate::error::RefusalCode::ContentWithheld,
+                    format!(
+                        "Cannot merge \"{}\": the merge needs its content {}, which the host of this \
+                        warehouse's remote withholds and this warehouse does not hold. No file was changed. \
+                        The host's statement: {}",
+                        path, hash, statement
+                    ),
+                    "The remote cannot supply the content; only a warehouse that holds it can make this merge.",
+                    serde_json::json!({ "path": path, "hash": hash, "statement": statement }),
+                ).into());
+            }
+            WithheldReads::Unknown(_) => unknown.push((index, path.to_string())),
+        }
+    }
+
+    if let WithheldReads::Unknown(paths) = withheld {
+        for (index, path) in unknown.into_iter().rev() {
+            pending.remove(index);
+            paths.push(path);
+        }
+    }
+
+    Ok(())
 }
 
 /// The number of deferred merges below which running them on the calling thread is cheaper

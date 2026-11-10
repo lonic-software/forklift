@@ -655,7 +655,9 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     // and withdraws its start marker. Judged after phase 0, which makes every recipe the walk
     // stored readable; the blobs it made durable stay unnamed.
     if blob_batch_published {
-        if let Some((path, hash)) = staged_redacted(&writes)? {
+        let named = staged_redacted(&writes).inspect_err(|_| load_guard_utils::withdraw_start(recorded.as_ref()))?;
+
+        if let Some((path, hash)) = named {
             load_guard_utils::withdraw_start(recorded.as_ref());
 
             return Err(load_refusal(&path, &hash));
@@ -910,6 +912,15 @@ impl<'l> ShardMutationBatch<'l> {
         let entry = build_inventory_item_from_stat(Path::new(path), name, hash, item_type, anchor)?;
 
         self.update(parent_key, |inventory| inventory.add_item(entry))
+    }
+
+    /// Record a file left out of the working directory ([`crate::util::shift_utils::NotCheckedOut`])
+    /// in its parent's shard, `Unavailable` at `hash`. Nothing is statted: the path holds no file.
+    pub fn stage_unavailable(&mut self, path: &str, hash: String, item_type: DirEntryType) -> Result<(), String> {
+        let (parent_key, name) = split_path_key(path);
+        let item = build_unavailable_inventory_item(name, hash, item_type);
+
+        self.update(parent_key, |inventory| { inventory.add_item(item); })
     }
 
     /// Stat a file just written with content not stored yet (e.g. a merge result), record it in

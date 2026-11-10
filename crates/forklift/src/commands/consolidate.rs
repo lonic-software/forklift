@@ -547,6 +547,7 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction],
                                              target: &str) -> Result<inventory_utils::ShardLedger, String> {
     shift_utils::check_planned_paths(actions.iter().filter_map(|action| match action {
         MergeAction::TakeTheirs { path, .. }
+        | MergeAction::LeaveOut { path, .. }
         | MergeAction::Delete { path }
         | MergeAction::Merged { path, .. }
         | MergeAction::Conflict { path, .. } => Some(path.as_str()),
@@ -554,12 +555,20 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction],
         MergeAction::ResolveOutOfScope { .. } => None,
     }))?;
 
-    let removals = MergeRemovals(actions.iter()
-        .filter_map(|action| match action {
-            MergeAction::Delete { path } => Some(path.clone()),
-            _ => None,
-        })
-        .collect());
+    let removals = MergeRemovals {
+        files: actions.iter()
+            .filter_map(|action| match action {
+                MergeAction::Delete { path } | MergeAction::LeaveOut { path, is_new: false, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect(),
+        deleted: actions.iter()
+            .filter_map(|action| match action {
+                MergeAction::Delete { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect(),
+    };
 
     let ledger = inventory_utils::ShardLedger::read()?;
     let mut check = alias_utils::AliasCheck::over(&ledger);
@@ -569,6 +578,9 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction],
     for action in actions {
         let new_path = match action {
             MergeAction::TakeTheirs { path, is_new: true, .. } => Some(path),
+            // Writes nothing, but stages the path: an untracked file there would stand under an
+            // entry that names other content, and read as that entry's file.
+            MergeAction::LeaveOut { path, is_new: true, .. } => Some(path),
             // A delete/modify conflict re-creates a file we deleted.
             MergeAction::Conflict { path, .. } if conflict_writes(action) => Some(path),
             _ => None,
@@ -608,19 +620,24 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction],
     Ok(ledger)
 }
 
-/// The files a merge deletes before it writes (its `Delete` actions).
-struct MergeRemovals(std::collections::HashSet<String>);
+/// The files a merge removes before it writes: its `Delete` actions, and the files it leaves out
+/// over ours. Only a `Delete` also removes the directories it empties.
+struct MergeRemovals {
+    files: std::collections::HashSet<String>,
+    deleted: std::collections::HashSet<String>,
+}
 
 impl alias_utils::Removals for MergeRemovals {
     fn removes_file(&self, key: &str) -> bool {
-        self.0.contains(key)
+        self.files.contains(key)
     }
 
     /// A Delete removes each directory up its own chain once it is empty (see
-    /// `apply_merge_action`), so a directory is removed when some deleted file lies beneath it.
+    /// `apply_merge_action`), so a directory is removed when some deleted file lies beneath it. A
+    /// file left out removes no directory.
     fn removes_directory(&self, key: &str) -> bool {
         let prefix = format!("{}/", key);
-        self.0.iter().any(|path| path.starts_with(&prefix))
+        self.deleted.iter().any(|path| path.starts_with(&prefix))
     }
 }
 
@@ -631,9 +648,10 @@ impl alias_utils::Removals for MergeRemovals {
 pub(crate) fn keep_aliased_files(actions: &mut Vec<MergeAction>,
                                  our_tree_hash: &str,
                                  scope: &scope_utils::PathScope) -> Result<(), String> {
+    // A file left out over our version removes ours as a deletion does.
     let removed: Vec<String> = actions.iter()
         .filter_map(|action| match action {
-            MergeAction::Delete { path } => Some(path.clone()),
+            MergeAction::Delete { path } | MergeAction::LeaveOut { path, is_new: false, .. } => Some(path.clone()),
             _ => None,
         })
         .collect();
@@ -645,6 +663,7 @@ pub(crate) fn keep_aliased_files(actions: &mut Vec<MergeAction>,
     let our_tree = object_utils::load_tree(our_tree_hash)?;
     let planned: HashSet<&str> = actions.iter().map(|action| match action {
         MergeAction::TakeTheirs { path, .. }
+        | MergeAction::LeaveOut { path, .. }
         | MergeAction::Delete { path }
         | MergeAction::Merged { path, .. }
         | MergeAction::Conflict { path, .. }
@@ -653,12 +672,18 @@ pub(crate) fn keep_aliased_files(actions: &mut Vec<MergeAction>,
 
     let kept = shift_utils::kept_through_aliases(&our_tree, &removed, &planned, scope)?;
 
-    actions.extend(kept.into_iter().map(|(path, item)| MergeAction::TakeTheirs {
-        path,
-        hash: item.hash,
-        item_type: item.item_type,
-        is_new: false,
-    }));
+    if kept.is_empty() {
+        return Ok(());
+    }
+
+    // A kept file whose content is left out stays out: nothing to write, its entry staged as it was.
+    let not_checked_out = shift_utils::NotCheckedOut::read()?;
+    for (path, item) in kept {
+        actions.push(match not_checked_out.holds(&item.hash)? {
+            true => MergeAction::LeaveOut { path, hash: item.hash, item_type: item.item_type, is_new: true },
+            false => MergeAction::TakeTheirs { path, hash: item.hash, item_type: item.item_type, is_new: false },
+        });
+    }
 
     Ok(())
 }
@@ -690,7 +715,7 @@ pub(crate) fn refuse_redacted_actions(actions: &[MergeAction],
 
     for action in actions {
         let named = match action {
-            MergeAction::TakeTheirs { path, hash, item_type, .. } => {
+            MergeAction::TakeTheirs { path, hash, item_type, .. } | MergeAction::LeaveOut { path, hash, item_type, .. } => {
                 guard.names_file(hash, *item_type)?.map(|hash| (path.clone(), hash))
             }
             MergeAction::Merged { path, content, item_type } => {
@@ -748,10 +773,10 @@ fn conflict_writes(action: &MergeAction) -> bool {
 /// paths left in conflict. Shared with `cherry-pick`, which applies a parcel's diff through
 /// the same `MergeAction`s.
 ///
-/// Every deletion is applied first, so a directory a write is about to replace (or a file a
-/// write is about to turn into a directory) is emptied — and, via `apply_merge_action`'s
-/// parent-chain cleanup, itself removed — before that write lands. Writing first would
-/// otherwise fail (`EISDIR`/`EEXIST`) for a tracked type flip in either direction.
+/// Every deletion, and every file left out, is applied first, so a directory a write is about to
+/// replace (or a file a write is about to turn into a directory) is emptied — and, via
+/// `apply_merge_action`'s parent-chain cleanup, itself removed — before that write lands. Writing
+/// first would otherwise fail (`EISDIR`/`EEXIST`) for a tracked type flip in either direction.
 ///
 /// Every inventory change goes through one [`inventory_utils::ShardMutationBatch`], published
 /// before this returns, so the caller records its in-progress state only over a published
@@ -784,13 +809,17 @@ fn apply_merge_actions_to(ledger: &inventory_utils::ShardLedger,
                           batch: &mut inventory_utils::ShardMutationBatch,
                           conflict_paths: &mut Vec<String>) -> Result<(), String> {
     // The batch writes nothing before it publishes, so `ledger` stays the registered set throughout.
+    // A file left out removes ours with the deletions, before any write: on a case-folding volume
+    // it may share its disk file with a fold-equal path written below.
+    let removes = |action: &MergeAction| matches!(action, MergeAction::Delete { .. } | MergeAction::LeaveOut { .. });
+
     for action in actions {
-        if matches!(action, MergeAction::Delete { .. }) {
+        if removes(action) {
             apply_merge_action(ledger, action, None, batch, conflict_paths)?;
         }
     }
 
-    let writes: Vec<&MergeAction> = actions.iter().filter(|action| !matches!(action, MergeAction::Delete { .. })).collect();
+    let writes: Vec<&MergeAction> = actions.iter().filter(|action| !removes(action)).collect();
 
     // Their blobs load ahead on worker threads while the writes land here, in order.
     shift_utils::write_in_order(&writes, |action| match action {
@@ -814,6 +843,11 @@ fn apply_merge_action(ledger: &inventory_utils::ShardLedger,
         MergeAction::TakeTheirs { path, hash, item_type, is_new } => {
             shift_utils::write_tracked_file_from(path, hash, *item_type, *is_new, content)?;
             batch.stage_file_from_stat(path, hash.clone(), *item_type)
+        }
+
+        MergeAction::LeaveOut { path, hash, item_type, is_new } => {
+            shift_utils::leave_out(path, *is_new)?;
+            batch.stage_unavailable(path, hash.clone(), *item_type)
         }
 
         MergeAction::Delete { path } => {
@@ -1096,6 +1130,46 @@ mod tests {
         assert!(test_support::file_holds(&warehouse.root, "new.txt", b"new\n"));
         assert_stack_refused();
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap().as_deref(), Some(our_head.as_str()));
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!((recovery.operation, recovery.outcome), (OperationKind::Merge, RecoveryOutcome::RolledBack));
+        assert_back_at_ours(&warehouse.root, &our_head, &our_tree);
+    }
+
+    /// Record their `b.txt` and `new.txt` of [`a_clean_merge_on_main`] unavailable, and delete
+    /// their objects, as a fetch leaving withheld content out would leave them.
+    fn withhold_theirs(root: &std::path::Path) {
+        let hashes: Vec<String> = [&b"theirs\n"[..], &b"new\n"[..]].iter()
+            .map(|content| LooseObjectBuilder::build_blob(&Blob { content: content.to_vec() }).hash)
+            .collect();
+        forklift_core::util::unavailable::record(hashes.iter().map(|hash| (hash.clone(), "Withheld.".to_string()))).unwrap();
+        for hash in &hashes {
+            std::fs::remove_file(root.join(".forklift").join("objects").join(&hash[0..2]).join(&hash[2..])).unwrap();
+        }
+    }
+
+    /// A merge taking their files whose content is left out writes neither, removes our `b.txt`,
+    /// and stages both `Unavailable`; heal's roll-back of it interrupted puts our `b.txt` back from
+    /// the store and leaves no `new.txt`, with staging at our tree.
+    ///
+    /// Revert: write `b.txt` through the normal take (no skip) → the merge dies reading the absent
+    /// blob → red; keep our `b.txt` on a skip → it holds our bytes under their hash → red.
+    #[test]
+    fn heal_rolls_back_an_interrupted_merge_that_left_their_files_out() {
+        let warehouse = Warehouse::with_working_tree("consolidate-merge-crash-left-out");
+        let (our_head, our_tree, _) = a_clean_merge_on_main();
+        withhold_theirs(&warehouse.root);
+
+        AFTER_MERGE_APPLY.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
+        assert_eq!(test_support::block_on(handle_command("feature")).unwrap_err(), "crashed");
+        operation_utils::forget_raised_for_tests();
+
+        assert!(!warehouse.root.join("b.txt").exists() && !warehouse.root.join("new.txt").exists(),
+            "their files are left out, and our b.txt is removed");
+        let states: Vec<InventoryItemState> = ["b.txt", "new.txt"].iter()
+            .map(|name| stocktake_utils::load_shard_or_empty("").unwrap().get_item_by_name(name).expect("staged").state)
+            .collect();
+        assert_eq!(states, [InventoryItemState::Unavailable, InventoryItemState::Unavailable]);
 
         let recovery = operation_utils::recover().unwrap().expect("a marker stands");
         assert_eq!((recovery.operation, recovery.outcome), (OperationKind::Merge, RecoveryOutcome::RolledBack));
