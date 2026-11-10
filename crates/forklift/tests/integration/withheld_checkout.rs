@@ -568,6 +568,33 @@ fn a_conflict_over_withheld_content_refuses_content_withheld() {
     assert_eq!(paths(&warehouse.stocktake()["unavailable"]), ["extra/new.bin"]);
 }
 
+/// A merge whose base version is left out names no way out: taking one's own change out would
+/// need the file as it was before, which this warehouse does not hold.
+///
+/// Revert: name the way out whatever the base (drop the base check in `withheld_way_out`) → the
+/// next step names taking the change out → red.
+#[test]
+fn a_merge_whose_base_is_withheld_names_no_way_out() {
+    let warehouse = Warehouse::new("refuse-base");
+    let base = warehouse.stack_files(&[("a.txt", "a\n"), ("film.mkv", OLD_FILM)], "main");
+    warehouse.run_ok(&["pallet", "create", "feature"]);
+    warehouse.stack_files(&[("film.mkv", "the film on feature\n")], "feature");
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.stack_files(&[("film.mkv", "the film on main\n")], "main changes the film");
+
+    warehouse.scoped(|| {
+        let withheld = file_hash(&base, "film.mkv");
+        unavailable::record([(withheld.clone(), "Withheld by the remote's host.".to_string())]).unwrap();
+        warehouse.delete_object(&withheld);
+    });
+
+    let output = warehouse.run(&["consolidate", "feature", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!((output.status.code(), &report["error"]["code"]), (Some(51), &"content_withheld".into()), "{}", report);
+    assert_eq!(report["error"]["next_step"], "Only a warehouse that holds the content can make this merge.", "{}", report);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), "the film on main\n");
+}
+
 /// `consolidate feature` into `main`, stopped at a conflict over `a.txt` (both sides changed it),
 /// having left their `film.mkv` and `extra/new.bin` out. Returns the warehouse and `feature`'s head.
 fn merge_stopped_at_a_conflict(name: &str) -> (Warehouse, String) {

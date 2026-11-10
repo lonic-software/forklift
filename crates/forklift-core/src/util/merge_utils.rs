@@ -919,7 +919,20 @@ enum PendingAction {
         path: String,
         hash: String,
         item_type: DirEntryType,
+        sides: Sides,
     },
+
+    /// A version kept in conflict (a [`MergeAction::Conflict`]), decided during the walk, with the
+    /// sides it was decided from.
+    Kept(MergeAction, Sides),
+}
+
+/// The three versions of a file kept or put back in conflict, `None` where that side has no file:
+/// what the way out of a `content_withheld` refusal is decided from.
+struct Sides {
+    base: Option<String>,
+    ours: Option<String>,
+    theirs: Option<String>,
 }
 
 /// A deferred three-way line merge of one file both sides changed (see [`PendingAction`]).
@@ -1016,7 +1029,7 @@ pub fn compute_merge_actions_with(base_hash: &str,
 
     // The blobs phase 2 reads, fetched in one batch in a cache warehouse.
     cache_miss::ensure_files_present(pending.iter().flat_map(|entry| match entry {
-        PendingAction::Ready(_) => Vec::new(),
+        PendingAction::Ready(_) | PendingAction::Kept(..) => Vec::new(),
         PendingAction::PutBack { hash, item_type, .. } => vec![(hash.as_str(), *item_type)],
         PendingAction::Merge(job) => {
             let mut sides = vec![(job.our_hash.as_str(), job.our_type), (job.their_hash.as_str(), job.their_type)];
@@ -1032,17 +1045,6 @@ pub fn compute_merge_actions_with(base_hash: &str,
     resolve_pending(pending, ours_label, theirs_label)
 }
 
-/// Which side of a merge changed a file whose merge needs its content, as far as the way out of a
-/// `content_withheld` refusal goes.
-enum Side<'a> {
-    /// Both sides changed it; the other side's version has this hash.
-    BothChanged(&'a str),
-    /// This pallet deleted it and the other side changed it.
-    WeDeleted,
-    /// This pallet changed it and the other side deleted it.
-    TheyDeleted,
-}
-
 /// Settle, before any blob is read, every entry that names content this warehouse leaves out
 /// ([`shift_utils::NotCheckedOut`]). A one-sided take of it becomes a [`MergeAction::LeaveOut`]:
 /// no read. A file both sides changed is handed to `withheld`: a line merge, or a version put back
@@ -1053,7 +1055,7 @@ fn sort_withheld(pending: &mut Vec<PendingAction>, withheld: WithheldReads) -> R
     let mut unknown = Vec::new();
 
     for (index, entry) in pending.iter_mut().enumerate() {
-        let (path, hashes, side): (&str, Vec<&str>, Side) = match entry {
+        let (path, hashes, sides): (&str, Vec<&str>, [Option<&str>; 3]) = match entry {
             PendingAction::Ready(MergeAction::TakeTheirs { path, hash, item_type, is_new }) => {
                 if not_checked_out.holds(hash)? {
                     *entry = PendingAction::Ready(MergeAction::LeaveOut {
@@ -1063,10 +1065,12 @@ fn sort_withheld(pending: &mut Vec<PendingAction>, withheld: WithheldReads) -> R
                 continue;
             }
             PendingAction::Merge(job) => {
-                (job.path.as_str(), job.base_hash.iter().map(String::as_str).chain([job.our_hash.as_str(), job.their_hash.as_str()]).collect(), Side::BothChanged(job.their_hash.as_str()))
+                (job.path.as_str(), job.base_hash.iter().map(String::as_str).chain([job.our_hash.as_str(), job.their_hash.as_str()]).collect(),
+                 [job.base_hash.as_deref(), Some(job.our_hash.as_str()), Some(job.their_hash.as_str())])
             }
-            PendingAction::PutBack { path, hash, .. } => (path.as_str(), vec![hash.as_str()], Side::WeDeleted),
-            PendingAction::Ready(MergeAction::Conflict { path, entry_hash, .. }) => (path.as_str(), vec![entry_hash.as_str()], Side::TheyDeleted),
+            PendingAction::PutBack { path, hash, sides, .. } => (path.as_str(), vec![hash.as_str()], sides.as_refs()),
+            PendingAction::Kept(MergeAction::Conflict { path, entry_hash, .. }, sides) => (path.as_str(), vec![entry_hash.as_str()], sides.as_refs()),
+            PendingAction::Kept(..) => continue,
             PendingAction::Ready(_) => continue,
         };
 
@@ -1083,24 +1087,7 @@ fn sort_withheld(pending: &mut Vec<PendingAction>, withheld: WithheldReads) -> R
             WithheldReads::Refuse => {
                 let statement = not_checked_out.statement(hash).unwrap_or_default();
 
-                // Taking this pallet's own change to the file out leaves the other side's alone to
-                // decide it, which reads nothing: their deletion goes through, their version is
-                // taken, or, when this warehouse leaves that version out too, the file is left out.
-                let outcome = match side {
-                    Side::TheyDeleted => "the merge takes the other side's deletion of it",
-                    Side::WeDeleted => "the merge leaves the file out",
-                    Side::BothChanged(their_hash) if not_checked_out.holds(their_hash)? => "the merge leaves the file out",
-                    Side::BothChanged(_) => "the merge takes the other side's version",
-                };
-                let change = match side {
-                    Side::WeDeleted => "this pallet's deletion of it taken out (the file put back as it was)",
-                    _ => "this pallet's own change to it taken out (the file as it was before)",
-                };
-                let next_step = format!(
-                    "With {}, only the other side changes \"{}\" and {}. Otherwise only a warehouse that \
-                    holds the content can make this merge.",
-                    change, path, outcome
-                );
+                let next_step = withheld_way_out(&not_checked_out, path, sides)?;
 
                 return Err(crate::error::CoreError::refusal_with_details(
                     crate::error::RefusalCode::ContentWithheld,
@@ -1128,6 +1115,42 @@ fn sort_withheld(pending: &mut Vec<PendingAction>, withheld: WithheldReads) -> R
     Ok(())
 }
 
+/// The next step of a merge's `content_withheld` refusal over `path`, from its three versions
+/// (`[base, ours, theirs]`). Taking this pallet's own change to the file out leaves the other
+/// side's alone to decide it, which reads nothing: their deletion goes through, their version is
+/// taken, or, when this warehouse leaves that version out too, the file is left out. That needs the
+/// file as it was before, so a base this warehouse leaves out names no way out.
+fn withheld_way_out(not_checked_out: &shift_utils::NotCheckedOut, path: &str, [base, ours, theirs]: [Option<&str>; 3])
+                    -> Result<String, String> {
+    const HOLDER_ONLY: &str = "Only a warehouse that holds the content can make this merge.";
+
+    if let Some(base) = base {
+        if not_checked_out.holds(base)? {
+            return Ok(HOLDER_ONLY.to_string());
+        }
+    }
+
+    let change = match (base, ours) {
+        (_, None) => "this pallet's deletion of it taken out (the file put back as it was)",
+        (None, Some(_)) => "this pallet's own addition of it taken out (the file removed)",
+        (Some(_), Some(_)) => "this pallet's own change to it taken out (the file as it was before)",
+    };
+    let outcome = match theirs {
+        None => "the merge takes the other side's deletion of it",
+        Some(theirs) if not_checked_out.holds(theirs)? => "the merge leaves the file out",
+        Some(_) => "the merge takes the other side's version",
+    };
+
+    Ok(format!("With {}, only the other side changes \"{}\" and {}. Otherwise {}", change, path, outcome,
+        HOLDER_ONLY.replacen("Only", "only", 1)))
+}
+
+impl Sides {
+    fn as_refs(&self) -> [Option<&str>; 3] {
+        [self.base.as_deref(), self.ours.as_deref(), self.theirs.as_deref()]
+    }
+}
+
 /// The number of deferred merges below which running them on the calling thread is cheaper
 /// than the threads that would share them.
 const PARALLEL_MERGE_THRESHOLD: usize = 8;
@@ -1146,8 +1169,8 @@ fn resolve_pending(pending: Vec<PendingAction>,
 
     for (index, entry) in pending.into_iter().enumerate() {
         match entry {
-            PendingAction::Ready(action) => ready.push((index, action)),
-            PendingAction::PutBack { path, hash, item_type } => ready.push((index, MergeAction::Conflict {
+            PendingAction::Ready(action) | PendingAction::Kept(action, _) => ready.push((index, action)),
+            PendingAction::PutBack { path, hash, item_type, .. } => ready.push((index, MergeAction::Conflict {
                 path,
                 content: Some(object_utils::load_blob(&hash)?.content),
                 entry_hash: hash,
@@ -1386,26 +1409,28 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
             // whole into memory here — it carries no inline content; the apply path
             // re-materializes it from its recipe hash (which `entry_hash` holds).
             (None, Some((their_hash, their_type))) => {
+                let sides = Sides { base: b.map(|(hash, _)| hash.clone()), ours: None, theirs: Some(their_hash.clone()) };
                 pending.push(if their_type.is_chunked() {
-                    PendingAction::Ready(MergeAction::Conflict {
+                    PendingAction::Kept(MergeAction::Conflict {
                         path,
                         content: None,
                         entry_hash: their_hash.clone(),
                         item_type: *their_type,
-                    })
+                    }, sides)
                 } else {
-                    PendingAction::PutBack { path, hash: their_hash.clone(), item_type: *their_type }
+                    PendingAction::PutBack { path, hash: their_hash.clone(), item_type: *their_type, sides }
                 });
             }
 
             // Modify/delete: we changed it, they deleted it. Our file is kept, in conflict.
             (Some((our_hash, our_type)), None) => {
-                pending.push(PendingAction::Ready(MergeAction::Conflict {
+                let sides = Sides { base: b.map(|(hash, _)| hash.clone()), ours: Some(our_hash.clone()), theirs: None };
+                pending.push(PendingAction::Kept(MergeAction::Conflict {
                     path,
                     content: None,
                     entry_hash: our_hash.clone(),
                     item_type: *our_type,
-                }));
+                }, sides));
             }
 
             (Some((our_hash, our_type)), Some((their_hash, their_type))) => {
@@ -1414,12 +1439,15 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
 
                 if !both_plain_files {
                     // Type conflicts (symlink vs file, …) are not line-mergeable; keep ours.
-                    pending.push(PendingAction::Ready(MergeAction::Conflict {
+                    let sides = Sides {
+                        base: b.map(|(hash, _)| hash.clone()), ours: Some(our_hash.clone()), theirs: Some(their_hash.clone()),
+                    };
+                    pending.push(PendingAction::Kept(MergeAction::Conflict {
                         path,
                         content: None,
                         entry_hash: our_hash.clone(),
                         item_type: *our_type,
-                    }));
+                    }, sides));
                     continue;
                 }
 
