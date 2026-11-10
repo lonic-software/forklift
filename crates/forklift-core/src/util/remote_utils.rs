@@ -464,6 +464,11 @@ pub struct LiftStats {
     pub uploaded_signatures: usize,
     pub old_head: Option<String>,
 
+    /// The content the lifted history names that the remote's host withholds, sorted: none of it
+    /// was offered or uploaded, since the remote takes history naming it without it. Named where
+    /// the walk would otherwise have offered it, or where the negotiation answered it withheld.
+    pub withheld: Vec<String>,
+
     /// Why the landed head could not be added to the held-heads record, if it could not. The lift
     /// stands; only a candidate for a later prune is lost, so the caller warns.
     pub unrecorded: Option<String>,
@@ -6536,7 +6541,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
 
     refuse_redacted_head(pallet, local_head, remote_head)?;
 
-    let (new_parcels, uploaded_objects, uploaded_signatures) =
+    let UploadedHistory { new_parcels, uploaded_objects, uploaded_signatures, withheld } =
         // An acknowledged tombstone's head is held on the remote (a gc root), so a re-creation
         // uploads only the work past it.
         upload_history(client, local_head, remote_head.or(tombstone),
@@ -6553,6 +6558,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
         uploaded_objects,
         uploaded_signatures,
         old_head: remote_head.map(|hash| hash.to_string()),
+        withheld,
         unrecorded,
     }))
 }
@@ -6749,64 +6755,64 @@ fn held_elsewhere(info: &WarehouseInfo, pallet: &str) -> Vec<String> {
 /// [`push_local_trust`] uses it alone for a re-genesis anchor's adopted office history, which no
 /// ref on the remote names.
 ///
-/// `info` is the remote's handshake. Content of a redaction it reports applied is never offered:
-/// the remote refuses it, and holds it absent in the closure of the heads it takes.
+/// `info` is the remote's handshake. Content of a redaction it reports applied, and content its
+/// host withholds, is never offered: the remote refuses both, and holds them absent in the closure
+/// of the heads it takes. The withheld content the history names is reported back.
 ///
 /// # Returns
-/// * `Ok((usize, usize, usize))` - The new parcels, uploaded objects and uploaded signatures.
-/// * `Err(String)`               - If the history could not be read or a transfer failed.
+/// * `Ok(UploadedHistory)` - What was uploaded, and the withheld content left out.
+/// * `Err(String)`         - If the history could not be read or a transfer failed.
 async fn upload_history(client: &RemoteClient,
                         local_head: &str,
                         remote_head: Option<&str>,
                         elsewhere: &[String],
                         info: &WarehouseInfo,
-                        progress: &Progress) -> Result<(usize, usize, usize), String> {
+                        progress: &Progress) -> Result<UploadedHistory, String> {
     let chunking_supported = info.chunking;
 
     // The new parcels the remote does not have, ordered parents-first — see
-    // `new_parcels_parents_first`, which owns both the walk and the order the candidate
-    // loop below depends on.
+    // `new_parcels_parents_first`, which owns both the walk and the order
+    // [`walk_lift_closure`] depends on.
     progress.status("Finding objects to lift");
 
     let new_parcels = new_parcels_parents_first(local_head, remote_head, elsewhere)?;
 
-    // Candidate objects for the negotiation: each new parcel's tree, walked against
-    // its parents' trees — a subtree identical to *any* parent's at the same path is
-    // skipped whole, the same skip the merge walk and the pallet diff use. A one-line
-    // change on a 100k-file warehouse thus negotiates the changed path, not the full
-    // closure.
-    let mut candidates: Vec<String> = new_parcels.clone();
-    let mut seen_trees: HashSet<String> = HashSet::new();
-
-    // Content the remote reports applied is never sent: it refuses it, and its ref update takes
-    // history naming it without it. The walk neither offers a file entry naming it nor descends a
-    // redacted recipe; a chunk is still offered whenever a recipe the walk reaches names it.
+    // Content the remote reports applied, or withholds, is never sent: it refuses it, and its ref
+    // update takes history naming it without it.
     let redacted: HashSet<String> = info.applied_redactions().into_iter().map(str::to_string).collect();
-    let mut seen_blobs: HashSet<String> = HashSet::new();
-    let mut seen_recipes: HashSet<String> = HashSet::new();
+    let mut withheld: HashSet<String> =
+        info.withheld.iter().flatten().map(|item| item.hash.clone()).collect();
 
-    // Parents first, guaranteed by `new_parcels_parents_first`: every parent of the parcel
-    // being walked is remote-known or already processed, so everything a base "explains" is
-    // on the remote or in the candidates already. Do not reorder this loop — a base that
-    // explains a subtree of a parcel not yet processed drops that subtree from the candidate
-    // set, and the push then fails the server's closure audit identically on every retry.
-    for parcel_hash in &new_parcels {
-        let parcel = object_utils::load_parcel(parcel_hash)?;
+    // One flow serves both heads: negotiate upload targets, PUT the missing objects straight to
+    // presigned staging URLs and/or to the control plane, and commit the staged session. Falls
+    // back to `missing` + per-object `PUT` against a remote that predates `upload-targets`.
+    //
+    // A takedown recorded after the handshake is first heard of in the negotiation. When it names
+    // a recipe the walk descended, that recipe's own chunks are among the candidates, so the walk
+    // runs again with the recipe withheld and the negotiation is repeated, before a byte moves.
+    // Each pass withholds at least one more recipe the history names, so the passes are bounded.
+    let (walk, session, negotiation) = loop {
+        let walk = walk_lift_closure(&new_parcels, chunking_supported, &redacted, &withheld)?;
+        let session = new_lift_session();
+        let mut negotiation = negotiate(client, &session, &walk.candidates).await?;
 
-        // Every parent's tree, not just the first. A merge parcel that
-        // adopted an out-of-scope sibling by hash from its *second* parent is explained by that
-        // parent — which the remote already has, or which is uploaded in this same session — so
-        // treating a subtree as base-explained when it matches ANY parent stops the walk from
-        // trying to load an object a sparse workspace never fetched. An ordinary single-parent
-        // parcel is the N=1 case: identical behavior, and a strictly-not-larger candidate set.
-        let base_trees: Vec<String> = parcel.parents.iter()
-            .map(|parent| object_utils::load_parcel(parent).map(|p| p.tree_hash))
-            .collect::<Result<_, _>>()?;
+        // Only what was offered can come back withheld; anything else is not this history's.
+        let offered: HashSet<&str> = walk.candidates.iter().map(String::as_str).collect();
+        negotiation.retain_withheld(|hash| offered.contains(hash));
 
-        collect_changed_closure(&parcel.tree_hash, "", &base_trees,
-                                &mut seen_trees, &mut seen_blobs, &mut seen_recipes,
-                                &mut candidates, chunking_supported, &redacted)?;
-    }
+        let late: Vec<String> = negotiation.withheld().iter()
+            .filter(|hash| walk.seen_recipes.contains(*hash) && !withheld.contains(*hash))
+            .cloned()
+            .collect();
+
+        if late.is_empty() {
+            break (walk, session, negotiation);
+        }
+
+        withheld.extend(late);
+    };
+
+    let Walk { seen_trees, seen_recipes, mut left_out, .. } = walk;
 
     // Control-plane objects — parcels, trees, and recipes — are promoted synchronously when a
     // storage-backed head commits the session; working blobs and chunks are promoted out of band
@@ -6818,14 +6824,13 @@ async fn upload_history(client: &RemoteClient,
     control_plane.extend(seen_trees.iter().cloned());
     control_plane.extend(seen_recipes.iter().cloned());
 
-    // One flow serves both heads: negotiate upload targets, PUT the missing objects straight to
-    // presigned staging URLs and/or to the control plane, and commit the staged session. Falls
-    // back to `missing` + per-object `PUT` against a remote that predates `upload-targets`.
+    // A takedown the handshake did not list yet is answered withheld by the negotiation.
+    left_out.met_withheld.extend(negotiation.withheld().iter().cloned());
+
     progress.status("Uploading objects");
 
-    let session = new_lift_session();
-    let uploaded_objects = negotiate_and_upload(
-        client, &session, &candidates, &control_plane, chunking_supported, progress,
+    let negotiated = upload_negotiated(
+        client, &session, negotiation, &control_plane, chunking_supported, progress,
     ).await?;
 
     progress.status("Updating the remote");
@@ -6840,7 +6845,95 @@ async fn upload_history(client: &RemoteClient,
         }
     }
 
-    Ok((new_parcels.len(), uploaded_objects, uploaded_signatures))
+    Ok(UploadedHistory {
+        new_parcels: new_parcels.len(),
+        uploaded_objects: negotiated,
+        uploaded_signatures,
+        withheld: left_out.met_withheld.into_iter().collect(),
+    })
+}
+
+/// What one closure walk of a lift's new parcels ([`walk_lift_closure`]) found to offer.
+struct Walk {
+    /// The new parcels, then everything their trees name that no parent explains.
+    candidates: Vec<String>,
+
+    seen_trees: HashSet<String>,
+    seen_recipes: HashSet<String>,
+    left_out: LeftOut,
+}
+
+/// Walk each of `new_parcels`' trees against its parents' trees, collecting the candidates a lift
+/// negotiates: each new parcel's tree, walked against its parents' trees — a subtree identical to
+/// *any* parent's at the same path is skipped whole, the same skip the merge walk and the pallet
+/// diff use. A one-line change on a 100k-file warehouse thus negotiates the changed path, not the
+/// full closure.
+///
+/// Content in `redacted` or `withheld` is never offered: the walk neither offers a file entry
+/// naming it nor descends such a recipe, nor offers a chunk it names. The withheld content it met
+/// is in the result's [`LeftOut::met_withheld`].
+fn walk_lift_closure(new_parcels: &[String],
+                     chunking_supported: bool,
+                     redacted: &HashSet<String>,
+                     withheld: &HashSet<String>) -> Result<Walk, String> {
+    let mut candidates: Vec<String> = new_parcels.to_vec();
+    let mut seen_trees: HashSet<String> = HashSet::new();
+    let mut seen_blobs: HashSet<String> = HashSet::new();
+    let mut seen_recipes: HashSet<String> = HashSet::new();
+    let mut left_out = LeftOut {
+        redacted: redacted.clone(),
+        withheld: withheld.clone(),
+        met_withheld: BTreeSet::new(),
+    };
+
+    // Parents first, guaranteed by `new_parcels_parents_first`: every parent of the parcel
+    // being walked is remote-known or already processed, so everything a base "explains" is
+    // on the remote or in the candidates already. Do not reorder this loop — a base that
+    // explains a subtree of a parcel not yet processed drops that subtree from the candidate
+    // set, and the push then fails the server's closure audit identically on every retry.
+    for parcel_hash in new_parcels {
+        let parcel = object_utils::load_parcel(parcel_hash)?;
+
+        // Every parent's tree, not just the first. A merge parcel that
+        // adopted an out-of-scope sibling by hash from its *second* parent is explained by that
+        // parent — which the remote already has, or which is uploaded in this same session — so
+        // treating a subtree as base-explained when it matches ANY parent stops the walk from
+        // trying to load an object a sparse workspace never fetched. An ordinary single-parent
+        // parcel is the N=1 case: identical behavior, and a strictly-not-larger candidate set.
+        let base_trees: Vec<String> = parcel.parents.iter()
+            .map(|parent| object_utils::load_parcel(parent).map(|p| p.tree_hash))
+            .collect::<Result<_, _>>()?;
+
+        collect_changed_closure(&parcel.tree_hash, "", &base_trees,
+                                &mut seen_trees, &mut seen_blobs, &mut seen_recipes,
+                                &mut candidates, chunking_supported, &mut left_out)?;
+    }
+
+    Ok(Walk { candidates, seen_trees, seen_recipes, left_out })
+}
+
+/// What [`upload_history`] uploaded, and the withheld content it left out.
+struct UploadedHistory {
+    new_parcels: usize,
+    uploaded_objects: usize,
+    uploaded_signatures: usize,
+
+    /// The withheld content the history names, sorted ([`LiftStats::withheld`]).
+    withheld: Vec<String>,
+}
+
+/// What a lift's closure walk ([`collect_changed_closure`]) never offers the remote, and the
+/// withheld content it met.
+#[derive(Default)]
+struct LeftOut {
+    /// Content the remote reports applied a redaction of.
+    redacted: HashSet<String>,
+
+    /// Content the remote's host withholds.
+    withheld: HashSet<String>,
+
+    /// The withheld content the walk met where it would otherwise have offered it.
+    met_withheld: BTreeSet<String>,
 }
 
 /// The new parcels of a lift — everything reachable from the local head that the remote does
@@ -7003,7 +7096,7 @@ fn collect_changed_closure(tree_hash: &str,
                            seen_recipes: &mut HashSet<String>,
                            candidates: &mut Vec<String>,
                            chunking_supported: bool,
-                           redacted: &HashSet<String>) -> Result<(), String> {
+                           left_out: &mut LeftOut) -> Result<(), String> {
     // Record the visit before checking base-explained, not after: content-addressing means the
     // same subtree hash can recur at another path in the same walk (e.g. a merge adopting one
     // side's out-of-scope subtree under two names), and that recurrence must be recognized even
@@ -7046,8 +7139,17 @@ fn collect_changed_closure(tree_hash: &str,
         let explained = base_file_hashes.get(name.as_str())
             .is_some_and(|hashes| hashes.contains(&file.hash.as_str()));
 
-        // Content the remote applied a redaction of: not offered, and a recipe not descended.
-        if redacted.contains(&file.hash) {
+        // Content the remote applied a redaction of, or withholds: not offered, and a recipe not
+        // descended. Withheld content is reported where it would otherwise have been offered.
+        if left_out.redacted.contains(&file.hash) {
+            continue;
+        }
+
+        if left_out.withheld.contains(&file.hash) {
+            if !explained {
+                left_out.met_withheld.insert(file.hash.clone());
+            }
+
             continue;
         }
 
@@ -7058,8 +7160,9 @@ fn collect_changed_closure(tree_hash: &str,
             //    (an old head), refuse client-side, before any negotiation or upload, naming the
             //    path — an old head's `gc` would silently collect a recipe's chunks (B1), so a
             //    chunk-aware client never lifts chunked content there. Checked for every chunked
-            //    entry this walk visits (explained or not), so it also catches one that is
-            //    unchanged-but-newly-reachable in this lift.
+            //    entry this walk visits (explained or not) and does not leave out as redacted or
+            //    withheld, so it also catches one that is unchanged-but-newly-reachable in this
+            //    lift.
             if !chunking_supported {
                 return Err(scope_utils::chunked_remote_refusal(&join_path(path_prefix, name)).into());
             }
@@ -7080,7 +7183,10 @@ fn collect_changed_closure(tree_hash: &str,
                 candidates.push(file.hash.clone());
 
                 for chunk_hash in object_utils::recipe_chunk_hashes(&file.hash)? {
-                    if seen_blobs.insert(chunk_hash.clone()) {
+                    // A withheld chunk is left out, and reported, like a withheld file.
+                    if left_out.withheld.contains(&chunk_hash) {
+                        left_out.met_withheld.insert(chunk_hash);
+                    } else if seen_blobs.insert(chunk_hash.clone()) {
                         candidates.push(chunk_hash);
                     }
                 }
@@ -7105,7 +7211,7 @@ fn collect_changed_closure(tree_hash: &str,
 
         collect_changed_closure(&subtree.hash, &join_path(path_prefix, name), &child_bases,
                                 seen_trees, seen_blobs, seen_recipes, candidates,
-                                chunking_supported, redacted)?;
+                                chunking_supported, left_out)?;
     }
 
     Ok(())
@@ -7249,7 +7355,7 @@ async fn upload_objects(client: &RemoteClient,
 }
 
 /// Refuse a lift whose commit would need more than one paginated batch (§9.4b Stage 3, W3) when
-/// the remote does not advertise chunking support. See [`negotiate_and_upload`] for why: the
+/// the remote does not advertise chunking support. See [`upload_negotiated`] for why: the
 /// additive `more` field that makes pagination safe shipped *with* chunking, not before it, and a
 /// remote that ignores it would silently sweep away a later batch's still-staged objects.
 ///
@@ -7269,11 +7375,62 @@ fn refuse_if_commit_pagination_unsupported(staged_count: usize,
     Err(scope_utils::commit_pagination_unsupported_refusal(staged_count))
 }
 
+/// [`negotiate`], then [`upload_negotiated`]: one pass of what [`upload_history`] does, for the
+/// tests that drive the upload flow alone.
+#[cfg(test)]
+async fn negotiate_and_upload(client: &RemoteClient,
+                              session: &str,
+                              candidates: &[String],
+                              control_plane: &HashSet<String>,
+                              chunking_supported: bool,
+                              progress: &Progress) -> Result<usize, String> {
+    let negotiation = negotiate(client, session, candidates).await?;
+    upload_negotiated(client, session, negotiation, control_plane, chunking_supported, progress).await
+}
+
+/// The remote's answer to which of a lift's candidates to send, and where.
+enum Negotiation {
+    /// From a remote that predates `upload-targets`: the candidates it is missing.
+    Missing(Vec<String>),
+
+    /// From `upload-targets`.
+    Targets(UploadTargetsResponse),
+}
+
+impl Negotiation {
+    /// What the remote answered withheld (nothing, from a remote that predates `upload-targets`).
+    fn withheld(&self) -> &[String] {
+        match self {
+            Negotiation::Missing(_) => &[],
+            Negotiation::Targets(response) => &response.withheld,
+        }
+    }
+
+    /// Keep only the withheld hashes `keep` accepts.
+    fn retain_withheld(&mut self, keep: impl Fn(&str) -> bool) {
+        if let Negotiation::Targets(response) = self {
+            response.withheld.retain(|hash| keep(hash));
+        }
+    }
+}
+
+/// Ask the remote which of `candidates` to send and where: `upload-targets`, or `missing` from a
+/// remote that predates it. Nothing is uploaded.
+async fn negotiate(client: &RemoteClient,
+                   session: &str,
+                   candidates: &[String]) -> Result<Negotiation, String> {
+    match client.upload_targets(session, candidates).await? {
+        Some(response) => Ok(Negotiation::Targets(response)),
+        None => Ok(Negotiation::Missing(client.missing_objects(candidates).await?)),
+    }
+}
+
 /// The one upload flow that serves both a storage-backed (staging) head and a direct head.
-/// Negotiates targets, uploads the missing objects — straight to presigned staging URLs and/or
-/// to the control plane — commits the staged session when there is one, and returns how many
-/// objects it uploaded (for [`LiftStats`], staged and direct alike). Falls back to the legacy
-/// `missing` + per-object `PUT` against a remote that predates `upload-targets`.
+/// Given what [`negotiate`] answered, uploads the missing objects — straight to presigned staging
+/// URLs and/or to the control plane — commits the staged session when there is one, and returns
+/// how many objects it uploaded (for [`LiftStats`], staged and direct alike). What the remote
+/// answered withheld is never sent. Against a remote that predates `upload-targets`, the legacy
+/// per-object `PUT` of what `missing` listed.
 ///
 /// `control_plane` names the hashes that are parcels or trees — small objects the commit
 /// verifies and promotes synchronously; every other staged hash is a working blob, promoted out
@@ -7285,19 +7442,21 @@ fn refuse_if_commit_pagination_unsupported(staged_count: usize,
 ///
 /// `progress` hears each finished upload against the total the negotiation settled on, and a
 /// status when the staged commit starts.
-async fn negotiate_and_upload(client: &RemoteClient,
-                              session: &str,
-                              candidates: &[String],
-                              control_plane: &HashSet<String>,
-                              chunking_supported: bool,
-                              progress: &Progress) -> Result<usize, String> {
-    let Some(negotiation) = client.upload_targets(session, candidates).await? else {
-        // An older remote with no `upload-targets`: negotiate the missing set and PUT each body
-        // to the control plane, exactly as before. No staging, no commit batching — each object is
-        // verified inline on its own PUT, so the pagination gate below does not apply here.
-        let missing = client.missing_objects(candidates).await?;
-        upload_objects(client, &missing, &mut upload_tally(progress, missing.len())).await?;
-        return Ok(missing.len());
+async fn upload_negotiated(client: &RemoteClient,
+                           session: &str,
+                           negotiation: Negotiation,
+                           control_plane: &HashSet<String>,
+                           chunking_supported: bool,
+                           progress: &Progress) -> Result<usize, String> {
+    let negotiation = match negotiation {
+        // An older remote with no `upload-targets`: PUT each missing body to the control plane,
+        // exactly as before. No staging, no commit batching — each object is verified inline on
+        // its own PUT, so the pagination gate below does not apply here.
+        Negotiation::Missing(missing) => {
+            upload_objects(client, &missing, &mut upload_tally(progress, missing.len())).await?;
+            return Ok(missing.len());
+        }
+        Negotiation::Targets(response) => response,
     };
 
     // Before a single byte is uploaded: a commit that will need more than one paginated batch
@@ -9505,7 +9664,7 @@ mod tests {
             let mut seen_recipes = HashSet::new();
             let mut candidates = Vec::new();
             collect_changed_closure(&root_merge, "", bases, &mut seen_trees, &mut seen_blobs,
-                                    &mut seen_recipes, &mut candidates, true, &HashSet::new())
+                                    &mut seen_recipes, &mut candidates, true, &mut LeftOut::default())
                 .expect("the closure walk must not load a pruned object");
             candidates
         };
@@ -9629,7 +9788,7 @@ mod tests {
                 .collect::<Result<_, _>>()
                 .expect("every parent resolves");
             collect_changed_closure(&parcel.tree_hash, "", &base_trees, &mut seen_trees,
-                                    &mut seen_blobs, &mut seen_recipes, &mut candidates, true, &HashSet::new())
+                                    &mut seen_blobs, &mut seen_recipes, &mut candidates, true, &mut LeftOut::default())
                 .expect("the client walk must not load a pruned object");
         }
         let priced: HashSet<String> = candidates.iter().cloned().collect();
@@ -9722,7 +9881,7 @@ mod tests {
         let mut seen_recipes = HashSet::new();
         let mut candidates = Vec::new();
         collect_changed_closure(&new_root, "", &[base_root], &mut seen_trees, &mut seen_blobs,
-                                &mut seen_recipes, &mut candidates, true, &HashSet::new())
+                                &mut seen_recipes, &mut candidates, true, &mut LeftOut::default())
             .expect("the second path must be recognized as already-seen, not re-loaded");
 
         assert!(!candidates.contains(&shared),
@@ -9791,7 +9950,7 @@ mod tests {
 
         // `false` = the remote's handshake omitted the chunking capability.
         let error = collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs,
-                                            &mut seen_recipes, &mut candidates, false, &HashSet::new())
+                                            &mut seen_recipes, &mut candidates, false, &mut LeftOut::default())
             .expect_err("a chunked file entry must refuse a lift to a non-chunking remote");
 
         let (code, message, next_step) = scope_utils::decode_refusal(&error)
@@ -9828,7 +9987,7 @@ mod tests {
         let mut candidates = Vec::new();
 
         collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs,
-                                &mut seen_recipes, &mut candidates, true, &HashSet::new())
+                                &mut seen_recipes, &mut candidates, true, &mut LeftOut::default())
             .expect("a chunked file must negotiate, not refuse, against a chunking remote");
 
         // The recipe is a control-plane candidate; every chunk is a blob candidate.
@@ -9868,10 +10027,13 @@ mod tests {
         let mut seen_blobs = HashSet::new();
         let mut seen_recipes = HashSet::new();
         let mut candidates = Vec::new();
-        let redacted = HashSet::from([redacted_recipe.clone(), shared.clone()]);
+        let mut left_out = LeftOut {
+            redacted: HashSet::from([redacted_recipe.clone(), shared.clone()]),
+            ..LeftOut::default()
+        };
 
         collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs,
-                                &mut seen_recipes, &mut candidates, true, &redacted).unwrap();
+                                &mut seen_recipes, &mut candidates, true, &mut left_out).unwrap();
 
         assert!(!candidates.contains(&redacted_recipe), "a redacted recipe is not offered");
         for chunk in &redacted_chunks {
@@ -9881,6 +10043,183 @@ mod tests {
         for chunk in &live_chunks {
             assert!(candidates.contains(chunk), "a live recipe's chunk is offered: {}", chunk);
         }
+    }
+
+    /// Content the remote's host withholds is not offered where a file entry names it, a withheld
+    /// recipe's own chunks are not offered, and each such hash is reported once; a chunk a live
+    /// recipe shares with it is still offered, a withheld chunk of a live recipe is not, and
+    /// withheld content a parent already names at the same path is not reported, since the walk
+    /// would not have offered it.
+    ///
+    /// Revert: descend a withheld recipe as any other → its own chunks are negotiated. Report
+    /// withheld content wherever it is met → the explained entry is reported. Offer every chunk a
+    /// live recipe names → the withheld one is offered.
+    #[test]
+    fn the_lift_leaves_out_withheld_content_and_reports_it() {
+        use crate::enums::dir_entry_type::DirEntryType::{Normal, NormalChunked};
+
+        let _scratch = Scratch::new("closure-withheld");
+
+        let (withheld_recipe, withheld_chunks) = store_recipe(&["shared-w", "taken-down"]);
+        let (live_recipe, live_chunks) = store_recipe(&["shared-w", "live-w"]);
+        let (holed_recipe, holed_chunks) = store_recipe(&["live-h", "withheld chunk"]);
+        let withheld_blob = store_blob("withheld file");
+        let kept_blob = store_blob("withheld at the base already");
+        let base = store_tree(&[("old.txt", &kept_blob, Normal)]);
+        let root = store_tree(&[
+            ("dump.bin", &withheld_recipe, NormalChunked),
+            ("again.bin", &withheld_recipe, NormalChunked),
+            ("live.bin", &live_recipe, NormalChunked),
+            ("holed.bin", &holed_recipe, NormalChunked),
+            ("notice.txt", &withheld_blob, Normal),
+            ("old.txt", &kept_blob, Normal),
+        ]);
+
+        let mut seen_trees = HashSet::new();
+        let mut seen_blobs = HashSet::new();
+        let mut seen_recipes = HashSet::new();
+        let mut candidates = Vec::new();
+        let mut left_out = LeftOut {
+            withheld: HashSet::from([
+                withheld_recipe.clone(), withheld_blob.clone(), kept_blob.clone(), holed_chunks[1].clone(),
+            ]),
+            ..LeftOut::default()
+        };
+
+        collect_changed_closure(&root, "", &[base], &mut seen_trees, &mut seen_blobs,
+                                &mut seen_recipes, &mut candidates, true, &mut left_out).unwrap();
+
+        assert!(!candidates.contains(&withheld_recipe), "a withheld recipe is not offered");
+        assert!(!candidates.contains(&withheld_blob), "a withheld file is not offered");
+        assert!(!candidates.contains(&withheld_chunks[1]), "a withheld recipe's own chunk is not offered");
+        assert!(candidates.contains(&live_recipe));
+        for chunk in &live_chunks {
+            assert!(candidates.contains(chunk), "a live recipe's chunk is offered: {}", chunk);
+        }
+        assert_eq!(live_chunks[0], withheld_chunks[0], "the fixture shares a chunk");
+        assert!(candidates.contains(&holed_recipe) && candidates.contains(&holed_chunks[0]));
+        assert!(!candidates.contains(&holed_chunks[1]), "a withheld chunk of a live recipe is not offered");
+        assert_eq!(
+            left_out.met_withheld.into_iter().collect::<Vec<_>>(),
+            {
+                let mut expected = vec![withheld_recipe, withheld_blob, holed_chunks[1].clone()];
+                expected.sort();
+                expected
+            },
+            "each withheld hash the walk would have offered is reported once, the explained one not"
+        );
+    }
+
+    /// A remote whose host withholds `withheld` without its handshake saying so — a takedown
+    /// recorded after the handshake — and that answers one hash nobody offered withheld too. Every
+    /// other hash is answered `direct`. Records each negotiation's hashes and each object `PUT`.
+    struct LateWithholdingRemote {
+        url: String,
+        negotiated: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        put: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl LateWithholdingRemote {
+        const UNOFFERED: &'static str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+        fn start(withheld: HashSet<String>) -> LateWithholdingRemote {
+            use std::io::Write;
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let negotiated = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let put = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (negotiated_log, put_log) = (Arc::clone(&negotiated), Arc::clone(&put));
+
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let Some((method, path, _, body)) = read_test_request(&mut stream) else { continue };
+
+                    let response = if path == "/v1/objects/upload-targets" {
+                        let request: UploadTargetsRequest = serde_json::from_slice(&body).unwrap();
+                        negotiated_log.lock().unwrap().push(request.hashes.clone());
+                        let (mut held, direct): (Vec<String>, Vec<String>) = request.hashes.into_iter()
+                            .partition(|hash| withheld.contains(hash));
+                        held.push(Self::UNOFFERED.to_string());
+                        serde_json::to_string(&UploadTargetsResponse {
+                            present: Vec::new(), targets: BTreeMap::new(), direct, withheld: held,
+                        }).unwrap()
+                    } else {
+                        if method == "PUT" {
+                            if let Some(hash) = path.strip_prefix("/v1/objects/") {
+                                put_log.lock().unwrap().push(hash.to_string());
+                            }
+                        }
+                        "{}".to_string()
+                    };
+
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response.len(), response
+                    );
+                    let _ = stream.flush();
+                }
+            });
+
+            LateWithholdingRemote { url, negotiated, put }
+        }
+    }
+
+    /// A takedown the handshake did not list, answered withheld only by the upload negotiation:
+    /// the lift walks again without the withheld recipe, so none of its own chunks is sent — only
+    /// the one a live recipe shares — and the report names it. A hash the negotiation answers
+    /// withheld that the lift never offered is not reported.
+    ///
+    /// Revert: upload after the first negotiation whatever it answers → the withheld recipe's
+    /// own chunk is sent. Report the negotiation's withheld list unfiltered → the unoffered hash
+    /// is reported.
+    #[test]
+    fn a_takedown_only_the_negotiation_reports_still_keeps_the_recipes_chunks_back() {
+        use crate::enums::dir_entry_type::DirEntryType::NormalChunked;
+
+        let _scratch = Scratch::new("late-takedown");
+
+        let (withheld_recipe, withheld_chunks) = store_recipe(&["shared-late", "taken-late"]);
+        let (live_recipe, live_chunks) = store_recipe(&["shared-late", "live-late"]);
+        let root = store_tree(&[
+            ("dump.bin", &withheld_recipe, NormalChunked),
+            ("live.bin", &live_recipe, NormalChunked),
+        ]);
+        let parcel = stack_with_tree(Vec::new(), &root, "late takedown");
+
+        let info = WarehouseInfo {
+            protocol: PROTOCOL_VERSION.to_string(),
+            default_pallet: "main".to_string(),
+            pallets: BTreeMap::new(),
+            trust: None,
+            chunking: true,
+            tombstones: None,
+            redactions: None,
+            withheld: None,
+        };
+
+        let remote = LateWithholdingRemote::start(HashSet::from([withheld_recipe.clone()]));
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let uploaded = runtime.block_on(upload_history(
+            &client, &parcel, None, &[], &info, &Progress::NONE,
+        )).unwrap();
+
+        let put = remote.put.lock().unwrap().clone();
+        assert!(!put.contains(&withheld_chunks[1]), "the withheld recipe's own chunk is not sent: {:?}", put);
+        assert!(!put.contains(&withheld_recipe), "the withheld recipe is not sent");
+        assert!(put.contains(&live_recipe) && put.contains(&live_chunks[1]), "the live recipe and its chunk are");
+        assert!(put.contains(&withheld_chunks[0]), "the chunk a live recipe shares is sent");
+        assert_eq!(uploaded.uploaded_objects, put.len());
+
+        let negotiated = remote.negotiated.lock().unwrap().clone();
+        assert_eq!(negotiated.len(), 2, "one walk more, once the negotiation named the recipe");
+        assert!(!negotiated[1].contains(&withheld_chunks[1]));
+
+        assert_eq!(uploaded.withheld, vec![withheld_recipe], "the unoffered hash is not reported");
     }
 
     /// Plant a blob above the whole-object ceiling directly, bypassing `LooseObject::store`'s

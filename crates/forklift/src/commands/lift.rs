@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Serialize;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{BatchLaneClosure, LiftResult, RemoteClient};
@@ -119,6 +121,7 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
             new_parcels: 0,
             uploaded_objects: 0,
             uploaded_signatures: 0,
+            withheld: Vec::new(),
             batch_lane: None,
             mirror: None,
         };
@@ -141,6 +144,7 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
                 report.new_parcels = stats.new_parcels;
                 report.uploaded_objects = stats.uploaded_objects;
                 report.uploaded_signatures = stats.uploaded_signatures;
+                report.withheld = lift_withheld(stats.withheld, &info);
             }
             Err(why) => {
                 // The human lines name the re-signed cells; JSON has only the error to carry them.
@@ -171,6 +175,22 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
 
         return Ok(());
     }
+}
+
+/// The withheld content a lift left out (`hashes`), each beside the statement the remote's
+/// handshake (`info`) gives for it, if it lists it.
+fn lift_withheld(hashes: Vec<String>, info: &forklift_core::model::remote::WarehouseInfo) -> Vec<LiftWithheld> {
+    let statements: HashMap<&str, &str> = info.withheld.iter().flatten()
+        .map(|item| (item.hash.as_str(), item.statement.as_str()))
+        .collect();
+
+    hashes.into_iter()
+        .map(|hash| {
+            let statement = statements.get(hash.as_str()).map(|statement| statement.to_string());
+
+            LiftWithheld { hash, statement }
+        })
+        .collect()
 }
 
 /// A lift's error, naming the cells a replay re-signed onto the remote before it — they landed,
@@ -404,6 +424,11 @@ pub(crate) struct LiftReport {
     uploaded_objects: usize,
     uploaded_signatures: usize,
 
+    /// The content the lifted history names that the remote's host withholds, so it was not
+    /// uploaded: the remote takes history naming it without it. Absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    withheld: Vec<LiftWithheld>,
+
     /// Why the remote's batch download stopped being used while this lift fetched (an auto-merge),
     /// when it did. Absent when it stayed open.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -414,6 +439,19 @@ pub(crate) struct LiftReport {
     /// never fails the lift.
     #[serde(skip_serializing_if = "Option::is_none")]
     mirror: Option<LiftMirror>,
+}
+
+/// Content the remote withholds, as a lift reports it.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct LiftWithheld {
+    /// The withheld object's hash.
+    hash: String,
+
+    /// Why the host withholds it, in the host's words. Absent when the handshake did not list it
+    /// and only the upload negotiation answered it withheld.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statement: Option<String>,
 }
 
 /// Whether a count is zero (for skipping it in the JSON envelope).
@@ -458,6 +496,25 @@ impl CommandOutput for LiftReport {
                 self.pallet, self.head, self.new_parcels, self.uploaded_objects,
                 self.uploaded_signatures
             );
+        }
+
+        if !self.withheld.is_empty() {
+            println!(
+                "The remote's host withholds {} object(s) this history names, so they were not uploaded; \
+                the remote takes the history without them:",
+                self.withheld.len()
+            );
+
+            for item in &self.withheld {
+                let hash = forklift_core::error::sanitize(&item.hash);
+
+                match &item.statement {
+                    Some(statement) => {
+                        println!("  {} ({})", hash, forklift_core::error::sanitize(statement))
+                    }
+                    None => println!("  {}", hash),
+                }
+            }
         }
 
         output::print_batch_lane(self.batch_lane);

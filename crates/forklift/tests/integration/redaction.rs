@@ -2572,6 +2572,67 @@ fn a_lift_naming_withheld_content_lands_without_its_bytes() {
     assert!(status.starts_with("HTTP/1.1 451"), "{} / {}", status, body);
 }
 
+/// A lift leaves out content the server's host withholds, a chunked file's chunks with its recipe,
+/// and reports each such hash with the host's statement; the ref write lands without them.
+///
+/// Revert: descend a withheld recipe as any other → its chunks are uploaded, and
+/// `uploaded_objects` counts them; drop the report → `withheld` is absent.
+#[test]
+fn a_lift_leaves_out_withheld_content_and_its_chunks_and_reports_them() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-takedown-lift-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("takedown-lift-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    // Above the chunking threshold, and varied, so the file is a recipe of several chunks.
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let content: Vec<u8> = (0..9 * 1024 * 1024).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    }).collect();
+    std::fs::write(owner.root.join("big.bin"), &content).unwrap();
+    std::fs::write(owner.root.join("film.mkv"), b"a film\n").unwrap();
+    owner.run_ok(&["load", "."]);
+    owner.run_ok(&["stack", "-m", "leaks"]);
+
+    let (recipe, chunks) = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&owner.root);
+        let root = object_utils::load_parcel(&owner.head("main")).unwrap().tree_hash;
+        let tree = object_utils::load_tree(&root).unwrap();
+        let recipe = tree.get_files().find(|(name, _)| name.as_str() == "big.bin").unwrap().1.hash.clone();
+        let chunks = object_utils::recipe_chunk_hashes(&recipe).unwrap();
+        (recipe, chunks)
+    };
+    assert!(chunks.len() > 1, "{:?}", chunks);
+    let film = hash_of(b"a film\n");
+
+    for (hash, statement) in [(&recipe, "court order 2026-51"), (&film, "court order 2026-52")] {
+        let added = withhold(&server.root, &["add", hash, "--statement", statement]);
+        assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    }
+
+    let lifted = owner.json(&["lift"]);
+    assert_eq!(server.main(), owner.head("main"));
+
+    // The new parcel and its tree, and nothing the withheld content names.
+    assert_eq!(lifted["data"]["uploaded_objects"], 2, "{}", lifted);
+    let mut expected = vec![
+        serde_json::json!({ "hash": recipe, "statement": "court order 2026-51" }),
+        serde_json::json!({ "hash": film, "statement": "court order 2026-52" }),
+    ];
+    expected.sort_by_key(|item| item["hash"].as_str().unwrap().to_string());
+    assert_eq!(lifted["data"]["withheld"], serde_json::Value::Array(expected), "{}", lifted);
+
+    let objects = server.root.join(".forklift/objects");
+    for chunk in &chunks {
+        assert!(loose_copies(&objects, chunk).is_empty(), "chunk {} reached the server", chunk);
+    }
+}
+
 /// Only a file's content is tolerated absent for being withheld: a lift whose history names a
 /// withheld hash as a parcel is refused, and the refusal says the host withholds it, since the
 /// negotiation never asked for it.

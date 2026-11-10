@@ -373,7 +373,8 @@ impl CommandOutput for RemoteMoveReport {
                 self.withheld.len(), why
             );
             for item in &self.withheld {
-                println!("  {}: {}", item.hash, item.statement);
+                println!("  {}: {}", forklift_core::error::sanitize(&item.hash),
+                         forklift_core::error::sanitize(&item.statement));
             }
         }
     }

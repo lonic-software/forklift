@@ -2479,6 +2479,26 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "LiftWithheld": {
+      "description": "Content the remote withholds, as a lift reports it.",
+      "properties": {
+        "hash": {
+          "description": "The withheld object's hash.",
+          "type": "string"
+        },
+        "statement": {
+          "description": "Why the host withholds it, in the host's words. Absent when the handshake did not list it\nand only the upload negotiation answered it withheld.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "hash"
+      ],
+      "type": "object"
+    },
     "MetaPalletFailure": {
       "description": "A meta pallet that failed to sync, and why.",
       "properties": {
@@ -2681,6 +2701,13 @@ A command not listed here either reports only the generic human-message shape `{
       "format": "uint",
       "minimum": 0,
       "type": "integer"
+    },
+    "withheld": {
+      "description": "The content the lifted history names that the remote's host withholds, so it was not\nuploaded: the remote takes history naming it without it. Absent when none.",
+      "items": {
+        "$ref": "#/$defs/LiftWithheld"
+      },
+      "type": "array"
     }
   },
   "required": [
