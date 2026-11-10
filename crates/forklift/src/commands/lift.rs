@@ -97,11 +97,15 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
                 // The auto-merge takes their history without content the remote's host withholds,
                 // as a lower does, through a client of its own: the lift's client also serves the
                 // mirror, whose export cannot leave a file out.
-                let merging = RemoteClient::for_warehouse()?;
-                merging.leave_out_withheld(&info);
-
-                let merged = try_auto_merge(&merging, &pallet, position.base.as_deref(), &head, remote, &progress).await;
-                batch_lane = batch_lane.or(merging.batch_lane_closure());
+                let merged = match RemoteClient::for_warehouse() {
+                    Ok(merging) => {
+                        merging.leave_out_withheld(&info);
+                        let merged = try_auto_merge(&merging, &pallet, position.base.as_deref(), &head, remote, &progress).await;
+                        batch_lane = batch_lane.or(merging.batch_lane_closure());
+                        merged
+                    }
+                    Err(why) => Err(why.into()),
+                };
 
                 match merged {
                     Ok(true) => {
@@ -388,20 +392,13 @@ async fn try_auto_merge(client: &RemoteClient,
     // already means a genuine, unresolved divergence (checked above), so every path past this
     // point is the same real merge, and the incomplete-load guard lives inside
     // `merge_head_into_current` itself.
-    // A merge that would have to read content the remote's host withholds refuses before it
-    // changes a file; it is not auto-merged, and stops with the diverged error as an overlap does.
-    match consolidate::merge_head_into_current(pallet, head, remote_head, lower::REMOTE_LABEL, Some(pallet), false, anchor).await {
-        Ok(MergeStatus::Merged(_)) => Ok(true),
-        Ok(MergeStatus::Conflicts(_)) => Ok(false),
-        Err(why) if is_content_withheld(&why) => Ok(false),
-        Err(why) => Err(why),
+    // A merge that would have to read content the remote's host withholds refuses with
+    // `content_withheld` before it changes a file, and that refusal stands: the diverged error's
+    // way out, a lower, would make the same merge and meet the same refusal.
+    match consolidate::merge_head_into_current(pallet, head, remote_head, lower::REMOTE_LABEL, Some(pallet), false, anchor).await? {
+        MergeStatus::Merged(_) => Ok(true),
+        MergeStatus::Conflicts(_) => Ok(false),
     }
-}
-
-/// Whether `why` is a `content_withheld` refusal.
-fn is_content_withheld(why: &str) -> bool {
-    forklift_core::error::deframe(why).and_then(|(code, _, _)| forklift_core::error::RefusalCode::from_code(code))
-        == Some(forklift_core::error::RefusalCode::ContentWithheld)
 }
 
 /// The result of a lift: the pallet's outcome, plus the office lift when trust

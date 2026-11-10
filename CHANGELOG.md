@@ -158,8 +158,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   with `content_withheld`. A cache never fetches it when a head move needs the file, and `heal`
   finishes an interrupted `lower` without it, removing the file's old version. A `lift` that
   auto-merges a diverged remote head takes that history the same way rather than failing with
-  `content_withheld`; a merge that would have to read the file is not auto-merged, and the lift
-  stops with the diverged error.
+  `content_withheld`; a merge that would have to read the file refuses with `content_withheld`
+  before it changes any file.
 - **`consolidate` and `pick` take a file whose content is withheld.** A merge or pick that takes
   the other side's version of a file whose content this warehouse does not hold because the
   remote's host withholds it no longer fails reading it: the file is left out, its old version is

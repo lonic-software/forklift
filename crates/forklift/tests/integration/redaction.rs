@@ -3428,12 +3428,14 @@ fn a_lift_auto_merges_a_head_naming_withheld_content_without_it() {
     left_out_film(&warehouse, &takedown);
 }
 
-/// A lift whose auto-merge would have to read content the remote's host withholds is not
-/// auto-merged: it stops with the diverged error, as an overlap does, and leaves the bay as it was.
+/// A lift whose auto-merge would have to read content the remote's host withholds refuses with
+/// `content_withheld`, naming the file and the host's statement, rather than the diverged error,
+/// whose way out (a lower) would meet the same refusal; nothing is stacked or lifted, the bay's
+/// file is as it was, and no operation is left standing.
 ///
-/// Revert: let the merge's `content_withheld` refusal through → the lift fails with that code.
+/// Revert: drop the auto-merge client's opt-in → the fetch is refused instead, naming no file.
 #[test]
-fn a_lift_whose_merge_must_read_withheld_content_stops_diverged() {
+fn a_lift_whose_merge_must_read_withheld_content_refuses_it() {
     let mut takedown = takedown("lift-overlap");
     let warehouse = takedown.writer("takedown-lift-overlap", &[]);
     warehouse.stack("media/film.mkv", b"our film\n", "our film");
@@ -3442,10 +3444,15 @@ fn a_lift_whose_merge_must_read_withheld_content_stops_diverged() {
 
     let lifted = warehouse.json(&["lift"]);
     assert_eq!(lifted["ok"], false, "{}", lifted);
-    assert_eq!(lifted["error"]["code"], "diverged", "{}", lifted);
+    assert_eq!(lifted["error"]["code"], "content_withheld", "{}", lifted);
+    assert_eq!(lifted["error"]["details"]["path"], "media/film.mkv", "{}", lifted);
+    assert!(lifted["error"]["message"].as_str().unwrap().contains(TAKEDOWN), "{}", lifted);
     assert_eq!(warehouse.head("main"), ours, "no merge is stacked");
     assert_eq!(takedown.server.main(), theirs, "nothing is lifted");
     assert_eq!(std::fs::read(warehouse.root.join("media/film.mkv")).unwrap(), b"our film\n");
+
+    let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+    forklift_core::util::operation_utils::check_none_standing().unwrap();
 }
 
 /// Heal fetches a damaged object back from a remote whose host withholds other content, and
