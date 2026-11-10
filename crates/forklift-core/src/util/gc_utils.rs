@@ -199,28 +199,8 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 /// An applied redaction's object no deletion census root names is not live
 /// ([`redaction_deleter::unheld_applied`]), and a recipe of one is not descended for its chunks: the
 /// collection and a repack then delete it like garbage, and every chunk only it named.
-pub(crate) fn collect_live_set() -> Result<LiveSet, String> {
-    let (hashes, whole) = walk_live_set(&redaction_deleter::unheld_applied()?)?;
-
-    Ok(LiveSet { hashes, whole })
-}
-
-/// What [`collect_live_set`] marked live, and whether its walk saw the whole closure its roots
-/// name.
-#[derive(Debug)]
-pub(crate) struct LiveSet {
-    /// Every hash marked live.
-    pub(crate) hashes: HashSet<String>,
-    /// False once the walk met an absent parcel or tree, below which it cannot tell what is named:
-    /// a hash missing from `hashes` is unreachable only when this is true.
-    pub(crate) whole: bool,
-}
-
-impl LiveSet {
-    /// Whether `hash` was marked live.
-    pub(crate) fn contains(&self, hash: &str) -> bool {
-        self.hashes.contains(hash)
-    }
+pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
+    collect_live_set_excluding(&redaction_deleter::unheld_applied()?)
 }
 
 /// [`collect_live_set`], with `excluded` (the unheld applied redactions) given. An excluded hash a
@@ -228,12 +208,6 @@ impl LiveSet {
 /// chunk stays live,
 /// since a redaction's ban never extends to the chunks of another file.
 pub(crate) fn collect_live_set_excluding(excluded: &HashSet<String>) -> Result<HashSet<String>, String> {
-    Ok(walk_live_set(excluded)?.0)
-}
-
-/// The walk behind [`collect_live_set`] and [`collect_live_set_excluding`]: the live hashes, and
-/// whether it saw the whole closure.
-fn walk_live_set(excluded: &HashSet<String>) -> Result<(HashSet<String>, bool), String> {
     // Pallet heads (both namespaces), haul heads, tombstone heads, the git mirror's roots, bay-scoped
     // parcel roots, trust-pin roots and staged shard leaves: the sources this function shares, hash
     // for hash, with `recovery_utils::collect_walk_roots` through `recovery_utils::gc_root_sources`,
@@ -254,8 +228,7 @@ fn walk_live_set(excluded: &HashSet<String>) -> Result<(HashSet<String>, bool), 
         crate::util::office_utils::TrustPinReadPolicy::FailClosed,
     )?;
 
-    let (parcels, parcel_gaps) = audit_utils::collect_reachable_noting_gaps(&sources.heads(), file_utils::is_present_for_sweep)?;
-    let mut whole = parcel_gaps.is_empty();
+    let parcels = collect_reachable_for_sweep(&sources.heads())?;
 
     let mut live: HashSet<String> = HashSet::new();
     let mut tree_queue: VecDeque<String> = VecDeque::new();
@@ -319,7 +292,6 @@ fn walk_live_set(excluded: &HashSet<String>) -> Result<(HashSet<String>, bool), 
         // orphan is kept while the fetch might still resume and complete it, and only one
         // abandoned past the grace period ages into legitimate, re-fetchable garbage.
         if !file_utils::is_present_for_sweep(&tree_hash)? {
-            whole = false;
             continue;
         }
 
@@ -351,7 +323,7 @@ fn walk_live_set(excluded: &HashSet<String>) -> Result<(HashSet<String>, bool), 
         }
     }
 
-    Ok((live, whole))
+    Ok(live)
 }
 
 /// Mark every chunk of a chunked file's recipe live, presence-tolerantly.
@@ -666,22 +638,6 @@ pub(crate) mod tests {
         // The blob *beneath* the sealed boundary is never reached (the boundary was not descended)
         // — correct, and by the store invariant it is absent locally anyway.
         assert!(!live.contains(&f.web_blob), "nothing beneath a sealed boundary is individually marked");
-
-        // So the walk says it was not whole: a hash it left unmarked may sit below the boundary.
-        // Revert: never clear `whole` at an absent tree → true here.
-        assert!(!live.whole, "a walk that stopped at an absent tree is not whole");
-    }
-
-    /// A walk that met no absent parcel or tree says it was whole. Revert: start `whole` false →
-    /// red.
-    #[test]
-    fn a_walk_meeting_no_absent_tree_is_whole() {
-        let _scratch = Scratch::new("live-set-whole");
-        let f = build_fixture();
-        delete_object(&f.readme_blob);
-
-        let live = collect_live_set().unwrap();
-        assert!(live.contains(&f.web_blob) && live.whole, "an absent blob under a present tree leaves the walk whole");
     }
 
     /// A pallet deleted in a served root keeps its history through its tombstone: gc marks the
