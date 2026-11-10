@@ -125,8 +125,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 - **A lift leaves out content its remote withholds, and says so.** A lift no longer offers
   content the remote's host withholds, nor the chunks of a withheld chunked file (a chunk another
-  file shares is still sent, unless the host withholds that chunk too), since the remote takes the history without them. The result lists
-  what was left out, with the host's statement, as `withheld`. `--json` schema is now 35.
+  file shares is still sent, unless the host withholds that chunk too), since the remote takes
+  the history without them. The result lists what was left out, with the host's statement, as
+  `withheld`. `--json` schema is now 35.
 
 - **`remote move` knows what the new origin withholds.** A cache or sparse warehouse moving to a
   server whose host withholds content it relies on its origin for no longer counts that content as

@@ -6791,8 +6791,6 @@ async fn upload_history(client: &RemoteClient,
     // a recipe the walk descended, that recipe's own chunks are among the candidates, so the walk
     // runs again with the recipe withheld and the negotiation is repeated, before a byte moves.
     // Each pass withholds at least one more recipe the history names, so the passes are bounded.
-    progress.status("Uploading objects");
-
     let (walk, session, negotiation) = loop {
         let walk = walk_lift_closure(&new_parcels, chunking_supported, &redacted, &withheld)?;
         let session = new_lift_session();
@@ -6828,6 +6826,8 @@ async fn upload_history(client: &RemoteClient,
 
     // A takedown the handshake did not list yet is answered withheld by the negotiation.
     left_out.met_withheld.extend(negotiation.withheld().iter().cloned());
+
+    progress.status("Uploading objects");
 
     let negotiated = upload_negotiated(
         client, &session, negotiation, &control_plane, chunking_supported, progress,
