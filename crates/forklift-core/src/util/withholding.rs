@@ -9,7 +9,8 @@
 //! names it ([`sealed_utils::Tolerated`](crate::util::sealed_utils::Tolerated)). So the upload
 //! negotiation answers it as withheld rather than asking for it. The handshake's withheld list
 //! publishes it, so a client can tell the content is unavailable from that remote rather than
-//! damaged or redacted; no client reads the list yet. A served head deletes its copy as it deletes
+//! damaged or redacted: an origin move counts it as not held by the new server, and a cache's
+//! eviction or a sparse warehouse's prune keeps the copy here. A served head deletes its copy as it deletes
 //! an applied redaction's ([`redaction_deleter`](crate::util::redaction_deleter)), under a census
 //! that history never holds a copy for.
 //!

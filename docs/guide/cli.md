@@ -2096,7 +2096,8 @@ any bay. The report counts those last three keeps apart (`kept_for_hauls`, `kept
 `kept_for_deleted`), since lifting cannot free them; a haul's goes once it is merged and its
 target lifted (a closed haul keeps it, since reopening proposes the same head), the mirror's once
 the remote holds it again, a deleted pallet's once
-the delete leaves the undo journal. So you can park edits
+the delete leaves the undo journal. Content the remote's host withholds is never freed either, nor
+the folders above it under the path (`kept_withheld`), since the remote may not serve it again. So you can park edits
 under the path, narrow and prune; the parked edits survive, and `park pop` re-applies them once
 `scope fetch` has brought the path back. If any of that state cannot be read, the prune refuses
 before changing anything; so does a sealed-object record that cannot be read. The prune reads
@@ -2165,7 +2166,10 @@ a haul, a deleted pallet) stays, and the report counts it (`not_held`): lift tha
 
 It keeps every checkout's files (the base tree of the main checkout and of each bay,
 `kept_for_checkouts`), every meta pallet in full, the trust records, staged work, and what a parked
-stash, an unfinished consolidation or pick needs (`kept_local`). A kept object that an
+stash, an unfinished consolidation or pick needs (`kept_local`). Content the origin's host withholds
+(the server lists it when asked, as for a legal takedown) stays too, since the origin may not serve
+it again: a withheld file's content, a withheld chunked file's chunks, and the folders above them
+(`kept_withheld`). A kept object that an
 earlier eviction recorded as held by hash and a later read fetched again has that record removed
 (`unsealed`).
 An object the origin's history reaches that is missing here without a record is damage, not an

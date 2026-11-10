@@ -961,7 +961,8 @@ fn collect_prune_targets(
                     // chunks were already freed, while a present recipe still names every chunk a
                     // partial free left behind. A chunk shared with a retained scope is filtered out
                     // later by `plan_prune`'s `retained` check, never here. A withheld recipe
-                    // keeps every chunk, one met first through another recipe too.
+                    // keeps every chunk, one met first through another recipe too: the host also
+                    // withholds the chunks only that recipe names, which nothing here tells apart.
                     if file.item_type.is_chunked() {
                         for chunk in object_utils::recipe_chunk_hashes(&file.hash)? {
                             if withheld_file {

@@ -427,7 +427,8 @@ fn walk_held(parcels: &[String], sealed: &Tolerated, withheld: &HashSet<String>)
 
             // A chunked entry names a recipe whose chunks only it reaches: they go before it, read
             // while it is still present, so a killed run that freed some leaves the rest listed.
-            // A withheld recipe keeps every chunk, one met first through another recipe too.
+            // A withheld recipe keeps every chunk, one met first through another recipe too: the host
+            // also withholds the chunks only that recipe names, which nothing here tells from shared ones.
             if file.item_type.is_chunked() {
                 for chunk in object_utils::recipe_chunk_hashes(&file.hash)? {
                     if kept {

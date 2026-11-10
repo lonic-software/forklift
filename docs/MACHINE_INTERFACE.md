@@ -85,7 +85,11 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 33** (current): `remote move`'s result carries `withheld`, the content this warehouse
+**Schema 34** (current): `store evict`'s result and `scope prune`'s (and the preview a
+`confirmation_required` refusal carries) carry `kept_withheld`, the objects kept because the
+remote's host withholds them or content beneath them.
+
+**Schema 33**: `remote move`'s result carries `withheld`, the content this warehouse
 relies on its origin for that the new origin's host withholds (each `hash` and `statement`; empty
 when none), `previous_origin_withheld` (why the move went ahead regardless: `withholds`,
 `unrecorded` or `unreachable`) and `previous_origin_unreachable` (the previous origin's error).
