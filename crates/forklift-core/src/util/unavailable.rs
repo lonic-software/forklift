@@ -13,9 +13,9 @@
 //!
 //! An entry whose object is present is dropped under the ref lock ([`drop_present`]); an entry whose
 //! object is absent is dropped only under exclusive store access, once nothing the live set's roots
-//! reach names it, judged only by a walk that met no absent tree ([`prune`]). Below an absent tree
-//! nothing can tell, and a refill of that tree would record the object sealed, so a cache or a
-//! sparse warehouse holding one keeps its absent entries.
+//! reach names it, judged only by a walk that was whole ([`prune`]): one that met no absent tree and
+//! no absent parcel the sealed record holds. Below either nothing can tell, and a refill would
+//! record the object sealed, so a cache or a sparse warehouse holding one keeps its absent entries.
 //!
 //! The record at `<forklift root>/unavailable` is in the [`record_utils`] form, one
 //! `<hash> <statement>` entry per line, sorted, written whole and atomically under the [`RefLock`],
@@ -231,7 +231,8 @@ pub fn drop_present() -> Result<usize, String> {
     drop_where(file_utils::is_present_for_sweep)
 }
 
-/// Drop every entry whose object is present, and, when the live walk met no absent tree, every one
+/// Drop every entry whose object is present, and, when the live walk was whole
+/// ([`gc_utils::LiveSet::whole`]), every one
 /// whose object is absent and that nothing the live set's roots reach names (every pallet, meta and
 /// tombstoned head, haul head, mirror root, bay root, trust pin and staged shard), read
 /// fail-closed. It takes exclusive store access, held
@@ -252,10 +253,11 @@ pub fn prune(hold: &StoreAccessExclusive) -> Result<usize, String> {
     prune_against(hold, &gc_utils::collect_live_set()?)
 }
 
-/// [`prune`], against `live`, a live set the caller computed under `_hold`. When its walk stopped
-/// at an absent tree, an entry it did not mark may sit below it, and a refill of that tree pushes
-/// its absent children down into the sealed record, which must never hold unavailable content: so
-/// only present entries are dropped then.
+/// [`prune`], against `live`, a live set the caller computed under `_hold`. When its walk was not
+/// whole, stopped at an absent tree or at an absent parcel the sealed record holds, an entry it did
+/// not mark may sit below that boundary, and a refill there pushes absent children down into the
+/// sealed record, which must never hold unavailable content: so only present entries are dropped
+/// then.
 pub(crate) fn prune_against(_hold: &StoreAccessExclusive, live: &gc_utils::LiveSet) -> Result<usize, String> {
     drop_where(|hash| Ok(file_utils::is_present_for_sweep(hash)? || (live.whole && !live.contains(hash))))
 }

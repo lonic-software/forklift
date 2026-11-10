@@ -66,7 +66,7 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
     };
 
     // Under the same hold, drop what the unavailable record lists that is present again, or that
-    // nothing names any more when no tree is absent (`unavailable::prune`), whether or not the
+    // nothing names any more when the live walk was whole (`unavailable::prune`), whether or not the
     // eviction freed anything. Its error is ignored: the record then only stays
     // larger than it needs to be, and must not fail the eviction that already landed. A dry run
     // changes nothing.
