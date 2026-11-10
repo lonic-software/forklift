@@ -390,8 +390,8 @@ still checking, `forklift remote abort` abandons it; the message says which appl
 
 The new server lacks content this warehouse relies on its origin for, so the origin stayed where it
 was. Copy that content to the new server as the message describes, then run the move again. When
-the message says the new server withholds content the current origin still serves, keep the
-current origin while it serves it: the move goes ahead once that origin no longer does.
+the message says the new server withholds content the current origin does not, keep the current
+origin: the move goes ahead once that origin withholds it too or no longer answers.
 
 ### `only_prefix_not_found` (exit 31)
 

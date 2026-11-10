@@ -2267,10 +2267,11 @@ rather than trust it.
 
 Content the new server's host withholds (a legal takedown) is not held there, though its history
 names it. When this warehouse lacks such content and relies on its origin for it, the move asks the
-previous origin, dialed with the configured `remote.token`. While that origin answers and still
-serves the content, the move is refused with `origin_move_incomplete`, naming it in
+previous origin, dialed with the configured `remote.token`. While that origin answers and does not
+withhold the content, the move is refused with `origin_move_incomplete`, naming it in
 `details.withheld` (each `hash` with the host's `statement`). When the previous origin withholds it
-too, no previous origin is recorded, or it does not answer, the move goes ahead, since it deletes
+too, no previous origin is recorded (or the record already names the new server, as after a move
+that stopped partway), or it does not answer for any reason, the move goes ahead, since it deletes
 nothing and a dead origin would otherwise hold the warehouse for good. The report then lists the
 content in `withheld`, which the new origin will not supply, says why in
 `previous_origin_withheld` (`withholds`, `unrecorded` or `unreachable`), and gives the previous

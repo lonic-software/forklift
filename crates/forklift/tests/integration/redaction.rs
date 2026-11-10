@@ -2901,7 +2901,7 @@ fn a_served_root_withholds_a_chunked_file_and_the_chunks_only_it_names() {
 }
 
 /// A move to a server whose host withholds content a cache leans on its origin for is refused
-/// while the previous origin still serves it, and the refusal names it. Once the previous origin
+/// while the previous origin answers and does not withhold it, and the refusal names it. Once the previous origin
 /// withholds it too, or no longer answers, the move goes ahead and reports the content as what the
 /// new origin will not supply.
 ///
@@ -2941,7 +2941,7 @@ fn a_move_to_an_origin_withholding_leaned_on_content_reads_the_previous_origin()
     let refused = refused_cache.json(&["remote", "move", &second.url]);
     assert_eq!(refused["ok"], false, "{}", refused);
     assert_eq!(refused["error"]["code"], "origin_move_incomplete", "{}", refused);
-    assert!(refused["error"]["message"].as_str().unwrap().contains(&format!("\"{}\" still serves", server.url)), "{}", refused);
+    assert!(refused["error"]["message"].as_str().unwrap().contains(&format!("current origin \"{}\" does not withhold", server.url)), "{}", refused);
     assert_eq!(refused["error"]["details"]["withheld"], serde_json::json!([{ "hash": draft, "statement": statement }]), "{}", refused);
     assert_eq!(refused_cache.json(&["remote"])["data"]["origin"], server.url.as_str());
 

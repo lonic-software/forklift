@@ -9,12 +9,15 @@ use crate::events;
 use crate::output::{self, CommandOutput};
 
 /// Handle `remote move` (§7.6.1): point a partial warehouse at a new origin, once the new server is
-/// checked to hold everything this warehouse lacks and leans on its origin for.
+/// checked to hold everything this warehouse lacks and leans on its origin for, but content its
+/// host withholds that the previous origin withholds too or cannot be asked about.
 ///
 /// The move holds the move lock for its whole run and records its intent first, so nothing fetches
 /// or writes what it checks until it ends. It judges the new server's trust as `lower` would,
 /// without adopting anything, fetches the parcels and signatures of its history it lacks, and
-/// checks that history reaches every absent object ([`origin_check`]). Only then does it rewrite
+/// checks that history reaches every absent object ([`origin_check`]), content the new server
+/// withholds set apart and judged against the previous origin's handshake
+/// ([`origin_check::judge_withheld`]). Only then does it rewrite
 /// the origin and `remote.url` (and `remote.token`, given one), and clear the intent. A move that
 /// fails before rewriting clears its intent; one that stops while rewriting leaves it, and the
 /// next move finishes it.
@@ -92,15 +95,18 @@ pub async fn move_origin(url: String,
         withheld: checked.withheld.into_iter()
             .map(|(hash, statement)| MoveWithheld { hash, statement })
             .collect(),
-        previous_origin_withheld: judged.0.map(|reason| reason.as_str()),
-        previous_origin_unreachable: judged.1,
+        previous_origin_withheld: judged.as_ref().map(|reason| reason.as_str()),
+        previous_origin_unreachable: match judged {
+            Some(origin_check::PreviousOrigin::Unreachable(why)) => Some(why),
+            _ => None,
+        },
     });
 
     Ok(())
 }
 
 /// What the previous origin said of the content the new one withholds ([`origin_check::judge_withheld`]).
-type Judged = (Option<origin_check::PreviousOrigin>, Option<String>);
+type Judged = Option<origin_check::PreviousOrigin>;
 
 /// Steps 2 to 5 of a move: judge the new server, check it, judge what it withholds against the
 /// previous origin, and rewrite the origin to it.
@@ -356,12 +362,9 @@ impl CommandOutput for RemoteMoveReport {
         );
 
         if !self.withheld.is_empty() {
-            let why = match self.previous_origin_withheld {
-                Some("withholds") => "the previous origin withholds it too".to_string(),
-                Some("unreachable") => format!(
-                    "the previous origin did not answer ({})",
-                    self.previous_origin_unreachable.as_deref().unwrap_or("no reason given")
-                ),
+            let why = match (self.previous_origin_withheld, &self.previous_origin_unreachable) {
+                (_, Some(error)) => format!("the previous origin did not answer ({})", error),
+                (Some("withholds"), None) => "the previous origin withholds it too".to_string(),
                 _ => "no previous origin is recorded".to_string(),
             };
             println!(

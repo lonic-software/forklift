@@ -120,8 +120,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 - **`remote move` knows what the new origin withholds.** A cache or sparse warehouse moving to a
   server whose host withholds content it relies on its origin for no longer counts that content as
-  held there. The move asks the previous origin: while that origin still serves the content, the
-  move is refused with `origin_move_incomplete`, naming it in `details.withheld`; when it withholds
+  held there. The move asks the previous origin: while that origin answers and does not withhold
+  the content, the move is refused with `origin_move_incomplete`, naming it in `details.withheld`; when it withholds
   it too, is not recorded or does not answer, the move goes ahead and lists the content in
   `withheld`, with why in `previous_origin_withheld`. `--json` schema is now 33.
 - **A forklift-server host can withhold content, as for a legal takedown.** `forklift-server

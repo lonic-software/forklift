@@ -683,11 +683,11 @@ new server, on the server's side, and run the move again. `details.missing` list
 found, sorted, up to the first thousand, and `details.missing_count` counts them all; the message
 names the first ten.
 
-Content the new server's host withholds is not held there. When the previous origin still serves
-some that this warehouse relies on, the move refuses with the same code: `details.withheld` lists
+Content the new server's host withholds is not held there. When the previous origin answers and
+does not withhold some that this warehouse relies on, the move refuses with the same code: `details.withheld` lists
 it, up to the first thousand, each as `hash` and the host's `statement`, `details.withheld_count`
 counts it, and `details.missing` is empty. `next_step` says to keep the previous origin while it
-serves that content.
+does not withhold that content.
 
 ```json
 "details": {

@@ -23,7 +23,8 @@
 //! and neither is a chunk only such a file's recipe names: the server answers neither. An absent
 //! object of that kind is no reason to refuse by itself. The check returns it as content the new
 //! origin will not supply ([`Checked::withheld`]), and the move judges it against the previous
-//! origin ([`judge_withheld`]): refused while that origin still serves it, reported otherwise.
+//! origin ([`judge_withheld`]): refused while that origin answers and does not withhold it,
+//! reported otherwise.
 //!
 //! The fetched-heads ledger and the held-heads record are not checked. Both name heads a remote
 //! may no longer hold, and both readers ask the remote rather than trust an entry: `scope fetch` drops a
@@ -66,22 +67,24 @@ pub struct Checked {
 
 /// Why a move goes ahead though the new origin withholds content this warehouse leans on its
 /// origin for ([`judge_withheld`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreviousOrigin {
-    /// The previous origin withholds that content too, or is the new server itself.
+    /// The previous origin withholds that content too.
     Withholds,
-    /// No previous origin is recorded, or its record could not be read.
+    /// No previous origin other than the new server is recorded, or its record could not be read.
+    /// A move finishing one that stopped while rewriting may find the record already naming the
+    /// new server, and then cannot tell which origin came before.
     Unrecorded,
-    /// The previous origin did not answer its handshake.
-    Unreachable,
+    /// The previous origin did not answer its handshake, with the error.
+    Unreachable(String),
 }
 
 impl PreviousOrigin {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             PreviousOrigin::Withholds => "withholds",
             PreviousOrigin::Unrecorded => "unrecorded",
-            PreviousOrigin::Unreachable => "unreachable",
+            PreviousOrigin::Unreachable(_) => "unreachable",
         }
     }
 }
@@ -97,7 +100,8 @@ impl PreviousOrigin {
 /// * `progress` - Where the fetch reports.
 ///
 /// # Returns
-/// * `Ok(Checked)`    - It holds them all.
+/// * `Ok(Checked)`    - It holds them all but the content its host withholds, which
+///   [`Checked::withheld`] lists and the caller must judge ([`judge_withheld`]).
 /// * `Err(CoreError)` - An `origin_move_incomplete` refusal naming what it lacks; or a transfer, a
 ///   verification or a read failed.
 pub async fn check_new_origin(client: &RemoteClient,
@@ -130,10 +134,13 @@ pub async fn check_new_origin(client: &RemoteClient,
     let withheld: HashMap<&str, &str> = info.withheld.iter().flatten()
         .map(|item| (item.hash.as_str(), item.statement.as_str()))
         .collect();
-    // Withheld content absent here, looked for beneath the absent trees this warehouse leans on.
+    // Withheld content this warehouse lacks, looked for beneath the absent trees it leans on: an
+    // absent file, or a recipe held here some of whose chunks are not. Looking costs a walk of
+    // that whole region at worst, read from the new server, paid only on a move to a server whose
+    // host withholds content absent here.
     let mut sought = HashSet::new();
     for hash in withheld.keys() {
-        if !sealed_utils::is_present(hash)? {
+        if lacks_withheld(hash)? {
             sought.insert(hash.to_string());
         }
     }
@@ -223,11 +230,29 @@ pub async fn check_new_origin(client: &RemoteClient,
     Ok(checked)
 }
 
+/// Whether this warehouse lacks the withheld content `hash`: it does not hold it, or holds it as a
+/// recipe some of whose chunks it does not hold.
+fn lacks_withheld(hash: &str) -> Result<bool, String> {
+    match crate::util::redaction_utils::stored_type(hash)? {
+        None => Ok(true),
+        Some(crate::enums::object_type::ObjectType::Recipe) => {
+            for chunk in object_utils::recipe_chunk_hashes(hash)? {
+                if !sealed_utils::is_present(&chunk)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Some(_) => Ok(false),
+    }
+}
+
 /// Judge the content the new server withholds that this warehouse leans on its origin for
 /// ([`Checked::withheld`]) against the previous origin, which a move reads only for this.
 ///
 /// The move is refused while the previous origin is recorded, answers its handshake and does not
-/// withhold some of that content: the warehouse still has a server that supplies it. Otherwise it
+/// withhold some of that content: it does not say it withholds it, so the warehouse may still have
+/// a server that supplies it. Whether it holds the content is not asked. Otherwise it
 /// goes ahead, and the caller reports the content as what the new origin will not supply. A move
 /// deletes nothing, so the bytes stay wherever they were, and refusing over an origin that no
 /// longer answers would hold the warehouse on it for good. Any failure to read the handshake,
@@ -242,24 +267,22 @@ pub async fn check_new_origin(client: &RemoteClient,
 /// * `token`    - The bearer token to dial the previous origin with.
 ///
 /// # Returns
-/// * `Ok((reason, unreachable))` - The move may go ahead: why, and for an origin that did not
-///   answer, its error. `None` when nothing is withheld.
-/// * `Err(CoreError)`            - An `origin_move_incomplete` refusal naming the content the
-///   previous origin still serves.
+/// * `Ok(reason)`     - The move may go ahead, and why; `None` when nothing is withheld.
+/// * `Err(CoreError)` - An `origin_move_incomplete` refusal naming the content the previous origin
+///   does not withhold.
 pub async fn judge_withheld(withheld: &BTreeMap<String, String>,
                             previous: Option<&str>,
                             target: &str,
-                            token: Option<String>) -> Result<(Option<PreviousOrigin>, Option<String>), CoreError> {
+                            token: Option<String>) -> Result<Option<PreviousOrigin>, CoreError> {
     if withheld.is_empty() {
-        return Ok((None, None));
+        return Ok(None);
     }
 
-    let Some(previous) = previous else {
-        return Ok((Some(PreviousOrigin::Unrecorded), None));
+    // A record naming the new server is one a stopped move already rewrote: the origin before it
+    // is not known.
+    let Some(previous) = previous.filter(|previous| !crate::util::origin_utils::same_remote(previous, target)) else {
+        return Ok(Some(PreviousOrigin::Unrecorded));
     };
-    if crate::util::origin_utils::same_remote(previous, target) {
-        return Ok((Some(PreviousOrigin::Withholds), None));
-    }
 
     let info = match RemoteClient::new(previous, token) {
         Ok(client) => client.fetch_info().await,
@@ -267,37 +290,42 @@ pub async fn judge_withheld(withheld: &BTreeMap<String, String>,
     };
     let info = match info {
         Ok(info) => info,
-        Err(why) => return Ok((Some(PreviousOrigin::Unreachable), Some(why))),
+        Err(why) => return Ok(Some(PreviousOrigin::Unreachable(why))),
     };
 
     let theirs: HashSet<&str> = info.withheld.iter().flatten().map(|item| item.hash.as_str()).collect();
     let served: Vec<&String> = withheld.keys().filter(|hash| !theirs.contains(hash.as_str())).collect();
     if served.is_empty() {
-        return Ok((Some(PreviousOrigin::Withholds), None));
+        return Ok(Some(PreviousOrigin::Withholds));
     }
 
     Err(withheld_refusal(target, previous, &served, withheld))
 }
 
-/// The `origin_move_incomplete` refusal for a new server at `url` that withholds `served`, which
-/// the previous origin at `previous` still serves.
-fn withheld_refusal(url: &str, previous: &str, served: &[&String], statements: &BTreeMap<String, String>) -> CoreError {
-    let shown: Vec<&str> = served.iter().take(NAMED_MISSING).map(|hash| hash.as_str()).collect();
-    let more = match served.len().saturating_sub(NAMED_MISSING) {
-        0 => String::new(),
-        rest => format!(" and {} more", rest),
-    };
+/// The first [`NAMED_MISSING`] of `hashes`, sorted, as a refusal's message names them, with how
+/// many more there are.
+fn named(hashes: &[&String]) -> String {
+    let shown: Vec<&str> = hashes.iter().take(NAMED_MISSING).map(|hash| hash.as_str()).collect();
+    match hashes.len().saturating_sub(NAMED_MISSING) {
+        0 => shown.join(", "),
+        rest => format!("{} and {} more", shown.join(", "), rest),
+    }
+}
 
+/// The `origin_move_incomplete` refusal for a new server at `url` that withholds `served`, which
+/// the previous origin at `previous` does not withhold.
+fn withheld_refusal(url: &str, previous: &str, served: &[&String], statements: &BTreeMap<String, String>) -> CoreError {
     CoreError::refusal_with_details(
         RefusalCode::OriginMoveIncomplete,
         format!(
-            "\"{}\" withholds {} object(s) this warehouse lacks and relies on its origin for ({}{}), which \
-            \"{}\" still serves, so it cannot be the origin; the origin was left where it was.",
-            url, served.len(), shown.join(", "), more, previous
+            "\"{}\" withholds {} object(s) this warehouse lacks and relies on its origin for ({}), which \
+            the current origin \"{}\" does not withhold, so it cannot be the origin; the origin was left \
+            where it was.",
+            url, served.len(), named(served), previous
         ),
         format!(
-            "Keep \"{}\" as the origin while it serves that content, or run \"forklift remote move {}\" \
-            again once it no longer does.",
+            "Keep \"{}\" as the origin while it does not withhold that content, or run \"forklift remote \
+            move {}\" again once it does or no longer answers.",
             previous, url
         ),
         serde_json::json!({
@@ -380,7 +408,7 @@ impl ServerWalk<'_> {
                         self.withheld_chunks.entry(chunk).or_insert_with(|| file.hash.clone());
                     }
                 }
-                if leaned && !present {
+                if leaned && lacks_withheld(&file.hash)? {
                     self.sought.remove(&file.hash);
                     self.found.insert(file.hash.clone());
                 }
@@ -419,18 +447,13 @@ fn incomplete_refusal(url: &str, missing: &HashSet<String>) -> CoreError {
         "Copy the old origin's warehouse to \"{}\" on the server's side, then run \"forklift remote move {}\" again.",
         url, url
     );
-    let shown: Vec<&str> = named.iter().take(NAMED_MISSING).map(|hash| hash.as_str()).collect();
-    let more = match named.len().saturating_sub(NAMED_MISSING) {
-        0 => String::new(),
-        rest => format!(" and {} more", rest),
-    };
 
     CoreError::refusal_with_details(
         RefusalCode::OriginMoveIncomplete,
         format!(
-            "\"{}\" does not hold {} object(s) this warehouse lacks and relies on its origin for ({}{}), \
+            "\"{}\" does not hold {} object(s) this warehouse lacks and relies on its origin for ({}), \
             so it cannot be the origin; the origin was left where it was.",
-            url, named.len(), shown.join(", "), more
+            url, named.len(), self::named(&named)
         ),
         next_step,
         serde_json::json!({
@@ -483,7 +506,8 @@ mod tests {
     /// warehouse leans on.
     ///
     /// Revert: drop the chunk map → the lone chunk has no owner → red. Revert: find a withheld
-    /// absent file beneath any tree → the walk not leaned on finds it → red.
+    /// absent file beneath any tree → the walk not leaned on finds it → red. Revert: lack only an
+    /// absent withheld object → the recipe missing a chunk is not found → red.
     #[test]
     fn withheld_content_is_never_found_on_the_new_server() {
         use crate::util::gc_utils::tests::store_recipe;
@@ -517,11 +541,31 @@ mod tests {
         assert_eq!(walk.withheld_chunks.get(&lone), Some(&withheld_recipe));
         assert!(walk.found.is_empty(), "nothing is leaned on beneath a tree this warehouse does not lean on");
 
+        // The withheld recipe held here lacks its lone chunk, so beneath a tree leaned on it is
+        // found as well as the absent film.
         let mut walk = walk_of();
         walk.descend(&tree, true, &mut HashSet::new()).unwrap();
-        assert_eq!(walk.found, HashSet::from([film.clone()]));
+        assert_eq!(walk.found, HashSet::from([film.clone(), withheld_recipe.clone()]));
         assert!(walk.sought.is_empty());
 
+        // A withheld recipe held here with every chunk is not lacked.
+        let whole = store_recipe(&[(crate::util::gc_utils::tests::store_chunk(b"c"), 1)]);
+        assert!(!lacks_withheld(&whole).unwrap());
+        assert!(lacks_withheld(&withheld_recipe).unwrap() && lacks_withheld(&film).unwrap());
+
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A previous origin the record names as the new server is not one the move can ask: it reads
+    /// as unrecorded, never as withholding, and nothing is dialed.
+    ///
+    /// Revert: read a record naming the new server as withholding → red.
+    #[test]
+    fn a_record_naming_the_new_server_reads_as_unrecorded() {
+        let withheld = BTreeMap::from([("6".repeat(64), "court order".to_string())]);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let judged = runtime.block_on(judge_withheld(&withheld, Some("http://127.0.0.1:9/"), "http://127.0.0.1:9", None));
+        assert_eq!(judged.unwrap(), Some(PreviousOrigin::Unrecorded));
+        assert_eq!(runtime.block_on(judge_withheld(&BTreeMap::new(), None, "http://x", None)).unwrap(), None);
     }
 }
