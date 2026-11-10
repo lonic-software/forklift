@@ -66,13 +66,13 @@ pub struct WithheldItem {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recipe: bool,
 
-    /// Whether a blob's canonical copy is kept, because meta history or the adopted history
-    /// names it.
+    /// Whether a blob's canonical copy is kept, for good: it is a meta kind's format marker, or the
+    /// late step's walk found meta history or the adopted history naming it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub kept: bool,
 
-    /// Whether the copies of the content the store keeps have been deleted: every staged copy,
-    /// and a blob's canonical object unless it is kept.
+    /// Whether the first deletion step has deleted every staged copy. A blob's canonical object
+    /// waits for the late step, and a recipe's for the chunk ledger.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub swept: bool,
 
@@ -80,7 +80,9 @@ pub struct WithheldItem {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recipe_deleted: bool,
 
-    /// Whether the late sweep has deleted every copy the bucket holds.
+    /// Whether the late step is done: every staged copy deleted again, every response bundle that
+    /// may hold the content, the item's work objects, and a blob's canonical object unless it is
+    /// kept.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deleted: bool,
 

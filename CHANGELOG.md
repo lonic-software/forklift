@@ -111,8 +111,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   AWS head answers a read or upload of it `451 content_withheld` with the statement, leaves it out
   of batches, never asks a lift for it and answers it in the upload negotiation's `withheld` list,
   lists it in the handshake, refuses a lift commit naming it, and accepts history naming it
-  without the content. A chunked file's chunks that only it names are deleted, and then its
-  recipe, as for a redacted file. This build does not yet delete any other stored copy.
+  without the content. Its stored copies are deleted as a redacted file's are: staged uploads at
+  once, and about half an hour later the stored file and any batch response that may hold it,
+  unless the history of a meta pallet or of the trust anchor's adopted history names it, in which
+  case that one copy is kept and the handshake keeps reporting its deletion as owed. Unless that
+  copy is kept, an update to a meta pallet that would newly name it is refused `451`. A chunked file's chunks
+  that only it names are deleted, and then its recipe, as for a redacted file.
 
 - **A forklift-server host can withhold content, as for a legal takedown.** `forklift-server
   withhold add --root … HASH --statement "…"` stops the server serving or taking a file's content
