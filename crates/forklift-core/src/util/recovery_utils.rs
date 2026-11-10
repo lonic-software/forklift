@@ -2266,9 +2266,8 @@ fn walk_closure_for(
     let mut visited_parcels = ParcelVisits::default();
 
     // A staged object is the bay's own work, which the remote need not hold, so the record never
-    // holds its absence. Content a redaction, this head's withholding or the unavailable record
-    // holds is absent by that set's account, as in the sealed record's own walk: an entry not
-    // checked out stages content the remote's host withholds.
+    // holds its absence. Content the unavailable record holds is absent by its account: an entry
+    // not checked out stages content the remote's host withholds.
     for (hash, item_type) in &roots.shard_referenced {
         if !targets.contains(hash) && is_recorded_boundary(sealed, corrupt, hash) {
             continue;
@@ -2806,13 +2805,11 @@ fn held_by_hash(sealed: Option<&Tolerated>, corrupt: &BTreeSet<String>, hash: &s
     !corrupt.contains(hash) && sealed.is_some_and(|sealed| sealed.held(hash, at).is_some())
 }
 
-/// Whether a staged file's content is held by a set no remote is leaned on for (an applied
-/// redaction, this head's withholding, or the unavailable record), and is not a corrupt boundary.
-/// The sealed record alone never holds a staged object's absence (see [`walk_closure_for`]).
+/// Whether a staged file's content is held by the unavailable record, and is not a corrupt
+/// boundary: an entry not checked out stages content the remote's host withholds. Nothing else
+/// holds a staged object's absence, the sealed record least of all (see [`walk_closure_for`]).
 fn is_recorded_boundary(sealed: Option<&Tolerated>, corrupt: &BTreeSet<String>, hash: &str) -> bool {
-    !corrupt.contains(hash) && sealed.is_some_and(|sealed| {
-        matches!(sealed.held(hash, At::File), Some(Held::Redacted | Held::Withheld | Held::Unavailable))
-    })
+    !corrupt.contains(hash) && sealed.is_some_and(|sealed| matches!(sealed.held(hash, At::File), Some(Held::Unavailable)))
 }
 
 /// Whether, and how cleanly, [`attempt_heal_driven_refetch`] actually consulted a configured
@@ -4099,13 +4096,15 @@ mod tests {
     }
 
     /// A staged entry not checked out names content the unavailable record holds, so its absence
-    /// is no loss, while a sealed staged object beside it still is. Mutation: check every staged
-    /// leaf against no record → the unavailable one is reported too → red.
+    /// is no loss, while a sealed or redacted staged object beside it still is: nothing else holds
+    /// the bay's own work. Mutation: check every staged leaf against no record → the unavailable
+    /// one is reported too → red; let a redaction hold a staged leaf → it goes unreported → red.
     #[test]
     fn a_staged_object_the_unavailable_record_holds_is_no_loss() {
         let (dir, _scope) = enter_temp_root("unavailable-staged");
-        let (sealed, withheld) = ("c".repeat(64), "e".repeat(64));
+        let (sealed, withheld, redacted) = ("c".repeat(64), "e".repeat(64), "f".repeat(64));
         seal(&[&sealed]);
+        crate::util::applied_redactions::apply_for_test(&[&redacted]);
         crate::util::unavailable::record([(withheld.clone(), "Withheld by the remote's host.".to_string())]).unwrap();
         let record = sealed_utils::read_tolerated().unwrap();
 
@@ -4118,7 +4117,9 @@ mod tests {
             haul_heads: Vec::new(),
             tombstone_heads: Vec::new(),
             mirror_roots: Vec::new(),
-            shard_referenced: vec![(sealed.clone(), DirEntryType::Normal), (withheld, DirEntryType::Normal)],
+            shard_referenced: vec![
+                (sealed.clone(), DirEntryType::Normal), (withheld, DirEntryType::Normal), (redacted.clone(), DirEntryType::Normal),
+            ],
             degraded_sources: Vec::new(),
         };
         let mut reported: BTreeSet<String> = BTreeSet::new();
@@ -4128,7 +4129,7 @@ mod tests {
                 &BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::full(), Some(&record), Some(&mut sink),
             ).unwrap();
         }
-        assert_eq!(reported, [sealed].into_iter().collect::<BTreeSet<String>>());
+        assert_eq!(reported, [sealed, redacted].into_iter().collect::<BTreeSet<String>>());
 
         std::fs::remove_dir_all(&dir).ok();
     }

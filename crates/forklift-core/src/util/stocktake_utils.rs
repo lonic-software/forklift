@@ -628,12 +628,21 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
 
         // Inventory entries whose file is gone from disk are unstaged removals (unless the
         // removal is already staged), but for an entry not checked out because its content is
-        // unavailable, which is reported as such.
+        // unavailable, which is reported as such: a removal only where a directory stands at its
+        // path, ignored or not, as the next load stages one.
         for (name, item) in inventory.get_items() {
-            if !seen_files.contains(name) && !ignored_names.contains(name) {
-                if let Some(kind) = missing_file_change(item.state) {
-                    found.push(Change::new(kind, join_key(&key, name)));
-                }
+            if seen_files.contains(name) {
+                continue;
+            }
+
+            if item.state != InventoryItemState::Unavailable && ignored_names.contains(name) {
+                continue;
+            }
+
+            let path = join_key(&key, name);
+            let directory_at_path = || std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir());
+            if let Some(kind) = missing_file_change(item.state, directory_at_path) {
+                found.push(Change::new(kind, path));
             }
         }
 
@@ -679,10 +688,12 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
 
 /// What an inventory entry whose file is not in the working directory reports in the unstaged
 /// walk: a removal, but nothing for a staged removal and `Unavailable` for an entry not checked
-/// out because its content is unavailable.
-fn missing_file_change(state: InventoryItemState) -> Option<ChangeKind> {
+/// out because its content is unavailable, unless something stands where it would be written
+/// (`obstructed`, asked only of such an entry), which makes it a removal, as the next load stages.
+fn missing_file_change(state: InventoryItemState, obstructed: impl FnOnce() -> bool) -> Option<ChangeKind> {
     match state {
         InventoryItemState::Deleted => None,
+        InventoryItemState::Unavailable if obstructed() => Some(ChangeKind::Removed),
         InventoryItemState::Unavailable => Some(ChangeKind::Unavailable),
         InventoryItemState::Normal
             | InventoryItemState::FirstParentConflict
@@ -692,8 +703,9 @@ fn missing_file_change(state: InventoryItemState) -> Option<ChangeKind> {
 }
 
 /// Report every entry of a tracked directory that is gone from the working directory
-/// (recursively) as [`missing_file_change`] says: removed, but for a staged removal and an entry
-/// not checked out.
+/// (recursively) as [`missing_file_change`] says: removed, but for a staged removal and an
+/// entry not checked out, which is a removal only where a file or link stands at the directory's
+/// path or above it, as the next load stages one.
 ///
 /// # Arguments
 /// * `key`     - The warehouse path key of the missing directory.
@@ -709,7 +721,7 @@ fn report_missing_directory_unstaged(key: &str,
     let inventory = load_shard_or_empty(key)?;
 
     for (name, item) in inventory.get_items() {
-        if let Some(kind) = missing_file_change(item.state) {
+        if let Some(kind) = missing_file_change(item.state, || inventory_utils::non_directory_stands_over(key)) {
             changes.push(Change::new(kind, join_key(key, name)));
         }
     }

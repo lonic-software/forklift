@@ -691,13 +691,8 @@ impl NotCheckedOut {
 pub fn apply_ops_each(ops: &[FileOp],
                       removed_dirs: &[String],
                       mut after: impl FnMut(&FileOp, Applied) -> Result<(), String>) -> Result<(), String> {
-    for op in ops.iter().filter(|op| matches!(op, FileOp::Remove { .. })) {
-        apply_file_op(op)?;
-        after(op, Applied::Done)?;
-    }
-
-    remove_empty_directories(removed_dirs);
-
+    // Which writes are left out is decided before anything is applied, so an unreadable record or
+    // a failed probe refuses the checkout with the working directory untouched.
     let not_checked_out = NotCheckedOut::read()?;
     let mut writes: Vec<(&FileOp, bool)> = Vec::new();
 
@@ -705,6 +700,13 @@ pub fn apply_ops_each(ops: &[FileOp],
         let FileOp::Write { hash, .. } = op else { continue };
         writes.push((op, not_checked_out.holds(hash)?));
     }
+
+    for op in ops.iter().filter(|op| matches!(op, FileOp::Remove { .. })) {
+        apply_file_op(op)?;
+        after(op, Applied::Done)?;
+    }
+
+    remove_empty_directories(removed_dirs);
 
     write_in_order(&writes, |(op, skipped)| match op {
         FileOp::Write { hash, item_type, .. } if !skipped => Some((hash.as_str(), *item_type)),

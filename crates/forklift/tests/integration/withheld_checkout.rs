@@ -303,6 +303,9 @@ fn a_file_put_back_a_removal_and_a_directory_end_a_file_not_checked_out() {
     warehouse.run_ok(&["shift", "feature"]);
     warehouse.run_ok(&["remove", "film.mkv"]);
     warehouse.write("extra/new.bin/inner.txt", "a directory now\n");
+    let report = warehouse.stocktake();
+    assert!(changes(&report["unstaged"]).contains(&("removed".to_string(), "extra/new.bin".to_string())),
+        "stocktake shows the removal the load will stage: {}", report);
     warehouse.run_ok(&["load", "."]);
     let report = warehouse.stocktake();
     assert!(report.get("unavailable").is_none(), "{}", report);
@@ -342,9 +345,13 @@ fn a_soft_reset_restacks_a_file_not_checked_out() {
 /// than remove the only copy of it, even when its bytes are the withheld content. A file standing
 /// where a directory of entries not checked out was stages their removal.
 ///
+/// Stocktake shows each removal before the load stages it, and an ignored directory at the path is
+/// as much in the way as a walked one.
+///
 /// Revert: compare the file by its entry's hash → the shift takes it for the head's content and
-/// overwrites it → red; take a file at the directory's path for no obstacle → the entry under it
-/// stays and no removal is staged → red.
+/// overwrites it → red; take a file at the directory's path for no obstacle, in the load or in
+/// stocktake → no removal is shown or staged → red; count only walked directories → the ignored
+/// one stages nothing → red.
 #[test]
 fn a_file_put_back_is_a_change_and_a_file_over_a_directory_ends_its_entries() {
     let (warehouse, _) = withheld_feature("put-back-unloaded");
@@ -358,6 +365,9 @@ fn a_file_put_back_is_a_change_and_a_file_over_a_directory_ends_its_entries() {
     let (warehouse, _) = withheld_feature("file-over-dir");
     warehouse.run_ok(&["shift", "feature"]);
     warehouse.write("extra", "a file now\n");
+    let report = warehouse.stocktake();
+    assert!(changes(&report["unstaged"]).contains(&("removed".to_string(), "extra/new.bin".to_string())),
+        "stocktake shows the removal the load will stage: {}", report);
     warehouse.run_ok(&["load", "."]);
     let report = warehouse.stocktake();
     assert_eq!(paths(&report["unavailable"]), ["film.mkv"], "{}", report);
@@ -365,4 +375,59 @@ fn a_file_put_back_is_a_change_and_a_file_over_a_directory_ends_its_entries() {
         ("added".to_string(), "extra".to_string()),
         ("removed".to_string(), "extra/new.bin".to_string()),
     ], "{}", report);
+
+    let (warehouse, _) = withheld_feature("ignored-dir");
+    warehouse.run_ok(&["shift", "feature"]);
+    warehouse.write(".forkliftignore", "film.mkv/\n");
+    warehouse.write("film.mkv/build.log", "ignored\n");
+    let report = warehouse.stocktake();
+    assert!(changes(&report["unstaged"]).contains(&("removed".to_string(), "film.mkv".to_string())), "{}", report);
+    warehouse.run_ok(&["load", "."]);
+    let report = warehouse.stocktake();
+    assert_eq!(paths(&report["unavailable"]), ["extra/new.bin"], "{}", report);
+    assert_eq!(changes(&report["staged"]), [
+        ("added".to_string(), ".forkliftignore".to_string()),
+        ("removed".to_string(), "film.mkv".to_string()),
+    ], "{}", report);
+}
+
+/// A directory restore writes a file not checked out once the store holds its content again, and
+/// leaves out only what is still withheld.
+///
+/// Revert: skip every `Unavailable` entry on its state alone → the film is never written and the
+/// restore says it left out two → red.
+#[test]
+fn a_restore_writes_a_file_whose_content_came_back() {
+    let (warehouse, _) = withheld_feature("came-back");
+    warehouse.run_ok(&["shift", "feature"]);
+
+    warehouse.write("copy.txt", WITHHELD_FILM);
+    warehouse.run_ok(&["load", "copy.txt"]);
+    warehouse.run_ok(&["unload", "copy.txt"]);
+    std::fs::remove_file(warehouse.root.join("copy.txt")).unwrap();
+
+    let restored = warehouse.run_ok(&["restore", ".", "--confirm"]);
+    let restored = String::from_utf8_lossy(&restored.stdout);
+    assert!(restored.contains("Left out 1 file(s) not checked out"), "{}", restored);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), WITHHELD_FILM);
+    assert!(!warehouse.exists("extra/new.bin"));
+    assert_eq!(paths(&warehouse.stocktake()["unavailable"]), ["extra/new.bin"]);
+}
+
+/// A checkout that cannot read the unavailable record refuses before it touches the working
+/// directory: which writes it leaves out is decided before the first removal.
+///
+/// Revert: read the record after the removals → `side.txt` is already gone when the shift fails
+/// → red.
+#[test]
+fn an_unreadable_record_refuses_a_shift_before_any_removal() {
+    let warehouse = Warehouse::new("unreadable-record");
+    warehouse.stack_files(&[("a.txt", "a\n")], "main");
+    warehouse.run_ok(&["pallet", "create", "side"]);
+    warehouse.stack_files(&[("side.txt", "side\n")], "side");
+    std::fs::write(warehouse.root.join(".forklift").join("unavailable"), "not a record\n").unwrap();
+
+    let refused = warehouse.run(&["shift", "main"]);
+    assert!(!refused.status.success(), "the shift must refuse over an unreadable record");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("side.txt")).unwrap(), "side\n");
 }

@@ -1105,8 +1105,8 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
 
         context.dirty_inventory_paths.lock().await.remove(path.as_key());
 
-        // The names of the directories this walk descends into, so that a directory standing
-        // where an entry was not checked out stages that entry's removal (see
+        // The names of the directories standing in this one, walked or not, so that a directory
+        // standing where an entry was not checked out stages that entry's removal (see
         // `carry_over_missing_entries_as_deleted`).
         let mut directory_names: HashSet<String> = HashSet::new();
 
@@ -1123,6 +1123,11 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
             )?;
 
             if !matches!(verdict, RuleVerdict::Walk) {
+                // A directory the walk leaves alone still stands at the path: an entry not checked
+                // out under its name can never be written beside it.
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    directory_names.insert(name);
+                }
                 continue;
             }
 
@@ -2143,7 +2148,7 @@ fn sweep_unregistered_shards() {
 /// Whether something other than a real directory (a file, or a symlink) stands at the working
 /// path of the directory `key` or of one of its ancestors: what the next parcel cannot hold
 /// beside the entries of that directory. A path that cannot be read stands nothing over it.
-fn non_directory_stands_over(key: &str) -> bool {
+pub(crate) fn non_directory_stands_over(key: &str) -> bool {
     if key.is_empty() {
         return false;
     }

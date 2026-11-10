@@ -122,7 +122,9 @@ fn restore_worktree(path: &WarehousePath, target: &str, confirm: bool) -> Result
 /// any file is written. That is every file, not only those a restore rewrites, which are known
 /// only by reading each one: offline, a restore refuses even where every file already matches,
 /// rather than rewrite some of them and then refuse.
-fn ensure_directory_present(ledger: &inventory_utils::ShardLedger, key: &str) -> Result<(), String> {
+fn ensure_directory_present(ledger: &inventory_utils::ShardLedger,
+                            key: &str,
+                            not_checked_out: &shift_utils::NotCheckedOut) -> Result<(), String> {
     if !scope_utils::is_cache_mode().unwrap_or(false) {
         return Ok(());
     }
@@ -136,9 +138,11 @@ fn ensure_directory_present(ledger: &inventory_utils::ShardLedger, key: &str) ->
 
         let Some(inventory) = ledger.inventory(shard_key)? else { continue };
 
-        files.extend(inventory.get_items()
-            .filter(|(_, item)| !skipped_by_directory_restore(item))
-            .map(|(_, item)| (item.hash.clone(), item.item_type)));
+        for (_, item) in inventory.get_items() {
+            if !skipped_by_directory_restore(item, not_checked_out)? {
+                files.push((item.hash.clone(), item.item_type));
+            }
+        }
     }
 
     cache_miss::ensure_files_present(files.iter().map(|(hash, item_type)| (hash.as_str(), *item_type)))
@@ -159,7 +163,8 @@ fn ensure_directory_present(ledger: &inventory_utils::ShardLedger, key: &str) ->
 fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str, target: &str, confirm: bool) -> Result<(), String> {
     // Every file is judged before any is written, so a refusal (a change to discard without
     // --confirm, an alias, a folder where a file was) leaves the whole directory as it was.
-    let discards = plan_directory(ledger, key, confirm)?;
+    let not_checked_out = shift_utils::NotCheckedOut::read()?;
+    let discards = plan_directory(ledger, key, confirm, &not_checked_out)?;
 
     if !confirm && !discards.is_empty() {
         return Err(discard_refusal(&discards, load_guard_utils::display_path(key), target));
@@ -168,11 +173,11 @@ fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str, 
     let mut restored_any = false;
     let mut restored_count = 0usize;
     let mut matched_count = 0usize;
-    let mut not_checked_out = 0usize;
+    let mut left_out = 0usize;
     let mut batch = inventory_utils::ShardMutationBatch::over(ledger);
     let mut result: Result<(), String> = Ok(());
 
-    ensure_directory_present(ledger, key)?;
+    ensure_directory_present(ledger, key, &not_checked_out)?;
 
     for shard_key in ledger.keys() {
         if !path_utils::covers(key, shard_key) {
@@ -189,9 +194,13 @@ fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str, 
 
         for (_, item) in inventory.get_items() {
             // The plan judged no folder entry, so none is written either.
-            if skipped_by_directory_restore(item) {
-                not_checked_out += usize::from(item.state == InventoryItemState::Unavailable);
-                continue;
+            match skipped_by_directory_restore(item, &not_checked_out) {
+                Ok(false) => {}
+                Ok(true) => {
+                    left_out += usize::from(item.state == InventoryItemState::Unavailable);
+                    continue;
+                }
+                Err(e) => { result = Err(e); break; }
             }
 
             let recorded = restore_entry(shard_key, item, false, confirm).and_then(|restored| match restored {
@@ -246,11 +255,11 @@ fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str, 
         ));
     }
 
-    if not_checked_out > 0 {
+    if left_out > 0 {
         output::message(format!(
             "Left out {} file(s) not checked out: the remote's host withholds their content and this \
             warehouse lacks it.",
-            not_checked_out
+            left_out
         ));
     }
 
@@ -258,12 +267,17 @@ fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str, 
 }
 
 /// Whether a directory restore leaves an entry alone, before its plan, its presence phase and its
-/// writes: a staged removal, a folder entry, and a file not checked out because its content is
-/// unavailable (which it reports), whose bytes no restore could write. A file standing at that
-/// path is the user's, and is left as it is.
-fn skipped_by_directory_restore(item: &InventoryItem) -> bool {
-    matches!(item.state, InventoryItemState::Deleted | InventoryItemState::Unavailable)
-        || item.item_type == DirEntryType::Tree
+/// writes: a staged removal, a folder entry, and a file not checked out whose content is still
+/// left out (see [`shift_utils::NotCheckedOut`]), which it reports: no restore could write its
+/// bytes, and a file standing at that path is the user's, left as it is. Once the store holds the
+/// content again, the restore writes it like any other entry.
+fn skipped_by_directory_restore(item: &InventoryItem, not_checked_out: &shift_utils::NotCheckedOut) -> Result<bool, String> {
+    Ok(match item.state {
+        InventoryItemState::Deleted => true,
+        _ if item.item_type == DirEntryType::Tree => true,
+        InventoryItemState::Unavailable => not_checked_out.holds(&item.hash)?,
+        _ => false,
+    })
 }
 
 /// The files under the directory at `key` whose changes restoring it would discard, refusing a
@@ -275,11 +289,15 @@ fn skipped_by_directory_restore(item: &InventoryItem) -> bool {
 /// * `key`    - The warehouse path key of the directory.
 /// * `confirm` - Whether the restore was confirmed: its discards need not be listed, so files are
 ///   only checked for the refusals, not compared.
+/// * `not_checked_out` - The content a checkout leaves out, which the restore skips.
 ///
 /// # Returns
 /// * `Ok(Vec<String>)` - The warehouse paths whose changes would be discarded (none when confirmed).
 /// * `Err(String)`     - If a file was refused or could not be read.
-fn plan_directory(ledger: &inventory_utils::ShardLedger, key: &str, confirm: bool) -> Result<Vec<String>, String> {
+fn plan_directory(ledger: &inventory_utils::ShardLedger,
+                  key: &str,
+                  confirm: bool,
+                  not_checked_out: &shift_utils::NotCheckedOut) -> Result<Vec<String>, String> {
     let anchor = file_utils::take_stat_anchor()?;
     let mut discards: Vec<String> = Vec::new();
 
@@ -291,7 +309,7 @@ fn plan_directory(ledger: &inventory_utils::ShardLedger, key: &str, confirm: boo
         let Some(inventory) = ledger.inventory(shard_key)? else { continue };
 
         for (_, item) in inventory.get_items() {
-            if skipped_by_directory_restore(item) {
+            if skipped_by_directory_restore(item, not_checked_out)? {
                 continue;
             }
 
