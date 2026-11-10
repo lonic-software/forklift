@@ -3371,9 +3371,17 @@ impl RemoteClient {
     /// returns ([`unavailable`](crate::util::unavailable)), so a head naming it can be written and
     /// checked out without it. A meta history's walk leaves none of it out: only a file of a user
     /// pallet's tree is checked out without its content.
+    ///
+    /// Two entries are not left out, so a walk asks for their content and is refused as it was:
+    /// one the handshake also reports redacted and applied, which stays an unapplied redaction
+    /// here until this warehouse applies it, and one whose statement is not one the record may
+    /// hold ([`withholding::checked_statement`](crate::util::withholding::checked_statement)).
     pub fn leave_out_withheld(&self, info: &WarehouseInfo) {
+        let applied = info.applied_redactions();
         let withheld = info.withheld.iter().flatten()
-            .map(|entry| (entry.hash.clone(), entry.statement.clone()))
+            .filter(|entry| !applied.contains(entry.hash.as_str()))
+            .filter_map(|entry| crate::util::withholding::checked_statement(&entry.statement).ok()
+                .map(|statement| (entry.hash.clone(), statement.to_string())))
             .collect();
 
         *self.withheld.write().unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(withheld);
@@ -10604,6 +10612,37 @@ mod tests {
         assert!(message.contains(&hash), "the refusal names the object: {}", message);
         assert!(message.contains("signed identity"), "states no migration exists: {}", message);
         assert!(next_step.is_empty(), "nothing moves the object, so there is no step: {}", next_step);
+    }
+
+    /// A walk leaves out what the handshake lists withheld, except content it also reports
+    /// redacted and applied, which stays an unapplied redaction here, and an entry whose statement
+    /// the unavailable record could not hold, which the walk asks for and is refused as withheld.
+    /// Revert: drop either filter → that hash is left out.
+    #[test]
+    fn a_walk_leaves_out_withheld_content_but_not_applied_redactions_or_unrecordable_statements() {
+        let (kept, redacted, multiline) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let info: WarehouseInfo = serde_json::from_value(serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "default_pallet": "main",
+            "pallets": {},
+            "trust": null,
+            "redactions": [{ "hash": redacted, "state": "deleted" }],
+            "withheld": [
+                { "hash": kept, "statement": "  DMCA notice 1  ", "state": "deleted" },
+                { "hash": redacted, "statement": "DMCA notice 2", "state": "deleted" },
+                { "hash": multiline, "statement": "DMCA notice\nsecond line", "state": "deleted" },
+            ],
+        })).unwrap();
+
+        let client = RemoteClient::new("http://127.0.0.1:1", None).unwrap();
+        client.leave_out_withheld(&info);
+
+        assert!(client.leaves_out_withheld(&kept));
+        assert!(!client.leaves_out_withheld(&redacted), "an applied redaction is not left out as withheld");
+        assert!(!client.leaves_out_withheld(&multiline), "an unrecordable statement is not left out");
+
+        let withheld = client.withheld.read().unwrap().clone();
+        assert_eq!(withheld.get(&kept).map(String::as_str), Some("DMCA notice 1"), "the statement is kept trimmed");
     }
 
     /// The same refusal on `upload_to_targets` (the presigned-PUT staging path) — the other of

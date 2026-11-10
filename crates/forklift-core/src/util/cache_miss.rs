@@ -210,15 +210,15 @@ pub fn ensure_files_present<'a>(files: impl IntoIterator<Item = (&'a str, DirEnt
     }
 
     let unavailable = unavailable::read_unavailable()?;
-    let mut files: Vec<(&str, DirEntryType)> = files.into_iter().collect();
-    let mut left_out: Vec<bool> = Vec::with_capacity(files.len());
+    let mut kept: Vec<(&str, DirEntryType)> = Vec::new();
 
-    for (hash, _) in &files {
-        left_out.push(unavailable.lacks(hash)?);
+    for file in files {
+        if !unavailable.lacks(file.0)? {
+            kept.push(file);
+        }
     }
 
-    let mut left_out = left_out.into_iter();
-    files.retain(|_| !left_out.next().unwrap_or(false));
+    let files = kept;
 
     ensure_present(files.iter().map(|(hash, _)| *hash))?;
 

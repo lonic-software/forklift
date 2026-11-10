@@ -77,17 +77,17 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     }
 
     let client = RemoteClient::for_warehouse()?;
-
-    // The content the remote's host withholds is left out of the widened walk and recorded
-    // unavailable, as a lower leaves it out, so a path brought into scope that names it widens
-    // without it rather than being refused.
-    client.leave_out_withheld(&client.fetch_info().await?);
     // The tree this bay holds: its base, not the pallet's ref, which another bay can move.
     let position = pallet_utils::read_position()?;
     let pallet = position.pallet.clone();
     let head = position.base.clone().ok_or_else(|| format!(
         "Pallet \"{}\" has nothing stacked yet; there is nothing to fetch.", pallet
     ))?;
+
+    // The content the remote's host withholds is left out of the widened walk and recorded
+    // unavailable, as a lower leaves it out, so a path brought into scope that names it widens
+    // without it rather than being refused.
+    client.leave_out_withheld(&client.fetch_info().await?);
 
     // Fetch the newly in-scope content FIRST, at the widened scope, and only then record it: the
     // fetch scope never claims a path is in scope until it is fully fetched. A transfer error, or
