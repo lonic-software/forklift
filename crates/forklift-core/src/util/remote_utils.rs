@@ -6550,15 +6550,15 @@ async fn lift_pallet_inner(client: &RemoteClient,
     // The remote may answer an object present and then delete it before the ref update: content
     // it owed a deletion. Its closure check then refuses the head as incomplete, and the
     // negotiation, asked again, answers that object missing. So the upload runs once more; the
-    // update after it reports whatever it answers. The walk again stops at `elsewhere`: a remote
-    // deletes nothing the history of a pallet head or tombstone names but withheld content, which
-    // its closure check tolerates, so what went missing is never below those heads.
+    // update after it reports whatever it answers. The walk no longer stops at the other heads the
+    // handshake listed: one deleted since, its tombstone dropped and its history collected, leaves
+    // the remote without history this lift took as held, and only a walk past it offers that.
     if let Err(refusal) = client.update_ref(pallet, remote_head, local_head, tombstone).await {
         if !is_remote_history_incomplete(&refusal) {
             return Err(refusal);
         }
 
-        let again = upload_history(client, local_head, base, &elsewhere, info, progress).await?;
+        let again = upload_history(client, local_head, base, &[], info, progress).await?;
         uploaded = uploaded.then(again);
 
         client.update_ref(pallet, remote_head, local_head, tombstone).await?;
@@ -6747,7 +6747,8 @@ pub fn head_not_materializable_refusal(pallet: &str, path: &str, route: RepairRo
 /// never branches off a user pallet's, so it gets none. A tombstone's head is left out: dropping
 /// one is an operator's routine cleanup, so stopping at it would make a lift refused for history
 /// the remote no longer roots far likelier than a live head's deletion would (either fails closed,
-/// at the remote's closure check). Like the stop itself, this is only a shortcut, so a head whose
+/// at the remote's closure check, and a lift refused that way walks once more without stopping at
+/// these heads). Like the stop itself, this is only a shortcut, so a head whose
 /// presence cannot be read is left out.
 fn held_elsewhere(info: &WarehouseInfo, pallet: &str) -> Vec<String> {
     let mut heads = Vec::new();
@@ -10333,16 +10334,25 @@ mod tests {
 
     /// Lift `main` at a fresh one-file head to `remote`, which has no such pallet yet.
     fn lift_to(remote: &RefusingRefRemote, content: &str) -> Result<LiftResult, String> {
+        lift_over(remote, content, Vec::new(), BTreeMap::new())
+    }
+
+    /// Lift `main` at a fresh one-file head on `parents` to `remote`, whose handshake lists
+    /// `pallets`.
+    fn lift_over(remote: &RefusingRefRemote,
+                 content: &str,
+                 parents: Vec<String>,
+                 pallets: BTreeMap<String, String>) -> Result<LiftResult, String> {
         use crate::enums::dir_entry_type::DirEntryType::Normal;
 
         let blob = store_blob(content);
         let root = store_tree(&[("file.txt", &blob, Normal)]);
-        let head = stack_with_tree(Vec::new(), &root, content);
+        let head = stack_with_tree(parents, &root, content);
 
         let info = WarehouseInfo {
             protocol: PROTOCOL_VERSION.to_string(),
             default_pallet: "main".to_string(),
-            pallets: BTreeMap::new(),
+            pallets,
             trust: None,
             chunking: true,
             tombstones: None,
@@ -10376,6 +10386,30 @@ mod tests {
         assert_eq!(put, 6, "a parcel, a tree and a blob, sent twice");
         assert_eq!(stats.uploaded_objects, put);
         assert_eq!(stats.new_parcels, 1);
+    }
+
+    /// The first upload stops at another pallet's head the handshake listed; the retry walks past
+    /// it, since that pallet may have been deleted and its history collected meanwhile.
+    ///
+    /// Revert: walk the retry with the handshake's other heads → the second negotiation offers
+    /// only the new parcel's content again → red.
+    #[test]
+    fn a_retried_lift_offers_the_history_another_pallet_was_taken_to_hold() {
+        use crate::enums::dir_entry_type::DirEntryType::Normal;
+
+        let _scratch = Scratch::new("lift-retry-elsewhere");
+        let remote = RefusingRefRemote::start(vec![RefusingRefRemote::incomplete()]);
+        let side_blob = store_blob("side");
+        let side_tree = store_tree(&[("side.txt", &side_blob, Normal)]);
+        let side = stack_with_tree(Vec::new(), &side_tree, "side");
+        let pallets = BTreeMap::from([("side".to_string(), side.clone())]);
+
+        lift_over(&remote, "on side", vec![side.clone()], pallets).expect("the second ref update lands");
+
+        let negotiated = remote.negotiated.lock().unwrap().clone();
+        assert_eq!(negotiated.len(), 2);
+        assert!(!negotiated[0].contains(&side), "the first upload takes the side head as held: {:?}", negotiated);
+        assert!(negotiated[1].contains(&side) && negotiated[1].contains(&side_blob), "{:?}", negotiated);
     }
 
     /// The retry happens once: a second incomplete refusal is the lift's answer, with its code.
