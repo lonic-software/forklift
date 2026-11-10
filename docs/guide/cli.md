@@ -1857,7 +1857,7 @@ The remote only accepts **fast-forward** updates — no force push.
 
 **Content the remote withholds** (a legal takedown its host recorded) is not uploaded: the remote
 takes history naming it without it. That covers a withheld chunked file's own chunks; a chunk
-another file shares is still sent. The lift lists what it left out, each hash with the host's
+another file shares is still sent, unless the host withholds that chunk too. The lift lists what it left out, each hash with the host's
 statement (`withheld` under `--json`).
 
 **Optimistic lift:** if the remote moved and the two changes merge without
