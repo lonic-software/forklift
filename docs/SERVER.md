@@ -53,7 +53,9 @@ A served root must hold the full tree. A partial warehouse (one cloned with `--o
 `--cache`) is refused: `serve --root` will not start on it, and a `--warehouses` server answers
 `409` for it. So is any root whose sealed-object record (`.forklift/sealed`) holds an object, since
 it holds that object by hash alone, without its content, whatever its marker says, and any root
-that records an origin (`.forklift/origin`), which only a partial warehouse has; a record that
+that records an origin (`.forklift/origin`), which only a partial warehouse has, and any root
+lacking content its unavailable record (`.forklift/unavailable`) lists, which a fetch left out
+because its remote's host withholds it, until those files' bytes are loaded again; a record that
 cannot be read is refused too (a `500` from a `--warehouses` server). Clients trust a server to
 hold every object its pallet heads reach, and `scope prune`, `evict` and `remote move` rely on that,
 so such a root could lead a client to free content it can never fetch back. To serve a cloned
