@@ -207,30 +207,15 @@ pub async fn check_new_origin(client: &RemoteClient,
     for hash in &walk.found {
         checked.withheld.insert(hash.clone(), withheld[hash.as_str()].to_string());
     }
-    // A chunk of a withheld recipe is held there while another recipe names it, so the new
-    // server, which lists as missing a chunk only withheld recipes name, is asked about the ones
-    // absent here, in one batch. A chunk the host withholds itself it never lists missing, so
-    // naming one makes the recipe withheld outright.
-    let mut asked: HashMap<String, Vec<String>> = HashMap::new();
-    for recipe in &walk.leaned_recipes {
-        let mut withheld_chunk = false;
-        for chunk in object_utils::recipe_chunk_hashes(recipe)? {
-            if !sealed_utils::is_present(&chunk)? {
-                withheld_chunk |= withheld.contains_key(chunk.as_str());
-                asked.entry(chunk).or_default().push(recipe.clone());
-            }
-        }
-        if withheld_chunk {
-            checked.withheld.insert(recipe.clone(), withheld[recipe.as_str()].to_string());
-        }
-    }
-    if !asked.is_empty() {
+    let (settled, asked) = leaned_asks(&walk.leaned_recipes, &withheld)?;
+    let answered = if asked.is_empty() {
+        HashSet::new()
+    } else {
         let chunks: Vec<String> = asked.keys().cloned().collect();
-        for chunk in client.missing_objects(&chunks).await? {
-            for recipe in asked.get(&chunk).into_iter().flatten() {
-                checked.withheld.insert(recipe.clone(), withheld[recipe.as_str()].to_string());
-            }
-        }
+        answered_recipes(&asked, &client.missing_objects(&chunks).await?)
+    };
+    for recipe in settled.iter().chain(&answered) {
+        checked.withheld.insert(recipe.clone(), withheld[recipe.as_str()].to_string());
     }
 
     // What is left the new server does not hold: content it withholds, a chunk only such a
@@ -256,6 +241,39 @@ pub async fn check_new_origin(client: &RemoteClient,
 }
 
 /// Whether this warehouse may lack the withheld content `hash`, so the walk seeks it: it does not
+/// Sorts the withheld recipes held here beneath a tree leaned on. A chunk of such a recipe is
+/// held on the new server while another recipe names it, and that server lists as missing a
+/// chunk only withheld recipes name, so the chunks absent here are asked about, each mapped to
+/// the recipes naming it. A recipe naming an absent chunk the host withholds itself is settled
+/// at once, since the server never lists such a chunk missing; its chunks are not asked.
+fn leaned_asks(
+    recipes: &HashSet<String>,
+    withheld: &HashMap<&str, &str>,
+) -> Result<(Vec<String>, HashMap<String, Vec<String>>), CoreError> {
+    let (mut settled, mut asked) = (Vec::new(), HashMap::<String, Vec<String>>::new());
+    for recipe in recipes {
+        let mut absent = Vec::new();
+        for chunk in object_utils::recipe_chunk_hashes(recipe)? {
+            if !sealed_utils::is_present(&chunk)? {
+                absent.push(chunk);
+            }
+        }
+        if absent.iter().any(|chunk| withheld.contains_key(chunk.as_str())) {
+            settled.push(recipe.clone());
+            continue;
+        }
+        for chunk in absent {
+            asked.entry(chunk).or_default().push(recipe.clone());
+        }
+    }
+    Ok((settled, asked))
+}
+
+/// The recipes naming a chunk the new server answered as missing.
+fn answered_recipes(asked: &HashMap<String, Vec<String>>, missing: &[String]) -> HashSet<String> {
+    missing.iter().flat_map(|chunk| asked.get(chunk).into_iter().flatten().cloned()).collect()
+}
+
 /// hold it, or holds it as a recipe some of whose chunks it does not hold.
 fn lacks_withheld(hash: &str) -> Result<bool, String> {
     if !sealed_utils::is_present(hash)? {
@@ -544,7 +562,8 @@ mod tests {
     ///
     /// Revert: drop the chunk map → the lone chunk has no owner → red. Revert: find a withheld
     /// absent file beneath any tree → the walk not leaned on finds it → red. Revert: lack only an
-    /// absent withheld object → the recipe missing a chunk is not found → red.
+    /// absent withheld object → the recipe missing a chunk is not found → red. Revert: map each
+    /// chunk to its first recipe only, or drop the settled arm → red.
     #[test]
     fn withheld_content_is_never_found_on_the_new_server() {
         use crate::util::gc_utils::tests::store_recipe;
@@ -586,6 +605,23 @@ mod tests {
         assert_eq!(walk.found, HashSet::from([film.clone()]));
         assert_eq!(walk.leaned_recipes, HashSet::from([withheld_recipe.clone()]));
         assert!(walk.sought.is_empty());
+
+        // The recipe held here is asked about by its absent chunks, and counts once the new
+        // server lists that chunk missing; a recipe naming a chunk the host withholds itself is
+        // settled without asking.
+        let one = HashSet::from([withheld_recipe.clone()]);
+        let (settled, asked) = leaned_asks(&one, &withheld).unwrap();
+        assert!(settled.is_empty());
+        assert_eq!(asked, HashMap::from([(lone.clone(), vec![withheld_recipe.clone()]), (shared.clone(), vec![withheld_recipe.clone()])]));
+        assert_eq!(answered_recipes(&asked, &[lone.clone()]), one);
+        assert!(answered_recipes(&asked, &[]).is_empty(), "a chunk the server holds leaves the recipe out");
+        let twin = store_recipe(&[(lone.clone(), 1)]);
+        let (_, asked) = leaned_asks(&HashSet::from([withheld_recipe.clone(), twin.clone()]), &withheld).unwrap();
+        assert_eq!(answered_recipes(&asked, &[lone.clone()]), HashSet::from([withheld_recipe.clone(), twin]));
+        let mut withholding_chunk = withheld.clone();
+        withholding_chunk.insert(lone.as_str(), "court order");
+        let (settled, asked) = leaned_asks(&one, &withholding_chunk).unwrap();
+        assert_eq!((settled, asked.is_empty()), (vec![withheld_recipe.clone()], true));
 
         // A withheld recipe held here with every chunk is not lacked.
         let whole = store_recipe(&[(crate::util::gc_utils::tests::store_chunk(b"c"), 1)]);
