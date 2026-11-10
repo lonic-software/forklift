@@ -3182,6 +3182,36 @@ impl Takedown {
     }
 }
 
+impl Takedown {
+    /// A clone of the remote that stacks as the owner does, from a copy of the owner's keys: the
+    /// owner's work on a second machine.
+    fn writer(&self, name: &str, extra: &[&str]) -> Warehouse {
+        let warehouse = Warehouse::cloned_with(name, &self.server.url, extra);
+        let keys = self.owner.home.join("keys");
+        for entry in walk_files(&keys) {
+            let target = warehouse.home.join("keys").join(entry.strip_prefix(&keys).unwrap());
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::copy(&entry, &target).unwrap();
+        }
+
+        warehouse
+    }
+}
+
+/// Every file under `dir`, at any depth.
+fn walk_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        match path.is_dir() {
+            true => files.extend(walk_files(&path)),
+            false => files.push(path),
+        }
+    }
+
+    files
+}
+
 /// The film is left out of `warehouse`: no file at its path, no copy in the store, the unavailable
 /// record names it with the host's statement, stocktake reports it and nothing else, and the full
 /// audit passes; the trailer beside it is checked out.
@@ -3331,4 +3361,127 @@ fn heal_finishes_an_interrupted_lower_to_a_head_naming_withheld_content() {
     };
     assert!(!standing, "heal finished the lower");
     left_out_film(&warehouse, &takedown);
+}
+
+/// A lower whose bay has diverged from a remote head changing a file to content the remote's host
+/// withholds merges that head in without it, in a full warehouse and in a cache: the merge parcel
+/// has both heads as parents, the local change stays, the old version is removed and the new one
+/// is left out, recorded unavailable. The film is chunked, so a cache's presence phase meets an
+/// absent recipe it must not read.
+///
+/// Revert: let the merge take a withheld file as any other TakeTheirs → the merge fails reading
+/// the absent content.
+#[test]
+fn a_diverged_lower_merges_in_a_head_naming_withheld_content_without_it() {
+    let mut takedown = takedown("diverged-lower");
+    let warehouses = [("takedown-diverged-full", &[][..]), ("takedown-diverged-cache", &["--cache"][..])]
+        .map(|(name, extra)| (name, takedown.writer(name, extra)));
+    for (_, warehouse) in &warehouses {
+        warehouse.stack("src/local.txt", b"local\n", "local change");
+    }
+    takedown.withhold_new_film(true);
+    let theirs = takedown.server.main();
+
+    for (name, warehouse) in &warehouses {
+        let ours = warehouse.head("main");
+        let lowered = warehouse.json(&["lower"]);
+        assert_eq!(lowered["ok"], true, "{}: {}", name, lowered);
+        assert_eq!(lowered["data"]["outcome"], "merged", "{}: {}", name, lowered);
+
+        let merged = warehouse.head("main");
+        let parents = {
+            let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+            object_utils::load_parcel(&merged).unwrap().parents
+        };
+        assert_eq!(parents, [ours, theirs.clone()], "{}", name);
+        assert_eq!(std::fs::read(warehouse.root.join("src/local.txt")).unwrap(), b"local\n", "{}", name);
+        left_out_film(warehouse, &takedown);
+    }
+}
+
+/// A lift whose remote has diverged to a head changing a file to content the remote's host
+/// withholds auto-merges that head in without it and lifts the merge: the remote's head is the
+/// merge parcel, and the new film is left out of this warehouse, recorded unavailable.
+///
+/// Revert: drop the lift's opt-in to leaving withheld content out → the auto-merge's fetch is
+/// refused with `content_withheld`.
+#[test]
+fn a_lift_auto_merges_a_head_naming_withheld_content_without_it() {
+    let mut takedown = takedown("lift-merge");
+    let warehouse = takedown.writer("takedown-lift-merge", &[]);
+    warehouse.stack("src/local.txt", b"local\n", "local change");
+    takedown.withhold_new_film(false);
+    let (ours, theirs) = (warehouse.head("main"), takedown.server.main());
+
+    let lifted = warehouse.json(&["lift"]);
+    assert_eq!(lifted["ok"], true, "{}", lifted);
+    assert_eq!(lifted["data"]["auto_merged"], 1, "{}", lifted);
+
+    let merged = warehouse.head("main");
+    assert_eq!(takedown.server.main(), merged, "the merge is lifted");
+    let parents = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        object_utils::load_parcel(&merged).unwrap().parents
+    };
+    assert_eq!(parents, [ours, theirs]);
+    assert_eq!(std::fs::read(warehouse.root.join("src/local.txt")).unwrap(), b"local\n");
+    left_out_film(&warehouse, &takedown);
+}
+
+/// A lift whose auto-merge would have to read content the remote's host withholds refuses with
+/// `content_withheld`, naming the file and the host's statement, rather than the diverged error,
+/// whose way out (a lower) would meet the same refusal; nothing is stacked or lifted, the bay's
+/// file is as it was, and no operation is left standing.
+///
+/// Revert: drop the auto-merge client's opt-in → the fetch is refused instead, naming no file.
+#[test]
+fn a_lift_whose_merge_must_read_withheld_content_refuses_it() {
+    let mut takedown = takedown("lift-overlap");
+    let warehouse = takedown.writer("takedown-lift-overlap", &[]);
+    warehouse.stack("media/film.mkv", b"our film\n", "our film");
+    takedown.withhold_new_film(false);
+    let (ours, theirs) = (warehouse.head("main"), takedown.server.main());
+
+    let lifted = warehouse.json(&["lift"]);
+    assert_eq!(lifted["ok"], false, "{}", lifted);
+    assert_eq!(lifted["error"]["code"], "content_withheld", "{}", lifted);
+    assert_eq!(lifted["error"]["details"]["path"], "media/film.mkv", "{}", lifted);
+    assert!(lifted["error"]["message"].as_str().unwrap().contains(TAKEDOWN), "{}", lifted);
+    assert_eq!(warehouse.head("main"), ours, "no merge is stacked");
+    assert_eq!(takedown.server.main(), theirs, "nothing is lifted");
+    assert_eq!(std::fs::read(warehouse.root.join("media/film.mkv")).unwrap(), b"our film\n");
+
+    let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+    forklift_core::util::operation_utils::check_none_standing().unwrap();
+}
+
+/// Heal fetches a damaged object back from a remote whose host withholds other content, and
+/// records none of that content unavailable: heal repairs this warehouse's own store, and a
+/// withholding it recorded could stand in for the very damage it was asked to repair.
+///
+/// Revert: opt heal's refetch in to leaving withheld content out → the film is recorded.
+#[test]
+fn heal_fetches_a_damaged_object_back_without_recording_withheld_content() {
+    let mut takedown = takedown("heal-refetch");
+    let warehouse = Warehouse::cloned("takedown-heal-refetch", &takedown.server.url);
+    takedown.withhold_new_film(false);
+
+    let trailer = hash_of(b"trailer\n");
+    warehouse.remove_object(&trailer);
+    let taint = forklift_core::util::taint_utils::taint_dir_path_under(&warehouse.root);
+    std::fs::create_dir_all(&taint).unwrap();
+    let relative = format!("objects/{}/{}", &trailer[..2], &trailer[2..]);
+    std::fs::write(taint.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(&[&relative])).unwrap();
+
+    let healed = warehouse.json(&["heal"]);
+    assert_eq!(healed["ok"], true, "{}", healed);
+    assert!(warehouse.holds_loose(&trailer), "the damaged object is fetched back");
+    assert_eq!(warehouse.head("main"), takedown.old, "heal moves no ref");
+    assert!(!warehouse.holds_loose(&takedown.film), "the store holds no copy of the withheld film");
+
+    let record = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        forklift_core::util::unavailable::read_unavailable().unwrap().entries().count()
+    };
+    assert_eq!(record, 0, "heal records no withheld content unavailable");
 }
