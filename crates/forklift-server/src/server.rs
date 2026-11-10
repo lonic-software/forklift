@@ -6682,6 +6682,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A full root lacking content its unavailable record lists is refused, counting only the
+    /// absent entries: one whose object it holds again is served. One whose record cannot be read
+    /// is refused as unreadable, and a multi-warehouse server answers the refusal with a 409.
+    ///
+    /// Revert: drop the check → the root lacking the content is served → red; count every entry →
+    /// the root holding its content is refused → red; read a garbled record as empty → served → red;
+    /// map `Unavailable` to a 500 → red on its status.
+    #[test]
+    fn serving_refuses_a_root_lacking_content_its_unavailable_record_lists() {
+        use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+        use forklift_core::model::blob::Blob;
+        let base = scratch_dir("unavailable");
+        let absent = "1".repeat(64);
+        let entry = |hash: &str| (hash.to_string(), "DMCA notice 5".to_string());
+
+        let lacking = base.join("lacking");
+        mark_warehouse(&lacking);
+        let present = {
+            let _scope = StorageRootScope::enter(&lacking);
+            let mut blob = LooseObjectBuilder::build_blob(&Blob { content: b"came back".to_vec() });
+            blob.store().unwrap();
+            unavailable::record([entry(&absent), entry(&blob.hash)]).unwrap();
+            blob.hash
+        };
+        let refused = WarehouseHandle::serving(lacking.clone(), false).err().expect("a root lacking content is refused");
+        assert!(matches!(refused, ServingRefusal::Unavailable(1)), "{:?}", refused);
+        let message = refused.message("\"/srv/wh\"");
+        assert!(message.starts_with("\"/srv/wh\" lacks 1 file its pallets reach"), "{}", message);
+        assert!(message.contains("Load the missing files' bytes into this warehouse"), "{}", message);
+        assert!(!lacking.join(FOLDER_NAME_FORKLIFT_ROOT).join("serve.lock").exists(), "a refused root keeps no serve lock");
+
+        let back = base.join("back");
+        mark_warehouse(&back);
+        {
+            let _scope = StorageRootScope::enter(&back);
+            let mut blob = LooseObjectBuilder::build_blob(&Blob { content: b"came back".to_vec() });
+            blob.store().unwrap();
+            unavailable::record([entry(&present)]).unwrap();
+        }
+        drop(WarehouseHandle::serving(back, false).expect("a root holding every listed object is served"));
+
+        let garbled = base.join("garbled");
+        mark_warehouse(&garbled);
+        std::fs::write(garbled.join(FOLDER_NAME_FORKLIFT_ROOT).join("unavailable"), b"/forklift-unavailable 999\n").unwrap();
+        let refused = WarehouseHandle::serving(garbled, false).err().expect("an unreadable record is refused");
+        assert!(matches!(&refused, ServingRefusal::Unreadable(reason) if reason.contains("cannot get")), "{:?}", refused);
+
+        let multi = base.join("multi");
+        let state = capped_state(&multi, 4, &["lacking"]);
+        {
+            let _scope = StorageRootScope::enter(&multi.join("lacking"));
+            unavailable::record([entry(&absent)]).unwrap();
+        }
+        let refused = resolve_handle(&state, &warehouse_params("lacking")).err().expect("refused");
+        assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
+        assert!(refused.1.starts_with("Warehouse \"lacking\" lacks 1 file"), "{}", refused.1);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A multi-warehouse server refuses a sealed root, and one that records an origin, with the 409
     /// a partial one gets, keeps no serve lock for either and makes neither live; a full one beside
     /// them is served.

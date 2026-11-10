@@ -1363,13 +1363,20 @@ fn update_pallet_head_checked(
             let current = crate::util::scope_utils::read_fetch_scope()?;
 
             // A record the verification leaned on is read again too: a refill or a repair may
-            // have dropped the entry that held an absence. An entry added since undoes nothing,
-            // and the applied redactions only ever grow. A full warehouse leaned on no record entry,
-            // so it reads no record.
+            // have dropped the sealed entry that held an absence, and heal or a prune the
+            // unavailable one. An entry added since undoes nothing, and the applied redactions and
+            // the withheld content only ever grow. A full warehouse leaned on no sealed entry, so
+            // it reads that record only when it holds one.
             let record_moved = match leaned_on {
-                Some(tolerated) if !tolerated.sealed.is_empty() =>
-                    !crate::util::sealed_utils::read_sealed()?.holds_all_of(&tolerated.sealed),
-                _ => false,
+                Some(tolerated) => {
+                    (!tolerated.sealed.is_empty()
+                        && !crate::util::sealed_utils::read_sealed()?.holds_all_of(&tolerated.sealed))
+                    || (!tolerated.unavailable.is_empty() && {
+                        let now = crate::util::unavailable::read_unavailable()?;
+                        tolerated.unavailable.entries().any(|(hash, _)| !now.contains(hash))
+                    })
+                }
+                None => false,
             };
 
             if &current != scope || record_moved {
@@ -1519,8 +1526,8 @@ fn verify_new_head(name: &str,
     };
 
     // Only a partial warehouse holds anything by hash alone: a full one must hold every object a
-    // redaction it applied does not name. Any warehouse may lack those, since its history names
-    // bytes the redaction took away.
+    // redaction it applied, a withholding or the unavailable record does not name. Any warehouse
+    // may lack those, since its history names bytes taken away or never fetched.
     let partial = crate::util::scope_utils::content_may_be_absent().map_err(|error| RefUpdateError::Failed(format!(
         "Cannot tell whether the history of {} is complete: {}, and whether this warehouse may lack \
         content cannot be read. {}",
@@ -1529,7 +1536,8 @@ fn verify_new_head(name: &str,
 
     let unreadable = |error: String| RefUpdateError::Failed(format!(
         "Cannot tell whether the history of {} is complete: {}, and the record of objects held by \
-        hash, of the redactions applied here or of the content withheld here, cannot be read. {}",
+        hash, of the redactions applied here, of the content withheld here or of the content recorded \
+        unavailable, cannot be read. {}",
         &new[..new.len().min(12)], missing.trim_end_matches('.'), error
     ));
 
