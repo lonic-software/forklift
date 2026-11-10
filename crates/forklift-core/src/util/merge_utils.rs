@@ -1037,12 +1037,23 @@ pub fn compute_merge_actions_with(base_hash: &str,
 /// no read. A file both sides changed is handed to `withheld`: a line merge, or a version put back
 /// in conflict, would have to read bytes the remote's host withholds, and a version kept in conflict
 /// would stand at a path holding no file.
+/// Which side of a merge changed a file whose merge needs its content, as far as the way out of a
+/// `content_withheld` refusal goes.
+enum Side<'a> {
+    /// Both sides changed it; the other side's version has this hash.
+    BothChanged(&'a str),
+    /// This pallet deleted it and the other side changed it.
+    WeDeleted,
+    /// This pallet changed it and the other side deleted it.
+    TheyDeleted,
+}
+
 fn sort_withheld(pending: &mut Vec<PendingAction>, withheld: WithheldReads) -> Result<(), String> {
     let not_checked_out = shift_utils::NotCheckedOut::read()?;
     let mut unknown = Vec::new();
 
     for (index, entry) in pending.iter_mut().enumerate() {
-        let (path, hashes): (&str, Vec<&str>) = match entry {
+        let (path, hashes, side): (&str, Vec<&str>, Side) = match entry {
             PendingAction::Ready(MergeAction::TakeTheirs { path, hash, item_type, is_new }) => {
                 if not_checked_out.holds(hash)? {
                     *entry = PendingAction::Ready(MergeAction::LeaveOut {
@@ -1052,10 +1063,10 @@ fn sort_withheld(pending: &mut Vec<PendingAction>, withheld: WithheldReads) -> R
                 continue;
             }
             PendingAction::Merge(job) => {
-                (job.path.as_str(), job.base_hash.iter().map(String::as_str).chain([job.our_hash.as_str(), job.their_hash.as_str()]).collect())
+                (job.path.as_str(), job.base_hash.iter().map(String::as_str).chain([job.our_hash.as_str(), job.their_hash.as_str()]).collect(), Side::BothChanged(job.their_hash.as_str()))
             }
-            PendingAction::PutBack { path, hash, .. } => (path.as_str(), vec![hash.as_str()]),
-            PendingAction::Ready(MergeAction::Conflict { path, entry_hash, .. }) => (path.as_str(), vec![entry_hash.as_str()]),
+            PendingAction::PutBack { path, hash, .. } => (path.as_str(), vec![hash.as_str()], Side::WeDeleted),
+            PendingAction::Ready(MergeAction::Conflict { path, entry_hash, .. }) => (path.as_str(), vec![entry_hash.as_str()], Side::TheyDeleted),
             PendingAction::Ready(_) => continue,
         };
 
@@ -1072,21 +1083,34 @@ fn sort_withheld(pending: &mut Vec<PendingAction>, withheld: WithheldReads) -> R
             WithheldReads::Refuse => {
                 let statement = not_checked_out.statement(hash).unwrap_or_default();
 
+                // Only content the other side brings can be left out: a merge reads nothing of a
+                // file only the other side changed. So taking this pallet's own change out is a way
+                // out exactly when the content left out is theirs.
+                let next_step = match side {
+                    Side::BothChanged(their_hash) if their_hash == hash => format!(
+                        "Both sides changed \"{}\"; with this pallet's own change to it taken out, only the \
+                        other side changes it and the merge leaves the file out. Otherwise only a warehouse \
+                        that holds the content can make this merge.",
+                        path
+                    ),
+                    Side::WeDeleted => format!(
+                        "This pallet deleted \"{}\" and the other side changed it; with the deletion taken out \
+                        (the file put back as it was), only the other side changes it and the merge leaves the \
+                        file out. Otherwise only a warehouse that holds the content can make this merge.",
+                        path
+                    ),
+                    _ => "Only a warehouse that holds the content can make this merge.".to_string(),
+                };
+
                 return Err(crate::error::CoreError::refusal_with_details(
                     crate::error::RefusalCode::ContentWithheld,
                     format!(
-                        "Cannot merge \"{}\": the merge needs its content {}, which the host of this \
-                        warehouse's remote withholds and this warehouse does not hold. No file was changed. \
+                        "Cannot merge \"{}\": the merge needs its content {}, which this warehouse does not \
+                        hold: it was left out because the host of a remote withholds it. No file was changed. \
                         The host's statement: {}",
                         path, hash, statement
                     ),
-                    format!(
-                        "The remote cannot supply the content. Both sides changed \"{}\", and a merge reads \
-                        nothing of a file only the other side changed, so with this pallet's own change to it \
-                        taken out the merge leaves the file out; otherwise only a warehouse that holds the \
-                        content can make it.",
-                        path
-                    ),
+                    next_step,
                     serde_json::json!({ "path": path, "hash": hash, "statement": statement }),
                 ).into());
             }

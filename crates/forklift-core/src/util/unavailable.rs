@@ -150,11 +150,11 @@ pub(crate) fn absent_read_refusal(hash: &str) -> Result<Option<String>, String> 
     Ok(Some(crate::error::CoreError::refusal_with_details(
         crate::error::RefusalCode::ContentWithheld,
         format!(
-            "Cannot read object {}: the host of this warehouse's remote withholds it, and this \
-            warehouse does not hold it. The host's statement: {}",
+            "Cannot read object {}: this warehouse does not hold it; it was left out because the host \
+            of a remote withholds it. The host's statement: {}",
             hash, statement
         ),
-        "The remote cannot supply the content; only a warehouse that holds it can read it.",
+        "Only a warehouse that holds the content can read it or send it on.",
         serde_json::json!({ "hash": hash, "statement": statement }),
     ).into()))
 }
