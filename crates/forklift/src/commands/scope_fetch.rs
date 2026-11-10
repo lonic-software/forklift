@@ -77,6 +77,11 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     }
 
     let client = RemoteClient::for_warehouse()?;
+
+    // The content the remote's host withholds is left out of the widened walk and recorded
+    // unavailable, as a lower leaves it out, so a path brought into scope that names it widens
+    // without it rather than being refused.
+    client.leave_out_withheld(&client.fetch_info().await?);
     // The tree this bay holds: its base, not the pallet's ref, which another bay can move.
     let position = pallet_utils::read_position()?;
     let pallet = position.pallet.clone();

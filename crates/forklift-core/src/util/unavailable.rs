@@ -61,6 +61,12 @@ impl UnavailableSet {
         self.statements.get(hash).map(String::as_str)
     }
 
+    /// Whether a file of content `hash` is left out here: the record lists it and the store lacks
+    /// it. Only a listed hash is probed.
+    pub fn lacks(&self, hash: &str) -> Result<bool, String> {
+        Ok(self.contains(hash) && !file_utils::does_object_exist(hash)?)
+    }
+
     /// Whether nothing is recorded.
     pub fn is_empty(&self) -> bool {
         self.statements.is_empty()

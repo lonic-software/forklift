@@ -126,6 +126,10 @@ pub async fn handle_command(url: &str,
     let client = RemoteClient::new_with_tor(url, token.clone(), TorSettings::from_global_config()?)?;
     let info = client.fetch_info().await?;
 
+    // The content the remote's host withholds is left out of every content walk and recorded
+    // unavailable, so a head naming it is checked out without it rather than refused.
+    client.leave_out_withheld(&info);
+
     // The handshake already carries the remote's trust anchor, so a stripped anchor and a pin are
     // checked here — before the bundle download and before the target is touched. A resume
     // enforces the genesis its first attempt bound to as if `--expect` were given again.

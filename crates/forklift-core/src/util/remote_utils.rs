@@ -2422,6 +2422,10 @@ pub struct RemoteClient {
     skip_files: std::sync::Arc<std::sync::RwLock<std::sync::Arc<HashSet<String>>>>,
     /// The members of `skip_files` a walk met and left out, read by [`Self::skipped_files`].
     skipped_files: std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
+    /// The file contents the remote's host withholds, each beside the host's statement, that a
+    /// content walk through this client, or any clone of it, leaves out and records unavailable:
+    /// set by [`Self::leave_out_withheld`]. Empty unless a command set it.
+    withheld: std::sync::Arc<std::sync::RwLock<std::sync::Arc<BTreeMap<String, String>>>>,
 }
 
 /// Compose the client-facing error for a non-success response, threading a server-side refusal
@@ -2621,6 +2625,7 @@ impl RemoteClient {
             batch_lane_closed: Default::default(),
             skip_files: Default::default(),
             skipped_files: Default::default(),
+            withheld: Default::default(),
         })
     }
 
@@ -3358,8 +3363,75 @@ impl RemoteClient {
         *self.skip_files.write().unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(hashes);
     }
 
+    /// Make every later content walk through this client, or any clone of it, leave out the files
+    /// whose content the handshake `info` lists withheld by the remote's host, in any state, as
+    /// [`Self::skip_files`] leaves out what it names. The remote refuses that content on every
+    /// route, so asking for it would refuse the whole walk. What a walk leaves out and this
+    /// warehouse lacks is recorded unavailable, with the host's statement, before the walk
+    /// returns ([`unavailable`](crate::util::unavailable)), so a head naming it can be written and
+    /// checked out without it. A meta history's walk leaves none of it out: only a file of a user
+    /// pallet's tree is checked out without its content.
+    pub fn leave_out_withheld(&self, info: &WarehouseInfo) {
+        let withheld = info.withheld.iter().flatten()
+            .map(|entry| (entry.hash.clone(), entry.statement.clone()))
+            .collect();
+
+        *self.withheld.write().unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(withheld);
+    }
+
+    /// Whether a content walk through this client leaves out `hash` as content the remote's host
+    /// withholds ([`Self::leave_out_withheld`]).
+    pub fn leaves_out_withheld(&self, hash: &str) -> bool {
+        self.withheld.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(hash)
+    }
+
+    /// Record unavailable every file a walk through this client left out as withheld by the
+    /// remote's host ([`Self::leave_out_withheld`]) that the store lacks, with the host's
+    /// statement. Content a redaction this warehouse applied names is left out of the record: its
+    /// absence is tolerated as a redaction already, and outranks a withholding.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - Every such file is recorded, or there was none.
+    /// * `Err(String)` - The store could not be probed, or the record of applied redactions or the
+    ///                   unavailable record could not be read or written.
+    fn record_withheld_skips(&self) -> Result<(), String> {
+        let withheld = self.withheld.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+
+        if withheld.is_empty() {
+            return Ok(());
+        }
+
+        let mut skipped: Vec<String> = self.skipped_files().into_iter()
+            .filter(|hash| withheld.contains_key(hash))
+            .collect();
+
+        if skipped.is_empty() {
+            return Ok(());
+        }
+
+        skipped.sort();
+
+        let applied = crate::util::applied_redactions::read_applied()?;
+        let mut entries: Vec<(String, String)> = Vec::new();
+
+        for hash in skipped {
+            if applied.contains(&hash) || file_utils::does_object_exist(&hash)? {
+                continue;
+            }
+
+            let statement = withheld[&hash].clone();
+            entries.push((hash, statement));
+        }
+
+        match entries.is_empty() {
+            true => Ok(()),
+            false => crate::util::unavailable::record(entries),
+        }
+    }
+
     /// The files that a walk through this client, or any clone of it, met and left out: of
-    /// [`Self::skip_files`], and of the redactions this warehouse applied.
+    /// [`Self::skip_files`], of [`Self::leave_out_withheld`], and of the redactions this warehouse
+    /// applied.
     pub fn skipped_files(&self) -> HashSet<String> {
         self.skipped_files.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
@@ -3376,7 +3448,8 @@ impl RemoteClient {
     }
 
     /// The files a walk leaves out (see [`Self::skip_files`]): those set, and with `applied`, the
-    /// content of every redaction this warehouse applied. When the record of applied redactions
+    /// content the remote's host withholds ([`Self::leave_out_withheld`]) and of every redaction
+    /// this warehouse applied. When the record of applied redactions
     /// cannot be read, the walk is refused: asking for what it meets would take back content
     /// removed here on purpose from a remote that has not removed it. A meta history's walk takes
     /// no `applied`: no meta cell may name an applied hash, so a served chain naming one must reach
@@ -3389,12 +3462,13 @@ impl RemoteClient {
         }
 
         let applied = crate::util::applied_redactions::read_applied()?;
+        let withheld = self.withheld.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
 
-        if applied.is_empty() {
+        if applied.is_empty() && withheld.is_empty() {
             return Ok(set);
         }
 
-        Ok(std::sync::Arc::new(set.iter().cloned().chain(applied.hashes().cloned()).collect()))
+        Ok(std::sync::Arc::new(set.iter().cloned().chain(applied.hashes().cloned()).chain(withheld.keys().cloned()).collect()))
     }
 
     /// The head-wait budget to arm for *this* client instance's call to [`Self::missing_objects`]
@@ -5063,8 +5137,12 @@ pub async fn fetch_history_within(client: &RemoteClient,
     }
 
     let skip = client.skip_set(true)?;
+    let stats = walk_history(client, head, &complete, true, &skip, progress).await?.0;
 
-    Ok(walk_history(client, head, &complete, true, &skip, progress).await?.0)
+    // Before any caller writes a head over what the walk left out.
+    client.record_withheld_skips()?;
+
+    Ok(stats)
 }
 
 /// [`fetch_history`] for meta history, bounded by the meta pallet heads alone. Meta history is held
@@ -5316,13 +5394,27 @@ pub async fn fetch_head_content(client: &RemoteClient,
 
         let skip = client.skip_set(true)?;
 
-        if let Err(why) = fetch_tree_closures(client, vec![root.clone()], &skip, &mut seen, &mut stats, progress).await {
+        let filled = fetch_tree_closures(client, vec![root.clone()], &skip, &mut seen, &mut stats, progress).await;
+
+        // What the walk left out as withheld is recorded unavailable before anything else here
+        // judges the closure: before the records of what it filled go, which would leave it
+        // absent and unrecorded under a present root, and before a failed fill records every
+        // absence beneath the root sealed, which would promise the origin serves it.
+        let recorded = client.record_withheld_skips();
+
+        if let Err(why) = filled {
+            let why = match recorded {
+                Ok(()) => why,
+                Err(unrecorded) => format!("{} What it left out as withheld could not be recorded unavailable either: {}", why, unrecorded),
+            };
+
             return Err(match sealed_utils::record_absences_under(&[root]) {
                 Ok(()) => why,
                 Err(unrecorded) => format!("{} What it left absent could not be recorded either: {}", why, unrecorded),
             });
         }
 
+        recorded?;
         sealed_utils::forget_filled(seen.trees.iter().chain(&seen.blobs))?;
     }
 
@@ -5990,6 +6082,10 @@ async fn fetch_scoped_from(client: &RemoteClient,
     }
 
     signatures.finish()?;
+
+    // Before any caller writes a head, or widens the scope, over what the walk left out.
+    client.record_withheld_skips()?;
+
     Ok(stats)
 }
 
