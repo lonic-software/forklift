@@ -667,7 +667,7 @@ impl NotCheckedOut {
     /// Whether a file of this content is left out: the record lists it and the store lacks it.
     /// Only a listed hash is probed.
     pub fn holds(&self, hash: &str) -> Result<bool, String> {
-        Ok(self.record.contains(hash) && !file_utils::does_object_exist(hash)?)
+        self.record.lacks(hash)
     }
 }
 

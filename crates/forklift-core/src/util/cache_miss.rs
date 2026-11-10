@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::OnceLock;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::error::{CoreError, RefusalCode};
-use crate::util::{file_utils, object_utils, pack_utils, scope_utils, sealed_utils};
+use crate::util::{file_utils, object_utils, pack_utils, scope_utils, sealed_utils, unavailable};
 use crate::util::lock_utils::{RefLock, StoreAccessLock};
 
 /// How a [`FetchHook`]'s fetch ended.
@@ -200,13 +200,25 @@ fn walk_with(hook: Option<&FetchHook>,
 
 /// [`ensure_present`] for the files a mutation is about to write, by entry hash and kind: their
 /// blobs and recipes in one batch, then the chunks of every chunked one, which a refilled recipe
-/// records as it lands.
+/// records as it lands. A file whose content is recorded unavailable and absent
+/// ([`UnavailableSet::lacks`](unavailable::UnavailableSet::lacks)) is left out: no checkout writes
+/// it, and its origin's host refuses it, so neither it nor the chunks its absent recipe would name
+/// are asked for.
 pub fn ensure_files_present<'a>(files: impl IntoIterator<Item = (&'a str, DirEntryType)>) -> Result<(), String> {
     if !scope_utils::is_cache_mode().unwrap_or(false) {
         return Ok(());
     }
 
-    let files: Vec<(&str, DirEntryType)> = files.into_iter().collect();
+    let unavailable = unavailable::read_unavailable()?;
+    let mut kept: Vec<(&str, DirEntryType)> = Vec::new();
+
+    for file in files {
+        if !unavailable.lacks(file.0)? {
+            kept.push(file);
+        }
+    }
+
+    let files = kept;
 
     ensure_present(files.iter().map(|(hash, _)| *hash))?;
 

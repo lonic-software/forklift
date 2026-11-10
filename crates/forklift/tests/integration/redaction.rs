@@ -3108,3 +3108,227 @@ fn a_prune_keeps_what_the_remote_withholds() {
     assert!(sparse.holds_loose(&film_hash), "the withheld copy is kept: {}", pruned);
     assert!(!sparse.holds_loose(&trailer_hash), "a served copy is freed: {}", pruned);
 }
+
+/// A remote holding `media/film.mkv`, `media/trailer.mkv` and `src/code.txt` at `old`; once
+/// `withhold_new_film` runs, the remote's head changes the film and its host withholds the new
+/// version, whose hash (a recipe when chunked) is `film`.
+struct Takedown {
+    server: Server,
+    owner: Warehouse,
+    old: String,
+    film: String,
+}
+
+/// The statement `withhold_new_film` withholds the film on.
+const TAKEDOWN: &str = "DMCA notice 2026-120 from Example Studios";
+
+fn takedown(name: &str) -> Takedown {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-takedown-{}-server-{}", name, std::process::id())));
+
+    let owner = Warehouse::cloned(&format!("takedown-{}-owner", name), &server.url);
+    owner.run_ok(&["office", "enroll"]);
+    owner.stack("media/film.mkv", b"the old film\n", "old film");
+    owner.stack("media/trailer.mkv", b"trailer\n", "trailer");
+    owner.stack("src/code.txt", b"code\n", "code");
+    owner.run_ok(&["lift"]);
+    let old = server.main();
+
+    Takedown { server, owner, old, film: String::new() }
+}
+
+impl Takedown {
+    /// Lift a new version of the film and withhold it on the remote, waiting until its copy there
+    /// is deleted.
+    fn withhold_new_film(&mut self, chunked: bool) {
+        // Above the chunking threshold, and varied, so the film is a recipe of several chunks.
+        let film: Vec<u8> = match chunked {
+            true => {
+                let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+                (0..9 * 1024 * 1024).map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                }).collect()
+            }
+            false => b"the new film\n".to_vec(),
+        };
+        self.owner.stack("media/film.mkv", &film, "new film");
+        self.owner.run_ok(&["lift"]);
+        self.film = {
+            let _scope = forklift_core::globals::StorageRootScope::enter(&self.owner.root);
+            let root = object_utils::load_parcel(&self.owner.head("main")).unwrap().tree_hash;
+            let media = forklift_core::util::tree_utils::resolve_subtree_hash(&root, "media").unwrap().unwrap();
+            let tree = object_utils::load_tree(&media).unwrap();
+            tree.get_files().find(|(name, _)| name.as_str() == "film.mkv").unwrap().1.hash.clone()
+        };
+
+        let added = withhold(&self.server.root, &["add", &self.film, "--statement", TAKEDOWN]);
+        assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+        // The deletion drains the warehouse briefly; wait until it is done.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let (status, info) = http(&self.server.url, "GET", "/v1/warehouse", b"");
+            if status.starts_with("HTTP/1.1 200") {
+                let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+                if info["withheld"][0]["state"] == "deleted" {
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "the takedown's deletion stayed owed");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+/// The film is left out of `warehouse`: no file at its path, no copy in the store, the unavailable
+/// record names it with the host's statement, stocktake reports it and nothing else, and the full
+/// audit passes; the trailer beside it is checked out.
+fn left_out_film(warehouse: &Warehouse, takedown: &Takedown) {
+    assert!(!warehouse.root.join("media/film.mkv").exists(), "the withheld film is not checked out");
+    assert_eq!(std::fs::read(warehouse.root.join("media/trailer.mkv")).unwrap(), b"trailer\n");
+    recorded_film(warehouse, takedown);
+
+    let report = warehouse.json(&["stocktake"]);
+    assert_eq!(report["ok"], true, "{}", report);
+    assert_eq!(report["data"]["unavailable"], serde_json::json!(["media/film.mkv"]), "{}", report);
+    assert_eq!((&report["data"]["staged_count"], &report["data"]["unstaged_count"]),
+        (&0.into(), &0.into()), "{}", report);
+}
+
+/// The store holds no copy of the film, the unavailable record names it with the host's
+/// statement, and the full audit passes.
+fn recorded_film(warehouse: &Warehouse, takedown: &Takedown) {
+    assert!(!warehouse.holds_loose(&takedown.film), "the store holds no copy of the withheld film");
+
+    let record: Vec<(String, String)> = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        forklift_core::util::unavailable::read_unavailable().unwrap().entries()
+            .map(|(hash, statement)| (hash.clone(), statement.clone())).collect()
+    };
+    assert_eq!(record, [(takedown.film.clone(), TAKEDOWN.to_string())]);
+
+    let audited = warehouse.json(&["audit", "--full"]);
+    assert_eq!(audited["ok"], true, "{}", audited);
+}
+
+/// A full clone, a cache clone and a sparse clone of a head naming content the remote's host
+/// withholds check the head out without it: the head is the remote's, the file is left out and
+/// recorded unavailable, and the clone is clean. A sparse clone whose scope leaves the file out
+/// records nothing, and widening the scope over it records it then.
+///
+/// Revert: leave the withheld hashes out of the fetch's skip set → every clone is refused with
+/// `content_withheld`. Revert: record nothing after the fetch → the full clone's head check is
+/// refused as incomplete. Revert: refuse what the fetch left out as withheld as an unapplied
+/// redaction → the full clone is refused as redacted. Revert: open the scope fetch without the remote's withheld list → the
+/// widening is refused with `content_withheld`.
+#[test]
+fn a_clone_checks_out_a_head_naming_withheld_content_without_it() {
+    let mut takedown = takedown("clone");
+    takedown.withhold_new_film(false);
+    let head = takedown.server.main();
+
+    for (name, extra) in [
+        ("takedown-clone-full", &[][..]),
+        ("takedown-clone-cache", &["--cache"][..]),
+        ("takedown-clone-sparse", &["--only", "media"][..]),
+    ] {
+        let clone = Warehouse::cloned_with(name, &takedown.server.url, extra);
+        assert_eq!(clone.head("main"), head, "{}", name);
+        left_out_film(&clone, &takedown);
+    }
+
+    let narrow = Warehouse::cloned_with("takedown-clone-narrow", &takedown.server.url, &["--only", "src"]);
+    let record = narrow.root.join(".forklift/unavailable");
+    assert!(!record.exists() || {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&narrow.root);
+        forklift_core::util::unavailable::read_unavailable().unwrap().is_empty()
+    }, "a scope leaving the film out records nothing");
+
+    // Widening fetches, and leaves the checkout's scope as it is.
+    let widened = narrow.json(&["scope", "fetch", "media"]);
+    assert_eq!(widened["ok"], true, "{}", widened);
+    assert!(narrow.holds_loose(&hash_of(b"trailer\n")), "the widening fetched the trailer");
+    recorded_film(&narrow, &takedown);
+}
+
+/// A lower to a head changing a file to content the remote's host withholds removes the old
+/// version and leaves the new one out, recorded unavailable, in a full warehouse and in a cache.
+/// The film is chunked, so a cache's presence phase meets an absent recipe it must not read.
+///
+/// Revert: let a cache's presence phase fetch what the unavailable record lists → the
+/// cache's lower fails reading the absent recipe.
+#[test]
+fn a_lower_to_a_head_naming_withheld_content_takes_it_without_it() {
+    let mut takedown = takedown("lower");
+    // Cloned while the remote serves the old head: the bay holds the old film.
+    let warehouses = [("takedown-lower-full", &[][..]), ("takedown-lower-cache", &["--cache"][..])]
+        .map(|(name, extra)| (name, Warehouse::cloned_with(name, &takedown.server.url, extra)));
+    takedown.withhold_new_film(true);
+    let head = takedown.server.main();
+
+    for (name, warehouse) in &warehouses {
+        assert_eq!(std::fs::read(warehouse.root.join("media/film.mkv")).unwrap(), b"the old film\n");
+
+        let lowered = warehouse.json(&["lower"]);
+        assert_eq!(lowered["ok"], true, "{}: {}", name, lowered);
+        assert_eq!(warehouse.head("main"), head, "{}", name);
+        left_out_film(&warehouse, &takedown);
+    }
+}
+
+/// A lower to a head naming withheld content, interrupted after its ref write and before it
+/// removed the old version, is finished by heal without the content: the head stays the remote's,
+/// the old version is removed, and the film stays recorded unavailable rather than taken for a
+/// removal or fetched.
+///
+/// Revert: judge a left-out write in heal's put-back by the rebuild's unheld files, as any other
+/// write → the old film stays.
+#[test]
+fn heal_finishes_an_interrupted_lower_to_a_head_naming_withheld_content() {
+    use forklift_core::util::{audit_utils, operation_utils, pallet_utils};
+    use forklift_core::util::operation_utils::{Operation, OperationKind};
+    use forklift_core::util::pallet_utils::{BayPosition, RefPreconditions};
+
+    let mut takedown = takedown("heal");
+    let warehouse = Warehouse::cloned("takedown-heal", &takedown.server.url);
+    takedown.withhold_new_film(false);
+    warehouse.run_ok(&["lower"]);
+    let (from, to) = (takedown.old.clone(), takedown.server.main());
+    assert_eq!(warehouse.head("main"), to);
+
+    {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        let (_, office) = audit_utils::verified_local_trust().unwrap().expect("the clone holds an anchor");
+        pallet_utils::update_pallet_head("main", Some(&to), &from, &RefPreconditions::NONE).unwrap();
+        pallet_utils::write_position(&BayPosition::new("main", Some(from.clone()))).unwrap();
+
+        let mut operation = Operation::new(
+            OperationKind::Lower,
+            BayPosition::new("main", Some(from.clone())),
+            Some(object_utils::load_parcel(&from).unwrap().tree_hash),
+            BayPosition::new("main", Some(to.clone())),
+        );
+        operation.target_tree = Some(object_utils::load_parcel(&to).unwrap().tree_hash);
+        operation.expected = Some(from.clone());
+        let preconditions = office.preconditions();
+        operation.office = preconditions.office;
+        operation.anchor = preconditions.anchor;
+        operation_utils::raise(&operation).unwrap();
+        operation_utils::forget_raised_for_tests();
+    }
+
+    // The crash came before the lower removed the old version.
+    std::fs::write(warehouse.root.join("media/film.mkv"), b"the old film\n").unwrap();
+
+    let healed = warehouse.json(&["heal"]);
+    assert_eq!(healed["ok"], true, "{}", healed);
+    assert_eq!(warehouse.head("main"), to);
+    let standing = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        operation_utils::read().unwrap().is_some()
+    };
+    assert!(!standing, "heal finished the lower");
+    left_out_film(&warehouse, &takedown);
+}

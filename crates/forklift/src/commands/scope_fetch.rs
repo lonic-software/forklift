@@ -84,6 +84,11 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
         "Pallet \"{}\" has nothing stacked yet; there is nothing to fetch.", pallet
     ))?;
 
+    // The content the remote's host withholds is left out of the widened walk and recorded
+    // unavailable, as a lower leaves it out, so a path brought into scope that names it widens
+    // without it rather than being refused.
+    client.leave_out_withheld(&client.fetch_info().await?);
+
     // Fetch the newly in-scope content FIRST, at the widened scope, and only then record it: the
     // fetch scope never claims a path is in scope until it is fully fetched. A transfer error, or
     // a hard crash mid-fetch, leaves the on-disk scope as it was, so a plain re-run retries the
