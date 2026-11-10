@@ -386,9 +386,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             tombstones: Some(tombstones),
             // Every redaction `@redactions` records, each judged first.
             redactions: Some(redactions),
-            // Every withheld item that applies, each settled first where its object can be read.
-            // Always present, empty or not: a client reads an absent list as a head that reports
-            // nothing.
+            // Every withheld item that applies, each settled first but for one whose object's header
+            // cannot be read. Always present, empty or not: a client reads an absent list as a head
+            // that reports nothing.
             withheld: Some(withholding.served()),
         })
     }

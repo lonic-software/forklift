@@ -13,11 +13,11 @@
 //! An item applies from the moment it is added. It never applies when the store holds its hash
 //! as no file's content (a tree, a parcel or a chunk); a request learns which by settling it
 //! ([`Head::withholding`]), reading the object once and recording what it is; one whose header
-//! this build cannot read is never recorded, so it applies and is read again by every request. Settling a recipe
-//! journals it in the chunk ledger in the same transaction, which is what gates its chunks (the
-//! chunk gate reads only the ledger, and a chunk request names no recipe). So every request that
-//! serves or takes objects settles every unsettled item before it answers, and answers `503`
-//! only when that does not finish within the request.
+//! this build cannot read is never recorded, so it applies and is read again by every request.
+//! Settling a recipe journals it in the chunk ledger in the same transaction, which is what gates
+//! its chunks (the chunk gate reads only the ledger, and a chunk request names no recipe). So
+//! every request that serves or takes objects settles every unsettled item before it answers, and
+//! answers `503` only when that does not finish within the request.
 //!
 //! The cost: one strongly consistent `Query` per such request, reading every item whole. An item
 //! is its statement (at most 1000 characters) and a few flags, so a strongly consistent read
@@ -112,8 +112,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         withheld::list(&self.refs).map_err(HeadError::internal)
     }
 
-    /// Every withheld item, each settled first where its object can be read: what a request that
-    /// serves or takes objects reads before it answers.
+    /// Every withheld item, each settled first but for one whose object's header cannot be read:
+    /// what a request that serves or takes objects reads before it answers.
     ///
     /// # Returns
     /// * `Ok(Withholding)` - Every item, settled, but for one whose object's header cannot be
