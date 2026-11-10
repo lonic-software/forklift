@@ -6551,14 +6551,16 @@ async fn lift_pallet_inner(client: &RemoteClient,
     // it owed a deletion. Its closure check then refuses the head as incomplete, and the
     // negotiation, asked again, answers that object missing. So the upload runs once more; the
     // update after it reports whatever it answers. The walk no longer stops at the other heads the
-    // handshake listed: one deleted since, its tombstone dropped and its history collected, leaves
-    // the remote without history this lift took as held, and only a walk past it offers that.
+    // handshake listed, nor at the tombstone: one deleted or dropped since, and its history
+    // collected, leaves the remote without history this lift took as held, and only a walk past it
+    // offers that. The remote checks a closure the tombstone no longer bounds before it reads the
+    // tombstone, so the refusal comes as an incomplete history too.
     if let Err(refusal) = client.update_ref(pallet, remote_head, local_head, tombstone).await {
         if !is_remote_history_incomplete(&refusal) {
             return Err(refusal);
         }
 
-        let again = upload_history(client, local_head, base, &[], info, progress).await?;
+        let again = upload_history(client, local_head, remote_head, &[], info, progress).await?;
         uploaded = uploaded.then(again);
 
         client.update_ref(pallet, remote_head, local_head, tombstone).await?;
@@ -10334,15 +10336,16 @@ mod tests {
 
     /// Lift `main` at a fresh one-file head to `remote`, which has no such pallet yet.
     fn lift_to(remote: &RefusingRefRemote, content: &str) -> Result<LiftResult, String> {
-        lift_over(remote, content, Vec::new(), BTreeMap::new())
+        lift_over(remote, content, Vec::new(), BTreeMap::new(), None)
     }
 
     /// Lift `main` at a fresh one-file head on `parents` to `remote`, whose handshake lists
-    /// `pallets`.
+    /// `pallets`, acknowledging `tombstone`.
     fn lift_over(remote: &RefusingRefRemote,
                  content: &str,
                  parents: Vec<String>,
-                 pallets: BTreeMap<String, String>) -> Result<LiftResult, String> {
+                 pallets: BTreeMap<String, String>,
+                 tombstone: Option<&str>) -> Result<LiftResult, String> {
         use crate::enums::dir_entry_type::DirEntryType::Normal;
 
         let blob = store_blob(content);
@@ -10363,7 +10366,7 @@ mod tests {
         let client = RemoteClient::new(&remote.url, None).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
-        runtime.block_on(lift_pallet_inner(&client, "main", &head, None, None, false, &info, &Progress::NONE))
+        runtime.block_on(lift_pallet_inner(&client, "main", &head, None, tombstone, false, &info, &Progress::NONE))
     }
 
     /// A ref update refused as an incomplete history — content the remote deleted after it was
@@ -10404,12 +10407,35 @@ mod tests {
         let side = stack_with_tree(Vec::new(), &side_tree, "side");
         let pallets = BTreeMap::from([("side".to_string(), side.clone())]);
 
-        lift_over(&remote, "on side", vec![side.clone()], pallets).expect("the second ref update lands");
+        lift_over(&remote, "on side", vec![side.clone()], pallets, None).expect("the second ref update lands");
 
         let negotiated = remote.negotiated.lock().unwrap().clone();
         assert_eq!(negotiated.len(), 2);
         assert!(!negotiated[0].contains(&side), "the first upload takes the side head as held: {:?}", negotiated);
         assert!(negotiated[1].contains(&side) && negotiated[1].contains(&side_blob), "{:?}", negotiated);
+    }
+
+    /// A re-creation's first upload stops at the tombstone's head; the retry walks past it, since
+    /// the tombstone may have been dropped and its history collected meanwhile.
+    ///
+    /// Revert: walk the retry from the tombstone → the second negotiation offers only the new
+    /// parcel's content again → red.
+    #[test]
+    fn a_retried_re_creation_offers_the_history_its_tombstone_was_taken_to_hold() {
+        use crate::enums::dir_entry_type::DirEntryType::Normal;
+
+        let _scratch = Scratch::new("lift-retry-tombstone");
+        let remote = RefusingRefRemote::start(vec![RefusingRefRemote::incomplete()]);
+        let gone_blob = store_blob("gone");
+        let gone_tree = store_tree(&[("gone.txt", &gone_blob, Normal)]);
+        let gone = stack_with_tree(Vec::new(), &gone_tree, "gone");
+
+        lift_over(&remote, "on gone", vec![gone.clone()], BTreeMap::new(), Some(&gone)).expect("the second ref update lands");
+
+        let negotiated = remote.negotiated.lock().unwrap().clone();
+        assert_eq!(negotiated.len(), 2);
+        assert!(!negotiated[0].contains(&gone), "the first upload takes the tombstone's head as held: {:?}", negotiated);
+        assert!(negotiated[1].contains(&gone) && negotiated[1].contains(&gone_blob), "{:?}", negotiated);
     }
 
     /// The retry happens once: a second incomplete refusal is the lift's answer, with its code.
