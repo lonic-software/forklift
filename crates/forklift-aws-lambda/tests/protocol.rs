@@ -6465,6 +6465,47 @@ fn a_withheld_tree_never_applies_and_stays_served() {
     assert_eq!(served_withheld(&head), vec![]);
 }
 
+/// A withheld hash the store lacks applies whatever it names, as a redaction's does: the store
+/// cannot tell what it is, so a tree of that hash a lift uploads later is refused, not taken.
+// Revert: settle an absent hash as never applying → the tree is taken → red.
+#[test]
+fn a_withheld_hash_the_store_lacks_applies_to_a_tree_uploaded_later() {
+    let source = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let main = gate_parcel(&source, &[], vec![gate_file(&source, "x", "1")]);
+    let bytes = source.objects.get(&main).expect("read").expect("the parcel");
+    let tree = object_utils::parse_parcel_bytes(&main, &bytes).expect("parcel").tree_hash;
+    let tree_bytes = source.objects.get(&tree).expect("read").expect("the tree");
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let other = gate_parcel(&head, &[], vec![gate_file(&head, "y", "2")]);
+    plant(&head.refs, "main", &other);
+    withhold(&head, &tree);
+
+    let err = head.object_put(&Principal::Static, None, &tree, &tree_bytes).expect_err("not taken");
+    assert_host_withheld(&err, &tree);
+    let listed = forklift_aws_lambda::withheld::list(&head.refs).expect("list");
+    assert!(listed[0].item.settled && !listed[0].item.never_applies, "{:?}", listed[0].item);
+}
+
+/// An object whose header this build cannot read is never guessed at: settling its withheld item
+/// fails loudly, every object request answers `500`, and the item stays unsettled.
+// Revert: settle an unreadable header as a blob → the request is served → red.
+#[test]
+fn a_withheld_object_whose_header_cannot_be_read_is_refused_loudly() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let main = gate_parcel(&head, &[], vec![gate_file(&head, "x", "1")]);
+    plant(&head.refs, "main", &main);
+    let odd = object_utils::hash_object_bytes(b"no header at all");
+    head.objects.put_verified(&odd, b"no header at all").expect("seed");
+    withhold(&head, &odd);
+
+    let err = head.object_get(&main).expect_err("not guessed at");
+    assert_eq!(err.status, Status::Internal, "{}", err.message);
+    assert!(err.message.contains(&odd), "{}", err.message);
+    let listed = forklift_aws_lambda::withheld::list(&head.refs).expect("list");
+    assert!(!listed[0].item.settled, "{:?}", listed[0].item);
+}
+
 /// An applied redaction of withheld content wins: it is for good, and is answered `410`.
 // Revert: refuse a withhold before a redaction → `451` → red.
 #[test]

@@ -11,7 +11,8 @@
 //! ([`forklift_aws_lambda::aws::operator`]). The role reads no object, so `add` records the hash
 //! with its statement and nothing more: what the store holds the hash as, and what to delete, is
 //! the head's to work out. The head refuses the content from its next request on; this build's
-//! head does not yet delete the copies it holds, so `add` says so.
+//! head deletes a chunked file's chunks that only it names and then its recipe, but no other copy
+//! yet, so `add` says so.
 
 use std::process::ExitCode;
 
@@ -100,7 +101,7 @@ fn run(arguments: &Arguments, store: &DynamoRefStore) -> Result<(), String> {
             if added == Added::Uncertain {
                 println!("A write's fate was unknown, so whether this run recorded it cannot be told.");
             }
-            println!("The head refuses the content from its next request on. This build's head does not yet delete the copies it holds.");
+            println!("The head refuses the content from its next request on. For a chunked file it deletes the chunks only that file names, then its recipe; this build's head deletes no other copy yet.");
         }
         Command::List => {
             let listed = withheld::list(store)?;

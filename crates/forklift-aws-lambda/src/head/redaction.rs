@@ -425,9 +425,9 @@ pub fn delete_if_applied<O: ObjectStore + ?Sized, R: RefStore + ?Sized>(
     hash: &str,
 ) -> Result<AppliedCopies, String> {
     let Some(record) = applied_record(refs, hash)? else {
-        // An item not settled yet may name a tree, a parcel or a chunk, which it never applies to;
-        // refusing a staged copy of one fails the lift that uploaded it, never a later one, since
-        // the first request that settles the item records it.
+        // An item applies until a request settles it as naming a tree, a parcel or a chunk, which
+        // needs the canonical object: a staged copy of one is refused, as one of a hash the store
+        // lacks is (see `head::withholding`).
         if crate::withheld::applies(refs, hash)? {
             objects.delete_staged_copy(session, hash)?;
             return Ok(AppliedCopies::Withheld);
@@ -633,7 +633,16 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let mut redacted = None;
         let mut withheld = None;
 
-        for hash in hashes.iter().filter(|hash| recorded.contains(hash) || withholding.lists(hash)) {
+        for hash in hashes {
+            // The listing answers for the withheld item; only a recorded redaction reads its own.
+            if !recorded.contains(hash) {
+                if withholding.withholds(hash) {
+                    self.objects.delete_staged_copy(session, hash).map_err(HeadError::internal)?;
+                    withheld.get_or_insert(hash);
+                }
+                continue;
+            }
+
             match delete_if_applied(&self.objects, &self.refs, session, hash).map_err(HeadError::internal)? {
                 AppliedCopies::Unapplied => {}
                 AppliedCopies::Withheld => {
@@ -651,10 +660,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }
 
         match withheld {
-            Some(hash) => Err(withholding.refusal(std::slice::from_ref(hash)).unwrap_or_else(|| HeadError::internal(format!(
-                "The withheld item for {} applies, and the listing this request read does not say so.",
-                hash
-            )))),
+            // A recorded hash's own item may have been added after the listing: refused all the
+            // same, with the statement it reads now.
+            Some(hash) => Err(match withholding.refusal(std::slice::from_ref(hash)) {
+                Some(refusal) => refusal,
+                None => self.withheld_refusal(hash),
+            }),
             None => Ok(()),
         }
     }

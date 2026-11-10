@@ -48,9 +48,9 @@ impl Withholding {
         applying(&self.items)
     }
 
-    /// Whether the listing holds an item of `hash`, applying or not.
-    pub(super) fn lists(&self, hash: &str) -> bool {
-        self.items.iter().any(|listed| listed.hash == hash)
+    /// Whether the host withholds `hash`: the listing holds an item of it that applies.
+    pub(super) fn withholds(&self, hash: &str) -> bool {
+        self.items.iter().any(|listed| listed.hash == hash && !listed.item.never_applies)
     }
 
     /// The `451` for the first of `hashes` this head withholds, if any.
@@ -62,9 +62,9 @@ impl Withholding {
         })
     }
 
-    /// Whether any item is a recipe, whose chunks the ledger may owe a round.
+    /// Whether any item is a recipe not deleted yet, whose chunks the ledger may owe a round.
     pub(super) fn has_recipe(&self) -> bool {
-        self.items.iter().any(|listed| listed.item.recipe && !listed.item.never_applies)
+        self.items.iter().any(|listed| listed.item.recipe && !listed.item.recipe_deleted && !listed.item.never_applies)
     }
 
     /// What the handshake reports: each item that applies, with its statement, its deletion owed
@@ -144,6 +144,19 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }
     }
 
+    /// The `451` for `hash`, with the statement its withheld item holds now: for an item added
+    /// after this request's listing. Its item cannot be read, or is gone, answers `500`.
+    pub(super) fn withheld_refusal(&self, hash: &str) -> HeadError {
+        let item = self.refs.get_item(ItemKey::Withheld(hash))
+            .and_then(|stored| stored.ok_or_else(|| format!("The withheld item for {} applies, and cannot be found.", hash)))
+            .and_then(|stored| withheld::decode(hash, &stored));
+
+        match item {
+            Ok(item) => HeadError::withheld(withholding::served_refusal(hash, &item.statement)),
+            Err(error) => HeadError::internal(error),
+        }
+    }
+
     /// Settle `listed`: read what the store holds its hash as, and record it, a recipe journaled
     /// in the chunk ledger in the same transaction.
     fn settle(&self, mut listed: Listed, budget: &mut Budget) -> HeadResult<Settled> {
@@ -162,9 +175,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 )));
             }
 
-            // A store that cannot be read leaves the item for a later request; an object whose
-            // header does not parse is no tree, parcel or chunk this head serves, so withholding it
-            // takes nothing that history needs.
+            // A store that cannot be read leaves the item for a later request. One that lacks the
+            // object cannot tell what it is, so the item applies, whatever it names, as a
+            // redaction's does: a tree or a chunk of that hash a lift uploads later is refused, and
+            // the lift fails rather than landing without it. A header this build cannot read is
+            // refused loudly, never guessed at.
             let bytes = match self.objects.get(&hash) {
                 Ok(bytes) => bytes,
                 Err(error) => return Ok(Settled::Unsettled(format!(
@@ -173,9 +188,16 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     hash, error
                 ))),
             };
-            let kind = bytes.as_deref()
-                .and_then(|bytes| object_utils::peek_object_header(bytes).ok())
-                .map(|(object_type, _)| object_type);
+            let kind = match bytes.as_deref() {
+                Some(bytes) => Some(object_utils::peek_object_header(bytes).map(|(object_type, _)| object_type).map_err(|error| {
+                    HeadError::internal(format!(
+                        "Object {} cannot be read ({:?}), so whether this warehouse's host withholds it \
+                        as a file's content cannot be settled.",
+                        hash, error
+                    ))
+                })?),
+                None => None,
+            };
 
             let next = match kind {
                 None | Some(ObjectType::Blob) => WithheldItem { settled: true, ..listed.item.clone() },
