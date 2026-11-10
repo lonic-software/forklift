@@ -716,29 +716,29 @@ pub(crate) fn refuse_redacted_actions(actions: &[MergeAction],
     for action in actions {
         let named = match action {
             MergeAction::TakeTheirs { path, hash, item_type, .. } | MergeAction::LeaveOut { path, hash, item_type, .. } => {
-                guard.names_file(hash, *item_type)?.map(|hash| (path.clone(), hash))
+                guard.names_file(path, hash, *item_type)?.map(|hash| (path.clone(), hash))
             }
             MergeAction::Merged { path, content, item_type } => {
                 let blob = LooseObjectBuilder::build_blob(&Blob { content: content.clone() });
 
-                guard.names_file(&blob.hash, *item_type)?.map(|hash| (path.clone(), hash))
+                guard.names_file(path, &blob.hash, *item_type)?.map(|hash| (path.clone(), hash))
             }
             MergeAction::Conflict { path, content: Some(content), item_type, .. } => {
                 let blob = LooseObjectBuilder::build_blob(&Blob { content: content.clone() });
 
-                match guard.names_file(&blob.hash, *item_type)? {
+                match guard.names_file(path, &blob.hash, *item_type)? {
                     Some(hash) => Some((path.clone(), hash)),
                     None => theirs_named(&guard, their_tree, path)?,
                 }
             }
             MergeAction::Conflict { path, content: None, entry_hash, item_type } if item_type.is_chunked() => {
-                guard.names_file(entry_hash, *item_type)?.map(|hash| (path.clone(), hash))
+                guard.names_file(path, entry_hash, *item_type)?.map(|hash| (path.clone(), hash))
             }
             MergeAction::ResolveOutOfScope { path, resolution: Some((hash, item_type)) } => {
                 if *item_type == DirEntryType::Tree {
                     guard.names_tree(hash)?.map(|(inner, hash)| (format!("{}/{}", path, inner), hash))
                 } else {
-                    guard.names_file(hash, *item_type)?.map(|hash| (path.clone(), hash))
+                    guard.names_file(path, hash, *item_type)?.map(|hash| (path.clone(), hash))
                 }
             }
             _ => None,
@@ -760,7 +760,7 @@ fn theirs_named(guard: &redaction_utils::StagingGuard,
         return Ok(None);
     };
 
-    Ok(guard.names_file(&hash, item_type)?.map(|hash| (path.to_string(), hash)))
+    Ok(guard.names_file(path, &hash, item_type)?.map(|hash| (path.to_string(), hash)))
 }
 
 /// Whether applying a conflict writes its file: inline content, or a chunked file materialized
@@ -773,10 +773,10 @@ fn conflict_writes(action: &MergeAction) -> bool {
 /// paths left in conflict. Shared with `cherry-pick`, which applies a parcel's diff through
 /// the same `MergeAction`s.
 ///
-/// Every deletion, and every file left out, is applied first, so a directory a write is about to replace (or a file a
-/// write is about to turn into a directory) is emptied — and, via `apply_merge_action`'s
-/// parent-chain cleanup, itself removed — before that write lands. Writing first would
-/// otherwise fail (`EISDIR`/`EEXIST`) for a tracked type flip in either direction.
+/// Every deletion, and every file left out, is applied first, so a directory a write is about to
+/// replace (or a file a write is about to turn into a directory) is emptied — and, via
+/// `apply_merge_action`'s parent-chain cleanup, itself removed — before that write lands. Writing
+/// first would otherwise fail (`EISDIR`/`EEXIST`) for a tracked type flip in either direction.
 ///
 /// Every inventory change goes through one [`inventory_utils::ShardMutationBatch`], published
 /// before this returns, so the caller records its in-progress state only over a published

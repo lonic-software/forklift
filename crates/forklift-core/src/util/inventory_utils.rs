@@ -3004,7 +3004,7 @@ fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
     };
 
     if let Some(guard) = redaction_utils::staging_guard()? {
-        if let Some(hash) = guard.names_file(&item.hash, item.item_type)? {
+        if let Some(hash) = guard.names_file(path.as_key(), &item.hash, item.item_type)? {
             return Err(load_refusal(path.as_key(), &hash));
         }
     }
@@ -3043,8 +3043,9 @@ fn staged_redacted(writes: &BTreeMap<String, Inventory>) -> Result<Option<(Strin
                 continue;
             }
 
-            if let Some(hash) = guard.names_file(&item.hash, item.item_type)? {
-                let path = if key.is_empty() { name.to_string() } else { format!("{}/{}", key, name) };
+            let path = if key.is_empty() { name.to_string() } else { format!("{}/{}", key, name) };
+
+            if let Some(hash) = guard.names_file(&path, &item.hash, item.item_type)? {
 
                 return Ok(Some((path, hash)));
             }

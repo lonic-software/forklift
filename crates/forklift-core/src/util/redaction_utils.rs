@@ -960,20 +960,26 @@ pub fn staging_guard() -> Result<Option<StagingGuard>, String> {
 
 impl StagingGuard {
     /// The redacted hash a file of content `hash`, stored as `item_type`, names, if any.
-    /// A chunked file whose content this warehouse leaves out
+    /// A chunked file at `path` whose content this warehouse leaves out
     /// ([`crate::util::shift_utils::NotCheckedOut`]) cannot be matched against a chunk-list
-    /// redaction: its recipe is not here. A full warehouse refuses it, as the head write it leads
-    /// to would; a partial one skips it, as its head write does.
-    pub fn names_file(&self, hash: &str, item_type: DirEntryType) -> Result<Option<String>, String> {
+    /// redaction: its recipe is not here. A full warehouse refuses it, as its head write refuses a
+    /// tree naming a recipe it cannot read; a partial one skips it, as its head write does.
+    pub fn names_file(&self, path: &str, hash: &str, item_type: DirEntryType) -> Result<Option<String>, String> {
         if !self.partial
             && item_type.is_chunked()
             && !self.set.chunk_lists.is_empty()
             && !self.set.hashes.contains(hash)
             && !file_utils::does_object_exist(hash)?
             && crate::util::shift_utils::NotCheckedOut::read()?.holds(hash)? {
-            return Err(format!("Cannot judge content {} against this warehouse's redactions: the host of its remote \
-                                withholds it, and a redaction here matches files by their chunk list, which only \
-                                its recipe names.", hash));
+            return Err(crate::error::CoreError::refusal_with_details(
+                crate::error::RefusalCode::ContentWithheld,
+                format!("Cannot judge \"{}\" against this warehouse's redactions: its content {} is withheld by the \
+                         host of this warehouse's remote, and a redaction here matches files by their chunk list, \
+                         which only the content's recipe names. Nothing was changed.", path, hash),
+                "Only a warehouse that holds the content can judge it; until then, nothing this warehouse writes \
+                 can name the file.",
+                serde_json::json!({ "path": path, "hash": hash }),
+            ).into());
         }
 
         let mut skipped = HashSet::new();
@@ -1020,7 +1026,7 @@ pub fn refuse_redacted_writes(ops: &[crate::util::shift_utils::FileOp],
             continue;
         };
 
-        if let Some(hash) = guard.names_file(hash, *item_type)? {
+        if let Some(hash) = guard.names_file(path, hash, *item_type)? {
             let next_step = match applied.names_hash(&hash, &LocalObjects) {
                 true => fresh_clone_next_step(),
                 false => next_step(path),
