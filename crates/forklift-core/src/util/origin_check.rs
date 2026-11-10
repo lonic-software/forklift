@@ -324,7 +324,9 @@ struct ServerWalk<'a> {
     /// The absent objects this warehouse leans on its origin for, as the walk from its roots met
     /// them.
     leaned_roots: &'a HashSet<String>,
-    /// Withheld content absent here not yet met beneath a tree this warehouse leans on.
+    /// Withheld content absent here not yet met beneath a tree this warehouse leans on. A withheld
+    /// recipe held here whose chunks are absent only beneath such a tree is not sought, so the walk
+    /// may stop before it meets it.
     sought: HashSet<String>,
     /// Withheld content absent here met beneath a tree this warehouse leans on.
     found: HashSet<String>,
