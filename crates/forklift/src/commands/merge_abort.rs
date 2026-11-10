@@ -319,8 +319,31 @@ fn merge_output(recorded: &Recorded, our_tree: &str) -> Result<(BTreeMap<String,
     consolidate::keep_aliased_files(&mut actions, our_tree, &scope)?;
 
     let blob_hash = |content: &[u8]| LooseObjectBuilder::build_blob(&Blob { content: content.to_vec() }).hash;
+    let not_checked_out = shift_utils::NotCheckedOut::read()?;
+    let mut written = BTreeMap::new();
 
-    let written = actions.into_iter().filter_map(|action| match action {
+    for action in actions {
+        let (path, output) = match action {
+            // Their file whose content this warehouse leaves out: the merge wrote nothing there and
+            // removed ours, staging their hash.
+            MergeAction::TakeTheirs { path, hash, item_type, .. } if not_checked_out.holds(&hash)? => {
+                (path, Written { working: None, entry: Some((hash, item_type)) })
+            },
+            action => match written_by(action, blob_hash) {
+                Some(written) => written,
+                None => continue,
+            },
+        };
+        written.insert(path, output);
+    }
+
+    Ok((written, their_tree))
+}
+
+/// What `action` wrote at its path, for content this warehouse holds; `None` for an action that
+/// touches no in-scope path.
+fn written_by(action: MergeAction, blob_hash: impl Fn(&[u8]) -> String) -> Option<(String, Written)> {
+    match action {
         MergeAction::TakeTheirs { path, hash, item_type, .. } => {
             Some((path, Written { working: Some((hash.clone(), item_type)), entry: Some((hash, item_type)) }))
         },
@@ -339,9 +362,7 @@ fn merge_output(recorded: &Recorded, our_tree: &str) -> Result<(BTreeMap<String,
             Some((path, Written { working, entry: Some((entry_hash, item_type)) }))
         },
         MergeAction::ResolveOutOfScope { .. } => None,
-    }).collect();
-
-    Ok((written, their_tree))
+    }
 }
 
 /// Whether the working file at `path` holds `expected`: its content and kind, or absence.

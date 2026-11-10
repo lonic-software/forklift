@@ -5,7 +5,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::model::remote::{HoldAnswer, MAX_HOLDS_CANDIDATES};
 use crate::globals::bay_root;
 use crate::util::scope_utils::{self, PathScope, ScopeClass};
-use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, lcs, object_utils, pallet_utils, record_utils};
+use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, lcs, object_utils, pallet_utils, record_utils, shift_utils};
 
 /// The name of the consolidation-state file (inside the forklift root folder). While a
 /// consolidation is in progress, it holds the head parcel hash of the pallet being
@@ -977,6 +977,8 @@ pub fn compute_merge_actions(base_hash: &str,
         &mut pending
     )?;
 
+    refuse_withheld_reads(&pending)?;
+
     // The blobs phase 2 reads, fetched in one batch in a cache warehouse.
     cache_miss::ensure_files_present(pending.iter().flat_map(|entry| match entry {
         PendingAction::Ready(_) => Vec::new(),
@@ -993,6 +995,46 @@ pub fn compute_merge_actions(base_hash: &str,
     // Phase 2 — run the deferred three-way merges across the cores and reassemble the
     // actions in walk order.
     resolve_pending(pending, ours_label, theirs_label)
+}
+
+/// Refuse the merge, before any blob is read, when a file both sides changed names content this
+/// warehouse leaves out ([`shift_utils::NotCheckedOut`]): a line merge, or a version put back in
+/// conflict, would have to read bytes the remote's host withholds, and a version kept in conflict
+/// would stand at a path holding no file. A one-sided change of such content is no read: its
+/// `TakeTheirs` leaves the file out.
+fn refuse_withheld_reads(pending: &[PendingAction]) -> Result<(), String> {
+    let not_checked_out = shift_utils::NotCheckedOut::read()?;
+
+    for entry in pending {
+        let (path, hashes): (&str, Vec<&str>) = match entry {
+            PendingAction::Merge(job) => {
+                (job.path.as_str(), job.base_hash.iter().map(String::as_str).chain([job.our_hash.as_str(), job.their_hash.as_str()]).collect())
+            }
+            PendingAction::PutBack { path, hash, .. } => (path.as_str(), vec![hash.as_str()]),
+            PendingAction::Ready(MergeAction::Conflict { path, entry_hash, .. }) => (path.as_str(), vec![entry_hash.as_str()]),
+            PendingAction::Ready(_) => continue,
+        };
+
+        for hash in hashes {
+            if not_checked_out.holds(hash)? {
+                let statement = not_checked_out.statement(hash).unwrap_or_default();
+
+                return Err(crate::error::CoreError::refusal_with_details(
+                    crate::error::RefusalCode::ContentWithheld,
+                    format!(
+                        "Cannot merge \"{}\": both sides changed it, and the merge needs content ({}) that \
+                        the host of this warehouse's remote withholds, which this warehouse does not hold. \
+                        Nothing was changed. The host's statement: {}",
+                        path, hash, statement
+                    ),
+                    "Keep any copy you hold; the remote cannot supply the content.",
+                    serde_json::json!({ "path": path, "hash": hash, "statement": statement }),
+                ).into());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// The number of deferred merges below which running them on the calling thread is cheaper

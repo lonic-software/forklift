@@ -431,3 +431,98 @@ fn an_unreadable_record_refuses_a_shift_before_any_removal() {
     assert!(!refused.status.success(), "the shift must refuse over an unreadable record");
     assert_eq!(std::fs::read_to_string(warehouse.root.join("side.txt")).unwrap(), "side\n");
 }
+
+/// `withheld_feature` with `main` moved on by a change to `a.txt`, so `feature` diverges from it.
+fn diverged_feature(name: &str) -> (Warehouse, String) {
+    let (warehouse, feature) = withheld_feature(name);
+    warehouse.stack_files(&[("a.txt", "a on main\n")], "main moves on");
+
+    (warehouse, feature)
+}
+
+/// After a merge of `feature` into `main` that took both its files: neither is written, the old
+/// film is gone rather than left under the new hash, both are staged `Unavailable`, and the bay
+/// is clean at a head naming their hashes.
+fn assert_merged_without_the_withheld_files(warehouse: &Warehouse, feature: &str) {
+    assert!(!warehouse.exists("film.mkv"), "the changed file's old bytes are removed, not left under the new hash");
+    assert!(!warehouse.exists("extra/new.bin"), "the new file is not written");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(), "a on main\n");
+
+    let report = warehouse.stocktake();
+    assert_eq!(paths(&report["unavailable"]), ["extra/new.bin", "film.mkv"], "{}", report);
+    assert_eq!((&report["staged_count"], &report["unstaged_count"]), (&0.into(), &0.into()), "{}", report);
+
+    let head = warehouse.head();
+    warehouse.scoped(|| for path in ["film.mkv", "extra/new.bin"] {
+        assert_eq!(file_hash(&head, path), file_hash(feature, path), "the merged head names their {}", path);
+    });
+}
+
+/// A diverged consolidate and a pick take a file whose content is left out without reading it,
+/// as a checkout does.
+///
+/// Revert: let the merge's take write such a file (no skip) → it dies reading the absent blob →
+/// red; skip it but keep the old film → it stands under the new hash → red; stage it `Normal` →
+/// stocktake reports it removed → red.
+#[test]
+fn a_merge_and_a_pick_leave_their_unavailable_files_out() {
+    let (warehouse, feature) = diverged_feature("merge");
+    warehouse.run_ok(&["consolidate", "feature"]);
+    assert_merged_without_the_withheld_files(&warehouse, &feature);
+
+    let (warehouse, feature) = diverged_feature("pick");
+    warehouse.run_ok(&["pick", &feature]);
+    assert_merged_without_the_withheld_files(&warehouse, &feature);
+}
+
+/// A merge or pick whose line merge needs content left out refuses `content_withheld` before it
+/// changes anything, naming the file and the host's statement.
+///
+/// Revert: drop the refusal → the merge dies reading the absent blob with a store error, not
+/// the refusal → red.
+#[test]
+fn a_merge_that_must_read_withheld_content_refuses_content_withheld() {
+    let (warehouse, feature) = withheld_feature("refuse");
+    warehouse.stack_files(&[("film.mkv", "the film on main\n")], "main changes the film");
+
+    for args in [vec!["consolidate", "feature"], vec!["pick", feature.as_str()]] {
+        let output = warehouse.run(&[args.as_slice(), &["--json"]].concat());
+        assert_eq!(output.status.code(), Some(51), "{}", String::from_utf8_lossy(&output.stderr));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["error"]["code"], "content_withheld", "{}", report);
+        assert_eq!(report["error"]["details"]["path"], "film.mkv", "{}", report);
+        assert_eq!(report["error"]["details"]["statement"], "Withheld by the remote's host.", "{}", report);
+
+        assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), "the film on main\n");
+        let report = warehouse.stocktake();
+        assert_eq!((&report["staged_count"], &report["unstaged_count"]), (&0.into(), &0.into()), "{}", report);
+        assert!(!warehouse.run(&["abort"]).status.success(), "nothing is in progress to abort");
+    }
+}
+
+/// Aborting a merge that stopped at a conflict puts back our version of a file it left out,
+/// without counting the path as a change to discard: no file standing there is what it wrote.
+///
+/// Revert: model the left-out take as having written their content → the abort lists
+/// `film.mkv` as a discard and refuses without --confirm → red.
+#[test]
+fn an_abort_puts_back_a_file_the_merge_left_out() {
+    let (warehouse, _) = withheld_feature("abort");
+    warehouse.run_ok(&["shift", "feature"]);
+    warehouse.stack_files(&[("a.txt", "a on feature\n")], "feature changes a");
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.stack_files(&[("a.txt", "a on main\n")], "main changes a");
+
+    let output = warehouse.run_ok(&["consolidate", "feature"]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("conflict: a.txt"), "the merge stops at the conflict over a.txt");
+    assert!(!warehouse.exists("film.mkv"), "the merge left their film out");
+
+    warehouse.run_ok(&["abort"]);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), OLD_FILM);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(), "a on main\n");
+    assert!(!warehouse.exists("extra/new.bin"));
+
+    let report = warehouse.stocktake();
+    assert!(report.get("unavailable_count").is_none(), "{}", report);
+    assert_eq!((&report["staged_count"], &report["unstaged_count"]), (&0.into(), &0.into()), "{}", report);
+}

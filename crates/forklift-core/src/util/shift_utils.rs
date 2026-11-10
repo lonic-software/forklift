@@ -669,6 +669,11 @@ impl NotCheckedOut {
     pub fn holds(&self, hash: &str) -> Result<bool, String> {
         self.record.lacks(hash)
     }
+
+    /// The host's statement `hash` is recorded with, if it is.
+    pub fn statement(&self, hash: &str) -> Option<&str> {
+        self.record.statement(hash)
+    }
 }
 
 /// [`apply_ops`], calling `after` with each operation once it has applied (for progress, or to

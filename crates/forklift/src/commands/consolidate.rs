@@ -790,13 +790,47 @@ fn apply_merge_actions_to(ledger: &inventory_utils::ShardLedger,
         }
     }
 
-    let writes: Vec<&MergeAction> = actions.iter().filter(|action| !matches!(action, MergeAction::Delete { .. })).collect();
+    // Which of their files are left out is decided before any write, as a checkout decides it.
+    let not_checked_out = shift_utils::NotCheckedOut::read()?;
+    let mut writes: Vec<(&MergeAction, bool)> = Vec::new();
+
+    for action in actions.iter().filter(|action| !matches!(action, MergeAction::Delete { .. })) {
+        let left_out = match action {
+            MergeAction::TakeTheirs { hash, .. } => not_checked_out.holds(hash)?,
+            _ => false,
+        };
+        writes.push((action, left_out));
+    }
 
     // Their blobs load ahead on worker threads while the writes land here, in order.
-    shift_utils::write_in_order(&writes, |action| match action {
-        MergeAction::TakeTheirs { hash, item_type, .. } => Some((hash.as_str(), *item_type)),
+    shift_utils::write_in_order(&writes, |(action, left_out)| match action {
+        MergeAction::TakeTheirs { hash, item_type, .. } if !left_out => Some((hash.as_str(), *item_type)),
         _ => None,
-    }, |action, content| apply_merge_action(ledger, action, content, batch, conflict_paths))
+    }, |(action, left_out), content| match action {
+        MergeAction::TakeTheirs { path, hash, item_type, is_new } if *left_out => {
+            leave_out_theirs(path, hash, *item_type, *is_new, batch)
+        }
+        _ => apply_merge_action(ledger, action, content, batch, conflict_paths),
+    })
+}
+
+/// Take their file at `path` whose content this warehouse leaves out
+/// ([`shift_utils::NotCheckedOut`]): write nothing, remove the file our side had there (as a
+/// checkout's skip does, so the path never holds our bytes under their hash), and stage the entry
+/// `Unavailable` at their hash.
+fn leave_out_theirs(path: &str,
+                    hash: &str,
+                    item_type: DirEntryType,
+                    is_new: bool,
+                    batch: &mut inventory_utils::ShardMutationBatch) -> Result<(), String> {
+    if !is_new {
+        shift_utils::apply_file_op(&shift_utils::FileOp::Remove { path: path.to_string() })?;
+    }
+
+    let (parent_key, name) = inventory_utils::split_path_key(path);
+    let item = inventory_utils::build_unavailable_inventory_item(name, hash.to_string(), item_type);
+
+    batch.update(parent_key, |inventory| { inventory.add_item(item); })
 }
 
 /// Apply one merge action to the working directory, and stage its inventory change into
@@ -1096,6 +1130,46 @@ mod tests {
         assert!(test_support::file_holds(&warehouse.root, "new.txt", b"new\n"));
         assert_stack_refused();
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap().as_deref(), Some(our_head.as_str()));
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!((recovery.operation, recovery.outcome), (OperationKind::Merge, RecoveryOutcome::RolledBack));
+        assert_back_at_ours(&warehouse.root, &our_head, &our_tree);
+    }
+
+    /// Record their `b.txt` and `new.txt` of [`a_clean_merge_on_main`] unavailable, and delete
+    /// their objects, as a fetch leaving withheld content out would leave them.
+    fn withhold_theirs(root: &std::path::Path) {
+        let hashes: Vec<String> = [&b"theirs\n"[..], &b"new\n"[..]].iter()
+            .map(|content| LooseObjectBuilder::build_blob(&Blob { content: content.to_vec() }).hash)
+            .collect();
+        forklift_core::util::unavailable::record(hashes.iter().map(|hash| (hash.clone(), "Withheld.".to_string()))).unwrap();
+        for hash in &hashes {
+            std::fs::remove_file(root.join(".forklift").join("objects").join(&hash[0..2]).join(&hash[2..])).unwrap();
+        }
+    }
+
+    /// A merge taking their files whose content is left out writes neither, removes our `b.txt`,
+    /// and stages both `Unavailable`; heal's roll-back of it interrupted puts our `b.txt` back from
+    /// the store and leaves no `new.txt`, with staging at our tree.
+    ///
+    /// Revert: write `b.txt` through the normal take (no skip) → the merge dies reading the absent
+    /// blob → red; keep our `b.txt` on a skip → it holds our bytes under their hash → red.
+    #[test]
+    fn heal_rolls_back_an_interrupted_merge_that_left_their_files_out() {
+        let warehouse = Warehouse::with_working_tree("consolidate-merge-crash-left-out");
+        let (our_head, our_tree, _) = a_clean_merge_on_main();
+        withhold_theirs(&warehouse.root);
+
+        AFTER_MERGE_APPLY.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
+        assert_eq!(test_support::block_on(handle_command("feature")).unwrap_err(), "crashed");
+        operation_utils::forget_raised_for_tests();
+
+        assert!(!warehouse.root.join("b.txt").exists() && !warehouse.root.join("new.txt").exists(),
+            "their files are left out, and our b.txt is removed");
+        let states: Vec<InventoryItemState> = ["b.txt", "new.txt"].iter()
+            .map(|name| stocktake_utils::load_shard_or_empty("").unwrap().get_item_by_name(name).expect("staged").state)
+            .collect();
+        assert_eq!(states, [InventoryItemState::Unavailable, InventoryItemState::Unavailable]);
 
         let recovery = operation_utils::recover().unwrap().expect("a marker stands");
         assert_eq!((recovery.operation, recovery.outcome), (OperationKind::Merge, RecoveryOutcome::RolledBack));
