@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Serialize;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{BatchLaneClosure, LiftResult, RemoteClient};
@@ -178,11 +180,13 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
 /// The withheld content a lift left out (`hashes`), each beside the statement the remote's
 /// handshake (`info`) gives for it, if it lists it.
 fn lift_withheld(hashes: Vec<String>, info: &forklift_core::model::remote::WarehouseInfo) -> Vec<LiftWithheld> {
+    let statements: HashMap<&str, &str> = info.withheld.iter().flatten()
+        .map(|item| (item.hash.as_str(), item.statement.as_str()))
+        .collect();
+
     hashes.into_iter()
         .map(|hash| {
-            let statement = info.withheld.iter().flatten()
-                .find(|item| item.hash == hash)
-                .map(|item| item.statement.clone());
+            let statement = statements.get(hash.as_str()).map(|statement| statement.to_string());
 
             LiftWithheld { hash, statement }
         })
@@ -502,9 +506,13 @@ impl CommandOutput for LiftReport {
             );
 
             for item in &self.withheld {
+                let hash = forklift_core::error::sanitize(&item.hash);
+
                 match &item.statement {
-                    Some(statement) => println!("  {} ({})", item.hash, statement),
-                    None => println!("  {}", item.hash),
+                    Some(statement) => {
+                        println!("  {} ({})", hash, forklift_core::error::sanitize(statement))
+                    }
+                    None => println!("  {}", hash),
                 }
             }
         }
