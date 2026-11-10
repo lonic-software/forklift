@@ -1063,6 +1063,11 @@ A command not listed here either reports only the generic human-message shape `{
           "const": "conflict",
           "description": "The item is in a conflict state (an unresolved consolidation).",
           "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "The item is not checked out: the head names it, but the remote's host withholds its\ncontent and this warehouse lacks it (inventory state `Unavailable`). It is no local change:\nthe next parcel still names the file, and only `forklift remove` stages its removal.",
+          "type": "string"
         }
       ]
     },
@@ -5272,6 +5277,11 @@ A command not listed here either reports only the generic human-message shape `{
           "const": "conflict",
           "description": "The item is in a conflict state (an unresolved consolidation).",
           "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "The item is not checked out: the head names it, but the remote's host withholds its\ncontent and this warehouse lacks it (inventory state `Unavailable`). It is no local change:\nthe next parcel still names the file, and only `forklift remove` stages its removal.",
+          "type": "string"
         }
       ]
     }
@@ -5320,6 +5330,19 @@ A command not listed here either reports only the generic human-message shape `{
     "summary": {
       "description": "Whether this is a counts-only report.",
       "type": "boolean"
+    },
+    "unavailable": {
+      "description": "The paths of those files (empty under `--summary`).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "unavailable_count": {
+      "description": "How many files the head names are not checked out because the remote's host withholds\ntheir content and this warehouse lacks it (omitted when `0`). They are no change: the next\nparcel still names them, and only `forklift remove` stages their removal.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
     },
     "unstaged": {
       "description": "The unstaged changes (empty under `--summary`).",
