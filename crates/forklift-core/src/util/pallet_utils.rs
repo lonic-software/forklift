@@ -2583,6 +2583,12 @@ pub(crate) mod tests {
             let lost = blob("a2");
             remove(&lost);
             assert!(crate::util::audit_utils::verify_parcel_closure_for_write(&damaged, Some(&head)).is_err());
+
+            // Nor does a server lean on the unavailable record: a served root lacks nothing it
+            // lists. Revert: read `read_removed` at the push gate → accepted.
+            crate::util::unavailable::record([(lost.clone(), "DMCA notice 6".to_string())]).unwrap();
+            assert!(crate::util::audit_utils::verify_parcel_closure_for_write(&damaged, Some(&head)).is_err(),
+                "a push gate never tolerates unavailable content");
         }
 
         /// The closure check a remote's ref update runs over its own store, with `removed` as the
