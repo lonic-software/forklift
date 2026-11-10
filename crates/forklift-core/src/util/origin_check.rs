@@ -474,4 +474,52 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// A withheld file is never found held by the new server. A withheld recipe held here leaves
+    /// the chunks only it names missing, each owned by the recipe, while a chunk another recipe
+    /// names is found; a withheld file absent here is found as leaned on only beneath a tree this
+    /// warehouse leans on.
+    ///
+    /// Revert: drop the chunk map → the lone chunk has no owner → red. Revert: find a withheld
+    /// absent file beneath any tree → the walk not leaned on finds it → red.
+    #[test]
+    fn withheld_content_is_never_found_on_the_new_server() {
+        use crate::util::gc_utils::tests::store_recipe;
+
+        let root = std::env::temp_dir().join(format!("forklift-origin-check-withheld-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+
+        let (lone, shared, film) = ("3".repeat(64), "4".repeat(64), "5".repeat(64));
+        let withheld_recipe = store_recipe(&[(lone.clone(), 1), (shared.clone(), 1)]);
+        let other_recipe = store_recipe(&[(shared.clone(), 1)]);
+        let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        tree.add_child(TreeItem::new("taken.bin".to_string(), withheld_recipe.clone(), DirEntryType::NormalChunked));
+        tree.add_child(TreeItem::new("other.bin".to_string(), other_recipe, DirEntryType::NormalChunked));
+        tree.add_child(TreeItem::new("film.mkv".to_string(), film.clone(), DirEntryType::Normal));
+
+        let applied = crate::util::applied_redactions::apply_for_test(&[]);
+        let withheld: HashMap<&str, &str> = [(withheld_recipe.as_str(), "court order"), (film.as_str(), "court order")].into();
+        let roots = HashSet::new();
+        let walk_of = || ServerWalk {
+            applied: &applied, withheld: &withheld, leaned_roots: &roots, sought: HashSet::from([film.clone()]),
+            found: HashSet::new(), withheld_chunks: HashMap::new(), seen: HashSet::new(), seen_leaned: HashSet::new(),
+            local: Vec::new(), trees: Vec::new(), recipes: Vec::new(),
+        };
+
+        let mut walk = walk_of();
+        let mut missing: HashSet<String> = [lone.clone(), shared.clone(), withheld_recipe.clone(), film.clone()].into();
+        walk.descend(&tree, false, &mut missing).unwrap();
+        assert_eq!(missing, [lone.clone(), withheld_recipe.clone(), film.clone()].into());
+        assert_eq!(walk.withheld_chunks.get(&lone), Some(&withheld_recipe));
+        assert!(walk.found.is_empty(), "nothing is leaned on beneath a tree this warehouse does not lean on");
+
+        let mut walk = walk_of();
+        walk.descend(&tree, true, &mut HashSet::new()).unwrap();
+        assert_eq!(walk.found, HashSet::from([film.clone()]));
+        assert!(walk.sought.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
