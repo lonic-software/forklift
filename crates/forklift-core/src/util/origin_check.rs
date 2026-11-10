@@ -209,16 +209,27 @@ pub async fn check_new_origin(client: &RemoteClient,
     }
     // A chunk of a withheld recipe is held there while another recipe names it, so the new
     // server, which lists as missing a chunk only withheld recipes name, is asked about the ones
-    // absent here.
+    // absent here, in one batch. A chunk the host withholds itself it never lists missing, so
+    // naming one makes the recipe withheld outright.
+    let mut asked: HashMap<String, Vec<String>> = HashMap::new();
     for recipe in &walk.leaned_recipes {
-        let mut absent = Vec::new();
+        let mut withheld_chunk = false;
         for chunk in object_utils::recipe_chunk_hashes(recipe)? {
             if !sealed_utils::is_present(&chunk)? {
-                absent.push(chunk);
+                withheld_chunk |= withheld.contains_key(chunk.as_str());
+                asked.entry(chunk).or_default().push(recipe.clone());
             }
         }
-        if !absent.is_empty() && !client.missing_objects(&absent).await?.is_empty() {
+        if withheld_chunk {
             checked.withheld.insert(recipe.clone(), withheld[recipe.as_str()].to_string());
+        }
+    }
+    if !asked.is_empty() {
+        let chunks: Vec<String> = asked.keys().cloned().collect();
+        for chunk in client.missing_objects(&chunks).await? {
+            for recipe in asked.get(&chunk).into_iter().flatten() {
+                checked.withheld.insert(recipe.clone(), withheld[recipe.as_str()].to_string());
+            }
         }
     }
 
