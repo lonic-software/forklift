@@ -1817,7 +1817,7 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
         &|hash| object_utils::recipe_chunk_hashes(hash),
         &|hash| object_utils::load_tree(hash),
         &|| Ok(Tolerated::default()),
-    )
+    ).map_err(String::from)
 }
 
 /// [`verify_parcel_closure`] for a ref update, returning the proof a ref write accepts in place of verifying the same head again
@@ -1836,10 +1836,10 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 /// # Returns
 /// * `Ok(VerifiedClosure)` - Everything is present, or absent only where an applied redaction
 ///                           names it, or the head withholds it, as a file's content.
-/// * `Err(String)`         - If a parcel, tree or blob is missing (or unreadable), or either
+/// * `Err(ClosureRefusal)` - If a parcel, tree or blob is missing (or unreadable), or either
 ///                           record cannot be read.
 pub fn verify_parcel_closure_for_write(head: &str,
-                                       known_complete: Option<&str>) -> Result<pallet_utils::VerifiedClosure, String> {
+                                       known_complete: Option<&str>) -> Result<pallet_utils::VerifiedClosure, ClosureRefusal> {
     verify_parcel_closure_with(
         head,
         known_complete,
@@ -1860,13 +1860,70 @@ pub fn verify_parcel_closure_for_write(head: &str,
 /// for withheld content and no upload of it is taken. A refusal may name the hash as an object's
 /// path, `<2 hex>/<62 hex>`, so the hash is found by its tail.
 pub fn withheld_beyond_files(refusal: String, withheld: &WithheldSet) -> String {
-    match withheld.entries().find(|(hash, _)| hash.get(2..).is_some_and(|tail| refusal.contains(tail))) {
-        Some((hash, _)) => format!(
+    match withheld_named(&refusal, withheld) {
+        Some(hash) => format!(
             "{} This server's host withholds {}, so it never takes it, and the refusal stands while \
             it does.",
             refusal, hash
         ),
         None => refusal,
+    }
+}
+
+/// The hash of `withheld` that `refusal` names, if any ([`withheld_beyond_files`]).
+fn withheld_named<'a>(refusal: &str, withheld: &'a WithheldSet) -> Option<&'a str> {
+    withheld.entries()
+        .find(|(hash, _)| hash.get(2..).is_some_and(|tail| refusal.contains(tail)))
+        .map(|(hash, _)| hash.as_str())
+}
+
+/// Why a remote's closure check ([`verify_parcel_closure_with`]) refused a head. Kept apart because
+/// only an incomplete history is one the client may be able to fix by uploading again.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ClosureRefusal {
+    /// The walk found an object of the history absent, or could not read one, and no redaction
+    /// the remote applied nor content its host withholds accounts for it.
+    Incomplete(String),
+
+    /// The walk was refused over content the remote's host withholds, absent where the closure
+    /// names it as a tree or a chunk: it never takes that content, so no upload changes this.
+    Withheld(String),
+
+    /// The walk failed, and the record of the redactions applied or the content withheld could not
+    /// be read to judge the absence.
+    RecordsUnreadable(String),
+}
+
+impl ClosureRefusal {
+    /// The refusal's text.
+    pub fn message(&self) -> &str {
+        match self {
+            ClosureRefusal::Incomplete(message)
+            | ClosureRefusal::Withheld(message)
+            | ClosureRefusal::RecordsUnreadable(message) => message,
+        }
+    }
+
+    /// The refusal a remote's ref update answers with: an incomplete history as the
+    /// [`RefusalCode::RemoteHistoryIncomplete`] refusal, which a lift answers by negotiating and
+    /// uploading again, and anything else as its plain text.
+    ///
+    /// [`RefusalCode::RemoteHistoryIncomplete`]: crate::error::RefusalCode::RemoteHistoryIncomplete
+    pub fn for_ref_update(self) -> String {
+        match self {
+            ClosureRefusal::Incomplete(message) => crate::error::CoreError::refusal(
+                crate::error::RefusalCode::RemoteHistoryIncomplete,
+                format!("{} This remote does not hold the new head's whole history, so the pallet was not moved.", message),
+                "forklift lift",
+            ).into(),
+            other => other.into(),
+        }
+    }
+}
+
+impl From<ClosureRefusal> for String {
+    fn from(refusal: ClosureRefusal) -> String {
+        refusal.message().to_string()
     }
 }
 
@@ -2017,6 +2074,11 @@ pub fn head_not_materializable_message(path: &str) -> String {
 ///                          refusal naming withheld content says the host withholds it
 ///                          ([`withheld_beyond_files`]). Called only once the walk without it has
 ///                          failed, so a remote holding the whole closure never depends on it.
+///
+/// # Returns
+/// * `Ok(())`                - Everything is present, or absent only where `removed` tolerates it.
+/// * `Err(ClosureRefusal)`   - Why not: an incomplete history, withheld content the closure names
+///                             beyond a file's content, or `removed` unreadable.
 pub fn verify_parcel_closure_with(
     head: &str,
     known_complete: Option<&str>,
@@ -2025,7 +2087,7 @@ pub fn verify_parcel_closure_with(
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
     removed: &dyn Fn() -> Result<Tolerated, String>,
-) -> Result<(), String> {
+) -> Result<(), ClosureRefusal> {
     let bounds = known_complete.as_ref().map(std::slice::from_ref);
     let seams = ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed: None };
 
@@ -2033,21 +2095,24 @@ pub fn verify_parcel_closure_with(
         return Ok(());
     };
 
-    let tolerated = removed().map_err(|error| format!(
+    let tolerated = removed().map_err(|error| ClosureRefusal::RecordsUnreadable(format!(
         "{} The record of the redactions applied here, or of the content withheld here, cannot be \
         read either: {}",
         missing, error
-    ))?;
+    )))?;
 
     if tolerated.is_empty() {
-        return Err(missing);
+        return Err(ClosureRefusal::Incomplete(missing));
     }
 
     let tolerance = SealedTolerance::new(&tolerated);
     let seams = ClosureSeams { sealed: Some(&tolerance), ..seams };
 
     verify_closure_core(head, bounds, known_complete, &PathScope::full(), false, &seams)
-        .map_err(|refusal| withheld_beyond_files(refusal, &tolerated.withheld))
+        .map_err(|refusal| match withheld_named(&refusal, &tolerated.withheld) {
+            Some(_) => ClosureRefusal::Withheld(withheld_beyond_files(refusal, &tolerated.withheld)),
+            None => ClosureRefusal::Incomplete(refusal),
+        })
 }
 
 /// The object-store reads [`verify_closure_core`] varies by head (see

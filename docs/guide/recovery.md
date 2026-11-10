@@ -226,6 +226,15 @@ hold the content. A chunked file can be in a head under another recipe with the 
 head's path names the other recipe, so where no head holds the object itself, record it by its
 hash. The error's `next_step` names the commands for one of the heads and the record that fits.
 
+### `remote_history_incomplete` (exit 52)
+
+The remote refused to move the pallet because part of the new head's history is absent there or
+cannot be read. A lift refused this way has already asked the remote again what it lacks and
+uploaded that, and was refused a second time. Nothing moved, and your warehouse is unchanged. The
+remote may have deleted content it owed a deletion again as the lift ran, or failed to read its own
+store for a moment: run `forklift lift` again. If it is refused the same way each time, the
+remote's store is damaged or lost content, and only whoever runs it can repair it.
+
 ### `content_withheld` (exit 51)
 
 The remote's host withholds content the command needed: a takedown, such as a legal notice, made by

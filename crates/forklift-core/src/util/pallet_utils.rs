@@ -2582,7 +2582,8 @@ pub(crate) mod tests {
         fn remote_closure(head: &str,
                           base: Option<&str>,
                           removed: (crate::util::applied_redactions::AppliedSet,
-                                    crate::util::withholding::WithheldSet)) -> Result<(), String> {
+                                    crate::util::withholding::WithheldSet))
+                          -> Result<(), crate::util::audit_utils::ClosureRefusal> {
             crate::util::audit_utils::verify_parcel_closure_with(
                 head,
                 base,
@@ -2597,7 +2598,8 @@ pub(crate) mod tests {
         // Revert: pass `WithheldSet::default()` to the tolerance again → the head naming the
         // withheld blob is refused. Revert: tolerate withheld content wherever it is met → the
         // absent root tree is accepted. Revert: drop the `withheld_beyond_files` mapping → the
-        // refusal over the root tree does not say the host withholds it.
+        // refusal over the root tree does not say the host withholds it. Revert: classify every
+        // refusal as incomplete → the withheld tree's refusal reads as one an upload could fix.
         #[test]
         fn a_remote_closure_tolerates_withheld_content_only_as_a_file() {
             let (_root, _scope) = scratch("closure-withheld-remote");
@@ -2607,7 +2609,10 @@ pub(crate) mod tests {
             remove(&withheld);
             let none = || (Default::default(), Default::default());
 
-            assert!(remote_closure(&head, Some(&base), none()).is_err(), "an absence nothing names is damage");
+            use crate::util::audit_utils::ClosureRefusal;
+
+            let damage = remote_closure(&head, Some(&base), none()).expect_err("an absence nothing names is damage");
+            assert!(matches!(damage, ClosureRefusal::Incomplete(_)), "{:?}", damage);
 
             crate::util::withholding::withhold(&withheld, "court order 9").unwrap();
             let removed = || (Default::default(), crate::util::withholding::read_withheld().unwrap());
@@ -2618,7 +2623,15 @@ pub(crate) mod tests {
             remove(&root_tree);
             crate::util::withholding::withhold(&root_tree, "court order 10").unwrap();
             let refused = remote_closure(&next, Some(&head), removed()).expect_err("a withheld tree is damage");
-            assert!(refused.contains(&format!("This server's host withholds {}", root_tree)), "{}", refused);
+            assert!(matches!(refused, ClosureRefusal::Withheld(_)), "no upload fixes it: {:?}", refused);
+            assert!(refused.message().contains(&format!("This server's host withholds {}", root_tree)), "{:?}", refused);
+
+            // With the withholding recorded, an absence it does not name is still incomplete.
+            let lost = two_dirs("a3", "b2");
+            let after = parcel(&lost, &[&head]);
+            remove(&blob("a3"));
+            let incomplete = remote_closure(&after, Some(&head), removed()).expect_err("a lost blob is damage");
+            assert!(matches!(incomplete, ClosureRefusal::Incomplete(_)), "{:?}", incomplete);
         }
 
         // Revert: stop comparing the token's bound → a walk cut at a parcel no ref reaches skips the

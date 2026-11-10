@@ -85,7 +85,11 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 35** (current): `lift`'s result carries `withheld`, the content the lifted history names
+**Schema 36** (current): the `remote_history_incomplete` error code exists (exit 52): a remote
+refused to move a pallet because part of the new head's history is absent there or unreadable, even
+after the lift negotiated and uploaded again.
+
+**Schema 35**: `lift`'s result carries `withheld`, the content the lifted history names
 that the remote's host withholds, so it was not uploaded (each `hash`, and the host's `statement`
 when the handshake lists it; absent when none).
 

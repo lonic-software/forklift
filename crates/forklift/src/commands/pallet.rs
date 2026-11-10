@@ -519,8 +519,9 @@ fn delete_failed(why: String, name: &str, head: &str) -> String {
 /// the listing instead: a bare rerun would delete a head nobody looked at, so its moved refusal
 /// names the delete pinned with `--at` for after the look, and its deleted refusal says the pallet
 /// was deleted at a head it did not see. Each keeps its code (the server's text for a deleted
-/// pallet is worded for a lift, so it is not carried over), and any other error is passed on as
-/// it is.
+/// pallet is worded for a lift, so it is not carried over). A restore refused as
+/// [`error::RefusalCode::RemoteHistoryIncomplete`] loses its code, whose next step is a lift's:
+/// the remote lost history it held. Any other error is passed on as it is.
 fn moved_since_read(why: String, name: &str, head: &str, action: RemoteAction) -> String {
     let Some((code, human, _)) = error::deframe(&why) else {
         return why;
@@ -550,6 +551,15 @@ fn moved_since_read(why: String, name: &str, head: &str, action: RemoteAction) -
             there.",
             name, head
         ), listing),
+        // Worded for a lift, whose next step uploads the history again. A restore uploads nothing:
+        // the history the tombstone holds is the remote's own, so no command here fixes it.
+        (Some(error::RefusalCode::RemoteHistoryIncomplete), RemoteAction::Restore) => return format!(
+            "The remote does not hold the whole history of the head its tombstone of pallet \"{}\" \
+            holds ({}), so it cannot restore the pallet there; nothing was changed. The remote's \
+            store lacks or cannot read content that history names, which only its operator can \
+            restore.",
+            name, human
+        ),
         _ => return why,
     };
 

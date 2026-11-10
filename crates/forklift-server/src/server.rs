@@ -3317,8 +3317,9 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             // covers the request's two heads, whose content no other writer can change.
             let verified = match verified_closure.take() {
                 Some(verified) => verified,
+                // An incomplete history is classified, so a lift can tell it apart and upload again.
                 None => audit_utils::verify_parcel_closure_for_write(&request.new_head, request.old_head.as_deref())
-                    .map_err(unprocessable)?,
+                    .map_err(|refusal| unprocessable(refusal.for_ref_update()))?,
             };
 
             // An early refusal too, after the closure check, so its walk of the new history reads
@@ -9063,7 +9064,11 @@ mod tests {
 
             let response = create(&root, "side", &on_absent, Some(&side)).await;
 
-            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{}", body_text(response).await);
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            // Revert: answer the closure refusal as plain text → no code → a lift cannot tell it
+            // apart and never uploads again → red.
+            let body = body_text(response).await;
+            assert!(body.contains(r#""code":"remote_history_incomplete""#), "a client branches on the code: {}", body);
             let _ = std::fs::remove_dir_all(&root);
         }
 
