@@ -105,6 +105,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Added
 
+- **The host of an AWS warehouse can withhold content too.** `forklift-aws-withhold --table …
+  WAREHOUSE add HASH --statement "…"`, run under the operator role, withholds a file's content
+  there, and `list` shows what is withheld and how far each has got. From the next request on, the
+  AWS head answers a read or upload of it `451 content_withheld` with the statement, leaves it out
+  of batches, never asks a lift for it and answers it in the upload negotiation's `withheld` list,
+  lists it in the handshake, refuses a lift commit naming it, and accepts history naming it
+  without the content. A chunked file's chunks that only it names are deleted, and then its
+  recipe, as for a redacted file. This build does not yet delete any other stored copy.
+
 - **A forklift-server host can withhold content, as for a legal takedown.** `forklift-server
   withhold add --root … HASH --statement "…"` stops the server serving or taking a file's content
   at once: a read or upload of it is answered `451` with the host's statement; `withhold list`

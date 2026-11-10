@@ -234,7 +234,10 @@ lists it, the remote refuses the content on the routes below with `451`, and the
 carries it. A lift may still name it, and uploads nothing for it (below). `state` is
 `deletion_owed` while the remote still holds a copy, `deleted` once it holds none; a client reads a
 state it does not know as `deletion_owed`. A head that does not withhold content sends `null` or
-omits the field.
+omits the field. A host lists a hash without saying what it is, so a head that holds a listed hash
+as a tree, a parcel or a chunk does not withhold it and leaves it out of this list. The AWS head
+learns which on the first request after the host lists it, and answers that request `503` with
+`Retry-After` when it cannot find out in time, never as if nothing were withheld.
 
 **Withheld content is refused.** `GET` and `PUT` of `/v1/objects/{hash}` for a withheld hash
 answer `451` with `code` `content_withheld`, the host's statement in the message, and

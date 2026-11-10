@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use forklift_core::util::haul_utils::{self, HAUL_PALLET_NAME};
 use forklift_core::util::pallet_utils::PalletNamespace;
 use forklift_core::util::{file_utils, object_utils};
+use forklift_core::util::withholding as withholding_utils;
 
 use super::redaction::{epoch_seconds, late_sweep_due, Budget, INVOCATION_CEILING, LATE_SWEEP_MARGIN, SWEEP_LEASE_MARGIN};
 use super::Head;
@@ -489,8 +490,8 @@ fn backoff(refusals: u32) -> u64 {
 /// The `503` a ref update answers while a round's census or delete runs.
 fn round_running() -> HeadError {
     HeadError::retry_after(
-        "The chunks of a redacted file are being deleted in this warehouse, and no pallet head moves \
-        until that is done. Try again shortly.",
+        "The chunks of a redacted or withheld file are being deleted in this warehouse, and no pallet \
+        head moves until that is done. Try again shortly.",
         ROUND_RETRY_AFTER_SECONDS,
     )
 }
@@ -499,7 +500,7 @@ fn round_running() -> HeadError {
 pub(super) fn promotion_refused(hash: &str) -> HeadError {
     HeadError::retry_after(
         format!(
-            "Object {} is a chunk of a redacted file whose chunks are being deleted in this \
+            "Object {} is a chunk of a redacted or withheld file whose chunks are being deleted in this \
             warehouse, so it is not stored until that is done. Try again shortly.",
             hash
         ),
@@ -521,7 +522,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
                 Err(HeadError::retry_after(
                     format!(
-                        "Object {} is a chunk of a redacted file, and whether anything else in this \
+                        "Object {} is a chunk of a redacted or withheld file, and whether anything else in this \
                         warehouse names it is not decided yet, so it is not served. Try again later.",
                         hash
                     ),
@@ -661,7 +662,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     }
 
     /// Delete every recipe object the ledger has due in `recipe_deleting`, record each deleted on
-    /// its redaction item, and take it off the ledger. A refused delete backs off.
+    /// its items, redaction and withheld, and take it off the ledger. A refused delete backs off.
     ///
     /// # Returns
     /// * `Ok(bool)` - Whether it wrote anything: read the ledger again.
@@ -677,8 +678,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let deleted = self.objects.delete_staged(recipe).and_then(|()| self.objects.delete_canonical(recipe));
         match deleted {
             Ok(()) => {
-                // The redaction item first: an entry off the ledger with no record of the deletion
-                // would leave the redaction `deletion_owed` with nothing left to do it.
+                // The items first: an entry off the ledger with no record of the deletion would
+                // leave the redaction or the withhold `deletion_owed` with nothing left to do it.
                 if !self.mark_recipe_deleted(recipe, budget)? {
                     return Ok(true);
                 }
@@ -686,7 +687,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 next.recipes.remove(recipe);
             }
             Err(error) => {
-                eprintln!("forklift-aws-lambda: redacted recipe {} was not deleted: {}", recipe, error);
+                eprintln!("forklift-aws-lambda: redacted or withheld recipe {} was not deleted: {}", recipe, error);
 
                 let refusals = journal.refusals.saturating_add(1);
                 next.recipes.insert(recipe.clone(), Journal { refusals, next_round_after: now + backoff(refusals), ..journal.clone() });
@@ -723,7 +724,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         let (lists, _) = round_chunks(&self.objects, &fence.recipes).map_err(HeadError::internal)?;
         let wanted: BTreeSet<String> = lists.values().flat_map(|chunks| chunks.iter().cloned()).collect();
-        let applied = self.applied_set().map_err(HeadError::internal)?;
+        // A recipe redacted or withheld is no root's to keep: neither is ever taken back.
+        let applied = withholding_utils::removed_from(
+            &self.applied_set().map_err(HeadError::internal)?,
+            &super::withholding::applying(&self.withheld_listing()?),
+        );
 
         // A census still running holds no verdict, so one this build cannot read is taken again,
         // never read as some other progress.

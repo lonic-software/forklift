@@ -54,6 +54,12 @@ pub struct WithheldSet {
 }
 
 impl WithheldSet {
+    /// The set of `entries`, each a hash beside its statement: what a head that keeps its record
+    /// somewhere other than this module's file reads it as.
+    pub fn of(entries: impl IntoIterator<Item = (String, String)>) -> WithheldSet {
+        WithheldSet { statements: entries.into_iter().collect() }
+    }
+
     /// Whether `hash` is withheld.
     pub fn contains(&self, hash: &str) -> bool {
         self.statements.contains_key(hash)

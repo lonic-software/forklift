@@ -51,6 +51,7 @@ use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 use forklift_core::util::redaction_utils::{self, HoldingWalk, Redaction, WalkObjects, WalkProgress, REDACTIONS_PALLET_NAME};
 use forklift_core::util::{file_utils, object_utils};
 
+use super::withholding::Withholding;
 use super::Head;
 use crate::error::{HeadError, HeadResult};
 use crate::scratch::{materialize_state, MirroredObjects, Mirror, Scratch};
@@ -65,7 +66,7 @@ const WORK_VERSION: u64 = 1;
 /// How many of one judge's item writes may lose a race to another request, or end with their fate
 /// unknown, before it answers the redaction undecided. A write that lands is the judge's own
 /// progress, and is never counted.
-const WRITE_ATTEMPTS: usize = 8;
+pub(super) const WRITE_ATTEMPTS: usize = 8;
 
 /// The `Retry-After` an undecided redaction's `503` carries, in seconds.
 pub const UNDECIDED_RETRY_AFTER_SECONDS: u32 = 2;
@@ -386,11 +387,14 @@ pub enum AppliedCopies {
     /// The redaction has applied, and the store holds the content as a recipe, kept until its
     /// chunks are deleted: only the session's staged copy was deleted.
     RecipeKept,
+    /// No redaction has applied, and the host withholds the content: only the session's staged
+    /// copy was deleted. The canonical object is the withheld item's deletion's to take.
+    Withheld,
 }
 
 impl AppliedCopies {
-    /// Whether the redaction has applied: the content must not be promoted, and a lift commit
-    /// naming it is refused.
+    /// Whether the content must not be promoted, and a lift commit naming it is refused: its
+    /// redaction has applied, or its host withholds it.
     pub fn applied(self) -> bool {
         self != AppliedCopies::Unapplied
     }
@@ -407,8 +411,12 @@ impl AppliedCopies {
 /// it is deleted by its own verifier event or the lift commit naming it, and one neither reaches is
 /// left to the `staging/` lifecycle rule.
 ///
+/// Content with no applied redaction whose withheld item applies ([`crate::withheld::applies`]) has
+/// only the session's staged copy deleted: its canonical object is the withhold's own deletion's.
+///
 /// # Returns
-/// * `Ok(AppliedCopies)` - Whether the redaction has applied, and what was deleted.
+/// * `Ok(AppliedCopies)` - Whether the redaction has applied or the host withholds the content, and
+///                         what was deleted.
 /// * `Err(String)`       - The item or the object could not be read, or a delete failed.
 pub fn delete_if_applied<O: ObjectStore + ?Sized, R: RefStore + ?Sized>(
     objects: &O,
@@ -417,6 +425,14 @@ pub fn delete_if_applied<O: ObjectStore + ?Sized, R: RefStore + ?Sized>(
     hash: &str,
 ) -> Result<AppliedCopies, String> {
     let Some(record) = applied_record(refs, hash)? else {
+        // An item not settled yet may name a tree, a parcel or a chunk, which it never applies to;
+        // refusing a staged copy of one fails the lift that uploaded it, never a later one, since
+        // the first request that settles the item records it.
+        if crate::withheld::applies(refs, hash)? {
+            objects.delete_staged_copy(session, hash)?;
+            return Ok(AppliedCopies::Withheld);
+        }
+
         return Ok(AppliedCopies::Unapplied);
     };
 
@@ -590,25 +606,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         Ok(())
     }
 
-    /// Refuse a lift commit naming a hash whose redaction applied, deleting the session's staged
-    /// copy of each such content first, and its canonical object ([`delete_if_applied`]): it is
-    /// never promoted, and a copy an earlier attempt of the commit promoted after the redaction's
-    /// sweep is deleted too. Reads only the item, and applies nothing.
-    pub(super) fn refuse_applied_staged(&self, session: &str, hashes: &[String]) -> HeadResult<()> {
-        let recorded = self.recorded()?;
-        let mut refused = None;
-
-        for hash in hashes.iter().filter(|hash| recorded.contains(hash)) {
-            if delete_if_applied(&self.objects, &self.refs, session, hash).map_err(HeadError::internal)?.applied() {
-                self.evict(hash)?;
-                refused.get_or_insert(hash);
-            }
-        }
-
-        match refused {
-            Some(hash) => Err(HeadError::gone(applied_redactions::served_refusal(hash))),
-            None => Ok(()),
-        }
+    /// Refuse a lift commit naming a hash whose redaction applied, or that its host withholds,
+    /// deleting the session's staged copy of each such content first, and a redacted one's
+    /// canonical object ([`delete_if_applied`]): it is never promoted, and a copy an earlier
+    /// attempt of the commit promoted after the redaction's sweep is deleted too. Reads only the
+    /// items, and applies nothing. A redaction is answered `410`, winning over a withhold's `451`,
+    /// since it is for good.
+    pub(super) fn refuse_applied_staged(&self, session: &str, hashes: &[String], withholding: &Withholding) -> HeadResult<()> {
+        self.refuse_applied(session, hashes, withholding)
     }
 
     /// After a lift commit promoted `promoted`, delete each one whose redaction applied while it
@@ -616,20 +621,40 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// [`refuse_applied_staged`](Self::refuse_applied_staged) does. `promoted` includes what was
     /// already present: an earlier attempt of the same commit may have written it and ended
     /// before this check. `@redactions` is read after the promotions landed, so a redaction it
-    /// does not record yet applies only after them, and its own deletion finds their objects.
-    pub(super) fn refuse_applied_promoted(&self, session: &str, promoted: &[String]) -> HeadResult<()> {
-        let recorded = self.recorded()?;
-        let mut refused = None;
+    /// does not record yet applies only after them, and its own deletion finds their objects. A
+    /// withhold the listing `withholding` holds no item of was added after the commit listed them,
+    /// and its own deletion finds the promoted copy.
+    pub(super) fn refuse_applied_promoted(&self, session: &str, promoted: &[String], withholding: &Withholding) -> HeadResult<()> {
+        self.refuse_applied(session, promoted, withholding)
+    }
 
-        for hash in promoted.iter().filter(|hash| recorded.contains(hash)) {
-            if delete_if_applied(&self.objects, &self.refs, session, hash).map_err(HeadError::internal)?.applied() {
-                self.evict(hash)?;
-                refused.get_or_insert(hash);
+    fn refuse_applied(&self, session: &str, hashes: &[String], withholding: &Withholding) -> HeadResult<()> {
+        let recorded = self.recorded()?;
+        let mut redacted = None;
+        let mut withheld = None;
+
+        for hash in hashes.iter().filter(|hash| recorded.contains(hash) || withholding.lists(hash)) {
+            match delete_if_applied(&self.objects, &self.refs, session, hash).map_err(HeadError::internal)? {
+                AppliedCopies::Unapplied => {}
+                AppliedCopies::Withheld => {
+                    withheld.get_or_insert(hash);
+                }
+                AppliedCopies::Deleted | AppliedCopies::RecipeKept => {
+                    self.evict(hash)?;
+                    redacted.get_or_insert(hash);
+                }
             }
         }
 
-        match refused {
-            Some(hash) => Err(HeadError::gone(applied_redactions::served_refusal(hash))),
+        if let Some(hash) = redacted {
+            return Err(HeadError::gone(applied_redactions::served_refusal(hash)));
+        }
+
+        match withheld {
+            Some(hash) => Err(withholding.refusal(std::slice::from_ref(hash)).unwrap_or_else(|| HeadError::internal(format!(
+                "The withheld item for {} applies, and the listing this request read does not say so.",
+                hash
+            )))),
             None => Ok(()),
         }
     }
@@ -1239,28 +1264,49 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         Ok(written)
     }
 
-    /// Record on the item of `hash` that its recipe object has been deleted.
+    /// Record on every item of `hash`, its redaction's and its withheld one, that its recipe
+    /// object has been deleted. The ledger holds one entry per recipe, journaled by either.
     ///
     /// # Returns
-    /// * `Ok(bool)` - Whether the item records it now.
+    /// * `Ok(bool)`        - Whether every item records it now.
+    /// * `Err(HeadError)`  - Neither item exists, or one could not be read or written.
     pub(super) fn mark_recipe_deleted(&self, hash: &str, budget: &mut Budget) -> HeadResult<bool> {
+        let redaction = self.mark_redaction_recipe_deleted(hash, budget)?;
+        let withheld = self.mark_withheld_recipe_deleted(hash, budget)?;
+
+        match (redaction, withheld) {
+            (None, None) => Err(HeadError::internal(format!(
+                "Neither a redaction item nor a withheld item names journaled recipe {}.",
+                hash
+            ))),
+            (redaction, withheld) => Ok(redaction.unwrap_or(true) && withheld.unwrap_or(true)),
+        }
+    }
+
+    /// Record on the redaction item of `hash`, if there is one, that its recipe object has been
+    /// deleted.
+    ///
+    /// # Returns
+    /// * `Ok(Some(bool))` - There is an item; whether it records it now.
+    /// * `Ok(None)`       - There is no redaction item of `hash`.
+    fn mark_redaction_recipe_deleted(&self, hash: &str, budget: &mut Budget) -> HeadResult<Option<bool>> {
         for _ in 0..WRITE_ATTEMPTS {
             let Some(stored) = self.refs.get_redaction(hash).map_err(HeadError::internal)? else {
-                return Err(HeadError::internal(format!("The redaction item for journaled recipe {} is missing.", hash)));
+                return Ok(None);
             };
             let record = decode_record(hash, &stored).map_err(HeadError::internal)?;
 
             if record.recipe_deleted {
-                return Ok(true);
+                return Ok(Some(true));
             }
 
             let next = Record { recipe_deleted: true, ..record };
             if self.write_record(hash, &next, Some(&stored), budget)? {
-                return Ok(true);
+                return Ok(Some(true));
             }
         }
 
-        Ok(false)
+        Ok(Some(false))
     }
 }
 

@@ -30,7 +30,7 @@ use forklift_aws_lambda::{AsyncBridge, BatchCut, BatchDelivery, BatchResult, Hea
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::globals::StorageRootScope;
 use forklift_core::util::authority_utils::Principal;
-use forklift_core::model::remote::{HoldAnswer, RefUpdateRequest, ServedRedactionState, TrustAnchorDto};
+use forklift_core::model::remote::{HoldAnswer, RefUpdateRequest, ServedRedactionState, ServedWithholdingState, TrustAnchorDto};
 use forklift_core::util::office_utils::{self, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils;
 use forklift_core::util::redaction_utils::REDACTIONS_PALLET_NAME;
@@ -6368,4 +6368,295 @@ fn a_push_whose_history_names_deleted_applied_content_lands() {
     let request = RefUpdateRequest { old_head: None, new_head: lost, tombstone: None };
     let err = head.ref_update(&Principal::Static, "lost", &request).expect_err("unapplied content is required");
     assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+}
+
+// ---------------------------------------------------------------------------------------
+// Withholding: the host's takedown, refused `451` on every route that serves or takes it.
+// ---------------------------------------------------------------------------------------
+
+const STATEMENT: &str = "Withheld under court order 12/2026.";
+
+/// The stored bytes of a blob holding `content`.
+fn blob_object(content: &str) -> Vec<u8> {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::model::blob::Blob;
+
+    LooseObjectBuilder::build_blob(&Blob { content: content.as_bytes().to_vec() }).content
+}
+
+/// Withhold `hash` in the warehouse behind `head`, as its host, with [`STATEMENT`].
+fn withhold<O: ObjectStore>(head: &Head<O, MemoryRefStore>, hash: &str) {
+    forklift_aws_lambda::withheld::add(&head.refs, hash, STATEMENT).expect("withhold");
+}
+
+/// Assert `err` is the host's `451`, naming `hash` and carrying its statement.
+fn assert_host_withheld(err: &forklift_aws_lambda::error::HeadError, hash: &str) {
+    assert_eq!(err.status, Status::UnavailableForLegalReasons, "{}", err.message);
+    assert_eq!(refusal_code(&err.message), Some(RefusalCode::ContentWithheld), "{}", err.message);
+    assert!(err.message.contains(hash), "the refusal names the hash: {}", err.message);
+    assert!(err.message.contains(STATEMENT), "the refusal carries the statement: {}", err.message);
+}
+
+/// The withheld list the handshake reports, as (hash, statement, state).
+fn served_withheld<O: ObjectStore, R: RefStore>(head: &Head<O, R>) -> Vec<(String, String, ServedWithholdingState)> {
+    let info = head.handshake().expect("handshake");
+    info.withheld.expect("the head reports what it withholds").into_iter()
+        .map(|served| (served.hash, served.statement, served.state))
+        .collect()
+}
+
+/// A withheld file's content is refused `451` with the statement on every route that serves or
+/// takes it by hash, from the first request after the withhold, while other content is served:
+/// upload-targets answers it apart, missing never lists it, batch leaves it out, and the
+/// handshake lists it, its deletion owed.
+// Revert: drop the refusal from `object_get` → it is served → red. Revert: from `object_put` → it
+// is stored → red. Revert: take no withheld list in `upload_targets` → it gets a target → red.
+// Revert: list it in `missing` → red. Revert: bundle it in `batch` → red. Revert: report nothing in
+// the handshake → red.
+#[test]
+fn withheld_content_is_refused_451_on_every_route() {
+    let area = Area::new("withheld-routes");
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let main = gate_parcel(&head, &[], vec![gate_file(&head, "x", "taken down\n"), gate_file(&head, "y", "1")]);
+    plant(&head.refs, "main", &main);
+    let (taken, other) = (blob_hash("taken down\n"), blob_hash("1"));
+    assert_eq!(served_withheld(&head), vec![], "nothing withheld yet");
+    withhold(&head, &taken);
+
+    assert_host_withheld(&head.object_get(&taken).expect_err("withheld"), &taken);
+    assert!(served(&head, &other), "other content is served");
+    let err = head.object_put(&Principal::Static, None, &taken, b"taken down\n").expect_err("not taken");
+    assert_host_withheld(&err, &taken);
+
+    let fresh = blob_hash("fresh\n");
+    let answer = head.upload_targets(&Principal::Static, "lift-1", &[other.clone(), taken.clone(), fresh.clone()]).expect("negotiated");
+    assert_eq!(answer.withheld, vec![taken.clone()]);
+    assert_eq!(answer.present, vec![other.clone()]);
+    assert_eq!(answer.direct, vec![fresh.clone()]);
+
+    head.objects.delete_canonical(&taken).expect("delete");
+    assert_eq!(head.missing(&[taken.clone(), fresh.clone()]).expect("missing"), vec![fresh], "withheld is never asked for");
+    head.objects.put_verified(&taken, &blob_object("taken down\n")).expect("stored again");
+
+    let requested = vec![taken.clone(), other.clone()];
+    let answer = head.batch(&requested).expect("batch");
+    assert_eq!(bundled(&area, "fetch", answer, &requested), vec![other]);
+
+    assert_eq!(served_withheld(&head), vec![(taken, STATEMENT.to_string(), ServedWithholdingState::DeletionOwed)]);
+}
+
+/// A withheld hash the store holds as a tree never applies: the first request settles it as such,
+/// the tree stays served, and the handshake does not list it.
+// Revert: settle every item as a blob → the tree is refused → red.
+#[test]
+fn a_withheld_tree_never_applies_and_stays_served() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let main = gate_parcel(&head, &[], vec![gate_file(&head, "x", "1")]);
+    plant(&head.refs, "main", &main);
+    let tree = {
+        let bytes = head.objects.get(&main).expect("read").expect("the parcel");
+        object_utils::parse_parcel_bytes(&main, &bytes).expect("parcel").tree_hash
+    };
+    withhold(&head, &tree);
+
+    assert!(served(&head, &tree), "a tree is no file's content");
+    let listed = forklift_aws_lambda::withheld::list(&head.refs).expect("list");
+    assert!(listed[0].item.settled && listed[0].item.never_applies, "{:?}", listed[0].item);
+    assert_eq!(served_withheld(&head), vec![]);
+}
+
+/// An applied redaction of withheld content wins: it is for good, and is answered `410`.
+// Revert: refuse a withhold before a redaction → `451` → red.
+#[test]
+fn an_applied_redaction_wins_over_a_withhold() {
+    let (_area, head, redactions, leak) = unplanted_redaction("withheld-redacted", "leaked\n");
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+    withhold(&head, &leak);
+
+    assert_gone(&head.object_get(&leak).expect_err("refused"), &leak);
+    assert_gone(&head.object_put(&Principal::Static, None, &leak, b"leaked\n").expect_err("refused"), &leak);
+    head.objects.stage("lift-1", &leak, b"leaked\n".to_vec());
+    assert_gone(&head.commit_lift(&Principal::Static, "lift-1", &[], &[leak.clone()], false).expect_err("refused"), &leak);
+}
+
+/// A request that cannot settle a withheld item within its time answers `503` with `Retry-After`,
+/// never serving the content as if nothing were withheld; the next request settles it.
+// Revert: serve an unsettled item's content → the late GET answers 200 → red.
+#[test]
+fn an_item_not_settled_in_time_answers_503_and_the_next_request_settles_it() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let main = gate_parcel(&head, &[], vec![gate_file(&head, "x", "taken down\n")]);
+    plant(&head.refs, "main", &main);
+    let taken = blob_hash("taken down\n");
+    withhold(&head, &taken);
+
+    let late = head.with_deadline(std::time::SystemTime::now());
+    let err = late.object_get(&taken).expect_err("unsettled");
+    assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
+    assert!(err.retry_after_seconds.is_some(), "{}", err.message);
+    assert!(!forklift_aws_lambda::withheld::list(&late.refs).expect("list")[0].item.settled);
+
+    let head = late.with_deadline(std::time::SystemTime::now() + std::time::Duration::from_secs(60));
+    assert_host_withheld(&head.object_get(&taken).expect_err("withheld"), &taken);
+    assert!(forklift_aws_lambda::withheld::list(&head.refs).expect("list")[0].item.settled);
+}
+
+/// A lift commit naming withheld content is refused `451`, its staged copy deleted and never
+/// promoted, and the staging verifier's check deletes a staged copy of it the same way, keeping the
+/// canonical object, which is the withhold's own deletion to take.
+// Revert: pass over withheld hashes in the commit's refusal → the commit lands → red. Revert: read
+// only the redaction item in `delete_if_applied` → the verifier would promote it → red.
+#[test]
+fn a_lift_commit_and_the_verifier_never_promote_withheld_content() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let main = gate_parcel(&head, &[], vec![gate_file(&head, "x", "1")]);
+    plant(&head.refs, "main", &main);
+    let taken = blob_hash("taken down\n");
+    withhold(&head, &taken);
+
+    for (control_plane, blobs) in [(vec![taken.clone()], vec![]), (vec![], vec![taken.clone()])] {
+        head.objects.stage("lift-1", &taken, b"taken down\n".to_vec());
+
+        let err = head.commit_lift(&Principal::Static, "lift-1", &control_plane, &blobs, false).expect_err("refused");
+        assert_host_withheld(&err, &taken);
+        assert_eq!(head.objects.staged_count(), 0, "the staged copy is dropped");
+        assert!(!head.objects.exists(&taken).expect("exists"), "never promoted");
+    }
+
+    head.objects.put_verified(&taken, &blob_object("taken down\n")).expect("a canonical copy");
+    head.objects.stage("lift-2", &taken, b"taken down\n".to_vec());
+    let found = forklift_aws_lambda::head::delete_if_redaction_applied(&head.objects, &head.refs, "lift-2", &taken).expect("check");
+    assert_eq!(found, forklift_aws_lambda::head::AppliedCopies::Withheld);
+    assert!(found.applied(), "the verifier does not promote it");
+    assert_eq!(head.objects.staged_count(), 0, "the staged copy is dropped");
+    assert!(head.objects.exists(&taken).expect("exists"), "the canonical copy is the withhold's to delete");
+}
+
+/// A ref update tolerates withheld content absent as a file's content, and refuses a head whose
+/// withheld hash is absent as a tree, saying the host withholds it; a new head the host withholds
+/// is refused saying so.
+// Revert: tolerate nothing withheld in the ref update → the first push is refused → red. Revert:
+// drop the note on an absent new head → red.
+#[test]
+fn a_ref_update_tolerates_withheld_file_content_only() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let first = gate_parcel(&head, &[], vec![gate_file(&head, "y", "1")]);
+    plant(&head.refs, "first", &first);
+    let named = gate_parcel(&head, &[], vec![gate_file(&head, "x", "taken down\n"), gate_file(&head, "y", "1")]);
+    let taken = blob_hash("taken down\n");
+    head.objects.delete_canonical(&taken).expect("delete");
+
+    let request = RefUpdateRequest { old_head: None, new_head: named.clone(), tombstone: None };
+    let err = head.ref_update(&Principal::Static, "main", &request).expect_err("absent content is required");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert!(!err.message.contains("host withholds"), "{}", err.message);
+
+    withhold(&head, &taken);
+    head.ref_update(&Principal::Static, "main", &request).expect("withheld content's absence is tolerated");
+    assert_eq!(user_head(&head, "main"), Some(named));
+
+    let dir = gate_dir(&head, "d", vec![gate_file(&head, "z", "2")]);
+    let nested = gate_parcel(&head, &[], vec![dir.clone()]);
+    head.objects.delete_canonical(&dir.hash).expect("delete");
+    withhold(&head, &dir.hash);
+    let request = RefUpdateRequest { old_head: None, new_head: nested, tombstone: None };
+    let err = head.ref_update(&Principal::Static, "nested", &request).expect_err("a tree is never tolerated");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert!(err.message.contains("host withholds"), "{}", err.message);
+
+    let absent = gate_parcel(&head, &[], vec![gate_file(&head, "w", "3")]);
+    head.objects.delete_canonical(&absent).expect("delete");
+    withhold(&head, &absent);
+    let request = RefUpdateRequest { old_head: None, new_head: absent, tombstone: None };
+    let err = head.ref_update(&Principal::Static, "absent", &request).expect_err("not uploaded");
+    assert!(err.message.contains("host withholds it"), "{}", err.message);
+}
+
+/// A withheld recipe gates its chunks from the first request after the withhold, as an applied
+/// redaction's does, and a round deletes the chunks only it names: a recipe the host withholds is
+/// no census root's to keep. The history naming it still lifts.
+// Revert: journal no recipe when settling → the chunk is served → red. Revert: leave withheld
+// recipes out of the census basis → the chunks only it names are kept → red. Revert: mark only
+// the redaction item of a deleted recipe → the late round errors → red.
+#[test]
+fn a_withheld_recipe_gates_its_chunks_and_a_round_deletes_the_ones_only_it_names() {
+    let area = Area::new("withheld-chunks");
+    let (recorded, main, recipe, own, shared) = chunked_leak(&area);
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    plant(&head.refs, "main", &main);
+    assert!(served(&head, &own[0]), "nothing withheld yet");
+    withhold(&head, &recipe);
+
+    assert_withheld(&head.object_get(&own[0]).expect_err("undecided"), &own[0]);
+    assert_host_withheld(&head.object_get(&recipe).expect_err("withheld"), &recipe);
+    assert_eq!(served_withheld(&head), vec![(recipe.clone(), STATEMENT.to_string(), ServedWithholdingState::DeletionOwed)]);
+
+    let head = head.with_chunk_round_wait(0);
+    served_withheld(&head);
+    for chunk in &own {
+        assert!(!head.objects.exists(chunk).expect("exists"), "a chunk only the recipe names is deleted");
+    }
+    for chunk in &shared {
+        assert!(head.objects.exists(chunk).expect("exists"), "a chunk the kept file names is kept");
+    }
+    assert!(served(&head, &shared[0]));
+    assert!(head.objects.exists(&recipe).expect("exists"), "the recipe waits for the late round");
+
+    let request = RefUpdateRequest { old_head: None, new_head: main, tombstone: None };
+    head.ref_update(&Principal::Static, "again", &request).expect("the history lifts");
+
+    // The late round deletes the recipe, and records it on the withheld item.
+    age_chunk_ledger(&head.refs, LATE_SWEEP_AFTER + 40);
+    served_withheld(&head);
+    assert!(!head.objects.exists(&recipe).expect("exists"), "then the recipe is deleted");
+    let listed = forklift_aws_lambda::withheld::list(&head.refs).expect("list");
+    assert!(listed[0].item.recipe && listed[0].item.recipe_deleted, "{:?}", listed[0].item);
+}
+
+/// A first anchor's adopted history is held strictly over withheld content too, and the refusal
+/// says the host withholds it rather than sending the client to upload it.
+// Revert: drop the withheld note from `require_adopted_history`'s refusal → red.
+#[test]
+fn a_first_anchor_adopting_history_naming_withheld_content_says_so() {
+    let area = Area::new("first-anchor-adopts-withheld");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
+
+    let office = harvest(&area.path("wh"));
+    let office_head = office.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+    let record = {
+        let _scope = StorageRootScope::enter(&area.path("wh"));
+        let mut tree = object_utils::load_tree(&object_utils::load_parcel(&office_head).expect("parcel").tree_hash)
+            .expect("the office tree");
+        loop {
+            if let Some((_, file)) = tree.get_files().next() {
+                break file.hash.clone();
+            }
+            let (_, subtree) = tree.get_subtrees().next().expect("the office tree names a record");
+            tree = object_utils::load_tree(&subtree.hash).expect("a subtree");
+        }
+    };
+    let anchor = TrustAnchorDto {
+        genesis: "e".repeat(64),
+        adopts: Some(office_head.clone()),
+        ..office.trust.clone().expect("trust")
+    };
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    for (hash, bytes) in office.objects.iter().filter(|(hash, _)| **hash != record) {
+        head.object_put(&Principal::Static, None, hash, bytes).expect("upload object");
+    }
+    let err = head.put_trust(&Principal::Static, &anchor).expect_err("the pin's history is incomplete");
+    assert!(!err.message.contains("host withholds"), "{}", err.message);
+
+    // A host withholds only in a warehouse that holds something.
+    plant(&head.refs, "main", &office_head);
+    withhold(&head, &record);
+    let err = head.put_trust(&Principal::Static, &anchor).expect_err("the pin names withheld content");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert!(err.message.contains("host withholds"), "{}", err.message);
 }

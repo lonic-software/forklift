@@ -121,8 +121,9 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
         // event is consumed — a corrupt object was discarded, not promoted, and retrying it
         // would only rediscard it. So is redacted content: its redaction item is read before
         // anything is promoted, and an applied one has its copies deleted instead; it is read
-        // again after the promotion, and an applied one has the copy just written deleted. An
-        // item that cannot be read is a storage error too: never promoted on a guess.
+        // again after the promotion, and an applied one has the copy just written deleted. So is
+        // content its host withholds, by its withheld item: the staged copy is deleted, never
+        // promoted. An item that cannot be read is a storage error too: never promoted on a guess.
         let outcome = tokio::task::spawn_blocking(move || -> Result<Result<PromoteOutcome, Refused>, String> {
             let before = delete_if_redaction_applied(&objects, &refs, &session, &hash)?;
             if before.applied() {
@@ -170,7 +171,11 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
                 eprintln!("verifier: deleted staged object {} and any canonical copy: its content is redacted", key);
                 continue;
             }
-            Err(Refused::Applied(AppliedCopies::Unapplied)) => unreachable!("only an applied redaction stops a promotion"),
+            Err(Refused::Applied(AppliedCopies::Withheld)) => {
+                eprintln!("verifier: deleted staged object {}: this warehouse's host withholds its content", key);
+                continue;
+            }
+            Err(Refused::Applied(AppliedCopies::Unapplied)) => unreachable!("only an applied redaction or a withhold stops a promotion"),
         };
 
         match outcome {

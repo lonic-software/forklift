@@ -711,8 +711,10 @@ Lambda. `forklift-aws-withhold --table <table> <warehouse> add <hash> --statemen
 a file's content hash with the host's statement as the warehouse's `withheld#<hash>` item, and
 `list` shows each item with how far withholding it has got. It reads the item and the format item
 (`GetItem`), lists the items (`Query`), and writes one by a transaction conditioned on the item
-and on the format item (`PutItem`, `ConditionCheckItem`). It reads no object. This build's head
-does not act on the items yet, so the content is still served.
+and on the format item (`PutItem`, `ConditionCheckItem`). It reads no object. The head reads the
+items on every request that serves or takes objects, so from the next one on it refuses the content
+with `451 content_withheld` and the statement, and reports it in the handshake. This build's head
+does not yet delete the copies it holds.
 
 ### `s3:ListBucket` on both roles is unconditional, and has to be
 
