@@ -65,7 +65,7 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
     // waits; refused while any writer or server holds the store.
     let _store_access = lock_utils::StoreAccessLock::try_exclusive()?;
 
-    let (live, whole) = collect_live_set_saying_whole()?;
+    let live = collect_live_set()?;
 
     let objects_root = std::path::PathBuf::from(file_utils::get_path_objects_root());
     let now = SystemTime::now();
@@ -162,7 +162,7 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
     // Under the same hold and against the same live set, drop what the unavailable record lists
     // that nothing names any more: a served root has no client to do it. Its error is ignored: the
     // record then only stays larger than it needs to be, and must not fail the sweep that landed.
-    let _ = crate::util::unavailable::prune_against(&_store_access, &live, whole);
+    let _ = crate::util::unavailable::prune_against(&_store_access, &live);
 
     Ok(stats)
 }
@@ -199,8 +199,28 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 /// An applied redaction's object no deletion census root names is not live
 /// ([`redaction_deleter::unheld_applied`]), and a recipe of one is not descended for its chunks: the
 /// collection and a repack then delete it like garbage, and every chunk only it named.
-pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
-    collect_live_set_excluding(&redaction_deleter::unheld_applied()?)
+pub(crate) fn collect_live_set() -> Result<LiveSet, String> {
+    let (hashes, whole) = walk_live_set(&redaction_deleter::unheld_applied()?)?;
+
+    Ok(LiveSet { hashes, whole })
+}
+
+/// What [`collect_live_set`] marked live, and whether its walk saw the whole closure its roots
+/// name.
+#[derive(Debug)]
+pub(crate) struct LiveSet {
+    /// Every hash marked live.
+    pub(crate) hashes: HashSet<String>,
+    /// False once the walk met an absent parcel or tree, below which it cannot tell what is named:
+    /// a hash missing from `hashes` is unreachable only when this is true.
+    pub(crate) whole: bool,
+}
+
+impl LiveSet {
+    /// Whether `hash` was marked live.
+    pub(crate) fn contains(&self, hash: &str) -> bool {
+        self.hashes.contains(hash)
+    }
 }
 
 /// [`collect_live_set`], with `excluded` (the unheld applied redactions) given. An excluded hash a
@@ -211,14 +231,8 @@ pub(crate) fn collect_live_set_excluding(excluded: &HashSet<String>) -> Result<H
     Ok(walk_live_set(excluded)?.0)
 }
 
-/// [`collect_live_set`], and whether the walk saw the whole closure its roots name: false once it
-/// met an absent parcel or tree, below which it cannot tell what is named. A hash missing from the
-/// set is unreachable only when that is true.
-pub(crate) fn collect_live_set_saying_whole() -> Result<(HashSet<String>, bool), String> {
-    walk_live_set(&redaction_deleter::unheld_applied()?)
-}
-
-/// The walk behind [`collect_live_set_excluding`] and [`collect_live_set_saying_whole`].
+/// The walk behind [`collect_live_set`] and [`collect_live_set_excluding`]: the live hashes, and
+/// whether it saw the whole closure.
 fn walk_live_set(excluded: &HashSet<String>) -> Result<(HashSet<String>, bool), String> {
     // Pallet heads (both namespaces), haul heads, tombstone heads, the git mirror's roots, bay-scoped
     // parcel roots, trust-pin roots and staged shard leaves: the sources this function shares, hash
@@ -655,8 +669,7 @@ pub(crate) mod tests {
 
         // So the walk says it was not whole: a hash it left unmarked may sit below the boundary.
         // Revert: never clear `whole` at an absent tree → true here.
-        let (_, whole) = collect_live_set_saying_whole().unwrap();
-        assert!(!whole, "a walk that stopped at an absent tree is not whole");
+        assert!(!live.whole, "a walk that stopped at an absent tree is not whole");
     }
 
     /// A walk that met no absent parcel or tree says it was whole. Revert: start `whole` false →
@@ -667,8 +680,8 @@ pub(crate) mod tests {
         let f = build_fixture();
         delete_object(&f.readme_blob);
 
-        let (live, whole) = collect_live_set_saying_whole().unwrap();
-        assert!(live.contains(&f.web_blob) && whole, "an absent blob under a present tree leaves the walk whole");
+        let live = collect_live_set().unwrap();
+        assert!(live.contains(&f.web_blob) && live.whole, "an absent blob under a present tree leaves the walk whole");
     }
 
     /// A pallet deleted in a served root keeps its history through its tombstone: gc marks the
