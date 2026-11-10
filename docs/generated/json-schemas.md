@@ -5662,6 +5662,26 @@ A command not listed here either reports only the generic human-message shape `{
 
 ```json
 {
+  "$defs": {
+    "MoveWithheld": {
+      "description": "Content the new origin withholds, as a move reports it.",
+      "properties": {
+        "hash": {
+          "description": "The withheld object's hash.",
+          "type": "string"
+        },
+        "statement": {
+          "description": "Why the host withholds it, in the host's words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "hash",
+        "statement"
+      ],
+      "type": "object"
+    }
+  },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of a move of the origin.",
   "properties": {
@@ -5698,6 +5718,20 @@ A command not listed here either reports only the generic human-message shape `{
         "null"
       ]
     },
+    "previous_origin_unreachable": {
+      "description": "Why the previous origin's handshake could not be read, when it did not answer.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "previous_origin_withheld": {
+      "description": "Why the move went ahead though the new origin withholds content: `withholds` (the previous\norigin withholds it too, or is the new one), `unrecorded` (no previous origin is recorded)\nor `unreachable` (the previous origin did not answer). None when nothing is withheld.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "read_objects": {
       "description": "Trees and recipes read from the new server, and not stored, to find them.",
       "format": "uint",
@@ -5709,6 +5743,13 @@ A command not listed here either reports only the generic human-message shape `{
       "format": "uint",
       "minimum": 0,
       "type": "integer"
+    },
+    "withheld": {
+      "description": "Content this warehouse lacks and leans on its origin for that the new origin's host\nwithholds, so it will not supply it; not counted in `absent_objects`. Empty when none.",
+      "items": {
+        "$ref": "#/$defs/MoveWithheld"
+      },
+      "type": "array"
     }
   },
   "required": [
@@ -5719,7 +5760,10 @@ A command not listed here either reports only the generic human-message shape `{
     "fetched_objects",
     "fetched_signatures",
     "absent_objects",
-    "read_objects"
+    "read_objects",
+    "withheld",
+    "previous_origin_withheld",
+    "previous_origin_unreachable"
   ],
   "title": "RemoteMoveReport",
   "type": "object"

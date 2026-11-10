@@ -2899,3 +2899,66 @@ fn a_served_root_withholds_a_chunked_file_and_the_chunks_only_it_names() {
     let (status, _) = ask("GET", &format!("/v1/objects/{}", shared[0]), b"");
     assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
 }
+
+/// A move to a server whose host withholds content a cache leans on its origin for is refused
+/// while the previous origin answers and does not withhold it, and the refusal names it. Once the previous origin
+/// withholds it too, or no longer answers, the move goes ahead and reports the content as what the
+/// new origin will not supply.
+///
+/// Revert: let the walk find a withheld file held by the new server → the first move goes through
+/// reporting nothing withheld. Revert: lean only on the absent trees the walk from the roots met,
+/// not on what is beneath them → the same. Revert: never read the previous origin's handshake (read every
+/// previous origin as withholding) → the first move goes through. Revert: refuse over a previous
+/// origin that does not answer → the last move is refused.
+#[test]
+fn a_move_to_an_origin_withholding_leaned_on_content_reads_the_previous_origin() {
+    let temp = std::env::temp_dir();
+    let first_root = temp.join(format!("forklift-takedown-move-server-{}", std::process::id()));
+    let server = Server::start(&first_root);
+
+    let owner = Warehouse::cloned("takedown-move-owner", &server.url);
+    // A draft no cache fetches, so each leans on its origin for it, beneath two trees it lacks.
+    owner.stack("docs/notes.txt", b"a draft the host takes down\n", "draft");
+    owner.stack("docs/notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+    let draft = hash_of(b"a draft the host takes down\n");
+    let statement = "court order 2026-77";
+
+    let refused_cache = Warehouse::cloned_with("takedown-move-cache", &server.url, &["--cache"]);
+    let unanswered_cache = Warehouse::cloned_with("takedown-move-cache-2", &server.url, &["--cache"]);
+
+    // A copy of the server's root whose host withholds the draft.
+    let second_root = temp.join(format!("forklift-takedown-move-copy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&second_root);
+    let copied = std::process::Command::new("cp").arg("-R").arg(&first_root).arg(&second_root).output().unwrap();
+    assert!(copied.status.success(), "{:?}", copied);
+    // The lock the first server holds is not the copy's.
+    std::fs::remove_file(second_root.join(".forklift/serve.lock")).unwrap();
+    let added = withhold(&second_root, &["add", &draft, "--statement", statement]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let second = Server::serve(&second_root);
+
+    let refused = refused_cache.json(&["remote", "move", &second.url]);
+    assert_eq!(refused["ok"], false, "{}", refused);
+    assert_eq!(refused["error"]["code"], "origin_move_incomplete", "{}", refused);
+    assert!(refused["error"]["message"].as_str().unwrap().contains(&format!("current origin \"{}\" does not withhold", server.url)), "{}", refused);
+    assert_eq!(refused["error"]["details"]["withheld"], serde_json::json!([{ "hash": draft, "statement": statement }]), "{}", refused);
+    assert_eq!(refused_cache.json(&["remote"])["data"]["origin"], server.url.as_str());
+
+    // The previous origin's host withholds it too.
+    let added = withhold(&server.root, &["add", &draft, "--statement", statement]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let moved = refused_cache.json(&["remote", "move", &second.url]);
+    assert_eq!(moved["ok"], true, "{}", moved);
+    assert_eq!(moved["data"]["origin"], second.url.as_str(), "{}", moved);
+    assert_eq!(moved["data"]["withheld"], serde_json::json!([{ "hash": draft, "statement": statement }]), "{}", moved);
+    assert_eq!(moved["data"]["previous_origin_withheld"], "withholds", "{}", moved);
+
+    // The previous origin no longer answers.
+    drop(server);
+    let moved = unanswered_cache.json(&["remote", "move", &second.url]);
+    assert_eq!(moved["ok"], true, "{}", moved);
+    assert_eq!(moved["data"]["withheld"], serde_json::json!([{ "hash": draft, "statement": statement }]), "{}", moved);
+    assert_eq!(moved["data"]["previous_origin_withheld"], "unreachable", "{}", moved);
+    assert!(moved["data"]["previous_origin_unreachable"].is_string(), "{}", moved);
+}

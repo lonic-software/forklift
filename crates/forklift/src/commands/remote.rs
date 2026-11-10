@@ -9,12 +9,15 @@ use crate::events;
 use crate::output::{self, CommandOutput};
 
 /// Handle `remote move` (§7.6.1): point a partial warehouse at a new origin, once the new server is
-/// checked to hold everything this warehouse lacks and leans on its origin for.
+/// checked to hold everything this warehouse lacks and leans on its origin for, but content its
+/// host withholds that the previous origin withholds too or cannot be asked about.
 ///
 /// The move holds the move lock for its whole run and records its intent first, so nothing fetches
 /// or writes what it checks until it ends. It judges the new server's trust as `lower` would,
 /// without adopting anything, fetches the parcels and signatures of its history it lacks, and
-/// checks that history reaches every absent object ([`origin_check`]). Only then does it rewrite
+/// checks that history reaches every absent object ([`origin_check`]), content the new server
+/// withholds set apart and judged against the previous origin's handshake
+/// ([`origin_check::judge_withheld`]). Only then does it rewrite
 /// the origin and `remote.url` (and `remote.token`, given one), and clear the intent. A move that
 /// fails before rewriting clears its intent; one that stops while rewriting leaves it, and the
 /// next move finishes it.
@@ -48,10 +51,10 @@ pub async fn move_origin(url: String,
         origin_move::begin(&move_lock, &lock, &target)?
     };
 
-    let moved = check_and_rewrite(&target, token, &move_token, store_access).await;
+    let moved = check_and_rewrite(&target, token, previous.as_deref(), &move_token, store_access).await;
 
-    let checked = match moved {
-        Ok(checked) => checked,
+    let (checked, judged) = match moved {
+        Ok(moved) => moved,
         Err(why) => {
             let lock = RefLock::acquire()?;
 
@@ -89,16 +92,29 @@ pub async fn move_origin(url: String,
         fetched_signatures: checked.fetched_signatures,
         absent_objects: checked.absent_objects,
         read_objects: checked.read_objects,
+        withheld: checked.withheld.into_iter()
+            .map(|(hash, statement)| MoveWithheld { hash, statement })
+            .collect(),
+        previous_origin_withheld: judged.as_ref().map(|reason| reason.as_str()),
+        previous_origin_unreachable: match judged {
+            Some(origin_check::PreviousOrigin::Unreachable(why)) => Some(why),
+            _ => None,
+        },
     });
 
     Ok(())
 }
 
-/// Steps 2 to 5 of a move: judge the new server, check it, and rewrite the origin to it.
+/// What the previous origin said of the content the new one withholds ([`origin_check::judge_withheld`]).
+type Judged = Option<origin_check::PreviousOrigin>;
+
+/// Steps 2 to 5 of a move: judge the new server, check it, judge what it withholds against the
+/// previous origin, and rewrite the origin to it.
 async fn check_and_rewrite(target: &str,
                            token: Option<String>,
+                           previous: Option<&str>,
                            move_token: &origin_move::MoveToken,
-                           store_access: &StoreAccessLock) -> Result<origin_check::Checked, String> {
+                           store_access: &StoreAccessLock) -> Result<(origin_check::Checked, Judged), String> {
     // Its own client: the origin-checked one refuses while the move stands.
     let dial_token = match &token {
         Some(token) => Some(token.clone()),
@@ -111,6 +127,10 @@ async fn check_and_rewrite(target: &str,
 
     let checked = origin_check::check_new_origin(&client, &info, store_access, &events::progress()).await?;
 
+    // The previous origin is dialed with the token configured for it, whatever the new one's is.
+    let previous_token = config_utils::get_effective_value(config_utils::KEY_REMOTE_TOKEN)?.map(|(value, _)| value);
+    let judged = origin_check::judge_withheld(&checked.withheld, previous, target, previous_token).await?;
+
     let lock = RefLock::acquire()?;
     origin_move::set_rewriting(&lock, move_token, target)?;
     origin_utils::write_locked(&lock, move_token, target)?;
@@ -120,7 +140,7 @@ async fn check_and_rewrite(target: &str,
     }
     origin_move::finish(&lock, move_token)?;
 
-    Ok(checked)
+    Ok((checked, judged))
 }
 
 /// Handle bare `remote`: report the configured remote, whether this is a partial warehouse and,
@@ -299,6 +319,29 @@ pub(crate) struct RemoteMoveReport {
 
     /// Trees and recipes read from the new server, and not stored, to find them.
     read_objects: usize,
+
+    /// Content this warehouse lacks and leans on its origin for that the new origin's host
+    /// withholds, so it will not supply it; not counted in `absent_objects`. Empty when none.
+    withheld: Vec<MoveWithheld>,
+
+    /// Why the move went ahead though the new origin withholds content: `withholds` (the previous
+    /// origin withholds it too, or is the new one), `unrecorded` (no previous origin is recorded)
+    /// or `unreachable` (the previous origin did not answer). None when nothing is withheld.
+    previous_origin_withheld: Option<&'static str>,
+
+    /// Why the previous origin's handshake could not be read, when it did not answer.
+    previous_origin_unreachable: Option<String>,
+}
+
+/// Content the new origin withholds, as a move reports it.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct MoveWithheld {
+    /// The withheld object's hash.
+    hash: String,
+
+    /// Why the host withholds it, in the host's words.
+    statement: String,
 }
 
 impl CommandOutput for RemoteMoveReport {
@@ -317,6 +360,22 @@ impl CommandOutput for RemoteMoveReport {
             history were fetched.",
             self.absent_objects, self.fetched_objects, self.fetched_signatures
         );
+
+        if !self.withheld.is_empty() {
+            let why = match (self.previous_origin_withheld, &self.previous_origin_unreachable) {
+                (_, Some(error)) => format!("the previous origin did not answer ({})", error),
+                (Some("withholds"), None) => "the previous origin withholds it too".to_string(),
+                _ => "no previous origin is recorded".to_string(),
+            };
+            println!(
+                "Its host withholds {} object(s) this warehouse lacks, which it will not supply; the move \
+                went ahead because {}:",
+                self.withheld.len(), why
+            );
+            for item in &self.withheld {
+                println!("  {}: {}", item.hash, item.statement);
+            }
+        }
     }
 }
 
