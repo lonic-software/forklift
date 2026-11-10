@@ -162,7 +162,7 @@ pub(crate) async fn abort(kind: MergeKind, confirm: bool, command: &str) -> Resu
         let left_out = staged.is_some_and(|item| item.state == InventoryItemState::Unavailable);
         let working_kept = is_folder
             || match left_out {
-                true => holds(path, None, anchor),
+                true => holds(path, None, anchor) || holds(path, ours.as_ref(), anchor),
                 false => holds(path, ours.as_ref(), anchor)
                     || output.is_some_and(|output| holds(path, output.working.as_ref(), anchor)),
             };

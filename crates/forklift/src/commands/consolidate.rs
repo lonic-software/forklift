@@ -635,9 +635,10 @@ impl alias_utils::Removals for MergeRemovals {
 pub(crate) fn keep_aliased_files(actions: &mut Vec<MergeAction>,
                                  our_tree_hash: &str,
                                  scope: &scope_utils::PathScope) -> Result<(), String> {
+    // A file left out over our version removes ours as a deletion does.
     let removed: Vec<String> = actions.iter()
         .filter_map(|action| match action {
-            MergeAction::Delete { path } => Some(path.clone()),
+            MergeAction::Delete { path } | MergeAction::LeaveOut { path, is_new: false, .. } => Some(path.clone()),
             _ => None,
         })
         .collect();
@@ -658,12 +659,14 @@ pub(crate) fn keep_aliased_files(actions: &mut Vec<MergeAction>,
 
     let kept = shift_utils::kept_through_aliases(&our_tree, &removed, &planned, scope)?;
 
-    actions.extend(kept.into_iter().map(|(path, item)| MergeAction::TakeTheirs {
-        path,
-        hash: item.hash,
-        item_type: item.item_type,
-        is_new: false,
-    }));
+    // A kept file whose content is left out stays out: nothing to write, its entry staged as it was.
+    let not_checked_out = shift_utils::NotCheckedOut::read()?;
+    for (path, item) in kept {
+        actions.push(match not_checked_out.holds(&item.hash)? {
+            true => MergeAction::LeaveOut { path, hash: item.hash, item_type: item.item_type, is_new: true },
+            false => MergeAction::TakeTheirs { path, hash: item.hash, item_type: item.item_type, is_new: false },
+        });
+    }
 
     Ok(())
 }
@@ -695,7 +698,7 @@ pub(crate) fn refuse_redacted_actions(actions: &[MergeAction],
 
     for action in actions {
         let named = match action {
-            MergeAction::TakeTheirs { path, hash, item_type, .. } => {
+            MergeAction::TakeTheirs { path, hash, item_type, .. } | MergeAction::LeaveOut { path, hash, item_type, .. } => {
                 guard.names_file(hash, *item_type)?.map(|hash| (path.clone(), hash))
             }
             MergeAction::Merged { path, content, item_type } => {

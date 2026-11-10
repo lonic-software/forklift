@@ -577,6 +577,15 @@ fn an_abort_puts_back_a_file_the_merge_left_out() {
     warehouse.run_ok(&["abort"]);
     assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), OLD_FILM);
     assert!(!warehouse.exists("extra/new.bin"));
+    let report = warehouse.stocktake();
+    assert!(report.get("unavailable_count").is_none(), "{}", report);
+    assert_eq!(changes(&report["staged"]), [("added".to_string(), "copy/film.mkv".to_string())], "the load is carried: {}", report);
+    assert_eq!(report["unstaged_count"], 0, "{}", report);
+
+    let (warehouse, _) = merge_stopped_at_a_conflict("abort-ours-back");
+    warehouse.write("film.mkv", OLD_FILM);
+    warehouse.run_ok(&["abort"]);
+    assert_aborted_to_main(&warehouse);
 }
 
 /// A merge's file whose output needs content left out since the merge ran (their `a.txt`,

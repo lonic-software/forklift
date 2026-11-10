@@ -936,6 +936,7 @@ fn tree_names(tree: &str,
 pub struct StagingGuard {
     set: RedactedSet,
     partial: bool,
+    not_checked_out: crate::util::shift_utils::NotCheckedOut,
 
     /// The `@redactions` head `set` was read at.
     head: String,
@@ -956,12 +957,20 @@ pub fn staging_guard() -> Result<Option<StagingGuard>, String> {
 
     let partial = crate::util::scope_utils::content_may_be_absent()?;
 
-    Ok(Some(StagingGuard { set, partial, head }))
+    let not_checked_out = crate::util::shift_utils::NotCheckedOut::read()?;
+
+    Ok(Some(StagingGuard { set, partial, not_checked_out, head }))
 }
 
 impl StagingGuard {
     /// The redacted hash a file of content `hash`, stored as `item_type`, names, if any.
+    /// Content this warehouse leaves out ([`crate::util::shift_utils::NotCheckedOut`]) is judged
+    /// by its hash alone: its recipe is not here to read, and none of its bytes reach the bay.
     pub fn names_file(&self, hash: &str, item_type: DirEntryType) -> Result<Option<String>, String> {
+        if self.not_checked_out.holds(hash)? {
+            return Ok(self.set.hashes.contains(hash).then(|| hash.to_string()));
+        }
+
         let mut skipped = HashSet::new();
 
         self.set.names_file(hash, item_type, &LocalObjects, self.partial.then_some(&mut skipped))
