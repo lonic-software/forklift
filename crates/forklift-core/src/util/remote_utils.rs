@@ -6550,7 +6550,9 @@ async fn lift_pallet_inner(client: &RemoteClient,
     // The remote may answer an object present and then delete it before the ref update: content
     // it owed a deletion. Its closure check then refuses the head as incomplete, and the
     // negotiation, asked again, answers that object missing. So the upload runs once more; the
-    // update after it reports whatever it answers.
+    // update after it reports whatever it answers. The walk again stops at `elsewhere`: a remote
+    // deletes nothing the history of a pallet head or tombstone names but withheld content, which
+    // its closure check tolerates, so what went missing is never below those heads.
     if let Err(refusal) = client.update_ref(pallet, remote_head, local_head, tombstone).await {
         if !is_remote_history_incomplete(&refusal) {
             return Err(refusal);

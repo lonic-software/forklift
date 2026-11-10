@@ -1923,11 +1923,7 @@ impl ClosureRefusal {
 
 impl From<ClosureRefusal> for String {
     fn from(refusal: ClosureRefusal) -> String {
-        match refusal {
-            ClosureRefusal::Incomplete(message)
-            | ClosureRefusal::Withheld(message)
-            | ClosureRefusal::RecordsUnreadable(message) => message,
-        }
+        refusal.message().to_string()
     }
 }
 
