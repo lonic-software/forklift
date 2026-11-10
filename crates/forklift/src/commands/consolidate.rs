@@ -555,12 +555,20 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction],
         MergeAction::ResolveOutOfScope { .. } => None,
     }))?;
 
-    let removals = MergeRemovals(actions.iter()
-        .filter_map(|action| match action {
-            MergeAction::Delete { path } | MergeAction::LeaveOut { path, is_new: false, .. } => Some(path.clone()),
-            _ => None,
-        })
-        .collect());
+    let removals = MergeRemovals {
+        files: actions.iter()
+            .filter_map(|action| match action {
+                MergeAction::Delete { path } | MergeAction::LeaveOut { path, is_new: false, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect(),
+        deleted: actions.iter()
+            .filter_map(|action| match action {
+                MergeAction::Delete { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect(),
+    };
 
     let ledger = inventory_utils::ShardLedger::read()?;
     let mut check = alias_utils::AliasCheck::over(&ledger);
@@ -612,19 +620,24 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction],
     Ok(ledger)
 }
 
-/// The files a merge deletes before it writes (its `Delete` actions).
-struct MergeRemovals(std::collections::HashSet<String>);
+/// The files a merge removes before it writes: its `Delete` actions, and the files it leaves out
+/// over ours. Only a `Delete` also removes the directories it empties.
+struct MergeRemovals {
+    files: std::collections::HashSet<String>,
+    deleted: std::collections::HashSet<String>,
+}
 
 impl alias_utils::Removals for MergeRemovals {
     fn removes_file(&self, key: &str) -> bool {
-        self.0.contains(key)
+        self.files.contains(key)
     }
 
     /// A Delete removes each directory up its own chain once it is empty (see
-    /// `apply_merge_action`), so a directory is removed when some deleted file lies beneath it.
+    /// `apply_merge_action`), so a directory is removed when some deleted file lies beneath it. A
+    /// file left out removes no directory.
     fn removes_directory(&self, key: &str) -> bool {
         let prefix = format!("{}/", key);
-        self.0.iter().any(|path| path.starts_with(&prefix))
+        self.deleted.iter().any(|path| path.starts_with(&prefix))
     }
 }
 
@@ -760,7 +773,7 @@ fn conflict_writes(action: &MergeAction) -> bool {
 /// paths left in conflict. Shared with `cherry-pick`, which applies a parcel's diff through
 /// the same `MergeAction`s.
 ///
-/// Every deletion is applied first, so a directory a write is about to replace (or a file a
+/// Every deletion, and every file left out, is applied first, so a directory a write is about to replace (or a file a
 /// write is about to turn into a directory) is emptied — and, via `apply_merge_action`'s
 /// parent-chain cleanup, itself removed — before that write lands. Writing first would
 /// otherwise fail (`EISDIR`/`EEXIST`) for a tracked type flip in either direction.
