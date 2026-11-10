@@ -156,8 +156,8 @@ pub async fn check_new_origin(client: &RemoteClient,
     let leaned_roots = missing.clone();
     let mut walk = ServerWalk {
         applied: &tolerated.applied, withheld: &withheld, leaned_roots: &leaned_roots, sought,
-        found: HashSet::new(), withheld_chunks: HashMap::new(), seen: HashSet::new(), seen_leaned: HashSet::new(),
-        local: Vec::new(), trees: Vec::new(), recipes: Vec::new(),
+        found: HashSet::new(), leaned_recipes: HashSet::new(), withheld_chunks: HashMap::new(),
+        seen: HashSet::new(), seen_leaned: HashSet::new(), local: Vec::new(), trees: Vec::new(), recipes: Vec::new(),
     };
     for parcel in &parcels {
         walk.local.push((object_utils::load_parcel(parcel)?.tree_hash, false));
@@ -207,6 +207,20 @@ pub async fn check_new_origin(client: &RemoteClient,
     for hash in &walk.found {
         checked.withheld.insert(hash.clone(), withheld[hash.as_str()].to_string());
     }
+    // A chunk of a withheld recipe is held there while another recipe names it, so the new
+    // server, which lists as missing a chunk only withheld recipes name, is asked about the ones
+    // absent here.
+    for recipe in &walk.leaned_recipes {
+        let mut absent = Vec::new();
+        for chunk in object_utils::recipe_chunk_hashes(recipe)? {
+            if !sealed_utils::is_present(&chunk)? {
+                absent.push(chunk);
+            }
+        }
+        if !absent.is_empty() && !client.missing_objects(&absent).await?.is_empty() {
+            checked.withheld.insert(recipe.clone(), withheld[recipe.as_str()].to_string());
+        }
+    }
 
     // What is left the new server does not hold: content it withholds, a chunk only such a
     // recipe names, or anything else, which refuses the move.
@@ -230,9 +244,14 @@ pub async fn check_new_origin(client: &RemoteClient,
     Ok(checked)
 }
 
-/// Whether this warehouse lacks the withheld content `hash`: it does not hold it, or holds it as a
-/// recipe some of whose chunks it does not hold.
+/// Whether this warehouse may lack the withheld content `hash`, so the walk seeks it: it does not
+/// hold it, or holds it as a recipe some of whose chunks it does not hold.
 fn lacks_withheld(hash: &str) -> Result<bool, String> {
+    if !sealed_utils::is_present(hash)? {
+        return Ok(true);
+    }
+
+    // Read whole to learn its type: a blob is at most the whole-object ceiling.
     match crate::util::redaction_utils::stored_type(hash)? {
         None => Ok(true),
         Some(crate::enums::object_type::ObjectType::Recipe) => {
@@ -324,8 +343,9 @@ fn withheld_refusal(url: &str, previous: &str, served: &[&String], statements: &
             url, served.len(), named(served), previous
         ),
         format!(
-            "Keep \"{}\" as the origin while it does not withhold that content, or run \"forklift remote \
-            move {}\" again once it does or no longer answers.",
+            "Keep \"{}\" as the origin while it does not withhold that content, or read that content here \
+            first, so this warehouse no longer relies on its origin for it, then run \"forklift remote move \
+            {}\" again.",
             previous, url
         ),
         serde_json::json!({
@@ -358,6 +378,9 @@ struct ServerWalk<'a> {
     sought: HashSet<String>,
     /// Withheld content absent here met beneath a tree this warehouse leans on.
     found: HashSet<String>,
+    /// Withheld recipes held here met beneath a tree this warehouse leans on: leaned on when the
+    /// new server lacks one of their chunks.
+    leaned_recipes: HashSet<String>,
     /// Each chunk a withheld recipe held here names, to the recipe: not held there unless another
     /// recipe the walk meets names it too.
     withheld_chunks: HashMap<String, String>,
@@ -408,9 +431,12 @@ impl ServerWalk<'_> {
                         self.withheld_chunks.entry(chunk).or_insert_with(|| file.hash.clone());
                     }
                 }
-                if leaned && lacks_withheld(&file.hash)? {
+                // Beneath a tree leaned on: an absent file is leaned on, and a recipe held here is
+                // if the new server lacks one of its chunks, which it is asked once the walk ends.
+                if leaned && !present && self.found.insert(file.hash.clone()) {
                     self.sought.remove(&file.hash);
-                    self.found.insert(file.hash.clone());
+                } else if leaned && present && file.item_type.is_chunked() && self.leaned_recipes.insert(file.hash.clone()) {
+                    self.sought.remove(&file.hash);
                 }
                 continue;
             }
@@ -489,7 +515,7 @@ mod tests {
         let (withheld, roots) = (HashMap::new(), HashSet::new());
         let mut walk = ServerWalk {
             applied: &applied, withheld: &withheld, leaned_roots: &roots, sought: HashSet::new(),
-            found: HashSet::new(), withheld_chunks: HashMap::new(), seen: HashSet::new(), seen_leaned: HashSet::new(),
+            found: HashSet::new(), leaned_recipes: HashSet::new(), withheld_chunks: HashMap::new(), seen: HashSet::new(), seen_leaned: HashSet::new(),
             local: Vec::new(), trees: Vec::new(), recipes: Vec::new(),
         };
         let mut missing: HashSet<String> = HashSet::new();
@@ -530,7 +556,7 @@ mod tests {
         let roots = HashSet::new();
         let walk_of = || ServerWalk {
             applied: &applied, withheld: &withheld, leaned_roots: &roots, sought: HashSet::from([film.clone()]),
-            found: HashSet::new(), withheld_chunks: HashMap::new(), seen: HashSet::new(), seen_leaned: HashSet::new(),
+            found: HashSet::new(), leaned_recipes: HashSet::new(), withheld_chunks: HashMap::new(), seen: HashSet::new(), seen_leaned: HashSet::new(),
             local: Vec::new(), trees: Vec::new(), recipes: Vec::new(),
         };
 
@@ -541,11 +567,13 @@ mod tests {
         assert_eq!(walk.withheld_chunks.get(&lone), Some(&withheld_recipe));
         assert!(walk.found.is_empty(), "nothing is leaned on beneath a tree this warehouse does not lean on");
 
-        // The withheld recipe held here lacks its lone chunk, so beneath a tree leaned on it is
-        // found as well as the absent film.
+        // Beneath a tree leaned on the absent film is found, and the withheld recipe held here is
+        // kept to ask the new server about its absent chunks.
         let mut walk = walk_of();
+        walk.sought.insert(withheld_recipe.clone());
         walk.descend(&tree, true, &mut HashSet::new()).unwrap();
-        assert_eq!(walk.found, HashSet::from([film.clone(), withheld_recipe.clone()]));
+        assert_eq!(walk.found, HashSet::from([film.clone()]));
+        assert_eq!(walk.leaned_recipes, HashSet::from([withheld_recipe.clone()]));
         assert!(walk.sought.is_empty());
 
         // A withheld recipe held here with every chunk is not lacked.
