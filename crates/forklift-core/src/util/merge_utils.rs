@@ -1119,14 +1119,26 @@ fn sort_withheld(pending: &mut Vec<PendingAction>, withheld: WithheldReads) -> R
 /// (`[base, ours, theirs]`). Taking this pallet's own change to the file out leaves the other
 /// side's alone to decide it, which reads nothing: their deletion goes through, their version is
 /// taken, or, when this warehouse leaves that version out too, the file is left out. That needs the
-/// file as it was before, so a base this warehouse leaves out names no way out.
+/// file as it was before; with the base left out, making this pallet's side agree with theirs (the
+/// same version, or deleted too) still reads nothing, unless their version is left out as well.
 fn withheld_way_out(not_checked_out: &shift_utils::NotCheckedOut, path: &str, [base, ours, theirs]: [Option<&str>; 3])
                     -> Result<String, String> {
-    const HOLDER_ONLY: &str = "Only a warehouse that holds the content can make this merge.";
+    const OTHERWISE: &str = "Otherwise only a warehouse that holds the content can make this merge.";
 
     if let Some(base) = base {
         if not_checked_out.holds(base)? {
-            return Ok(HOLDER_ONLY.to_string());
+            return Ok(match theirs {
+                None => format!(
+                    "With \"{}\" deleted on this pallet too, both sides delete it and the merge reads nothing. {}",
+                    path, OTHERWISE
+                ),
+                Some(theirs) if !not_checked_out.holds(theirs)? => format!(
+                    "With this pallet's \"{}\" made the same as the other side's version, which this warehouse \
+                    holds, both sides agree and the merge reads nothing. {}",
+                    path, OTHERWISE
+                ),
+                Some(_) => "Only a warehouse that holds the content can make this merge.".to_string(),
+            });
         }
     }
 
@@ -1141,8 +1153,7 @@ fn withheld_way_out(not_checked_out: &shift_utils::NotCheckedOut, path: &str, [b
         Some(_) => "the merge takes the other side's version",
     };
 
-    Ok(format!("With {}, only the other side changes \"{}\" and {}. Otherwise {}", change, path, outcome,
-        HOLDER_ONLY.replacen("Only", "only", 1)))
+    Ok(format!("With {}, only the other side changes \"{}\" and {}. {}", change, path, outcome, OTHERWISE))
 }
 
 impl Sides {

@@ -568,13 +568,15 @@ fn a_conflict_over_withheld_content_refuses_content_withheld() {
     assert_eq!(paths(&warehouse.stocktake()["unavailable"]), ["extra/new.bin"]);
 }
 
-/// A merge whose base version is left out names no way out: taking one's own change out would
-/// need the file as it was before, which this warehouse does not hold.
+/// A merge whose base version is left out cannot take one's own change out (that needs the file
+/// as it was before), so it names the way out that reads nothing: making this pallet's file the
+/// same as the other side's version, which this warehouse holds. Following it, the merge goes
+/// through.
 ///
-/// Revert: name the way out whatever the base (drop the base check in `withheld_way_out`) → the
-/// next step names taking the change out → red.
+/// Revert: drop the base check in `withheld_way_out` → the next step names taking the change out
+/// → red.
 #[test]
-fn a_merge_whose_base_is_withheld_names_no_way_out() {
+fn a_merge_whose_base_is_withheld_names_matching_theirs() {
     let warehouse = Warehouse::new("refuse-base");
     let base = warehouse.stack_files(&[("a.txt", "a\n"), ("film.mkv", OLD_FILM)], "main");
     warehouse.run_ok(&["pallet", "create", "feature"]);
@@ -591,8 +593,15 @@ fn a_merge_whose_base_is_withheld_names_no_way_out() {
     let output = warehouse.run(&["consolidate", "feature", "--json"]);
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!((output.status.code(), &report["error"]["code"]), (Some(51), &"content_withheld".into()), "{}", report);
-    assert_eq!(report["error"]["next_step"], "Only a warehouse that holds the content can make this merge.", "{}", report);
+    let next_step = report["error"]["next_step"].as_str().unwrap_or_default();
+    assert!(next_step.contains("made the same as the other side's version"), "{}", report);
     assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), "the film on main\n");
+
+    // The way out it names: main's film made the same as feature's, and the merge goes through.
+    let theirs = warehouse.run_ok(&["show", "feature:film.mkv"]);
+    warehouse.stack_files(&[("film.mkv", &String::from_utf8_lossy(&theirs.stdout))], "main takes feature's film");
+    warehouse.run_ok(&["consolidate", "feature"]);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), "the film on feature\n");
 }
 
 /// `consolidate feature` into `main`, stopped at a conflict over `a.txt` (both sides changed it),
