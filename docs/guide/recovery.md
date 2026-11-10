@@ -246,6 +246,13 @@ another remote that holds it, or ask the host about the statement.
 `clone`, `lower` and `scope fetch` do not stop here: they take the history without the content and
 check the head out without the file, which `forklift stocktake` then lists as not checked out.
 
+A command that needs the bytes of such a file refuses with this code too, with the hash and the
+host's statement in `details`: `show` and `blame` of it, a `diff` that prints its lines, a
+`restore` of the file, a merge that must read it, and a `lift` of history naming it to a remote
+that does not withhold it. This warehouse never received the content, so it cannot read it or send
+it anywhere. If you get the same bytes some other way, put them at the path and `forklift load`
+it: the content is known by its hash, so the file is then checked out again.
+
 ### `merge_conflicts` (exit 47)
 
 `lower` merged the remote's diverged head into your pallet, and both sides changed the same paths.

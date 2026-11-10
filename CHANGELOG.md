@@ -160,6 +160,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   auto-merges a diverged remote head takes that history the same way rather than failing with
   `content_withheld`; a merge that would have to read the file refuses with `content_withheld`
   before it changes any file.
+- **Reading a file whose content is withheld says so.** `show`, `blame`, a `diff` that prints the
+  file's lines and a `restore` of it, for a file this warehouse never received because its remote's
+  host withholds the content, now fail with `content_withheld` (exit 51) and the host's statement
+  instead of a missing-object error, and so does a `lift` of such history to another remote. A
+  merge that must read such a file now says the way out: take your own change to it out, and the
+  merge leaves the file out. `--json` schema is now 39.
 - **`consolidate` and `pick` take a file whose content is withheld.** A merge or pick that takes
   the other side's version of a file whose content this warehouse does not hold because the
   remote's host withholds it no longer fails reading it: the file is left out, its old version is

@@ -85,7 +85,14 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 38** (current): `stocktake` carries `unavailable_count` and `unavailable`, the files
+**Schema 39** (current): `content_withheld` (exit 51) is also returned by a read that needs a file's
+content this warehouse never received because its remote's host withholds it (the `unavailable`
+record): `show`, `blame`, a `diff` showing changes, `restore` of the file, and a `lift` to a remote
+that does not withhold it. Such a refusal carries `details.hash` and `details.statement`, since the
+read is of an object, not a path. A merge's refusal also carries `details.path`, and its
+`next_step` now names taking this pallet's own change to the file out.
+
+**Schema 38**: `stocktake` carries `unavailable_count` and `unavailable`, the files
 the head names that are not checked out because the remote's host withholds their content and this
 warehouse lacks it (both absent when none). They are no longer counted in `unstaged`.
 
