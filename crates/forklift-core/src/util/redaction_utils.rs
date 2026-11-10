@@ -936,7 +936,8 @@ fn tree_names(tree: &str,
 pub struct StagingGuard {
     set: RedactedSet,
     partial: bool,
-    not_checked_out: crate::util::shift_utils::NotCheckedOut,
+    /// Read on the first file the store does not hold.
+    not_checked_out: std::cell::OnceCell<crate::util::shift_utils::NotCheckedOut>,
 
     /// The `@redactions` head `set` was read at.
     head: String,
@@ -957,23 +958,33 @@ pub fn staging_guard() -> Result<Option<StagingGuard>, String> {
 
     let partial = crate::util::scope_utils::content_may_be_absent()?;
 
-    let not_checked_out = crate::util::shift_utils::NotCheckedOut::read()?;
-
-    Ok(Some(StagingGuard { set, partial, not_checked_out, head }))
+    Ok(Some(StagingGuard { set, partial, not_checked_out: std::cell::OnceCell::new(), head }))
 }
 
 impl StagingGuard {
     /// The redacted hash a file of content `hash`, stored as `item_type`, names, if any.
     /// Content this warehouse leaves out ([`crate::util::shift_utils::NotCheckedOut`]) is judged
-    /// by its hash alone: its recipe is not here to read, and none of its bytes reach the bay.
+    /// by its hash alone, as a partial warehouse judges a recipe it does not hold: the recipe is
+    /// not here, so a chunk-list redaction cannot be matched against it, and this warehouse cannot
+    /// hand its bytes on. A head that receives the parcel judges it against its own redactions.
     pub fn names_file(&self, hash: &str, item_type: DirEntryType) -> Result<Option<String>, String> {
-        if self.not_checked_out.holds(hash)? {
+        if !file_utils::does_object_exist(hash)? && self.not_checked_out()?.holds(hash)? {
             return Ok(self.set.hashes.contains(hash).then(|| hash.to_string()));
         }
 
         let mut skipped = HashSet::new();
 
         self.set.names_file(hash, item_type, &LocalObjects, self.partial.then_some(&mut skipped))
+    }
+
+    fn not_checked_out(&self) -> Result<&crate::util::shift_utils::NotCheckedOut, String> {
+        if let Some(read) = self.not_checked_out.get() {
+            return Ok(read);
+        }
+
+        let read = crate::util::shift_utils::NotCheckedOut::read()?;
+
+        Ok(self.not_checked_out.get_or_init(|| read))
     }
 
     /// The first file under `tree` naming redacted content, as its path from the tree's root and

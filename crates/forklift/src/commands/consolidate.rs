@@ -557,7 +557,7 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction],
 
     let removals = MergeRemovals(actions.iter()
         .filter_map(|action| match action {
-            MergeAction::Delete { path } => Some(path.clone()),
+            MergeAction::Delete { path } | MergeAction::LeaveOut { path, is_new: false, .. } => Some(path.clone()),
             _ => None,
         })
         .collect());
@@ -658,6 +658,10 @@ pub(crate) fn keep_aliased_files(actions: &mut Vec<MergeAction>,
     }).collect();
 
     let kept = shift_utils::kept_through_aliases(&our_tree, &removed, &planned, scope)?;
+
+    if kept.is_empty() {
+        return Ok(());
+    }
 
     // A kept file whose content is left out stays out: nothing to write, its entry staged as it was.
     let not_checked_out = shift_utils::NotCheckedOut::read()?;
@@ -792,13 +796,17 @@ fn apply_merge_actions_to(ledger: &inventory_utils::ShardLedger,
                           batch: &mut inventory_utils::ShardMutationBatch,
                           conflict_paths: &mut Vec<String>) -> Result<(), String> {
     // The batch writes nothing before it publishes, so `ledger` stays the registered set throughout.
+    // A file left out removes ours with the deletions, before any write: on a case-folding volume
+    // it may share its disk file with a fold-equal path written below.
+    let removes = |action: &MergeAction| matches!(action, MergeAction::Delete { .. } | MergeAction::LeaveOut { .. });
+
     for action in actions {
-        if matches!(action, MergeAction::Delete { .. }) {
+        if removes(action) {
             apply_merge_action(ledger, action, None, batch, conflict_paths)?;
         }
     }
 
-    let writes: Vec<&MergeAction> = actions.iter().filter(|action| !matches!(action, MergeAction::Delete { .. })).collect();
+    let writes: Vec<&MergeAction> = actions.iter().filter(|action| !removes(action)).collect();
 
     // Their blobs load ahead on worker threads while the writes land here, in order.
     shift_utils::write_in_order(&writes, |action| match action {
