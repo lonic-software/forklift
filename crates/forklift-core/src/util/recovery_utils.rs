@@ -2912,12 +2912,11 @@ fn unconsulted(why: CoreError) -> RemoteConsultation {
 /// **Pass 1 — every pallet's remote head** ([`remote_utils::fetch_history_scoped`]/
 /// [`remote_utils::fetch_meta_history`], the exact functions `lower.rs:78`/`adopt_meta_pallets` call;
 /// meta pallets unscoped, mirroring `adopt_meta_pallets` — their own audit reads full content, so
-/// a sparse fetch scope must never prune them). Its job is **not primarily to land
-/// `candidate_hashes`' own bytes** — it is to bring each pallet's *actual, current* history
-/// locally up to date before the caller's `closure_references_any` runs, so that check sees every
-/// pallet's real history rather than a stale local ref: without this, a hash referenced only from
-/// a pallet's not-yet-locally-known newer history could be misclassified "unreferenced" (safe to
-/// drop) purely because this warehouse never looked far enough. A pallet whose remote head has
+/// a sparse fetch scope must never prune them). It lands the objects of each pallet's remote
+/// history that the store lacks, `candidate_hashes` among them where that history names them. It
+/// moves no ref, and the caller's `closure_references_any` walks the local roots only, so history
+/// it lands that no local ref names does not widen that check: a hash only such history
+/// references is judged by what the local refs name, as before the fetch. A pallet whose remote head has
 /// diverged from its local counterpart (`lower.rs:89-97`'s own check) needs no special-case skip
 /// here: unlike `lower`, this function never calls `update_pallet_head` or merges anything — it only
 /// ever stores content-addressed objects, so there is no ref-move decision for divergence to gate.
@@ -2974,11 +2973,9 @@ async fn attempt_heal_driven_refetch(
 
     match client.fetch_info().await {
         Ok(info) => {
-            // A user pallet's history comes down without content the remote's host withholds,
-            // as a lower's does, which records what this warehouse lacks of it unavailable: a
-            // walk that asked for it would be refused whole and leave the pallet's newer history
-            // unseen by the caller's reference check.
-            client.leave_out_withheld(&info);
+            // No opt-in to leaving out content the remote's host withholds: such a walk records
+            // what it leaves out unavailable, and heal must not turn damage to an object this
+            // warehouse held into a tolerated withholding.
 
             // A user pallet's history fetch needs the fetch scope; one this build cannot read
             // skips those fetches, never widens them to the whole remote. The meta pallets and

@@ -3428,14 +3428,33 @@ fn a_lift_auto_merges_a_head_naming_withheld_content_without_it() {
     left_out_film(&warehouse, &takedown);
 }
 
-/// Heal's refetch of a damaged object takes every pallet's newer remote history without content
-/// the remote's host withholds, so the history comes down and what this warehouse lacks of it is
-/// recorded unavailable; the damaged object is fetched back.
+/// A lift whose auto-merge would have to read content the remote's host withholds is not
+/// auto-merged: it stops with the diverged error, as an overlap does, and leaves the bay as it was.
 ///
-/// Revert: drop heal's opt-in to leaving withheld content out → the history fetch is refused
-/// whole and nothing is recorded.
+/// Revert: let the merge's `content_withheld` refusal through → the lift fails with that code.
 #[test]
-fn heal_refetches_history_naming_withheld_content_without_it() {
+fn a_lift_whose_merge_must_read_withheld_content_stops_diverged() {
+    let mut takedown = takedown("lift-overlap");
+    let warehouse = takedown.writer("takedown-lift-overlap", &[]);
+    warehouse.stack("media/film.mkv", b"our film\n", "our film");
+    takedown.withhold_new_film(false);
+    let (ours, theirs) = (warehouse.head("main"), takedown.server.main());
+
+    let lifted = warehouse.json(&["lift"]);
+    assert_eq!(lifted["ok"], false, "{}", lifted);
+    assert_eq!(lifted["error"]["code"], "diverged", "{}", lifted);
+    assert_eq!(warehouse.head("main"), ours, "no merge is stacked");
+    assert_eq!(takedown.server.main(), theirs, "nothing is lifted");
+    assert_eq!(std::fs::read(warehouse.root.join("media/film.mkv")).unwrap(), b"our film\n");
+}
+
+/// Heal fetches a damaged object back from a remote whose host withholds other content, and
+/// records none of that content unavailable: heal repairs this warehouse's own store, and a
+/// withholding it recorded could stand in for the very damage it was asked to repair.
+///
+/// Revert: opt heal's refetch in to leaving withheld content out → the film is recorded.
+#[test]
+fn heal_fetches_a_damaged_object_back_without_recording_withheld_content() {
     let mut takedown = takedown("heal-refetch");
     let warehouse = Warehouse::cloned("takedown-heal-refetch", &takedown.server.url);
     takedown.withhold_new_film(false);
@@ -3450,7 +3469,12 @@ fn heal_refetches_history_naming_withheld_content_without_it() {
     let healed = warehouse.json(&["heal"]);
     assert_eq!(healed["ok"], true, "{}", healed);
     assert!(warehouse.holds_loose(&trailer), "the damaged object is fetched back");
-    assert!(warehouse.holds_loose(&takedown.server.main()), "the remote's newer history came down");
     assert_eq!(warehouse.head("main"), takedown.old, "heal moves no ref");
-    recorded_film(&warehouse, &takedown);
+    assert!(!warehouse.holds_loose(&takedown.film), "the store holds no copy of the withheld film");
+
+    let record = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        forklift_core::util::unavailable::read_unavailable().unwrap().entries().count()
+    };
+    assert_eq!(record, 0, "heal records no withheld content unavailable");
 }
