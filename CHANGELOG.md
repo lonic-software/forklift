@@ -129,6 +129,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   the history without them. The result lists what was left out, with the host's statement, as
   `withheld`. `--json` schema is now 35.
 
+- **A lift uploads again when the remote deletes content under it.** A server or the AWS head
+  that answers content present and then deletes it, as content it owed a deletion, before the lift
+  moves the pallet now refuses the move with `remote_history_incomplete` (exit 52) instead of an
+  uncoded error. A lift refused that way asks again what the remote lacks, uploads it, and tries
+  the move once more; a second refusal fails the lift with that code. `--json` schema is now 36.
+
 - **`remote move` knows what the new origin withholds.** A cache or sparse warehouse moving to a
   server whose host withholds content it relies on its origin for no longer counts that content as
   held there. The move asks the previous origin: while that origin answers and does not withhold
