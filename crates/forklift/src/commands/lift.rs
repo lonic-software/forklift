@@ -48,6 +48,10 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
         // lacks; another could fail late at its closure check over objects never verified there.
         let client = RemoteClient::for_warehouse()?;
         let info = client.fetch_info().await?;
+        // The auto-merge's fetch below takes their history without content the remote's host
+        // withholds, as a lower does; the merge leaves such a file out, or refuses if it must
+        // read it.
+        client.leave_out_withheld(&info);
 
         // The upload lifts the pallet's ref; only the auto-merge below works from this bay's files.
         let position = pallet_utils::read_position()?;

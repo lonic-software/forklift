@@ -2974,6 +2974,12 @@ async fn attempt_heal_driven_refetch(
 
     match client.fetch_info().await {
         Ok(info) => {
+            // A user pallet's history comes down without content the remote's host withholds,
+            // as a lower's does, which records what this warehouse lacks of it unavailable: a
+            // walk that asked for it would be refused whole and leave the pallet's newer history
+            // unseen by the caller's reference check.
+            client.leave_out_withheld(&info);
+
             // A user pallet's history fetch needs the fetch scope; one this build cannot read
             // skips those fetches, never widens them to the whole remote. The meta pallets and
             // the hash-addressed passes below need no scope and still run, and whatever stays
