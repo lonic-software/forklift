@@ -114,11 +114,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// before it answers.
     ///
     /// # Returns
-    /// * `Ok(Withholding)` - Every item, settled.
+    /// * `Ok(Withholding)` - Every item, settled, but for one whose object's header cannot be
+    ///                       read: that one stays unsettled and applies, refusing only its own
+    ///                       hash, and journals no recipe.
     /// * `Err(HeadError)`  - The items could not be listed or one cannot be read (`500`), or one
-    ///                       was not settled within this request (`503`, with `Retry-After`). An
-    ///                       item whose object's header cannot be read stays unsettled and applies,
-    ///                       refusing only its own hash.
+    ///                       was not settled within this request (`503`, with `Retry-After`).
     pub(super) fn withholding(&self) -> HeadResult<Withholding> {
         let mut budget = self.scan_budget();
         let mut items = Vec::new();
@@ -182,7 +182,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // redaction's does: a tree or a chunk of that hash a lift uploads later is refused, and
             // the lift fails rather than landing without it. A header this build cannot read is
             // never guessed at: the item stays unsettled, so it applies and only its own hash is
-            // refused, and each request logs it.
+            // refused, and each request reads and logs it again. The canonical store holds only
+            // objects the verifier parsed, so this is a damaged object, which stays loud until it
+            // is repaired.
             let bytes = match self.objects.get(&hash) {
                 Ok(bytes) => bytes,
                 Err(error) => return Ok(Settled::Unsettled(format!(
