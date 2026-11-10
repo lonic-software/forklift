@@ -205,8 +205,10 @@ fn a_head_move_leaves_unavailable_content_out_and_the_bay_clean() {
 /// of it as lost.
 ///
 /// Revert: let the load's carry-over, or its pass over a directory gone from disk, stage it
-/// `Deleted` → stocktake reports a removal and the stacked tree lacks it → red; leave the record out of the staged-content check → `stack`
-/// refuses → red; let the audit walk report a staged unavailable leaf → heal fails → red.
+/// `Deleted` → stocktake reports a removal and the stacked tree lacks it → red. The staged-content
+/// check sees nothing here, since the head names the same hashes; see
+/// [`a_soft_reset_restacks_a_file_not_checked_out`]. The audit walk's own boundary is pinned in
+/// `recovery_utils`'s unit tests: plain `heal` runs it only over a torn taint.
 #[test]
 fn a_load_and_a_stack_keep_a_file_not_checked_out() {
     let (warehouse, feature) = withheld_feature("load");
@@ -308,5 +310,59 @@ fn a_file_put_back_a_removal_and_a_directory_end_a_file_not_checked_out() {
         ("added".to_string(), "extra/new.bin/inner.txt".to_string()),
         ("removed".to_string(), "extra/new.bin".to_string()),
         ("removed".to_string(), "film.mkv".to_string()),
+    ], "{}", report);
+}
+
+/// A soft reset keeps an entry not checked out staged while the head moves back past the parcel
+/// that named it, so the next `stack` stages content this warehouse lacks: the record holds it,
+/// and the stack names it at the same hash rather than refusing.
+///
+/// Revert: leave the record out of the staged-content check → `stack` refuses → red.
+#[test]
+fn a_soft_reset_restacks_a_file_not_checked_out() {
+    let (warehouse, feature) = withheld_feature("undo");
+
+    warehouse.run_ok(&["undo"]);
+    assert!(!warehouse.exists("film.mkv"), "undoing the shift back to main leaves the file out again");
+    warehouse.run_ok(&["undo"]);
+    assert_ne!(warehouse.head(), feature, "the stack that named the withheld content is undone");
+    assert!(!warehouse.exists("film.mkv") && !warehouse.exists("extra/new.bin"));
+
+    warehouse.run_ok(&["stack", "-m", "again"]);
+    let head = warehouse.head();
+    warehouse.scoped(|| {
+        for path in ["film.mkv", "extra/new.bin"] {
+            assert_eq!(file_hash(&head, path), file_hash(&feature, path), "{} is named as before", path);
+        }
+    });
+    assert_eq!(paths(&warehouse.stocktake()["unavailable"]), ["extra/new.bin", "film.mkv"]);
+}
+
+/// A file put at a path not checked out is a change before any load: a shift away refuses rather
+/// than remove the only copy of it, even when its bytes are the withheld content. A file standing
+/// where a directory of entries not checked out was stages their removal.
+///
+/// Revert: compare the file by its entry's hash → the shift takes it for the head's content and
+/// overwrites it → red; take a file at the directory's path for no obstacle → the entry under it
+/// stays and no removal is staged → red.
+#[test]
+fn a_file_put_back_is_a_change_and_a_file_over_a_directory_ends_its_entries() {
+    let (warehouse, _) = withheld_feature("put-back-unloaded");
+    warehouse.run_ok(&["shift", "feature"]);
+
+    warehouse.write("film.mkv", WITHHELD_FILM);
+    let refused = warehouse.run(&["shift", "main"]);
+    assert!(!refused.status.success(), "the shift must refuse over the put-back file");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), WITHHELD_FILM);
+
+    let (warehouse, _) = withheld_feature("file-over-dir");
+    warehouse.run_ok(&["shift", "feature"]);
+    warehouse.write("extra", "a file now\n");
+    warehouse.run_ok(&["load", "."]);
+    let report = warehouse.stocktake();
+    assert_eq!(paths(&report["unavailable"]), ["film.mkv"], "{}", report);
+    assert_eq!(changes(&report["staged"]), [
+        ("added".to_string(), "extra".to_string()),
+        ("removed".to_string(), "extra/new.bin".to_string()),
     ], "{}", report);
 }

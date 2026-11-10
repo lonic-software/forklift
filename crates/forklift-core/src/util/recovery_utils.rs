@@ -4098,6 +4098,41 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A staged entry not checked out names content the unavailable record holds, so its absence
+    /// is no loss, while a sealed staged object beside it still is. Mutation: check every staged
+    /// leaf against no record → the unavailable one is reported too → red.
+    #[test]
+    fn a_staged_object_the_unavailable_record_holds_is_no_loss() {
+        let (dir, _scope) = enter_temp_root("unavailable-staged");
+        let (sealed, withheld) = ("c".repeat(64), "e".repeat(64));
+        seal(&[&sealed]);
+        crate::util::unavailable::record([(withheld.clone(), "Withheld by the remote's host.".to_string())]).unwrap();
+        let record = sealed_utils::read_tolerated().unwrap();
+
+        let roots = WalkRoots {
+            parcels: Vec::new(),
+            meta_heads: Vec::new(),
+            tag_subjects: Vec::new(),
+            tags_unread: None,
+            pin_parcels: Vec::new(),
+            haul_heads: Vec::new(),
+            tombstone_heads: Vec::new(),
+            mirror_roots: Vec::new(),
+            shard_referenced: vec![(sealed.clone(), DirEntryType::Normal), (withheld, DirEntryType::Normal)],
+            degraded_sources: Vec::new(),
+        };
+        let mut reported: BTreeSet<String> = BTreeSet::new();
+        {
+            let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
+            walk_closure_for(
+                &BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::full(), Some(&record), Some(&mut sink),
+            ).unwrap();
+        }
+        assert_eq!(reported, [sealed].into_iter().collect::<BTreeSet<String>>());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// FORK-133: a sealed-object record that cannot be read is a degraded source, so the rescan
     /// refuses rather than clearing on a walk that cannot tell held from lost; the walk itself
     /// holds nothing. Mutation: propagate the read error → `Err` → red; or ignore it with no note →
