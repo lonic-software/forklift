@@ -630,3 +630,42 @@ fn a_resolved_merge_keeps_the_files_it_left_out() {
     assert_eq!(paths(&report["unavailable"]), ["extra/new.bin", "film.mkv"], "{}", report);
     assert_eq!((&report["staged_count"], &report["unstaged_count"]), (&0.into(), &0.into()), "{}", report);
 }
+
+/// A read that needs the bytes of a file not checked out refuses `content_withheld`, carrying the
+/// hash and the host's statement, rather than reporting a missing object: `show`, `blame`, a `diff`
+/// between revisions that prints its lines, and a `restore` of that file. A `diff --json` lists the
+/// change without reading the bytes, and the same reads of content this warehouse holds succeed.
+///
+/// Revert: drop the read path's unavailable arm (`unavailable::absent_read_refusal`) → each read
+/// fails with a raw missing-object error and no code → red.
+#[test]
+fn a_read_of_a_file_not_checked_out_refuses_content_withheld() {
+    let (warehouse, feature) = withheld_feature("reads");
+    let withheld = warehouse.scoped(|| file_hash(&feature, "film.mkv"));
+    warehouse.run_ok(&["shift", "feature"]);
+
+    let reads: [&[&str]; 3] = [
+        &["show", "feature:film.mkv"],
+        &["blame", "film.mkv"],
+        &["restore", "film.mkv"],
+    ];
+    for args in reads {
+        let output = warehouse.run(&[args, &["--json"]].concat());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+        assert_eq!(output.status.code(), Some(51), "{:?}: {}{}", args, report, String::from_utf8_lossy(&output.stderr));
+        assert_eq!(report["error"]["code"], "content_withheld", "{:?}: {}", args, report);
+        assert_eq!(report["error"]["details"]["hash"], withheld.as_str(), "{:?}: {}", args, report);
+        assert_eq!(report["error"]["details"]["statement"], "Withheld by the remote's host.", "{:?}: {}", args, report);
+    }
+
+    let diff = warehouse.run(&["diff", "main", "feature", "film.mkv"]);
+    let stderr = String::from_utf8_lossy(&diff.stderr);
+    assert_eq!(diff.status.code(), Some(51), "{}{}", String::from_utf8_lossy(&diff.stdout), stderr);
+    assert!(stderr.contains("Withheld by the remote's host."), "{}", stderr);
+    let listed = warehouse.run_ok(&["diff", "main", "feature", "--json"]);
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("film.mkv"));
+
+    let shown = warehouse.run_ok(&["show", "main:film.mkv"]);
+    assert_eq!(String::from_utf8_lossy(&shown.stdout), OLD_FILM);
+    warehouse.run_ok(&["blame", "a.txt"]);
+}

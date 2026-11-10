@@ -134,6 +134,31 @@ pub fn absent_count() -> Result<usize, String> {
     Ok(absent)
 }
 
+/// The `content_withheld` refusal of a read that found `hash` held nowhere in the store, when it is
+/// absent because the record lists it: this warehouse's remote withholds the content, so the read
+/// is refused with the host's statement rather than reported as a missing object. `details` carries
+/// the hash and the statement.
+///
+/// # Returns
+/// * `Ok(Some(String))` - The refusal: the record lists `hash`.
+/// * `Ok(None)`         - It does not; the absence is the caller's to report.
+/// * `Err(String)`      - The record cannot be read (see [`read_unavailable`]).
+pub(crate) fn absent_read_refusal(hash: &str) -> Result<Option<String>, String> {
+    let record = read_unavailable()?;
+    let Some(statement) = record.statement(hash) else { return Ok(None) };
+
+    Ok(Some(crate::error::CoreError::refusal_with_details(
+        crate::error::RefusalCode::ContentWithheld,
+        format!(
+            "Cannot read object {}: the host of this warehouse's remote withholds it, and this \
+            warehouse does not hold it. The host's statement: {}",
+            hash, statement
+        ),
+        "The remote cannot supply the content; only a warehouse that holds it can read it.",
+        serde_json::json!({ "hash": hash, "statement": statement }),
+    ).into()))
+}
+
 /// Write `set` whole as the record, or remove the record when `set` is empty. The caller holds the
 /// ref lock and read `set` under it.
 fn write_locked(_lock: &RefLock, set: &UnavailableSet) -> Result<(), String> {
