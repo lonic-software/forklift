@@ -3220,7 +3220,8 @@ fn recorded_film(warehouse: &Warehouse, takedown: &Takedown) {
 ///
 /// Revert: leave the withheld hashes out of the fetch's skip set → every clone is refused with
 /// `content_withheld`. Revert: record nothing after the fetch → the full clone's head check is
-/// refused as incomplete. Revert: open the scope fetch without the remote's withheld list → the
+/// refused as incomplete. Revert: refuse what the fetch left out as withheld as an unapplied
+/// redaction → the full clone is refused as redacted. Revert: open the scope fetch without the remote's withheld list → the
 /// widening is refused with `content_withheld`.
 #[test]
 fn a_clone_checks_out_a_head_naming_withheld_content_without_it() {
@@ -3256,8 +3257,7 @@ fn a_clone_checks_out_a_head_naming_withheld_content_without_it() {
 /// version and leaves the new one out, recorded unavailable, in a full warehouse and in a cache.
 /// The film is chunked, so a cache's presence phase meets an absent recipe it must not read.
 ///
-/// Revert: refuse the lower's unapplied skips for withheld hashes too → the lower is refused as
-/// redacted. Revert: let a cache's presence phase fetch what the unavailable record lists → the
+/// Revert: let a cache's presence phase fetch what the unavailable record lists → the
 /// cache's lower fails reading the absent recipe.
 #[test]
 fn a_lower_to_a_head_naming_withheld_content_takes_it_without_it() {
@@ -3278,12 +3278,12 @@ fn a_lower_to_a_head_naming_withheld_content_takes_it_without_it() {
     }
 }
 
-/// A lower to a head naming withheld content, interrupted after its ref write, is finished by
-/// heal without the content: the head stays the remote's, and the film stays recorded unavailable
-/// rather than taken for a removal or fetched.
+/// A lower to a head naming withheld content, interrupted after its ref write and before it
+/// removed the old version, is finished by heal without the content: the head stays the remote's,
+/// the old version is removed, and the film stays recorded unavailable rather than taken for a
+/// removal or fetched.
 ///
-/// Revert: let the roll-forward's presence phase fetch what the unavailable record lists → heal
-/// fails on the withheld film.
+/// Revert: let heal's put-back write the left-out file as a new one → the old film stays.
 #[test]
 fn heal_finishes_an_interrupted_lower_to_a_head_naming_withheld_content() {
     use forklift_core::util::{audit_utils, operation_utils, pallet_utils};
@@ -3317,6 +3317,9 @@ fn heal_finishes_an_interrupted_lower_to_a_head_naming_withheld_content() {
         operation_utils::raise(&operation).unwrap();
         operation_utils::forget_raised_for_tests();
     }
+
+    // The crash came before the lower removed the old version.
+    std::fs::write(warehouse.root.join("media/film.mkv"), b"the old film\n").unwrap();
 
     let healed = warehouse.json(&["heal"]);
     assert_eq!(healed["ok"], true, "{}", healed);
