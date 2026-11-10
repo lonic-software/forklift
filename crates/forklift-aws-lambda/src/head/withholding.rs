@@ -116,6 +116,10 @@ fn deleted(item: &WithheldItem) -> bool {
     !item.kept && item.swept && item.deleted && (!item.recipe || item.recipe_deleted)
 }
 
+/// How long, in seconds, an item whose deletion step failed waits before a request takes it
+/// again, leaving the requests between to the other items.
+const FAILED_STEP_BACKOFF: u64 = 60;
+
 /// Whether `item` is owed a deletion step at `now`: its staged copies are not swept yet, or its
 /// late step is due and not done.
 fn owed(item: &WithheldItem, now: u64) -> bool {
@@ -155,8 +159,9 @@ enum Keepers {
     /// Nothing does: its canonical copy may go.
     None,
 
-    /// The walk has not finished within this request, for this reason; it is saved.
-    Stopped(String),
+    /// The walk has not finished within this request, for this reason; it is saved. `failed`
+    /// when an object it needs could not be read, rather than the budget running out.
+    Stopped { why: String, failed: bool },
 }
 
 /// Walk the tree `root` and every tree under it not in `trees`, adding each to `trees`, and
@@ -369,14 +374,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     fn advance_withheld_deletion(&self, withholding: &mut Withholding, budget: &mut Budget) {
         let now = epoch_seconds(SystemTime::now());
 
-        // One owed item, turned by the clock, so an item whose step keeps failing never keeps
-        // the others from theirs.
-        let mut owing: Vec<&mut Listed> = withholding.items.iter_mut().filter(|listed| owed(&listed.item, now)).collect();
-        if owing.is_empty() {
+        // A step that failed leaves its lease to run out ([`FAILED_STEP_BACKOFF`]), so an item whose
+        // step keeps failing never keeps the others from theirs.
+        let Some(listed) = withholding.items.iter_mut().find(|listed| owed(&listed.item, now)) else {
             return;
-        }
-        let turn = (now % owing.len() as u64) as usize;
-        let listed = owing.swap_remove(turn);
+        };
 
         if !budget.timely() {
             return;
@@ -423,7 +425,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let deleted = self.delete_withheld_copies(hash, &leased, late, budget);
         let next = match &deleted {
             Ok(Some(kept)) => WithheldItem { swept: true, kept: *kept, deleted: late, lease_until: None, ..leased.clone() },
-            Ok(None) | Err(_) => WithheldItem { lease_until: None, ..leased.clone() },
+            Ok(None) => WithheldItem { lease_until: None, ..leased.clone() },
+            Err(_) => WithheldItem { lease_until: Some(now + FAILED_STEP_BACKOFF), ..leased.clone() },
         };
 
         // Lost, the lease simply runs out, and the first request after it takes the step again.
@@ -457,7 +460,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     self.objects.delete_canonical(hash).map_err(HeadError::internal)?;
                     false
                 }
-                Keepers::Stopped(why) => {
+                Keepers::Stopped { why, failed: true } => return Err(HeadError::internal(why)),
+                Keepers::Stopped { why, failed: false } => {
                     eprintln!("forklift-aws-lambda: {}", why);
                     return Ok(None);
                 }
@@ -512,11 +516,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             }
         });
 
-        let why = match stepped {
+        let (why, failed) = match stepped {
             Ok(Some(true)) => return Ok(Keepers::Named),
             Ok(Some(false)) => return Ok(Keepers::None),
-            Ok(None) => format!("The walk for whether meta history names withheld content {} has not finished yet.", hash),
-            Err(why) => format!("Whether meta history names withheld content {} cannot be told yet: {}", hash, why),
+            Ok(None) => (format!("The walk for whether meta history names withheld content {} has not finished yet.", hash), false),
+            Err(why) => (format!("Whether meta history names withheld content {} cannot be told yet: {}", hash, why), true),
         };
 
         // A walk the budget stopped between heads resumes at the next one. A stop is never read
@@ -525,14 +529,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             Some(walk) => walk,
             None => match heads.pop() {
                 Some(head) => HoldingWalk::of_history(&head),
-                None => return Ok(Keepers::Stopped(why)),
+                None => return Ok(Keepers::Stopped { why, failed }),
             },
         };
         let bytes = serde_json::to_vec(&SavedKeepers { version: WORK_VERSION, heads, walk })
             .map_err(|error| HeadError::internal(format!("encoding a withheld item's walk failed: {}", error)))?;
         self.objects.work_put(&name, &bytes).map_err(HeadError::internal)?;
 
-        Ok(Keepers::Stopped(why))
+        Ok(Keepers::Stopped { why, failed })
     }
 
     /// Every head whose history may name content a meta cell is verified by: each meta pallet's,

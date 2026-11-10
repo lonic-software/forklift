@@ -6954,3 +6954,38 @@ fn a_meta_update_newly_naming_withheld_content_is_refused_451() {
     head.ref_update(&Principal::Static, "@kv", &RefUpdateRequest { old_head: None, new_head: heads[0].clone(), tombstone: None })
         .expect("the kv marker withheld, the pallet is still created");
 }
+
+/// An item whose deletion step keeps failing waits before it is taken again, so the requests
+/// between take the other items' steps: one never starves the rest.
+// Revert: clear the lease of a failed step → every request takes the failing item first → red.
+#[test]
+fn a_withheld_item_whose_step_fails_never_starves_another() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let main = gate_parcel(&head, &[], vec![gate_file(&head, "a", "first\n"), gate_file(&head, "b", "second\n")]);
+    plant(&head.refs, "main", &main);
+    let mut hashes = [blob_hash("first\n"), blob_hash("second\n")];
+    hashes.sort();
+    let [failing, other] = hashes;
+    for hash in [&failing, &other] {
+        withhold(&head, hash);
+    }
+    served_withheld(&head);
+    served_withheld(&head);
+    for hash in [&failing, &other] {
+        age_withheld(&head.refs, hash, LATE_SWEEP_AFTER + 40);
+    }
+
+    // The first item's saved walk reaches a parcel the store lacks: its step fails every time.
+    let missing = object_utils::hash_object_bytes(b"a parcel this store never had");
+    let walk = format!(r#"{{"version":1,"heads":[],"walk":{{"history":true,"frontier":[["{}",true]],"visited":[]}}}}"#, missing);
+    head.objects.work_put(&format!("withheld-{}/keepers", failing), walk.as_bytes()).expect("work");
+
+    for _ in 0..4 {
+        served_withheld(&head);
+    }
+    let item = withheld_item(&head, &failing);
+    assert!(!item.deleted && item.lease_until.is_some(), "the failing step waits: {:?}", item);
+    assert!(withheld_item(&head, &other).deleted, "the other item's step ran");
+    assert!(!head.objects.exists(&other).expect("exists"));
+    assert!(head.objects.exists(&failing).expect("exists"), "an unfinished walk deletes nothing");
+}
