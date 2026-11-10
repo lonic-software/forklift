@@ -85,7 +85,11 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 34** (current): `store evict`'s result and `scope prune`'s (and the preview a
+**Schema 35** (current): `lift`'s result carries `withheld`, the content the lifted history names
+that the remote's host withholds, so it was not uploaded (each `hash`, and the host's `statement`
+when the handshake lists it; absent when none).
+
+**Schema 34**: `store evict`'s result and `scope prune`'s (and the preview a
 `confirmation_required` refusal carries) carry `kept_withheld`, the objects kept because the
 remote's host withholds them or content beneath them.
 

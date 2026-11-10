@@ -123,6 +123,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   takedown, since the remote may not serve it again; the folders above it stay with it, and both
   reports count what was kept in `kept_withheld`. `--json` schema is now 34.
 
+- **A lift leaves out content its remote withholds, and says so.** A lift no longer offers
+  content the remote's host withholds, nor the chunks of a withheld chunked file (a chunk another
+  file shares is still sent), since the remote takes the history without them. The result lists
+  what was left out, with the host's statement, as `withheld`. `--json` schema is now 35.
+
 - **`remote move` knows what the new origin withholds.** A cache or sparse warehouse moving to a
   server whose host withholds content it relies on its origin for no longer counts that content as
   held there. The move asks the previous origin: while that origin answers and does not withhold
