@@ -1161,11 +1161,6 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 }
             }
 
-            // A meta pallet's update newly names no withheld content its late step may delete.
-            if is_meta {
-                self.refuse_meta_naming_withheld(&request.new_head, request.old_head.as_deref(), &MirroredObjects::new(&self.objects))?;
-            }
-
             // Every head a user pallet takes can be checked out, judged against the old head or a
             // creation against the tombstone this warehouse stores, never the request's tombstone
             // field; the order and the rule are `forklift-server`'s. The base's trees are read
@@ -1247,6 +1242,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     )
                     .map_err(|refusal| HeadError::unprocessable(String::from(refusal)))?;
                 }
+            }
+
+            // 4. A meta pallet's update newly names no withheld content its late step may delete:
+            // after the trust and rules checks, so an update they refuse is answered by them.
+            if is_meta {
+                self.refuse_meta_naming_withheld(&request.new_head, request.old_head.as_deref(), &MirroredObjects::new(&self.objects))?;
             }
 
             Ok(())

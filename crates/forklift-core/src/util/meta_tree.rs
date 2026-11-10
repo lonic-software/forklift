@@ -145,10 +145,12 @@ impl MetaKind {
 /// The blob hash of every kind's format marker: content every parcel of that kind names, so a
 /// head that deletes content its history does not name must never delete one of these, or that
 /// kind could no longer be created.
-pub fn format_marker_hashes() -> Vec<String> {
-    MetaKind::ALL.iter()
+pub fn format_marker_hashes() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+
+    HASHES.get_or_init(|| MetaKind::ALL.iter()
         .map(|kind| LooseObjectBuilder::build_blob(&Blob { content: kind.format_marker().into_bytes() }).hash)
-        .collect()
+        .collect())
 }
 
 /// What a `format` blob says.

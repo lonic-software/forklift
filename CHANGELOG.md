@@ -114,8 +114,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   without the content. Its stored copies are deleted as a redacted file's are: staged uploads at
   once, and about half an hour later the stored file and any batch response that may hold it,
   unless the history of a meta pallet or of the trust anchor's adopted history names it, in which
-  case that one copy is kept and the handshake keeps reporting its deletion as owed. Until then,
-  an update to a meta pallet that would newly name it is refused `451`. A chunked file's chunks
+  case that one copy is kept and the handshake keeps reporting its deletion as owed. Unless that
+  copy is kept, an update to a meta pallet that would newly name it is refused `451`. A chunked file's chunks
   that only it names are deleted, and then its recipe, as for a redacted file.
 
 - **A forklift-server host can withhold content, as for a legal takedown.** `forklift-server

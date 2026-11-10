@@ -6894,7 +6894,7 @@ fn tree_files(root: &Path, parcel: &str) -> std::collections::HashSet<String> {
 // Revert: drop `refuse_meta_naming_withheld` from `ref_update` → the first update commits → red.
 // Revert: bound nothing by the old head's tree → the second is refused → red. Revert: judge the
 // whole history rather than the segment → the third is refused → red. Revert: guard kept items
-// too → the last is refused → red.
+// too → the kept case is refused → red. Revert: guard format markers → the creation is refused → red.
 #[test]
 fn a_meta_update_newly_naming_withheld_content_is_refused_451() {
     let area = Area::new("withheld-meta");
@@ -6945,4 +6945,12 @@ fn a_meta_update_newly_naming_withheld_content_is_refused_451() {
     rewrite_withheld(&head.refs, &cell, |item| item["kept"] = true.into());
     plant_meta(&head.refs, "kv", None, &heads[0]);
     update(&head, 0, 1).expect("a kept item refuses nothing");
+
+    // A format marker is kept from settling, so even unsettled it refuses no creation.
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &tagged);
+    plant(&head.refs, "main", &tagged.head_of("main").expect("main"));
+    withhold(&head, &blob_hash("forklift-meta 1 kv"));
+    head.ref_update(&Principal::Static, "@kv", &RefUpdateRequest { old_head: None, new_head: heads[0].clone(), tombstone: None })
+        .expect("the kv marker withheld, the pallet is still created");
 }

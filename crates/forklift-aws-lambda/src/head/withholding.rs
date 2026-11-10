@@ -362,16 +362,21 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         )))
     }
 
-    /// Run one owed deletion step, for the first item of `withholding` owed one, within `budget`:
+    /// Run one owed deletion step, for one item of `withholding` owed one, within `budget`:
     /// best effort, as redaction's judge sweeps, so a failure is logged and never answered, and a
     /// request without time to spare skips it.
     /// The listing takes the item as the step wrote it, so the answer reports what is done.
     fn advance_withheld_deletion(&self, withholding: &mut Withholding, budget: &mut Budget) {
         let now = epoch_seconds(SystemTime::now());
 
-        let Some(listed) = withholding.items.iter_mut().find(|listed| owed(&listed.item, now)) else {
+        // One owed item, turned by the clock, so an item whose step keeps failing never keeps
+        // the others from theirs.
+        let mut owing: Vec<&mut Listed> = withholding.items.iter_mut().filter(|listed| owed(&listed.item, now)).collect();
+        if owing.is_empty() {
             return;
-        };
+        }
+        let turn = (now % owing.len() as u64) as usize;
+        let listed = owing.swap_remove(turn);
 
         if !budget.timely() {
             return;
@@ -423,10 +428,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         // Lost, the lease simply runs out, and the first request after it takes the step again.
         let state = withheld::encode(&next);
-        let written = self.write_items(&[ItemWrite { key: ItemKey::Withheld(hash), state: &state, expected: Some(&leased_state) }], budget)?;
+        let written = self.write_items(&[ItemWrite { key: ItemKey::Withheld(hash), state: &state, expected: Some(&leased_state) }], budget);
 
+        // A failed delete is the cause worth reporting, whatever became of the write after it.
         deleted?;
-        Ok(written.then(|| Listed { hash: hash.clone(), stored: state, item: next }))
+        Ok(written?.then(|| Listed { hash: hash.clone(), stored: state, item: next }))
     }
 
     /// Delete the copies the store keeps of `hash`, withheld as `item`, for the step
@@ -513,12 +519,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             Err(why) => format!("Whether meta history names withheld content {} cannot be told yet: {}", hash, why),
         };
 
-        // A walk the budget stopped between heads resumes at the next one.
+        // A walk the budget stopped between heads resumes at the next one. A stop is never read
+        // as a finished walk: with nothing left to save, the next request walks again.
         let walk = match walk {
             Some(walk) => walk,
             None => match heads.pop() {
                 Some(head) => HoldingWalk::of_history(&head),
-                None => return Ok(Keepers::None),
+                None => return Ok(Keepers::Stopped(why)),
             },
         };
         let bytes = serde_json::to_vec(&SavedKeepers { version: WORK_VERSION, heads, walk })
@@ -552,9 +559,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// in the parcels from `new_head` back to `old_head`, that `old_head`'s own tree does not name.
     /// With no old head, nothing is named. Read before the ref is written, so a meta history never
     /// comes to rest on a copy a sweep deletes. Its old head is meta history the late walk finds,
-    /// so the content it names stays named, and content only the old head's history names is
-    /// found there too: a parcel the update adds may name it again. An item added after this
-    /// listing is not late yet, and this request ends before it is.
+    /// so the content its tree names stays named. Content only the old head's history names, not
+    /// its tree, is refused too if the update names it again, until the walk records it kept;
+    /// the update need not, so the pallet is never wedged by what its history once named. A
+    /// format marker is never refused: it is kept from settling, settled or not. An item added
+    /// after this listing is not late yet, and this request ends before it is.
     ///
     /// # Returns
     /// * `Ok(())`         - The update newly names no such content.
@@ -564,6 +573,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let listing = self.withheld_listing()?;
         let guarded: HashMap<&str, &str> = listing.iter()
             .filter(|listed| !listed.item.never_applies && !listed.item.kept)
+            .filter(|listed| !meta_tree::format_marker_hashes().contains(&listed.hash))
             .map(|listed| (listed.hash.as_str(), listed.item.statement.as_str()))
             .collect();
 
