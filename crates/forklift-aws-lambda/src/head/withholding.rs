@@ -426,7 +426,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let next = match &deleted {
             Ok(Some(kept)) => WithheldItem { swept: true, kept: *kept, deleted: late, lease_until: None, ..leased.clone() },
             Ok(None) => WithheldItem { lease_until: None, ..leased.clone() },
-            Err(_) => WithheldItem { lease_until: Some(now + FAILED_STEP_BACKOFF), ..leased.clone() },
+            // From the failure, not the request's start: a walk may have run for minutes first.
+            Err(_) => WithheldItem { lease_until: Some(epoch_seconds(SystemTime::now()) + FAILED_STEP_BACKOFF), ..leased.clone() },
         };
 
         // Lost, the lease simply runs out, and the first request after it takes the step again.
