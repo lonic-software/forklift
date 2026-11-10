@@ -3283,7 +3283,8 @@ fn a_lower_to_a_head_naming_withheld_content_takes_it_without_it() {
 /// the old version is removed, and the film stays recorded unavailable rather than taken for a
 /// removal or fetched.
 ///
-/// Revert: let heal's put-back write the left-out file as a new one → the old film stays.
+/// Revert: judge a left-out write in heal's put-back by the rebuild's unheld files, as any other
+/// write → the old film stays.
 #[test]
 fn heal_finishes_an_interrupted_lower_to_a_head_naming_withheld_content() {
     use forklift_core::util::{audit_utils, operation_utils, pallet_utils};

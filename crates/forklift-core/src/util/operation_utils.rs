@@ -728,16 +728,32 @@ fn put_back(from: &str, to: &str, carried: &[CarriedEntry]) -> Result<(), String
     };
     let (off_from, off_to) = (unheld(from)?, unheld(to)?);
     let present = |path: &str| crate::globals::warehouse_root().join(path).symlink_metadata().is_ok();
+    let not_checked_out = shift_utils::NotCheckedOut::read()?;
+    let mut put: Vec<FileOp> = Vec::new();
 
-    let ops: Vec<FileOp> = ops.into_iter().filter(|op| match op {
-        FileOp::Write { path, .. } | FileOp::Remove { path } => !carried.contains(path.as_str()),
-    }).filter_map(|op| match op {
-        FileOp::Write { path, hash, item_type, is_new } => {
-            let writable = off_to.contains(&path) && (!present(&path) || (!is_new && !off_from.contains(&path)));
-            writable.then_some(FileOp::Write { path, hash, item_type, is_new: false })
-        }
-        FileOp::Remove { path } => (present(&path) && !off_from.contains(&path)).then_some(FileOp::Remove { path }),
-    }).collect();
+    for op in ops {
+        let op = match op {
+            FileOp::Write { path, .. } | FileOp::Remove { path } if carried.contains(path.as_str()) => None,
+
+            // Content left out is at `to` when no file stands at its path, which the rebuild never
+            // counts as unheld: a file holding `from`'s content is the operation's, and the
+            // write, left out, removes it. Anything else there is the user's.
+            FileOp::Write { path, hash, item_type, is_new } if not_checked_out.holds(&hash)? => {
+                let writable = !is_new && present(&path) && !off_from.contains(&path);
+                writable.then_some(FileOp::Write { path, hash, item_type, is_new: false })
+            }
+
+            FileOp::Write { path, hash, item_type, is_new } => {
+                let writable = off_to.contains(&path) && (!present(&path) || (!is_new && !off_from.contains(&path)));
+                writable.then_some(FileOp::Write { path, hash, item_type, is_new: false })
+            }
+            FileOp::Remove { path } => (present(&path) && !off_from.contains(&path)).then_some(FileOp::Remove { path }),
+        };
+
+        put.extend(op);
+    }
+
+    let ops = put;
 
     shift_utils::ensure_writes_present(&ops)?;
     shift_utils::apply_ops(&ops, &removed_dirs)
