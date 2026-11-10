@@ -2351,38 +2351,4 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
     }
-
-    /// The unavailable prune drops an entry below an absent tree, since the live walk cannot
-    /// descend there, and that loses nothing: refilling the tree pushes the entry's absent object
-    /// down into this record, so a walk meeting it holds it by hash, never as damage.
-    ///
-    /// Revert: skip absent leaves in `refill_all`'s push-down → the dropped object is held by
-    /// nothing → red.
-    #[test]
-    fn an_unavailable_entry_pruned_below_an_absent_tree_comes_back_sealed_on_refill() {
-        use crate::enums::dir_entry_type::DirEntryType;
-        use crate::util::gc_utils::tests::store_tree;
-
-        let (root, _scope) = scratch("prune-below-absent");
-        let film = "4".repeat(64);
-        let tree = store_tree(&[("film.mkv", &film, DirEntryType::Normal)]);
-        let bytes = crate::util::file_utils::retrieve_object_by_hash(&tree).unwrap();
-        let (folder, file) = crate::util::file_utils::get_path_for_object(&tree).unwrap();
-        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
-        append(&[(SealOp::Record, &tree)]).unwrap();
-        unavailable::record([(film.clone(), "DMCA notice 8".to_string())]).unwrap();
-
-        // The live walk marks the absent tree and stops there.
-        let live: std::collections::HashSet<String> = [tree.clone()].into();
-        let exclusive = StoreAccessLock::try_exclusive().unwrap();
-        assert_eq!(unavailable::prune_against(&exclusive, &live).unwrap(), 1);
-        drop(exclusive);
-        assert!(!unavailable::read_unavailable().unwrap().contains(&film));
-
-        refill_all(&hold(), &[(tree.as_str(), bytes.as_slice())]).unwrap();
-        assert_eq!(read_tolerated().unwrap().held(&film, At::File), Some(Held::Sealed),
-            "the refill holds the pruned entry's object by hash");
-
-        std::fs::remove_dir_all(&root).ok();
-    }
 }

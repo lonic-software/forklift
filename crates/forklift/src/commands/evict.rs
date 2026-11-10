@@ -65,8 +65,9 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
         Some(evict_utils::carry_out(&plan, &store_lock, &serve_lock, &store_access, &events::progress())?)
     };
 
-    // Under the same hold, drop what the unavailable record lists that nothing names any more,
-    // whether or not the eviction freed anything. Its error is ignored: the record then only stays
+    // Under the same hold, drop what the unavailable record lists that is present again, or that
+    // nothing names any more when no tree is absent (`unavailable::prune`), whether or not the
+    // eviction freed anything. Its error is ignored: the record then only stays
     // larger than it needs to be, and must not fail the eviction that already landed. A dry run
     // changes nothing.
     if !dry_run {

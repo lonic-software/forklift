@@ -11,9 +11,11 @@
 //! absence recording ever moves a hash this record holds into the sealed record, and a served root
 //! is refused while it lacks content the record lists.
 //!
-//! The record never outlives its reason. An entry whose object is present is dropped under the ref
-//! lock ([`drop_present`]); an entry whose object is absent is dropped only under exclusive store
-//! access, once nothing the live set's roots reach names it ([`prune`]).
+//! An entry whose object is present is dropped under the ref lock ([`drop_present`]); an entry whose
+//! object is absent is dropped only under exclusive store access, once nothing the live set's roots
+//! reach names it, judged only by a walk that met no absent tree ([`prune`]). Below an absent tree
+//! nothing can tell, and a refill of that tree would record the object sealed, so a cache or a
+//! sparse warehouse holding one keeps its absent entries.
 //!
 //! The record at `<forklift root>/unavailable` is in the [`record_utils`] form, one
 //! `<hash> <statement>` entry per line, sorted, written whole and atomically under the [`RefLock`],
@@ -22,7 +24,7 @@
 //! fails every read and is never written over: a hash it lists must never read as damage, nor a
 //! root lacking it as whole.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use crate::globals;
 use crate::util::lock_utils::{RefLock, StoreAccessExclusive};
@@ -229,9 +231,10 @@ pub fn drop_present() -> Result<usize, String> {
     drop_where(file_utils::is_present_for_sweep)
 }
 
-/// Drop every entry whose object is present, and every one whose object is absent and that nothing
-/// the live set's roots reach names (every pallet, meta and tombstoned head, haul head, mirror root,
-/// bay root, trust pin and staged shard), read fail-closed. It takes exclusive store access, held
+/// Drop every entry whose object is present, and, when the live walk met no absent tree, every one
+/// whose object is absent and that nothing the live set's roots reach names (every pallet, meta and
+/// tombstoned head, haul head, mirror root, bay root, trust pin and staged shard), read
+/// fail-closed. It takes exclusive store access, held
 /// by the caller, so no writer, fetch or checkout that recorded an entry and has not yet written
 /// its head runs meanwhile.
 ///
@@ -249,15 +252,12 @@ pub fn prune(hold: &StoreAccessExclusive) -> Result<usize, String> {
     prune_against(hold, &gc_utils::collect_live_set()?)
 }
 
-/// [`prune`], against `live`, a live set the caller computed under `_hold`.
-///
-/// An entry below an absent tree is not live, since the walk cannot descend there, and is dropped
-/// as one nothing names: as for the sealed record's bound, a walk only meets an object through a
-/// parent, and one whose parents are all absent is never met. A refill of such a tree pushes its
-/// absent children down into the sealed record, so the dropped entry comes back held by hash,
-/// never as damage, and a fetch of it then meets the withholding again.
-pub(crate) fn prune_against(_hold: &StoreAccessExclusive, live: &HashSet<String>) -> Result<usize, String> {
-    drop_where(|hash| Ok(file_utils::is_present_for_sweep(hash)? || !live.contains(hash)))
+/// [`prune`], against `live`, a live set the caller computed under `_hold`. When its walk stopped
+/// at an absent tree, an entry it did not mark may sit below it, and a refill of that tree pushes
+/// its absent children down into the sealed record, which must never hold unavailable content: so
+/// only present entries are dropped then.
+pub(crate) fn prune_against(_hold: &StoreAccessExclusive, live: &gc_utils::LiveSet) -> Result<usize, String> {
+    drop_where(|hash| Ok(file_utils::is_present_for_sweep(hash)? || (live.whole && !live.contains(hash))))
 }
 
 #[cfg(test)]
@@ -351,20 +351,21 @@ mod tests {
     }
 
     // Revert: drop the liveness check → the named absent entry goes; keep every absent entry →
-    // the unnamed one stays.
+    // the unnamed one stays; ignore `whole` → the walk that stopped at a boundary drops B.
     #[test]
-    fn the_prune_drops_an_absent_entry_only_when_nothing_live_names_it() {
+    fn the_prune_drops_an_absent_entry_only_when_a_whole_walk_names_it_nowhere() {
         let _scratch = Scratch::new("prune");
         std::fs::create_dir_all(file_utils::get_path_objects_root()).unwrap();
         record([(A.to_string(), "statement".to_string()), (B.to_string(), "statement".to_string())]).unwrap();
         let hold = crate::util::lock_utils::StoreAccessLock::try_exclusive().unwrap();
 
-        let live: HashSet<String> = [A.to_string()].into();
-        assert_eq!(prune_against(&hold, &live).unwrap(), 1);
+        let live = |whole| gc_utils::LiveSet { hashes: [A.to_string()].into(), whole };
+        assert_eq!(prune_against(&hold, &live(false)).unwrap(), 0, "B may sit below an absent tree");
+        assert_eq!(prune_against(&hold, &live(true)).unwrap(), 1);
         let set = read_unavailable().unwrap();
         assert!(set.contains(A) && !set.contains(B));
 
-        assert_eq!(prune_against(&hold, &HashSet::new()).unwrap(), 1);
+        assert_eq!(prune_against(&hold, &gc_utils::LiveSet { hashes: Default::default(), whole: true }).unwrap(), 1);
         assert!(!unavailable_path().exists(), "an empty record is removed");
     }
 

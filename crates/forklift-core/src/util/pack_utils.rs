@@ -3697,8 +3697,9 @@ fn compact_bounded(all: bool,
     let stats = compact_held(all, redelta, salvage, progress, table_bound, &HashSet::new(), &HashSet::new())?;
 
     // A full repack holds exclusive store access, so it also drops what the unavailable record
-    // lists that nothing names any more. Its error is ignored: the record then only stays larger
-    // than it needs to be, and must not fail the repack that already landed.
+    // lists that is present again, or that nothing names any more when no tree is absent. Its
+    // error is ignored: the record then only stays larger than it needs to be, and must not fail
+    // the repack that already landed.
     if let Some(hold) = &_store_exclusive {
         let _ = crate::util::unavailable::prune(hold);
     }

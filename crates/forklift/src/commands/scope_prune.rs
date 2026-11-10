@@ -120,7 +120,8 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
 
     let stats = prune_utils::free_objects(&plan.to_free, &store_access)?;
 
-    // Under the same hold, drop what the unavailable record lists that nothing names any more. Its
+    // Under the same hold, drop what the unavailable record lists that is present again, or that
+    // nothing names any more when no tree is absent (`unavailable::prune`). Its
     // error is ignored: the record then only stays larger than it needs to be, and must not fail
     // the prune that already landed.
     let _ = unavailable::prune(&store_access);

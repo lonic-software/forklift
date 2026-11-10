@@ -223,7 +223,8 @@ pub(crate) fn delete_applied() -> Result<Option<DeletionView>, String> {
 
     let deletion = redaction_deleter::delete_applied(&store_lock, &serve_lock, &store_access, &events::progress())?;
 
-    // Under the same hold, drop what the unavailable record lists that nothing names any more. Its
+    // Under the same hold, drop what the unavailable record lists that is present again, or that
+    // nothing names any more when no tree is absent (`unavailable::prune`). Its
     // error is ignored: the record then only stays larger than it needs to be, and must not fail
     // the deletion that already landed.
     let _ = unavailable::prune(&store_access);
