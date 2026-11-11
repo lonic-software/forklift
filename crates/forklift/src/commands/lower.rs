@@ -93,11 +93,10 @@ pub async fn handle_command(pallet: Option<String>,
         ).into());
     }
 
+    // The handshake sets the client to leave out of every content walk below the content the
+    // remote's host withholds, recorded unavailable, so a head naming it is checked out without
+    // it rather than refused.
     let info = client.fetch_info().await?;
-
-    // The content the remote's host withholds is left out of every content walk below and recorded
-    // unavailable, so a head naming it is checked out without it rather than refused.
-    client.leave_out_withheld(&info);
 
     // A named pallet the remote lacks is refused before trust or a meta pallet is written: it is
     // where a missing pallet's refusal sends an operator, so it must fail cleanly and coded. The
@@ -1144,11 +1143,11 @@ pub(crate) fn reported_applied(info: &forklift_core::model::remote::WarehouseInf
 /// Refuse, as `content_redacted`, history `client`'s fetch left out content of (see
 /// [`RemoteClient::skip_files`]) when this warehouse has not applied that redaction: the remote
 /// no longer serves the content, and a head write here would find the history incomplete. Content
-/// the remote's host withholds passes ([`RemoteClient::leave_out_withheld`]): the walk that left it
+/// the remote's host withholds passes ([`RemoteClient::leaves_out_withheld`]): the walk that left it
 /// out recorded it unavailable where this warehouse lacks it.
 ///
 /// [`RemoteClient::skip_files`]: forklift_core::util::remote_utils::RemoteClient::skip_files
-/// [`RemoteClient::leave_out_withheld`]: forklift_core::util::remote_utils::RemoteClient::leave_out_withheld
+/// [`RemoteClient::leaves_out_withheld`]: forklift_core::util::remote_utils::RemoteClient::leaves_out_withheld
 pub(crate) fn refuse_unapplied_skips(client: &forklift_core::util::remote_utils::RemoteClient) -> Result<(), String> {
     let skipped = client.skipped_files();
 

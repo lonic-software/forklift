@@ -2642,7 +2642,10 @@ revoked key's own distrust boundary) to work out whether the affected object is 
 needed by anything. If a remote is configured, `heal` also tries fetching from it itself, right
 here, before giving up on anything — you never need to run `lower` by hand for this (and it
 would not help: `lower` is subject to the very same taint check, so it would just hit the same
-refusal before ever reaching its own fetch):
+refusal before ever reaching its own fetch). It does not ask for content the remote's host
+withholds, which the remote refuses: a lost object whose content is withheld is named with the
+host's statement, and no re-run brings it back. Heal never records such content as unavailable,
+so the loss stays reported until the object is restored:
 
 - **Nothing was actually lost, or what vanished is not needed by anything anymore** — `heal`
   clears the taint and reports what it restaged or dropped. Exit 0; go on with what you were

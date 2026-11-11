@@ -677,7 +677,7 @@ async fn resolve_the_rest(
         .collect();
     let corrupt_hashes: Vec<String> = corrupt_candidates.keys().cloned().collect();
 
-    let (consultation, corrupt_failures) = match remote {
+    let HealRefetch { consultation, corrupt_failures, withheld } = match remote {
         // No client, for one of three different reasons: a partial warehouse's remote that is
         // not its origin (reported as that refusal), genuinely nothing set, or
         // something set but unusable (a config read/parse error, or a URL `RemoteClient::new`
@@ -686,11 +686,12 @@ async fn resolve_the_rest(
         // first steers a user with a real, merely broken remote toward the heavyweight remedies
         // (clone / reproduce / accept the loss) for an object that remote may still actually
         // have, once whatever is wrong with its config is fixed.
-        Err(why) => (unconsulted(why), BTreeMap::new()),
+        Err(why) => HealRefetch { consultation: unconsulted(why), corrupt_failures: BTreeMap::new(), withheld: BTreeMap::new() },
         // Nothing a fetch could help with this round (e.g. every remaining recorded path is
         // `unreadable`/`restage_failed`, never object-shaped) — skip the network entirely.
-        Ok(_) if candidate_hashes.is_empty() && corrupt_hashes.is_empty() =>
-            (RemoteConsultation::ConsultedCleanly, BTreeMap::new()),
+        Ok(_) if candidate_hashes.is_empty() && corrupt_hashes.is_empty() => HealRefetch {
+            consultation: RemoteConsultation::ConsultedCleanly, corrupt_failures: BTreeMap::new(), withheld: BTreeMap::new(),
+        },
         Ok(client) => attempt_heal_driven_refetch(client, &candidate_hashes, &corrupt_hashes).await,
     };
 
@@ -770,10 +771,10 @@ async fn resolve_the_rest(
                 // Present, but an ordinary read fails on it — quote the mechanical failure, never
                 // the "vanished" wording (see the module doc comment's message-honesty rule).
                 Some(reason) => format!(
-                    "cannot be read back verified: \"{}\" ({}; {})", hash, reason, remedy_text(&consultation)
+                    "cannot be read back verified: \"{}\" ({}; {})", hash, reason, remedy_for(&consultation, &withheld, hash)
                 ),
                 None => format!(
-                    "vanished and still referenced: \"{}\" ({})", hash, remedy_text(&consultation)
+                    "vanished and still referenced: \"{}\" ({})", hash, remedy_for(&consultation, &withheld, hash)
                 ),
             });
         } else if roots_incomplete {
@@ -816,7 +817,7 @@ async fn resolve_the_rest(
         // `corrupt_failures` names, per hash, why *this run's own* dedicated refetch
         // (`remote_utils::fetch_corrupt_replacements`, threaded up through
         // `attempt_heal_driven_refetch`) did not land a copy for it — additive detail folded into
-        // the dangling line below, never a substitute for `remedy_text(&consultation)`'s own
+        // the dangling line below, never a substitute for `remedy_for`'s own
         // general guidance. Absent whenever pass 3 never ran for this hash, recovered it, or lost
         // its own attribution to a task panic (see `fetch_corrupt_replacements`'s own doc).
         let refetch_failure = corrupt_failures.get(hash);
@@ -834,11 +835,11 @@ async fn resolve_the_rest(
                     Some(fetch_error) => format!(
                         "cannot be read back verified: \"{}\" ({}; {}; the automatic refetch of \
                         this object failed: {})",
-                        relative.to_string_lossy(), reason, remedy_text(&consultation), fetch_error
+                        relative.to_string_lossy(), reason, remedy_for(&consultation, &withheld, hash), fetch_error
                     ),
                     None => format!(
                         "cannot be read back verified: \"{}\" ({}; {})",
-                        relative.to_string_lossy(), reason, remedy_text(&consultation)
+                        relative.to_string_lossy(), reason, remedy_for(&consultation, &withheld, hash)
                     ),
                 });
             }
@@ -852,12 +853,12 @@ async fn resolve_the_rest(
                         "no longer present at its recorded address, and this run's refetch did not \
                         land a verified copy: \"{}\" ({}; the automatic refetch of this object \
                         failed: {})",
-                        relative.to_string_lossy(), remedy_text(&consultation), fetch_error
+                        relative.to_string_lossy(), remedy_for(&consultation, &withheld, hash), fetch_error
                     ),
                     None => format!(
                         "no longer present at its recorded address, and this run's refetch did not \
                         land a verified copy: \"{}\" ({})",
-                        relative.to_string_lossy(), remedy_text(&consultation)
+                        relative.to_string_lossy(), remedy_for(&consultation, &withheld, hash)
                     ),
                 });
             }
@@ -2852,42 +2853,55 @@ enum RemoteConsultation {
 fn remedy_text(consultation: &RemoteConsultation) -> String {
     match consultation {
         RemoteConsultation::NotConfigured =>
-            "no remote is configured for this warehouse; reproduce it by re-running the \
-            operation that created it if its content still exists in your working tree \
-            (\"forklift load\" then \"forklift stack\") — there is no in-tool way to abandon a \
-            single dangling reference yet",
-        RemoteConsultation::ConsultedCleanly =>
+            format!("no remote is configured for this warehouse; {}", REPRODUCE_REMEDY),
+        RemoteConsultation::ConsultedCleanly => format!(
             "this heal already checked the configured remote automatically and it does not have \
-            this object either; reproduce it by re-running the operation that created it if its \
-            content still exists in your working tree (\"forklift load\" then \"forklift \
-            stack\") — there is no in-tool way to abandon a single dangling reference yet",
-        RemoteConsultation::ConsultedWithErrors =>
-            "this heal tried to check the configured remote automatically but could not complete \
-            that check this run; re-run \"forklift heal\" once connectivity is restored, or \
-            reproduce it by re-running the operation that created it if its content still exists \
-            in your working tree (\"forklift load\" then \"forklift stack\") — there is no \
-            in-tool way to abandon a single dangling reference yet",
-        RemoteConsultation::NotAsked { reason } => return format!(
-            "this heal did not ask the configured remote for it: {} Then re-run \"forklift heal\", \
-            or reproduce it by re-running the operation that created it if its content still exists \
-            in your working tree (\"forklift load\" then \"forklift stack\") — there is no in-tool \
-            way to abandon a single dangling reference yet",
-            reason.trim_end()
+            this object either; {}",
+            REPRODUCE_REMEDY
         ),
-        RemoteConsultation::ScopeUnreadable { reason, other_errors } => return format!(
+        RemoteConsultation::ConsultedWithErrors => format!(
+            "this heal tried to check the configured remote automatically but could not complete \
+            that check this run; re-run \"forklift heal\" once connectivity is restored, or {}",
+            REPRODUCE_REMEDY
+        ),
+        RemoteConsultation::NotAsked { reason } => format!(
+            "this heal did not ask the configured remote for it: {} Then re-run \"forklift heal\", \
+            or {}",
+            reason.trim_end(),
+            REPRODUCE_REMEDY
+        ),
+        RemoteConsultation::ScopeUnreadable { reason, other_errors } => format!(
             "this heal checked the configured remote for it but skipped the history fetch of the \
-            working pallets: {} {}reproduce it by re-running the operation that created it if its \
-            content still exists in your working tree (\"forklift load\" then \"forklift \
-            stack\") — there is no in-tool way to abandon a single dangling reference yet",
+            working pallets: {} {}{}",
             reason,
             if *other_errors {
                 "Part of that check also failed; re-run \"forklift heal\" once connectivity is \
                 restored, or "
             } else {
                 "Otherwise, "
-            }
+            },
+            REPRODUCE_REMEDY
         ),
-    }.to_string()
+    }
+}
+
+/// The way out every remedy ends on: the only one that exists whatever the remote holds.
+const REPRODUCE_REMEDY: &str = "reproduce it by re-running the operation that created it if its \
+    content still exists in your working tree (\"forklift load\" then \"forklift stack\") — there \
+    is no in-tool way to abandon a single dangling reference yet";
+
+/// [`remedy_text`] for `hash`, unless the handshake listed it withheld by the remote's host
+/// (`withheld`, mapped to the host's statement): then heal did not ask for it, and no re-run will.
+fn remedy_for(consultation: &RemoteConsultation, withheld: &BTreeMap<String, String>, hash: &str) -> String {
+    match withheld.get(hash) {
+        Some(statement) => format!(
+            "the configured remote's host withholds this content (\"{}\"), so this heal did not ask \
+            the remote for it and a re-run will not either; {}",
+            statement,
+            REPRODUCE_REMEDY
+        ),
+        None => remedy_text(consultation),
+    }
 }
 
 /// What heal reports when it could not build the remote client: nothing configured, or a remote
@@ -2942,24 +2956,29 @@ fn unconsulted(why: CoreError) -> RemoteConsultation {
 /// skipped by `fetch_missing_objects`'s own dedup filter (it already answers "present"), so routing
 /// it there would recover nothing — see the module doc comment for the full reasoning.
 ///
+/// Pass 1 leaves out, and passes 2 and 3 do not ask for, the content the handshake lists withheld
+/// by the remote's host ([`remote_utils::RemoteClient::withheld_statement`]: not a redaction the
+/// remote applied, and with a statement that can be quoted), and nothing records it unavailable
+/// (see the body). An entry listed with a statement that cannot be quoted is asked for like any
+/// other candidate, and its refusal reads as a failed consultation.
+///
 /// Best-effort and read/store-only throughout: a failure in any one pass, for one pallet, or for
-/// one hash in the targeted batches, never aborts the rest, and nothing here ever calls
+/// one hash of pass 3, never aborts the rest (one hash of pass 2 refused cancels the loose fetches
+/// still running beside it, so whatever stays missing is reported by the recheck), and nothing
+/// here ever calls
 /// `update_pallet_head` or merges a pallet. In a cache the user pallets' fetches also append to
 /// the sealed-object record what content they skip, as every cache fetch does; no ref moves. Whether anything is actually recovered is decided
 /// afterward, uniformly, by the caller's own recheck — never by this function's return value (§3.2
 /// D3, see the module doc comment); `RemoteConsultation` only ever feeds [`remedy_text`]'s wording.
 ///
 /// # Returns
-/// `(RemoteConsultation, BTreeMap<String, String>)` — the wording selector (unchanged by this
-/// return value's second half), and every `corrupt_hashes` entry pass 3 could not recover mapped
-/// to its own failure reason ([`remote_utils::fetch_corrupt_replacements`]'s own per-hash detail,
-/// threaded straight through). Empty whenever pass 3 never ran (no corrupt candidates this round)
-/// or recovered every one of them.
+/// The [`HealRefetch`]: the wording selector, pass 3's per-hash failures, and the candidates not
+/// asked for as withheld.
 async fn attempt_heal_driven_refetch(
     client: remote_utils::RemoteClient,
     candidate_hashes: &[String],
     corrupt_hashes: &[String],
-) -> (RemoteConsultation, BTreeMap<String, String>) {
+) -> HealRefetch {
     // Armed for the rest of this function — both passes below, and every `.await` inside them —
     // so every store this refetch makes is exempt from `taint_recheck`'s standing-taint success
     // re-check against the very taint this run is in the middle of healing (see
@@ -2971,12 +2990,14 @@ async fn attempt_heal_driven_refetch(
     let mut clean = true;
     let mut scope_failure: Option<String> = None;
 
+    // The handshake sets the walks below to leave out the content the remote's host withholds,
+    // which the remote refuses on every route, so pass 1 is not refused over newer history that
+    // names it. None of it is recorded unavailable: heal writes no head over what a walk left out,
+    // and must not turn damage to an object this warehouse held into a tolerated withholding.
+    client.leave_withheld_unrecorded();
+
     match client.fetch_info().await {
         Ok(info) => {
-            // No opt-in to leaving out content the remote's host withholds: such a walk records
-            // what it leaves out unavailable, and heal must not turn damage to an object this
-            // warehouse held into a tolerated withholding.
-
             // A user pallet's history fetch needs the fetch scope; one this build cannot read
             // skips those fetches, never widens them to the whole remote. The meta pallets and
             // the hash-addressed passes below need no scope and still run, and whatever stays
@@ -3004,8 +3025,23 @@ async fn attempt_heal_driven_refetch(
         Err(_) => clean = false,
     }
 
+    // A candidate the handshake lists withheld is not asked for: the remote refuses it on every
+    // route, and in pass 2 that refusal would cancel the loose fetches of the candidates beside it.
+    // Its host's statement goes back to the caller, whose remedy for it names the withholding.
+    let mut withheld: BTreeMap<String, String> = BTreeMap::new();
+    let mut askable = |hashes: &[String]| -> Vec<String> {
+        hashes.iter().filter(|hash| match client.withheld_statement(hash) {
+            Some(statement) => {
+                withheld.insert((*hash).clone(), statement);
+                false
+            }
+            None => true,
+        }).cloned().collect()
+    };
+    let (candidate_hashes, corrupt_hashes) = (askable(candidate_hashes), askable(corrupt_hashes));
+
     if !candidate_hashes.is_empty()
-        && remote_utils::fetch_missing_objects(&client, candidate_hashes).await.is_err()
+        && remote_utils::fetch_missing_objects(&client, &candidate_hashes).await.is_err()
     {
         clean = false;
     }
@@ -3013,7 +3049,7 @@ async fn attempt_heal_driven_refetch(
     let mut corrupt_failures: BTreeMap<String, String> = BTreeMap::new();
     if !corrupt_hashes.is_empty() {
         let (recovered, failures) =
-            remote_utils::fetch_corrupt_replacements(&client, corrupt_hashes).await;
+            remote_utils::fetch_corrupt_replacements(&client, &corrupt_hashes).await;
         if recovered != corrupt_hashes.len() {
             clean = false;
         }
@@ -3027,7 +3063,21 @@ async fn attempt_heal_driven_refetch(
         (None, true) => RemoteConsultation::ConsultedCleanly,
         (None, false) => RemoteConsultation::ConsultedWithErrors,
     };
-    (consultation, corrupt_failures)
+    HealRefetch { consultation, corrupt_failures, withheld }
+}
+
+/// What [`attempt_heal_driven_refetch`] found.
+struct HealRefetch {
+    /// The wording selector, for a hash not in `withheld`.
+    consultation: RemoteConsultation,
+    /// Every corrupt candidate pass 3 asked for and could not recover, mapped to its own failure
+    /// reason ([`remote_utils::fetch_corrupt_replacements`]'s own per-hash detail, threaded
+    /// straight through). Empty whenever pass 3 never ran (no corrupt candidates this round) or
+    /// recovered every one of them.
+    corrupt_failures: BTreeMap<String, String>,
+    /// Every candidate not asked for because the handshake lists it withheld by the remote's host,
+    /// mapped to the host's statement.
+    withheld: BTreeMap<String, String>,
 }
 
 fn display_paths<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Vec<String> {

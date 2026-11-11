@@ -66,10 +66,9 @@ pub async fn handle_command() -> Result<(), String> {
 
     let repo = open_repository().map_err(Problem::into_message)?;
     let mut record = load_record(&repo).map_err(Problem::into_message)?;
+    // The handshake sets the client to bring the history down without content the remote's host
+    // withholds, as a lower takes it, and the export leaves such a file out and names it.
     let info = client.fetch_info().await?;
-    // The history comes down without content the remote's host withholds, as a lower takes it, and
-    // the export leaves such a file out and names it.
-    client.leave_out_withheld(&info);
 
     // The configured set, else every user pallet the remote holds.
     let pallets: Vec<String> = match config_utils::get_effective_value(config_utils::KEY_MIRROR_PALLETS)? {
