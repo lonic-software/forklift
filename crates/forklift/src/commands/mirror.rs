@@ -7,7 +7,7 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{self, RemoteClient};
 use forklift_core::util::{
     applied_redactions, config_utils, file_utils, graph_utils, merge_utils, meta_tree, mirror_utils, object_utils,
-    pallet_utils, scope_utils, tag_utils, take_utils, unavailable,
+    pallet_utils, scope_utils, tag_utils, take_utils, unavailable, withholding,
 };
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use crate::commands::export_git::{self, Exporter, GitRepo, RedactedFile, SkippedTag, WithheldFile, WritableTag, EXPORT_LAYOUT};
@@ -119,6 +119,7 @@ pub async fn handle_command() -> Result<(), String> {
             lines.push(format!("  \"{}\": {}", outcome.pallet, outcome.message.as_deref().unwrap_or_default()));
             lines.extend(export_git::redacted_lines(&outcome.redacted).into_iter()
                 .chain(export_git::withheld_lines(&outcome.withheld))
+                .chain(export_git::withheld_here_lines(&outcome.withheld_here))
                 .map(|line| format!("    {line}")));
         }
     }
@@ -523,7 +524,8 @@ impl<'a> Run<'a> {
             from: mirror_utils::warehouse_root(),
             unattended,
             // The unavailable record is read before each export, after the fetch that may add to it.
-            exporter: Exporter::new(repo, applied_redactions::read_applied()?, unavailable::UnavailableSet::default()),
+            exporter: Exporter::new(repo, applied_redactions::read_applied()?, withholding::read_withheld()?,
+                unavailable::UnavailableSet::default()),
             boundaries: Vec::new(),
             pending,
             refused,
@@ -575,6 +577,7 @@ impl<'a> Run<'a> {
         };
         outcome.redacted = self.exporter.take_redacted();
         outcome.withheld = self.exporter.take_withheld();
+        outcome.withheld_here = self.exporter.take_withheld_here();
 
         outcome
     }
@@ -618,9 +621,15 @@ impl<'a> Run<'a> {
         self.progress.status("Exporting to git");
         let exported = self.export(head)?;
         let commit = self.exporter.commit_of(head).expect("the head was exported").to_string();
-        self.repo.run(&["update-ref", &format!("{}{}", EXPORTED_PREFIX, pallet), &commit], None)?;
+        // Before the exported ref names the commit, since a later run builds on that ref: content
+        // redacted or withheld during the run is not kept, here or by that run. The exporter's
+        // sets stay as first read, so every later pallet of the run is refused too.
+        let exported_ref = format!("{}{}", EXPORTED_PREFIX, pallet);
+        self.exporter.check_removed().map_err(Problem::Failed)?;
+        let previous = self.read_ref(&exported_ref)?;
+        self.repo.run(&["update-ref", &exported_ref, &commit], None)?;
 
-        record.insert(pallet.to_string(), head.to_string());
+        let previous_root = record.insert(pallet.to_string(), head.to_string());
         mirror_utils::write_mirror_roots(record)?;
 
         // Classified once more after the last attempt's re-fetch, so a race that ends in step is
@@ -648,6 +657,19 @@ impl<'a> Run<'a> {
                 Verdict::Push => {}
             }
 
+            // Once more right before git receives it, putting the exported ref and the record's
+            // entry back so no later run pushes the commit either.
+            if let Err(refused) = self.exporter.check_removed() {
+                match previous_root.clone() {
+                    Some(root) => record.insert(pallet.to_string(), root),
+                    None => record.remove(pallet),
+                };
+                let rewritten = mirror_utils::write_mirror_roots(record);
+                self.put_back(&exported_ref, previous.as_deref(), &commit)?;
+                rewritten?;
+                return Err(Problem::Failed(refused));
+            }
+
             let pushed = self.repo.network(
                 &["push", "--porcelain", &self.url, &format!("{}{}:{}", EXPORTED_PREFIX, pallet, branch)],
                 &self.from,
@@ -672,6 +694,31 @@ impl<'a> Run<'a> {
             git mirror\" again.",
             pallet, PUSH_ATTEMPTS
         )))
+    }
+
+    /// The commit `name` names, or none when the ref does not exist.
+    fn read_ref(&self, name: &str) -> Result<Option<String>, Problem> {
+        let read = self.repo.output(&["rev-parse", "-q", "--verify", name])?;
+
+        Ok(read.status.success().then(|| String::from_utf8_lossy(&read.stdout).trim().to_string()))
+    }
+
+    /// Return the exported ref `name` to `previous` (deleting it when none) from `commit`. A ref
+    /// write can land and report failure, so the ref read back decides; one still naming `commit`
+    /// would have a later run push it, so the mirror is then reported damaged.
+    fn put_back(&self, name: &str, previous: Option<&str>, commit: &str) -> Result<(), Problem> {
+        let written = match previous {
+            Some(previous) => self.repo.run(&["update-ref", name, previous, commit], None),
+            None => self.repo.run(&["update-ref", "-d", name, commit], None),
+        };
+        match self.read_ref(name)? {
+            now if now.as_deref() == previous => Ok(()),
+            _ => Err(damaged(format!(
+                "has {} naming commit {}, which may hold content redacted or withheld during this run, \
+                and putting it back failed ({})",
+                name, commit, written.err().unwrap_or_else(|| "it still names that commit".to_string())
+            ))),
+        }
     }
 
     /// Fetch git's branch of `pallet` into the comparison ref, returning its tip (none when git
@@ -1142,18 +1189,25 @@ pub(crate) struct PalletMirror {
     /// the commit, as `redacted` is.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     withheld: Vec<WithheldFile>,
+
+    /// The files left out of the commits this run wrote, because this warehouse's host withholds
+    /// their content, whether or not the store still holds a copy: each by path, with the host's
+    /// statement and the parcels whose commits left it out. Named only under the first pallet whose
+    /// export wrote the commit, as `redacted` is.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    withheld_here: Vec<WithheldFile>,
 }
 
 impl PalletMirror {
     fn new(pallet: &str, status: MirrorStatus, message: String) -> PalletMirror {
         PalletMirror { pallet: pallet.to_string(), status, commit: None, exported: 0, message: Some(message), redacted: Vec::new(),
-            withheld: Vec::new() }
+            withheld: Vec::new(), withheld_here: Vec::new() }
     }
 
     fn in_step(pallet: &str, status: MirrorStatus, commit: &str, exported: usize) -> PalletMirror {
         PalletMirror {
             pallet: pallet.to_string(), status, commit: Some(commit.to_string()), exported, message: None, redacted: Vec::new(),
-            withheld: Vec::new(),
+            withheld: Vec::new(), withheld_here: Vec::new(),
         }
     }
 
@@ -1176,6 +1230,7 @@ impl PalletMirror {
         }
         export_git::render_redacted(&self.redacted);
         export_git::render_withheld(&self.withheld);
+        export_git::render_withheld_here(&self.withheld_here);
     }
 }
 

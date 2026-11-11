@@ -12,6 +12,7 @@ use forklift_core::util::{file_utils, haul_utils, kv_utils, manifest_utils, obje
 use forklift_core::util::{applied_redactions, bay_utils, pallet_utils, park_utils};
 use forklift_core::util::applied_redactions::AppliedSet;
 use forklift_core::util::unavailable::{self, UnavailableSet};
+use forklift_core::util::withholding::{self, WithheldSet};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 use forklift_core::util::remote_utils::RemoteClient;
 use crate::commands::pallet::{relation_to_remote, RemoteRelation};
@@ -44,7 +45,9 @@ pub(crate) const EXPORT_LAYOUT: u32 = 1;
 /// A file whose redaction this warehouse applied is left out of every commit that carried it, never
 /// replaced by a placeholder, and the report names it by path and parcel. So is a file whose content
 /// this warehouse lacks because the host of a remote withholds it (the unavailable record), named
-/// with the host's statement.
+/// with the host's statement, and a file whose content this warehouse's own host withholds (the
+/// withheld record of a served root), named with that host's statement, whether or not the store
+/// still holds a copy.
 ///
 /// # Arguments
 /// * `path` - Where to create the git repository (must be empty or nonexistent).
@@ -112,13 +115,15 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
     }
     let RemoteCheck { left_behind, unchecked, .. } = remote.unwrap_or_default();
     let applied = applied_redactions::read_applied()?;
+    let withheld_here = withholding::read_withheld()?;
     let unavailable = unavailable::read_unavailable()?;
 
+    let created = !target.exists();
     std::fs::create_dir_all(target)
         .map_err(|e| format!("Error while creating \"{}\": {}", path, e))?;
     let repo = GitRepo::create(target)?;
 
-    let mut exporter = Exporter::new(&repo, applied, unavailable);
+    let mut exporter = Exporter::new(&repo, applied, withheld_here, unavailable);
     for parcel in &order {
         exporter.export_parcel(parcel)?;
     }
@@ -145,6 +150,35 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
         repo.run_as_user(&["checkout", "-f", "-q", branch])?;
     }
 
+    // Last, after the checkout: content redacted or withheld during the run is not left in the
+    // branches or the working tree. Removing what the run made leaves the path as it found it, so
+    // the retry the refusal names is not refused for an existing repository.
+    if let Err(refused) = exporter.check_removed() {
+        // The path was new or empty, so everything in it is the run's.
+        let removed = match created {
+            true => std::fs::remove_dir_all(target),
+            false => std::fs::read_dir(target).and_then(|entries| entries.into_iter().try_for_each(|entry| {
+                let entry = entry?;
+                // A link is removed, never followed; Windows removes a link to a folder as a folder.
+                match entry.file_type()?.is_dir() {
+                    true => std::fs::remove_dir_all(entry.path()),
+                    false => std::fs::remove_file(entry.path()).or_else(|error| match entry.file_type()?.is_symlink() {
+                        true => std::fs::remove_dir(entry.path()),
+                        false => Err(error),
+                    }),
+                }
+            })),
+        };
+        return Err(match removed {
+            Ok(()) => format!("{} What the export wrote to \"{}\" was removed.", refused, path),
+            Err(error) => format!(
+                "{} Removing what it wrote to \"{}\" failed ({}); empty it, since it may hold that \
+                content, before running it again.",
+                refused, path, error
+            ),
+        });
+    }
+
     output::emit(&ExportReport {
         path: path.to_string(),
         commits: exporter.exported.len(),
@@ -158,6 +192,7 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
         not_exported,
         redacted: exporter.take_redacted(),
         withheld: exporter.take_withheld(),
+        withheld_here: exporter.take_withheld_here(),
         signed,
         parked,
         remote_left_behind: left_behind,
@@ -567,12 +602,14 @@ struct ExportedCommit {
 /// proportion to its changed paths, not to its tree's size.
 ///
 /// A file whose content is an applied redaction's hash is left out of the git tree, and so is one
-/// whose content the unavailable record lists and the store lacks (withheld by the host of a
-/// remote); a folder that held nothing else is left out with them. Whatever this run converts it
-/// converts that way, but a seeded commit may have been written before the redaction applied, so a
-/// tree of one is reused only when nothing under it is redacted; while the redaction record is
-/// non-empty, that check reads every tree under such a reused commit once per run, so the cost is
-/// no longer only the changed paths. A seeded commit may also have been written while content was
+/// whose content this warehouse's host withholds (the withheld record, whether or not the store
+/// still holds a copy), and one whose content the unavailable record lists and the store lacks
+/// (withheld by the host of a remote); a folder that held nothing else is left out with them.
+/// Whatever this run converts it converts that way, but a seeded commit may have been written
+/// before the redaction applied or the withholding began, so a tree of one is reused only when
+/// nothing under it is redacted or withheld here; while either record is non-empty, that check
+/// reads every tree under such a reused commit once per run, so the cost is no longer only the
+/// changed paths. A seeded commit may also have been written while content was
 /// absent, which the unavailable record cannot say once the bytes are back, so a mirror keeps its
 /// own log of the git trees it wrote leaving withheld content out ([`Self::keep_withheld_log`]),
 /// and a logged tree is never reused.
@@ -585,6 +622,10 @@ pub(crate) struct Exporter<'a> {
     blobs_written: usize,
     /// The redactions applied here, whose files every commit leaves out.
     applied: AppliedSet,
+    /// The content this warehouse's host withholds, whose files every commit leaves out, as last
+    /// read. A takedown recorded since is caught by [`Self::check_removed`] before anything
+    /// written reaches the user or git.
+    withheld_here: WithheldSet,
     /// The content recorded unavailable here: a file of it the store lacks is left out.
     unavailable: UnavailableSet,
     /// The files each converted forklift tree left out, by path under it, content hash and why. A
@@ -601,7 +642,7 @@ pub(crate) struct Exporter<'a> {
     withheld_log_failed: bool,
     /// The forklift trees that held entries, every one of which was left out.
     emptied: HashSet<String>,
-    /// Whether nothing under a forklift tree is redacted, for the trees asked about.
+    /// Whether nothing under a forklift tree is redacted or withheld here, for the trees asked about.
     clean: HashMap<String, bool>,
     /// The files left out of the commits written since the last [`Self::take_redacted`] for a
     /// redaction, by path and content hash, each with the parcels whose commits left it out, in
@@ -610,6 +651,9 @@ pub(crate) struct Exporter<'a> {
     /// As `redacted`, for content withheld by the host of a remote, since the last
     /// [`Self::take_withheld`], each with the host's statement when it was left out.
     withheld: BTreeMap<(String, String), (String, Vec<String>)>,
+    /// As `withheld`, for content this warehouse's host withholds, since the last
+    /// [`Self::take_withheld_here`].
+    withheld_here_files: BTreeMap<(String, String), (String, Vec<String>)>,
 }
 
 /// Why an export left a file out.
@@ -619,6 +663,8 @@ enum LeftOut {
     Redacted,
     /// This warehouse lacks its content, which the host of a remote withholds on this statement.
     Withheld(String),
+    /// This warehouse's host withholds its content on this statement.
+    WithheldHere(String),
 }
 
 /// The log, in a mirror's git folder, of the git trees its runs wrote leaving withheld content out:
@@ -626,7 +672,7 @@ enum LeftOut {
 const WITHHELD_TREES_LOG: &str = "forklift-withheld-trees";
 
 impl<'a> Exporter<'a> {
-    pub(crate) fn new(repo: &'a GitRepo, applied: AppliedSet, unavailable: UnavailableSet) -> Exporter<'a> {
+    pub(crate) fn new(repo: &'a GitRepo, applied: AppliedSet, withheld_here: WithheldSet, unavailable: UnavailableSet) -> Exporter<'a> {
         Exporter {
             repo,
             exported: HashMap::new(),
@@ -635,6 +681,7 @@ impl<'a> Exporter<'a> {
             trees_written: 0,
             blobs_written: 0,
             applied,
+            withheld_here,
             unavailable,
             omitted_in: HashMap::new(),
             withheld_trees: None,
@@ -644,6 +691,7 @@ impl<'a> Exporter<'a> {
             clean: HashMap::new(),
             redacted: BTreeMap::new(),
             withheld: BTreeMap::new(),
+            withheld_here_files: BTreeMap::new(),
         }
     }
 
@@ -663,6 +711,14 @@ impl<'a> Exporter<'a> {
             .collect()
     }
 
+    /// The files left out of the commits written since the last call because this warehouse's host
+    /// withholds their content, sorted by path, each with the host's statement.
+    pub(crate) fn take_withheld_here(&mut self) -> Vec<WithheldFile> {
+        std::mem::take(&mut self.withheld_here_files).into_iter()
+            .map(|((path, hash), (statement, parcels))| WithheldFile { path, hash, statement, parcels })
+            .collect()
+    }
+
     /// Read the unavailable record again, after a fetch that may have added to it, so a file whose
     /// content it now lists is left out rather than read. No tree converted or reused before
     /// depends on the record: a converted one read every file it kept, and a reused one is judged
@@ -671,6 +727,30 @@ impl<'a> Exporter<'a> {
         self.unavailable = unavailable::read_unavailable()?;
 
         Ok(())
+    }
+
+    /// Refuse when this warehouse applied a redaction or its host withheld content since the
+    /// exporter read their records: a commit already written may hold it, and none says which.
+    /// The bundle builder re-checks the same set before it publishes.
+    pub(crate) fn check_removed(&self) -> Result<(), String> {
+        let removed = withholding::removed()?;
+        let gained: Vec<&String> = removed.hashes()
+            .filter(|hash| !self.applied.contains(hash) && !self.withheld_here.contains(hash))
+            .collect();
+        if gained.is_empty() {
+            return Ok(());
+        }
+
+        let named: Vec<&str> = gained.iter().take(3).map(|hash| hash.as_str()).collect();
+        let more = match gained.len() > named.len() {
+            true => format!(" and {} more", gained.len() - named.len()),
+            false => String::new(),
+        };
+        Err(format!(
+            "This warehouse redacted or withheld content while this ran ({}{}), which the commits \
+            written may hold. Run it again to leave that content out.",
+            named.join(", "), more
+        ))
     }
 
     /// Keep the log of the git trees written leaving withheld content out, in the repository's
@@ -768,9 +848,10 @@ impl<'a> Exporter<'a> {
     }
 
     /// Whether nothing under the forklift tree `forklift_hash` is a file an applied redaction
-    /// names, so a git tree written for it before the redaction applied holds no copy.
+    /// names or whose content this warehouse's host withholds, so a git tree written for it before
+    /// the redaction applied or the withholding began holds no copy.
     fn is_clean(&mut self, forklift_hash: &str) -> Result<bool, String> {
-        if self.applied.is_empty() {
+        if self.applied.is_empty() && self.withheld_here.is_empty() {
             return Ok(true);
         }
         if let Some(clean) = self.clean.get(forklift_hash) {
@@ -779,7 +860,7 @@ impl<'a> Exporter<'a> {
 
         let tree = object_utils::load_tree(forklift_hash)?;
         let mut clean = !tree.get_files()
-            .any(|(_, item)| self.applied.contains(&item.hash));
+            .any(|(_, item)| self.applied.contains(&item.hash) || self.withheld_here.contains(&item.hash));
         for (_, item) in tree.get_subtrees() {
             if !clean {
                 break;
@@ -869,6 +950,8 @@ impl<'a> Exporter<'a> {
                     LeftOut::Redacted => self.redacted.entry(key).or_default(),
                     LeftOut::Withheld(statement) => &mut self.withheld.entry(key)
                         .or_insert_with(|| (statement.clone(), Vec::new())).1,
+                    LeftOut::WithheldHere(statement) => &mut self.withheld_here_files.entry(key)
+                        .or_insert_with(|| (statement.clone(), Vec::new())).1,
                 }.push(forklift_hash.to_string());
             }
         }
@@ -885,9 +968,10 @@ impl<'a> Exporter<'a> {
     /// same path in the first parent, with the git tree it was exported as. An entry this run has
     /// not converted yet, whose forklift hash matches the base's entry of the same name and kind,
     /// reuses that entry's git hash. Only the hash: the mode is always recomputed from the entry's
-    /// own type. A file an applied redaction names, or one whose content the store lacks and the
-    /// unavailable record lists, is left out, never reused, and a base tree equal to this one is
-    /// reused only when nothing under it is redacted and the withheld-trees log does not name it.
+    /// own type. A file an applied redaction names, one whose content this warehouse's host
+    /// withholds, or one whose content the store lacks and the unavailable record lists, is left
+    /// out, never reused, and a base tree equal to this one is reused only when nothing under it is
+    /// redacted or withheld here and the withheld-trees log does not name it.
     fn convert_tree(&mut self, forklift_hash: &str, base: Option<(&str, &str)>) -> Result<String, String> {
         if let Some(hash) = self.trees.get(forklift_hash) {
             return Ok(hash.clone());
@@ -913,9 +997,14 @@ impl<'a> Exporter<'a> {
 
         for (name, item) in tree.get_files() {
             // Left out, never replaced: placeholder content would read as a real version of it. A
-            // redaction outranks a withholding, as it does on every read.
+            // redaction outranks a withholding, and this head's withholding a remote's, as they do
+            // on every read. This head's is left out whether or not the store still holds a copy.
             if self.applied.contains(&item.hash) {
                 omitted.push((name.to_string(), item.hash.clone(), LeftOut::Redacted));
+                continue;
+            }
+            if let Some(statement) = self.withheld_here.statement(&item.hash) {
+                omitted.push((name.to_string(), item.hash.clone(), LeftOut::WithheldHere(statement.to_string())));
                 continue;
             }
             if self.unavailable.lacks(&item.hash)? {
@@ -970,7 +1059,9 @@ impl<'a> Exporter<'a> {
         if entries.is_empty() && !omitted.is_empty() {
             self.emptied.insert(forklift_hash.to_string());
         }
-        let withheld = omitted.iter().any(|(_, _, why)| matches!(why, LeftOut::Withheld(_)));
+        // A tree that left out content this warehouse's host withholds is logged too: the record
+        // naming it may be edited away, and the tree must not then be reused as complete.
+        let withheld = omitted.iter().any(|(_, _, why)| matches!(why, LeftOut::Withheld(_) | LeftOut::WithheldHere(_)));
 
         if !omitted.is_empty() {
             self.omitted_in.insert(forklift_hash.to_string(), omitted);
@@ -1285,6 +1376,12 @@ pub(crate) struct ExportReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     withheld: Vec<WithheldFile>,
 
+    /// The files left out because this warehouse's host withholds their content (the withheld
+    /// record of a served root), whether or not the store still holds a copy: each by path, with
+    /// the host's statement and the parcels whose commits carry no version of it in its place.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    withheld_here: Vec<WithheldFile>,
+
     /// Whether this warehouse has an office, so its parcels and tags carry signatures the export
     /// drops.
     #[serde(skip)]
@@ -1353,8 +1450,8 @@ pub(crate) fn redacted_lines(redacted: &[RedactedFile]) -> Vec<String> {
         .collect()
 }
 
-/// A file an export or a mirror left out of the commits it wrote, because this warehouse lacks its
-/// content, which the host of a remote withholds.
+/// A file an export or a mirror left out of the commits it wrote, because a host withholds its
+/// content: the host of a remote, so this warehouse lacks it, or this warehouse's own.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize, Debug)]
 pub(crate) struct WithheldFile {
@@ -1364,7 +1461,8 @@ pub(crate) struct WithheldFile {
     /// Its content's hash.
     hash: String,
 
-    /// The statement of the host that withholds it, as this warehouse recorded it.
+    /// The statement of the host that withholds it: for a remote's, as this warehouse recorded it
+    /// when the fetch was refused; for this warehouse's own, as its host recorded the takedown.
     statement: String,
 
     /// The parcels whose commits left it out, in the order they were written.
@@ -1381,13 +1479,30 @@ pub(crate) fn render_withheld(withheld: &[WithheldFile]) {
 /// One line per file an export left out because this warehouse lacks its withheld content,
 /// unindented. The statement is the host's text.
 pub(crate) fn withheld_lines(withheld: &[WithheldFile]) -> Vec<String> {
+    left_out_lines(withheld, "this warehouse does not hold its content, which the host of a remote withholds")
+}
+
+/// One line per file of `withheld`, left out for `why`, unindented.
+fn left_out_lines(withheld: &[WithheldFile], why: &str) -> Vec<String> {
     withheld.iter()
         .map(|file| format!(
-            "Left out \"{}\" ({}) of {} commit(s): this warehouse does not hold its content, which the \
-            host of a remote withholds. The host's statement: {}",
-            sanitize(&file.path), file.hash, file.parcels.len(), sanitize(&file.statement)
+            "Left out \"{}\" ({}) of {} commit(s): {}. The host's statement: {}",
+            sanitize(&file.path), file.hash, file.parcels.len(), why, sanitize(&file.statement)
         ))
         .collect()
+}
+
+/// Print each of `withheld` as a line of human output.
+pub(crate) fn render_withheld_here(withheld: &[WithheldFile]) {
+    for line in withheld_here_lines(withheld) {
+        println!("  {line}");
+    }
+}
+
+/// One line per file an export left out because this warehouse's host withholds its content,
+/// unindented. The statement is the host's text.
+pub(crate) fn withheld_here_lines(withheld: &[WithheldFile]) -> Vec<String> {
+    left_out_lines(withheld, "the host of this warehouse withholds its content")
 }
 
 /// How an export's human output names a meta pallet it did not export.
@@ -1427,6 +1542,7 @@ impl CommandOutput for ExportReport {
 
         render_redacted(&self.redacted);
         render_withheld(&self.withheld);
+        render_withheld_here(&self.withheld_here);
 
         // A remote's pallet names are its own text.
         for left in &self.remote_left_behind {
@@ -1642,7 +1758,7 @@ mod tests {
         ], Some("merge"));
 
         let repo = create_repo(&warehouse);
-        let mut exporter = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        let mut exporter = Exporter::new(&repo, AppliedSet::default(), WithheldSet::default(), UnavailableSet::default());
         let tip = export(&mut exporter, &merge);
 
         let commit = |hash: &str| String::from_utf8(git_bytes(&repo, &["cat-file", "commit", hash])).unwrap();
@@ -1688,12 +1804,12 @@ mod tests {
         let moved = store_parcel(&tree(b"two\n", "moved"), &[&second], vec![action(ParcelActionType::Stack, "op", 3_000)], Some("moved"));
 
         let repo = create_repo(&warehouse);
-        let mut earlier = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        let mut earlier = Exporter::new(&repo, AppliedSet::default(), WithheldSet::default(), UnavailableSet::default());
         export(&mut earlier, &first);
         assert_eq!((earlier.trees_written, earlier.blobs_written), (4, 9));
 
         // A later run knows only the commit it builds on, as the mirror does.
-        let mut later = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        let mut later = Exporter::new(&repo, AppliedSet::default(), WithheldSet::default(), UnavailableSet::default());
         later.exported.insert(first.clone(), earlier.exported[&first].clone());
         export(&mut later, &second);
         assert_eq!((later.trees_written, later.blobs_written), (3, 1),
@@ -1718,7 +1834,7 @@ mod tests {
         std::fs::write(git_dir.join("info").join("attributes"), "* text\n").unwrap();
         git_bytes(&repo, &["config", "core.autocrlf", "true"]);
 
-        let mut exporter = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        let mut exporter = Exporter::new(&repo, AppliedSet::default(), WithheldSet::default(), UnavailableSet::default());
         let commit = export(&mut exporter, &parcel);
 
         assert_eq!(git_bytes(&repo, &["cat-file", "blob", &format!("{}:crlf.txt", commit)]), content.concat());
@@ -1734,7 +1850,7 @@ mod tests {
         let parcel = store_parcel(&tree, &[], vec![action(ParcelActionType::Stack, "op", 1_000)], Some(description));
 
         let repo = create_repo(&warehouse);
-        let mut exporter = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        let mut exporter = Exporter::new(&repo, AppliedSet::default(), WithheldSet::default(), UnavailableSet::default());
         let commit = export(&mut exporter, &parcel);
 
         let raw = git_bytes(&repo, &["cat-file", "commit", &commit]);
@@ -1828,23 +1944,69 @@ mod tests {
         let (first, second) = ("a".repeat(40), "b".repeat(64));
         std::fs::write(&log, format!("{}\n{}", first, &second[..10])).unwrap();
 
-        let mut exporter = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        let mut exporter = Exporter::new(&repo, AppliedSet::default(), WithheldSet::default(), UnavailableSet::default());
         exporter.keep_withheld_log().unwrap();
         assert_eq!(exporter.withheld_trees, Some(HashSet::from([first.clone()])));
         exporter.log_withheld_tree(&second);
         exporter.flush_withheld_log().unwrap();
         assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("{}\n{}\n", first, second));
 
-        let mut again = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        let mut again = Exporter::new(&repo, AppliedSet::default(), WithheldSet::default(), UnavailableSet::default());
         again.keep_withheld_log().unwrap();
         assert_eq!(again.withheld_trees, Some(HashSet::from([first.clone(), second.clone()])));
 
         std::fs::write(&log, format!("{}\nnot a tree\n", first)).unwrap();
-        let mut refused = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        let mut refused = Exporter::new(&repo, AppliedSet::default(), WithheldSet::default(), UnavailableSet::default());
         assert!(refused.keep_withheld_log().unwrap_err().contains("not a tree"));
 
         std::fs::write(&log, [first.as_bytes(), b"\n\xff\n"].concat()).unwrap();
-        let mut garbled = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        let mut garbled = Exporter::new(&repo, AppliedSet::default(), WithheldSet::default(), UnavailableSet::default());
         assert!(garbled.keep_withheld_log().unwrap_err().contains("cannot read"));
+    }
+
+    /// A tree that left out content this warehouse's host withholds is logged, so it is not reused
+    /// as complete once the record no longer names the content.
+    #[test]
+    fn a_tree_leaving_out_content_withheld_here_is_logged() {
+        let warehouse = Warehouse::storage_only("export-withheld-here-log");
+        let tree = store_tree(&[
+            Entry::File("film", DirEntryType::Normal, b"the film\n"),
+            Entry::File("README", DirEntryType::Normal, b"kept\n"),
+        ]);
+        let parcel = store_parcel(&tree, &[], vec![action(ParcelActionType::Stack, "ada@example.com", 1_000_000_000)], None);
+        let film = store_blob(b"the film\n");
+        let withheld = WithheldSet::of([(film, "a takedown".to_string(), withholding::ChunkDigest::Unknown)]);
+
+        let repo = create_repo(&warehouse);
+        let mut exporter = Exporter::new(&repo, AppliedSet::default(), withheld, UnavailableSet::default());
+        exporter.keep_withheld_log().unwrap();
+        export(&mut exporter, &parcel);
+        let written = exporter.trees.get(&tree).unwrap().clone();
+        assert_eq!(exporter.withheld_trees, Some(HashSet::from([written])));
+    }
+
+    /// A takedown recorded, or a redaction applied, after the exporter read their records is
+    /// refused, never kept in the commits written; one the exporter read is not.
+    #[test]
+    fn a_takedown_recorded_during_a_run_is_refused() {
+        let warehouse = Warehouse::storage_only("export-withheld-during");
+        let repo = create_repo(&warehouse);
+        let exporter = Exporter::new(&repo, AppliedSet::default(), withholding::read_withheld().unwrap(), UnavailableSet::default());
+        exporter.check_removed().unwrap();
+
+        let film = store_blob(b"the film\n");
+        withholding::withhold(&film, "a takedown").unwrap();
+        assert!(exporter.check_removed().unwrap_err().contains("Run it again"));
+
+        let after = Exporter::new(&repo, AppliedSet::default(), withholding::read_withheld().unwrap(), UnavailableSet::default());
+        after.check_removed().unwrap();
+
+        // A redaction applied during the run is refused the same way.
+        let secret = store_blob(b"a secret\n");
+        let applied = forklift_core::util::record_utils::to_bytes("redactions-applied", 1, [secret.as_str()]);
+        std::fs::write(forklift_core::globals::forklift_root().join("redactions-applied"), applied).unwrap();
+        assert!(after.check_removed().unwrap_err().contains(&secret));
+        let both = Exporter::new(&repo, applied_redactions::read_applied().unwrap(), withholding::read_withheld().unwrap(), UnavailableSet::default());
+        both.check_removed().unwrap();
     }
 }

@@ -407,6 +407,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **`git export` and `git mirror` in a server's own root leave out content its host withholds.**
+  Run in a forklift-server root, both used to write a file the host withholds into git while the
+  server still held its copy, and to fail on the missing object once it had deleted it. They now
+  leave the file out of each commit they write, as they do for an applied redaction, and name it
+  with the host's statement (`withheld_here` in `--json`); a mirror's commits already in git, and
+  a branch whose tip has not moved, keep it. A takedown or redaction recorded while either runs
+  fails the export, or that run's mirror pallets, before git holds it; run it again. `--json` schema is now 41.
 - Every parcel `stack` and `pick` record has a description. `stack` without `-m` refuses instead of
   recording a parcel with none, unless it completes a consolidation or pick in progress, which
   supplies one. `pick` of a parcel with no description needs `-m`. A blank `-m` on `stack`, `pick`
