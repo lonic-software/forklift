@@ -2391,6 +2391,10 @@ mod clients {
 
 use clients::{Clients, Posture, RequestDestination, SendBody, SendOutcome, UnboundedTicket, WatchdogOutcome};
 
+/// What one handshake lists withheld, by hash: the host's statement and the chunk-list digest
+/// reported beside it.
+type HandshakeWithheld = BTreeMap<String, (String, Option<String>)>;
+
 /// The remote endpoint: base URL, optional bearer token, and the HTTP clients — see the
 /// [`clients`] module's own doc for why there is more than one of them and why they are not fields here
 /// any more.
@@ -2427,7 +2431,7 @@ pub struct RemoteClient {
     /// ([`ServedWithholding::chunks`](crate::model::remote::ServedWithholding::chunks)), that a
     /// content walk through this client, or any clone of it, leaves out and records unavailable:
     /// set by every handshake ([`Self::fetch_info`]). Empty until one succeeds.
-    withheld: std::sync::Arc<std::sync::RwLock<std::sync::Arc<BTreeMap<String, (String, Option<String>)>>>>,
+    withheld: std::sync::Arc<std::sync::RwLock<std::sync::Arc<HandshakeWithheld>>>,
     /// Set by [`Self::leave_withheld_unrecorded`]: a walk through this client, or any clone of it,
     /// still leaves out what `withheld` names, but records none of it unavailable.
     withheld_unrecorded: std::sync::Arc<std::sync::atomic::AtomicBool>,
