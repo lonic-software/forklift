@@ -16,7 +16,9 @@
 //! 2. `late`: a round deleted its chunks. One more round, due once every presigned upload of the
 //!    content has expired, deletes any chunk such an upload landed after the first.
 //! 3. `recipe_deleting`: its chunks are done; the recipe object itself goes, with no fence and no
-//!    census. The redaction item then records `recipe_deleted`, and the entry leaves the ledger.
+//!    census, once a withheld recipe's item records its chunk-list digest (or no copy is left to
+//!    take one from). The redaction item then records `recipe_deleted`, and the entry leaves the
+//!    ledger.
 //!
 //! A recipe whose delete S3 refused keeps its state, and its next round backs off from an hour,
 //! doubling to a day.
@@ -662,7 +664,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     }
 
     /// Delete every recipe object the ledger has due in `recipe_deleting`, record each deleted on
-    /// its items, redaction and withheld, and take it off the ledger. A refused delete backs off.
+    /// its items, redaction and withheld, and take it off the ledger. A withheld recipe whose item
+    /// records no digest has it recorded from the canonical copy first
+    /// ([`Head::fill_withheld_digest`]). A refused delete, or a fill that cannot read, backs off.
     ///
     /// # Returns
     /// * `Ok(bool)` - Whether it wrote anything: read the ledger again.
@@ -675,7 +679,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         let mut next = ledger.clone();
 
-        let deleted = self.objects.delete_staged(recipe).and_then(|()| self.objects.delete_canonical(recipe));
+        // A withheld recipe's digest is recorded before its last copy goes, so a later chunk-list
+        // redaction can still judge the file it names; a fill that lost its write reads again.
+        let deleted = match self.fill_withheld_digest(recipe, budget) {
+            Ok(true) => self.objects.delete_staged(recipe).and_then(|()| self.objects.delete_canonical(recipe)),
+            Ok(false) => return Ok(true),
+            Err(error) => Err(error.message),
+        };
         match deleted {
             Ok(()) => {
                 // The items first: an entry off the ledger with no record of the deletion would

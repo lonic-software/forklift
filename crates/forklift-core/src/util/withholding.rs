@@ -161,13 +161,12 @@ pub struct WithheldSet {
 }
 
 impl WithheldSet {
-    /// The set of `entries`, each a hash beside its statement: what a head that keeps its record
-    /// somewhere other than this module's file reads it as.
-    /// Every digest it holds is [`ChunkDigest::Unknown`].
-    pub fn of(entries: impl IntoIterator<Item = (String, String)>) -> WithheldSet {
+    /// The set of `entries`, each a hash beside its statement and what is known of its chunk list:
+    /// what a head that keeps its record somewhere other than this module's file reads it as.
+    pub fn of(entries: impl IntoIterator<Item = (String, String, ChunkDigest)>) -> WithheldSet {
         WithheldSet {
             entries: entries.into_iter()
-                .map(|(hash, statement)| (hash, WithheldEntry { statement, digest: ChunkDigest::Unknown }))
+                .map(|(hash, statement, digest)| (hash, WithheldEntry { statement, digest }))
                 .collect(),
         }
     }

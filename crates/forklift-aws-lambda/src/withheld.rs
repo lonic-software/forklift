@@ -76,6 +76,15 @@ pub struct WithheldItem {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub swept: bool,
 
+    /// For a recipe, the digest of its ordered chunk list that a chunk-list redaction compares
+    /// (`forklift_core::util::withholding::recipe_digest`), taken from the head's own copy of the
+    /// recipe while it held one: by settling, by the deletion step's re-settle of an item settled
+    /// while the store lacked the object, or by the chunk ledger before it deletes the recipe.
+    /// Absent while no copy was at hand, and for a blob: read as not known. Once recorded it is
+    /// never taken off or replaced, also after the recipe is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<String>,
+
     /// Whether the recipe's object has been deleted, after its chunks.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recipe_deleted: bool,
@@ -103,9 +112,18 @@ impl WithheldItem {
             recipe: false,
             kept: false,
             swept: false,
+            chunks: None,
             recipe_deleted: false,
             deleted: false,
             lease_until: None,
+        }
+    }
+
+    /// What is known of the chunk list of the content this item withholds.
+    pub fn digest(&self) -> withholding::ChunkDigest {
+        match &self.chunks {
+            Some(digest) => withholding::ChunkDigest::Known(digest.clone()),
+            None => withholding::ChunkDigest::Unknown,
         }
     }
 }
@@ -139,11 +157,23 @@ pub fn decode(hash: &str, stored: &str) -> Result<WithheldItem, String> {
         ));
     }
 
-    serde_json::from_str(stored).map_err(|error| format!(
+    let item: WithheldItem = serde_json::from_str(stored).map_err(|error| format!(
         "The withheld item for {} cannot be read ({}), so what this warehouse's host withholds \
         cannot be told. Nothing was written over it.",
         hash, error
-    ))
+    ))?;
+
+    // A digest that is not a digest's form is refused, never read as none: it would reopen a
+    // judgement the head already made.
+    if let Some(digest) = &item.chunks {
+        withholding::checked_digest(digest).map_err(|error| format!(
+            "The withheld item for {} cannot be read ({}), so what this warehouse's host withholds \
+            cannot be told. Nothing was written over it.",
+            hash, error
+        ))?;
+    }
+
+    Ok(item)
 }
 
 /// Whether the host withholds `hash` as a file's content, by its own item: what the staging
@@ -335,8 +365,8 @@ mod tests {
         assert_eq!(add_at(&refs, &hash, "court order 1", 9, &|_| {}).unwrap(), Added::Unchanged);
         assert_eq!(list(&refs).unwrap()[0].item.withheld_at, 7, "nothing was written");
 
-        // A record the head has carried forward keeps its progress when restated.
-        let progressed = WithheldItem { settled: true, swept: true, ..WithheldItem::new("court order 1", 7) };
+        // A record the head has carried forward keeps its progress, and its digest, when restated.
+        let progressed = WithheldItem { settled: true, swept: true, chunks: Some("e".repeat(64)), ..WithheldItem::new("court order 1", 7) };
         let fence = FormatFence::At(format::AWS_FORMAT.to_string());
         let write = ItemWrite { key: ItemKey::Withheld(&hash), state: &encode(&progressed), expected: Some(&listed[0].stored) };
         assert_eq!(refs.put_items(&[write], &fence).unwrap(), RedactionWrite::Written);
@@ -470,5 +500,29 @@ mod tests {
 
         let readable = with(r#"{"version":1,"statement":"s","withheld_at":1}"#);
         assert_eq!(list(&readable).unwrap()[0].item, WithheldItem::new("s", 1));
+        assert_eq!(list(&readable).unwrap()[0].item.digest(), withholding::ChunkDigest::Unknown);
+    }
+
+    // Revert: drop the digest's form check from `decode` → the malformed digest is listed → red.
+    #[test]
+    fn a_listing_fails_loudly_on_a_digest_that_is_not_one_and_reads_one_that_is() {
+        let hash = "d".repeat(64);
+        let with = |chunks: &str| {
+            let state = format!(r#"{{"version":1,"statement":"s","withheld_at":1,"chunks":"{}"}}"#, chunks);
+            let items = [
+                ("format".to_string(), "state".to_string(), format::AWS_FORMAT.to_string()),
+                (format!("withheld#{}", hash), "state".to_string(), state),
+            ];
+            MemoryRefStore::from_items(&items).expect("a store")
+        };
+
+        for malformed in ["", "ABC", &"A".repeat(64), &"a".repeat(63)] {
+            assert!(list(&with(malformed)).unwrap_err().contains("is not a chunk-list digest"), "{:?}", malformed);
+        }
+
+        let digest = "e".repeat(64);
+        let listed = list(&with(&digest)).unwrap();
+        assert_eq!(listed[0].item.digest(), withholding::ChunkDigest::Known(digest.clone()));
+        assert_eq!(decode(&hash, &encode(&listed[0].item)).unwrap().chunks, Some(digest), "it encodes back");
     }
 }
