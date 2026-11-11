@@ -3893,3 +3893,57 @@ fn a_chunk_list_redaction_judges_a_withheld_recipe_by_its_recorded_digest() {
     let record = std::fs::read_to_string(dir.join("warehouse/.forklift/unavailable")).unwrap();
     assert!(record.lines().any(|line| line.starts_with(&format!("{} {} ", takedown.film, digest))), "{}", record);
 }
+
+/// A host withholding a chunked recipe whose chunk list it never learnt refuses a lift whose new
+/// history names that recipe as a chunked file afresh, with `content_withheld` naming the path and
+/// the way out: lift again, or from a warehouse that holds the recipe. A lift that names it no more
+/// than the host's head already does still lands. The host reaches this state only when no lift
+/// sent it the recipe: a takedown made during a lift whose digest intake failed, or a lift from a
+/// warehouse that never held the recipe, as here.
+///
+/// Revert: tolerate absent withheld content at a chunked entry whatever its digest → the pick lands.
+#[test]
+fn a_lift_newly_naming_a_withheld_recipe_the_host_cannot_judge_is_refused() {
+    let mut takedown = takedown("uncomparable");
+    takedown.withhold_new_film(true);
+    let picked = takedown.owner.head("main");
+
+    // Main names the film no more, so no head the host carries vouches for it.
+    takedown.owner.run_ok(&["remove", "media/film.mkv"]);
+    takedown.owner.run_ok(&["stack", "-m", "take the film out"]);
+    takedown.owner.run_ok(&["lift"]);
+
+    // The host forgets the film's digest, as when no lift sent it the recipe.
+    let record = takedown.server.root.join(".forklift/withheld");
+    let text = std::fs::read_to_string(&record).unwrap();
+    let stripped: String = text.lines()
+        .map(|line| match line.strip_prefix(&format!("{} ", takedown.film)) {
+            Some(rest) => format!("{} - {}\n", takedown.film, rest.split_once(' ').unwrap().1),
+            None => format!("{}\n", line),
+        })
+        .collect();
+    assert_ne!(stripped, text, "{}", text);
+    std::fs::write(&record, stripped).unwrap();
+    assert_eq!(withheld_digests(&takedown.server.url).get(&takedown.film), Some(&None));
+
+    // A clone holds no copy of the film, so it can send the host no recipe.
+    let warehouse = takedown.writer("takedown-uncomparable", &[]);
+    warehouse.stack("notes.txt", b"notes\n", "notes");
+    warehouse.run_ok(&["lift"]);
+    assert_eq!(takedown.server.main(), warehouse.head("main"), "a lift naming the film no more than main does lands");
+
+    // Picking the new film onto a pallet at the old head, beside a poster, names it chunked in a
+    // tree no ref carries.
+    warehouse.run_ok(&["pallet", "create", "copy", &takedown.old]);
+    warehouse.stack("media/poster.txt", b"poster\n", "poster");
+    warehouse.run_ok(&["pick", &picked]);
+    let lifted = warehouse.json(&["lift"]);
+    assert_eq!(lifted["ok"], false, "{}", lifted);
+    assert_eq!(lifted["error"]["code"], "content_withheld", "{}", lifted);
+    let message = lifted["error"]["message"].as_str().unwrap();
+    assert!(message.contains("\"media/film.mkv\" as a chunked file") && message.contains(&takedown.film), "{}", lifted);
+    assert!(message.contains(TAKEDOWN), "{}", lifted);
+    let next_step = lifted["error"]["next_step"].as_str().unwrap();
+    assert!(next_step.starts_with("Lift again, or from a warehouse that holds the recipe"), "{}", lifted);
+    assert!(!takedown.server.root.join(".forklift/pallets/copy").exists(), "nothing is lifted");
+}

@@ -1955,7 +1955,7 @@ impl ClosureRefusal {
             ).into(),
             ClosureRefusal::Uncomparable(uncomparable) => crate::error::CoreError::refusal_with_details(
                 crate::error::RefusalCode::ContentWithheld,
-                format!("{} The pallet was not moved.", uncomparable.message),
+                uncomparable.message,
                 "Lift again, or from a warehouse that holds the recipe: a lift from such a warehouse \
                 sends this host the recipe before it moves the pallet.",
                 serde_json::json!({
@@ -2207,7 +2207,7 @@ fn refuse_uncomparable(tolerance: &SealedTolerance,
         message: format!(
             "The new history names \"{}\" as a chunked file whose content {} this server's host \
             withholds, and the host neither holds that recipe nor knows its chunk list, so it cannot \
-            judge the file against a redaction. The host's statement: {}",
+            judge the file against a redaction and did not move the pallet. The host's statement: {}",
             file.path, file.hash, statement
         ),
         hash: file.hash,
