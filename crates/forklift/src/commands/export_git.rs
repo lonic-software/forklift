@@ -732,7 +732,7 @@ impl<'a> Exporter<'a> {
         let fail = |error: std::io::Error| format!("Could not write {}: {}", path.display(), error);
         let created = !path.exists();
         // A write handle, not an append-only one, which Windows refuses to flush.
-        let mut log = std::fs::OpenOptions::new().create(true).write(true).open(&path).map_err(fail)?;
+        let mut log = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&path).map_err(fail)?;
         std::io::Seek::seek(&mut log, std::io::SeekFrom::End(0)).map_err(fail)?;
         let lines: String = self.withheld_unlogged.iter().map(|tree| format!("{}\n", tree)).collect();
         std::io::Write::write_all(&mut log, lines.as_bytes()).map_err(fail)?;
