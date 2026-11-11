@@ -2422,14 +2422,12 @@ pub struct RemoteClient {
     skip_files: std::sync::Arc<std::sync::RwLock<std::sync::Arc<HashSet<String>>>>,
     /// The members of `skip_files` a walk met and left out, read by [`Self::skipped_files`].
     skipped_files: std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
-    /// The file contents the remote's host withholds, each beside the host's statement, that a
+    /// The file contents the remote's host withholds, each beside the host's statement and the
+    /// chunk-list digest reported with it
+    /// ([`ServedWithholding::chunks`](crate::model::remote::ServedWithholding::chunks)), that a
     /// content walk through this client, or any clone of it, leaves out and records unavailable:
     /// set by every handshake ([`Self::fetch_info`]). Empty until one succeeds.
-    withheld: std::sync::Arc<std::sync::RwLock<std::sync::Arc<BTreeMap<String, String>>>>,
-    /// The chunk-list digest the same handshake reported beside each entry of `withheld` that has
-    /// one ([`ServedWithholding::chunks`](crate::model::remote::ServedWithholding::chunks)), which
-    /// the unavailable record keeps.
-    withheld_digests: std::sync::Arc<std::sync::RwLock<std::sync::Arc<BTreeMap<String, String>>>>,
+    withheld: std::sync::Arc<std::sync::RwLock<std::sync::Arc<BTreeMap<String, (String, Option<String>)>>>>,
     /// Set by [`Self::leave_withheld_unrecorded`]: a walk through this client, or any clone of it,
     /// still leaves out what `withheld` names, but records none of it unavailable.
     withheld_unrecorded: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2633,7 +2631,6 @@ impl RemoteClient {
             skip_files: Default::default(),
             skipped_files: Default::default(),
             withheld: Default::default(),
-            withheld_digests: Default::default(),
             withheld_unrecorded: Default::default(),
         })
     }
@@ -3386,27 +3383,22 @@ impl RemoteClient {
     /// not. Every handshake sets this ([`Self::fetch_info`]). A meta history's walk leaves none of it out: only a file of a user
     /// pallet's tree is checked out without its content.
     ///
-    /// Two entries are not left out, so a walk asks for their content and is refused as it was:
+    /// Three entries are not left out, so a walk asks for their content and is refused as it was:
     /// one the handshake also reports redacted and applied, which stays an unapplied redaction
-    /// here until this warehouse applies it, and one whose statement is not one the record may
-    /// hold ([`withholding::checked_statement`](crate::util::withholding::checked_statement)).
+    /// here until this warehouse applies it, one whose statement is not one the record may hold
+    /// ([`withholding::checked_statement`](crate::util::withholding::checked_statement)), and one
+    /// whose chunk-list digest is not a digest's form
+    /// ([`withholding::checked_digest`](crate::util::withholding::checked_digest)).
     fn leave_out_withheld(&self, info: &WarehouseInfo) {
         let applied = info.applied_redactions();
-        let left_out: Vec<(&crate::model::remote::ServedWithholding, &str)> = info.withheld.iter().flatten()
+        let withheld = info.withheld.iter().flatten()
             .filter(|entry| !applied.contains(entry.hash.as_str()))
-            .filter_map(|entry| crate::util::withholding::checked_statement(&entry.statement).ok().map(|statement| (entry, statement)))
-            .collect();
-        let withheld = left_out.iter()
-            .map(|(entry, statement)| (entry.hash.clone(), statement.to_string()))
-            .collect();
-        let digests = left_out.iter()
-            .filter_map(|(entry, _)| entry.chunks.clone().map(|digest| (entry.hash.clone(), digest)))
+            .filter(|entry| entry.chunks.as_deref().is_none_or(|digest| crate::util::withholding::checked_digest(digest).is_ok()))
+            .filter_map(|entry| crate::util::withholding::checked_statement(&entry.statement).ok()
+                .map(|statement| (entry.hash.clone(), (statement.to_string(), entry.chunks.clone()))))
             .collect();
 
-        // Each under its own lock: a walk reads the digests only after its statements, and a
-        // handshake replaces both before any walk it starts.
         *self.withheld.write().unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(withheld);
-        *self.withheld_digests.write().unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(digests);
     }
 
     /// Whether a content walk through this client leaves out `hash` as content the remote's host
@@ -3418,7 +3410,7 @@ impl RemoteClient {
     /// The host's statement beside `hash`, when a content walk through this client leaves it out
     /// as content the remote's host withholds ([`Self::leave_out_withheld`]).
     pub fn withheld_statement(&self, hash: &str) -> Option<String> {
-        self.withheld.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(hash).cloned()
+        self.withheld.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(hash).map(|(statement, _)| statement.clone())
     }
 
     /// Make every later walk through this client, or any clone of it, record none of what it
@@ -3462,7 +3454,6 @@ impl RemoteClient {
         skipped.sort();
 
         let applied = crate::util::applied_redactions::read_applied()?;
-        let digests = self.withheld_digests.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let mut entries: Vec<crate::util::unavailable::Unavailable> = Vec::new();
 
         for hash in skipped {
@@ -3470,8 +3461,7 @@ impl RemoteClient {
                 continue;
             }
 
-            let statement = withheld[&hash].clone();
-            let digest = digests.get(&hash).cloned();
+            let (statement, digest) = withheld[&hash].clone();
             entries.push(crate::util::unavailable::Unavailable { hash, statement, digest });
         }
 
@@ -10665,11 +10655,14 @@ mod tests {
 
     /// A walk leaves out what the handshake lists withheld, except content it also reports
     /// redacted and applied, which stays an unapplied redaction here, and an entry whose statement
-    /// the unavailable record could not hold, which the walk asks for and is refused as withheld.
-    /// Revert: drop either filter → that hash is left out.
+    /// the unavailable record could not hold, or whose chunk-list digest is not a digest's form,
+    /// each of which the walk asks for and is refused as withheld. A digest is kept beside its
+    /// statement.
+    /// Revert: drop any filter → that hash is left out.
     #[test]
     fn a_walk_leaves_out_withheld_content_but_not_applied_redactions_or_unrecordable_statements() {
         let (kept, redacted, multiline) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let (digested, misdigested, digest) = ("d".repeat(64), "e".repeat(64), "f".repeat(64));
         let info: WarehouseInfo = serde_json::from_value(serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "default_pallet": "main",
@@ -10680,6 +10673,8 @@ mod tests {
                 { "hash": kept, "statement": "  DMCA notice 1  ", "state": "deleted" },
                 { "hash": redacted, "statement": "DMCA notice 2", "state": "deleted" },
                 { "hash": multiline, "statement": "DMCA notice\nsecond line", "state": "deleted" },
+                { "hash": digested, "statement": "DMCA notice 3", "state": "deleted", "chunks": digest },
+                { "hash": misdigested, "statement": "DMCA notice 4", "state": "deleted", "chunks": "F".repeat(64) },
             ],
         })).unwrap();
 
@@ -10689,9 +10684,11 @@ mod tests {
         assert!(client.leaves_out_withheld(&kept));
         assert!(!client.leaves_out_withheld(&redacted), "an applied redaction is not left out as withheld");
         assert!(!client.leaves_out_withheld(&multiline), "an unrecordable statement is not left out");
+        assert!(!client.leaves_out_withheld(&misdigested), "a digest of another form is refused, never taken for none");
 
         let withheld = client.withheld.read().unwrap().clone();
-        assert_eq!(withheld.get(&kept).map(String::as_str), Some("DMCA notice 1"), "the statement is kept trimmed");
+        assert_eq!(withheld.get(&kept), Some(&("DMCA notice 1".to_string(), None)), "the statement is kept trimmed");
+        assert_eq!(withheld.get(&digested), Some(&("DMCA notice 3".to_string(), Some(digest))), "the digest is kept beside it");
     }
 
     /// The same refusal on `upload_to_targets` (the presigned-PUT staging path) — the other of

@@ -236,7 +236,7 @@ pub fn record_locked<E: Into<Unavailable>>(lock: &RefLock, entries: impl IntoIte
         }
 
         let statement = withholding::checked_statement(&statement)?.to_string();
-        let digest = merged(set.digest(&hash), ChunkDigest::of_report(digest.as_deref()));
+        let digest = merged(set.digest(&hash), ChunkDigest::of_report(digest.as_deref())?);
         let entry = UnavailableEntry { statement, digest };
 
         if set.entries.get(&hash) != Some(&entry) {
@@ -419,9 +419,9 @@ mod tests {
             assert_eq!(read_unavailable().unwrap().digest(A), Some(&ChunkDigest::Conflicted));
         }
 
-        // A report that is not a digest's form is none.
-        record([reported(B, Some("not a digest"))]).unwrap();
-        assert_eq!(read_unavailable().unwrap().digest(B), Some(&ChunkDigest::Unknown));
+        // A report that is not a digest's form is refused, and nothing is recorded.
+        assert!(record([reported(B, Some("not a digest"))]).unwrap_err().contains("not a chunk-list digest"));
+        assert!(!read_unavailable().unwrap().contains(B));
     }
 
     // Revert: drop a validity check → the non-hash or the two-line statement is recorded.

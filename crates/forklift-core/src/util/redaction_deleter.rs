@@ -562,19 +562,21 @@ pub fn delete_applied(store_lock: &StoreLock,
         }
         let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
         if let ParsedObject::Recipe(recipe) = loose_object_parser::parse(&bytes)? {
-            let recipe_chunks: Vec<String> = recipe.chunks.into_iter().map(|chunk| chunk.hash).collect();
             if withheld.digest(hash) == Some(&withholding::ChunkDigest::Unknown) {
-                digests.push((hash.clone(), redaction_utils::chunk_list_digest(&recipe_chunks)));
+                if let withholding::ChunkDigest::Known(digest) = withholding::verified_digest(hash, &bytes) {
+                    digests.push((hash.clone(), digest));
+                }
             }
             journal.pairs.extend(
-                recipe_chunks.into_iter().filter(|chunk| !live.contains(chunk)).map(|chunk| (hash.clone(), chunk))
+                recipe.chunks.into_iter().map(|chunk| chunk.hash).filter(|chunk| !live.contains(chunk))
+                    .map(|chunk| (hash.clone(), chunk))
             );
         }
     }
     let chunks = journal.chunks();
 
     // A withheld recipe about to go whose entry has no chunk-list digest yet takes one from the copy
-    // still here, so the head can judge the recipe's chunk list once it no longer holds it. Recorded
+    // still here, when that copy verifies, so the head can judge the recipe's chunk list once it no longer holds it. Recorded
     // before the copy goes: a run cut short after it leaves the digest, never a recipe gone without
     // one. The ref lock is taken inside the serve lock, the order a tombstone drop takes them in.
     if !digests.is_empty() {

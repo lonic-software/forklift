@@ -77,12 +77,15 @@ impl ChunkDigest {
         }
     }
 
-    /// The digest `known` reports, or [`ChunkDigest::Unknown`] when it reports none. A report that
-    /// is not a digest's form is no digest.
-    pub fn of_report(known: Option<&str>) -> ChunkDigest {
+    /// The digest `known` reports, or [`ChunkDigest::Unknown`] when it reports none.
+    ///
+    /// # Returns
+    /// * `Ok(ChunkDigest)` - The reported state.
+    /// * `Err(String)`     - The report is not a digest's form: it is refused, never taken for none.
+    pub fn of_report(known: Option<&str>) -> Result<ChunkDigest, String> {
         match known {
-            Some(digest) if is_digest(digest) => ChunkDigest::Known(digest.to_string()),
-            _ => ChunkDigest::Unknown,
+            None => Ok(ChunkDigest::Unknown),
+            Some(digest) => checked_digest(digest).map(|digest| ChunkDigest::Known(digest.to_string())),
         }
     }
 
@@ -109,6 +112,34 @@ impl ChunkDigest {
 /// Whether `digest` has a chunk-list digest's form: 64 lowercase hex digits.
 fn is_digest(digest: &str) -> bool {
     digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// `digest`, when it is a chunk-list digest's form (64 lowercase hex digits).
+///
+/// # Returns
+/// * `Ok(&str)`    - The digest.
+/// * `Err(String)` - It is not one.
+pub fn checked_digest(digest: &str) -> Result<&str, String> {
+    match is_digest(digest) {
+        true => Ok(digest),
+        false => Err(format!("\"{}\" is not a chunk-list digest.", digest)),
+    }
+}
+
+/// The chunk-list digest of the recipe `hash` from `bytes`, a copy of it read from the store, or
+/// [`ChunkDigest::Unknown`] when the bytes do not hash to `hash` or are not a recipe: a digest is
+/// only ever recorded from the recipe's own bytes.
+pub(crate) fn verified_digest(hash: &str, bytes: &[u8]) -> ChunkDigest {
+    if object_utils::verify_object_bytes(hash, bytes).is_err() {
+        return ChunkDigest::Unknown;
+    }
+
+    match object_utils::parse_recipe_bytes(hash, bytes) {
+        Ok(recipe) => ChunkDigest::Known(redaction_utils::chunk_list_digest(
+            &recipe.chunks.into_iter().map(|chunk| chunk.hash).collect::<Vec<_>>()
+        )),
+        Err(_) => ChunkDigest::Unknown,
+    }
 }
 
 /// One withheld hash's entry: the operator's statement, and what is known of its chunk list.
@@ -305,10 +336,14 @@ pub fn withhold(hash: &str, statement: &str) -> Result<Withheld, String> {
 
     let statement = checked_statement(statement)?;
 
-    // The bytes are pinned by the hash, so a digest read before the lock is the recipe's still.
+    // The bytes are pinned by the hash, so a digest read before the lock is the recipe's still. A
+    // copy that cannot be read whole and verified leaves the entry without one: the takedown is
+    // not held up by a damaged copy, and a digest is never recorded from bytes that are not the
+    // recipe's.
     let digest = match redaction_utils::stored_type(hash)? {
         None | Some(ObjectType::Blob) => ChunkDigest::Unknown,
-        Some(ObjectType::Recipe) => ChunkDigest::Known(redaction_utils::chunk_list_digest(&object_utils::recipe_chunk_hashes(hash)?)),
+        Some(ObjectType::Recipe) => file_utils::retrieve_object_by_hash_shared(hash)
+            .map_or(ChunkDigest::Unknown, |bytes| verified_digest(hash, &bytes)),
         Some(other) => return Err(format!(
             "Object {} is a {:?}, not a file's content: a takedown withholds one file's content.", hash, other
         )),
@@ -347,7 +382,7 @@ pub fn withhold(hash: &str, statement: &str) -> Result<Withheld, String> {
 
 /// Record `digests`, each a withheld hash beside the chunk-list digest of a recipe of that hash at
 /// hand, under the ref lock `lock` the caller holds, for every entry that has no digest yet. The
-/// caller computed each digest from bytes that hash to its hash. A hash not withheld, or whose
+/// caller computed each digest from bytes it verified hash to its hash ([`verified_digest`]). A hash not withheld, or whose
 /// entry has a digest already, is left as it is.
 ///
 /// # Returns
@@ -538,6 +573,20 @@ mod tests {
         assert_eq!(set.digest(&recipe), Some(&ChunkDigest::Known(digest)));
         assert_eq!(set.digest(A), Some(&ChunkDigest::Known(other)));
         assert!(!set.contains(B));
+    }
+
+    // Revert: compute the digest without verifying the bytes → the other recipe's chunk list is
+    // taken for this one's.
+    #[test]
+    fn a_digest_is_only_ever_taken_from_the_recipes_own_bytes() {
+        let _scratch = Scratch::new("verified");
+        let (recipe, digest) = stored_recipe(b"a chunk of a film");
+        let (other, _) = stored_recipe(b"a chunk of another film");
+        let bytes = |hash: &str| file_utils::retrieve_object_by_hash_shared(hash).unwrap();
+
+        assert_eq!(verified_digest(&recipe, &bytes(&recipe)), ChunkDigest::Known(digest));
+        assert_eq!(verified_digest(&recipe, &bytes(&other)), ChunkDigest::Unknown);
+        assert_eq!(verified_digest(&recipe, b"not an object"), ChunkDigest::Unknown);
     }
 
     // Revert: return Unchanged before the fill → an entry recorded while the recipe was absent
