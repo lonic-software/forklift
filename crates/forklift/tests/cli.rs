@@ -1694,8 +1694,7 @@ fn a_folder_load_refuses_an_unreadable_shard_instead_of_dropping_a_tracked_file_
     assert!(stderr(&load).contains("cannot be read"), "{}", stderr(&load));
 
     // The way out the message names works, and x.log is still tracked afterwards.
-    let suggested = if cfg!(windows) { "forklift unload \".\"" } else { "forklift unload '.'" };
-    assert!(stderr(&load).contains(suggested), "{}", stderr(&load));
+    assert!(stderr(&load).contains("\"forklift unload .\" resets it"), "{}", stderr(&load));
     assert!(stderr(&load).contains("every folder below it"), "the reset's scope must be named: {}", stderr(&load));
     assert_success(&warehouse.run(&["unload", "."]));
     assert_success(&warehouse.run(&["load", "."]));
@@ -8864,6 +8863,101 @@ fn a_clean_reload_of_the_same_root_clears_the_marker_and_stack_succeeds() {
         "a clean re-load of the same root must clear the marker"
     );
     assert_success(&warehouse.run(&["stack", "-m", "clean"]));
+}
+
+/// Run `command` the way a user pastes a printed next step: through `sh`, from the warehouse
+/// root, with this build's `forklift` first on `PATH` and the test's isolated configuration.
+#[cfg(unix)]
+fn run_in_shell(warehouse: &TestWarehouse, command: &str) -> Output {
+    let bin = warehouse.home.join("shell-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let link = bin.join("forklift");
+    if !link.exists() {
+        std::os::unix::fs::symlink(FORKLIFT, &link).unwrap();
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+
+    common::test_command("sh")
+        .args(["-c", command])
+        .current_dir(&warehouse.root)
+        .env("PATH", path)
+        .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", warehouse.home.join("test-keys"))
+        .output()
+        .unwrap()
+}
+
+/// The incomplete_load next step names a root a shell would split as one quoted argument, and
+/// both of its commands run as printed: the load finishes and clears the marker, the unload
+/// abandons it.
+#[cfg(unix)]
+#[test]
+fn an_incomplete_load_next_step_runs_as_printed_for_a_path_that_needs_quoting() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (index, finish) in [true, false].into_iter().enumerate() {
+        let warehouse = TestWarehouse::new(&format!("incomplete-load-quoted-{}", index));
+        assert_success(&warehouse.run(&["prepare"]));
+        configure_operator(&warehouse);
+
+        warehouse.write_file("my dir/readable.txt", "fine\n");
+        warehouse.write_file("my dir/blocked.txt", "unreadable\n");
+        let blocked_path = warehouse.root.join("my dir").join("blocked.txt");
+        std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(!warehouse.run(&["load", "my dir"]).status.success());
+        assert!(incomplete_load_marker_path(&warehouse).exists());
+
+        let stacked = warehouse.run(&["stack", "-m", "attempt", "--json"]);
+        assert_eq!(stacked.status.code(), Some(20), "{}", stdout(&stacked));
+        let value = json(&stacked);
+        assert_eq!(value["error"]["code"], "incomplete_load", "{}", value);
+        let next_step = value["error"]["next_step"].as_str().unwrap();
+        let quoted: Vec<&str> = next_step.split('"').skip(1).step_by(2).collect();
+        assert_eq!(quoted, ["forklift load 'my dir'", "forklift unload 'my dir'"], "{}", next_step);
+
+        std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let ran = run_in_shell(&warehouse, if finish { quoted[0] } else { quoted[1] });
+        assert_success(&ran);
+        assert!(
+            !incomplete_load_marker_path(&warehouse).exists(),
+            "the printed step ({}) clears the marker", if finish { quoted[0] } else { quoted[1] }
+        );
+
+        let stacked = warehouse.run(&["stack", "-m", "after"]);
+        assert_ne!(stacked.status.code(), Some(20), "stack no longer refuses: {}", stderr(&stacked));
+        if finish {
+            assert_success(&stacked);
+        }
+    }
+}
+
+/// Restoring a file whose removal is staged, from a subdirectory, names the unload for the
+/// root-relative path quoted as one argument, and run as printed from the working tree's root it
+/// unstages the removal.
+#[cfg(unix)]
+#[test]
+fn a_staged_removal_next_step_runs_as_printed_from_the_working_tree_root() {
+    let warehouse = TestWarehouse::new("restore-staged-removal-quoted");
+    warehouse.write_file("docs/my notes.txt", "original\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "baseline"]));
+
+    std::fs::remove_file(warehouse.root.join("docs/my notes.txt")).unwrap();
+    assert_success(&warehouse.run(&["load", "docs"]));
+
+    let docs = warehouse.root.join("docs");
+    let refused = warehouse.run_at(&docs, &["restore", "my notes.txt"]);
+    assert!(!refused.status.success());
+    let message = stderr(&refused);
+    let command = message.split('"').nth(3).expect("the message quotes the unload");
+    assert_eq!(command, "forklift unload 'docs/my notes.txt'", "{}", message);
+
+    assert_success(&run_in_shell(&warehouse, command));
+    assert_success(&warehouse.run_at(&docs, &["restore", "my notes.txt"]));
+    assert_eq!(std::fs::read_to_string(docs.join("my notes.txt")).unwrap(), "original\n");
 }
 
 #[cfg(unix)]
