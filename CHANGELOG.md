@@ -22,6 +22,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   undecided rather than calling it applied. The `withheld` and `unavailable` records are now
   format 2: a record written by an earlier build is refused until it is removed.
 
+- **A lift gives forklift-server the chunk list of a withheld file it never held.** When the host
+  withholds a chunked file before it ever held a copy, a lift from a warehouse that holds the file
+  now sends the host the file's recipe (the list of its chunks, never the content) so it can record
+  the chunk-list digest, and the host keeps nothing of it. The handshake advertises this with
+  `withheld_intake`; the AWS head does not offer it yet. A recipe that could not be sent leaves the
+  lift's result as it was and writes a `withheld_intake_failed` warning.
+
 - **Commands wait for a remote that is unavailable for a moment.** A remote that answers `503`
   with `Retry-After`, as a server does while it deletes or settles redacted content, or while the
   AWS head deletes a redacted file's chunks, is asked again after the wait, for up to 2 minutes,

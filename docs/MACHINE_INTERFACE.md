@@ -1055,6 +1055,10 @@ Example session:
   held-heads record (`.forklift/held-heads`, the remote heads it lifted to or was served by a lower,
   up to date or ahead included, or a clone) writes a `held_head_unrecorded` warning to the same channel; `message` names the cause. The command's own
   result stands and its exit code is unchanged.
+* A `lift` that could not read, or send to its remote's digest intake, a withheld recipe the
+  remote has no chunk-list digest for writes a `withheld_intake_failed` warning to the same channel,
+  one per recipe; `message` names the cause. The lift's result and exit code are its own, and the
+  next lift sends the recipe again.
 * A `scope prune` or `evict` whose remote could not answer which recorded heads of a pallet it still holds
   (a server too old to know the check answers `404`; a busy one answers `unknown`) writes a `holds_unanswered` warning to the
   same channel, with `details` `{ "pallet": "<name>" }`; `message` names the cause. The command frees

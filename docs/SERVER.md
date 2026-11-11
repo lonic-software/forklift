@@ -341,7 +341,9 @@ revocation by more than about a day.
   when it is next served. A chunked file is withheld by its hash as well: until its copy is
   deleted, a chunk only that file names is served as absent (`404`, left out of a batch, listed
   missing), and a chunk another file shares is served as before; the deletion takes the file's
-  own chunks with it. Not yet: if a hash withheld before it arrived turns out to be a chunked
+  own chunks with it. The server records the digest of a withheld chunked file's chunk list from
+  its copy, or, when it never held one, from the recipe a lift's client sends it (it keeps nothing
+  of that), so a chunk-list redaction can still judge the file. Not yet: if a hash withheld before it arrived turns out to be a chunked
   file's, its chunks are still taken and served; and there is no command to lift a takedown.
 - **Redactions:** after every pallet update or deletion, the server applies each redaction
   recorded on `@redactions` that no pallet head, tombstone or metadata history it holds still
