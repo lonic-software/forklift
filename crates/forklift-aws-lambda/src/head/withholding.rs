@@ -529,7 +529,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// path whatever history names it, as one present when the item was settled does. An item
     /// settled as a blob is not read again: a hash is one object's, of one type. For such an
     /// item the type is read before the staged copies are deleted, so a tree, a parcel or a chunk
-    /// a lift has staged since is left to it.
+    /// that landed before the step began is left to the lift that staged it; one landing during
+    /// the walk is found only after the staged copies are gone.
     ///
     /// # Returns
     /// * `Ok(Copies)`     - What the step came to.
@@ -591,9 +592,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         Ok(Copies::Done(kept))
     }
 
-    /// What the canonical copy of `hash` is now. Unlike settling, which leaves an unreadable header unsettled and refused for good,
-    /// this reads one as a blob's (logged): the item was settled as a blob already, and its late
-    /// step is owed.
+    /// What the canonical copy of `hash` is now. Unlike settling, which leaves an unreadable header
+    /// unsettled and refused for good, this reads one as no recipe's (logged). For an item
+    /// settled as a blob while the store lacked it, that leaves the blob's late step to run; for
+    /// the chunk ledger's fill ([`Head::canonical_recipe`]), it leaves the digest not known.
     ///
     /// # Returns
     /// * `Ok(Landed)`     - What it is.
@@ -610,7 +612,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             Err(error) => {
                 eprintln!(
                     "forklift-aws-lambda: withheld object {} has a header this build cannot read ({:?}); \
-                    it is read as a blob's",
+                    it is read as no recipe's",
                     hash, error
                 );
                 Landed::Stands
