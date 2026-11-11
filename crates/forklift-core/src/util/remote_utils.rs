@@ -2498,9 +2498,10 @@ const DROPPED_GET_ATTEMPTS: u32 = 3;
 /// Whether `e` is a connection that was established and then dropped before any answer came: a
 /// pooled connection the remote or a gateway had already closed fails this way ("connection closed
 /// before message completed"). A failed connect is not one (a refused or unreachable remote stays
-/// so for the moment), nor is a timeout, which another attempt would wait out again.
+/// so for the moment), nor is a timeout, which another attempt would wait out again and which
+/// [`RemoteClient::connection_failed`] does not count as a failed connection.
 fn dropped_before_answer(e: &reqwest::Error) -> bool {
-    !e.is_connect() && !e.is_timeout() && !RemoteClient::connection_failed(e).is_empty()
+    !e.is_connect() && !RemoteClient::connection_failed(e).is_empty()
 }
 
 /// How a mutation timeout ends: rerunning the same request converges. A command whose plain rerun
