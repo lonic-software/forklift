@@ -1926,41 +1926,57 @@ mod clients {
                 | Posture::UnboundedNoRedirect(_) => (None, None),
             };
 
-            let client = self.pick(&posture);
+            // A `GET` whose connection dropped before any answer (a pooled connection the remote
+            // or a gateway had already closed) is sent again, a bounded number of times: it changes
+            // nothing on the remote, so another attempt is the recovery. Any other method may have
+            // taken effect, and any other failure (a refused connect, a timeout, TLS) would repeat.
+            let mut attempts = 1;
 
-            let mut builder = match destination {
-                RequestDestination::Authenticated { base, token, path } => {
-                    let mut builder = client.request(method, format!("{}{}", base, path));
-                    if let Some(token) = token {
-                        builder = builder.bearer_auth(token);
+            loop {
+                let client = self.pick(&posture);
+
+                let mut builder = match destination {
+                    RequestDestination::Authenticated { base, token, path } => {
+                        let mut builder = client.request(method.clone(), format!("{}{}", base, path));
+                        if let Some(token) = token {
+                            builder = builder.bearer_auth(token);
+                        }
+                        builder
                     }
-                    builder
+                    RequestDestination::Presigned { url } => client.request(method.clone(), url),
+                };
+
+                if let Some(duration) = total_deadline {
+                    builder = builder.timeout(duration);
                 }
-                RequestDestination::Presigned { url } => client.request(method, url),
-            };
 
-            if let Some(duration) = total_deadline {
-                builder = builder.timeout(duration);
-            }
+                let send_fut = body.clone().apply(builder.headers(headers.clone())).send();
 
-            let send_fut = body.apply(builder.headers(headers)).send();
+                // The three cells of `Result<Result<_, reqwest::Error>, Elapsed>` map one-to-one
+                // onto the three `SendOutcome` variants, and the `Elapsed` is consumed here: it
+                // never leaves this function, which is what makes "a head-wait expiry is never a
+                // `reqwest::Error` and never reaches `classify`" a property of the type rather
+                // than a rule to remember. `tokio::time::timeout` wraps only `send()`, which
+                // resolves once the header section has arrived — so nothing here can observe, or
+                // cut off, a body.
+                let outcome = match head_deadline {
+                    Some(head) => match tokio::time::timeout(head, send_fut).await {
+                        Ok(Ok(response)) => SendOutcome::Sent(response),
+                        Ok(Err(e)) => SendOutcome::Transport(e),
+                        Err(_elapsed) => SendOutcome::HeadWaitExpired { budget: head },
+                    },
+                    None => match send_fut.await {
+                        Ok(response) => SendOutcome::Sent(response),
+                        Err(e) => SendOutcome::Transport(e),
+                    },
+                };
 
-            // The three cells of `Result<Result<_, reqwest::Error>, Elapsed>` map one-to-one onto
-            // the three `SendOutcome` variants, and the `Elapsed` is consumed here: it never
-            // leaves this function, which is what makes "a head-wait expiry is never a
-            // `reqwest::Error` and never reaches `classify`" a property of the type rather than a
-            // rule to remember. `tokio::time::timeout` wraps only `send()`, which resolves once
-            // the header section has arrived — so nothing here can observe, or cut off, a body.
-            match head_deadline {
-                Some(head) => match tokio::time::timeout(head, send_fut).await {
-                    Ok(Ok(response)) => SendOutcome::Sent(response),
-                    Ok(Err(e)) => SendOutcome::Transport(e),
-                    Err(_elapsed) => SendOutcome::HeadWaitExpired { budget: head },
-                },
-                None => match send_fut.await {
-                    Ok(response) => SendOutcome::Sent(response),
-                    Err(e) => SendOutcome::Transport(e),
-                },
+                match outcome {
+                    SendOutcome::Transport(e)
+                        if method == reqwest::Method::GET && attempts < super::DROPPED_GET_ATTEMPTS
+                            && super::dropped_before_answer(&e) => attempts += 1,
+                    outcome => return outcome,
+                }
             }
         }
 
@@ -2473,6 +2489,19 @@ fn classify_remote_error(status: u16, action: &str, message: String,
 /// connect, a reset, a body cut off. Its own words, so [`is_transient_failure`] can tell it from a
 /// local `Error while …` and from a transport failure that repeats (DNS, TLS, a bad body).
 const CONNECTION_FAILED: &str = "the connection to the remote failed: ";
+
+/// How many times a `GET` is sent in all when its connection keeps dropping before any answer
+/// (see [`dropped_before_answer`]). More than two, since a client holding several pooled
+/// connections the remote closed at once may draw another closed one on the retry.
+const DROPPED_GET_ATTEMPTS: u32 = 3;
+
+/// Whether `e` is a connection that was established and then dropped before any answer came: a
+/// pooled connection the remote or a gateway had already closed fails this way ("connection closed
+/// before message completed"). A failed connect is not one (a refused or unreachable remote stays
+/// so for the moment), nor is a timeout, which another attempt would wait out again.
+fn dropped_before_answer(e: &reqwest::Error) -> bool {
+    !e.is_connect() && !e.is_timeout() && !RemoteClient::connection_failed(e).is_empty()
+}
 
 /// How a mutation timeout ends: rerunning the same request converges. A command whose plain rerun
 /// is not that same request (it reads the remote anew first) replaces this with its own advice.
@@ -13602,6 +13631,82 @@ mod tests {
 
         assert!(message.contains(CONNECTION_FAILED), "{}", message);
         assert!(is_transient_failure(&message), "{}", message);
+    }
+
+    /// A `GET` whose connection is dropped before any answer (a pooled connection the remote had
+    /// already closed) is sent again on a fresh one and succeeds there.
+    #[test]
+    fn a_get_whose_connection_drops_before_any_answer_is_sent_again() {
+        let remote = CommitRemote::start(vec![CommitAnswer::Drop, CommitAnswer::Reply("HTTP/1.1 200 OK")]);
+        let client = RemoteClient::new_test_with_budgets(&remote.url, FAST);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let fetched = runtime.block_on(client.fetch_object("ab"));
+
+        assert_eq!(fetched, Ok(Vec::new()));
+        assert_eq!(remote.connections(), 2);
+    }
+
+    /// A `GET` whose every connection drops is sent [`DROPPED_GET_ATTEMPTS`] times in all, and
+    /// then fails as a dropped connection.
+    #[test]
+    fn a_get_whose_connections_keep_dropping_stops_after_its_attempts() {
+        let remote = CommitRemote::start(vec![CommitAnswer::Drop]);
+        let client = RemoteClient::new_test_with_budgets(&remote.url, FAST);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let message = runtime.block_on(client.fetch_object("ab")).err().expect("no answer is not a success");
+
+        assert!(message.contains(CONNECTION_FAILED), "{}", message);
+        assert_eq!(remote.connections(), 3);
+    }
+
+    /// A `POST` may have taken effect before its connection dropped, so it is never sent again
+    /// here, even one that only reads.
+    #[test]
+    fn a_post_whose_connection_drops_before_any_answer_is_not_sent_again() {
+        let remote = CommitRemote::start(vec![CommitAnswer::Drop, CommitAnswer::Reply("HTTP/1.1 200 OK")]);
+        let client = RemoteClient::new_test_with_budgets(&remote.url, FAST);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let message = runtime.block_on(client.missing_objects(&[String::from("ab")]))
+            .err().expect("the dropped POST is not retried into the 200");
+
+        assert!(message.contains(CONNECTION_FAILED), "{}", message);
+        assert_eq!(remote.connections(), 1);
+    }
+
+    /// A `GET` that timed out is not sent again: another attempt would wait out the same silence.
+    #[test]
+    fn a_get_that_timed_out_is_not_sent_again() {
+        let remote = CommitRemote::start(vec![CommitAnswer::Wedge, CommitAnswer::Reply("HTTP/1.1 200 OK")]);
+        let client = RemoteClient::new_test_with_budgets(&remote.url, FAST);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let message = runtime.block_on(client.fetch_info()).err().expect("a silent remote is not a success");
+
+        assert!(message.contains("Timed out while "), "{}", message);
+        assert_eq!(remote.connections(), 1);
+    }
+
+    /// A refused connect is not a dropped connection: the remote is not taking connections now,
+    /// and a pooled connection it closed is not what failed. A dropped one is.
+    #[test]
+    fn a_refused_connect_is_not_a_connection_dropped_before_any_answer() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let client = reqwest::Client::new();
+        let refused_url = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}/", listener.local_addr().unwrap())
+        };
+        let dropped = CommitRemote::start(vec![CommitAnswer::Drop]);
+
+        let refused = runtime.block_on(client.get(&refused_url).send()).expect_err("nothing listens");
+        let dropped = runtime.block_on(client.get(&dropped.url).send()).expect_err("no answer");
+
+        assert!(!RemoteClient::connection_failed(&refused).is_empty(), "{:?}", refused);
+        assert!(!dropped_before_answer(&refused), "{:?}", refused);
+        assert!(dropped_before_answer(&dropped), "{:?}", dropped);
     }
 
     /// A refused connection is `is_connect() == true` but never `is_timeout() ==
