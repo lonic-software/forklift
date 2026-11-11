@@ -1610,13 +1610,13 @@ mod tests {
 
         let human = withheld_intake_failed_warning_text(OutputMode::Human, error);
         assert!(human.contains(error), "the human line must carry the cause: {}", human);
-        assert!(human.contains("lift again"), "human text: {}", human);
+        assert!(human.contains("next lift that carries new history"), "human text: {}", human);
 
         let value: serde_json::Value =
             serde_json::from_str(&withheld_intake_failed_warning_text(OutputMode::Json, error)).unwrap();
         assert_eq!(value["warning"], "withheld_intake_failed");
         assert_eq!(value["message"], error);
-        assert!(value["next_step"].as_str().unwrap().contains("lift again"), "next_step: {}", value["next_step"]);
+        assert!(value["next_step"].as_str().unwrap().contains("next lift that carries new history"), "next_step: {}", value["next_step"]);
     }
 
     #[test]
