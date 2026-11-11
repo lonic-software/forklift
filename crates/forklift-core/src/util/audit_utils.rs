@@ -1817,7 +1817,7 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
         &|hash| object_utils::recipe_chunk_hashes(hash),
         &|hash| object_utils::load_tree(hash),
         &|| Ok(Tolerated::default()),
-        WithheldDigests::Recorded { accepted: &local_pallet_heads },
+        WithheldDigests::Recorded,
     ).map_err(String::from)
 }
 
@@ -1850,7 +1850,7 @@ pub fn verify_parcel_closure_for_write(head: &str,
         &|hash| object_utils::recipe_chunk_hashes(hash),
         &|hash| object_utils::load_tree(hash),
         &crate::util::sealed_utils::read_redacted_and_withheld,
-        WithheldDigests::Recorded { accepted: &local_pallet_heads },
+        WithheldDigests::Recorded,
     )?;
 
     Ok(pallet_utils::VerifiedClosure::new(head, PathScope::full(), known_complete))
@@ -1918,13 +1918,12 @@ pub struct UncomparableWithheld {
 
 /// What the push gate ([`verify_parcel_closure_with`]) knows of the chunk lists of the content its
 /// host withholds.
-#[derive(Clone, Copy)]
-pub enum WithheldDigests<'a> {
-    /// What the withheld set records ([`WithheldSet::digest`]): history no head of the host reaches
-    /// may name absent withheld content as a chunked file only where the set records its digest,
-    /// or the expected head already names it so. `accepted` reads the heads of the host's pallets
-    /// ([`local_pallet_heads`]), and is called only when the walk held such content.
-    Recorded { accepted: &'a dyn Fn() -> Result<Vec<String>, String> },
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WithheldDigests {
+    /// What the withheld set records ([`WithheldSet::digest`]): a new head may name absent
+    /// withheld content as a chunked file only where the set records its digest, or the expected
+    /// head already names it so.
+    Recorded,
 
     /// Every withheld hash is taken as carrying a digest, so absent withheld content is tolerated
     /// as any file's content, whatever its entry's type: for a head whose record carries no digests
@@ -1958,8 +1957,8 @@ impl ClosureRefusal {
             ClosureRefusal::Uncomparable(uncomparable) => crate::error::CoreError::refusal_with_details(
                 crate::error::RefusalCode::ContentWithheld,
                 uncomparable.message,
-                "Lift again, or from a warehouse that holds the recipe: a lift from such a warehouse \
-                sends this host the recipe before it moves the pallet.",
+                "Lift from a warehouse that holds the recipe, which sends this host the recipe before \
+                it moves the pallet; if this warehouse holds it, lift again.",
                 serde_json::json!({
                     "hash": uncomparable.hash,
                     "path": uncomparable.path,
@@ -2115,9 +2114,7 @@ pub fn head_not_materializable_message(path: &str) -> String {
 ///                          meta push the bound's tree may be present after all. Read through
 ///                          this parameter and the mode stops mattering. On the self-host head
 ///                          everything comes from the local store. Never called for a creation
-///                          (`known_complete: None`), which takes no candidates at all, but by
-///                          the walk [`WithheldDigests::Recorded`] adds, which is bounded by
-///                          every head of the host and so prunes against parents.
+///                          (`known_complete: None`), which takes no candidates at all.
 /// * `removed`            - Reads the redactions the remote applied and the content it withholds.
 ///                          A remote must hold the whole closure of every head it accepts but for
 ///                          the content it redacted or withholds, so an absent file's content one
@@ -2127,16 +2124,16 @@ pub fn head_not_materializable_message(path: &str) -> String {
 ///                          ([`withheld_beyond_files`]). Called only once the walk without it has
 ///                          failed, so a remote holding the whole closure never depends on it.
 /// * `digests`            - What the head knows of the chunk lists of what it withholds. Under
-///                          [`WithheldDigests::Recorded`], absent withheld content is tolerated at a
-///                          chunked entry of history no head of the host reaches only where its
-///                          digest is recorded or the expected head names it at a chunked entry,
-///                          and is otherwise refused as [`ClosureRefusal::Uncomparable`].
+///                          [`WithheldDigests::Recorded`], absent withheld content the walk holds at
+///                          a chunked entry is tolerated only where its digest is recorded or the
+///                          expected head names it at a chunked entry, and is otherwise refused as
+///                          [`ClosureRefusal::Uncomparable`].
 ///
 /// # Returns
 /// * `Ok(())`                - Everything is present, or absent only where `removed` tolerates it.
 /// * `Err(ClosureRefusal)`   - Why not: an incomplete history, withheld content the closure names
-///                             beyond a file's content or cannot judge, or `removed` or the heads
-///                             unreadable.
+///                             beyond a file's content or cannot judge, or `removed` or the
+///                             expected head's tree unreadable.
 pub fn verify_parcel_closure_with(
     head: &str,
     known_complete: Option<&str>,
@@ -2173,45 +2170,10 @@ pub fn verify_parcel_closure_with(
             None => ClosureRefusal::Incomplete(refusal),
         })?;
 
-    let WithheldDigests::Recorded { accepted } = digests else { return Ok(()) };
-
-    if uncomparable(&tolerance, &tolerated.withheld).is_empty() {
-        return Ok(());
+    match digests {
+        WithheldDigests::Recorded => refuse_uncomparable(&tolerance, &tolerated.withheld, known_complete, load_base_tree),
+        WithheldDigests::AssumedKnown => Ok(()),
     }
-
-    // The walk above is bounded by the expected head alone, or by nothing for a creation, so it
-    // also meets history another of the host's heads already reaches. That history was accepted,
-    // and a judgement it wedges is wedged whatever this head does, so only history no head
-    // reaches is judged: walked again, bounded by every head, as a local write's gate walks it.
-    let mut heads = accepted().map_err(|error| ClosureRefusal::RecordsUnreadable(format!(
-        "The new history names content this server's host withholds, and the heads of its pallets, \
-        which tell what history it already accepted, cannot be read: {}",
-        error
-    )))?;
-    heads.extend(known_complete.map(str::to_string));
-    let bounds: Vec<&str> = heads.iter().map(String::as_str).collect();
-    let judged = SealedTolerance::new(&tolerated);
-    let seams = ClosureSeams { sealed: Some(&judged), ..seams };
-
-    verify_closure_core(head, Some(&bounds), known_complete, &PathScope::full(), false, &seams)
-        .map_err(ClosureRefusal::Incomplete)?;
-
-    refuse_uncomparable(&judged, &tolerated.withheld, known_complete, load_base_tree)
-}
-
-/// The heads of every pallet of this warehouse, user and metadata alike: the history it already
-/// accepted, for [`WithheldDigests::Recorded`].
-pub fn local_pallet_heads() -> Result<Vec<String>, String> {
-    Ok(pallet_utils::all_pallet_refs()?.into_iter().map(|(_, head)| head).collect())
-}
-
-/// The absent withheld content a walk held at a chunked entry while `withheld` records no digest
-/// for it.
-fn uncomparable(tolerance: &SealedTolerance, withheld: &WithheldSet) -> Vec<WithheldFile> {
-    tolerance.withheld_files.borrow().iter()
-        .filter(|file| file.chunked && !matches!(withheld.digest(&file.hash), Some(ChunkDigest::Known(_))))
-        .cloned()
-        .collect()
 }
 
 /// Refuse a walk that held absent withheld content at a chunked entry while `withheld` records no
@@ -2225,7 +2187,10 @@ fn refuse_uncomparable(tolerance: &SealedTolerance,
                        withheld: &WithheldSet,
                        expected: Option<&str>,
                        load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>) -> Result<(), ClosureRefusal> {
-    let uncomparable = uncomparable(tolerance, withheld);
+    let uncomparable: Vec<WithheldFile> = tolerance.withheld_files.borrow().iter()
+        .filter(|file| !matches!(withheld.digest(&file.hash), Some(ChunkDigest::Known(_))))
+        .cloned()
+        .collect();
 
     if uncomparable.is_empty() {
         return Ok(());
@@ -2233,8 +2198,10 @@ fn refuse_uncomparable(tolerance: &SealedTolerance,
 
     let wanted: HashSet<&str> = uncomparable.iter().map(|file| file.hash.as_str()).collect();
     let named = match expected {
-        Some(expected) => chunked_named(expected, &wanted, load_base_tree).map_err(|error| ClosureRefusal::Incomplete(format!(
-            "The expected head {} could not be read to judge withheld content the new head names: {}",
+        // Read failures are not missing history: the walk above already found the new history whole.
+        Some(expected) => chunked_named(expected, &wanted, load_base_tree).map_err(|error| ClosureRefusal::RecordsUnreadable(format!(
+            "The pallet's current head {} could not be read to judge withheld content the new history \
+            names, so the pallet was not moved: {}",
             expected, error
         )))?,
         None => HashSet::new(),
@@ -2315,12 +2282,12 @@ pub struct SealedTolerance<'a> {
     withheld_files: RefCell<Vec<WithheldFile>>,
 }
 
-/// An absent file's content a walk held because its head withholds it, where the walk met it.
+/// An absent file's content a walk held at a chunked entry because its head withholds it, where the
+/// walk met it.
 #[derive(Clone, Debug)]
 struct WithheldFile {
     hash: String,
     path: String,
-    chunked: bool,
 }
 
 impl<'a> SealedTolerance<'a> {
@@ -2398,11 +2365,11 @@ fn holds_absent_file(sealed: Option<&SealedTolerance>, file: &TreeItem, path: &s
     if !sealed.holds_absent(&file.hash, At::File) {
         return false;
     }
-    if sealed.tolerated.held(&file.hash, At::File) == Some(Held::Withheld) {
+    // Only a chunked entry is judged further ([`refuse_uncomparable`]).
+    if file.item_type.is_chunked() && sealed.tolerated.held(&file.hash, At::File) == Some(Held::Withheld) {
         sealed.withheld_files.borrow_mut().push(WithheldFile {
             hash: file.hash.clone(),
             path: path.to_string(),
-            chunked: file.item_type.is_chunked(),
         });
     }
     true

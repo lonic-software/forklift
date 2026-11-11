@@ -329,10 +329,11 @@ revocation by more than about a day.
   (`content_withheld`) and the statement, a batch or subtree fetch leaves it out, the latest bundle is taken down and every bundle built
   after leaves the content out. Pallets keep naming the file, and a lift may name it without
   the server ever holding it: nothing asks for its bytes, and the ref write tolerates their
-  absence, as when the file is moved or copied. A chunked file the server never held is
-  tolerated so only once a lift has sent it the file's recipe, so it knows the chunk list; until
-  then a lift that names the file afresh is refused (`content_withheld`) and told to lift from a
-  warehouse that holds the file. The handshake lists the hash
+  absence, as when the file is moved or copied. For a chunked file whose chunk list the server
+  never learnt, because no lift has sent it the file's recipe, the ref write is stricter: a lift
+  that newly gives such a file a chunked entry, at a path or in a pallet whose head does not
+  already name it so, is refused (`content_withheld`) and told to lift from a warehouse that holds
+  the file. The handshake lists the hash
   and the statement (one plain line, at most 1000 characters). The list is kept in
   `<root>/.forklift/withheld`. The running server notices a new entry within a few seconds: it
   cuts a bundle download already under way, deletes the stored copy, and rebuilds the bundle when

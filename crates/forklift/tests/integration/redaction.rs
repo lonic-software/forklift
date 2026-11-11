@@ -3896,14 +3896,12 @@ fn a_chunk_list_redaction_judges_a_withheld_recipe_by_its_recorded_digest() {
 
 /// A host withholding a chunked recipe whose chunk list it never learnt refuses a lift whose new
 /// history names that recipe as a chunked file afresh, with `content_withheld` naming the path and
-/// the way out: lift again, or from a warehouse that holds the recipe. A lift whose new history names
-/// it no more than history the host already holds does, a new pallet over that history included,
-/// still lands. The host reaches this state only when no lift
-/// sent it the recipe: a takedown made during a lift whose digest intake failed, or a lift from a
-/// warehouse that never held the recipe, as here.
+/// the way out: lift from a warehouse that holds the recipe. A lift that names it no more than the
+/// pallet's head already does still lands; a new pallet has no head, so one over the file's parcel
+/// is refused. The test strips the digest by hand, standing in for a takedown made before the host
+/// held the file whose recipe no lift has sent it yet, and lifts from a clone that never held it.
 ///
-/// Revert: tolerate absent withheld content at a chunked entry whatever its digest → the pick lands;
-/// judge history main reaches → the new pallet over the film's parcel is refused.
+/// Revert: tolerate absent withheld content at a chunked entry whatever its digest → the pick lands.
 #[test]
 fn a_lift_newly_naming_a_withheld_recipe_the_host_cannot_judge_is_refused() {
     let mut takedown = takedown("uncomparable");
@@ -3934,11 +3932,12 @@ fn a_lift_newly_naming_a_withheld_recipe_the_host_cannot_judge_is_refused() {
     warehouse.run_ok(&["lift"]);
     assert_eq!(takedown.server.main(), warehouse.head("main"), "a lift naming the film no more than main does lands");
 
-    // So does a new pallet over the film's parcel, which main's history already reaches.
+    // A creation has no current head to vouch for the film, so a new pallet over its parcel is
+    // refused too, though main's history names it.
     warehouse.run_ok(&["pallet", "create", "over", &picked]);
     warehouse.stack("over.txt", b"over\n", "over");
-    warehouse.run_ok(&["lift"]);
-    assert!(takedown.server.root.join(".forklift/pallets/over").exists(), "the pallet over held history lands");
+    let over = warehouse.json(&["lift"]);
+    assert_eq!(over["error"]["code"], "content_withheld", "{}", over);
 
     // Picking the new film onto a pallet at the old head, beside a poster, names it chunked in a
     // tree no ref carries.
@@ -3952,6 +3951,6 @@ fn a_lift_newly_naming_a_withheld_recipe_the_host_cannot_judge_is_refused() {
     assert!(message.contains("\"media/film.mkv\" as a chunked file") && message.contains(&takedown.film), "{}", lifted);
     assert!(message.contains(TAKEDOWN), "{}", lifted);
     let next_step = lifted["error"]["next_step"].as_str().unwrap();
-    assert!(next_step.starts_with("Lift again, or from a warehouse that holds the recipe"), "{}", lifted);
+    assert!(next_step.starts_with("Lift from a warehouse that holds the recipe"), "{}", lifted);
     assert!(!takedown.server.root.join(".forklift/pallets/copy").exists(), "nothing is lifted");
 }

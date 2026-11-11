@@ -63,6 +63,6 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `redaction_blocked` | 48 | The object to redact is named by a meta pallet's history, which is never rewritten, so it cannot be removed; nothing was recorded |
 | `content_redacted` | 49 | A pallet head would have named a file whose content is redacted, or a load, park, merge or pick would have brought it into the bay, and nothing was written; or a read needed content that a redaction applied in this warehouse removed |
 | `head_names_content` | 50 | The object to redact is in a pallet head; take the file out of that head first. Nothing was recorded |
-| `content_withheld` | 51 | The remote's host withholds content the command needed (a takedown, not a redaction), so the remote neither serves nor takes it; a copy this warehouse holds is kept |
+| `content_withheld` | 51 | The remote's host withholds content the command needed (a takedown, not a redaction), so the remote neither serves nor takes it, or refused to move a pallet whose new history names a withheld chunked file it cannot judge; a copy this warehouse holds is kept |
 | `remote_history_incomplete` | 52 | The remote refused to move a pallet because part of the new head's history is absent there or unreadable, even after the lift negotiated and uploaded again; nothing moved |
 
