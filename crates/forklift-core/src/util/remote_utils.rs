@@ -10414,8 +10414,11 @@ mod tests {
         url: String,
         negotiated: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
         put: Arc<std::sync::Mutex<Vec<String>>>,
-        intake: Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
+        intake: Arc<std::sync::Mutex<Vec<IntakeSent>>>,
     }
+
+    /// A withheld recipe's hash and the bytes sent to the digest intake.
+    type IntakeSent = (String, Vec<u8>);
 
     impl LateWithholdingRemote {
         const UNOFFERED: &'static str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
