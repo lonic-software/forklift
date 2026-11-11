@@ -6490,6 +6490,36 @@ fn a_withheld_hash_the_store_lacks_applies_to_a_tree_uploaded_later() {
     assert!(listed[0].item.settled && !listed[0].item.never_applies, "{:?}", listed[0].item);
 }
 
+/// A tree a racing upload lands after its withheld hash was settled absent is not deleted as a
+/// blob by the late step: it is no file's content, so the item is settled again as never applying,
+/// and the tree stays served.
+// Revert: drop the `NoFile` outcome of the late step's type read → the tree is deleted → red.
+#[test]
+fn a_withheld_tree_landing_after_it_was_settled_absent_never_applies_and_stays() {
+    let source = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let main = gate_parcel(&source, &[], vec![gate_file(&source, "x", "1")]);
+    let bytes = source.objects.get(&main).expect("read").expect("the parcel");
+    let tree = object_utils::parse_parcel_bytes(&main, &bytes).expect("parcel").tree_hash;
+    let tree_bytes = source.objects.get(&tree).expect("read").expect("the tree");
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let other = gate_parcel(&head, &[], vec![gate_file(&head, "y", "2")]);
+    plant(&head.refs, "main", &other);
+    withhold(&head, &tree);
+    served_withheld(&head);
+    let item = withheld_item(&head, &tree);
+    assert!(item.settled && item.absent && !item.never_applies, "settled while absent: {:?}", item);
+
+    head.objects.put_verified(&tree, &tree_bytes).expect("the racing upload");
+    age_withheld(&head.refs, &tree, LATE_SWEEP_AFTER + 40);
+    served_withheld(&head);
+
+    let item = withheld_item(&head, &tree);
+    assert!(item.never_applies && !item.absent && !item.deleted && item.lease_until.is_none(), "{:?}", item);
+    assert!(head.objects.exists(&tree).expect("exists"), "not deleted as a blob");
+    assert!(served(&head, &tree), "a tree is no file's content");
+}
+
 /// An object whose header this build cannot read is never guessed at: its withheld item stays
 /// unsettled and applies, so its own hash is refused `451`, while other content is served.
 // Revert: settle an unreadable header as never applying → it is served → red. Revert: fail the

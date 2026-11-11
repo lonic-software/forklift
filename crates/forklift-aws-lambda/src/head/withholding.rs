@@ -223,6 +223,21 @@ enum Copies {
     /// withhold: its digest, if its bytes give one. The item is settled again as a recipe, and the
     /// copy goes on the recipe's path, after its chunks.
     Recipe(Option<String>),
+
+    /// As [`Copies::Recipe`], but the copy that landed is a tree, a parcel or a chunk, which is
+    /// no file's content: the item is settled again as never applying, and the copy stays served.
+    NeverApplies,
+}
+
+/// What the canonical copy of an item settled while the store lacked the object turned out to be
+/// ([`Head::landed_copy`]).
+enum Landed {
+    /// Still absent, or a blob (or of a header this build cannot read): the item stands.
+    Stands,
+    /// A recipe, with its digest if its bytes give one.
+    Recipe(Option<String>),
+    /// A tree, a parcel or a chunk.
+    NoFile,
 }
 
 /// What settling one item found.
@@ -324,7 +339,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // never guessed at: the item stays unsettled, so it applies and only its own hash is
             // refused, and each request reads and logs it again. The verifier checks only that an
             // object's bytes hash to its key, so this is content no client of this build writes,
-            // and it stays loud rather than cheap.
+            // and it stays loud rather than cheap. Only one that lands after its item was settled
+            // as a blob without it is read as a blob's, since that item's late step is owed
+            // ([`Head::landed_copy`]).
             let bytes = match self.objects.get(&hash) {
                 Ok(bytes) => bytes,
                 Err(error) => return Ok(Settled::Unsettled(format!(
@@ -472,6 +489,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 lease_until: None,
                 ..leased.clone()
             },
+            Ok(Copies::NeverApplies) => WithheldItem { never_applies: true, absent: false, lease_until: None, ..leased.clone() },
             // From the failure, not the request's start: a walk may have run for minutes first.
             Err(_) => WithheldItem { lease_until: Some(epoch_seconds(SystemTime::now()) + FAILED_STEP_BACKOFF), ..leased.clone() },
         };
@@ -503,10 +521,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// [`withheld_deletion_step`](Self::withheld_deletion_step) describes.
     ///
     /// For an item settled while the store lacked the object, it reads the canonical copy's type
-    /// before the walk for its keepers and again before it deletes the copy: a recipe that a racing
-    /// upload landed since is never kept or deleted as a blob, so its chunks are gated and its
-    /// digest is recorded before any deleter takes its last copy ([`Copies::Recipe`]). An item
-    /// settled as a blob is not read again: a hash is one object's, of one type.
+    /// before the walk for its keepers and again once the walk is done, whatever it found: a recipe
+    /// that a racing upload landed since is never kept or deleted as a blob, so its chunks are
+    /// gated and its digest is recorded before any deleter takes its last copy
+    /// ([`Copies::Recipe`]), and a tree, a parcel or a chunk is settled as never applying and kept
+    /// ([`Copies::NeverApplies`]). An item settled as a blob is not read again: a hash is one
+    /// object's, of one type.
     ///
     /// # Returns
     /// * `Ok(Copies)`     - What the step came to.
@@ -518,24 +538,36 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             return Ok(Copies::Done(item.kept));
         }
 
-        let landed_recipe = || match item.absent {
-            true => self.canonical_recipe(hash),
-            false => Ok(None),
+        // What a copy that landed since settling makes of the item, if anything.
+        let retyped = || -> HeadResult<Option<Copies>> {
+            if !item.absent {
+                return Ok(None);
+            }
+            Ok(match self.landed_copy(hash)? {
+                Landed::Stands => None,
+                Landed::Recipe(digest) => Some(Copies::Recipe(digest)),
+                Landed::NoFile => Some(Copies::NeverApplies),
+            })
         };
 
         if !item.kept && !item.recipe {
-            if let Some(digest) = landed_recipe()? {
-                return Ok(Copies::Recipe(digest));
+            if let Some(copies) = retyped()? {
+                return Ok(copies);
             }
         }
 
         let kept = match item.kept || item.recipe {
             true => item.kept,
             false => match self.walk_keepers(hash, budget)? {
-                Keepers::Named => true,
+                Keepers::Named => {
+                    if let Some(copies) = retyped()? {
+                        return Ok(copies);
+                    }
+                    true
+                }
                 Keepers::None => {
-                    if let Some(digest) = landed_recipe()? {
-                        return Ok(Copies::Recipe(digest));
+                    if let Some(copies) = retyped()? {
+                        return Ok(copies);
                     }
 
                     self.objects.delete_canonical(hash).map_err(HeadError::internal)?;
@@ -556,30 +588,49 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         Ok(Copies::Done(kept))
     }
 
-    /// Whether the canonical copy of `hash` is a recipe, and its digest if its bytes give one.
+    /// What the canonical copy of `hash`, withheld by an item settled while the store lacked it,
+    /// is now. Unlike settling, which leaves an unreadable header unsettled and refused for good,
+    /// this reads one as a blob's (logged): the item was settled as a blob already, and its late
+    /// step is owed.
     ///
     /// # Returns
-    /// * `Ok(Some(digest))` - It is a recipe.
-    /// * `Ok(None)`         - It is absent, or of another type, or its header cannot be read
-    ///                        (logged: it is no recipe a digest could be taken from).
-    /// * `Err(HeadError)`   - It could not be read: nothing is deleted.
-    fn canonical_recipe(&self, hash: &str) -> HeadResult<Option<Option<String>>> {
+    /// * `Ok(Landed)`     - What it is.
+    /// * `Err(HeadError)` - It could not be read: nothing is deleted.
+    fn landed_copy(&self, hash: &str) -> HeadResult<Landed> {
         let Some(bytes) = self.objects.get(hash).map_err(HeadError::internal)? else {
-            return Ok(None);
+            return Ok(Landed::Stands);
         };
 
-        match object_utils::peek_object_header(&bytes) {
-            Ok((ObjectType::Recipe, _)) => Ok(Some(digest_of(hash, &bytes))),
-            Ok(_) => Ok(None),
+        Ok(match object_utils::peek_object_header(&bytes) {
+            Ok((ObjectType::Recipe, _)) => Landed::Recipe(digest_of(hash, &bytes)),
+            Ok((ObjectType::Blob, _)) => Landed::Stands,
+            Ok(_) => Landed::NoFile,
             Err(error) => {
                 eprintln!(
                     "forklift-aws-lambda: withheld object {} has a header this build cannot read ({:?}); \
                     it is deleted as a blob",
                     hash, error
                 );
-                Ok(None)
+                Landed::Stands
             }
-        }
+        })
+    }
+
+    /// Whether the canonical copy of `hash` is a recipe, and its digest if its bytes give one.
+    ///
+    /// # Returns
+    /// * `Ok(Some(digest))` - It is a recipe.
+    /// * `Ok(None)`         - It is absent, or of another type, or its header cannot be read.
+    /// * `Err(HeadError)`   - It could not be read.
+    fn canonical_recipe(&self, hash: &str) -> HeadResult<Option<Option<String>>> {
+        let Some(bytes) = self.objects.get(hash).map_err(HeadError::internal)? else {
+            return Ok(None);
+        };
+
+        Ok(match object_utils::peek_object_header(&bytes) {
+            Ok((ObjectType::Recipe, _)) => Some(digest_of(hash, &bytes)),
+            _ => None,
+        })
     }
 
     /// Record the chunk-list digest on the withheld item of the recipe `hash`, when the item has

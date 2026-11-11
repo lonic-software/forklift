@@ -57,7 +57,9 @@ pub struct WithheldItem {
     pub settled: bool,
 
     /// Whether the store lacked the object when the item was settled, so it was settled as a blob
-    /// without one. A recipe a racing upload lands later is settled again as a recipe.
+    /// without one: what settling saw, kept after the late step deletes a blob that landed since.
+    /// A recipe, tree, parcel or chunk a racing upload lands later is settled again as what it
+    /// is, which clears it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub absent: bool,
 
