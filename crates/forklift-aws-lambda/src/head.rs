@@ -1129,8 +1129,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     Ok(Tolerated::removed_only(self.applied_set()?, withholding.applying()))
                 },
                 // This head takes no digest intake yet, so a recipe withheld before it ever held a
-                // copy could never come to carry a digest here: absent withheld content stays
-                // tolerated as any file's content, chunked or not, until it does.
+                // copy carries a digest here only if a racing upload lands one: absent withheld
+                // content stays tolerated as any file's content, chunked or not, until it does.
                 audit_utils::WithheldDigests::AssumedKnown,
             )
             // An incomplete history is classified, so a lift can tell it apart and upload again.

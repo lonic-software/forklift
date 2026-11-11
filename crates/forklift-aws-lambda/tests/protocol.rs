@@ -6675,13 +6675,24 @@ fn served_digests<O: ObjectStore, R: RefStore>(head: &Head<O, R>) -> Vec<(String
 /// A recipe withheld while the store lacked it, which a racing upload lands after it is settled,
 /// is never deleted as a blob: the late step finds the copy a recipe and settles it again as one,
 /// with its digest and its chunk ledger entry, so its chunks are gated and the digest is recorded
-/// before the chunk ledger deletes it.
+/// before the chunk ledger deletes it; also when meta history names it, which would keep a blob.
 // Revert: drop the type read before the late step's `delete_canonical` → the recipe goes as a
-// blob with no digest and its chunks stay → red. Revert: journal nothing on the re-settle → the
-// chunk is served → red. Revert: record no digest on the re-settle → red.
+// blob with no digest and its chunks stay → red. Revert: drop the read before the walk → the
+// recipe meta history names is kept as a blob → red. Revert: journal nothing on the re-settle →
+// the chunk is served → red. Revert: record no digest on the re-settle → red. Revert: record no
+// `absent` at settling → nothing is read again → red.
 #[test]
 fn a_withheld_recipe_landing_after_it_was_settled_absent_is_settled_again_with_its_digest() {
-    let area = Area::new("withheld-race");
+    for named in [false, true] {
+        landing_after_settled_absent(named);
+    }
+}
+
+fn landing_after_settled_absent(named: bool) {
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+    use forklift_core::model::tree_item::TreeItem;
+
+    let area = Area::new(if named { "withheld-race-named" } else { "withheld-race" });
     let (mut recorded, main, recipe, own, shared) = chunked_leak(&area);
     let bytes = recorded.objects.remove(&recipe).expect("the recipe");
     let digest = forklift_core::util::withholding::recipe_digest(&recipe, &bytes).expect("a recipe");
@@ -6692,16 +6703,20 @@ fn a_withheld_recipe_landing_after_it_was_settled_absent_is_settled_again_with_i
 
     served_withheld(&head);
     let item = withheld_item(&head, &recipe);
-    assert!(item.settled && item.swept && !item.recipe && item.chunks.is_none(), "settled while absent: {:?}", item);
+    assert!(item.settled && item.absent && item.swept && !item.recipe && item.chunks.is_none(), "settled while absent: {:?}", item);
     assert!(served(&head, &own[0]), "no recipe is journaled, so its chunks are served");
 
     // The upload that raced the withhold lands.
     head.objects.put_verified(&recipe, &bytes).expect("the racing upload");
+    if named {
+        let meta = gate_parcel(&head, &[], vec![TreeItem::new("cell".to_string(), recipe.clone(), DirEntryType::Normal)]);
+        plant_meta(&head.refs, "tags", None, &meta);
+    }
     age_withheld(&head.refs, &recipe, LATE_SWEEP_AFTER + 40);
     served_withheld(&head);
 
     let item = withheld_item(&head, &recipe);
-    assert!(item.recipe && !item.deleted && item.lease_until.is_none(), "settled again as a recipe: {:?}", item);
+    assert!(item.recipe && !item.absent && !item.kept && !item.deleted && item.lease_until.is_none(), "settled again as a recipe: {:?}", item);
     assert_eq!(item.chunks.as_deref(), Some(digest.as_str()), "with its digest");
     assert!(head.objects.exists(&recipe).expect("exists"), "not deleted as a blob");
     assert_withheld(&head.object_get(&own[0]).expect_err("gated"), &own[0]);

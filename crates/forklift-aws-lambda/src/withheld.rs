@@ -56,6 +56,11 @@ pub struct WithheldItem {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub settled: bool,
 
+    /// Whether the store lacked the object when the item was settled, so it was settled as a blob
+    /// without one. A recipe a racing upload lands later is settled again as a recipe.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub absent: bool,
+
     /// Whether the store holds the hash as no file's content (a tree, a parcel or a chunk), so the
     /// withholding never applies and the object stays served.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -108,6 +113,7 @@ impl WithheldItem {
             statement: statement.to_string(),
             withheld_at,
             settled: false,
+            absent: false,
             never_applies: false,
             recipe: false,
             kept: false,
@@ -157,20 +163,18 @@ pub fn decode(hash: &str, stored: &str) -> Result<WithheldItem, String> {
         ));
     }
 
-    let item: WithheldItem = serde_json::from_str(stored).map_err(|error| format!(
+    let unreadable = |error: &dyn std::fmt::Display| format!(
         "The withheld item for {} cannot be read ({}), so what this warehouse's host withholds \
         cannot be told. Nothing was written over it.",
         hash, error
-    ))?;
+    );
+
+    let item: WithheldItem = serde_json::from_str(stored).map_err(|error| unreadable(&error))?;
 
     // A digest that is not a digest's form is refused, never read as none: it would reopen a
     // judgement the head already made.
     if let Some(digest) = &item.chunks {
-        withholding::checked_digest(digest).map_err(|error| format!(
-            "The withheld item for {} cannot be read ({}), so what this warehouse's host withholds \
-            cannot be told. Nothing was written over it.",
-            hash, error
-        ))?;
+        withholding::checked_digest(digest).map_err(|error| unreadable(&error))?;
     }
 
     Ok(item)
