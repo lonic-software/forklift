@@ -299,8 +299,11 @@ hardcode the `staging/` and `intake/` prefixes and are the only code paths that 
 
 An `intake/` copy is withheld content the host must not keep, and the request that names it
 deletes it. One whose request never comes (a client killed between the upload and the intake
-request) is left to a lifecycle rule. `infra/aws-serverless` expires `intake/*` after **1 day**,
+request), or whose upload lands only after that request (a presigned `PUT` stays valid for its
+TTL), is left to a lifecycle rule. `infra/aws-serverless` expires `intake/*` after **1 day**,
 noncurrent versions after 1 day, and expired delete markers by a second rule, as for `staging/`.
+On a versioned bucket such a copy is gone no sooner than 2 days after it landed, and often a day
+later (S3 rounds each to midnight UTC and runs lifecycle actions asynchronously).
 
 ### Required: expire the `staging/` prefix
 

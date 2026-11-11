@@ -654,7 +654,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         };
         let item = withheld::decode(hash, &stored).map_err(HeadError::internal)?;
 
-        // Only an item settled as a recipe carries a digest; any other is settled from the store.
+        // Only an item settled as a recipe is filled from the store's copy here. An item settled
+        // while the store lacked the object gets its digest from the intake, or re-settled.
         if item.chunks.is_some() || !item.recipe {
             return Ok(true);
         }

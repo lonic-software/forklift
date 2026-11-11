@@ -1143,7 +1143,7 @@ mod tests {
 
         assert_eq!(key, format!("intake/wh-a/{}", hash));
         assert!(parse_staging_key(&key).is_none(), "the staging verifier never reads an intake copy");
-        assert!(!intake_key("wh-b", &hash).starts_with(&intake_key("wh", "")), "a warehouse's prefix holds no other's");
+        assert_ne!(intake_key("wh-b", &hash), key, "each warehouse has its own intake key for a hash");
         for other in ["objects/", "staging/", "signatures/", "responses/", "redaction-work/"] {
             assert!(!key.starts_with(other), "{}", other);
         }

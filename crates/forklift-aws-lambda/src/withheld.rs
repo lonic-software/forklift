@@ -88,7 +88,9 @@ pub struct WithheldItem {
     /// recipe while it held one: by settling, by the deletion step's re-settle of an item settled
     /// while the store lacked the object, or by the chunk ledger before it deletes the recipe; or
     /// from the copy an uploader sent the digest intake, which is read once and never kept.
-    /// Absent while no copy was at hand, and for a blob: read as not known. Once recorded it is
+    /// Absent while no copy was at hand, and for content the store holds as a blob: read as not
+    /// known. The intake records it on an item settled while the store lacked the object, which
+    /// stays settled so: the store still holds no copy for the chunk ledger to read. Once recorded it is
     /// never taken off or replaced, also after the recipe is deleted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunks: Option<String>,
