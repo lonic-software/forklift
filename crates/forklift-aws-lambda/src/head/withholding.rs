@@ -525,16 +525,18 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// that a racing upload landed since is never kept or deleted as a blob, so its chunks are
     /// gated and its digest is recorded before any deleter takes its last copy
     /// ([`Copies::Recipe`]), and a tree, a parcel or a chunk is settled as never applying and kept
-    /// ([`Copies::NeverApplies`]). An item settled as a blob is not read again: a hash is one
-    /// object's, of one type.
+    /// ([`Copies::NeverApplies`]). Keepers protect only a blob: a recipe goes down the recipe's
+    /// path whatever history names it, as one present when the item was settled does. An item
+    /// settled as a blob is not read again: a hash is one object's, of one type. For such an
+    /// item the type is read before the staged copies are deleted, so a tree, a parcel or a chunk
+    /// a lift has staged since is left to it.
     ///
     /// # Returns
     /// * `Ok(Copies)`     - What the step came to.
     /// * `Err(HeadError)` - A read or a delete failed: the step stays owed.
     fn delete_withheld_copies(&self, hash: &str, item: &WithheldItem, late: bool, budget: &mut Budget) -> HeadResult<Copies> {
-        self.objects.delete_staged(hash).map_err(HeadError::internal)?;
-
         if !late {
+            self.objects.delete_staged(hash).map_err(HeadError::internal)?;
             return Ok(Copies::Done(item.kept));
         }
 
@@ -555,6 +557,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 return Ok(copies);
             }
         }
+        self.objects.delete_staged(hash).map_err(HeadError::internal)?;
 
         let kept = match item.kept || item.recipe {
             true => item.kept,
@@ -588,8 +591,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         Ok(Copies::Done(kept))
     }
 
-    /// What the canonical copy of `hash`, withheld by an item settled while the store lacked it,
-    /// is now. Unlike settling, which leaves an unreadable header unsettled and refused for good,
+    /// What the canonical copy of `hash` is now. Unlike settling, which leaves an unreadable header unsettled and refused for good,
     /// this reads one as a blob's (logged): the item was settled as a blob already, and its late
     /// step is owed.
     ///
@@ -608,7 +610,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             Err(error) => {
                 eprintln!(
                     "forklift-aws-lambda: withheld object {} has a header this build cannot read ({:?}); \
-                    it is deleted as a blob",
+                    it is read as a blob's",
                     hash, error
                 );
                 Landed::Stands
@@ -620,16 +622,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     ///
     /// # Returns
     /// * `Ok(Some(digest))` - It is a recipe.
-    /// * `Ok(None)`         - It is absent, or of another type, or its header cannot be read.
+    /// * `Ok(None)`         - It is absent, or of another type, or its header cannot be read
+    ///                        (logged).
     /// * `Err(HeadError)`   - It could not be read.
     fn canonical_recipe(&self, hash: &str) -> HeadResult<Option<Option<String>>> {
-        let Some(bytes) = self.objects.get(hash).map_err(HeadError::internal)? else {
-            return Ok(None);
-        };
-
-        Ok(match object_utils::peek_object_header(&bytes) {
-            Ok((ObjectType::Recipe, _)) => Some(digest_of(hash, &bytes)),
-            _ => None,
+        Ok(match self.landed_copy(hash)? {
+            Landed::Recipe(digest) => Some(digest),
+            Landed::Stands | Landed::NoFile => None,
         })
     }
 

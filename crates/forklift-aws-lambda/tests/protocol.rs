@@ -6492,8 +6492,9 @@ fn a_withheld_hash_the_store_lacks_applies_to_a_tree_uploaded_later() {
 
 /// A tree a racing upload lands after its withheld hash was settled absent is not deleted as a
 /// blob by the late step: it is no file's content, so the item is settled again as never applying,
-/// and the tree stays served.
+/// and the tree stays served, as does a copy a lift staged since.
 // Revert: drop the `NoFile` outcome of the late step's type read → the tree is deleted → red.
+// Revert: delete the staged copies before the type read → the staged tree is gone → red.
 #[test]
 fn a_withheld_tree_landing_after_it_was_settled_absent_never_applies_and_stays() {
     let source = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
@@ -6511,12 +6512,14 @@ fn a_withheld_tree_landing_after_it_was_settled_absent_never_applies_and_stays()
     assert!(item.settled && item.absent && !item.never_applies, "settled while absent: {:?}", item);
 
     head.objects.put_verified(&tree, &tree_bytes).expect("the racing upload");
+    head.objects.stage("lift-1", &tree, tree_bytes.clone());
     age_withheld(&head.refs, &tree, LATE_SWEEP_AFTER + 40);
     served_withheld(&head);
 
     let item = withheld_item(&head, &tree);
     assert!(item.never_applies && !item.absent && !item.deleted && item.lease_until.is_none(), "{:?}", item);
     assert!(head.objects.exists(&tree).expect("exists"), "not deleted as a blob");
+    assert_eq!(head.objects.staged_count(), 1, "the staged copy is left to its lift");
     assert!(served(&head, &tree), "a tree is no file's content");
 }
 
