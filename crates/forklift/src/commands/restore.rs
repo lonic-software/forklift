@@ -676,8 +676,9 @@ mod tests {
         assert!(matches!(restore_entry("dir", &item, false, true), Ok(Restored::Rewritten(_))));
     }
 
-    /// A staged removal's remedy names the path as given, as one argument: plain bare, single-quoted
-    /// for POSIX when a shell would split it, a placeholder on Windows.
+    /// A staged removal's remedy names the root-relative path, from the working tree's root, as one
+    /// argument: plain bare, single-quoted for POSIX when a shell would split it, a placeholder on
+    /// Windows.
     #[test]
     fn a_staged_removal_names_the_root_relative_path_as_one_argument() {
         let cases = [

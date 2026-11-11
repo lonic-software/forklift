@@ -411,9 +411,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   refusal, of `restore` on a file whose removal is staged, and of an inventory that cannot be read
   used to paste the path in bare, so a path with a space or a character a shell reads specially
   gave a command that did not run as printed. They now quote it for a POSIX shell and put a path
-  starting with `-` after `--`. Where no quoting reads the path as one argument (any path needing
-  quoting on Windows, or one holding `"`), they print a placeholder instead and say to quote the
-  path for your shell. All three now name the path relative to the working tree's root and say to
+  starting with `-` after `--`. On Windows, where no quoting reads such a path as one argument,
+  they print a placeholder instead and say to quote the path for your shell. All three now name the path relative to the working tree's root and say to
   run the step from there, and an `incomplete_load` over several paths names a command for every
   one of them, not only the first three.
 
