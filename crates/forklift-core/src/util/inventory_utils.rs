@@ -347,6 +347,24 @@ pub enum RuleVerdict {
     NestedBoundary,
 }
 
+/// The error for a folder whose inventory cannot be parsed. `folder` is warehouse-root-relative,
+/// so the remedy is run from the working tree's root, with the folder as one argument
+/// ([`tree_utils::remedy_path_when`] for the platform `windows`), or as a placeholder where no
+/// quoting there reads it as one.
+fn unreadable_inventory_error(folder: &str, error: &str, windows: bool) -> String {
+    let remedy = tree_utils::remedy_path_when(folder, windows);
+
+    format!(
+        "The inventory of folder \"{}\" cannot be read: {}. From the working tree's root, \
+        \"forklift unload {}\"{} resets it, and every folder below it, to the pallet head, unstaging \
+        everything staged there. Then load the folder again, naming any file an ignore rule covers \
+        that you had loaded by name.",
+        folder, error.trim_end_matches('.'),
+        remedy.as_deref().unwrap_or("-- <folder>"),
+        if remedy.is_some() { "" } else { ", with that path quoted for your shell," }
+    )
+}
+
 /// The refusal for a directory this warehouse tracks that has become the root of another working
 /// tree: walking it would report the other tree's metadata as content, and skipping it would report
 /// this warehouse's tracked content there as gone.
@@ -1090,20 +1108,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         let existing_inventory = match existing_bytes {
             Some(bytes) => {
                 let folder = if path.is_root() { "." } else { path.as_key() };
-                // Quoted for the shell the user is likely in: POSIX single quotes, or double quotes
-                // on Windows (where a path cannot contain one, and cmd.exe ignores single quotes).
-                let quoted = if cfg!(windows) {
-                    format!("\"{}\"", folder)
-                } else {
-                    format!("'{}'", folder.replace('\'', "'\\''"))
-                };
-                let unreadable = |e: String| format!(
-                    "The inventory of folder \"{}\" cannot be read: {}. \"forklift unload {}\" \
-                    resets it, and every folder below it, to the pallet head, unstaging everything staged \
-                    there. Then load the folder again, naming any file an ignore rule covers that you had \
-                    loaded by name.",
-                    folder, e.trim_end_matches('.'), quoted
-                );
+                let unreadable = |e: String| unreadable_inventory_error(folder, &e, cfg!(windows));
                 Some(parser::inventory::inventory_parser::parse_inventory(&bytes).map_err(unreadable)?)
             }
             None => None,
@@ -3099,6 +3104,27 @@ fn stage_removal_for_file(ledger: &mut ShardLedger, path: &WarehousePath) -> Res
 mod tests {
     use super::*;
     use crate::model::inventory::RollupStamp;
+
+    /// An unreadable inventory's remedy runs from the root with the folder as one argument:
+    /// plain bare, single-quoted for POSIX when a shell would split it, a placeholder on Windows.
+    #[test]
+    fn an_unreadable_inventory_names_the_folder_as_one_argument() {
+        let cases = [
+            ("src/api", false, "\"forklift unload src/api\" resets it"),
+            ("src/api", true, "\"forklift unload src/api\" resets it"),
+            ("my docs", false, "\"forklift unload 'my docs'\" resets it"),
+            ("my docs", true, "\"forklift unload -- <folder>\", with that path quoted for your shell, resets it"),
+        ];
+
+        for (folder, windows, expected) in cases {
+            let message = unreadable_inventory_error(folder, "bad header.", windows);
+            assert!(
+                message.starts_with(&format!("The inventory of folder \"{}\" cannot be read: bad header. \
+                    From the working tree's root, {}", folder, expected)),
+                "{:?} (windows: {}): {}", folder, windows, message
+            );
+        }
+    }
 
     /// Whether `key` is registered, as a fresh read of the metadata finds it.
     fn is_registered(key: &str) -> bool {

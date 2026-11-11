@@ -8866,6 +8866,73 @@ fn a_clean_reload_of_the_same_root_clears_the_marker_and_stack_succeeds() {
     assert_success(&warehouse.run(&["stack", "-m", "clean"]));
 }
 
+/// Run `command` the way a user pastes a printed next step: through `sh`, from the warehouse
+/// root, with this build's `forklift` first on `PATH` and the test's isolated configuration.
+#[cfg(unix)]
+fn run_in_shell(warehouse: &TestWarehouse, command: &str) -> Output {
+    let bin = warehouse.home.join("shell-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let link = bin.join("forklift");
+    if !link.exists() {
+        std::os::unix::fs::symlink(FORKLIFT, &link).unwrap();
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+
+    common::test_command("sh")
+        .args(["-c", command])
+        .current_dir(&warehouse.root)
+        .env("PATH", path)
+        .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", warehouse.home.join("test-keys"))
+        .output()
+        .unwrap()
+}
+
+/// The incomplete_load next step names a root a shell would split as one quoted argument, and
+/// both of its commands run as printed: the load finishes and clears the marker, the unload
+/// abandons it.
+#[cfg(unix)]
+#[test]
+fn an_incomplete_load_next_step_runs_as_printed_for_a_path_that_needs_quoting() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (index, finish) in [true, false].into_iter().enumerate() {
+        let warehouse = TestWarehouse::new(&format!("incomplete-load-quoted-{}", index));
+        assert_success(&warehouse.run(&["prepare"]));
+        configure_operator(&warehouse);
+
+        warehouse.write_file("my dir/readable.txt", "fine\n");
+        warehouse.write_file("my dir/blocked.txt", "unreadable\n");
+        let blocked_path = warehouse.root.join("my dir").join("blocked.txt");
+        std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(!warehouse.run(&["load", "my dir"]).status.success());
+        assert!(incomplete_load_marker_path(&warehouse).exists());
+
+        let stacked = warehouse.run(&["stack", "-m", "attempt", "--json"]);
+        assert_eq!(stacked.status.code(), Some(20), "{}", stdout(&stacked));
+        let value = json(&stacked);
+        assert_eq!(value["error"]["code"], "incomplete_load", "{}", value);
+        let next_step = value["error"]["next_step"].as_str().unwrap();
+        let quoted: Vec<&str> = next_step.split('"').skip(1).step_by(2).collect();
+        assert_eq!(quoted, ["forklift load 'my dir'", "forklift unload 'my dir'"], "{}", next_step);
+
+        std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let ran = run_in_shell(&warehouse, if finish { quoted[0] } else { quoted[1] });
+        assert_success(&ran);
+        assert!(
+            !incomplete_load_marker_path(&warehouse).exists(),
+            "the printed step ({}) clears the marker", if finish { quoted[0] } else { quoted[1] }
+        );
+
+        let stacked = warehouse.run(&["stack", "-m", "after"]);
+        assert_ne!(stacked.status.code(), Some(20), "stack no longer refuses: {}", stderr(&stacked));
+        if finish {
+            assert_success(&stacked);
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_narrower_clean_load_does_not_heal_a_broader_failed_root() {

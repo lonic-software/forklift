@@ -118,7 +118,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
-use crate::util::{file_utils, marker_utils};
+use crate::util::{file_utils, marker_utils, tree_utils};
 
 /// The name of the incomplete-load marker file (kept beside the inventory metadata file — see
 /// the module doc comment on why this placement is safe against a whole-staging-area wipe).
@@ -248,8 +248,18 @@ fn format_roots(recorded: &BTreeSet<String>) -> String {
     description
 }
 
-/// Build the `incomplete_load` refusal naming the recorded root(s).
+/// Build the `incomplete_load` refusal naming the recorded root(s), its next step quoted for
+/// this platform's shell: see [`incomplete_load_refusal_when`].
 fn incomplete_load_refusal(recorded: &BTreeSet<String>) -> CoreError {
+    incomplete_load_refusal_when(recorded, cfg!(windows))
+}
+
+/// [`incomplete_load_refusal`] as the platform `windows` says. The recorded roots are
+/// warehouse-root-relative, so the next step is run from the working tree's root. A single root
+/// goes into its commands as one argument ([`tree_utils::remedy_path_when`]), or as a `<path>`
+/// placeholder where no quoting there reads it as one; several roots are named in the message
+/// and the commands take a placeholder.
+fn incomplete_load_refusal_when(recorded: &BTreeSet<String>, windows: bool) -> CoreError {
     let description = if recorded.len() == 1 {
         format!("The load of \"{}\"", display_path(recorded.iter().next().expect("len == 1")))
     } else {
@@ -257,15 +267,20 @@ fn incomplete_load_refusal(recorded: &BTreeSet<String>) -> CoreError {
     };
 
     let next_step = if recorded.len() == 1 {
-        let path = display_path(recorded.iter().next().expect("len == 1"));
-        format!(
-            "Run \"forklift load {}\" again, or \"forklift unload {}\" to abandon it.",
-            path, path
-        )
+        match tree_utils::remedy_path_when(display_path(recorded.iter().next().expect("len == 1")), windows) {
+            Some(path) => format!(
+                "From the working tree's root, run \"forklift load {}\" again, or \"forklift unload {}\" \
+                to abandon it.",
+                path, path
+            ),
+            None => "From the working tree's root, run \"forklift load -- <path>\" again, or \"forklift \
+                unload -- <path>\" to abandon it, with that path quoted for your shell.".to_string(),
+        }
     } else {
         format!(
-            "Re-run \"forklift load\" over each affected path ({}), or \"forklift unload <path>\" to \
-            abandon it, for each.",
+            "From the working tree's root, re-run \"forklift load -- <path>\" over each affected path \
+            ({}), or \"forklift unload -- <path>\" to abandon it, for each, with the path quoted for \
+            your shell.",
             format_roots(recorded)
         )
     };
@@ -513,5 +528,36 @@ mod tests {
         assert!(pending_start_marker("docs").is_some(), "disjoint from \"src\"");
 
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// The next step's commands take a single recorded root as one argument on each platform: a
+    /// plain path bare, one a shell would split single-quoted for POSIX and a placeholder on
+    /// Windows, a leading `-` after `--`; several roots take a placeholder.
+    #[test]
+    fn the_next_step_names_a_recorded_root_as_one_argument() {
+        let mut failures = Vec::new();
+        let roots = |keys: &[&str]| keys.iter().map(|key| key.to_string()).collect::<BTreeSet<_>>();
+        let cases: [(&[&str], bool, &str); 8] = [
+            (&["src/api"], false, "run \"forklift load src/api\" again, or \"forklift unload src/api\""),
+            (&["src/api"], true, "run \"forklift load src/api\" again, or \"forklift unload src/api\""),
+            (&[""], false, "run \"forklift load ./\" again, or \"forklift unload ./\""),
+            (&["my dir"], false, "run \"forklift load 'my dir'\" again, or \"forklift unload 'my dir'\""),
+            (&["my dir"], true, "run \"forklift load -- <path>\" again, or \"forklift unload -- <path>\" to \
+                abandon it, with that path quoted for your shell."),
+            (&["-draft"], false, "run \"forklift load -- -draft\" again, or \"forklift unload -- -draft\""),
+            (&["-draft"], true, "run \"forklift load -- -draft\" again, or \"forklift unload -- -draft\""),
+            (&["my dir", "src"], false, "re-run \"forklift load -- <path>\" over each affected path \
+                (my dir, src), or \"forklift unload -- <path>\" to abandon it, for each, with the path \
+                quoted for your shell."),
+        ];
+
+        for (keys, windows, expected) in cases {
+            match incomplete_load_refusal_when(&roots(keys), windows) {
+                CoreError::Refusal { next_step, .. } if next_step.starts_with("From the working tree's root, ")
+                    && next_step.contains(expected) => {}
+                other => failures.push(format!("{:?} (windows: {}): expected {:?} in {:?}", keys, windows, expected, other)),
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }
