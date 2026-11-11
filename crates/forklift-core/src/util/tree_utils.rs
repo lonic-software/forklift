@@ -544,7 +544,7 @@ fn probe_staged_object(path: &str, hash: &str, chunked: bool) -> Result<StagedOb
 }
 
 /// `path` as it goes into a remedy command on this platform: see [`remedy_path_when`].
-pub fn remedy_path(path: &str) -> Option<String> {
+pub(crate) fn remedy_path(path: &str) -> Option<String> {
     remedy_path_when(path, cfg!(windows))
 }
 
@@ -552,15 +552,16 @@ pub fn remedy_path(path: &str) -> Option<String> {
 /// treats specially, and single-quoted for a POSIX shell otherwise. On Windows there is no quoting
 /// that both `cmd` and PowerShell read as one literal argument (both expand inside double quotes,
 /// and the message already wraps the command in them), so such a path gets `None` and the caller
-/// prints a `<path>` placeholder instead. A path starting with `-` is put after `--`, so it is not
-/// taken for an option.
+/// prints a `<path>` placeholder instead. So does a path holding `"` on either platform: the
+/// message wraps the command in double quotes, and one inside it would end the command early. A
+/// path starting with `-` is put after `--`, so it is not taken for an option.
 pub fn remedy_path_when(path: &str, windows: bool) -> Option<String> {
     // PowerShell also reads `,` (an array), a leading `@` (splatting) and `+`, `:` in some
     // positions, so Windows keeps to the characters no shell there treats specially.
     let plain = if windows { "._-/" } else { "._-/+@%:," };
     let quoted = if !path.is_empty() && path.chars().all(|c| c.is_ascii_alphanumeric() || plain.contains(c)) {
         path.to_string()
-    } else if windows {
+    } else if windows || path.contains('"') {
         return None;
     } else {
         format!("'{}'", path.replace('\'', "'\\''"))
@@ -1104,8 +1105,9 @@ mod subtree_closure_tests {
     }
 
     /// A remedy command's path is one argument: plain paths stay as they are, anything a shell
-    /// would split or expand is single-quoted for POSIX (embedded quotes included) and left to a
-    /// placeholder on Windows, and a leading `-` goes after `--`.
+    /// would split or expand is single-quoted for POSIX (embedded single quotes included) and left to
+    /// a placeholder on Windows, a `"` (which would end the message's quoting of the command) takes
+    /// the placeholder on both, and a leading `-` goes after `--`.
     #[test]
     fn a_remedy_path_is_one_argument() {
         let mut failures = Vec::new();
@@ -1121,6 +1123,7 @@ mod subtree_closure_tests {
             ("-draft.txt", Some("-- -draft.txt"), Some("-- -draft.txt")),
             ("-my draft", Some("-- '-my draft'"), None),
             ("", Some("''"), None),
+            ("say \"hi\".txt", None, None),
         ];
         for (path, posix, windows) in cases {
             for (is_windows, expected) in [(false, posix), (true, windows)] {

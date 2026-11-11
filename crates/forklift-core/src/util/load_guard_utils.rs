@@ -257,8 +257,9 @@ fn incomplete_load_refusal(recorded: &BTreeSet<String>) -> CoreError {
 /// [`incomplete_load_refusal`] as the platform `windows` says. The recorded roots are
 /// warehouse-root-relative, so the next step is run from the working tree's root. A single root
 /// goes into its commands as one argument ([`tree_utils::remedy_path_when`]), or as a `<path>`
-/// placeholder where no quoting there reads it as one; several roots are named in the message
-/// and the commands take a placeholder.
+/// placeholder where no quoting there reads it as one. Several roots each get their own command,
+/// all of them listed (past the description's cap), or, when any one of them cannot be quoted,
+/// a placeholder step that lists every root.
 fn incomplete_load_refusal_when(recorded: &BTreeSet<String>, windows: bool) -> CoreError {
     let description = if recorded.len() == 1 {
         format!("The load of \"{}\"", display_path(recorded.iter().next().expect("len == 1")))
@@ -277,12 +278,22 @@ fn incomplete_load_refusal_when(recorded: &BTreeSet<String>, windows: bool) -> C
                 unload -- <path>\" to abandon it, with that path quoted for your shell.".to_string(),
         }
     } else {
-        format!(
-            "From the working tree's root, re-run \"forklift load -- <path>\" over each affected path \
-            ({}), or \"forklift unload -- <path>\" to abandon it, for each, with the path quoted for \
-            your shell.",
-            format_roots(recorded)
-        )
+        // Every root is named here, not just the ones the description shows: each needs its own
+        // load or unload, and the refusal has nowhere else to list them.
+        let paths: Vec<&str> = recorded.iter().map(|key| display_path(key)).collect();
+        match paths.iter().map(|path| tree_utils::remedy_path_when(path, windows)).collect::<Option<Vec<_>>>() {
+            Some(arguments) => format!(
+                "From the working tree's root, run each of these again, or \"forklift unload\" with the \
+                same path to abandon it: {}.",
+                arguments.iter().map(|argument| format!("\"forklift load {}\"", argument)).collect::<Vec<_>>().join(", ")
+            ),
+            None => format!(
+                "From the working tree's root, run \"forklift load -- <path>\" again for each of these \
+                paths, or \"forklift unload -- <path>\" to abandon it, with the path quoted for your \
+                shell: {}.",
+                paths.iter().map(|path| format!("\"{}\"", path)).collect::<Vec<_>>().join(", ")
+            ),
+        }
     };
 
     CoreError::refusal(
@@ -532,12 +543,13 @@ mod tests {
 
     /// The next step's commands take a single recorded root as one argument on each platform: a
     /// plain path bare, one a shell would split single-quoted for POSIX and a placeholder on
-    /// Windows, a leading `-` after `--`; several roots take a placeholder.
+    /// Windows, a leading `-` after `--`; several roots are each named, past the description's cap,
+    /// as their own command where every one quotes and in a listed placeholder step otherwise.
     #[test]
     fn the_next_step_names_a_recorded_root_as_one_argument() {
         let mut failures = Vec::new();
         let roots = |keys: &[&str]| keys.iter().map(|key| key.to_string()).collect::<BTreeSet<_>>();
-        let cases: [(&[&str], bool, &str); 8] = [
+        let cases: [(&[&str], bool, &str); 10] = [
             (&["src/api"], false, "run \"forklift load src/api\" again, or \"forklift unload src/api\""),
             (&["src/api"], true, "run \"forklift load src/api\" again, or \"forklift unload src/api\""),
             (&[""], false, "run \"forklift load ./\" again, or \"forklift unload ./\""),
@@ -546,9 +558,14 @@ mod tests {
                 abandon it, with that path quoted for your shell."),
             (&["-draft"], false, "run \"forklift load -- -draft\" again, or \"forklift unload -- -draft\""),
             (&["-draft"], true, "run \"forklift load -- -draft\" again, or \"forklift unload -- -draft\""),
-            (&["my dir", "src"], false, "re-run \"forklift load -- <path>\" over each affected path \
-                (my dir, src), or \"forklift unload -- <path>\" to abandon it, for each, with the path \
-                quoted for your shell."),
+            (&["a, b", "c"], false, "run each of these again, or \"forklift unload\" with the same path \
+                to abandon it: \"forklift load 'a, b'\", \"forklift load c\"."),
+            (&["a", "b", "c", "d", "e"], false, "run each of these again, or \"forklift unload\" with the \
+                same path to abandon it: \"forklift load a\", \"forklift load b\", \"forklift load c\", \
+                \"forklift load d\", \"forklift load e\"."),
+            (&["my dir", "src"], true, "run \"forklift load -- <path>\" again for each of these paths, or \
+                \"forklift unload -- <path>\" to abandon it, with the path quoted for your shell: \
+                \"my dir\", \"src\"."),
         ];
 
         for (keys, windows, expected) in cases {

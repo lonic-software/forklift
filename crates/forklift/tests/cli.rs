@@ -8869,12 +8869,6 @@ fn a_clean_reload_of_the_same_root_clears_the_marker_and_stack_succeeds() {
 /// root, with this build's `forklift` first on `PATH` and the test's isolated configuration.
 #[cfg(unix)]
 fn run_in_shell(warehouse: &TestWarehouse, command: &str) -> Output {
-    run_in_shell_at(warehouse, &warehouse.root, command)
-}
-
-/// [`run_in_shell`] from `dir`.
-#[cfg(unix)]
-fn run_in_shell_at(warehouse: &TestWarehouse, dir: &std::path::Path, command: &str) -> Output {
     let bin = warehouse.home.join("shell-bin");
     std::fs::create_dir_all(&bin).unwrap();
     let link = bin.join("forklift");
@@ -8885,7 +8879,7 @@ fn run_in_shell_at(warehouse: &TestWarehouse, dir: &std::path::Path, command: &s
 
     common::test_command("sh")
         .args(["-c", command])
-        .current_dir(dir)
+        .current_dir(&warehouse.root)
         .env("PATH", path)
         .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
         .env("FORKLIFT_KEYS_DIR", warehouse.home.join("test-keys"))
@@ -8938,11 +8932,12 @@ fn an_incomplete_load_next_step_runs_as_printed_for_a_path_that_needs_quoting() 
     }
 }
 
-/// Restoring a file whose removal is staged names the unload for the path as given, quoted as one
-/// argument, and run as printed from the same subdirectory it unstages the removal.
+/// Restoring a file whose removal is staged, from a subdirectory, names the unload for the
+/// root-relative path quoted as one argument, and run as printed from the working tree's root it
+/// unstages the removal.
 #[cfg(unix)]
 #[test]
-fn a_staged_removal_next_step_runs_as_printed_from_the_restore_directory() {
+fn a_staged_removal_next_step_runs_as_printed_from_the_working_tree_root() {
     let warehouse = TestWarehouse::new("restore-staged-removal-quoted");
     warehouse.write_file("docs/my notes.txt", "original\n");
     assert_success(&warehouse.run(&["prepare"]));
@@ -8958,9 +8953,9 @@ fn a_staged_removal_next_step_runs_as_printed_from_the_restore_directory() {
     assert!(!refused.status.success());
     let message = stderr(&refused);
     let command = message.split('"').nth(3).expect("the message quotes the unload");
-    assert_eq!(command, "forklift unload 'my notes.txt'", "{}", message);
+    assert_eq!(command, "forklift unload 'docs/my notes.txt'", "{}", message);
 
-    assert_success(&run_in_shell_at(&warehouse, &docs, command));
+    assert_success(&run_in_shell(&warehouse, command));
     assert_success(&warehouse.run_at(&docs, &["restore", "my notes.txt"]));
     assert_eq!(std::fs::read_to_string(docs.join("my notes.txt")).unwrap(), "original\n");
 }

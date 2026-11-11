@@ -81,7 +81,7 @@ fn restore_worktree(path: &WarehousePath, target: &str, confirm: bool) -> Result
     };
 
     if item.state == InventoryItemState::Deleted {
-        return Err(staged_removal_error(path.as_key(), target, cfg!(windows)));
+        return Err(staged_removal_error(path.as_key(), cfg!(windows)));
     }
 
     // Judged before what is on disk is compared: another spelling's file is not this one's change.
@@ -364,18 +364,20 @@ fn folder_refusal(file_path: &str) -> String {
     )
 }
 
-/// The error for a restore of `key` (warehouse-root-relative), whose removal is staged. Its remedy
-/// names `target`, the path as given, which resolves from the directory the restore was run in,
-/// as one argument (`tree_utils::remedy_path_when` for the platform `windows`), or as a
-/// placeholder where no quoting there reads it as one.
-fn staged_removal_error(key: &str, target: &str, windows: bool) -> String {
-    let remedy = forklift_core::util::tree_utils::remedy_path_when(target, windows);
+/// The error for a restore of `key` (warehouse-root-relative, `/`-separated), whose removal is
+/// staged. Its remedy names `key` from the working tree's root rather than the path as given: the
+/// key is the same whatever directory, separators or absolute form the user typed, so it stays one
+/// plain argument wherever quoting allows (`tree_utils::remedy_path_when` for the platform
+/// `windows`), and becomes a placeholder only where no quoting there reads it as one.
+fn staged_removal_error(key: &str, windows: bool) -> String {
+    let remedy = forklift_core::util::tree_utils::remedy_path_when(key, windows);
 
     format!(
-        "The removal of \"{}\" is staged; run \"forklift unload {}\"{} to unstage it first.",
+        "The removal of \"{}\" is staged; from the working tree's root, run \"forklift unload {}\"{} to \
+        unstage it first.",
         key,
         remedy.as_deref().unwrap_or("-- <path>"),
-        if remedy.is_some() { "" } else { ", with the path you gave quoted for your shell," }
+        if remedy.is_some() { "" } else { ", with that path quoted for your shell," }
     )
 }
 
@@ -677,19 +679,19 @@ mod tests {
     /// A staged removal's remedy names the path as given, as one argument: plain bare, single-quoted
     /// for POSIX when a shell would split it, a placeholder on Windows.
     #[test]
-    fn a_staged_removal_names_the_given_path_as_one_argument() {
+    fn a_staged_removal_names_the_root_relative_path_as_one_argument() {
         let cases = [
-            ("docs/a.txt", false, "run \"forklift unload a.txt\" to unstage it first."),
-            ("docs/a.txt", true, "run \"forklift unload a.txt\" to unstage it first."),
-            ("docs/my notes.txt", false, "run \"forklift unload 'my notes.txt'\" to unstage it first."),
-            ("docs/my notes.txt", true, "run \"forklift unload -- <path>\", with the path you gave quoted for \
-                your shell, to unstage it first."),
+            ("docs/a.txt", false, "run \"forklift unload docs/a.txt\" to unstage it first."),
+            ("docs/a.txt", true, "run \"forklift unload docs/a.txt\" to unstage it first."),
+            ("docs/my notes.txt", false, "run \"forklift unload 'docs/my notes.txt'\" to unstage it first."),
+            ("docs/my notes.txt", true, "run \"forklift unload -- <path>\", with that path quoted for your \
+                shell, to unstage it first."),
         ];
 
         for (key, windows, expected) in cases {
-            let target = key.trim_start_matches("docs/");
-            let message = staged_removal_error(key, target, windows);
-            assert!(message.starts_with(&format!("The removal of \"{}\" is staged; ", key)), "{}", message);
+            let message = staged_removal_error(key, windows);
+            let prefix = format!("The removal of \"{}\" is staged; from the working tree's root, ", key);
+            assert!(message.starts_with(&prefix), "{}", message);
             assert!(message.ends_with(expected), "{:?} (windows: {}): {}", key, windows, message);
         }
     }
