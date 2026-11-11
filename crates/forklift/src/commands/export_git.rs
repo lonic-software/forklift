@@ -39,7 +39,8 @@ pub(crate) const EXPORT_LAYOUT: u32 = 1;
 ///
 /// The objects are deterministic (§9.8): every commit ends in a line naming its parcel and the
 /// export layout, and no git configuration or environment of the user's reaches an object write, so
-/// the same history exports to the same commits on any machine that applied the same redactions.
+/// the same history exports to the same commits on any machine that applied the same redactions
+/// and lacks the same withheld content.
 /// A file whose redaction this warehouse applied is left out of every commit that carried it, never
 /// replaced by a placeholder, and the report names it by path and parcel. So is a file whose content
 /// this warehouse lacks because the host of a remote withholds it (the unavailable record), named
@@ -592,6 +593,9 @@ pub(crate) struct Exporter<'a> {
     /// The git trees written leaving withheld content out, by this run or a logged earlier one,
     /// when this exporter keeps the log; none of them is reused for a forklift tree.
     withheld_trees: Option<HashSet<String>>,
+    /// The trees in `withheld_trees` written since the log was last appended to, which must reach
+    /// it before a commit names them.
+    withheld_unlogged: Vec<String>,
     /// The forklift trees that held entries, every one of which was left out.
     emptied: HashSet<String>,
     /// Whether nothing under a forklift tree is redacted, for the trees asked about.
@@ -631,6 +635,7 @@ impl<'a> Exporter<'a> {
             unavailable,
             omitted_in: HashMap::new(),
             withheld_trees: None,
+            withheld_unlogged: Vec::new(),
             emptied: HashSet::new(),
             clean: HashMap::new(),
             redacted: BTreeMap::new(),
@@ -671,49 +676,73 @@ impl<'a> Exporter<'a> {
     /// here can tell.
     pub(crate) fn keep_withheld_log(&mut self) -> Result<(), String> {
         let path = self.repo.git_dir().join(WITHHELD_TREES_LOG);
-        let logged = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        let logged = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(format!("Could not read {}: {}", path.display(), error)),
         };
         // Text after the last newline is a torn append, from a run stopped before any commit named
         // its tree: no tree, cut off so the next append starts a fresh line. Any whole line
         // unreadable is refused rather than skipped, since a tree it named would then be reused.
-        let kept = logged.rfind('\n').map_or(0, |end| end + 1);
+        let kept = logged.iter().rposition(|byte| *byte == b'\n').map_or(0, |end| end + 1);
         let whole = &logged[..kept.saturating_sub(1)];
         if kept < logged.len() {
             let fail = |error: std::io::Error| format!("Could not write {}: {}", path.display(), error);
             let log = std::fs::OpenOptions::new().write(true).open(&path).map_err(fail)?;
             log.set_len(kept as u64).map_err(fail)?;
-            log.sync_all().map_err(fail)?;
+            if file_utils::fsync_enabled() {
+                log.sync_all().map_err(fail)?;
+            }
         }
         let mut trees = HashSet::new();
-        for line in whole.split('\n').filter(|_| kept > 0) {
-            if !matches!(line.len(), 40 | 64) || !line.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) {
-                return Err(format!("{} holds a line this build cannot read: \"{}\"", path.display(), line));
-            }
-            trees.insert(line.to_string());
+        for line in whole.split(|byte| *byte == b'\n').filter(|_| kept > 0) {
+            // A git object id: SHA-1 or SHA-256, as git prints it.
+            let hash = std::str::from_utf8(line).ok()
+                .filter(|hash| matches!(hash.len(), 40 | 64) && hash.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
+            let Some(hash) = hash else {
+                return Err(format!("{} holds a line this build cannot read: \"{}\"",
+                    path.display(), String::from_utf8_lossy(line)));
+            };
+            trees.insert(hash.to_string());
         }
         self.withheld_trees = Some(trees);
 
         Ok(())
     }
 
-    /// Log `git_tree` as written leaving withheld content out, durably, when the log is kept.
-    fn log_withheld_tree(&mut self, git_tree: &str) -> Result<(), String> {
-        let Some(trees) = self.withheld_trees.as_mut() else {
-            return Ok(());
-        };
-        if trees.contains(git_tree) {
+    /// Note `git_tree` as written leaving withheld content out, when the log is kept; it reaches
+    /// the log at the next [`Self::flush_withheld_log`].
+    fn log_withheld_tree(&mut self, git_tree: &str) {
+        if let Some(trees) = self.withheld_trees.as_mut() {
+            if trees.insert(git_tree.to_string()) {
+                self.withheld_unlogged.push(git_tree.to_string());
+            }
+        }
+    }
+
+    /// Append the trees noted since the last flush to the log, durably: called before a commit
+    /// that may name them is written.
+    fn flush_withheld_log(&mut self) -> Result<(), String> {
+        if self.withheld_unlogged.is_empty() {
             return Ok(());
         }
 
-        let path = self.repo.git_dir().join(WITHHELD_TREES_LOG);
+        let dir = self.repo.git_dir();
+        let path = dir.join(WITHHELD_TREES_LOG);
         let fail = |error: std::io::Error| format!("Could not write {}: {}", path.display(), error);
-        let mut log = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(fail)?;
-        std::io::Write::write_all(&mut log, format!("{}\n", git_tree).as_bytes()).map_err(fail)?;
-        log.sync_all().map_err(fail)?;
-        trees.insert(git_tree.to_string());
+        let created = !path.exists();
+        // A write handle, not an append-only one, which Windows refuses to flush.
+        let mut log = std::fs::OpenOptions::new().create(true).write(true).open(&path).map_err(fail)?;
+        std::io::Seek::seek(&mut log, std::io::SeekFrom::End(0)).map_err(fail)?;
+        let lines: String = self.withheld_unlogged.iter().map(|tree| format!("{}\n", tree)).collect();
+        std::io::Write::write_all(&mut log, lines.as_bytes()).map_err(fail)?;
+        if file_utils::fsync_enabled() {
+            log.sync_all().map_err(fail)?;
+        }
+        if created {
+            file_utils::sync_dir(&dir)?;
+        }
+        self.withheld_unlogged.clear();
 
         Ok(())
     }
@@ -798,6 +827,7 @@ impl<'a> Exporter<'a> {
                 }.push(forklift_hash.to_string());
             }
         }
+        self.flush_withheld_log()?;
         let mut args = vec!["commit-tree".to_string(), tree.clone()];
         for commit in parent_commits {
             args.extend(["-p".to_string(), commit]);
@@ -929,9 +959,9 @@ impl<'a> Exporter<'a> {
         // C-unquotes a name that begins with `"`, writing a different name than the tree holds.
         // A name never holds NUL (the tree parser refuses one), so NUL frames every entry.
         let git_hash = self.repo.run(&["mktree", "-z"], Some(entries.as_bytes()))?.trim().to_string();
-        // Logged before any commit names it, so no later run can reuse it unlogged.
+        // Logged before any commit names it (see export_parcel), so no later run reuses it.
         if withheld {
-            self.log_withheld_tree(&git_hash)?;
+            self.log_withheld_tree(&git_hash);
         }
         self.trees_written += 1;
         self.trees.insert(forklift_hash.to_string(), git_hash.clone());
@@ -1780,7 +1810,8 @@ mod tests {
         let mut exporter = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
         exporter.keep_withheld_log().unwrap();
         assert_eq!(exporter.withheld_trees, Some(HashSet::from([first.clone()])));
-        exporter.log_withheld_tree(&second).unwrap();
+        exporter.log_withheld_tree(&second);
+        exporter.flush_withheld_log().unwrap();
         assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("{}\n{}\n", first, second));
 
         let mut again = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
@@ -1790,5 +1821,9 @@ mod tests {
         std::fs::write(&log, format!("{}\nnot a tree\n", first)).unwrap();
         let mut refused = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
         assert!(refused.keep_withheld_log().unwrap_err().contains("not a tree"));
+
+        std::fs::write(&log, [first.as_bytes(), b"\n\xff\n"].concat()).unwrap();
+        let mut garbled = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        assert!(garbled.keep_withheld_log().unwrap_err().contains("cannot read"));
     }
 }
