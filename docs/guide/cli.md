@@ -188,7 +188,10 @@ of each commit that carried it, with nothing in its place; the export names it w
 those commits. A commit a mirror wrote before the redaction applied keeps the file. A file whose
 content this warehouse lacks because the host of a remote withholds it (`stocktake` lists it as not
 checked out) is left out the same way, and named with the host's statement (`withheld` in `--json`);
-`git mirror` takes the remote's history without such content, as `lower` does.
+`git mirror` takes the remote's history without such content, as `lower` does. Once the content
+is back in the warehouse, the next commit a mirror writes holds the file again; the commits written
+without it stay as they are. (The mirror keeps a log of the git folders it wrote without such a
+file, `forklift-withheld-trees` in the git repository's folder, so it never reuses one.)
 
 Only what this warehouse holds is exported, so with a remote configured, the export also asks the
 remote for its pallets. Each one the export has no branch for as it stands there (none of that
