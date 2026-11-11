@@ -127,7 +127,7 @@ The one-round-trip handshake: protocol version, refs and trust.
   "tombstones": { "old-feature": "<parcel-hash>" },
   "redactions": [{ "hash": "<hash>", "state": "deletion_owed" },
                  { "hash": "<hash>", "state": "pending" }],
-  "withheld": [{ "hash": "<hash>", "statement": "<the host's words>", "state": "deletion_owed" }]
+  "withheld": [{ "hash": "<hash>", "statement": "<the host's words>", "state": "deletion_owed", "chunks": "<digest>" }]
 }
 ```
 
@@ -240,6 +240,11 @@ the object withholds it whatever it is, as with a redaction (below). The AWS hea
 learns which on the first request after the host lists it, and answers that request `503` with
 `Retry-After` when it cannot find out in time, never as if nothing were withheld. A stored object
 whose kind it cannot read is withheld until it can, refused like any other withheld content.
+`chunks` (additive) is, for a withheld chunked file, the digest of its recipe's chunk list, as a
+chunk-list redaction records it, which the head computed from a copy of the recipe it held. It is
+omitted while the head has no such copy to compute it from, and always for content that is not a
+recipe. A client keeps it in its `unavailable` record, and judges a chunk-list redaction over the
+file by it while it lacks the recipe. The AWS head does not send it yet.
 
 **Withheld content is refused.** `GET` and `PUT` of `/v1/objects/{hash}` for a withheld hash
 answer `451` with `code` `content_withheld`, the host's statement in the message, and
@@ -249,7 +254,9 @@ an applied redaction's content. A hash both redacted and withheld is answered `4
 **Withheld content is still named.** Pallet heads may keep naming a withheld file, and a lift may
 name it without uploading it: `missing` never lists a withheld hash, `upload-targets` answers it in
 `withheld`, and a ref update tolerates its absence wherever a file names it, moved or copied
-included. Only a file's content is tolerated so, a chunked file's recipe among it; a tree, parcel
+included. While the head's `@redactions` pallet holds a chunk-list redaction, forklift-server judges
+a withheld chunked file it no longer holds by its recorded `chunks` digest: a match is refused as
+redacted content, as the recipe itself would be. Only a file's content is tolerated so, a chunked file's recipe among it; a tree, parcel
 or chunk is never withheld. A withheld recipe's chunks are not refused by hash, since other content
 may share them: until its deletion is done, forklift-server serves a chunk that only withheld or
 redacted recipes name as absent, as it does for an applied redaction (below).
