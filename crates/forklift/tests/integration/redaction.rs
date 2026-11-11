@@ -3738,8 +3738,8 @@ fn git_export_leaves_out_a_file_whose_content_the_remote_withholds_and_names_it(
 /// earlier version of the file is exported as before, and nothing reads as redacted or as withheld
 /// by a remote's host.
 ///
-/// Revert: leave the withheld record out of the export → the stored copy is written into git, and
-/// the deleted one fails the export as a missing object.
+/// Revert: leave the withheld record out of the export → the stored copy's export names nothing
+/// withheld here, and the deleted one fails the export as a missing object.
 #[test]
 fn git_export_in_a_served_root_leaves_out_content_its_host_withholds() {
     for deleted in [false, true] {
@@ -3788,6 +3788,40 @@ fn git_export_in_a_served_root_leaves_out_content_its_host_withholds() {
         assert!(human.contains("the host of this warehouse withholds its content"), "{}", human);
         assert!(human.contains(&format!("The host's statement: {}", TAKEDOWN)), "{}", human);
     }
+}
+
+/// `git mirror` run in a served root, whose remote is the server itself, leaves out of the commit
+/// it pushes a file whose content that root's own host withholds, once the served root has deleted
+/// the copy, and names it with the host's statement.
+///
+/// Revert: leave the withheld record out of the mirror's exporter → the pallet fails reading the
+/// deleted film.
+#[test]
+fn git_mirror_in_a_served_root_leaves_out_content_its_host_withholds() {
+    let mut takedown = takedown("mirror-here");
+    takedown.withhold_new_film(false);
+    let head = takedown.server.main();
+    let served = Warehouse { root: takedown.server.root.clone(), home: takedown.owner.home.clone() };
+    let git = takedown.server.root.parent().unwrap().join("forklift-takedown-mirror-here-git");
+    let _ = std::fs::remove_dir_all(&git);
+    let initialised = std::process::Command::new("git").args(["init", "-q", "--bare", git.to_str().unwrap()])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+        .output().unwrap();
+    assert!(initialised.status.success(), "{}", String::from_utf8_lossy(&initialised.stderr));
+    served.run_ok(&["config", "set", "remote.url", &takedown.server.url]);
+    served.run_ok(&["config", "set", "mirror.url", git.to_str().unwrap()]);
+
+    let mirrored = served.json(&["git", "mirror"]);
+    assert_eq!(mirrored["ok"], true, "{}", mirrored);
+    let main = &mirrored["data"]["pallets"][0];
+    assert_eq!(main["status"], "pushed", "{}", mirrored);
+    assert_eq!(main["withheld_here"], serde_json::json!([
+        { "path": "media/film.mkv", "hash": takedown.film, "statement": TAKEDOWN, "parcels": [head] }
+    ]), "{}", mirrored);
+    let paths = git_paths(&git, "main");
+    assert!(!paths.contains(&"media/film.mkv".to_string()), "{:?}", paths);
+    assert!(paths.contains(&"media/trailer.mkv".to_string()), "{:?}", paths);
 }
 
 /// `git mirror` in a warehouse behind its remote takes the new history without the content the
