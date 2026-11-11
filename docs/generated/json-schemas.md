@@ -1343,7 +1343,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "statement": {
-          "description": "The statement of the host that withholds it, as this warehouse recorded it.",
+          "description": "The statement of the host that withholds it: for a remote's, as this warehouse recorded it\nwhen the fetch was refused; for this warehouse's own, as its host recorded the takedown.",
           "type": "string"
         }
       },
@@ -1658,7 +1658,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "statement": {
-          "description": "The statement of the host that withholds it, as this warehouse recorded it.",
+          "description": "The statement of the host that withholds it: for a remote's, as this warehouse recorded it\nwhen the fetch was refused; for this warehouse's own, as its host recorded the takedown.",
           "type": "string"
         }
       },
@@ -2749,7 +2749,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "statement": {
-          "description": "The statement of the host that withholds it, as this warehouse recorded it.",
+          "description": "The statement of the host that withholds it: for a remote's, as this warehouse recorded it\nwhen the fetch was refused; for this warehouse's own, as its host recorded the takedown.",
           "type": "string"
         }
       },
