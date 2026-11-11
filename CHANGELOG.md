@@ -407,6 +407,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **A read from a remote no longer fails on a connection the remote had already closed.** When a
+  remote or a gateway in front of it closed an idle connection the client was about to reuse, the
+  `GET` of an object, a subtree, a signature, a bundle or the handshake failed the command with
+  "connection closed before message completed". The client now sends such a `GET` again, up to
+  three times in all. No other kind of request is resent, nor a `GET` that timed out or could not
+  connect.
+
 - **forklift-server writes plain-text logs when stderr is not a terminal.** Its logs used to carry
   colour escape sequences into a log file or a service manager's journal; they are now coloured
   only on a terminal.
