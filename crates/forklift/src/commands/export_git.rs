@@ -701,7 +701,7 @@ impl<'a> Exporter<'a> {
                 .filter(|hash| matches!(hash.len(), 40 | 64) && hash.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
             let Some(hash) = hash else {
                 return Err(format!("{} holds a line this build cannot read: \"{}\"",
-                    path.display(), String::from_utf8_lossy(line)));
+                    path.display(), sanitize(&String::from_utf8_lossy(line))));
             };
             trees.insert(hash.to_string());
         }
@@ -733,11 +733,15 @@ impl<'a> Exporter<'a> {
         let created = !path.exists();
         // A write handle, not an append-only one, which Windows refuses to flush.
         let mut log = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&path).map_err(fail)?;
-        std::io::Seek::seek(&mut log, std::io::SeekFrom::End(0)).map_err(fail)?;
+        let end = std::io::Seek::seek(&mut log, std::io::SeekFrom::End(0)).map_err(fail)?;
         let lines: String = self.withheld_unlogged.iter().map(|tree| format!("{}\n", tree)).collect();
-        std::io::Write::write_all(&mut log, lines.as_bytes()).map_err(fail)?;
-        if file_utils::fsync_enabled() {
-            log.sync_all().map_err(fail)?;
+        let written = std::io::Write::write_all(&mut log, lines.as_bytes())
+            .and_then(|()| if file_utils::fsync_enabled() { log.sync_all() } else { Ok(()) });
+        if let Err(error) = written {
+            // Cut a partial batch back off, so a later flush in this run starts a whole line; a
+            // tail this cannot cut is a torn append the next read cuts.
+            let _ = log.set_len(end);
+            return Err(fail(error));
         }
         if created {
             file_utils::sync_dir(&dir)?;
@@ -817,16 +821,6 @@ impl<'a> Exporter<'a> {
         let base = parents.first().map(|parent| (parent.forklift_tree.clone(), parent.git_tree.clone()));
 
         let tree = self.convert_tree(&parcel.tree_hash, base.as_ref().map(|(forklift, git)| (forklift.as_str(), git.as_str())))?;
-        if let Some(omitted) = self.omitted_in.get(&parcel.tree_hash) {
-            for (path, hash, why) in omitted {
-                let key = (path.clone(), hash.clone());
-                match why {
-                    LeftOut::Redacted => self.redacted.entry(key).or_default(),
-                    LeftOut::Withheld(statement) => &mut self.withheld.entry(key)
-                        .or_insert_with(|| (statement.clone(), Vec::new())).1,
-                }.push(forklift_hash.to_string());
-            }
-        }
         self.flush_withheld_log()?;
         let mut args = vec!["commit-tree".to_string(), tree.clone()];
         for commit in parent_commits {
@@ -851,6 +845,17 @@ impl<'a> Exporter<'a> {
             Some(commit_message(&parcel, forklift_hash).as_bytes()),
         )?.trim().to_string();
 
+        // Reported once the commit that left them out is written.
+        if let Some(omitted) = self.omitted_in.get(&parcel.tree_hash) {
+            for (path, hash, why) in omitted {
+                let key = (path.clone(), hash.clone());
+                match why {
+                    LeftOut::Redacted => self.redacted.entry(key).or_default(),
+                    LeftOut::Withheld(statement) => &mut self.withheld.entry(key)
+                        .or_insert_with(|| (statement.clone(), Vec::new())).1,
+                }.push(forklift_hash.to_string());
+            }
+        }
         self.exported.insert(forklift_hash.to_string(), ExportedCommit {
             commit: commit.clone(),
             git_tree: tree,
