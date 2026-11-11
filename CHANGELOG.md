@@ -407,6 +407,14 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **Three more next steps quote the path they name.** The next step of an `incomplete_load`
+  refusal, of `restore` on a file whose removal is staged, and of an inventory that cannot be read
+  used to paste the path in bare, so a path with a space or a character a shell reads specially
+  gave a command that did not run as printed. They now quote it for a POSIX shell, put a path
+  starting with `-` after `--`, and on Windows print a `<path>` placeholder with "quoted for your
+  shell" when the path needs quoting. The `incomplete_load` and inventory next steps now also say
+  to run them from the working tree's root, since the paths they name are relative to it.
+
 - **A read from a remote no longer fails on a connection the remote had already closed.** When a
   remote or a gateway in front of it closed an idle connection the client was about to reuse, the
   `GET` of an object, a subtree, a signature, a bundle or the handshake failed the command with
