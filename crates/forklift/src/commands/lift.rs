@@ -82,6 +82,7 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
 
         let Some(head) = local_head else {
             lift_meta(&client, &info, haul_utils::HAUL_PALLET_NAME, None, &mut meta).await;
+            warn_intake_failures(&client);
             return Err(with_meta_outcome(format!(
                 "Pallet \"{}\" has nothing stacked yet; there is nothing to lift.",
                 pallet
@@ -107,6 +108,7 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
                     Ok(false) => {}
                     Err(why) => {
                         lift_meta(&client, &info, haul_utils::HAUL_PALLET_NAME, None, &mut meta).await;
+                        warn_intake_failures(&client);
                         return Err(with_meta_outcome(why, &meta.resigned, &meta.failed));
                     }
                 }
@@ -136,15 +138,13 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
 
         let landed = lifted.is_ok().then_some((pallet.as_str(), head.as_str()));
         lift_meta(&client, &info, haul_utils::HAUL_PALLET_NAME, landed, &mut meta).await;
+        warn_intake_failures(&client);
         (report.meta_pallets, report.meta_resigned, report.meta_failed) = (meta.lifted, meta.resigned, meta.failed);
         report.batch_lane = batch_lane.or(client.batch_lane_closure());
 
         match lifted {
             Ok(LiftResult::UpToDate) => report.up_to_date = true,
             Ok(LiftResult::Lifted(stats)) => {
-                for why in &stats.intake_failed {
-                    output::warn_withheld_intake_failed(why);
-                }
                 if let Some(why) = &stats.unrecorded {
                     output::warn_held_head_unrecorded(why);
                 }
@@ -181,6 +181,14 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
         output::emit(&report);
 
         return Ok(());
+    }
+}
+
+/// Warn of each withheld recipe a lift through `client` (the office's, a meta pallet's, the working
+/// pallet's) owed the remote's digest intake and could not send it.
+fn warn_intake_failures(client: &RemoteClient) {
+    for why in client.intake_failures() {
+        output::warn_withheld_intake_failed(&why);
     }
 }
 

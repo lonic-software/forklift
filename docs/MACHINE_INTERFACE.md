@@ -1057,8 +1057,9 @@ Example session:
   result stands and its exit code is unchanged.
 * A `lift` that could not read, or send to its remote's digest intake, a withheld recipe the
   remote has no chunk-list digest for writes a `withheld_intake_failed` warning to the same channel,
-  one per recipe; `message` names the cause. The lift's result and exit code are its own, and the
-  next lift sends the recipe again.
+  one per recipe, from any of the pallets it lifts; `message` names the cause. The lift's result
+  and exit code are its own. The next lift that carries new history sends the recipe again; one
+  that finds the remote up to date sends nothing.
 * A `scope prune` or `evict` whose remote could not answer which recorded heads of a pallet it still holds
   (a server too old to know the check answers `404`; a busy one answers `unknown`) writes a `holds_unanswered` warning to the
   same channel, with `details` `{ "pallet": "<name>" }`; `message` names the cause. The command frees

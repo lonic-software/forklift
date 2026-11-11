@@ -1091,10 +1091,11 @@ fn maintenance_unavailable_warning_text(mode: OutputMode, error: &str) -> String
 pub const CODE_WITHHELD_INTAKE_FAILED: &str = "withheld_intake_failed";
 
 /// What to do about [`CODE_WITHHELD_INTAKE_FAILED`]. The ref update went ahead without the digest;
-/// the next lift sends the recipe again.
+/// a later lift that uploads history sends the recipe again, while one that finds the remote up to
+/// date sends nothing.
 pub const WITHHELD_INTAKE_FAILED_NEXT_STEP: &str =
-    "Resolve the reported cause and lift again, which sends the recipe again. The lift's own result \
-     stands.";
+    "Resolve the reported cause; the next lift that carries new history sends the recipe again. The \
+     lift's own result stands.";
 
 /// Surface a withheld recipe the remote's digest intake did not take, on the stderr side-channel
 /// the other warnings use: the lift's result and exit code stay its own.
