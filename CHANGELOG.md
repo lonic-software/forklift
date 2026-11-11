@@ -411,8 +411,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   remote or a gateway in front of it closed an idle connection the client was about to reuse, the
   `GET` of an object, a subtree, a signature, a bundle or the handshake failed the command with
   "connection closed before message completed". The client now sends such a `GET` again, up to
-  three times in all. No other kind of request is resent, nor a `GET` that timed out or could not
-  connect.
+  three times in all, when its connection closed at once (faster than connecting may take). A
+  connection that closed after the remote had worked on the request for longer is not resent, nor
+  is any other kind of request, or a `GET` that timed out or could not connect.
 
 - **forklift-server writes plain-text logs when stderr is not a terminal.** Its logs used to carry
   colour escape sequences into a log file or a service manager's journal; they are now coloured
