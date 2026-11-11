@@ -2853,43 +2853,42 @@ enum RemoteConsultation {
 fn remedy_text(consultation: &RemoteConsultation) -> String {
     match consultation {
         RemoteConsultation::NotConfigured =>
-            "no remote is configured for this warehouse; reproduce it by re-running the \
-            operation that created it if its content still exists in your working tree \
-            (\"forklift load\" then \"forklift stack\") — there is no in-tool way to abandon a \
-            single dangling reference yet",
-        RemoteConsultation::ConsultedCleanly =>
+            format!("no remote is configured for this warehouse; {}", REPRODUCE_REMEDY),
+        RemoteConsultation::ConsultedCleanly => format!(
             "this heal already checked the configured remote automatically and it does not have \
-            this object either; reproduce it by re-running the operation that created it if its \
-            content still exists in your working tree (\"forklift load\" then \"forklift \
-            stack\") — there is no in-tool way to abandon a single dangling reference yet",
-        RemoteConsultation::ConsultedWithErrors =>
-            "this heal tried to check the configured remote automatically but could not complete \
-            that check this run; re-run \"forklift heal\" once connectivity is restored, or \
-            reproduce it by re-running the operation that created it if its content still exists \
-            in your working tree (\"forklift load\" then \"forklift stack\") — there is no \
-            in-tool way to abandon a single dangling reference yet",
-        RemoteConsultation::NotAsked { reason } => return format!(
-            "this heal did not ask the configured remote for it: {} Then re-run \"forklift heal\", \
-            or reproduce it by re-running the operation that created it if its content still exists \
-            in your working tree (\"forklift load\" then \"forklift stack\") — there is no in-tool \
-            way to abandon a single dangling reference yet",
-            reason.trim_end()
+            this object either; {}",
+            REPRODUCE_REMEDY
         ),
-        RemoteConsultation::ScopeUnreadable { reason, other_errors } => return format!(
+        RemoteConsultation::ConsultedWithErrors => format!(
+            "this heal tried to check the configured remote automatically but could not complete \
+            that check this run; re-run \"forklift heal\" once connectivity is restored, or {}",
+            REPRODUCE_REMEDY
+        ),
+        RemoteConsultation::NotAsked { reason } => format!(
+            "this heal did not ask the configured remote for it: {} Then re-run \"forklift heal\", \
+            or {}",
+            reason.trim_end(),
+            REPRODUCE_REMEDY
+        ),
+        RemoteConsultation::ScopeUnreadable { reason, other_errors } => format!(
             "this heal checked the configured remote for it but skipped the history fetch of the \
-            working pallets: {} {}reproduce it by re-running the operation that created it if its \
-            content still exists in your working tree (\"forklift load\" then \"forklift \
-            stack\") — there is no in-tool way to abandon a single dangling reference yet",
+            working pallets: {} {}{}",
             reason,
             if *other_errors {
                 "Part of that check also failed; re-run \"forklift heal\" once connectivity is \
                 restored, or "
             } else {
                 "Otherwise, "
-            }
+            },
+            REPRODUCE_REMEDY
         ),
-    }.to_string()
+    }
 }
+
+/// The way out every remedy ends on: the only one that exists whatever the remote holds.
+const REPRODUCE_REMEDY: &str = "reproduce it by re-running the operation that created it if its \
+    content still exists in your working tree (\"forklift load\" then \"forklift stack\") — there \
+    is no in-tool way to abandon a single dangling reference yet";
 
 /// [`remedy_text`] for `hash`, unless the handshake listed it withheld by the remote's host
 /// (`withheld`, mapped to the host's statement): then heal did not ask for it, and no re-run will.
@@ -2897,10 +2896,9 @@ fn remedy_for(consultation: &RemoteConsultation, withheld: &BTreeMap<String, Str
     match withheld.get(hash) {
         Some(statement) => format!(
             "the configured remote's host withholds this content (\"{}\"), so this heal did not ask \
-            the remote for it and a re-run will not either; reproduce it by re-running the operation \
-            that created it if its content still exists in your working tree (\"forklift load\" then \
-            \"forklift stack\") — there is no in-tool way to abandon a single dangling reference yet",
-            statement
+            the remote for it and a re-run will not either; {}",
+            statement,
+            REPRODUCE_REMEDY
         ),
         None => remedy_text(consultation),
     }
@@ -2959,7 +2957,10 @@ fn unconsulted(why: CoreError) -> RemoteConsultation {
 /// it there would recover nothing — see the module doc comment for the full reasoning.
 ///
 /// Pass 1 leaves out, and passes 2 and 3 do not ask for, the content the handshake lists withheld
-/// by the remote's host, and nothing records it unavailable (see the body).
+/// by the remote's host ([`remote_utils::RemoteClient::withheld_statement`]: not a redaction the
+/// remote applied, and with a statement that can be quoted), and nothing records it unavailable
+/// (see the body). An entry listed with a statement that cannot be quoted is asked for like any
+/// other candidate, and its refusal reads as a failed consultation.
 ///
 /// Best-effort and read/store-only throughout: a failure in any one pass, for one pallet, or for
 /// one hash of pass 3, never aborts the rest (one hash of pass 2 refused cancels the loose fetches

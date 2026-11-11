@@ -3399,7 +3399,7 @@ impl RemoteClient {
     /// Whether a content walk through this client leaves out `hash` as content the remote's host
     /// withholds ([`Self::leave_out_withheld`]).
     pub fn leaves_out_withheld(&self, hash: &str) -> bool {
-        self.withheld.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(hash)
+        self.withheld_statement(hash).is_some()
     }
 
     /// The host's statement beside `hash`, when a content walk through this client leaves it out
@@ -3411,7 +3411,8 @@ impl RemoteClient {
     /// Make every later walk through this client, or any clone of it, record none of what it
     /// leaves out as withheld unavailable ([`Self::record_withheld_skips`]). For a command that
     /// writes no head over what a walk left out, and must not tolerate the absence of content this
-    /// warehouse held as a withholding.
+    /// warehouse held as a withholding. Such a client cannot fill a cache
+    /// ([`fetch_head_content`] refuses), since a fill judges its closure by that record.
     pub fn leave_withheld_unrecorded(&self) {
         self.withheld_unrecorded.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -5425,6 +5426,11 @@ pub async fn fetch_head_content(client: &RemoteClient,
     let mut stats = FetchStats::default();
 
     if scope_utils::is_cache_mode()? {
+        if client.withheld_unrecorded.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("Internal error: a client set to leave withheld content unrecorded cannot fill a cache, \
+                whose closure is judged by that record.".to_string());
+        }
+
         let root = object_utils::load_parcel(head)?.tree_hash;
         let mut seen = ContentSeen::default();
 
