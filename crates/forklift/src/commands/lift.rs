@@ -43,10 +43,21 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
     // Optimistic lift (§7.7): a diverged push whose merge is clean auto-lowers,
     // consolidates and retries, so a fleet stacking to one pallet stops serializing
     // through a human. True overlaps still stop with the diverged error.
+    // Every attempt's lifts, the office's and the meta pallets' included, share one digest-intake
+    // ledger, reported on every exit.
+    let mut intake = output::IntakeWarnings(None);
+
     loop {
         // A partial warehouse lifts only to its origin, the one remote proved to hold what it
         // lacks; another could fail late at its closure check over objects never verified there.
         let client = RemoteClient::for_warehouse()?;
+        let client = match &intake.0 {
+            Some(first) => client.with_intake_ledger_of(first),
+            None => {
+                intake.0 = Some(client.clone());
+                client
+            }
+        };
         let info = client.fetch_info().await?;
 
         // The upload lifts the pallet's ref; only the auto-merge below works from this bay's files.

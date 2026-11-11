@@ -127,7 +127,8 @@ The one-round-trip handshake: protocol version, refs and trust.
   "tombstones": { "old-feature": "<parcel-hash>" },
   "redactions": [{ "hash": "<hash>", "state": "deletion_owed" },
                  { "hash": "<hash>", "state": "pending" }],
-  "withheld": [{ "hash": "<hash>", "statement": "<the host's words>", "state": "deletion_owed", "chunks": "<digest>" }]
+  "withheld": [{ "hash": "<hash>", "statement": "<the host's words>", "state": "deletion_owed", "chunks": "<digest>" }],
+  "withheld_intake": true
 }
 ```
 
@@ -245,6 +246,9 @@ chunk-list redaction records it, which the head computed from a copy of the reci
 omitted while the head has no such copy to compute it from, and always for content that is not a
 recipe. A client keeps it in its `unavailable` record, and judges a chunk-list redaction over the
 file by it while it lacks the recipe. The AWS head does not send it yet.
+`withheld_intake` (additive, default `false`) says the head takes a withheld recipe's bytes at
+`PUT /v1/withheld/{hash}/recipe` (below), so a head that withholds a recipe it never held can still
+record its `chunks`. The AWS head does not offer it yet.
 
 **Withheld content is refused.** `GET` and `PUT` of `/v1/objects/{hash}` for a withheld hash
 answer `451` with `code` `content_withheld`, the host's statement in the message, and
@@ -461,6 +465,20 @@ A session id is one or more ASCII letters, digits and `-` (the client sends a hy
 wherever it appears: this query, the `upload-targets` body and the commit path. A head that reads
 the session (the serverless head, whatever its store) refuses any other id with `422`, since a
 `/` would place that session's staging keys under another session's prefix.
+
+### `PUT /v1/withheld/{hash}/recipe` (additive; heads that send `withheld_intake`)
+
+The digest intake. Body: the raw bytes of the recipe `hash`, which the head withholds. The head
+verifies `Blake3(body) == hash` and that the body parses as a recipe, and answers `422` with
+nothing changed when either fails. It then records the digest of the recipe's chunk list as that
+entry's `chunks`, unless the entry has one already, and answers `204`. A hash it does not withhold
+is answered `204` with nothing changed. Nothing of the body is stored or served, and the hash stays
+refused on every other route. It takes the same authority as an object upload.
+
+Before a lift's ref update, a client sends every withheld recipe it holds whose handshake entry
+has no `chunks`, and every recipe first answered withheld by the upload negotiation, whether or not
+the lifted history names it, and only to a head that sends `withheld_intake`. It never sends a
+blob. A recipe that could not be sent does not stop the lift.
 
 ### `GET /v1/signatures/{hash}` · `PUT /v1/signatures/{hash}`
 

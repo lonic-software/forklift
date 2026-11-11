@@ -1108,6 +1108,7 @@ fn router(state: Arc<AppState>, body_limit: DefaultBodyLimit) -> Router {
         .route("/objects/batch", post(post_objects_batch))
         .route("/parcels/{parcel}/subtree/{*path}", get(get_subtree))
         .route("/objects/{hash}", get(get_object).put(put_object))
+        .route("/withheld/{hash}/recipe", put(put_withheld_recipe))
         .route("/signatures/{hash}", get(get_signature).put(put_signature))
         .route("/trust", put(put_trust))
         .route("/pallets/{*name}", post(post_ref_update).delete(delete_ref))
@@ -2548,6 +2549,9 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
             tombstones: Some(forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?),
             redactions: Some(served_redactions()?),
             withheld: Some(served_withheld()?),
+            // `PUT /v1/withheld/{hash}/recipe` records the digest of a withheld recipe this head
+            // never held a copy of.
+            withheld_intake: true,
         })
     }).await;
 
@@ -2983,6 +2987,43 @@ async fn put_object(State(state): State<Arc<AppState>>,
     match result {
         Ok(true) => StatusCode::CREATED.into_response(),
         Ok(false) => StatusCode::OK.into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+/// `PUT /v1/withheld/{hash}/recipe` — the digest intake: the bytes of the withheld recipe `hash`,
+/// sent by a client that holds it, so this head can record the chunk-list digest a chunk-list
+/// redaction compares when it never held a copy to compute it from. The bytes must hash to `hash`
+/// and parse as a recipe; nothing of them is stored or served. A hash not withheld, or withheld
+/// with a digest already, is answered the same, with nothing changed.
+async fn put_withheld_recipe(State(state): State<Arc<AppState>>,
+                             Extension(principal): Extension<Principal>,
+                             Path(params): Path<PathParams>,
+                             body: Bytes) -> Response {
+    let warehouse = match resolve_warehouse(&state, &params) {
+        Ok(warehouse) => warehouse,
+        Err(error) => return error_response(error),
+    };
+
+    if let Err(error) = check_admission(&state, &params, &principal, "upload", None).await {
+        return error_response(error);
+    }
+
+    let hash = match hash_param(&params) {
+        Ok(hash) => hash,
+        Err(error) => return error_response(error),
+    };
+
+    let result = blocking(warehouse, move || {
+        require_uploader(&principal)?;
+
+        let digest = withholding::recipe_digest(&hash, &body).map_err(unprocessable)?;
+
+        withholding::record_digest(&hash, &digest).map_err(internal)
+    }).await;
+
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error_response(error),
     }
 }
