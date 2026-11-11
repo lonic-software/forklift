@@ -1128,6 +1128,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
                     Ok(Tolerated::removed_only(self.applied_set()?, withholding.applying()))
                 },
+                // Its withheld items carry no digest yet, so absent withheld content is tolerated
+                // as any file's content, chunked or not, as before digests were recorded.
+                audit_utils::WithheldDigests::AssumedKnown,
             )
             // An incomplete history is classified, so a lift can tell it apart and upload again.
             .map_err(|refusal| unsettled.take().unwrap_or_else(|| HeadError::unprocessable(refusal.for_ref_update())))?;
@@ -2025,6 +2028,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     // every adopter, so one naming content this head redacted or withholds is a pin
                     // it can never serve.
                     &|| Ok(Tolerated::default()),
+                    audit_utils::WithheldDigests::AssumedKnown,
                 )
                 .map_err(String::from)
             };

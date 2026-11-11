@@ -12,7 +12,7 @@ use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
 use crate::util::scope_utils::{PathScope, ScopeClass};
 use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sign_utils};
 use crate::util::sealed_utils::{At, Held, Tolerated};
-use crate::util::withholding::WithheldSet;
+use crate::util::withholding::{ChunkDigest, WithheldSet};
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 
 /// Why an office chain did not verify. The heads answer the two classes differently: an
@@ -1817,6 +1817,7 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
         &|hash| object_utils::recipe_chunk_hashes(hash),
         &|hash| object_utils::load_tree(hash),
         &|| Ok(Tolerated::default()),
+        WithheldDigests::Recorded,
     ).map_err(String::from)
 }
 
@@ -1848,6 +1849,7 @@ pub fn verify_parcel_closure_for_write(head: &str,
         &|hash| object_utils::recipe_chunk_hashes(hash),
         &|hash| object_utils::load_tree(hash),
         &crate::util::sealed_utils::read_redacted_and_withheld,
+        WithheldDigests::Recorded,
     )?;
 
     Ok(pallet_utils::VerifiedClosure::new(head, PathScope::full(), known_complete))
@@ -1889,9 +1891,43 @@ pub enum ClosureRefusal {
     /// names it as a tree or a chunk: it never takes that content, so no upload changes this.
     Withheld(String),
 
+    /// The walk was refused over content the remote's host withholds, absent where the new history
+    /// newly names it as a chunked file's recipe, while the host knows nothing of its chunk list: it
+    /// could not judge that file against a chunk-list redaction. A lift from a warehouse holding the
+    /// recipe sends the host that list first, so a later lift may land.
+    Uncomparable(UncomparableWithheld),
+
     /// The walk failed, and the record of the redactions applied or the content withheld could not
     /// be read to judge the absence.
     RecordsUnreadable(String),
+}
+
+/// A chunked file a ref update was refused over ([`ClosureRefusal::Uncomparable`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct UncomparableWithheld {
+    /// The refusal's text.
+    pub message: String,
+    /// The recipe's hash, the file's content.
+    pub hash: String,
+    /// A path the new history names it at.
+    pub path: String,
+    /// The host's statement.
+    pub statement: String,
+}
+
+/// What the push gate ([`verify_parcel_closure_with`]) knows of the chunk lists of the content its
+/// host withholds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WithheldDigests {
+    /// What the withheld set records ([`WithheldSet::digest`]): a new head may name absent
+    /// withheld content as a chunked file only where the set records its digest, or the expected
+    /// head already names it so.
+    Recorded,
+
+    /// Every withheld hash is taken as carrying a digest, so absent withheld content is tolerated
+    /// as any file's content, whatever its entry's type: for a head whose record carries no digests
+    /// yet.
+    AssumedKnown,
 }
 
 impl ClosureRefusal {
@@ -1901,6 +1937,7 @@ impl ClosureRefusal {
             ClosureRefusal::Incomplete(message)
             | ClosureRefusal::Withheld(message)
             | ClosureRefusal::RecordsUnreadable(message) => message,
+            ClosureRefusal::Uncomparable(uncomparable) => &uncomparable.message,
         }
     }
 
@@ -1915,6 +1952,17 @@ impl ClosureRefusal {
                 crate::error::RefusalCode::RemoteHistoryIncomplete,
                 format!("{} This remote does not hold the new head's whole history, so the pallet was not moved.", message),
                 "forklift lift",
+            ).into(),
+            ClosureRefusal::Uncomparable(uncomparable) => crate::error::CoreError::refusal_with_details(
+                crate::error::RefusalCode::ContentWithheld,
+                format!("{} The pallet was not moved.", uncomparable.message),
+                "Lift again, or from a warehouse that holds the recipe: a lift from such a warehouse \
+                sends this host the recipe before it moves the pallet.",
+                serde_json::json!({
+                    "hash": uncomparable.hash,
+                    "path": uncomparable.path,
+                    "statement": uncomparable.statement,
+                }),
             ).into(),
             other => other.into(),
         }
@@ -2087,6 +2135,7 @@ pub fn verify_parcel_closure_with(
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
     removed: &dyn Fn() -> Result<Tolerated, String>,
+    digests: WithheldDigests,
 ) -> Result<(), ClosureRefusal> {
     let bounds = known_complete.as_ref().map(std::slice::from_ref);
     let seams = ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed: None };
@@ -2112,7 +2161,89 @@ pub fn verify_parcel_closure_with(
         .map_err(|refusal| match withheld_named(&refusal, &tolerated.withheld) {
             Some(_) => ClosureRefusal::Withheld(withheld_beyond_files(refusal, &tolerated.withheld)),
             None => ClosureRefusal::Incomplete(refusal),
-        })
+        })?;
+
+    match digests {
+        WithheldDigests::Recorded => refuse_uncomparable(&tolerance, &tolerated.withheld, known_complete, load_base_tree),
+        WithheldDigests::AssumedKnown => Ok(()),
+    }
+}
+
+/// Refuse a walk that held absent withheld content at a chunked entry while `withheld` records no
+/// digest for it, unless `expected`'s tree already names that hash at a chunked entry. Without the
+/// digest the host cannot judge the file against a chunk-list redaction, and a head it accepted
+/// would then wedge every such judgement. A file the expected head already names so was accepted
+/// before, and refusing it again would refuse every write over it.
+///
+/// The expected head's tree is read through `load_base_tree`, and only when such a holding exists.
+fn refuse_uncomparable(tolerance: &SealedTolerance,
+                       withheld: &WithheldSet,
+                       expected: Option<&str>,
+                       load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>) -> Result<(), ClosureRefusal> {
+    let uncomparable: Vec<WithheldFile> = tolerance.withheld_files.borrow().iter()
+        .filter(|file| file.chunked && !matches!(withheld.digest(&file.hash), Some(ChunkDigest::Known(_))))
+        .cloned()
+        .collect();
+
+    if uncomparable.is_empty() {
+        return Ok(());
+    }
+
+    let wanted: HashSet<&str> = uncomparable.iter().map(|file| file.hash.as_str()).collect();
+    let named = match expected {
+        Some(expected) => chunked_named(expected, &wanted, load_base_tree).map_err(|error| ClosureRefusal::Incomplete(format!(
+            "The expected head {} could not be read to judge withheld content the new head names: {}",
+            expected, error
+        )))?,
+        None => HashSet::new(),
+    };
+
+    let Some(file) = uncomparable.into_iter().find(|file| !named.contains(&file.hash)) else {
+        return Ok(());
+    };
+    let statement = withheld.statement(&file.hash).unwrap_or_default().to_string();
+
+    Err(ClosureRefusal::Uncomparable(UncomparableWithheld {
+        message: format!(
+            "The new history names \"{}\" as a chunked file whose content {} this server's host \
+            withholds, and the host neither holds that recipe nor knows its chunk list, so it cannot \
+            judge the file against a redaction. The host's statement: {}",
+            file.path, file.hash, statement
+        ),
+        hash: file.hash,
+        path: file.path,
+        statement,
+    }))
+}
+
+/// Which of `wanted` the tree of parcel `head` names at a chunked entry, at any path. Stops reading
+/// once every one is found.
+fn chunked_named(head: &str,
+                 wanted: &HashSet<&str>,
+                 load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>) -> Result<HashSet<String>, String> {
+    let mut found: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut pending = vec![object_utils::load_parcel(head)?.tree_hash];
+
+    while let Some(tree_hash) = pending.pop() {
+        if found.len() == wanted.len() {
+            break;
+        }
+        if !seen.insert(tree_hash.clone()) {
+            continue;
+        }
+
+        let tree = load_base_tree(&tree_hash)?;
+
+        for (_, file) in tree.get_files() {
+            if file.item_type.is_chunked() && wanted.contains(file.hash.as_str()) {
+                found.insert(file.hash.clone());
+            }
+        }
+        pending.extend(tree.get_subtrees().map(|(_, subtree)| subtree.hash.clone()));
+    }
+
+    Ok(found)
 }
 
 /// The object-store reads [`verify_closure_core`] varies by head (see
@@ -2139,6 +2270,15 @@ pub struct SealedTolerance<'a> {
     redacted: RefCell<HashSet<String>>,
     withheld: RefCell<HashSet<String>>,
     unavailable: RefCell<HashSet<String>>,
+    withheld_files: RefCell<Vec<WithheldFile>>,
+}
+
+/// An absent file's content a walk held because its head withholds it, where the walk met it.
+#[derive(Clone, Debug)]
+struct WithheldFile {
+    hash: String,
+    path: String,
+    chunked: bool,
 }
 
 impl<'a> SealedTolerance<'a> {
@@ -2149,6 +2289,7 @@ impl<'a> SealedTolerance<'a> {
             redacted: RefCell::new(HashSet::new()),
             withheld: RefCell::new(HashSet::new()),
             unavailable: RefCell::new(HashSet::new()),
+            withheld_files: RefCell::new(Vec::new()),
         }
     }
 
@@ -2204,6 +2345,25 @@ impl<'a> SealedTolerance<'a> {
 /// [`SealedTolerance::holds_absent`], where `None` holds nothing.
 fn holds_absent(sealed: Option<&SealedTolerance>, hash: &str, at: At) -> bool {
     sealed.is_some_and(|sealed| sealed.holds_absent(hash, at))
+}
+
+/// [`holds_absent`] for the absent content of `file`, at warehouse path `path`, remembering where
+/// withheld content was held and whether its entry is chunked, for the push gate's judgement of
+/// content whose chunk list the host does not know ([`verify_parcel_closure_with`]).
+fn holds_absent_file(sealed: Option<&SealedTolerance>, file: &TreeItem, path: &str) -> bool {
+    let Some(sealed) = sealed else { return false };
+
+    if !sealed.holds_absent(&file.hash, At::File) {
+        return false;
+    }
+    if sealed.tolerated.held(&file.hash, At::File) == Some(Held::Withheld) {
+        sealed.withheld_files.borrow_mut().push(WithheldFile {
+            hash: file.hash.clone(),
+            path: path.to_string(),
+            chunked: file.item_type.is_chunked(),
+        });
+    }
+    true
 }
 
 /// The closure walk behind every verifier here.
@@ -2615,7 +2775,7 @@ fn verify_tree_closure_scoped(tree_hash: &str,
     match scope.classify(prefix) {
         ScopeClass::InScope => {
             return verify_tree_closure(
-                tree_hash, bases, verified, blob_exists, chunks_missing, load_recipe_chunks,
+                tree_hash, prefix, bases, verified, blob_exists, chunks_missing, load_recipe_chunks,
                 load_base_tree, reverify, sealed,
             )
         }
@@ -2647,11 +2807,11 @@ fn verify_tree_closure_scoped(tree_hash: &str,
         if scope.classify(&path) == ScopeClass::OutOfScope {
             continue; // sealed by hash, never fetched
         }
-        if base_files.get(name).is_some_and(|hashes| hashes.contains(&file.hash)) {
+        if base_files.get(name).is_some_and(|entries| entries.contains(&file_entry(file))) {
             continue; // a base carries it here: present by the base's own verification
         }
         if !blob_exists(&file.hash)? {
-            if holds_absent(sealed, &file.hash, At::File) {
+            if holds_absent_file(sealed, file, &path) {
                 continue; // held by hash alone: a chunked file's recipe seals its chunks too
             }
             return Err(format!(
@@ -2683,21 +2843,29 @@ fn verify_tree_closure_scoped(tree_hash: &str,
     Ok(())
 }
 
-/// The candidate bases' entries one level down, by name and unioned: the file hashes each base
-/// carries under a name, and the distinct subtree hashes. Read tolerantly per base: a base that
-/// cannot be read contributes no explanations, so the walk verifies more rather than less.
+/// A file entry as the prune compares it: its content hash, and whether the entry is chunked. A
+/// hash a base names under one type explains nothing under the other: the push gate judges
+/// withheld content by both ([`verify_parcel_closure_with`]).
+fn file_entry(file: &TreeItem) -> (String, bool) {
+    (file.hash.clone(), file.item_type.is_chunked())
+}
+
+/// The candidate bases' entries one level down, by name and unioned: the file entries each base
+/// carries under a name ([`file_entry`]), and the distinct subtree hashes. Read tolerantly per
+/// base: a base that cannot be read contributes no explanations, so the walk verifies more rather
+/// than less.
 #[allow(clippy::type_complexity)]
 fn base_entries(bases: &[String],
                 load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>)
-                -> (HashMap<String, HashSet<String>>, HashMap<String, Vec<String>>) {
-    let mut base_files: HashMap<String, HashSet<String>> = HashMap::new();
+                -> (HashMap<String, HashSet<(String, bool)>>, HashMap<String, Vec<String>>) {
+    let mut base_files: HashMap<String, HashSet<(String, bool)>> = HashMap::new();
     let mut base_subtrees: HashMap<String, Vec<String>> = HashMap::new();
 
     for base in bases {
         let Ok(base_tree) = load_base_tree(base) else { continue };
 
         for (name, file) in base_tree.get_files() {
-            base_files.entry(name.clone()).or_default().insert(file.hash.clone());
+            base_files.entry(name.clone()).or_default().insert(file_entry(file));
         }
         for (name, subtree) in base_tree.get_subtrees() {
             let candidates = base_subtrees.entry(name.clone()).or_default();
@@ -2798,6 +2966,7 @@ pub(crate) fn child_path(prefix: &str, name: &str) -> String {
 /// * `Err(String)` - If a tree or blob is missing (or unreadable).
 #[allow(clippy::too_many_arguments)]
 fn verify_tree_closure(tree_hash: &str,
+                       prefix: &str,
                        base_tree_hashes: &[String],
                        visited_trees: &mut HashSet<String>,
                        blob_exists: &dyn Fn(&str) -> Result<bool, String>,
@@ -2809,9 +2978,10 @@ fn verify_tree_closure(tree_hash: &str,
                        -> Result<(), String> {
     // An explicit stack rather than recursion: a ref write runs this walk, and a tree nested a
     // few thousand levels deep would otherwise overflow the thread's stack.
-    let mut pending: Vec<(String, Vec<String>)> = vec![(tree_hash.to_string(), base_tree_hashes.to_vec())];
+    let mut pending: Vec<(String, Vec<String>, String)> =
+        vec![(tree_hash.to_string(), base_tree_hashes.to_vec(), prefix.to_string())];
 
-    while let Some((tree_hash, base_tree_hashes)) = pending.pop() {
+    while let Some((tree_hash, base_tree_hashes, prefix)) = pending.pop() {
         // Record the visit before checking base-explained, not after — the same discipline
         // `collect_changed_closure` states on the client side. Content-addressing means one subtree
         // hash can recur at another path in the same walk (a merge adopting one side's subtree under
@@ -2858,12 +3028,12 @@ fn verify_tree_closure(tree_hash: &str,
             // Base-explained: this exact file hash sits at this path under some candidate base, so its
             // blob — and, for a chunked file, its whole recipe→chunk closure — is present by induction.
             // Skipping it is what makes an unchanged file cost nothing on a push.
-            if base_files.get(name).is_some_and(|hashes| hashes.contains(&file.hash)) {
+            if base_files.get(name).is_some_and(|entries| entries.contains(&file_entry(file))) {
                 continue;
             }
 
             if !blob_exists(&file.hash)? {
-                if holds_absent(sealed, &file.hash, At::File) {
+                if holds_absent_file(sealed, file, &child_path(&prefix, name)) {
                     continue; // held by hash alone: a chunked file's recipe seals its chunks too
                 }
                 return Err(format!(
@@ -2889,7 +3059,9 @@ fn verify_tree_closure(tree_hash: &str,
         // Pushed in reverse so they are walked by name, as a recursive walk would: a subtree hash
         // recurring under a later name is free once the earlier one settled it.
         let children: Vec<_> = tree.get_subtrees()
-            .map(|(name, subtree)| (subtree.hash.clone(), base_subtrees.remove(name).unwrap_or_default()))
+            .map(|(name, subtree)| (
+                subtree.hash.clone(), base_subtrees.remove(name).unwrap_or_default(), child_path(&prefix, name),
+            ))
             .collect();
         pending.extend(children.into_iter().rev());
     }
