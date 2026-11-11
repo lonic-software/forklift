@@ -3547,11 +3547,13 @@ fn git_export_leaves_out_a_file_whose_content_the_remote_withholds_and_names_it(
 /// `git mirror` in a warehouse behind its remote takes the new history without the content the
 /// remote's host withholds, recording it unavailable as a lower does, and its export leaves the file
 /// out of the commit it pushes, naming it with the host's statement. The film is chunked, so what
-/// is left out is a recipe.
+/// is left out is a recipe. A later run, over a parcel that leaves the folder as it was, names the
+/// file again.
 ///
 /// Revert: open the mirror's walk without the remote's withheld list → the mirror is refused, its
 /// pallet failing `content_withheld`. Revert: export the file as before → the pallet fails reading
-/// the absent recipe.
+/// the absent recipe. Revert: keep the record the run started with → the same. Revert: reuse a
+/// seeded folder whatever the unavailable record lists → the later run names nothing.
 #[test]
 fn git_mirror_leaves_out_a_file_whose_content_the_remote_withholds_and_names_it() {
     let mut takedown = takedown("mirror");
@@ -3578,4 +3580,16 @@ fn git_mirror_leaves_out_a_file_whose_content_the_remote_withholds_and_names_it(
     let paths = git_paths(&git, "main");
     assert!(!paths.contains(&"media/film.mkv".to_string()), "{:?}", paths);
     assert!(paths.contains(&"media/trailer.mkv".to_string()), "{:?}", paths);
+
+    // A later parcel leaves the folder as it was: the git folder the first run wrote is not
+    // reused unnamed, so the film is named again, under the new parcel.
+    takedown.owner.stack("src/code.txt", b"code 2\n", "code 2");
+    takedown.owner.run_ok(&["lift"]);
+    let later = takedown.server.main();
+    let mirrored = clone.json(&["git", "mirror"]);
+    assert_eq!(mirrored["ok"], true, "{}", mirrored);
+    assert_eq!(mirrored["data"]["pallets"][0]["withheld"], serde_json::json!([
+        { "path": "media/film.mkv", "hash": takedown.film, "statement": TAKEDOWN, "parcels": [later] }
+    ]), "{}", mirrored);
+    assert!(!git_paths(&git, "main").contains(&"media/film.mkv".to_string()));
 }
