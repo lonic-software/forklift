@@ -14,6 +14,11 @@
 //! has a folder, a global configuration and keys of its own. A value one command prints and a later
 //! one reuses, such as a key, is written `<name>`: in the output a page shows, it stands for one
 //! word and binds it, and in a later command it is replaced by what it bound.
+//!
+//! A server the page starts runs in the background, as the page's second terminal. The first
+//! line under its `$` line is the line it starts with; any lines after it are everything that
+//! terminal prints later, while the rest of the page runs, checked when the run ends. A server
+//! that prints anything else, or exits, fails the page.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
@@ -24,7 +29,8 @@ use crate::common;
 use common::{fence, forklift_command, repository_root, server_binary, tracked_pages};
 
 /// The pages under `docs/guide/` this test runs, each from an empty folder.
-const RUN_PAGES: &[&str] = &["tutorial.md", "concepts.md", "team.md", "cache.md", "leaving.md"];
+const RUN_PAGES: &[&str] =
+    &["tutorial.md", "concepts.md", "team.md", "cache.md", "leaving.md", "leaked-secret.md"];
 
 /// The address the pages tell the reader to serve on. The test serves on a port the server picks
 /// itself, so a busy 7171 on a CI machine cannot fail it, and rewrites this address wherever a
@@ -471,6 +477,8 @@ fn printed_lines(bytes: &[u8]) -> Vec<String> {
 /// A server the page started, stopped when the run ends.
 struct Server {
     line: usize,
+    /// What the page shows the server printing on stderr after its startup line.
+    later: Vec<String>,
     child: Child,
     _stdout: BufReader<ChildStdout>,
     stderr: PathBuf,
@@ -663,7 +671,7 @@ impl Reader {
                     self.address = Some(address.to_string());
                 }
 
-                self.servers.push(Server { line: step.line, child, _stdout: stdout, stderr });
+                self.servers.push(Server { line: step.line, later: Vec::new(), child, _stdout: stdout, stderr });
                 (Some(0), line.into_bytes())
             }
             ("forklift-server", None) => {
@@ -689,6 +697,33 @@ impl Reader {
             }
         }
         trouble
+    }
+
+    /// Each server that has exited, or whose stderr is not what the page shows it printing, with
+    /// what it printed; empty if every server matches. A server prints as the commands it serves
+    /// finish, so one that has printed less than the page shows is given a while to catch up.
+    fn server_mismatch(&mut self) -> String {
+        let mut mismatch = String::new();
+        for server in &mut self.servers {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let printed = loop {
+                let printed = printed_lines(&std::fs::read(&server.stderr).unwrap());
+                let matches = output_matches(&server.later, &printed, &mut self.bound.clone());
+                if matches || printed.len() > server.later.len() || std::time::Instant::now() > deadline {
+                    break printed;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            };
+            let exited = server.child.try_wait().unwrap();
+            if exited.is_some() || !output_matches(&server.later, &printed, &mut self.bound.clone()) {
+                mismatch.push_str(&format!(
+                    "\n\nThe server started at line {} exited ({:?}) or printed on stderr\n{}\n\nThe \
+                    page shows it printing\n{}",
+                    server.line, exited, printed.join("\n"), server.later.join("\n")
+                ));
+            }
+        }
+        mismatch
     }
 
     /// The page's text for this machine: its server address replaced by the real one.
@@ -744,9 +779,15 @@ fn run_page(name: &str) {
             expected: step.expected.clone(),
         };
 
+        let servers = reader.servers.len();
         let (status, output) = reader.run(&step);
         let printed = printed_lines(&output);
-        let expected: Vec<String> = step.expected.iter().map(|line| reader.localize(line)).collect();
+        let mut expected: Vec<String> = step.expected.iter().map(|line| reader.localize(line)).collect();
+        if reader.servers.len() > servers {
+            // Below a server's startup line is what it prints later, checked when the run ends.
+            let later = expected.split_off(expected.len().min(1));
+            reader.servers.last_mut().unwrap().later = later;
+        }
 
         assert!(
             status == Some(0) && output_matches(&expected, &printed, &mut reader.bound),
@@ -756,9 +797,9 @@ fn run_page(name: &str) {
         );
     }
 
-    // A server's second terminal shows its stderr too, and the page shows none. A server that
-    // died mid-run is reported with the step that failed because of it.
-    let trouble = reader.server_trouble();
+    // A server's second terminal shows its stderr too, which must be what the page shows. A
+    // server that died mid-run is reported with the step that failed because of it.
+    let trouble = reader.server_mismatch();
     assert!(trouble.is_empty(), "{}:{}", label, trouble);
 
     drop(reader);
@@ -794,6 +835,11 @@ fn leaving_runs_as_written() {
 /// is either run here or a failure: adding examples to a page cannot leave them unrun. Every page
 /// in the repository is read, and a fence counts in any form `parse_steps` would refuse as well as
 /// the one it runs: either fence character, any case, indented, in a list item or a quote.
+#[test]
+fn leaked_secret_runs_as_written() {
+    run_page("leaked-secret.md");
+}
+
 #[test]
 fn every_page_with_console_blocks_is_run() {
     for path in tracked_pages() {
