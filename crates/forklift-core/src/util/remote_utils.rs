@@ -7202,7 +7202,8 @@ impl UploadedHistory {
             uploaded_objects: self.uploaded_objects + again.uploaded_objects,
             uploaded_signatures: self.uploaded_signatures + again.uploaded_signatures,
             withheld,
-            // The second upload sends the same recipes again, so its failures are the ones that stand.
+            // The second upload, walking at least as far, sends the recipes again, so its failures
+            // are the ones that stand.
             intake_failed: again.intake_failed,
         }
     }
@@ -8690,6 +8691,9 @@ pub async fn push_local_trust(client: &RemoteClient,
         // starts fresh — so the office lift below never carries it. Upload it first: the remote
         // refuses an anchor whose adopted history it does not hold, and every warehouse that
         // later adopts this anchor fetches that history from it.
+        // A recipe the upload's digest intake could not send goes unreported here, as on the
+        // office's and the meta pallets' lifts: only `forklift lift`'s working pallet reports one,
+        // when its lift uploads and sends it again.
         if let Some(adopts) = &local.adopts {
             upload_history(client, adopts, None, &[], info, &Progress::NONE).await?;
         }
