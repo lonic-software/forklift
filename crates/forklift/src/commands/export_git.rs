@@ -592,8 +592,6 @@ pub(crate) struct Exporter<'a> {
     /// The git trees written leaving withheld content out, by this run or a logged earlier one,
     /// when this exporter keeps the log; none of them is reused for a forklift tree.
     withheld_trees: Option<HashSet<String>>,
-    /// Whether the log ends in a torn append, which the next append must end first.
-    withheld_log_torn: bool,
     /// The forklift trees that held entries, every one of which was left out.
     emptied: HashSet<String>,
     /// Whether nothing under a forklift tree is redacted, for the trees asked about.
@@ -633,7 +631,6 @@ impl<'a> Exporter<'a> {
             unavailable,
             omitted_in: HashMap::new(),
             withheld_trees: None,
-            withheld_log_torn: false,
             emptied: HashSet::new(),
             clean: HashMap::new(),
             redacted: BTreeMap::new(),
@@ -680,21 +677,24 @@ impl<'a> Exporter<'a> {
             Err(error) => return Err(format!("Could not read {}: {}", path.display(), error)),
         };
         // Text after the last newline is a torn append, from a run stopped before any commit named
-        // its tree: no tree, and the next append starts a fresh line. Any whole line unreadable is
-        // refused rather than skipped, since a tree it named would then be reused.
-        let (whole, torn) = match logged.rfind('\n') {
-            Some(end) => (&logged[..end], end + 1 < logged.len()),
-            None => ("", !logged.is_empty()),
-        };
+        // its tree: no tree, cut off so the next append starts a fresh line. Any whole line
+        // unreadable is refused rather than skipped, since a tree it named would then be reused.
+        let kept = logged.rfind('\n').map_or(0, |end| end + 1);
+        let whole = &logged[..kept.saturating_sub(1)];
+        if kept < logged.len() {
+            let fail = |error: std::io::Error| format!("Could not write {}: {}", path.display(), error);
+            let log = std::fs::OpenOptions::new().write(true).open(&path).map_err(fail)?;
+            log.set_len(kept as u64).map_err(fail)?;
+            log.sync_all().map_err(fail)?;
+        }
         let mut trees = HashSet::new();
-        for line in whole.split('\n').filter(|_| !whole.is_empty()) {
+        for line in whole.split('\n').filter(|_| kept > 0) {
             if !matches!(line.len(), 40 | 64) || !line.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) {
                 return Err(format!("{} holds a line this build cannot read: \"{}\"", path.display(), line));
             }
             trees.insert(line.to_string());
         }
         self.withheld_trees = Some(trees);
-        self.withheld_log_torn = torn;
 
         Ok(())
     }
@@ -711,11 +711,9 @@ impl<'a> Exporter<'a> {
         let path = self.repo.git_dir().join(WITHHELD_TREES_LOG);
         let fail = |error: std::io::Error| format!("Could not write {}: {}", path.display(), error);
         let mut log = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(fail)?;
-        let line = format!("{}{}\n", if self.withheld_log_torn { "\n" } else { "" }, git_tree);
-        std::io::Write::write_all(&mut log, line.as_bytes()).map_err(fail)?;
+        std::io::Write::write_all(&mut log, format!("{}\n", git_tree).as_bytes()).map_err(fail)?;
         log.sync_all().map_err(fail)?;
         trees.insert(git_tree.to_string());
-        self.withheld_log_torn = false;
 
         Ok(())
     }
@@ -1767,5 +1765,30 @@ mod tests {
                 commit
             )
         );
+    }
+
+    /// The withheld-trees log: a torn last append is no tree and is cut off, so a tree logged after
+    /// it is read back whole; a whole line naming no tree is refused, never skipped.
+    #[test]
+    fn the_withheld_trees_log_cuts_a_torn_append_and_refuses_an_unreadable_line() {
+        let warehouse = Warehouse::storage_only("export-withheld-log");
+        let repo = create_repo(&warehouse);
+        let log = repo.git_dir().join(WITHHELD_TREES_LOG);
+        let (first, second) = ("a".repeat(40), "b".repeat(64));
+        std::fs::write(&log, format!("{}\n{}", first, &second[..10])).unwrap();
+
+        let mut exporter = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        exporter.keep_withheld_log().unwrap();
+        assert_eq!(exporter.withheld_trees, Some(HashSet::from([first.clone()])));
+        exporter.log_withheld_tree(&second).unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("{}\n{}\n", first, second));
+
+        let mut again = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        again.keep_withheld_log().unwrap();
+        assert_eq!(again.withheld_trees, Some(HashSet::from([first.clone(), second.clone()])));
+
+        std::fs::write(&log, format!("{}\nnot a tree\n", first)).unwrap();
+        let mut refused = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        assert!(refused.keep_withheld_log().unwrap_err().contains("not a tree"));
     }
 }
