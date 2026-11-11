@@ -3313,6 +3313,11 @@ impl Takedown {
             tree.get_files().find(|(name, _)| name.as_str() == "film.mkv").unwrap().1.hash.clone()
         };
 
+        self.withhold_film();
+    }
+
+    /// Withhold `film` on the remote, waiting until its copy there is deleted.
+    fn withhold_film(&self) {
         let added = withhold(&self.server.root, &["add", &self.film, "--statement", TAKEDOWN]);
         assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
         // The deletion drains the warehouse briefly; wait until it is done.
@@ -3792,15 +3797,19 @@ fn git_export_in_a_served_root_leaves_out_content_its_host_withholds() {
 
 /// `git mirror` run in a served root, whose remote is the server itself, leaves out of the commit
 /// it pushes a file whose content that root's own host withholds, once the served root has deleted
-/// the copy, and names it with the host's statement.
+/// the copy, and names it with the host's statement. The commit an earlier run wrote before the
+/// withholding began keeps the file, and its folder is not reused for a later parcel that leaves
+/// the folder as it was.
 ///
-/// Revert: leave the withheld record out of the mirror's exporter → the pallet fails reading the
-/// deleted film.
+/// Revert: leave the withheld record out of the mirror's exporter → the mirror fails, reading the
+/// deleted film. Revert: judge a seeded folder clean by the applied redactions alone → the later
+/// commit holds the film.
 #[test]
 fn git_mirror_in_a_served_root_leaves_out_content_its_host_withholds() {
     let mut takedown = takedown("mirror-here");
-    takedown.withhold_new_film(false);
-    let head = takedown.server.main();
+    takedown.owner.stack("media/film.mkv", b"the new film\n", "new film");
+    takedown.owner.run_ok(&["lift"]);
+    takedown.film = hash_of(b"the new film\n");
     let served = Warehouse { root: takedown.server.root.clone(), home: takedown.owner.home.clone() };
     let git = takedown.server.root.parent().unwrap().join("forklift-takedown-mirror-here-git");
     let _ = std::fs::remove_dir_all(&git);
@@ -3812,16 +3821,28 @@ fn git_mirror_in_a_served_root_leaves_out_content_its_host_withholds() {
     served.run_ok(&["config", "set", "remote.url", &takedown.server.url]);
     served.run_ok(&["config", "set", "mirror.url", git.to_str().unwrap()]);
 
+    // Mirrored before the withholding: the commit holds the film.
+    let mirrored = served.json(&["git", "mirror"]);
+    assert_eq!(mirrored["ok"], true, "{}", mirrored);
+    assert_eq!(mirrored["data"]["pallets"][0]["withheld_here"], serde_json::Value::Null, "{}", mirrored);
+    assert!(git_paths(&git, "main").contains(&"media/film.mkv".to_string()));
+
+    takedown.withhold_film();
+    takedown.owner.stack("src/code.txt", b"code 2\n", "code 2");
+    takedown.owner.run_ok(&["lift"]);
+    let later = takedown.server.main();
+
     let mirrored = served.json(&["git", "mirror"]);
     assert_eq!(mirrored["ok"], true, "{}", mirrored);
     let main = &mirrored["data"]["pallets"][0];
     assert_eq!(main["status"], "pushed", "{}", mirrored);
     assert_eq!(main["withheld_here"], serde_json::json!([
-        { "path": "media/film.mkv", "hash": takedown.film, "statement": TAKEDOWN, "parcels": [head] }
+        { "path": "media/film.mkv", "hash": takedown.film, "statement": TAKEDOWN, "parcels": [later] }
     ]), "{}", mirrored);
     let paths = git_paths(&git, "main");
     assert!(!paths.contains(&"media/film.mkv".to_string()), "{:?}", paths);
     assert!(paths.contains(&"media/trailer.mkv".to_string()), "{:?}", paths);
+    assert!(git_paths(&git, "main~1").contains(&"media/film.mkv".to_string()), "the earlier commit is kept");
 }
 
 /// `git mirror` in a warehouse behind its remote takes the new history without the content the
