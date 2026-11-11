@@ -855,12 +855,14 @@ fn authentication_cache_ttl(secs: Option<u64>) -> Result<std::time::Duration, St
 ///                   (serving itself runs until the process is stopped or receives
 ///                   SIGINT/SIGTERM, which drains gracefully).
 pub async fn serve(options: ServeOptions) -> Result<(), String> {
-    // Structured request logs; RUST_LOG overrides (default: info).
+    // Structured request logs; RUST_LOG overrides (default: info). Coloured only on a terminal:
+    // a log file or a service manager's journal would otherwise keep the escape sequences as text.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
         )
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr)
         .try_init();
 
