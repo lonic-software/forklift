@@ -7,10 +7,10 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{self, RemoteClient};
 use forklift_core::util::{
     applied_redactions, config_utils, file_utils, graph_utils, merge_utils, meta_tree, mirror_utils, object_utils,
-    pallet_utils, scope_utils, tag_utils, take_utils,
+    pallet_utils, scope_utils, tag_utils, take_utils, unavailable,
 };
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
-use crate::commands::export_git::{self, Exporter, GitRepo, RedactedFile, SkippedTag, WritableTag, EXPORT_LAYOUT};
+use crate::commands::export_git::{self, Exporter, GitRepo, RedactedFile, SkippedTag, WithheldFile, WritableTag, EXPORT_LAYOUT};
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -67,6 +67,9 @@ pub async fn handle_command() -> Result<(), String> {
     let repo = open_repository().map_err(Problem::into_message)?;
     let mut record = load_record(&repo).map_err(Problem::into_message)?;
     let info = client.fetch_info().await?;
+    // The history comes down without content the remote's host withholds, as a lower takes it, and
+    // the export leaves such a file out and names it.
+    client.leave_out_withheld(&info);
 
     // The configured set, else every user pallet the remote holds.
     let pallets: Vec<String> = match config_utils::get_effective_value(config_utils::KEY_MIRROR_PALLETS)? {
@@ -115,7 +118,9 @@ pub async fn handle_command() -> Result<(), String> {
         lines.push(format!("Did not mirror {} of {} pallet(s):", failed.len(), report.pallets.len()));
         for outcome in &failed {
             lines.push(format!("  \"{}\": {}", outcome.pallet, outcome.message.as_deref().unwrap_or_default()));
-            lines.extend(export_git::redacted_lines(&outcome.redacted).into_iter().map(|line| format!("    {line}")));
+            lines.extend(export_git::redacted_lines(&outcome.redacted).into_iter()
+                .chain(export_git::withheld_lines(&outcome.withheld))
+                .map(|line| format!("    {line}")));
         }
     }
     lines.extend(report.tags.failure_lines());
@@ -518,7 +523,7 @@ impl<'a> Run<'a> {
             url,
             from: mirror_utils::warehouse_root(),
             unattended,
-            exporter: Exporter::new(repo, applied_redactions::read_applied()?),
+            exporter: Exporter::new(repo, applied_redactions::read_applied()?, unavailable::read_unavailable()?),
             boundaries: Vec::new(),
             pending,
             refused,
@@ -568,6 +573,7 @@ impl<'a> Run<'a> {
             Err(problem) => problem.into_outcome(pallet),
         };
         outcome.redacted = self.exporter.take_redacted();
+        outcome.withheld = self.exporter.take_withheld();
 
         outcome
     }
@@ -697,6 +703,9 @@ impl<'a> Run<'a> {
     /// Export `head` and every parcel it reaches that no boundary already holds, parents first.
     /// Returns how many parcels were written.
     fn export(&mut self, head: &str) -> Result<usize, Problem> {
+        // A fetch since the run started may have recorded content it left out as withheld, which
+        // the export must leave out in turn.
+        self.exporter.reread_unavailable()?;
         let mut written = 0;
         let mut visited: HashSet<String> = HashSet::new();
         let mut stack: Vec<(String, bool)> = vec![(head.to_string(), false)];
@@ -1125,16 +1134,25 @@ pub(crate) struct PalletMirror {
     /// (`.forklift/mirror.git`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     redacted: Vec<RedactedFile>,
+
+    /// The files left out of the commits this run wrote, because this warehouse lacks their
+    /// content, which the host of a remote withholds: each by path, with the host's statement and
+    /// the parcels whose commits left it out. Named only under the first pallet whose export wrote
+    /// the commit, as `redacted` is.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    withheld: Vec<WithheldFile>,
 }
 
 impl PalletMirror {
     fn new(pallet: &str, status: MirrorStatus, message: String) -> PalletMirror {
-        PalletMirror { pallet: pallet.to_string(), status, commit: None, exported: 0, message: Some(message), redacted: Vec::new() }
+        PalletMirror { pallet: pallet.to_string(), status, commit: None, exported: 0, message: Some(message), redacted: Vec::new(),
+            withheld: Vec::new() }
     }
 
     fn in_step(pallet: &str, status: MirrorStatus, commit: &str, exported: usize) -> PalletMirror {
         PalletMirror {
             pallet: pallet.to_string(), status, commit: Some(commit.to_string()), exported, message: None, redacted: Vec::new(),
+            withheld: Vec::new(),
         }
     }
 
@@ -1156,6 +1174,7 @@ impl PalletMirror {
             _ => println!("Did not mirror \"{}\": {}", self.pallet, message),
         }
         export_git::render_redacted(&self.redacted);
+        export_git::render_withheld(&self.withheld);
     }
 }
 

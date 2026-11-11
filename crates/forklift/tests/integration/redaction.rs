@@ -3509,3 +3509,73 @@ fn a_lift_to_another_remote_refuses_content_withheld_here() {
     assert_eq!(lifted["error"]["details"]["statement"], TAKEDOWN, "{}", lifted);
     assert!(!other.root.join(".forklift/pallets/main").exists(), "the other remote's main moved: {}", lifted);
 }
+
+/// `git export` in a warehouse that lacks content the host of its remote withholds leaves the file
+/// out of every commit whose tree names that content, never writing anything in its place, and
+/// names it with the host's statement and the parcels whose commits left it out. An earlier version
+/// of the file, which this warehouse holds, is exported as before.
+///
+/// Revert: export the file as before → the export refuses `content_withheld`, reading the absent
+/// film.
+#[test]
+fn git_export_leaves_out_a_file_whose_content_the_remote_withholds_and_names_it() {
+    let mut takedown = takedown("export");
+    takedown.withhold_new_film(false);
+    let head = takedown.server.main();
+    let clone = Warehouse::cloned("takedown-export", &takedown.server.url);
+    left_out_film(&clone, &takedown);
+
+    let target = clone.root.parent().unwrap().join("exported");
+    let exported = clone.json(&["git", "export", target.to_str().unwrap()]);
+    assert_eq!(exported["ok"], true, "{}", exported);
+    assert_eq!(exported["data"]["withheld"], serde_json::json!([
+        { "path": "media/film.mkv", "hash": takedown.film, "statement": TAKEDOWN, "parcels": [head] }
+    ]), "{}", exported);
+    assert_eq!(exported["data"]["redacted"], serde_json::Value::Null, "{}", exported);
+
+    let paths = git_paths(&target, "main");
+    assert!(!paths.contains(&"media/film.mkv".to_string()), "{:?}", paths);
+    assert!(paths.contains(&"media/trailer.mkv".to_string()), "{:?}", paths);
+    assert!(git_paths(&target, "main~1").contains(&"media/film.mkv".to_string()), "the old film is exported");
+
+    let human = String::from_utf8_lossy(&clone.run_ok(&["git", "export", target.with_extension("2").to_str().unwrap()]).stdout)
+        .into_owned();
+    assert!(human.contains("Left out \"media/film.mkv\""), "{}", human);
+    assert!(human.contains(&format!("The host's statement: {}", TAKEDOWN)), "{}", human);
+}
+
+/// `git mirror` in a warehouse behind its remote takes the new history without the content the
+/// remote's host withholds, recording it unavailable as a lower does, and its export leaves the file
+/// out of the commit it pushes, naming it with the host's statement. The film is chunked, so what
+/// is left out is a recipe.
+///
+/// Revert: open the mirror's walk without the remote's withheld list → the mirror is refused, its
+/// pallet failing `content_withheld`. Revert: export the file as before → the pallet fails reading
+/// the absent recipe.
+#[test]
+fn git_mirror_leaves_out_a_file_whose_content_the_remote_withholds_and_names_it() {
+    let mut takedown = takedown("mirror");
+    let clone = Warehouse::cloned("takedown-mirror", &takedown.server.url);
+    let git = clone.root.parent().unwrap().join("mirror.git");
+    let initialised = std::process::Command::new("git").args(["init", "-q", "--bare", git.to_str().unwrap()])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+        .output().unwrap();
+    assert!(initialised.status.success(), "{}", String::from_utf8_lossy(&initialised.stderr));
+    clone.run_ok(&["config", "set", "mirror.url", git.to_str().unwrap()]);
+    takedown.withhold_new_film(true);
+    let head = takedown.server.main();
+
+    let mirrored = clone.json(&["git", "mirror"]);
+    assert_eq!(mirrored["ok"], true, "{}", mirrored);
+    let main = &mirrored["data"]["pallets"][0];
+    assert_eq!(main["status"], "pushed", "{}", mirrored);
+    assert_eq!(main["withheld"], serde_json::json!([
+        { "path": "media/film.mkv", "hash": takedown.film, "statement": TAKEDOWN, "parcels": [head] }
+    ]), "{}", mirrored);
+    recorded_film(&clone, &takedown);
+
+    let paths = git_paths(&git, "main");
+    assert!(!paths.contains(&"media/film.mkv".to_string()), "{:?}", paths);
+    assert!(paths.contains(&"media/trailer.mkv".to_string()), "{:?}", paths);
+}
