@@ -6803,6 +6803,79 @@ fn the_chunk_ledger_records_a_withheld_recipes_digest_before_deleting_it() {
     }
 }
 
+/// A recipe withheld before the store held it has no digest, so a ref update newly naming it at a
+/// chunked entry is refused as content the host cannot judge. The handshake names the staged
+/// intake; its target is a presigned upload outside staging, so neither the staging verifier's step
+/// nor the deletion step touches the copy, and the intake request records the digest from it,
+/// deletes it, and promotes nothing. The ref update then lands, the target names no URL, and a
+/// second intake request is answered as taken.
+// Revert: keep `AssumedKnown` on the ref update → the first update lands → red. Revert: record no
+// digest in `withheld_intake` → the second update is refused → red. Revert: keep the copy after the
+// read → red. Revert: hand out a staging target → the verifier's step deletes it, and the intake
+// finds no copy → red.
+#[test]
+fn the_digest_intake_records_a_withheld_recipes_digest_from_an_uploaded_copy_and_keeps_nothing() {
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+    use forklift_core::model::remote::WithheldIntake;
+    use forklift_core::model::tree_item::TreeItem;
+    use forklift_aws_lambda::head::delete_if_redaction_applied;
+
+    let area = Area::new("withheld-intake");
+    let (mut recorded, main, recipe, _, _) = chunked_leak(&area);
+    let bytes = recorded.objects.remove(&recipe).expect("the recipe");
+    let digest = forklift_core::util::withholding::recipe_digest(&recipe, &bytes).expect("a recipe");
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    plant(&head.refs, "main", &main);
+    withhold(&head, &recipe);
+    served_withheld(&head);
+    assert!(withheld_item(&head, &recipe).absent, "settled while the store lacks it");
+
+    assert_eq!(head.handshake().expect("handshake").withheld_intake, WithheldIntake::Staged);
+
+    let new = gate_parcel(&head, &[&main], vec![TreeItem::new("film.bin".to_string(), recipe.clone(), DirEntryType::NormalChunked)]);
+    let update = RefUpdateRequest { old_head: Some(main.clone()), new_head: new.clone(), tombstone: None };
+    let err = head.ref_update(&Principal::Static, "main", &update).expect_err("no digest to judge the file by");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert_eq!(refusal_code(&err.message), Some(RefusalCode::ContentWithheld), "{}", err.message);
+    assert!(err.message.contains(&recipe), "{}", err.message);
+
+    // An intake request with no copy sent is refused, and records nothing.
+    let err = head.withheld_intake(&Principal::Static, &recipe).expect_err("no copy");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+
+    let url = head.withheld_intake_target(&Principal::Static, &recipe).expect("target").url.expect("a digest is owed");
+    assert!(url.contains(&format!("/intake/{}", recipe)) && !url.contains("/staging/"), "{}", url);
+
+    // A copy that is not the recipe is refused, and is deleted all the same.
+    head.objects.land_intake(&recipe, blob_object("not the recipe"));
+    let err = head.withheld_intake(&Principal::Static, &recipe).expect_err("not the recipe");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert_eq!(head.objects.intake_count(), 0, "a refused copy is not kept");
+    assert!(withheld_item(&head, &recipe).chunks.is_none());
+
+    // The client's upload, then the staging verifier's step and the deletion step, as they run on
+    // any event before the intake request.
+    head.objects.land_intake(&recipe, bytes.clone());
+    assert!(delete_if_redaction_applied(&head.objects, &head.refs, "lift-1", &recipe).expect("verifier").applied(),
+        "the verifier deletes every staged copy of withheld content");
+    head.objects.delete_staged(&recipe).expect("the deletion step's sweep");
+    served_withheld(&head);
+    assert_eq!(head.objects.intake_count(), 1, "nothing outside staging deletes the copy");
+
+    head.withheld_intake(&Principal::Static, &recipe).expect("intake");
+    assert_eq!(withheld_item(&head, &recipe).chunks.as_deref(), Some(digest.as_str()), "the digest is recorded");
+    assert_eq!(served_digests(&head), vec![(recipe.clone(), Some(digest.clone()))], "and reported");
+    assert_eq!(head.objects.intake_count(), 0, "the copy is deleted");
+    assert!(!head.objects.exists(&recipe).expect("exists"), "nothing is promoted");
+    assert_eq!(head.objects.staged_count(), 0);
+
+    assert_eq!(head.withheld_intake_target(&Principal::Static, &recipe).expect("target").url, None, "no digest is owed");
+    head.withheld_intake(&Principal::Static, &recipe).expect("a recorded digest is answered as taken");
+
+    head.ref_update(&Principal::Static, "main", &update).expect("the host can judge the file now");
+}
+
 /// A first anchor's adopted history is held strictly over withheld content too, and the refusal
 /// says the host withholds it rather than sending the client to upload it.
 // Revert: drop the withheld note from `require_adopted_history`'s refusal → red.

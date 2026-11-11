@@ -118,6 +118,28 @@ run "c2_staging_lifecycle_rule" {
   }
 }
 
+# An intake copy is withheld content: one whose intake request never comes expires after a day,
+# every version of it, and the delete markers after it.
+run "intake_lifecycle_rules" {
+  command = apply
+
+  assert {
+    condition = anytrue([
+      for rule in aws_s3_bucket_lifecycle_configuration.this.rule :
+      rule.id == "expire-intake" && rule.status == "Enabled" && rule.filter[0].prefix == "intake/" && rule.expiration[0].days == 1 && rule.noncurrent_version_expiration[0].noncurrent_days == 1
+    ])
+    error_message = "An intake/ rule must expire every version of an abandoned intake copy after a day."
+  }
+
+  assert {
+    condition = anytrue([
+      for rule in aws_s3_bucket_lifecycle_configuration.this.rule :
+      rule.id == "expire-intake-delete-markers" && rule.filter[0].prefix == "intake/" && rule.expiration[0].expired_object_delete_marker == true
+    ])
+    error_message = "An intake/ rule must expire the delete markers the intake expiry leaves."
+  }
+}
+
 run "c2_staging_expiry_floor_rejects_zero" {
   command = plan
 

@@ -267,8 +267,8 @@ in its SDK retries for longer than the reserve can still carry the walk past the
 
 ### Key layout
 
-One bucket, four prefixes (`aws::s3`'s module docs), and the boundary between them **is** the
-protocol's "nothing unverified is fetchable" invariant. Under three of them every warehouse has its
+One bucket, six prefixes (`aws::s3`'s module docs), and the boundary between them **is** the
+protocol's "nothing unverified is fetchable" invariant. Under every one of them each warehouse has its
 own keys, so no warehouse's answers depend on what another one stores: one warehouse cannot learn
 whether another holds an object.
 
@@ -279,6 +279,7 @@ whether another holds an object.
 | `signatures/{warehouse}/{parcel_hash}` | Parcel signature sidecars — a distinct prefix so a sidecar never collides with its parcel's own object at `objects/{warehouse}/{parcel_hash}`. | `put_signature` |
 | `responses/{warehouse}/{content_hash}` | Ephemeral, content-addressed `batch`-bundle bodies offloaded from the control plane, reached only through a presigned URL. Never `objects/`. | `offload_response` |
 | `redaction-work/{warehouse}/{hash}/…` | A redaction scan's progress: the pallets it has still to walk, and each walk stopped part way. Holds no verdict, and is deleted as the scan finishes; a walk object a request left behind is deleted by the redaction's late sweep. Never served. | The control plane's redaction judge |
+| `intake/{warehouse}/{hash}` | A client's copy of a recipe the warehouse withholds and holds no chunk-list digest for, sent for the digest intake. The control plane reads it once, records the digest when it is the recipe, and deletes every version of it in the same request, whatever it holds; never promoted, never served. | The client, via a presigned `PUT` |
 | `redaction-work/{warehouse}/chunks/census-{round}[-final]` | A chunk round's census: which of its recipes' chunks something else names, as far as the walk has gone, and, once finished, the chunks nothing else names, written once and never rewritten. Both are deleted as the round ends. Never served. | The control plane's chunk round |
 
 A warehouse in AWS format 1 kept one `objects/{hash}` and `signatures/{hash}` key for every
@@ -290,8 +291,16 @@ a prefix or recursive delete: a format 2 warehouse id may itself be 64 hex chara
 `objects/{id}/` is that live warehouse's objects. Its DynamoDB partition stays too, and keeps its id
 taken until its items are deleted.
 
-No presigned `PUT` is ever issued to `objects/` — `presign_staging_put` hardcodes the
-`staging/` prefix and is the only code path that mints a presigned `PUT` at all.
+No presigned `PUT` is ever issued to `objects/` — `presign_staging_put` and `presign_intake_put`
+hardcode the `staging/` and `intake/` prefixes and are the only code paths that mint a presigned
+`PUT` at all.
+
+### Recommended: expire the `intake/` prefix
+
+An `intake/` copy is withheld content the host must not keep, and the request that names it
+deletes it. One whose request never comes (a client killed between the upload and the intake
+request) is left to a lifecycle rule. `infra/aws-serverless` expires `intake/*` after **1 day**,
+noncurrent versions after 1 day, and expired delete markers by a second rule, as for `staging/`.
 
 ### Required: expire the `staging/` prefix
 
@@ -665,7 +674,10 @@ sweep, the committing session's when a lift commit names it), which lists the ke
 `s3:DeleteObjectVersion` on `objects/*` and `staging/*`, the `DeleteRedactedCopies` statement), so
 no earlier version survives on a bucket with versioning enabled or suspended; the late sweep deletes the
 warehouse's older `responses/` objects and the redaction's `redaction-work/` objects the same way
-(`DeleteRedactedCopies` on `responses/*` and `redaction-work/*`); `ListObjectsV2`
+(`DeleteRedactedCopies` on `responses/*` and `redaction-work/*`); the digest intake's presigned
+`PUT`, its read of the copy, and its deletion of every version of it (`GetObject`/`PutObject`/
+`DeleteObject`/`DeleteObjectVersion` under `intake/{warehouse}/`) → the `WithheldIntake` statement
+on `intake/*`; `ListObjectsV2`
 (`discard_session`'s sweep) and `HeadObject`/`GetObject` 404-vs-403 semantics (below) →
 `s3:ListBucket` on the **bucket** resource (not `bucket/*`); `GetItem`/`Query` (ref reads,
 enumeration, the format item and the partition check behind it) → the table ARN, no index ARN

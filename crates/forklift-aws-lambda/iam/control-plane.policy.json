@@ -24,6 +24,12 @@
       "Resource": "${bucket_arn}/redaction-work/*"
     },
     {
+      "Sid": "WithheldIntake",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"],
+      "Resource": "${bucket_arn}/intake/*"
+    },
+    {
       "Sid": "DeleteRedactedCopies",
       "Effect": "Allow",
       "Action": "s3:DeleteObjectVersion",
