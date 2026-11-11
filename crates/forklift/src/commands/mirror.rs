@@ -660,12 +660,13 @@ impl<'a> Run<'a> {
             // Once more right before git receives it, putting the exported ref and the record's
             // entry back so no later run pushes the commit either.
             if let Err(refused) = self.exporter.check_removed() {
-                self.put_back(&exported_ref, previous.as_deref(), &commit)?;
                 match previous_root.clone() {
                     Some(root) => record.insert(pallet.to_string(), root),
                     None => record.remove(pallet),
                 };
-                mirror_utils::write_mirror_roots(record)?;
+                let rewritten = mirror_utils::write_mirror_roots(record);
+                self.put_back(&exported_ref, previous.as_deref(), &commit)?;
+                rewritten?;
                 return Err(Problem::Failed(refused));
             }
 

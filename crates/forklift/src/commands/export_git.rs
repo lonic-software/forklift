@@ -127,20 +127,6 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
     for parcel in &order {
         exporter.export_parcel(parcel)?;
     }
-    // Before any branch names a commit: content redacted or withheld during the run is not left
-    // in. Nothing is checked out yet, so removing what the run made leaves the path as it found
-    // it, and the retry the refusal names is not refused for an existing repository.
-    if let Err(refused) = exporter.check_removed() {
-        let made = match created { true => target.to_path_buf(), false => target.join(".git") };
-        return Err(match std::fs::remove_dir_all(&made) {
-            Ok(()) => refused,
-            Err(error) => format!(
-                "{} Removing \"{}\" failed ({}); delete it, since it may hold that content, before \
-                running it again.",
-                refused, made.display(), error
-            ),
-        });
-    }
 
     // Point each branch at its commit. Refs and the checkout write no objects, so they run under
     // the user's own configuration: from here on the repository is theirs.
@@ -162,6 +148,31 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
     if let Some(branch) = &current {
         repo.run_as_user(&["symbolic-ref", "HEAD", &format!("refs/heads/{}", branch)])?;
         repo.run_as_user(&["checkout", "-f", "-q", branch])?;
+    }
+
+    // Last, after the checkout: content redacted or withheld during the run is not left in the
+    // branches or the working tree. Removing what the run made leaves the path as it found it, so
+    // the retry the refusal names is not refused for an existing repository.
+    if let Err(refused) = exporter.check_removed() {
+        // The path was new or empty, so everything in it is the run's.
+        let removed = match created {
+            true => std::fs::remove_dir_all(target),
+            false => std::fs::read_dir(target).and_then(|entries| entries.into_iter().try_for_each(|entry| {
+                let entry = entry?;
+                match entry.file_type()?.is_dir() {
+                    true => std::fs::remove_dir_all(entry.path()),
+                    false => std::fs::remove_file(entry.path()),
+                }
+            })),
+        };
+        return Err(match removed {
+            Ok(()) => refused,
+            Err(error) => format!(
+                "{} Removing what it wrote to \"{}\" failed ({}); empty it, since it may hold that \
+                content, before running it again.",
+                refused, path, error
+            ),
+        });
     }
 
     output::emit(&ExportReport {
@@ -733,7 +744,7 @@ impl<'a> Exporter<'a> {
         };
         Err(format!(
             "This warehouse redacted or withheld content while this ran ({}{}), which the commits \
-            written may hold, so they are not kept. Run it again to leave that content out.",
+            written may hold, so the run stopped before anything named them. Run it again to leave that content out.",
             named.join(", "), more
         ))
     }
