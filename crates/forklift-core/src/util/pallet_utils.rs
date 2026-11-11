@@ -2598,7 +2598,9 @@ pub(crate) mod tests {
                           removed: (crate::util::applied_redactions::AppliedSet,
                                     crate::util::withholding::WithheldSet))
                           -> Result<(), crate::util::audit_utils::ClosureRefusal> {
-            remote_closure_with(head, base, removed, crate::util::audit_utils::WithheldDigests::Recorded)
+            remote_closure_with(head, base, removed, crate::util::audit_utils::WithheldDigests::Recorded {
+                accepted: &crate::util::audit_utils::local_pallet_heads,
+            })
         }
 
         /// [`remote_closure`], judging the chunk lists of withheld content by `digests`.
@@ -2606,7 +2608,7 @@ pub(crate) mod tests {
                                base: Option<&str>,
                                removed: (crate::util::applied_redactions::AppliedSet,
                                          crate::util::withholding::WithheldSet),
-                               digests: crate::util::audit_utils::WithheldDigests)
+                               digests: crate::util::audit_utils::WithheldDigests<'_>)
                                -> Result<(), crate::util::audit_utils::ClosureRefusal> {
             crate::util::audit_utils::verify_parcel_closure_with(
                 head,
@@ -2677,6 +2679,34 @@ pub(crate) mod tests {
             assert!(crate::util::withholding::record_digest(&film, &"a".repeat(64)).unwrap());
             remote_closure(&chunked, Some(&base), removed()).expect("a recorded digest is tolerated");
             remote_closure(&later, None, removed()).expect("a recorded digest is tolerated in a creation too");
+        }
+
+        // Revert: judge the walk bounded by the expected head alone → the creation and the merge over
+        // history main already reaches are refused.
+        #[test]
+        fn a_remote_closure_judges_withheld_content_only_in_history_no_head_reaches() {
+            let (_root, _scope) = scratch("closure-withheld-accepted");
+            let notes = blob("notes");
+            let base = parcel(&tree(&[("notes", &notes, DirEntryType::Normal)]), &[]);
+            let film = withheld_undigested("film");
+            let removed = || (Default::default(), crate::util::withholding::read_withheld().unwrap());
+            let media = tree(&[("film.mkv", &film, DirEntryType::NormalChunked)]);
+            let named = parcel(&tree(&[("notes", &notes, DirEntryType::Normal), ("media", &media, DirEntryType::Tree)]), &[&base]);
+
+            // A pallet created over it, and a merge bringing it into another, beside new work.
+            let more = blob("more");
+            let created = parcel(&tree(&[("more", &more, DirEntryType::Normal), ("media", &media, DirEntryType::Tree)]), &[&named]);
+            let merged = parcel(&tree(&[("more", &more, DirEntryType::Normal), ("notes", &notes, DirEntryType::Normal),
+                                        ("media", &media, DirEntryType::Tree)]), &[&base, &named]);
+
+            // While no head reaches it, both are refused.
+            assert_eq!(uncomparable(remote_closure(&created, None, removed())).0, "media/film.mkv");
+            assert_eq!(uncomparable(remote_closure(&merged, Some(&base), removed())).0, "media/film.mkv");
+
+            // Once main holds it, the host accepted it, and both land.
+            write("main", None, &named).unwrap();
+            remote_closure(&created, None, removed()).expect("a creation over accepted history lands");
+            remote_closure(&merged, Some(&base), removed()).expect("a merge of accepted history lands");
         }
 
         // Revert: key the file prune by hash alone → the entry turned chunked is pruned against the

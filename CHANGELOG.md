@@ -29,6 +29,14 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   `withheld_intake`; the AWS head does not offer it yet. A recipe that could not be sent leaves the
   lift's result as it was and writes a `withheld_intake_failed` warning.
 
+- **forklift-server refuses a lift naming a withheld file it cannot judge.** When the host
+  withholds a chunked file whose chunk list it never learnt, a lift whose new history names that
+  file afresh, at a path or as a chunked file where the server's history did not already name it,
+  is now refused with `content_withheld`, naming the file, instead of landing a head the server
+  could never judge against a chunk-list redaction. The way out is to lift again, or to lift from a
+  warehouse that holds the file, which sends the server its recipe first. Lifts that leave such a
+  file where it was still land. The AWS head does not refuse them yet.
+
 - **Commands wait for a remote that is unavailable for a moment.** A remote that answers `503`
   with `Retry-After`, as a server does while it deletes or settles redacted content, or while the
   AWS head deletes a redacted file's chunks, is asked again after the wait, for up to 2 minutes,
