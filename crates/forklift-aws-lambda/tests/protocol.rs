@@ -6490,6 +6490,39 @@ fn a_withheld_hash_the_store_lacks_applies_to_a_tree_uploaded_later() {
     assert!(listed[0].item.settled && !listed[0].item.never_applies, "{:?}", listed[0].item);
 }
 
+/// A tree a racing upload lands after its withheld hash was settled absent is not deleted as a
+/// blob by the late step: it is no file's content, so the item is settled again as never applying,
+/// and the tree stays served, as does a copy a lift staged since.
+// Revert: drop the `NoFile` outcome of the late step's type read → the tree is deleted → red.
+// Revert: delete the staged copies before the type read → the staged tree is gone → red.
+#[test]
+fn a_withheld_tree_landing_after_it_was_settled_absent_never_applies_and_stays() {
+    let source = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let main = gate_parcel(&source, &[], vec![gate_file(&source, "x", "1")]);
+    let bytes = source.objects.get(&main).expect("read").expect("the parcel");
+    let tree = object_utils::parse_parcel_bytes(&main, &bytes).expect("parcel").tree_hash;
+    let tree_bytes = source.objects.get(&tree).expect("read").expect("the tree");
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let other = gate_parcel(&head, &[], vec![gate_file(&head, "y", "2")]);
+    plant(&head.refs, "main", &other);
+    withhold(&head, &tree);
+    served_withheld(&head);
+    let item = withheld_item(&head, &tree);
+    assert!(item.settled && item.absent && !item.never_applies, "settled while absent: {:?}", item);
+
+    head.objects.put_verified(&tree, &tree_bytes).expect("the racing upload");
+    head.objects.stage("lift-1", &tree, tree_bytes.clone());
+    age_withheld(&head.refs, &tree, LATE_SWEEP_AFTER + 40);
+    served_withheld(&head);
+
+    let item = withheld_item(&head, &tree);
+    assert!(item.never_applies && !item.absent && !item.deleted && item.lease_until.is_none(), "{:?}", item);
+    assert!(head.objects.exists(&tree).expect("exists"), "not deleted as a blob");
+    assert_eq!(head.objects.staged_count(), 1, "the staged copy is left to its lift");
+    assert!(served(&head, &tree), "a tree is no file's content");
+}
+
 /// An object whose header this build cannot read is never guessed at: its withheld item stays
 /// unsettled and applies, so its own hash is refused `451`, while other content is served.
 // Revert: settle an unreadable header as never applying → it is served → red. Revert: fail the
@@ -6621,11 +6654,13 @@ fn a_ref_update_tolerates_withheld_file_content_only() {
 /// no census root's to keep. The history naming it still lifts.
 // Revert: journal no recipe when settling → the chunk is served → red. Revert: leave withheld
 // recipes out of the census basis → the chunks only it names are kept → red. Revert: mark only
-// the redaction item of a deleted recipe → the late round errors → red.
+// the redaction item of a deleted recipe → the late round errors → red. Revert: record no digest
+// when settling → red. Revert: report none in the handshake → red.
 #[test]
 fn a_withheld_recipe_gates_its_chunks_and_a_round_deletes_the_ones_only_it_names() {
     let area = Area::new("withheld-chunks");
     let (recorded, main, recipe, own, shared) = chunked_leak(&area);
+    let digest = forklift_core::util::withholding::recipe_digest(&recipe, &recorded.objects[&recipe]).expect("a recipe");
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
     upload_all(&head, &recorded);
     plant(&head.refs, "main", &main);
@@ -6635,6 +6670,8 @@ fn a_withheld_recipe_gates_its_chunks_and_a_round_deletes_the_ones_only_it_names
     assert_withheld(&head.object_get(&own[0]).expect_err("undecided"), &own[0]);
     assert_host_withheld(&head.object_get(&recipe).expect_err("withheld"), &recipe);
     assert_eq!(served_withheld(&head), vec![(recipe.clone(), STATEMENT.to_string(), ServedWithholdingState::DeletionOwed)]);
+    assert_eq!(withheld_item(&head, &recipe).chunks.as_deref(), Some(digest.as_str()), "settling records the digest");
+    assert_eq!(served_digests(&head), vec![(recipe.clone(), Some(digest.clone()))], "the handshake reports it");
 
     let head = head.with_chunk_round_wait(0);
     served_withheld(&head);
@@ -6656,6 +6693,114 @@ fn a_withheld_recipe_gates_its_chunks_and_a_round_deletes_the_ones_only_it_names
     assert!(!head.objects.exists(&recipe).expect("exists"), "then the recipe is deleted");
     let listed = forklift_aws_lambda::withheld::list(&head.refs).expect("list");
     assert!(listed[0].item.recipe && listed[0].item.recipe_deleted, "{:?}", listed[0].item);
+    assert_eq!(listed[0].item.chunks.as_deref(), Some(digest.as_str()), "the digest outlives the recipe");
+    assert_eq!(served_digests(&head), vec![(recipe.clone(), Some(digest))]);
+}
+
+/// The handshake's withheld list, as (hash, chunk-list digest).
+fn served_digests<O: ObjectStore, R: RefStore>(head: &Head<O, R>) -> Vec<(String, Option<String>)> {
+    let info = head.handshake().expect("handshake");
+    info.withheld.expect("the head reports what it withholds").into_iter()
+        .map(|served| (served.hash, served.chunks))
+        .collect()
+}
+
+/// A recipe withheld while the store lacked it, which a racing upload lands after it is settled,
+/// is never deleted as a blob: the late step finds the copy a recipe and settles it again as one,
+/// with its digest and its chunk ledger entry, so its chunks are gated and the digest is recorded
+/// before the chunk ledger deletes it; also when meta history names it, which would keep a blob.
+// Revert: drop the type read before the late step's `delete_canonical` → the recipe goes as a
+// blob with no digest and its chunks stay → red. Revert: drop the read before the walk → the
+// recipe meta history names is kept as a blob → red. Revert: journal nothing on the re-settle →
+// the chunk is served → red. Revert: record no digest on the re-settle → red. Revert: record no
+// `absent` at settling → nothing is read again → red.
+#[test]
+fn a_withheld_recipe_landing_after_it_was_settled_absent_is_settled_again_with_its_digest() {
+    for named in [false, true] {
+        landing_after_settled_absent(named);
+    }
+}
+
+fn landing_after_settled_absent(named: bool) {
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+    use forklift_core::model::tree_item::TreeItem;
+
+    let area = Area::new(if named { "withheld-race-named" } else { "withheld-race" });
+    let (mut recorded, main, recipe, own, shared) = chunked_leak(&area);
+    let bytes = recorded.objects.remove(&recipe).expect("the recipe");
+    let digest = forklift_core::util::withholding::recipe_digest(&recipe, &bytes).expect("a recipe");
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    plant(&head.refs, "main", &main);
+    withhold(&head, &recipe);
+
+    served_withheld(&head);
+    let item = withheld_item(&head, &recipe);
+    assert!(item.settled && item.absent && item.swept && !item.recipe && item.chunks.is_none(), "settled while absent: {:?}", item);
+    assert!(served(&head, &own[0]), "no recipe is journaled, so its chunks are served");
+
+    // The upload that raced the withhold lands.
+    head.objects.put_verified(&recipe, &bytes).expect("the racing upload");
+    if named {
+        let meta = gate_parcel(&head, &[], vec![TreeItem::new("cell".to_string(), recipe.clone(), DirEntryType::Normal)]);
+        plant_meta(&head.refs, "tags", None, &meta);
+    }
+    age_withheld(&head.refs, &recipe, LATE_SWEEP_AFTER + 40);
+    served_withheld(&head);
+
+    let item = withheld_item(&head, &recipe);
+    assert!(item.recipe && !item.absent && !item.kept && !item.deleted && item.lease_until.is_none(), "settled again as a recipe: {:?}", item);
+    assert_eq!(item.chunks.as_deref(), Some(digest.as_str()), "with its digest");
+    assert!(head.objects.exists(&recipe).expect("exists"), "not deleted as a blob");
+    assert_withheld(&head.object_get(&own[0]).expect_err("gated"), &own[0]);
+
+    // The recipe's path: its own chunks, then, late, the recipe; the digest stays.
+    let head = head.with_chunk_round_wait(0);
+    served_withheld(&head);
+    for chunk in &own {
+        assert!(!head.objects.exists(chunk).expect("exists"), "a chunk only the recipe names is deleted");
+    }
+    assert!(head.objects.exists(&shared[0]).expect("exists"));
+    age_chunk_ledger(&head.refs, LATE_SWEEP_AFTER + 40);
+    served_withheld(&head);
+    assert!(!head.objects.exists(&recipe).expect("exists"), "then the recipe is deleted");
+    let item = withheld_item(&head, &recipe);
+    assert!(item.recipe_deleted && item.deleted, "{:?}", item);
+    assert_eq!(item.chunks.as_deref(), Some(digest.as_str()));
+}
+
+/// The chunk ledger records a withheld recipe's digest from the canonical copy before it deletes
+/// the recipe, when its item has none (settled by a build that recorded none); with no copy left,
+/// it records the deletion and the digest stays not known.
+// Revert: drop `fill_withheld_digest` from `finish_recipes` → the recipe goes with no digest → red.
+// Revert: refuse to finish a recipe whose copy is gone → it is never marked deleted → red.
+#[test]
+fn the_chunk_ledger_records_a_withheld_recipes_digest_before_deleting_it() {
+    for copy_left in [true, false] {
+        let area = Area::new(if copy_left { "withheld-fill" } else { "withheld-fill-gone" });
+        let (recorded, main, recipe, _, _) = chunked_leak(&area);
+        let digest = forklift_core::util::withholding::recipe_digest(&recipe, &recorded.objects[&recipe]).expect("a recipe");
+        let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new()).with_chunk_round_wait(0);
+        upload_all(&head, &recorded);
+        plant(&head.refs, "main", &main);
+        withhold(&head, &recipe);
+        served_withheld(&head);
+
+        rewrite_withheld(&head.refs, &recipe, |item| {
+            item.as_object_mut().expect("an object").remove("chunks").expect("settling recorded one");
+        });
+        if !copy_left {
+            head.objects.delete_canonical(&recipe).expect("an earlier run deleted it");
+        }
+        age_chunk_ledger(&head.refs, LATE_SWEEP_AFTER + 40);
+        served_withheld(&head);
+
+        assert!(!head.objects.exists(&recipe).expect("exists"));
+        let item = withheld_item(&head, &recipe);
+        assert!(item.recipe_deleted, "copy left {}: {:?}", copy_left, item);
+        let expected = copy_left.then_some(digest.as_str());
+        assert_eq!(item.chunks.as_deref(), expected, "copy left {}", copy_left);
+    }
 }
 
 /// A first anchor's adopted history is held strictly over withheld content too, and the refusal

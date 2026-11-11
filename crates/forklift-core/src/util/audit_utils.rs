@@ -1927,8 +1927,8 @@ pub enum WithheldDigests {
     Recorded,
 
     /// Every withheld hash is taken as carrying a digest, so absent withheld content is tolerated
-    /// as any file's content, whatever its entry's type: for a head whose record carries no digests
-    /// yet.
+    /// as any file's content, whatever its entry's type: for a head that has no way yet to learn
+    /// the digest of a recipe it never held.
     AssumedKnown,
 }
 

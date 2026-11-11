@@ -14,8 +14,9 @@
 //! as no file's content (a tree, a parcel or a chunk); a request learns which by settling it
 //! ([`Head::withholding`]), reading the object once and recording what it is; one whose header
 //! this build cannot read is never recorded, so it applies and is read again by every request.
-//! Settling a recipe journals it in the chunk ledger in the same transaction, which is what gates
-//! its chunks (the chunk gate reads only the ledger, and a chunk request names no recipe). So
+//! Settling a recipe records its chunk-list digest, from the bytes it read, and journals it in the
+//! chunk ledger in the same transaction, which is what gates its chunks (the chunk gate reads only
+//! the ledger, and a chunk request names no recipe). So
 //! every request that serves or takes objects settles every unsettled item before it answers, and
 //! answers `503` only when that does not finish within the request.
 //!
@@ -98,18 +99,29 @@ impl Withholding {
                 true => ServedWithholdingState::Deleted,
                 false => ServedWithholdingState::DeletionOwed,
             },
-            // The AWS head records no chunk-list digest yet.
-            chunks: None,
+            chunks: listed.item.chunks.clone(),
         }).collect()
     }
 }
 
-/// The content `items` withhold, each hash beside its statement: every item that applies, settled
-/// or not.
+/// The content `items` withhold, each hash beside its statement and its recorded chunk-list
+/// digest: every item that applies, settled or not.
 pub(super) fn applying(items: &[Listed]) -> WithheldSet {
     WithheldSet::of(items.iter()
         .filter(|listed| !listed.item.never_applies)
-        .map(|listed| (listed.hash.clone(), listed.item.statement.clone())))
+        .map(|listed| (listed.hash.clone(), listed.item.statement.clone(), listed.item.digest())))
+}
+
+/// The chunk-list digest of the recipe `hash` from `bytes`, the head's own copy of it, when they
+/// hash to `hash` and parse as a recipe: a digest is only ever recorded from the recipe's bytes.
+/// A recipe that yields none is logged: its entry stays not known, and a chunk-list redaction over
+/// the file it names stays undecided on a client.
+fn digest_of(hash: &str, bytes: &[u8]) -> Option<String> {
+    withholding::recipe_digest(hash, bytes).map_err(|error| eprintln!(
+        "forklift-aws-lambda: withheld recipe {} gives no chunk-list digest ({}), so a chunk-list \
+        redaction cannot judge the file it names",
+        hash, error
+    )).ok()
 }
 
 /// Whether every copy of the content `item` withholds is deleted: a blob's canonical copy unless
@@ -196,6 +208,36 @@ fn walk_files<T>(
     }
 
     Ok(None)
+}
+
+/// What one deletion step's deletes came to ([`Head::delete_withheld_copies`]).
+enum Copies {
+    /// The step is done: whether the blob's canonical copy is kept.
+    Done(bool),
+
+    /// The walk for its keepers stopped part way; it is saved.
+    Stopped,
+
+    /// The item was settled as a blob, or while the store lacked the object, and the canonical copy
+    /// the late step was about to delete is a recipe, which landed through a race with the
+    /// withhold: its digest, if its bytes give one. The item is settled again as a recipe, and the
+    /// copy goes on the recipe's path, after its chunks.
+    Recipe(Option<String>),
+
+    /// As [`Copies::Recipe`], but the copy that landed is a tree, a parcel or a chunk, which is
+    /// no file's content: the item is settled again as never applying, and the copy stays served.
+    NeverApplies,
+}
+
+/// What the canonical copy of an item settled while the store lacked the object turned out to be
+/// ([`Head::landed_copy`]).
+enum Landed {
+    /// Still absent, or a blob (or of a header this build cannot read): the item stands.
+    Stands,
+    /// A recipe, with its digest if its bytes give one.
+    Recipe(Option<String>),
+    /// A tree, a parcel or a chunk.
+    NoFile,
 }
 
 /// What settling one item found.
@@ -297,7 +339,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // never guessed at: the item stays unsettled, so it applies and only its own hash is
             // refused, and each request reads and logs it again. The verifier checks only that an
             // object's bytes hash to its key, so this is content no client of this build writes,
-            // and it stays loud rather than cheap.
+            // and it stays loud rather than cheap. Only one that lands after its item was settled
+            // as a blob without it is read as a blob's, since that item's late step is owed
+            // ([`Head::landed_copy`]).
             let bytes = match self.objects.get(&hash) {
                 Ok(bytes) => bytes,
                 Err(error) => return Ok(Settled::Unsettled(format!(
@@ -327,10 +371,16 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 // start, with no walk: no deletion may leave a kind uncreatable.
                 None | Some(ObjectType::Blob) => WithheldItem {
                     settled: true,
+                    absent: kind.is_none(),
                     kept: listed.item.kept || meta_tree::format_marker_hashes().contains(&hash),
                     ..listed.item.clone()
                 },
-                Some(ObjectType::Recipe) => WithheldItem { settled: true, recipe: true, ..listed.item.clone() },
+                Some(ObjectType::Recipe) => WithheldItem {
+                    settled: true,
+                    recipe: true,
+                    chunks: listed.item.chunks.clone().or_else(|| bytes.as_deref().and_then(|bytes| digest_of(&hash, bytes))),
+                    ..listed.item.clone()
+                },
                 Some(_) => WithheldItem { settled: true, never_applies: true, ..listed.item.clone() },
             };
 
@@ -404,7 +454,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     ///   late step, and a recipe's for the chunk ledger, which settling journaled it in.
     /// - Once it is due, no request begun before the withhold is still running: for a blob not
     ///   kept, walk every meta pallet's history and the adopted history for one naming it, saving
-    ///   the walk between requests. Named, it is kept; otherwise its canonical copy is deleted.
+    ///   the walk between requests. Named, it is kept; otherwise its canonical copy is deleted,
+    ///   unless that copy is a recipe that landed after the item was settled: then the item is
+    ///   settled again as a recipe, its digest and its chunk ledger entry in the same write, and
+    ///   the next step takes the recipe's path.
     ///   Either is for good: a meta ref update never comes to name content that is neither
     ///   ([`Head::refuse_meta_naming_withheld`]). Then delete every staged copy again, every response
     ///   bundle written before [`response_cutoff`], and the item's work objects.
@@ -426,15 +479,38 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let late = now >= late_sweep_due(leased.withheld_at);
         let deleted = self.delete_withheld_copies(hash, &leased, late, budget);
         let next = match &deleted {
-            Ok(Some(kept)) => WithheldItem { swept: true, kept: *kept, deleted: late, lease_until: None, ..leased.clone() },
-            Ok(None) => WithheldItem { lease_until: None, ..leased.clone() },
+            Ok(Copies::Done(kept)) => WithheldItem { swept: true, kept: *kept, deleted: late, lease_until: None, ..leased.clone() },
+            Ok(Copies::Stopped) => WithheldItem { lease_until: None, ..leased.clone() },
+            // The next step owed takes the recipe's path; until then nothing deletes the copy.
+            Ok(Copies::Recipe(digest)) => WithheldItem {
+                recipe: true,
+                absent: false,
+                chunks: leased.chunks.clone().or_else(|| digest.clone()),
+                lease_until: None,
+                ..leased.clone()
+            },
+            Ok(Copies::NeverApplies) => WithheldItem { never_applies: true, absent: false, lease_until: None, ..leased.clone() },
             // From the failure, not the request's start: a walk may have run for minutes first.
             Err(_) => WithheldItem { lease_until: Some(epoch_seconds(SystemTime::now()) + FAILED_STEP_BACKOFF), ..leased.clone() },
         };
 
         // Lost, the lease simply runs out, and the first request after it takes the step again.
         let state = withheld::encode(&next);
-        let written = self.write_items(&[ItemWrite { key: ItemKey::Withheld(hash), state: &state, expected: Some(&leased_state) }], budget);
+        let mut writes = vec![ItemWrite { key: ItemKey::Withheld(hash), state: &state, expected: Some(&leased_state) }];
+
+        // A recipe re-settled is journaled in the chunk ledger in the same transaction, as
+        // settling journals one, so its chunks are gated from the write that records it.
+        let ledger = match &deleted {
+            // As of the write, not the step's start: a walk may have run for minutes first, and no
+            // request before the write gated the recipe's chunks.
+            Ok(Copies::Recipe(_)) => Some(super::chunks::journal(&self.refs, hash, epoch_seconds(SystemTime::now())).map_err(HeadError::internal)?),
+            _ => None,
+        };
+        if let Some((expected, ledger_state)) = &ledger {
+            writes.push(ItemWrite { key: ItemKey::ChunkLedger, state: ledger_state, expected: expected.as_deref() });
+        }
+
+        let written = self.write_items(&writes, budget);
 
         // A failed delete is the cause worth reporting, whatever became of the write after it.
         deleted?;
@@ -444,29 +520,67 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// Delete the copies the store keeps of `hash`, withheld as `item`, for the step
     /// [`withheld_deletion_step`](Self::withheld_deletion_step) describes.
     ///
+    /// For an item settled while the store lacked the object, it reads the canonical copy's type
+    /// before the walk for its keepers and again once the walk is done, whatever it found: a recipe
+    /// that a racing upload landed since is never kept or deleted as a blob, so its chunks are
+    /// gated and its digest is recorded before any deleter takes its last copy
+    /// ([`Copies::Recipe`]), and a tree, a parcel or a chunk is settled as never applying and kept
+    /// ([`Copies::NeverApplies`]). Keepers protect only a blob: a recipe goes down the recipe's
+    /// path whatever history names it, as one present when the item was settled does. An item
+    /// settled as a blob is not read again: a hash is one object's, of one type. For such an
+    /// item the type is read before the staged copies are deleted, so a tree, a parcel or a chunk
+    /// that landed before the step began is left to the lift that staged it; one landing during
+    /// the walk is found only after the staged copies are gone.
+    ///
     /// # Returns
-    /// * `Ok(Some(kept))` - The step is done: whether the blob's canonical copy is kept.
-    /// * `Ok(None)`       - The walk for its keepers stopped part way; it is saved.
+    /// * `Ok(Copies)`     - What the step came to.
     /// * `Err(HeadError)` - A read or a delete failed: the step stays owed.
-    fn delete_withheld_copies(&self, hash: &str, item: &WithheldItem, late: bool, budget: &mut Budget) -> HeadResult<Option<bool>> {
-        self.objects.delete_staged(hash).map_err(HeadError::internal)?;
-
+    fn delete_withheld_copies(&self, hash: &str, item: &WithheldItem, late: bool, budget: &mut Budget) -> HeadResult<Copies> {
         if !late {
-            return Ok(Some(item.kept));
+            self.objects.delete_staged(hash).map_err(HeadError::internal)?;
+            return Ok(Copies::Done(item.kept));
         }
+
+        // What a copy that landed since settling makes of the item, if anything.
+        let retyped = || -> HeadResult<Option<Copies>> {
+            if !item.absent {
+                return Ok(None);
+            }
+            Ok(match self.landed_copy(hash)? {
+                Landed::Stands => None,
+                Landed::Recipe(digest) => Some(Copies::Recipe(digest)),
+                Landed::NoFile => Some(Copies::NeverApplies),
+            })
+        };
+
+        if !item.kept && !item.recipe {
+            if let Some(copies) = retyped()? {
+                return Ok(copies);
+            }
+        }
+        self.objects.delete_staged(hash).map_err(HeadError::internal)?;
 
         let kept = match item.kept || item.recipe {
             true => item.kept,
             false => match self.walk_keepers(hash, budget)? {
-                Keepers::Named => true,
+                Keepers::Named => {
+                    if let Some(copies) = retyped()? {
+                        return Ok(copies);
+                    }
+                    true
+                }
                 Keepers::None => {
+                    if let Some(copies) = retyped()? {
+                        return Ok(copies);
+                    }
+
                     self.objects.delete_canonical(hash).map_err(HeadError::internal)?;
                     false
                 }
                 Keepers::Stopped { why, failed: true } => return Err(HeadError::internal(why)),
                 Keepers::Stopped { why, failed: false } => {
                     eprintln!("forklift-aws-lambda: {}", why);
-                    return Ok(None);
+                    return Ok(Copies::Stopped);
                 }
             },
         };
@@ -475,7 +589,78 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         self.objects.delete_responses_before(cutoff).map_err(HeadError::internal)?;
         self.objects.work_delete_under(&work_prefix(hash)).map_err(HeadError::internal)?;
 
-        Ok(Some(kept))
+        Ok(Copies::Done(kept))
+    }
+
+    /// What the canonical copy of `hash` is now. Unlike settling, which leaves an unreadable header
+    /// unsettled and refused for good, this reads one as no recipe's (logged). For an item
+    /// settled as a blob while the store lacked it, that leaves the blob's late step to run; for
+    /// the chunk ledger's fill ([`Head::canonical_recipe`]), it leaves the digest not known.
+    ///
+    /// # Returns
+    /// * `Ok(Landed)`     - What it is.
+    /// * `Err(HeadError)` - It could not be read: nothing is deleted.
+    fn landed_copy(&self, hash: &str) -> HeadResult<Landed> {
+        let Some(bytes) = self.objects.get(hash).map_err(HeadError::internal)? else {
+            return Ok(Landed::Stands);
+        };
+
+        Ok(match object_utils::peek_object_header(&bytes) {
+            Ok((ObjectType::Recipe, _)) => Landed::Recipe(digest_of(hash, &bytes)),
+            Ok((ObjectType::Blob, _)) => Landed::Stands,
+            Ok(_) => Landed::NoFile,
+            Err(error) => {
+                eprintln!(
+                    "forklift-aws-lambda: withheld object {} has a header this build cannot read ({:?}); \
+                    it is read as no recipe's",
+                    hash, error
+                );
+                Landed::Stands
+            }
+        })
+    }
+
+    /// Whether the canonical copy of `hash` is a recipe, and its digest if its bytes give one.
+    ///
+    /// # Returns
+    /// * `Ok(Some(digest))` - It is a recipe.
+    /// * `Ok(None)`         - It is absent, or of another type, or its header cannot be read
+    ///                        (logged).
+    /// * `Err(HeadError)`   - It could not be read.
+    fn canonical_recipe(&self, hash: &str) -> HeadResult<Option<Option<String>>> {
+        Ok(match self.landed_copy(hash)? {
+            Landed::Recipe(digest) => Some(digest),
+            Landed::Stands | Landed::NoFile => None,
+        })
+    }
+
+    /// Record the chunk-list digest on the withheld item of the recipe `hash`, when the item has
+    /// none, from the canonical copy: what the chunk ledger runs before it deletes the recipe,
+    /// which no other deleter reads first.
+    ///
+    /// # Returns
+    /// * `Ok(true)`       - The recipe may be deleted: there is no withheld item of it settled as
+    ///                      a recipe without a digest, or it records the digest now, or no copy is
+    ///                      at hand to take one from (the entry stays not known).
+    /// * `Ok(false)`      - The write lost to another: read the ledger again.
+    /// * `Err(HeadError)` - The item or the copy could not be read: back off, delete nothing.
+    pub(super) fn fill_withheld_digest(&self, hash: &str, budget: &mut Budget) -> HeadResult<bool> {
+        let Some(stored) = self.refs.get_item(ItemKey::Withheld(hash)).map_err(HeadError::internal)? else {
+            return Ok(true);
+        };
+        let item = withheld::decode(hash, &stored).map_err(HeadError::internal)?;
+
+        // Only an item settled as a recipe carries a digest; any other is settled from the store.
+        if item.chunks.is_some() || !item.recipe {
+            return Ok(true);
+        }
+
+        let Some(digest) = self.canonical_recipe(hash)?.flatten() else {
+            return Ok(true);
+        };
+
+        let state = withheld::encode(&WithheldItem { chunks: Some(digest), ..item });
+        self.write_items(&[ItemWrite { key: ItemKey::Withheld(hash), state: &state, expected: Some(&stored) }], budget)
     }
 
     /// Whether meta history or the trust anchor's adopted history names the blob `hash`: walk the
