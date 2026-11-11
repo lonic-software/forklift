@@ -1325,7 +1325,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "object"
     },
     "WithheldFile": {
-      "description": "A file an export or a mirror left out of the commits it wrote, because this warehouse lacks its\ncontent, which the host of a remote withholds.",
+      "description": "A file an export or a mirror left out of the commits it wrote, because a host withholds its\ncontent: the host of a remote, so this warehouse lacks it, or this warehouse's own.",
       "properties": {
         "hash": {
           "description": "Its content's hash.",
@@ -1454,6 +1454,13 @@ A command not listed here either reports only the generic human-message shape `{
         "$ref": "#/$defs/WithheldFile"
       },
       "type": "array"
+    },
+    "withheld_here": {
+      "description": "The files left out because this warehouse's host withholds their content (the withheld\nrecord of a served root), whether or not the store still holds a copy: each by path, with\nthe host's statement and the parcels whose commits carry no version of it in its place.",
+      "items": {
+        "$ref": "#/$defs/WithheldFile"
+      },
+      "type": "array"
     }
   },
   "required": [
@@ -1572,6 +1579,13 @@ A command not listed here either reports only the generic human-message shape `{
             "$ref": "#/$defs/WithheldFile"
           },
           "type": "array"
+        },
+        "withheld_here": {
+          "description": "The files left out of the commits this run wrote, because this warehouse's host withholds\ntheir content, whether or not the store still holds a copy: each by path, with the host's\nstatement and the parcels whose commits left it out. Named only under the first pallet whose\nexport wrote the commit, as `redacted` is.",
+          "items": {
+            "$ref": "#/$defs/WithheldFile"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -1626,7 +1640,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "object"
     },
     "WithheldFile": {
-      "description": "A file an export or a mirror left out of the commits it wrote, because this warehouse lacks its\ncontent, which the host of a remote withholds.",
+      "description": "A file an export or a mirror left out of the commits it wrote, because a host withholds its\ncontent: the host of a remote, so this warehouse lacks it, or this warehouse's own.",
       "properties": {
         "hash": {
           "description": "Its content's hash.",
@@ -2562,6 +2576,13 @@ A command not listed here either reports only the generic human-message shape `{
             "$ref": "#/$defs/WithheldFile"
           },
           "type": "array"
+        },
+        "withheld_here": {
+          "description": "The files left out of the commits this run wrote, because this warehouse's host withholds\ntheir content, whether or not the store still holds a copy: each by path, with the host's\nstatement and the parcels whose commits left it out. Named only under the first pallet whose\nexport wrote the commit, as `redacted` is.",
+          "items": {
+            "$ref": "#/$defs/WithheldFile"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -2710,7 +2731,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "object"
     },
     "WithheldFile": {
-      "description": "A file an export or a mirror left out of the commits it wrote, because this warehouse lacks its\ncontent, which the host of a remote withholds.",
+      "description": "A file an export or a mirror left out of the commits it wrote, because a host withholds its\ncontent: the host of a remote, so this warehouse lacks it, or this warehouse's own.",
       "properties": {
         "hash": {
           "description": "Its content's hash.",

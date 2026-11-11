@@ -3803,7 +3803,7 @@ fn git_export_in_a_served_root_leaves_out_content_its_host_withholds() {
 ///
 /// Revert: leave the withheld record out of the mirror's exporter → the mirror fails, reading the
 /// deleted film. Revert: judge a seeded folder clean by the applied redactions alone → the later
-/// commit holds the film.
+/// run names nothing.
 #[test]
 fn git_mirror_in_a_served_root_leaves_out_content_its_host_withholds() {
     let mut takedown = takedown("mirror-here");

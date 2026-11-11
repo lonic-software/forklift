@@ -85,7 +85,14 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 40** (current): `git export` and each pallet of `git mirror` carry `withheld`, the files
+**Schema 41** (current): `git export` and each pallet of `git mirror` also carry `withheld_here`,
+the files left out of the commits written because this warehouse's own host withholds their
+content (the withheld record of a served root, `forklift-server withhold`), whether or not the
+store still holds a copy: each `{path, hash, statement, parcels}`, beside `withheld`. Before, an
+export or mirror run in a served root wrote such a file while its copy was stored, and failed once
+it was deleted.
+
+**Schema 40**: `git export` and each pallet of `git mirror` carry `withheld`, the files
 left out of the commits written because this warehouse lacks their content, which the host of a
 remote withholds (the `unavailable` record): each `{path, hash, statement, parcels}`, beside
 `redacted`. Such an export or mirror no longer fails with `content_withheld`.
