@@ -331,9 +331,9 @@ revocation by more than about a day.
   the server ever holding it: nothing asks for its bytes, and the ref write tolerates their
   absence, as when the file is moved or copied. For a chunked file whose chunk list the server
   never learnt, because no lift has sent it the file's recipe, the ref write is stricter: a lift
-  that newly gives such a file a chunked entry, at a path or in a pallet whose head does not
-  already name it so, is refused (`content_withheld`) and told to lift from a warehouse that holds
-  the file. The handshake lists the hash
+  whose new history gives such a file a chunked entry, while the pallet's head names it as a
+  chunked file nowhere (a new pallet's whole history counts), is refused (`content_withheld`) and
+  told to lift from a warehouse that holds the file. The handshake lists the hash
   and the statement (one plain line, at most 1000 characters). The list is kept in
   `<root>/.forklift/withheld`. The running server notices a new entry within a few seconds: it
   cuts a bundle download already under way, deletes the stored copy, and rebuilds the bundle when

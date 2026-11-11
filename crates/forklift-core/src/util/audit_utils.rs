@@ -1899,7 +1899,8 @@ pub enum ClosureRefusal {
     Uncomparable(UncomparableWithheld),
 
     /// The walk failed, and the record of the redactions applied or the content withheld could not
-    /// be read to judge the absence.
+    /// be read to judge the absence; or the walk held withheld content it would judge against the
+    /// pallet's current head, and that head's tree could not be read.
     RecordsUnreadable(String),
 }
 
@@ -1944,9 +1945,11 @@ impl ClosureRefusal {
 
     /// The refusal a remote's ref update answers with: an incomplete history as the
     /// [`RefusalCode::RemoteHistoryIncomplete`] refusal, which a lift answers by negotiating and
-    /// uploading again, and anything else as its plain text.
+    /// uploading again; withheld content it cannot judge as the [`RefusalCode::ContentWithheld`]
+    /// refusal, naming the way out; and anything else as its plain text.
     ///
     /// [`RefusalCode::RemoteHistoryIncomplete`]: crate::error::RefusalCode::RemoteHistoryIncomplete
+    /// [`RefusalCode::ContentWithheld`]: crate::error::RefusalCode::ContentWithheld
     pub fn for_ref_update(self) -> String {
         match self {
             ClosureRefusal::Incomplete(message) => crate::error::CoreError::refusal(

@@ -3937,7 +3937,9 @@ fn a_lift_newly_naming_a_withheld_recipe_the_host_cannot_judge_is_refused() {
     warehouse.run_ok(&["pallet", "create", "over", &picked]);
     warehouse.stack("over.txt", b"over\n", "over");
     let over = warehouse.json(&["lift"]);
+    assert_eq!(over["ok"], false, "{}", over);
     assert_eq!(over["error"]["code"], "content_withheld", "{}", over);
+    assert!(!takedown.server.root.join(".forklift/pallets/over").exists(), "nothing is lifted");
 
     // Picking the new film onto a pallet at the old head, beside a poster, names it chunked in a
     // tree no ref carries.

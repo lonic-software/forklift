@@ -262,8 +262,9 @@ included. One case is refused: forklift-server answers a ref update `422` with `
 `content_withheld` when a parcel the update adds names a withheld recipe it holds no `chunks` for
 at a chunked entry its parent does not carry at that path and type, and the pallet's current head
 names that recipe at no chunked entry, since it could not judge that file against a chunk-list
-redaction. A creation has no current head, so it is refused whenever one of its new parcels does
-so. The `next_step` is to lift from a warehouse that holds the recipe, whose lift sends it through
+redaction. A creation has no current head, and its walk takes in the new head's whole history,
+so it is refused whenever any parcel of that history names such a recipe at a chunked entry, one
+the host already holds included. The `next_step` is to lift from a warehouse that holds the recipe, whose lift sends it through
 the digest intake (below) first. The AWS head does not refuse it yet. While the head's `@redactions` pallet holds a chunk-list redaction, forklift-server judges
 a withheld chunked file it no longer holds by its recorded `chunks` digest: a match is refused as
 redacted content, as the recipe itself would be. Only a file's content is tolerated so, a chunked file's recipe among it; a tree, parcel
