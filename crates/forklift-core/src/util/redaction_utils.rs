@@ -619,13 +619,10 @@ pub fn record_command(head: &str, path: &str) -> String {
 
 /// [`record_command`], quoting for Windows when `windows`.
 fn record_command_when(head: &str, path: &str, windows: bool) -> String {
-    // The path is quoted on its own; behind the head it never starts the argument, so it needs no
-    // `--` either.
-    match crate::util::tree_utils::remedy_path_when(path, windows) {
-        Some(quoted) => format!(
-            "forklift redact record {}:{} -m <reason>",
-            head, quoted.strip_prefix("-- ").unwrap_or(&quoted)
-        ),
+    // The path is quoted on its own; behind the head it never starts the argument, so a leading
+    // `-` needs no guard.
+    match crate::util::tree_utils::remedy_word_when(path, windows) {
+        Some(quoted) => format!("forklift redact record {}:{} -m <reason>", head, quoted),
         None => format!(
             "forklift redact record {}:<path> -m <reason>, with that path quoted for your shell",
             head

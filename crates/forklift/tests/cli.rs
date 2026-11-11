@@ -9014,18 +9014,18 @@ fn run_in_windows_shell(warehouse: &TestWarehouse, shell: WindowsShell, command:
         .unwrap()
 }
 
-/// The `--` that `tree_utils::remedy_path_when` puts before a path starting with `-` reaches
-/// `forklift` when the printed next step is pasted into Windows PowerShell 5.1 or `cmd`, also for a
-/// path with a `.` in it (5.1 splits some unquoted `-`-led arguments at a dot). Driven through the
+/// A printed next step names a path starting with `-` as `./<path>`, and pasted into Windows
+/// PowerShell 5.1 or `cmd` it runs, also for a path with a `.` in it. Driven through the
 /// staged-removal remedy `restore` prints: the pasted unload unstages the removal and the restore
-/// then succeeds. The same command without `--`, run first, is refused by `forklift`'s own parser
-/// and leaves the removal staged, so the `--` is what keeps the path from being read as an option.
+/// then succeeds. Run first, and each refused by `forklift`'s parser with the removal left staged:
+/// the path bare, read as an option; and in PowerShell, for a dotted path, the `--` guard this
+/// replaced, since 5.1 splits `-- -draft.txt` into `-draft` and `.txt`.
 #[cfg(windows)]
 #[test]
-fn a_double_dash_remedy_runs_as_printed_in_windows_shells() {
+fn a_dash_led_remedy_path_runs_as_printed_in_windows_shells() {
     for name in ["-draft", "-draft.txt"] {
         for shell in [WindowsShell::PowerShell, WindowsShell::Cmd] {
-            let warehouse = TestWarehouse::new(&format!("windows-double-dash-{:?}-{}", shell, name.len()));
+            let warehouse = TestWarehouse::new(&format!("windows-dash-led-{:?}-{}", shell, name.len()));
             if let WindowsShell::PowerShell = shell {
                 // About 5.1's native-argument passing: on PowerShell 7 it would prove nothing.
                 let version = run_in_windows_shell(&warehouse, shell, "Write-Output $PSVersionTable.PSVersion.ToString()");
@@ -9045,19 +9045,25 @@ fn a_double_dash_remedy_runs_as_printed_in_windows_shells() {
             let message = stderr(&refused);
             assert!(!refused.status.success() && message.contains(&staged), "{}", message);
             let command = message.split('"').nth(3).expect("the message quotes the unload");
-            assert_eq!(command, format!("forklift unload -- {}", name), "{}", message);
+            assert_eq!(command, format!("forklift unload ./{}", name), "{}", message);
 
-            let without = run_in_windows_shell(&warehouse, shell, &format!("forklift unload {}", name));
-            let said = format!("{}{}", stdout(&without), stderr(&without));
-            assert!(
-                without.status.code() == Some(2) && said.contains("unexpected argument"),
-                "{:?} {}: without `--`, forklift reads the path as an option: status {:?}\n{}", shell, name, without.status, said
-            );
-            let still = warehouse.run(&["restore", "--", name]);
-            assert!(
-                !still.status.success() && stderr(&still).contains(&staged),
-                "{:?} {}: the refused unload left the removal staged: {}", shell, name, stderr(&still)
-            );
+            let mut refused_forms = vec![(format!("forklift unload {}", name), "unexpected argument '-d'")];
+            if let (WindowsShell::PowerShell, true) = (shell, name.contains('.')) {
+                refused_forms.push((format!("forklift unload -- {}", name), "unexpected argument '.txt'"));
+            }
+            for (form, reason) in refused_forms {
+                let out = run_in_windows_shell(&warehouse, shell, &form);
+                let said = format!("{}{}", stdout(&out), stderr(&out));
+                assert!(
+                    out.status.code() == Some(2) && said.contains(reason),
+                    "{:?} ran {:?}: forklift's parser refuses it ({}): status {:?}\n{}", shell, form, reason, out.status, said
+                );
+                let still = warehouse.run(&["restore", "--", name]);
+                assert!(
+                    !still.status.success() && stderr(&still).contains(&staged),
+                    "{:?} ran {:?}: the refused unload left the removal staged: {}", shell, form, stderr(&still)
+                );
+            }
 
             let ran = run_in_windows_shell(&warehouse, shell, command);
             assert!(

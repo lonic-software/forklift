@@ -957,10 +957,10 @@ mod tests {
         };
 
         assert_eq!(pair.instructions_when(false),
-            "From the working tree's root, run \"forklift remove 'My Notes'\", then \"forklift remove -- -x\", \
+            "From the working tree's root, run \"forklift remove 'My Notes'\", then \"forklift remove ./-x\", \
             then \"forklift load 'my notes'\".");
         assert_eq!(pair.instructions_when(true),
-            "From the working tree's root, run \"forklift remove -- <path>\", then \"forklift remove -- -x\", \
+            "From the working tree's root, run \"forklift remove -- <path>\", then \"forklift remove ./-x\", \
             then \"forklift load -- <path>\". In place of each <path>, put \"My Notes\", then \"my notes\", in \
             that order, quoted for your shell.");
         assert_eq!(Remedy::Load("a b".to_string()).instructions_when(false),
