@@ -185,7 +185,10 @@ export's last line names each one the warehouse (or its remote) holds; `--json` 
 it, in every bay (`parked`). A file whose redaction this warehouse applied (`redact`) is left out
 of each commit that carried it, with nothing in its place; the export names it with those parcels
 (`redacted` in `--json`), and so does `git mirror`, under the first pallet whose export wrote
-those commits. A commit a mirror wrote before the redaction applied keeps the file.
+those commits. A commit a mirror wrote before the redaction applied keeps the file. A file whose
+content this warehouse lacks because the host of a remote withholds it (`stocktake` lists it as not
+checked out) is left out the same way, and named with the host's statement (`withheld` in `--json`);
+`git mirror` takes the remote's history without such content, as `lower` does.
 
 Only what this warehouse holds is exported, so with a remote configured, the export also asks the
 remote for its pallets. Each one the export has no branch for as it stands there (none of that

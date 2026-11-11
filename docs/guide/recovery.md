@@ -245,6 +245,7 @@ another remote that holds it, or ask the host about the statement.
 
 `clone`, `lower` and `scope fetch` do not stop here: they take the history without the content and
 check the head out without the file, which `forklift stocktake` then lists as not checked out.
+`git export` and `git mirror` leave such a file out of the commits they write and name it.
 
 A command that needs the bytes of such a file refuses with this code too, with the hash and the
 host's statement in `details`: `show` and `blame` of it, a `diff` that prints its lines, a
