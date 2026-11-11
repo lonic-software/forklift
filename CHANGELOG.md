@@ -172,6 +172,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   `content_withheld`. Both name it with the host's statement and the parcels whose commits left it
   out (`withheld` in `--json`, beside `redacted`), and `git mirror` takes the remote's new history
   without the content, as `lower` does. `--json` schema is now 40.
+- **`heal` says when what it lost is withheld.** `heal` no longer asks its remote for an object
+  whose content the remote's host withholds: it names the object with the host's statement and
+  says a re-run will not bring it back, instead of telling you to re-run once connectivity is
+  restored, and it still fetches back the damaged objects beside it. Its fetch of newer history
+  naming withheld content no longer fails, and it never records that content as unavailable.
+  `office accept-regenesis` fetches boundary history naming withheld content without it, as
+  `lower` does.
 - **`consolidate` and `pick` take a file whose content is withheld.** A merge or pick that takes
   the other side's version of a file whose content this warehouse does not hold because the
   remote's host withholds it no longer fails reading it: the file is left out, its old version is
