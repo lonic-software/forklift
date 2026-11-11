@@ -126,6 +126,8 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
     for parcel in &order {
         exporter.export_parcel(parcel)?;
     }
+    // Before any branch names a commit: a takedown recorded during the run is not left in.
+    exporter.check_withheld_here()?;
 
     // Point each branch at its commit. Refs and the checkout write no objects, so they run under
     // the user's own configuration: from here on the repository is theirs.
@@ -592,8 +594,9 @@ pub(crate) struct Exporter<'a> {
     blobs_written: usize,
     /// The redactions applied here, whose files every commit leaves out.
     applied: AppliedSet,
-    /// The content this warehouse's host withholds, whose files every commit leaves out. Neither
-    /// record ever drops a hash, so a git tree written leaving one out needs no log.
+    /// The content this warehouse's host withholds, whose files every commit leaves out, as last
+    /// read. A takedown recorded since is caught by [`Self::check_withheld_here`] before anything
+    /// written reaches the user or git.
     withheld_here: WithheldSet,
     /// The content recorded unavailable here: a file of it the store lacks is left out.
     unavailable: UnavailableSet,
@@ -696,6 +699,22 @@ impl<'a> Exporter<'a> {
         self.unavailable = unavailable::read_unavailable()?;
 
         Ok(())
+    }
+
+    /// Refuse when this warehouse's host withheld content since the exporter last read the
+    /// withheld record: a commit already written may hold it, and none of them says which.
+    pub(crate) fn check_withheld_here(&self) -> Result<(), String> {
+        let now = withholding::read_withheld()?;
+        let gained = now.entries().filter(|(hash, _)| !self.withheld_here.contains(hash)).count();
+        if gained == 0 {
+            return Ok(());
+        }
+
+        Err(format!(
+            "The host of this warehouse withheld {} more file content(s) while this ran, which the \
+            commits written may hold. Run it again to leave them out.",
+            gained
+        ))
     }
 
     /// Keep the log of the git trees written leaving withheld content out, in the repository's
@@ -1004,7 +1023,9 @@ impl<'a> Exporter<'a> {
         if entries.is_empty() && !omitted.is_empty() {
             self.emptied.insert(forklift_hash.to_string());
         }
-        let withheld = omitted.iter().any(|(_, _, why)| matches!(why, LeftOut::Withheld(_)));
+        // A tree that left out content this warehouse's host withholds is logged too: the record
+        // naming it may be edited away, and the tree must not then be reused as complete.
+        let withheld = omitted.iter().any(|(_, _, why)| matches!(why, LeftOut::Withheld(_) | LeftOut::WithheldHere(_)));
 
         if !omitted.is_empty() {
             self.omitted_in.insert(forklift_hash.to_string(), omitted);
@@ -1404,7 +1425,8 @@ pub(crate) struct WithheldFile {
     /// Its content's hash.
     hash: String,
 
-    /// The statement of the host that withholds it, as this warehouse recorded it.
+    /// The statement of the host that withholds it: for a remote's, as this warehouse recorded it
+    /// when the fetch was refused; for this warehouse's own, as its host recorded the takedown.
     statement: String,
 
     /// The parcels whose commits left it out, in the order they were written.
@@ -1421,11 +1443,15 @@ pub(crate) fn render_withheld(withheld: &[WithheldFile]) {
 /// One line per file an export left out because this warehouse lacks its withheld content,
 /// unindented. The statement is the host's text.
 pub(crate) fn withheld_lines(withheld: &[WithheldFile]) -> Vec<String> {
+    left_out_lines(withheld, "this warehouse does not hold its content, which the host of a remote withholds")
+}
+
+/// One line per file of `withheld`, left out for `why`, unindented.
+fn left_out_lines(withheld: &[WithheldFile], why: &str) -> Vec<String> {
     withheld.iter()
         .map(|file| format!(
-            "Left out \"{}\" ({}) of {} commit(s): this warehouse does not hold its content, which the \
-            host of a remote withholds. The host's statement: {}",
-            sanitize(&file.path), file.hash, file.parcels.len(), sanitize(&file.statement)
+            "Left out \"{}\" ({}) of {} commit(s): {}. The host's statement: {}",
+            sanitize(&file.path), file.hash, file.parcels.len(), why, sanitize(&file.statement)
         ))
         .collect()
 }
@@ -1440,13 +1466,7 @@ pub(crate) fn render_withheld_here(withheld: &[WithheldFile]) {
 /// One line per file an export left out because this warehouse's host withholds its content,
 /// unindented. The statement is the host's text.
 pub(crate) fn withheld_here_lines(withheld: &[WithheldFile]) -> Vec<String> {
-    withheld.iter()
-        .map(|file| format!(
-            "Left out \"{}\" ({}) of {} commit(s): the host of this warehouse withholds its content. \
-            The host's statement: {}",
-            sanitize(&file.path), file.hash, file.parcels.len(), sanitize(&file.statement)
-        ))
-        .collect()
+    left_out_lines(withheld, "the host of this warehouse withholds its content")
 }
 
 /// How an export's human output names a meta pallet it did not export.
@@ -1906,5 +1926,43 @@ mod tests {
         std::fs::write(&log, [first.as_bytes(), b"\n\xff\n"].concat()).unwrap();
         let mut garbled = Exporter::new(&repo, AppliedSet::default(), WithheldSet::default(), UnavailableSet::default());
         assert!(garbled.keep_withheld_log().unwrap_err().contains("cannot read"));
+    }
+
+    /// A tree that left out content this warehouse's host withholds is logged, so it is not reused
+    /// as complete once the record no longer names the content.
+    #[test]
+    fn a_tree_leaving_out_content_withheld_here_is_logged() {
+        let warehouse = Warehouse::storage_only("export-withheld-here-log");
+        let tree = store_tree(&[
+            Entry::File("film", DirEntryType::Normal, b"the film\n"),
+            Entry::File("README", DirEntryType::Normal, b"kept\n"),
+        ]);
+        let parcel = store_parcel(&tree, &[], vec![action(ParcelActionType::Stack, "ada@example.com", 1_000_000_000)], None);
+        let film = store_blob(b"the film\n");
+        let withheld = WithheldSet::of([(film, "a takedown".to_string(), withholding::ChunkDigest::Unknown)]);
+
+        let repo = create_repo(&warehouse);
+        let mut exporter = Exporter::new(&repo, AppliedSet::default(), withheld, UnavailableSet::default());
+        exporter.keep_withheld_log().unwrap();
+        export(&mut exporter, &parcel);
+        let written = exporter.trees.get(&tree).unwrap().clone();
+        assert_eq!(exporter.withheld_trees, Some(HashSet::from([written])));
+    }
+
+    /// A takedown recorded after the exporter read the withheld record is refused, never kept in
+    /// the commits written; one the exporter read is not.
+    #[test]
+    fn a_takedown_recorded_during_a_run_is_refused() {
+        let warehouse = Warehouse::storage_only("export-withheld-during");
+        let repo = create_repo(&warehouse);
+        let exporter = Exporter::new(&repo, AppliedSet::default(), withholding::read_withheld().unwrap(), UnavailableSet::default());
+        exporter.check_withheld_here().unwrap();
+
+        let film = store_blob(b"the film\n");
+        withholding::withhold(&film, "a takedown").unwrap();
+        assert!(exporter.check_withheld_here().unwrap_err().contains("Run it again"));
+
+        let after = Exporter::new(&repo, AppliedSet::default(), withholding::read_withheld().unwrap(), UnavailableSet::default());
+        after.check_withheld_here().unwrap();
     }
 }

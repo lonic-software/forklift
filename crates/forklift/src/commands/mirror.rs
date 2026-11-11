@@ -621,7 +621,13 @@ impl<'a> Run<'a> {
         self.progress.status("Exporting to git");
         let exported = self.export(head)?;
         let commit = self.exporter.commit_of(head).expect("the head was exported").to_string();
-        self.repo.run(&["update-ref", &format!("{}{}", EXPORTED_PREFIX, pallet), &commit], None)?;
+        // Before the exported ref names the commit, since a later run builds on that ref: content
+        // this warehouse's host withheld during the run is not kept, here or by that run.
+        let exported_ref = format!("{}{}", EXPORTED_PREFIX, pallet);
+        self.exporter.check_withheld_here()?;
+        let previous = self.repo.output(&["rev-parse", "-q", "--verify", &exported_ref])?;
+        let previous = previous.status.success().then(|| String::from_utf8_lossy(&previous.stdout).trim().to_string());
+        self.repo.run(&["update-ref", &exported_ref, &commit], None)?;
 
         record.insert(pallet.to_string(), head.to_string());
         mirror_utils::write_mirror_roots(record)?;
@@ -649,6 +655,16 @@ impl<'a> Run<'a> {
                 ))),
                 Verdict::Push if attempt == PUSH_ATTEMPTS => break,
                 Verdict::Push => {}
+            }
+
+            // Once more right before git receives it, putting the exported ref back so no later
+            // run pushes the commit either.
+            if let Err(refused) = self.exporter.check_withheld_here() {
+                match &previous {
+                    Some(previous) => self.repo.run(&["update-ref", &exported_ref, previous], None)?,
+                    None => self.repo.run(&["update-ref", "-d", &exported_ref], None)?,
+                };
+                return Err(Problem::Failed(refused));
             }
 
             let pushed = self.repo.network(
