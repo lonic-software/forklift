@@ -10154,6 +10154,7 @@ mod tests {
             crate::util::audit_utils::verify_parcel_closure_with(
                 &merge, known_complete, &blob_exists, &chunks_missing,
                 &load_recipe_chunks, &load_base_tree, &|| Ok(Default::default()),
+                crate::util::audit_utils::WithheldDigests::Recorded,
             ).expect("the fixture is complete, so the audit must pass");
 
             touched.into_inner()

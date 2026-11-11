@@ -828,7 +828,7 @@ impl ErrorCode {
             ErrorCode::HeadNamesContent =>
                 "The object to redact is in a pallet head; take the file out of that head first. Nothing was recorded",
             ErrorCode::ContentWithheld =>
-                "The remote's host withholds content the command needed (a takedown, not a redaction), so the remote neither serves nor takes it; a copy this warehouse holds is kept",
+                "The remote's host withholds content the command needed (a takedown, not a redaction), so the remote neither serves nor takes it, or refused to move a pallet whose new history names a withheld chunked file it cannot judge; a copy this warehouse holds is kept",
             ErrorCode::RemoteHistoryIncomplete =>
                 "The remote refused to move a pallet because part of the new head's history is absent there or unreadable, even after the lift negotiated and uploaded again; nothing moved",
         }

@@ -258,7 +258,14 @@ an applied redaction's content. A hash both redacted and withheld is answered `4
 **Withheld content is still named.** Pallet heads may keep naming a withheld file, and a lift may
 name it without uploading it: `missing` never lists a withheld hash, `upload-targets` answers it in
 `withheld`, and a ref update tolerates its absence wherever a file names it, moved or copied
-included. While the head's `@redactions` pallet holds a chunk-list redaction, forklift-server judges
+included. One case is refused: forklift-server answers a ref update `422` with `code`
+`content_withheld` when a parcel the update adds names a withheld recipe it holds no `chunks` for
+at a chunked entry its parent does not carry at that path and type, and the pallet's current head
+names that recipe at no chunked entry, since it could not judge that file against a chunk-list
+redaction. A creation has no current head, and its walk takes in the new head's whole history,
+so it is refused whenever any parcel of that history names such a recipe at a chunked entry, one
+the host already holds included. The `next_step` is to lift from a warehouse that holds the recipe, whose lift sends it through
+the digest intake (below) first. The AWS head does not refuse it yet. While the head's `@redactions` pallet holds a chunk-list redaction, forklift-server judges
 a withheld chunked file it no longer holds by its recorded `chunks` digest: a match is refused as
 redacted content, as the recipe itself would be. Only a file's content is tolerated so, a chunked file's recipe among it; a tree, parcel
 or chunk is never withheld. A withheld recipe's chunks are not refused by hash, since other content

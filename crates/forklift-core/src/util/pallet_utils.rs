@@ -2598,6 +2598,16 @@ pub(crate) mod tests {
                           removed: (crate::util::applied_redactions::AppliedSet,
                                     crate::util::withholding::WithheldSet))
                           -> Result<(), crate::util::audit_utils::ClosureRefusal> {
+            remote_closure_with(head, base, removed, crate::util::audit_utils::WithheldDigests::Recorded)
+        }
+
+        /// [`remote_closure`], judging the chunk lists of withheld content by `digests`.
+        fn remote_closure_with(head: &str,
+                               base: Option<&str>,
+                               removed: (crate::util::applied_redactions::AppliedSet,
+                                         crate::util::withholding::WithheldSet),
+                               digests: crate::util::audit_utils::WithheldDigests)
+                               -> Result<(), crate::util::audit_utils::ClosureRefusal> {
             crate::util::audit_utils::verify_parcel_closure_with(
                 head,
                 base,
@@ -2606,7 +2616,89 @@ pub(crate) mod tests {
                 &|hash| crate::util::object_utils::recipe_chunk_hashes(hash),
                 &|hash| crate::util::object_utils::load_tree(hash),
                 &|| Ok(crate::util::sealed_utils::Tolerated::removed_only(removed.0.clone(), removed.1.clone())),
+                digests,
             )
+        }
+
+        /// The path and hash a closure check refused as withheld content it cannot judge.
+        fn uncomparable(result: Result<(), crate::util::audit_utils::ClosureRefusal>) -> (String, String) {
+            match result {
+                Err(crate::util::audit_utils::ClosureRefusal::Uncomparable(refused)) => (refused.path, refused.hash),
+                other => panic!("not refused as uncomparable: {:?}", other),
+            }
+        }
+
+        /// Withheld content the host holds no digest for, absent from its store: the state a
+        /// takedown recorded before the host held the file leaves until a lift sends the recipe.
+        fn withheld_undigested(content: &str) -> String {
+            let hash = blob(content);
+            remove(&hash);
+            crate::util::withholding::withhold(&hash, "court order 11").unwrap();
+            hash
+        }
+
+        // Revert: tolerate absent withheld content as before, whatever its entry and digest → the
+        // chunked entry lands. Refuse it whatever its digest → the head lands no more once the
+        // digest is recorded. Drop the expected head's exemption → the move is refused. Judge every
+        // entry as chunked → the plain entry is refused.
+        #[test]
+        fn a_remote_closure_refuses_withheld_content_newly_named_chunked_without_a_digest() {
+            use crate::util::audit_utils::WithheldDigests;
+
+            let (_root, _scope) = scratch("closure-withheld-undigested");
+            let notes = blob("notes");
+            let base = parcel(&tree(&[("notes", &notes, DirEntryType::Normal)]), &[]);
+            let film = withheld_undigested("film");
+            let removed = || (Default::default(), crate::util::withholding::read_withheld().unwrap());
+
+            // A plain entry is tolerated as before.
+            let plain = parcel(&tree(&[("notes", &notes, DirEntryType::Normal), ("film.mkv", &film, DirEntryType::Normal)]), &[&base]);
+            remote_closure(&plain, Some(&base), removed()).expect("withheld content at a plain entry is tolerated");
+
+            // At a chunked entry it is refused, as an update and as a creation.
+            let media = tree(&[("film.mkv", &film, DirEntryType::NormalChunked)]);
+            let chunked = parcel(&tree(&[("notes", &notes, DirEntryType::Normal), ("media", &media, DirEntryType::Tree)]), &[&base]);
+            assert_eq!(uncomparable(remote_closure(&chunked, Some(&base), removed())), ("media/film.mkv".to_string(), film.clone()));
+            assert_eq!(uncomparable(remote_closure(&chunked, None, removed())), ("media/film.mkv".to_string(), film.clone()));
+
+            // Also when only an earlier parcel of the new segment names it.
+            let later = parcel(&tree(&[("notes", &notes, DirEntryType::Normal)]), &[&chunked]);
+            assert_eq!(uncomparable(remote_closure(&later, Some(&base), removed())), ("media/film.mkv".to_string(), film.clone()));
+
+            // A head whose expected head already names it chunked, here at another path, lands.
+            let moved = parcel(&tree(&[("notes", &notes, DirEntryType::Normal), ("film.mkv", &film, DirEntryType::NormalChunked)]), &[&chunked]);
+            remote_closure(&moved, Some(&chunked), removed()).expect("the expected head names it chunked");
+
+            // A head whose record carries no digests takes every one as known.
+            remote_closure_with(&chunked, Some(&base), removed(), WithheldDigests::AssumedKnown)
+                .expect("a digest taken as known is tolerated");
+
+            // Once the digest is recorded, the host can judge the file, and the head lands.
+            assert!(crate::util::withholding::record_digest(&film, &"a".repeat(64)).unwrap());
+            remote_closure(&chunked, Some(&base), removed()).expect("a recorded digest is tolerated");
+            remote_closure(&later, None, removed()).expect("a recorded digest is tolerated in a creation too");
+        }
+
+        // Revert: key the file prune by hash alone → the entry turned chunked is pruned against the
+        // plain one, and lands.
+        #[test]
+        fn a_remote_closure_judges_withheld_content_by_hash_and_entry_type() {
+            let (_root, _scope) = scratch("closure-withheld-type");
+            let notes = blob("notes");
+            let base = parcel(&tree(&[("notes", &notes, DirEntryType::Normal)]), &[]);
+            let film = withheld_undigested("film");
+            let removed = || (Default::default(), crate::util::withholding::read_withheld().unwrap());
+
+            let plain = parcel(&tree(&[("film.mkv", &film, DirEntryType::Normal)]), &[&base]);
+            remote_closure(&plain, Some(&base), removed()).expect("a plain entry is tolerated");
+
+            // The same path and hash, its entry turned chunked.
+            let flipped = parcel(&tree(&[("film.mkv", &film, DirEntryType::NormalChunked)]), &[&plain]);
+            assert_eq!(uncomparable(remote_closure(&flipped, Some(&plain), removed())), ("film.mkv".to_string(), film.clone()));
+
+            // One hash, plain at one path and chunked at another.
+            let both = parcel(&tree(&[("a", &film, DirEntryType::Normal), ("b", &film, DirEntryType::ExecutableChunked)]), &[&base]);
+            assert_eq!(uncomparable(remote_closure(&both, Some(&base), removed())), ("b".to_string(), film));
         }
 
         // Revert: pass `WithheldSet::default()` to the tolerance again → the head naming the
