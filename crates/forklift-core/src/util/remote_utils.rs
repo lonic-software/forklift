@@ -6,6 +6,7 @@
 //! out over concurrent connections, bounded by [`CONCURRENT_TRANSFERS`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use crate::enums::object_type::ObjectType;
 use std::sync::Arc;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use tokio::sync::Semaphore;
@@ -468,6 +469,10 @@ pub struct LiftStats {
     /// was offered or uploaded, since the remote takes history naming it without it. Named where
     /// the walk would otherwise have offered it, or where the negotiation answered it withheld.
     pub withheld: Vec<String>,
+
+    /// Why each withheld recipe the remote's digest intake was owed could not be read or sent. The
+    /// lift went on to its ref update, which the remote judged without the digest; the caller warns.
+    pub intake_failed: Vec<String>,
 
     /// Why the landed head could not be added to the held-heads record, if it could not. The lift
     /// stands; only a candidate for a later prune is lost, so the caller warns.
@@ -4639,6 +4644,31 @@ impl RemoteClient {
         Ok(())
     }
 
+    /// Send `bytes`, this warehouse's copy of the recipe `hash` the remote withholds, to the
+    /// remote's digest intake ([`WarehouseInfo::withheld_intake`]), so it records the chunk-list
+    /// digest it had no copy to compute. The remote keeps nothing of the bytes. Rides the same
+    /// posture as [`Self::upload_signature`].
+    pub async fn put_withheld_recipe(&self, hash: &str, bytes: Vec<u8>) -> Result<(), String> {
+        let action = format!("sending the withheld recipe {} to the remote's digest intake", hash);
+        let what = format!("the withheld recipe {}", hash);
+        let outcome = self.send_waiting_out(
+            Posture::HeadDeadlineNoRedirect { head: self.retryable_head_budget() },
+            reqwest::Method::PUT, &format!("/v1/withheld/{}/recipe", hash),
+            SendBody::Bytes(bytes), &what,
+        ).await?;
+        let response = self.response_from_send_mutation(&action, outcome)?;
+
+        if response.status().is_redirection() {
+            return Err(Self::describe_mutation_redirect(&action, &response));
+        }
+
+        if !response.status().is_success() {
+            return Err(self.error_of(response, &what).await);
+        }
+
+        Ok(())
+    }
+
     /// Establish the trust anchor on the remote (idempotent for an identical anchor).
     ///
     /// Rides [`Posture::HeadDeadlineNoRedirect`], sized by [`Self::retryable_head_budget`] — same
@@ -6713,7 +6743,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
         client.update_ref(pallet, remote_head, local_head, tombstone).await?;
     }
 
-    let UploadedHistory { new_parcels, uploaded_objects, uploaded_signatures, withheld } = uploaded;
+    let UploadedHistory { new_parcels, uploaded_objects, uploaded_signatures, withheld, intake_failed } = uploaded;
 
     // After the compare-and-set, so a refused or failed lift records nothing; best-effort, since
     // the remote has the head now and an error here would read as a lift that did not land.
@@ -6725,6 +6755,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
         uploaded_signatures,
         old_head: remote_head.map(|hash| hash.to_string()),
         withheld,
+        intake_failed,
         unrecorded,
     }))
 }
@@ -6994,11 +7025,24 @@ async fn upload_history(client: &RemoteClient,
     // A takedown the handshake did not list yet is answered withheld by the negotiation.
     left_out.met_withheld.extend(negotiation.withheld().iter().cloned());
 
+    // Every withheld hash the remote has no digest for: the handshake's entries without one, and
+    // the takedowns first heard of in the negotiation, whose entries the handshake did not show.
+    let undigested: BTreeSet<String> = info.withheld.iter().flatten()
+        .filter(|item| item.chunks.is_none())
+        .map(|item| item.hash.clone())
+        .chain(negotiation.withheld().iter().cloned())
+        .collect();
+
     progress.status("Uploading objects");
 
     let negotiated = upload_negotiated(
         client, &session, negotiation, &control_plane, chunking_supported, progress,
     ).await?;
+
+    let intake_failed = match info.withheld_intake {
+        true => send_withheld_recipes(client, &undigested, progress).await,
+        false => Vec::new(),
+    };
 
     progress.status("Updating the remote");
 
@@ -7017,7 +7061,54 @@ async fn upload_history(client: &RemoteClient,
         uploaded_objects: negotiated,
         uploaded_signatures,
         withheld: left_out.met_withheld.into_iter().collect(),
+        intake_failed,
     })
+}
+
+/// Send the remote's digest intake every recipe among `undigested`, withheld hashes the remote
+/// has no chunk-list digest for, that the local store holds as a recipe, before the ref update. A
+/// takedown made before the remote held the recipe leaves it nothing to compute the digest from,
+/// and the negotiation never asks for withheld content. So the set is the withheld list itself,
+/// not what this history names: the remote's closure check may walk more of the history than the
+/// lift's walk does. A file's content is never sent, only a recipe, the list of its chunks.
+///
+/// # Returns
+/// Why each recipe that could not be read or sent was not, in hash order. Neither stops the lift:
+/// its ref update is judged without the digest.
+async fn send_withheld_recipes(client: &RemoteClient, undigested: &BTreeSet<String>, progress: &Progress) -> Vec<String> {
+    let mut failed = Vec::new();
+
+    for hash in undigested {
+        let bytes = match held_recipe(hash) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            Err(why) => {
+                failed.push(format!("The withheld recipe {} could not be read here: {}", hash, why));
+                continue;
+            }
+        };
+
+        progress.status("Sending withheld recipes to the remote's digest intake");
+
+        if let Err(why) = client.put_withheld_recipe(hash, bytes).await {
+            failed.push(why);
+        }
+    }
+
+    failed
+}
+
+/// The local store's copy of `hash`, when it holds it as a recipe.
+fn held_recipe(hash: &str) -> Result<Option<Vec<u8>>, String> {
+    if !file_utils::does_object_exist(hash)? {
+        return Ok(None);
+    }
+
+    let bytes = file_utils::retrieve_object_by_hash(hash)?;
+    let (object_type, _) = object_utils::peek_object_header(&bytes)
+        .map_err(|e| format!("Object {} cannot be read: {:?}", hash, e))?;
+
+    Ok((object_type == ObjectType::Recipe).then_some(bytes))
 }
 
 /// What one closure walk of a lift's new parcels ([`walk_lift_closure`]) found to offer.
@@ -7087,6 +7178,9 @@ struct UploadedHistory {
 
     /// The withheld content the history names, sorted ([`LiftStats::withheld`]).
     withheld: Vec<String>,
+
+    /// Why each withheld recipe the digest intake was owed was not sent ([`LiftStats::intake_failed`]).
+    intake_failed: Vec<String>,
 }
 
 impl UploadedHistory {
@@ -7104,6 +7198,8 @@ impl UploadedHistory {
             uploaded_objects: self.uploaded_objects + again.uploaded_objects,
             uploaded_signatures: self.uploaded_signatures + again.uploaded_signatures,
             withheld,
+            // The second upload sends the same recipes again, so its failures are the ones that stand.
+            intake_failed: again.intake_failed,
         }
     }
 }
@@ -9812,6 +9908,7 @@ mod tests {
             tombstones: Some(BTreeMap::from([("gone".to_string(), deleted)])),
             redactions: None,
             withheld: None,
+            withheld_intake: false,
         };
 
         assert_eq!(held_elsewhere(&info, "feature"), vec![main.clone()]);
@@ -10390,6 +10487,7 @@ mod tests {
             tombstones: None,
             redactions: None,
             withheld: None,
+            withheld_intake: false,
         };
 
         let remote = LateWithholdingRemote::start(HashSet::from([withheld_recipe.clone()]));
@@ -10509,6 +10607,7 @@ mod tests {
             tombstones: None,
             redactions: None,
             withheld: None,
+            withheld_intake: false,
         };
 
         let client = RemoteClient::new(&remote.url, None).unwrap();

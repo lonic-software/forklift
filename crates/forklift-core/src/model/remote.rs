@@ -112,6 +112,14 @@ pub struct WarehouseInfo {
     /// An **additive** field like [`Self::redactions`].
     #[serde(default)]
     pub withheld: Option<Vec<ServedWithholding>>,
+
+    /// Whether this head takes a withheld recipe's bytes at `PUT /v1/withheld/{hash}/recipe` to
+    /// record the [`ServedWithholding::chunks`] digest it has no copy to compute from, keeping
+    /// nothing of them. A client that holds such a recipe sends it before a lift's ref update, and
+    /// only to a head that says so. An **additive** capability field like [`Self::chunking`]:
+    /// absent reads as `false`.
+    #[serde(default)]
+    pub withheld_intake: bool,
 }
 
 /// One withheld object, as a head reports it in [`WarehouseInfo::withheld`].
@@ -598,6 +606,7 @@ mod tests {
             tombstones: None,
             redactions: None,
             withheld: None,
+            withheld_intake: false,
         };
 
         let wire = serde_json::to_string(&info).expect("serialize");

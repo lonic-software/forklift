@@ -142,6 +142,9 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
         match lifted {
             Ok(LiftResult::UpToDate) => report.up_to_date = true,
             Ok(LiftResult::Lifted(stats)) => {
+                for why in &stats.intake_failed {
+                    output::warn_withheld_intake_failed(why);
+                }
                 if let Some(why) = &stats.unrecorded {
                     output::warn_held_head_unrecorded(why);
                 }

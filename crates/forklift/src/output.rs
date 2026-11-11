@@ -1086,6 +1086,33 @@ fn maintenance_unavailable_warning_text(mode: OutputMode, error: &str) -> String
     }
 }
 
+/// The `--json` warning code for a withheld recipe a lift owed its remote's digest intake but
+/// could not read or send.
+pub const CODE_WITHHELD_INTAKE_FAILED: &str = "withheld_intake_failed";
+
+/// What to do about [`CODE_WITHHELD_INTAKE_FAILED`]. The ref update went ahead without the digest;
+/// the next lift sends the recipe again.
+pub const WITHHELD_INTAKE_FAILED_NEXT_STEP: &str =
+    "Resolve the reported cause and lift again, which sends the recipe again. The lift's own result \
+     stands.";
+
+/// Surface a withheld recipe the remote's digest intake did not take, on the stderr side-channel
+/// the other warnings use: the lift's result and exit code stay its own.
+pub fn warn_withheld_intake_failed(error: &str) {
+    eprintln!("{}", withheld_intake_failed_warning_text(mode(), error));
+}
+
+/// The pure half of [`warn_withheld_intake_failed`], asserted in both modes without capturing stderr.
+fn withheld_intake_failed_warning_text(mode: OutputMode, error: &str) -> String {
+    match mode {
+        OutputMode::Human => format!(
+            "Warning: the remote's host could not be given a withheld recipe it lacks. {} {}",
+            forklift_core::error::sanitize_lines(error), WITHHELD_INTAKE_FAILED_NEXT_STEP
+        ),
+        OutputMode::Json => warning_envelope(CODE_WITHHELD_INTAKE_FAILED, error, WITHHELD_INTAKE_FAILED_NEXT_STEP, None),
+    }
+}
+
 /// The `--json` warning code for a remote head that a lift landed, or a lower or clone was
 /// served, but that could not be added to the held-heads record.
 pub const CODE_HELD_HEAD_UNRECORDED: &str = "held_head_unrecorded";
@@ -1574,6 +1601,21 @@ mod tests {
         assert_eq!(value["warning"], "held_head_unrecorded");
         assert_eq!(value["message"], error);
         assert!(value["next_step"].as_str().unwrap().contains("unaffected"), "next_step: {}", value["next_step"]);
+    }
+
+    #[test]
+    fn the_withheld_intake_failed_warning_carries_the_cause_in_both_modes() {
+        let error = "The remote refused the withheld recipe 1f2e: 422 The bytes do not hash to 1f2e.";
+
+        let human = withheld_intake_failed_warning_text(OutputMode::Human, error);
+        assert!(human.contains(error), "the human line must carry the cause: {}", human);
+        assert!(human.contains("lift again"), "human text: {}", human);
+
+        let value: serde_json::Value =
+            serde_json::from_str(&withheld_intake_failed_warning_text(OutputMode::Json, error)).unwrap();
+        assert_eq!(value["warning"], "withheld_intake_failed");
+        assert_eq!(value["message"], error);
+        assert!(value["next_step"].as_str().unwrap().contains("lift again"), "next_step: {}", value["next_step"]);
     }
 
     #[test]

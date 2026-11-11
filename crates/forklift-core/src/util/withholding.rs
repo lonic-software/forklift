@@ -130,16 +130,21 @@ pub fn checked_digest(digest: &str) -> Result<&str, String> {
 /// [`ChunkDigest::Unknown`] when the bytes do not hash to `hash` or are not a recipe: a digest is
 /// only ever recorded from the recipe's own bytes.
 pub(crate) fn verified_digest(hash: &str, bytes: &[u8]) -> ChunkDigest {
-    if object_utils::verify_object_bytes(hash, bytes).is_err() {
-        return ChunkDigest::Unknown;
-    }
+    recipe_digest(hash, bytes).map_or(ChunkDigest::Unknown, ChunkDigest::Known)
+}
 
-    match object_utils::parse_recipe_bytes(hash, bytes) {
-        Ok(recipe) => ChunkDigest::Known(redaction_utils::chunk_list_digest(
-            &recipe.chunks.into_iter().map(|chunk| chunk.hash).collect::<Vec<_>>()
-        )),
-        Err(_) => ChunkDigest::Unknown,
-    }
+/// The chunk-list digest of the recipe `hash` from `bytes`, a copy of it from anywhere, once the
+/// bytes are shown to hash to `hash` and to parse as a recipe.
+///
+/// # Returns
+/// * `Ok(String)`  - The digest.
+/// * `Err(String)` - The bytes do not hash to `hash`, or are not a recipe.
+pub fn recipe_digest(hash: &str, bytes: &[u8]) -> Result<String, String> {
+    object_utils::verify_object_bytes(hash, bytes).map_err(|_| format!("The bytes do not hash to {}.", hash))?;
+
+    let recipe = object_utils::parse_recipe_bytes(hash, bytes)?;
+
+    Ok(redaction_utils::chunk_list_digest(&recipe.chunks.into_iter().map(|chunk| chunk.hash).collect::<Vec<_>>()))
 }
 
 /// One withheld hash's entry: the operator's statement, and what is known of its chunk list.
@@ -411,6 +416,21 @@ pub fn record_digests_locked(lock: &RefLock, digests: impl IntoIterator<Item = (
     }
 
     Ok(filled)
+}
+
+/// Record `digest`, the chunk-list digest of the withheld recipe `hash` from a copy shown to be
+/// it ([`recipe_digest`]), under the ref lock, when its entry has no digest yet: the digest intake
+/// a head offers, so a client holding a recipe the host never held can supply what a chunk-list
+/// redaction compares. Nothing of the copy is kept. A hash not withheld, or whose entry has a
+/// digest already, is left as it is.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether the entry took the digest.
+/// * `Err(String)` - See [`record_digests_locked`], or the ref lock could not be taken.
+pub fn record_digest(hash: &str, digest: &str) -> Result<bool, String> {
+    let lock = RefLock::acquire()?;
+
+    Ok(record_digests_locked(&lock, [(hash.to_string(), digest.to_string())])? > 0)
 }
 
 /// The [`RefusalCode::ContentWithheld`] refusal a server answers a request for `hash` with, read

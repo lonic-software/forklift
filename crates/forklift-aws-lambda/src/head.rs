@@ -390,6 +390,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // cannot be read. Always present, empty or not: a client reads an absent list as a head
             // that reports nothing.
             withheld: Some(withholding.served()),
+            // No digest intake yet: a client sends this head no withheld recipe.
+            withheld_intake: false,
         })
     }
 
