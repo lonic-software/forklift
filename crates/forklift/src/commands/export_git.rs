@@ -596,8 +596,8 @@ pub(crate) struct Exporter<'a> {
     /// The trees in `withheld_trees` written since the log was last appended to, which must reach
     /// it before a commit names them.
     withheld_unlogged: Vec<String>,
-    /// Whether a flush of the log failed in this run, leaving it in doubt: no later commit that
-    /// needs the log is written.
+    /// Whether a flush of the log failed in this run, leaving it in doubt: no later commit in the
+    /// run is written, since any of them may reuse a tree noted but not logged.
     withheld_log_failed: bool,
     /// The forklift trees that held entries, every one of which was left out.
     emptied: HashSet<String>,
@@ -731,7 +731,8 @@ impl<'a> Exporter<'a> {
             return Ok(());
         }
         if self.withheld_log_failed {
-            return Err(format!("An earlier write of {} failed in this run, so no commit that needs it is written",
+            return Err(format!(
+                "Writing {} failed earlier in this run, so no further commit is written; run \"forklift git mirror\" again once it can be written",
                 self.repo.git_dir().join(WITHHELD_TREES_LOG).display()));
         }
         let flushed = self.append_withheld_log();
