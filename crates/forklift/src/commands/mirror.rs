@@ -622,14 +622,14 @@ impl<'a> Run<'a> {
         let exported = self.export(head)?;
         let commit = self.exporter.commit_of(head).expect("the head was exported").to_string();
         // Before the exported ref names the commit, since a later run builds on that ref: content
-        // this warehouse's host withheld during the run is not kept, here or by that run.
+        // redacted or withheld during the run is not kept, here or by that run. The exporter's
+        // sets stay as first read, so every later pallet of the run is refused too.
         let exported_ref = format!("{}{}", EXPORTED_PREFIX, pallet);
-        self.exporter.check_withheld_here()?;
-        let previous = self.repo.output(&["rev-parse", "-q", "--verify", &exported_ref])?;
-        let previous = previous.status.success().then(|| String::from_utf8_lossy(&previous.stdout).trim().to_string());
+        self.exporter.check_removed().map_err(Problem::Failed)?;
+        let previous = self.read_ref(&exported_ref)?;
         self.repo.run(&["update-ref", &exported_ref, &commit], None)?;
 
-        record.insert(pallet.to_string(), head.to_string());
+        let previous_root = record.insert(pallet.to_string(), head.to_string());
         mirror_utils::write_mirror_roots(record)?;
 
         // Classified once more after the last attempt's re-fetch, so a race that ends in step is
@@ -657,13 +657,15 @@ impl<'a> Run<'a> {
                 Verdict::Push => {}
             }
 
-            // Once more right before git receives it, putting the exported ref back so no later
-            // run pushes the commit either.
-            if let Err(refused) = self.exporter.check_withheld_here() {
-                match &previous {
-                    Some(previous) => self.repo.run(&["update-ref", &exported_ref, previous], None)?,
-                    None => self.repo.run(&["update-ref", "-d", &exported_ref], None)?,
+            // Once more right before git receives it, putting the exported ref and the record's
+            // entry back so no later run pushes the commit either.
+            if let Err(refused) = self.exporter.check_removed() {
+                self.put_back(&exported_ref, previous.as_deref(), &commit)?;
+                match previous_root.clone() {
+                    Some(root) => record.insert(pallet.to_string(), root),
+                    None => record.remove(pallet),
                 };
+                mirror_utils::write_mirror_roots(record)?;
                 return Err(Problem::Failed(refused));
             }
 
@@ -691,6 +693,31 @@ impl<'a> Run<'a> {
             git mirror\" again.",
             pallet, PUSH_ATTEMPTS
         )))
+    }
+
+    /// The commit `name` names, or none when the ref does not exist.
+    fn read_ref(&self, name: &str) -> Result<Option<String>, Problem> {
+        let read = self.repo.output(&["rev-parse", "-q", "--verify", name])?;
+
+        Ok(read.status.success().then(|| String::from_utf8_lossy(&read.stdout).trim().to_string()))
+    }
+
+    /// Return the exported ref `name` to `previous` (deleting it when none) from `commit`. A ref
+    /// write can land and report failure, so the ref read back decides; one still naming `commit`
+    /// would have a later run push it, so the mirror is then reported damaged.
+    fn put_back(&self, name: &str, previous: Option<&str>, commit: &str) -> Result<(), Problem> {
+        let written = match previous {
+            Some(previous) => self.repo.run(&["update-ref", name, previous, commit], None),
+            None => self.repo.run(&["update-ref", "-d", name, commit], None),
+        };
+        match self.read_ref(name)? {
+            now if now.as_deref() == previous => Ok(()),
+            _ => Err(damaged(format!(
+                "has {} naming commit {}, which may hold content redacted or withheld during this run, \
+                and putting it back failed ({})",
+                name, commit, written.err().unwrap_or_else(|| "it still names that commit".to_string())
+            ))),
+        }
     }
 
     /// Fetch git's branch of `pallet` into the comparison ref, returning its tip (none when git

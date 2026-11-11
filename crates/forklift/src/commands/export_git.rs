@@ -118,6 +118,7 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
     let withheld_here = withholding::read_withheld()?;
     let unavailable = unavailable::read_unavailable()?;
 
+    let created = !target.exists();
     std::fs::create_dir_all(target)
         .map_err(|e| format!("Error while creating \"{}\": {}", path, e))?;
     let repo = GitRepo::create(target)?;
@@ -126,8 +127,20 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
     for parcel in &order {
         exporter.export_parcel(parcel)?;
     }
-    // Before any branch names a commit: a takedown recorded during the run is not left in.
-    exporter.check_withheld_here()?;
+    // Before any branch names a commit: content redacted or withheld during the run is not left
+    // in. Nothing is checked out yet, so removing what the run made leaves the path as it found
+    // it, and the retry the refusal names is not refused for an existing repository.
+    if let Err(refused) = exporter.check_removed() {
+        let made = match created { true => target.to_path_buf(), false => target.join(".git") };
+        return Err(match std::fs::remove_dir_all(&made) {
+            Ok(()) => refused,
+            Err(error) => format!(
+                "{} Removing \"{}\" failed ({}); delete it, since it may hold that content, before \
+                running it again.",
+                refused, made.display(), error
+            ),
+        });
+    }
 
     // Point each branch at its commit. Refs and the checkout write no objects, so they run under
     // the user's own configuration: from here on the repository is theirs.
@@ -595,7 +608,7 @@ pub(crate) struct Exporter<'a> {
     /// The redactions applied here, whose files every commit leaves out.
     applied: AppliedSet,
     /// The content this warehouse's host withholds, whose files every commit leaves out, as last
-    /// read. A takedown recorded since is caught by [`Self::check_withheld_here`] before anything
+    /// read. A takedown recorded since is caught by [`Self::check_removed`] before anything
     /// written reaches the user or git.
     withheld_here: WithheldSet,
     /// The content recorded unavailable here: a file of it the store lacks is left out.
@@ -701,19 +714,27 @@ impl<'a> Exporter<'a> {
         Ok(())
     }
 
-    /// Refuse when this warehouse's host withheld content since the exporter last read the
-    /// withheld record: a commit already written may hold it, and none of them says which.
-    pub(crate) fn check_withheld_here(&self) -> Result<(), String> {
-        let now = withholding::read_withheld()?;
-        let gained = now.entries().filter(|(hash, _)| !self.withheld_here.contains(hash)).count();
-        if gained == 0 {
+    /// Refuse when this warehouse applied a redaction or its host withheld content since the
+    /// exporter read their records: a commit already written may hold it, and none says which.
+    /// The bundle builder re-checks the same set before it publishes.
+    pub(crate) fn check_removed(&self) -> Result<(), String> {
+        let removed = withholding::removed()?;
+        let gained: Vec<&String> = removed.hashes()
+            .filter(|hash| !self.applied.contains(hash) && !self.withheld_here.contains(hash))
+            .collect();
+        if gained.is_empty() {
             return Ok(());
         }
 
+        let named: Vec<&str> = gained.iter().take(3).map(|hash| hash.as_str()).collect();
+        let more = match gained.len() > named.len() {
+            true => format!(" and {} more", gained.len() - named.len()),
+            false => String::new(),
+        };
         Err(format!(
-            "The host of this warehouse withheld {} more file content(s) while this ran, which the \
-            commits written may hold. Run it again to leave them out.",
-            gained
+            "This warehouse redacted or withheld content while this ran ({}{}), which the commits \
+            written may hold, so they are not kept. Run it again to leave that content out.",
+            named.join(", "), more
         ))
     }
 
@@ -1949,20 +1970,28 @@ mod tests {
         assert_eq!(exporter.withheld_trees, Some(HashSet::from([written])));
     }
 
-    /// A takedown recorded after the exporter read the withheld record is refused, never kept in
-    /// the commits written; one the exporter read is not.
+    /// A takedown recorded, or a redaction applied, after the exporter read their records is
+    /// refused, never kept in the commits written; one the exporter read is not.
     #[test]
     fn a_takedown_recorded_during_a_run_is_refused() {
         let warehouse = Warehouse::storage_only("export-withheld-during");
         let repo = create_repo(&warehouse);
         let exporter = Exporter::new(&repo, AppliedSet::default(), withholding::read_withheld().unwrap(), UnavailableSet::default());
-        exporter.check_withheld_here().unwrap();
+        exporter.check_removed().unwrap();
 
         let film = store_blob(b"the film\n");
         withholding::withhold(&film, "a takedown").unwrap();
-        assert!(exporter.check_withheld_here().unwrap_err().contains("Run it again"));
+        assert!(exporter.check_removed().unwrap_err().contains("Run it again"));
 
         let after = Exporter::new(&repo, AppliedSet::default(), withholding::read_withheld().unwrap(), UnavailableSet::default());
-        after.check_withheld_here().unwrap();
+        after.check_removed().unwrap();
+
+        // A redaction applied during the run is refused the same way.
+        let secret = store_blob(b"a secret\n");
+        let applied = forklift_core::util::record_utils::to_bytes("redactions-applied", 1, [secret.as_str()]);
+        std::fs::write(forklift_core::globals::forklift_root().join("redactions-applied"), applied).unwrap();
+        assert!(after.check_removed().unwrap_err().contains(&secret));
+        let both = Exporter::new(&repo, applied_redactions::read_applied().unwrap(), withholding::read_withheld().unwrap(), UnavailableSet::default());
+        both.check_removed().unwrap();
     }
 }
