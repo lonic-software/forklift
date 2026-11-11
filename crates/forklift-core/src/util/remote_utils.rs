@@ -1170,6 +1170,9 @@ struct Budgets {
     /// [`UNAVAILABLE_PATIENCE`]'s role: how long a request keeps retrying a `503` with
     /// `Retry-After`.
     unavailable_patience: std::time::Duration,
+    /// [`DROPPED_AT_ONCE`]'s role: how soon a `GET`'s connection must have dropped for the `GET`
+    /// to be sent again. Not a deadline: nothing is armed with it.
+    dropped_at_once: std::time::Duration,
 }
 
 impl Budgets {
@@ -1189,6 +1192,7 @@ impl Budgets {
             min_commit_attempt: MIN_COMMIT_ATTEMPT,
             throttle_patience: FETCH_THROTTLE_PATIENCE,
             unavailable_patience: UNAVAILABLE_PATIENCE,
+            dropped_at_once: DROPPED_AT_ONCE,
         }
     }
 
@@ -1885,18 +1889,18 @@ mod clients {
         /// [`check_total_deadline_payload`], a debug-build tripwire against a *future* payload
         /// producer, and [`check_head_deadline_payload`]/[`clamp_head_deadline_payload`], whose
         /// clamp is not a tripwire but a live repair, for the reason that function's own doc
-        /// gives. Neither fires against any producer this module has today. It also bounds which
-        /// dropped connection a `GET` is sent again after (below).
+        /// gives. Neither fires against any producer this module has today.
         ///
         /// **A `GET` may be sent more than once.** When its connection drops before a complete
-        /// answer head, sooner than `connect_timeout` after the attempt began, it is sent again
-        /// on a fresh attempt, up to [`super::DROPPED_GET_ATTEMPTS`] in all, each with the
-        /// posture's own deadlines armed anew. Since only an attempt that failed within
-        /// `connect_timeout` is followed by another, the resends add at most
-        /// `(DROPPED_GET_ATTEMPTS - 1)` such failures and their short pauses to the bound of the
-        /// one attempt that answers or fails for good: the posture's deadlines are not multiplied.
-        /// A head-wait expiry, a timeout and every other method are returned from their first
-        /// attempt.
+        /// answer head within `budgets.dropped_at_once` ([`super::DROPPED_AT_ONCE`]) of the
+        /// attempt beginning, it is sent again on a fresh attempt, up to
+        /// [`super::DROPPED_GET_ATTEMPTS`] in all, each with the posture's own deadlines armed
+        /// anew. Since only an attempt that failed that quickly is followed by another, the resends
+        /// add at most `(DROPPED_GET_ATTEMPTS - 1)` such failures and a pause of up to 100 ms
+        /// before each resend to the bound of the one attempt that answers or fails for good: the
+        /// posture's deadlines are not multiplied. Whatever ends an attempt other than such a drop
+        /// (an answer, a head-wait expiry, a timeout, a later drop) is returned as it is, and a
+        /// method other than `GET` is sent once.
         ///
         /// Returns a [`SendOutcome`] rather than a `Result<_, String>` for the same reason
         /// [`Self::send_with_watchdog`] returns a [`WatchdogOutcome`]: this module's boundary is
@@ -1937,9 +1941,9 @@ mod clients {
                 | Posture::UnboundedNoRedirect(_) => (None, None),
             };
 
-            // A `GET` whose connection dropped before a complete answer head, sooner than a
-            // connect may take (a pooled connection the remote or a gateway had already closed),
-            // is sent again, a bounded number of times: it changes nothing on the remote, so
+            // A `GET` whose connection dropped before a complete answer head at once (a pooled
+            // connection the remote or a gateway had already closed, which fails within a round
+            // trip) is sent again, a bounded number of times: it changes nothing on the remote, so
             // another attempt is the recovery. A later drop is a remote that worked on the request
             // and died, which the same request may kill again. Any other method may have taken
             // effect, and any other failure (a refused connect, a timeout, TLS) would repeat. Only
@@ -1972,8 +1976,8 @@ mod clients {
                 } else {
                     (body.take(), headers.take())
                 };
-                let send_fut = this_body.unwrap_or(SendBody::Empty)
-                    .apply(builder.headers(this_headers.unwrap_or_default()))
+                let send_fut = this_body.expect("a request that is not resendable is sent once")
+                    .apply(builder.headers(this_headers.expect("a request that is not resendable is sent once")))
                     .send();
 
                 // The three cells of `Result<Result<_, reqwest::Error>, Elapsed>` map one-to-one
@@ -1998,12 +2002,13 @@ mod clients {
                 match outcome {
                     SendOutcome::Transport(e)
                         if resendable && attempts < super::DROPPED_GET_ATTEMPTS
-                            && started.elapsed() < connect_timeout
+                            && started.elapsed() < budgets.dropped_at_once
                             && super::dropped_before_answer(&e) => {
                         attempts += 1;
                         // Spread, so the parallel fetches one remote dropped together do not all
                         // land on it again in the same instant.
-                        tokio::time::sleep(super::jittered(std::time::Duration::ZERO, super::RETRY_BACKOFF_START)).await;
+                        let pause = super::jittered(std::time::Duration::ZERO, super::RETRY_BACKOFF_START);
+                        tokio::time::sleep(pause).await;
                     }
                     outcome => return outcome,
                 }
@@ -2520,8 +2525,17 @@ fn classify_remote_error(status: u16, action: &str, message: String,
 /// local `Error while …` and from a transport failure that repeats (DNS, TLS, a bad body).
 const CONNECTION_FAILED: &str = "the connection to the remote failed: ";
 
+/// How soon after an attempt began a `GET`'s connection must have dropped (see
+/// [`dropped_before_answer`]) for [`clients::Clients::send_on`] to send the `GET` again. A pooled
+/// connection the remote or a gateway had already closed fails within a round trip of the request
+/// being written; a remote that worked on the request and died usually takes longer, and the
+/// request may kill it again. A fixed figure, not the connect bound: a slow connect is no reason to
+/// wait longer, and through Tor a stale connection that takes longer to report is not resent and
+/// fails as it would have without this.
+const DROPPED_AT_ONCE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// How many times [`clients::Clients::send_on`] sends a `GET` in all when its connection keeps
-/// dropping at once (see [`dropped_before_answer`]). More than two, since a client holding several
+/// dropping at once (see [`DROPPED_AT_ONCE`]). More than two, since a client holding several
 /// pooled connections the remote closed at once may draw another closed one on the retry.
 const DROPPED_GET_ATTEMPTS: u32 = 3;
 
@@ -2529,9 +2543,10 @@ const DROPPED_GET_ATTEMPTS: u32 = 3;
 /// head arrived (reset, cut off, or closed part-way through the status line or headers). A pooled
 /// connection the remote or a gateway had already closed fails this way ("connection closed before
 /// message completed"), and so does a remote that died while working on the request, which only
-/// the time it took tells apart (see [`clients::Clients::send_on`]). A failed connect is not one (a refused or unreachable remote stays
-/// so for the moment), nor is a timeout, which another attempt would wait out again and which
-/// [`RemoteClient::connection_failed`] does not count as a failed connection.
+/// the time it took tells apart (see [`DROPPED_AT_ONCE`]). A failed connect is not one (a refused
+/// or unreachable remote stays so for the moment), nor is a timeout, which another attempt would
+/// wait out again and which [`RemoteClient::connection_failed`] does not count as a failed
+/// connection.
 fn dropped_before_answer(e: &reqwest::Error) -> bool {
     !e.is_connect() && !RemoteClient::connection_failed(e).is_empty()
 }
@@ -13383,6 +13398,7 @@ mod tests {
     /// Mirrors production `UNAVAILABLE_PATIENCE`, for the reason `TEST_TIGHT_READ_TIMEOUT`'s doc
     /// gives.
     const TEST_UNAVAILABLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+    const TEST_DROPPED_AT_ONCE: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// The budgets a waiting fixture builds its client with. Every value is distinct from every
     /// other one and from every production figure, and so is every sum a budget is armed as
@@ -13410,6 +13426,9 @@ mod tests {
         min_commit_attempt: std::time::Duration::from_millis(90),
         throttle_patience: std::time::Duration::from_millis(2_590),
         unavailable_patience: std::time::Duration::from_millis(3_710),
+        // Generous, not tight: a resend test needs its first attempt to fail within it on a loaded
+        // runner. The test that a late drop is not resent narrows it instead.
+        dropped_at_once: std::time::Duration::from_millis(3_000),
     };
 
     /// [`FAST`]'s connect bound for a client that routes through Tor, standing in for
@@ -13460,6 +13479,7 @@ mod tests {
             min_commit_attempt: millis(4_700),
             throttle_patience: millis(6_600),
             unavailable_patience: millis(10_100),
+            dropped_at_once: millis(1_000),
         }
         .checked()
     }
@@ -13485,6 +13505,8 @@ mod tests {
                 connect: _, read, object_read, batch_head_patience, error_body_read, upload_silence,
                 retryable_head_patience, commit_deadline, commit_attempt_allowance,
                 min_commit_attempt, throttle_patience, unavailable_patience,
+                // Nothing is armed with it, so it is no rival.
+                dropped_at_once: _,
             } = b;
             [read, object_read, batch_head_patience, error_body_read, upload_silence,
                 retryable_head_patience, commit_deadline, commit_attempt_allowance,
@@ -13564,6 +13586,7 @@ mod tests {
         min_commit_attempt: TEST_MIN_COMMIT_ATTEMPT,
         throttle_patience: TEST_FETCH_THROTTLE_PATIENCE,
         unavailable_patience: TEST_UNAVAILABLE_PATIENCE,
+        dropped_at_once: TEST_DROPPED_AT_ONCE,
     };
 
     /// [`PRODUCTION_MIRROR`] for a dial through Tor, which differs in the connect bound alone.
@@ -13694,16 +13717,18 @@ mod tests {
         assert_eq!(remote.connections(), 3);
     }
 
-    /// A `GET` whose connection dropped only after longer than a connect may take is a remote that
-    /// worked on the request and died, not a closed pooled connection: it is not sent again.
+    /// A `GET` whose connection dropped only after its `dropped_at_once` is a remote that worked on
+    /// the request and died, not a closed pooled connection: it is not sent again.
     #[test]
     fn a_get_whose_connection_drops_late_is_not_sent_again() {
-        // Past FAST's 330 ms connect budget, well inside its 4.1 s object-read silence budget.
+        // A drop 600 ms past the narrowed window, well inside FAST's 4.1 s object-read silence
+        // budget.
         let remote = CommitRemote::start(vec![
             CommitAnswer::DropAfter(std::time::Duration::from_millis(900)),
             CommitAnswer::Reply("HTTP/1.1 200 OK"),
         ]);
-        let client = RemoteClient::new_test_with_budgets(&remote.url, FAST);
+        let budgets = Budgets { dropped_at_once: std::time::Duration::from_millis(300), ..FAST };
+        let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
         let message = runtime.block_on(client.fetch_object("ab")).expect_err("the late drop is not resent into the 200");
