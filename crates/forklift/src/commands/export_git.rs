@@ -159,14 +159,18 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
             true => std::fs::remove_dir_all(target),
             false => std::fs::read_dir(target).and_then(|entries| entries.into_iter().try_for_each(|entry| {
                 let entry = entry?;
+                // A link is removed, never followed; Windows removes a link to a folder as a folder.
                 match entry.file_type()?.is_dir() {
                     true => std::fs::remove_dir_all(entry.path()),
-                    false => std::fs::remove_file(entry.path()),
+                    false => std::fs::remove_file(entry.path()).or_else(|error| match entry.file_type()?.is_symlink() {
+                        true => std::fs::remove_dir(entry.path()),
+                        false => Err(error),
+                    }),
                 }
             })),
         };
         return Err(match removed {
-            Ok(()) => refused,
+            Ok(()) => format!("{} What the export wrote to \"{}\" was removed.", refused, path),
             Err(error) => format!(
                 "{} Removing what it wrote to \"{}\" failed ({}); empty it, since it may hold that \
                 content, before running it again.",
@@ -744,7 +748,7 @@ impl<'a> Exporter<'a> {
         };
         Err(format!(
             "This warehouse redacted or withheld content while this ran ({}{}), which the commits \
-            written may hold, so the run stopped before anything named them. Run it again to leave that content out.",
+            written may hold. Run it again to leave that content out.",
             named.join(", "), more
         ))
     }

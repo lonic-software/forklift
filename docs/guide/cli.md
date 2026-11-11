@@ -195,7 +195,9 @@ file, `forklift-withheld-trees` in the git repository's folder, so it never reus
 server's own root, an export or a mirror also leaves out a file whose content that server's host
 withholds (`forklift-server withhold`), whether or not the server still holds a copy, and names it
 with the host's statement (`withheld_here` in `--json`). A commit a mirror wrote before the
-withholding began keeps the file.
+withholding began keeps the file. If content is withheld or a redaction applied while either runs,
+an export fails and removes what it wrote, and a mirror fails each pallet it had not pushed yet;
+run it again to leave that content out.
 
 Only what this warehouse holds is exported, so with a remote configured, the export also asks the
 remote for its pallets. Each one the export has no branch for as it stands there (none of that
