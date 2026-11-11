@@ -523,12 +523,14 @@ impl<'a> Run<'a> {
             url,
             from: mirror_utils::warehouse_root(),
             unattended,
-            exporter: Exporter::new(repo, applied_redactions::read_applied()?, unavailable::read_unavailable()?),
+            // The unavailable record is read before each export, after the fetch that may add to it.
+            exporter: Exporter::new(repo, applied_redactions::read_applied()?, unavailable::UnavailableSet::default()),
             boundaries: Vec::new(),
             pending,
             refused,
             progress: events::progress(),
         };
+        run.exporter.keep_withheld_log()?;
         run.promote();
 
         Ok(run)
