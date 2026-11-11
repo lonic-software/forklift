@@ -302,8 +302,9 @@ deletes it. One whose request never comes (a client killed between the upload an
 request), or whose upload lands only after that request (a presigned `PUT` stays valid for its
 TTL), is left to a lifecycle rule. `infra/aws-serverless` expires `intake/*` after **1 day**,
 noncurrent versions after 1 day, and expired delete markers by a second rule, as for `staging/`.
-On a versioned bucket such a copy is gone no sooner than 2 days after it landed, and often a day
-later (S3 rounds each to midnight UTC and runs lifecycle actions asynchronously).
+On a versioned bucket such a copy can stay up to about 2 days after it landed (1 day current,
+then 1 noncurrent; a copy another upload overwrote goes sooner), and often a day longer, since S3
+rounds each to midnight UTC and runs lifecycle actions asynchronously.
 
 ### Required: expire the `staging/` prefix
 
