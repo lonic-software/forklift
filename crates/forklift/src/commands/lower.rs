@@ -82,6 +82,8 @@ pub async fn handle_command(pallet: Option<String>,
 
     let progress = events::progress();
     let client = RemoteClient::for_warehouse()?;
+    // The meta pallets a lower replays lift through the digest intake too.
+    let _intake = output::IntakeWarnings(Some(client.clone()));
 
     // A repair reads the whole of the head's tree, which a sparse warehouse never holds.
     if repair && !scope_utils::read_fetch_scope()?.is_full() {

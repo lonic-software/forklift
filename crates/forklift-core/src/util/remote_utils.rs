@@ -3505,6 +3505,14 @@ impl RemoteClient {
         self.intake.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(hash, failed);
     }
 
+    /// This client, keeping the digest intake's ledger of `earlier` ([`Self::intake_failures`]), so a
+    /// command that dials again, as an auto-merging lift does, neither resends what an earlier
+    /// attempt settled nor loses what it failed to send.
+    pub fn with_intake_ledger_of(mut self, earlier: &RemoteClient) -> RemoteClient {
+        self.intake = std::sync::Arc::clone(&earlier.intake);
+        self
+    }
+
     /// Whether the digest intake's ledger settled `hash` for good: taken, or not held as a recipe.
     fn intake_settled(&self, hash: &str) -> bool {
         matches!(self.intake.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(hash), Some(None))
@@ -7101,55 +7109,66 @@ async fn upload_history(client: &RemoteClient,
 /// attempt at the same recipe succeeds. A failure does not stop the lift: its ref update is judged
 /// without the digest. The sends fan out over [`CONCURRENT_TRANSFERS`] connections.
 async fn send_withheld_recipes(client: &RemoteClient, undigested: &BTreeSet<String>, progress: &Progress) {
-    let mut held = Vec::new();
+    let owed: Vec<&String> = undigested.iter().filter(|hash| !client.intake_settled(hash)).collect();
 
-    for hash in undigested.iter().filter(|hash| !client.intake_settled(hash)) {
-        match held_recipe(hash) {
-            Ok(Some(bytes)) => held.push((hash.clone(), bytes)),
-            Ok(None) => client.settle_intake(hash.clone(), None),
-            Err(why) => client.settle_intake(
-                hash.clone(), Some(format!("The withheld recipe {} could not be read here: {}", hash, why)),
-            ),
-        }
-    }
-
-    if held.is_empty() {
+    if owed.is_empty() {
         return;
     }
 
     progress.status("Sending withheld recipes to the remote's digest intake");
 
+    // Each task reads its recipe once it holds a connection, so only as many are in memory as are
+    // in flight, and answers for its own recipe; one that fails as a task is mapped back by its id.
     let semaphore = Arc::new(Semaphore::new(CONCURRENT_TRANSFERS));
-    let mut tasks: JoinSet<Result<(String, Option<String>), String>> = JoinSet::new();
+    let mut tasks: JoinSet<Option<String>> = JoinSet::new();
+    let mut recipe_of = HashMap::new();
 
-    for (hash, bytes) in held {
+    for hash in owed {
         let client = client.clone();
         let semaphore = Arc::clone(&semaphore);
+        let recipe = hash.clone();
 
-        tasks.spawn(async move {
-            let _permit = semaphore.acquire().await
-                .map_err(|_| "The transfer pool was closed unexpectedly.".to_string())?;
-            let failed = client.put_withheld_recipe(&hash, bytes).await.err();
+        let task = tasks.spawn(async move {
+            let Ok(_permit) = semaphore.acquire().await else {
+                return Some(format!("The withheld recipe {} was not sent: the transfer pool was closed unexpectedly.", recipe));
+            };
 
-            Ok((hash, failed))
+            match held_recipe(&recipe) {
+                Ok(Some(bytes)) => client.put_withheld_recipe(&recipe, bytes).await.err(),
+                Ok(None) => None,
+                Err(why) => Some(format!("The withheld recipe {} could not be read here: {}", recipe, why)),
+            }
         });
+        recipe_of.insert(task.id(), hash.clone());
     }
 
-    for outcome in join_all_independent(tasks).await {
-        match outcome {
-            Ok((hash, failed)) => client.settle_intake(hash, failed),
-            // A task that never reported its recipe: the message names the failure, and keys it.
-            Err(why) => client.settle_intake(why.clone(), Some(why)),
+    while let Some(joined) = tasks.join_next_with_id().await {
+        let (id, failed) = match joined {
+            Ok((id, failed)) => (id, failed),
+            Err(error) => (error.id(), Some(error.to_string())),
+        };
+
+        if let Some(hash) = recipe_of.remove(&id) {
+            let failed = failed.map(|why| match why.contains(hash.as_str()) {
+                true => why,
+                false => format!("Sending the withheld recipe {} failed: {}", hash, why),
+            });
+            client.settle_intake(hash, failed);
         }
     }
 }
 
-/// The local store's copy of `hash`, when it holds it as a recipe.
+/// The local store's copy of `hash`, when it holds it as a recipe: read once, its header peeked.
 fn held_recipe(hash: &str) -> Result<Option<Vec<u8>>, String> {
-    match redaction_utils::stored_type(hash)? {
-        Some(ObjectType::Recipe) => file_utils::retrieve_object_by_hash(hash).map(Some),
-        _ => Ok(None),
+    if !file_utils::does_object_exist(hash)? {
+        return Ok(None);
     }
+
+    let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
+    let (object_type, _) = object_utils::peek_object_header(&bytes)
+        .map_err(|e| format!("Object {} cannot be read: {:?}", hash, e))?;
+
+    Ok((object_type == ObjectType::Recipe).then(|| bytes.as_ref().clone()))
 }
 
 /// What one closure walk of a lift's new parcels ([`walk_lift_closure`]) found to offer.
@@ -10453,7 +10472,14 @@ mod tests {
         const UNOFFERED: &'static str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
         fn start(withheld: HashSet<String>) -> LateWithholdingRemote {
+            Self::start_refusing_intake(withheld, 0)
+        }
+
+        /// [`Self::start`], refusing the first `refusals` digest-intake requests with a `422`.
+        fn start_refusing_intake(withheld: HashSet<String>, refusals: usize) -> LateWithholdingRemote {
             use std::io::Write;
+
+            let refusals = Arc::new(std::sync::atomic::AtomicUsize::new(refusals));
 
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
@@ -10467,6 +10493,7 @@ mod tests {
                     let Ok(mut stream) = stream else { continue };
                     let Some((method, path, _, body)) = read_test_request(&mut stream) else { continue };
 
+                    let mut status = "200 OK";
                     let response = if path == "/v1/objects/upload-targets" {
                         let request: UploadTargetsRequest = serde_json::from_slice(&body).unwrap();
                         negotiated_log.lock().unwrap().push(request.hashes.clone());
@@ -10483,6 +10510,13 @@ mod tests {
                             }
                             if let Some(hash) = path.strip_prefix("/v1/withheld/").and_then(|rest| rest.strip_suffix("/recipe")) {
                                 intake_log.lock().unwrap().push((hash.to_string(), body.clone()));
+                                let refused = refusals.fetch_update(
+                                    std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst,
+                                    |left| left.checked_sub(1),
+                                );
+                                if refused.is_ok() {
+                                    status = "422 Unprocessable Entity";
+                                }
                             }
                         }
                         "{}".to_string()
@@ -10490,8 +10524,8 @@ mod tests {
 
                     let _ = write!(
                         stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        response.len(), response
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status, response.len(), response
                     );
                     let _ = stream.flush();
                 }
@@ -10584,6 +10618,56 @@ mod tests {
             )).unwrap();
             assert_eq!(remote.intake.lock().unwrap().len(), expected.len(), "nothing is sent twice");
         }
+    }
+
+    /// A recipe the digest intake refused stays owed: the next lift through the same client sends
+    /// it again, and once the remote takes it, it is no longer reported failed nor sent again.
+    ///
+    /// Revert: settle every attempt → the second lift does not resend it. Leave a failure in place
+    /// after a success → the second lift still reports it.
+    #[test]
+    fn a_recipe_the_digest_intake_refused_is_sent_again_and_cleared_once_taken() {
+        use crate::model::remote::{ServedWithholding, ServedWithholdingState};
+
+        let _scratch = Scratch::new("intake-retry");
+
+        let (recipe, _) = store_recipe(&["retried-intake"]);
+        let root = store_tree(&[("note.txt", &store_blob("intake retry"), crate::enums::dir_entry_type::DirEntryType::Normal)]);
+        let parcel = stack_with_tree(Vec::new(), &root, "intake retry");
+
+        let info = WarehouseInfo {
+            protocol: PROTOCOL_VERSION.to_string(),
+            default_pallet: "main".to_string(),
+            pallets: BTreeMap::new(),
+            trust: None,
+            chunking: true,
+            tombstones: None,
+            redactions: None,
+            withheld: Some(vec![ServedWithholding {
+                hash: recipe.clone(),
+                statement: "court order".to_string(),
+                state: ServedWithholdingState::Deleted,
+                chunks: None,
+            }]),
+            withheld_intake: true,
+        };
+
+        let remote = LateWithholdingRemote::start_refusing_intake(HashSet::new(), 1);
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let lift = || runtime.block_on(upload_history(&client, &parcel, None, &[], &info, &Progress::NONE)).unwrap();
+
+        lift();
+        let failures = client.intake_failures();
+        assert_eq!(failures.len(), 1, "the refused send is reported: {:?}", failures);
+        assert!(failures[0].contains(&recipe), "the failure names the recipe: {:?}", failures);
+
+        lift();
+        assert_eq!(remote.intake.lock().unwrap().len(), 2, "the refused recipe is sent again");
+        assert!(client.intake_failures().is_empty(), "taken, it is not reported: {:?}", client.intake_failures());
+
+        lift();
+        assert_eq!(remote.intake.lock().unwrap().len(), 2, "taken, it is not sent again");
     }
 
     /// A takedown the handshake did not list, answered withheld only by the upload negotiation:

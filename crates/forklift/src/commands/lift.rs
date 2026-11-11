@@ -43,10 +43,21 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
     // Optimistic lift (§7.7): a diverged push whose merge is clean auto-lowers,
     // consolidates and retries, so a fleet stacking to one pallet stops serializing
     // through a human. True overlaps still stop with the diverged error.
+    // Every attempt's lifts, the office's and the meta pallets' included, share one digest-intake
+    // ledger, reported on every exit.
+    let mut intake = output::IntakeWarnings(None);
+
     loop {
         // A partial warehouse lifts only to its origin, the one remote proved to hold what it
         // lacks; another could fail late at its closure check over objects never verified there.
         let client = RemoteClient::for_warehouse()?;
+        let client = match &intake.0 {
+            Some(first) => client.with_intake_ledger_of(first),
+            None => {
+                intake.0 = Some(client.clone());
+                client
+            }
+        };
         let info = client.fetch_info().await?;
 
         // The upload lifts the pallet's ref; only the auto-merge below works from this bay's files.
@@ -82,7 +93,6 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
 
         let Some(head) = local_head else {
             lift_meta(&client, &info, haul_utils::HAUL_PALLET_NAME, None, &mut meta).await;
-            warn_intake_failures(&client);
             return Err(with_meta_outcome(format!(
                 "Pallet \"{}\" has nothing stacked yet; there is nothing to lift.",
                 pallet
@@ -108,7 +118,6 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
                     Ok(false) => {}
                     Err(why) => {
                         lift_meta(&client, &info, haul_utils::HAUL_PALLET_NAME, None, &mut meta).await;
-                        warn_intake_failures(&client);
                         return Err(with_meta_outcome(why, &meta.resigned, &meta.failed));
                     }
                 }
@@ -138,7 +147,6 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
 
         let landed = lifted.is_ok().then_some((pallet.as_str(), head.as_str()));
         lift_meta(&client, &info, haul_utils::HAUL_PALLET_NAME, landed, &mut meta).await;
-        warn_intake_failures(&client);
         (report.meta_pallets, report.meta_resigned, report.meta_failed) = (meta.lifted, meta.resigned, meta.failed);
         report.batch_lane = batch_lane.or(client.batch_lane_closure());
 
@@ -181,14 +189,6 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
         output::emit(&report);
 
         return Ok(());
-    }
-}
-
-/// Warn of each withheld recipe a lift through `client` (the office's, a meta pallet's, the working
-/// pallet's) owed the remote's digest intake and could not send it.
-fn warn_intake_failures(client: &RemoteClient) {
-    for why in client.intake_failures() {
-        output::warn_withheld_intake_failed(&why);
     }
 }
 

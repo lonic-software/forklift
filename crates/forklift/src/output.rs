@@ -1103,6 +1103,19 @@ pub fn warn_withheld_intake_failed(error: &str) {
     eprintln!("{}", withheld_intake_failed_warning_text(mode(), error));
 }
 
+/// Warns, when dropped, of each withheld recipe a command's lifts through its client owed the
+/// remote's digest intake and could not send ([`RemoteClient::intake_failures`]), so every exit of
+/// the command, an error's included, reports them.
+pub struct IntakeWarnings(pub Option<forklift_core::util::remote_utils::RemoteClient>);
+
+impl Drop for IntakeWarnings {
+    fn drop(&mut self) {
+        for why in self.0.iter().flat_map(|client| client.intake_failures()) {
+            warn_withheld_intake_failed(&why);
+        }
+    }
+}
+
 /// The pure half of [`warn_withheld_intake_failed`], asserted in both modes without capturing stderr.
 fn withheld_intake_failed_warning_text(mode: OutputMode, error: &str) -> String {
     match mode {
