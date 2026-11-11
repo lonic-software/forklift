@@ -212,7 +212,7 @@ The content you tried to redact is also part of a meta pallet's history: the off
 manifest, the tags, the hauls, the custom metadata or the redactions themselves. That history is
 never rewritten, so the content can never be removed from this warehouse or any copy of it, and
 nothing was recorded. The error's `details.meta_pallets` names where it is. Treat the content as
-exposed: rotate or revoke the secret it holds.
+exposed: rotate or revoke the secret it holds (see [`leaked-secret.md`](leaked-secret.md)).
 
 ### `head_names_content` (exit 50)
 

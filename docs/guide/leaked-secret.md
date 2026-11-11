@@ -88,9 +88,11 @@ $ forklift stack -m "Stop tracking settings.env"
 Stacked parcel … on pallet "main".
 ```
 
-Do the same on every pallet whose head has the file. If you miss one, the next step refuses as
+Do the same on every pallet whose head has the file. If you miss one here, the next step refuses as
 `head_names_content` and names each pallet, its head and the path the file has there (see
-[recovery](recovery.md#head_names_content-exit-50)).
+[recovery](recovery.md#head_names_content-exit-50)). Check the server's pallets too, with
+`forklift pallet list --remote`: the server applies the redaction only once none of its pallet
+heads has the file, so one you do not hold here keeps it pending until its head is cleaned.
 
 ## 4. Record the redaction
 
@@ -136,8 +138,10 @@ that needs that content, such as a `show`, `restore` or `diff` of the first parc
 
 ## 6. Every copy that hears of it
 
-Each teammate's warehouse applies the redaction the next time it takes from the remote. A `lower`
-in the teammate's copy deletes the content, along with `settings.env` in its working folder, since
+Each teammate's warehouse applies the redaction the next time it takes from the remote, once
+nothing it holds still names the content: a pallet of their own whose head has the file, or work
+they have staged or parked, keeps the copy until they take the file out. A `lower` in the teammate's
+copy deletes the content, along with `settings.env` in its working folder, since
 the file is no longer tracked:
 
 ```console

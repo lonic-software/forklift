@@ -407,6 +407,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **forklift-server writes plain-text logs when stderr is not a terminal.** Its logs used to carry
+  colour escape sequences into a log file or a service manager's journal; they are now coloured
+  only on a terminal.
+
 - **`git export` and `git mirror` in a server's own root leave out content its host withholds.**
   Run in a forklift-server root, both used to write a file the host withholds into git while the
   server still held its copy, and to fail on the missing object once it had deleted it. They now

@@ -2247,7 +2247,8 @@ redaction it lists applied that nothing here names any more, and delete the copi
 asks the remote for its report first, and says so when it cannot reach it. A git mirror
 (`.forklift/mirror.git`) may still hold a copy exported before the redaction: nothing here deletes
 it, and the command that applied the redaction names it. Neither
-`redact record` nor `redact apply` is an agent tool under `forklift mcp`.
+`redact record` nor `redact apply` is an agent tool under `forklift mcp`. For a leaked secret,
+[`leaked-secret.md`](leaked-secret.md) walks through the whole response, rotation first.
 
 ### `remote` — the remote and the origin
 

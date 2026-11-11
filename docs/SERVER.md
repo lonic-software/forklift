@@ -274,7 +274,8 @@ revocation by more than about a day.
 - **Health:** `GET /healthz` answers `200 ok`, unauthenticated — point the load
   balancer or systemd watchdog at it.
 - **Logs:** structured request logs on stderr (`tracing`); `RUST_LOG` controls the
-  filter (default `info`).
+  filter (default `info`). They are coloured only when stderr is a terminal, so a log file
+  or a journal holds plain text.
 - **Bundles:** `forklift-server bundle --root …` builds the snapshot served at
   `/v1/bundles/latest` (fast cloning); `rebuild_after_lifts` automates it. The
   bundle is written atomically and streamed, so rebuilds never interrupt serving. A build
