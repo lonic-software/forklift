@@ -1828,7 +1828,8 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 ///
 /// An absent file's content a redaction this warehouse applied names, or its head withholds, is
 /// tolerated, as the ref write's own verification tolerates it: the history of every head still
-/// names the content the redaction took away or the head does not hold. The same hash absent where
+/// names the content the redaction took away or the head does not hold. Withheld content at a
+/// chunked entry is tolerated so only as [`WithheldDigests::Recorded`] allows. The same hash absent where
 /// the closure names it as a tree or a chunk is not, since neither takes one away. Nothing else
 /// absent is. The records are read only when the walk without them fails, so a warehouse holding
 /// the whole closure never depends on them; and both only ever grow, so the write need not read
@@ -2114,7 +2115,9 @@ pub fn head_not_materializable_message(path: &str) -> String {
 ///                          meta push the bound's tree may be present after all. Read through
 ///                          this parameter and the mode stops mattering. On the self-host head
 ///                          everything comes from the local store. Never called for a creation
-///                          (`known_complete: None`), which takes no candidates at all.
+///                          (`known_complete: None`), which takes no candidates at all, but by
+///                          the walk [`WithheldDigests::Recorded`] adds, which is bounded by
+///                          every head of the host and so prunes against parents.
 /// * `removed`            - Reads the redactions the remote applied and the content it withholds.
 ///                          A remote must hold the whole closure of every head it accepts but for
 ///                          the content it redacted or withholds, so an absent file's content one
@@ -2123,11 +2126,17 @@ pub fn head_not_materializable_message(path: &str) -> String {
 ///                          refusal naming withheld content says the host withholds it
 ///                          ([`withheld_beyond_files`]). Called only once the walk without it has
 ///                          failed, so a remote holding the whole closure never depends on it.
+/// * `digests`            - What the head knows of the chunk lists of what it withholds. Under
+///                          [`WithheldDigests::Recorded`], absent withheld content is tolerated at a
+///                          chunked entry of history no head of the host reaches only where its
+///                          digest is recorded or the expected head names it at a chunked entry,
+///                          and is otherwise refused as [`ClosureRefusal::Uncomparable`].
 ///
 /// # Returns
 /// * `Ok(())`                - Everything is present, or absent only where `removed` tolerates it.
 /// * `Err(ClosureRefusal)`   - Why not: an incomplete history, withheld content the closure names
-///                             beyond a file's content, or `removed` unreadable.
+///                             beyond a file's content or cannot judge, or `removed` or the heads
+///                             unreadable.
 pub fn verify_parcel_closure_with(
     head: &str,
     known_complete: Option<&str>,
