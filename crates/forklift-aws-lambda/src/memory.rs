@@ -28,7 +28,7 @@ use crate::aws::dynamo::{
     ENTITY_FORMAT, ENTITY_PALLET_PREFIX, ENTITY_REDACTION_PREFIX, ENTITY_TRUST, ENTITY_WITHHELD_PREFIX,
 };
 use crate::store::{
-    CasOutcome, ExpectedHead, FormatFence, FormatStore, ObjectAccess, ObjectStore, OffloadedResponse,
+    CasOutcome, ExpectedHead, FormatFence, FormatStore, IntakeCopy, ObjectAccess, ObjectStore, OffloadedResponse,
     ItemKey, ItemWrite, OfficePrecondition, PromoteOutcome, PutOutcome, PutTarget, RedactionWrite, RedactionsPrecondition, RefHead, RefListing, RefStore,
     SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
@@ -56,6 +56,9 @@ pub struct MemoryObjectStore {
     /// Redaction work objects, keyed by name — the stand-in for the `redaction-work/{wh}/`
     /// prefix. Never objects.
     work: Mutex<HashMap<String, Vec<u8>>>,
+    /// Clients' copies of withheld recipes, keyed by hash — the stand-in for the `intake/{wh}/`
+    /// prefix. Never objects, never staged.
+    intake: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl MemoryObjectStore {
@@ -81,6 +84,17 @@ impl MemoryObjectStore {
     /// not verified and not fetchable; only `verify_and_promote` can make them so.
     pub fn stage(&self, session: &str, hash: &str, bytes: Vec<u8>) {
         self.staged.lock().unwrap().insert((session.to_string(), hash.to_string()), bytes);
+    }
+
+    /// Land `bytes` at the intake key of `hash`, as a client's `PUT` to the URL
+    /// [`intake_target`](ObjectStore::intake_target) handed out would.
+    pub fn land_intake(&self, hash: &str, bytes: Vec<u8>) {
+        self.intake.lock().unwrap().insert(hash.to_string(), bytes);
+    }
+
+    /// How many intake copies the store holds (for test assertions).
+    pub fn intake_count(&self) -> usize {
+        self.intake.lock().unwrap().len()
     }
 
     /// How many objects are stored at their canonical key (for test assertions).
@@ -312,6 +326,20 @@ impl ObjectStore for MemoryObjectStore {
         self.work.lock().unwrap().retain(|name, _| !name.starts_with(prefix));
 
         Ok(())
+    }
+
+    /// A URL under the redirect base when there is one, else under a base of its own: the fake
+    /// takes the bytes only through [`MemoryObjectStore::land_intake`] either way.
+    fn intake_target(&self, hash: &str) -> Result<String, String> {
+        Ok(format!("{}/intake/{}", self.redirect_base.as_deref().unwrap_or("memory://store"), hash))
+    }
+
+    fn take_intake(&self, hash: &str, cap: u64) -> Result<IntakeCopy, String> {
+        Ok(match self.intake.lock().unwrap().remove(hash) {
+            None => IntakeCopy::Absent,
+            Some(bytes) if bytes.len() as u64 > cap => IntakeCopy::Oversized,
+            Some(bytes) => IntakeCopy::Bytes(bytes),
+        })
     }
 
     fn delete_responses_before(&self, cutoff: std::time::SystemTime) -> Result<(), String> {

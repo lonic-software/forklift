@@ -1817,7 +1817,7 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
         &|hash| object_utils::recipe_chunk_hashes(hash),
         &|hash| object_utils::load_tree(hash),
         &|| Ok(Tolerated::default()),
-        WithheldDigests::Recorded,
+        &|hash| object_utils::load_parcel(hash),
     ).map_err(String::from)
 }
 
@@ -1829,7 +1829,8 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 /// An absent file's content a redaction this warehouse applied names, or its head withholds, is
 /// tolerated, as the ref write's own verification tolerates it: the history of every head still
 /// names the content the redaction took away or the head does not hold. Withheld content at a
-/// chunked entry is tolerated so only as [`WithheldDigests::Recorded`] allows. The same hash absent where
+/// chunked entry is tolerated so only where the withheld set records its digest, or the expected head
+/// already names it at a chunked entry ([`ClosureRefusal::Uncomparable`]). The same hash absent where
 /// the closure names it as a tree or a chunk is not, since neither takes one away. Nothing else
 /// absent is. The records are read only when the walk without them fails, so a warehouse holding
 /// the whole closure never depends on them; and both only ever grow, so the write need not read
@@ -1850,7 +1851,7 @@ pub fn verify_parcel_closure_for_write(head: &str,
         &|hash| object_utils::recipe_chunk_hashes(hash),
         &|hash| object_utils::load_tree(hash),
         &crate::util::sealed_utils::read_redacted_and_withheld,
-        WithheldDigests::Recorded,
+        &|hash| object_utils::load_parcel(hash),
     )?;
 
     Ok(pallet_utils::VerifiedClosure::new(head, PathScope::full(), known_complete))
@@ -1915,21 +1916,6 @@ pub struct UncomparableWithheld {
     pub path: String,
     /// The host's statement.
     pub statement: String,
-}
-
-/// What the push gate ([`verify_parcel_closure_with`]) knows of the chunk lists of the content its
-/// host withholds.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum WithheldDigests {
-    /// What the withheld set records ([`WithheldSet::digest`]): a new head may name absent
-    /// withheld content as a chunked file only where the set records its digest, or the expected
-    /// head already names it so.
-    Recorded,
-
-    /// Every withheld hash is taken as carrying a digest, so absent withheld content is tolerated
-    /// as any file's content, whatever its entry's type: for a head that has no way yet to learn
-    /// the digest of a recipe it never held.
-    AssumedKnown,
 }
 
 impl ClosureRefusal {
@@ -2126,11 +2112,14 @@ pub fn head_not_materializable_message(path: &str) -> String {
 ///                          refusal naming withheld content says the host withholds it
 ///                          ([`withheld_beyond_files`]). Called only once the walk without it has
 ///                          failed, so a remote holding the whole closure never depends on it.
-/// * `digests`            - What the head knows of the chunk lists of what it withholds. Under
-///                          [`WithheldDigests::Recorded`], absent withheld content the walk holds at
-///                          a chunked entry is tolerated only where its digest is recorded or the
-///                          expected head names it at a chunked entry, and is otherwise refused as
-///                          [`ClosureRefusal::Uncomparable`].
+/// * `load_parcel`        - Reads the expected head's parcel, the one read the judgement of
+///                          withheld content makes beyond the walk's: absent withheld content the
+///                          walk holds at a chunked entry is tolerated only where the withheld set
+///                          records its digest or the expected head (`known_complete`) names it at
+///                          a chunked entry, and is otherwise refused as
+///                          [`ClosureRefusal::Uncomparable`]. The expected head's trees are read
+///                          through `load_base_tree`. On the AWS head the parcel is in object
+///                          storage, not the audit scratch, which is why this is a parameter.
 ///
 /// # Returns
 /// * `Ok(())`                - Everything is present, or absent only where `removed` tolerates it.
@@ -2145,7 +2134,7 @@ pub fn verify_parcel_closure_with(
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
     removed: &dyn Fn() -> Result<Tolerated, String>,
-    digests: WithheldDigests,
+    load_parcel: &dyn Fn(&str) -> Result<crate::model::parcel::Parcel, String>,
 ) -> Result<(), ClosureRefusal> {
     let bounds = known_complete.as_ref().map(std::slice::from_ref);
     let seams = ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed: None };
@@ -2173,10 +2162,7 @@ pub fn verify_parcel_closure_with(
             None => ClosureRefusal::Incomplete(refusal),
         })?;
 
-    match digests {
-        WithheldDigests::Recorded => refuse_uncomparable(&tolerance, &tolerated.withheld, known_complete, load_base_tree),
-        WithheldDigests::AssumedKnown => Ok(()),
-    }
+    refuse_uncomparable(&tolerance, &tolerated.withheld, known_complete, load_parcel, load_base_tree)
 }
 
 /// Refuse a walk that held absent withheld content at a chunked entry while `withheld` records no
@@ -2185,10 +2171,12 @@ pub fn verify_parcel_closure_with(
 /// would then wedge every such judgement. A file the expected head already names so was accepted
 /// before, and refusing it again would refuse every write over it.
 ///
-/// The expected head's tree is read through `load_base_tree`, and only when such a holding exists.
+/// The expected head's parcel is read through `load_parcel` and its trees through `load_base_tree`,
+/// and only when such a holding exists.
 fn refuse_uncomparable(tolerance: &SealedTolerance,
                        withheld: &WithheldSet,
                        expected: Option<&str>,
+                       load_parcel: &dyn Fn(&str) -> Result<crate::model::parcel::Parcel, String>,
                        load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>) -> Result<(), ClosureRefusal> {
     let uncomparable: Vec<WithheldFile> = tolerance.withheld_files.borrow().iter()
         .filter(|file| !matches!(withheld.digest(&file.hash), Some(ChunkDigest::Known(_))))
@@ -2202,7 +2190,7 @@ fn refuse_uncomparable(tolerance: &SealedTolerance,
     let wanted: HashSet<&str> = uncomparable.iter().map(|file| file.hash.as_str()).collect();
     let named = match expected {
         // Read failures are not missing history: the walk above already found the new history whole.
-        Some(expected) => chunked_named(expected, &wanted, load_base_tree).map_err(|error| ClosureRefusal::RecordsUnreadable(format!(
+        Some(expected) => chunked_named(expected, &wanted, load_parcel, load_base_tree).map_err(|error| ClosureRefusal::RecordsUnreadable(format!(
             "The pallet's current head {} could not be read to judge withheld content the new history \
             names, so the pallet was not moved: {}",
             expected, error
@@ -2232,10 +2220,11 @@ fn refuse_uncomparable(tolerance: &SealedTolerance,
 /// once every one is found.
 fn chunked_named(head: &str,
                  wanted: &HashSet<&str>,
+                 load_parcel: &dyn Fn(&str) -> Result<crate::model::parcel::Parcel, String>,
                  load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>) -> Result<HashSet<String>, String> {
     let mut found: HashSet<String> = HashSet::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut pending = vec![object_utils::load_parcel(head)?.tree_hash];
+    let mut pending = vec![load_parcel(head)?.tree_hash];
 
     while let Some(tree_hash) = pending.pop() {
         if found.len() == wanted.len() {

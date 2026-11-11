@@ -2598,16 +2598,6 @@ pub(crate) mod tests {
                           removed: (crate::util::applied_redactions::AppliedSet,
                                     crate::util::withholding::WithheldSet))
                           -> Result<(), crate::util::audit_utils::ClosureRefusal> {
-            remote_closure_with(head, base, removed, crate::util::audit_utils::WithheldDigests::Recorded)
-        }
-
-        /// [`remote_closure`], judging the chunk lists of withheld content by `digests`.
-        fn remote_closure_with(head: &str,
-                               base: Option<&str>,
-                               removed: (crate::util::applied_redactions::AppliedSet,
-                                         crate::util::withholding::WithheldSet),
-                               digests: crate::util::audit_utils::WithheldDigests)
-                               -> Result<(), crate::util::audit_utils::ClosureRefusal> {
             crate::util::audit_utils::verify_parcel_closure_with(
                 head,
                 base,
@@ -2616,7 +2606,7 @@ pub(crate) mod tests {
                 &|hash| crate::util::object_utils::recipe_chunk_hashes(hash),
                 &|hash| crate::util::object_utils::load_tree(hash),
                 &|| Ok(crate::util::sealed_utils::Tolerated::removed_only(removed.0.clone(), removed.1.clone())),
-                digests,
+                &|hash| crate::util::object_utils::load_parcel(hash),
             )
         }
 
@@ -2643,8 +2633,6 @@ pub(crate) mod tests {
         // entry as chunked → the plain entry is refused.
         #[test]
         fn a_remote_closure_refuses_withheld_content_newly_named_chunked_without_a_digest() {
-            use crate::util::audit_utils::WithheldDigests;
-
             let (_root, _scope) = scratch("closure-withheld-undigested");
             let notes = blob("notes");
             let base = parcel(&tree(&[("notes", &notes, DirEntryType::Normal)]), &[]);
@@ -2668,10 +2656,6 @@ pub(crate) mod tests {
             // A head whose expected head already names it chunked, here at another path, lands.
             let moved = parcel(&tree(&[("notes", &notes, DirEntryType::Normal), ("film.mkv", &film, DirEntryType::NormalChunked)]), &[&chunked]);
             remote_closure(&moved, Some(&chunked), removed()).expect("the expected head names it chunked");
-
-            // A head whose record carries no digests takes every one as known.
-            remote_closure_with(&chunked, Some(&base), removed(), WithheldDigests::AssumedKnown)
-                .expect("a digest taken as known is tolerated");
 
             // Once the digest is recorded, the host can judge the file, and the head lands.
             assert!(crate::util::withholding::record_digest(&film, &"a".repeat(64)).unwrap());

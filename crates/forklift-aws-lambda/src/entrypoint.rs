@@ -517,7 +517,9 @@ where
         | Route::PutTrust
         | Route::RefUpdate(_)
         | Route::RefDelete { .. }
-        | Route::CommitLift(_) => true,
+        | Route::CommitLift(_)
+        | Route::WithheldIntakeTarget(_)
+        | Route::WithheldIntake(_) => true,
         Route::Handshake
         | Route::Missing
         | Route::Batch
@@ -560,6 +562,8 @@ enum Route {
     Resolve,
     BundleLatest,
     CommitLift(String),
+    WithheldIntakeTarget(String),
+    WithheldIntake(String),
 }
 
 /// Resolve the warehouse id and the endpoint of a request, stripping the `/warehouses/{id}`
@@ -648,6 +652,8 @@ fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> He
         (&Method::POST, ["holds", name @ ..]) if is_tail(name) => Some(Route::Holds(pallet_name(name)?)),
         (&Method::POST, ["resolve"]) => Some(Route::Resolve),
         (&Method::GET, ["bundles", "latest"]) => Some(Route::BundleLatest),
+        (&Method::POST, ["withheld", hash, "recipe", "target"]) => Some(Route::WithheldIntakeTarget(param(hash)?)),
+        (&Method::POST, ["withheld", hash, "recipe"]) => Some(Route::WithheldIntake(param(hash)?)),
         _ => None,
     })
 }
@@ -862,6 +868,17 @@ where
             reject_oversized_commit(request.control_plane.len(), request.blobs.len())?;
             head.commit_lift(caller, &session, &request.control_plane, &request.blobs, request.more)?;
             Ok(empty(StatusCode::OK))
+        }
+
+        // The digest intake: a withheld recipe's bytes never cross the control plane. The target
+        // is where the client uploads them, and the second request has the head read them there.
+        Route::WithheldIntakeTarget(hash) => {
+            Ok(json_response(StatusCode::OK, &head.withheld_intake_target(caller, &hash)?))
+        }
+
+        Route::WithheldIntake(hash) => {
+            head.withheld_intake(caller, &hash)?;
+            Ok(empty(StatusCode::NO_CONTENT))
         }
     }
 }

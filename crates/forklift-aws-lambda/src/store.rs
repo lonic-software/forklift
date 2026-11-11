@@ -610,6 +610,35 @@ pub trait ObjectStore {
     fn work_delete_under(&self, _prefix: &str) -> Result<(), String> {
         Err("This object store keeps no redaction work objects.".to_string())
     }
+
+    /// A presigned `PUT` for a client's copy of the withheld recipe `hash`, which the digest
+    /// intake reads once to record the recipe's chunk-list digest. The key sits under the
+    /// warehouse's own `intake/` prefix, outside `staging/`: the staging verifier deletes every
+    /// staged copy of withheld content, and nothing under `intake/` is ever promoted or served.
+    ///
+    /// The default takes no intake and fails, loudly.
+    fn intake_target(&self, _hash: &str) -> Result<String, String> {
+        Err("This object store takes no withheld recipe.".to_string())
+    }
+
+    /// Read the intake copy of `hash`, at most `cap` bytes of it, and delete every version of it
+    /// whatever the read found: the copy is read once and never kept.
+    fn take_intake(&self, _hash: &str, _cap: u64) -> Result<IntakeCopy, String> {
+        Err("This object store takes no withheld recipe.".to_string())
+    }
+}
+
+/// What [`ObjectStore::take_intake`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IntakeCopy {
+    /// No copy was uploaded.
+    Absent,
+
+    /// The copy's bytes.
+    Bytes(Vec<u8>),
+
+    /// The copy was larger than the cap, so it was not read.
+    Oversized,
 }
 
 /// The consistency point: pallet heads and the trust anchor.
