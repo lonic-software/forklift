@@ -15,6 +15,7 @@ use crate::model::remote::{
     CommitLiftRequest, ErrorResponse, HoldAnswer, HoldsRequest, HoldsResponse,
     MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest, ResolveRequest,
     ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse, WarehouseInfo,
+    WithheldIntake, WithheldIntakeTarget,
     BATCH_CUT_BUDGET, BATCH_CUT_DEADLINE, BATCH_HEADER, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY, MAX_HOLDS_CANDIDATES, MAX_MISSING_BATCH,
     MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
 };
@@ -121,6 +122,10 @@ async fn read_error_body(response: reqwest::Response, budget: std::time::Duratio
 /// Per-hash allowance in an `upload-targets` answer: a presigned upload URL (about 500 bytes in
 /// practice) keyed by its hash.
 const UPLOAD_TARGETS_BODY_BYTES_PER_HASH: u64 = 8 * 1024;
+
+/// The most bytes a withheld recipe's intake target may take: one presigned upload URL, as
+/// [`UPLOAD_TARGETS_BODY_BYTES_PER_HASH`] allows.
+const WITHHELD_INTAKE_TARGET_BYTES: u64 = UPLOAD_TARGETS_BODY_BYTES_PER_HASH;
 
 /// The most identifier bytes, as serialised, one resolve request carries, so a roster of long
 /// identifiers is split rather than refused whole. A quarter of the smallest body limit a server
@@ -4676,16 +4681,41 @@ impl RemoteClient {
     }
 
     /// Send `bytes`, this warehouse's copy of the recipe `hash` the remote withholds, to the
-    /// remote's digest intake ([`WarehouseInfo::withheld_intake`]), so it records the chunk-list
-    /// digest it had no copy to compute. The remote keeps nothing of the bytes. Rides the same
-    /// posture as [`Self::upload_signature`].
-    pub async fn put_withheld_recipe(&self, hash: &str, bytes: Vec<u8>) -> Result<(), String> {
+    /// remote's digest intake by the way it named ([`WarehouseInfo::withheld_intake`]), so it
+    /// records the chunk-list digest it had no copy to compute. The remote keeps nothing of the
+    /// bytes. A way that takes none sends nothing. Every request rides the same posture as
+    /// [`Self::upload_signature`].
+    ///
+    /// [`WithheldIntake::Staged`] asks for a target first, uploads to its URL as a staged object
+    /// is ([`Self::put_presigned`]), then has the head read the bytes from there. A target with no
+    /// URL means the head needs none, so the call ends there.
+    pub async fn put_withheld_recipe(&self, intake: WithheldIntake, hash: &str, bytes: Vec<u8>) -> Result<(), String> {
+        let route = format!("/v1/withheld/{}/recipe", hash);
+
+        match intake {
+            WithheldIntake::None | WithheldIntake::Unknown => Ok(()),
+            WithheldIntake::Direct => self.post_withheld_intake(hash, reqwest::Method::PUT, &route, SendBody::Bytes(bytes)).await,
+            WithheldIntake::Staged => {
+                let target = self.withheld_intake_target(hash).await?;
+
+                let Some(url) = target.url else {
+                    return Ok(());
+                };
+
+                self.put_presigned(&url, bytes).await?;
+                self.post_withheld_intake(hash, reqwest::Method::POST, &route, SendBody::Bytes(Vec::new())).await
+            }
+        }
+    }
+
+    /// One mutating request of [`Self::put_withheld_recipe`], whose answer carries nothing but its
+    /// status.
+    async fn post_withheld_intake(&self, hash: &str, method: reqwest::Method, route: &str, body: SendBody) -> Result<(), String> {
         let action = format!("sending the withheld recipe {} to the remote's digest intake", hash);
         let what = format!("the withheld recipe {}", hash);
         let outcome = self.send_waiting_out(
             Posture::HeadDeadlineNoRedirect { head: self.retryable_head_budget() },
-            reqwest::Method::PUT, &format!("/v1/withheld/{}/recipe", hash),
-            SendBody::Bytes(bytes), &what,
+            method, route, body, &what,
         ).await?;
         let response = self.response_from_send_mutation(&action, outcome)?;
 
@@ -4698,6 +4728,30 @@ impl RemoteClient {
         }
 
         Ok(())
+    }
+
+    /// `POST /v1/withheld/{hash}/recipe/target`: where a [`WithheldIntake::Staged`] head takes the
+    /// recipe's bytes.
+    async fn withheld_intake_target(&self, hash: &str) -> Result<WithheldIntakeTarget, String> {
+        let action = format!("asking the remote where to send the withheld recipe {}", hash);
+        let what = format!("the intake target of the withheld recipe {}", hash);
+        let posture = Posture::HeadDeadlineNoRedirect { head: self.retryable_head_budget() };
+        let outcome = self.send_waiting_out(
+            posture,
+            reqwest::Method::POST, &format!("/v1/withheld/{}/recipe/target", hash),
+            SendBody::Bytes(Vec::new()), &what,
+        ).await?;
+        let response = self.response_from_send_mutation(&action, outcome)?;
+
+        if response.status().is_redirection() {
+            return Err(Self::describe_mutation_redirect(&action, &response));
+        }
+
+        if !response.status().is_success() {
+            return Err(self.error_of(response, &what).await);
+        }
+
+        self.read_presence_json(response, WITHHELD_INTAKE_TARGET_BYTES, &action, posture, "intake target").await
     }
 
     /// Establish the trust anchor on the remote (idempotent for an identical anchor).
@@ -7073,8 +7127,8 @@ async fn upload_history(client: &RemoteClient,
         client, &session, negotiation, &control_plane, chunking_supported, progress,
     ).await?;
 
-    if info.withheld_intake {
-        send_withheld_recipes(client, &undigested, progress).await;
+    if matches!(info.withheld_intake, WithheldIntake::Direct | WithheldIntake::Staged) {
+        send_withheld_recipes(client, info.withheld_intake, &undigested, progress).await;
     }
 
     progress.status("Updating the remote");
@@ -7108,7 +7162,7 @@ async fn upload_history(client: &RemoteClient,
 /// recipe an earlier lift settled is neither read nor sent again, and a failure stands until a later
 /// attempt at the same recipe succeeds. A failure does not stop the lift: its ref update is judged
 /// without the digest. The sends fan out over [`CONCURRENT_TRANSFERS`] connections.
-async fn send_withheld_recipes(client: &RemoteClient, undigested: &BTreeSet<String>, progress: &Progress) {
+async fn send_withheld_recipes(client: &RemoteClient, intake: WithheldIntake, undigested: &BTreeSet<String>, progress: &Progress) {
     let owed: Vec<&String> = undigested.iter().filter(|hash| !client.intake_settled(hash)).collect();
 
     if owed.is_empty() {
@@ -7134,7 +7188,7 @@ async fn send_withheld_recipes(client: &RemoteClient, undigested: &BTreeSet<Stri
             };
 
             match held_recipe(&recipe) {
-                Ok(Some(bytes)) => client.put_withheld_recipe(&recipe, bytes).await.err(),
+                Ok(Some(bytes)) => client.put_withheld_recipe(intake, &recipe, bytes).await.err(),
                 Ok(None) => None,
                 Err(why) => Some(format!("The withheld recipe {} could not be read here: {}", recipe, why)),
             }
@@ -9964,7 +10018,7 @@ mod tests {
             tombstones: Some(BTreeMap::from([("gone".to_string(), deleted)])),
             redactions: None,
             withheld: None,
-            withheld_intake: false,
+            withheld_intake: WithheldIntake::None,
         };
 
         assert_eq!(held_elsewhere(&info, "feature"), vec![main.clone()]);
@@ -10154,7 +10208,7 @@ mod tests {
             crate::util::audit_utils::verify_parcel_closure_with(
                 &merge, known_complete, &blob_exists, &chunks_missing,
                 &load_recipe_chunks, &load_base_tree, &|| Ok(Default::default()),
-                crate::util::audit_utils::WithheldDigests::Recorded,
+                &|hash| object_utils::load_parcel(hash),
             ).expect("the fixture is complete, so the audit must pass");
 
             touched.into_inner()
@@ -10459,11 +10513,14 @@ mod tests {
     /// A remote whose host withholds `withheld` without its handshake saying so — a takedown
     /// recorded after the handshake — and that answers one hash nobody offered withheld too. Every
     /// other hash is answered `direct`. Records each negotiation's hashes and each object `PUT`.
+    /// Takes a withheld recipe either way: a `PUT` with its bytes, or a target, an upload to it, and
+    /// a `POST` that takes what was uploaded.
     struct LateWithholdingRemote {
         url: String,
         negotiated: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
         put: Arc<std::sync::Mutex<Vec<String>>>,
         intake: Arc<std::sync::Mutex<Vec<IntakeSent>>>,
+        intake_ways: Arc<std::sync::Mutex<Vec<WithheldIntake>>>,
     }
 
     /// A withheld recipe's hash and the bytes sent to the digest intake.
@@ -10487,7 +10544,11 @@ mod tests {
             let negotiated = Arc::new(std::sync::Mutex::new(Vec::new()));
             let put = Arc::new(std::sync::Mutex::new(Vec::new()));
             let intake = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let intake_ways = Arc::new(std::sync::Mutex::new(Vec::new()));
             let (negotiated_log, put_log, intake_log) = (Arc::clone(&negotiated), Arc::clone(&put), Arc::clone(&intake));
+            let ways_log = Arc::clone(&intake_ways);
+            let own_url = url.clone();
+            let mut uploaded: HashMap<String, Vec<u8>> = HashMap::new();
 
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
@@ -10510,6 +10571,7 @@ mod tests {
                                 put_log.lock().unwrap().push(hash.to_string());
                             }
                             if let Some(hash) = path.strip_prefix("/v1/withheld/").and_then(|rest| rest.strip_suffix("/recipe")) {
+                                ways_log.lock().unwrap().push(WithheldIntake::Direct);
                                 intake_log.lock().unwrap().push((hash.to_string(), body.clone()));
                                 let mut left = refusals.lock().unwrap();
                                 if *left > 0 {
@@ -10518,7 +10580,33 @@ mod tests {
                                 }
                             }
                         }
-                        "{}".to_string()
+                        let intake_target = path.strip_prefix("/v1/withheld/").and_then(|rest| rest.strip_suffix("/recipe/target"));
+                        let staged_take = path.strip_prefix("/v1/withheld/").and_then(|rest| rest.strip_suffix("/recipe"));
+
+                        if method == "PUT" {
+                            if let Some(hash) = path.strip_prefix("/intake/") {
+                                uploaded.insert(hash.to_string(), body.clone());
+                            }
+                        }
+
+                        match (method.as_str(), intake_target, staged_take) {
+                            ("POST", Some(hash), _) => {
+                                serde_json::to_string(&WithheldIntakeTarget {
+                                    url: Some(format!("{}/intake/{}", own_url, hash)),
+                                }).unwrap()
+                            }
+                            ("POST", None, Some(hash)) => {
+                                ways_log.lock().unwrap().push(WithheldIntake::Staged);
+                                intake_log.lock().unwrap().push((hash.to_string(), uploaded.remove(hash).unwrap_or_default()));
+                                let mut left = refusals.lock().unwrap();
+                                if *left > 0 {
+                                    *left -= 1;
+                                    status = "422 Unprocessable Entity";
+                                }
+                                "{}".to_string()
+                            }
+                            _ => "{}".to_string(),
+                        }
                     };
 
                     let _ = write!(
@@ -10530,27 +10618,29 @@ mod tests {
                 }
             });
 
-            LateWithholdingRemote { url, negotiated, put, intake }
+            LateWithholdingRemote { url, negotiated, put, intake, intake_ways }
         }
     }
 
     /// A lift sends a head that advertises the digest intake every withheld recipe it holds that
     /// the head has no digest for, whether or not the lifted history names it: one the handshake
     /// lists without a digest, and a takedown only the negotiation reports. It sends no recipe the
-    /// handshake lists with a digest, no blob, and nothing it does not hold; and a head that does
-    /// not advertise the intake is sent nothing. A second lift through the same client sends
-    /// nothing again.
+    /// handshake lists with a digest, no blob, and nothing it does not hold; and a head that names
+    /// no intake, or one this build does not know, is sent nothing. Each recipe goes the way the
+    /// head named: as the body of one `PUT`, or uploaded to the target the head answers and then
+    /// taken from there. A second lift through the same client sends nothing again.
     ///
     /// Revert: send only what the lift's walk met → the unnamed recipe is not sent. Ignore the
-    /// flag → the head without it is sent both. Drop the `chunks` filter → the digested recipe is
-    /// sent. Skip the ledger → the second lift sends both again.
+    /// field → the head without it is sent both. Send a staged head the bytes directly → the
+    /// recorded way is `Direct`. Drop the `chunks` filter → the digested recipe is sent. Skip the
+    /// ledger → the second lift sends both again.
     #[test]
     fn a_lift_sends_the_digest_intake_every_undigested_withheld_recipe_it_holds() {
         use crate::enums::dir_entry_type::DirEntryType::NormalChunked;
         use crate::model::remote::{ServedWithholding, ServedWithholdingState};
 
-        for advertised in [true, false] {
-            let _scratch = Scratch::new(&format!("intake-{}", advertised));
+        for advertised in [WithheldIntake::Direct, WithheldIntake::Staged, WithheldIntake::None, WithheldIntake::Unknown] {
+            let _scratch = Scratch::new(&format!("intake-{:?}", advertised));
 
             let (late_recipe, _) = store_recipe(&["late-intake"]);
             let (unnamed_recipe, _) = store_recipe(&["unnamed-intake"]);
@@ -10595,10 +10685,13 @@ mod tests {
             let mut sent = remote.intake.lock().unwrap().clone();
             sent.sort();
 
-            if !advertised {
-                assert!(sent.is_empty(), "a head without the intake is sent nothing: {:?}", sent);
+            if matches!(advertised, WithheldIntake::None | WithheldIntake::Unknown) {
+                assert!(sent.is_empty(), "a head without a known intake is sent nothing: {:?}", sent);
                 continue;
             }
+
+            let ways = remote.intake_ways.lock().unwrap().clone();
+            assert!(ways.iter().all(|way| *way == advertised), "each goes the named way: {:?}", ways);
 
             let mut expected: Vec<(String, Vec<u8>)> = [&late_recipe, &unnamed_recipe].into_iter()
                 .map(|hash| (hash.clone(), file_utils::retrieve_object_by_hash(hash).unwrap()))
@@ -10648,7 +10741,7 @@ mod tests {
                 state: ServedWithholdingState::Deleted,
                 chunks: None,
             }]),
-            withheld_intake: true,
+            withheld_intake: WithheldIntake::Direct,
         };
 
         let remote = LateWithholdingRemote::start_refusing_intake(HashSet::new(), 1);
@@ -10700,7 +10793,7 @@ mod tests {
             tombstones: None,
             redactions: None,
             withheld: None,
-            withheld_intake: false,
+            withheld_intake: WithheldIntake::None,
         };
 
         let remote = LateWithholdingRemote::start(HashSet::from([withheld_recipe.clone()]));
@@ -10820,7 +10913,7 @@ mod tests {
             tombstones: None,
             redactions: None,
             withheld: None,
-            withheld_intake: false,
+            withheld_intake: WithheldIntake::None,
         };
 
         let client = RemoteClient::new(&remote.url, None).unwrap();

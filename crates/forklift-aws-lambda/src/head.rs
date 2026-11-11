@@ -42,7 +42,8 @@ use std::time::SystemTime;
 
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::model::remote::{
-    HoldAnswer, RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo, MAX_MISSING_BATCH,
+    HoldAnswer, RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo, WithheldIntake,
+    MAX_MISSING_BATCH,
     PROTOCOL_VERSION, REFUSAL_NOT_AN_OBJECT_HASH,
 };
 use forklift_core::model::parcel::Parcel;
@@ -390,8 +391,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // cannot be read. Always present, empty or not: a client reads an absent list as a head
             // that reports nothing.
             withheld: Some(withholding.served()),
-            // No digest intake yet: a client sends this head no withheld recipe.
-            withheld_intake: false,
+            // A withheld recipe's bytes never cross the control plane: the client uploads them to
+            // an intake target in the store, and the head reads them from there.
+            withheld_intake: WithheldIntake::Staged,
         })
     }
 
@@ -1128,10 +1130,18 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
                     Ok(Tolerated::removed_only(self.applied_set()?, withholding.applying()))
                 },
-                // This head takes no digest intake yet, so a recipe withheld before it ever held a
-                // copy carries a digest here only if a racing upload lands one: absent withheld
-                // content stays tolerated as any file's content, chunked or not, until it does.
-                audit_utils::WithheldDigests::AssumedKnown,
+                // The expected head's parcel, read from object storage as its trees are, for the
+                // judgement of withheld content the new history names at a chunked entry: such
+                // content is tolerated only where its digest is recorded, by settling or by the
+                // digest intake, or the expected head already names it so.
+                &|hash: &str| -> Result<Parcel, String> {
+                    let bytes = self
+                        .objects
+                        .get(hash)?
+                        .ok_or_else(|| format!("Parcel {} is missing.", hash))?;
+
+                    object_utils::parse_parcel_bytes(hash, &bytes)
+                },
             )
             // An incomplete history is classified, so a lift can tell it apart and upload again.
             .map_err(|refusal| unsettled.take().unwrap_or_else(|| HeadError::unprocessable(refusal.for_ref_update())))?;
@@ -2029,7 +2039,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     // every adopter, so one naming content this head redacted or withholds is a pin
                     // it can never serve.
                     &|| Ok(Tolerated::default()),
-                    audit_utils::WithheldDigests::AssumedKnown,
+                    // Nothing is tolerated, so no withheld content is judged and no expected head
+                    // is read.
+                    &|hash| Err(format!("Parcel {} was read as an expected head, but this walk has none.", hash)),
                 )
                 .map_err(String::from)
             };

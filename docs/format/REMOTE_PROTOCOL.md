@@ -128,7 +128,7 @@ The one-round-trip handshake: protocol version, refs and trust.
   "redactions": [{ "hash": "<hash>", "state": "deletion_owed" },
                  { "hash": "<hash>", "state": "pending" }],
   "withheld": [{ "hash": "<hash>", "statement": "<the host's words>", "state": "deletion_owed", "chunks": "<digest>" }],
-  "withheld_intake": true
+  "withheld_intake": "direct"
 }
 ```
 
@@ -246,9 +246,11 @@ chunk-list redaction records it, which the head computed from a copy of the reci
 omitted while the head has no such copy to compute it from, and always for content that is not a
 recipe. A client keeps it in its `unavailable` record, and judges a chunk-list redaction over the
 file by it while it lacks the recipe.
-`withheld_intake` (additive, default `false`) says the head takes a withheld recipe's bytes at
-`PUT /v1/withheld/{hash}/recipe` (below), so a head that withholds a recipe it never held can still
-record its `chunks`. The AWS head does not offer it yet.
+`withheld_intake` (additive, default `"none"`) names the way the head takes a withheld recipe's
+bytes, so a head that withholds a recipe it never held can still record its `chunks`: `"direct"`
+in the body of `PUT /v1/withheld/{hash}/recipe` (forklift-server), `"staged"` through an intake
+target and `POST /v1/withheld/{hash}/recipe` (the serverless head), both below. `"none"` takes no
+recipe. A client that does not know the value sends nothing, as for `"none"`.
 
 **Withheld content is refused.** `GET` and `PUT` of `/v1/objects/{hash}` for a withheld hash
 answer `451` with `code` `content_withheld`, the host's statement in the message, and
@@ -258,14 +260,14 @@ an applied redaction's content. A hash both redacted and withheld is answered `4
 **Withheld content is still named.** Pallet heads may keep naming a withheld file, and a lift may
 name it without uploading it: `missing` never lists a withheld hash, `upload-targets` answers it in
 `withheld`, and a ref update tolerates its absence wherever a file names it, moved or copied
-included. One case is refused: forklift-server answers a ref update `422` with `code`
+included. One case is refused: a head answers a ref update `422` with `code`
 `content_withheld` when a parcel the update adds names a withheld recipe it holds no `chunks` for
 at a chunked entry its parent does not carry at that path and type, and the pallet's current head
 names that recipe at no chunked entry, since it could not judge that file against a chunk-list
 redaction. A creation has no current head, and its walk takes in the new head's whole history,
 so it is refused whenever any parcel of that history names such a recipe at a chunked entry, one
 the host already holds included. The `next_step` is to lift from a warehouse that holds the recipe, whose lift sends it through
-the digest intake (below) first. The AWS head does not refuse it yet. While the head's `@redactions` pallet holds a chunk-list redaction, forklift-server judges
+the digest intake (below) first. While the head's `@redactions` pallet holds a chunk-list redaction, forklift-server judges
 a withheld chunked file it no longer holds by its recorded `chunks` digest: a match is refused as
 redacted content, as the recipe itself would be. Only a file's content is tolerated so, a chunked file's recipe among it; a tree, parcel
 or chunk is never withheld. A withheld recipe's chunks are not refused by hash, since other content
@@ -473,19 +475,33 @@ wherever it appears: this query, the `upload-targets` body and the commit path. 
 the session (the serverless head, whatever its store) refuses any other id with `422`, since a
 `/` would place that session's staging keys under another session's prefix.
 
-### `PUT /v1/withheld/{hash}/recipe` (additive; heads that send `withheld_intake`)
+### `PUT /v1/withheld/{hash}/recipe` (additive; heads whose `withheld_intake` is `"direct"`)
 
-The digest intake. Body: the raw bytes of the recipe `hash`, which the head withholds. The head
+The direct digest intake. Body: the raw bytes of the recipe `hash`, which the head withholds. The head
 verifies `Blake3(body) == hash` and that the body parses as a recipe, and answers `422` with
 nothing changed when either fails. It then records the digest of the recipe's chunk list as that
 entry's `chunks`, unless the entry has one already, and answers `204`. A hash it does not withhold
 is answered `204` with nothing changed. Nothing of the body is stored or served, and the hash stays
 refused on every other route. It takes the same authority as an object upload.
 
+### `POST /v1/withheld/{hash}/recipe/target` · `POST /v1/withheld/{hash}/recipe` (additive; heads whose `withheld_intake` is `"staged"`)
+
+The staged digest intake, for a head whose request bodies cannot carry an object. `POST
+.../recipe/target` (empty body) answers `200` with `{"url": "<presigned PUT>"}` where the client
+sends the recipe's raw bytes, or `{"url": null}` when the head owes `hash` no digest: it withholds
+no such recipe, or records its `chunks` already. The client then sends `POST .../recipe` (empty
+body), and the head reads the copy at that target and deletes it, whatever it holds, before
+answering. It verifies the copy as the direct intake verifies its body, and answers `422` with
+nothing recorded when no copy was sent, the copy is larger than an object may be, or it is not the
+recipe; otherwise it records `chunks` and answers `204`, or `204` with nothing changed when no
+digest is owed. The copy is never promoted, stored or served, and a copy whose request never comes
+is expired by the store. Both take the same authority as an object upload.
+
 Before a lift's ref update, a client sends every withheld recipe it holds whose handshake entry
 has no `chunks`, and every recipe first answered withheld by the upload negotiation, whether or not
-the lifted history names it, and only to a head that sends `withheld_intake`. It never sends a
-blob. A recipe that could not be sent does not stop the lift.
+the lifted history names it, by the way the handshake's `withheld_intake` names, and nothing to a
+head whose value is `"none"` or one it does not know. It never sends a blob. A recipe that could
+not be sent does not stop the lift.
 
 ### `GET /v1/signatures/{hash}` · `PUT /v1/signatures/{hash}`
 

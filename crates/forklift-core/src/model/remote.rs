@@ -113,13 +113,42 @@ pub struct WarehouseInfo {
     #[serde(default)]
     pub withheld: Option<Vec<ServedWithholding>>,
 
-    /// Whether this head takes a withheld recipe's bytes at `PUT /v1/withheld/{hash}/recipe` to
-    /// record the [`ServedWithholding::chunks`] digest it has no copy to compute from, keeping
-    /// nothing of them. A client that holds such a recipe sends it before a lift's ref update, and
-    /// only to a head that says so. An **additive** capability field like [`Self::chunking`]:
-    /// absent reads as `false`.
+    /// How this head takes a withheld recipe's bytes to record the [`ServedWithholding::chunks`]
+    /// digest it has no copy to compute from, keeping nothing of them ([`WithheldIntake`]). A
+    /// client that holds such a recipe sends it before a lift's ref update, and only to a head that
+    /// names a way it knows. An **additive** capability field like [`Self::chunking`]: absent reads
+    /// as [`WithheldIntake::None`].
     #[serde(default)]
-    pub withheld_intake: bool,
+    pub withheld_intake: WithheldIntake,
+}
+
+/// How a head takes the bytes of a withheld recipe for its digest ([`WarehouseInfo::withheld_intake`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WithheldIntake {
+    /// The head takes none.
+    #[default]
+    None,
+
+    /// `PUT /v1/withheld/{hash}/recipe` with the bytes as the body.
+    Direct,
+
+    /// `POST /v1/withheld/{hash}/recipe/target` answers a [`WithheldIntakeTarget`]; the bytes go
+    /// to its URL, and `POST /v1/withheld/{hash}/recipe` then has the head read them from there.
+    /// For a head whose control plane must not carry a recipe's bytes.
+    Staged,
+
+    /// A way this build does not know. The client sends nothing, as to a head that takes none.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The answer of `POST /v1/withheld/{hash}/recipe/target` ([`WithheldIntake::Staged`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithheldIntakeTarget {
+    /// Where to `PUT` the recipe's bytes, or `None` when the head needs none: it withholds no such
+    /// hash as a file's content, or records its digest already.
+    pub url: Option<String>,
 }
 
 /// One withheld object, as a head reports it in [`WarehouseInfo::withheld`].
@@ -606,7 +635,7 @@ mod tests {
             tombstones: None,
             redactions: None,
             withheld: None,
-            withheld_intake: false,
+            withheld_intake: WithheldIntake::None,
         };
 
         let wire = serde_json::to_string(&info).expect("serialize");

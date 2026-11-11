@@ -2551,7 +2551,7 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
             withheld: Some(served_withheld()?),
             // `PUT /v1/withheld/{hash}/recipe` records the digest of a withheld recipe this head
             // never held a copy of.
-            withheld_intake: true,
+            withheld_intake: forklift_core::model::remote::WithheldIntake::Direct,
         })
     }).await;
 

@@ -2770,6 +2770,80 @@ async fn the_cli_lifts_and_franchises_a_chunked_file_over_s3_and_dynamodb() {
     );
 }
 
+/// The staged digest intake end to end through the real CLI, over S3 and DynamoDB: a recipe the
+/// host withholds before it ever held a copy is left out of the lift, the CLI uploads its copy to
+/// the presigned intake target and has the head read it, and the ref update that names it chunked
+/// lands. The head records the recipe's digest, keeps no intake copy, and holds no recipe.
+// Revert: send this head nothing (the handshake's `none`) → the ref update is refused as content
+// the host cannot judge, and the lift exits non-zero → red. Revert: keep the copy in
+// `take_intake` → the `intake/` listing → red.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cli_sends_a_withheld_recipe_through_the_staged_digest_intake() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let head = StagingHead::start(&config, bridge.clone()).await;
+    let (raw_s3, _) = raw_clients(&config).await;
+
+    let area = Area::new("cli-staging-intake");
+    prepare(&area, "wh");
+    area.write_file("wh/readme.txt", "hello intake\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "-m", "first"]);
+    area.forklift("wh", &["config", "set", "remote.url", &head.url]);
+    area.forklift("wh", &["lift"]);
+
+    area.write_large_file("wh/big.bin", 0x5EED, CHUNK_THRESHOLD + 5 * 1024 * 1024);
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "-m", "a giant"]);
+
+    let (recipe, digest) = {
+        let _scope = StorageRootScope::enter(&area.path("wh"));
+        let main = harvest(&area.path("wh")).head_of("main").expect("main head");
+        let tree = object_utils::load_tree(&object_utils::load_parcel(&main).expect("parcel").tree_hash).expect("tree");
+        let recipe = tree.get_files().find(|(name, _)| name.as_str() == "big.bin").expect("the file").1.hash.clone();
+        let bytes = file_utils::retrieve_object_by_hash(&recipe).expect("the recipe");
+        let digest = forklift_core::util::withholding::recipe_digest(&recipe, &bytes).expect("a recipe");
+        (recipe, digest)
+    };
+
+    let (objects, refs) = build_stores(&config, bridge.clone()).await.expect("stores");
+    let (objects, refs) = (Arc::new(objects), Arc::new(refs));
+    {
+        let (refs, recipe) = (Arc::clone(&refs), recipe.clone());
+        tokio::task::spawn_blocking(move || forklift_aws_lambda::withheld::add(&*refs, &recipe, "court order 2026-71").expect("withhold"))
+            .await
+            .expect("the withhold");
+    }
+
+    // A failed intake leaves the ref update refused, which `Area::forklift` turns into a panic.
+    area.forklift("wh", &["lift"]);
+
+    let item = {
+        let (refs, recipe) = (Arc::clone(&refs), recipe.clone());
+        tokio::task::spawn_blocking(move || forklift_aws_lambda::withheld::list(&*refs).expect("list")
+            .into_iter().find(|listed| listed.hash == recipe).expect("the item").item)
+            .await
+            .expect("the item read")
+    };
+    assert_eq!(item.chunks.as_deref(), Some(digest.as_str()), "the digest is recorded: {:?}", item);
+
+    let intake = raw_s3.list_objects_v2().bucket(&config.bucket).prefix("intake/").send().await.expect("list intake");
+    assert!(intake.contents().is_empty(), "no intake copy is kept: {:?}", intake.contents());
+
+    let held = {
+        let recipe = recipe.clone();
+        tokio::task::spawn_blocking(move || objects.exists(&recipe).expect("exists")).await.expect("the probe")
+    };
+    assert!(!held, "the recipe is not promoted");
+}
+
 /// The withheld items over real DynamoDB: an operator's add is refused on a warehouse holding
 /// nothing, lands beside a pallet's first write, and the listing reads every item back, across
 /// pages, in hash order, with none of the warehouse's other items and none of another's.

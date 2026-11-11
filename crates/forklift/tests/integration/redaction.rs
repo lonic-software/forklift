@@ -2646,7 +2646,7 @@ fn withheld_digests(url: &str) -> BTreeMap<String, Option<String>> {
     let (status, info) = http(url, "GET", "/v1/warehouse", b"");
     assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
     let info: serde_json::Value = serde_json::from_str(&info).unwrap();
-    assert_eq!(info["withheld_intake"], true, "{}", info);
+    assert_eq!(info["withheld_intake"], "direct", "{}", info);
 
     info["withheld"].as_array().unwrap().iter()
         .map(|item| (

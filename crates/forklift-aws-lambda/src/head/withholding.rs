@@ -16,7 +16,10 @@
 //! this build cannot read is never recorded, so it applies and is read again by every request.
 //! Settling a recipe records its chunk-list digest, from the bytes it read, and journals it in the
 //! chunk ledger in the same transaction, which is what gates its chunks (the chunk gate reads only
-//! the ledger, and a chunk request names no recipe). So
+//! the ledger, and a chunk request names no recipe). A recipe withheld before the store held it
+//! gets its digest from the digest intake instead ([`Head::withheld_intake`]): an uploader that
+//! holds it uploads a copy to the store's `intake/` prefix, and the head reads it once, records
+//! the digest, and deletes it. So
 //! every request that serves or takes objects settles every unsettled item before it answers, and
 //! answers `503` only when that does not finish within the request.
 //!
@@ -39,7 +42,8 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use forklift_core::model::remote::{ServedWithholding, ServedWithholdingState};
+use forklift_core::model::remote::{ServedWithholding, ServedWithholdingState, WithheldIntakeTarget};
+use forklift_core::util::authority_utils::Principal;
 use forklift_core::enums::object_type::ObjectType;
 use forklift_core::util::meta_tree;
 use forklift_core::util::object_utils;
@@ -51,10 +55,10 @@ use super::redaction::{
     decode_work, epoch_seconds, late_sweep_due, response_cutoff, Budget, INVOCATION_CEILING, SWEEP_LEASE_MARGIN,
     UNDECIDED_RETRY_AFTER_SECONDS, WORK_VERSION, WRITE_ATTEMPTS,
 };
-use super::Head;
+use super::{require_object_hash, Head};
 use crate::error::{HeadError, HeadResult};
 use crate::scratch::MirroredObjects;
-use crate::store::{ItemKey, ItemWrite, ObjectStore, RefStore};
+use crate::store::{IntakeCopy, ItemKey, ItemWrite, ObjectStore, RefStore};
 use crate::withheld::{self, Listed, WithheldItem};
 
 /// Every withheld item of a warehouse, each settled but for one whose object's header cannot be
@@ -650,7 +654,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         };
         let item = withheld::decode(hash, &stored).map_err(HeadError::internal)?;
 
-        // Only an item settled as a recipe carries a digest; any other is settled from the store.
+        // Only an item settled as a recipe is filled from the store's copy here. An item settled
+        // while the store lacked the object gets its digest from the intake, or re-settled.
         if item.chunks.is_some() || !item.recipe {
             return Ok(true);
         }
@@ -807,6 +812,85 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }
 
         Ok(())
+    }
+
+    /// `POST /v1/withheld/{hash}/recipe/target` — where an uploader sends its copy of the withheld
+    /// recipe `hash` for the digest intake: a presigned `PUT` to the store's intake key, or no URL
+    /// when the head needs none, because it withholds no such hash as a file's content or records
+    /// its digest already.
+    pub fn withheld_intake_target(&self, caller: &Principal, hash: &str) -> HeadResult<WithheldIntakeTarget> {
+        self.require_uploader(caller)?;
+        require_object_hash(hash)?;
+
+        if self.intake_owed(hash)?.is_none() {
+            return Ok(WithheldIntakeTarget { url: None });
+        }
+
+        let url = self.objects.intake_target(hash).map_err(HeadError::internal)?;
+
+        Ok(WithheldIntakeTarget { url: Some(url) })
+    }
+
+    /// `POST /v1/withheld/{hash}/recipe` — record the chunk-list digest of the withheld recipe
+    /// `hash` from the copy an uploader sent to its intake target. The copy is read once and
+    /// deleted, whatever it holds, and nothing of it is kept or promoted: the digest is computed
+    /// only from bytes that hash to `hash` and parse as a recipe, so the copy proves itself and
+    /// the uploader is not trusted for it. A head that needs no digest answers as having taken it.
+    ///
+    /// # Errors
+    /// * `422` - No copy was sent, it is larger than an object may be, or it is not the recipe.
+    /// * `503` - Every write lost a race with another request.
+    pub fn withheld_intake(&self, caller: &Principal, hash: &str) -> HeadResult<()> {
+        self.require_uploader(caller)?;
+        require_object_hash(hash)?;
+
+        let copy = self.objects.take_intake(hash, object_utils::MAX_OBJECT_BYTES as u64).map_err(HeadError::internal)?;
+
+        if self.intake_owed(hash)?.is_none() {
+            return Ok(());
+        }
+
+        let bytes = match copy {
+            IntakeCopy::Bytes(bytes) => bytes,
+            IntakeCopy::Absent => return Err(HeadError::unprocessable(format!(
+                "No copy of the withheld recipe {} was sent to its intake target.", hash
+            ))),
+            IntakeCopy::Oversized => return Err(HeadError::unprocessable(format!(
+                "The copy of the withheld recipe {} sent to its intake target is larger than an object may be.", hash
+            ))),
+        };
+
+        let digest = withholding::recipe_digest(hash, &bytes).map_err(|error| HeadError::unprocessable(format!(
+            "The copy sent for the withheld recipe {} gives no chunk-list digest: {}", hash, error
+        )))?;
+
+        let mut budget = self.scan_budget();
+
+        for _ in 0..WRITE_ATTEMPTS {
+            let Some((stored, item)) = self.intake_owed(hash)? else {
+                return Ok(());
+            };
+
+            let state = withheld::encode(&WithheldItem { chunks: Some(digest.clone()), ..item });
+            if self.write_items(&[ItemWrite { key: ItemKey::Withheld(hash), state: &state, expected: Some(&stored) }], &mut budget)? {
+                return Ok(());
+            }
+        }
+
+        Err(HeadError::service_unavailable(format!(
+            "The digest of the withheld recipe {} was not recorded: other requests kept changing its item.", hash
+        )))
+    }
+
+    /// The withheld item of `hash`, as stored and decoded, when the digest intake owes it a
+    /// digest: it applies and records none.
+    fn intake_owed(&self, hash: &str) -> HeadResult<Option<(String, WithheldItem)>> {
+        let Some(stored) = self.refs.get_item(ItemKey::Withheld(hash)).map_err(HeadError::internal)? else {
+            return Ok(None);
+        };
+        let item = withheld::decode(hash, &stored).map_err(HeadError::internal)?;
+
+        Ok((!item.never_applies && item.chunks.is_none()).then_some((stored, item)))
     }
 
     /// Record on the withheld item of `hash`, if there is one, that its recipe object has been

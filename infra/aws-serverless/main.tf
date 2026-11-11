@@ -153,6 +153,41 @@ resource "aws_s3_bucket_lifecycle_configuration" "this" {
     }
   }
 
+  # intake/ holds a client's copy of a recipe the warehouse withholds, which the head reads and
+  # deletes within the request that names it (docs/DEPLOYMENT.md, "Recommended: expire the intake/
+  # prefix"). A copy whose request never comes, or whose upload lands after it, is withheld content
+  # the host must not keep: it is expired after a day, the version that leaves noncurrent a day
+  # after that, and the delete markers after it, as staging/'s rules do.
+  rule {
+    id     = "expire-intake"
+    status = "Enabled"
+
+    filter {
+      prefix = "intake/"
+    }
+
+    expiration {
+      days = 1
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 1
+    }
+  }
+
+  rule {
+    id     = "expire-intake-delete-markers"
+    status = "Enabled"
+
+    filter {
+      prefix = "intake/"
+    }
+
+    expiration {
+      expired_object_delete_marker = true
+    }
+  }
+
   dynamic "rule" {
     for_each = var.responses_expiry_days != null ? [var.responses_expiry_days] : []
 

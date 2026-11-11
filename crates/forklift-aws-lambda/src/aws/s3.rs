@@ -2,7 +2,7 @@
 //!
 //! # Key layout
 //!
-//! One bucket, four prefixes, and the boundary between them *is* invariant 1. Every key but a
+//! One bucket, six prefixes, and the boundary between them *is* invariant 1. Every key but a
 //! response's names the warehouse it belongs to, right after its prefix: a store is built for one
 //! warehouse ([`S3ObjectStore::new`]) and reads and writes only under that warehouse's keys, so
 //! one warehouse on a shared bucket can neither fetch another's objects nor learn which hashes
@@ -27,6 +27,13 @@
 //!   (invariant 1 is not in play; the client verifies every record on import regardless). A
 //!   response is reached only through the presigned URL the head hands back; it is keyed by its
 //!   warehouse so an applied redaction's late sweep can find the bundles that may hold its content.
+//! * `redaction-work/{warehouse}/{name}` — a redaction scan's progress between invocations; never
+//!   an object and never served.
+//! * `intake/{warehouse}/{hash}` — a client's copy of a recipe the warehouse withholds, uploaded
+//!   so the head can record the recipe's chunk-list digest. Outside `staging/`, because the
+//!   staging verifier deletes every staged copy of withheld content before the head could read
+//!   it; [`take_intake`](S3ObjectStore::take_intake) reads it once and deletes it, and nothing
+//!   ever promotes or serves it.
 //!
 //! Warehouses in AWS format 1 kept objects and signatures at `objects/{hash}` and
 //! `signatures/{hash}`, shared by every warehouse. Nothing here reads those keys, and the format
@@ -76,8 +83,9 @@
 //! Reads and staged writes are handed to the client as presigned URLs (a `307` from the
 //! head), so object bytes never traverse the control plane. Every presigned URL is valid for
 //! [`PRESIGN_TTL`] — short, constant, and the same for reads and writes. A presigned `PUT` is
-//! constructible by exactly one private helper, [`S3ObjectStore::presign_staging_put`], which
-//! hardcodes the `staging/` prefix; there is no code path that presigns a `PUT` to a hash key.
+//! constructible by exactly two private helpers, [`S3ObjectStore::presign_staging_put`] and
+//! [`S3ObjectStore::presign_intake_put`], which hardcode the `staging/` and `intake/` prefixes;
+//! there is no code path that presigns a `PUT` to a hash key.
 //!
 //! A presigned `PUT` (SigV4 query-string auth) cannot itself carry a size **range**
 //! condition — that is a presigned-**POST** policy feature (`content-length-range`), which
@@ -127,7 +135,7 @@ use crate::aws::sdk::{
 };
 use crate::blocking::AsyncBridge;
 use crate::store::{
-    ObjectAccess, ObjectStore, OffloadedResponse, PromoteOutcome, PutOutcome, PutTarget, SignatureOutcome,
+    IntakeCopy, ObjectAccess, ObjectStore, OffloadedResponse, PromoteOutcome, PutOutcome, PutTarget, SignatureOutcome,
 };
 
 /// How long a presigned URL is valid. Short and constant, the same for a read and a staged
@@ -237,6 +245,13 @@ fn work_key(warehouse: &str, name: &str) -> String {
     format!("redaction-work/{}/{}", warehouse, name)
 }
 
+/// `warehouse`'s key for a client's copy of the withheld recipe `hash`, which the digest intake
+/// reads once. Neither an `objects/` nor a `staging/` key: nothing promotes it, and the staging
+/// verifier never sees it.
+fn intake_key(warehouse: &str, hash: &str) -> String {
+    format!("intake/{}/{}", warehouse, hash)
+}
+
 /// `warehouse`'s prefix for offloaded response bodies.
 fn response_prefix(warehouse: &str) -> String {
     format!("responses/{}/", warehouse)
@@ -336,6 +351,22 @@ async fn stream_hash_capped(mut body: ByteStream, cap: u64) -> Result<StreamHash
     }
 
     Ok(StreamHash::Hash(hasher.finalize().to_hex().to_string()))
+}
+
+/// Read `body` whole, or `None` once it passes `cap` bytes, which stops the read there. A free
+/// function so a unit test can drive it with a small `cap`.
+async fn read_capped(mut body: ByteStream, cap: u64) -> Result<Option<Vec<u8>>, String> {
+    let mut bytes = Vec::new();
+
+    while let Some(chunk) = body.try_next().await.map_err(|err| format!("reading the intake copy failed: {}", err))? {
+        if bytes.len() as u64 + chunk.len() as u64 > cap {
+            return Ok(None);
+        }
+
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok(Some(bytes))
 }
 
 /// Maps a raw `HeadObject` result to "does the key exist" — a free function (not inlined into
@@ -545,6 +576,26 @@ impl S3ObjectStore {
             .put_object()
             .bucket(&self.bucket)
             .key(staging_key(&self.warehouse, session, hash))
+            .presigned(config)
+            .await
+            .map_err(|err| describe("S3 presign put_object", err))?;
+
+        Ok(request.uri().to_string())
+    }
+
+    /// Presign a `PUT` to `warehouse`'s **intake** key for `hash`, valid for [`PRESIGN_TTL`]: the
+    /// one other presigned-`PUT` path, hardcoding `intake/{warehouse}/`, which nothing promotes.
+    /// Carries no size condition, as [`presign_staging_put`](Self::presign_staging_put) does not;
+    /// [`take_intake`](S3ObjectStore::take_intake) reads under a cap instead.
+    async fn presign_intake_put(&self, hash: &str) -> Result<String, String> {
+        let config = PresigningConfig::expires_in(PRESIGN_TTL)
+            .map_err(|err| format!("building the presigning config failed: {}", err))?;
+
+        let request = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(intake_key(&self.warehouse, hash))
             .presigned(config)
             .await
             .map_err(|err| describe("S3 presign put_object", err))?;
@@ -989,6 +1040,30 @@ impl ObjectStore for S3ObjectStore {
         self.bridge.block_on(self.delete_every_version(&prefix, |listed, _| listed.starts_with(&prefix)))
     }
 
+    fn intake_target(&self, hash: &str) -> Result<String, String> {
+        self.bridge.block_on(self.presign_intake_put(hash))
+    }
+
+    fn take_intake(&self, hash: &str, cap: u64) -> Result<IntakeCopy, String> {
+        let key = intake_key(&self.warehouse, hash);
+
+        self.bridge.block_on(async {
+            let read = match self.client.get_object().bucket(&self.bucket).key(&key).send().await {
+                Ok(output) => read_capped(output.body, cap).await.map(|read| match read {
+                    Some(bytes) => IntakeCopy::Bytes(bytes),
+                    None => IntakeCopy::Oversized,
+                }),
+                Err(err) if is_no_such_key(&err) => Ok(IntakeCopy::Absent),
+                Err(err) => Err(describe("S3 get_object", err)),
+            };
+
+            // Whatever the read found, no version of the copy is kept.
+            self.delete_every_version(&key, |listed, _| listed == key).await?;
+
+            read
+        })
+    }
+
     fn work_delete(&self, name: &str) -> Result<(), String> {
         let key = work_key(&self.warehouse, name);
 
@@ -1054,6 +1129,31 @@ mod tests {
 
         assert_eq!(key, format!("redaction-work/wh-a/{}/pallets", hash));
         assert!(!key.starts_with("objects/") && !key.starts_with("staging/") && !key.starts_with("responses/"));
+    }
+
+    /// An intake copy is keyed by its warehouse, and is neither an object, a staged upload the
+    /// verifier would read, nor any other prefix's key.
+    ///
+    /// Revert: key it under `staging/` → the verifier parses it; drop the warehouse → the
+    /// prefix assertion.
+    #[test]
+    fn the_intake_prefix_is_its_own_and_names_the_warehouse() {
+        let hash = "c".repeat(64);
+        let key = intake_key("wh-a", &hash);
+
+        assert_eq!(key, format!("intake/wh-a/{}", hash));
+        assert!(parse_staging_key(&key).is_none(), "the staging verifier never reads an intake copy");
+        assert_ne!(intake_key("wh-b", &hash), key, "each warehouse has its own intake key for a hash");
+        for other in ["objects/", "staging/", "signatures/", "responses/", "redaction-work/"] {
+            assert!(!key.starts_with(other), "{}", other);
+        }
+    }
+
+    /// A body at the cap is read whole; one byte over stops the read.
+    #[tokio::test]
+    async fn a_capped_read_takes_a_body_at_the_cap_and_refuses_one_over() {
+        assert_eq!(read_capped(ByteStream::from(vec![7u8; 16]), 16).await.unwrap(), Some(vec![7u8; 16]));
+        assert_eq!(read_capped(ByteStream::from(vec![7u8; 17]), 16).await.unwrap(), None);
     }
 
     #[test]
