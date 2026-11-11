@@ -1885,7 +1885,18 @@ mod clients {
         /// [`check_total_deadline_payload`], a debug-build tripwire against a *future* payload
         /// producer, and [`check_head_deadline_payload`]/[`clamp_head_deadline_payload`], whose
         /// clamp is not a tripwire but a live repair, for the reason that function's own doc
-        /// gives. Neither fires against any producer this module has today.
+        /// gives. Neither fires against any producer this module has today. It also bounds which
+        /// dropped connection a `GET` is sent again after (below).
+        ///
+        /// **A `GET` may be sent more than once.** When its connection drops before a complete
+        /// answer head, sooner than `connect_timeout` after the attempt began, it is sent again
+        /// on a fresh attempt, up to [`super::DROPPED_GET_ATTEMPTS`] in all, each with the
+        /// posture's own deadlines armed anew. Since only an attempt that failed within
+        /// `connect_timeout` is followed by another, the resends add at most
+        /// `(DROPPED_GET_ATTEMPTS - 1)` such failures and their short pauses to the bound of the
+        /// one attempt that answers or fails for good: the posture's deadlines are not multiplied.
+        /// A head-wait expiry, a timeout and every other method are returned from their first
+        /// attempt.
         ///
         /// Returns a [`SendOutcome`] rather than a `Result<_, String>` for the same reason
         /// [`Self::send_with_watchdog`] returns a [`WatchdogOutcome`]: this module's boundary is
@@ -1926,13 +1937,19 @@ mod clients {
                 | Posture::UnboundedNoRedirect(_) => (None, None),
             };
 
-            // A `GET` whose connection dropped before any answer (a pooled connection the remote
-            // or a gateway had already closed) is sent again, a bounded number of times: it changes
-            // nothing on the remote, so another attempt is the recovery. Any other method may have
-            // taken effect, and any other failure (a refused connect, a timeout, TLS) would repeat.
+            // A `GET` whose connection dropped before a complete answer head, sooner than a
+            // connect may take (a pooled connection the remote or a gateway had already closed),
+            // is sent again, a bounded number of times: it changes nothing on the remote, so
+            // another attempt is the recovery. A later drop is a remote that worked on the request
+            // and died, which the same request may kill again. Any other method may have taken
+            // effect, and any other failure (a refused connect, a timeout, TLS) would repeat. Only
+            // a `GET` keeps a copy of its body and headers for another attempt.
+            let resendable = method == reqwest::Method::GET;
+            let (mut body, mut headers) = (Some(body), Some(headers));
             let mut attempts = 1;
 
             loop {
+                let started = tokio::time::Instant::now();
                 let client = self.pick(&posture);
 
                 let mut builder = match destination {
@@ -1950,7 +1967,14 @@ mod clients {
                     builder = builder.timeout(duration);
                 }
 
-                let send_fut = body.clone().apply(builder.headers(headers.clone())).send();
+                let (this_body, this_headers) = if resendable {
+                    (body.clone(), headers.clone())
+                } else {
+                    (body.take(), headers.take())
+                };
+                let send_fut = this_body.unwrap_or(SendBody::Empty)
+                    .apply(builder.headers(this_headers.unwrap_or_default()))
+                    .send();
 
                 // The three cells of `Result<Result<_, reqwest::Error>, Elapsed>` map one-to-one
                 // onto the three `SendOutcome` variants, and the `Elapsed` is consumed here: it
@@ -1973,8 +1997,14 @@ mod clients {
 
                 match outcome {
                     SendOutcome::Transport(e)
-                        if method == reqwest::Method::GET && attempts < super::DROPPED_GET_ATTEMPTS
-                            && super::dropped_before_answer(&e) => attempts += 1,
+                        if resendable && attempts < super::DROPPED_GET_ATTEMPTS
+                            && started.elapsed() < connect_timeout
+                            && super::dropped_before_answer(&e) => {
+                        attempts += 1;
+                        // Spread, so the parallel fetches one remote dropped together do not all
+                        // land on it again in the same instant.
+                        tokio::time::sleep(super::jittered(std::time::Duration::ZERO, super::RETRY_BACKOFF_START)).await;
+                    }
                     outcome => return outcome,
                 }
             }
@@ -2490,14 +2520,16 @@ fn classify_remote_error(status: u16, action: &str, message: String,
 /// local `Error while …` and from a transport failure that repeats (DNS, TLS, a bad body).
 const CONNECTION_FAILED: &str = "the connection to the remote failed: ";
 
-/// How many times a `GET` is sent in all when its connection keeps dropping before any answer
-/// (see [`dropped_before_answer`]). More than two, since a client holding several pooled
-/// connections the remote closed at once may draw another closed one on the retry.
+/// How many times [`clients::Clients::send_on`] sends a `GET` in all when its connection keeps
+/// dropping at once (see [`dropped_before_answer`]). More than two, since a client holding several
+/// pooled connections the remote closed at once may draw another closed one on the retry.
 const DROPPED_GET_ATTEMPTS: u32 = 3;
 
-/// Whether `e` is a connection that was established and then dropped before any answer came: a
-/// pooled connection the remote or a gateway had already closed fails this way ("connection closed
-/// before message completed"). A failed connect is not one (a refused or unreachable remote stays
+/// Whether `e` is a connection that was established and then dropped before a complete answer
+/// head arrived (reset, cut off, or closed part-way through the status line or headers). A pooled
+/// connection the remote or a gateway had already closed fails this way ("connection closed before
+/// message completed"), and so does a remote that died while working on the request, which only
+/// the time it took tells apart (see [`clients::Clients::send_on`]). A failed connect is not one (a refused or unreachable remote stays
 /// so for the moment), nor is a timeout, which another attempt would wait out again and which
 /// [`RemoteClient::connection_failed`] does not count as a failed connection.
 fn dropped_before_answer(e: &reqwest::Error) -> bool {
@@ -13662,6 +13694,38 @@ mod tests {
         assert_eq!(remote.connections(), 3);
     }
 
+    /// A `GET` whose connection dropped only after longer than a connect may take is a remote that
+    /// worked on the request and died, not a closed pooled connection: it is not sent again.
+    #[test]
+    fn a_get_whose_connection_drops_late_is_not_sent_again() {
+        // Past FAST's 330 ms connect budget, well inside its 4.1 s object-read silence budget.
+        let remote = CommitRemote::start(vec![
+            CommitAnswer::DropAfter(std::time::Duration::from_millis(900)),
+            CommitAnswer::Reply("HTTP/1.1 200 OK"),
+        ]);
+        let client = RemoteClient::new_test_with_budgets(&remote.url, FAST);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let message = runtime.block_on(client.fetch_object("ab")).expect_err("the late drop is not resent into the 200");
+
+        assert!(message.contains(CONNECTION_FAILED), "{}", message);
+        assert_eq!(remote.connections(), 1);
+    }
+
+    /// A `GET` on a head-deadline posture is sent again the same way: `fetch_subtree`'s answer
+    /// after the dropped connection is its `404` absence signal.
+    #[test]
+    fn a_head_deadline_get_whose_connection_drops_before_any_answer_is_sent_again() {
+        let remote = CommitRemote::start(vec![CommitAnswer::Drop, CommitAnswer::Reply("HTTP/1.1 404 Not Found")]);
+        let client = RemoteClient::new_test_with_budgets(&remote.url, FAST);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let outcome = runtime.block_on(client.fetch_subtree(&"p".repeat(64), "src", &"t".repeat(64)));
+
+        assert!(matches!(outcome, Ok(None)), "{:?}", outcome.map(|stats| stats.is_some()));
+        assert_eq!(remote.connections(), 2);
+    }
+
     /// A `POST` may have taken effect before its connection dropped, so it is never sent again
     /// here, even one that only reads.
     #[test]
@@ -16772,6 +16836,8 @@ mod tests {
         Wedge,
         /// Read the request and close the connection without a byte of answer.
         Drop,
+        /// Read the request, wait this long, then close the connection without a byte of answer.
+        DropAfter(std::time::Duration),
         /// Write this status line and these headers after `head_after`, then this body after a
         /// further `body_after`, and close.
         Slow {
@@ -16819,6 +16885,7 @@ mod tests {
                         }
                         CommitAnswer::Wedge => held.push(stream),
                         CommitAnswer::Drop => {}
+                        CommitAnswer::DropAfter(after) => std::thread::sleep(after),
                         CommitAnswer::Slow { head, head_after, body, body_after } => {
                             std::thread::sleep(head_after);
                             let _ = write!(stream, "{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", head, body.len());
