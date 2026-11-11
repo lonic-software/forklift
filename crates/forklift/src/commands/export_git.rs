@@ -596,6 +596,9 @@ pub(crate) struct Exporter<'a> {
     /// The trees in `withheld_trees` written since the log was last appended to, which must reach
     /// it before a commit names them.
     withheld_unlogged: Vec<String>,
+    /// Whether a flush of the log failed in this run, leaving it in doubt: no later commit that
+    /// needs the log is written.
+    withheld_log_failed: bool,
     /// The forklift trees that held entries, every one of which was left out.
     emptied: HashSet<String>,
     /// Whether nothing under a forklift tree is redacted, for the trees asked about.
@@ -636,6 +639,7 @@ impl<'a> Exporter<'a> {
             omitted_in: HashMap::new(),
             withheld_trees: None,
             withheld_unlogged: Vec::new(),
+            withheld_log_failed: false,
             emptied: HashSet::new(),
             clean: HashMap::new(),
             redacted: BTreeMap::new(),
@@ -726,7 +730,18 @@ impl<'a> Exporter<'a> {
         if self.withheld_unlogged.is_empty() {
             return Ok(());
         }
+        if self.withheld_log_failed {
+            return Err(format!("An earlier write of {} failed in this run, so no commit that needs it is written",
+                self.repo.git_dir().join(WITHHELD_TREES_LOG).display()));
+        }
+        let flushed = self.append_withheld_log();
+        self.withheld_log_failed = flushed.is_err();
 
+        flushed
+    }
+
+    /// Append the noted trees to the log and make it durable, its folder too when it is new.
+    fn append_withheld_log(&mut self) -> Result<(), String> {
         let dir = self.repo.git_dir();
         let path = dir.join(WITHHELD_TREES_LOG);
         let fail = |error: std::io::Error| format!("Could not write {}: {}", path.display(), error);
@@ -738,8 +753,8 @@ impl<'a> Exporter<'a> {
         let written = std::io::Write::write_all(&mut log, lines.as_bytes())
             .and_then(|()| if file_utils::fsync_enabled() { log.sync_all() } else { Ok(()) });
         if let Err(error) = written {
-            // Cut a partial batch back off, so a later flush in this run starts a whole line; a
-            // tail this cannot cut is a torn append the next read cuts.
+            // Cut a partial batch back off; a tail this cannot cut is a torn append the next run's
+            // read cuts, since no later flush in this run appends after it.
             let _ = log.set_len(end);
             return Err(fail(error));
         }
