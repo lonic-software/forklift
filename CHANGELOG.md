@@ -166,6 +166,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   instead of a missing-object error, and so does a `lift` of such history to another remote. A
   merge that must read such a file now says the way out: take your own change to it out, and the
   merge leaves the file out. `--json` schema is now 39.
+- **`git export` and `git mirror` leave out a file whose content is withheld.** A file this
+  warehouse never received because its remote's host withholds the content is left out of each
+  commit that names it, with nothing in its place, instead of failing the export or the mirror with
+  `content_withheld`. Both name it with the host's statement and the parcels whose commits left it
+  out (`withheld` in `--json`, beside `redacted`), and `git mirror` takes the remote's new history
+  without the content, as `lower` does. `--json` schema is now 40.
 - **`consolidate` and `pick` take a file whose content is withheld.** A merge or pick that takes
   the other side's version of a file whose content this warehouse does not hold because the
   remote's host withholds it no longer fails reading it: the file is left out, its old version is

@@ -11,6 +11,7 @@ use forklift_core::util::tag_utils::{self, AttributedTag};
 use forklift_core::util::{file_utils, haul_utils, kv_utils, manifest_utils, object_utils, office_utils};
 use forklift_core::util::{applied_redactions, bay_utils, pallet_utils, park_utils};
 use forklift_core::util::applied_redactions::AppliedSet;
+use forklift_core::util::unavailable::{self, UnavailableSet};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 use forklift_core::util::remote_utils::RemoteClient;
 use crate::commands::pallet::{relation_to_remote, RemoteRelation};
@@ -38,9 +39,12 @@ pub(crate) const EXPORT_LAYOUT: u32 = 1;
 ///
 /// The objects are deterministic (§9.8): every commit ends in a line naming its parcel and the
 /// export layout, and no git configuration or environment of the user's reaches an object write, so
-/// the same history exports to the same commits on any machine that applied the same redactions.
+/// the same history exports to the same commits on any machine that applied the same redactions
+/// and lacks the same withheld content.
 /// A file whose redaction this warehouse applied is left out of every commit that carried it, never
-/// replaced by a placeholder, and the report names it by path and parcel.
+/// replaced by a placeholder, and the report names it by path and parcel. So is a file whose content
+/// this warehouse lacks because the host of a remote withholds it (the unavailable record), named
+/// with the host's statement.
 ///
 /// # Arguments
 /// * `path` - Where to create the git repository (must be empty or nonexistent).
@@ -108,12 +112,13 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
     }
     let RemoteCheck { left_behind, unchecked, .. } = remote.unwrap_or_default();
     let applied = applied_redactions::read_applied()?;
+    let unavailable = unavailable::read_unavailable()?;
 
     std::fs::create_dir_all(target)
         .map_err(|e| format!("Error while creating \"{}\": {}", path, e))?;
     let repo = GitRepo::create(target)?;
 
-    let mut exporter = Exporter::new(&repo, applied);
+    let mut exporter = Exporter::new(&repo, applied, unavailable);
     for parcel in &order {
         exporter.export_parcel(parcel)?;
     }
@@ -152,6 +157,7 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
         current,
         not_exported,
         redacted: exporter.take_redacted(),
+        withheld: exporter.take_withheld(),
         signed,
         parked,
         remote_left_behind: left_behind,
@@ -516,7 +522,7 @@ impl GitRepo {
     }
 
     /// The repository's git folder.
-    fn git_dir(&self) -> PathBuf {
+    pub(crate) fn git_dir(&self) -> PathBuf {
         if self.bare { self.path.clone() } else { self.path.join(".git") }
     }
 
@@ -560,11 +566,16 @@ struct ExportedCommit {
 /// the repository, so a parcel built on a commit an earlier run wrote also costs git processes in
 /// proportion to its changed paths, not to its tree's size.
 ///
-/// A file whose content is an applied redaction's hash is left out of the git tree, and a folder
-/// that held nothing else is left out with it. Whatever this run converts it converts that way, but
-/// a seeded commit may have been written before the redaction applied, so a tree of one is reused
-/// only when nothing under it is redacted. While any redaction is applied, that check reads every
-/// tree under such a reused commit once per run, so the cost is no longer only the changed paths.
+/// A file whose content is an applied redaction's hash is left out of the git tree, and so is one
+/// whose content the unavailable record lists and the store lacks (withheld by the host of a
+/// remote); a folder that held nothing else is left out with them. Whatever this run converts it
+/// converts that way, but a seeded commit may have been written before the redaction applied, so a
+/// tree of one is reused only when nothing under it is redacted; while the redaction record is
+/// non-empty, that check reads every tree under such a reused commit once per run, so the cost is
+/// no longer only the changed paths. A seeded commit may also have been written while content was
+/// absent, which the unavailable record cannot say once the bytes are back, so a mirror keeps its
+/// own log of the git trees it wrote leaving withheld content out ([`Self::keep_withheld_log`]),
+/// and a logged tree is never reused.
 pub(crate) struct Exporter<'a> {
     repo: &'a GitRepo,
     exported: HashMap<String, ExportedCommit>,
@@ -574,20 +585,48 @@ pub(crate) struct Exporter<'a> {
     blobs_written: usize,
     /// The redactions applied here, whose files every commit leaves out.
     applied: AppliedSet,
-    /// The files each converted forklift tree left out, by path under it and content hash. A tree
-    /// that left nothing out has no entry.
-    omitted_in: HashMap<String, Vec<(String, String)>>,
+    /// The content recorded unavailable here: a file of it the store lacks is left out.
+    unavailable: UnavailableSet,
+    /// The files each converted forklift tree left out, by path under it, content hash and why. A
+    /// tree that left nothing out has no entry.
+    omitted_in: HashMap<String, Vec<(String, String, LeftOut)>>,
+    /// The git trees written leaving withheld content out, by this run or a logged earlier one,
+    /// when this exporter keeps the log; none of them is reused for a forklift tree.
+    withheld_trees: Option<HashSet<String>>,
+    /// The trees in `withheld_trees` written since the log was last appended to, which must reach
+    /// it before a commit names them.
+    withheld_unlogged: Vec<String>,
+    /// Whether a flush of the log failed in this run, leaving it in doubt: no later commit in the
+    /// run is written, since any of them may reuse a tree noted but not logged.
+    withheld_log_failed: bool,
     /// The forklift trees that held entries, every one of which was left out.
     emptied: HashSet<String>,
     /// Whether nothing under a forklift tree is redacted, for the trees asked about.
     clean: HashMap<String, bool>,
-    /// The files left out of the commits written since the last [`Self::take_redacted`], by path
-    /// and content hash, each with the parcels whose commits left it out, in the order written.
+    /// The files left out of the commits written since the last [`Self::take_redacted`] for a
+    /// redaction, by path and content hash, each with the parcels whose commits left it out, in
+    /// the order written.
     redacted: BTreeMap<(String, String), Vec<String>>,
+    /// As `redacted`, for content withheld by the host of a remote, since the last
+    /// [`Self::take_withheld`], each with the host's statement when it was left out.
+    withheld: BTreeMap<(String, String), (String, Vec<String>)>,
 }
 
+/// Why an export left a file out.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum LeftOut {
+    /// This warehouse applied a redaction of its content.
+    Redacted,
+    /// This warehouse lacks its content, which the host of a remote withholds on this statement.
+    Withheld(String),
+}
+
+/// The log, in a mirror's git folder, of the git trees its runs wrote leaving withheld content out:
+/// one hash per line.
+const WITHHELD_TREES_LOG: &str = "forklift-withheld-trees";
+
 impl<'a> Exporter<'a> {
-    pub(crate) fn new(repo: &'a GitRepo, applied: AppliedSet) -> Exporter<'a> {
+    pub(crate) fn new(repo: &'a GitRepo, applied: AppliedSet, unavailable: UnavailableSet) -> Exporter<'a> {
         Exporter {
             repo,
             exported: HashMap::new(),
@@ -596,22 +635,140 @@ impl<'a> Exporter<'a> {
             trees_written: 0,
             blobs_written: 0,
             applied,
+            unavailable,
             omitted_in: HashMap::new(),
+            withheld_trees: None,
+            withheld_unlogged: Vec::new(),
+            withheld_log_failed: false,
             emptied: HashSet::new(),
             clean: HashMap::new(),
             redacted: BTreeMap::new(),
+            withheld: BTreeMap::new(),
         }
     }
 
-    /// The files left out of the commits written since the last call, sorted by path.
+    /// The files left out of the commits written since the last call for a redaction, sorted by
+    /// path.
     pub(crate) fn take_redacted(&mut self) -> Vec<RedactedFile> {
         std::mem::take(&mut self.redacted).into_iter()
             .map(|((path, hash), parcels)| RedactedFile { path, hash, parcels })
             .collect()
     }
 
+    /// The files left out of the commits written since the last call because this warehouse lacks
+    /// content the host of a remote withholds, sorted by path, each with the host's statement.
+    pub(crate) fn take_withheld(&mut self) -> Vec<WithheldFile> {
+        std::mem::take(&mut self.withheld).into_iter()
+            .map(|((path, hash), (statement, parcels))| WithheldFile { path, hash, statement, parcels })
+            .collect()
+    }
+
+    /// Read the unavailable record again, after a fetch that may have added to it, so a file whose
+    /// content it now lists is left out rather than read. No tree converted or reused before
+    /// depends on the record: a converted one read every file it kept, and a reused one is judged
+    /// by the redaction record and the withheld-trees log alone.
+    pub(crate) fn reread_unavailable(&mut self) -> Result<(), String> {
+        self.unavailable = unavailable::read_unavailable()?;
+
+        Ok(())
+    }
+
+    /// Keep the log of the git trees written leaving withheld content out, in the repository's
+    /// git folder: read what earlier runs logged, and log each such tree this run writes before it
+    /// is used. For a repository whose commits later runs build on (a mirror), so a tree written
+    /// while content was absent is never reused once the bytes are back, which no record held
+    /// here can tell.
+    pub(crate) fn keep_withheld_log(&mut self) -> Result<(), String> {
+        let path = self.repo.git_dir().join(WITHHELD_TREES_LOG);
+        let logged = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(format!("Could not read {}: {}", path.display(), error)),
+        };
+        // Text after the last newline is a torn append, from a run stopped before any commit named
+        // its tree: no tree, cut off so the next append starts a fresh line. Any whole line
+        // unreadable is refused rather than skipped, since a tree it named would then be reused.
+        let kept = logged.iter().rposition(|byte| *byte == b'\n').map_or(0, |end| end + 1);
+        let whole = &logged[..kept.saturating_sub(1)];
+        if kept < logged.len() {
+            let fail = |error: std::io::Error| format!("Could not write {}: {}", path.display(), error);
+            let log = std::fs::OpenOptions::new().write(true).open(&path).map_err(fail)?;
+            log.set_len(kept as u64).map_err(fail)?;
+            if file_utils::fsync_enabled() {
+                log.sync_all().map_err(fail)?;
+            }
+        }
+        let mut trees = HashSet::new();
+        for line in whole.split(|byte| *byte == b'\n').filter(|_| kept > 0) {
+            // A git object id: SHA-1 or SHA-256, as git prints it.
+            let hash = std::str::from_utf8(line).ok()
+                .filter(|hash| matches!(hash.len(), 40 | 64) && hash.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
+            let Some(hash) = hash else {
+                return Err(format!("{} holds a line this build cannot read: \"{}\"",
+                    path.display(), sanitize(&String::from_utf8_lossy(line))));
+            };
+            trees.insert(hash.to_string());
+        }
+        self.withheld_trees = Some(trees);
+
+        Ok(())
+    }
+
+    /// Note `git_tree` as written leaving withheld content out, when the log is kept; it reaches
+    /// the log at the next [`Self::flush_withheld_log`].
+    fn log_withheld_tree(&mut self, git_tree: &str) {
+        if let Some(trees) = self.withheld_trees.as_mut() {
+            if trees.insert(git_tree.to_string()) {
+                self.withheld_unlogged.push(git_tree.to_string());
+            }
+        }
+    }
+
+    /// Append the trees noted since the last flush to the log, durably: called before a commit
+    /// that may name them is written.
+    fn flush_withheld_log(&mut self) -> Result<(), String> {
+        if self.withheld_unlogged.is_empty() {
+            return Ok(());
+        }
+        if self.withheld_log_failed {
+            return Err(format!(
+                "Writing {} failed earlier in this run, so no further commit is written; run \"forklift git mirror\" again once it can be written",
+                self.repo.git_dir().join(WITHHELD_TREES_LOG).display()));
+        }
+        let flushed = self.append_withheld_log();
+        self.withheld_log_failed = flushed.is_err();
+
+        flushed
+    }
+
+    /// Append the noted trees to the log and make it durable, its folder too when it is new.
+    fn append_withheld_log(&mut self) -> Result<(), String> {
+        let dir = self.repo.git_dir();
+        let path = dir.join(WITHHELD_TREES_LOG);
+        let fail = |error: std::io::Error| format!("Could not write {}: {}", path.display(), error);
+        let created = !path.exists();
+        // A write handle, not an append-only one, which Windows refuses to flush.
+        let mut log = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&path).map_err(fail)?;
+        let end = std::io::Seek::seek(&mut log, std::io::SeekFrom::End(0)).map_err(fail)?;
+        let lines: String = self.withheld_unlogged.iter().map(|tree| format!("{}\n", tree)).collect();
+        let written = std::io::Write::write_all(&mut log, lines.as_bytes())
+            .and_then(|()| if file_utils::fsync_enabled() { log.sync_all() } else { Ok(()) });
+        if let Err(error) = written {
+            // Cut a partial batch back off; a tail this cannot cut is a torn append the next run's
+            // read cuts, since no later flush in this run appends after it.
+            let _ = log.set_len(end);
+            return Err(fail(error));
+        }
+        if created {
+            file_utils::sync_dir(&dir)?;
+        }
+        self.withheld_unlogged.clear();
+
+        Ok(())
+    }
+
     /// Whether nothing under the forklift tree `forklift_hash` is a file an applied redaction
-    /// names, so a git tree written for it before the redaction applied still holds no copy.
+    /// names, so a git tree written for it before the redaction applied holds no copy.
     fn is_clean(&mut self, forklift_hash: &str) -> Result<bool, String> {
         if self.applied.is_empty() {
             return Ok(true);
@@ -621,7 +778,8 @@ impl<'a> Exporter<'a> {
         }
 
         let tree = object_utils::load_tree(forklift_hash)?;
-        let mut clean = !tree.get_files().any(|(_, item)| self.applied.contains(&item.hash));
+        let mut clean = !tree.get_files()
+            .any(|(_, item)| self.applied.contains(&item.hash));
         for (_, item) in tree.get_subtrees() {
             if !clean {
                 break;
@@ -679,11 +837,7 @@ impl<'a> Exporter<'a> {
         let base = parents.first().map(|parent| (parent.forklift_tree.clone(), parent.git_tree.clone()));
 
         let tree = self.convert_tree(&parcel.tree_hash, base.as_ref().map(|(forklift, git)| (forklift.as_str(), git.as_str())))?;
-        if let Some(omitted) = self.omitted_in.get(&parcel.tree_hash) {
-            for (path, hash) in omitted {
-                self.redacted.entry((path.clone(), hash.clone())).or_default().push(forklift_hash.to_string());
-            }
-        }
+        self.flush_withheld_log()?;
         let mut args = vec!["commit-tree".to_string(), tree.clone()];
         for commit in parent_commits {
             args.extend(["-p".to_string(), commit]);
@@ -707,6 +861,17 @@ impl<'a> Exporter<'a> {
             Some(commit_message(&parcel, forklift_hash).as_bytes()),
         )?.trim().to_string();
 
+        // Reported once the commit that left them out is written.
+        if let Some(omitted) = self.omitted_in.get(&parcel.tree_hash) {
+            for (path, hash, why) in omitted {
+                let key = (path.clone(), hash.clone());
+                match why {
+                    LeftOut::Redacted => self.redacted.entry(key).or_default(),
+                    LeftOut::Withheld(statement) => &mut self.withheld.entry(key)
+                        .or_insert_with(|| (statement.clone(), Vec::new())).1,
+                }.push(forklift_hash.to_string());
+            }
+        }
         self.exported.insert(forklift_hash.to_string(), ExportedCommit {
             commit: commit.clone(),
             git_tree: tree,
@@ -720,14 +885,16 @@ impl<'a> Exporter<'a> {
     /// same path in the first parent, with the git tree it was exported as. An entry this run has
     /// not converted yet, whose forklift hash matches the base's entry of the same name and kind,
     /// reuses that entry's git hash. Only the hash: the mode is always recomputed from the entry's
-    /// own type. A file an applied redaction names is never reused, and a base tree equal to this
-    /// one is reused only when nothing under it is redacted.
+    /// own type. A file an applied redaction names, or one whose content the store lacks and the
+    /// unavailable record lists, is left out, never reused, and a base tree equal to this one is
+    /// reused only when nothing under it is redacted and the withheld-trees log does not name it.
     fn convert_tree(&mut self, forklift_hash: &str, base: Option<(&str, &str)>) -> Result<String, String> {
         if let Some(hash) = self.trees.get(forklift_hash) {
             return Ok(hash.clone());
         }
         if let Some((base_forklift, base_git)) = base {
-            if base_forklift == forklift_hash && self.is_clean(forklift_hash)? {
+            let logged = self.withheld_trees.as_ref().is_some_and(|trees| trees.contains(base_git));
+            if base_forklift == forklift_hash && !logged && self.is_clean(forklift_hash)? {
                 self.trees.insert(forklift_hash.to_string(), base_git.to_string());
                 return Ok(base_git.to_string());
             }
@@ -742,12 +909,19 @@ impl<'a> Exporter<'a> {
         let mut base_entries: Option<HashMap<String, (String, String)>> = None;
 
         let mut entries = String::new();
-        let mut omitted: Vec<(String, String)> = Vec::new();
+        let mut omitted: Vec<(String, String, LeftOut)> = Vec::new();
 
         for (name, item) in tree.get_files() {
-            // Left out, never replaced: placeholder content would read as a real version of it.
+            // Left out, never replaced: placeholder content would read as a real version of it. A
+            // redaction outranks a withholding, as it does on every read.
             if self.applied.contains(&item.hash) {
-                omitted.push((name.to_string(), item.hash.clone()));
+                omitted.push((name.to_string(), item.hash.clone(), LeftOut::Redacted));
+                continue;
+            }
+            if self.unavailable.lacks(&item.hash)? {
+                let statement = self.unavailable.statement(&item.hash)
+                    .ok_or(format!("The unavailable record lacks {} but holds no statement for it", item.hash))?;
+                omitted.push((name.to_string(), item.hash.clone(), LeftOut::Withheld(statement.to_string())));
                 continue;
             }
 
@@ -786,9 +960,9 @@ impl<'a> Exporter<'a> {
             }
             let subtree = self.convert_tree(&item.hash, base_subtree.as_ref().map(|(forklift, git)| (forklift.as_str(), git.as_str())))?;
             if let Some(under) = self.omitted_in.get(&item.hash) {
-                omitted.extend(under.iter().map(|(path, hash)| (format!("{}/{}", name, path), hash.clone())));
+                omitted.extend(under.iter().map(|(path, hash, why)| (format!("{}/{}", name, path), hash.clone(), why.clone())));
             }
-            // A folder that held only redacted files is left out with them.
+            // A folder that held only files left out is left out with them.
             if !self.emptied.contains(&item.hash) {
                 entries.push_str(&format!("040000 tree {}\t{}\0", subtree, name));
             }
@@ -796,6 +970,8 @@ impl<'a> Exporter<'a> {
         if entries.is_empty() && !omitted.is_empty() {
             self.emptied.insert(forklift_hash.to_string());
         }
+        let withheld = omitted.iter().any(|(_, _, why)| matches!(why, LeftOut::Withheld(_)));
+
         if !omitted.is_empty() {
             self.omitted_in.insert(forklift_hash.to_string(), omitted);
         }
@@ -804,6 +980,10 @@ impl<'a> Exporter<'a> {
         // C-unquotes a name that begins with `"`, writing a different name than the tree holds.
         // A name never holds NUL (the tree parser refuses one), so NUL frames every entry.
         let git_hash = self.repo.run(&["mktree", "-z"], Some(entries.as_bytes()))?.trim().to_string();
+        // Logged before any commit names it (see export_parcel), so no later run reuses it.
+        if withheld {
+            self.log_withheld_tree(&git_hash);
+        }
         self.trees_written += 1;
         self.trees.insert(forklift_hash.to_string(), git_hash.clone());
 
@@ -1099,6 +1279,12 @@ pub(crate) struct ExportReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     redacted: Vec<RedactedFile>,
 
+    /// The files left out because this warehouse lacks their content, which the host of a remote
+    /// withholds (the unavailable record): each by path, with the host's statement and the parcels
+    /// whose commits carry no version of it in its place.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    withheld: Vec<WithheldFile>,
+
     /// Whether this warehouse has an office, so its parcels and tags carry signatures the export
     /// drops.
     #[serde(skip)]
@@ -1167,6 +1353,43 @@ pub(crate) fn redacted_lines(redacted: &[RedactedFile]) -> Vec<String> {
         .collect()
 }
 
+/// A file an export or a mirror left out of the commits it wrote, because this warehouse lacks its
+/// content, which the host of a remote withholds.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize, Debug)]
+pub(crate) struct WithheldFile {
+    /// The file's path in the parcels' trees, `/`-separated.
+    path: String,
+
+    /// Its content's hash.
+    hash: String,
+
+    /// The statement of the host that withholds it, as this warehouse recorded it.
+    statement: String,
+
+    /// The parcels whose commits left it out, in the order they were written.
+    parcels: Vec<String>,
+}
+
+/// Print each of `withheld` as a line of human output.
+pub(crate) fn render_withheld(withheld: &[WithheldFile]) {
+    for line in withheld_lines(withheld) {
+        println!("  {line}");
+    }
+}
+
+/// One line per file an export left out because this warehouse lacks its withheld content,
+/// unindented. The statement is the host's text.
+pub(crate) fn withheld_lines(withheld: &[WithheldFile]) -> Vec<String> {
+    withheld.iter()
+        .map(|file| format!(
+            "Left out \"{}\" ({}) of {} commit(s): this warehouse does not hold its content, which the \
+            host of a remote withholds. The host's statement: {}",
+            sanitize(&file.path), file.hash, file.parcels.len(), sanitize(&file.statement)
+        ))
+        .collect()
+}
+
 /// How an export's human output names a meta pallet it did not export.
 fn describe_not_exported(name: &str) -> String {
     let bare = name.trim_start_matches(pallet_utils::META_QUALIFIER);
@@ -1203,6 +1426,7 @@ impl CommandOutput for ExportReport {
         }
 
         render_redacted(&self.redacted);
+        render_withheld(&self.withheld);
 
         // A remote's pallet names are its own text.
         for left in &self.remote_left_behind {
@@ -1418,7 +1642,7 @@ mod tests {
         ], Some("merge"));
 
         let repo = create_repo(&warehouse);
-        let mut exporter = Exporter::new(&repo, AppliedSet::default());
+        let mut exporter = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
         let tip = export(&mut exporter, &merge);
 
         let commit = |hash: &str| String::from_utf8(git_bytes(&repo, &["cat-file", "commit", hash])).unwrap();
@@ -1464,12 +1688,12 @@ mod tests {
         let moved = store_parcel(&tree(b"two\n", "moved"), &[&second], vec![action(ParcelActionType::Stack, "op", 3_000)], Some("moved"));
 
         let repo = create_repo(&warehouse);
-        let mut earlier = Exporter::new(&repo, AppliedSet::default());
+        let mut earlier = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
         export(&mut earlier, &first);
         assert_eq!((earlier.trees_written, earlier.blobs_written), (4, 9));
 
         // A later run knows only the commit it builds on, as the mirror does.
-        let mut later = Exporter::new(&repo, AppliedSet::default());
+        let mut later = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
         later.exported.insert(first.clone(), earlier.exported[&first].clone());
         export(&mut later, &second);
         assert_eq!((later.trees_written, later.blobs_written), (3, 1),
@@ -1494,7 +1718,7 @@ mod tests {
         std::fs::write(git_dir.join("info").join("attributes"), "* text\n").unwrap();
         git_bytes(&repo, &["config", "core.autocrlf", "true"]);
 
-        let mut exporter = Exporter::new(&repo, AppliedSet::default());
+        let mut exporter = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
         let commit = export(&mut exporter, &parcel);
 
         assert_eq!(git_bytes(&repo, &["cat-file", "blob", &format!("{}:crlf.txt", commit)]), content.concat());
@@ -1510,7 +1734,7 @@ mod tests {
         let parcel = store_parcel(&tree, &[], vec![action(ParcelActionType::Stack, "op", 1_000)], Some(description));
 
         let repo = create_repo(&warehouse);
-        let mut exporter = Exporter::new(&repo, AppliedSet::default());
+        let mut exporter = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
         let commit = export(&mut exporter, &parcel);
 
         let raw = git_bytes(&repo, &["cat-file", "commit", &commit]);
@@ -1592,5 +1816,35 @@ mod tests {
                 commit
             )
         );
+    }
+
+    /// The withheld-trees log: a torn last append is no tree and is cut off, so a tree logged after
+    /// it is read back whole; a whole line naming no tree is refused, never skipped.
+    #[test]
+    fn the_withheld_trees_log_cuts_a_torn_append_and_refuses_an_unreadable_line() {
+        let warehouse = Warehouse::storage_only("export-withheld-log");
+        let repo = create_repo(&warehouse);
+        let log = repo.git_dir().join(WITHHELD_TREES_LOG);
+        let (first, second) = ("a".repeat(40), "b".repeat(64));
+        std::fs::write(&log, format!("{}\n{}", first, &second[..10])).unwrap();
+
+        let mut exporter = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        exporter.keep_withheld_log().unwrap();
+        assert_eq!(exporter.withheld_trees, Some(HashSet::from([first.clone()])));
+        exporter.log_withheld_tree(&second);
+        exporter.flush_withheld_log().unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("{}\n{}\n", first, second));
+
+        let mut again = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        again.keep_withheld_log().unwrap();
+        assert_eq!(again.withheld_trees, Some(HashSet::from([first.clone(), second.clone()])));
+
+        std::fs::write(&log, format!("{}\nnot a tree\n", first)).unwrap();
+        let mut refused = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        assert!(refused.keep_withheld_log().unwrap_err().contains("not a tree"));
+
+        std::fs::write(&log, [first.as_bytes(), b"\n\xff\n"].concat()).unwrap();
+        let mut garbled = Exporter::new(&repo, AppliedSet::default(), UnavailableSet::default());
+        assert!(garbled.keep_withheld_log().unwrap_err().contains("cannot read"));
     }
 }
