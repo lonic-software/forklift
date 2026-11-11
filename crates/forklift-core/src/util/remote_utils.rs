@@ -10479,7 +10479,7 @@ mod tests {
         fn start_refusing_intake(withheld: HashSet<String>, refusals: usize) -> LateWithholdingRemote {
             use std::io::Write;
 
-            let refusals = Arc::new(std::sync::atomic::AtomicUsize::new(refusals));
+            let refusals = Arc::new(std::sync::Mutex::new(refusals));
 
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
@@ -10510,11 +10510,9 @@ mod tests {
                             }
                             if let Some(hash) = path.strip_prefix("/v1/withheld/").and_then(|rest| rest.strip_suffix("/recipe")) {
                                 intake_log.lock().unwrap().push((hash.to_string(), body.clone()));
-                                let refused = refusals.fetch_update(
-                                    std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst,
-                                    |left| left.checked_sub(1),
-                                );
-                                if refused.is_ok() {
+                                let mut left = refusals.lock().unwrap();
+                                if *left > 0 {
+                                    *left -= 1;
                                     status = "422 Unprocessable Entity";
                                 }
                             }
