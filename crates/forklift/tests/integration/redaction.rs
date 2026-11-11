@@ -3732,6 +3732,64 @@ fn git_export_leaves_out_a_file_whose_content_the_remote_withholds_and_names_it(
     assert!(human.contains(&format!("The host's statement: {}", TAKEDOWN)), "{}", human);
 }
 
+/// `git export` in a served root leaves out a file whose content that root's own host withholds,
+/// whether the store still holds the copy (withheld while the server was not serving, so nothing
+/// deleted it yet) or the served root has deleted it, and names it with the host's statement. The
+/// earlier version of the file is exported as before, and nothing reads as redacted or as withheld
+/// by a remote's host.
+///
+/// Revert: leave the withheld record out of the export → the stored copy is written into git, and
+/// the deleted one fails the export as a missing object.
+#[test]
+fn git_export_in_a_served_root_leaves_out_content_its_host_withholds() {
+    for deleted in [false, true] {
+        let name = if deleted { "export-here-deleted" } else { "export-here-stored" };
+        let mut takedown = takedown(name);
+        let head = match deleted {
+            true => {
+                takedown.withhold_new_film(false);
+                takedown.server.main()
+            }
+            false => {
+                takedown.owner.stack("media/film.mkv", b"the new film\n", "new film");
+                takedown.owner.run_ok(&["lift"]);
+                let head = takedown.server.main();
+                let _ = takedown.server.child.kill();
+                let _ = takedown.server.child.wait();
+                takedown.film = hash_of(b"the new film\n");
+                let added = withhold(&takedown.server.root, &["add", &takedown.film, "--statement", TAKEDOWN]);
+                assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+                head
+            }
+        };
+        let served = Warehouse { root: takedown.server.root.clone(), home: takedown.owner.home.clone() };
+        assert_eq!(served.holds_loose(&takedown.film), !deleted, "the fixture's copy is {}",
+            if deleted { "deleted" } else { "stored" });
+
+        let target = takedown.server.root.parent().unwrap().join(format!("{}-git", name));
+        let _ = std::fs::remove_dir_all(&target);
+        let _ = std::fs::remove_dir_all(target.with_extension("2"));
+        let exported = served.json(&["git", "export", target.to_str().unwrap()]);
+        assert_eq!(exported["ok"], true, "{}", exported);
+        assert_eq!(exported["data"]["withheld_here"], serde_json::json!([
+            { "path": "media/film.mkv", "hash": takedown.film, "statement": TAKEDOWN, "parcels": [head] }
+        ]), "{}", exported);
+        assert_eq!(exported["data"]["withheld"], serde_json::Value::Null, "{}", exported);
+        assert_eq!(exported["data"]["redacted"], serde_json::Value::Null, "{}", exported);
+
+        let paths = git_paths(&target, "main");
+        assert!(!paths.contains(&"media/film.mkv".to_string()), "{:?}", paths);
+        assert!(paths.contains(&"media/trailer.mkv".to_string()), "{:?}", paths);
+        assert!(git_paths(&target, "main~1").contains(&"media/film.mkv".to_string()), "the old film is exported");
+
+        let human = String::from_utf8_lossy(&served.run_ok(&["git", "export", target.with_extension("2").to_str().unwrap()]).stdout)
+            .into_owned();
+        assert!(human.contains("Left out \"media/film.mkv\""), "{}", human);
+        assert!(human.contains("the host of this warehouse withholds its content"), "{}", human);
+        assert!(human.contains(&format!("The host's statement: {}", TAKEDOWN)), "{}", human);
+    }
+}
+
 /// `git mirror` in a warehouse behind its remote takes the new history without the content the
 /// remote's host withholds, recording it unavailable as a lower does, and its export leaves the file
 /// out of the commit it pushes, naming it with the host's statement. The film is chunked, so what

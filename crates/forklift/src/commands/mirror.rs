@@ -7,7 +7,7 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{self, RemoteClient};
 use forklift_core::util::{
     applied_redactions, config_utils, file_utils, graph_utils, merge_utils, meta_tree, mirror_utils, object_utils,
-    pallet_utils, scope_utils, tag_utils, take_utils, unavailable,
+    pallet_utils, scope_utils, tag_utils, take_utils, unavailable, withholding,
 };
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use crate::commands::export_git::{self, Exporter, GitRepo, RedactedFile, SkippedTag, WithheldFile, WritableTag, EXPORT_LAYOUT};
@@ -119,6 +119,7 @@ pub async fn handle_command() -> Result<(), String> {
             lines.push(format!("  \"{}\": {}", outcome.pallet, outcome.message.as_deref().unwrap_or_default()));
             lines.extend(export_git::redacted_lines(&outcome.redacted).into_iter()
                 .chain(export_git::withheld_lines(&outcome.withheld))
+                .chain(export_git::withheld_here_lines(&outcome.withheld_here))
                 .map(|line| format!("    {line}")));
         }
     }
@@ -523,7 +524,8 @@ impl<'a> Run<'a> {
             from: mirror_utils::warehouse_root(),
             unattended,
             // The unavailable record is read before each export, after the fetch that may add to it.
-            exporter: Exporter::new(repo, applied_redactions::read_applied()?, unavailable::UnavailableSet::default()),
+            exporter: Exporter::new(repo, applied_redactions::read_applied()?, withholding::read_withheld()?,
+                unavailable::UnavailableSet::default()),
             boundaries: Vec::new(),
             pending,
             refused,
@@ -575,6 +577,7 @@ impl<'a> Run<'a> {
         };
         outcome.redacted = self.exporter.take_redacted();
         outcome.withheld = self.exporter.take_withheld();
+        outcome.withheld_here = self.exporter.take_withheld_here();
 
         outcome
     }
@@ -1142,18 +1145,25 @@ pub(crate) struct PalletMirror {
     /// the commit, as `redacted` is.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     withheld: Vec<WithheldFile>,
+
+    /// The files left out of the commits this run wrote, because this warehouse's host withholds
+    /// their content, whether or not the store still holds a copy: each by path, with the host's
+    /// statement and the parcels whose commits left it out. Named only under the first pallet whose
+    /// export wrote the commit, as `redacted` is.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    withheld_here: Vec<WithheldFile>,
 }
 
 impl PalletMirror {
     fn new(pallet: &str, status: MirrorStatus, message: String) -> PalletMirror {
         PalletMirror { pallet: pallet.to_string(), status, commit: None, exported: 0, message: Some(message), redacted: Vec::new(),
-            withheld: Vec::new() }
+            withheld: Vec::new(), withheld_here: Vec::new() }
     }
 
     fn in_step(pallet: &str, status: MirrorStatus, commit: &str, exported: usize) -> PalletMirror {
         PalletMirror {
             pallet: pallet.to_string(), status, commit: Some(commit.to_string()), exported, message: None, redacted: Vec::new(),
-            withheld: Vec::new(),
+            withheld: Vec::new(), withheld_here: Vec::new(),
         }
     }
 
@@ -1176,6 +1186,7 @@ impl PalletMirror {
         }
         export_git::render_redacted(&self.redacted);
         export_git::render_withheld(&self.withheld);
+        export_git::render_withheld_here(&self.withheld_here);
     }
 }
 
