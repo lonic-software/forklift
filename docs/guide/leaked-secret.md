@@ -2,9 +2,9 @@
 
 A password, an API token or a private key went into a parcel, and the parcel was lifted. This page
 says what to do, in order. **Rotating the secret comes first**, and it is the step that actually
-protects you. Redacting it afterwards (`forklift redact`) removes the content from every warehouse
-that hears of the redaction, so it stops spreading, but it cannot reach a copy that has already
-left.
+protects you. Redacting it afterwards (`forklift redact`) stops it spreading: the server deletes its
+copy, and each warehouse that takes from the server deletes its copy once nothing it still holds
+needs the file. It cannot reach a copy that has already left Forklift.
 
 As in the [tutorial](tutorial.md), each `$` line is a command and the lines under it are what
 forklift prints. A `…` stands for text that differs on your machine. A word in angle brackets, such
@@ -19,8 +19,8 @@ password, a new key pair. Do this before anything on this page, and treat the ol
 from the moment it was lifted. A redaction cannot do this part for you, because by the time you
 notice the leak the content may already be outside Forklift's reach:
 
-- in a teammate's warehouse, and in their working folder as a file, from a `clone` or `lower` made
-  while the content was there;
+- in a teammate's working folder as a file, or in a warehouse that copied it and never takes from
+  the server again;
 - in a git repository written by `forklift git export`, or in the git mirror
   (`.forklift/mirror.git`) that `forklift git mirror` keeps;
 - in a CI checkout, a backup of the server or of anyone's disk, an editor's history, a terminal's
@@ -138,11 +138,13 @@ that needs that content, such as a `show`, `restore` or `diff` of the first parc
 
 ## 6. Every copy that hears of it
 
-Each teammate's warehouse applies the redaction the next time it takes from the remote, once
-nothing it holds still names the content: a pallet of their own whose head has the file, or work
-they have staged or parked, keeps the copy until they take the file out. A `lower` in the teammate's
-copy deletes the content, along with `settings.env` in its working folder, since
-the file is no longer tracked:
+Each teammate's warehouse applies the redaction the next time it takes from the remote. A pallet
+of their own whose head still has the file keeps it pending until they take the file out of that
+head, as in section 3. Once it is applied, the warehouse deletes its copy unless work there still
+needs the file (what is checked out, staged or parked, or a consolidation or cherry-pick under way);
+then it keeps the copy, and `forklift redact apply` names what holds it. A `lower` in the teammate's
+copy deletes the content, along with `settings.env` in its working folder, since the file is no
+longer tracked:
 
 ```console
 $ cd ../copy
@@ -156,7 +158,7 @@ $ forklift redact list
     applied
 ```
 
-A new `clone` never fetches the content at all. A git mirror the warehouse keeps
+Once the server has applied the redaction, a new `clone` never fetches the content at all. A git mirror the warehouse keeps
 (`.forklift/mirror.git`) may still hold a copy written before the redaction: forklift does not
 delete it, and the command that applied the redaction names it. Delete or rewrite that mirror
 yourself, along with any git repository an earlier `forklift git export` wrote.

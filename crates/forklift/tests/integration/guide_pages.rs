@@ -683,38 +683,33 @@ impl Reader {
         }
     }
 
-    /// Each server that has exited or printed on stderr, with what it printed; empty if none has.
-    fn server_trouble(&mut self) -> String {
-        let mut trouble = String::new();
-        for server in &mut self.servers {
-            let exited = server.child.try_wait().unwrap();
-            let stderr = std::fs::read_to_string(&server.stderr).unwrap();
-            if exited.is_some() || !stderr.is_empty() {
-                trouble.push_str(&format!(
-                    "\n\nThe server started at line {} exited ({:?}) or printed on stderr:\n{}",
-                    server.line, exited, stderr
-                ));
-            }
-        }
-        trouble
-    }
-
     /// Each server that has exited, or whose stderr is not what the page shows it printing, with
-    /// what it printed; empty if every server matches. A server prints as the commands it serves
-    /// finish, so one that has printed less than the page shows is given a while to catch up.
-    fn server_mismatch(&mut self) -> String {
+    /// what it printed and what the page shows; empty if every server matches. After a failed
+    /// step it reports what the servers have printed so far. Once the run is over (`finished`),
+    /// a server still printing what the commands it served left it to do is given until one
+    /// deadline shared by every server to catch up, kept running a moment past a match so a line
+    /// printed just after it is seen, and then stopped before its stderr is read for the last
+    /// time, so nothing it printed goes unchecked.
+    fn server_mismatch(&mut self, finished: bool) -> String {
+        let read = |server: &Server| printed_lines(&std::fs::read(&server.stderr).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut mismatch = String::new();
         for server in &mut self.servers {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            let printed = loop {
-                let printed = printed_lines(&std::fs::read(&server.stderr).unwrap());
-                let matches = output_matches(&server.later, &printed, &mut self.bound.clone());
-                if matches || printed.len() > server.later.len() || std::time::Instant::now() > deadline {
-                    break printed;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            };
             let exited = server.child.try_wait().unwrap();
+            if finished && exited.is_none() {
+                loop {
+                    let printed = read(server);
+                    let matches = output_matches(&server.later, &printed, &mut self.bound.clone());
+                    if matches || printed.len() > server.later.len() || std::time::Instant::now() > deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let _ = server.child.kill();
+                let _ = server.child.wait();
+            }
+            let printed = read(server);
             if exited.is_some() || !output_matches(&server.later, &printed, &mut self.bound.clone()) {
                 mismatch.push_str(&format!(
                     "\n\nThe server started at line {} exited ({:?}) or printed on stderr\n{}\n\nThe \
@@ -793,13 +788,13 @@ fn run_page(name: &str) {
             status == Some(0) && output_matches(&expected, &printed, &mut reader.bound),
             "{} line {}: `{}` exited {:?} and printed\n{}\n\nThe page shows\n{}{}",
             label, step.line, step.command, status, printed.join("\n"), expected.join("\n"),
-            reader.server_trouble()
+            reader.server_mismatch(false)
         );
     }
 
     // A server's second terminal shows its stderr too, which must be what the page shows. A
     // server that died mid-run is reported with the step that failed because of it.
-    let trouble = reader.server_mismatch();
+    let trouble = reader.server_mismatch(true);
     assert!(trouble.is_empty(), "{}:{}", label, trouble);
 
     drop(reader);
@@ -831,15 +826,15 @@ fn leaving_runs_as_written() {
     run_page("leaving.md");
 }
 
-/// A page that shows commands in a `console` block promises they run as shown, so a page with one
-/// is either run here or a failure: adding examples to a page cannot leave them unrun. Every page
-/// in the repository is read, and a fence counts in any form `parse_steps` would refuse as well as
-/// the one it runs: either fence character, any case, indented, in a list item or a quote.
 #[test]
 fn leaked_secret_runs_as_written() {
     run_page("leaked-secret.md");
 }
 
+/// A page that shows commands in a `console` block promises they run as shown, so a page with one
+/// is either run here or a failure: adding examples to a page cannot leave them unrun. Every page
+/// in the repository is read, and a fence counts in any form `parse_steps` would refuse as well as
+/// the one it runs: either fence character, any case, indented, in a list item or a quote.
 #[test]
 fn every_page_with_console_blocks_is_run() {
     for path in tracked_pages() {
