@@ -7026,11 +7026,15 @@ async fn upload_history(client: &RemoteClient,
     left_out.met_withheld.extend(negotiation.withheld().iter().cloned());
 
     // Every withheld hash the remote has no digest for: the handshake's entries without one, and
-    // the takedowns first heard of in the negotiation, whose entries the handshake did not show.
-    let undigested: BTreeSet<String> = info.withheld.iter().flatten()
-        .filter(|item| item.chunks.is_none())
-        .map(|item| item.hash.clone())
-        .chain(negotiation.withheld().iter().cloned())
+    // the takedowns first heard of in a negotiation, whose entries the handshake did not show. A
+    // late one an earlier pass learned is not offered again, so the last negotiation lacks it.
+    let digested: HashSet<&str> = info.withheld.iter().flatten()
+        .filter(|item| item.chunks.is_some())
+        .map(|item| item.hash.as_str())
+        .collect();
+    let undigested: BTreeSet<String> = withheld.iter().chain(negotiation.withheld())
+        .filter(|hash| !digested.contains(hash.as_str()))
+        .cloned()
         .collect();
 
     progress.status("Uploading objects");
@@ -10406,6 +10410,7 @@ mod tests {
         url: String,
         negotiated: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
         put: Arc<std::sync::Mutex<Vec<String>>>,
+        intake: Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
     }
 
     impl LateWithholdingRemote {
@@ -10418,7 +10423,8 @@ mod tests {
             let url = format!("http://{}", listener.local_addr().unwrap());
             let negotiated = Arc::new(std::sync::Mutex::new(Vec::new()));
             let put = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let (negotiated_log, put_log) = (Arc::clone(&negotiated), Arc::clone(&put));
+            let intake = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (negotiated_log, put_log, intake_log) = (Arc::clone(&negotiated), Arc::clone(&put), Arc::clone(&intake));
 
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
@@ -10439,6 +10445,9 @@ mod tests {
                             if let Some(hash) = path.strip_prefix("/v1/objects/") {
                                 put_log.lock().unwrap().push(hash.to_string());
                             }
+                            if let Some(hash) = path.strip_prefix("/v1/withheld/").and_then(|rest| rest.strip_suffix("/recipe")) {
+                                intake_log.lock().unwrap().push((hash.to_string(), body.clone()));
+                            }
                         }
                         "{}".to_string()
                     };
@@ -10452,7 +10461,84 @@ mod tests {
                 }
             });
 
-            LateWithholdingRemote { url, negotiated, put }
+            LateWithholdingRemote { url, negotiated, put, intake }
+        }
+    }
+
+    /// A lift sends a head that advertises the digest intake every withheld recipe it holds that
+    /// the head has no digest for, whether or not the lifted history names it: one the handshake
+    /// lists without a digest, and a takedown only the negotiation reports. It sends no recipe the
+    /// handshake lists with a digest, no blob, and nothing it does not hold; and a head that does
+    /// not advertise the intake is sent nothing.
+    ///
+    /// Revert: send only what the lift's walk met → the unnamed recipe is not sent. Ignore the
+    /// flag → the head without it is sent both. Drop the `chunks` filter → the digested recipe is
+    /// sent.
+    #[test]
+    fn a_lift_sends_the_digest_intake_every_undigested_withheld_recipe_it_holds() {
+        use crate::enums::dir_entry_type::DirEntryType::NormalChunked;
+        use crate::model::remote::{ServedWithholding, ServedWithholdingState};
+
+        for advertised in [true, false] {
+            let _scratch = Scratch::new(&format!("intake-{}", advertised));
+
+            let (late_recipe, _) = store_recipe(&["late-intake"]);
+            let (unnamed_recipe, _) = store_recipe(&["unnamed-intake"]);
+            let (digested_recipe, _) = store_recipe(&["digested-intake"]);
+            let blob = store_blob("a withheld blob\n");
+            let absent = "e".repeat(64);
+            let root = store_tree(&[("late.bin", &late_recipe, NormalChunked)]);
+            let parcel = stack_with_tree(Vec::new(), &root, "intake");
+
+            let listed = |hash: &str, chunks: Option<&str>| ServedWithholding {
+                hash: hash.to_string(),
+                statement: "court order".to_string(),
+                state: ServedWithholdingState::Deleted,
+                chunks: chunks.map(str::to_string),
+            };
+            let info = WarehouseInfo {
+                protocol: PROTOCOL_VERSION.to_string(),
+                default_pallet: "main".to_string(),
+                pallets: BTreeMap::new(),
+                trust: None,
+                chunking: true,
+                tombstones: None,
+                redactions: None,
+                withheld: Some(vec![
+                    listed(&unnamed_recipe, None),
+                    listed(&digested_recipe, Some(&"d".repeat(64))),
+                    listed(&blob, None),
+                    listed(&absent, None),
+                ]),
+                withheld_intake: advertised,
+            };
+
+            let remote = LateWithholdingRemote::start(HashSet::from([late_recipe.clone()]));
+            let client = RemoteClient::new(&remote.url, None).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+            let uploaded = runtime.block_on(upload_history(
+                &client, &parcel, None, &[], &info, &Progress::NONE,
+            )).unwrap();
+            assert!(uploaded.intake_failed.is_empty(), "{:?}", uploaded.intake_failed);
+
+            let mut sent = remote.intake.lock().unwrap().clone();
+            sent.sort();
+
+            if !advertised {
+                assert!(sent.is_empty(), "a head without the intake is sent nothing: {:?}", sent);
+                continue;
+            }
+
+            let mut expected: Vec<(String, Vec<u8>)> = [&late_recipe, &unnamed_recipe].into_iter()
+                .map(|hash| (hash.clone(), file_utils::retrieve_object_by_hash(hash).unwrap()))
+                .collect();
+            expected.sort();
+            assert_eq!(
+                sent.iter().map(|(hash, _)| hash).collect::<Vec<_>>(),
+                expected.iter().map(|(hash, _)| hash).collect::<Vec<_>>(),
+            );
+            assert_eq!(sent, expected, "each is sent as its stored bytes");
         }
     }
 
