@@ -2424,8 +2424,11 @@ pub struct RemoteClient {
     skipped_files: std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
     /// The file contents the remote's host withholds, each beside the host's statement, that a
     /// content walk through this client, or any clone of it, leaves out and records unavailable:
-    /// set by [`Self::leave_out_withheld`]. Empty unless a command set it.
+    /// set by every handshake ([`Self::fetch_info`]). Empty until one succeeds.
     withheld: std::sync::Arc<std::sync::RwLock<std::sync::Arc<BTreeMap<String, String>>>>,
+    /// Set by [`Self::leave_withheld_unrecorded`]: a walk through this client, or any clone of it,
+    /// still leaves out what `withheld` names, but records none of it unavailable.
+    withheld_unrecorded: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Compose the client-facing error for a non-success response, threading a server-side refusal
@@ -2626,6 +2629,7 @@ impl RemoteClient {
             skip_files: Default::default(),
             skipped_files: Default::default(),
             withheld: Default::default(),
+            withheld_unrecorded: Default::default(),
         })
     }
 
@@ -3298,7 +3302,9 @@ impl RemoteClient {
             + std::time::Duration::from_secs_f64(cap as f64 / PRESENCE_BODY_RATE_BYTES_PER_SEC as f64)
     }
 
-    /// Fetch the warehouse handshake and check the protocol version.
+    /// Fetch the warehouse handshake and check the protocol version. From then on every content
+    /// walk through this client, or any clone of it, leaves out the content the handshake lists
+    /// withheld by the remote's host ([`Self::leave_out_withheld`]).
     pub async fn fetch_info(&self) -> Result<WarehouseInfo, String> {
         let posture = Posture::BoundedReads;
         let outcome = self.send_waiting_out(
@@ -3347,6 +3353,8 @@ impl RemoteClient {
             ).into());
         }
 
+        self.leave_out_withheld(&info);
+
         Ok(info)
     }
 
@@ -3369,14 +3377,15 @@ impl RemoteClient {
     /// route, so asking for it would refuse the whole walk. What a walk leaves out and this
     /// warehouse lacks is recorded unavailable, with the host's statement, before the walk
     /// returns ([`unavailable`](crate::util::unavailable)), so a head naming it can be written and
-    /// checked out without it. A meta history's walk leaves none of it out: only a file of a user
+    /// checked out without it; through a client set to [`Self::leave_withheld_unrecorded`], it is
+    /// not. Every handshake sets this ([`Self::fetch_info`]). A meta history's walk leaves none of it out: only a file of a user
     /// pallet's tree is checked out without its content.
     ///
     /// Two entries are not left out, so a walk asks for their content and is refused as it was:
     /// one the handshake also reports redacted and applied, which stays an unapplied redaction
     /// here until this warehouse applies it, and one whose statement is not one the record may
     /// hold ([`withholding::checked_statement`](crate::util::withholding::checked_statement)).
-    pub fn leave_out_withheld(&self, info: &WarehouseInfo) {
+    fn leave_out_withheld(&self, info: &WarehouseInfo) {
         let applied = info.applied_redactions();
         let withheld = info.withheld.iter().flatten()
             .filter(|entry| !applied.contains(entry.hash.as_str()))
@@ -3393,16 +3402,35 @@ impl RemoteClient {
         self.withheld.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(hash)
     }
 
+    /// The host's statement beside `hash`, when a content walk through this client leaves it out
+    /// as content the remote's host withholds ([`Self::leave_out_withheld`]).
+    pub fn withheld_statement(&self, hash: &str) -> Option<String> {
+        self.withheld.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(hash).cloned()
+    }
+
+    /// Make every later walk through this client, or any clone of it, record none of what it
+    /// leaves out as withheld unavailable ([`Self::record_withheld_skips`]). For a command that
+    /// writes no head over what a walk left out, and must not tolerate the absence of content this
+    /// warehouse held as a withholding.
+    pub fn leave_withheld_unrecorded(&self) {
+        self.withheld_unrecorded.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Record unavailable every file a walk through this client left out as withheld by the
     /// remote's host ([`Self::leave_out_withheld`]) that the store lacks, with the host's
     /// statement. Content a redaction this warehouse applied names is left out of the record: its
-    /// absence is tolerated as a redaction already, and outranks a withholding.
+    /// absence is tolerated as a redaction already, and outranks a withholding. Nothing is recorded
+    /// through a client set to [`Self::leave_withheld_unrecorded`].
     ///
     /// # Returns
     /// * `Ok(())`      - Every such file is recorded, or there was none.
     /// * `Err(String)` - The store could not be probed, or the record of applied redactions or the
     ///                   unavailable record could not be read or written.
     fn record_withheld_skips(&self) -> Result<(), String> {
+        if self.withheld_unrecorded.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+
         let withheld = self.withheld.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
 
         if withheld.is_empty() {

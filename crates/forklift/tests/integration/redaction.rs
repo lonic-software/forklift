@@ -3486,6 +3486,45 @@ fn heal_fetches_a_damaged_object_back_without_recording_withheld_content() {
     assert_eq!(record, 0, "heal records no withheld content unavailable");
 }
 
+/// A warehouse that held content its remote's host now withholds, and lost its copy, does not ask
+/// the remote for it: heal reports it still referenced with the host's statement and says no
+/// re-run will bring it back, records nothing unavailable, and still fetches back the damaged
+/// object beside it.
+///
+/// Revert: ask the remote for every candidate, withheld or not → the remote refuses the film, and
+/// its remedy tells the user to re-run once connectivity is restored, without the statement.
+#[test]
+fn heal_does_not_ask_for_content_the_remote_withholds_and_says_so() {
+    let mut takedown = takedown("heal-withheld-candidate");
+    takedown.withhold_new_film(false);
+    let owner = &takedown.owner;
+    assert!(owner.holds_loose(&takedown.film), "the owner held the film before the takedown");
+
+    let trailer = hash_of(b"trailer\n");
+    owner.remove_object(&takedown.film);
+    owner.remove_object(&trailer);
+    let taint = forklift_core::util::taint_utils::taint_dir_path_under(&owner.root);
+    std::fs::create_dir_all(&taint).unwrap();
+    let relative = |hash: &str| format!("objects/{}/{}", &hash[..2], &hash[2..]);
+    std::fs::write(taint.join("taint-1-0"),
+        forklift_core::util::taint_utils::taint_file_bytes(&[&relative(&takedown.film), &relative(&trailer)])).unwrap();
+
+    let healed = owner.json(&["heal"]);
+    assert_eq!(healed["ok"], false, "{}", healed);
+    let message = healed["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("vanished and still referenced: \"{}\"", takedown.film)), "{}", message);
+    assert!(message.contains(&format!("withholds this content (\"{}\")", TAKEDOWN)), "{}", message);
+    assert!(message.contains("a re-run will not either"), "{}", message);
+    assert!(!message.contains("connectivity"), "{}", message);
+    assert!(owner.holds_loose(&trailer), "the damaged object beside it is fetched back");
+
+    let record = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&owner.root);
+        forklift_core::util::unavailable::read_unavailable().unwrap().entries().count()
+    };
+    assert_eq!(record, 0, "heal records no withheld content unavailable");
+}
+
 /// A lift to a remote other than the one whose host withholds the film, of a head naming it,
 /// refuses `content_withheld` with the hash and the host's statement: this warehouse cannot upload
 /// content it was never given, and the other remote's `main` does not move.

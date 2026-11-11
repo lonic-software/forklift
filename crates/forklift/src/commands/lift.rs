@@ -95,17 +95,9 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
         if let Some(remote) = &remote_head {
             if remote != &head && auto_merged < MAX_AUTO_MERGES {
                 // The auto-merge takes their history without content the remote's host withholds,
-                // as a lower does, through a client of its own: the lift's client also serves the
-                // mirror, whose export cannot leave a file out.
-                let merged = match RemoteClient::for_warehouse() {
-                    Ok(merging) => {
-                        merging.leave_out_withheld(&info);
-                        let merged = try_auto_merge(&merging, &pallet, position.base.as_deref(), &head, remote, &progress).await;
-                        batch_lane = batch_lane.or(merging.batch_lane_closure());
-                        merged
-                    }
-                    Err(why) => Err(why.into()),
-                };
+                // as a lower does: the handshake set the client to leave it out.
+                let merged = try_auto_merge(&client, &pallet, position.base.as_deref(), &head, remote, &progress).await;
+                batch_lane = batch_lane.or(client.batch_lane_closure());
 
                 match merged {
                     Ok(true) => {
