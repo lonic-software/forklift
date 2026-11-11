@@ -3507,7 +3507,7 @@ fn heal_does_not_ask_for_content_the_remote_withholds_and_says_so() {
     std::fs::create_dir_all(&taint).unwrap();
     let relative = |hash: &str| format!("objects/{}/{}", &hash[..2], &hash[2..]);
     std::fs::write(taint.join("taint-1-0"),
-        forklift_core::util::taint_utils::taint_file_bytes(&[&relative(&takedown.film), &relative(&trailer)])).unwrap();
+        forklift_core::util::taint_utils::taint_file_bytes([&relative(&takedown.film), &relative(&trailer)])).unwrap();
 
     let healed = owner.json(&["heal"]);
     assert_eq!(healed["ok"], false, "{}", healed);
