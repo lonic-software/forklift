@@ -13656,7 +13656,7 @@ mod tests {
         let client = RemoteClient::new_test_with_budgets(&remote.url, FAST);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
-        let message = runtime.block_on(client.fetch_object("ab")).err().expect("no answer is not a success");
+        let message = runtime.block_on(client.fetch_object("ab")).expect_err("no answer is not a success");
 
         assert!(message.contains(CONNECTION_FAILED), "{}", message);
         assert_eq!(remote.connections(), 3);
@@ -13671,7 +13671,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
         let message = runtime.block_on(client.missing_objects(&[String::from("ab")]))
-            .err().expect("the dropped POST is not retried into the 200");
+            .expect_err("the dropped POST is not retried into the 200");
 
         assert!(message.contains(CONNECTION_FAILED), "{}", message);
         assert_eq!(remote.connections(), 1);
@@ -13684,7 +13684,10 @@ mod tests {
         let client = RemoteClient::new_test_with_budgets(&remote.url, FAST);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
-        let message = runtime.block_on(client.fetch_info()).err().expect("a silent remote is not a success");
+        let message = match runtime.block_on(client.fetch_info()) {
+            Ok(_) => panic!("a silent remote is not a success"),
+            Err(message) => message,
+        };
 
         assert!(message.contains("Timed out while "), "{}", message);
         assert_eq!(remote.connections(), 1);
