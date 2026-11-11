@@ -19,8 +19,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   records that chunk list's digest while it still holds the file, or before it deletes it, and
   reports it to clients in the warehouse's `withheld` list; both judge the file by it. A full
   warehouse with no remote that cannot compare a withheld file this way leaves the redaction
-  undecided rather than calling it applied. The `withheld` and `unavailable` records are now
-  format 2: a record written by an earlier build is refused until it is removed.
+  undecided rather than calling it applied. The AWS head records and reports the digest as well,
+  on its `withheld#<hash>` item. The `withheld` and `unavailable` records are now format 2: a
+  record written by an earlier build is refused until it is removed.
 
 - **A lift gives forklift-server the chunk list of a withheld file it never held.** When the host
   withholds a chunked file before it ever held a copy, a lift from a warehouse that holds the file

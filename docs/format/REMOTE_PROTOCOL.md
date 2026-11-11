@@ -245,7 +245,7 @@ whose kind it cannot read is withheld until it can, refused like any other withh
 chunk-list redaction records it, which the head computed from a copy of the recipe it held. It is
 omitted while the head has no such copy to compute it from, and always for content that is not a
 recipe. A client keeps it in its `unavailable` record, and judges a chunk-list redaction over the
-file by it while it lacks the recipe. The AWS head does not send it yet.
+file by it while it lacks the recipe.
 `withheld_intake` (additive, default `false`) says the head takes a withheld recipe's bytes at
 `PUT /v1/withheld/{hash}/recipe` (below), so a head that withholds a recipe it never held can still
 record its `chunks`. The AWS head does not offer it yet.

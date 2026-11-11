@@ -714,8 +714,9 @@ a file's content hash with the host's statement as the warehouse's `withheld#<ha
 and on the format item (`PutItem`, `ConditionCheckItem`). It reads no object. The head reads the
 items on every request that serves or takes objects, so from the next one on it refuses the content
 with `451 content_withheld` and the statement, and reports it in the handshake. For a chunked file
-it deletes the chunks only that file names, and then its recipe; this build's head deletes no other
-copy yet.
+it records the digest of the file's chunk list on the item, from its own copy of the recipe, and
+then deletes the chunks only that file names, and then the recipe. A plain file's staged copies go
+at once, and its stored copy once the late sweep is due, unless metadata or adopted history names it.
 
 ### `s3:ListBucket` on both roles is unconditional, and has to be
 
