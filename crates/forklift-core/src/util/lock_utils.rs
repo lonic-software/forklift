@@ -634,8 +634,9 @@ impl MoveLock {
 /// file description conflicts with the first, and on Windows a lock is per handle). Only the
 /// ref compare-and-set (which writes and clears tombstones in its hold), the trust install, `heal`'s
 /// restage of a ref or the anchor, the scoped fetch's record and re-check, `scope fetch`'s commit, the
-/// held-heads write, a sealed-object record write, the first served mark and a tombstone drop
-/// (taken inside its serve lock) take it, and none of them calls another: work inside a hold uses the lock-free variants, which take the held lock as
+/// held-heads write, a sealed-object record write, a withheld-record write, the first served mark,
+/// and a tombstone drop and a redaction deletion's chunk-list digest fill (each taken inside its
+/// serve lock) take it, and none of them calls another: work inside a hold uses the lock-free variants, which take the held lock as
 /// an argument.
 pub struct RefLock {
     // Held only to keep the lock: closing the handle releases it.

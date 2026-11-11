@@ -393,8 +393,9 @@ pub struct HeadHolder {
 /// judged by: the redacted hash anywhere in the head's tree, or for a recipe, a chunked file with
 /// the same chunk list. A partial warehouse skips a head, subtree or recipe it does not hold, as
 /// the write check does, so a head can name the content in a part this warehouse never fetched.
-/// Elsewhere an object the walk needs and the store lacks is an error, never a pass; a pallet that
-/// does name the content is reported ahead of that error.
+/// A chunked file whose recipe the store lacks because content is withheld is judged by the digest
+/// recorded for it ([`Absence::Verdict`]). Elsewhere an object the walk needs and the store lacks is
+/// an error, never a pass; a pallet that does name the content is reported ahead of that error.
 pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
     let mut heads = Vec::new();
 
@@ -422,6 +423,7 @@ fn holders_among(redaction: &Redaction, heads: Vec<(String, String)>, what: &str
     let set = RedactedSet::of(redaction);
 
     let partial = crate::util::scope_utils::content_may_be_absent()?;
+    let remote = crate::util::applied_redactions::configured_remote()?.is_some();
     let mut holders = Vec::new();
     let mut undecided = None;
 
@@ -430,9 +432,8 @@ fn holders_among(redaction: &Redaction, heads: Vec<(String, String)>, what: &str
             continue;
         }
 
-        let mut skipped = HashSet::new();
         let named = object_utils::load_parcel(&head)
-            .and_then(|parcel| tree_names(&parcel.tree_hash, &set, &LocalObjects, partial.then_some(&mut skipped)));
+            .and_then(|parcel| tree_names(&parcel.tree_hash, &set, &LocalObjects::default(), &mut Absence::Verdict { partial, remote }));
 
         match named {
             Ok(Some((path, hash))) => holders.push(HeadHolder { pallet, head, path, hash }),
@@ -584,7 +585,7 @@ impl HoldingWalk {
                 }
 
                 for (_, file) in tree.get_files() {
-                    if set.named_by(file, objects, None)?.is_some() {
+                    if set.named_by(file, objects, &mut Absence::Strict)?.is_some() {
                         return Ok(WalkProgress::Names);
                     }
                 }
@@ -722,10 +723,39 @@ pub trait WalkObjects {
     /// A hint that the walk is about to read each of the recipes `hashes`, so a store whose reads
     /// are remote can fetch them in one round. What it cannot fetch the read reports.
     fn prefetch(&self, _hashes: &[String]) {}
+
+    /// What this substrate records of `hash`, a file's content whose read failed: whether it is
+    /// withheld, by whose record, and the chunk-list digest recorded with it. Asked only after a
+    /// read of the recipe failed. A substrate that keeps no such record answers
+    /// [`WithheldRecord::NotRecorded`].
+    fn withheld_record(&self, _hash: &str) -> Result<WithheldRecord, String> {
+        Ok(WithheldRecord::NotRecorded)
+    }
 }
 
-/// The warehouse's own store, read through `object_utils`.
-pub struct LocalObjects;
+/// What a walk's substrate records of a file's content it could not read ([`WalkObjects::withheld_record`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WithheldRecord {
+    /// No record says the content is withheld: its absence is judged as any other.
+    NotRecorded,
+
+    /// The warehouse's own head withholds it. The digest is the head's own, computed from a copy
+    /// it held, so it is exact; `None` when no copy was ever at hand.
+    Host(Option<String>),
+
+    /// The warehouse left it out because its remote's host withholds it. The digest is the one the
+    /// remote reported, which this warehouse cannot check while it lacks the recipe; `None` when
+    /// none was reported, or two remotes reported different ones.
+    Client(Option<String>),
+}
+
+/// The warehouse's own store, read through `object_utils`. One walk's: the withheld and
+/// unavailable records it consults are read once, on the first recipe it cannot read, and kept for
+/// the rest of the walk.
+#[derive(Default)]
+pub struct LocalObjects {
+    records: std::sync::OnceLock<Result<(crate::util::withholding::WithheldSet, crate::util::unavailable::UnavailableSet), String>>,
+}
 
 impl WalkObjects for LocalObjects {
     fn load_tree(&self, hash: &str) -> Result<std::sync::Arc<crate::model::tree_item::TreeItem>, String> {
@@ -738,6 +768,70 @@ impl WalkObjects for LocalObjects {
 
     fn recipe_chunks(&self, hash: &str) -> Result<Vec<String>, String> {
         object_utils::recipe_chunk_hashes(hash)
+    }
+
+    /// From this root's records: the `withheld` record, which its head keeps, and then the
+    /// `unavailable` record, which a fetch from a remote keeps. An object the store holds is not
+    /// recorded, so a read that failed over it stays the damage it is.
+    fn withheld_record(&self, hash: &str) -> Result<WithheldRecord, String> {
+        if file_utils::does_object_exist(hash)? {
+            return Ok(WithheldRecord::NotRecorded);
+        }
+
+        let (withheld, unavailable) = self.records.get_or_init(|| {
+            Ok((crate::util::withholding::read_withheld()?, crate::util::unavailable::read_unavailable()?))
+        }).as_ref().map_err(String::clone)?;
+
+        if let Some(digest) = withheld.digest(hash) {
+            return Ok(WithheldRecord::Host(digest.known().map(str::to_string)));
+        }
+
+        Ok(match unavailable.digest(hash) {
+            Some(digest) => WithheldRecord::Client(digest.known().map(str::to_string)),
+            None => WithheldRecord::NotRecorded,
+        })
+    }
+}
+
+/// What a walk does with a chunked file whose recipe it cannot read, and so whose chunk list it
+/// cannot compare against a chunk-list redaction, and with a subtree it cannot read.
+///
+/// Whatever the policy, a recipe the substrate records withheld with a digest that matches is
+/// redacted content. A host's own digest is exact, so a host recipe with a digest that does not
+/// match passes. What is left depends on the judge:
+enum Absence<'a> {
+    /// Fail on it: the meta walk and the resumable holder walk.
+    Strict,
+
+    /// A write judge: let the write through and record the file in `skipped`, which the write's
+    /// hold re-reads (a recipe stored meanwhile sends the write round again). It does so for a
+    /// withheld recipe with no digest the warehouse can check. That is sound because no warehouse
+    /// that lets such a write through serves the bytes: a host serves no withheld content, and a
+    /// client lacks it. With `partial`, a sparse or cache warehouse also skips any recipe or subtree
+    /// the store lacks.
+    Write { partial: bool, skipped: &'a mut HashSet<String> },
+
+    /// A verdict walk: one whose clean answer may become Applied. A host recipe with no digest fails
+    /// the walk, which leaves the redaction undecided. A recipe that only its remote's record knows
+    /// is passed when `remote` is set, since a remote's report then decides a clean scan, and fails
+    /// the walk otherwise. `partial` is as for [`Absence::Write`].
+    Verdict { partial: bool, remote: bool },
+}
+
+impl Absence<'_> {
+    /// Whether a sparse or cache warehouse's walk skips what the store lacks.
+    fn partial(&self) -> bool {
+        match self {
+            Absence::Strict => false,
+            Absence::Write { partial, .. } | Absence::Verdict { partial, .. } => *partial,
+        }
+    }
+
+    /// Record `hash` skipped, where the policy keeps a record of what it skipped.
+    fn skip(&mut self, hash: &str) {
+        if let Absence::Write { skipped, .. } = self {
+            skipped.insert(hash.to_string());
+        }
     }
 }
 
@@ -812,26 +906,38 @@ impl RedactedSet {
     }
 
     /// Whether this set names `hash`, a file a walk found redacted: the hash itself, or a recipe
-    /// whose chunk list is one this set holds. Only ever asked of a file the walk could read, so a
-    /// recipe that cannot be read is not one this set names.
-    fn names_hash(&self, hash: &str, objects: &dyn WalkObjects) -> bool {
+    /// whose chunk list is one this set holds, read or, for a recipe the substrate records withheld,
+    /// recorded. A recipe whose chunk list can be neither read nor looked up is not one this set
+    /// names.
+    ///
+    /// # Returns
+    /// * `Ok(bool)`    - Whether it names it.
+    /// * `Err(String)` - The substrate's withheld record could not be read.
+    fn names_hash(&self, hash: &str, objects: &dyn WalkObjects) -> Result<bool, String> {
         if self.hashes.contains(hash) {
-            return true;
+            return Ok(true);
         }
 
-        !self.chunk_lists.is_empty() && objects.recipe_chunks(hash)
-            .is_ok_and(|chunks| self.chunk_lists.contains_key(&chunk_list_digest(&chunks)))
+        if self.chunk_lists.is_empty() {
+            return Ok(false);
+        }
+
+        Ok(match objects.recipe_chunks(hash) {
+            Ok(chunks) => self.chunk_lists.contains_key(&chunk_list_digest(&chunks)),
+            Err(_) => match objects.withheld_record(hash)? {
+                WithheldRecord::Host(Some(digest)) | WithheldRecord::Client(Some(digest)) => self.chunk_lists.contains_key(&digest),
+                _ => false,
+            },
+        })
     }
 
-    /// The redacted hash a file entry names: its own hash, or for a chunked file whose recipe the
-    /// store holds, the hash of the redaction its chunk list matches. `partial` tolerates a recipe
-    /// the store lacks, which then carries no chunks this warehouse could hand on, and records it
-    /// as skipped.
+    /// The redacted hash a file entry names: its own hash, or for a chunked file, the hash of the
+    /// redaction its chunk list matches. A recipe the walk cannot read is judged by `absence`.
     fn named_by(&self,
                 entry: &crate::model::tree_item::TreeItem,
                 objects: &dyn WalkObjects,
-                partial: Option<&mut HashSet<String>>) -> Result<Option<String>, String> {
-        self.names_file(&entry.hash, entry.item_type, objects, partial)
+                absence: &mut Absence) -> Result<Option<String>, String> {
+        self.names_file(&entry.hash, entry.item_type, objects, absence)
     }
 
     /// [`RedactedSet::named_by`] for a file of content `hash` stored as `item_type`.
@@ -839,7 +945,7 @@ impl RedactedSet {
                   hash: &str,
                   item_type: DirEntryType,
                   objects: &dyn WalkObjects,
-                  partial: Option<&mut HashSet<String>>) -> Result<Option<String>, String> {
+                  absence: &mut Absence) -> Result<Option<String>, String> {
         if self.hashes.contains(hash) {
             return Ok(Some(hash.to_string()));
         }
@@ -850,33 +956,72 @@ impl RedactedSet {
 
         let chunks = match objects.recipe_chunks(hash) {
             Ok(chunks) => chunks,
-            Err(error) => match partial {
-                Some(skipped) if !file_utils::does_object_exist(hash)? => {
-                    skipped.insert(hash.to_string());
-                    return Ok(None);
-                }
-                _ => return Err(error),
-            },
+            Err(error) => return self.names_unread(hash, error, objects, absence),
         };
 
         Ok(self.chunk_lists.contains_key(&chunk_list_digest(&chunks)).then(|| hash.to_string()))
+    }
+
+    /// [`RedactedSet::names_file`] for the chunked file `hash` whose recipe read failed with
+    /// `error`, by what the substrate records of it and by `absence`.
+    fn names_unread(&self,
+                    hash: &str,
+                    error: String,
+                    objects: &dyn WalkObjects,
+                    absence: &mut Absence) -> Result<Option<String>, String> {
+        let uncomparable = |whose: &str| format!(
+            "The recipe {} is not here: {} withholds it, and no digest of its chunk list that this \
+            warehouse can rely on is recorded, so whether it repeats a redacted recipe's chunk list \
+            cannot be told.",
+            hash, whose
+        );
+
+        let record = objects.withheld_record(hash)?;
+
+        // A recorded digest decides what it can: a match names the file, and a host's own digest
+        // is exact, so a mismatch passes it.
+        match &record {
+            WithheldRecord::Host(Some(digest)) | WithheldRecord::Client(Some(digest)) if self.chunk_lists.contains_key(digest) => {
+                return Ok(Some(hash.to_string()));
+            }
+            WithheldRecord::Host(Some(_)) => return Ok(None),
+            _ => {}
+        }
+
+        // A sparse or cache warehouse lacks what it never fetched, recorded or not: it cannot hand
+        // those bytes on.
+        if absence.partial() && !file_utils::does_object_exist(hash)? {
+            absence.skip(hash);
+            return Ok(None);
+        }
+
+        match (record, absence) {
+            (WithheldRecord::NotRecorded, _) => Err(error),
+            (_, absence @ Absence::Write { .. }) => {
+                absence.skip(hash);
+                Ok(None)
+            }
+            (WithheldRecord::Client(_), Absence::Verdict { remote: true, .. }) => Ok(None),
+            (WithheldRecord::Client(_), _) => Err(uncomparable("the host of a remote")),
+            (_, _) => Err(uncomparable("this warehouse's host")),
+        }
     }
 }
 
 /// A redacted file a tree names: its path from the tree's root, and the redacted hash.
 type Named = (String, String);
 
-/// The first file under `tree` that names content in `set`, walking every subtree once. `partial`
-/// (a sparse or cache warehouse) skips a subtree or recipe the store does not hold: its bytes are
-/// not here, so this warehouse cannot hand them on. A head that receives the parcel judges it
-/// against its own redactions, so a redaction recorded only here does not follow a skipped
-/// subtree. Each skipped object is recorded in
-/// `partial`, so the write's hold can see one stored meanwhile. In a full warehouse a missing
-/// object is an error, never a pass.
+/// The first file under `tree` that names content in `set`, walking every subtree once. A partial
+/// `absence` (a sparse or cache warehouse) skips a subtree or recipe the store does not hold: its
+/// bytes are not here, so this warehouse cannot hand them on. A head that receives the parcel
+/// judges it against its own redactions, so a redaction recorded only here does not follow a
+/// skipped subtree. A write judge's `absence` records each skipped object, so the write's hold can
+/// see one stored meanwhile. A withheld recipe is judged as [`Absence`] says. In a full warehouse
+/// any other missing object is an error, never a pass.
 fn tree_names(tree: &str,
               set: &RedactedSet,
               objects: &dyn WalkObjects,
-              mut partial: Option<&mut HashSet<String>>) -> Result<Option<Named>, String> {
+              absence: &mut Absence) -> Result<Option<Named>, String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut level = vec![(String::new(), tree.to_string())];
 
@@ -890,11 +1035,9 @@ fn tree_names(tree: &str,
         for (prefix, hash) in level {
             match objects.load_tree(&hash) {
                 Ok(loaded) => loaded_level.push((prefix, loaded)),
-                Err(error) => match partial.as_deref_mut() {
-                    Some(skipped) if !file_utils::does_object_exist(&hash)? => {
-                        skipped.insert(hash);
-                    }
-                    _ => return Err(error),
+                Err(error) => match absence.partial() && !file_utils::does_object_exist(&hash)? {
+                    true => absence.skip(&hash),
+                    false => return Err(error),
                 },
             }
         }
@@ -912,7 +1055,7 @@ fn tree_names(tree: &str,
 
         for (prefix, loaded) in &loaded_level {
             for (name, file) in loaded.get_files() {
-                if let Some(redacted) = set.named_by(file, objects, partial.as_deref_mut())? {
+                if let Some(redacted) = set.named_by(file, objects, absence)? {
                     return Ok(Some((format!("{}{}", prefix, name), redacted)));
                 }
             }
@@ -964,7 +1107,7 @@ impl StagingGuard {
     pub fn names_file(&self, hash: &str, item_type: DirEntryType) -> Result<Option<String>, String> {
         let mut skipped = HashSet::new();
 
-        self.set.names_file(hash, item_type, &LocalObjects, self.partial.then_some(&mut skipped))
+        self.set.names_file(hash, item_type, &LocalObjects::default(), &mut Absence::Write { partial: self.partial, skipped: &mut skipped })
     }
 
     /// The first file under `tree` naming redacted content, as its path from the tree's root and
@@ -972,7 +1115,7 @@ impl StagingGuard {
     pub fn names_tree(&self, tree: &str) -> Result<Option<(String, String)>, String> {
         let mut skipped = HashSet::new();
 
-        tree_names(tree, &self.set, &LocalObjects, self.partial.then_some(&mut skipped))
+        tree_names(tree, &self.set, &LocalObjects::default(), &mut Absence::Write { partial: self.partial, skipped: &mut skipped })
     }
 }
 
@@ -1007,7 +1150,7 @@ pub fn refuse_redacted_writes(ops: &[crate::util::shift_utils::FileOp],
         };
 
         if let Some(hash) = guard.names_file(hash, *item_type)? {
-            let next_step = match applied.names_hash(&hash, &LocalObjects) {
+            let next_step = match applied.names_hash(&hash, &LocalObjects::default())? {
                 true => fresh_clone_next_step(),
                 false => next_step(path),
             };
@@ -1234,7 +1377,7 @@ pub fn check_head_write(namespace: pallet_utils::PalletNamespace,
                         served: Option<Served>) -> HeadWriteCheck {
     let redactions = pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME);
     let outcome = match &redactions {
-        Ok(redactions) => check_head_write_at(namespace, name, expected, new, served, redactions.clone(), &LocalObjects,
+        Ok(redactions) => check_head_write_at(namespace, name, expected, new, served, redactions.clone(), &LocalObjects::default(),
                                               crate::util::scope_utils::content_may_be_absent),
         Err(error) => Err(error.clone().into()),
     };
@@ -1319,8 +1462,11 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
         pallet_utils::PalletNamespace::User => {
             let tree = objects.load_parcel(new)?.tree_hash;
             let partial = partial()?;
-            let named = tree_names(&tree, &set, objects, partial.then_some(&mut check.skipped))?;
-            let applied = named.as_ref().is_some_and(|(_, hash)| withheld.names_hash(hash, objects));
+            let named = tree_names(&tree, &set, objects, &mut Absence::Write { partial, skipped: &mut check.skipped })?;
+            let applied = match &named {
+                Some((_, hash)) => withheld.names_hash(hash, objects)?,
+                None => false,
+            };
 
             (named, applied)
         }
@@ -1521,7 +1667,7 @@ fn tree_adds(tree: &str,
                 continue;
             }
 
-            if let Some(redacted) = set.named_by(file, objects, None)? {
+            if let Some(redacted) = set.named_by(file, objects, &mut Absence::Strict)? {
                 return Ok(Some((format!("{}{}", prefix, name), redacted)));
             }
         }
@@ -1570,7 +1716,7 @@ mod tests {
         assert!(!set(&[], &[('x', &['a'])]).is_empty());
 
         let applied_part = set(&['a', 'b'], &[('x', &['a', 'b'])]).filtered(|hash| hash == applied);
-        assert!(applied_part.names_hash(&applied, &LocalObjects) && !applied_part.names_hash(&"b".repeat(64), &LocalObjects));
+        assert!(applied_part.names_hash(&applied, &LocalObjects::default()).unwrap() && !applied_part.names_hash(&"b".repeat(64), &LocalObjects::default()).unwrap());
     }
 
     // Revert: skip the applied re-read in `holds` → a check that exempted a hash applied since
@@ -1696,6 +1842,92 @@ mod tests {
             assert!(validate_redacted_hash(bad).is_err(), "{:?} must be refused", bad);
         }
     }
+    /// A substrate that holds no object and answers every withheld lookup with its record.
+    struct Withheld(WithheldRecord);
+
+    impl WalkObjects for Withheld {
+        fn load_tree(&self, hash: &str) -> Result<std::sync::Arc<crate::model::tree_item::TreeItem>, String> {
+            Err(format!("no tree {}", hash))
+        }
+
+        fn load_parcel(&self, hash: &str) -> Result<crate::model::parcel::Parcel, String> {
+            Err(format!("no parcel {}", hash))
+        }
+
+        fn recipe_chunks(&self, hash: &str) -> Result<Vec<String>, String> {
+            Err(format!("no recipe {}", hash))
+        }
+
+        fn withheld_record(&self, _hash: &str) -> Result<WithheldRecord, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    // Revert: drop the digest lookup → an exact match passes every judge; pass a host's recipe
+    // without a digest in a verdict → a redaction is decided over content nobody compared; pass a
+    // client's without a remote → the same; refuse a write over one → every lift naming withheld
+    // content fails.
+    #[test]
+    fn a_withheld_recipe_is_judged_by_its_recorded_digest() {
+        let redacted = set(&[], &[('x', &['a'])]);
+        let file = "f".repeat(64);
+        let judge = |record: WithheldRecord, absence: &mut Absence| {
+            redacted.names_file(&file, DirEntryType::NormalChunked, &Withheld(record), absence)
+        };
+        let known = |digest: &str| Some(digest.to_string());
+
+        for record in [WithheldRecord::Host(known("x")), WithheldRecord::Client(known("x"))] {
+            let mut skipped = HashSet::new();
+            assert_eq!(judge(record.clone(), &mut Absence::Write { partial: false, skipped: &mut skipped }), Ok(Some(file.clone())));
+            assert_eq!(judge(record.clone(), &mut Absence::Verdict { partial: false, remote: true }), Ok(Some(file.clone())));
+            assert_eq!(judge(record.clone(), &mut Absence::Strict), Ok(Some(file.clone())));
+            assert!(skipped.is_empty());
+            assert!(redacted.names_hash(&file, &Withheld(record)).unwrap());
+        }
+
+        // A host's own digest is exact: a different one passes everywhere.
+        let mut skipped = HashSet::new();
+        assert_eq!(judge(WithheldRecord::Host(known("y")), &mut Absence::Write { partial: false, skipped: &mut skipped }), Ok(None));
+        assert_eq!(judge(WithheldRecord::Host(known("y")), &mut Absence::Verdict { partial: false, remote: false }), Ok(None));
+        assert_eq!(judge(WithheldRecord::Host(known("y")), &mut Absence::Strict), Ok(None));
+        assert!(skipped.is_empty() && !redacted.names_hash(&file, &Withheld(WithheldRecord::Host(known("y")))).unwrap());
+
+        // Nothing to compare: a write lets it through and records it skipped; a host's verdict and
+        // a strict walk fail.
+        let mut skipped = HashSet::new();
+        assert_eq!(judge(WithheldRecord::Host(None), &mut Absence::Write { partial: false, skipped: &mut skipped }), Ok(None));
+        assert_eq!(skipped, HashSet::from([file.clone()]));
+        for absence in [Absence::Verdict { partial: false, remote: true }, Absence::Strict] {
+            assert!(judge(WithheldRecord::Host(None), &mut { absence }).unwrap_err().contains("no digest"));
+        }
+        assert!(!redacted.names_hash(&file, &Withheld(WithheldRecord::Host(None))).unwrap());
+
+        // A client's record is the remote's report: with a remote, that remote decides a verdict;
+        // without one, nothing does.
+        for record in [WithheldRecord::Client(None), WithheldRecord::Client(known("y"))] {
+            let mut skipped = HashSet::new();
+            assert_eq!(judge(record.clone(), &mut Absence::Write { partial: false, skipped: &mut skipped }), Ok(None));
+            assert_eq!(skipped, HashSet::from([file.clone()]));
+            assert_eq!(judge(record.clone(), &mut Absence::Verdict { partial: false, remote: true }), Ok(None));
+            assert!(judge(record.clone(), &mut Absence::Verdict { partial: false, remote: false }).unwrap_err().contains("no digest"));
+            assert!(judge(record, &mut Absence::Strict).is_err());
+        }
+
+        // A sparse or cache warehouse skips what it lacks, recorded or not, as it never fetched it.
+        {
+            let root = std::env::temp_dir().join(format!("forklift-redaction-absence-{}", std::process::id()));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = crate::globals::StorageRootScope::enter(&root);
+            for record in [WithheldRecord::Client(None), WithheldRecord::Host(None)] {
+                assert_eq!(judge(record, &mut Absence::Verdict { partial: true, remote: false }), Ok(None));
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // Not withheld: the read's own failure, as before.
+        assert_eq!(judge(WithheldRecord::NotRecorded, &mut Absence::Verdict { partial: false, remote: true }), Err(format!("no recipe {}", file)));
+    }
+
     /// Trees and parcels by hash for a [`HoldingWalk`], failing the next read of `flaky` once.
     struct Objects {
         trees: HashMap<String, std::sync::Arc<crate::model::tree_item::TreeItem>>,

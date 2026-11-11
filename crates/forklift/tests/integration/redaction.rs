@@ -3683,3 +3683,64 @@ fn git_mirror_writes_a_file_it_left_out_once_its_bytes_are_back() {
     assert!(shown.status.success(), "{}", String::from_utf8_lossy(&shown.stderr));
     assert_eq!(shown.stdout, b"the new film\n");
 }
+
+/// A chunk-list redaction in `@redactions` judges a withheld chunked file whose recipe the store
+/// no longer holds by the chunk-list digest recorded for it: the host's, which it computed while it
+/// held the recipe, and the one a clone's record copies from the host's report. Neither the
+/// server's ref update over a tree naming the file nor a full clone fails on the missing recipe.
+///
+/// Revert: judge an unreadable recipe as before → the lift is refused (500) and the clone fails
+/// on reading the film; or let the server leave the digest out of its report → the clone's record
+/// carries none.
+#[test]
+fn a_chunk_list_redaction_judges_a_withheld_recipe_by_its_recorded_digest() {
+    let mut takedown = takedown("chunkjudge");
+
+    // A chunk-list redaction of an unrelated chunked secret, recorded while no head names it.
+    let mut state: u64 = 0x1234_5678_9abc_def1;
+    let secret: Vec<u8> = (0..9 * 1024 * 1024).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    }).collect();
+    takedown.owner.run_ok(&["pallet", "create", "leakbox"]);
+    takedown.owner.run_ok(&["shift", "leakbox"]);
+    takedown.owner.stack("secret.bin", &secret, "leak");
+    let leak = takedown.owner.head("leakbox");
+    takedown.owner.run_ok(&["remove", "secret.bin"]);
+    takedown.owner.run_ok(&["stack", "-m", "take the leak out"]);
+    let recorded = recorded_hash(&takedown.owner, &format!("{}:secret.bin", leak), "leaked dump");
+    assert_eq!(recorded["data"]["chunked"], true, "{}", recorded);
+    assert_eq!(takedown.owner.redactions()[0]["chunks"].as_str().map(str::len), Some(64));
+    let _ = std::fs::remove_file(takedown.owner.root.join("secret.bin"));
+    takedown.owner.run_ok(&["shift", "main"]);
+    takedown.owner.run_ok(&["lift"]);
+
+    // The film is a chunked recipe, withheld while the server held it, then deleted there.
+    takedown.withhold_new_film(true);
+    let (status, info) = http(&takedown.server.url, "GET", "/v1/warehouse", b"");
+    assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    let digest = info["withheld"][0]["chunks"].as_str().expect("the host reports the film's digest").to_string();
+    assert_eq!(digest.len(), 64, "{}", info);
+
+    takedown.owner.stack("notes.txt", b"notes\n", "notes");
+    let lifted = takedown.owner.run(&["--json", "lift"]);
+    assert!(lifted.status.success(), "{}", String::from_utf8_lossy(&lifted.stdout));
+    assert_eq!(takedown.server.main(), takedown.owner.head("main"));
+
+    let dir = std::env::temp_dir().join(format!("forklift-redaction-chunkjudge-writer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cloned = forklift_command()
+        .args(["clone", &takedown.server.url, "warehouse"])
+        .current_dir(&dir)
+        .env("FORKLIFT_GLOBAL_CONFIG", dir.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", dir.join("keys"))
+        .output().unwrap();
+    assert!(cloned.status.success(), "{}", String::from_utf8_lossy(&cloned.stderr));
+
+    let record = std::fs::read_to_string(dir.join("warehouse/.forklift/unavailable")).unwrap();
+    assert!(record.lines().any(|line| line.starts_with(&format!("{} {} ", takedown.film, digest))), "{}", record);
+}

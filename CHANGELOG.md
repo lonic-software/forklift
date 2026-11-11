@@ -12,6 +12,16 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **A chunk-list redaction no longer stops a lift or a clone over withheld content.** Where the
+  `@redactions` pallet holds a redaction of a chunked file, forklift-server used to refuse a lift
+  (`500`), and a full `clone` or `lower` to fail, as soon as a head named a chunked file the host
+  withholds and no longer holds, since the file's chunk list could no longer be read. The host now
+  records that chunk list's digest while it still holds the file, or before it deletes it, and
+  reports it to clients in the warehouse's `withheld` list; both judge the file by it. A full
+  warehouse with no remote that cannot compare a withheld file this way leaves the redaction
+  undecided rather than calling it applied. The `withheld` and `unavailable` records are now
+  format 2: a record written by an earlier build is refused until it is removed.
+
 - **Commands wait for a remote that is unavailable for a moment.** A remote that answers `503`
   with `Retry-After`, as a server does while it deletes or settles redacted content, or while the
   AWS head deletes a redacted file's chunks, is asked again after the wait, for up to 2 minutes,
