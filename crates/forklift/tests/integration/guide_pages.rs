@@ -695,7 +695,7 @@ impl Reader {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut mismatch = String::new();
         for server in &mut self.servers {
-            let exited = server.child.try_wait().unwrap();
+            let mut exited = server.child.try_wait().unwrap();
             if finished && exited.is_none() {
                 loop {
                     let printed = read(server);
@@ -706,11 +706,19 @@ impl Reader {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
+                exited = server.child.try_wait().unwrap();
                 let _ = server.child.kill();
                 let _ = server.child.wait();
             }
             let printed = read(server);
-            if exited.is_some() || !output_matches(&server.later, &printed, &mut self.bound.clone()) {
+            // Mid-run, lines the page shows a server printing later may not be due yet, so only
+            // an exit or something printed counts as trouble.
+            let wrong = if finished {
+                !output_matches(&server.later, &printed, &mut self.bound.clone())
+            } else {
+                !printed.is_empty() && !output_matches(&server.later, &printed, &mut self.bound.clone())
+            };
+            if exited.is_some() || wrong {
                 mismatch.push_str(&format!(
                     "\n\nThe server started at line {} exited ({:?}) or printed on stderr\n{}\n\nThe \
                     page shows it printing\n{}",

@@ -158,10 +158,11 @@ $ forklift redact list
     applied
 ```
 
-Once the server has applied the redaction, a new `clone` never fetches the content at all. A git mirror the warehouse keeps
-(`.forklift/mirror.git`) may still hold a copy written before the redaction: forklift does not
-delete it, and the command that applied the redaction names it. Delete or rewrite that mirror
-yourself, along with any git repository an earlier `forklift git export` wrote.
+Once the server has applied the redaction, a new `clone` never fetches the content at all. A git
+mirror the warehouse keeps (`.forklift/mirror.git`) may still hold a copy written before the
+redaction: forklift does not delete it, and the command that applied the redaction names it. Delete
+or rewrite that mirror yourself, along with any git repository an earlier `forklift git export`
+wrote.
 
 ## 7. What a redaction cannot remove
 
