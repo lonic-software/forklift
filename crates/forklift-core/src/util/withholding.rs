@@ -22,7 +22,11 @@
 //!
 //! The list is head-local configuration, not history: the record at `<forklift root>/withheld`
 //! lists each withheld hash beside its statement, in the [`record_utils`] form, one
-//! `<hash> <statement>` entry per line, sorted. It is written whole and atomically under the
+//! `<hash> <digest> <statement>` entry per line, sorted. For a chunked file's recipe, `<digest>`
+//! is the [`chunk_list_digest`](redaction_utils::chunk_list_digest) a chunk-list redaction
+//! compares, taken while a copy of the recipe was at hand ([`ChunkDigest`]); it is `-` while none
+//! was, and for a blob. A recorded digest is never taken off: once the host deletes the recipe it
+//! is the only way left to tell whether the file repeats a redacted recipe's chunk list. It is written whole and atomically under the
 //! [`RefLock`], re-read under that lock first, so two writers never drop each other's entries. A
 //! record this build cannot read, of another version or with an entry that is not a hash and a
 //! statement, fails every read and is never written over: withheld content must never read as
@@ -39,7 +43,7 @@ use crate::util::{bundle_utils, file_utils, object_utils, record_utils, redactio
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
 const FILE_NAME_WITHHELD: &str = "withheld";
 const WITHHELD_RECORD: &str = "withheld";
-const WITHHELD_VERSION: u32 = 1;
+const WITHHELD_VERSION: u32 = 2;
 
 /// The longest statement a takedown may carry, in characters: every handshake carries it.
 pub const STATEMENT_MAX_CHARS: usize = 1000;
@@ -48,37 +52,121 @@ fn withheld_path() -> PathBuf {
     globals::forklift_root().join(FILE_NAME_WITHHELD)
 }
 
+/// What a record of withheld content knows of a withheld recipe's chunk list: the digest a
+/// chunk-list redaction compares ([`redaction_utils::chunk_list_digest`]), taken while a copy of the
+/// recipe was at hand. The hash fixes the chunk list, so two honest digests of one hash are equal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChunkDigest {
+    /// The digest of the recipe's chunk list.
+    Known(String),
+
+    /// No copy of a recipe of this hash was at hand when it was recorded, or it is a blob's hash.
+    Unknown,
+
+    /// Two remotes reported different digests for the hash, so one of them is wrong. Only a client's
+    /// record of unavailable content holds it, and no later recording takes the entry out of it.
+    Conflicted,
+}
+
+impl ChunkDigest {
+    /// The digest, when it is known.
+    pub fn known(&self) -> Option<&str> {
+        match self {
+            ChunkDigest::Known(digest) => Some(digest),
+            ChunkDigest::Unknown | ChunkDigest::Conflicted => None,
+        }
+    }
+
+    /// The digest `known` reports, or [`ChunkDigest::Unknown`] when it reports none. A report that
+    /// is not a digest's form is no digest.
+    pub fn of_report(known: Option<&str>) -> ChunkDigest {
+        match known {
+            Some(digest) if is_digest(digest) => ChunkDigest::Known(digest.to_string()),
+            _ => ChunkDigest::Unknown,
+        }
+    }
+
+    /// The entry's state column: the digest, `-` for Unknown, `!` for Conflicted.
+    pub(crate) fn column(&self) -> &str {
+        match self {
+            ChunkDigest::Known(digest) => digest,
+            ChunkDigest::Unknown => "-",
+            ChunkDigest::Conflicted => "!",
+        }
+    }
+
+    /// The state a column says, or `None` when it is none of [`Self::column`]'s forms.
+    pub(crate) fn parse_column(column: &str) -> Option<ChunkDigest> {
+        match column {
+            "-" => Some(ChunkDigest::Unknown),
+            "!" => Some(ChunkDigest::Conflicted),
+            digest if is_digest(digest) => Some(ChunkDigest::Known(digest.to_string())),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `digest` has a chunk-list digest's form: 64 lowercase hex digits.
+fn is_digest(digest: &str) -> bool {
+    digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// One withheld hash's entry: the operator's statement, and what is known of its chunk list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WithheldEntry {
+    statement: String,
+    digest: ChunkDigest,
+}
+
 /// Every hash this head withholds, each beside the operator's statement.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WithheldSet {
-    statements: BTreeMap<String, String>,
+    entries: BTreeMap<String, WithheldEntry>,
 }
 
 impl WithheldSet {
     /// The set of `entries`, each a hash beside its statement: what a head that keeps its record
     /// somewhere other than this module's file reads it as.
+    /// Every digest it holds is [`ChunkDigest::Unknown`].
     pub fn of(entries: impl IntoIterator<Item = (String, String)>) -> WithheldSet {
-        WithheldSet { statements: entries.into_iter().collect() }
+        WithheldSet {
+            entries: entries.into_iter()
+                .map(|(hash, statement)| (hash, WithheldEntry { statement, digest: ChunkDigest::Unknown }))
+                .collect(),
+        }
     }
 
     /// Whether `hash` is withheld.
     pub fn contains(&self, hash: &str) -> bool {
-        self.statements.contains_key(hash)
+        self.entries.contains_key(hash)
     }
 
     /// The statement `hash` is withheld with, if it is.
     pub fn statement(&self, hash: &str) -> Option<&str> {
-        self.statements.get(hash).map(String::as_str)
+        self.entries.get(hash).map(|entry| entry.statement.as_str())
+    }
+
+    /// What is known of the chunk list of `hash`, if it is withheld.
+    pub fn digest(&self, hash: &str) -> Option<&ChunkDigest> {
+        self.entries.get(hash).map(|entry| &entry.digest)
     }
 
     /// Whether nothing is withheld.
     pub fn is_empty(&self) -> bool {
-        self.statements.is_empty()
+        self.entries.is_empty()
     }
 
     /// Every withheld hash beside its statement, sorted by hash.
     pub fn entries(&self) -> impl Iterator<Item = (&String, &String)> {
-        self.statements.iter()
+        self.entries.iter().map(|(hash, entry)| (hash, &entry.statement))
+    }
+
+    /// Write this set whole as the record. The caller holds the ref lock and read the set under it.
+    fn write(&self, _lock: &RefLock) -> Result<(), String> {
+        let entries = self.entries.iter()
+            .map(|(hash, entry)| format!("{} {} {}", hash, entry.digest.column(), entry.statement));
+        let bytes = record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, entries);
+        file_utils::replace_file_atomically(&withheld_path(), &bytes)
     }
 }
 
@@ -103,14 +191,20 @@ pub fn read_withheld() -> Result<WithheldSet, String> {
 
     let mut set = WithheldSet::default();
 
+    // A host never records Conflicted: every digest it fills comes from bytes of the entry's hash.
     for entry in entries {
-        match entry.split_once(' ') {
-            Some((hash, statement)) if object_utils::is_object_hash(hash) && valid_statement(statement) => {
-                set.statements.insert(hash.to_string(), statement.to_string());
+        let parsed = entry.split_once(' ')
+            .and_then(|(hash, rest)| rest.split_once(' ').map(|(column, statement)| (hash, column, statement)))
+            .and_then(|(hash, column, statement)| Some((hash, ChunkDigest::parse_column(column)?, statement)));
+
+        match parsed {
+            Some((hash, digest, statement)) if object_utils::is_object_hash(hash) && valid_statement(statement)
+                && digest != ChunkDigest::Conflicted => {
+                set.entries.insert(hash.to_string(), WithheldEntry { statement: statement.to_string(), digest });
             }
             _ => return Err(format!(
-                "The record of withheld content \"{}\" holds an entry that is not an object hash and \
-                a statement: \"{}\". This version of Forklift never writes over it.",
+                "The record of withheld content \"{}\" holds an entry that is not an object hash, a \
+                chunk-list digest and a statement: \"{}\". This version of Forklift never writes over it.",
                 path.to_string_lossy(), entry.escape_debug()
             )),
         }
@@ -161,7 +255,7 @@ pub fn removed() -> Result<AppliedSet, String> {
 
 /// The content [`removed`] names, of `applied` and `withheld` already read.
 pub fn removed_from(applied: &AppliedSet, withheld: &WithheldSet) -> AppliedSet {
-    AppliedSet::of(applied.hashes().chain(withheld.statements.keys()).cloned())
+    AppliedSet::of(applied.hashes().chain(withheld.entries.keys()).cloned())
 }
 
 /// What [`withhold`] did.
@@ -173,7 +267,8 @@ pub enum Withheld {
     /// The hash was withheld already; the statement now is the one given.
     Restated,
 
-    /// The hash was withheld already, with this statement; nothing was written.
+    /// The hash was withheld already, with this statement. Nothing was written, unless the entry
+    /// lacked the digest of a recipe the store now holds, which is filled in.
     Unchanged,
 }
 
@@ -189,6 +284,10 @@ pub enum Withheld {
 /// absent ([`redaction_deleter::withheld_chunks`]). One the store lacks is withheld all the same,
 /// so it is never taken; should it be a chunked file's recipe, nothing here can tell, and its
 /// chunks are still taken and served, since no recipe the store holds names them.
+///
+/// A recipe the store holds has its chunk-list digest recorded with it ([`ChunkDigest`]). An entry
+/// restated keeps the digest it has, even once the recipe is deleted; one without a digest takes
+/// the held recipe's.
 ///
 /// [`redaction_deleter::withheld_chunks`]: crate::util::redaction_deleter::withheld_chunks
 ///
@@ -206,20 +305,32 @@ pub fn withhold(hash: &str, statement: &str) -> Result<Withheld, String> {
 
     let statement = checked_statement(statement)?;
 
-    match redaction_utils::stored_type(hash)? {
-        None | Some(ObjectType::Blob | ObjectType::Recipe) => {}
+    // The bytes are pinned by the hash, so a digest read before the lock is the recipe's still.
+    let digest = match redaction_utils::stored_type(hash)? {
+        None | Some(ObjectType::Blob) => ChunkDigest::Unknown,
+        Some(ObjectType::Recipe) => ChunkDigest::Known(redaction_utils::chunk_list_digest(&object_utils::recipe_chunk_hashes(hash)?)),
         Some(other) => return Err(format!(
             "Object {} is a {:?}, not a file's content: a takedown withholds one file's content.", hash, other
         )),
-    }
+    };
 
-    let _lock = RefLock::acquire()?;
+    let lock = RefLock::acquire()?;
     let mut set = read_withheld()?;
 
-    let outcome = match set.statement(hash) {
-        Some(held) if held == statement => return Ok(Withheld::Unchanged),
-        Some(_) => Withheld::Restated,
-        None => Withheld::Added,
+    let (outcome, digest) = match set.entries.get(hash) {
+        Some(held) => {
+            let digest = match &held.digest {
+                ChunkDigest::Unknown => digest,
+                recorded => recorded.clone(),
+            };
+
+            match held.statement == statement {
+                true if digest == held.digest => return Ok(Withheld::Unchanged),
+                true => (Withheld::Unchanged, digest),
+                false => (Withheld::Restated, digest),
+            }
+        }
+        None => (Withheld::Added, digest),
     };
 
     if outcome == Withheld::Added {
@@ -228,12 +339,43 @@ pub fn withhold(hash: &str, statement: &str) -> Result<Withheld, String> {
         ))?;
     }
 
-    set.statements.insert(hash.to_string(), statement.to_string());
-    let entries = set.statements.iter().map(|(hash, statement)| format!("{} {}", hash, statement));
-    let bytes = record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, entries);
-    file_utils::replace_file_atomically(&withheld_path(), &bytes)?;
+    set.entries.insert(hash.to_string(), WithheldEntry { statement: statement.to_string(), digest });
+    set.write(&lock)?;
 
     Ok(outcome)
+}
+
+/// Record `digests`, each a withheld hash beside the chunk-list digest of a recipe of that hash at
+/// hand, under the ref lock `lock` the caller holds, for every entry that has no digest yet. The
+/// caller computed each digest from bytes that hash to its hash. A hash not withheld, or whose
+/// entry has a digest already, is left as it is.
+///
+/// # Returns
+/// * `Ok(usize)`   - How many entries took a digest; nothing is written when none did.
+/// * `Err(String)` - A digest is not one, the record cannot be read, or it could not be written.
+///                   A write that failed after its rename has still landed.
+pub fn record_digests_locked(lock: &RefLock, digests: impl IntoIterator<Item = (String, String)>) -> Result<usize, String> {
+    let mut set = read_withheld()?;
+    let mut filled = 0;
+
+    for (hash, digest) in digests {
+        if !is_digest(&digest) {
+            return Err(format!("\"{}\" is not a chunk-list digest; nothing was recorded.", digest));
+        }
+
+        if let Some(entry) = set.entries.get_mut(&hash) {
+            if entry.digest == ChunkDigest::Unknown {
+                entry.digest = ChunkDigest::Known(digest);
+                filled += 1;
+            }
+        }
+    }
+
+    if filled > 0 {
+        set.write(lock)?;
+    }
+
+    Ok(filled)
 }
 
 /// The [`RefusalCode::ContentWithheld`] refusal a server answers a request for `hash` with, read
@@ -345,6 +487,78 @@ mod tests {
         assert_eq!(set.entries().map(|(hash, _)| hash.as_str()).collect::<Vec<_>>(), [recipe_object.hash.as_str()]);
     }
 
+    /// A recipe of one chunk of `content`, stored, with its chunk-list digest.
+    fn stored_recipe(content: &[u8]) -> (String, String) {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::chunk::Chunk;
+        use crate::model::recipe::{Recipe, RecipeChunk};
+
+        let chunk = Chunk { content: content.to_vec() };
+        let mut chunk_object = LooseObjectBuilder::build_chunk(&chunk);
+        chunk_object.store().unwrap();
+        let recipe = Recipe {
+            content_hash: object_utils::hash_object_bytes(&chunk.content),
+            total_size: chunk.content.len() as u64,
+            chunks: vec![RecipeChunk { hash: chunk_object.hash.clone(), size: chunk.content.len() as u64 }],
+        };
+        let mut recipe_object = LooseObjectBuilder::build_recipe(&recipe);
+        recipe_object.store().unwrap();
+
+        (recipe_object.hash.clone(), redaction_utils::chunk_list_digest(&[chunk_object.hash]))
+    }
+
+    // Revert: record Unknown for a held recipe → no digest; let a restatement take the stored
+    // type's (absent) digest → the digest is lost once the recipe is deleted; let a fill replace a
+    // Known digest → the entry changes.
+    #[test]
+    fn a_withheld_recipe_keeps_its_chunk_list_digest() {
+        let _scratch = Scratch::new("digest");
+        let (recipe, digest) = stored_recipe(b"a chunk of a withheld film");
+
+        withhold(&recipe, "DMCA notice 1").unwrap();
+        withhold(A, "a blob or an absent hash").unwrap();
+        let set = read_withheld().unwrap();
+        assert_eq!(set.digest(&recipe), Some(&ChunkDigest::Known(digest.clone())));
+        assert_eq!(set.digest(A), Some(&ChunkDigest::Unknown));
+
+        // Deleted, then restated: the digest stays.
+        let (folder, name) = file_utils::get_path_for_object(&recipe).unwrap();
+        let path = std::path::Path::new(&folder).join(name);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(withhold(&recipe, "DMCA notice 2").unwrap(), Withheld::Restated);
+        assert_eq!(read_withheld().unwrap().digest(&recipe), Some(&ChunkDigest::Known(digest.clone())));
+
+        // A fill takes only an entry without one, and never one not withheld.
+        let other = "c".repeat(64);
+        let lock = RefLock::acquire().unwrap();
+        assert_eq!(record_digests_locked(&lock, [(recipe.clone(), other.clone()), (A.to_string(), other.clone()), (B.to_string(), other.clone())]).unwrap(), 1);
+        assert!(record_digests_locked(&lock, [(A.to_string(), "not a digest".to_string())]).is_err());
+        drop(lock);
+        let set = read_withheld().unwrap();
+        assert_eq!(set.digest(&recipe), Some(&ChunkDigest::Known(digest)));
+        assert_eq!(set.digest(A), Some(&ChunkDigest::Known(other)));
+        assert!(!set.contains(B));
+    }
+
+    // Revert: return Unchanged before the fill → an entry recorded while the recipe was absent
+    // never takes its digest from withhold() again.
+    #[test]
+    fn withholding_again_fills_the_digest_of_a_recipe_held_since() {
+        let _scratch = Scratch::new("refill");
+        let (recipe, digest) = stored_recipe(b"a chunk of a film withheld before it arrived");
+        let (folder, name) = file_utils::get_path_for_object(&recipe).unwrap();
+        let path = std::path::Path::new(&folder).join(name);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        withhold(&recipe, "statement").unwrap();
+        assert_eq!(read_withheld().unwrap().digest(&recipe), Some(&ChunkDigest::Unknown));
+
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(withhold(&recipe, "statement").unwrap(), Withheld::Unchanged);
+        assert_eq!(read_withheld().unwrap().digest(&recipe), Some(&ChunkDigest::Known(digest)));
+    }
+
     // Revert: read an unknown version or a malformed entry as nothing withheld → served again.
     #[test]
     fn an_unreadable_record_fails_every_read() {
@@ -355,7 +569,17 @@ mod tests {
         assert!(removed().is_err());
 
         std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [A])).unwrap();
-        assert!(read_withheld().unwrap_err().contains("not an object hash and a statement"));
+        assert!(read_withheld().unwrap_err().contains("not an object hash, a chunk-list digest and a statement"));
+
+        // A version-1 entry, with no digest column, and a host entry recorded Conflicted.
+        std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} statement", A)])).unwrap();
+        assert!(read_withheld().is_err());
+        std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} ! statement", A)])).unwrap();
+        assert!(read_withheld().is_err());
+        std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} - statement", A)])).unwrap();
+        assert_eq!(read_withheld().unwrap().digest(A), Some(&ChunkDigest::Unknown));
+
+        std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [A])).unwrap();
         assert!(withhold(B, "statement").is_err(), "never written over");
     }
 

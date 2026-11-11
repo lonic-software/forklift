@@ -31,7 +31,7 @@ use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
 use crate::enums::object::parsed_object::ParsedObject;
 use crate::enums::object_type::ObjectType;
 use crate::parser::object::loose_object_parser;
-use crate::util::lock_utils::{ServeLock, StoreAccessExclusive, StoreLock};
+use crate::util::lock_utils::{RefLock, ServeLock, StoreAccessExclusive, StoreLock};
 use crate::util::progress_utils::Progress;
 use crate::util::{
     applied_redactions, bay_utils, cache_miss, file_utils, gc_utils, object_utils, office_utils, pack_utils,
@@ -554,19 +554,32 @@ pub fn delete_applied(store_lock: &StoreLock,
     let mut journal = ChunksOwed {
         pairs: owed.pairs.into_iter().filter(|(_, chunk)| !live.contains(chunk)).collect(),
     };
+    let withheld = withholding::read_withheld()?;
+    let mut digests = Vec::new();
     for hash in &objects {
         if !file_utils::is_present_for_sweep(hash)? {
             continue;
         }
         let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
         if let ParsedObject::Recipe(recipe) = loose_object_parser::parse(&bytes)? {
+            let recipe_chunks: Vec<String> = recipe.chunks.into_iter().map(|chunk| chunk.hash).collect();
+            if withheld.digest(hash) == Some(&withholding::ChunkDigest::Unknown) {
+                digests.push((hash.clone(), redaction_utils::chunk_list_digest(&recipe_chunks)));
+            }
             journal.pairs.extend(
-                recipe.chunks.into_iter().map(|chunk| chunk.hash).filter(|chunk| !live.contains(chunk))
-                    .map(|chunk| (hash.clone(), chunk))
+                recipe_chunks.into_iter().filter(|chunk| !live.contains(chunk)).map(|chunk| (hash.clone(), chunk))
             );
         }
     }
     let chunks = journal.chunks();
+
+    // A withheld recipe about to go whose entry has no chunk-list digest yet takes one from the copy
+    // still here, so the head can judge the recipe's chunk list once it no longer holds it. Recorded
+    // before the copy goes: a run cut short after it leaves the digest, never a recipe gone without
+    // one. The ref lock is taken inside the serve lock, the order a tombstone drop takes them in.
+    if !digests.is_empty() {
+        withholding::record_digests_locked(&RefLock::acquire()?, digests)?;
+    }
 
     // Durable before the first pass deletes a recipe, so a run cut short after it finds the chunks.
     write_chunks_owed(&journal)?;
@@ -848,6 +861,32 @@ mod tests {
         assert!(pack_utils::is_in_packs(&own_chunk).unwrap(), "the fixture packs the chunk");
 
         (recipe, own_chunk, shared_chunk, live_recipe)
+    }
+
+    /// A withheld recipe whose entry has no chunk-list digest (withheld while its copy was not here,
+    /// as an upload racing the takedown leaves it) takes one from its copy before the copy goes.
+    ///
+    /// Revert: drop the fill → the entry stays without a digest once the recipe is gone.
+    #[test]
+    fn a_withheld_recipe_takes_its_digest_before_its_copy_goes() {
+        let _scratch = Scratch::new("digest-fill");
+        let chunk = store_chunk(b"film");
+        let recipe = store_recipe(&[(chunk.clone(), 4)]);
+        let (folder, name) = file_utils::get_path_for_object(&recipe).unwrap();
+        let path = std::path::Path::new(&folder).join(name);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        withholding::withhold(&recipe, "DMCA notice").unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(withholding::read_withheld().unwrap().digest(&recipe), Some(&withholding::ChunkDigest::Unknown));
+
+        let deletion = delete().unwrap();
+        assert!(deletion.objects.contains(&recipe), "{:?}", deletion.objects);
+        assert!(!present(&recipe));
+        assert_eq!(
+            withholding::read_withheld().unwrap().digest(&recipe),
+            Some(&withholding::ChunkDigest::Known(redaction_utils::chunk_list_digest(&[chunk])))
+        );
     }
 
     /// The deleter drops a packed and a loose copy of applied redactions' objects that nothing in

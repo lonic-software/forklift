@@ -125,6 +125,15 @@ pub struct ServedWithholding {
 
     /// Whether the head still stores a copy, or has deleted every one it held.
     pub state: ServedWithholdingState,
+
+    /// For a chunked file's recipe, the digest of its ordered chunk list that a chunk-list
+    /// redaction compares ([`chunk_list_digest`](crate::util::redaction_utils::chunk_list_digest)),
+    /// taken by the head while it held a copy. Absent while it never did, for a blob, and from a
+    /// head that reports none: all read as not known. A client keeps it beside the content it
+    /// records unavailable, so its own redaction checks can compare a recipe it never holds. An
+    /// **additive** field like [`WarehouseInfo::withheld`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<String>,
 }
 
 /// Where a withholding stands on a head ([`ServedWithholding::state`]).

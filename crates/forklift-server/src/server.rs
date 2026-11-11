@@ -1530,13 +1530,16 @@ fn served_redactions() -> Result<Vec<ServedRedaction>, HandlerError> {
 fn served_withheld() -> Result<Vec<ServedWithholding>, HandlerError> {
     let owing_chunks = redaction_deleter::recipes_owing_chunks();
 
-    Ok(read_withheld()?.entries().map(|(hash, statement)| ServedWithholding {
+    let withheld = read_withheld()?;
+
+    Ok(withheld.entries().map(|(hash, statement)| ServedWithholding {
         hash: hash.clone(),
         statement: statement.clone(),
         state: match (file_utils::does_object_exist(hash), &owing_chunks) {
             (Ok(false), Ok(owing)) if !owing.contains(hash) => ServedWithholdingState::Deleted,
             _ => ServedWithholdingState::DeletionOwed,
         },
+        chunks: withheld.digest(hash).and_then(|digest| digest.known()).map(str::to_string),
     }).collect())
 }
 

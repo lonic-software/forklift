@@ -2426,6 +2426,10 @@ pub struct RemoteClient {
     /// content walk through this client, or any clone of it, leaves out and records unavailable:
     /// set by every handshake ([`Self::fetch_info`]). Empty until one succeeds.
     withheld: std::sync::Arc<std::sync::RwLock<std::sync::Arc<BTreeMap<String, String>>>>,
+    /// The chunk-list digest the same handshake reported beside each entry of `withheld` that has
+    /// one ([`ServedWithholding::chunks`](crate::model::remote::ServedWithholding::chunks)), which
+    /// the unavailable record keeps.
+    withheld_digests: std::sync::Arc<std::sync::RwLock<std::sync::Arc<BTreeMap<String, String>>>>,
     /// Set by [`Self::leave_withheld_unrecorded`]: a walk through this client, or any clone of it,
     /// still leaves out what `withheld` names, but records none of it unavailable.
     withheld_unrecorded: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2629,6 +2633,7 @@ impl RemoteClient {
             skip_files: Default::default(),
             skipped_files: Default::default(),
             withheld: Default::default(),
+            withheld_digests: Default::default(),
             withheld_unrecorded: Default::default(),
         })
     }
@@ -3387,13 +3392,21 @@ impl RemoteClient {
     /// hold ([`withholding::checked_statement`](crate::util::withholding::checked_statement)).
     fn leave_out_withheld(&self, info: &WarehouseInfo) {
         let applied = info.applied_redactions();
-        let withheld = info.withheld.iter().flatten()
+        let left_out: Vec<(&crate::model::remote::ServedWithholding, &str)> = info.withheld.iter().flatten()
             .filter(|entry| !applied.contains(entry.hash.as_str()))
-            .filter_map(|entry| crate::util::withholding::checked_statement(&entry.statement).ok()
-                .map(|statement| (entry.hash.clone(), statement.to_string())))
+            .filter_map(|entry| crate::util::withholding::checked_statement(&entry.statement).ok().map(|statement| (entry, statement)))
+            .collect();
+        let withheld = left_out.iter()
+            .map(|(entry, statement)| (entry.hash.clone(), statement.to_string()))
+            .collect();
+        let digests = left_out.iter()
+            .filter_map(|(entry, _)| entry.chunks.clone().map(|digest| (entry.hash.clone(), digest)))
             .collect();
 
+        // Each under its own lock: a walk reads the digests only after its statements, and a
+        // handshake replaces both before any walk it starts.
         *self.withheld.write().unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(withheld);
+        *self.withheld_digests.write().unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(digests);
     }
 
     /// Whether a content walk through this client leaves out `hash` as content the remote's host
@@ -3449,7 +3462,8 @@ impl RemoteClient {
         skipped.sort();
 
         let applied = crate::util::applied_redactions::read_applied()?;
-        let mut entries: Vec<(String, String)> = Vec::new();
+        let digests = self.withheld_digests.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let mut entries: Vec<crate::util::unavailable::Unavailable> = Vec::new();
 
         for hash in skipped {
             if applied.contains(&hash) || file_utils::does_object_exist(&hash)? {
@@ -3457,7 +3471,8 @@ impl RemoteClient {
             }
 
             let statement = withheld[&hash].clone();
-            entries.push((hash, statement));
+            let digest = digests.get(&hash).cloned();
+            entries.push(crate::util::unavailable::Unavailable { hash, statement, digest });
         }
 
         match entries.is_empty() {

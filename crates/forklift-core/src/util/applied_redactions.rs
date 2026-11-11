@@ -195,7 +195,7 @@ fn add_locked(_lock: &RefLock, hashes: &[String]) -> Result<AppliedSet, String> 
 /// The remote this warehouse has configured, in its own configuration or the global one. One that
 /// is configured but broken still counts: what decides is whose report the warehouse waits for,
 /// not whether it can reach it.
-fn configured_remote() -> Result<Option<String>, String> {
+pub(crate) fn configured_remote() -> Result<Option<String>, String> {
     Ok(config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?.map(|(url, _)| url))
 }
 

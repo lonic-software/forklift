@@ -98,6 +98,8 @@ impl Withholding {
                 true => ServedWithholdingState::Deleted,
                 false => ServedWithholdingState::DeletionOwed,
             },
+            // The AWS head records no chunk-list digest yet.
+            chunks: None,
         }).collect()
     }
 }

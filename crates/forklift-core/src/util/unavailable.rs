@@ -18,7 +18,10 @@
 //! record the object sealed, so a cache or a sparse warehouse holding one keeps its absent entries.
 //!
 //! The record at `<forklift root>/unavailable` is in the [`record_utils`] form, one
-//! `<hash> <statement>` entry per line, sorted, written whole and atomically under the [`RefLock`],
+//! `<hash> <digest> <statement>` entry per line, sorted. `<digest>` is what the remote's handshake
+//! said of a recipe's chunk list ([`ChunkDigest`]): its digest, `-` when it said none, or `!` once
+//! two remotes said different ones. A recorded digest is never replaced by none, a different one
+//! makes the entry Conflicted, and nothing takes it out of Conflicted. The record is written whole and atomically under the [`RefLock`],
 //! re-read under that lock first, so two writers never drop each other's entries. A record this
 //! build cannot read, of another version or with an entry that is not a hash and a statement,
 //! fails every read and is never written over: a hash it lists must never read as damage, nor a
@@ -29,36 +32,59 @@ use std::path::PathBuf;
 use crate::globals;
 use crate::util::lock_utils::{RefLock, StoreAccessExclusive};
 use crate::util::{file_utils, gc_utils, object_utils, record_utils, withholding};
+use crate::util::withholding::ChunkDigest;
 
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
 const FILE_NAME_UNAVAILABLE: &str = "unavailable";
 const UNAVAILABLE_RECORD: &str = "unavailable";
-const UNAVAILABLE_VERSION: u32 = 1;
+const UNAVAILABLE_VERSION: u32 = 2;
 
 fn unavailable_path() -> PathBuf {
     globals::forklift_root().join(FILE_NAME_UNAVAILABLE)
 }
 
+/// One hash to record unavailable: the host's statement, and the chunk-list digest its handshake
+/// reported, if any. A `(hash, statement)` pair reports none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unavailable {
+    pub hash: String,
+    pub statement: String,
+    pub digest: Option<String>,
+}
+
+impl From<(String, String)> for Unavailable {
+    fn from((hash, statement): (String, String)) -> Unavailable {
+        Unavailable { hash, statement, digest: None }
+    }
+}
+
+/// One recorded hash's entry: the host's statement, and what is known of its chunk list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnavailableEntry {
+    statement: String,
+    digest: ChunkDigest,
+}
+
 /// Every hash recorded unavailable, each beside the statement of the host that withholds it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnavailableSet {
-    statements: BTreeMap<String, String>,
+    entries: BTreeMap<String, UnavailableEntry>,
 }
 
 impl UnavailableSet {
-    /// The set of `entries`, each a hash beside its statement.
-    pub fn of(entries: impl IntoIterator<Item = (String, String)>) -> UnavailableSet {
-        UnavailableSet { statements: entries.into_iter().collect() }
-    }
-
     /// Whether `hash` is recorded unavailable.
     pub fn contains(&self, hash: &str) -> bool {
-        self.statements.contains_key(hash)
+        self.entries.contains_key(hash)
     }
 
     /// The host's statement `hash` is recorded with, if it is.
     pub fn statement(&self, hash: &str) -> Option<&str> {
-        self.statements.get(hash).map(String::as_str)
+        self.entries.get(hash).map(|entry| entry.statement.as_str())
+    }
+
+    /// What is known of the chunk list of `hash`, if it is recorded.
+    pub fn digest(&self, hash: &str) -> Option<&ChunkDigest> {
+        self.entries.get(hash).map(|entry| &entry.digest)
     }
 
     /// Whether a file of content `hash` is left out here: the record lists it and the store lacks
@@ -69,12 +95,12 @@ impl UnavailableSet {
 
     /// Whether nothing is recorded.
     pub fn is_empty(&self) -> bool {
-        self.statements.is_empty()
+        self.entries.is_empty()
     }
 
     /// Every recorded hash beside its statement, sorted by hash.
     pub fn entries(&self) -> impl Iterator<Item = (&String, &String)> {
-        self.statements.iter()
+        self.entries.iter().map(|(hash, entry)| (hash, &entry.statement))
     }
 }
 
@@ -100,13 +126,18 @@ pub fn read_unavailable() -> Result<UnavailableSet, String> {
     let mut set = UnavailableSet::default();
 
     for entry in entries {
-        match entry.split_once(' ') {
-            Some((hash, statement)) if object_utils::is_object_hash(hash) && withholding::valid_statement(statement) => {
-                set.statements.insert(hash.to_string(), statement.to_string());
+        let parsed = entry.split_once(' ')
+            .and_then(|(hash, rest)| rest.split_once(' ').map(|(column, statement)| (hash, column, statement)))
+            .and_then(|(hash, column, statement)| Some((hash, ChunkDigest::parse_column(column)?, statement)));
+
+        match parsed {
+            Some((hash, digest, statement)) if object_utils::is_object_hash(hash) && withholding::valid_statement(statement) => {
+                set.entries.insert(hash.to_string(), UnavailableEntry { statement: statement.to_string(), digest });
             }
             _ => return Err(format!(
                 "The record of content this warehouse cannot get \"{}\" holds an entry that is not an \
-                object hash and a statement: \"{}\". This version of Forklift never writes over it.",
+                object hash, a chunk-list digest and a statement: \"{}\". This version of Forklift never \
+                writes over it.",
                 path.to_string_lossy(), entry.escape_debug()
             )),
         }
@@ -166,18 +197,20 @@ fn write_locked(_lock: &RefLock, set: &UnavailableSet) -> Result<(), String> {
         return file_utils::remove_unfollowed(&unavailable_path());
     }
 
-    let entries = set.statements.iter().map(|(hash, statement)| format!("{} {}", hash, statement));
+    let entries = set.entries.iter()
+        .map(|(hash, entry)| format!("{} {} {}", hash, entry.digest.column(), entry.statement));
     let bytes = record_utils::to_bytes(UNAVAILABLE_RECORD, UNAVAILABLE_VERSION, entries);
     file_utils::replace_file_atomically(&unavailable_path(), &bytes)
 }
 
-/// Record each of `entries`, a hash beside its host's statement, as unavailable, under the ref
-/// lock this takes. A hash recorded already takes the statement given.
+/// Record each of `entries`, a hash beside its host's statement and the digest its handshake
+/// reported, as unavailable, under the ref lock this takes. A hash recorded already takes the
+/// statement given, and its digest is merged ([`merged`]).
 ///
 /// # Returns
 /// * `Ok(())`      - Every entry is recorded.
 /// * `Err(String)` - As [`record_locked`].
-pub fn record(entries: impl IntoIterator<Item = (String, String)>) -> Result<(), String> {
+pub fn record<E: Into<Unavailable>>(entries: impl IntoIterator<Item = E>) -> Result<(), String> {
     let lock = RefLock::acquire()?;
     record_locked(&lock, entries)
 }
@@ -191,19 +224,23 @@ pub fn record(entries: impl IntoIterator<Item = (String, String)>) -> Result<(),
 /// * `Err(String)` - An entry is not an object hash and a statement of one plain line, the record
 ///                   cannot be read, or it could not be written. A write that failed after its
 ///                   rename has still landed: read the record back to learn which.
-pub fn record_locked(lock: &RefLock, entries: impl IntoIterator<Item = (String, String)>) -> Result<(), String> {
+pub fn record_locked<E: Into<Unavailable>>(lock: &RefLock, entries: impl IntoIterator<Item = E>) -> Result<(), String> {
     let mut set = read_unavailable()?;
     let mut changed = false;
 
-    for (hash, statement) in entries {
+    for entry in entries {
+        let Unavailable { hash, statement, digest } = entry.into();
+
         if !object_utils::is_object_hash(&hash) {
             return Err(format!("\"{}\" is not an object hash; nothing was recorded unavailable.", hash));
         }
 
         let statement = withholding::checked_statement(&statement)?.to_string();
+        let digest = merged(set.digest(&hash), ChunkDigest::of_report(digest.as_deref()));
+        let entry = UnavailableEntry { statement, digest };
 
-        if set.statement(&hash) != Some(statement.as_str()) {
-            set.statements.insert(hash, statement);
+        if set.entries.get(&hash) != Some(&entry) {
+            set.entries.insert(hash, entry);
             changed = true;
         }
     }
@@ -211,6 +248,20 @@ pub fn record_locked(lock: &RefLock, entries: impl IntoIterator<Item = (String, 
     match changed {
         true => write_locked(lock, &set),
         false => Ok(()),
+    }
+}
+
+/// What an entry recorded as `recorded` (none, when it is new) knows of its chunk list once a
+/// handshake reported `reported`: a known digest is never replaced by an unknown one, and a second,
+/// different known digest makes the entry Conflicted, since the hash fixes the chunk list and so
+/// one of the two remotes is wrong. Conflicted stays.
+fn merged(recorded: Option<&ChunkDigest>, reported: ChunkDigest) -> ChunkDigest {
+    match (recorded, reported) {
+        (None | Some(ChunkDigest::Unknown), reported) => reported,
+        (Some(ChunkDigest::Conflicted), _) => ChunkDigest::Conflicted,
+        (Some(known), ChunkDigest::Unknown | ChunkDigest::Conflicted) => known.clone(),
+        (Some(known), reported) if *known == reported => reported,
+        (Some(_), _) => ChunkDigest::Conflicted,
     }
 }
 
@@ -233,17 +284,17 @@ fn drop_where(mut drop: impl FnMut(&str) -> Result<bool, String>) -> Result<usiz
 
     let lock = RefLock::acquire()?;
     let mut set = read_unavailable()?;
-    let before = set.statements.len();
+    let before = set.entries.len();
     let mut kept = BTreeMap::new();
 
-    for (hash, statement) in std::mem::take(&mut set.statements) {
+    for (hash, entry) in std::mem::take(&mut set.entries) {
         if !drop(&hash)? {
-            kept.insert(hash, statement);
+            kept.insert(hash, entry);
         }
     }
 
-    set.statements = kept;
-    let dropped = before - set.statements.len();
+    set.entries = kept;
+    let dropped = before - set.entries.len();
 
     if dropped > 0 {
         write_locked(&lock, &set)?;
@@ -339,6 +390,40 @@ mod tests {
         assert_eq!(set.entries().count(), 2);
     }
 
+    /// An entry for `hash` reporting `digest`.
+    fn reported(hash: &str, digest: Option<&str>) -> Unavailable {
+        Unavailable { hash: hash.to_string(), statement: "statement".to_string(), digest: digest.map(str::to_string) }
+    }
+
+    // Revert: let a report without a digest replace a known one → Unknown again; keep the first of
+    // two different digests → the remote that lied wins; let a later report end Conflicted → it
+    // reads as known again.
+    #[test]
+    fn a_digest_is_kept_and_two_different_ones_conflict_for_good() {
+        let _scratch = Scratch::new("digest");
+        let (one, two) = ("1".repeat(64), "2".repeat(64));
+
+        record([reported(A, None)]).unwrap();
+        assert_eq!(read_unavailable().unwrap().digest(A), Some(&ChunkDigest::Unknown));
+        record([reported(A, Some(&one))]).unwrap();
+        record([reported(A, None)]).unwrap();
+        assert_eq!(read_unavailable().unwrap().digest(A), Some(&ChunkDigest::Known(one.clone())));
+        record([reported(A, Some(&one))]).unwrap();
+        assert_eq!(read_unavailable().unwrap().digest(A), Some(&ChunkDigest::Known(one.clone())));
+
+        record([reported(A, Some(&two))]).unwrap();
+        assert_eq!(read_unavailable().unwrap().digest(A), Some(&ChunkDigest::Conflicted));
+
+        for digest in [Some(one.as_str()), Some(two.as_str()), None] {
+            record([reported(A, digest)]).unwrap();
+            assert_eq!(read_unavailable().unwrap().digest(A), Some(&ChunkDigest::Conflicted));
+        }
+
+        // A report that is not a digest's form is none.
+        record([reported(B, Some("not a digest"))]).unwrap();
+        assert_eq!(read_unavailable().unwrap().digest(B), Some(&ChunkDigest::Unknown));
+    }
+
     // Revert: drop a validity check → the non-hash or the two-line statement is recorded.
     #[test]
     fn an_entry_needs_a_hash_and_a_statement() {
@@ -360,7 +445,9 @@ mod tests {
         assert!(read_unavailable().is_err());
 
         std::fs::write(unavailable_path(), record_utils::to_bytes(UNAVAILABLE_RECORD, UNAVAILABLE_VERSION, [A])).unwrap();
-        assert!(read_unavailable().unwrap_err().contains("not an object hash and a statement"));
+        assert!(read_unavailable().unwrap_err().contains("not an object hash, a chunk-list digest and a statement"));
+        std::fs::write(unavailable_path(), record_utils::to_bytes(UNAVAILABLE_RECORD, UNAVAILABLE_VERSION, [format!("{} statement", A)])).unwrap();
+        assert!(read_unavailable().is_err(), "a version-1 entry has no digest column");
         assert!(record([(B.to_string(), "statement".to_string())]).is_err(), "never written over");
         assert!(drop_present().is_err(), "never written over");
     }
