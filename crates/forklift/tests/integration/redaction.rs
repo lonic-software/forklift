@@ -2,10 +2,12 @@
 //! redacted object hash, never changed or removed, refused outright for a hash some meta pallet's
 //! history names, and refused while a pallet head names it.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Output;
 
 use forklift_core::util::object_utils;
+use forklift_core::util::redaction_utils::chunk_list_digest;
 
 use crate::common;
 use common::forklift_command;
@@ -2631,6 +2633,153 @@ fn a_lift_leaves_out_withheld_content_and_its_chunks_and_reports_them() {
     for chunk in &chunks {
         assert!(loose_copies(&objects, chunk).is_empty(), "chunk {} reached the server", chunk);
     }
+
+    // The server never held the recipe, so only the owner's copy, sent to its digest intake, gave
+    // it the digest; it kept nothing of it.
+    assert_eq!(withheld_digests(&server.url).get(&recipe), Some(&Some(chunk_list_digest(&chunks))));
+    assert_eq!(withheld_digests(&server.url).get(&film), Some(&None), "a blob has no digest");
+    assert!(loose_copies(&objects, &recipe).is_empty(), "the recipe was stored");
+}
+
+/// The `chunks` digest of every withheld entry the handshake at `url` lists, by hash.
+fn withheld_digests(url: &str) -> BTreeMap<String, Option<String>> {
+    let (status, info) = http(url, "GET", "/v1/warehouse", b"");
+    assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["withheld_intake"], true, "{}", info);
+
+    info["withheld"].as_array().unwrap().iter()
+        .map(|item| (
+            item["hash"].as_str().unwrap().to_string(),
+            item["chunks"].as_str().map(str::to_string),
+        ))
+        .collect()
+}
+
+/// 9 MiB of varied bytes from `seed`: above the chunking threshold, so the file is a recipe of
+/// several chunks.
+fn chunked_content(seed: u64) -> Vec<u8> {
+    let mut state = seed;
+
+    (0..9 * 1024 * 1024).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    }).collect()
+}
+
+/// The recipe `name` is at in the head of `warehouse`'s main pallet, and its chunks.
+fn recipe_at(warehouse: &Warehouse, name: &str) -> (String, Vec<String>) {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+    let root = object_utils::load_parcel(&warehouse.head("main")).unwrap().tree_hash;
+    let tree = object_utils::load_tree(&root).unwrap();
+    let recipe = tree.get_files().find(|(entry, _)| entry.as_str() == name).unwrap().1.hash.clone();
+    let chunks = object_utils::recipe_chunk_hashes(&recipe).unwrap();
+
+    (recipe, chunks)
+}
+
+/// forklift-server's digest intake records the chunk-list digest of a withheld recipe it never
+/// held from a copy a client sends, and keeps nothing of it. It refuses, with a `422` and nothing
+/// changed, bytes that do not hash to the hash and bytes that are not a recipe. Bytes for a hash
+/// not withheld change nothing either.
+///
+/// Revert: record without verifying the hash → the mismatched copy (another recipe's bytes)
+/// records that recipe's digest. Accept any object → the blob is answered `204`. Store the bytes →
+/// the recipe is in the server's store.
+#[test]
+fn the_digest_intake_records_a_withheld_recipes_digest_and_keeps_nothing() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-takedown-intake-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("takedown-intake-owner", &server.url);
+    std::fs::write(owner.root.join("big.bin"), chunked_content(0x2545_f491_4f6c_dd1d)).unwrap();
+    std::fs::write(owner.root.join("other.bin"), chunked_content(0x9e37_79b9_7f4a_7c15)).unwrap();
+    std::fs::write(owner.root.join("film.mkv"), b"a film\n").unwrap();
+    owner.run_ok(&["load", "."]);
+    owner.run_ok(&["stack", "-m", "leaks"]);
+
+    let (recipe, chunks) = recipe_at(&owner, "big.bin");
+    let (other, _) = recipe_at(&owner, "other.bin");
+    let film = hash_of(b"a film\n");
+    let bytes = |hash: &str| {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&owner.root);
+        forklift_core::util::file_utils::retrieve_object_by_hash(hash).unwrap()
+    };
+
+    for hash in [&recipe, &film] {
+        let added = withhold(&server.root, &["add", hash, "--statement", "court order 2026-61"]);
+        assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    }
+
+    let unknown = BTreeMap::from([(film.clone(), None), (recipe.clone(), None)]);
+    assert_eq!(withheld_digests(&server.url), unknown);
+
+    // Another recipe's bytes, and a blob's under its own hash.
+    for (hash, body) in [(&recipe, bytes(&other)), (&film, bytes(&film))] {
+        let (status, body) = http(&server.url, "PUT", &format!("/v1/withheld/{}/recipe", hash), &body);
+        assert!(status.starts_with("HTTP/1.1 422"), "{} / {}", status, body);
+    }
+    assert_eq!(withheld_digests(&server.url), unknown, "a refused copy changes nothing");
+
+    // A recipe not withheld is answered, and nothing is recorded.
+    let (status, body) = http(&server.url, "PUT", &format!("/v1/withheld/{}/recipe", other), &bytes(&other));
+    assert!(status.starts_with("HTTP/1.1 204"), "{} / {}", status, body);
+    assert_eq!(withheld_digests(&server.url), unknown);
+
+    let (status, body) = http(&server.url, "PUT", &format!("/v1/withheld/{}/recipe", recipe), &bytes(&recipe));
+    assert!(status.starts_with("HTTP/1.1 204"), "{} / {}", status, body);
+    assert_eq!(withheld_digests(&server.url), BTreeMap::from([
+        (film.clone(), None), (recipe.clone(), Some(chunk_list_digest(&chunks))),
+    ]));
+
+    let objects = server.root.join(".forklift/objects");
+    for hash in [&recipe, &other, &film] {
+        assert!(loose_copies(&objects, hash).is_empty(), "{} was stored", hash);
+    }
+}
+
+/// A lift sends the digest intake a withheld recipe the server has no digest for even when its
+/// walk never meets the recipe: a new pallet whose history the server holds on another pallet
+/// up to its head, which the walk stops at.
+///
+/// The fixture takes the digest off the server's record by hand, as a takedown recorded before
+/// the server took digests leaves it, since no command does.
+///
+/// Revert: send only the withheld content the lift's walk met → the entry stays without a digest.
+#[test]
+fn a_lift_sends_the_digest_intake_a_withheld_recipe_its_walk_never_meets() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-takedown-intake-elsewhere-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("takedown-intake-elsewhere-owner", &server.url);
+    std::fs::write(owner.root.join("big.bin"), chunked_content(0x2545_f491_4f6c_dd1d)).unwrap();
+    owner.run_ok(&["load", "."]);
+    owner.run_ok(&["stack", "-m", "leak"]);
+    let (recipe, chunks) = recipe_at(&owner, "big.bin");
+
+    let added = withhold(&server.root, &["add", &recipe, "--statement", "court order 2026-62"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    owner.run_ok(&["lift"]);
+    assert_eq!(server.main(), owner.head("main"));
+
+    let digest = chunk_list_digest(&chunks);
+    assert_eq!(withheld_digests(&server.url).get(&recipe), Some(&Some(digest.clone())));
+
+    let record = server.root.join(".forklift/withheld");
+    let text = std::fs::read_to_string(&record).unwrap();
+    let stripped = text.replace(&format!("{} {} ", recipe, digest), &format!("{} - ", recipe));
+    assert_ne!(stripped, text, "{}", text);
+    std::fs::write(&record, stripped).unwrap();
+    assert_eq!(withheld_digests(&server.url).get(&recipe), Some(&None));
+
+    owner.run_ok(&["pallet", "create", "copy"]);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    let lifted = owner.json(&["lift"]);
+    assert!(lifted["data"].get("withheld").is_none(), "the walk met the recipe: {}", lifted);
+
+    assert_eq!(withheld_digests(&server.url).get(&recipe), Some(&Some(digest)));
 }
 
 /// Only a file's content is tolerated absent for being withheld: a lift whose history names a
