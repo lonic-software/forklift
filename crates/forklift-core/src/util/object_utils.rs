@@ -1183,8 +1183,9 @@ enum StreamHeader {
 }
 
 /// Store an object streamed from `reader`, bounding memory to a small constant for a blob or a
-/// chunk whatever its size or declared length, and to the whole-object ceiling for a tree, parcel
-/// or recipe, which is parsed whole — the unconditional defense behind the bundle-import
+/// chunk whatever its size or declared length, and for a tree, parcel or recipe, which is parsed
+/// whole, to about three times the whole-object ceiling (its bytes, the parsed value and the
+/// rebuilt bytes it is compared against) — the unconditional defense behind the bundle-import
 /// bomb ceiling (DESIGN.html §9.4b, §5.0 row D item 7). Exactly `expected_len` bytes are read (a
 /// shorter stream is reported as truncation), hashed through an incremental Blake3, and
 /// zstd-encoded incrementally to a temp file in the object's own shard folder; the temp file is
@@ -2424,8 +2425,10 @@ mod tests {
         assert!(store_object_stream(&empty.hash, &mut reader, empty.content.len() as u64).unwrap());
     }
 
-    /// A tree streamed above the whole-object ceiling is refused without being buffered, and only
-    /// once its bytes are whole and verified: a short stream reads as truncation, not as policy.
+    /// A tree streamed above the whole-object ceiling is refused only once its bytes are whole and
+    /// verified: a short stream reads as truncation, not as policy. (That it is never buffered
+    /// follows from the refusal replacing the header before the buffer is made; this test does
+    /// not measure memory.)
     ///
     /// Revert: refuse it as soon as the header is read → the short stream reports the ceiling.
     #[test]
