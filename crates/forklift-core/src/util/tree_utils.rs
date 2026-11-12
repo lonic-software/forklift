@@ -566,14 +566,20 @@ pub fn remedy_path_when(path: &str, windows: bool) -> Option<String> {
 /// `word` as one shell word in a remedy command, for a caller that puts it where it does not start
 /// an argument (behind a prefix), or that guards a leading `-` itself. Unchanged when it holds only
 /// characters no shell treats specially, and single-quoted for a POSIX shell otherwise. On Windows
-/// there is no quoting that both `cmd` and PowerShell read as one literal argument (both expand
-/// inside double quotes, and the message already wraps the command in them), so such a word gets
-/// `None` and the caller prints a `<path>` placeholder instead.
+/// `\` and a drive's `:` (`C:\…`) are plain too, since both shells pass them through, so a path as
+/// typed there stays as typed. Past that there is no quoting that both `cmd` and PowerShell read as
+/// one literal argument (both expand inside double quotes, and the message already wraps the
+/// command in them), so such a word gets `None` and the caller prints a `<path>` placeholder.
 pub(crate) fn remedy_word_when(word: &str, windows: bool) -> Option<String> {
     // PowerShell also reads `,` (an array), a leading `@` (splatting) and `+`, `:` in some
     // positions, so Windows keeps to the characters no shell there treats specially.
-    let plain = if windows { "._-/" } else { "._-/+@%:," };
-    if !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || plain.contains(c)) {
+    let plain = if windows { "._-/\\" } else { "._-/+@%:," };
+    let drive_colon = |i: usize, c: char| {
+        windows && c == ':' && i == 1 && word.as_bytes()[0].is_ascii_alphabetic()
+    };
+    if !word.is_empty()
+        && word.char_indices().all(|(i, c)| c.is_ascii_alphanumeric() || plain.contains(c) || drive_colon(i, c))
+    {
         Some(word.to_string())
     } else if windows {
         None
@@ -1118,8 +1124,8 @@ mod subtree_closure_tests {
 
     /// A remedy command's path is one argument: plain paths stay as they are, anything a shell
     /// would split or expand is single-quoted for POSIX (embedded quotes included) and left to a
-    /// placeholder on Windows, and a leading `-` is guarded by `./`, never by `--` (which PowerShell
-    /// 5.1 does not keep a dotted path whole behind).
+    /// placeholder on Windows, where `\` and a leading drive's `:` stay plain, and a leading `-` is
+    /// guarded by `./`, never by `--` (which PowerShell 5.1 does not keep a dotted path whole behind).
     #[test]
     fn a_remedy_path_is_one_argument() {
         let mut failures = Vec::new();
@@ -1137,6 +1143,11 @@ mod subtree_closure_tests {
             ("dir/-draft.txt", Some("dir/-draft.txt"), Some("dir/-draft.txt")),
             ("", Some("''"), None),
             ("say \"hi\".txt", Some("'say \"hi\".txt'"), None),
+            ("docs\\a.txt", Some("'docs\\a.txt'"), Some("docs\\a.txt")),
+            ("C:\\wh\\a.txt", Some("'C:\\wh\\a.txt'"), Some("C:\\wh\\a.txt")),
+            ("-x\\y.txt", Some("'./-x\\y.txt'"), Some("./-x\\y.txt")),
+            ("1:\\a.txt", Some("'1:\\a.txt'"), None),
+            ("a\\C:x", Some("'a\\C:x'"), None),
         ];
         for (path, posix, windows) in cases {
             for (is_windows, expected) in [(false, posix), (true, windows)] {

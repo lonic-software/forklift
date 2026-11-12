@@ -9114,7 +9114,8 @@ fn quoted_command_after_run(message: &str, verb: &str) -> String {
 
 /// The discard refusal of a restore names the path as given as one argument, `./` before a
 /// leading `-` (never a `--` guard, which PowerShell 5.1 splits a dotted dash-led path behind), and
-/// the printed command, pasted into this platform's shells, discards the change.
+/// the printed command, pasted into this platform's shells, discards the change. On Windows a path
+/// typed with `\` is kept as typed.
 #[test]
 fn a_restore_discard_next_step_runs_as_printed() {
     in_each_pasting_shell("restore-discard-pasted", |run, label| {
@@ -9134,6 +9135,24 @@ fn a_restore_discard_next_step_runs_as_printed() {
         let ran = run(&warehouse, &command);
         assert!(ran.status.success(), "{} ran {:?}: {}{}", label, command, stdout(&ran), stderr(&ran));
         assert_eq!(std::fs::read_to_string(warehouse.root.join("-draft.txt")).unwrap(), "original\n");
+
+        // A path typed with Windows separators needs no quoting in either shell there, so the
+        // next step keeps it as typed rather than asking for it again.
+        if cfg!(windows) {
+            warehouse.write_file("sub/notes.txt", "original\n");
+            assert_success(&warehouse.run(&["load", "."]));
+            assert_success(&warehouse.run(&["stack", "-m", "notes"]));
+            warehouse.write_file("sub/notes.txt", "edited\n");
+
+            let refused = warehouse.run(&["restore", "sub\\notes.txt"]);
+            assert!(!refused.status.success(), "{}", stderr(&refused));
+            let command = quoted_command_after_run(&stderr(&refused), "restore");
+            assert_eq!(command, "forklift restore --confirm sub\\notes.txt", "{}", stderr(&refused));
+
+            let ran = run(&warehouse, &command);
+            assert!(ran.status.success(), "{} ran {:?}: {}{}", label, command, stdout(&ran), stderr(&ran));
+            assert_eq!(std::fs::read_to_string(warehouse.root.join("sub/notes.txt")).unwrap(), "original\n");
+        }
     });
 }
 
