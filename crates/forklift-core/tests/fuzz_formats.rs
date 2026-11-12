@@ -40,6 +40,7 @@ use forklift_core::model::chunk::Chunk;
 use forklift_core::model::recipe::{Recipe, RecipeChunk};
 use forklift_core::util::byte_utils::{number_from_vlq_bytes, number_to_vlq_bytes};
 use forklift_core::util::chunk_utils::MAX_CHUNK_BYTES;
+use forklift_core::util::meta_tree::{encode_cell, parse_cell, Stamp};
 
 // ---------------------------------------------------------------------------------------------
 // Deterministic RNG (splitmix64) — no external dependency, reproducible seed → stream.
@@ -261,6 +262,30 @@ fn mutate(bytes: &mut Vec<u8>, rng: &mut Rng) {
     }
 }
 
+/// A meta-tree cell as `encode_cell` writes it: a signer or operator stamp, a schema, and a value
+/// of strings, integers, booleans, arrays and a nested table.
+fn cell_bytes(rng: &mut Rng) -> Vec<u8> {
+    let stamp = if rng.bool() { Stamp::Signer(random_hash(rng)) } else { Stamp::Operator(random_name(rng)) };
+    let mut value = toml_edit::Table::new();
+
+    for _ in 0..rng.below(5) {
+        let item = match rng.below(5) {
+            0 => toml_edit::value(random_name(rng)),
+            1 => toml_edit::value(rng.next_u64() as i64),
+            2 => toml_edit::value(rng.bool()),
+            3 => toml_edit::value(toml_edit::Array::from_iter((0..rng.below(3)).map(|_| random_name(rng)))),
+            _ => {
+                let mut nested = toml_edit::Table::new();
+                nested.insert(&random_name(rng), toml_edit::value(random_name(rng)));
+                toml_edit::Item::Table(nested)
+            }
+        };
+        value.insert(&random_name(rng), item);
+    }
+
+    encode_cell(&stamp, "fuzz.shape 1", &value).expect("the generator writes only kinds a cell holds")
+}
+
 // ---------------------------------------------------------------------------------------------
 // The never-panic property.
 // ---------------------------------------------------------------------------------------------
@@ -273,12 +298,15 @@ type ParseEntryPoint = (&'static str, fn(&[u8]));
 /// equally acceptable; a panic is the bug. Returns the offending description on panic so the
 /// caller can print the reproducing bytes.
 fn parse_never_panics(bytes: &[u8]) -> Result<(), String> {
-    let entry_points: [ParseEntryPoint; 2] = [
+    let entry_points: [ParseEntryPoint; 3] = [
         ("loose_object", |b| {
             let _ = parse_loose_object(b);
         }),
         ("inventory", |b| {
             let _ = parse_inventory(b);
+        }),
+        ("meta_cell", |b| {
+            let _ = parse_cell(b);
         }),
     ];
 
@@ -297,8 +325,8 @@ fn parsers_never_panic_on_mutated_or_random_input() {
     // A fixed base seed keeps the whole run reproducible; the inner streams vary per case.
     let mut rng = Rng::new(0xF01C_11F7_5EED_0001);
 
-    let generators: [fn(&mut Rng) -> Vec<u8>; 4] =
-        [blob_object_bytes, tree_object_bytes, parcel_object_bytes, inventory_bytes];
+    let generators: [fn(&mut Rng) -> Vec<u8>; 5] =
+        [blob_object_bytes, tree_object_bytes, parcel_object_bytes, inventory_bytes, cell_bytes];
 
     let mut cases = 0usize;
 
@@ -325,7 +353,7 @@ fn parsers_never_panic_on_mutated_or_random_input() {
         cases += 1;
     }
 
-    assert!(cases >= 20_000, "the fuzzer should exercise a large corpus, ran {cases}");
+    assert!(cases >= 24_000, "the fuzzer should exercise a large corpus, ran {cases}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -394,6 +422,17 @@ fn parcels_round_trip() {
             assert_eq!(got.description, want.description);
             assert_eq!(got.timestamp, want.timestamp);
         }
+    }
+}
+
+/// A written cell parses back to the same envelope, and re-encodes to the same bytes.
+#[test]
+fn cells_round_trip() {
+    let mut rng = Rng::new(0xCE11_2002);
+    for _ in 0..500 {
+        let bytes = cell_bytes(&mut rng);
+        let parsed = parse_cell(&bytes).unwrap_or_else(|e| panic!("{}: {:?}", e, String::from_utf8_lossy(&bytes)));
+        assert_eq!(encode_cell(&parsed.stamp, &parsed.schema, &parsed.value).unwrap(), bytes);
     }
 }
 
