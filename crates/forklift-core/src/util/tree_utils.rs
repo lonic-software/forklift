@@ -434,12 +434,12 @@ pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&s
             ),
             match remedy_path(first_path) {
                 Some(quoted) => format!(
-                    "Run \"forklift unload {}\", then \"forklift load {}\" to stage it again \
-                    from its working copy.",
+                    "From the working tree's root, run \"forklift unload {}\", then \"forklift load {}\" \
+                    to stage it again from its working copy.",
                     quoted, quoted
                 ),
-                None => "Run \"forklift unload -- <path>\", then \"forklift load -- <path>\", \
-                    with that path quoted for your shell, to stage it again from its working copy.".to_string(),
+                None => "From the working tree's root, run \"forklift unload -- <path>\", then \"forklift load \
+                    -- <path>\", with that path quoted for your shell, to stage it again from its working copy.".to_string(),
             },
         )
     } else {
@@ -455,8 +455,8 @@ pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&s
                 since one naming them could not be restored.",
                 lost.len(), named.join("; "), and_more
             ),
-            "Run \"forklift unload -- <path>\", then \"forklift load -- <path>\", for each, \
-            to stage it again from its working copy.".to_string(),
+            "From the working tree's root, run \"forklift unload -- <path>\", then \"forklift load -- <path>\", \
+            for each, to stage it again from its working copy.".to_string(),
         )
     };
 
@@ -535,8 +535,8 @@ fn probe_staged_object(path: &str, hash: &str, chunked: bool) -> Result<StagedOb
     let remedy = remedy_path(path);
     object_utils::recipe_chunk_hashes(hash).map(StagedObject::Chunked).map_err(|e| format!(
         "\"{}\" is staged, but its recipe {} is in the store and cannot be read: {}. No parcel was made. \
-        Loading the file again will not replace it while the damaged object stays in place; run \
-        \"forklift unload {}\"{} to leave it out and stack the rest.",
+        Loading the file again will not replace it while the damaged object stays in place; from the \
+        working tree's root, run \"forklift unload {}\"{} to leave it out and stack the rest.",
         path, hash, e.trim_end_matches('.'),
         remedy.as_deref().unwrap_or("-- <path>"),
         if remedy.is_some() { "" } else { " with that path quoted for your shell" }
@@ -551,10 +551,11 @@ pub(crate) fn remedy_path(path: &str) -> Option<String> {
 /// `path` (relative) as one argument of a remedy command, which never starts with `-`: a path that
 /// does is spelled `./<path>`, the same path, so it is not taken for an option. Not after `--`:
 /// Windows PowerShell 5.1 splits an unquoted argument that starts with `-` at its first `.`, after
-/// a `--` too (`-- -draft.txt` reaches the program as `-draft` and `.txt`), while the `-- <path>`
-/// placeholder callers print for `None` runs once the user quotes the path, as
-/// `a_dash_led_remedy_path_runs_as_printed_in_windows_shells` in the CLI tests shows. Otherwise as
-/// [`remedy_word_when`] quotes it.
+/// a `--` too (`-- -draft.txt` reaches the program as `-draft` and `.txt`). For `None`, callers
+/// print a `-- <path>` placeholder for the user to quote; that a quoted dash-led path with a space
+/// then runs in both Windows shells is shown for `unload` by
+/// `a_dash_led_remedy_path_runs_as_printed_in_windows_shells` in the CLI tests, and a path holding
+/// `%` or `'` has quoting traps there of its own. Otherwise as [`remedy_word_when`] quotes it.
 pub fn remedy_path_when(path: &str, windows: bool) -> Option<String> {
     match path.starts_with('-') {
         true => remedy_word_when(&format!("./{}", path), windows),
@@ -565,14 +566,20 @@ pub fn remedy_path_when(path: &str, windows: bool) -> Option<String> {
 /// `word` as one shell word in a remedy command, for a caller that puts it where it does not start
 /// an argument (behind a prefix), or that guards a leading `-` itself. Unchanged when it holds only
 /// characters no shell treats specially, and single-quoted for a POSIX shell otherwise. On Windows
-/// there is no quoting that both `cmd` and PowerShell read as one literal argument (both expand
-/// inside double quotes, and the message already wraps the command in them), so such a word gets
-/// `None` and the caller prints a `<path>` placeholder instead.
+/// `\` and a drive's `:` (`C:\…`) are plain too, since both shells pass them through, so a path as
+/// typed there stays as typed. Past that there is no quoting that both `cmd` and PowerShell read as
+/// one literal argument (both expand inside double quotes, and the message already wraps the
+/// command in them), so such a word gets `None` and the caller prints a `<path>` placeholder.
 pub(crate) fn remedy_word_when(word: &str, windows: bool) -> Option<String> {
     // PowerShell also reads `,` (an array), a leading `@` (splatting) and `+`, `:` in some
     // positions, so Windows keeps to the characters no shell there treats specially.
-    let plain = if windows { "._-/" } else { "._-/+@%:," };
-    if !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || plain.contains(c)) {
+    let plain = if windows { "._-/\\" } else { "._-/+@%:," };
+    let drive_colon = |i: usize, c: char| {
+        windows && c == ':' && i == 1 && word.as_bytes()[0].is_ascii_alphabetic()
+    };
+    if !word.is_empty()
+        && word.char_indices().all(|(i, c)| c.is_ascii_alphanumeric() || plain.contains(c) || drive_colon(i, c))
+    {
         Some(word.to_string())
     } else if windows {
         None
@@ -1117,8 +1124,8 @@ mod subtree_closure_tests {
 
     /// A remedy command's path is one argument: plain paths stay as they are, anything a shell
     /// would split or expand is single-quoted for POSIX (embedded quotes included) and left to a
-    /// placeholder on Windows, and a leading `-` is guarded by `./`, never by `--` (which PowerShell
-    /// 5.1 does not keep a dotted path whole behind).
+    /// placeholder on Windows, where `\` and a leading drive's `:` stay plain, and a leading `-` is
+    /// guarded by `./`, never by `--` (which PowerShell 5.1 does not keep a dotted path whole behind).
     #[test]
     fn a_remedy_path_is_one_argument() {
         let mut failures = Vec::new();
@@ -1136,6 +1143,11 @@ mod subtree_closure_tests {
             ("dir/-draft.txt", Some("dir/-draft.txt"), Some("dir/-draft.txt")),
             ("", Some("''"), None),
             ("say \"hi\".txt", Some("'say \"hi\".txt'"), None),
+            ("docs\\a.txt", Some("'docs\\a.txt'"), Some("docs\\a.txt")),
+            ("C:\\wh\\a.txt", Some("'C:\\wh\\a.txt'"), Some("C:\\wh\\a.txt")),
+            ("-x\\y.txt", Some("'./-x\\y.txt'"), Some("./-x\\y.txt")),
+            ("1:\\a.txt", Some("'1:\\a.txt'"), None),
+            ("a\\C:x", Some("'a\\C:x'"), None),
         ];
         for (path, posix, windows) in cases {
             for (is_windows, expected) in [(false, posix), (true, windows)] {

@@ -9094,6 +9094,108 @@ fn a_dash_led_remedy_path_runs_as_printed_in_windows_shells() {
     }
 }
 
+/// Run `command` in each shell a user of this platform pastes a printed next step into: `sh` on
+/// Unix, Windows PowerShell 5.1 and `cmd` on Windows. `each` gets the runner and a label naming
+/// the shell, to name its own warehouse by.
+fn in_each_pasting_shell(name: &str, mut each: impl FnMut(&dyn Fn(&TestWarehouse, &str) -> Output, &str)) {
+    #[cfg(unix)]
+    each(&|warehouse, command| run_in_shell(warehouse, command), &format!("{}-sh", name));
+    #[cfg(windows)]
+    for shell in [WindowsShell::PowerShell, WindowsShell::Cmd] {
+        each(&move |warehouse, command| run_in_windows_shell(warehouse, shell, command), &format!("{}-{:?}", name, shell));
+    }
+}
+
+/// The command a refusal's next step quotes after `run `, as printed.
+fn quoted_command_after_run(message: &str, verb: &str) -> String {
+    let start = message.find(&format!("run \"forklift {}", verb)).unwrap_or_else(|| panic!("no {} named: {}", verb, message)) + 5;
+    message[start..].split('"').next().unwrap().to_string()
+}
+
+/// The discard refusal of a restore names the path as given as one argument, `./` before a
+/// leading `-` (never a `--` guard, which PowerShell 5.1 splits a dotted dash-led path behind), and
+/// the printed command, pasted into this platform's shells, discards the change. On Windows a path
+/// typed with `\` is kept as typed.
+#[test]
+fn a_restore_discard_next_step_runs_as_printed() {
+    in_each_pasting_shell("restore-discard-pasted", |run, label| {
+        let warehouse = TestWarehouse::new(label);
+        warehouse.write_file("-draft.txt", "original\n");
+        assert_success(&warehouse.run(&["prepare"]));
+        configure_operator(&warehouse);
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["stack", "-m", "baseline"]));
+        warehouse.write_file("-draft.txt", "edited\n");
+
+        let refused = warehouse.run(&["restore", "--", "-draft.txt"]);
+        assert!(!refused.status.success(), "{}", stderr(&refused));
+        let command = quoted_command_after_run(&stderr(&refused), "restore");
+        assert_eq!(command, "forklift restore --confirm ./-draft.txt", "{}", stderr(&refused));
+
+        let ran = run(&warehouse, &command);
+        assert!(ran.status.success(), "{} ran {:?}: {}{}", label, command, stdout(&ran), stderr(&ran));
+        assert_eq!(std::fs::read_to_string(warehouse.root.join("-draft.txt")).unwrap(), "original\n");
+
+        // A path typed with Windows separators needs no quoting in either shell there, so the
+        // next step keeps it as typed rather than asking for it again.
+        if cfg!(windows) {
+            warehouse.write_file("sub/notes.txt", "original\n");
+            assert_success(&warehouse.run(&["load", "."]));
+            assert_success(&warehouse.run(&["stack", "-m", "notes"]));
+            warehouse.write_file("sub/notes.txt", "edited\n");
+
+            let refused = warehouse.run(&["restore", "sub\\notes.txt"]);
+            assert!(!refused.status.success(), "{}", stderr(&refused));
+            let command = quoted_command_after_run(&stderr(&refused), "restore");
+            assert_eq!(command, "forklift restore --confirm sub\\notes.txt", "{}", stderr(&refused));
+
+            let ran = run(&warehouse, &command);
+            assert!(ran.status.success(), "{} ran {:?}: {}{}", label, command, stdout(&ran), stderr(&ran));
+            assert_eq!(std::fs::read_to_string(warehouse.root.join("sub/notes.txt")).unwrap(), "original\n");
+        }
+    });
+}
+
+/// A bays folder whose name starts with `-` is named after a `--` in the listing's way out, and
+/// the printed command, pasted into this platform's shells, removes exactly that folder. On
+/// Windows a dash-led name holding a `.` gets no command, since PowerShell 5.1 splits it at the
+/// `.` behind `--` too: the listing says to remove the folder by hand, and the `--` form is shown
+/// failing there without removing it.
+#[test]
+fn a_dash_led_bay_folder_is_removable_as_the_listing_prints() {
+    in_each_pasting_shell("bay-remove-pasted", |run, label| {
+        for name in ["-x", "-x.y"] {
+            let (warehouse, _bay_dir) = warehouse_with_a_bay(&format!("{}{}", label, name));
+            let bays = warehouse.root.join(".forklift").join("bays");
+            std::fs::create_dir(bays.join(name)).unwrap();
+
+            let listed = warehouse.run(&["bay"]);
+            assert!(!listed.status.success(), "the listing must not skip {:?}", name);
+            let message = stderr(&listed);
+            let windows_dotted = cfg!(windows) && name.contains('.');
+            if windows_dotted {
+                assert!(message.contains("Remove that folder by hand"), "{}", message);
+                let guarded = format!("forklift bay remove -- {}", name);
+                let out = run(&warehouse, &guarded);
+                if label.ends_with("PowerShell") {
+                    assert!(!out.status.success(), "{} ran {:?}: {}{}", label, guarded, stdout(&out), stderr(&out));
+                    assert!(bays.join(name).is_dir(), "{} ran {:?}: the folder stands", label, guarded);
+                }
+                continue;
+            }
+            let command = message.split("Remove it with \"").nth(1).and_then(|rest| rest.split('"').next())
+                .unwrap_or_else(|| panic!("no way out named: {}", message)).to_string();
+            assert_eq!(command, format!("forklift bay remove -- {}", name), "{}", message);
+
+            let ran = run(&warehouse, &command);
+            assert!(ran.status.success(), "{} ran {:?}: {}{}", label, command, stdout(&ran), stderr(&ran));
+            assert!(!bays.join(name).exists(), "{} ran {:?}: the folder is removed", label, command);
+            assert!(bays.join("b1").is_dir(), "only the named folder was removed");
+            assert_success(&warehouse.run(&["bay"]));
+        }
+    });
+}
+
 #[cfg(unix)]
 #[test]
 fn a_narrower_clean_load_does_not_heal_a_broader_failed_root() {

@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_BAYS_ROOT, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{cherry_pick_utils, file_utils, journal_utils, merge_utils, pallet_utils, park_utils, record_utils, warehouse_utils};
+use crate::util::{cherry_pick_utils, file_utils, journal_utils, merge_utils, pallet_utils, park_utils, record_utils, tree_utils, warehouse_utils};
 use crate::error::{CoreError, RefusalCode};
 use crate::util::record_utils::RecordError;
 
@@ -397,26 +397,32 @@ pub fn validate_bay_name(name: &str) -> Result<(), String> {
     pallet_utils::validate_pallet_name(name)
 }
 
-/// The `forklift bay remove` command line that addresses the bay folder `name` exactly, quoted so
-/// it can be pasted into a shell, or `None` when no command line can: `bay remove` matches one
-/// listed folder, so never a name holding "/", and refuses a name ending in "." or a space (see
-/// [`is_listed_bay`]); a name holding a quote or a control character has no safe spelling here.
+/// The `forklift bay remove` command line that addresses the bay folder `name` exactly, as one
+/// shell argument on this platform, or `None` when no command line can: see [`remove_command_when`].
 pub fn remove_command(name: &str) -> Option<String> {
-    if name.is_empty() || name.contains('/') || name.ends_with('.') || name.ends_with(' ') {
+    remove_command_when(name, cfg!(windows))
+}
+
+/// [`remove_command`] on the platform `windows`. `bay remove` matches one listed folder, so never a
+/// name holding "/", and refuses a name ending in "." or a space (see [`is_listed_bay`]); a name
+/// holding a quote or a control character has no safe spelling here, and neither has one that
+/// [`tree_utils::remedy_word_when`] leaves to a placeholder on Windows. A leading `-` would be read
+/// as an option, so the name follows `--`; a name is not a path, so `./` cannot stand in for that.
+/// On Windows such a name holding a `.` has none either: PowerShell 5.1 splits an unquoted
+/// argument that starts with `-` at its first `.`, after a `--` too.
+pub(crate) fn remove_command_when(name: &str, windows: bool) -> Option<String> {
+    if name.is_empty() || name.contains('/') || name.ends_with('.') || name.ends_with(' ')
+        || name.chars().any(|c| c == '\'' || c == '"' || c.is_control()) {
         return None;
     }
 
-    let word = if name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
-        name.to_string()
-    } else if name.chars().any(|c| c == '\'' || c == '"' || c.is_control()) {
-        return None;
-    } else {
-        format!("'{}'", name)
-    };
+    let word = tree_utils::remedy_word_when(name, windows)?;
 
-    // A leading '-' would be read as an option, so the name follows "--".
-    let separator = if name.starts_with('-') { "-- " } else { "" };
-    Some(format!("forklift bay remove {}{}", separator, word))
+    match name.starts_with('-') {
+        false => Some(format!("forklift bay remove {}", word)),
+        true if windows && name.contains('.') => None,
+        true => Some(format!("forklift bay remove -- {}", word)),
+    }
 }
 
 /// Read and validate the redirect in a bay's `.forklift` folder.
@@ -1014,17 +1020,29 @@ mod tests {
         assert!(validate_bay_name("Review").unwrap_err().contains("is not a valid pallet name"));
     }
 
-    /// The way-out command line spells the exact folder name for a shell, or is withheld where
-    /// `bay remove` would refuse the name or no safe spelling exists.
+    /// The way-out command line spells the exact folder name as one argument for the platform's
+    /// shells, or is withheld where `bay remove` would refuse the name or no safe spelling exists:
+    /// on Windows, a name a shell there reads specially, and a dash-led one holding a `.`.
     #[test]
     fn the_remove_command_spells_the_folder_name_for_a_shell() {
-        assert_eq!(remove_command("Main").as_deref(), Some("forklift bay remove Main"));
-        assert_eq!(remove_command("My Bay").as_deref(), Some("forklift bay remove 'My Bay'"));
-        assert_eq!(remove_command("a$b;c").as_deref(), Some("forklift bay remove 'a$b;c'"));
-        assert_eq!(remove_command("-x").as_deref(), Some("forklift bay remove -- -x"));
+        let cases = [
+            ("Main", Some("forklift bay remove Main"), Some("forklift bay remove Main")),
+            ("review.2", Some("forklift bay remove review.2"), Some("forklift bay remove review.2")),
+            ("My Bay", Some("forklift bay remove 'My Bay'"), None),
+            ("a$b;c", Some("forklift bay remove 'a$b;c'"), None),
+            ("-x", Some("forklift bay remove -- -x"), Some("forklift bay remove -- -x")),
+            ("-x.y", Some("forklift bay remove -- -x.y"), None),
+            ("-my bay", Some("forklift bay remove -- '-my bay'"), None),
+        ];
+        for (name, posix, windows) in cases {
+            assert_eq!(remove_command_when(name, false).as_deref(), posix, "{:?} (POSIX)", name);
+            assert_eq!(remove_command_when(name, true).as_deref(), windows, "{:?} (Windows)", name);
+        }
 
         for name in ["", "b1.", "b1 ", "it's", "say\"hi\"", "tab\there", "feature/x"] {
-            assert_eq!(remove_command(name), None, "{:?}", name);
+            for windows in [false, true] {
+                assert_eq!(remove_command_when(name, windows), None, "{:?} (windows: {})", name, windows);
+            }
         }
     }
 

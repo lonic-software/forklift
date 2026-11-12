@@ -1,6 +1,6 @@
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
-use forklift_core::util::{bay_utils, journal_utils, unavailable};
+use forklift_core::util::{bay_utils, journal_utils, tree_utils, unavailable};
 use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::scope_utils::{self, PathScope, ScopeClass};
@@ -75,7 +75,7 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
     if !confirm && !plan.to_free.is_empty() {
         let preview = ScopePruneReport {
             preview: true,
-            rerun: rerun_args(&paths),
+            rerun: Rerun::when(&paths, cfg!(windows)),
             pruned: to_reclaim,
             scope: post_prune.prefixes().to_vec(),
             freed: 0,
@@ -103,8 +103,8 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
                 preview.pruned.join(", "), preview.would_free
             ),
             format!(
-                "Check what it would free, then run \"forklift scope prune --confirm {}\" to free it.",
-                preview.rerun
+                "Check what it would free, then run \"{}\" to free it.{}",
+                preview.rerun.command, preview.rerun.note()
             ),
             serde_json::json!(preview),
         ).into());
@@ -128,7 +128,7 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
 
     output::emit(&ScopePruneReport {
         preview: false,
-        rerun: rerun_args(&paths),
+        rerun: Rerun::when(&paths, cfg!(windows)),
         pruned: to_reclaim,
         scope: post_prune.prefixes().to_vec(),
         freed: stats.freed,
@@ -277,10 +277,9 @@ pub(crate) struct ScopePruneReport {
     #[serde(skip)]
     preview: bool,
 
-    /// The paths as given, quoted for a shell, for a hint to run the prune again: they resolve
-    /// from the directory it was run in, as the pruned keys (relative to the root) would not.
+    /// The prune again, for a hint (human output and the refusal's next step only).
     #[serde(skip)]
-    rerun: String,
+    rerun: Rerun,
 
     /// The fetched path(s) pruned (forgotten) from the warehouse fetch scope.
     pruned: Vec<String>,
@@ -425,8 +424,8 @@ impl CommandOutput for ScopePruneReport {
             println!(
                 "{} object(s) were kept because lifting history the remote does not hold yet reads \
                 them{}; some may be the only copy. Lift that work (or lower, if the remote is \
-                ahead), then run \"forklift scope prune --confirm {}\" again to free them.",
-                self.kept_unlifted, pallets, self.rerun
+                ahead), then run \"{}\" again to free them.{}",
+                self.kept_unlifted, pallets, self.rerun.command, self.rerun.note()
             );
         }
 
@@ -475,23 +474,44 @@ impl CommandOutput for ScopePruneReport {
 }
 
 
-/// Quote a path for a POSIX shell, leaving it bare when it holds only characters a shell never
-/// reinterprets.
-///
-/// # Arguments
-/// * `path` - The path key.
-pub(crate) fn shell_quote(path: &str) -> String {
-    if !path.is_empty() && path.chars().all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c)) {
-        return path.to_string();
-    }
+/// A command line that runs the prune again, for a hint: the paths as given, which resolve from
+/// the directory it was run in as the pruned keys (relative to the root) would not.
+struct Rerun {
+    /// The command line: each path as one argument (`tree_utils::remedy_path_when`), or `<path>`
+    /// where no quoting on this platform reads it as one, led by `-- ` once any is.
+    command: String,
 
-    format!("'{}'", path.replace('\'', "'\\''"))
+    /// The paths in place of the `<path>` placeholders, in order.
+    placeholders: Vec<String>,
 }
 
-/// The paths as given, quoted for a shell and led by `-- ` when one starts with a dash.
-fn rerun_args(paths: &[String]) -> String {
-    let separator = if paths.iter().any(|path| path.starts_with('-')) { "-- " } else { "" };
-    format!("{}{}", separator, paths.iter().map(|path| shell_quote(path)).collect::<Vec<_>>().join(" "))
+impl Rerun {
+    /// The re-run of a prune of `paths` on the platform `windows`.
+    fn when(paths: &[String], windows: bool) -> Rerun {
+        let mut placeholders = Vec::new();
+        let args: Vec<String> = paths.iter().map(|path| match tree_utils::remedy_path_when(path, windows) {
+            Some(arg) => arg,
+            None => {
+                placeholders.push(path.clone());
+                "<path>".to_string()
+            }
+        }).collect();
+        let separator = if placeholders.is_empty() { "" } else { "-- " };
+
+        Rerun { command: format!("forklift scope prune --confirm {}{}", separator, args.join(" ")), placeholders }
+    }
+
+    /// The sentence that follows the one naming [`Rerun::command`]: which path goes in place of
+    /// each `<path>`, or nothing when there is none (with a leading space otherwise).
+    fn note(&self) -> String {
+        let quoted: Vec<String> = self.placeholders.iter().map(|path| format!("\"{}\"", path)).collect();
+
+        match quoted.len() {
+            0 => String::new(),
+            1 => format!(" In place of <path>, put {}, quoted for your shell.", quoted[0]),
+            _ => format!(" In place of each <path>, put {}, in that order, quoted for your shell.", quoted.join(", then ")),
+        }
+    }
 }
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
@@ -504,13 +524,29 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 
 #[cfg(test)]
 mod tests {
-    use super::shell_quote;
+    use super::Rerun;
 
+    /// The re-run names each path as given as one argument: plain bare, a leading `-` as `./`,
+    /// single-quoted for POSIX when a shell would split it, and on Windows a placeholder behind
+    /// one `--`, with the paths to put in their places named in order.
     #[test]
-    fn shell_quote_leaves_plain_paths_bare_and_quotes_the_rest() {
-        assert_eq!(shell_quote("src/api_v2.d-x"), "src/api_v2.d-x");
-        assert_eq!(shell_quote("design docs"), "'design docs'");
-        assert_eq!(shell_quote("assets/*.png"), "'assets/*.png'");
-        assert_eq!(shell_quote("it's docs"), "'it'\\''s docs'");
+    fn a_rerun_names_each_path_as_one_argument() {
+        let paths = |list: &[&str]| list.iter().map(|path| path.to_string()).collect::<Vec<_>>();
+        let cases = [
+            (paths(&["src/api_v2.d-x"]), false, "forklift scope prune --confirm src/api_v2.d-x", ""),
+            (paths(&["src/api_v2.d-x"]), true, "forklift scope prune --confirm src/api_v2.d-x", ""),
+            (paths(&["-drafts.v2", "docs"]), false, "forklift scope prune --confirm ./-drafts.v2 docs", ""),
+            (paths(&["-drafts.v2", "docs"]), true, "forklift scope prune --confirm ./-drafts.v2 docs", ""),
+            (paths(&["design docs", "it's"]), false, "forklift scope prune --confirm 'design docs' 'it'\\''s'", ""),
+            (paths(&["design docs"]), true, "forklift scope prune --confirm -- <path>",
+                " In place of <path>, put \"design docs\", quoted for your shell."),
+            (paths(&["docs", "design docs", "-a b"]), true, "forklift scope prune --confirm -- docs <path> <path>",
+                " In place of each <path>, put \"design docs\", then \"-a b\", in that order, quoted for your shell."),
+        ];
+
+        for (paths, windows, command, note) in cases {
+            let rerun = Rerun::when(&paths, windows);
+            assert_eq!((rerun.command.as_str(), rerun.note().as_str()), (command, note), "{:?} (windows: {})", paths, windows);
+        }
     }
 }
