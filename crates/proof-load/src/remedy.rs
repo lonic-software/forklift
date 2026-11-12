@@ -120,7 +120,7 @@ mod tests {
     fn a_next_step_that_is_a_command_is_extracted() {
         assert_eq!(extract(&["This bay is behind pallet \"main\".", "forklift shift main"]).remedies,
             vec![Remedy::Command { arguments: vec!["shift".to_string(), "main".to_string()] }]);
-        assert!(extract(&["Run forklift heal when done."]).remedies.is_empty());
+        assert!(extract(&["Run forklift heal, when done."]).remedies.is_empty());
         assert_eq!(extract(&["forklift shift <pallet>"]).unextractable, vec!["forklift shift <pallet>"]);
     }
 

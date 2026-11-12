@@ -137,7 +137,7 @@ impl Context<'_> {
         corpus::write(&snapshot, &self.scratch.work()).map_err(|error| RunError::Io(error.to_string()))?;
         let mut lines = Vec::new();
         for op in std::iter::once(&Op::Record { index }).chain(self.then) {
-            for arguments in bind(Tool::Forklift, op).expect("forklift binds every operation") {
+            for arguments in bind(Tool::Forklift, op).expect("Tool::Forklift binds every operation") {
                 lines.push(runner::fill(arguments, self.url, &self.scratch.work())
                     .map_err(|placeholder| RunError::Io(format!("{:?} needs {} and the scenario hosts nothing", op, placeholder)))?);
             }

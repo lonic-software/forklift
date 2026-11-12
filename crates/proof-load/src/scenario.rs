@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn forklift_binds_every_operation_with_json() {
         for op in every_op() {
-            let lines = bind(Tool::Forklift, &op).unwrap_or_else(|| panic!("forklift binds {:?}", op));
+            let lines = bind(Tool::Forklift, &op).unwrap_or_else(|| panic!("Tool::Forklift binds {:?}", op));
             // Bundle and withhold are the server's own commands, which the build runs with the
             // server binary; enrolling the host runs in another warehouse, which the build lays out.
             assert_eq!(lines.is_empty(), matches!(op, Op::Bundle | Op::Withhold { .. } | Op::EnrollHost), "{:?}", op);
