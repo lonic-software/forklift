@@ -68,10 +68,16 @@ records     concatenated native records
 Native records are:
 
 ```text
-full:   kind 0x00 | zstd(object bytes)
+full:   kind 0x00 | one zstd frame of the object bytes
 delta:  kind 0x01 | base hash[32 raw bytes] | target length[VLQ] |
-        zstd frame compressed with the base object as its dictionary
+        one zstd frame compressed with the base object as its dictionary
 ```
+
+Each record's frame is a standard zstd frame and ends exactly where the record ends: import
+refuses a record split across several frames, one led or followed by a skippable frame, and one
+with any byte after its frame. The target length is the shortest VLQ that spells it. These are import rules; a local read of
+the store's own packs, and salvage of a damaged one, accept any record that still rebuilds to its
+hash.
 
 The accompanying index section is byte-for-byte a Forklift pack index:
 
@@ -90,7 +96,9 @@ The file is exactly `24 + 8 × 2^fanout_bits + 48 × count` bytes. Fanout bucket
 whose hash's top `fanout_bits` bits equal `b`; its `end` is the number of entries in buckets `0..=b`
 (so the ends never decrease and the last equals `count`), and its `crc` is the crc32 of those
 entries' bytes. Writers pick the smallest `fanout_bits` that keeps the average bucket at 32 entries
-or fewer. Readers refuse any other version by name.
+or fewer, and import refuses an index whose `fanout_bits` is any other width. That rule is part
+of the index format: a writer that picks widths another way is a new format version. Readers refuse any
+other version by name.
 
 Index entries are strictly sorted by hash for binary search. Their record ranges must be non-empty,
 in bounds, non-overlapping, and together cover every byte after the data header exactly once. A
@@ -114,25 +122,52 @@ Import is deliberately two-phase, and runs only once the whole file has matched 
 3. Resolve every indexed full or delta record, verify its Blake3 address, enforce the 64 MiB object
    ceiling and the chunk-specific ceiling, and reject duplicate hashes or delta cycles. A bounded
    reconstruction cache accelerates chains without retaining the whole warehouse in memory.
-4. Sync the handful of verified aggregate files, then publish data first and index last. The index
-   is the reader-visible commit point. Finally sync the pack directory and invalidate the in-process
+4. Read the signature section while the packs are still in quarantine, and require the digest to
+   follow it. An entry is admitted only when its hash names a parcel the packs carry, only once per
+   bundle, and only when its bytes are a well-formed signature (`PARCEL_SIGNATURE_FORMAT.md`). An
+   entry naming a blob, a tree, an absent hash, or a parcel an earlier entry already signed rejects
+   the bundle before its bytes are read. Admitted entries are staged in a hidden temporary file
+   beside the packs, so admission holds one signature in memory at a time.
+5. Sync the handful of verified aggregate files, then publish data first and index last. The index
+   is the reader-visible commit point. Then sync the pack directory and invalidate the in-process
    pack cache.
-5. Import the signature section and require the digest to follow it, then write the signatures
-   as signature tables. An entry is admitted only when its hash names a parcel present in the store
-   once the packs have landed, and only once per bundle; a parcel the store already holds a
-   different signature for keeps its own, and the bundle's copy is skipped. An entry naming a blob, a tree, an absent hash, or a parcel an
-   earlier entry already signed rejects the bundle before its bytes are read. (The importer runs
-   only against a freshly prepared warehouse, so "present in the store" is "carried by the packs".)
+6. Write the staged signatures as signature tables. A parcel the store already holds a different
+   signature for keeps its own, and the bundle's copy is skipped.
 
-Any failure before pack publication removes the temporary files. A process crash during
-publication leaves at worst a valid subset of verified packs: an index is never published before
-its data, and the normal history walk fetches anything still missing. Re-import is idempotent; if
+A bundle is refused as a whole: every check, the signature section's included, runs before pack
+publication, and any failure there removes the temporary files and stores nothing. Only a local
+fault after publication — a failed sync, or a signature table that cannot be written — can leave
+the packs installed without the bundle's signatures. The import still fails, and says so. A process crash during publication leaves
+at worst a valid subset of verified packs: an index is never published before its data, and the
+normal history walk fetches anything still missing. Re-import is idempotent; if
 all indexed hashes already exist, the incoming duplicate pack is discarded.
 
 This does **not** skip cryptographic work. Like Git's receive/index-pack path, Forklift still parses
 the native framing, reconstructs deltas, and hashes every untrusted object. The speedup comes from
 avoiding thousands of decompressed loose-file writes and durability barriers, not from trusting the
 sender.
+
+## One object set, how many spellings
+
+A digest-matching bundle is not a canonical one: many byte strings carry the same objects, and a
+builder is free to choose among some of them. Each freedom is either harmless, because it cannot
+change what is stored or what any record means, or refused at import.
+
+Harmless, because every object is reconstructed and hash-verified and each pack's name is derived
+from its own layout:
+
+- how the objects are split into packs, and the order of the packs;
+- the order of records inside a pack, and of entries in the signature section;
+- whether a blob travels as a full record or as a delta, and against which base;
+- the zstd compression level and parameters inside a record's frame;
+- in a partial bundle, how the outer zstd stream is framed, since its records are verified one by
+  one.
+
+Refused, because each is a second spelling of the same record that the reader would otherwise
+accept: bytes outside a record's single zstd frame, an index fanout width other than the writer's,
+a target length VLQ longer than it needs to be, a signature entry for anything but a carried parcel,
+and a second entry for one parcel. A signature's own bytes are not content-addressed, so they are
+checked for shape here and against the signer's key when the parcel is verified.
 
 ## Builder and server behavior
 
