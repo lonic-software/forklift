@@ -2271,6 +2271,57 @@ mod tests {
         assert!(accepted < 400, "every mutation was accepted");
     }
 
+    /// A mutated record stream (a batch response) never panics, and whatever of it is stored is an
+    /// object it was asked for, under its own hash. The stream is imported record by record, so a
+    /// refusal part-way may leave the records before it stored; each of those was requested and
+    /// verified. Mutations land in the record stream before compression, or in the compressed
+    /// bytes themselves.
+    #[test]
+    fn a_mutated_record_stream_stores_only_requested_verified_objects() {
+        use crate::util::fuzz_bytes::{mutate, Rng};
+
+        let contents: Vec<Vec<u8>> = ["one", "two", "three"].iter()
+            .map(|text| object_utils::blob_bytes(format!("record stream object {}", text).as_bytes()))
+            .collect();
+        let hashes: Vec<String> = contents.iter().map(|content| object_utils::hash_object_bytes(content)).collect();
+        let requested: Vec<&str> = hashes.iter().map(String::as_str).collect();
+        let records: Vec<u8> = contents.iter().zip(&hashes)
+            .flat_map(|(content, hash)| record(b'O', hash, content))
+            .collect();
+        {
+            let _destination = Scratch::new("stream-fuzz-reference");
+            assert_eq!(import_batch_bytes(&raw_bundle(BUNDLE_HEADER_V3, &records), &requested).unwrap().stored_objects, 3);
+        }
+
+        let mut rng = Rng::new(0x57EA_0423);
+        for case in 0..300 {
+            let bytes = if rng.below(2) == 0 {
+                let mut mutated = records.clone();
+                mutate(&mut mutated, &mut rng);
+                raw_bundle(BUNDLE_HEADER_V3, &mutated)
+            } else {
+                let mut bytes = raw_bundle(BUNDLE_HEADER_V3, &records);
+                let header_len = BUNDLE_HEADER_V3.len() + 1;
+                let mut compressed = bytes.split_off(header_len);
+                mutate(&mut compressed, &mut rng);
+                bytes.extend(compressed);
+                bytes
+            };
+
+            let _destination = Scratch::new("stream-fuzz-case");
+            std::panic::catch_unwind(|| { let _ = import_batch_bytes(&bytes, &requested); })
+                .unwrap_or_else(|_| panic!("case {} panicked", case));
+            for (hash, content) in hashes.iter().zip(&contents) {
+                if file_utils::does_object_exist(hash).unwrap() {
+                    assert_eq!(&file_utils::retrieve_object_by_hash(hash).unwrap(), content, "case {}", case);
+                }
+            }
+            let stored = files_under_objects().len();
+            let requested_stored = hashes.iter().filter(|hash| file_utils::does_object_exist(hash).unwrap()).count();
+            assert_eq!(stored, requested_stored, "case {}: nothing but requested objects is stored", case);
+        }
+    }
+
     /// A native bundle is refused as a whole: a refusal anywhere in its signature section, or
     /// after it, leaves the destination without a pack, an object or a signature from it, though
     /// its packs verified before that section was read.

@@ -2561,20 +2561,21 @@ struct StagedTransportPack {
 /// store lock (`compact`) or warehouse lock.
 ///
 /// # Returns
-/// * `Ok((TransportImportStats, T))` - `admit_rest`'s value, and every renamed pack pair's directory entries are durable and,
-///                                once [`taint_utils::activate`](crate::util::taint_utils::activate)
-///                                has been called in this process, no durability taint was found
-///                                standing for this root on the re-check that runs right before
-///                                this returns (see `file_utils::sync_dir_or_taint`). An
-///                                unactivated process skips that re-check entirely.
-/// * `Err(String)`                - A section, a pack, a sync, or the trailing directory sync
-///                                failed. On the trailing directory-sync failure specifically,
-///                                every pack pair actually renamed *this run* (never a pair kept
-///                                because an identical layout was already published) is visible
-///                                but its directory entries are not proven durable — once
-///                                activated, that is recorded as a taint over exactly those paths.
-///                                A later `heal_utils::heal_if_tainted` call restages exactly
-///                                those paths and clears the taint once they are durable again.
+/// * `Ok((TransportImportStats, T))` - `admit_rest`'s value, and every renamed pack pair's
+///                                       directory entries are durable and,
+///                                       once [`taint_utils::activate`](crate::util::taint_utils::activate)
+///                                       has been called in this process, no durability taint was found
+///                                       standing for this root on the re-check that runs right before
+///                                       this returns (see `file_utils::sync_dir_or_taint`). An
+///                                       unactivated process skips that re-check entirely.
+/// * `Err(String)`                     - A section, a pack, `admit_rest`, a sync, or the trailing
+///                                       directory sync failed. On the trailing directory-sync failure specifically,
+///                                       every pack pair actually renamed *this run* (never a pair kept
+///                                       because an identical layout was already published) is visible
+///                                       but its directory entries are not proven durable — once
+///                                       activated, that is recorded as a taint over exactly those paths.
+///                                       A later `heal_utils::heal_if_tainted` call restages exactly
+///                                       those paths and clears the taint once they are durable again.
 pub(crate) fn import_transport_packs<R: Read, T>(
     reader: &mut R,
     sections: &[(u64, u64)],
@@ -6512,7 +6513,6 @@ fn compute_pack_id(records: &[([u8; HASH_LEN], u64, u64)]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// A unique temp path in the pack folder for an in-progress write.
 /// A fresh staging path in this store's pack folder, for a transport importer that must hold part
 /// of its stream on disk until the packs are published. Its name is one a later run reclaims if a
 /// hard kill leaves it behind.
@@ -6522,6 +6522,7 @@ pub(crate) fn transport_staging_path(extension: &str) -> Result<PathBuf, String>
     Ok(temp_path(&folder, extension))
 }
 
+/// A unique temp path in the pack folder for an in-progress write.
 fn temp_path(pack_folder: &Path, extension: &str) -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
