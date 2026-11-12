@@ -550,8 +550,7 @@ pub fn remove_entry_unfollowed(path: impl AsRef<Path>, file_type: std::fs::FileT
 /// Whether `file_type` is a link Windows removes as a folder: a directory symlink or a junction.
 #[cfg(windows)]
 fn is_folder_link(file_type: std::fs::FileType) -> bool {
-    let _ = file_type;
-    false
+    std::os::windows::fs::FileTypeExt::is_symlink_dir(&file_type)
 }
 
 #[cfg(not(windows))]
@@ -566,11 +565,11 @@ fn delete_while_held(path: &Path, op: impl Fn(&Path) -> std::io::Result<()>) -> 
     let mut first = true;
     retry_while_held(
         || match (op(path), std::mem::replace(&mut first, false)) {
-            (Err(error), false) if error.kind() == std::io::ErrorKind::NotFound && first => Ok(()),
+            (Err(error), false) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             (result, _) => result,
         },
         is_held_by_another_process,
-        || { let _ = path; true },
+        || path_remains(path),
     )
 }
 
