@@ -1054,10 +1054,30 @@ fn enforce_header_policy(claimed_hash: &str, bytes: &[u8]) -> Result<(), String>
         ObjectType::Tree | ObjectType::Parcel | ObjectType::Recipe => {
             enforce_structured_body(claimed_hash, bytes)?;
         }
-        ObjectType::Blob => {}
+        ObjectType::Blob => {
+            check_blob_version(&bytes[header_len..])
+                .map_err(|reason| malformed_object_error(claimed_hash, &reason))?;
+        }
     }
 
     Ok(())
+}
+
+/// The most bytes a VLQ of a `u64` takes.
+const MAX_VLQ_BYTES: usize = 10;
+
+/// Check that a blob body begins with a blob format version this build reads, in its shortest
+/// spelling: the rest of a blob is raw content with one spelling, so this is all a blob's form
+/// adds to its header's. It reads at most [`MAX_VLQ_BYTES`] of the body, so the streaming store
+/// can check it without holding the blob.
+///
+/// # Returns
+/// * `Ok(())`      - If the body starts with a known blob version.
+/// * `Err(String)` - If it does not, why.
+fn check_blob_version(body: &[u8]) -> Result<(), String> {
+    let (code, _) = byte_utils::number_from_vlq_bytes(0, body)
+        .map_err(|e| format!("Failed to parse blob version: {}", e))?;
+    crate::enums::object::blob_version::BlobVersion::from_code(code).map(|_| ())
 }
 
 /// Refuse a tree, parcel or recipe whose bytes the object parser does not read, its canonical-form
@@ -1148,6 +1168,8 @@ struct StreamOutcome {
 enum StreamRefusal {
     UnknownVersion(u64),
     Malformed(String),
+    /// A tree, parcel or recipe longer than the whole-object ceiling, which is never buffered.
+    OverCeiling(ObjectType, u64),
 }
 
 /// How far [`stream_to_temp`] has read the object's header.
@@ -1160,8 +1182,9 @@ enum StreamHeader {
     Refused(StreamRefusal),
 }
 
-/// Store an object streamed from `reader`, bounding memory to a small constant regardless of the
-/// object's size or a lying declared length — the unconditional defense behind the bundle-import
+/// Store an object streamed from `reader`, bounding memory to a small constant for a blob or a
+/// chunk whatever its size or declared length, and to the whole-object ceiling for a tree, parcel
+/// or recipe, which is parsed whole — the unconditional defense behind the bundle-import
 /// bomb ceiling (DESIGN.html §9.4b, §5.0 row D item 7). Exactly `expected_len` bytes are read (a
 /// shorter stream is reported as truncation), hashed through an incremental Blake3, and
 /// zstd-encoded incrementally to a temp file in the object's own shard folder; the temp file is
@@ -1169,14 +1192,16 @@ enum StreamHeader {
 /// (a bomb, a corrupt or a truncated record) discards the temp file — so nothing unverified ever
 /// lands and a failed import cleans up after itself.
 ///
-/// The whole-object ceiling (`MAX_OBJECT_BYTES`) is *not* enforced here: the bundle importer, its
-/// only production caller, refuses a record whose declared length is above it before streaming a
-/// byte, and the bundle tests store their pre-ceiling giant fixture through this path because it
-/// skips the check. The per-type chunk ceiling *is* enforced — a `Chunk`-typed object whose
-/// payload exceeds `MAX_CHUNK_BYTES` is refused mid-stream, exactly as [`store_object_bytes`]
-/// refuses it whole. So is the object's form, as [`enforce_header_policy`] holds it: a malformed
-/// header is refused, and a tree, parcel or recipe is held in memory (it is under the whole-object
-/// ceiling, or refused) and parsed before it is promoted.
+/// The whole-object ceiling (`MAX_OBJECT_BYTES`) is not enforced on a blob: the bundle importer,
+/// its only production caller, refuses a record whose declared length is above it before
+/// streaming a byte, and the bundle tests store their pre-ceiling giant blob through this path
+/// because it skips the check. The per-type chunk ceiling *is* enforced — a `Chunk`-typed object
+/// whose payload exceeds `MAX_CHUNK_BYTES` is refused mid-stream, exactly as
+/// [`store_object_bytes`] refuses it whole. So is the object's form, as [`enforce_header_policy`]
+/// holds it: a malformed header or blob version is refused, and a tree, parcel or recipe is held
+/// in memory and parsed before it is promoted, or refused when it is above the whole-object
+/// ceiling. Every refusal of form is made only once the hash verifies, so damaged bytes are
+/// reported as damage.
 ///
 /// # Arguments
 /// * `claimed_hash` - The hash the streamed bytes must have.
@@ -1191,7 +1216,10 @@ enum StreamHeader {
 ///                   [`file_utils::sync_dir_or_taint`]). An unactivated process skips that
 ///                   re-check entirely.
 /// * `Ok(false)`   - The object was already present (temp discarded, nothing written).
-/// * `Err(String)` - On a short/truncated stream, a hash mismatch, an over-ceiling chunk, or I/O.
+/// * `Err(String)` - On a short/truncated stream, a hash mismatch, an over-ceiling chunk, an
+///                   object that is not well formed (an unknown version, a header or blob version
+///                   in a second spelling, a tree, parcel or recipe that does not parse or is not
+///                   canonical), a tree, parcel or recipe above the whole-object ceiling, or I/O.
 ///                   A directory-sync failure specifically leaves the object visible at
 ///                   `final_path` with its directory entry not proven durable — once activated,
 ///                   that is recorded as a taint over exactly that path (see
@@ -1254,6 +1282,8 @@ pub fn store_object_stream(claimed_hash: &str,
     let refusal = match outcome.refusal {
         Some(StreamRefusal::UnknownVersion(version)) => Some(unknown_version_error(claimed_hash, version)),
         Some(StreamRefusal::Malformed(reason)) => Some(malformed_object_error(claimed_hash, &reason)),
+        Some(StreamRefusal::OverCeiling(object_type, length)) =>
+            Some(object_ceiling_error(Some(&object_type), length as usize)),
         None => outcome.structured.and_then(|bytes| enforce_structured_body(claimed_hash, &bytes).err()),
     };
     if let Some(refusal) = refusal {
@@ -1287,7 +1317,8 @@ pub fn store_object_stream(claimed_hash: &str,
 /// `reader`, hash them, zstd-encode them to `temp_path`, and enforce the per-chunk ceiling on a
 /// `Chunk`-typed object mid-stream. Returns what it observed; the caller verifies length + hash and
 /// form, then promotes or discards the temp file. Peak memory is one read block plus zstd's own
-/// window, and for a tree, parcel or recipe the object itself, under the whole-object ceiling.
+/// window, and for a tree, parcel or recipe the object itself, under the whole-object ceiling (its
+/// parse and rebuild then take about as much again each).
 fn stream_to_temp(claimed_hash: &str,
                   reader: &mut impl Read,
                   expected_len: u64,
@@ -1301,6 +1332,8 @@ fn stream_to_temp(claimed_hash: &str,
     let mut read_total: u64 = 0;
     let mut header = StreamHeader::Pending(Vec::new());
     let mut structured: Option<Vec<u8>> = None;
+    // The start of a blob's body, up to the most bytes its version can take.
+    let mut blob_head: Option<Vec<u8>> = None;
     let mut block = vec![0u8; 64 * 1024];
 
     let mut bounded = reader.take(expected_len);
@@ -1321,6 +1354,10 @@ fn stream_to_temp(claimed_hash: &str,
         if let Some(bytes) = structured.as_mut() {
             bytes.extend_from_slice(data);
         }
+        if let Some(head) = blob_head.as_mut() {
+            let wanted = MAX_VLQ_BYTES.saturating_sub(head.len()).min(data.len());
+            head.extend_from_slice(&data[..wanted]);
+        }
 
         // Peek the header until it is whole. It is at most `MAX_HEADER_BYTES` long, so a prefix
         // that long which still does not peek is malformed; a shorter one may only be short.
@@ -1328,13 +1365,18 @@ fn stream_to_temp(claimed_hash: &str,
             prefix.extend_from_slice(data);
             match peek_object_header_prefix(prefix) {
                 Ok(PeekedHeader { object_type, header_len: Some(header_len), content_length }) => {
-                    if matches!(object_type, ObjectType::Tree | ObjectType::Parcel | ObjectType::Recipe) {
-                        if expected_len > MAX_OBJECT_BYTES as u64 {
-                            return Err(object_ceiling_error(Some(&object_type), expected_len as usize));
+                    let structured_type = matches!(object_type, ObjectType::Tree | ObjectType::Parcel | ObjectType::Recipe);
+                    if structured_type && expected_len > MAX_OBJECT_BYTES as u64 {
+                        header = StreamHeader::Refused(StreamRefusal::OverCeiling(object_type, expected_len));
+                    } else {
+                        if structured_type {
+                            structured = Some(std::mem::take(prefix));
+                        } else if object_type == ObjectType::Blob {
+                            let body = &prefix[header_len..];
+                            blob_head = Some(body[..body.len().min(MAX_VLQ_BYTES)].to_vec());
                         }
-                        structured = Some(std::mem::take(prefix));
+                        header = StreamHeader::Read { object_type, header_len, content_length };
                     }
-                    header = StreamHeader::Read { object_type, header_len, content_length };
                 }
                 Ok(PeekedHeader { header_len: None, .. }) => {}
                 // A whole version is judged at once, however short the prefix.
@@ -1369,8 +1411,10 @@ fn stream_to_temp(claimed_hash: &str,
         },
         StreamHeader::Read { header_len, content_length, .. } =>
             check_declared_length(content_length, read_total - header_len as u64)
+                .map_err(|error| error.to_string())
+                .and_then(|()| blob_head.as_deref().map_or(Ok(()), check_blob_version))
                 .err()
-                .map(|error| StreamRefusal::Malformed(error.to_string())),
+                .map(StreamRefusal::Malformed),
         StreamHeader::Refused(refusal) => Some(refusal),
     };
 
@@ -2347,6 +2391,69 @@ mod tests {
         let blob = LooseObjectBuilder::build_blob(&Blob { content: vec![7u8; 3] });
         let mut reader = OneByteAtATime { remaining: &blob.content, consumed: 0 };
         assert!(store_object_stream(&blob.hash, &mut reader, blob.content.len() as u64).unwrap());
+    }
+
+    /// A blob's body starts with its blob version, which the reader decodes; a blob without one,
+    /// with one this build does not read, or with one in a second spelling is refused by both
+    /// stores, read whole or a byte at a time, as the parser refuses it.
+    ///
+    /// Revert: let `enforce_header_policy` pass any blob → the buffered store takes them; drop the
+    /// blob-head check in `stream_to_temp` → the streaming store does.
+    #[test]
+    fn both_stores_refuse_a_blob_without_a_known_blob_version() {
+        let _scratch = Scratch::new("blob-version");
+
+        let cases = [
+            ("no version", wrap(ObjectType::Blob, b"")),
+            ("an unknown version", wrap(ObjectType::Blob, &[0x02, 7, 7])),
+            ("an overlong version", wrap(ObjectType::Blob, &[0x81, 0x00, 7, 7])),
+        ];
+        for (what, bytes) in cases {
+            assert!(parser::object::loose_object_parser::parse_blob(&bytes).is_err(), "{} parses", what);
+            let hash = hash_object_bytes(&bytes);
+            let err = store_object_bytes(&hash, &bytes).expect_err(what);
+            assert!(err.contains("not a well-formed object"), "{}: {}", what, err);
+            let mut reader = OneByteAtATime { remaining: &bytes, consumed: 0 };
+            let err = store_object_stream(&hash, &mut reader, bytes.len() as u64).expect_err(what);
+            assert!(err.contains("not a well-formed object"), "{}: {}", what, err);
+            assert!(!file_utils::does_object_exist(&hash).unwrap(), "{} landed", what);
+        }
+
+        let empty = LooseObjectBuilder::build_blob(&Blob { content: Vec::new() });
+        let mut reader = OneByteAtATime { remaining: &empty.content, consumed: 0 };
+        assert!(store_object_stream(&empty.hash, &mut reader, empty.content.len() as u64).unwrap());
+    }
+
+    /// A tree streamed above the whole-object ceiling is refused without being buffered, and only
+    /// once its bytes are whole and verified: a short stream reads as truncation, not as policy.
+    ///
+    /// Revert: refuse it as soon as the header is read → the short stream reports the ceiling.
+    #[test]
+    fn store_object_stream_judges_an_over_ceiling_tree_after_its_bytes() {
+        let _scratch = Scratch::new("tree-over-ceiling");
+
+        let body_len = MAX_OBJECT_BYTES - 4;
+        let mut header = byte_utils::number_to_vlq_bytes(LooseObjectVersion::latest().get_code());
+        header.extend(byte_utils::number_to_vlq_bytes(ObjectType::Tree.get_code()));
+        header.extend(byte_utils::number_to_vlq_bytes(body_len as u64));
+        header.push(0);
+        let total = (header.len() + body_len) as u64;
+        assert!(total > MAX_OBJECT_BYTES as u64);
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&header);
+        hasher.update(&vec![0u8; body_len]);
+        let hash = hasher.finalize().to_hex().to_string();
+
+        let mut short = std::io::Read::chain(header.as_slice(), std::io::repeat(0).take(1024));
+        let err = store_object_stream(&hash, &mut short, total).expect_err("a short stream");
+        assert!(err.contains("truncated"), "{}", err);
+
+        let mut whole = std::io::Read::chain(header.as_slice(), std::io::repeat(0).take(body_len as u64));
+        let err = store_object_stream(&hash, &mut whole, total).expect_err("an over-ceiling tree");
+        assert!(err.contains("ceiling"), "{}", err);
+        assert!(!file_utils::does_object_exist(&hash).unwrap());
+        assert!(no_temp_files_left(&_scratch.root), "the temp files must be cleaned up");
     }
 
     /// A tree whose body is not its builder's spelling (here, its entries out of order) is refused
