@@ -11,5 +11,6 @@ pub mod damage;
 pub mod oracle;
 pub mod remedy;
 pub mod report;
+pub mod scenario;
 pub mod scrub;
 pub mod tool;
