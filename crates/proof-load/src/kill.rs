@@ -187,8 +187,10 @@ pub fn enumerate(calls: &[Call], line: usize, command: &str, root: &Root, start:
         if touched.class == Class::Inert || call.returned == Returned::Restarted {
             continue;
         }
-        // A descriptor that is no file (a pipe, a socket), or a device, is not state.
-        let files: Vec<usize> = (0..resolved.len()).filter(|at| resolved[*at].starts_with('/') && !resolved[*at].starts_with("/dev/")).collect();
+        // A descriptor that is no file (a pipe, a socket, anonymous memory), or a device, is not state.
+        let files: Vec<usize> = (0..resolved.len())
+            .filter(|at| resolved[*at].starts_with('/') && !resolved[*at].starts_with("/dev/") && !resolved[*at].starts_with("/memfd:"))
+            .collect();
         if files.is_empty() && !touched.operands.is_empty() {
             continue;
         }
@@ -203,10 +205,8 @@ pub fn enumerate(calls: &[Call], line: usize, command: &str, root: &Root, start:
             continue;
         }
         let target = identity(&touched.operands, &touched.detail, root, group);
-        let temp = touched.operands.iter().zip(&resolved).any(|(operand, path)| {
-            let text = match operand { Operand::Named { traced, .. } => traced, Operand::Held { .. } => path };
-            trace::without_temp(text, group).1
-        });
+        // Judged below the root, so digits in the scratch area's own name are never taken for a temp.
+        let temp = resolved.iter().any(|path| trace::without_temp(&root.tokenized(path), group).1);
         let (aim, aims) = match touched.operands.first() {
             Some(first) if !temp => {
                 let path = match first { Operand::Named { traced, .. } => traced.clone(), Operand::Held { target } => target.clone() };
@@ -903,6 +903,21 @@ mod tests {
         ]);
         let lifted = summary.completeness.iter().find(|check| check.check == "kill points of lifted").unwrap();
         assert!(lifted.missing.is_empty() && matches!(lifted.cell, Cell::NotRun { .. }));
+    }
+
+    /// A write to anonymous memory is no state and refuses nothing, and a scratch area whose own
+    /// name looks like a temp's pid and count leaves a fixed path aimed by path.
+    ///
+    /// Revert: count /memfd: as a file → the scenario refuses as writing outside its area; judge
+    /// temps on the full path → the fixed path is aimed by position.
+    #[test]
+    fn neither_anonymous_memory_nor_the_root_name_misleads() {
+        let memfd = trace::parse("50 execve(\"/b\", [], 0x1) = 0\n50 write(3</memfd:x>, \"a\", 1) = 1\n").unwrap();
+        assert!(enumerate(&memfd, 0, "load", &root(), "/o/s/0001-h-count/work", |_| false).unwrap().points.is_empty());
+        let named = Root { given: "/o/run-50-1".into(), canonical: "/o/run-50-1".into() };
+        let fixed = trace::parse("50 execve(\"/b\", [], 0x1) = 0\n50 openat(AT_FDCWD</o/run-50-1/work>, \"/o/run-50-1/work/a\", O_WRONLY) = 3</o/run-50-1/work/a>\n").unwrap();
+        let points = enumerate(&fixed, 0, "load", &named, "/o/run-50-1/work", |_| false).unwrap().points;
+        assert!(matches!(points[0].aim, Aim::Path { .. }), "{:?}", points[0].aim);
     }
 
     /// A summary with no graded kill never reads as run: no scenario, every scenario not run, or
