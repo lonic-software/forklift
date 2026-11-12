@@ -783,6 +783,62 @@ async fn s3_verify_and_promote_discards_an_object_core_would_not_store() {
     .expect("the blocking assertions");
 }
 
+/// The verifier's store leaves a staged tree at or above the streaming threshold staged and
+/// unpromoted, so a lift commit's store still finds it; that store judges it (here, malformed: its
+/// body is not a tree's) and discards it.
+///
+/// Revert: drop the `Structured` arm's early return in `verify_and_promote` (or the store's
+/// `holds_large_structured` flag) → the verifier's store discards it.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_the_verifier_store_leaves_a_large_tree_for_the_lift_commit() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (s3, _dynamodb) = raw_clients(&config).await;
+    let (objects, _refs) = build_stores(&config, bridge.clone()).await.expect("stores");
+    let (verifier_s3, _) = build_clients(&config).await.expect("clients");
+    let verifier = S3ObjectStore::new(verifier_s3, config.bucket.clone(), config.warehouse_id.clone(), bridge)
+        .expect("a store")
+        .leaving_large_structured_staged();
+
+    let body_len = forklift_aws_lambda::aws::STREAMING_THRESHOLD_BYTES;
+    let mut tree = forklift_core::util::byte_utils::number_to_vlq_bytes(1);
+    tree.extend(forklift_core::util::byte_utils::number_to_vlq_bytes(
+        forklift_core::enums::object_type::ObjectType::Tree.get_code(),
+    ));
+    tree.extend(forklift_core::util::byte_utils::number_to_vlq_bytes(body_len));
+    tree.push(0);
+    tree.extend(vec![0u8; body_len as usize]);
+    let hash = object_utils::hash_object_bytes(&tree);
+
+    s3.put_object()
+        .bucket(&config.bucket)
+        .key(format!("staging/{}/lift-tree/{}", config.warehouse_id, hash))
+        .body(tree.into())
+        .send()
+        .await
+        .expect("stage the tree");
+
+    tokio::task::spawn_blocking(move || {
+        assert_eq!(verifier.verify_and_promote("lift-tree", &hash).expect("verifier"), PromoteOutcome::LeftStaged);
+        assert!(!verifier.exists(&hash).expect("exists"), "promoted unparsed");
+
+        match objects.verify_and_promote("lift-tree", &hash).expect("lift commit") {
+            PromoteOutcome::Malformed { .. } => {}
+            other => panic!("the lift commit's store: expected Malformed, got {:?}", other),
+        }
+        assert!(!objects.exists(&hash).expect("exists"));
+    })
+    .await
+    .expect("the blocking assertions");
+}
+
 /// The full [`RefStore`] contract against real DynamoDB: the head CAS (committed / conflict
 /// with the current head reported), enumeration, and the one-way trust door.
 #[tokio::test(flavor = "multi_thread")]
