@@ -80,6 +80,7 @@ pub const BINDINGS: &[Binding] = &[
     hosted("withheld", "withheld", FILE),
     bound_in("unavailable", "withheld", FILE),
     bound_in("redactions-applied", "redacted", FILE),
+    bound_in("unvouched-heads", "unvouched", FILE),
 ];
 
 const NO_MIRROR_ORACLE: &str = "no mirror oracle: the corpus configures no mirror url, so nothing reads a mirror back";
@@ -106,13 +107,6 @@ pub const EXEMPTIONS: &[Exemption] = &[
     Exemption { name: "store.lock", reason: HELD_LOCK },
     Exemption { name: "serve.lock", reason: HELD_LOCK },
     Exemption { name: "{bay}lock", reason: HELD_LOCK },
-];
-
-/// Census names no scenario of this build creates yet, so neither bound nor exempted: a run
-/// reports each one missing and fails. This list only lets the unit test hold the gap exact, so a
-/// name that joins or leaves it is noticed. It is not an exemption and the run never reads it.
-pub const NOT_YET_CREATED: &[&str] = &[
-    "unvouched-heads",
 ];
 
 /// What the damage completeness check finds missing: census names no binding or exemption covers,
@@ -178,20 +172,16 @@ mod tests {
         assert_eq!(check(&census, &bindings, &exemptions, &scenarios, &hosted_only), vec!["warehouse: its scenario history does not create it"]);
     }
 
-    /// The bindings file covers this tree's census except for names no scenario of this build
-    /// creates, and lists nothing the census does not: a new census row fails here until it is
-    /// bound or exempted, or, while no scenario creates it, added to `NOT_YET_CREATED`.
+    /// The bindings file covers this tree's whole census and lists nothing the census does not: a
+    /// new census row fails here until it is bound or exempted.
     ///
     /// Revert: drop a binding → its name joins the uncovered list.
     #[test]
-    fn this_trees_census_is_covered_but_for_what_no_scenario_creates() {
+    fn this_trees_census_is_covered() {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let census = Census::load(&source).unwrap().unwrap();
-        let mut uncovered: Vec<String> = damage::uncovered(&census, BINDINGS, EXEMPTIONS).into_iter().map(|name| name.path).collect();
-        uncovered.sort();
-        let mut expected: Vec<&str> = NOT_YET_CREATED.to_vec();
-        expected.sort();
-        assert_eq!(uncovered, expected);
+        let uncovered: Vec<String> = damage::uncovered(&census, BINDINGS, EXEMPTIONS).into_iter().map(|name| name.path).collect();
+        assert_eq!(uncovered, Vec::<String>::new());
         assert_eq!(damage::stale(&census, BINDINGS, EXEMPTIONS), Vec::<&str>::new());
     }
 }

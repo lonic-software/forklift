@@ -209,6 +209,16 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                 // Its lines ran above, with the target filled.
                 continue;
             }
+            Op::EnrollHost => {
+                let url = host.as_ref().map(|host| host.url.clone())
+                    .ok_or_else(|| RunError::Io(format!("scenario {} enrolls a host before it hosts one", scenario.id)))?;
+                let elsewhere = scratch.root().join("enroller");
+                outcomes.push(run_in(program, vec!["--json".into(), "clone".into(), url, elsewhere.display().to_string()], scratch.root().to_path_buf())?);
+                for command in [["office", "enroll"].as_slice(), ["lift"].as_slice()] {
+                    let arguments = std::iter::once("--json").chain(command.iter().copied()).map(str::to_string).collect();
+                    outcomes.push(run_in(program, arguments, elsewhere.clone())?);
+                }
+            }
             Op::Clone { .. } => {
                 // A clone makes its target; the work tree it replaces is the harness's own scratch.
                 #[allow(clippy::disallowed_methods)] // a scratch work tree the harness made; no retry is wanted

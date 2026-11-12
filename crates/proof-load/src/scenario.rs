@@ -41,6 +41,10 @@ pub enum Op {
     Host,
     /// Move a partial warehouse's origin to the host it already has, which holds all it leans on.
     MoveOrigin,
+    /// Have another warehouse enroll on the host: a clone of it elsewhere enrolls its operator and
+    /// lifts, so the host serves a trust anchor this warehouse has not seen. The next contact is
+    /// this warehouse's first, which judges its unsigned heads against that anchor.
+    EnrollHost,
     /// Have the host's server build the bundle a full clone imports.
     Bundle,
     /// Delete pallet `name` on the remote too, which leaves the host a tombstone for it.
@@ -175,6 +179,8 @@ pub fn bind(tool: Tool, op: &Op) -> Option<Vec<Vec<String>>> {
                 Op::Redact { .. } => vec![line(&["redact", "record", "-m", TAKEN_BECAUSE, TARGET])],
                 // The server's own commands, which the build runs with the server binary.
                 Op::Bundle | Op::Withhold { .. } => vec![],
+                // Run in another warehouse, which the build lays out.
+                Op::EnrollHost => vec![],
                 Op::Push => vec![line(&["lift"])],
                 Op::Fetch => vec![line(&["lower"])],
                 Op::Verify => vec![line(&["audit", "--full"])],
@@ -200,7 +206,7 @@ pub fn bind(tool: Tool, op: &Op) -> Option<Vec<Vec<String>>> {
                 // failed step; and git signs nothing by enrollment.
                 Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll => return None,
                 // The host is a forklift-server; git has no server of its own to clone from.
-                Op::Host | Op::Bundle | Op::Clone { .. } | Op::MoveOrigin | Op::DeleteRemote { .. } | Op::Withhold { .. } => return None,
+                Op::Host | Op::Bundle | Op::Clone { .. } | Op::MoveOrigin | Op::DeleteRemote { .. } | Op::Withhold { .. } | Op::EnrollHost => return None,
                 // Git has no redaction: a rewrite of history is a different operation.
                 Op::Redact { .. } => return None,
             };
@@ -350,6 +356,13 @@ pub fn catalog() -> Vec<Scenario> {
             Op::Switch { name: "main".into() }, Op::DeleteRemote { name: "side".into() }, Op::Withhold { index: 1 },
             Op::Clone { kind: CloneKind::Full },
         ]) },
+        // A host another warehouse enrolled after this one lifted record 0, and a side branch of
+        // unsigned work that never left: the lower is first contact, which records the side head
+        // as one the anchor does not vouch for. The faulted command records and lifts.
+        Scenario { then: vec![Op::Push], ..named("unvouched", vec![
+            Op::Host, record(0), Op::Push, Op::Branch { name: "side".into() }, Op::Switch { name: "side".into() }, Op::Variant { index: 0 },
+            Op::Switch { name: "main".into() }, Op::EnrollHost, Op::Fetch,
+        ]) },
         // Content of record 0 no later record holds, redacted once record 1 no longer names it.
         named("redacted", vec![record(0), record(1), Op::Redact { index: 0 }]),
         named("signed", vec![record(0), Op::Enroll, record(1), record(2)]),
@@ -378,7 +391,7 @@ mod tests {
             Op::Variant { index: 0 }, Op::Conflict { name: "side".into() }, Op::Pick { name: "side".into() },
             Op::Park { index: 0 }, Op::Enroll, Op::Pack, Op::Host, Op::Clone { kind: CloneKind::Only("src".into()) },
             Op::Clone { kind: CloneKind::Cache }, Op::Bundle, Op::MoveOrigin, Op::DeleteRemote { name: "side".into() },
-            Op::Withhold { index: 0 }, Op::Redact { index: 0 },
+            Op::Withhold { index: 0 }, Op::Redact { index: 0 }, Op::EnrollHost,
         ]
     }
 
@@ -390,8 +403,8 @@ mod tests {
         for op in every_op() {
             let lines = bind(Tool::Forklift, &op).unwrap_or_else(|| panic!("forklift binds {:?}", op));
             // Bundle and withhold are the server's own commands, which the build runs with the
-            // server binary.
-            assert_eq!(lines.is_empty(), matches!(op, Op::Bundle | Op::Withhold { .. }), "{:?}", op);
+            // server binary; enrolling the host runs in another warehouse, which the build lays out.
+            assert_eq!(lines.is_empty(), matches!(op, Op::Bundle | Op::Withhold { .. } | Op::EnrollHost), "{:?}", op);
             assert!(lines.iter().all(|arguments| arguments[0] == "--json"), "{:?}", lines);
         }
         assert_eq!(bind(Tool::Forklift, &Op::Clone { kind: CloneKind::Cache }).unwrap(),
@@ -410,7 +423,7 @@ mod tests {
     fn git_binds_what_it_has_and_the_rest_is_forklift_only() {
         for op in every_op() {
             let forklift_only = matches!(op, Op::Repair | Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll | Op::Host | Op::Bundle | Op::Clone { .. } | Op::MoveOrigin
-                | Op::DeleteRemote { .. } | Op::Withhold { .. } | Op::Redact { .. });
+                | Op::DeleteRemote { .. } | Op::Withhold { .. } | Op::Redact { .. } | Op::EnrollHost);
             assert_eq!(bind(Tool::Git, &op).is_some(), !forklift_only, "{:?}", op);
         }
         let tuned = bind(Tool::GitTuned, &Op::Verify).unwrap();
