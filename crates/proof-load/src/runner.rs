@@ -158,8 +158,19 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                 let root = host_root(scratch);
                 outcomes.push(run_in(server, vec![
                     "withhold".into(), "add".into(), "--root".into(), root.display().to_string(),
-                    "--statement".into(), crate::scenario::TAKEN_BECAUSE.into(), hash,
+                    "--statement".into(), crate::scenario::TAKEN_BECAUSE.into(), hash.clone(),
                 ], scratch.root().to_path_buf())?);
+                // The server deletes its own copy within seconds of a withhold; a fault before
+                // that would grade the window, not the state a host is in from then on. Wait for
+                // the loose object to go, as the census lays it out.
+                let copy = root.join(".forklift").join("objects").join(&hash[..2]).join(&hash[2..]);
+                let started = std::time::Instant::now();
+                while std::fs::symlink_metadata(&copy).is_ok() {
+                    if started.elapsed() > limit {
+                        return Err(RunError::Io(format!("scenario {}: the host kept its copy of withheld {} past {:?}", scenario.id, hash, limit)));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
                 taken.push(Taken { path, digest: oracle::digest(&bytes), by: TakenBy::Withheld });
             }
             Op::Redact { index } => {
