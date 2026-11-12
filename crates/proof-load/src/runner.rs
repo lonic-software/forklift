@@ -10,12 +10,12 @@ use std::time::Duration;
 
 use crate::census::{self, Census};
 use crate::corpus::{self, Corpus};
-use crate::scenario::{bind, Mark, Scenario, Tool};
+use crate::scenario::{bind, Mark, Op, Scenario, Tool, URL, WORK};
 use crate::scrub::{Environment, Scratch};
-use crate::tool::{self, Invocation, Outcome};
+use crate::tool::{self, Invocation, Outcome, Served};
 
 /// What building a scenario's history produced.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(serde::Serialize)]
 pub struct Built {
     /// Every command the build ran, in order, with what it said.
     pub outcomes: Vec<Outcome>,
@@ -23,6 +23,16 @@ pub struct Built {
     pub walked: Vec<String>,
     /// Marks acknowledged: each record or variant whose binding exited 0 throughout.
     pub acknowledged: Vec<Mark>,
+    /// The server a `Host` operation started, serving until this is dropped.
+    #[serde(skip)]
+    pub host: Option<Served>,
+}
+
+impl std::fmt::Debug for Built {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Built").field("outcomes", &self.outcomes).field("walked", &self.walked)
+            .field("acknowledged", &self.acknowledged).field("host", &self.host.as_ref().map(|host| &host.url)).finish()
+    }
 }
 
 #[derive(Debug)]
@@ -62,13 +72,19 @@ fn prepare(tool: Tool) -> Vec<String> {
     }
 }
 
-/// Builds `scenario`'s history with `program` (the binary of `tool`) in `scratch`'s work tree.
-/// Every build step must succeed: a failed one means the scenario's precondition does not hold,
-/// which is reported, never graded.
-pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Built, RunError> {
+/// The host warehouse a `Host` operation serves, beside the work tree in the scratch area.
+pub fn host_root(scratch: &Scratch) -> PathBuf {
+    scratch.root().join("host")
+}
+
+/// Builds `scenario`'s history with `program` (the binary of `tool`) in `scratch`'s work tree,
+/// with `server` the forklift-server a `Host` operation starts. Every build step must succeed: a
+/// failed one means the scenario's precondition does not hold, which is reported, never graded.
+#[allow(clippy::too_many_arguments)]
+pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, server: Option<&Path>, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Built, RunError> {
     let work = scratch.work();
-    let run = |arguments: Vec<String>| -> Result<Outcome, RunError> {
-        let invocation = Invocation { program: PathBuf::from(program), arguments, directory: work.clone(), limit };
+    let run_in = |program: &Path, arguments: Vec<String>, directory: PathBuf| -> Result<Outcome, RunError> {
+        let invocation = Invocation { program: PathBuf::from(program), arguments, directory, limit };
         let outcome = tool::run(&invocation, scratch, environment).map_err(RunError::Tool)?;
         if !outcome.succeeded() {
             return Err(RunError::BuildFailed {
@@ -80,16 +96,35 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
         Ok(outcome)
     };
 
-    let mut outcomes = vec![run(prepare(tool))?];
+    let mut outcomes = vec![run_in(program, prepare(tool), work.clone())?];
     let mut acknowledged = Vec::new();
+    let mut host: Option<Served> = None;
     for op in &scenario.history {
         if let Some(snapshot) = op.writes(corpus) {
             let snapshot = snapshot.map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?;
             corpus::write(&snapshot, &work).map_err(|error| RunError::Io(error.to_string()))?;
         }
+        let mut directory = work.clone();
+        match op {
+            Op::Host => {
+                let server = server.ok_or_else(|| RunError::Io(format!("scenario {} hosts a warehouse, and no forklift-server binary was given", scenario.id)))?;
+                let root = host_root(scratch);
+                outcomes.push(run_in(server, vec!["prepare".into(), "--root".into(), root.display().to_string()], scratch.root().to_path_buf())?);
+                host = Some(tool::serve(server, &root, scratch, environment, limit).map_err(RunError::Tool)?);
+            }
+            Op::Clone { .. } => {
+                // A clone makes its target; the work tree it replaces is the harness's own scratch.
+                #[allow(clippy::disallowed_methods)] // a scratch work tree the harness made; no retry is wanted
+                std::fs::remove_dir_all(&work).map_err(|error| RunError::Io(error.to_string()))?;
+                directory = scratch.root().to_path_buf();
+            }
+            _ => {}
+        }
         let lines = bind(tool, op).ok_or_else(|| RunError::Io(format!("{:?} has no binding for {:?}", tool, op)))?;
         for arguments in lines {
-            outcomes.push(run(arguments)?);
+            let arguments = fill(arguments, host.as_ref().map(|host| host.url.as_str()), &work)
+                .map_err(|placeholder| RunError::Io(format!("scenario {}: {:?} needs {} before a Host", scenario.id, op, placeholder)))?;
+            outcomes.push(run_in(program, arguments, directory.clone())?);
         }
         if let Some(mark) = op.mark() {
             acknowledged.push(mark);
@@ -97,7 +132,17 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
     }
 
     let walked = census::walk(&work.join(state_folder(tool))).map_err(|error| RunError::Io(error.to_string()))?;
-    Ok(Built { outcomes, walked, acknowledged })
+    Ok(Built { outcomes, walked, acknowledged, host })
+}
+
+/// Fills a binding's placeholders: the host's URL, and the work tree's path. A URL placeholder
+/// with no host yet is an error naming it.
+pub fn fill(arguments: Vec<String>, url: Option<&str>, work: &Path) -> Result<Vec<String>, &'static str> {
+    arguments.into_iter().map(|argument| match argument.as_str() {
+        URL => url.map(str::to_string).ok_or(URL),
+        WORK => Ok(work.display().to_string()),
+        _ => Ok(argument),
+    }).collect()
 }
 
 /// The census names some walked path matches: the names this build creates.
@@ -110,8 +155,24 @@ pub fn created_names(census: &Census, walked: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scenario::Op;
     use std::collections::BTreeMap;
+
+    fn strings(arguments: &[&str]) -> Vec<String> {
+        arguments.iter().map(|argument| argument.to_string()).collect()
+    }
+
+    /// A binding's placeholders are filled whole, the URL only once a host serves one, and an
+    /// argument merely containing a placeholder's text is left as it is.
+    ///
+    /// Revert: fill a missing URL with an empty string → the clone line runs `clone "" <work>`.
+    #[test]
+    fn placeholders_fill_whole_arguments_and_a_missing_host_is_an_error() {
+        let work = Path::new("/s/work");
+        assert_eq!(fill(strings(&["clone", URL, WORK, "-m", "x{url}"]), Some("http://127.0.0.1:9"), work).unwrap(),
+            strings(&["clone", "http://127.0.0.1:9", "/s/work", "-m", "x{url}"]));
+        assert_eq!(fill(strings(&["clone", URL, WORK]), None, work), Err(URL));
+        assert_eq!(fill(strings(&["stack", "-m", WORK]), None, work).unwrap(), strings(&["stack", "-m", "/s/work"]));
+    }
 
     /// The forklift binary to drive, given by path; the harness never builds or links it.
     fn forklift() -> Option<PathBuf> {
@@ -134,10 +195,11 @@ mod tests {
         let scenario = Scenario {
             id: "history".into(),
             history: vec![Op::Record { index: 0 }, Op::Record { index: 1 }, Op::Record { index: 2 }],
+            then: vec![],
             damage: None,
         };
 
-        let built = build(&scenario, &corpus, Tool::Forklift, &program, &scratch, &environment, Duration::from_secs(60)).unwrap();
+        let built = build(&scenario, &corpus, Tool::Forklift, &program, None, &scratch, &environment, Duration::from_secs(60)).unwrap();
         assert_eq!(built.acknowledged, vec![Mark::Record(0), Mark::Record(1), Mark::Record(2)]);
 
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

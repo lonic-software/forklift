@@ -24,6 +24,8 @@ pub enum ToolError {
     Spawn { program: PathBuf, reason: String },
     /// The tool ran past its wall-clock limit and was killed.
     TimedOut { program: PathBuf, limit: Duration },
+    /// A server that exited, or had not bound its listener, within its limit.
+    NotListening { program: PathBuf, limit: Duration, said: String },
 }
 
 impl fmt::Display for ToolError {
@@ -33,6 +35,8 @@ impl fmt::Display for ToolError {
             ToolError::OutsideScratch(path) => write!(f, "the working directory {} is outside the run's scratch area", path.display()),
             ToolError::Spawn { program, reason } => write!(f, "could not start {}: {}", program.display(), reason),
             ToolError::TimedOut { program, limit } => write!(f, "{} ran past its {} s limit and was killed", program.display(), limit.as_secs()),
+            ToolError::NotListening { program, limit, said } =>
+                write!(f, "{} was not listening within {} s: {}", program.display(), limit.as_secs(), said.trim()),
         }
     }
 }
@@ -141,6 +145,74 @@ pub fn run(invocation: &Invocation, scratch: &Scratch, environment: &Environment
     let stdout = stdout.join().unwrap_or_default();
     let stderr = stderr.join().unwrap_or_default();
     Ok(Outcome { arguments: invocation.arguments.clone(), exit: status.code(), failure: failure_of(&stdout), stdout, stderr })
+}
+
+/// A forklift-server serving one warehouse for the length of a scenario, killed when dropped.
+pub struct Served {
+    child: std::process::Child,
+    /// The base URL it printed once listening.
+    pub url: String,
+    /// Everything it said, drained so a full pipe never stalls it.
+    output: Vec<std::thread::JoinHandle<Vec<u8>>>,
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        for handle in self.output.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// The line forklift-server prints once its listener is bound.
+const LISTENING: &str = "forklift-server listening on ";
+
+/// Starts `program serve` over the warehouse at `root`, open and on a port the system picks, and
+/// waits up to `limit` for the line naming the address it bound.
+pub fn serve(program: &Path, root: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Served, ToolError> {
+    use std::io::BufRead;
+    if !program.is_absolute() {
+        return Err(ToolError::NotAbsolute(program.to_path_buf()));
+    }
+    if !root.starts_with(scratch.root()) {
+        return Err(ToolError::OutsideScratch(root.to_path_buf()));
+    }
+    let mut command = Command::new(program);
+    command.arg("serve").arg("--root").arg(root).args(["--open", "--addr", "127.0.0.1:0"])
+        .current_dir(scratch.root()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    environment.apply(&mut command);
+
+    let spawn = |error: std::io::Error| ToolError::Spawn { program: program.to_path_buf(), reason: error.to_string() };
+    let mut child = command.spawn().map_err(spawn)?;
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let lines = std::thread::spawn(move || {
+        let mut said = Vec::new();
+        for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(url) = line.strip_prefix(LISTENING) {
+                let _ = sender.send(url.trim().to_string());
+            }
+            said.extend_from_slice(line.as_bytes());
+            said.push(b'\n');
+        }
+        said
+    });
+    let stderr = drain(child.stderr.take().expect("stderr is piped"));
+    let mut served = Served { child, url: String::new(), output: vec![lines, stderr] };
+    match receiver.recv_timeout(limit) {
+        Ok(url) => {
+            served.url = url;
+            Ok(served)
+        }
+        Err(_) => {
+            let _ = served.child.kill();
+            let _ = served.child.wait();
+            let said: Vec<u8> = served.output.drain(..).flat_map(|handle| handle.join().unwrap_or_default()).collect();
+            Err(ToolError::NotListening { program: program.to_path_buf(), limit, said: String::from_utf8_lossy(&said).into_owned() })
+        }
+    }
 }
 
 /// The absolute path of `program`, resolved against the harness's working directory once, when

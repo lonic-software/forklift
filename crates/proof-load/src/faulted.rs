@@ -25,6 +25,8 @@ pub struct Programs {
     pub forklift: PathBuf,
     /// The git the harness lays out exported commits with.
     pub git: PathBuf,
+    /// The forklift-server a scenario's host runs; a scenario with a host is not built without it.
+    pub server: Option<PathBuf>,
 }
 
 /// The concrete path, relative to the state folder, that `pattern` resolves to in a built
@@ -96,6 +98,10 @@ struct Context<'a> {
     scratch: &'a Scratch,
     environment: &'a Environment,
     limit: Duration,
+    /// What the faulted command runs after its record.
+    then: &'a [Op],
+    /// The host's URL, when the scenario serves one.
+    url: Option<&'a str>,
 }
 
 impl Context<'_> {
@@ -117,10 +123,16 @@ impl Context<'_> {
     }
 
     /// The faulted command: corpus record `index` written into the work tree, then the record
-    /// operation's lines run in order until one fails.
+    /// operation's lines and those of the scenario's `then` run in order until one fails.
     fn record(&self, index: usize, steps: &mut Vec<Outcome>) -> Result<bool, RunError> {
         corpus::write(&self.corpus.records[index], &self.scratch.work()).map_err(|error| RunError::Io(error.to_string()))?;
-        let lines = bind(Tool::Forklift, &Op::Record { index }).expect("forklift binds every operation");
+        let mut lines = Vec::new();
+        for op in std::iter::once(&Op::Record { index }).chain(self.then) {
+            for arguments in bind(Tool::Forklift, op).expect("forklift binds every operation") {
+                lines.push(runner::fill(arguments, self.url, &self.scratch.work())
+                    .map_err(|placeholder| RunError::Io(format!("{:?} needs {} and the scenario hosts nothing", op, placeholder)))?);
+            }
+        }
         for arguments in lines {
             let outcome = self.run(&self.programs.forklift, arguments, self.scratch.work())?;
             let succeeded = outcome.succeeded();
@@ -246,7 +258,7 @@ impl Trail {
 /// build, then the faulted command, readback, a plain retry, the named remedies, and heal.
 #[allow(clippy::too_many_arguments)]
 pub fn run(scenario: &Scenario, name: &str, kind: Kind, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, seed: u64) -> Result<Faulted, RunError> {
-    let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, scratch, environment, limit)?;
+    let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), scratch, environment, limit)?;
     let target = resolve(name, &built.walked, seed)
         .ok_or_else(|| RunError::Io(format!("{} resolves to nothing {} built", name, scenario.id)))?;
     let state = scratch.work().join(".forklift");
@@ -258,7 +270,7 @@ pub fn run(scenario: &Scenario, name: &str, kind: Kind, corpus: &Corpus, program
     // Before the faulted command, the work tree holds what the history recorded last.
     let before = built.acknowledged.last().and_then(|last| last.snapshot(corpus)).map(|snapshot| corpus::expected(&snapshot)).unwrap_or_default();
     let expected = Expected { before, after: corpus::expected(snapshot), acknowledged: built.acknowledged, faulted: Mark::Record(faulted) };
-    let context = Context { corpus, programs, scratch, environment, limit };
+    let context = Context { corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.host.as_ref().map(|host| host.url.as_str()) };
     let mut trail = Trail::default();
     let mut unextractable = Vec::new();
 

@@ -45,11 +45,15 @@ enum Command {
         /// damaged-file faults are reported as not run.
         #[arg(long)]
         git: Option<PathBuf>,
+        /// The forklift-server binary under test, by path. Without it a scenario that hosts a
+        /// warehouse is not built, and its walk reports that.
+        #[arg(long)]
+        forklift_server: Option<PathBuf>,
     },
 }
 
 fn main() -> ExitCode {
-    let Command::Run { source, out, seed, only, forklift, git } = Cli::parse().command;
+    let Command::Run { source, out, seed, only, forklift, git, forklift_server } = Cli::parse().command;
 
     let mut output = match Output::claim(&out) {
         Ok(output) => output,
@@ -71,6 +75,16 @@ fn main() -> ExitCode {
     let corpus = corpus::generate(seed, corpus::Shape::SMALL);
     let mut tools = BTreeMap::new();
     let mut environment_seen = BTreeMap::new();
+    let server = match forklift_server.as_deref().map(tool::absolute).transpose() {
+        Ok(server) => server,
+        Err(error) => {
+            eprintln!("proof-load: the forklift-server path: {}", error);
+            return ExitCode::from(2);
+        }
+    };
+    if let Some(server) = &server {
+        tools.insert("forklift-server".to_string(), server.display().to_string());
+    }
 
     // Each scenario's history built with the forklift under test: what it created, and what its
     // walk found that no census row classifies.
@@ -93,7 +107,7 @@ fn main() -> ExitCode {
                     .and_then(|scratch| {
                         let environment = Environment::scrubbed(&scratch, std::env::var_os("PATH"), &BTreeMap::new()).map_err(|error| error.to_string())?;
                         environment_seen = environment.variables.clone();
-                        runner::build(scenario, &corpus, Tool::Forklift, &program, &scratch, &environment, std::time::Duration::from_secs(120))
+                        runner::build(scenario, &corpus, Tool::Forklift, &program, server.as_deref(), &scratch, &environment, std::time::Duration::from_secs(120))
                             .map_err(|error| error.to_string())
                     });
                 match built {
@@ -130,7 +144,7 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             tools.insert("git".to_string(), git.display().to_string());
-            let programs = Programs { forklift, git };
+            let programs = Programs { forklift, git, server: server.clone() };
             let faulted_corpus = corpus::generate(seed, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL });
             for binding in proof_load::bindings::BINDINGS {
                 let Some(scenario) = scenarios.iter().find(|scenario| scenario.id == binding.scenario) else { continue };

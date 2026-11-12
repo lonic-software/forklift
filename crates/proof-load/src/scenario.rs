@@ -36,6 +36,12 @@ pub enum Op {
     Enroll,
     /// Pack the store's loose objects.
     Pack,
+    /// Start a forklift-server over a fresh host warehouse and make it this warehouse's remote.
+    /// The server serves for the rest of the scenario, its faulted run included.
+    Host,
+    /// Replace this warehouse with a clone of the host, scoped to `only` when given. What the
+    /// history acknowledged before stays acknowledged: the clone holds it from the host.
+    Clone { only: Option<String> },
     Push,
     Fetch,
     /// Check the store's integrity.
@@ -86,6 +92,11 @@ pub fn record_message(index: usize) -> String {
     Mark::Record(index).message()
 }
 
+/// Stands in a binding's line for the host's URL, which is known only once its server listens.
+pub const URL: &str = "{url}";
+/// Stands in a binding's line for the work tree's absolute path.
+pub const WORK: &str = "{work}";
+
 fn line(arguments: &[&str]) -> Vec<String> {
     arguments.iter().map(|argument| argument.to_string()).collect()
 }
@@ -110,6 +121,12 @@ pub fn bind(tool: Tool, op: &Op) -> Option<Vec<Vec<String>>> {
                 Op::Park { .. } => vec![line(&["load", "."]), line(&["park"])],
                 Op::Enroll => vec![line(&["office", "enroll"])],
                 Op::Pack => vec![line(&["store", "compact"])],
+                Op::Host => vec![line(&["config", "set", "remote.url", URL])],
+                Op::Clone { only } => {
+                    let mut clone = line(&["clone", URL, WORK]);
+                    clone.extend(only.iter().flat_map(|scope| ["--only".to_string(), scope.clone()]));
+                    vec![clone]
+                }
                 Op::Push => vec![line(&["lift"])],
                 Op::Fetch => vec![line(&["lower"])],
                 Op::Verify => vec![line(&["audit", "--full"])],
@@ -134,6 +151,8 @@ pub fn bind(tool: Tool, op: &Op) -> Option<Vec<Vec<String>>> {
                 // Git's merge and cherry-pick exit 1 on a conflict, which a build reads as a
                 // failed step; and git signs nothing by enrollment.
                 Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll => return None,
+                // The host is a forklift-server; git has no server of its own to clone from.
+                Op::Host | Op::Clone { .. } => return None,
             };
             let prefix: &[&str] = if tool == Tool::GitTuned { GIT_TUNED } else { &[] };
             Some(lines.into_iter().map(|arguments| line(prefix).into_iter().chain(arguments).collect()).collect())
@@ -153,6 +172,9 @@ pub struct Damage {
 pub struct Scenario {
     pub id: String,
     pub history: Vec<Op>,
+    /// What a faulted run's command does after recording its record, so a fault in state only
+    /// these operations read (a remote's, say) is reached by the command that grades it.
+    pub then: Vec<Op>,
     pub damage: Option<Damage>,
 }
 
@@ -204,7 +226,7 @@ impl Op {
 /// scenario that creates its path, and a run checks that it does.
 pub fn catalog() -> Vec<Scenario> {
     let record = |index| Op::Record { index };
-    let named = |id: &str, history: Vec<Op>| Scenario { id: id.to_string(), history, damage: None };
+    let named = |id: &str, history: Vec<Op>| Scenario { id: id.to_string(), history, then: vec![], damage: None };
     vec![
         named("history", vec![record(0), record(1), record(2)]),
         named("branched", vec![
@@ -214,6 +236,9 @@ pub fn catalog() -> Vec<Scenario> {
         // No Verify: `audit` refuses a warehouse with no office, and none of these enrolls one.
         named("repaired", vec![record(0), record(1), Op::Repair]),
         named("parked", vec![record(0), record(1), Op::Park { index: 1 }]),
+        // The faulted command lifts its record too: the remote's state is read by lift.
+        Scenario { then: vec![Op::Push], ..named("lifted", vec![Op::Host, record(0), record(1), Op::Push]) },
+        Scenario { then: vec![Op::Push], ..named("cloned", vec![Op::Host, record(0), record(1), Op::Push, Op::Clone { only: None }]) },
         named("signed", vec![record(0), Op::Enroll, record(1), record(2)]),
         named("packed", vec![record(0), Op::Enroll, record(1), record(2), Op::Pack]),
         // The variant changes every file of record 0 on the side branch, and record 1 changes at
@@ -238,7 +263,7 @@ mod tests {
             Op::Record { index: 0 }, Op::Branch { name: "side".into() }, Op::Switch { name: "side".into() },
             Op::Merge { name: "main".into() }, Op::Push, Op::Fetch, Op::Verify, Op::Repair,
             Op::Variant { index: 0 }, Op::Conflict { name: "side".into() }, Op::Pick { name: "side".into() },
-            Op::Park { index: 0 }, Op::Enroll, Op::Pack,
+            Op::Park { index: 0 }, Op::Enroll, Op::Pack, Op::Host, Op::Clone { only: Some("src".into()) },
         ]
     }
 
@@ -252,6 +277,8 @@ mod tests {
             assert!(!lines.is_empty());
             assert!(lines.iter().all(|arguments| arguments[0] == "--json"), "{:?}", lines);
         }
+        assert_eq!(bind(Tool::Forklift, &Op::Clone { only: Some("src".into()) }).unwrap(),
+            vec![line(&["--json", "clone", URL, WORK, "--only", "src"])]);
         assert_eq!(bind(Tool::Forklift, &Op::Record { index: 2 }).unwrap(),
             vec![line(&["--json", "load", "."]), line(&["--json", "stack", "-m", "proof-load record 2"])]);
     }
@@ -263,7 +290,7 @@ mod tests {
     #[test]
     fn git_binds_what_it_has_and_the_rest_is_forklift_only() {
         for op in every_op() {
-            let forklift_only = matches!(op, Op::Repair | Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll);
+            let forklift_only = matches!(op, Op::Repair | Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll | Op::Host | Op::Clone { .. });
             assert_eq!(bind(Tool::Git, &op).is_some(), !forklift_only, "{:?}", op);
         }
         let tuned = bind(Tool::GitTuned, &Op::Verify).unwrap();
@@ -271,10 +298,10 @@ mod tests {
         assert_eq!(tuned[0].last().unwrap(), "--strict");
         assert_eq!(bind(Tool::Git, &Op::Verify).unwrap(), vec![line(&["fsck", "--full", "--strict"])]);
 
-        let plain = Scenario { id: "plain".into(), history: vec![Op::Record { index: 0 }, Op::Verify], damage: None };
+        let plain = Scenario { id: "plain".into(), history: vec![Op::Record { index: 0 }, Op::Verify], then: vec![], damage: None };
         assert_eq!(plain.tools(), vec![Tool::Forklift, Tool::Git, Tool::GitTuned]);
         assert!(!plain.forklift_only());
-        let repaired = Scenario { id: "repaired".into(), history: vec![Op::Record { index: 0 }, Op::Repair], damage: None };
+        let repaired = Scenario { id: "repaired".into(), history: vec![Op::Record { index: 0 }, Op::Repair], then: vec![], damage: None };
         assert_eq!(repaired.tools(), vec![Tool::Forklift]);
         assert!(repaired.forklift_only());
         assert_eq!(repaired.records(), vec![0]);
