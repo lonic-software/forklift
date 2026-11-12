@@ -1,0 +1,26 @@
+[package]
+name = "proof-load"
+description = "Proof Load: drives forklift, forklift-server and git as subprocesses under injected faults and grades what they read back."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "proof-load"
+path = "src/main.rs"
+
+# Never forklift-core, forklift or forklift-server: an oracle that links the code under test
+# inherits its bugs. tests/dependency.rs fails on any of them anywhere in this graph.
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
