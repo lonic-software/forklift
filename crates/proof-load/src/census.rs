@@ -85,8 +85,11 @@ impl fmt::Display for CensusError {
 
 impl std::error::Error for CensusError {}
 
+/// The paths a Path cell lists: its leading comma-separated backticked items. A qualifier after
+/// them ("in a bay's own `.forklift`") may quote a name of its own, which is not a listed path.
 fn backticked(cell: &str) -> Vec<String> {
-    cell.split('`').skip(1).step_by(2).map(str::to_string).collect()
+    cell.split(", ").map_while(|item| item.strip_prefix('`')?.strip_suffix('`').filter(|inner| !inner.contains('`')))
+        .map(str::to_string).collect()
 }
 
 impl Census {
@@ -245,6 +248,7 @@ mod tests {
         | `store.lock`, `serve.lock` | lock | `a::C`, `a::D` |\n\
         | `objects/<xx>/<hash>` | history-borne | `a::E` |\n\
         | `clock` | probe | `a::F` |\n\
+        | `redirect`, in a bay's own `.forklift` | rewritable | `a::H` |\n\
         | `~/.forkliftconfig`, in the home folder | outside | `a::G` |\n\
         <!-- census:end -->\n";
 
@@ -253,11 +257,12 @@ mod tests {
     }
 
     /// Revert: count a row instead of each of its names → `serve.lock` goes missing; let a probe or
-    /// an outside row need damage → `clock` or the home config appears.
+    /// an outside row need damage → `clock` or the home config appears; read every backticked span
+    /// of a Path cell as a path → the qualifier's `.forklift` appears.
     #[test]
     fn damage_is_owed_per_listed_name_of_the_damageable_classes() {
         let names: Vec<String> = sample().damage_names().into_iter().map(|name| name.path).collect();
-        assert_eq!(names, vec!["objects/<xx>/<hash>", "serve.lock", "store.lock", "warehouse"]);
+        assert_eq!(names, vec!["objects/<xx>/<hash>", "redirect", "serve.lock", "store.lock", "warehouse"]);
     }
 
     /// A tree with no census document, or a document with no markers, is a version with no census.
