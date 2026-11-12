@@ -2133,19 +2133,9 @@ impl Drop for Area {
     }
 }
 
-/// The compiled `forklift` CLI, located next to this test binary.
-fn forklift_binary() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("the test binary has a path");
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-
-    let binary = dir.join(format!("forklift{}", std::env::consts::EXE_SUFFIX));
-    assert!(binary.exists(), "forklift is not built at {}", binary.display());
-
-    binary
-}
+#[path = "support/cli_binary.rs"]
+mod cli_binary;
+use cli_binary::forklift_binary;
 
 /// `forklift` with fsync off. Durability is not what these tests check, and paying an fsync per
 /// write made the suite much slower.

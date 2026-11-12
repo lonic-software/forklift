@@ -42,25 +42,40 @@ use forklift_core::util::{bundle_utils, file_utils, object_utils, sign_utils};
 
 static AREA_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// The compiled `forklift` CLI. Cargo exposes `CARGO_BIN_EXE_*` only to a package's own
-/// tests, so — like `forklift/tests/remote.rs` locates the server next to the CLI — this
-/// locates the CLI next to the test binary (both land in the target dir).
-fn forklift_binary() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("the test binary has a path");
-    dir.pop(); // the test executable's file name
-    if dir.ends_with("deps") {
-        dir.pop();
+#[path = "support/cli_binary.rs"]
+mod cli_binary;
+use cli_binary::forklift_binary;
+
+/// The CLI is found in the profile directory from a test executable in either toolchain's layout,
+/// `deps/` (through Rust 1.99) and `build/<package>/<hash>/out/` (from 1.100), and nowhere else:
+/// not a file of another name beside the executable, and not a `forklift` above the profile
+/// directory, which another build left there.
+///
+/// Revert: look only beside the executable, popping one `deps` (the helper before 1.100) → the
+/// `build/…/out/` layout finds nothing; walk every ancestor (this PR's first helper) → the
+/// `forklift` above the profile directory is taken.
+#[test]
+fn the_cli_is_found_above_a_test_executable_in_either_layout() {
+    let root = std::env::temp_dir().join(format!("cli-beside-{}", std::process::id()));
+    let _ = file_utils::remove_dir_all(&root);
+    let profile = root.join("debug");
+    let name = format!("forklift{}", std::env::consts::EXE_SUFFIX);
+    let old = profile.join("deps").join("protocol-0123");
+    let new = profile.join("build").join("forklift-aws-lambda").join("0123").join("out")
+        .join("protocol-0123");
+    for exe in [&old, &new] {
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(exe, b"").unwrap();
+        std::fs::write(exe.with_file_name("forklift-0123"), b"").unwrap();
     }
-
-    let binary = dir.join(format!("forklift{}", std::env::consts::EXE_SUFFIX));
-
-    assert!(
-        binary.exists(),
-        "forklift is not built at {}; run the suite via a workspace `cargo test`.",
-        binary.display()
-    );
-
-    binary
+    std::fs::write(root.join(&name), b"").unwrap();
+    let unbuilt = (cli_binary::cli_beside(&old), cli_binary::cli_beside(&new));
+    let cli = profile.join(&name);
+    std::fs::write(&cli, b"").unwrap();
+    let built = (cli_binary::cli_beside(&old), cli_binary::cli_beside(&new));
+    let _ = file_utils::remove_dir_all(&root);
+    assert_eq!(unbuilt, (None, None), "a forklift above the profile directory is not this build's");
+    assert_eq!(built, (Some(cli.clone()), Some(cli)));
 }
 
 /// `forklift` with fsync off. Durability is not what these tests check, and paying an fsync per

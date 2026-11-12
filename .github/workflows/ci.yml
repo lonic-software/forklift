@@ -205,7 +205,8 @@ jobs:
       # CI builds with the config's rustflags switched off (see RUSTFLAGS above), so this checks
       # what developers get on macOS. A throwaway crate is built twice, as a developer would build
       # it (RUSTFLAGS unset, incremental on): with cargo's default it must leave object files in its
-      # deps directory, which shows the probe can see them, and under .cargo/config.toml it must
+      # profile directory (deps/ through Rust 1.99, build/<package>/<hash>/out/ from 1.100, so the
+      # count spans the whole directory), which shows the probe can see them, and under .cargo/config.toml it must
       # leave none. It fails if a toolchain stops honouring the setting, for instance by putting
       # cargo's own "-Csplit-debuginfo=unpacked" after it. It runs last so a failure here does not
       # hide what the doc-tests and Clippy would report, and after a failed step too.
@@ -217,14 +218,14 @@ jobs:
           cargo new --quiet --lib "$probe"
           count() {
             (cd "$probe" && env -u RUSTFLAGS -u CARGO_INCREMENTAL cargo build --quiet) || return 1
-            find "$probe/target/debug/deps" -name '*.rcgu.o' | wc -l
+            find "$probe/target/debug" -name '*.rcgu.o' | wc -l
           }
           default=$(count)
           rm -rf "$probe/target"
           mkdir "$probe/.cargo"
           cp .cargo/config.toml "$probe/.cargo/"
           packed=$(count)
-          echo "object files left in deps: $default with cargo's default, $packed with the config"
+          echo "object files left in target/debug: $default with cargo's default, $packed with the config"
           [ "$default" -gt 0 ] && [ "$packed" -eq 0 ]
 
   # The one check to gate a merge on. It needs every job above and passes only when each one
