@@ -121,9 +121,10 @@ Notes:
   built in the same time. Release builds (`release.yml`) and local builds keep `link.exe`. Changing the
   variable changes the build cache's key, so the first run after it builds cold.
 - On macOS, `.cargo/config.toml` builds with `-Csplit-debuginfo=packed`: debuginfo
-  goes into a `.dSYM` beside each binary instead of object files left in
-  `target/debug/deps`. Under the default, every incremental rebuild leaves fresh
-  objects there and nothing removes the old ones. rustc lists that directory to find
+  goes into a `.dSYM` beside each binary instead of object files left under
+  `target/debug` (in `deps/` through Rust 1.99, under `build/` from 1.100). Under
+  the default, every incremental rebuild leaves fresh objects there and nothing
+  removes the old ones. Through 1.99, rustc lists `deps/` to find
   crates, so builds slow down as it grows: with 2.9 million stale files, rebuilding
   the server and the tests after a core edit took over 3 min. With the setting it
   takes about 16 s on an 18-core Mac, and does not grow. Things to know:
@@ -138,7 +139,7 @@ Notes:
     lists across config files.
   - A debug binary copied away from `target/` leaves its `.dSYM` behind, so its
     backtraces lose file and line.
-  - To check for the problem, `find target/debug/deps -name '*.rcgu.o' | head -1000 | wc -l`
+  - To check for the problem, `find target/debug -name '*.rcgu.o' | head -1000 | wc -l`
     should print 0. Listing the whole directory is itself slow once it is large.
 - To install a working binary (e.g. to dogfood): `cargo install --path
   crates/forklift --force` (lands in `~/.cargo/bin`).
