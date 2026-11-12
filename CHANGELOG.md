@@ -428,6 +428,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   `incomplete_load` over several paths names a command for every one of them, not only the first
   three.
 
+- **The `restore --confirm`, `scope prune --confirm` and `bay remove` next steps run as printed on
+  Windows.** They used to single-quote a name for a POSIX shell, which `cmd` reads literally, and
+  to put a name starting with `-` after `--`, which Windows PowerShell 5.1 splits at its first dot.
+  A path starting with `-` is now spelled `./<path>` on every platform. On Windows, a path no
+  quoting there reads as one argument becomes a `<path>` placeholder, and the message names the
+  path to put in its place. A bay folder whose name needs quoting there, or starts with `-` and
+  holds a dot, is left to be removed by hand, as one no shell can spell already was. A
+  `staged_content_missing` next step now also says to run it from the working tree's root.
+
 - **A read from a remote no longer fails on a connection the remote had already closed.** When a
   remote or a gateway in front of it closed an idle connection the client was about to reuse, the
   `GET` of an object, a subtree, a signature, a bundle or the handshake failed the command with

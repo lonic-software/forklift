@@ -391,19 +391,30 @@ fn discard_refusal(files: &[String], shown_path: &str, target: &str) -> String {
         true => format!("\n  ... and {} more", files.len() - shown.len()),
         false => String::new(),
     };
-    let separator = if target.starts_with('-') { "-- " } else { "" };
-
     crate::human!("Restoring \"{}\" would discard the changes to:\n{}{}", shown_path, shown.join("\n"), more);
 
     CoreError::refusal_with_details(
         RefusalCode::ConfirmationRequired,
         format!("Restoring \"{}\" would discard the changes to {} file(s); nothing was changed.", shown_path, files.len()),
-        format!(
-            "Keep any change you want first (load it, or copy it aside), then run \"forklift restore --confirm {}{}\" to discard the rest.",
-            separator, crate::commands::scope_prune::shell_quote(target)
-        ),
+        discard_next_step(target, cfg!(windows)),
         serde_json::json!({ "path": shown_path, "discards": files }),
     ).into()
+}
+
+/// The next step of [`discard_refusal`] on the platform `windows`: the restore again with
+/// `--confirm`, naming `target` as one argument (`tree_utils::remedy_path_when`), or a `<path>`
+/// placeholder where no quoting there reads it as one, with the path to put in its place.
+fn discard_next_step(target: &str, windows: bool) -> String {
+    let remedy = forklift_core::util::tree_utils::remedy_path_when(target, windows);
+    let next_step = format!(
+        "Keep any change you want first (load it, or copy it aside), then run \"forklift restore --confirm {}\" to discard the rest.",
+        remedy.as_deref().unwrap_or("-- <path>")
+    );
+
+    match remedy {
+        Some(_) => next_step,
+        None => format!("{} In place of <path>, put \"{}\", quoted for your shell.", next_step, target),
+    }
 }
 
 /// What restoring one tracked entry did.
@@ -694,6 +705,28 @@ mod tests {
             let prefix = format!("The removal of \"{}\" is staged; from the working tree's root, ", key);
             assert!(message.starts_with(&prefix), "{}", message);
             assert!(message.ends_with(expected), "{:?} (windows: {}): {}", key, windows, message);
+        }
+    }
+
+    /// The discard refusal's re-run names the path as given as one argument: plain bare, a leading
+    /// `-` as `./`, single-quoted for POSIX when a shell would split it, and on Windows a
+    /// placeholder followed by the path to put in its place.
+    #[test]
+    fn a_discard_refusal_names_the_path_as_one_argument() {
+        let prefix = "Keep any change you want first (load it, or copy it aside), then run ";
+        let cases = [
+            ("docs/a.txt", false, "\"forklift restore --confirm docs/a.txt\" to discard the rest."),
+            ("docs/a.txt", true, "\"forklift restore --confirm docs/a.txt\" to discard the rest."),
+            ("-draft.txt", false, "\"forklift restore --confirm ./-draft.txt\" to discard the rest."),
+            ("-draft.txt", true, "\"forklift restore --confirm ./-draft.txt\" to discard the rest."),
+            ("my notes.txt", false, "\"forklift restore --confirm 'my notes.txt'\" to discard the rest."),
+            ("my notes.txt", true, "\"forklift restore --confirm -- <path>\" to discard the rest. In place of \
+                <path>, put \"my notes.txt\", quoted for your shell."),
+        ];
+
+        for (target, windows, expected) in cases {
+            let next_step = discard_next_step(target, windows);
+            assert_eq!(next_step, format!("{}{}", prefix, expected), "{:?} (windows: {})", target, windows);
         }
     }
 }

@@ -434,12 +434,12 @@ pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&s
             ),
             match remedy_path(first_path) {
                 Some(quoted) => format!(
-                    "Run \"forklift unload {}\", then \"forklift load {}\" to stage it again \
-                    from its working copy.",
+                    "From the working tree's root, run \"forklift unload {}\", then \"forklift load {}\" \
+                    to stage it again from its working copy.",
                     quoted, quoted
                 ),
-                None => "Run \"forklift unload -- <path>\", then \"forklift load -- <path>\", \
-                    with that path quoted for your shell, to stage it again from its working copy.".to_string(),
+                None => "From the working tree's root, run \"forklift unload -- <path>\", then \"forklift load \
+                    -- <path>\", with that path quoted for your shell, to stage it again from its working copy.".to_string(),
             },
         )
     } else {
@@ -455,8 +455,8 @@ pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&s
                 since one naming them could not be restored.",
                 lost.len(), named.join("; "), and_more
             ),
-            "Run \"forklift unload -- <path>\", then \"forklift load -- <path>\", for each, \
-            to stage it again from its working copy.".to_string(),
+            "From the working tree's root, run \"forklift unload -- <path>\", then \"forklift load -- <path>\", \
+            for each, to stage it again from its working copy.".to_string(),
         )
     };
 
@@ -535,8 +535,8 @@ fn probe_staged_object(path: &str, hash: &str, chunked: bool) -> Result<StagedOb
     let remedy = remedy_path(path);
     object_utils::recipe_chunk_hashes(hash).map(StagedObject::Chunked).map_err(|e| format!(
         "\"{}\" is staged, but its recipe {} is in the store and cannot be read: {}. No parcel was made. \
-        Loading the file again will not replace it while the damaged object stays in place; run \
-        \"forklift unload {}\"{} to leave it out and stack the rest.",
+        Loading the file again will not replace it while the damaged object stays in place; from the \
+        working tree's root, run \"forklift unload {}\"{} to leave it out and stack the rest.",
         path, hash, e.trim_end_matches('.'),
         remedy.as_deref().unwrap_or("-- <path>"),
         if remedy.is_some() { "" } else { " with that path quoted for your shell" }
@@ -551,10 +551,11 @@ pub(crate) fn remedy_path(path: &str) -> Option<String> {
 /// `path` (relative) as one argument of a remedy command, which never starts with `-`: a path that
 /// does is spelled `./<path>`, the same path, so it is not taken for an option. Not after `--`:
 /// Windows PowerShell 5.1 splits an unquoted argument that starts with `-` at its first `.`, after
-/// a `--` too (`-- -draft.txt` reaches the program as `-draft` and `.txt`), while the `-- <path>`
-/// placeholder callers print for `None` runs once the user quotes the path, as
-/// `a_dash_led_remedy_path_runs_as_printed_in_windows_shells` in the CLI tests shows. Otherwise as
-/// [`remedy_word_when`] quotes it.
+/// a `--` too (`-- -draft.txt` reaches the program as `-draft` and `.txt`). For `None`, callers
+/// print a `-- <path>` placeholder for the user to quote; that a quoted dash-led path with a space
+/// then runs in both Windows shells is shown for `unload` by
+/// `a_dash_led_remedy_path_runs_as_printed_in_windows_shells` in the CLI tests, and a path holding
+/// `%` or `'` has quoting traps there of its own. Otherwise as [`remedy_word_when`] quotes it.
 pub fn remedy_path_when(path: &str, windows: bool) -> Option<String> {
     match path.starts_with('-') {
         true => remedy_word_when(&format!("./{}", path), windows),
