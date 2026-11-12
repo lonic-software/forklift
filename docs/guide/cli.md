@@ -904,6 +904,13 @@ Flags AND together; `--where` takes a JSON predicate tree (`all`/`any`/`not` ove
 globs (`*`, `?`) or plain substrings — never regex. Pagination works like history
 (`-n`, `--after`, `--oneline`).
 
+A predicate that could be read two ways is refused (`query_predicate_invalid`, exit 18)
+rather than guessed at. That covers an object that names a key twice, an empty `matches`
+pattern (use `*` to match any value), an empty `--touches` path (use `.`), and a
+`--signer` or `parcel` prefix that is empty or not lower-case hex. A `--signer` typed in
+capitals is lower-cased first. Flags given alongside `--where` sit beside its tree rather than
+above it, so a tree at the depth limit stays within it.
+
 The honest cost: `--limit` bounds *output*, not verification — a verified identity
 query resolves every candidate its walk considers. Scope the walk (a pallet argument,
 `--from`) to bound the work; unscoped over all of history costs about an `audit`.
