@@ -2550,17 +2550,18 @@ struct StagedTransportPack {
 }
 
 /// Import consecutive native pack/index sections from `reader`. Every section is copied to an
-/// ignored temp file, the complete incoming set is structurally and content-hash verified, and
-/// only then are its pack pairs made visible. A failure before publication removes every temp;
-/// a crash during publication leaves at worst a valid subset, which the ordinary clone
-/// history walk heals from loose/batch fetches.
+/// ignored temp file, the complete incoming set is structurally and content-hash verified, then
+/// `admit_rest` reads and admits whatever of the stream follows the packs, and only once it has
+/// accepted are the pack pairs made visible. A failure before publication — `admit_rest`'s
+/// included — removes every temp and publishes nothing; a crash during publication leaves at
+/// worst a valid subset, which the ordinary clone history walk heals from loose/batch fetches.
 ///
 /// The exists/rename publication sequence assumes no *concurrent* importer of the same store:
 /// `clone` targets a directory it just created, and every other pack writer runs under the
 /// store lock (`compact`) or warehouse lock.
 ///
 /// # Returns
-/// * `Ok(TransportImportStats)` - Every renamed pack pair's directory entries are durable and,
+/// * `Ok((TransportImportStats, T))` - `admit_rest`'s value, and every renamed pack pair's directory entries are durable and,
 ///                                once [`taint_utils::activate`](crate::util::taint_utils::activate)
 ///                                has been called in this process, no durability taint was found
 ///                                standing for this root on the re-check that runs right before
@@ -2574,9 +2575,11 @@ struct StagedTransportPack {
 ///                                activated, that is recorded as a taint over exactly those paths.
 ///                                A later `heal_utils::heal_if_tainted` call restages exactly
 ///                                those paths and clears the taint once they are durable again.
-pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
-                                               sections: &[(u64, u64)])
-                                               -> Result<TransportImportStats, String> {
+pub(crate) fn import_transport_packs<R: Read, T>(
+    reader: &mut R,
+    sections: &[(u64, u64)],
+    admit_rest: impl FnOnce(&mut R, &TransportImportStats) -> Result<T, String>,
+) -> Result<(TransportImportStats, T), String> {
     if sections.len() > MAX_TRANSPORT_PACKS {
         return Err(format!(
             "The bundle declares {} native packs, above the {}-pack limit.",
@@ -2589,7 +2592,7 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
     remove_stale_temp_files(&folder);
     let mut staged: Vec<StagedTransportPack> = Vec::with_capacity(sections.len());
 
-    let result = (|| -> Result<TransportImportStats, String> {
+    let result = (|| -> Result<(TransportImportStats, T), String> {
         for (data_len, index_len) in sections {
             if *data_len > MAX_TRANSPORT_PACK_BYTES {
                 return Err(format!(
@@ -2616,9 +2619,9 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
             .map(|pair| load_pack_pair(&pair.data_path, &pair.index_path))
             .collect::<Result<_, _>>()?;
         // Every byte of an incoming pack is accounted for before any of it is trusted: each index
-        // is validated in full, not bucket by bucket as a local read would.
-        // The fanout width is the one thing an index's records do not fix, so it is held to the
-        // writer's choice: one record set, one index.
+        // is validated in full, not bucket by bucket as a local read would. Its fanout width, the
+        // one thing an index's records do not fix, is held to the writer's choice: one record
+        // set, one index.
         for pack in &incoming {
             pack.validate_full()?;
             if !pack.index.has_writer_fanout() {
@@ -2637,8 +2640,13 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
         // file; POSIX permits it, but the portable contract is cheap to preserve).
         drop(incoming);
 
+        // The rest of the stream is admitted before anything is published, so a refusal there
+        // leaves the store exactly as it was.
+        let stats = TransportImportStats { stored_objects, skipped_objects, parcels };
+        let rest = admit_rest(reader, &stats)?;
+
         if stored_objects == 0 {
-            return Ok(TransportImportStats { stored_objects, skipped_objects, parcels });
+            return Ok((stats, rest));
         }
 
         // All pack bytes and indexes are valid. Harden the small number of aggregate files, then
@@ -2707,7 +2715,7 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
         // the same undensified shape `--redelta` exists to fix.
         mark_densify_pending(&folder);
 
-        Ok(TransportImportStats { stored_objects, skipped_objects, parcels })
+        Ok((stats, rest))
     })();
 
     // Published paths were renamed away and return NotFound here; failed/unneeded staging files
@@ -6505,6 +6513,15 @@ fn compute_pack_id(records: &[([u8; HASH_LEN], u64, u64)]) -> String {
 }
 
 /// A unique temp path in the pack folder for an in-progress write.
+/// A fresh staging path in this store's pack folder, for a transport importer that must hold part
+/// of its stream on disk until the packs are published. Its name is one a later run reclaims if a
+/// hard kill leaves it behind.
+pub(crate) fn transport_staging_path(extension: &str) -> Result<PathBuf, String> {
+    let folder = pack_folder();
+    file_utils::create_folder_if_not_exists(&folder)?;
+    Ok(temp_path(&folder, extension))
+}
+
 fn temp_path(pack_folder: &Path, extension: &str) -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7172,7 +7189,7 @@ pub(crate) mod tests {
         let mut reader = std::io::Cursor::new(combined);
 
         let _guard = SyncDirFaultGuard::failing("pack");
-        let error = match import_transport_packs(&mut reader, &sections) {
+        let error = match import_transport_packs(&mut reader, &sections, |_, _| Ok(())) {
             Err(e) => e,
             Ok(_) => panic!("a blocked pack directory must fail the trailing sync"),
         };
@@ -7218,7 +7235,7 @@ pub(crate) mod tests {
         let mut combined = data_bytes;
         combined.extend_from_slice(&index_bytes);
 
-        let error = match import_transport_packs(&mut std::io::Cursor::new(combined), &sections) {
+        let error = match import_transport_packs(&mut std::io::Cursor::new(combined), &sections, |_, _| Ok(())) {
             Err(error) => error,
             Ok(_) => panic!("a pack holding a malformed object must be refused"),
         };
@@ -11778,7 +11795,7 @@ pub(crate) mod tests {
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let (bytes, sections) = hand_laid_pack(records, bits);
-        let result = import_transport_packs(&mut std::io::Cursor::new(bytes), &sections).map(|stats| stats.stored_objects);
+        let result = import_transport_packs(&mut std::io::Cursor::new(bytes), &sections, |_, _| Ok(())).map(|(stats, ())| stats.stored_objects);
         let published = std::fs::read_dir(temp.join(".forklift").join("objects").join("pack"))
             .map(|entries| entries.flatten().filter(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();

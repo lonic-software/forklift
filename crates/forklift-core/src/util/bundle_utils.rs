@@ -1401,8 +1401,10 @@ fn read_record_stream<R: std::io::BufRead>(reader: R,
 }
 
 /// Import the body of a version-5 whole-warehouse bundle, between its header and its digest:
-/// quarantine and verify its native pack pairs, publish those aggregate files, then store the
-/// signature sidecars that follow, each admitted only for a parcel those packs carry.
+/// quarantine and verify its native pack pairs, admit the signature section that follows (each
+/// entry only for a parcel those packs carry, once, and well formed) and the end of the body,
+/// then publish the packs and store the admitted signatures. The bundle is refused as a whole:
+/// nothing is published unless every section is admitted.
 fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, String> {
     let pack_count = read_u32_be(reader, "native pack count")? as usize;
     if pack_count > pack_utils::MAX_TRANSPORT_PACKS {
@@ -1431,15 +1433,13 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
         sections.push((data_len, index_len));
     }
 
-    let mut imported = pack_utils::import_transport_packs(reader, &sections)?;
-    let total_objects = imported.stored_objects + imported.skipped_objects;
-    let signature_count = read_u64_be(reader, "signature count")?;
-    if signature_count > total_objects as u64 {
-        return Err(format!(
-            "The bundle declares {} signatures but its native packs contain only {} objects.",
-            signature_count, total_objects
-        ));
-    }
+    // The signature section is admitted while the packs are still quarantined, and staged on disk
+    // rather than in memory: a signature has no size bound of its own short of the object
+    // ceiling, so only its own payload is ever held at once.
+    let staging = SignatureStaging::new()?;
+    let (imported, signature_count) = pack_utils::import_transport_packs(reader, &sections, |reader, imported| {
+        admit_signature_section(reader, imported, &staging)
+    })?;
 
     let mut stats = ImportStats {
         stored_objects: imported.stored_objects,
@@ -1450,46 +1450,15 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
         installed_packs: imported.stored_objects > 0,
     };
 
-    // An entry is admitted only for a parcel the packs carry, once: a signature naming anything
-    // else would store bytes for a parcel the bundle never carried. Each admitted parcel moves
-    // from the carried set to the signed one.
-    let mut signed: HashSet<String> = HashSet::new();
     // The admitted signatures go into signature tables, not a sidecar each. A signature already
     // stored in either layer wins and the bundle's copy is skipped, even a conflicting one, whose
     // refusal would otherwise fail the import after its packs were already published.
     let mut signatures = sign_utils::SignatureBatch::new(sign_utils::OnConflict::Skip);
-
+    let mut staged = std::io::BufReader::new(std::fs::File::open(&staging.path)
+        .map_err(|e| format!("Error while reopening the staged bundle signatures: {}", e))?);
     for _ in 0..signature_count {
-        let mut hash_bytes = [0u8; 64];
-        reader.read_exact(&mut hash_bytes)
-            .map_err(|e| format!("The bundle is truncated while reading a signature hash: {}", e))?;
-        let hash = std::str::from_utf8(&hash_bytes).ok()
-            .filter(|text| object_utils::is_object_hash(text))
-            .ok_or_else(|| "A bundle signature hash is not lowercase hexadecimal ASCII.".to_string())?
-            .to_string();
-        let length = read_u64_be(reader, "signature length")?;
-        if length > object_utils::MAX_OBJECT_BYTES as u64 {
-            return Err(oversized_record_refusal("signature", length));
-        }
-        if !imported.parcels.remove(&hash) {
-            return Err(if signed.contains(&hash) {
-                format!("The bundle carries two signatures for {}; refusing it.", hash)
-            } else {
-                format!(
-                    "The bundle carries a signature for {}, which is not a parcel it carries; \
-                    refusing it.", hash
-                )
-            });
-        }
-        signed.insert(hash.clone());
-        signatures.add(hash, read_exact_payload(reader, length)?)?;
-    }
-
-    let mut trailing = [0u8; 1];
-    match reader.read(&mut trailing) {
-        Ok(0) => {}
-        Ok(_) => return Err("The bundle has bytes between its signature section and its digest.".into()),
-        Err(e) => return Err(format!("Error while checking the end of the bundle: {}", e)),
+        let (hash, length) = read_signature_header(&mut staged)?;
+        signatures.add(hash, read_exact_payload(&mut staged, length)?)?;
     }
 
     let stored = signatures.finish()?;
@@ -1497,6 +1466,95 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
     stats.skipped_records += stored.skipped;
 
     Ok(stats)
+}
+
+/// A staging file for a bundle's signature section, removed when dropped.
+struct SignatureStaging {
+    path: std::path::PathBuf,
+}
+
+impl SignatureStaging {
+    fn new() -> Result<SignatureStaging, String> {
+        Ok(SignatureStaging { path: pack_utils::transport_staging_path("sig")? })
+    }
+}
+
+impl Drop for SignatureStaging {
+    fn drop(&mut self) {
+        let _ = crate::util::file_utils::remove_file(&self.path);
+    }
+}
+
+/// Read and admit a native bundle's signature section and the end of its body, copying each
+/// admitted entry to `staging`: an entry only for a parcel the packs carry, at most once each,
+/// and structurally well formed. Nothing is stored here; the caller stores what was staged once
+/// the packs are published.
+///
+/// # Returns
+/// * `Ok(u64)`     - How many entries were admitted and staged.
+/// * `Err(String)` - If any entry, or anything after the section, is refused.
+fn admit_signature_section(reader: &mut impl Read,
+                           imported: &pack_utils::TransportImportStats,
+                           staging: &SignatureStaging) -> Result<u64, String> {
+    let total_objects = imported.stored_objects + imported.skipped_objects;
+    let signature_count = read_u64_be(reader, "signature count")?;
+    if signature_count > total_objects as u64 {
+        return Err(format!(
+            "The bundle declares {} signatures but its native packs contain only {} objects.",
+            signature_count, total_objects
+        ));
+    }
+
+    let mut staged = std::io::BufWriter::new(std::fs::File::create(&staging.path)
+        .map_err(|e| format!("Error while creating the bundle signature staging file: {}", e))?);
+    // An entry is admitted only for a parcel the packs carry, once: a signature naming anything
+    // else would store bytes for a parcel the bundle never carried.
+    let mut signed: HashSet<String> = HashSet::new();
+
+    for _ in 0..signature_count {
+        let (hash, length) = read_signature_header(reader)?;
+        if !imported.parcels.contains(&hash) {
+            return Err(format!(
+                "The bundle carries a signature for {}, which is not a parcel it carries; \
+                refusing it.", hash
+            ));
+        }
+        if !signed.insert(hash.clone()) {
+            return Err(format!("The bundle carries two signatures for {}; refusing it.", hash));
+        }
+        let payload = read_exact_payload(reader, length)?;
+        sign_utils::validate_raw_parcel_signature(&payload, &hash)?;
+
+        staged.write_all(hash.as_bytes())
+            .and_then(|()| staged.write_all(&length.to_be_bytes()))
+            .and_then(|()| staged.write_all(&payload))
+            .map_err(|e| format!("Error while staging a bundle signature: {}", e))?;
+    }
+    staged.flush().map_err(|e| format!("Error while staging the bundle signatures: {}", e))?;
+
+    let mut trailing = [0u8; 1];
+    match reader.read(&mut trailing) {
+        Ok(0) => Ok(signature_count),
+        Ok(_) => Err("The bundle has bytes between its signature section and its digest.".into()),
+        Err(e) => Err(format!("Error while checking the end of the bundle: {}", e)),
+    }
+}
+
+/// Read one signature entry's header: the parcel hash it names, and its declared length, which is
+/// refused above the object ceiling before a byte of the payload is read.
+fn read_signature_header(reader: &mut impl Read) -> Result<(String, u64), String> {
+    let mut hash_bytes = [0u8; 64];
+    reader.read_exact(&mut hash_bytes)
+        .map_err(|e| format!("The bundle is truncated while reading a signature hash: {}", e))?;
+    let hash = std::str::from_utf8(&hash_bytes).ok()
+        .filter(|text| object_utils::is_object_hash(text))
+        .ok_or_else(|| "A bundle signature hash is not lowercase hexadecimal ASCII.".to_string())?
+        .to_string();
+    let length = read_u64_be(reader, "signature length")?;
+    if length > object_utils::MAX_OBJECT_BYTES as u64 {
+        return Err(oversized_record_refusal("signature", length));
+    }
+    Ok((hash, length))
 }
 
 fn read_u32_be(reader: &mut impl Read, what: &str) -> Result<u32, String> {
@@ -2112,9 +2170,9 @@ mod tests {
         sealed(bytes)
     }
 
-    /// Each signature entry becomes its own sidecar file, so one is admitted only for a parcel the
-    /// bundle's packs carry, and only once. An entry naming a blob, a hash nowhere in the bundle,
-    /// or a parcel already signed by an earlier entry is refused, and no sidecar is written for it.
+    /// A signature entry is admitted only for a parcel the bundle's packs carry, and only once. An
+    /// entry naming a blob, a hash nowhere in the bundle, or a parcel already signed by an earlier
+    /// entry is refused, and no signature is stored for it.
     #[test]
     fn a_native_signature_entry_must_name_a_parcel_the_bundle_carries_once() {
         let (bundle, parcel_hash, blob_hash) = build_tiny_native_bundle("bundle-sig-admission-src");
@@ -2140,6 +2198,46 @@ mod tests {
         let repeated = with_signature_section(&bundle, &[(&parcel_hash, &sidecar), (&parcel_hash, &sidecar)]);
         let error = import_bundle_bytes(&repeated).err().unwrap();
         assert!(error.contains("two signatures"), "{}", error);
+    }
+
+    /// A native bundle is refused as a whole: a refusal anywhere in its signature section, or
+    /// after it, leaves the destination without a pack, an object or a signature from it, though
+    /// its packs verified before that section was read.
+    ///
+    /// Revert: publish the packs before reading the signature section → every case leaves a pack
+    /// published → red.
+    #[test]
+    fn a_native_bundle_refused_after_its_packs_publishes_none_of_them() {
+        let (bundle, parcel_hash, blob_hash) = build_tiny_native_bundle("bundle-whole-src");
+        let sidecar = raw_signature_sidecar("test-key", b"test-signature");
+        let mut trailing = with_signature_section(&bundle, &[(&parcel_hash, &sidecar)]);
+        let digest_at = trailing.len() - BUNDLE_DIGEST_BYTES;
+        trailing.truncate(digest_at);
+        trailing.push(0);
+        let trailing = sealed(trailing);
+
+        let cases: [(&str, Vec<u8>, &str); 5] = [
+            ("foreign", with_signature_section(&bundle, &[(&blob_hash, &sidecar)]), "not a parcel it carries"),
+            ("repeat", with_signature_section(&bundle, &[(&parcel_hash, &sidecar), (&parcel_hash, &sidecar)]), "two signatures"),
+            ("malformed", with_signature_section(&bundle, &[(parcel_hash.as_str(), &b"\x07"[..])]), "is malformed"),
+            ("overcount", with_signature_section(&bundle, &[(parcel_hash.as_str(), sidecar.as_slice()); 4]), "contain only"),
+            ("trailing", trailing, "between its signature section and its digest"),
+        ];
+        for (name, bytes, expected) in cases {
+            let _destination = Scratch::new(&format!("bundle-whole-{}", name));
+            let error = import_bundle_bytes(&bytes).err()
+                .unwrap_or_else(|| panic!("{}: the bundle must be refused", name));
+            assert!(error.contains(expected), "{}: {}", name, error);
+
+            let status = pack_utils::store_status().unwrap();
+            assert_eq!((status.packs.len(), status.packed_objects, status.loose_objects), (0, 0, 0),
+                "{}: nothing of a refused bundle is published", name);
+            assert_eq!(signature_files(), (0, 0), "{}: no signature of a refused bundle is stored", name);
+            let leftovers: Vec<_> = std::fs::read_dir(pack_utils::pack_folder()).into_iter().flatten().flatten()
+                .map(|entry| entry.file_name())
+                .collect();
+            assert!(leftovers.is_empty(), "{}: staging is removed: {:?}", name, leftovers);
+        }
     }
 
     /// The envelope/native-pack write-then-read semantics, end to end: a real (tiny)
