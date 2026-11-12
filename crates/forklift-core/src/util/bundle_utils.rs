@@ -481,11 +481,8 @@ fn remove_stale_staging(parent: &Path) {
 
         if is_staging && is_stale {
             let path = entry.path();
-            let _ = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                crate::util::file_utils::remove_dir_all(&path)
-            } else {
-                crate::util::file_utils::remove_file(&path)
-            };
+            let _ = entry.file_type()
+                .and_then(|kind| crate::util::file_utils::remove_entry_unfollowed(&path, kind));
         }
     }
 }

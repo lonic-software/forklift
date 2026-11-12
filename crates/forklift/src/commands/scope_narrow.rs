@@ -263,7 +263,7 @@ fn remove_working_subtree(prefix: &str) -> Result<(), String> {
 fn remove_working_path(path: &str) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => remove_working_subtree(path),
-        Ok(_) => forklift_core::util::file_utils::remove_file(path).map_err(|e| format!("Error while de-materializing \"{}\": {}", path, e)),
+        Ok(metadata) => forklift_core::util::file_utils::remove_entry_unfollowed(path, metadata.file_type()).map_err(|e| format!("Error while de-materializing \"{}\": {}", path, e)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("Error while de-materializing \"{}\": {}", path, e)),
     }

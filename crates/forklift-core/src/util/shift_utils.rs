@@ -816,7 +816,7 @@ pub fn apply_file_op(op: &FileOp) -> Result<(), String> {
         FileOp::Remove { path } => {
             check_working_path(path)?;
 
-            match file_utils::remove_file(path) {
+            match file_utils::remove_file_or_link(path) {
                 Ok(()) => Ok(()),
                 // The file being gone already is the desired outcome.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -888,7 +888,7 @@ pub fn write_tracked_file_from(path: &str,
         // unless the path is new, where what resolves there is not ours to remove and
         // `symlink` refuses it on its own.
         if !create {
-            match file_utils::remove_file(fs_path) {
+            match file_utils::remove_file_or_link(fs_path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("Error while replacing \"{}\": {}", path, e)),

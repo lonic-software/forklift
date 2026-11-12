@@ -547,6 +547,21 @@ pub fn remove_entry_unfollowed(path: impl AsRef<Path>, file_type: std::fs::FileT
     }
 }
 
+/// Remove the file or link at `path` without following it, as [`remove_entry_unfollowed`] does,
+/// for a caller that never means to remove a real folder: one there is refused at once with
+/// `IsADirectory`, never waited on.
+pub fn remove_file_or_link(path: impl AsRef<Path>) -> std::io::Result<()> {
+    let path = path.as_ref();
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Err(std::io::Error::new(
+            std::io::ErrorKind::IsADirectory,
+            format!("\"{}\" is a folder, not a file or a link", path.to_string_lossy()),
+        )),
+        Ok(metadata) => remove_entry_unfollowed(path, metadata.file_type()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Whether `file_type` is a link Windows removes as a folder: a directory symlink or a junction.
 #[cfg(windows)]
 fn is_folder_link(file_type: std::fs::FileType) -> bool {
@@ -559,16 +574,27 @@ fn is_folder_link(_file_type: std::fs::FileType) -> bool {
 }
 
 /// Run the delete `op` on `path` through [`retry_while_held`]. A retry that fails `NotFound`
-/// counts as success: the path stood when the held failure was judged, so whatever removed it
-/// since did what this call was asked to do.
+/// counts as success: the path stood when the held failure was judged and is gone now, which is
+/// the state this call was asked for. (Should a parent have been renamed away meanwhile, the
+/// entry survives under the new name; a held file blocks that rename, so only the last sleep is
+/// exposed.)
 fn delete_while_held(path: &Path, op: impl Fn(&Path) -> std::io::Result<()>) -> std::io::Result<()> {
+    delete_while_held_when(path, op, is_held_by_another_process)
+}
+
+/// [`delete_while_held`] with the held classifier given, so the retry rules run on every platform.
+fn delete_while_held_when(
+    path: &Path,
+    op: impl Fn(&Path) -> std::io::Result<()>,
+    is_held: impl Fn(&std::io::Error) -> bool,
+) -> std::io::Result<()> {
     let mut first = true;
     retry_while_held(
         || match (op(path), std::mem::replace(&mut first, false)) {
             (Err(error), false) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             (result, _) => result,
         },
-        is_held_by_another_process,
+        is_held,
         || path_remains(path),
     )
 }
@@ -4933,30 +4959,31 @@ mod tests {
         let _ = remove_dir_all(&dir);
     }
 
-    /// The held error a delete of a held file fails with on Windows.
-    #[cfg(windows)]
-    fn sharing_violation() -> std::io::Error {
-        std::io::Error::from_raw_os_error(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+    /// The classifier that calls only [`held`]'s error held, so the delete retry rules run on
+    /// every platform.
+    fn is_stand_in_held(error: &std::io::Error) -> bool {
+        error.raw_os_error() == Some(7)
     }
 
     /// A delete whose retry finds the path gone (another process removed it after the held
     /// failure) succeeds, rather than failing `NotFound` on a path that is gone.
-    #[cfg(windows)]
     #[test]
     fn a_held_delete_whose_retry_finds_the_path_gone_succeeds() {
-        let dir = held_rename_dir("delete-gone-on-retry");
+        let dir = std::env::temp_dir().join(format!("forklift-delete-gone-on-retry-{}", std::process::id()));
+        let _ = remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("file");
         std::fs::write(&file, b"x").unwrap();
 
         let attempts = std::cell::Cell::new(0);
-        let deleted = delete_while_held(&file, |path| {
+        let deleted = delete_while_held_when(&file, |path| {
             attempts.set(attempts.get() + 1);
             match attempts.get() {
-                1 => Err(sharing_violation()),
+                1 => Err(held()),
                 #[allow(clippy::disallowed_methods)] // the other process's removal, then this one's retry
                 _ => std::fs::remove_file(path).and_then(|()| std::fs::remove_file(path)),
             }
-        });
+        }, is_stand_in_held);
 
         deleted.unwrap();
         assert_eq!(attempts.get(), 2);
@@ -4965,27 +4992,31 @@ mod tests {
 
     /// A held failure on a path that is already gone is not retried, and a first attempt's
     /// `NotFound` stays an error.
-    #[cfg(windows)]
     #[test]
     fn a_held_delete_of_a_path_already_gone_is_not_retried() {
-        let dir = held_rename_dir("delete-held-gone");
+        let dir = std::env::temp_dir().join(format!("forklift-delete-held-gone-{}", std::process::id()));
+        let _ = remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let attempts = std::cell::Cell::new(0);
         let started = std::time::Instant::now();
-        let refused = delete_while_held(&dir.join("absent"), |_| {
+        let refused = delete_while_held_when(&dir.join("absent"), |_| {
             attempts.set(attempts.get() + 1);
-            Err(sharing_violation())
-        }).unwrap_err();
-        assert!(is_held_by_another_process(&refused), "{:?}", refused);
+            Err(held())
+        }, is_stand_in_held).unwrap_err();
+        assert!(is_stand_in_held(&refused), "{:?}", refused);
         assert_eq!(attempts.get(), 1);
         assert!(started.elapsed() < HELD_DEADLINE);
 
-        let missing = remove_file(dir.join("absent")).unwrap_err();
+        #[allow(clippy::disallowed_methods)] // the first attempt's NotFound, unretried
+        let missing = delete_while_held_when(&dir.join("absent"), |path| std::fs::remove_file(path), is_stand_in_held)
+            .unwrap_err();
         assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
         let _ = remove_dir_all(&dir);
     }
 
     /// A link to a folder is removed as the link, at once: `remove_file` refuses it on Windows
-    /// with an error that reads as held, so the type decides the call rather than a fallback.
+    /// with an error that reads as held, so the type decides the call rather than a fallback. On
+    /// Windows both kinds are tried: a directory symlink and a junction.
     #[test]
     fn a_folder_link_is_removed_at_once_and_its_target_kept() {
         let dir = std::env::temp_dir().join(format!("forklift-delete-folder-link-{}", std::process::id()));
@@ -4993,20 +5024,39 @@ mod tests {
         let target = dir.join("target");
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join("kept"), b"x").unwrap();
-        let link = dir.join("link");
+
+        let mut links = Vec::new();
         #[cfg(windows)]
-        if std::os::windows::fs::symlink_dir(&target, &link).is_err() {
-            return; // no symlink privilege on this machine
+        {
+            let symlink = dir.join("symlink");
+            match std::os::windows::fs::symlink_dir(&target, &symlink) {
+                Ok(()) => links.push(symlink),
+                // Without symlink privilege only the junction is tried; CI has the privilege.
+                Err(error) => assert!(std::env::var_os("CI").is_none(), "symlink_dir: {}", error),
+            }
+            let junction = dir.join("junction");
+            let made = std::process::Command::new("cmd").arg("/c").arg("mklink").arg("/J").arg(&junction).arg(&target)
+                .output().unwrap();
+            assert!(made.status.success(), "mklink /J: {:?}", made);
+            links.push(junction);
         }
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        {
+            let symlink = dir.join("symlink");
+            std::os::unix::fs::symlink(&target, &symlink).unwrap();
+            links.push(symlink);
+        }
 
-        let started = std::time::Instant::now();
-        let file_type = std::fs::symlink_metadata(&link).unwrap().file_type();
-        remove_entry_unfollowed(&link, file_type).unwrap();
+        for link in &links {
+            let started = std::time::Instant::now();
+            remove_file_or_link(link).unwrap();
+            assert!(started.elapsed() < HELD_DEADLINE, "{}", link.display());
+            assert!(std::fs::symlink_metadata(link).is_err(), "{}", link.display());
+            assert!(target.join("kept").exists());
+        }
 
-        assert!(started.elapsed() < HELD_DEADLINE);
-        assert!(std::fs::symlink_metadata(&link).is_err());
+        let refused = remove_file_or_link(&target).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::IsADirectory);
         assert!(target.join("kept").exists());
         let _ = remove_dir_all(&dir);
     }

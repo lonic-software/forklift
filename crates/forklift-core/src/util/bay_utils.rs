@@ -293,11 +293,8 @@ pub fn remove_bay_redirect(bay_dir: &Path, shared_forklift: &Path, name: &str) -
         ))),
     }
 
-    let deleted = match std::fs::symlink_metadata(&retired) {
-        Ok(metadata) if metadata.is_dir() => file_utils::remove_dir_all(&retired),
-        Ok(_) => file_utils::remove_file(&retired),
-        Err(e) => Err(e),
-    };
+    let deleted = std::fs::symlink_metadata(&retired)
+        .and_then(|metadata| file_utils::remove_entry_unfollowed(&retired, metadata.file_type()));
 
     deleted.map_err(|e| RedirectRemoval::Left(format!(
         "The bay folder was moved aside to \"{}\", but it could not be deleted: {}. Delete it by hand.",

@@ -2435,10 +2435,8 @@ fn sweep_interrupted_creations(base: &std::path::Path) {
         }
 
         let path = entry.path();
-        let removed = match entry.file_type() {
-            Ok(file_type) if file_type.is_dir() => forklift_core::util::file_utils::remove_dir_all(&path),
-            _ => forklift_core::util::file_utils::remove_file(&path),
-        };
+        let removed = entry.file_type()
+            .and_then(|file_type| forklift_core::util::file_utils::remove_entry_unfollowed(&path, file_type));
         match removed {
             Ok(()) => tracing::info!(path = %path.display(), "removed an interrupted warehouse creation"),
             Err(error) => tracing::warn!(
