@@ -21,6 +21,7 @@ use std::time::Duration;
 use crate::corpus::Corpus;
 use crate::damage::Warehouse;
 use crate::faulted::{self, Context, Graded, Programs};
+use crate::report::{Category, Cell, Completeness, Row};
 use crate::runner::{self, RunError};
 use crate::scenario::{Op, Scenario, Tool};
 use crate::scrub::{Environment, Scratch};
@@ -549,6 +550,75 @@ fn inject(shared: &Shared, point: &Point, at: usize) -> Result<Killed, RunError>
     Ok(Killed { point: point.clone(), landing, graded })
 }
 
+/// What the kill points of a run add to its report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Summary {
+    /// Run, or sampled once any landed point was.
+    pub cell: Cell,
+    pub rows: Vec<Row>,
+    pub completeness: Vec<Completeness>,
+    pub not_reached: u64,
+}
+
+/// The report's share of every scenario's kill points. A unit, a command's calls of one name on
+/// one path base, is covered when any of its points landed; one with none landed is missing, as is
+/// a scenario whose faulted command made no call to kill. A scenario reported not run is listed,
+/// and fails nothing.
+pub fn summarize(kills: &[ScenarioKills]) -> Summary {
+    let mut rows = Vec::new();
+    let mut units: BTreeMap<(String, String, String, String), bool> = BTreeMap::new();
+    let (mut refusals, mut errors, mut empty, mut not_run) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut not_reached = 0;
+    let mut sampled = false;
+    for scenario in kills {
+        if let Some(reason) = &scenario.not_run {
+            not_run.push(Completeness { check: format!("kill points of {}", scenario.scenario), cell: Cell::not_run(reason), missing: vec![] });
+            continue;
+        }
+        refusals.extend(scenario.refusals.iter().map(|refusal| format!("{}: {}", scenario.scenario, refusal)));
+        errors.extend(scenario.errors.iter().map(|error| format!("{}: {}", scenario.scenario, error)));
+        if scenario.refusals.is_empty() && scenario.killed.is_empty() && scenario.errors.is_empty() {
+            empty.push(format!("{}: the faulted command made no call to kill", scenario.scenario));
+        }
+        for killed in &scenario.killed {
+            let (command, name, base) = killed.point.unit();
+            let covered = units.entry((scenario.scenario.clone(), command, name, base)).or_default();
+            let Some(graded) = &killed.graded else {
+                not_reached += 1;
+                continue;
+            };
+            *covered = true;
+            sampled |= killed.point.sampled;
+            let mut notes = Vec::new();
+            if killed.point.sampled {
+                notes.push("sampled".to_string());
+            }
+            if !graded.unextractable.is_empty() {
+                notes.push(format!("unextractable remedies: {}", graded.unextractable.join("; ")));
+            }
+            let point = &killed.point;
+            rows.push(Row {
+                scenario: format!("{} {} {}#{} {}", scenario.scenario, point.command, point.name, point.when, point.base),
+                category: Category::KillPointsClient,
+                binding: "forklift".to_string(),
+                grade: graded.grade,
+                recoverability: graded.recoverability.clone(),
+                note: (!notes.is_empty()).then(|| notes.join("; ")),
+            });
+        }
+    }
+    let mut missing: Vec<String> = units.into_iter().filter(|(_, covered)| !covered)
+        .map(|((scenario, command, name, base), _)| format!("{}: {} {} {}: no kill landed", scenario, command, name, base)).collect();
+    missing.extend(empty);
+    let mut completeness = vec![
+        Completeness { check: "kill-point units".to_string(), cell: Cell::Run, missing },
+        Completeness { check: "kill-point soundness".to_string(), cell: Cell::Run, missing: refusals },
+        Completeness { check: "kill points ran".to_string(), cell: Cell::Run, missing: errors },
+    ];
+    completeness.extend(not_run);
+    Summary { cell: if sampled { Cell::Sampled } else { Cell::Run }, rows, completeness, not_reached }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,5 +778,47 @@ mod tests {
         std::fs::write(dir.join("a/other"), b"/o/s/0001-h-count").unwrap();
         assert_eq!(recorded_root(&dir, &["/o/s/0001-h"]).unwrap().as_deref(), Some("a/b/bay"));
         assert_eq!(recorded_root(&dir, &["/nowhere"]).unwrap(), None);
+    }
+
+    fn killed(name: &str, base: &str, landed: bool, sampled: bool) -> Killed {
+        let mut point = point(name, Aim::Position, 1, &[], "");
+        point.base = base.into();
+        point.sampled = sampled;
+        let graded = Graded {
+            grade: crate::oracle::Grade::Healed, evidence: Default::default(), recoverability: Default::default(),
+            steps: vec![], readbacks: vec![], unextractable: vec![],
+        };
+        Killed {
+            point,
+            landing: if landed { Landing::Landed } else { Landing::NotReached { why: "stolen".into() } },
+            graded: landed.then_some(graded),
+        }
+    }
+
+    /// A unit is covered by any landed point of it; one whose every point went unreached is
+    /// missing, a scenario with no point at all is missing, a not-run scenario fails nothing, and a
+    /// landed sampled point makes the cell sampled and notes its row.
+    ///
+    /// Revert: cover a unit by any point, landed or not → the unreached fsync unit goes unreported.
+    #[test]
+    fn a_unit_no_kill_landed_on_is_missing() {
+        let kills = vec![
+            ScenarioKills { scenario: "history".into(), killed: vec![
+                killed("openat", "<root>/a", false, false), killed("openat", "<root>/a", true, true), killed("fsync", "<root>/b", false, false),
+            ], ..Default::default() },
+            ScenarioKills { scenario: "quiet".into(), ..Default::default() },
+            ScenarioKills { scenario: "lifted".into(), not_run: Some("hosted".into()), ..Default::default() },
+        ];
+        let summary = summarize(&kills);
+        assert_eq!(summary.cell, Cell::Sampled);
+        assert_eq!(summary.not_reached, 2);
+        assert_eq!(summary.rows.len(), 1);
+        assert_eq!(summary.rows[0].note.as_deref(), Some("sampled"));
+        let units = &summary.completeness[0];
+        assert_eq!(units.missing, vec![
+            "history: stack fsync <root>/b: no kill landed".to_string(), "quiet: the faulted command made no call to kill".to_string(),
+        ]);
+        let lifted = summary.completeness.iter().find(|check| check.check == "kill points of lifted").unwrap();
+        assert!(lifted.missing.is_empty() && matches!(lifted.cell, Cell::NotRun { .. }));
     }
 }
