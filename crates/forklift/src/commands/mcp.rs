@@ -13,6 +13,7 @@
 
 use std::io::{BufRead, Write};
 use serde_json::{json, Value};
+use forklift_core::util::json_utils;
 
 /// The MCP protocol version this server defaults to when a client does not pin one.
 /// The `initialize` handshake echoes the client's version when it sends one.
@@ -140,9 +141,22 @@ impl ServerState {
 /// Handle one JSON-RPC message; `None` for a notification (which gets no reply) or an
 /// unparseable line we choose to ignore rather than crash the session.
 ///
+/// A message that is JSON but names a key twice in one object is answered with an Invalid
+/// Request error rather than read: `serde_json` would keep the last spelling, so a tool's
+/// arguments (a query predicate among them) could mean something other than what the client
+/// meant.
+///
 /// `notify` writes a notification to the client; a `tools/call` uses it for progress.
 fn handle_message(line: &str, state: &mut ServerState, notify: &mut dyn FnMut(&Value)) -> Option<Value> {
-    let message: Value = serde_json::from_str(line).ok()?;
+    let message: Value = match json_utils::parse_strict(line) {
+        Ok(message) => message,
+        Err(reason) => {
+            let loose: Value = serde_json::from_str(line).ok()?;
+            let id = loose.get("id").cloned()?;
+            let error = JsonRpcError::invalid_request(&reason);
+            return Some(json!({ "jsonrpc": "2.0", "id": id, "error": error.to_value() }));
+        }
+    };
 
     let id = message.get("id").cloned();
     let method = message.get("method").and_then(Value::as_str)?;
@@ -1359,6 +1373,10 @@ struct JsonRpcError {
 impl JsonRpcError {
     fn method_not_found(method: &str) -> JsonRpcError {
         JsonRpcError { code: -32601, message: format!("Unknown method \"{}\".", method) }
+    }
+
+    fn invalid_request(reason: &str) -> JsonRpcError {
+        JsonRpcError { code: -32600, message: format!("Invalid Request: {}.", reason) }
     }
 
     fn invalid_params(reason: &str) -> JsonRpcError {

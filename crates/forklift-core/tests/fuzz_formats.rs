@@ -41,6 +41,12 @@ use forklift_core::model::recipe::{Recipe, RecipeChunk};
 use forklift_core::util::byte_utils::{number_from_vlq_bytes, number_to_vlq_bytes};
 use forklift_core::util::chunk_utils::MAX_CHUNK_BYTES;
 use forklift_core::util::meta_tree::{encode_cell, parse_cell, Stamp};
+use forklift_core::error::{CoreError, RefusalCode};
+use forklift_core::util::path_utils::WarehousePath;
+use forklift_core::util::query_utils::{
+    parse_where, MAX_GLOB_CHARS, MAX_IN_VALUES, MAX_PREDICATE_DEPTH, MAX_PREDICATE_LEAVES, MAX_WHERE_BYTES,
+};
+use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------------------------
 // Deterministic RNG (splitmix64) — no external dependency, reproducible seed → stream.
@@ -744,4 +750,328 @@ fn every_accepted_object_is_in_its_canonical_form() {
     for label in ["blob", "chunk", "tree v1", "tree v2", "parcel v1", "parcel v2", "recipe v1"] {
         assert!(accepted.get(label).copied().unwrap_or(0) >= 20, "too few accepted {} mutations: {:?}", label, accepted);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Query predicates: the `--where` JSON a client (or an agent, through the MCP server) hands the
+// query engine. Three properties: no input panics the decoder; every refusal is the one
+// predicate refusal; and a predicate is accepted exactly when the grammar below accepts it, so
+// a malformed or out-of-bounds one is refused, never read as something wider.
+// ---------------------------------------------------------------------------------------------
+
+const CLASSES: [&str; 4] = ["human", "agent", "bot", "service"];
+const ROLES: [&str; 3] = ["admin", "writer", "reader"];
+const DATE: &str = "2026-03-01T12:00:00Z";
+
+/// The predicate grammar as the query guide states it, written without the decoder: whether
+/// `node`, at `depth` (the root is 1), is a predicate, counting leaves into `leaves`.
+fn grammar_accepts(node: &Value, depth: usize, leaves: &mut usize) -> bool {
+    if depth > MAX_PREDICATE_DEPTH {
+        return false;
+    }
+    let Some(object) = node.as_object() else { return false };
+    let combinators: Vec<&String> = object.keys().filter(|key| ["all", "any", "not"].contains(&key.as_str())).collect();
+    match combinators.as_slice() {
+        [] => {
+            *leaves += 1;
+            *leaves <= MAX_PREDICATE_LEAVES && grammar_accepts_leaf(object)
+        }
+        [combinator] if object.len() == 1 => match (combinator.as_str(), &object[combinator.as_str()]) {
+            ("not", inner) => grammar_accepts(inner, depth + 1, leaves),
+            (_, Value::Array(children)) => children.iter().all(|child| grammar_accepts(child, depth + 1, leaves)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn grammar_accepts_leaf(object: &serde_json::Map<String, Value>) -> bool {
+    if object.keys().any(|key| !["field", "op", "value"].contains(&key.as_str())) {
+        return false;
+    }
+    let (Some(field), Some(op), Some(value)) =
+        (object.get("field").and_then(Value::as_str), object.get("op").and_then(Value::as_str), object.get("value"))
+    else {
+        return false;
+    };
+
+    // eq/ne take one value, in an array of at most MAX_IN_VALUES; `ne_ok` says whether ne applies.
+    let membership = |ne_ok: bool, each: &dyn Fn(&Value) -> bool| match op {
+        "eq" => each(value),
+        "ne" => ne_ok && each(value),
+        "in" => value.as_array().is_some_and(|items| items.len() <= MAX_IN_VALUES && items.iter().all(each)),
+        _ => false,
+    };
+    let string = |value: &Value| value.is_string();
+    let one_of = |names: &'static [&'static str]| move |value: &Value| value.as_str().is_some_and(|text| names.contains(&text));
+    let hash_prefix = |value: &Value| {
+        value.as_str().is_some_and(|text| {
+            (1..=64).contains(&text.len()) && text.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    };
+    let date = |value: &Value| value.as_str().is_some_and(|text| chrono::DateTime::parse_from_rfc3339(text).is_ok());
+    let glob = |value: &Value| value.as_str().is_some_and(|text| !text.is_empty() && text.chars().count() <= MAX_GLOB_CHARS);
+
+    match field {
+        "author.operator" | "stacker.operator" | "signer.operator" => membership(true, &string),
+        "author.date" | "stacker.date" => match op {
+            "before" | "after" => date(value),
+            "between" => value.as_array().is_some_and(|bounds| bounds.len() == 2 && bounds.iter().all(date)),
+            _ => false,
+        },
+        "author.class" | "signer.class" => membership(true, &one_of(&CLASSES)),
+        "author.supervisor" => membership(true, &|value: &Value| value.is_string() || value.is_null()),
+        "author.role" => membership(true, &one_of(&ROLES)),
+        "signer.key" | "parcel" => membership(false, &hash_prefix),
+        "signer.boundary" => membership(false, &one_of(&["vouched", "suspect"])),
+        "description" => op == "matches" && glob(value),
+        "is_merge" => op == "eq" && value.is_boolean(),
+        "parents.count" => op == "eq" && value.as_u64().is_some(),
+        "provenance.model" | "provenance.tool" | "provenance.session" => {
+            if op == "matches" { glob(value) } else { membership(true, &string) }
+        }
+        "tag" => membership(false, &string),
+        "path" => {
+            op == "touches"
+                && value.as_str().is_some_and(|text| !text.is_empty() && WarehousePath::from_user_input(text).is_ok())
+        }
+        _ => false,
+    }
+}
+
+/// A valid leaf for every field the grammar names.
+fn predicate_leaf(rng: &mut Rng) -> Value {
+    let pick = |rng: &mut Rng, names: &[&str]| names[rng.below(names.len())].to_string();
+    let leaf = |field: &str, op: &str, value: Value| json!({ "field": field, "op": op, "value": value });
+    match rng.below(14) {
+        0 => leaf(&pick(rng, &["author.operator", "stacker.operator", "signer.operator"]), &pick(rng, &["eq", "ne"]), json!(random_name(rng))),
+        1 => leaf(&pick(rng, &["author.date", "stacker.date"]), &pick(rng, &["before", "after"]), json!(DATE)),
+        2 => leaf("author.date", "between", json!([DATE, "2026-04-01T00:00:00+02:00"])),
+        3 => leaf(&pick(rng, &["author.class", "signer.class"]), "in", json!([pick(rng, &CLASSES), pick(rng, &CLASSES)])),
+        4 => leaf("author.supervisor", "eq", if rng.bool() { Value::Null } else { json!("alice@corp") }),
+        5 => leaf("author.role", "ne", json!(pick(rng, &ROLES))),
+        6 => leaf(&pick(rng, &["signer.key", "parcel"]), "eq", json!(&random_hash(rng)[..1 + rng.below(64)])),
+        7 => leaf("signer.boundary", "in", json!(["vouched", "suspect"])),
+        8 => leaf("description", "matches", json!(pick(rng, &["fix", "fix*walk", "?", "*"]))),
+        9 => leaf("is_merge", "eq", json!(rng.bool())),
+        10 => leaf("parents.count", "eq", json!(rng.below(3))),
+        11 => leaf(&pick(rng, &["provenance.model", "provenance.tool", "provenance.session"]), &pick(rng, &["matches", "eq"]), json!("claude-*")),
+        12 => leaf("tag", "in", json!(["v1.0", random_name(rng)])),
+        _ => leaf("path", "touches", json!(pick(rng, &["src", "src/app.rs", "."]))),
+    }
+}
+
+/// A valid predicate tree, at most `room` levels deep.
+fn predicate_tree(rng: &mut Rng, room: usize) -> Value {
+    if room <= 1 || rng.below(3) == 0 {
+        return predicate_leaf(rng);
+    }
+    match rng.below(3) {
+        0 => json!({ "not": predicate_tree(rng, room - 1) }),
+        kind => {
+            let children: Vec<Value> = (0..rng.below(4)).map(|_| predicate_tree(rng, room - 1)).collect();
+            if kind == 1 { json!({ "all": children }) } else { json!({ "any": children }) }
+        }
+    }
+}
+
+/// Values a mutation writes into a tree: each sits at the edge of some rule.
+fn edge_value(rng: &mut Rng) -> Value {
+    let strings = [
+        "", "*", "fix*", "9f", "9F", "9g", "ABC", "human", "agent", "admin", "vouched", "suspect", "unresolved",
+        DATE, "2026-13-01T00:00:00Z", "yesterday", "all", "any", "not", "eq", "ne", "in", "matches", "touches",
+        "between", "field", "op", "value", "src", ".", "../outside", "a\u{0}b", "\u{e9}",
+    ];
+    match rng.below(12) {
+        0 => Value::Null,
+        1 => json!(rng.bool()),
+        2 => json!([0i64, -1, 1, 2, i64::MIN][rng.below(5)]),
+        3 => json!(u64::MAX),
+        4 => json!(1.5),
+        5 => json!([]),
+        6 => json!({}),
+        7 => json!([DATE, DATE]),
+        8 => Value::Array((0..MAX_IN_VALUES + rng.below(2)).map(|i| json!(format!("v{i}"))).collect()),
+        9 => json!("f".repeat(64 + rng.below(2))),
+        10 => json!("x".repeat(MAX_GLOB_CHARS + rng.below(2))),
+        _ => json!(strings[rng.below(strings.len())]),
+    }
+}
+
+/// Every value position in `node`, as a path of object keys and array indexes.
+fn value_paths(node: &Value, here: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    out.push(here.clone());
+    match node {
+        Value::Object(object) => object.iter().for_each(|(key, child)| {
+            here.push(key.clone());
+            value_paths(child, here, out);
+            here.pop();
+        }),
+        Value::Array(items) => items.iter().enumerate().for_each(|(index, child)| {
+            here.push(index.to_string());
+            value_paths(child, here, out);
+            here.pop();
+        }),
+        _ => {}
+    }
+}
+
+fn at_path<'a>(node: &'a mut Value, path: &[String]) -> &'a mut Value {
+    path.iter().fold(node, |node, step| match node {
+        Value::Object(object) => object.get_mut(step).unwrap(),
+        Value::Array(items) => &mut items[step.parse::<usize>().unwrap()],
+        _ => unreachable!("a path only steps into containers"),
+    })
+}
+
+/// One structural mutation: replace a value, rename, add or drop a key, or bury a node under
+/// enough `not`s to cross the depth bound, or under enough siblings to cross the leaf bound.
+fn mutate_predicate(tree: &mut Value, rng: &mut Rng) {
+    let mut paths = Vec::new();
+    value_paths(tree, &mut Vec::new(), &mut paths);
+    let path = paths[rng.below(paths.len())].clone();
+    let keys = ["field", "op", "value", "all", "any", "not", "values"];
+    let target = at_path(tree, &path);
+    match rng.below(6) {
+        0 | 1 => *target = edge_value(rng),
+        2 => {
+            if let Value::Object(object) = target {
+                let key = keys[rng.below(keys.len())].to_string();
+                object.insert(key, edge_value(rng));
+            }
+        }
+        3 => {
+            if let Value::Object(object) = target {
+                if let Some(key) = object.keys().nth(rng.below(object.len().max(1))).cloned() {
+                    let value = object.remove(&key).unwrap();
+                    object.insert(keys[rng.below(keys.len())].to_string(), value);
+                }
+            }
+        }
+        4 => {
+            for _ in 0..MAX_PREDICATE_DEPTH - 2 + rng.below(4) {
+                *target = json!({ "not": target.take() });
+            }
+        }
+        _ => {
+            let siblings = MAX_PREDICATE_LEAVES - 2 + rng.below(4);
+            *target = json!({ "all": vec![target.take(); siblings] });
+        }
+    }
+}
+
+/// The verdict for one payload, under `catch_unwind`: `Ok(accepted)`, or a description of the
+/// panic or of an error that is not the predicate refusal.
+fn decode_predicate(payload: &str) -> Result<bool, String> {
+    let owned = payload.to_string();
+    match std::panic::catch_unwind(move || parse_where(&owned).map(|_| ())) {
+        Err(_) => Err("the decoder panicked".to_string()),
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(error)) => match CoreError::from(error) {
+            CoreError::Refusal { code: RefusalCode::QueryPredicateInvalid, .. } => Ok(false),
+            other => Err(format!("refused without the predicate code: {:?}", other)),
+        },
+    }
+}
+
+#[test]
+fn predicates_are_accepted_exactly_when_the_grammar_accepts_them() {
+    let mut rng = Rng::new(0xF01C_11F7_5EED_0426);
+    let (mut accepted, mut refused) = (0usize, 0usize);
+
+    for case in 0..30_000 {
+        let mut tree = predicate_tree(&mut rng, 5);
+        if case % 10 != 0 {
+            for _ in 0..1 + rng.below(2) {
+                mutate_predicate(&mut tree, &mut rng);
+            }
+        }
+        let payload = tree.to_string();
+        let expected = payload.len() <= MAX_WHERE_BYTES && grammar_accepts(&tree, 1, &mut 0);
+        match decode_predicate(&payload) {
+            Ok(verdict) if verdict == expected => {}
+            Ok(verdict) => panic!("case {case}: the decoder {} what the grammar {}: {payload}",
+                if verdict { "accepted" } else { "refused" }, if expected { "accepts" } else { "refuses" }),
+            Err(what) => panic!("case {case}: {what}: {payload}"),
+        }
+        if expected { accepted += 1 } else { refused += 1 }
+    }
+
+    // Both sides of the property need a real domain.
+    assert!(accepted >= 5_000 && refused >= 5_000, "accepted {accepted}, refused {refused}");
+}
+
+/// Write `node` as JSON, spelling the first key of the `target`-th object (in writing order) a
+/// second time, with the value `again`.
+fn write_with_duplicate(node: &Value, target: usize, again: &Value, seen: &mut usize, out: &mut String) {
+    match node {
+        Value::Object(object) => {
+            let this = *seen;
+            *seen += 1;
+            out.push('{');
+            for (index, (key, child)) in object.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(key.clone()).to_string());
+                out.push(':');
+                write_with_duplicate(child, target, again, seen, out);
+            }
+            if this == target {
+                if let Some(key) = object.keys().next() {
+                    out.push(',');
+                    out.push_str(&Value::String(key.clone()).to_string());
+                    out.push(':');
+                    out.push_str(&again.to_string());
+                }
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (index, child) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_with_duplicate(child, target, again, seen, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+#[test]
+fn a_predicate_naming_a_key_twice_is_refused_wherever_the_key_is() {
+    let mut rng = Rng::new(0xF01C_11F7_5EED_D0B1);
+    for case in 0..5_000 {
+        let tree = predicate_tree(&mut rng, 5);
+        let mut objects = 0;
+        write_with_duplicate(&tree, usize::MAX, &Value::Null, &mut objects, &mut String::new());
+
+        // The second spelling is sometimes the one that widens: an empty conjunction.
+        let again = if rng.bool() { json!([]) } else { edge_value(&mut rng) };
+        let mut payload = String::new();
+        write_with_duplicate(&tree, rng.below(objects), &again, &mut 0, &mut payload);
+        assert_eq!(decode_predicate(&payload), Ok(false), "case {case}: {payload}");
+    }
+}
+
+#[test]
+fn predicate_text_never_panics_the_decoder() {
+    let mut rng = Rng::new(0xF01C_11F7_5EED_7E47);
+    for case in 0..20_000 {
+        let mut bytes = predicate_tree(&mut rng, 6).to_string().into_bytes();
+        mutate(&mut bytes, &mut rng);
+        let payload = String::from_utf8_lossy(&bytes);
+        if let Err(what) = decode_predicate(&payload) {
+            panic!("case {case}: {what}: {payload}");
+        }
+    }
+
+    // Nesting inside the byte bound is refused by the JSON reader's own limit, before any tree
+    // is built.
+    let deep = format!("{}{}", "[".repeat(30_000), "]".repeat(30_000));
+    assert!(deep.len() <= MAX_WHERE_BYTES);
+    assert_eq!(decode_predicate(&deep), Ok(false));
 }

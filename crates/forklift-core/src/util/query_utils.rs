@@ -44,7 +44,7 @@ use crate::util::office_utils::{IdentityClass, OfficeState, RevocationReason, Ro
 use crate::util::path_utils::WarehousePath;
 use crate::util::scope_utils::{self, PathScope, ScopeClass};
 use crate::util::{
-    fanout_utils, manifest_utils, merge_utils, object_utils, pallet_utils, tag_utils,
+    fanout_utils, json_utils, manifest_utils, merge_utils, object_utils, pallet_utils, tag_utils,
     tree_utils,
 };
 
@@ -55,7 +55,9 @@ pub const CODE_QUERY_PREDICATE_INVALID: &str = RefusalCode::QueryPredicateInvali
 /// reason to be large; bounding the payload bounds the parse itself.
 pub const MAX_WHERE_BYTES: usize = 64 * 1024;
 
-/// The maximum predicate nesting depth (bounds the evaluator's recursion).
+/// The maximum predicate nesting depth (bounds the evaluator's recursion). It counts from each
+/// conjunct of [`parse_conjunction`], so the conjunction the CLI's flags form around a
+/// `--where` payload is not charged to the payload.
 pub const MAX_PREDICATE_DEPTH: usize = 16;
 
 /// The maximum total number of leaves (bounds per-parcel evaluation work).
@@ -666,9 +668,29 @@ fn invalid(message: impl Into<String>) -> String {
 
 /// Parse a `--where` payload (raw JSON text) into a validated predicate. Enforces the
 /// payload byte bound before parsing and every structural bound during validation; all
-/// failures — including `serde_json`'s own parse and recursion errors — are the one
-/// predicate refusal, never a generic error.
+/// failures — including `serde_json`'s own parse and recursion errors, and a key spelled twice
+/// in one object — are the one predicate refusal, never a generic error.
 pub fn parse_where(payload: &str) -> Result<Predicate, String> {
+    parse_value(&read_where(payload)?)
+}
+
+/// Parse the conjunction of `conjuncts` (already-built JSON trees, such as the head's flag
+/// desugaring) and an optional `--where` payload, with one leaf budget across all of them.
+/// Each conjunct is a root for the depth bound.
+pub fn parse_conjunction(conjuncts: &[Value], payload: Option<&str>) -> Result<Predicate, String> {
+    let payload = payload.map(read_where).transpose()?;
+    let mut leaves = 0usize;
+    let parsed = conjuncts
+        .iter()
+        .chain(payload.as_ref())
+        .map(|conjunct| parse_node(conjunct, 1, &mut leaves))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Predicate::All(parsed))
+}
+
+/// The byte bound, then a strict JSON read: an object naming a key twice is refused rather than
+/// read as its last spelling, which could turn `{"all": [<filter>], "all": []}` into everything.
+fn read_where(payload: &str) -> Result<Value, String> {
     if payload.len() > MAX_WHERE_BYTES {
         return Err(invalid(format!(
             "The predicate payload is {} bytes; the maximum is {} bytes.",
@@ -677,10 +699,8 @@ pub fn parse_where(payload: &str) -> Result<Predicate, String> {
         )));
     }
 
-    let value: Value = serde_json::from_str(payload)
-        .map_err(|error| invalid(format!("The predicate is not valid JSON: {}.", error)))?;
-
-    parse_value(&value)
+    json_utils::parse_strict(payload)
+        .map_err(|error| invalid(format!("The predicate could not be read as JSON: {}.", error)))
 }
 
 /// Parse an already-built JSON predicate tree (the head's flag desugaring goes through here
@@ -785,6 +805,50 @@ fn membership_values<'a>(
             other, field
         ))),
     }
+}
+
+/// The longest hash prefix: a parcel hash and a key id are both 64 hex characters.
+const HASH_HEX_CHARS: usize = 64;
+
+/// Every value must be a hash prefix as Forklift spells hashes: 1 to 64 lower-case hex
+/// characters. An empty prefix would match every hash and an upper-case one none, so both are
+/// refused rather than read.
+fn hash_prefixes(values: Vec<String>, field: &str) -> Result<Vec<String>, String> {
+    for value in &values {
+        let spelled = !value.is_empty()
+            && value.len() <= HASH_HEX_CHARS
+            && value.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+        if !spelled {
+            return Err(invalid(format!(
+                "\"{}\" takes a hash prefix of 1 to {} lower-case hex characters; got \"{}\".",
+                field, HASH_HEX_CHARS, value
+            )));
+        }
+    }
+    Ok(values)
+}
+
+/// A `matches` pattern within the glob bound and not empty: an empty pattern is a substring of
+/// every text, so it would match everything; `*` says that on purpose.
+fn glob_pattern<'a>(object: &'a serde_json::Map<String, Value>, field: &str) -> Result<&'a str, String> {
+    let glob = object
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid(format!("\"{}\" matches against a string.", field)))?;
+    if glob.is_empty() {
+        return Err(invalid(format!(
+            "The \"matches\" pattern on \"{}\" is empty, which would match everything; use \"*\" \
+             to match any value.",
+            field
+        )));
+    }
+    if glob.chars().count() > MAX_GLOB_CHARS {
+        return Err(invalid(format!(
+            "The \"matches\" pattern is longer than the maximum of {} characters.",
+            MAX_GLOB_CHARS
+        )));
+    }
+    Ok(glob)
 }
 
 /// Every value must be a string; returns them owned.
@@ -903,7 +967,7 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
             if negate {
                 return Err(invalid("The \"signer.key\" field supports \"eq\" and \"in\" only.".to_string()));
             }
-            Ok(Leaf::SignerKey { prefixes: string_values(values, field)? })
+            Ok(Leaf::SignerKey { prefixes: hash_prefixes(string_values(values, field)?, field)? })
         }
 
         "signer.operator" => {
@@ -936,16 +1000,7 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
                     "\"description\" supports the \"matches\" operator only.".to_string(),
                 ));
             }
-            let glob = object
-                .get("value")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid("\"description\" matches against a string.".to_string()))?;
-            if glob.chars().count() > MAX_GLOB_CHARS {
-                return Err(invalid(format!(
-                    "The \"matches\" pattern is longer than the maximum of {} characters.",
-                    MAX_GLOB_CHARS
-                )));
-            }
+            let glob = glob_pattern(object, field)?;
             Ok(Leaf::Description { glob: glob.to_string() })
         }
 
@@ -976,7 +1031,7 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
             if negate {
                 return Err(invalid("The \"parcel\" field supports \"eq\" and \"in\" only.".to_string()));
             }
-            Ok(Leaf::ParcelPrefix { prefixes: string_values(values, field)? })
+            Ok(Leaf::ParcelPrefix { prefixes: hash_prefixes(string_values(values, field)?, field)? })
         }
 
         "provenance.model" | "provenance.tool" | "provenance.session" => {
@@ -987,16 +1042,7 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
             };
 
             if op == "matches" {
-                let glob = object
-                    .get("value")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| invalid(format!("\"{}\" matches against a string.", field)))?;
-                if glob.chars().count() > MAX_GLOB_CHARS {
-                    return Err(invalid(format!(
-                        "The \"matches\" pattern is longer than the maximum of {} characters.",
-                        MAX_GLOB_CHARS
-                    )));
-                }
+                let glob = glob_pattern(object, field)?;
                 return Ok(Leaf::Provenance {
                     field: provenance_field,
                     test: ProvenanceTest::Matches { glob: glob.to_string() },
@@ -1026,6 +1072,13 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
                 .get("value")
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid("\"path\" touches a warehouse-relative path string.".to_string()))?;
+            // An empty string would resolve to the current directory, which at the root is the
+            // whole warehouse; that reading is spelled ".", never "".
+            if raw.is_empty() {
+                return Err(invalid(
+                    "\"path\" is empty; use \".\" for the current directory.".to_string(),
+                ));
+            }
             // The same normalization every other path-taking command uses, so `--touches foo`
             // and `--touches ./foo/` (and the equivalent `--where` leaf) agree on one key —
             // both the CLI flag and a raw `--where` payload route through this same parser.
@@ -1051,18 +1104,25 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
 /// Glob (`*`, `?`) or literal-substring match, never regex. A pattern with no wildcard is a
 /// substring test (the ergonomic reading of `--grep fix`); a pattern with wildcards must
 /// match the whole text. Iterative with single backtrack, so cost is O(text × pattern) worst
-/// case with both operands already bounded.
+/// case with both operands already bounded (`glob_steps_stay_within_text_times_pattern` pins it).
 fn glob_match(pattern: &str, text: &str) -> bool {
+    glob_scan(pattern, text).0
+}
+
+/// [`glob_match`]'s answer and, for a wildcard pattern, how many times its loop ran.
+fn glob_scan(pattern: &str, text: &str) -> (bool, usize) {
     if !pattern.contains(['*', '?']) {
-        return text.contains(pattern);
+        return (text.contains(pattern), 0);
     }
 
     let pattern: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = text.chars().collect();
     let (mut p, mut t) = (0usize, 0usize);
     let mut star: Option<(usize, usize)> = None;
+    let mut steps = 0usize;
 
     while t < text.len() {
+        steps += 1;
         if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
             p += 1;
             t += 1;
@@ -1074,11 +1134,11 @@ fn glob_match(pattern: &str, text: &str) -> bool {
             t = star_t + 1;
             star = Some((star_p, star_t + 1));
         } else {
-            return false;
+            return (false, steps);
         }
     }
 
-    pattern[p..].iter().all(|&c| c == '*')
+    (pattern[p..].iter().all(|&c| c == '*'), steps)
 }
 
 /// Kleene three-valued truth: an identity leaf is `Unknown` until (and unless) the verified
@@ -1852,6 +1912,162 @@ mod tests {
         assert!(!glob_match("fix", "nothing here"));
         assert!(glob_match("*", ""));
         assert!(!glob_match("?", ""));
+    }
+
+    /// `levels` nodes deep: `levels - 1` `not`s over one leaf.
+    fn nested(levels: usize) -> Value {
+        let mut node = leaf("is_merge", "eq", Value::Bool(true));
+        for _ in 1..levels {
+            node = serde_json::json!({ "not": node });
+        }
+        node
+    }
+
+    fn refusal_message(result: Result<Predicate, String>) -> String {
+        match result {
+            Ok(_) => panic!("the predicate was accepted"),
+            Err(error) => match CoreError::from(error) {
+                CoreError::Refusal { code, message, .. } => {
+                    assert_eq!(code, RefusalCode::QueryPredicateInvalid);
+                    message
+                }
+                other => panic!("expected a predicate refusal, got {:?}", other),
+            },
+        }
+    }
+
+    /// Each bound admits exactly its stated value and refuses one more, so a bound moved either
+    /// way, or dropped, goes red here (the test above only probes past each bound).
+    #[test]
+    fn every_bound_admits_its_limit_and_refuses_one_past_it() {
+        assert!(parse_value(&nested(MAX_PREDICATE_DEPTH)).is_ok(), "depth at the limit");
+        assert!(refusal_message(parse_value(&nested(MAX_PREDICATE_DEPTH + 1))).contains("deeper"));
+
+        let truth = leaf("is_merge", "eq", Value::Bool(true));
+        let conjunction = |count: usize| serde_json::json!({ "all": vec![truth.clone(); count] });
+        assert!(parse_value(&conjunction(MAX_PREDICATE_LEAVES)).is_ok(), "leaves at the limit");
+        assert!(refusal_message(parse_value(&conjunction(MAX_PREDICATE_LEAVES + 1))).contains("leaves"));
+
+        let operators = |count: usize| {
+            let values: Vec<Value> = (0..count).map(|i| Value::String(i.to_string())).collect();
+            leaf("author.operator", "in", Value::Array(values))
+        };
+        assert!(parse_value(&operators(MAX_IN_VALUES)).is_ok(), "an in array at the limit");
+        assert!(refusal_message(parse_value(&operators(MAX_IN_VALUES + 1))).contains("the maximum is"));
+
+        // Counted in characters, not bytes: a two-byte character at the limit is admitted.
+        let pattern = |text: String| leaf("description", "matches", Value::String(text));
+        assert!(parse_value(&pattern("\u{e9}".repeat(MAX_GLOB_CHARS))).is_ok(), "a glob at the limit");
+        assert!(refusal_message(parse_value(&pattern("x".repeat(MAX_GLOB_CHARS + 1)))).contains("longer"));
+
+        let small = truth.to_string();
+        let padded = |bytes: usize| format!("{}{}", small, " ".repeat(bytes - small.len()));
+        assert!(parse_where(&padded(MAX_WHERE_BYTES)).is_ok(), "a payload at the limit");
+        assert!(refusal_message(parse_where(&padded(MAX_WHERE_BYTES + 1))).contains("bytes"));
+    }
+
+    #[test]
+    fn a_key_spelled_twice_is_refused_rather_than_read_as_its_last_spelling() {
+        for payload in [
+            // Read as its last spelling, this is the empty conjunction: every parcel.
+            r#"{"all": [{"field": "is_merge", "op": "eq", "value": true}], "all": []}"#,
+            r#"{"field": "tag", "op": "eq", "value": "v1", "value": "v2"}"#,
+            r#"{"not": {"any": [{"field": "tag", "op": "eq", "value": "v1", "field": "tag"}]}}"#,
+        ] {
+            assert!(refusal_message(parse_where(payload)).contains("appears twice"), "{payload}");
+        }
+    }
+
+    #[test]
+    fn hash_prefixes_take_only_the_lower_case_hex_spelling() {
+        for field in ["parcel", "signer.key"] {
+            for good in ["9".to_string(), "0123456789abcdef".to_string(), "f".repeat(64)] {
+                assert!(parse_value(&leaf(field, "eq", Value::String(good.clone()))).is_ok(), "{field} {good}");
+            }
+            // Empty would match every hash; the others would match none.
+            for bad in ["".to_string(), "9F".to_string(), "9g".to_string(), " 9".to_string(), "f".repeat(65)] {
+                let message = refusal_message(parse_value(&leaf(field, "eq", Value::String(bad.clone()))));
+                assert!(message.contains("lower-case hex"), "{field} {bad:?}: {message}");
+            }
+            let mixed = serde_json::json!(["9f", ""]);
+            assert!(refusal_message(parse_value(&leaf(field, "in", mixed))).contains("lower-case hex"));
+        }
+    }
+
+    #[test]
+    fn an_empty_pattern_or_path_is_refused_never_read_as_everything() {
+        for field in ["description", "provenance.model", "provenance.tool", "provenance.session"] {
+            let empty = refusal_message(parse_value(&leaf(field, "matches", Value::String(String::new()))));
+            assert!(empty.contains("is empty"), "{field}: {empty}");
+            assert!(parse_value(&leaf(field, "matches", Value::String("*".to_string()))).is_ok(), "{field}");
+        }
+        let empty = refusal_message(parse_value(&leaf("path", "touches", Value::String(String::new()))));
+        assert!(empty.contains("\"path\" is empty"), "{empty}");
+    }
+
+    #[test]
+    fn the_flag_conjunction_shares_the_leaf_budget_but_not_the_payload_depth() {
+        let flags = [leaf("is_merge", "eq", Value::Bool(true))];
+
+        let at_limit = nested(MAX_PREDICATE_DEPTH).to_string();
+        assert!(parse_conjunction(&flags, Some(&at_limit)).is_ok(), "a payload at the depth limit");
+        let past = nested(MAX_PREDICATE_DEPTH + 1).to_string();
+        assert!(refusal_message(parse_conjunction(&flags, Some(&past))).contains("deeper"));
+
+        let truth = leaf("is_merge", "eq", Value::Bool(true));
+        let fill = |count: usize| serde_json::json!({ "all": vec![truth.clone(); count] }).to_string();
+        assert!(parse_conjunction(&flags, Some(&fill(MAX_PREDICATE_LEAVES - 1))).is_ok());
+        assert!(refusal_message(parse_conjunction(&flags, Some(&fill(MAX_PREDICATE_LEAVES)))).contains("leaves"));
+
+        // The payload goes through the strict read and the byte bound too.
+        let twice = r#"{"all": [], "all": []}"#;
+        assert!(refusal_message(parse_conjunction(&flags, Some(twice))).contains("appears twice"));
+        let long = " ".repeat(MAX_WHERE_BYTES + 1);
+        assert!(refusal_message(parse_conjunction(&flags, Some(&long))).contains("bytes"));
+    }
+
+    /// The glob semantics, written independently: a wildcard pattern matches the whole text,
+    /// a plain one any substring. Exponential, so only for short operands.
+    fn reference_glob(pattern: &[char], text: &[char]) -> bool {
+        match pattern.first() {
+            None => text.is_empty(),
+            Some('*') => reference_glob(&pattern[1..], text) || (!text.is_empty() && reference_glob(pattern, &text[1..])),
+            Some('?') => !text.is_empty() && reference_glob(&pattern[1..], &text[1..]),
+            Some(c) => text.first() == Some(c) && reference_glob(&pattern[1..], &text[1..]),
+        }
+    }
+
+    #[test]
+    fn glob_steps_stay_within_text_times_pattern() {
+        let within = |pattern: &str, text: &str| {
+            let (_, steps) = glob_scan(pattern, text);
+            let bound = (text.chars().count() + 1) * (pattern.chars().count() + 1);
+            assert!(steps <= bound, "{steps} steps over the bound {bound} for {pattern:?}");
+        };
+
+        // The shapes that make a naive backtracking matcher exponential, at the pattern bound
+        // and against a long text that never quite matches.
+        let alternating = format!("{}*b", "*a".repeat(MAX_GLOB_CHARS / 2 - 1));
+        assert_eq!(alternating.chars().count(), MAX_GLOB_CHARS);
+        let text = "a".repeat(4096);
+        assert!(!glob_match(&alternating, &text));
+        within(&alternating, &text);
+        within(&format!("{}b", "?*".repeat(MAX_GLOB_CHARS / 2 - 1)), &text);
+
+        // Seeded short cases, against the reference semantics.
+        let mut rng = crate::util::fuzz_bytes::Rng::new(0x9_10B5);
+        let alphabet = ['a', 'b', '*', '?'];
+        for _ in 0..20_000 {
+            let pattern: String = (0..rng.below(9)).map(|_| alphabet[rng.below(4)]).collect();
+            let text: String = (0..rng.below(9)).map(|_| alphabet[rng.below(2)]).collect();
+            let expected = if pattern.contains(['*', '?']) {
+                reference_glob(&pattern.chars().collect::<Vec<_>>(), &text.chars().collect::<Vec<_>>())
+            } else {
+                text.contains(&pattern)
+            };
+            assert_eq!(glob_match(&pattern, &text), expected, "{pattern:?} against {text:?}");
+            within(&pattern, &text);
+        }
     }
 
     #[test]

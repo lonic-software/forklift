@@ -190,7 +190,9 @@ fn build_predicate(args: &QueryArgs) -> Result<query_utils::Predicate, String> {
         leaves.push(leaf("author.supervisor", "eq", json!(supervisor)));
     }
     if let Some(signer) = &args.signer {
-        leaves.push(leaf("signer.key", "eq", json!(signer)));
+        // A typed key id is lower-cased, as the office commands do; the predicate itself takes
+        // only the lower-case spelling.
+        leaves.push(leaf("signer.key", "eq", json!(signer.to_lowercase())));
     }
     if let Some(after) = &args.author_after {
         leaves.push(leaf("author.date", "after", json!(after)));
@@ -220,26 +222,19 @@ fn build_predicate(args: &QueryArgs) -> Result<query_utils::Predicate, String> {
         leaves.push(leaf("path", "touches", json!(path)));
     }
 
-    if let Some(payload) = &args.r#where {
-        let payload = if payload == "-" {
+    let payload = match args.r#where.as_deref() {
+        Some("-") => {
             let mut text = String::new();
             std::io::stdin()
                 .read_to_string(&mut text)
                 .map_err(|error| format!("Could not read the predicate from stdin: {}.", error))?;
-            text
-        } else {
-            payload.clone()
-        };
+            Some(text)
+        }
+        other => other.map(str::to_string),
+    };
 
-        // Parse the payload alone first (its own byte/shape bounds), then re-parse the
-        // combined tree so the flag leaves count against the same structural bounds.
-        query_utils::parse_where(&payload)?;
-        let where_value: Value = serde_json::from_str(&payload)
-            .expect("parse_where accepted this payload, so it is valid JSON");
-        leaves.push(where_value);
-    }
-
-    query_utils::parse_value(&json!({ "all": leaves }))
+    // The flag leaves and the payload share one leaf budget; the payload keeps its own depth.
+    query_utils::parse_conjunction(&leaves, payload.as_deref())
 }
 
 fn scope_block(trust: TrustMode, outcome: &QueryOutcome, fetch_scope: Option<Vec<String>>) -> QueryScope {
