@@ -5,6 +5,7 @@ members = [
     "crates/forklift",
     "crates/forklift-server",
     "crates/forklift-aws-lambda",
+    "crates/proof-load",
 ]
 
 [workspace.package]
