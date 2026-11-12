@@ -6,6 +6,7 @@
 //! the oracle and grades, damaged-file faults with their completeness check, and the report.
 
 pub mod census;
+pub mod corpus;
 pub mod damage;
 pub mod oracle;
 pub mod remedy;
