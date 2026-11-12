@@ -177,11 +177,11 @@ mod tests {
     /// Revert: drop the newline nudge for an unchanged rewrite → some seed's record repeats.
     #[test]
     fn a_seed_names_one_history_and_every_record_changes_it() {
-        let shape = Shape { records: 6, initial_files: 4, max_bytes: 8 };
+        let shape = Shape { records: 6, initial_files: 4, max_bytes: 1 };
         assert_eq!(generate(7, shape), generate(7, shape));
         assert_ne!(generate(7, shape).records, generate(8, shape).records);
 
-        for seed in 0..200 {
+        for seed in 0..4000 {
             let corpus = generate(seed, shape);
             assert_eq!(corpus.records.len(), 6);
             for pair in corpus.records.windows(2) {
