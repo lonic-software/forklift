@@ -92,7 +92,7 @@ mod tests {
     fn a_key_spelled_twice_is_refused_at_any_depth() {
         for text in [
             r#"{"all": [], "all": []}"#,
-            r#"{"not": {"field": "tag", "op": "eq", "value": "a", "value": "b"}}"#,
+            r#"{"not": {"field":"tag", "op": "eq", "value": "a", "value": "b"}}"#,
             r#"[1, {"a": {"b": 1, "b": 1}}]"#,
         ] {
             let error = parse_strict(text).unwrap_err();

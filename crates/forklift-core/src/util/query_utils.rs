@@ -1971,8 +1971,8 @@ mod tests {
         for payload in [
             // Read as its last spelling, this is the empty conjunction: every parcel.
             r#"{"all": [{"field": "is_merge", "op": "eq", "value": true}], "all": []}"#,
-            r#"{"field": "tag", "op": "eq", "value": "v1", "value": "v2"}"#,
-            r#"{"not": {"any": [{"field": "tag", "op": "eq", "value": "v1", "field": "tag"}]}}"#,
+            r#"{"field":"tag", "op": "eq", "value": "v1", "value": "v2"}"#,
+            r#"{"not": {"any": [{"field":"tag", "op": "eq", "value": "v1", "field":"tag"}]}}"#,
         ] {
             assert!(refusal_message(parse_where(payload)).contains("appears twice"), "{payload}");
         }
