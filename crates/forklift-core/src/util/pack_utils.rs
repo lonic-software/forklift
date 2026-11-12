@@ -733,7 +733,8 @@ mod index_format {
     const MAX_FANOUT_BITS: u32 = 20;
 
     /// The writer sizes the table so a bucket averages at most this many records, which keeps a
-    /// lookup's validation to about 1.5 KiB of crc.
+    /// lookup's validation to about 1.5 KiB of crc. Import refuses any other width, so this and
+    /// [`MAX_FANOUT_BITS`] are part of the index format: changing either is a format version.
     const TARGET_BUCKET_RECORDS: usize = 32;
 
     /// The bytes that identify an index: its magic and its version.
@@ -2958,7 +2959,16 @@ fn resolve_incoming_object(hash: &[u8; HASH_LEN],
                     file_utils::retrieve_object_by_hash_shared(&sign_utils::to_hex(&base_hash))?
                 };
 
-                delta_utils::decompress_delta(&base, &body[payload_start..], target_len)
+                // One frame, and nothing after it: one delta has one spelling, and no byte of the
+                // record goes unread into the published pack. Only import holds a record to this;
+                // a local read and salvage take whatever still rebuilds to its hash.
+                let payload = &body[payload_start..];
+                if !object_utils::is_one_zstd_frame(payload) {
+                    return Err(format!(
+                        "Packed delta {} is not exactly one zstd frame; refusing the bundle.", hex
+                    ));
+                }
+                delta_utils::decompress_delta(&base, payload, target_len)
             }
             other => Err(format!("Packed object {} has an unknown record kind {}.", hex, other)),
         }

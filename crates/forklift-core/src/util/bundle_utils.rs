@@ -1435,7 +1435,7 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
 
     // The signature section is admitted while the packs are still quarantined, and staged on disk
     // rather than in memory: a signature has no size bound of its own short of the object
-    // ceiling, so only its own payload is ever held at once.
+    // ceiling, so admission holds one payload at a time, and storing holds one table's batch.
     let staging = SignatureStaging::new()?;
     let (imported, signature_count) = pack_utils::import_transport_packs(reader, &sections, |reader, imported| {
         admit_signature_section(reader, imported, &staging)
@@ -1456,9 +1456,10 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
     let mut signatures = sign_utils::SignatureBatch::new(sign_utils::OnConflict::Skip);
     let mut staged = std::io::BufReader::new(std::fs::File::open(&staging.path)
         .map_err(|e| format!("Error while reopening the staged bundle signatures: {}", e))?);
+    let restage_error = |e: String| format!("Error while reading back the staged bundle signatures: {}", e);
     for _ in 0..signature_count {
-        let (hash, length) = read_signature_header(&mut staged)?;
-        signatures.add(hash, read_exact_payload(&mut staged, length)?)?;
+        let (hash, length) = read_signature_header(&mut staged).map_err(restage_error)?;
+        signatures.add(hash, read_exact_payload(&mut staged, length).map_err(restage_error)?)?;
     }
 
     let stored = signatures.finish()?;
@@ -1496,12 +1497,11 @@ impl Drop for SignatureStaging {
 fn admit_signature_section(reader: &mut impl Read,
                            imported: &pack_utils::TransportImportStats,
                            staging: &SignatureStaging) -> Result<u64, String> {
-    let total_objects = imported.stored_objects + imported.skipped_objects;
     let signature_count = read_u64_be(reader, "signature count")?;
-    if signature_count > total_objects as u64 {
+    if signature_count > imported.parcels.len() as u64 {
         return Err(format!(
-            "The bundle declares {} signatures but its native packs contain only {} objects.",
-            signature_count, total_objects
+            "The bundle declares {} signatures but its native packs carry only {} parcels.",
+            signature_count, imported.parcels.len()
         ));
     }
 
@@ -1525,10 +1525,7 @@ fn admit_signature_section(reader: &mut impl Read,
         let payload = read_exact_payload(reader, length)?;
         sign_utils::validate_raw_parcel_signature(&payload, &hash)?;
 
-        staged.write_all(hash.as_bytes())
-            .and_then(|()| staged.write_all(&length.to_be_bytes()))
-            .and_then(|()| staged.write_all(&payload))
-            .map_err(|e| format!("Error while staging a bundle signature: {}", e))?;
+        write_signature_record(&mut staged, &hash, &payload)?;
     }
     staged.flush().map_err(|e| format!("Error while staging the bundle signatures: {}", e))?;
 
@@ -2154,11 +2151,17 @@ mod tests {
     /// `entries`, re-sealed. That section ends the body: a count, then one hash, length and
     /// sidecar.
     fn with_signature_section(bundle: &[u8], entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let body = unsealed(bundle);
         let sidecar = raw_signature_sidecar("test-key", b"test-signature");
-        let start = body.len() - 8 - (64 + 8 + sidecar.len());
-        assert_eq!(u64::from_be_bytes(body[start..start + 8].try_into().unwrap()), 1,
-            "the tiny bundle's signature section holds one entry");
+        with_signature_section_replacing(bundle, &[sidecar], entries)
+    }
+
+    /// `bundle` with its signature section, which holds one entry for each of `original`, replaced
+    /// by `entries`, re-sealed.
+    fn with_signature_section_replacing(bundle: &[u8], original: &[Vec<u8>], entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let body = unsealed(bundle);
+        let start = body.len() - 8 - original.iter().map(|sidecar| 64 + 8 + sidecar.len()).sum::<usize>();
+        assert_eq!(u64::from_be_bytes(body[start..start + 8].try_into().unwrap()), original.len() as u64,
+            "the bundle's signature section holds the entries named");
 
         let mut bytes = body[..start].to_vec();
         bytes.extend((entries.len() as u64).to_be_bytes());
@@ -2194,10 +2197,19 @@ mod tests {
             assert_eq!(sign_utils::load_raw_parcel_signature(signed).unwrap(), None, "{}: no sidecar lands", name);
         }
 
+        let repeated = repeated_signature_bundle("bundle-sig-admission-repeat-src");
         let _destination = Scratch::new("bundle-sig-admission-repeat");
-        let repeated = with_signature_section(&bundle, &[(&parcel_hash, &sidecar), (&parcel_hash, &sidecar)]);
         let error = import_bundle_bytes(&repeated).err().unwrap();
         assert!(error.contains("two signatures"), "{}", error);
+    }
+
+    /// A bundle of two signed parcels whose signature section signs the first one twice: as many
+    /// entries as parcels, so only the repeat refuses it.
+    fn repeated_signature_bundle(name: &str) -> Vec<u8> {
+        let (bundle, signed) = build_signed_line_bundle(name, 2);
+        let original: Vec<Vec<u8>> = signed.iter().map(|(_, signature)| signature.clone()).collect();
+        let (first, signature) = &signed[0];
+        with_signature_section_replacing(&bundle, &original, &[(first, signature), (first, signature)])
     }
 
     /// Every file under the active store's objects folder: packs, loose objects, signatures and
@@ -2340,9 +2352,9 @@ mod tests {
 
         let cases: [(&str, Vec<u8>, &str); 5] = [
             ("foreign", with_signature_section(&bundle, &[(&blob_hash, &sidecar)]), "not a parcel it carries"),
-            ("repeat", with_signature_section(&bundle, &[(&parcel_hash, &sidecar), (&parcel_hash, &sidecar)]), "two signatures"),
+            ("repeat", repeated_signature_bundle("bundle-whole-repeat-src"), "two signatures"),
             ("malformed", with_signature_section(&bundle, &[(parcel_hash.as_str(), &b"\x01\x05ab"[..])]), "is malformed"),
-            ("overcount", with_signature_section(&bundle, &[(parcel_hash.as_str(), sidecar.as_slice()); 4]), "contain only"),
+            ("overcount", with_signature_section(&bundle, &[(parcel_hash.as_str(), sidecar.as_slice()); 2]), "carry only"),
             ("trailing", trailing, "between its signature section and its digest"),
         ];
         for (name, bytes, expected) in cases {

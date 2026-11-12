@@ -19,7 +19,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   refuses, when reading and when storing, any object that is not exactly the bytes its format
   writes; a refused object reads as malformed. Objects written by Forklift are unaffected.
 
-- **A clone bundle is taken whole or not at all, and each pack record has one spelling.** A bundle
+- **A refused clone bundle installs nothing, and each pack record has one spelling.** A bundle
   whose signature section was refused used to leave its packs installed. The client now reads and
   checks the whole bundle, signatures included, before it installs any pack from it. It also
   refuses a pack record that does not hold exactly one zstd frame, and a pack index whose fanout

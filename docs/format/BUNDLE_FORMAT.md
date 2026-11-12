@@ -75,7 +75,9 @@ delta:  kind 0x01 | base hash[32 raw bytes] | target length[VLQ] |
 
 Each record's frame is a standard zstd frame and ends exactly where the record ends: import
 refuses a record split across several frames, one led or followed by a skippable frame, and one
-with any byte after its frame. The target length is the shortest VLQ that spells it.
+with any byte after its frame. The target length is the shortest VLQ that spells it. These are import rules; a local read of
+the store's own packs, and salvage of a damaged one, accept any record that still rebuilds to its
+hash.
 
 The accompanying index section is byte-for-byte a Forklift pack index:
 
@@ -94,7 +96,8 @@ The file is exactly `24 + 8 × 2^fanout_bits + 48 × count` bytes. Fanout bucket
 whose hash's top `fanout_bits` bits equal `b`; its `end` is the number of entries in buckets `0..=b`
 (so the ends never decrease and the last equals `count`), and its `crc` is the crc32 of those
 entries' bytes. Writers pick the smallest `fanout_bits` that keeps the average bucket at 32 entries
-or fewer, and import refuses an index whose `fanout_bits` is any other width. Readers refuse any
+or fewer, and import refuses an index whose `fanout_bits` is any other width. That rule is part
+of the index format: a writer that picks widths another way is a new format version. Readers refuse any
 other version by name.
 
 Index entries are strictly sorted by hash for binary search. Their record ranges must be non-empty,
@@ -124,15 +127,18 @@ Import is deliberately two-phase, and runs only once the whole file has matched 
    bundle, and only when its bytes are a well-formed signature (`PARCEL_SIGNATURE_FORMAT.md`). An
    entry naming a blob, a tree, an absent hash, or a parcel an earlier entry already signed rejects
    the bundle before its bytes are read. Admitted entries are staged in a hidden temporary file
-   beside the packs, so no more than one signature is held in memory at once.
+   beside the packs, so admission holds one signature in memory at a time.
 5. Sync the handful of verified aggregate files, then publish data first and index last. The index
    is the reader-visible commit point. Then sync the pack directory and invalidate the in-process
    pack cache.
 6. Write the staged signatures as signature tables. A parcel the store already holds a different
    signature for keeps its own, and the bundle's copy is skipped.
 
-A bundle is refused as a whole: any failure before pack publication, the signature section's
-included, removes the temporary files and stores nothing. A process crash during publication leaves
+A bundle is refused as a whole: every check, the signature section's included, runs before pack
+publication, and any failure there removes the temporary files and stores nothing. Only a local
+fault after publication — a failed sync, or a signature table that cannot be written — can leave
+the packs installed without the bundle's signatures; the import still fails, and a later fetch
+brings the signatures. A process crash during publication leaves
 at worst a valid subset of verified packs: an index is never published before its data, and the
 normal history walk fetches anything still missing. Re-import is idempotent; if
 all indexed hashes already exist, the incoming duplicate pack is discarded.
