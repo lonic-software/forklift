@@ -1858,7 +1858,7 @@ fn parse_key_record(toml: &str) -> Result<KeyRecord, String> {
 /// The refusal of a record that parses but is not spelled the way forklift writes it. Unknown
 /// fields land here too: the writer emits none, so a record carrying one re-encodes without it.
 fn not_one_spelling(kind: &str) -> String {
-    format!("A {} record is not spelled the one way forklift writes it (its fields in their fixed \
+    format!("A {} record is not in the one spelling Forklift writes (its fields in their fixed \
         order, its strings and numbers in their plain form, no other field and nothing else on any \
         line). A signed record has exactly one spelling, so any other is refused.", kind)
 }
