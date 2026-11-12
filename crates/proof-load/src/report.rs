@@ -185,6 +185,25 @@ pub struct Completeness {
     pub missing: Vec<String>,
 }
 
+impl Completeness {
+    /// The wall-clock budget: a run that took longer than `budget` fails, though every scenario
+    /// ran, so a slow scenario is noticed rather than dropped. No budget given is not run.
+    pub fn budget(elapsed: std::time::Duration, budget: Option<std::time::Duration>) -> Completeness {
+        let check = "wall-clock budget".to_string();
+        match budget {
+            None => Completeness { check, cell: Cell::not_run("no budget given"), missing: vec![] },
+            Some(budget) => {
+                let missing = if elapsed > budget {
+                    vec![format!("the run took {} s, over its budget of {} s", elapsed.as_secs(), budget.as_secs())]
+                } else {
+                    vec![]
+                };
+                Completeness { check, cell: Cell::Run, missing }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Report {
     pub coverage: CoverageTable,
@@ -293,5 +312,20 @@ mod tests {
             forklift_only: vec![],
         };
         assert!(report.failed());
+    }
+
+    /// A run over its budget fails, one within it does not, and without a budget the check says
+    /// it did not run.
+    ///
+    /// Revert: compare against the budget with `<` → the slow run passes and the quick one fails.
+    #[test]
+    fn a_run_over_its_budget_fails() {
+        use std::time::Duration;
+        let over = Completeness::budget(Duration::from_secs(61), Some(Duration::from_secs(60)));
+        assert_eq!(over.missing, vec!["the run took 61 s, over its budget of 60 s"]);
+        assert_eq!(over.cell, Cell::Run);
+        assert_eq!(Completeness::budget(Duration::from_secs(59), Some(Duration::from_secs(60))).missing, Vec::<String>::new());
+        let unset = Completeness::budget(Duration::from_secs(10_000), None);
+        assert!(unset.missing.is_empty() && matches!(unset.cell, Cell::NotRun { .. }));
     }
 }

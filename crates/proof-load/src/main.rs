@@ -50,11 +50,16 @@ enum Command {
         /// warehouse is not built, and its walk reports that.
         #[arg(long)]
         forklift_server: Option<PathBuf>,
+        /// The wall-clock budget in seconds. A run that takes longer still runs every scenario,
+        /// then fails.
+        #[arg(long)]
+        budget: Option<u64>,
     },
 }
 
 fn main() -> ExitCode {
-    let Command::Run { source, out, seed, only, forklift, git, forklift_server } = Cli::parse().command;
+    let Command::Run { source, out, seed, only, forklift, git, forklift_server, budget } = Cli::parse().command;
+    let started = std::time::Instant::now();
 
     let mut output = match Output::claim(&out) {
         Ok(output) => output,
@@ -192,7 +197,7 @@ fn main() -> ExitCode {
             platform: Platform::current(),
             environment: environment_seen,
         },
-        completeness: vec![damage_check, walk_check, fault_check],
+        completeness: vec![damage_check, walk_check, fault_check, Completeness::budget(started.elapsed(), budget.map(std::time::Duration::from_secs))],
         rows,
         forklift_only: vec![],
     };
