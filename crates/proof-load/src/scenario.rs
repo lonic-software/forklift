@@ -39,9 +39,11 @@ pub enum Op {
     /// Start a forklift-server over a fresh host warehouse and make it this warehouse's remote.
     /// The server serves for the rest of the scenario, its faulted run included.
     Host,
-    /// Replace this warehouse with a clone of the host, scoped to `only` when given. What the
-    /// history acknowledged before stays acknowledged: the clone holds it from the host.
-    Clone { only: Option<String> },
+    /// Have the host's server build the bundle a full clone imports.
+    Bundle,
+    /// Replace this warehouse with a clone of the host, of the given kind. What the history
+    /// acknowledged before stays acknowledged: the clone holds it from the host.
+    Clone { kind: CloneKind },
     Push,
     Fetch,
     /// Check the store's integrity.
@@ -59,6 +61,18 @@ pub enum Tool {
     Git,
     /// Git tuned for durability and integrity: every fsync on, fsck on transfer.
     GitTuned,
+}
+
+/// What a clone takes from its remote.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CloneKind {
+    /// Everything: the bundle when the remote has one, then every object.
+    Full,
+    /// Only the paths under one folder.
+    Only(String),
+    /// Heads and trees, content fetched when read.
+    Cache,
 }
 
 /// A recorded snapshot a readback grades: a corpus record, or the variant of one.
@@ -122,11 +136,17 @@ pub fn bind(tool: Tool, op: &Op) -> Option<Vec<Vec<String>>> {
                 Op::Enroll => vec![line(&["office", "enroll"])],
                 Op::Pack => vec![line(&["store", "compact"])],
                 Op::Host => vec![line(&["config", "set", "remote.url", URL])],
-                Op::Clone { only } => {
+                Op::Clone { kind } => {
                     let mut clone = line(&["clone", URL, WORK]);
-                    clone.extend(only.iter().flat_map(|scope| ["--only".to_string(), scope.clone()]));
+                    match kind {
+                        CloneKind::Full => {}
+                        CloneKind::Only(scope) => clone.extend(["--only".to_string(), scope.clone()]),
+                        CloneKind::Cache => clone.push("--cache".to_string()),
+                    }
                     vec![clone]
                 }
+                // The server's own command, which the build runs with the server binary.
+                Op::Bundle => vec![],
                 Op::Push => vec![line(&["lift"])],
                 Op::Fetch => vec![line(&["lower"])],
                 Op::Verify => vec![line(&["audit", "--full"])],
@@ -152,7 +172,7 @@ pub fn bind(tool: Tool, op: &Op) -> Option<Vec<Vec<String>>> {
                 // failed step; and git signs nothing by enrollment.
                 Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll => return None,
                 // The host is a forklift-server; git has no server of its own to clone from.
-                Op::Host | Op::Clone { .. } => return None,
+                Op::Host | Op::Bundle | Op::Clone { .. } => return None,
             };
             let prefix: &[&str] = if tool == Tool::GitTuned { GIT_TUNED } else { &[] };
             Some(lines.into_iter().map(|arguments| line(prefix).into_iter().chain(arguments).collect()).collect())
@@ -238,7 +258,12 @@ pub fn catalog() -> Vec<Scenario> {
         named("parked", vec![record(0), record(1), Op::Park { index: 1 }]),
         // The faulted command lifts its record too: the remote's state is read by lift.
         Scenario { then: vec![Op::Push], ..named("lifted", vec![Op::Host, record(0), record(1), Op::Push]) },
-        Scenario { then: vec![Op::Push], ..named("cloned", vec![Op::Host, record(0), record(1), Op::Push, Op::Clone { only: None }]) },
+        Scenario { then: vec![Op::Push], ..named("bundled", vec![
+            Op::Host, record(0), record(1), Op::Push, Op::Bundle, Op::Clone { kind: CloneKind::Full },
+        ]) },
+        Scenario { then: vec![Op::Push], ..named("cached", vec![
+            Op::Host, record(0), record(1), Op::Push, Op::Clone { kind: CloneKind::Cache },
+        ]) },
         named("signed", vec![record(0), Op::Enroll, record(1), record(2)]),
         named("packed", vec![record(0), Op::Enroll, record(1), record(2), Op::Pack]),
         // The variant changes every file of record 0 on the side branch, and record 1 changes at
@@ -263,7 +288,8 @@ mod tests {
             Op::Record { index: 0 }, Op::Branch { name: "side".into() }, Op::Switch { name: "side".into() },
             Op::Merge { name: "main".into() }, Op::Push, Op::Fetch, Op::Verify, Op::Repair,
             Op::Variant { index: 0 }, Op::Conflict { name: "side".into() }, Op::Pick { name: "side".into() },
-            Op::Park { index: 0 }, Op::Enroll, Op::Pack, Op::Host, Op::Clone { only: Some("src".into()) },
+            Op::Park { index: 0 }, Op::Enroll, Op::Pack, Op::Host, Op::Clone { kind: CloneKind::Only("src".into()) },
+            Op::Clone { kind: CloneKind::Cache }, Op::Bundle,
         ]
     }
 
@@ -274,10 +300,13 @@ mod tests {
     fn forklift_binds_every_operation_with_json() {
         for op in every_op() {
             let lines = bind(Tool::Forklift, &op).unwrap_or_else(|| panic!("forklift binds {:?}", op));
-            assert!(!lines.is_empty());
+            // Bundle is the server's own command, which the build runs with the server binary.
+            assert_eq!(lines.is_empty(), op == Op::Bundle, "{:?}", op);
             assert!(lines.iter().all(|arguments| arguments[0] == "--json"), "{:?}", lines);
         }
-        assert_eq!(bind(Tool::Forklift, &Op::Clone { only: Some("src".into()) }).unwrap(),
+        assert_eq!(bind(Tool::Forklift, &Op::Clone { kind: CloneKind::Cache }).unwrap(),
+            vec![line(&["--json", "clone", URL, WORK, "--cache"])]);
+        assert_eq!(bind(Tool::Forklift, &Op::Clone { kind: CloneKind::Only("src".into()) }).unwrap(),
             vec![line(&["--json", "clone", URL, WORK, "--only", "src"])]);
         assert_eq!(bind(Tool::Forklift, &Op::Record { index: 2 }).unwrap(),
             vec![line(&["--json", "load", "."]), line(&["--json", "stack", "-m", "proof-load record 2"])]);
@@ -290,7 +319,7 @@ mod tests {
     #[test]
     fn git_binds_what_it_has_and_the_rest_is_forklift_only() {
         for op in every_op() {
-            let forklift_only = matches!(op, Op::Repair | Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll | Op::Host | Op::Clone { .. });
+            let forklift_only = matches!(op, Op::Repair | Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll | Op::Host | Op::Bundle | Op::Clone { .. });
             assert_eq!(bind(Tool::Git, &op).is_some(), !forklift_only, "{:?}", op);
         }
         let tuned = bind(Tool::GitTuned, &Op::Verify).unwrap();

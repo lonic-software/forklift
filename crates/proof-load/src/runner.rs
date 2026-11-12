@@ -112,6 +112,12 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                 outcomes.push(run_in(server, vec!["prepare".into(), "--root".into(), root.display().to_string()], scratch.root().to_path_buf())?);
                 host = Some(tool::serve(server, &root, scratch, environment, limit).map_err(RunError::Tool)?);
             }
+            Op::Bundle => {
+                let server = server.filter(|_| host.is_some())
+                    .ok_or_else(|| RunError::Io(format!("scenario {} bundles before it hosts a warehouse", scenario.id)))?;
+                let root = host_root(scratch);
+                outcomes.push(run_in(server, vec!["bundle".into(), "--root".into(), root.display().to_string()], scratch.root().to_path_buf())?);
+            }
             Op::Clone { .. } => {
                 // A clone makes its target; the work tree it replaces is the harness's own scratch.
                 #[allow(clippy::disallowed_methods)] // a scratch work tree the harness made; no retry is wanted

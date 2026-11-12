@@ -61,7 +61,11 @@ pub const BINDINGS: &[Binding] = &[
     bound_in("{bay}consolidation-skeleton", "conflicted", FILE),
     bound_in("{bay}cherry-pick", "picking", FILE),
     bound_in("held-heads", "lifted", FILE),
-    bound_in("bundles/", "cloned", FOLDER),
+    bound_in("bundles/", "bundled", FOLDER),
+    bound_in("bundles/latest", "bundled", FILE),
+    bound_in("objects/pack/densify-pending", "bundled", FILE),
+    bound_in("origin", "cached", FILE),
+    bound_in("sealed", "cached", FILE),
 ];
 
 const NO_MIRROR_ORACLE: &str = "no mirror oracle: the corpus configures no mirror url, so nothing reads a mirror back";
@@ -91,15 +95,11 @@ pub const EXEMPTIONS: &[Exemption] = &[
 /// scenarios, or a command interrupted or holding its lock; this list only lets the unit test hold the gap exact, so a name
 /// that joins or leaves it is noticed. It is not an exemption and the run never reads it.
 pub const NOT_YET_CREATED: &[&str] = &[
-    "bundles/latest",
     "config/fetch-scope",
     "fetched-heads",
-    "objects/pack/densify-pending",
-    "origin",
     "origin-move",
     "origin-move.lock",
     "redactions-applied",
-    "sealed",
     "served",
     "taint/",
     "taint/<name>",
