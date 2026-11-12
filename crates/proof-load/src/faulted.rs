@@ -463,11 +463,14 @@ impl Trail {
 }
 
 /// Whether `last`, the latest command run, answered and asked nothing further: it exited (a kill
-/// is no answer), and either succeeded or refused naming no remedy, as a re-stack of a record
-/// already made is refused with nothing left to stack.
+/// is no answer), and either succeeded or refused with a failure document naming no remedy and
+/// nothing unreadable as one, as a re-stack of a record already made is refused with nothing left
+/// to stack. A crash with no failure document is no answer.
 fn answered(last: Option<&Outcome>) -> bool {
-    last.is_some_and(|outcome| outcome.exit.is_some()
-        && (outcome.succeeded() || remedy::extract(&outcome.remedy_texts()).remedies.is_empty()))
+    last.is_some_and(|outcome| outcome.succeeded() || (outcome.exit.is_some() && outcome.failure.is_some() && {
+        let extracted = remedy::extract(&outcome.remedy_texts());
+        extracted.remedies.is_empty() && extracted.unextractable.is_empty()
+    }))
 }
 
 /// What the faulted command of a built scenario must leave readable: the record it writes, and
@@ -825,7 +828,9 @@ mod tests {
     /// through it first.
     ///
     /// Revert: count a kill as an answer → a command killed after its record was durable heals
-    /// with no retry; count any refusal → a stale lock's refusal heals before its remedy runs.
+    /// with no retry; count any refusal → a stale lock's refusal heals before its remedy runs;
+    /// drop the failure-document or unextractable conditions → a crash or an unreadable remedy
+    /// settles the record.
     #[test]
     fn only_an_answer_asking_nothing_further_settles_a_served_record() {
         assert!(answered(Some(&answer(Some(0), "", None))));
@@ -834,6 +839,10 @@ mod tests {
         assert!(!answered(Some(&answer(Some(26), "This bay is behind pallet \"main\".", Some("forklift shift main")))));
         assert!(!answered(Some(&answer(Some(6), "If that process is no longer running, remove \"/s/work/.forklift/lock\" and try again.", None))));
         assert!(!answered(None));
+        let mut crashed = answer(Some(101), "", None);
+        crashed.failure = None;
+        assert!(!answered(Some(&crashed)), "a crash with no failure document is no answer");
+        assert!(!answered(Some(&answer(Some(1), "Stuck.", Some("forklift load -- <path>")))), "an unreadable remedy is no answer");
     }
 
 }

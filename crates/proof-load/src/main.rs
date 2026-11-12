@@ -232,6 +232,10 @@ fn main() -> ExitCode {
                 strace: &strace, search_path: search_path.clone(), limit: std::time::Duration::from_secs(120),
                 jobs: jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from)), traces: &traces,
             };
+            if let Some(unknown) = kill.iter().find(|id| !scenarios.iter().any(|scenario| &scenario.id == *id)) {
+                eprintln!("proof-load: --kill {}: no such scenario", unknown);
+                return ExitCode::from(2);
+            }
             let mut all = Vec::new();
             for scenario in scenarios.iter().filter(|scenario| kill.is_empty() || kill.contains(&scenario.id)) {
                 let result = output.scratch(&format!("{}-kill", scenario.id)).map_err(|error| error.to_string())

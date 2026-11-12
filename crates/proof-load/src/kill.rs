@@ -639,13 +639,23 @@ pub fn summarize(kills: &[ScenarioKills]) -> Summary {
     let mut missing: Vec<String> = units.into_iter().filter(|(_, covered)| !covered)
         .map(|((scenario, command, name, base), _)| format!("{}: {} {} {}: no kill landed", scenario, command, name, base)).collect();
     missing.extend(empty);
+    if kills.iter().all(|scenario| scenario.not_run.is_some()) {
+        missing.push("no scenario's kill points ran".to_string());
+    }
     let mut completeness = vec![
         Completeness { check: "kill-point units".to_string(), cell: Cell::Run, missing },
         Completeness { check: "kill-point soundness".to_string(), cell: Cell::Run, missing: refusals },
         Completeness { check: "kill points ran".to_string(), cell: Cell::Run, missing: errors },
     ];
     completeness.extend(not_run);
-    Summary { cell: if sampled { Cell::Sampled } else { Cell::Run }, rows, completeness, not_reached }
+    let cell = if rows.is_empty() {
+        Cell::not_run("no kill point was graded")
+    } else if sampled {
+        Cell::Sampled
+    } else {
+        Cell::Run
+    };
+    Summary { cell, rows, completeness, not_reached }
 }
 
 #[cfg(test)]
@@ -863,5 +873,22 @@ mod tests {
         ]);
         let lifted = summary.completeness.iter().find(|check| check.check == "kill points of lifted").unwrap();
         assert!(lifted.missing.is_empty() && matches!(lifted.cell, Cell::NotRun { .. }));
+    }
+
+    /// A summary with no graded kill never reads as run: no scenario, every scenario not run, or
+    /// every point unreached leaves the cell not run, and with nothing run the units check misses.
+    ///
+    /// Revert: keep the cell Run whatever ran → each case below reads as run.
+    #[test]
+    fn a_summary_with_no_graded_kill_is_not_run() {
+        for kills in [
+            vec![],
+            vec![ScenarioKills { scenario: "lifted".into(), not_run: Some("hosted".into()), ..Default::default() }],
+            vec![ScenarioKills { scenario: "history".into(), killed: vec![killed("fsync", "<root>/b", false, false)], ..Default::default() }],
+        ] {
+            let summary = summarize(&kills);
+            assert!(matches!(summary.cell, Cell::NotRun { .. }), "{:?}", summary.cell);
+            assert!(!summary.completeness[0].missing.is_empty());
+        }
     }
 }
