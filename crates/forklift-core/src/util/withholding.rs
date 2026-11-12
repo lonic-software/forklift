@@ -462,7 +462,7 @@ mod tests {
     impl Scratch {
         fn new(name: &str) -> Scratch {
             let root = std::env::temp_dir().join(format!("forklift-withheld-test-{}-{}", name, std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
 
@@ -472,7 +472,7 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = file_utils::remove_dir_all(&self.root);
         }
     }
 
@@ -578,7 +578,7 @@ mod tests {
         // Deleted, then restated: the digest stays.
         let (folder, name) = file_utils::get_path_for_object(&recipe).unwrap();
         let path = std::path::Path::new(&folder).join(name);
-        std::fs::remove_file(&path).unwrap();
+        file_utils::remove_file(&path).unwrap();
         assert_eq!(withhold(&recipe, "DMCA notice 2").unwrap(), Withheld::Restated);
         assert_eq!(read_withheld().unwrap().digest(&recipe), Some(&ChunkDigest::Known(digest.clone())));
 
@@ -617,7 +617,7 @@ mod tests {
         let (folder, name) = file_utils::get_path_for_object(&recipe).unwrap();
         let path = std::path::Path::new(&folder).join(name);
         let bytes = std::fs::read(&path).unwrap();
-        std::fs::remove_file(&path).unwrap();
+        file_utils::remove_file(&path).unwrap();
 
         withhold(&recipe, "statement").unwrap();
         assert_eq!(read_withheld().unwrap().digest(&recipe), Some(&ChunkDigest::Unknown));

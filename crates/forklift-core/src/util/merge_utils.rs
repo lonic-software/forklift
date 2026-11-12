@@ -167,7 +167,7 @@ pub(crate) fn consolidation_state_bytes(state: &ConsolidationState) -> Vec<u8> {
 pub fn clear_consolidation_state() -> Result<(), String> {
     let path = get_consolidation_state_path();
 
-    match std::fs::remove_file(&path) {
+    match file_utils::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("Error while removing \"{}\": {}", path.to_string_lossy(), e)),
@@ -303,7 +303,7 @@ format!(
     pub fn clear() -> Result<(), String> {
         let path = OutOfScopeSkeleton::path();
 
-        match std::fs::remove_file(&path) {
+        match file_utils::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(format!("Error while removing \"{}\": {}", path.to_string_lossy(), e)),
@@ -1753,7 +1753,7 @@ mod tests {
         use std::time::Instant;
 
         let temp = std::env::temp_dir().join(format!("forklift-mergebase-bench-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
 
@@ -1814,7 +1814,7 @@ mod tests {
         println!("find_merge_base : walk {walk_base_ms:8.2} ms  graph {graph_base_ms:8.3} ms  ({:.0}x)", walk_base_ms / graph_base_ms.max(0.0001));
         println!("is_ancestor(div): walk {walk_anc_ms:8.2} ms  graph {graph_anc_ms:8.3} ms  ({:.0}x)", walk_anc_ms / graph_anc_ms.max(0.0001));
 
-        std::fs::remove_dir_all(&temp).ok();
+        file_utils::remove_dir_all(&temp).ok();
     }
 
     fn merge(base: &str, ours: &str, theirs: &str) -> (String, bool) {
@@ -1927,7 +1927,7 @@ mod tests {
 
         let temp = std::env::temp_dir()
             .join(format!("forklift-skeleton-flip-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope_guard = StorageRootScope::enter(&temp);
 
@@ -2004,7 +2004,7 @@ mod tests {
             );
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        file_utils::remove_dir_all(&temp).ok();
     }
 
     /// The names a tree may hold but a line-per-entry record cannot carry raw: a line feed, a
@@ -2040,7 +2040,7 @@ mod tests {
 
         let temp = std::env::temp_dir()
             .join(format!("forklift-consolidation-state-label-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&temp);
 
@@ -2067,6 +2067,6 @@ mod tests {
         let error = read_consolidation_state().err().expect("a headerless state file must be refused");
         assert!(error.contains("has no format header") && error.contains("Abandon the consolidation"), "{}", error);
 
-        std::fs::remove_dir_all(&temp).ok();
+        file_utils::remove_dir_all(&temp).ok();
     }
 }

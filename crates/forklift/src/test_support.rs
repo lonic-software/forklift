@@ -37,7 +37,7 @@ impl Warehouse {
 
     fn create(name: &str, cwd: Option<MutexGuard<'static, ()>>) -> Warehouse {
         let root = std::env::temp_dir().join(format!("forklift-bin-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         // A bare full warehouse: its marker is what every ref write reads the mode from.
         let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::create_dir_all(&forklift).unwrap();
@@ -59,7 +59,7 @@ impl Drop for Warehouse {
         if self._cwd.is_some() {
             let _ = std::env::set_current_dir(std::env::temp_dir());
         }
-        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.root);
     }
 }
 

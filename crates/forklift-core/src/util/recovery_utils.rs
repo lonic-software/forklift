@@ -3273,7 +3273,7 @@ mod tests {
         use crate::globals::StorageRootScope;
 
         let dir = std::env::temp_dir().join(format!("forklift-recovery-respelled-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -3300,7 +3300,7 @@ mod tests {
             assert_eq!(file_utils::hash_from_object_path(path), Some(hash.clone()), "the listing carries the hash");
         }
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3324,7 +3324,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-walk-readonly-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -3392,7 +3392,7 @@ mod tests {
         assert!(!graph_root.exists(),
             "neither walk may self-heal a commit-graph shard (an unsynced write, invisible to the recorders)");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// Shared fixture for the I3 (presence-tolerant descent) tests: a pallet head "main" whose
@@ -3448,7 +3448,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-i3-boundary-clears-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -3464,7 +3464,7 @@ mod tests {
         assert!(!referenced.contains(&target_hash),
             "T is not actually reachable — its only theoretical path runs through the absent subtree");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// (I3, test 2 — gc-consistency) Pins the superset invariant `collect_walk_roots`'s doc
@@ -3479,7 +3479,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-i3-gc-consistency-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -3498,7 +3498,7 @@ mod tests {
             subtree boundary — heal's root set is gc's own, so anything heal's tolerant walk \
             calls unreferenced must be unreferenced under gc's live set too");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// (I3, test 3 — targets-before-presence) A vanished object that is itself a hunted target
@@ -3514,7 +3514,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-i3-targets-before-presence-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -3533,7 +3533,7 @@ mod tests {
         assert!(referenced.contains(&vanished_head_hash),
             "a vanished pallet head that is itself a hunted target must still be reported referenced");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// (I3, test 4 — present-but-corrupt still fails loud) A pallet head naming a hash that IS
@@ -3549,7 +3549,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-i3-corrupt-fails-loud-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -3576,7 +3576,7 @@ mod tests {
         assert!(result.is_err(),
             "a present-but-corrupt object must fail the walk loudly, never be silently skipped");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// (I3, test 9 — enumerating mode) On the same present-parent/absent-subtree boundary fixture
@@ -3593,7 +3593,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-i3-enumerate-boundary-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -3610,7 +3610,7 @@ mod tests {
             "nothing beneath the absent boundary may be recorded — it must never be descended \
             into: {:?}", absent);
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// Store `tree` and a root parcel over it, and point the `namespace` pallet `name` at the parcel.
@@ -3639,7 +3639,7 @@ mod tests {
     /// A temp storage root for one test, entered for the returned guard's lifetime.
     fn enter_temp_root(label: &str) -> (PathBuf, crate::globals::StorageRootScope) {
         let dir = std::env::temp_dir().join(format!("forklift-recovery-utils-{}-{}", label, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -3676,7 +3676,7 @@ mod tests {
             "only the in-scope loss may be recorded, never a sealed object outside the scope");
         assert!(!walk.degraded_sources.iter().any(|note| note.contains("fetch scope")), "{:?}", walk.degraded_sources);
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// FORK-262: one tree reached at two paths is walked at each, because the scope selects
@@ -3711,7 +3711,7 @@ mod tests {
                 "under scope {:?}, the loss at b/lost must be recorded", prefixes);
         }
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// A root tree of meta form, `.forklift/tracked/cells/<lost>`, whose one cell was never stored.
@@ -3755,7 +3755,7 @@ mod tests {
         assert_eq!(walk.hashes, [lost].into_iter().collect::<BTreeSet<String>>(),
             "a meta pallet's lost object must be recorded whatever the fetch scope");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// FORK-262: a trust pin over a user tree is walked within the fetch scope, even when no
@@ -3807,7 +3807,7 @@ mod tests {
         assert_eq!(reported, [lost].into_iter().collect::<BTreeSet<String>>(),
             "a pinned parcel's in-scope loss is recorded, and nothing outside the scope");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// FORK-262: the re-genesis `adopts` pin names office history that no meta head reaches any
@@ -3851,7 +3851,7 @@ mod tests {
         assert_eq!(reported, [lost].into_iter().collect::<BTreeSet<String>>(),
             "the adopted office history's lost cell must be recorded whatever the fetch scope");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// A stored parcel over `root` with `parents`.
@@ -3918,7 +3918,7 @@ mod tests {
             assert!(walk_reports(roots).is_empty(), "{}: nothing outside the scope may be recorded", route);
         }
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// FORK-332: the sources themselves give a meta ref its class and a user ref its own, whatever
@@ -3942,7 +3942,7 @@ mod tests {
         let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
         assert_eq!(walk.hashes, [under_meta].into_iter().collect::<BTreeSet<String>>());
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// FORK-332: a crafted user parent that reaches a meta parcel before its meta root does must not
@@ -3972,7 +3972,7 @@ mod tests {
         };
         assert_eq!(walk_reports(&under_adopts), expected, "under adopts");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// FORK-262: a fetch scope that cannot be read is a degraded source, so the rescan refuses
@@ -3998,7 +3998,7 @@ mod tests {
             "{:?}", walk.degraded_sources);
         assert_eq!(walk.hashes, [sealed].into_iter().collect::<BTreeSet<String>>());
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// Write the sealed-by-hash record holding exactly `hashes`. Call inside a storage scope.
@@ -4077,7 +4077,7 @@ mod tests {
             "every unrecorded absence is still recorded"
         );
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// The enumerating walk holds an absent blob or recipe an applied redaction names, with no
@@ -4112,7 +4112,7 @@ mod tests {
         assert!(walk.degraded_sources.is_empty(), "{:?}", walk.degraded_sources);
         assert_eq!(walk.hashes, [lost_blob].into_iter().collect::<BTreeSet<String>>());
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// FORK-133: a staged object is the bay's own work, so its absence is a loss even when its
@@ -4145,7 +4145,7 @@ mod tests {
         }
         assert_eq!(reported, [staged].into_iter().collect::<BTreeSet<String>>());
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// A staged entry not checked out names content the unavailable record holds, so its absence
@@ -4184,7 +4184,7 @@ mod tests {
         }
         assert_eq!(reported, [sealed, redacted].into_iter().collect::<BTreeSet<String>>());
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// FORK-133: a sealed-object record that cannot be read is a degraded source, so the rescan
@@ -4206,7 +4206,7 @@ mod tests {
             "{:?}", walk.degraded_sources);
         assert_eq!(walk.hashes, [held].into_iter().collect::<BTreeSet<String>>());
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// Shared fixture for the chunked-leaf tests below: a pallet head "main" whose parcel's spine
@@ -4272,7 +4272,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-i3-enumerate-absent-chunk-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -4287,7 +4287,7 @@ mod tests {
             "a raw-absent chunk under a present recipe must be recorded by the collecting sink: {:?}",
             absent);
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// (I3 refinement — gating non-regression) `closure_references_any` must still find a target
@@ -4302,7 +4302,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-i3-target-chunk-noregress-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -4315,7 +4315,7 @@ mod tests {
         assert!(referenced.contains(&chunk_hash),
             "a target chunk hash under a present recipe must still be found by the targeted walk");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// A pathologically deep parcel spine tree (a chain of `DEPTH` nested subtrees, one child
@@ -4370,7 +4370,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-deep-tree-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -4433,7 +4433,7 @@ mod tests {
         assert!(referenced.contains(&target_hash),
             "the deeply nested leaf's target hash must still be found by the closure walk");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// (i) A staged shard planted in bay "b" (never the active bay — no bay context is entered;
@@ -4451,7 +4451,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-bay-shard-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -4492,7 +4492,7 @@ mod tests {
         assert!(referenced.contains(&target_hash),
             "a shard staged in a non-active bay must still be found by the closure walk");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// (ii) A parked hash planted in bay "b"'s `parked` file must still be found. Pins
@@ -4505,7 +4505,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-bay-parked-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -4524,7 +4524,7 @@ mod tests {
         assert!(referenced.contains(&target_hash),
             "a parked hash in a non-active bay must still be found by the closure walk");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// (fail-closed/tolerant split — design call) `closure_references_any` is `forklift heal`'s
@@ -4543,7 +4543,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-bay-unreadable-parked-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -4565,7 +4565,7 @@ mod tests {
         assert!(walk.degraded_sources[0].contains("forklift bay remove"),
             "the note must name the in-tool cleanup route: {}", walk.degraded_sources[0]);
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// (iii) A consolidation `their_head` planted in bay "b"'s `consolidation` file must still be
@@ -4578,7 +4578,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-bay-consolidation-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -4600,7 +4600,7 @@ mod tests {
         assert!(referenced.contains(&target_hash),
             "a consolidation their_head in a non-active bay must still be found by the closure walk");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// (iv) A trust-anchor `adopts` hash (shared, warehouse-global — no bay involved) must still
@@ -4613,7 +4613,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-trust-adopts-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -4634,7 +4634,7 @@ mod tests {
         assert!(referenced.contains(&target_hash),
             "a trust-anchor adopts hash must be found by the closure walk (a re-genesis GC root)");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// (iv-b) Finding 4 (round 1, PR #120): the `walk_finds_a_trust_anchor_adopts_hash` sibling
@@ -4648,7 +4648,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-trust-boundary-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -4670,7 +4670,7 @@ mod tests {
             "a trust-anchor boundary hash must be found by the closure walk (the enrollment \
              pre-trust-history root)");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// Finding 3 (round 2, PR #120): the two `walk_finds_a_trust_anchor_*` tests above (and
@@ -4699,7 +4699,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-present-pin-descent-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -4749,7 +4749,7 @@ mod tests {
             "a present pin root's own parent must be found by ordinary ancestry descent, not \
              merely by the pin root's own hash matching `targets`");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// Build a minimal, unsigned office parcel recording one key whose `distrust_boundary` is
@@ -4845,7 +4845,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-distrust-boundary-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -4871,7 +4871,7 @@ mod tests {
             "a revoked key's distrust_boundary hash must be found by the closure walk (the \
              revocation's vouched-for history root)");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// F1 (PR #120 round 3): heal's own root collection must never call the taint-**gated**
@@ -4898,7 +4898,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-office-past-gate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -4945,7 +4945,7 @@ mod tests {
              standing gate: {:?}", walk.pin_parcels
         );
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// F2 (PR #120 round 3): `HealReport::notes`'s own doc comment (`heal.rs`) is narrowed to
@@ -4972,7 +4972,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-no-walk-no-pin-note-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -5023,7 +5023,7 @@ mod tests {
              `HealReport::notes`'s narrowed doc comment: {:?}", outcome.notes
         );
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// Finding 1 (round 1, PR #120): heal's root collection must be TOLERANT of an unreadable
@@ -5042,7 +5042,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-office-head-absent-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -5086,7 +5086,7 @@ mod tests {
             "the misleading \"rather than blocking\" clause must be gone — every consumer of a \
              non-empty degraded_sources actually refuses: {:?}", walk.degraded_sources);
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// Finding 4 (round 2, PR #120), the `UnparseableRecord` sibling of the `AbsentObject` case
@@ -5104,7 +5104,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-unparseable-key-record-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -5181,7 +5181,7 @@ mod tests {
             "the absent-object remedy must not be worded for a present-but-malformed record: {:?}",
             walk.degraded_sources);
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -5231,7 +5231,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-shard-only-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -5353,7 +5353,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-torn-intact-clears-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -5381,7 +5381,7 @@ mod tests {
         assert!(state.recorded.is_empty(), "nothing may remain recorded after a clean rescan");
         assert!(taint_utils::gate_check(&forklift).is_ok(), "the in-memory gate must clear too");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// A torn taint over a store whose only absent reachable object is one a redaction applied
@@ -5400,7 +5400,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-torn-redacted-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -5428,7 +5428,7 @@ mod tests {
         );
         assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty());
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// Finding 2 (round 1, PR #120) falsifier: a trust boundary can legitimately name a head this
@@ -5452,7 +5452,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-torn-never-held-pin-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -5499,7 +5499,7 @@ mod tests {
              very state the next `forklift audit` will refuse over: {:?}", outcome.notes
         );
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// FORK-256: a haul's proposed head is declared, so heal never reports it absent, while a
@@ -5518,7 +5518,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-haul-heads-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -5554,7 +5554,7 @@ mod tests {
         }
         assert_eq!(reported, vec![lost_parent.clone()]);
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// FORK-255: a tombstone head was a ref of this served root, which held its whole history, so
@@ -5569,7 +5569,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-tombstone-heads-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -5594,7 +5594,7 @@ mod tests {
         }
         assert_eq!(reported, vec![lost]);
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// FORK-83: tags are never walked, only classified for notes. A present tag-only parcel's
@@ -5617,7 +5617,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-tag-notes-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -5680,7 +5680,7 @@ mod tests {
         let note = tags_unread_note("bad \x1b[2K record");
         assert!(!note.chars().any(|c| c.is_control()), "a quoted record must be sanitized: {:?}", note);
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// Finding 1 (round 2, PR #120): a lost parcel that is reachable BOTH as its own boundary pin
@@ -5717,7 +5717,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-pin-to-pin-edge-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -5742,7 +5742,7 @@ mod tests {
         let (folder, file_name) = file_utils::get_path_for_object(&p2_hash).unwrap();
         let p2_absolute = PathBuf::from(&folder).join(&file_name);
         let p2_relative = p2_absolute.strip_prefix(&forklift).unwrap().to_path_buf();
-        std::fs::remove_file(&p2_absolute).unwrap();
+        crate::util::file_utils::remove_file(&p2_absolute).unwrap();
 
         // P1: present, and its own parent IS P2 — a genuine ancestry edge to the same hash the
         // boundary also declares.
@@ -5782,7 +5782,7 @@ mod tests {
              ancestry, never silently swallowed by the gap rule for P2's OWN boundary \
              declaration");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// `adopts` is reported when absent, exactly like an ordinary ref — never the `Gap` tolerance
@@ -5811,7 +5811,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-lost-adopts-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -5832,7 +5832,7 @@ mod tests {
         let (folder, file_name) = file_utils::get_path_for_object(&adopted_hash).unwrap();
         let adopted_absolute = PathBuf::from(&folder).join(&file_name);
         let adopted_relative = adopted_absolute.strip_prefix(&forklift).unwrap().to_path_buf();
-        std::fs::remove_file(&adopted_absolute).unwrap();
+        crate::util::file_utils::remove_file(&adopted_absolute).unwrap();
 
         office_utils::write_trust_anchor(&TrustAnchor {
             genesis: "0".repeat(64),
@@ -5858,7 +5858,7 @@ mod tests {
         assert_eq!(state.recorded, expected,
             "the remainder must name exactly the lost adopts target's loose path");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (memo §8.5 test 8, I5) A torn taint whose surviving recorded prefix does **not** name blob
@@ -5883,7 +5883,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-torn-dangling-remainder-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -5918,7 +5918,7 @@ mod tests {
         ).unwrap();
 
         // B vanishes — the crash-lost dentry this whole mechanism exists for.
-        std::fs::remove_file(&b_absolute).unwrap();
+        crate::util::file_utils::remove_file(&b_absolute).unwrap();
 
         // Torn, and its surviving prefix deliberately does NOT mention B.
         plant_torn_taint(&forklift, &["objects/aa/an-unrelated-surviving-line"]);
@@ -5938,7 +5938,7 @@ mod tests {
         assert_eq!(state.recorded, expected,
             "the remainder must name exactly B's loose path — not empty, and not the whole store");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (memo §8.5 test 12, I5) Two corrupt-present loose objects under an otherwise intact,
@@ -5967,7 +5967,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-torn-corrupt-present-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -6026,7 +6026,7 @@ mod tests {
             "the remainder must name exactly the two corrupt objects — nothing more (never the \
             whole store — the walk must not have aborted), nothing less (never empty)");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     // ---- D4 (force-fetch a corrupt remainder entry): reachable vs. unreachable remote ----
@@ -6211,7 +6211,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-d4-offline-one-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -6244,7 +6244,7 @@ mod tests {
             "the corrupt object's bytes must be byte-for-byte untouched when the fetch that was \
             supposed to replace them never even connected");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (D4 negative, two objects) The same claim with two corrupt objects at once — before this
@@ -6262,7 +6262,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-d4-offline-two-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -6297,7 +6297,7 @@ mod tests {
         assert_eq!(before_b, std::fs::read(forklift.join(&relative_b)).unwrap(),
             "the second corrupt object's bytes must be untouched");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (D4 positive, one object) A remote that is actually reachable and has the real bytes: the
@@ -6316,7 +6316,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-d4-online-one-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -6347,7 +6347,7 @@ mod tests {
         object_utils::verify_object_bytes(&hash, &decompressed)
             .expect("the on-disk bytes must content-verify against the object's own hash");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (D4 positive, two objects — the partial-bypass witness) Two corrupt objects, both actually
@@ -6367,7 +6367,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-d4-online-two-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -6410,7 +6410,7 @@ mod tests {
             object_utils::verify_object_bytes(hash, &decompressed).unwrap();
         }
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (D4, mixed reachable remote — the partial-recovery witness) Two corrupt objects, one remote
@@ -6436,7 +6436,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-d4-mixed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -6504,7 +6504,7 @@ mod tests {
         assert_eq!(before_unserved, std::fs::read(forklift.join(&relative_unserved)).unwrap(),
             "the unserved object's bytes must be untouched");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (D4, pack-side content check) A corrupt candidate's hash is a *hit* in a pack index, but
@@ -6531,7 +6531,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-d4-pack-corrupt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -6573,7 +6573,7 @@ mod tests {
         let after = std::fs::read(forklift.join(&relative)).unwrap();
         assert_eq!(before, after, "the still-corrupt loose object's bytes must be untouched");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (DESIGN.html §3.1.1 — the classifying-read core) H's recorded loose taint path is
@@ -6604,7 +6604,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-514-vanished-unreconstructable-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -6663,7 +6663,7 @@ mod tests {
         assert!(!state.recorded.is_empty(), "the taint must survive — H was never actually recovered");
         assert!(state.recorded.contains(&h_relative));
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (DESIGN.html §3.1.1, I6 — superseded fixture) The classifying read core's fall-through is
@@ -6702,7 +6702,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-pack-failed-loose-fallthrough-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -6759,7 +6759,7 @@ mod tests {
         assert!(!after_state.recorded.contains(&h_relative),
             "the taint over H must clear — a genuinely verified copy was found");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (FORK-45 finding #1) A per-candidate environment failure reading one recorded path back
@@ -6795,7 +6795,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "forklift-recovery-utils-unreadable-candidate-sibling-independence-{}", std::process::id()
         ));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -6852,7 +6852,7 @@ mod tests {
             which must never read as \"recovered\"");
 
         std::fs::set_permissions(&absolute_b, std::fs::Permissions::from_mode(0o644)).unwrap();
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (FORK-45 finding #1, corrected scope) The corrupt-candidates loop has the identical
@@ -6886,7 +6886,7 @@ mod tests {
             "forklift-recovery-utils-unreadable-corrupt-candidate-sibling-independence-{}",
             std::process::id()
         ));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -6954,7 +6954,7 @@ mod tests {
             not block its own, independent recovery");
 
         std::fs::set_permissions(&absolute_c, std::fs::Permissions::from_mode(0o644)).unwrap();
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (memo §8.5 test 10) Entry-heal's own torn refusal is completely unaffected by §8.3 — it
@@ -6971,7 +6971,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-entry-heal-still-refuses-torn-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -6985,7 +6985,7 @@ mod tests {
         assert!(taint_utils::read_taints(&forklift).unwrap().torn,
             "entry-heal must never attempt the store-wide rescan itself — the taint stays torn");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     // ---- Multi-bay ref-pointer resurrection audit ----
@@ -7046,7 +7046,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-ref-resurrection-overwrite-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7097,7 +7097,7 @@ mod tests {
             taint, before heal ran) survives untouched, exactly like restaging any other file \
             that was legitimately overwritten in place after it was tainted");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (§10.3, mechanism check 2 — the delete variant) The complementary case to the test above:
@@ -7118,7 +7118,7 @@ mod tests {
         for (pallet, emptied) in [("main", None), ("team/feature", Some("team"))] {
             let root = std::env::temp_dir()
                 .join(format!("forklift-recovery-utils-ref-delete-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = crate::util::file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let _scope = StorageRootScope::enter(&root);
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7131,9 +7131,9 @@ mod tests {
 
             // The ref file vanishes entirely, with a nested name's emptied folder, before heal runs.
             let ref_path = pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::User, pallet);
-            std::fs::remove_file(&ref_path).unwrap();
+            crate::util::file_utils::remove_file(&ref_path).unwrap();
             if let Some(folder) = emptied {
-                std::fs::remove_dir(forklift.join("pallets").join(folder)).unwrap();
+                crate::util::file_utils::remove_dir(forklift.join("pallets").join(folder)).unwrap();
             }
 
             run_heal().unwrap_or_else(|error| panic!("{}: a removed ref must heal, got {}", pallet, error));
@@ -7144,7 +7144,7 @@ mod tests {
             let state = taint_utils::read_taints(&forklift).unwrap();
             assert!(state.recorded.is_empty(), "{}: the removed ref's taint must clear: {:?}", pallet, state.recorded);
 
-            std::fs::remove_dir_all(&root).ok();
+            crate::util::file_utils::remove_dir_all(&root).ok();
         }
     }
 
@@ -7184,7 +7184,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-heal-tolerates-gc-refuses-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7234,7 +7234,7 @@ mod tests {
         assert!(compact_all_result.is_err(),
             "compact --all must still fail closed on an unreadable bay's parked file");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// The core Fix-A regression fixture — the sharper version of the one above, and the one that
@@ -7261,7 +7261,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-degraded-bay-sole-ref-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7289,7 +7289,7 @@ mod tests {
         assert!(state.recorded.contains(&vanished_path),
             "the object must still be named in the remainder after this run: {:?}", state.recorded);
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// An unreadable git mirror roots record follows the caller's policy, like a bay: gc and prune
@@ -7307,7 +7307,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-unreadable-mirror-record-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7341,11 +7341,11 @@ mod tests {
         assert_durability_taint(&error, &[vanished_hash.as_str(), record_name.as_str(), "delete it"]);
         assert!(taint_utils::read_taints(&forklift).unwrap().recorded.contains(&vanished_path));
 
-        std::fs::remove_file(&record).unwrap();
+        crate::util::file_utils::remove_file(&record).unwrap();
         run_heal().expect("with the record deleted, nothing references the object and heal clears the taint");
         assert!(!taint_utils::read_taints(&forklift).unwrap().recorded.contains(&vanished_path));
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// §8.3's degraded-bay counterpart: a torn taint's rescan must refuse rather than silently
@@ -7366,7 +7366,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-torn-rescan-degraded-bay-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7388,7 +7388,7 @@ mod tests {
         let state = taint_utils::read_taints(&forklift).unwrap();
         assert!(state.torn, "the original torn record must be left standing, untouched");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     // ---- "not configured" vs "configured but unusable" (design call) ----
@@ -7420,7 +7420,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-broken-remote-config-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7457,7 +7457,7 @@ mod tests {
             &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
-        std::fs::remove_file(&b_absolute).unwrap();
+        crate::util::file_utils::remove_file(&b_absolute).unwrap();
         plant_complete_taint(&forklift, &[b_relative.to_str().unwrap()]);
 
         // A remote IS configured, in the sense that something real is on disk at `remote.url`'s
@@ -7482,7 +7482,7 @@ mod tests {
             && !message.contains("connectivity"),
             "a broken remote config must be reported as configured but not asked, naming the file: {}", message);
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// A partial warehouse's heal asks only its origin: pointed at another remote, it reports the
@@ -7504,7 +7504,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-non-origin-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Cache);
@@ -7533,7 +7533,7 @@ mod tests {
         parcel_object.store().unwrap();
         pallet_utils::update_pallet_head("main", None, &parcel_object.hash, &pallet_utils::RefPreconditions::NONE).unwrap();
 
-        std::fs::remove_file(&b_absolute).unwrap();
+        crate::util::file_utils::remove_file(&b_absolute).unwrap();
         plant_complete_taint(&forklift, &[b_relative.to_str().unwrap()]);
 
         let mut objects = HashMap::new();
@@ -7551,7 +7551,7 @@ mod tests {
         assert!(message.contains(crate::util::warehouse_utils::TEST_ORIGIN) && message.contains(&other), "{}", message);
         assert!(!b_absolute.exists(), "nothing was fetched from the other remote");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     // ---- FORK-47 leg 2: pack-health surfacing + heal liveness (I4 surfacing half, I7) ----
@@ -7577,7 +7577,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-unenumerable-surfacing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7611,7 +7611,7 @@ mod tests {
             "a clean heal run must still warn about the unrelated unenumerable index by name: {:?}",
             outcome.notes);
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// **T7a** (I7) An orphaned pack pair no longer wedges the whole heal run: a sibling taint
@@ -7646,7 +7646,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-t7a-orphan-sibling-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7667,7 +7667,7 @@ mod tests {
         assert_eq!(artifacts.len(), 1, "test fixture expects exactly one pack pair for B");
         let b_data_relative = artifacts[0].data_path.strip_prefix(&forklift).unwrap().to_path_buf();
         let b_index_name = artifacts[0].index_path.file_name().unwrap().to_str().unwrap().to_string();
-        std::fs::remove_file(&artifacts[0].data_path).unwrap();
+        crate::util::file_utils::remove_file(&artifacts[0].data_path).unwrap();
 
         assert!(!pack_utils::is_in_packs(&y_hash).unwrap(),
             "sanity: the very first registry load must already see B as quarantined, not loaded");
@@ -7727,7 +7727,7 @@ mod tests {
         assert!(state.recorded.contains(&b_data_relative),
             "B's pack data path must remain the unresolved remainder");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// **T7b** (I7, the Finding-1 discriminator) A stray, unparseable pack index sitting in the
@@ -7753,7 +7753,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-t7b-stray-unenumerable-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7784,7 +7784,7 @@ mod tests {
         let state = taint_utils::read_taints(&forklift).unwrap();
         assert!(state.recorded.is_empty(), "the taint must be fully cleared");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (§2a implementation note, closed per review) Pack-health warnings are warehouse *state*,
@@ -7816,7 +7816,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-warnings-survive-refusal-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7877,7 +7877,7 @@ mod tests {
             "the pack-health warning must be in a clearly-separated section, never read as the \
             refusal's own cause: {}", message);
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (Code review finding 3) Pack-health gathering is advisory, decorating the recovery verb —
@@ -7903,7 +7903,7 @@ mod tests {
 
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-pack-folder-read-failure-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7934,14 +7934,14 @@ mod tests {
             "the degrade fallback line must be reported, not silently dropped: {:?}", outcome.notes
         );
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// A fresh warehouse whose staging registers `keys`, each with a one-entry shard.
     fn staged_warehouse(name: &str, keys: &[&str]) -> (PathBuf, crate::globals::StorageRootScope) {
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7987,14 +7987,14 @@ mod tests {
         let error = walk_shard_files(&inventory_root, &mut Vec::new()).unwrap_err();
         assert!(error.contains("parsing the inventory of folder \"docs\""), "{}", error);
 
-        std::fs::remove_dir_all(shard_data_path("docs").parent().unwrap()).unwrap();
+        crate::util::file_utils::remove_dir_all(shard_data_path("docs").parent().unwrap()).unwrap();
         std::fs::create_dir_all(shard_data_path("ghost").parent().unwrap()).unwrap();
         std::fs::write(shard_data_path("ghost"), b"not a shard").unwrap();
         let error = walk_shard_files(&inventory_root, &mut Vec::new()).unwrap_err();
         assert!(error.contains("which matches no registered directory"), "{}", error);
         assert!(!error.contains("ghost"), "{}", error);
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// An inventory root that is a link to a folder out of reach holds an unknown set of shards, so
@@ -8013,7 +8013,7 @@ mod tests {
         assert!(error.contains("does not resolve to a folder"), "{error}");
         assert!(error.contains(&format!("belongs to the checkout \"{}\"", root.to_string_lossy())), "{error}");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// Without a storage root, as in the main tree's CLI, the state folder is the relative
@@ -8053,7 +8053,7 @@ mod tests {
             assert!(error.contains("is a link") && error.contains("unload ."), "{level}: {error}");
             assert!(error.contains(&format!("belongs to the checkout \"{}\"", root.to_string_lossy())), "{level}: {error}");
 
-            std::fs::remove_dir_all(&root).ok();
+            crate::util::file_utils::remove_dir_all(&root).ok();
         }
     }
 
@@ -8074,7 +8074,7 @@ mod tests {
         }
 
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o644)).unwrap();
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// Heal's note on a vanished shard names its directory when a registered key addresses it,
@@ -8087,7 +8087,7 @@ mod tests {
 
         let (root, _scope) = staged_warehouse("heal-names-key", &["", "docs", "old"]);
         inventory_utils::remove_inventories_under("old").unwrap();
-        std::fs::remove_file(shard_data_path("docs")).unwrap();
+        crate::util::file_utils::remove_file(shard_data_path("docs")).unwrap();
 
         let relative = |key: &str| shard_data_path(key).strip_prefix(forklift_root()).unwrap().to_string_lossy().into_owned();
         let (docs, never, old) = (relative("docs"), relative("never"), relative("old"));
@@ -8102,7 +8102,7 @@ mod tests {
             assert!(note_for(path).contains("it matches no registered directory"), "{}", note_for(path));
         }
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     // ---- FORK-217: a node only an unreadable pack index might hold ----
@@ -8111,7 +8111,7 @@ mod tests {
     fn unreadable_scratch(name: &str, how: pack_utils::tests::Unreadable) -> PathBuf {
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-{}-{:?}-{}", name, how, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -8172,7 +8172,7 @@ mod tests {
             pack_as_unreadable(&chunk, Unreadable::CorruptBucket);
             pack_health_warning_lines().unwrap()
         };
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
 
         assert_eq!(lines.len(), 1, "{:?}", lines);
         assert!(lines[0].contains("is damaged"), "{}", lines[0]);
@@ -8201,7 +8201,7 @@ mod tests {
 
                 unwalked_outcome(how, &parcel, &target)
             };
-            std::fs::remove_dir_all(&dir).ok();
+            crate::util::file_utils::remove_dir_all(&dir).ok();
             failure
         });
     }
@@ -8227,7 +8227,7 @@ mod tests {
 
                 unwalked_outcome(how, &recipe, &chunk)
             };
-            std::fs::remove_dir_all(&dir).ok();
+            crate::util::file_utils::remove_dir_all(&dir).ok();
             failure
         });
     }
@@ -8299,7 +8299,7 @@ mod tests {
                     }
                 }
             };
-            std::fs::remove_dir_all(&dir).ok();
+            crate::util::file_utils::remove_dir_all(&dir).ok();
             failure
         });
     }
@@ -8344,7 +8344,7 @@ mod tests {
                     }
                 }
             };
-            std::fs::remove_dir_all(&dir).ok();
+            crate::util::file_utils::remove_dir_all(&dir).ok();
             failure
         });
     }
@@ -8354,7 +8354,7 @@ mod tests {
     /// A fresh, activated, full-mode storage root for a signature recovery test, entered.
     fn enter_signature_heal_root(name: &str) -> (PathBuf, crate::globals::StorageRootScope) {
         let root = std::env::temp_dir().join(format!("forklift-recovery-utils-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -8394,7 +8394,7 @@ mod tests {
         assert!(outcome.notes.iter().any(|note| note.contains("1 pack file(s)") && note.contains("of which 1 were")),
             "the torn rescan must restage the table: {:?}", outcome.notes);
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (xv) A recorded signature table that has vanished resolves with a note naming the loss and
@@ -8424,7 +8424,7 @@ mod tests {
         assert_eq!(sign_utils::load_raw_parcel_signature(&hash).unwrap(), Some(some_signature()),
             "the sidecar the table would have replaced still answers");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// (xvii) A recorded loose signature sidecar that has vanished, with no table holding its
@@ -8449,6 +8449,6 @@ mod tests {
             "{:?}", outcome.notes);
         assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "no taint may stand");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 }

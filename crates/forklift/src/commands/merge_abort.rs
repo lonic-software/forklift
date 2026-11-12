@@ -588,7 +588,7 @@ mod tests {
 
         // Made while the merge waits, to paths only our side changed: the merge left both alone.
         std::fs::write(warehouse.root.join("c.txt"), b"base\n").unwrap();
-        std::fs::remove_file(warehouse.root.join("d.txt")).unwrap();
+        forklift_core::util::file_utils::remove_file(warehouse.root.join("d.txt")).unwrap();
 
         BEFORE_STATE_CLEAR.with(|seam| seam.replace(Some(Box::new(|| Err("crashed".to_string())))));
         let error = test_support::block_on(abort(MergeKind::Consolidation, false, ABORT_COMMAND))

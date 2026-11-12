@@ -5313,7 +5313,7 @@ impl<'a> RemoveFileOnDrop<'a> {
 impl Drop for RemoveFileOnDrop<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = std::fs::remove_file(self.path);
+            let _ = crate::util::file_utils::remove_file(self.path);
         }
     }
 }
@@ -9191,7 +9191,7 @@ mod tests {
         fn new(name: &str) -> Regenesis {
             let root = std::env::temp_dir()
                 .join(format!("forklift-remote-utils-regenesis-{}-{}", name, std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = crate::util::file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = crate::globals::StorageRootScope::enter(&root);
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -9242,7 +9242,7 @@ mod tests {
 
     impl Drop for Regenesis {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = crate::util::file_utils::remove_dir_all(&self.root);
         }
     }
 
@@ -9530,7 +9530,7 @@ mod tests {
             let root = std::env::temp_dir().join(format!(
                 "forklift-remote-test-{}-{}-{}", name, std::process::id(), id
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = crate::util::file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -9541,7 +9541,7 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = crate::util::file_utils::remove_dir_all(&self.root);
         }
     }
 
@@ -10351,7 +10351,7 @@ mod tests {
         // and confirm the walk still succeeds and never collects it — a load on the "two" path
         // would fail (and the walk would error) because the object is gone.
         let (folder, file_name) = crate::util::file_utils::get_path_for_object(&shared).unwrap();
-        std::fs::remove_file(PathBuf::from(folder).join(file_name))
+        crate::util::file_utils::remove_file(PathBuf::from(folder).join(file_name))
             .expect("the shared tree object must exist to delete");
 
         let mut seen_trees = HashSet::new();
@@ -14024,7 +14024,7 @@ mod tests {
         // dedicated test below is what actually exercises the mid-download cleanup.
         assert!(!dest.exists(), "no file should appear at the destination at all in this scenario");
 
-        let _ = std::fs::remove_file(&dest);
+        let _ = crate::util::file_utils::remove_file(&dest);
     }
 
     /// `resolve` must **return** — its designed fallback, an empty map — against a remote that
@@ -14593,7 +14593,7 @@ mod tests {
             "a mid-download timeout must never leave a truncated file at the destination"
         );
 
-        let _ = std::fs::remove_file(&dest);
+        let _ = crate::util::file_utils::remove_file(&dest);
     }
 
     /// A completed download lands at the destination through the fsync-on path: the bundle is
@@ -14615,7 +14615,7 @@ mod tests {
 
         assert_eq!(fetched, Ok(BundleDownload::Complete { resumed: false }));
         assert_eq!(std::fs::read(&dest).unwrap(), b"a complete bundle");
-        let _ = std::fs::remove_file(&dest);
+        let _ = crate::util::file_utils::remove_file(&dest);
     }
 
     /// Download the bundle with nothing kept and no record to checkpoint into.
@@ -19256,7 +19256,7 @@ mod tests {
             let head = parcel("part-way", vec![base.to_string()]);
             let tree = object_utils::load_parcel(&head).unwrap().tree_hash;
             let (folder, file) = file_utils::get_path_for_object(&tree).unwrap();
-            std::fs::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
+            crate::util::file_utils::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
             record(&head, "part-way");
             head
         }
@@ -19268,7 +19268,7 @@ mod tests {
             let head = parcel("web-missing", vec![base.to_string()]);
             let blob = blob("b web-missing");
             let (folder, file) = file_utils::get_path_for_object(&blob).unwrap();
-            std::fs::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
+            crate::util::file_utils::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
             record(&head, "web-missing");
             head
         }

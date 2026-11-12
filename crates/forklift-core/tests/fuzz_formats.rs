@@ -479,7 +479,7 @@ mod regressions {
         // A private storage scope: `import` resolves the object root from the thread-local scope,
         // and the scope is thread-local so this stays isolated from the parallel tests.
         let temp = std::env::temp_dir().join(format!("forklift-fuzz-bundle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(temp.join(forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = forklift_core::globals::StorageRootScope::enter(&temp);
 
@@ -499,7 +499,7 @@ mod regressions {
         let error = result.err().expect("a huge record length must be an error, not a panic/abort");
         assert!(error.contains("declares 18446744073709551615 bytes"), "refused on its length: {}", error);
 
-        std::fs::remove_dir_all(&temp).ok();
+        forklift_core::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// A delta record's declared decompressed length is attacker-controlled. It must neither be

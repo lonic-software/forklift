@@ -26,8 +26,8 @@ impl TestWarehouse {
             .join(format!("forklift-test-{}-{}-home", name, std::process::id()));
 
         // A leftover directory from a previous run must not leak state into this one.
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&home);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
 
@@ -110,8 +110,8 @@ impl TestWarehouse {
 
 impl Drop for TestWarehouse {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-        let _ = std::fs::remove_dir_all(&self.home);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.home);
     }
 }
 
@@ -337,8 +337,8 @@ fn reloading_stages_deleted_directories_and_files_for_removal() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["store", "peek", "--inventory", "src/gone_dir"]));
 
-    std::fs::remove_dir_all(warehouse.root.join("src/gone_dir")).unwrap();
-    std::fs::remove_file(warehouse.root.join("src/gone_file.txt")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("src/gone_dir")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("src/gone_file.txt")).unwrap();
 
     // Re-loading only the affected subtree must stage the deleted directory's entries and
     // the deleted file's entry for removal, while leaving directories outside the subtree
@@ -398,7 +398,7 @@ fn unchanged_files_are_not_rehashed_on_reload() {
         .join(&hash[2..]);
 
     assert!(object_path.exists(), "blob must exist after the first load");
-    std::fs::remove_file(&object_path).unwrap();
+    forklift_core::util::file_utils::remove_file(&object_path).unwrap();
 
     assert_success(&warehouse.run(&["load", "src"]));
     assert!(!object_path.exists(), "unchanged file must be reused via the stat cache, not rehashed");
@@ -458,7 +458,7 @@ fn config_values_are_scoped_and_the_warehouse_overrides_the_global_scope() {
     assert!(stderr(&unknown).contains("Unknown configuration key"));
 
     // An unset key is an error on read.
-    std::fs::remove_file(warehouse.home.join("global-config.toml")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.home.join("global-config.toml")).unwrap();
     assert_success(&warehouse.run(&["config", "get", "remote.url"]));
     let unset = warehouse.run(&["config", "get", "operator.identifier"]);
     assert!(!unset.status.success());
@@ -773,7 +773,7 @@ fn a_dangling_warehouse_config_link_is_an_error_not_a_fallback_to_global() {
     assert_success(&warehouse.run(&["config", "set", "--global", "remote.url", "http://global.example/"]));
 
     let config = warehouse.root.join(".forklift/config/warehouse.toml");
-    let _ = std::fs::remove_file(&config);
+    let _ = forklift_core::util::file_utils::remove_file(&config);
     std::os::unix::fs::symlink(warehouse.root.join("gone.toml"), &config).unwrap();
 
     let read = warehouse.run(&["config", "get", "remote.url"]);
@@ -791,7 +791,7 @@ fn a_dangling_warehouse_config_link_is_an_error_not_a_fallback_to_global() {
 
     // A link to a link whose target is gone is dangling too — the whole chain is followed, not
     // one level of it.
-    std::fs::remove_file(&config).unwrap();
+    forklift_core::util::file_utils::remove_file(&config).unwrap();
     std::os::unix::fs::symlink(warehouse.root.join("gone.toml"), warehouse.root.join("middle.toml")).unwrap();
     std::os::unix::fs::symlink(warehouse.root.join("middle.toml"), &config).unwrap();
 
@@ -803,8 +803,8 @@ fn a_dangling_warehouse_config_link_is_an_error_not_a_fallback_to_global() {
     // path ends in nothing at all and only the walk up the path can tell it from absence.
     let folder = warehouse.root.join(".forklift/config");
     // Recursive: beside the file the folder also holds its edit-lock sidecar.
-    std::fs::remove_file(&config).unwrap();
-    std::fs::remove_dir_all(&folder).unwrap();
+    forklift_core::util::file_utils::remove_file(&config).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(&folder).unwrap();
     std::os::unix::fs::symlink(warehouse.root.join("unmounted"), &folder).unwrap();
 
     let read = warehouse.run(&["config", "get", "remote.url"]);
@@ -815,7 +815,7 @@ fn a_dangling_warehouse_config_link_is_an_error_not_a_fallback_to_global() {
     assert!(stderr(&read).contains("symbolic link"), "the refusal must say why: {}", stderr(&read));
 
     // With nothing at the path at all, the global value applies — that is what absent means.
-    std::fs::remove_file(&folder).unwrap();
+    forklift_core::util::file_utils::remove_file(&folder).unwrap();
     let read = warehouse.run(&["config", "get", "remote.url"]);
     assert_success(&read);
     assert_eq!(stdout(&read).trim(), "http://global.example/");
@@ -1007,7 +1007,7 @@ fn stocktake_leaves_an_ignored_tracked_directory_alone_instead_of_reporting_it_r
     assert!(!paths.iter().any(|path| path.starts_with("build")), "{:?}", paths);
 
     // But a genuine deletion of a tracked, non-ignored file is still reported.
-    std::fs::remove_file(warehouse.root.join("keep.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("keep.txt")).unwrap();
     let paths = unstaged_paths(&warehouse);
     assert!(
         paths.iter().any(|path| path == "keep.txt"),
@@ -1087,8 +1087,8 @@ impl ExfatVolume {
     fn attach_at(name: &str, mount: PathBuf) -> Option<ExfatVolume> {
         let image = std::env::temp_dir().join(format!("forklift-test-{}-{}.dmg", name, std::process::id()));
         let _ = std::process::Command::new("hdiutil").args(["detach", "-force"]).arg(&mount).output();
-        let _ = std::fs::remove_file(&image);
-        let _ = std::fs::remove_dir_all(&mount);
+        let _ = forklift_core::util::file_utils::remove_file(&image);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&mount);
 
         let created = std::process::Command::new("hdiutil")
             .args(["create", "-size", "32m", "-fs", "ExFAT", "-volname", "FKEXFAT", "-quiet"]).arg(&image)
@@ -1100,7 +1100,7 @@ impl ExfatVolume {
         if !attached {
             assert!(std::env::var_os("CI").is_none(), "hdiutil could not attach an exFAT image on CI");
             eprintln!("skipping: hdiutil could not attach an exFAT image");
-            let _ = std::fs::remove_file(&image);
+            let _ = forklift_core::util::file_utils::remove_file(&image);
             return None;
         }
 
@@ -1112,7 +1112,7 @@ impl ExfatVolume {
 impl Drop for ExfatVolume {
     fn drop(&mut self) {
         let _ = std::process::Command::new("hdiutil").args(["detach", "-force", "-quiet"]).arg(&self.mount).status();
-        let _ = std::fs::remove_file(&self.image);
+        let _ = forklift_core::util::file_utils::remove_file(&self.image);
     }
 }
 
@@ -1131,7 +1131,7 @@ fn a_volume_without_the_executable_bit_shifts_twice_and_keeps_each_entry_s_bit()
     };
     let mode = |root: &std::path::Path, name: &str| std::fs::metadata(root.join(name)).unwrap().permissions().mode();
     let copy = |from: &std::path::Path, to: &std::path::Path| {
-        let _ = std::fs::remove_dir_all(to);
+        let _ = forklift_core::util::file_utils::remove_dir_all(to);
         let status = std::process::Command::new("cp").arg("-R").arg(from).arg(to).status().unwrap();
         assert!(status.success(), "cp -R {} {}", from.display(), to.display());
     };
@@ -1189,7 +1189,7 @@ fn a_volume_without_the_executable_bit_shifts_twice_and_keeps_each_entry_s_bit()
 #[cfg(target_os = "macos")]
 fn bay_inventory_entry(warehouse: &TestWarehouse, bay: &str, key: &str, name: &str) -> forklift_core::model::inventory::InventoryItem {
     let copy = warehouse.home.join(format!("bay-inventory-{}", bay));
-    let _ = std::fs::remove_dir_all(&copy);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&copy);
     std::fs::create_dir_all(copy.join(".forklift")).unwrap();
     let inventory = warehouse.root.join(".forklift").join("bays").join(bay).join("inventory");
     let status = std::process::Command::new("cp").arg("-R").arg(&inventory).arg(copy.join(".forklift").join("inventory"))
@@ -1581,7 +1581,7 @@ fn a_directory_only_its_descendant_registered_is_tracked_for_replace_and_remove(
 #[test]
 fn remove_and_restore_follow_a_directory_replaced_by_a_file() {
     let warehouse = warehouse_with_a_nested_single_file_load("flip-dir-to-file");
-    std::fs::remove_dir_all(warehouse.root.join("a")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("a")).unwrap();
     warehouse.write_file("a", "now a file\n");
     assert_success(&warehouse.run(&["load", "."]));
 
@@ -1603,7 +1603,7 @@ fn restore_follows_a_file_replaced_by_a_directory() {
     assert_success(&warehouse.run(&["load", "a"]));
     assert_success(&warehouse.run(&["stack", "-m", "a is a file"]));
 
-    std::fs::remove_file(warehouse.root.join("a")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("a")).unwrap();
     warehouse.write_file("a/b.txt", "b\n");
     assert_success(&warehouse.run(&["load", "a/b.txt"]));
 
@@ -1616,7 +1616,7 @@ fn restore_follows_a_file_replaced_by_a_directory() {
 fn a_tracked_file_a_rule_covers_replaced_by_a_folder_still_shows_its_removal() {
     let warehouse = warehouse_with_a_diverged_pallet("flip-file-to-dir-ignored");
     warehouse.write_file(".forkliftignore", "/notes.txt\n");
-    std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("notes.txt")).unwrap();
     warehouse.write_file("notes.txt/new.txt", "new\n");
 
     let unstaged = changes(&warehouse, "unstaged");
@@ -1640,7 +1640,7 @@ fn a_tracked_file_a_rule_covers_replaced_by_a_folder_still_shows_its_removal() {
 fn a_tracked_folder_a_rule_covers_replaced_by_a_file_is_removed_and_the_file_stays_ignored() {
     let warehouse = warehouse_with_a_diverged_pallet("flip-dir-to-file-ignored");
     warehouse.write_file(".forkliftignore", "/build\n");
-    std::fs::remove_dir_all(warehouse.root.join("build")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("build")).unwrap();
     warehouse.write_file("build", "now a file\n");
 
     let unstaged = changes(&warehouse, "unstaged");
@@ -1705,7 +1705,7 @@ fn a_folder_load_refuses_an_unreadable_shard_instead_of_dropping_a_tracked_file_
 #[test]
 fn restore_refuses_a_file_replaced_by_a_folder_and_keeps_the_folder() {
     let warehouse = warehouse_with_a_diverged_pallet("restore-flip-file-to-dir");
-    std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("notes.txt")).unwrap();
     warehouse.write_file("notes.txt/new.txt", "new\n");
 
     let restore = warehouse.run(&["restore", "--confirm", "notes.txt"]);
@@ -1717,7 +1717,7 @@ fn restore_refuses_a_file_replaced_by_a_folder_and_keeps_the_folder() {
 #[test]
 fn remove_untracks_a_file_replaced_by_a_folder_on_disk() {
     let warehouse = warehouse_with_a_diverged_pallet("remove-flip-file-to-dir");
-    std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("notes.txt")).unwrap();
     warehouse.write_file("notes.txt/new.txt", "new\n");
 
     assert_success(&warehouse.run(&["remove", "notes.txt"]));
@@ -1727,7 +1727,7 @@ fn remove_untracks_a_file_replaced_by_a_folder_on_disk() {
 #[test]
 fn remove_untracks_a_folder_replaced_by_a_file_on_disk() {
     let warehouse = warehouse_with_a_diverged_pallet("remove-flip-dir-to-file");
-    std::fs::remove_dir_all(warehouse.root.join("build")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("build")).unwrap();
     warehouse.write_file("build", "now a file\n");
 
     assert_success(&warehouse.run(&["remove", "build"]));
@@ -1738,7 +1738,7 @@ fn remove_untracks_a_folder_replaced_by_a_file_on_disk() {
 fn an_ancestor_registered_only_for_removed_content_stops_being_tracked() {
     let warehouse = warehouse_with_a_nested_single_file_load("prune-ancestor");
     warehouse.write_file("a/untracked.txt", "u\n");
-    std::fs::remove_dir_all(warehouse.root.join("a/b")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("a/b")).unwrap();
     assert_success(&warehouse.run(&["remove", "a/b"]));
     assert_success(&warehouse.run(&["stack", "-m", "drop a/b"]));
 
@@ -1933,7 +1933,7 @@ fn stocktake_reports_staged_and_unstaged_changes() {
     assert!(removal.contains("untracked: dir/b.txt"));
 
     // A file deleted from disk (but still loaded) is an unstaged removal.
-    std::fs::remove_file(warehouse.root.join("a.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("a.txt")).unwrap();
     let deleted = stdout(&warehouse.run(&["stocktake"]));
     let unstaged_section = deleted.split("Changes not in the inventory").nth(1)
         .expect("stocktake must report unstaged changes");
@@ -2062,8 +2062,8 @@ fn shift_preserves_executables_and_symlinks() {
     // An empty pallet state to shift away to: remove everything on a feature pallet.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("placeholder.txt", "placeholder\n");
-    std::fs::remove_file(warehouse.root.join("run.sh")).unwrap();
-    std::fs::remove_file(warehouse.root.join("link")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("run.sh")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("link")).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "without modes"]));
 
@@ -2124,8 +2124,8 @@ fn a_wide_shift_writes_every_file_its_own_content_mode_and_type() {
     }
     // A rewrite keeps the file's mode, so clear it: the shift back must set it, not inherit it.
     std::fs::set_permissions(warehouse.root.join(&paths[7]), std::fs::Permissions::from_mode(0o644)).unwrap();
-    std::fs::remove_file(warehouse.root.join("d0/sub0/link")).unwrap();
-    std::fs::remove_file(warehouse.root.join("d1/big.bin")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("d0/sub0/link")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("d1/big.bin")).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "feature's files"]));
 
@@ -2221,7 +2221,7 @@ fn restore_discards_unstaged_changes() {
 
     // Restoring a directory rewrites modified files and brings deleted ones back.
     warehouse.write_file("dir/b.txt", "scribbled over\n");
-    std::fs::remove_file(warehouse.root.join("a.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("a.txt")).unwrap();
     assert_success(&warehouse.run(&["restore", "--confirm", "."]));
     assert_eq!(
         std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(),
@@ -2256,7 +2256,7 @@ fn restore_needs_confirm_to_discard_a_change() {
     assert_success(&warehouse.run(&["stack", "-m", "baseline"]));
 
     warehouse.write_file("dir/b.txt", "wanted?\n");
-    std::fs::remove_file(warehouse.root.join("a.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("a.txt")).unwrap();
 
     let refused = warehouse.run(&["--json", "restore", "."]);
     assert_eq!(refused.status.code(), Some(39), "{}", stdout(&refused));
@@ -2614,7 +2614,7 @@ fn import_git_reports_a_file_git_converted_on_checkout_from_the_start() {
     // convert, comes back as it was. The filter is configured only now, so the commit stored its input unchanged.
     let names = ["run.bat", "id.txt", "auto.txt", "shout.up", "plain.txt"];
     for name in names {
-        std::fs::remove_file(root.join(name)).unwrap();
+        forklift_core::util::file_utils::remove_file(root.join(name)).unwrap();
     }
     git_in(&root, &["config", "filter.up.smudge", "tr a-z A-Z"]);
     git_in(&root, &["-c", "core.autocrlf=true", "checkout", "--", "run.bat", "id.txt", "auto.txt", "shout.up", "plain.txt"]);
@@ -2770,14 +2770,14 @@ fn checkout_scopes_in_a_full_warehouse_are_recorded_and_checked() {
         assert!(stderr(&refused).contains("its main tree holds a scope") && stderr(&refused).contains("Delete that file"),
             "{:?}: {}", args, stderr(&refused));
     }
-    std::fs::remove_file(warehouse.root.join(".forklift").join("scope")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift").join("scope")).unwrap();
     assert_success(&warehouse.run(&["stack", "-m", "second"]));
 
     // A scoped bay whose scope file is gone is refused the same way, naming its removal, instead of
     // recording src/web, which it never checked out, as removed.
     std::fs::write(scoped_dir.join("src/api/a.txt"), "api v2\n").unwrap();
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
-    std::fs::remove_file(bays.join("scoped").join("scope")).unwrap();
+    forklift_core::util::file_utils::remove_file(bays.join("scoped").join("scope")).unwrap();
     for args in [&["stocktake"][..], &["stack", "-m", "third"]] {
         let refused = warehouse.run_at(&scoped_dir, args);
         assert!(!refused.status.success(), "{:?} must refuse: {}", args, stdout(&refused));
@@ -3010,7 +3010,7 @@ fn re_proving_an_unproven_entry_never_hides_a_kind_change() {
     std::fs::set_permissions(root.join("big.bin"), std::fs::Permissions::from_mode(0o755)).unwrap();
     forklift_core::util::file_utils::rename(root.join("file.txt"), root.join("copy.txt")).unwrap();
     std::os::unix::fs::symlink("copy.txt", root.join("file.txt")).unwrap();
-    std::fs::remove_file(root.join("link")).unwrap();
+    forklift_core::util::file_utils::remove_file(root.join("link")).unwrap();
     warehouse.write_file("link", "file.txt");
 
     let changes = unstaged_changes(&warehouse);
@@ -3039,8 +3039,8 @@ fn a_bay_stamps_its_own_clock_probe() {
     assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
     let shared_probe = warehouse.root.join(".forklift").join(forklift_core::util::file_utils::FILE_NAME_CLOCK_PROBE);
     let bay_probe = bay_dir.join(".forklift").join(forklift_core::util::file_utils::FILE_NAME_CLOCK_PROBE);
-    let _ = std::fs::remove_file(&shared_probe);
-    let _ = std::fs::remove_file(&bay_probe);
+    let _ = forklift_core::util::file_utils::remove_file(&shared_probe);
+    let _ = forklift_core::util::file_utils::remove_file(&bay_probe);
 
     std::fs::write(bay_dir.join("code.txt"), "v2\n").unwrap();
     assert_success(&warehouse.run_at(&bay_dir, &["load", "."]));
@@ -3519,7 +3519,7 @@ fn compact_rebuilds_lost_ancestor_shards_behind_a_recorded_head() {
     assert!(shards.len() > 1 && shards.contains(&head_shard),
         "sanity: the history spans several shards, one of them the head's: {:?}", shards);
     for shard in shards.iter().filter(|shard| **shard != head_shard) {
-        std::fs::remove_file(shard).unwrap();
+        forklift_core::util::file_utils::remove_file(shard).unwrap();
     }
 
     assert_success(&warehouse.run(&["store", "compact"]));
@@ -3573,7 +3573,7 @@ fn an_unwritable_commit_graph_never_fails_a_query() {
     assert_success(&warehouse.run(&["stack", "-m", "main work"]));
 
     let graph_root = warehouse.root.join(".forklift/graph");
-    let _ = std::fs::remove_dir_all(&graph_root);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&graph_root);
     std::fs::write(&graph_root, "not a directory").unwrap();
 
     // `blame` reads its parent edges through the graph and has no object-walk fallback of its
@@ -3642,7 +3642,7 @@ fn a_cold_blame_writes_each_commit_graph_shard_a_bounded_number_of_times() {
     assert_success(&warehouse.run(&["git", "import", ".", "--no-compact"]));
 
     let graph_root = warehouse.root.join(".forklift/graph");
-    let _ = std::fs::remove_dir_all(&graph_root);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&graph_root);
     let blame = warehouse.run_with_env(&["blame", "a.txt"], &[("FORKLIFT_DEBUG_GRAPH_WRITES", "1"), NARROW_GRAPH]);
     assert_success(&blame);
     assert!(stdout(&blame).contains(&format!("line {}", COMMITS - 1)), "blame output: {}", stdout(&blame));
@@ -3799,7 +3799,7 @@ fn park_saves_and_reapplies_work_in_progress() {
     // Dirty the warehouse: an unstaged modification, a staged-then-modified file, a
     // deleted tracked file, and an untracked file that must survive untouched.
     warehouse.write_file("a.txt", "work in progress\n");
-    std::fs::remove_file(warehouse.root.join("dir/b.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("dir/b.txt")).unwrap();
     warehouse.write_file("untracked.txt", "leave me alone\n");
 
     let park = warehouse.run(&["park"]);
@@ -3899,7 +3899,7 @@ fn mutating_commands_respect_the_warehouse_lock() {
     // Read-only commands still work while the lock is held.
     assert_success(&warehouse.run(&["help"]));
 
-    std::fs::remove_file(warehouse.root.join(".forklift/lock")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/lock")).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
 
     // The lock is released after the command finishes.
@@ -4250,8 +4250,8 @@ fn diff_prints_the_files_before_an_unreadable_one_then_fails() {
         let line = peek.lines().find(|line| line.ends_with(name)).unwrap_or_else(|| panic!("{} not in: {}", name, peek));
         line.split_whitespace().nth(1).expect("peek line: <state> <hash> <name>").to_string()
     };
-    std::fs::remove_file(object_store_path(&warehouse, &stored_hash("fan", "f05.txt"))).unwrap();
-    std::fs::remove_file(object_store_path(&warehouse, &stored_hash("ser", "s1.txt"))).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&warehouse, &stored_hash("fan", "f05.txt"))).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&warehouse, &stored_hash("ser", "s1.txt"))).unwrap();
 
     for index in 0..10 {
         warehouse.write_file(&format!("fan/f{:02}.txt", index), &format!("new {}\n", index));
@@ -4295,7 +4295,7 @@ fn diff_reports_removals_added_files_and_binary_content() {
     assert_success(&warehouse.run(&["stack", "-m", "first"]));
 
     // A file deleted from disk is an unstaged removal with its lines shown.
-    std::fs::remove_file(warehouse.root.join("gone.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("gone.txt")).unwrap();
     let unstaged = stdout(&warehouse.run(&["diff"]));
     assert!(unstaged.contains("removed: gone.txt"), "unexpected diff output: {}", unstaged);
     assert!(unstaged.contains("- going away"));
@@ -4325,7 +4325,7 @@ fn diff_compares_the_heads_of_two_pallets() {
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("src/app.rs", "shared\nfeature line\n");
     warehouse.write_file("new.txt", "extra\n");
-    std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("notes.txt")).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "feature work"]));
 
@@ -5109,7 +5109,7 @@ fn import_git_refuses_an_office_without_its_anchor_before_any_branch_lands() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["office", "enroll"]));
-    std::fs::remove_file(root.join(".forklift/trust")).unwrap();
+    forklift_core::util::file_utils::remove_file(root.join(".forklift/trust")).unwrap();
 
     git_in(&root, &["init", "-q", "-b", "trunk"]);
     warehouse.write_file("x.txt", "here\n");
@@ -5193,13 +5193,13 @@ fn git_add_all_stages_nothing_of_a_forklift_folder() {
     assert_eq!(git_would_add(&bay_dir), vec!["a.txt".to_string()]);
 
     let ignore = root.join(".forklift/.gitignore");
-    std::fs::remove_file(&ignore).unwrap();
+    forklift_core::util::file_utils::remove_file(&ignore).unwrap();
     assert!(git_would_add(&root).iter().any(|path| path.starts_with(".forklift/")), "the domain is the folder");
     assert_success(&warehouse.run(&["prepare"]));
     assert_eq!(git_would_add(&root), vec!["a.txt".to_string()]);
 
     // Writing the token back restores a lost ignore file before the token lands.
-    std::fs::remove_file(&ignore).unwrap();
+    forklift_core::util::file_utils::remove_file(&ignore).unwrap();
     assert_success(&warehouse.run(&["config", "set", "remote.token", "other"]));
     assert_eq!(git_would_add(&root), vec!["a.txt".to_string()]);
 
@@ -5626,7 +5626,7 @@ fn a_gitignore_that_is_no_regular_file_contributes_nothing_and_fails_nothing() {
     assert_eq!(staged, [".gitignore", "dir/.gitignore/inner.txt", "rules", "sub/.gitignore", "sub/a.txt"]);
 
     // The positive half: the same rules in a regular file are read.
-    std::fs::remove_file(warehouse.root.join("sub/.gitignore")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("sub/.gitignore")).unwrap();
     warehouse.write_file("sub/.gitignore", "*\n");
     warehouse.write_file("sub/b.txt", "b\n");
     let unstaged = changes(&warehouse, "unstaged");
@@ -5696,7 +5696,7 @@ fn a_symlinked_ignore_file_is_refused() {
     warehouse.write_file("rules", "/x\n");
 
     for target in ["rules", "missing"] {
-        let _ = std::fs::remove_file(warehouse.root.join(".forkliftignore"));
+        let _ = forklift_core::util::file_utils::remove_file(warehouse.root.join(".forkliftignore"));
         std::os::unix::fs::symlink(target, warehouse.root.join(".forkliftignore")).unwrap();
         let refused = warehouse.run(&["stocktake"]);
         assert!(!refused.status.success(), "a link to {} must be refused: {}", target, stdout(&refused));
@@ -5704,7 +5704,7 @@ fn a_symlinked_ignore_file_is_refused() {
     }
 
     // The positive half: the same rules in a regular file are read.
-    std::fs::remove_file(warehouse.root.join(".forkliftignore")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forkliftignore")).unwrap();
     warehouse.write_file(".forkliftignore", "/x\n");
     assert_success(&warehouse.run(&["stocktake"]));
 }
@@ -6082,7 +6082,7 @@ fn export_git_leaves_tags_out_when_the_office_cannot_name_their_tagger() {
     let human = stdout(&warehouse.run(&["git", "export", warehouse.root.join("damaged-human").to_str().unwrap()]));
     assert!(human.contains("warning: tag \"v1\" was not exported: the office"), "{}", human);
 
-    std::fs::remove_file(&office_head).unwrap();
+    forklift_core::util::file_utils::remove_file(&office_head).unwrap();
     let unborn = export("unborn");
     assert_eq!(unborn["tags"], serde_json::json!(["pre"]));
     assert_eq!(unborn["skipped_tags"].as_array().unwrap().len(), 1, "{}", unborn);
@@ -6199,7 +6199,7 @@ impl AliasScratch {
         let dir = std::env::temp_dir()
             .join(format!("forklift-test-alias-{}-{}", name, std::process::id()));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         AliasScratch { dir }
@@ -6230,7 +6230,7 @@ impl AliasScratch {
 
 impl Drop for AliasScratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.dir);
     }
 }
 
@@ -7172,7 +7172,7 @@ fn a_header_less_or_missing_position_is_refused_naming_the_file() {
     assert!(stderr(&headerless).contains(&named) && stderr(&headerless).contains("no format header"),
         "{}", stderr(&headerless));
 
-    std::fs::remove_file(&path).unwrap();
+    forklift_core::util::file_utils::remove_file(&path).unwrap();
     let missing = warehouse.run(&["stocktake"]);
     assert!(!missing.status.success());
     assert!(stderr(&missing).contains(&named), "{}", stderr(&missing));
@@ -7387,8 +7387,8 @@ fn a_bay_whose_path_file_is_missing_still_lists_and_removes() {
     // The state a `bay add` that failed writing its path file leaves: the path file is written
     // before the redirect, so neither exists. Unlike a damaged path file, nothing is misread, and
     // the bay is removable.
-    std::fs::remove_file(warehouse.root.join(".forklift/bays/feature/path")).unwrap();
-    std::fs::remove_dir_all(bay_dir.join(".forklift")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/bays/feature/path")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(bay_dir.join(".forklift")).unwrap();
 
     let listed = warehouse.run(&["bay"]);
     assert_success(&listed);
@@ -7526,7 +7526,7 @@ fn deliver_refuses_an_office_without_its_anchor_before_anything_is_written() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "draft work"]));
     let main_head = stdout(&warehouse.run(&["history", "main", "-n", "1"]));
-    std::fs::remove_file(warehouse.root.join(".forklift/trust")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/trust")).unwrap();
     fn files_under(dir: &std::path::Path) -> usize {
         std::fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().path())
             .map(|path| if path.is_dir() { files_under(&path) } else { 1 })
@@ -7676,7 +7676,7 @@ fn regenesis_resets_trust_and_pins_prior_history_as_attested() {
     assert!(stderr(&refused).contains("admin with a usable key"), "{}", stderr(&refused));
 
     // Simulate total key loss: no key on this machine can extend the chain.
-    std::fs::remove_dir_all(warehouse.home.join("test-keys")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.home.join("test-keys")).unwrap();
     warehouse.write_file("a.txt", "two\n");
     assert_success(&warehouse.run(&["load", "."]));
     let locked = warehouse.run(&["stack", "-m", "locked out"]);
@@ -8429,7 +8429,7 @@ fn parcels_are_signed_after_enrollment_and_audit_verifies_them() {
     assert!(stderr(&tampered).contains("does not verify"));
 
     // A missing signature on a post-trust parcel is detected too.
-    std::fs::remove_file(&sidecar).unwrap();
+    forklift_core::util::file_utils::remove_file(&sidecar).unwrap();
     let missing = warehouse.run(&["audit"]);
     assert!(!missing.status.success());
     assert!(stderr(&missing).contains("carries no signature"));
@@ -8945,7 +8945,7 @@ fn a_staged_removal_next_step_runs_as_printed_from_the_working_tree_root() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "baseline"]));
 
-    std::fs::remove_file(warehouse.root.join("docs/my notes.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("docs/my notes.txt")).unwrap();
     assert_success(&warehouse.run(&["load", "docs"]));
 
     let docs = warehouse.root.join("docs");
@@ -9038,7 +9038,7 @@ fn a_dash_led_remedy_path_runs_as_printed_in_windows_shells() {
             assert_success(&warehouse.run(&["load", "."]));
             assert_success(&warehouse.run(&["stack", "-m", "baseline"]));
 
-            std::fs::remove_file(warehouse.root.join(name)).unwrap();
+            forklift_core::util::file_utils::remove_file(warehouse.root.join(name)).unwrap();
             assert_success(&warehouse.run(&["load", "."]));
 
             let staged = format!("The removal of \"{}\" is staged", name);
@@ -9298,7 +9298,7 @@ fn consolidate_refuses_on_an_incomplete_load_before_writing_consolidation_state(
     );
 
     // Healing the load lets the consolidation proceed normally.
-    std::fs::remove_file(&marker_path).unwrap();
+    forklift_core::util::file_utils::remove_file(&marker_path).unwrap();
     assert_success(&warehouse.run(&["consolidate", "feature"]));
 }
 
@@ -9338,7 +9338,7 @@ fn cherry_pick_refuses_on_an_incomplete_load_before_writing_state() {
     assert!(!warehouse.root.join("feat.txt").exists(), "the pick must not have applied anything");
 
     // Healing the load lets the cherry-pick proceed normally.
-    std::fs::remove_file(&marker_path).unwrap();
+    forklift_core::util::file_utils::remove_file(&marker_path).unwrap();
     assert_success(&warehouse.run(&["pick", &source]));
 }
 
@@ -9390,7 +9390,7 @@ fn haul_merge_refuses_on_an_incomplete_load_before_writing_consolidation_state()
     );
 
     // Healing the load lets the haul merge normally.
-    std::fs::remove_file(&marker_path).unwrap();
+    forklift_core::util::file_utils::remove_file(&marker_path).unwrap();
     assert_success(&warehouse.run(&["haul", "consolidate", &id]));
 }
 
@@ -10275,7 +10275,7 @@ fn undo_refuses_a_corrupt_journal_by_name() {
     assert_eq!(std::fs::read_to_string(&journal).unwrap(), "{\"version\":1,\"entr", "a refused journal is never rewritten");
 
     // The remedy the message names works.
-    std::fs::remove_file(&journal).unwrap();
+    forklift_core::util::file_utils::remove_file(&journal).unwrap();
     warehouse.write_file("d.txt", "four\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "fourth"]));
@@ -10865,7 +10865,7 @@ fn shift_flips_a_tracked_directory_into_a_file_and_back() {
 
     // "flipped" replaces the tracked directory "foo" with a plain file.
     assert_success(&warehouse.run(&["pallet", "create", "flipped"]));
-    std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "flip foo to a file"]));
@@ -10909,7 +10909,7 @@ fn shift_still_refuses_a_directory_to_file_flip_when_untracked_content_is_beneat
     assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "flipped"]));
-    std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "flip foo to a file"]));
@@ -10946,7 +10946,7 @@ fn consolidate_flips_a_tracked_directory_into_a_file_and_back() {
 
     // "feature" one-sidedly replaces the tracked directory "foo" with a file.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
-    std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "feature flips foo to a file"]));
@@ -10990,7 +10990,7 @@ fn consolidate_flips_a_tracked_file_into_a_directory() {
     assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
-    std::fs::remove_file(warehouse.root.join("foo")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo/inner.txt", "inner v1\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "feature flips foo to a directory"]));
@@ -11026,7 +11026,7 @@ fn consolidate_still_refuses_a_directory_to_file_flip_when_untracked_content_is_
     assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
-    std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "feature flips foo to a file"]));
@@ -11063,7 +11063,7 @@ fn cherry_pick_flips_a_tracked_directory_into_a_file_and_back() {
 
     // "feature" replaces the tracked directory "foo" with a file, in a single parcel.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
-    std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
     let source = extract_parcel_hash(&warehouse.run(&["stack", "-m", "flip foo to a file"]));
@@ -11098,7 +11098,7 @@ fn cherry_pick_flips_a_tracked_file_into_a_directory() {
     assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
-    std::fs::remove_file(warehouse.root.join("foo")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo/inner.txt", "inner v1\n");
     assert_success(&warehouse.run(&["load", "."]));
     let source = extract_parcel_hash(&warehouse.run(&["stack", "-m", "flip foo to a directory"]));
@@ -12060,8 +12060,8 @@ fn a_scoped_stack_prunes_an_emptied_subtree_identically_to_a_full_stack() {
     assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "lonely/deep"]));
 
     // Delete the only in-scope file in both bays and stack the removal.
-    std::fs::remove_file(full_dir.join("lonely/deep/only.txt")).unwrap();
-    std::fs::remove_file(scoped_dir.join("lonely/deep/only.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(full_dir.join("lonely/deep/only.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(scoped_dir.join("lonely/deep/only.txt")).unwrap();
     assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
     assert_success(&warehouse.run_at(&full_dir, &["stack", "-m", "drop it (full)"]));
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
@@ -12153,7 +12153,7 @@ fn a_scoped_bay_refuses_a_spine_path_type_flip() {
 
     // On main, replace the `src` directory with a *file* named `src` and stack it: the scope's
     // spine now has a file where it expects a directory.
-    std::fs::remove_dir_all(warehouse.root.join("src")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("src")).unwrap();
     std::fs::write(warehouse.root.join("src"), "src is a file now\n").unwrap();
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "src becomes a file"]));
@@ -12184,13 +12184,13 @@ fn a_scoped_stack_refuses_when_the_dock_replaces_an_in_scope_directory_with_a_fi
 
     // Full bay: replacing src/api with a file is an ordinary (non-sparse) edit and must
     // keep succeeding — the fix must not regress the unscoped case.
-    std::fs::remove_dir_all(full_dir.join("src/api")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(full_dir.join("src/api")).unwrap();
     std::fs::write(full_dir.join("src/api"), "api is a file now\n").unwrap();
     assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
     assert_success(&warehouse.run_at(&full_dir, &["stack", "-m", "api becomes a file"]));
 
     // Scoped bay: the same edit must refuse rather than silently drop the file from the tree.
-    std::fs::remove_dir_all(scoped_dir.join("src/api")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(scoped_dir.join("src/api")).unwrap();
     std::fs::write(scoped_dir.join("src/api"), "api is a file now\n").unwrap();
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
     let stacked = warehouse.run_at(&scoped_dir, &["--json", "stack", "-m", "api becomes a file"]);
@@ -12391,7 +12391,7 @@ fn a_scoped_merge_resolves_one_sided_out_of_scope_changes_by_hash_without_readin
     let web_blob = path_object_hash(&warehouse, &theirs_head, "src/web/w.txt");
     let readme_blob = path_object_hash(&warehouse, &theirs_head, "README.md");
     for hash in [&web_tree, &web_blob, &readme_blob] {
-        std::fs::remove_file(object_store_path(&warehouse, hash)).expect("the out-of-scope object existed");
+        forklift_core::util::file_utils::remove_file(object_store_path(&warehouse, hash)).expect("the out-of-scope object existed");
     }
 
     // The scoped bay makes the same in-scope edit and consolidates theirs. It must succeed...
@@ -12463,7 +12463,7 @@ fn a_scoped_merge_resolves_a_one_sided_out_of_scope_symlink_by_hash() {
 
     // theirs re-points the out-of-scope symlink one-sided.
     assert_success(&warehouse.run(&["pallet", "create", "theirs"]));
-    std::fs::remove_file(warehouse.root.join("shortcut")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("shortcut")).unwrap();
     symlink("src/api/a.txt", warehouse.root.join("shortcut")).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "theirs re-points the symlink"]));
@@ -12548,7 +12548,7 @@ fn a_scoped_merge_resolves_an_out_of_scope_directory_to_file_flip_by_hash() {
     // exact construction that emits a "set" (file loop) then a "delete" (subtree loop) for the
     // same path, in that order — the direction a plain last-write-wins insert gets wrong.
     assert_success(&warehouse.run(&["pallet", "create", "theirs"]));
-    std::fs::remove_dir_all(warehouse.root.join("src/web")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("src/web")).unwrap();
     warehouse.write_file("src/web", "web is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "theirs turns src/web into a file"]));
@@ -12596,7 +12596,7 @@ fn a_scoped_merge_resolves_an_out_of_scope_file_to_directory_flip_by_hash() {
     // the warehouse root onto it — the warehouse root stays on "main" throughout.
     let theirs_dir = warehouse.home.join("bay-theirs");
     assert_success(&warehouse.run(&["bay", "add", "theirs", theirs_dir.to_str().unwrap()]));
-    std::fs::remove_file(theirs_dir.join("src/web")).unwrap();
+    forklift_core::util::file_utils::remove_file(theirs_dir.join("src/web")).unwrap();
     std::fs::create_dir_all(theirs_dir.join("src/web")).unwrap();
     std::fs::write(theirs_dir.join("src/web/inner.txt"), "inner v1\n").unwrap();
     assert_success(&warehouse.run_at(&theirs_dir, &["load", "."]));
@@ -12679,7 +12679,7 @@ fn a_stack_refuses_when_consolidation_state_exists_but_the_skeleton_file_is_gone
     assert!(skeleton_path.exists(), "the skeleton file must exist too, even before the conflict is resolved");
 
     // Simulate the interrupted write: the skeleton vanishes, the state does not.
-    std::fs::remove_file(&skeleton_path).unwrap();
+    forklift_core::util::file_utils::remove_file(&skeleton_path).unwrap();
 
     // Resolve the in-scope conflict so only the skeleton-durability gate stands in the way.
     std::fs::write(scoped_dir.join("src/api/a.txt"), "api a resolved\n").unwrap();
@@ -12778,7 +12778,7 @@ fn compact_all_tolerates_a_sparse_store_and_a_later_scoped_stack_still_works() {
     // Make them unreadable, the way a sparsely-fetched store holds them: sealed by hash in the
     // signed head, never downloaded.
     for hash in [&web_tree, &web_blob, &readme_blob] {
-        std::fs::remove_file(object_store_path(&warehouse, hash)).expect("the out-of-scope object existed");
+        forklift_core::util::file_utils::remove_file(object_store_path(&warehouse, hash)).expect("the out-of-scope object existed");
     }
 
     // The repack must not error on the absent-but-reachable subtree: it packs the present live set.
@@ -12903,7 +12903,7 @@ fn chunked_file_round_trips_byte_identical_through_shift() {
 
     // Diverge on a feature pallet that does not have the giant.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
-    std::fs::remove_file(warehouse.root.join("big.bin")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("big.bin")).unwrap();
     warehouse.write_file("small.txt", "on feature\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "without the giant"]));
@@ -12988,7 +12988,7 @@ fn compact_leaves_chunks_loose_and_the_file_still_materializes() {
 
     // The file still materializes byte-identically after compaction.
     assert_success(&warehouse.run(&["pallet", "create", "empty"]));
-    std::fs::remove_file(warehouse.root.join("big.bin")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("big.bin")).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "no giant"]));
     assert_success(&warehouse.run(&["shift", "main"]));
@@ -13162,7 +13162,7 @@ fn a_chunked_file_directory_flip_shift_succeeds() {
 
     // On a branch, "node" becomes a directory. `pallet create` switches to the new pallet.
     assert_success(&warehouse.run(&["pallet", "create", "asdir"]));
-    std::fs::remove_file(warehouse.root.join("node")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("node")).unwrap();
     warehouse.write_file("node/inside.txt", "now a directory\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "node is a directory"]));
@@ -13594,7 +13594,7 @@ fn heal_reports_a_vanished_but_referenced_object_and_everything_still_refuses() 
     // The pallet head is a durable ref by construction, so vanishing (and taining) its own
     // parcel object is the simplest "still referenced" case: it is the walk's own root.
     let relative = loose_object_relative_path(&parcel_hash);
-    std::fs::remove_file(warehouse.root.join(".forklift").join(&relative)).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift").join(&relative)).unwrap();
     plant_taint(&warehouse, &[&relative]);
 
     let status = warehouse.run(&["heal", "--json"]);
@@ -13646,7 +13646,7 @@ fn heal_partial_clear_leaves_exactly_the_unresolved_remainder_recorded() {
     assert_success(&stack_out);
     let parcel_hash = extract_parcel_hash(&stack_out);
     let referenced_relative = loose_object_relative_path(&parcel_hash);
-    std::fs::remove_file(warehouse.root.join(".forklift").join(&referenced_relative)).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift").join(&referenced_relative)).unwrap();
 
     let fake_hash = "2".repeat(64);
     let unreferenced_relative = loose_object_relative_path(&fake_hash);
@@ -13742,7 +13742,7 @@ fn heal_on_a_torn_taint_with_a_dangling_reference_rescans_into_a_named_remainder
     // The pallet head is a durable ref by construction — vanishing its own parcel object is the
     // simplest genuinely-dangling fixture.
     let relative = loose_object_relative_path(&parcel_hash);
-    std::fs::remove_file(warehouse.root.join(".forklift").join(&relative)).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift").join(&relative)).unwrap();
 
     // Torn, and its surviving prefix deliberately does NOT mention the vanished parcel — proving
     // the rescan finds it by walking ref sources (§8.1's targetless enumerator), not by trusting
@@ -13813,7 +13813,7 @@ fn a_mutating_command_reports_the_lock_before_the_taint_when_both_apply() {
     assert_eq!(read_only.status.code(), Some(21));
     assert_eq!(json(&read_only)["error"]["code"], "durability_taint");
 
-    std::fs::remove_file(warehouse.root.join(".forklift/lock")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/lock")).unwrap();
 }
 
 #[test]
@@ -13967,8 +13967,8 @@ fn heal_is_never_serialized_against_another_bays_warehouse_lock_or_the_shared_st
     assert!(bay_b_lock.exists(), "bay B's own lock file must be untouched by bay A's heal");
     assert!(store_lock.exists(), "the shared store lock must be untouched by bay A's heal");
 
-    std::fs::remove_file(&bay_b_lock).unwrap();
-    std::fs::remove_file(&store_lock).unwrap();
+    forklift_core::util::file_utils::remove_file(&bay_b_lock).unwrap();
+    forklift_core::util::file_utils::remove_file(&store_lock).unwrap();
 }
 
 /// Every `.pack` data file currently present under a warehouse's pack folder, sorted.
@@ -14088,7 +14088,7 @@ fn a_stack_in_a_named_bay_locks_the_shared_refs() {
 
     // Only the bay's stack below may create it.
     let shared = warehouse.root.join(".forklift").join("refs.lock");
-    std::fs::remove_file(&shared).unwrap();
+    forklift_core::util::file_utils::remove_file(&shared).unwrap();
 
     std::fs::write(bay_dir.join("b.txt"), "b\n").unwrap();
     assert_success(&warehouse.run_at(&bay_dir, &["load", "."]));
@@ -14257,7 +14257,7 @@ fn a_bay_redirect_naming_an_invalid_bay_refuses_to_enter_it() {
     let removed = warehouse.run(&["bay", "remove", "B1"]);
     assert!(!removed.status.success());
     assert!(warehouse.root.join(".forklift/bays/b1").is_dir());
-    std::fs::remove_dir_all(bay_dir.join(".forklift")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(bay_dir.join(".forklift")).unwrap();
     let output = warehouse.run_at(&bay_dir, &["stocktake"]);
     assert!(!stderr(&output).contains("names an invalid bay"), "{}", stderr(&output));
 }
@@ -14270,7 +14270,7 @@ fn an_old_format_bay_redirect_is_refused_with_a_conversion_that_works() {
     let (warehouse, bay_dir) = warehouse_with_a_bay("bay-old-format");
     let forklift = bay_dir.join(".forklift");
     let content = std::fs::read(forklift.join("redirect")).unwrap();
-    std::fs::remove_dir_all(&forklift).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(&forklift).unwrap();
     std::fs::write(&forklift, &content).unwrap();
     std::fs::write(bay_dir.join("redirect"), "the bay's own file\n").unwrap();
     // The bay's tree holds the remedy's first-choice name, so the remedy names another.
@@ -14328,7 +14328,7 @@ fn a_bay_whose_folder_cannot_be_moved_aside_is_kept() {
     assert!(!removed.status.success());
 
     // Followed literally, the way out removes the bay.
-    std::fs::remove_dir_all(bay_dir.join(".forklift")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(bay_dir.join(".forklift")).unwrap();
     assert_success(&warehouse.run(&["bay", "remove", "b1"]));
     assert!(!warehouse.root.join(".forklift/bays/b1").exists());
     let left: Vec<String> = std::fs::read_dir(&bay_dir).unwrap()
@@ -14343,7 +14343,7 @@ fn a_bay_whose_folder_cannot_be_moved_aside_is_kept() {
 #[test]
 fn removing_a_bay_whose_directory_now_holds_a_warehouse_leaves_that_warehouse_alone() {
     let (warehouse, bay_dir) = warehouse_with_a_bay("bay-remove-reused");
-    std::fs::remove_dir_all(&bay_dir).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(&bay_dir).unwrap();
     std::fs::create_dir_all(&bay_dir).unwrap();
     let reused = TestWarehouse { root: bay_dir.clone(), home: warehouse.home.clone() };
     assert_success(&reused.run(&["prepare"]));
@@ -14383,7 +14383,7 @@ fn prepare_refuses_a_bay_and_creates_nothing() {
 #[test]
 fn a_bay_without_a_position_still_lists() {
     let (warehouse, _bay_dir) = warehouse_with_a_bay("bay-no-position");
-    std::fs::remove_file(position_path(&warehouse, Some("b1"))).unwrap();
+    forklift_core::util::file_utils::remove_file(position_path(&warehouse, Some("b1"))).unwrap();
 
     let listed = warehouse.run(&["bay"]);
     assert_success(&listed);
@@ -14987,7 +14987,7 @@ fn a_repack_keeps_the_head_an_open_or_closed_haul_proposes_after_its_source_move
         hauls.push((json(&opened)["data"]["id"].as_str().unwrap().to_string(), proposed));
 
         assert_success(&warehouse.run(&["undo"]));
-        std::fs::remove_file(warehouse.root.join(&file)).unwrap();
+        forklift_core::util::file_utils::remove_file(warehouse.root.join(&file)).unwrap();
         assert_success(&warehouse.run(&["load", "."]));
         assert_success(&warehouse.run(&["shift", "main"]));
     }
@@ -15025,12 +15025,12 @@ fn haul_merge_of_a_head_this_warehouse_does_not_hold_names_where_to_get_it() {
     assert_success(&opened);
     let id = json(&opened)["data"]["id"].as_str().unwrap().to_string();
     assert_success(&warehouse.run(&["undo"]));
-    std::fs::remove_file(warehouse.root.join("feature.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("feature.txt")).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     // As if the haul had been opened elsewhere and its head never fetched here.
-    std::fs::remove_file(warehouse.root.join(".forklift/objects").join(&proposed[..2]).join(&proposed[2..])).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/objects").join(&proposed[..2]).join(&proposed[2..])).unwrap();
 
     let merged = warehouse.run(&["haul", "consolidate", &id]);
     assert!(!merged.status.success());
@@ -15202,7 +15202,7 @@ fn an_abort_under_a_pallet_delete_leaves_both_undoable() {
 #[test]
 fn abort_works_with_the_skeleton_missing() {
     let warehouse = a_conflicted_consolidation("abort-no-skeleton");
-    std::fs::remove_file(warehouse.root.join(".forklift/consolidation-skeleton")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/consolidation-skeleton")).unwrap();
 
     let undo = warehouse.run(&["undo"]);
     assert!(!undo.status.success() && stderr(&undo).contains("\"forklift abort\""),
@@ -15226,7 +15226,7 @@ fn abort_puts_a_file_back_over_the_folder_their_side_made_of_it() {
     assert_success(&warehouse.run(&["stack", "-m", "base"]));
     assert_success(&warehouse.run(&["pallet", "create", "other"]));
     assert_success(&warehouse.run(&["remove", "d"]));
-    std::fs::remove_file(warehouse.root.join("d")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("d")).unwrap();
     warehouse.write_file("d/f", "x\n");
     warehouse.write_file("f.txt", "theirs\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -15245,7 +15245,7 @@ fn abort_puts_a_file_back_over_the_folder_their_side_made_of_it() {
     assert!(stderr(&refused).contains("d/notes.txt"), "{}", stderr(&refused));
     assert_eq!(read(&warehouse, "d/f"), "x\n", "a refused abort changes nothing");
 
-    std::fs::remove_file(warehouse.root.join("d/notes.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("d/notes.txt")).unwrap();
     assert_success(&warehouse.run(&["abort"]));
     assert_eq!(read(&warehouse, "d"), "d\n");
     assert_eq!(staged_and_unstaged(&warehouse), (vec![], vec![]));

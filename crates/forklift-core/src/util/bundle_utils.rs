@@ -293,7 +293,7 @@ fn write_native_bundle(bundle_path: &Path,
     if result.is_err() {
         // A failed write or rename must not strand a store-sized temp envelope until the stale
         // sweep reclaims it; on success the rename already consumed the temp name.
-        let _ = std::fs::remove_file(&temporary_path);
+        let _ = crate::util::file_utils::remove_file(&temporary_path);
     }
     result
 }
@@ -440,7 +440,7 @@ impl TemporaryBundleDirectory {
 
 impl Drop for TemporaryBundleDirectory {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = crate::util::file_utils::remove_dir_all(&self.path);
     }
 }
 
@@ -482,9 +482,9 @@ fn remove_stale_staging(parent: &Path) {
         if is_staging && is_stale {
             let path = entry.path();
             let _ = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                std::fs::remove_dir_all(&path)
+                crate::util::file_utils::remove_dir_all(&path)
             } else {
-                std::fs::remove_file(&path)
+                crate::util::file_utils::remove_file(&path)
             };
         }
     }
@@ -1579,7 +1579,7 @@ mod tests {
         let bundle = std::fs::read(get_latest_bundle_path()).unwrap();
 
         // A redaction applied while the build runs keeps the build from publishing.
-        std::fs::remove_file(get_latest_bundle_path()).unwrap();
+        crate::util::file_utils::remove_file(get_latest_bundle_path()).unwrap();
         let applied_meanwhile = later.clone();
         BEFORE_PUBLISH.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
             crate::util::applied_redactions::apply_for_test(&[&applied_meanwhile]);
@@ -1610,7 +1610,7 @@ mod tests {
         build_bundle().unwrap();
         let bundle = std::fs::read(get_latest_bundle_path()).unwrap();
 
-        std::fs::remove_file(get_latest_bundle_path()).unwrap();
+        crate::util::file_utils::remove_file(get_latest_bundle_path()).unwrap();
         let withheld_meanwhile = later.clone();
         BEFORE_PUBLISH.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
             crate::util::withholding::withhold(&withheld_meanwhile, "DMCA notice").unwrap();
@@ -1677,7 +1677,7 @@ mod tests {
             let root = std::env::temp_dir().join(format!(
                 "forklift-bundle-test-{}-{}-{}", name, std::process::id(), id
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = crate::util::file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -1688,7 +1688,7 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = crate::util::file_utils::remove_dir_all(&self.root);
         }
     }
 

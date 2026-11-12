@@ -276,12 +276,12 @@ fn write_taint_file(root: &Path, relative_paths: &BTreeSet<PathBuf>) -> Result<(
     let content = taint_file_bytes(relative_paths.iter().map(|path| taint_record_line(path)));
 
     if let Err(e) = handle.write_all(&content) {
-        let _ = std::fs::remove_file(&candidate);
+        let _ = file_utils::remove_file(&candidate);
         return Err(format!("Error while writing taint file \"{}\": {}", candidate.to_string_lossy(), e));
     }
 
     if let Err(e) = sync_taint_file(&handle, &candidate) {
-        let _ = std::fs::remove_file(&candidate);
+        let _ = file_utils::remove_file(&candidate);
         return Err(e);
     }
 
@@ -290,7 +290,7 @@ fn write_taint_file(root: &Path, relative_paths: &BTreeSet<PathBuf>) -> Result<(
     // unchanged — a plain fsync-of-a-directory-handle helper, never itself a barrier that could
     // fail a rename and recurse back into tainting.
     if let Err(e) = file_utils::sync_dir(&taint_dir) {
-        let _ = std::fs::remove_file(&candidate);
+        let _ = file_utils::remove_file(&candidate);
         return Err(e);
     }
 
@@ -695,7 +695,7 @@ fn parse_taint_content(bytes: &[u8]) -> (BTreeSet<PathBuf>, bool) {
 /// construction. Shared by [`remove_taint_files`] and [`resolve_taints`].
 fn delete_snapshot_and_sync(root: &Path, files: &[PathBuf]) -> Result<(), String> {
     for path in files {
-        match std::fs::remove_file(path) {
+        match file_utils::remove_file(path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("Error while removing taint file \"{}\": {}", path.to_string_lossy(), e)),
@@ -895,7 +895,7 @@ mod tests {
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()
             .join(format!("forklift-taint-utils-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1041,7 +1041,7 @@ mod tests {
         let object_a = forklift.join("objects").join("aa").join("bb001122");
         record_taint(&[object_a.as_path()]).unwrap();
         let first_name = only_taint_filename(&taint_dir);
-        std::fs::remove_file(taint_dir.join(&first_name)).unwrap();
+        file_utils::remove_file(taint_dir.join(&first_name)).unwrap();
 
         let object_b = forklift.join("objects").join("cc").join("dd003344");
         record_taint(&[object_b.as_path()]).unwrap();
@@ -1311,7 +1311,7 @@ mod tests {
 
         // Out-of-band removal, standing in for a sibling healer that already won the race on this
         // exact file.
-        std::fs::remove_file(&snapshot.files[0]).unwrap();
+        file_utils::remove_file(&snapshot.files[0]).unwrap();
 
         let _guard = file_utils::SyncDirFaultGuard::recording();
         let result = remove_taint_files(&forklift, &snapshot.files);
@@ -1586,11 +1586,11 @@ mod tests {
         assert!(gate_check(&forklift).is_err(), "sanity: the gate is standing before the swap");
 
         let taint_dir = forklift.join(FOLDER_NAME_TAINT);
-        std::fs::remove_dir_all(&taint_dir).unwrap();
+        file_utils::remove_dir_all(&taint_dir).unwrap();
         std::fs::write(&taint_dir, b"not a directory").unwrap();
 
         // Empty remainder *and* empty `old_files`, deliberately: a non-empty `old_files` would
-        // make the durable-file-work phase's own `std::fs::remove_file` calls fail with their own
+        // make the durable-file-work phase's own `remove_file` calls fail with their own
         // "not a directory" error — a different, already-covered failure mode, not the one this
         // test targets.
         let result = resolve_taints(&forklift, &BTreeSet::new(), &[]);
@@ -1599,7 +1599,7 @@ mod tests {
         assert!(gate_check(&forklift).is_err(),
             "the gate must be left exactly as it was — still standing — never guessed clear");
 
-        std::fs::remove_file(&taint_dir).unwrap();
+        file_utils::remove_file(&taint_dir).unwrap();
     }
 
     // --- GATE_COUNT fast-path tests --------------------------------------------------------

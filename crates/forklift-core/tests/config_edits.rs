@@ -24,7 +24,7 @@ const SETTLE: Duration = Duration::from_millis(500);
 #[test]
 fn configuration_edits_are_atomic_and_serialized() {
     let root = std::env::temp_dir().join(format!("forklift-config-edits-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
 
     an_edit_waits_for_the_lock_and_loads_only_after_taking_it(&root);
@@ -38,7 +38,7 @@ fn configuration_edits_are_atomic_and_serialized() {
     a_dangling_symlinked_config_folder_is_refused_before_anything_is_created(&root);
     a_replaced_config_keeps_its_permissions(&root);
 
-    std::fs::remove_dir_all(&root).ok();
+    forklift_core::util::file_utils::remove_dir_all(&root).ok();
 }
 
 /// Point the global configuration at a fresh file in its own folder, optionally seeded.

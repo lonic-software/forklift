@@ -196,7 +196,7 @@ pub fn restore(path: &Path, set: &BTreeSet<String>) {
 /// Unconditionally clear the marker, best-effort — see [`remove_covered_by`]'s doc comment on
 /// why failures are swallowed here too.
 pub fn clear(path: &Path) {
-    let _ = std::fs::remove_file(path);
+    let _ = file_utils::remove_file(path);
 }
 
 /// Write `set`'s serialized bytes to `path`, or remove `path` entirely when `set` is empty — a
@@ -233,7 +233,7 @@ mod tests {
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()
             .join(format!("forklift-marker-utils-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("marker")
     }

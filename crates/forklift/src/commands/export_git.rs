@@ -156,14 +156,14 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
     if let Err(refused) = exporter.check_removed() {
         // The path was new or empty, so everything in it is the run's.
         let removed = match created {
-            true => std::fs::remove_dir_all(target),
+            true => file_utils::remove_dir_all(target),
             false => std::fs::read_dir(target).and_then(|entries| entries.into_iter().try_for_each(|entry| {
                 let entry = entry?;
                 // A link is removed, never followed; Windows removes a link to a folder as a folder.
                 match entry.file_type()?.is_dir() {
-                    true => std::fs::remove_dir_all(entry.path()),
-                    false => std::fs::remove_file(entry.path()).or_else(|error| match entry.file_type()?.is_symlink() {
-                        true => std::fs::remove_dir(entry.path()),
+                    true => file_utils::remove_dir_all(entry.path()),
+                    false => file_utils::remove_file(entry.path()).or_else(|error| match entry.file_type()?.is_symlink() {
+                        true => file_utils::remove_dir(entry.path()),
                         false => Err(error),
                     }),
                 }
@@ -1140,14 +1140,14 @@ impl<'a> Exporter<'a> {
         };
 
         if let Err(e) = assemble() {
-            let _ = std::fs::remove_file(&temp_path);
+            let _ = file_utils::remove_file(&temp_path);
             return Err(e);
         }
 
         let temp_str = temp_path.to_string_lossy().into_owned();
         let git_hash = self.repo.run(&["hash-object", "-w", "--no-filters", "--", &temp_str], None)
             .map(|h| h.trim().to_string());
-        let _ = std::fs::remove_file(&temp_path);
+        let _ = file_utils::remove_file(&temp_path);
         let git_hash = git_hash?;
         self.blobs_written += 1;
 
@@ -1889,11 +1889,11 @@ mod tests {
         let created = create_export_temp(&recipe, &counter);
         let contents: Vec<_> = litter.iter().map(|file| std::fs::read(file).unwrap()).collect();
         for file in &litter {
-            let _ = std::fs::remove_file(file);
+            let _ = file_utils::remove_file(file);
         }
 
         let (path, _file) = created.expect("litter must not fail the export");
-        let _ = std::fs::remove_file(&path);
+        let _ = file_utils::remove_file(&path);
         assert!(!litter.contains(&path), "a taken name was reused: {}", path.display());
         assert!(contents.iter().all(|content| content == b"litter"), "litter is left as it was");
     }

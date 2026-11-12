@@ -847,7 +847,7 @@ mod tests {
         assert!(file.resolution_hook.is_none());
         assert_eq!(file.authentication_cache_secs, None);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     #[test]
@@ -884,7 +884,7 @@ mod tests {
                    Some("https://provider.example/hooks/auth"));
         assert_eq!(file.authentication_cache_secs, Some(60));
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// The inline-table form of `hooks` (`hooks = { … }`, `Value::InlineTable`) is legal TOML
@@ -910,7 +910,7 @@ mod tests {
         );
         assert_eq!(file.authentication_cache_secs, Some(60));
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// The inline-table form must still reject an unrecognized key inside it, the same as the
@@ -928,7 +928,7 @@ mod tests {
         assert!(error.contains("\"autentication_url\""), "{}", error);
         assert!(error.contains("[hooks]"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     // ---------------------------------------------------------------------------------
@@ -946,7 +946,7 @@ mod tests {
         assert!(error.contains("\"token\""), "{}", error);
         assert!(error.contains("not a string"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     #[test]
@@ -957,7 +957,7 @@ mod tests {
         assert!(error.contains("\"max_body_mb\""), "{}", error);
         assert!(error.contains("not an integer"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     #[test]
@@ -968,7 +968,7 @@ mod tests {
         assert!(error.contains("\"rebuild_after_lifts\""), "{}", error);
         assert!(error.contains("not an integer"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// Part 2's own opt-in field gets the same strict treatment as every other scalar: a
@@ -982,7 +982,7 @@ mod tests {
         assert!(error.contains("\"open\""), "{}", error);
         assert!(error.contains("not a boolean"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// A present-but-not-a-table `hooks` entry must error rather than silently read as "no
@@ -997,7 +997,7 @@ mod tests {
         assert!(error.contains("\"hooks\""), "{}", error);
         assert!(error.contains("not a table"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     #[test]
@@ -1008,7 +1008,7 @@ mod tests {
         assert!(error.contains("authentication_url"), "{}", error);
         assert!(error.contains("not a string"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     #[test]
@@ -1023,7 +1023,7 @@ mod tests {
         assert!(error.contains("authentication_cache_secs"), "{}", error);
         assert!(error.contains("not an integer"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// The auth-path instance of the negative-integer-wraps-to-huge-unsigned hole:
@@ -1045,7 +1045,7 @@ mod tests {
         assert!(error.contains("authentication_cache_secs"), "{}", error);
         assert!(error.contains("negative"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// The magnitude half of the same hole (PR #124 round 3, F3): the sign check alone lets
@@ -1069,7 +1069,7 @@ mod tests {
         assert!(error.contains("authentication_cache_secs"), "{}", error);
         assert!(error.contains("ceiling"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// The boundary itself must still be accepted: exactly the ceiling (24h) is a legal, if
@@ -1088,7 +1088,7 @@ mod tests {
 
         assert_eq!(file.authentication_cache_secs, Some(server::MAX_AUTHENTICATION_CACHE_SECS));
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// The same negative-wraps-to-huge-unsigned hole, applied to `max_body_mb` (`as u64`) while
@@ -1104,7 +1104,7 @@ mod tests {
         assert!(error.contains("\"max_body_mb\""), "{}", error);
         assert!(error.contains("negative"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// Same again for `rebuild_after_lifts` (`as u32`): closes the negative-wraps-to-huge-unsigned
@@ -1119,7 +1119,7 @@ mod tests {
         assert!(error.contains("\"rebuild_after_lifts\""), "{}", error);
         assert!(error.contains("negative"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// The magnitude half of the class the sign check alone does not close (PR #124 round 3,
@@ -1138,7 +1138,7 @@ mod tests {
         assert!(error.contains("\"rebuild_after_lifts\""), "{}", error);
         assert!(error.contains("u32::MAX"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// The boundary itself must still be accepted: `u32::MAX` is the largest legal value, not an
@@ -1153,7 +1153,7 @@ mod tests {
 
         assert_eq!(file.rebuild_after_lifts, Some(u32::MAX));
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// Pre-existing behaviour (not new in this fix): a hook configured with only one of its
@@ -1166,7 +1166,7 @@ mod tests {
         assert!(error.contains("authentication"), "{}", error);
         assert!(error.contains("only one of"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     // ---------------------------------------------------------------------------------
@@ -1183,7 +1183,7 @@ mod tests {
         assert!(error.contains("\"tokenn\""), "{}", error);
         assert!(error.contains("top-level"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// The mistyped-hook-key reproduction: `autentication_url` (missing an "h") must never be
@@ -1199,7 +1199,7 @@ mod tests {
         assert!(error.contains("\"autentication_url\""), "{}", error);
         assert!(error.contains("[hooks]"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     // ---------------------------------------------------------------------------------
@@ -1209,7 +1209,7 @@ mod tests {
     #[test]
     fn a_missing_config_file_is_an_error() {
         let path = std::env::temp_dir().join("forklift-server-main-test-does-not-exist.toml");
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
         assert!(parse_config(path.to_str().unwrap()).is_err());
     }
 
@@ -1217,7 +1217,7 @@ mod tests {
     fn invalid_toml_is_an_error() {
         let path = scratch_config("invalid-toml", "not [ valid toml");
         assert!(parse_config(path.to_str().unwrap()).is_err());
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     // ---------------------------------------------------------------------------------
@@ -1344,7 +1344,7 @@ mod tests {
         assert!(!error.contains("No authentication is configured"), "{}", error);
         assert!(error.contains("Error while resolving"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// The whitespace-only sibling of the test just above (PR #124 round 3, F1): a
@@ -1369,7 +1369,7 @@ mod tests {
         assert!(!error.contains("No authentication is configured"), "{}", error);
         assert!(error.contains("Error while resolving"), "{}", error);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     /// F2: when a blank `--token` is the *only* auth-flavored thing supplied (no real token
@@ -1415,7 +1415,7 @@ mod tests {
         assert!(formatted.contains("token"), "{}", formatted);
         assert!(formatted.contains("redacted"), "{}", formatted);
 
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
     // ---------------------------------------------------------------------------------
@@ -1454,7 +1454,7 @@ mod tests {
     /// A scratch root for one test, empty.
     fn scratch_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("forklift-server-main-test-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
     }
@@ -1499,14 +1499,14 @@ mod tests {
         assert_eq!(refusal(refused).0, forklift_core::error::RefusalCode::CloneIncomplete);
 
         // Without the clone, the folder holds no marker: still no warehouse.
-        std::fs::remove_file(forklift_core::util::franchise_utils::record_path(&forklift)).unwrap();
+        forklift_core::util::file_utils::remove_file(forklift_core::util::franchise_utils::record_path(&forklift)).unwrap();
         let refused = server::open_root(root.to_str().unwrap()).unwrap_err();
         assert_eq!(refusal(refused).0, forklift_core::error::RefusalCode::NotAWarehouse);
 
         std::fs::write(forklift.join(forklift_core::util::warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), b"/forklift-warehouse 3\nformat 1\nfull\n").unwrap();
         assert_eq!(server::open_root(root.to_str().unwrap()).unwrap().root, std::fs::canonicalize(&root).unwrap());
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// `bundle` writes into its root and `gc` deletes from it, so each refuses every root that is
@@ -1553,7 +1553,7 @@ mod tests {
             assert_eq!(listing(&root), before, "{}: nothing written", name);
             assert!(name == "none" || root.join(forklift_name).exists());
 
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
     }
 
@@ -1604,7 +1604,7 @@ mod tests {
         bundle(file.to_str().unwrap()).unwrap();
 
         for root in [empty, warehouse, old, file] {
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
     }
 }

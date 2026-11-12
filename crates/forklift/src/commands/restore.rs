@@ -621,7 +621,7 @@ mod tests {
     fn a_restore_that_would_discard_a_change_lists_it_and_writes_nothing_without_confirm() {
         let warehouse = loaded_pair("restore-needs-confirm");
         std::fs::write(warehouse.root.join("dir/a.txt"), b"edited\n").unwrap();
-        std::fs::remove_file(warehouse.root.join("dir/b.txt")).unwrap();
+        forklift_core::util::file_utils::remove_file(warehouse.root.join("dir/b.txt")).unwrap();
 
         // The missing file would be written back first, were anything written: nothing is.
         for target in ["dir", "dir/a.txt", "."] {
@@ -639,12 +639,12 @@ mod tests {
     #[test]
     fn a_restore_that_discards_nothing_needs_no_confirm() {
         let warehouse = loaded_pair("restore-no-confirm");
-        std::fs::remove_file(warehouse.root.join("dir/a.txt")).unwrap();
+        forklift_core::util::file_utils::remove_file(warehouse.root.join("dir/a.txt")).unwrap();
 
         handle_command("dir/a.txt", false).unwrap();
         assert_eq!(std::fs::read(warehouse.root.join("dir/a.txt")).unwrap(), b"a\n");
 
-        std::fs::remove_file(warehouse.root.join("dir/b.txt")).unwrap();
+        forklift_core::util::file_utils::remove_file(warehouse.root.join("dir/b.txt")).unwrap();
         handle_command("dir", false).unwrap();
         assert_eq!(std::fs::read(warehouse.root.join("dir/b.txt")).unwrap(), b"b\n");
     }
@@ -653,7 +653,7 @@ mod tests {
     fn a_folder_where_a_file_was_refuses_the_directory_before_anything_is_written() {
         let warehouse = loaded_pair("restore-folder-first");
         std::fs::write(warehouse.root.join("dir/a.txt"), b"edited\n").unwrap();
-        std::fs::remove_file(warehouse.root.join("dir/b.txt")).unwrap();
+        forklift_core::util::file_utils::remove_file(warehouse.root.join("dir/b.txt")).unwrap();
         std::fs::create_dir(warehouse.root.join("dir/b.txt")).unwrap();
 
         let error = handle_command("dir", true).unwrap_err();

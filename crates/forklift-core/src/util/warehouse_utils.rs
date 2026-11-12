@@ -875,7 +875,7 @@ pub fn prepare_warehouse(mode: PrepareMode) -> Result<Vec<String>, String> {
     // folder something was put in since is filled in place instead, and so is one that cannot be
     // removed (a mount point, or in a directory this may not write).
     if is_empty_real_folder(&forklift)? {
-        let _ = std::fs::remove_dir(&forklift);
+        let _ = file_utils::remove_dir(&forklift);
     }
 
     match std::fs::symlink_metadata(&forklift) {
@@ -1142,8 +1142,8 @@ pub(crate) fn place_forklift(forklift: &Path, build: impl FnOnce(&Path) -> Resul
     let lock = match lock {
         Ok(lock) => lock,
         Err(e) => {
-            let _ = std::fs::remove_file(&lock_path);
-            let _ = std::fs::remove_dir(&staging);
+            let _ = file_utils::remove_file(&lock_path);
+            let _ = file_utils::remove_dir(&staging);
             return Err(e);
         }
     };
@@ -1175,8 +1175,8 @@ pub(crate) fn place_forklift(forklift: &Path, build: impl FnOnce(&Path) -> Resul
     // removal follows nothing it did not make; gone already once placed.
     let _ = file_utils::remove_unfollowed(&staged);
     drop(lock);
-    let _ = std::fs::remove_file(&lock_path);
-    let _ = std::fs::remove_dir(&staging);
+    let _ = file_utils::remove_file(&lock_path);
+    let _ = file_utils::remove_dir(&staging);
 
     let placement = placed?;
 
@@ -1225,11 +1225,11 @@ fn sweep_staging_leftovers(parent: &Path, name: &str) {
                 }
 
                 drop(lock);
-                let _ = std::fs::remove_file(&lock_path);
-                let _ = std::fs::remove_dir(&staging);
+                let _ = file_utils::remove_file(&lock_path);
+                let _ = file_utils::remove_dir(&staging);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let _ = std::fs::remove_dir(&staging);
+                let _ = file_utils::remove_dir(&staging);
             }
             Err(_) => (),
         }
@@ -1318,7 +1318,7 @@ mod tests {
     #[test]
     fn a_current_directory_is_respelled_as_its_parents_list_it() {
         let root = std::env::temp_dir().join(format!("forklift-warehouse-respell-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("docs/Sub")).unwrap();
 
         assert_eq!(respell_as_listed(&root, Path::new("docs/Sub")).unwrap(), Path::new("docs/Sub"));
@@ -1332,7 +1332,7 @@ mod tests {
         let error = respell_as_listed(&root, Path::new("docs/missing")).unwrap_err();
         assert!(error.contains("\"missing\" is not listed"), "{}", error);
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// Below a parent that can be traversed but not listed, a component keeps the spelling it was
@@ -1343,7 +1343,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!("forklift-warehouse-respell-locked-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("locked/inner")).unwrap();
         std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o100)).unwrap();
 
@@ -1359,12 +1359,12 @@ mod tests {
         }
 
         std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     fn fresh_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("forklift-warehouse-{}-{}", label, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1417,7 +1417,7 @@ mod tests {
         assert_eq!(prepare_at(&root).unwrap(), Vec::<String>::new());
         assert_eq!(bay_utils::classify_forklift(&forklift), Ok(bay_utils::ForkliftKind::Warehouse));
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// An empty `.forklift` is replaced by a built one, never filled in place.
@@ -1438,7 +1438,7 @@ mod tests {
         assert_eq!(notes[0], "Created folder \".forklift\".");
         assert_eq!(staging_leftovers(&root), Vec::<PathBuf>::new());
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// A `.forklift` with anything in it is filled in place, marker last (a clone's claim is
@@ -1459,7 +1459,7 @@ mod tests {
         assert!(!notes.iter().any(|note| note.contains("objects")), "objects existed: {:?}", notes);
         assert!(notes.iter().any(|note| note.contains("inventory")), "{:?}", notes);
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// A prepare stopped before its rename leaves no `.forklift`, only a staging folder the built-in
@@ -1494,7 +1494,7 @@ mod tests {
             assert_eq!(staging_leftovers(&root), Vec::<PathBuf>::new(), "the leftover was swept");
         }
 
-        std::fs::remove_dir_all(&outer).ok();
+        file_utils::remove_dir_all(&outer).ok();
     }
 
     /// A bay's folder put at `.forklift` while a prepare builds its own is refused, never filled.
@@ -1515,7 +1515,7 @@ mod tests {
         let names: Vec<_> = std::fs::read_dir(&forklift).unwrap().flatten().map(|entry| entry.file_name()).collect();
         assert_eq!(names, vec![std::ffi::OsString::from(bay_utils::FILE_NAME_BAY_REDIRECT)], "the bay's folder was filled");
         assert!(staging_leftovers(&root).is_empty());
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// A staging folder whose lock is held is in use and kept; once released it is swept. One
@@ -1557,7 +1557,7 @@ mod tests {
         sweep_staging_leftovers(&root, FOLDER_NAME_FORKLIFT_ROOT);
         assert!(!live.exists(), "released, it is swept");
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// A marker this build cannot read is an error everywhere a warehouse is judged, and prepare
@@ -1595,7 +1595,7 @@ mod tests {
             assert_eq!(bay_utils::classify_forklift(&forklift), Ok(bay_utils::ForkliftKind::Warehouse));
         }
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// A clone's claim puts its `.forklift` in place with the record inside; prepare then fills
@@ -1627,7 +1627,7 @@ mod tests {
         assert!(forklift.join("objects").is_dir());
         assert_eq!(franchise_utils::read(&forklift), Ok(Some(record)));
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// The scopes a mode's prepare writes before the marker: both scope files for a sparse
@@ -1688,8 +1688,8 @@ mod tests {
 
         // Prepared again over its marker, with its fetch scope and origin gone: the mode stands and
         // nothing is restored, so the warehouse stays refused rather than quietly whole again.
-        std::fs::remove_file(forklift.join("config").join("fetch-scope")).unwrap();
-        std::fs::remove_file(forklift.join(origin_utils::FILE_NAME)).unwrap();
+        file_utils::remove_file(forklift.join("config").join("fetch-scope")).unwrap();
+        file_utils::remove_file(forklift.join(origin_utils::FILE_NAME)).unwrap();
         {
             let _scope = globals::StorageRootScope::enter(&target);
             prepare_warehouse(PrepareMode::Full).unwrap();
@@ -1699,7 +1699,7 @@ mod tests {
         assert_eq!(scope_files(&forklift), (None, Some(written)));
         assert_eq!(origin_in(&target), None);
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// A warehouse put in place of another format between the check and the fill is not completed:
@@ -1722,7 +1722,7 @@ mod tests {
             left.retain(|name| name != lock_utils::FILE_NAME_FORMAT_LOCK);
             assert_eq!(left, [FILE_NAME_WAREHOUSE_MARKER], "{:?}", marker);
 
-            std::fs::remove_dir_all(&root).ok();
+            file_utils::remove_dir_all(&root).ok();
         }
     }
 
@@ -1777,6 +1777,6 @@ mod tests {
         std::fs::write(&marker, "/forklift-warehouse 3\nformat 1\nsomething-new\n").unwrap();
         assert!(has_warehouse_marker(&forklift).is_err());
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 }

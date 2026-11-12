@@ -32,7 +32,7 @@ impl Warehouse {
             .join(format!("forklift-nested-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
         let home = base.join("home");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
 
@@ -144,7 +144,7 @@ impl Warehouse {
 
 impl Drop for Warehouse {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.base);
     }
 }
 
@@ -426,7 +426,7 @@ fn replacing_a_folder_holding_a_nested_working_tree_refuses_whatever_the_rules_s
         warehouse.run_ok(&["pallet", "create", "flip"]);
         warehouse.run_ok(&["shift", "flip"]);
         warehouse.run_ok(&["remove", "a"]);
-        std::fs::remove_dir_all(warehouse.path("a")).unwrap();
+        forklift_core::util::file_utils::remove_dir_all(warehouse.path("a")).unwrap();
         warehouse.write("a", "now a file\n");
         warehouse.write("0.txt", "changed\n");
         warehouse.run_ok(&["load", "."]);
@@ -472,7 +472,7 @@ fn replacing_a_folder_holding_an_ignored_file_refuses_and_writes_nothing() {
     warehouse.run_ok(&["pallet", "create", "flip"]);
     warehouse.run_ok(&["shift", "flip"]);
     warehouse.run_ok(&["remove", "a"]);
-    std::fs::remove_dir_all(warehouse.path("a")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.path("a")).unwrap();
     warehouse.write("a", "now a file\n");
     warehouse.write("0.txt", "changed\n");
     warehouse.run_ok(&["load", "."]);
@@ -490,7 +490,7 @@ fn replacing_a_folder_holding_an_ignored_file_refuses_and_writes_nothing() {
     assert_eq!(warehouse.read("a/junk"), "ignored\n");
 
     // Once the ignored file is out of the way, the same shift goes through.
-    std::fs::remove_file(warehouse.path("a/junk")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.path("a/junk")).unwrap();
     warehouse.run_ok(&["shift", "flip"]);
     assert_eq!(warehouse.read("a"), "now a file\n");
 }
@@ -499,7 +499,7 @@ fn replacing_a_folder_holding_an_ignored_file_refuses_and_writes_nothing() {
 #[test]
 fn import_git_refuses_a_metadata_folder_below_the_top_level() {
     let base = std::env::temp_dir().join(format!("forklift-nested-import-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     let root = base.join("repo");
     let home = base.join("home");
     std::fs::create_dir_all(root.join("sub/.forklift")).unwrap();
@@ -511,7 +511,7 @@ fn import_git_refuses_a_metadata_folder_below_the_top_level() {
     git_in(&root, &["commit", "-qm", "planted"]);
     // The planted folder stays in git's history; it must not stay on disk, or it would be the
     // warehouse `prepare` finds.
-    std::fs::remove_dir_all(root.join("sub")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(root.join("sub")).unwrap();
 
     let run = |args: &[&str]| forklift_command()
         .args(args)
@@ -524,7 +524,7 @@ fn import_git_refuses_a_metadata_folder_below_the_top_level() {
     assert!(run(&["config", "set", "operator.identifier", "nested@forklift"]).status.success());
 
     let import = run(&["git", "import", "."]);
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     assert!(!import.status.success(), "git import accepted the planted folder");
     assert!(stderr(&import).contains("\"sub\"") && stderr(&import).contains("\".forklift\""),
         "the refusal must name where: {}", stderr(&import));

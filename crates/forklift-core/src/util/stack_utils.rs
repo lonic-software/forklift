@@ -659,7 +659,7 @@ mod tests {
     #[test]
     fn an_unsigned_write_whose_anchor_appeared_after_the_signing_choice_is_refused() {
         let root = std::env::temp_dir().join(format!("forklift-stack-utils-anchor-appeared-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = crate::globals::StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -675,6 +675,6 @@ mod tests {
 
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), None, "the pallet must be unchanged");
         assert_eq!(refused, Err(RefUpdateError::AnchorMoved));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
     }
 }

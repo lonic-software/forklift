@@ -3684,7 +3684,7 @@ mod tests {
             let root = std::env::temp_dir().join(format!(
                 "forklift-audit-test-{}-{}-{}", name, std::process::id(), id
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = crate::globals::StorageRootScope::enter(&root);
             Scratch { _scope: scope, root }
@@ -3693,7 +3693,7 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = file_utils::remove_dir_all(&self.root);
         }
     }
 
@@ -4054,7 +4054,7 @@ mod tests {
             let root = std::env::temp_dir().join(format!(
                 "forklift-privilege-test-{}-{}", name, std::process::id()
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
             let keys_dir = root.join("keys");
             std::fs::create_dir_all(&keys_dir).unwrap();
             let previous_keys_dir = std::env::var("FORKLIFT_KEYS_DIR").ok();
@@ -4141,7 +4141,7 @@ mod tests {
                 Some(previous) => std::env::set_var("FORKLIFT_KEYS_DIR", previous),
                 None => std::env::remove_var("FORKLIFT_KEYS_DIR"),
             }
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = file_utils::remove_dir_all(&self.root);
         }
     }
 

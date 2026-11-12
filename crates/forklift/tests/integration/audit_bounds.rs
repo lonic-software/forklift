@@ -44,7 +44,7 @@ impl Warehouse {
             std::env::temp_dir().join(format!("forklift-audit-bounds-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
         let home = base.join("home");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
 
@@ -130,7 +130,7 @@ impl Warehouse {
     /// Delete an arbitrary object (not a parcel — no signature sidecar) from the store.
     fn delete_object(&self, hash: &str) {
         let objects = self.root.join(".forklift").join("objects").join(&hash[0..2]);
-        std::fs::remove_file(objects.join(&hash[2..])).expect("the object existed");
+        forklift_core::util::file_utils::remove_file(objects.join(&hash[2..])).expect("the object existed");
     }
 
     /// Overwrite an object's on-disk bytes with garbage: the file stays *present* (a presence
@@ -165,8 +165,8 @@ impl Warehouse {
     fn delete_parcel(&self, hash: &str) {
         let objects = self.root.join(".forklift").join("objects").join(&hash[0..2]);
 
-        std::fs::remove_file(objects.join(&hash[2..])).expect("the parcel object existed");
-        let _ = std::fs::remove_file(objects.join(format!("{}.sig", &hash[2..])));
+        forklift_core::util::file_utils::remove_file(objects.join(&hash[2..])).expect("the parcel object existed");
+        let _ = forklift_core::util::file_utils::remove_file(objects.join(format!("{}.sig", &hash[2..])));
     }
 
     /// Write the sealed-by-hash record holding exactly `hashes`, as the record's writers would.
@@ -1454,11 +1454,11 @@ fn a_failed_rebuild_stops_heal() {
     warehouse.stack_files(&[("a.txt", "a\n")], "K");
     let (bytes, _) = plant_damaged_record(&warehouse, &"a".repeat(64), &"b".repeat(64));
     let lock = warehouse.root.join(".forklift").join("refs.lock");
-    let _ = std::fs::remove_file(&lock);
+    let _ = forklift_core::util::file_utils::remove_file(&lock);
     std::fs::create_dir(&lock).unwrap();
 
     let failed = warehouse.run(&["heal"]);
-    std::fs::remove_dir(&lock).unwrap();
+    forklift_core::util::file_utils::remove_dir(&lock).unwrap();
     let stderr = String::from_utf8_lossy(&failed.stderr);
 
     assert!(!failed.status.success(), "{}", stderr);

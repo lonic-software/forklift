@@ -250,7 +250,7 @@ fn find_nested_working_tree(dir: &Path) -> Result<Option<String>, String> {
 /// Remove a subtree's working files (relative to the checkout root the process entered). A
 /// subtree already gone is the desired outcome.
 fn remove_working_subtree(prefix: &str) -> Result<(), String> {
-    match std::fs::remove_dir_all(prefix) {
+    match forklift_core::util::file_utils::remove_dir_all(prefix) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("Error while de-materializing \"{}\": {}", prefix, e)),
@@ -263,7 +263,7 @@ fn remove_working_subtree(prefix: &str) -> Result<(), String> {
 fn remove_working_path(path: &str) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => remove_working_subtree(path),
-        Ok(_) => std::fs::remove_file(path).map_err(|e| format!("Error while de-materializing \"{}\": {}", path, e)),
+        Ok(_) => forklift_core::util::file_utils::remove_file(path).map_err(|e| format!("Error while de-materializing \"{}\": {}", path, e)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("Error while de-materializing \"{}\": {}", path, e)),
     }

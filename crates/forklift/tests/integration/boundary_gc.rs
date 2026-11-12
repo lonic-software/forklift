@@ -83,7 +83,7 @@ impl Warehouse {
             std::env::temp_dir().join(format!("forklift-boundary-gc-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
         let home = base.join("home");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = file_utils::remove_dir_all(&base);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
 
@@ -144,7 +144,7 @@ impl Warehouse {
 
     /// What a pallet-deletion verb would do: unlink the ref file.
     fn delete_pallet_ref(&self, pallet: &str) {
-        std::fs::remove_file(self.root.join(".forklift").join("pallets").join(pallet))
+        file_utils::remove_file(self.root.join(".forklift").join("pallets").join(pallet))
             .expect("the ref existed");
     }
 
@@ -189,7 +189,7 @@ impl Warehouse {
     /// so a leg that needs it reaches for this instead.
     fn delete_object(&self, hash: &str) {
         let path = self.root.join(".forklift").join("objects").join(&hash[..2]).join(&hash[2..]);
-        std::fs::remove_file(&path).unwrap_or_else(|e| {
+        file_utils::remove_file(&path).unwrap_or_else(|e| {
             panic!("failed to delete object {} at {}: {}", hash, path.display(), e)
         });
     }
@@ -203,7 +203,7 @@ impl Warehouse {
     fn delete_signature(&self, hash: &str) {
         let path = self.root.join(".forklift").join("objects").join(&hash[..2])
             .join(format!("{}.sig", &hash[2..]));
-        std::fs::remove_file(&path).unwrap_or_else(|e| {
+        file_utils::remove_file(&path).unwrap_or_else(|e| {
             panic!("failed to delete signature for {} at {}: {}", hash, path.display(), e)
         });
     }
@@ -946,7 +946,7 @@ fn a_pick_whose_source_was_lost_refuses_naming_the_pick_and_the_abort_works() {
         err
     );
 
-    std::fs::remove_file(pick_state_file(&warehouse)).unwrap();
+    file_utils::remove_file(pick_state_file(&warehouse)).unwrap();
     warehouse.run_ok(&["stack", "-m", "completed pick"]);
 
     // As the refusal says, the stacked changes record the operator as their only author. With the
@@ -1367,7 +1367,7 @@ fn staged_content_survives_collection_and_a_torn_taint_heals_over_it() {
         String::from_utf8_lossy(&stocktake.stdout)
     );
 
-    std::fs::remove_file(warehouse.root.join("wip.txt")).unwrap();
+    file_utils::remove_file(warehouse.root.join("wip.txt")).unwrap();
     warehouse.run_ok(&["restore", "--confirm", "wip.txt"]);
     assert_eq!(
         std::fs::read_to_string(warehouse.root.join("wip.txt")).unwrap(),
@@ -1398,7 +1398,7 @@ fn a_full_repack_keeps_staged_content_and_the_next_stack_restores_it() {
     warehouse.run_ok(&["stack", "-m", "second"]);
     warehouse.run_ok(&["audit"]);
 
-    std::fs::remove_file(warehouse.root.join("wip.txt")).unwrap();
+    file_utils::remove_file(warehouse.root.join("wip.txt")).unwrap();
     let restored = warehouse.run(&["restore", "--confirm", "wip.txt"]);
     assert!(
         restored.status.success(),
@@ -1570,7 +1570,7 @@ fn stack_and_park_refuse_a_staged_object_the_store_lost() {
         if arm == "park" {
             warehouse.run_ok(&["park", "pop"]);
         } else {
-            std::fs::remove_file(warehouse.root.join(file)).unwrap();
+            file_utils::remove_file(warehouse.root.join(file)).unwrap();
             warehouse.run_ok(&["restore", "--confirm", "--", file]);
         }
         if std::fs::read(warehouse.root.join(file)).ok().as_deref() != Some(&content[..]) {
@@ -1656,7 +1656,7 @@ fn stack_names_an_unreadable_head_tree_or_recipe_as_itself() {
         };
 
         let path = warehouse.root.join(".forklift").join("objects").join(&damaged[..2]).join(&damaged[2..]);
-        std::fs::remove_file(&path).unwrap();
+        file_utils::remove_file(&path).unwrap();
         std::fs::write(&path, b"not an object").unwrap();
 
         let stacked = warehouse.run(&["stack", "-m", "second"]);

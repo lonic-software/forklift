@@ -1701,7 +1701,7 @@ mod tests {
 
     fn scratch(name: &str) -> (PathBuf, crate::globals::StorageRootScope) {
         let root = std::env::temp_dir().join(format!("forklift-sealed-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&root);
         origin_utils::write_for_tests("http://origin.test");
@@ -1739,7 +1739,7 @@ mod tests {
         expected.extend(encode_frames(&[(SealOp::Record, B), (SealOp::Remove, A)]).unwrap().concat());
         assert_eq!(std::fs::read(sealed_path()).unwrap(), expected, "appended in place, one frame");
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -1757,7 +1757,7 @@ mod tests {
         assert_eq!(read_sealed().unwrap(), set);
         assert!(set.contains(A) && hashes.iter().all(|hash| set.contains(hash)));
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -1774,7 +1774,7 @@ mod tests {
         assert!(set.contains(A) && set.contains(B), "the torn removal was never replayed");
         assert_eq!(std::fs::read(sealed_path()).unwrap(), record(&[(SealOp::Record, A), (SealOp::Record, B)]));
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -1794,7 +1794,7 @@ mod tests {
         assert!(append(&[(SealOp::Record, B)]).unwrap_err().contains("format this version"));
         assert_eq!(std::fs::read(sealed_path()).unwrap(), other);
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     /// FORK-309: heal's rebuild keeps the header and the frames before the damage, verbatim, and
@@ -1819,7 +1819,7 @@ mod tests {
 
         assert!(append(&[(SealOp::Record, B)]).unwrap().contains(B));
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     /// A record whose header is missing is damage too: its read says it is rebuilt empty, and it is
@@ -1837,7 +1837,7 @@ mod tests {
         assert_eq!(std::fs::read(sealed_path()).unwrap(), header_bytes());
         assert!(read_sealed().unwrap().is_empty());
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     /// What is not damage is never rebuilt: a record that reads (a torn append left for the next
@@ -1872,7 +1872,7 @@ mod tests {
             }
         }
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -1886,7 +1886,7 @@ mod tests {
         assert!(append(&[(SealOp::Record, &B.to_uppercase())]).is_err());
         assert_eq!(std::fs::read(sealed_path()).unwrap(), before);
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     /// An entry says the origin holds the object, so with no origin recorded no new claim is
@@ -1900,7 +1900,7 @@ mod tests {
     fn an_entry_is_never_added_where_no_origin_is_recorded() {
         let (root, _scope) = scratch("no-origin");
         append(&[(SealOp::Record, A)]).unwrap();
-        std::fs::remove_file(globals::forklift_root().join(origin_utils::FILE_NAME)).unwrap();
+        file_utils::remove_file(globals::forklift_root().join(origin_utils::FILE_NAME)).unwrap();
         let before = std::fs::read(sealed_path()).unwrap();
 
         let error = append(&[(SealOp::Remove, A), (SealOp::Record, B)]).unwrap_err();
@@ -1912,7 +1912,7 @@ mod tests {
         append(&[(SealOp::Remove, A)]).unwrap();
         assert!(!read_sealed().unwrap().contains(A));
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -1940,11 +1940,11 @@ mod tests {
             compact().unwrap();
             assert_eq!(inode(), compacted);
         }
-        std::fs::remove_file(sealed_path()).unwrap();
+        file_utils::remove_file(sealed_path()).unwrap();
         assert!(compact().unwrap().is_empty());
         assert!(!sealed_path().exists());
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -1961,7 +1961,7 @@ mod tests {
         expected.extend(encode_frames(&[(SealOp::Record, A), (SealOp::Record, B)]).unwrap().concat());
         assert_eq!(std::fs::read(sealed_path()).unwrap(), expected, "one frame, sorted");
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -2024,7 +2024,7 @@ mod tests {
         }
         assert!(present_recorded(&record).unwrap().is_empty(), "nothing present is recorded");
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// The push-down's records land before the removal: a crash after the first frame of a longer
@@ -2058,7 +2058,7 @@ mod tests {
         assert!(first_frame.set.contains(&tree), "the first frame removes nothing");
         assert!(!parse(&bytes).unwrap().set.contains(&tree));
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// An object whose closure cannot be walked stays recorded, and so does one not in the store;
@@ -2103,7 +2103,7 @@ mod tests {
         let unsealed = unseal(&hold(), &[unrecorded]).unwrap();
         assert_eq!(unsealed, Unsealed::default());
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// A walk that fails counts nothing it went through as checked: a later object reaching the
@@ -2130,7 +2130,7 @@ mod tests {
         assert_eq!(unsealed.pushed_down, vec![lost]);
         assert_eq!(unsealed.kept.len(), 1);
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// An applied redaction holds its hash whether or not the sealed record names it too, and says
@@ -2151,7 +2151,7 @@ mod tests {
         assert!(!tolerated.is_empty() && !Tolerated::removed_only(tolerated.applied.clone(), WithheldSet::default()).is_empty());
         assert!(Tolerated::default().is_empty());
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// Withheld content holds a file's content only, below an applied redaction of the same hash
@@ -2180,7 +2180,7 @@ mod tests {
         assert!(read_removed().unwrap().sealed.is_empty());
         assert!(!Tolerated::removed_only(AppliedSet::default(), withholding::read_withheld().unwrap()).is_empty());
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// A closure refusal naming a withheld hash, bare or as an object's path, says the host
@@ -2203,7 +2203,7 @@ mod tests {
         let other = format!("{} is missing.", "8".repeat(64));
         assert_eq!(crate::util::audit_utils::withheld_beyond_files(other.clone(), &set), other);
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// An applied redaction holds a file's content only: met as a tree or a chunk, its hash is held
@@ -2224,7 +2224,7 @@ mod tests {
         }
         assert_eq!(tolerated.held(&applied_only, At::File), Some(Held::Redacted));
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// No absence an applied redaction names is recorded as held by the remote: not by a fetch's
@@ -2264,7 +2264,7 @@ mod tests {
 
         let bytes = crate::util::file_utils::retrieve_object_by_hash(&tree).unwrap();
         let (folder, file) = crate::util::file_utils::get_path_for_object(&tree).unwrap();
-        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+        file_utils::remove_file(PathBuf::from(folder).join(file)).unwrap();
         append(&[(SealOp::Remove, &lost), (SealOp::Record, &tree)]).unwrap();
         refill_all(&hold(), &[(tree.as_str(), bytes.as_slice())]).unwrap();
         assert!(read_sealed().unwrap().contains(&lost), "the refill pushes down");
@@ -2277,7 +2277,7 @@ mod tests {
         assert!(read_sealed().unwrap().contains(&lost), "a plain append records");
         redacted_unrecorded("a plain append");
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// Unavailable content holds a file's content only, below an applied redaction and a
@@ -2306,7 +2306,7 @@ mod tests {
         assert_eq!(read_tolerated().unwrap().held(&sealed_too, At::Tree), Some(Held::Sealed));
         assert!(!Tolerated { unavailable: unavailable::read_unavailable().unwrap(), ..Tolerated::default() }.is_empty());
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// No append records an absence the unavailable record lists: the fetch's recording, the
@@ -2338,7 +2338,7 @@ mod tests {
 
         let bytes = crate::util::file_utils::retrieve_object_by_hash(&tree).unwrap();
         let (folder, file) = crate::util::file_utils::get_path_for_object(&tree).unwrap();
-        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+        file_utils::remove_file(PathBuf::from(folder).join(file)).unwrap();
         append(&[(SealOp::Remove, &lost), (SealOp::Record, &tree)]).unwrap();
         refill_all(&hold(), &[(tree.as_str(), bytes.as_slice())]).unwrap();
         assert!(read_sealed().unwrap().contains(&lost), "the refill pushes down");
@@ -2349,6 +2349,6 @@ mod tests {
         assert!(read_sealed().unwrap().contains(&lost), "a plain append records");
         unrecorded("a plain append");
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 }

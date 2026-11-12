@@ -1885,7 +1885,7 @@ mod carry_tests {
         test_support::check_out(&start_tree);
 
         std::fs::write("staged.txt", "staged mine\n").unwrap();
-        std::fs::remove_file("gone.txt").unwrap();
+        forklift_core::util::file_utils::remove_file("gone.txt").unwrap();
         test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
         std::fs::write("bob.txt", "bob mine\n").unwrap();
         // Old enough that a stat taken now proves whatever hash it is recorded with.

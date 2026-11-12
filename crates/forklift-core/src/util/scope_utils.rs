@@ -1263,7 +1263,7 @@ mod tests {
 
     fn scratch(name: &str) -> (PathBuf, globals::StorageRootScope) {
         let root = std::env::temp_dir().join(format!("forklift-scope-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT).join(FOLDER_NAME_CONFIG)).unwrap();
         let scope = globals::StorageRootScope::enter(&root);
         (root, scope)
@@ -1296,7 +1296,7 @@ mod tests {
         assert!(!is_cache_mode().unwrap());
         assert_eq!(read_fetch_scope().unwrap(), PathScope::from_prefixes(["docs"]));
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// Every pairing of mode and fetch-scope file but the two a clone writes is refused, by
@@ -1323,7 +1323,7 @@ mod tests {
             mark_for_test(mode);
             match &file {
                 Some(bytes) => std::fs::write(&path, bytes).unwrap(),
-                None => { let _ = std::fs::remove_file(&path); }
+                None => { let _ = crate::util::file_utils::remove_file(&path); }
             }
 
             for error in [read_fetch_scope().unwrap_err(), content_may_be_absent().unwrap_err(), is_cache_mode().unwrap_err()] {
@@ -1332,7 +1332,7 @@ mod tests {
             }
         }
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// Only a sparse warehouse's fetch scope can be replaced, and never by a full one.
@@ -1353,6 +1353,6 @@ mod tests {
         assert!(set_fetch_scope(&PathScope::full()).unwrap_err().contains("at least one path"));
         assert!(!fetch_scope_path().exists());
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 }

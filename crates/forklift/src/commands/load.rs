@@ -64,7 +64,7 @@ mod tests {
     fn folds_case() -> bool {
         std::fs::write("case-probe", "").unwrap();
         let folds = std::path::Path::new("CASE-PROBE").exists();
-        std::fs::remove_file("case-probe").unwrap();
+        forklift_core::util::file_utils::remove_file("case-probe").unwrap();
         folds
     }
 

@@ -158,7 +158,7 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         if self.ephemeral {
-            let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = file_utils::remove_dir_all(&self.dir);
         }
     }
 }
@@ -447,7 +447,7 @@ mod tests {
         let fresh_name = scratch.as_ref().is_ok_and(|scratch| !litter.iter().any(|folder| folder == scratch.root()));
         drop(scratch);
         for folder in &litter {
-            let _ = std::fs::remove_dir_all(folder);
+            let _ = file_utils::remove_dir_all(folder);
         }
 
         assert_eq!(error, None, "litter must not fail the scratch");

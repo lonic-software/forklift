@@ -146,7 +146,7 @@ pub(crate) fn state_bytes(state: &CherryPickState) -> Vec<u8> {
 pub fn clear_state() -> Result<(), String> {
     let path = state_path();
 
-    match std::fs::remove_file(&path) {
+    match file_utils::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("Error while removing \"{}\": {}", path.to_string_lossy(), e)),
@@ -189,7 +189,7 @@ mod tests {
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("forklift-pick-state-{}-{}", tag, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -223,7 +223,7 @@ mod tests {
             assert_eq!(read.our_pallet, written.our_pallet);
             assert_eq!(read.description, written.description);
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
     }
 
     /// A state file without a header, such as the JSON written before it was a record, is refused.
@@ -235,7 +235,7 @@ mod tests {
         let error = read_state_in(&dir).err().unwrap();
         assert!(error.contains("has no format header"), "{}", error);
         assert!(error.contains("Remove it to abort the pick."), "{}", error);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
     }
 
     /// A record with fewer than three entries or more than four is refused, as is one whose head is
@@ -254,6 +254,6 @@ mod tests {
             let error = read_state_in(&dir).err().unwrap_or_else(|| panic!("{:?} must be refused", entries));
             assert!(error.contains("is malformed"), "{}", error);
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
     }
 }

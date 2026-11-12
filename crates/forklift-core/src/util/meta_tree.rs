@@ -2223,7 +2223,7 @@ mod tests {
             let root = std::env::temp_dir().join(format!(
                 "forklift-meta-tree-test-{}-{}-{}", name, std::process::id(), id
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = crate::util::file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = crate::globals::StorageRootScope::enter(&root);
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -2233,7 +2233,7 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = crate::util::file_utils::remove_dir_all(&self.root);
         }
     }
 
@@ -3864,7 +3864,7 @@ mod tests {
 
         for missing in [&root_tree, &root] {
             let (folder, file_name) = crate::util::file_utils::get_path_for_object(missing).unwrap();
-            std::fs::remove_file(std::path::Path::new(&folder).join(file_name)).unwrap();
+            crate::util::file_utils::remove_file(std::path::Path::new(&folder).join(file_name)).unwrap();
             let error = redaction_utils::chain_names("kv", &head, &other).unwrap_err();
             assert!(error.contains(missing.as_str()) && error.contains("cannot be told"), "{}", error);
         }

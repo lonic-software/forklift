@@ -10,9 +10,16 @@
 # peer can make the client hold. The streaming loops that write to disk or to the bundle importer
 # allow `chunk` per site with a justification.
 #
-# std::fs::rename: every rename goes through file_utils::rename (or rename_no_replace), which
-# retries while another process's handle blocks it on Windows.
+# std::fs::rename and the deletes: every rename goes through file_utils::rename (or
+# rename_no_replace), and every remove_file, remove_dir and remove_dir_all through its namesake in
+# file_utils, each of which retries while another process's handle blocks it on Windows.
 disallowed-methods = [
+    { path = "std::fs::remove_file", reason = "use file_utils::remove_file, which retries a delete another process's open handle blocks on Windows (an editor, indexer or antivirus holding the file without delete sharing)" },
+    { path = "std::fs::remove_dir", reason = "use file_utils::remove_dir, which retries a removal an open handle on the folder blocks on Windows" },
+    { path = "std::fs::remove_dir_all", reason = "use file_utils::remove_dir_all, which retries a removal an open handle on a file or folder inside blocks on Windows" },
+    { path = "tokio::fs::remove_file", reason = "use file_utils::remove_file, on a blocking thread if need be; tokio's does not retry a delete an open handle blocks on Windows" },
+    { path = "tokio::fs::remove_dir", reason = "use file_utils::remove_dir, on a blocking thread if need be; tokio's does not retry a removal an open handle blocks on Windows" },
+    { path = "tokio::fs::remove_dir_all", reason = "use file_utils::remove_dir_all, on a blocking thread if need be; tokio's does not retry a removal an open handle blocks on Windows" },
     { path = "tokio::fs::rename", reason = "use file_utils::rename (or rename_no_replace), on a blocking thread if need be; tokio's rename does not retry a rename an open handle blocks on Windows" },
     { path = "std::fs::rename", reason = "use file_utils::rename (or rename_no_replace), which retries a rename another process's open handle blocks on Windows (an editor, indexer or antivirus holding the source, the target, or a file in a renamed folder)" },
     { path = "zstd::stream::decode_all", reason = "unbounded decode of untrusted bytes; use object_utils::decode_object_bounded unless reading back bytes this store itself wrote — allow per-site with a justification" },

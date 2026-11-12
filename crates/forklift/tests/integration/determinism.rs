@@ -31,7 +31,7 @@ impl Warehouse {
         let base = std::env::temp_dir().join(format!("forklift-determinism-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
         let home = base.join("home");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         Warehouse { root, home }
@@ -127,7 +127,7 @@ impl Warehouse {
 impl Drop for Warehouse {
     fn drop(&mut self) {
         if let Some(base) = self.root.parent() {
-            let _ = std::fs::remove_dir_all(base);
+            let _ = forklift_core::util::file_utils::remove_dir_all(base);
         }
     }
 }
@@ -182,8 +182,8 @@ fn a_scoped_stack_is_byte_reproducible_and_matches_a_full_stack() {
             let siblings = warehouse.root.parent().unwrap();
             let full_dir = siblings.join("full-bay");
             let scoped_dir = siblings.join("scoped-bay");
-            let _ = std::fs::remove_dir_all(&full_dir);
-            let _ = std::fs::remove_dir_all(&scoped_dir);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&full_dir);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&scoped_dir);
 
             warehouse.run_ok(&["bay", "add", "full", full_dir.to_str().unwrap()]);
             warehouse.run_ok(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "dir0/sub0"]);
@@ -208,8 +208,8 @@ fn a_scoped_stack_is_byte_reproducible_and_matches_a_full_stack() {
             assert_eq!(full_tree, scoped_tree,
                 "a scoped stack must produce a byte-identical root tree to a full stack");
 
-            let _ = std::fs::remove_dir_all(&full_dir);
-            let _ = std::fs::remove_dir_all(&scoped_dir);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&full_dir);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&scoped_dir);
             scoped_tree
         })).collect();
         runs.into_iter().map(|run| run.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))).collect()
@@ -306,7 +306,7 @@ fn a_mutating_command_is_refused_while_the_warehouse_lock_is_held() {
 
     // Once the lock is cleared (the other process finished / the operator removed a stale lock),
     // the mutating command works again.
-    std::fs::remove_file(&lock).unwrap();
+    forklift_core::util::file_utils::remove_file(&lock).unwrap();
     warehouse.run_ok(&["load", "a.txt"]);
     warehouse.run_ok(&["stack", "-m", "after the lock cleared"]);
 }

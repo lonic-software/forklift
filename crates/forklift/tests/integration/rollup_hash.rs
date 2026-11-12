@@ -24,7 +24,7 @@ impl Warehouse {
         let base = std::env::temp_dir().join(format!("forklift-rollup-hash-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
         let home = base.join("home");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         Warehouse { root, home }
@@ -74,7 +74,7 @@ impl Warehouse {
 impl Drop for Warehouse {
     fn drop(&mut self) {
         if let Some(base) = self.root.parent() {
-            let _ = std::fs::remove_dir_all(base);
+            let _ = forklift_core::util::file_utils::remove_dir_all(base);
         }
     }
 }

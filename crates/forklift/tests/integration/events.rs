@@ -29,8 +29,8 @@ impl TestWarehouse {
         let home = std::env::temp_dir()
             .join(format!("forklift-events-{}-{}-home", name, std::process::id()));
 
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&home);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
 
@@ -82,8 +82,8 @@ impl TestWarehouse {
 
 impl Drop for TestWarehouse {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-        let _ = std::fs::remove_dir_all(&self.home);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.home);
     }
 }
 

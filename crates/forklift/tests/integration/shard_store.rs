@@ -22,7 +22,7 @@ impl Warehouse {
             .join(format!("forklift-shard-store-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
         let home = base.join("home");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
 
@@ -84,14 +84,14 @@ impl Warehouse {
         std::fs::create_dir_all(&probe).unwrap();
         std::fs::write(probe.join("probe"), "").unwrap();
         let folds = probe.join("PROBE").exists();
-        std::fs::remove_dir_all(&probe).unwrap();
+        forklift_core::util::file_utils::remove_dir_all(&probe).unwrap();
         folds
     }
 }
 
 impl Drop for Warehouse {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.base);
     }
 }
 
@@ -172,7 +172,7 @@ fn a_store_in_another_layout_is_refused_and_left_alone() {
     warehouse.run_ok(&["stack", "-m", "side"]);
 
     let inventory = warehouse.root.join(".forklift/inventory");
-    std::fs::remove_dir_all(inventory.join("inv_")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(inventory.join("inv_")).unwrap();
     let old_shards = [inventory.join("inv_/data"), inventory.join("inv_/inv_Docs/data")];
     for shard in &old_shards {
         std::fs::create_dir_all(shard.parent().unwrap()).unwrap();
@@ -267,7 +267,7 @@ fn restore_never_reads_a_shard_of_an_unregistered_directory() {
 
     std::fs::create_dir_all(shard.parent().unwrap()).unwrap();
     std::fs::write(&shard, saved).unwrap();
-    std::fs::remove_file(warehouse.root.join("docs/a.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("docs/a.txt")).unwrap();
 
     let output = warehouse.run(&["restore", "--confirm", "docs/a.txt"]);
 
@@ -298,9 +298,9 @@ fn a_linked_shard_folder_is_refused_and_the_named_way_out_works() {
             "{}", stderr(&output));
 
     if cfg!(windows) {
-        std::fs::remove_dir(&slot).unwrap();
+        forklift_core::util::file_utils::remove_dir(&slot).unwrap();
     } else {
-        std::fs::remove_file(&slot).unwrap();
+        forklift_core::util::file_utils::remove_file(&slot).unwrap();
     }
     warehouse.run_ok(&["unload", "."]);
 

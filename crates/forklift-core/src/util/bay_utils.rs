@@ -222,7 +222,7 @@ pub fn write_bay_redirect(bay_dir: &Path, warehouse_root: &Path, name: &str) -> 
 
     if let Err(e) = placed {
         // A real folder this call created, so the recursive removal follows nothing it did not make.
-        let _ = std::fs::remove_dir_all(&staging);
+        let _ = file_utils::remove_dir_all(&staging);
         return Err(e);
     }
 
@@ -294,8 +294,8 @@ pub fn remove_bay_redirect(bay_dir: &Path, shared_forklift: &Path, name: &str) -
     }
 
     let deleted = match std::fs::symlink_metadata(&retired) {
-        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&retired),
-        Ok(_) => std::fs::remove_file(&retired),
+        Ok(metadata) if metadata.is_dir() => file_utils::remove_dir_all(&retired),
+        Ok(_) => file_utils::remove_file(&retired),
         Err(e) => Err(e),
     };
 
@@ -859,7 +859,7 @@ pub fn remove_bay_state(name: &str) -> Result<(), String> {
 
     let state = bay_state_dir(name);
 
-    std::fs::remove_dir_all(&state)
+    file_utils::remove_dir_all(&state)
         .map_err(|e| format!("Error while removing the bay state \"{}\": {}", state.to_string_lossy(), e))
 }
 
@@ -903,7 +903,7 @@ mod tests {
     fn collect_bay_scoped_parcel_roots_finds_both_sources_from_a_non_active_bay() {
         let dir = std::env::temp_dir()
             .join(format!("forklift-bay-utils-shared-roots-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
@@ -944,7 +944,7 @@ mod tests {
         assert!(roots.contains(&pick_source),
             "a non-active bay's cherry-pick source must be in the shared roots");
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// The fail-closed/tolerant split this helper's `policy` parameter exists for (see
@@ -958,7 +958,7 @@ mod tests {
     fn collect_bay_scoped_parcel_roots_splits_on_policy_for_the_same_corrupt_bay() {
         let dir = std::env::temp_dir()
             .join(format!("forklift-bay-utils-policy-split-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
@@ -981,18 +981,18 @@ mod tests {
         assert!(tolerant.degraded[0].contains("forklift bay remove"),
             "the note must name the in-tool cleanup route: {}", tolerant.degraded[0]);
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_redirect_round_trips_a_warehouse_root_holding_a_line_break() {
         let dir = std::env::temp_dir()
             .join(format!("forklift-bay-utils-redirect-line-break-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         for root in ["/srv/ware\nhouse", "/srv/ware\r", "/srv/a\\nb"] {
-            let _ = std::fs::remove_dir_all(dir.join(FOLDER_NAME_FORKLIFT_ROOT));
+            let _ = file_utils::remove_dir_all(dir.join(FOLDER_NAME_FORKLIFT_ROOT));
             write_bay_redirect(&dir, Path::new(root), "review").unwrap();
 
             let redirect = read_bay_redirect(&dir.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
@@ -1001,7 +1001,7 @@ mod tests {
             assert_eq!(redirect.name, "review");
         }
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1035,7 +1035,7 @@ mod tests {
     fn a_redirect_naming_an_invalid_bay_is_refused() {
         let dir = std::env::temp_dir()
             .join(format!("forklift-bay-utils-redirect-invalid-name-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let forklift_path = dir.join(FOLDER_NAME_FORKLIFT_ROOT);
 
@@ -1043,7 +1043,7 @@ mod tests {
         assert_eq!(read_bay_redirect(&forklift_path).unwrap().name, "review");
 
         for name in ["Review", "..", "review."] {
-            std::fs::remove_dir_all(&forklift_path).unwrap();
+            file_utils::remove_dir_all(&forklift_path).unwrap();
             write_bay_redirect(&dir, Path::new("/srv/warehouse"), name).unwrap();
             let error = read_bay_redirect(&forklift_path).err().expect(name);
             assert!(error.contains("names an invalid bay") && error.contains(&format!("\"{}\" is not a valid pallet name", name)),
@@ -1054,7 +1054,7 @@ mod tests {
                 "{}: {}", name, error);
         }
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// Each shape of `.forklift` is classified as what it is: a folder holding a `redirect` file is a
@@ -1063,7 +1063,7 @@ mod tests {
     #[test]
     fn a_forklift_entry_is_classified_by_its_shape() {
         let dir = std::env::temp_dir().join(format!("forklift-bay-utils-classify-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let forklift = dir.join(FOLDER_NAME_FORKLIFT_ROOT);
 
@@ -1072,28 +1072,28 @@ mod tests {
 
         std::fs::write(&forklift, "old").unwrap();
         assert_eq!(classify_forklift(&forklift).unwrap(), ForkliftKind::OldFormatBay);
-        std::fs::remove_file(&forklift).unwrap();
+        file_utils::remove_file(&forklift).unwrap();
 
         std::fs::create_dir(&forklift).unwrap();
         assert_eq!(classify_forklift(&forklift).unwrap(), ForkliftKind::Unprepared, "a folder with no marker is no warehouse");
         let marker = forklift.join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER);
         std::fs::write(&marker, "/forklift-warehouse 3\nformat 1\nfull\n").unwrap();
         assert_eq!(classify_forklift(&forklift).unwrap(), ForkliftKind::Warehouse);
-        std::fs::remove_file(&marker).unwrap();
+        file_utils::remove_file(&marker).unwrap();
 
         std::fs::create_dir(forklift.join(FILE_NAME_BAY_REDIRECT)).unwrap();
         let error = classify_forklift(&forklift).unwrap_err();
         assert!(error.contains("is not a regular file"), "{}", error);
-        std::fs::remove_dir(forklift.join(FILE_NAME_BAY_REDIRECT)).unwrap();
+        file_utils::remove_dir(forklift.join(FILE_NAME_BAY_REDIRECT)).unwrap();
 
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(dir.join("nowhere"), forklift.join(FILE_NAME_BAY_REDIRECT)).unwrap();
             let error = classify_forklift(&forklift).map(|kind| format!("{:?}", kind)).unwrap_or_else(|e| e);
             assert!(error.contains("is a link to nothing"), "a dangling redirect must not read as a warehouse: {}", error);
-            std::fs::remove_file(forklift.join(FILE_NAME_BAY_REDIRECT)).unwrap();
+            file_utils::remove_file(forklift.join(FILE_NAME_BAY_REDIRECT)).unwrap();
         }
-        std::fs::remove_dir(&forklift).unwrap();
+        file_utils::remove_dir(&forklift).unwrap();
 
         write_bay_redirect(&dir, Path::new("/srv/warehouse"), "review").unwrap();
         assert_eq!(classify_forklift(&forklift).unwrap(), ForkliftKind::Bay);
@@ -1106,7 +1106,7 @@ mod tests {
         assert_eq!(read_bay_redirect(&forklift).unwrap().warehouse_root, PathBuf::from("/srv/warehouse"));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "the staging folder is cleaned up");
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// Removing a bay's `.forklift` deletes only this bay's own entry, judged as commands judge it:
@@ -1117,7 +1117,7 @@ mod tests {
     #[test]
     fn removing_a_bay_deletes_only_its_own_folder() {
         let dir = std::env::temp_dir().join(format!("forklift-bay-utils-remove-own-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         let warehouse = dir.join("warehouse");
         let shared = warehouse.join(FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::create_dir_all(&shared).unwrap();
@@ -1143,7 +1143,7 @@ mod tests {
         write_bay_redirect(&old, &warehouse, "review").unwrap();
         let folder = old.join(FOLDER_NAME_FORKLIFT_ROOT);
         file_utils::rename(folder.join(FILE_NAME_BAY_REDIRECT), old.join("record")).unwrap();
-        std::fs::remove_dir_all(&folder).unwrap();
+        file_utils::remove_dir_all(&folder).unwrap();
         file_utils::rename(old.join("record"), &folder).unwrap();
         remove_bay_redirect(&old, &shared, "review").unwrap();
         assert!(std::fs::symlink_metadata(&folder).is_err(), "this bay's old-format file is removed");
@@ -1220,13 +1220,13 @@ mod tests {
         remove_bay_redirect(&own, &shared, "review").unwrap();
         remove_bay_redirect(&dir.join("missing"), &shared, "review").unwrap();
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// A fresh warehouse root with the given bay folders (and one plain file) under `bays/`.
     fn bays_fixture(name: &str, bays: &[&str]) -> (PathBuf, StorageRootScope) {
         let dir = std::env::temp_dir().join(format!("forklift-bay-utils-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         let bays_root = dir.join(FOLDER_NAME_FORKLIFT_ROOT).join(FOLDER_NAME_BAYS_ROOT);
         std::fs::create_dir_all(&bays_root).unwrap();
         for bay in bays {
@@ -1254,7 +1254,7 @@ mod tests {
             assert!(!is_listed_bay(name).unwrap(), "must not resolve: {:?}", name);
         }
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// The live data-loss case: removing `..` once emptied the whole forklift root. Only a listed
@@ -1274,7 +1274,7 @@ mod tests {
         assert!(!root.join("bays/Main").exists());
         assert!(root.join("keep").is_file() && root.join("bays/b1/marker").is_file(), "only the named folder goes");
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// A sibling whose name is not UTF-8 neither aborts the match nor blocks removing another bay.
@@ -1293,7 +1293,7 @@ mod tests {
         remove_bay_state("b1").unwrap();
         assert!(!bay_state_dir("b1").exists());
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// Only a missing position reads as "no pallet"; a position naming a refused pallet is an
@@ -1312,14 +1312,14 @@ mod tests {
         let error = read_bay_current_pallet("bad").unwrap_err();
         assert!(error.contains("\"Main\" is not a valid pallet name"), "{}", error);
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_redirect_without_its_format_header_is_refused() {
         let dir = std::env::temp_dir()
             .join(format!("forklift-bay-utils-redirect-headerless-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let forklift_path = dir.join(FOLDER_NAME_FORKLIFT_ROOT);
@@ -1329,14 +1329,14 @@ mod tests {
         let error = read_bay_redirect(&forklift_path).err().expect("a headerless redirect must be refused");
         assert!(error.contains("is not a valid bay redirect"), "{}", error);
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn the_bay_path_round_trips_a_directory_holding_a_line_break_and_refuses_a_headerless_file() {
         let dir = std::env::temp_dir()
             .join(format!("forklift-bay-utils-bay-path-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
 
@@ -1349,6 +1349,6 @@ mod tests {
         let error = read_bay_path("review").unwrap_err();
         assert!(error.contains("has no format header"), "{}", error);
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 }

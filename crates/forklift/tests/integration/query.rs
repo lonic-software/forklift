@@ -25,8 +25,8 @@ impl TestWarehouse {
         let home = std::env::temp_dir()
             .join(format!("forklift-test-{}-{}-home", name, std::process::id()));
 
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&home);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
 
@@ -76,15 +76,15 @@ impl TestWarehouse {
     /// Delete a parcel object (and its signature sidecar) from the loose store.
     fn delete_parcel(&self, hash: &str) {
         let objects = self.root.join(".forklift").join("objects").join(&hash[0..2]);
-        std::fs::remove_file(objects.join(&hash[2..])).expect("the parcel object existed");
-        let _ = std::fs::remove_file(objects.join(format!("{}.sig", &hash[2..])));
+        forklift_core::util::file_utils::remove_file(objects.join(&hash[2..])).expect("the parcel object existed");
+        let _ = forklift_core::util::file_utils::remove_file(objects.join(format!("{}.sig", &hash[2..])));
     }
 }
 
 impl Drop for TestWarehouse {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-        let _ = std::fs::remove_dir_all(&self.home);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.home);
     }
 }
 

@@ -1114,7 +1114,7 @@ pub fn store_object_stream(claimed_hash: &str,
     let outcome = match stream_to_temp(claimed_hash, reader, expected_len, &temp_path) {
         Ok(outcome) => outcome,
         Err(e) => {
-            let _ = std::fs::remove_file(&temp_path);
+            let _ = file_utils::remove_file(&temp_path);
             return Err(e);
         }
     };
@@ -1122,7 +1122,7 @@ pub fn store_object_stream(claimed_hash: &str,
     // Exactly `expected_len`, not fewer: a short stream is a truncated record, reported the same
     // way the buffered import path reports it.
     if outcome.read_total != expected_len {
-        let _ = std::fs::remove_file(&temp_path);
+        let _ = file_utils::remove_file(&temp_path);
         return Err(format!(
             "The bundle is truncated: a record declared {} bytes but only {} remained.",
             expected_len, outcome.read_total
@@ -1131,7 +1131,7 @@ pub fn store_object_stream(claimed_hash: &str,
 
     // Content-addressing: nothing unverified may land.
     if outcome.hash != claimed_hash {
-        let _ = std::fs::remove_file(&temp_path);
+        let _ = file_utils::remove_file(&temp_path);
         return Err(format!(
             "Object content does not match its claimed hash {} (actual: {}); refusing to store it.",
             claimed_hash, outcome.hash
@@ -1139,13 +1139,13 @@ pub fn store_object_stream(claimed_hash: &str,
     }
 
     if let Some(version) = outcome.unknown_version {
-        let _ = std::fs::remove_file(&temp_path);
+        let _ = file_utils::remove_file(&temp_path);
         return Err(unknown_version_error(claimed_hash, version));
     }
 
     // Already present (an idempotent re-import): drop the temp and report the skip.
     if file_utils::does_object_exist(claimed_hash)? {
-        let _ = std::fs::remove_file(&temp_path);
+        let _ = file_utils::remove_file(&temp_path);
         return Ok(false);
     }
 
@@ -1678,7 +1678,7 @@ mod tests {
             let root = std::env::temp_dir().join(format!(
                 "forklift-object-test-{}-{}-{}", name, std::process::id(), id
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
             Scratch { _scope: scope, root }
@@ -1687,7 +1687,7 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = file_utils::remove_dir_all(&self.root);
         }
     }
 

@@ -842,7 +842,7 @@ fn probe_aliases(parent: &str, first: &str, second: &str) -> Result<bool, String
         .is_ok()
         && identity(&probe_dir.join(second)).is_some_and(|id| identity(&probe_dir.join(first)) == Some(id));
 
-    let _ = std::fs::remove_dir_all(&probe_dir);
+    let _ = file_utils::remove_dir_all(&probe_dir);
 
     Ok(aliases)
 }
@@ -938,7 +938,7 @@ mod tests {
         let sealed_read = std::fs::symlink_metadata(sealed.join("inside"));
         let verdict = same_entry(&sealed.join("inside"), &root.join("file"));
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::remove_dir_all(&root).unwrap();
+        file_utils::remove_dir_all(&root).unwrap();
 
         // Root reads through a sealed directory, so there is nothing to refuse.
         if !matches!(sealed_read, Err(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied) {

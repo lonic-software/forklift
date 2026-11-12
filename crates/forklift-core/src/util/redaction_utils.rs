@@ -1724,12 +1724,12 @@ mod tests {
 
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
+                let _ = file_utils::remove_dir_all(&self.0);
             }
         }
 
         let root = Cleanup(std::env::temp_dir().join(format!("forklift-redaction-holds-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&root.0);
+        let _ = file_utils::remove_dir_all(&root.0);
         std::fs::create_dir_all(root.0.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = crate::globals::StorageRootScope::enter(&root.0);
 
@@ -1918,7 +1918,7 @@ mod tests {
             for record in [WithheldRecord::Client(None), WithheldRecord::Host(None)] {
                 assert_eq!(judge(record, &mut Absence::Verdict { partial: true, remote: false }), Ok(None));
             }
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
 
         // Not withheld: the read's own failure, as before.

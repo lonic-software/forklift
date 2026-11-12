@@ -16,7 +16,7 @@ struct Area {
 impl Area {
     fn new(name: &str) -> Area {
         let root = std::env::temp_dir().join(format!("forklift-recovery-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         Area { root }
     }
@@ -82,7 +82,7 @@ impl Area {
 
 impl Drop for Area {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.root);
     }
 }
 
@@ -207,7 +207,7 @@ fn a_lock_a_killed_process_left_is_cleared_by_removing_the_file_it_names() {
     let message = error["message"].as_str().unwrap();
     assert!(message.contains(".forklift") && message.contains("999999"), "{}", error);
 
-    std::fs::remove_file(&lock).unwrap();
+    forklift_core::util::file_utils::remove_file(&lock).unwrap();
     area.ok("w", &["load", "a.txt"]);
 }
 
@@ -226,7 +226,7 @@ fn a_serve_lock_a_hard_kill_left_is_cleared_by_removing_the_file_it_names() {
     assert!(!gc.status.success(), "{}", stdout(&gc));
     assert!(stderr(&gc).contains("serve.lock"), "{}", stderr(&gc));
 
-    std::fs::remove_file(&lock).unwrap();
+    forklift_core::util::file_utils::remove_file(&lock).unwrap();
     let gc = Command::new(server_binary()).args(["gc", "--root", root]).output().unwrap();
     assert!(gc.status.success(), "{}", stderr(&gc));
     let _restarted = Server::serve(root);
@@ -275,7 +275,7 @@ fn staged_content_lost_from_the_store_is_staged_again_from_the_working_copy() {
         .collect();
     assert!(!added.is_empty(), "the load wrote no object");
     for object in added {
-        std::fs::remove_file(object).unwrap();
+        forklift_core::util::file_utils::remove_file(object).unwrap();
     }
 
     area.refused("w", &["stack", "-m", "x"], "staged_content_missing", 25);

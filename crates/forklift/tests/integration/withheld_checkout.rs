@@ -29,7 +29,7 @@ impl Warehouse {
         let base = std::env::temp_dir().join(format!("forklift-withheld-checkout-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
         let home = base.join("home");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = file_utils::remove_dir_all(&base);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
 
@@ -92,7 +92,7 @@ impl Warehouse {
 
     fn delete_object(&self, hash: &str) {
         let objects = self.root.join(".forklift").join("objects").join(&hash[0..2]);
-        std::fs::remove_file(objects.join(&hash[2..])).expect("the object existed");
+        file_utils::remove_file(objects.join(&hash[2..])).expect("the object existed");
     }
 
     fn scoped<T>(&self, work: impl FnOnce() -> T) -> T {
@@ -404,7 +404,7 @@ fn a_restore_writes_a_file_whose_content_came_back() {
     warehouse.write("copy.txt", WITHHELD_FILM);
     warehouse.run_ok(&["load", "copy.txt"]);
     warehouse.run_ok(&["unload", "copy.txt"]);
-    std::fs::remove_file(warehouse.root.join("copy.txt")).unwrap();
+    file_utils::remove_file(warehouse.root.join("copy.txt")).unwrap();
 
     let restored = warehouse.run_ok(&["restore", ".", "--confirm"]);
     let restored = String::from_utf8_lossy(&restored.stdout);
@@ -556,7 +556,7 @@ fn a_conflict_over_withheld_content_refuses_content_withheld() {
     let (warehouse, _) = withheld_feature("refuse-keep-ours");
     warehouse.run_ok(&["remove", "film.mkv"]);
     warehouse.run_ok(&["stack", "-m", "main deletes the film"]);
-    std::fs::remove_file(warehouse.root.join("film.mkv")).unwrap();
+    file_utils::remove_file(warehouse.root.join("film.mkv")).unwrap();
     warehouse.run_ok(&["shift", "feature"]);
     let next_step = refused(&warehouse, &["consolidate", "main"]);
     assert!(next_step.contains("the merge takes the other side's deletion of it"), "{}", next_step);

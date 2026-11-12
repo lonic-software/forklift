@@ -537,7 +537,7 @@ pub fn free_objects(to_free: &[String], _store_access: &StoreAccessExclusive) ->
         let path = std::path::Path::new(&folder).join(file_name);
         let size = std::fs::symlink_metadata(&path).map_or(0, |metadata| metadata.len());
 
-        match std::fs::remove_file(&path) {
+        match crate::util::file_utils::remove_file(&path) {
             Ok(()) => {
                 freed += 1;
                 bytes += size;
@@ -1085,7 +1085,7 @@ mod tests {
             let root = std::env::temp_dir().join(format!(
                 "forklift-prune-test-{}-{}-{}", name, std::process::id(), id
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = crate::util::file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -1097,7 +1097,7 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = crate::util::file_utils::remove_dir_all(&self.root);
         }
     }
 
@@ -1429,7 +1429,7 @@ mod tests {
             let root = store_tree(&[("other", &lost, DirEntryType::Tree)]);
             let meta = store_parcel(&root, Vec::new());
             let (folder, file) = file_utils::get_path_for_object(&lost).unwrap();
-            std::fs::remove_file(std::path::PathBuf::from(folder).join(file)).unwrap();
+            crate::util::file_utils::remove_file(std::path::PathBuf::from(folder).join(file)).unwrap();
 
             let mut sources = root_sources().unwrap();
             if adopted {
@@ -1935,7 +1935,7 @@ mod tests {
                 pack_utils::compact(true, false, true, &crate::util::progress_utils::Progress::NONE).unwrap();
             } else {
                 for entry in std::fs::read_dir(PathBuf::from(file_utils::get_path_objects_root()).join("pack")).unwrap() {
-                    std::fs::remove_file(entry.unwrap().path()).unwrap();
+                    crate::util::file_utils::remove_file(entry.unwrap().path()).unwrap();
                 }
                 pack_utils::forget_warehouse();
             }

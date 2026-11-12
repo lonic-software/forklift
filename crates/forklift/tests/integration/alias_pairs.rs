@@ -31,7 +31,7 @@ impl Warehouse {
             .join(format!("forklift-alias-pairs-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
         let home = base.join("home");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
 
@@ -113,7 +113,7 @@ impl Warehouse {
         std::fs::create_dir_all(&probe).unwrap();
         std::fs::write(probe.join("probe"), "").unwrap();
         let folds = probe.join("PROBE").exists();
-        std::fs::remove_dir_all(&probe).unwrap();
+        forklift_core::util::file_utils::remove_dir_all(&probe).unwrap();
         folds
     }
 
@@ -141,7 +141,7 @@ impl Warehouse {
 
 impl Drop for Warehouse {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.base);
     }
 }
 
@@ -420,7 +420,7 @@ fn a_pair_with_neither_spelling_on_disk_is_refused_and_removed() {
     warehouse.stage_other_work();
     warehouse.rename("README", "readme");
     warehouse.run_ok(&["load", "readme"]);
-    std::fs::remove_file(warehouse.path("readme")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.path("readme")).unwrap();
     warehouse.leave_other_work();
 
     let head = warehouse.head();
@@ -453,7 +453,7 @@ fn a_pair_beneath_a_spelling_that_became_a_file_is_refused_not_unreadable() {
     warehouse.stage_other_work();
     warehouse.rename("Docs", "docs");
     warehouse.run_ok(&["load", "docs/a"]);
-    std::fs::remove_dir_all(warehouse.path("docs")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.path("docs")).unwrap();
     warehouse.write("docs", "x\n");
 
     let head = warehouse.head();
@@ -474,12 +474,12 @@ fn a_file_pair_whose_listed_occupant_is_a_directory_is_cleared_by_loading_the_tr
         return;
     }
 
-    std::fs::remove_dir_all(warehouse.path("README")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.path("README")).unwrap();
     warehouse.write("README", "f\n");
     warehouse.run_ok(&["load", "README"]);
     warehouse.rename("README", "Readme");
     warehouse.run_ok(&["load", "Readme"]);
-    std::fs::remove_file(warehouse.path("Readme")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.path("Readme")).unwrap();
     std::fs::create_dir(warehouse.path("readme")).unwrap();
 
     let message = assert_pair_refusal(&warehouse.run(&["stack", "-m", "pair"]), ("README", "Readme"), LOAD_ALL);

@@ -853,7 +853,7 @@ fn apply_merge_action(ledger: &inventory_utils::ShardLedger,
         MergeAction::Delete { path } => {
             shift_utils::check_working_path(path)?;
 
-            match std::fs::remove_file(path) {
+            match forklift_core::util::file_utils::remove_file(path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("Error while removing \"{}\": {}", path, e)),
@@ -867,7 +867,7 @@ fn apply_merge_action(ledger: &inventory_utils::ShardLedger,
             let mut dir = std::path::Path::new(path).parent();
 
             while let Some(parent) = dir {
-                if parent.as_os_str().is_empty() || std::fs::remove_dir(parent).is_err() {
+                if parent.as_os_str().is_empty() || forklift_core::util::file_utils::remove_dir(parent).is_err() {
                     break;
                 }
 
@@ -1144,7 +1144,7 @@ mod tests {
             .collect();
         forklift_core::util::unavailable::record(hashes.iter().map(|hash| (hash.clone(), "Withheld.".to_string()))).unwrap();
         for hash in &hashes {
-            std::fs::remove_file(root.join(".forklift").join("objects").join(&hash[0..2]).join(&hash[2..])).unwrap();
+            forklift_core::util::file_utils::remove_file(root.join(".forklift").join("objects").join(&hash[0..2]).join(&hash[2..])).unwrap();
         }
     }
 
