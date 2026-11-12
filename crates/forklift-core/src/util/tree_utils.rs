@@ -549,9 +549,10 @@ pub(crate) fn remedy_path(path: &str) -> Option<String> {
 }
 
 /// `path` (relative) as one argument of a remedy command, which never starts with `-`: a path that
-/// does is spelled `./<path>`, the same path, so it is not taken for an option. Not `-- <path>`:
+/// does is spelled `./<path>`, the same path, so it is not taken for an option. Not after `--`:
 /// Windows PowerShell 5.1 splits an unquoted argument that starts with `-` at its first `.`, after
-/// a `--` too (`-- -draft.txt` reaches the program as `-draft` and `.txt`), as
+/// a `--` too (`-- -draft.txt` reaches the program as `-draft` and `.txt`), while the `-- <path>`
+/// placeholder callers print for `None` runs once the user quotes the path, as
 /// `a_dash_led_remedy_path_runs_as_printed_in_windows_shells` in the CLI tests shows. Otherwise as
 /// [`remedy_word_when`] quotes it.
 pub fn remedy_path_when(path: &str, windows: bool) -> Option<String> {

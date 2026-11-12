@@ -9015,7 +9015,8 @@ fn run_in_windows_shell(warehouse: &TestWarehouse, shell: WindowsShell, command:
 }
 
 /// A printed next step names a path starting with `-` as `./<path>`, and pasted into Windows
-/// PowerShell 5.1 or `cmd` it runs, also for a path with a `.` in it. Driven through the
+/// PowerShell 5.1 or `cmd` it runs, also for a path with a `.` in it; one that needs quoting gets
+/// the `-- <path>` placeholder, which runs with the path quoted for that shell. Driven through the
 /// staged-removal remedy `restore` prints: the pasted unload unstages the removal and the restore
 /// then succeeds. Run first, and each refused by `forklift`'s parser with the removal left staged:
 /// the path bare, read as an option; and in PowerShell, for a dotted path, the `--` guard this
@@ -9023,7 +9024,7 @@ fn run_in_windows_shell(warehouse: &TestWarehouse, shell: WindowsShell, command:
 #[cfg(windows)]
 #[test]
 fn a_dash_led_remedy_path_runs_as_printed_in_windows_shells() {
-    for name in ["-draft", "-draft.txt"] {
+    for name in ["-draft", "-draft.txt", "-my draft.txt"] {
         for shell in [WindowsShell::PowerShell, WindowsShell::Cmd] {
             let warehouse = TestWarehouse::new(&format!("windows-dash-led-{:?}-{}", shell, name.len()));
             if let WindowsShell::PowerShell = shell {
@@ -9044,10 +9045,26 @@ fn a_dash_led_remedy_path_runs_as_printed_in_windows_shells() {
             let refused = warehouse.run(&["restore", "--", name]);
             let message = stderr(&refused);
             assert!(!refused.status.success() && message.contains(&staged), "{}", message);
-            let command = message.split('"').nth(3).expect("the message quotes the unload");
-            assert_eq!(command, format!("forklift unload ./{}", name), "{}", message);
+            let printed = message.split('"').nth(3).expect("the message quotes the unload");
+            let command = if name.contains(' ') {
+                // No quoting reads it as one argument in both shells, so the message prints a
+                // placeholder and says to quote the path: pasted with it quoted for this shell.
+                assert_eq!(printed, "forklift unload -- <path>", "{}", message);
+                assert!(message.contains("with that path quoted for your shell"), "{}", message);
+                let quoted = match shell {
+                    WindowsShell::PowerShell => format!("'{}'", name),
+                    WindowsShell::Cmd => format!("\"{}\"", name),
+                };
+                printed.replace("<path>", &quoted)
+            } else {
+                assert_eq!(printed, format!("forklift unload ./{}", name), "{}", message);
+                printed.to_string()
+            };
 
-            let mut refused_forms = vec![(format!("forklift unload {}", name), "unexpected argument '-d'")];
+            let mut refused_forms = Vec::new();
+            if !name.contains(' ') {
+                refused_forms.push((format!("forklift unload {}", name), "unexpected argument '-d'"));
+            }
             if let (WindowsShell::PowerShell, true) = (shell, name.contains('.')) {
                 refused_forms.push((format!("forklift unload -- {}", name), "unexpected argument '.txt'"));
             }
@@ -9065,7 +9082,7 @@ fn a_dash_led_remedy_path_runs_as_printed_in_windows_shells() {
                 );
             }
 
-            let ran = run_in_windows_shell(&warehouse, shell, command);
+            let ran = run_in_windows_shell(&warehouse, shell, &command);
             assert!(
                 ran.status.success(),
                 "{:?} ran {:?}: status {:?}\nstdout: {}\nstderr: {}", shell, command, ran.status, stdout(&ran), stderr(&ran)

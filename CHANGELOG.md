@@ -407,11 +407,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
-- **A next step that names a path starting with `-` runs as printed in Windows PowerShell.** Such
-  a path used to follow `--`, and Windows PowerShell 5.1 splits an unquoted argument that starts
-  with `-` at its first dot, so `forklift unload -- -draft.txt` reached Forklift as two paths. A
-  next step that tells you to load, unload or remove such a path now spells it `./-draft.txt`
-  instead, on every platform.
+- **A load, unload or remove next step for a path starting with `-` runs as printed in Windows
+  PowerShell.** Such a path used to follow `--`, and Windows PowerShell 5.1 splits an unquoted
+  argument that starts with `-` at its first dot, so `forklift unload -- -draft.txt` reached
+  Forklift as two paths. These next steps now spell it `./-draft.txt` instead, on every platform.
 
 - **Three more next steps quote the path they name.** The next step of an `incomplete_load`
   refusal, of `restore` on a file whose removal is staged, and of an inventory that cannot be read
