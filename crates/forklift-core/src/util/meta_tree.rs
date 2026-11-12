@@ -2746,6 +2746,80 @@ mod tests {
         assert_eq!(parse_cell(&encode_cell(&key_stamp(&signer), TEXT, &Table::new())).unwrap().value.len(), 0);
     }
 
+    /// A random cell value: keys that need quoting and keys that do not, and strings, integers,
+    /// booleans, arrays and nested tables, including the characters a string must escape.
+    fn random_value(rng: &mut crate::util::fuzz_bytes::Rng, depth: usize) -> Table {
+        const KEYS: [&str; 8] = ["text", "body", "opened_at", "a b", "ü", "x-y", "head", "n_2"];
+        const TEXTS: [&str; 9] = ["", "hello", "two\nlines", "quote \" and back \\ slash", "tab\there",
+            "\u{1}control", "ünïcödé", "'single'", "#not a comment"];
+        let mut table = Table::new();
+
+        for _ in 0..rng.below(5) {
+            let key = KEYS[rng.below(KEYS.len())];
+            let item = match rng.below(if depth == 0 { 6 } else { 5 }) {
+                0 | 1 => toml_edit::value(TEXTS[rng.below(TEXTS.len())]),
+                2 => toml_edit::value([0, 7, -3, 1_782_205_234, i64::MAX, i64::MIN][rng.below(6)]),
+                3 => toml_edit::value(rng.below(2) == 0),
+                4 => {
+                    let mut array = toml_edit::Array::new();
+                    (0..rng.below(3)).for_each(|_| array.push(TEXTS[rng.below(TEXTS.len())]));
+                    toml_edit::value(array)
+                }
+                _ => Item::Table(random_value(rng, depth + 1)),
+            };
+            table.insert(key, item);
+        }
+
+        table
+    }
+
+    /// Any bytes `parse_cell` accepts are exactly what `encode_cell` writes for the envelope they
+    /// parsed to. A cell is content named by its hash and signed through its parcel, so a second
+    /// spelling of one value would be a second cell carrying the first one's meaning: it would read
+    /// as a disagreement in the sync walk, and slip past anything naming the first.
+    ///
+    /// Each fixture is re-spelled by a rewrite that keeps its data (checked independently with
+    /// `toml_data`), or damaged at random. Revert: let `parse_cell` accept a cell that does not
+    /// re-encode to its own bytes → a respelling parses and the property fails.
+    #[test]
+    fn every_accepted_cell_is_in_its_canonical_form() {
+        use crate::util::fuzz_bytes::{mutate, respell_toml, toml_data, Rng, RESPELLINGS};
+
+        let mut rng = Rng::new(0xCE11_0001);
+        let mut respelled: BTreeMap<&str, usize> = BTreeMap::new();
+
+        for _ in 0..4000 {
+            let stamp = if rng.below(2) == 0 { key_stamp(&format!("{:064x}", rng.next_u64())) } else { Stamp::Operator("alice".to_string()) };
+            let schema = ["kv.text 1", "haul.opened 1", "newer.shape 9"][rng.below(3)];
+            let fixture = encode_cell(&stamp, schema, &random_value(&mut rng, 0));
+            let parsed = parse_cell(&fixture).unwrap_or_else(|e| panic!("{}: {}", String::from_utf8_lossy(&fixture), e));
+            assert_eq!(encode_cell(&parsed.stamp, &parsed.schema, &parsed.value), fixture, "a written cell does not round-trip");
+
+            let text = String::from_utf8(fixture.clone()).unwrap();
+            let bytes = if rng.below(4) == 0 {
+                let mut bytes = fixture.clone();
+                mutate(&mut bytes, &mut rng);
+                bytes
+            } else {
+                let (kind, rewritten) = respell_toml(&text, &mut rng);
+                if rewritten != text && toml_data(&rewritten).is_some() && toml_data(&rewritten) == toml_data(&text) {
+                    *respelled.entry(kind).or_default() += 1;
+                }
+                rewritten.into_bytes()
+            };
+
+            let Ok(parsed) = parse_cell(&bytes) else { continue };
+            let rebuilt = encode_cell(&parsed.stamp, &parsed.schema, &parsed.value);
+            assert!(rebuilt == bytes, "a second spelling of a cell was accepted\n  in : {:?}\n  out: {:?}",
+                String::from_utf8_lossy(&bytes), String::from_utf8_lossy(&rebuilt));
+        }
+
+        // The property is only as strong as the second spellings it was offered.
+        for kind in RESPELLINGS {
+            assert!(respelled.get(kind).copied().unwrap_or(0) >= 20, "too few {} respellings: {:?}", kind, respelled);
+        }
+    }
+
     #[test]
     fn a_cell_envelope_parses_strictly() {
         let signer = "a".repeat(64);
