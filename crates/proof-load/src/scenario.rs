@@ -39,6 +39,8 @@ pub enum Op {
     /// Start a forklift-server over a fresh host warehouse and make it this warehouse's remote.
     /// The server serves for the rest of the scenario, its faulted run included.
     Host,
+    /// Move a partial warehouse's origin to the host it already has, which holds all it leans on.
+    MoveOrigin,
     /// Have the host's server build the bundle a full clone imports.
     Bundle,
     /// Replace this warehouse with a clone of the host, of the given kind. What the history
@@ -145,6 +147,7 @@ pub fn bind(tool: Tool, op: &Op) -> Option<Vec<Vec<String>>> {
                     }
                     vec![clone]
                 }
+                Op::MoveOrigin => vec![line(&["remote", "move", URL])],
                 // The server's own command, which the build runs with the server binary.
                 Op::Bundle => vec![],
                 Op::Push => vec![line(&["lift"])],
@@ -172,7 +175,7 @@ pub fn bind(tool: Tool, op: &Op) -> Option<Vec<Vec<String>>> {
                 // failed step; and git signs nothing by enrollment.
                 Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll => return None,
                 // The host is a forklift-server; git has no server of its own to clone from.
-                Op::Host | Op::Bundle | Op::Clone { .. } => return None,
+                Op::Host | Op::Bundle | Op::Clone { .. } | Op::MoveOrigin => return None,
             };
             let prefix: &[&str] = if tool == Tool::GitTuned { GIT_TUNED } else { &[] };
             Some(lines.into_iter().map(|arguments| line(prefix).into_iter().chain(arguments).collect()).collect())
@@ -264,6 +267,9 @@ pub fn catalog() -> Vec<Scenario> {
         Scenario { then: vec![Op::Push], ..named("cached", vec![
             Op::Host, record(0), record(1), Op::Push, Op::Clone { kind: CloneKind::Cache },
         ]) },
+        Scenario { then: vec![Op::Push], ..named("moved", vec![
+            Op::Host, record(0), record(1), Op::Push, Op::Clone { kind: CloneKind::Cache }, Op::MoveOrigin,
+        ]) },
         named("signed", vec![record(0), Op::Enroll, record(1), record(2)]),
         named("packed", vec![record(0), Op::Enroll, record(1), record(2), Op::Pack]),
         // The variant changes every file of record 0 on the side branch, and record 1 changes at
@@ -289,7 +295,7 @@ mod tests {
             Op::Merge { name: "main".into() }, Op::Push, Op::Fetch, Op::Verify, Op::Repair,
             Op::Variant { index: 0 }, Op::Conflict { name: "side".into() }, Op::Pick { name: "side".into() },
             Op::Park { index: 0 }, Op::Enroll, Op::Pack, Op::Host, Op::Clone { kind: CloneKind::Only("src".into()) },
-            Op::Clone { kind: CloneKind::Cache }, Op::Bundle,
+            Op::Clone { kind: CloneKind::Cache }, Op::Bundle, Op::MoveOrigin,
         ]
     }
 
@@ -319,7 +325,7 @@ mod tests {
     #[test]
     fn git_binds_what_it_has_and_the_rest_is_forklift_only() {
         for op in every_op() {
-            let forklift_only = matches!(op, Op::Repair | Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll | Op::Host | Op::Bundle | Op::Clone { .. });
+            let forklift_only = matches!(op, Op::Repair | Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll | Op::Host | Op::Bundle | Op::Clone { .. } | Op::MoveOrigin);
             assert_eq!(bind(Tool::Git, &op).is_some(), !forklift_only, "{:?}", op);
         }
         let tuned = bind(Tool::GitTuned, &Op::Verify).unwrap();

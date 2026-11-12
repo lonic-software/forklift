@@ -66,10 +66,12 @@ pub const BINDINGS: &[Binding] = &[
     bound_in("objects/pack/densify-pending", "bundled", FILE),
     bound_in("origin", "cached", FILE),
     bound_in("sealed", "cached", FILE),
+    bound_in("origin-move.lock", "moved", LOCK_FILE),
 ];
 
 const NO_MIRROR_ORACLE: &str = "no mirror oracle: the corpus configures no mirror url, so nothing reads a mirror back";
 const INTERRUPTED: &str = "present only while a command runs or after one is interrupted, and removed when it finishes: no finished history holds one to damage, so the kill-point faults grade it";
+const SYNC_FAILED: &str = "written only when a directory sync after a rename fails, and cleared by heal: no finished history holds one to damage, so the power-loss and kill-point faults grade it";
 const HELD_LOCK: &str = "removed when the command holding it exits, a hard kill leaving it behind: the dead-process lock fault grades it, not a damaged copy";
 const PATH_BOUND: &str = "path-bound: a bay records its absolute path, so a run on a copy cannot reach it";
 
@@ -85,6 +87,9 @@ pub const EXEMPTIONS: &[Exemption] = &[
     Exemption { name: "franchise", reason: INTERRUPTED },
     Exemption { name: "{bay}inventory/incomplete-load", reason: INTERRUPTED },
     Exemption { name: "{bay}operation", reason: INTERRUPTED },
+    Exemption { name: "origin-move", reason: INTERRUPTED },
+    Exemption { name: "taint/", reason: SYNC_FAILED },
+    Exemption { name: "taint/<name>", reason: SYNC_FAILED },
     Exemption { name: "store.lock", reason: HELD_LOCK },
     Exemption { name: "serve.lock", reason: HELD_LOCK },
     Exemption { name: "{bay}lock", reason: HELD_LOCK },
@@ -97,12 +102,8 @@ pub const EXEMPTIONS: &[Exemption] = &[
 pub const NOT_YET_CREATED: &[&str] = &[
     "config/fetch-scope",
     "fetched-heads",
-    "origin-move",
-    "origin-move.lock",
     "redactions-applied",
     "served",
-    "taint/",
-    "taint/<name>",
     "tombstones",
     "unavailable",
     "unvouched-heads",
