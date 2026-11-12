@@ -9064,9 +9064,9 @@ fn a_dash_led_remedy_path_runs_as_printed_in_windows_shells() {
             let mut refused_forms = Vec::new();
             if !name.contains(' ') {
                 refused_forms.push((format!("forklift unload {}", name), "unexpected argument '-d'"));
-            }
-            if let (WindowsShell::PowerShell, true) = (shell, name.contains('.')) {
-                refused_forms.push((format!("forklift unload -- {}", name), "unexpected argument '.txt'"));
+                if let (WindowsShell::PowerShell, true) = (shell, name.contains('.')) {
+                    refused_forms.push((format!("forklift unload -- {}", name), "unexpected argument '.txt'"));
+                }
             }
             for (form, reason) in refused_forms {
                 let out = run_in_windows_shell(&warehouse, shell, &form);
