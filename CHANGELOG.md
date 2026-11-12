@@ -414,6 +414,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **The AWS head no longer stores a file or a chunk under a second hash.** A client uploading
+  straight to the AWS head's storage could respell a file's or a chunk's header, and the head
+  stored it under the new hash, where a redaction of the file's own hash did not reach it. The head
+  now refuses any upload that is not exactly the bytes Forklift writes, as forklift-server does;
+  a batch fetch of such an object already in a bucket is refused with a `422` naming it, not an
+  internal error.
+
 - **On Windows, a delete no longer fails at once on a file another program is reading.** A search
   indexer, an antivirus scanner or an editor that opens a file without letting others delete it
   used to fail any Forklift command that removed that file or a folder holding it, such as a

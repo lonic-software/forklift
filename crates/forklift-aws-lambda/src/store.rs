@@ -82,8 +82,8 @@ pub enum PutTarget {
     /// Upload the bytes to this URL (a presigned S3 PUT); the head answers `307`. The URL
     /// addresses a **staging key**, never the object's hash key: bytes written there are
     /// invisible to [`ObjectStore::exists`]/[`get`](ObjectStore::get) and become fetchable
-    /// only once [`ObjectStore::verify_and_promote`] has checked `Blake3(bytes) == hash`
-    /// and copied them to the canonical key. That ordering is what upholds invariant 1
+    /// only once [`ObjectStore::verify_and_promote`] has checked `Blake3(bytes) == hash` and
+    /// the object's form, and copied them to the canonical key. That ordering is what upholds invariant 1
     /// against a client that uploads straight to storage (DESIGN.html §4.2 / §4.6).
     Staged(String),
     /// The store stages uploads, but the request named no lift session to stage under —

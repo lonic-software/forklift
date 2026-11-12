@@ -1726,12 +1726,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// prefix, so the control plane never saw the bytes. This is where the small
     /// control-plane objects of `session` are **verified and promoted** to their hash keys
     /// (synchronously, via [`ObjectStore::verify_and_promote`]) — until it runs they are not
-    /// fetchable, and a corrupt one is discarded and stops the lift rather than ever
-    /// becoming visible.
+    /// fetchable, and a corrupt or malformed one is discarded and stops the lift rather than
+    /// ever becoming visible.
     ///
     /// Large blobs are only checked for *presence at their canonical key*, which is itself
     /// the proof they were verified: the staging verifier promotes a blob only after the
-    /// same `Blake3(bytes) == hash` check. A blob absent there is probed in the session's
+    /// same hash and form checks. A blob absent there is probed in the session's
     /// staging area: still staged means the verifier has not caught up, answered as a `503`
     /// with `Forklift-Commit: not-ready` that the client retries; gone from both places means
     /// the upload was discarded (the verifier rejected it) or never sent, a terminal `422`

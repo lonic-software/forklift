@@ -63,7 +63,8 @@ endpoints, which do return raw bytes through the control-plane Lambda — see "B
 below.
 
 A client `PUT`s straight to `staging/{warehouse}/{session}/{hash}`, never to the canonical
-`objects/{warehouse}/{hash}` key — nothing lands at a hash key until it is hash-verified. Small
+`objects/{warehouse}/{hash}` key — nothing lands at a hash key until it is hash-verified and its
+form checked as core's own store checks it (one spelling per object, within the ceilings). Small
 control-plane objects (parcels, trees, signatures) are verified and promoted **synchronously** by
 the control plane when the client calls `POST /lift/{session}/commit`; large blobs and chunks are
 verified and promoted **asynchronously** by the verifier Lambda, triggered by the S3 event the
@@ -973,10 +974,11 @@ deployer-supplied, out-of-repo mechanism.
   one:** the whole-object write ceiling (`MAX_OBJECT_BYTES`, 64 MiB) is enforced only on the way
   *in* — a pre-existing, over-ceiling object authored before this policy existed stays fully
   readable (a "grandfathered giant"), though no client import admits one any more. This head's
-  own promotion path (`verify_and_promote`) is type-blind and enforces only the coarse, size-only
-  `MAX_STAGED_OBJECT_BYTES` (5 GiB) backstop regardless — so it will happily promote a grandfathered giant if one is ever staged. It is mentioned here only
-  so you are not surprised by it; there is no operator action this document can recommend beyond
-  awareness.
+  own promotion path (`verify_and_promote`) checks a staged object's form as core's streaming
+  store does: a tree, parcel or recipe is held to the ceiling, but a blob above the streaming
+  threshold only to the coarse, size-only `MAX_STAGED_OBJECT_BYTES` (5 GiB) backstop — so it will
+  promote a grandfathered giant blob if one is ever staged. It is mentioned here only so you are
+  not surprised by it; there is no operator action this document can recommend beyond awareness.
 
 * **Upgrading a warehouse's format.** A deployment that reads a newer format refuses every
   warehouse in an older one with a `503` until it is upgraded, so a format break is an outage

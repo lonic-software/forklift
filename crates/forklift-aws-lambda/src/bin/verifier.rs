@@ -4,8 +4,8 @@
 //! object straight to `staging/{warehouse}/{session}/{hash}` via a presigned URL, which the
 //! control plane never sees; S3 fires an object-created event, and this function runs the *same*
 //! [`ObjectStore::verify_and_promote`] the control plane runs synchronously for small objects —
-//! it stream-hashes the staged bytes and, only if `Blake3(bytes) == hash`, server-side-copies
-//! them to that warehouse's canonical key. Promotion is the single moment the object becomes
+//! it stream-hashes the staged bytes and, only if `Blake3(bytes) == hash` and the object's form is
+//! one core's own store takes in, server-side-copies them to that warehouse's canonical key. Promotion is the single moment the object becomes
 //! fetchable (invariant 1), and it is idempotent, so this racing the control plane's
 //! `commit_lift` on one hash is safe.
 //!

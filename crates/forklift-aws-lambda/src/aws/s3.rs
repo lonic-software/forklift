@@ -68,7 +68,8 @@
 //!   bounded by one chunk, not by the object's size — aborting the moment the running total passes
 //!   [`MAX_STAGED_OBJECT_BYTES`], the hard ceiling regardless of path. The form check holds only
 //!   the header and a blob's version, except for a tree, parcel or recipe, which it holds up to
-//!   core's whole-object ceiling (`MAX_OBJECT_BYTES`) to parse, and refuses past it. Once the hash
+//!   core's whole-object ceiling (`MAX_OBJECT_BYTES`) to parse, refusing one past it (and never
+//!   holding one whose header declares it past it). Once the hash
 //!   and the form are known good, promotion moves the bytes with a server-side `CopyObject` rather
 //!   than re-uploading them from a buffer this process would otherwise have had to hold.
 //!
