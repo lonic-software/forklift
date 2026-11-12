@@ -284,7 +284,7 @@ fn create_alias(alias_path: &Path, target: &Path) -> io::Result<()> {
 
 #[cfg(unix)]
 fn remove_alias(alias_path: &Path) -> io::Result<()> {
-    std::fs::remove_file(alias_path)
+    forklift_core::util::file_utils::remove_file(alias_path)
 }
 
 // ── Windows: symlinks need elevated privilege, so drop a `.cmd` shim instead ──────────────
@@ -367,7 +367,7 @@ fn create_alias(alias_path: &Path, target: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn remove_alias(alias_path: &Path) -> io::Result<()> {
-    std::fs::remove_file(alias_path)
+    forklift_core::util::file_utils::remove_file(alias_path)
 }
 
 // ── Anything else: no supported mechanism yet ─────────────────────────────

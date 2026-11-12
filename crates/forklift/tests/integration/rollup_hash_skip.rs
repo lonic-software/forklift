@@ -30,7 +30,7 @@ impl Warehouse {
         ));
         let root = base.join("warehouse");
         let home = base.join("home");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         Warehouse { root, home, disable_skip }
@@ -96,7 +96,7 @@ impl Warehouse {
 impl Drop for Warehouse {
     fn drop(&mut self) {
         if let Some(base) = self.root.parent() {
-            let _ = std::fs::remove_dir_all(base);
+            let _ = forklift_core::util::file_utils::remove_dir_all(base);
         }
     }
 }
@@ -121,8 +121,8 @@ impl Twin {
     }
 
     fn remove_file(&self, relative: &str) {
-        std::fs::remove_file(self.on.root.join(relative)).unwrap();
-        std::fs::remove_file(self.off.root.join(relative)).unwrap();
+        forklift_core::util::file_utils::remove_file(self.on.root.join(relative)).unwrap();
+        forklift_core::util::file_utils::remove_file(self.off.root.join(relative)).unwrap();
     }
 
     /// Run the same mutating command on both twins, requiring the same exit status on each.
@@ -592,11 +592,11 @@ fn a_shard_that_vanishes_out_from_under_load_still_invalidates_its_ancestors() {
     // dirty-path pass into the specific branch this regression targets, rather than the
     // already-correct "shard exists, mark everything Deleted" branch a plain working-directory
     // deletion alone would hit.
-    std::fs::remove_dir_all(warehouse.root.join("a/b/c")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("a/b/c")).unwrap();
     {
         let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
         let shard_folder = forklift_core::util::file_utils::get_inventory_folder_for_key("a/b/c").unwrap();
-        std::fs::remove_dir_all(&shard_folder).unwrap();
+        forklift_core::util::file_utils::remove_dir_all(&shard_folder).unwrap();
     }
 
     warehouse.run_ok(&["load", "."]);
@@ -788,7 +788,7 @@ fn a_directory_removed_without_a_load_survives_the_stacks_that_follow() {
     twin.run_ok(&["stack", "-m", "base"]);
 
     for warehouse in [&twin.on, &twin.off] {
-        std::fs::remove_dir_all(warehouse.root.join("gone")).unwrap();
+        forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("gone")).unwrap();
     }
 
     for (round, content) in [("second", "v2\n"), ("third", "v3\n")] {

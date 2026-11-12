@@ -25,7 +25,7 @@ type Writer<'a> = (&'a str, Box<dyn Fn(&str) -> Result<(), String> + 'a>);
 fn a_write_to_a_new_path_fails_on_any_occupant_and_leaves_it_intact() {
     let base = std::env::temp_dir().join(format!("forklift-case-alias-backstop-{}", std::process::id()));
     let root = base.join("warehouse");
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     std::fs::create_dir_all(&root).unwrap();
 
     let prepared = forklift_command()
@@ -62,7 +62,7 @@ fn a_write_to_a_new_path_fails_on_any_occupant_and_leaves_it_intact() {
     let folds = {
         std::fs::write("probe", "").unwrap();
         let folds = Path::new("PROBE").exists();
-        std::fs::remove_file("probe").unwrap();
+        forklift_core::util::file_utils::remove_file("probe").unwrap();
         folds
     };
     let mut spellings = vec!["readme"];
@@ -87,18 +87,18 @@ fn a_write_to_a_new_path_fails_on_any_occupant_and_leaves_it_intact() {
                 assert_eq!(listed_names(), vec![".forklift".to_string(), occupant.to_string()],
                            "{}: nothing else is left behind", case);
 
-                std::fs::remove_file(occupant).unwrap();
+                forklift_core::util::file_utils::remove_file(occupant).unwrap();
             }
         }
 
         // With nothing there, the same write lands.
         write("readme").unwrap_or_else(|e| panic!("{} write onto nothing: {}", label, e));
-        std::fs::remove_file("readme").unwrap();
+        forklift_core::util::file_utils::remove_file("readme").unwrap();
     }
 
     std::env::set_current_dir(&base).unwrap();
     drop(_scope);
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&base);
 }
 
 fn store_blob(content: &[u8]) -> String {

@@ -717,7 +717,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             .scoped(|| {
                 let (folder, file_name) = file_utils::get_path_for_object(hash)?;
 
-                match std::fs::remove_file(std::path::Path::new(&folder).join(file_name)) {
+                match file_utils::remove_file(std::path::Path::new(&folder).join(file_name)) {
                     Ok(()) => Ok(()),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                     Err(error) => Err(format!("Error while evicting redacted object {} from the scratch: {}", hash, error)),

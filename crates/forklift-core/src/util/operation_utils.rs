@@ -395,7 +395,7 @@ pub fn finish() -> Result<(), String> {
 }
 
 fn remove_marker(path: &Path) -> Result<(), String> {
-    match std::fs::remove_file(path) {
+    match file_utils::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("Error while clearing the operation record \"{}\": {}", path.to_string_lossy(), e)),
@@ -900,7 +900,7 @@ mod tests {
     #[test]
     fn a_wholesale_rewrite_of_staging_refuses_unless_this_process_raised_a_marker() {
         let root = std::env::temp_dir().join(format!("forklift-operation-required-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&root);
 
@@ -921,14 +921,14 @@ mod tests {
         assert!(read().unwrap().is_none());
 
         drop(scope);
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     // Revert: `raise_in` returns the bare message → no code, and no step to finish it by.
     #[test]
     fn raising_over_a_standing_marker_refuses_naming_heal() {
         let root = std::env::temp_dir().join(format!("forklift-operation-raise-over-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&root);
 
@@ -945,6 +945,6 @@ mod tests {
         }
 
         drop(scope);
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 }

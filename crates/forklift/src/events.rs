@@ -731,7 +731,7 @@ mod tests {
         fn regular_file() -> std::fs::File {
             let path = std::env::temp_dir().join(format!("forklift-events-test-{}", std::process::id()));
             let file = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&path).unwrap();
-            let _ = std::fs::remove_file(&path);
+            let _ = forklift_core::util::file_utils::remove_file(&path);
             file
         }
     }

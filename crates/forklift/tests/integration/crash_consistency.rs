@@ -41,7 +41,7 @@ struct Area {
 impl Area {
     fn new(name: &str) -> Area {
         let root = std::env::temp_dir().join(format!("forklift-crash-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("warehouse")).unwrap();
         std::fs::create_dir_all(root.join("home")).unwrap();
         Area { root }
@@ -82,7 +82,7 @@ impl Area {
     /// power loss would; the operator clears it. Do the same before the next command so the lock
     /// is never the reason a later step fails — we are testing store integrity, not the lock.
     fn clear_stale_lock(&self) {
-        let _ = std::fs::remove_file(self.warehouse().join(".forklift").join("lock"));
+        let _ = forklift_core::util::file_utils::remove_file(self.warehouse().join(".forklift").join("lock"));
     }
 
     /// Assert the store is internally consistent right now: any pallet head is a whole 64-hex hash
@@ -129,7 +129,7 @@ impl Area {
 
 impl Drop for Area {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.root);
     }
 }
 
@@ -389,7 +389,7 @@ fn stopping_load_at_every_rename_never_leaves_a_shard_referencing_a_missing_or_t
         },
         |at, _| {
             area.clear_stale_lock();
-            let _ = std::fs::remove_file(
+            let _ = forklift_core::util::file_utils::remove_file(
                 forklift_core::util::load_guard_utils::marker_path_under(&area.warehouse())
             );
 
@@ -675,7 +675,7 @@ fn park_pop_barrier_count_for(files_per_dir: usize) -> u64 {
         let dir_path = warehouse.join(format!("dir{dir}"));
         for f in 0..files_per_dir {
             std::fs::write(dir_path.join(format!("file{f}.txt")), format!("parked {dir} {f}\n")).unwrap();
-            std::fs::remove_file(dir_path.join(format!("gone{f}.txt"))).unwrap();
+            forklift_core::util::file_utils::remove_file(dir_path.join(format!("gone{f}.txt"))).unwrap();
         }
     }
 
@@ -798,7 +798,7 @@ fn consolidate_whose_action_fails_stages_nothing() {
 
     // Root removes from a read-only folder, so the failure cannot be staged; nothing to test.
     if std::fs::write(locked.join("probe"), "").is_ok() {
-        std::fs::remove_file(locked.join("probe")).unwrap();
+        forklift_core::util::file_utils::remove_file(locked.join("probe")).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         return;
     }
@@ -873,7 +873,7 @@ fn diverged_merge_fixture(area: &Area, files_per_dir: usize, clash: bool) -> Str
         let dir_path = warehouse.join(format!("dir{dir}"));
         for f in 0..files_per_dir {
             std::fs::write(dir_path.join(format!("file{f}.txt")), format!("theirs {dir} {f}\n")).unwrap();
-            std::fs::remove_file(dir_path.join(format!("gone{f}.txt"))).unwrap();
+            forklift_core::util::file_utils::remove_file(dir_path.join(format!("gone{f}.txt"))).unwrap();
             std::fs::write(dir_path.join(format!("merged{f}.txt")), merge_lines("theirs", &format!("{dir} {f}"), "e")).unwrap();
             if clash {
                 std::fs::write(dir_path.join(format!("clash{f}.txt")), format!("theirs {dir} {f}\n")).unwrap();
@@ -1189,7 +1189,7 @@ fn building_the_commit_graph_pays_no_durability_barrier() {
     }
 
     let graph_root = warehouse.join(".forklift").join("graph");
-    let _ = std::fs::remove_dir_all(&graph_root);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&graph_root);
 
     let mut blame = area.command(&["blame", "f.txt"]);
     blame.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");

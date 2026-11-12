@@ -363,7 +363,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new(name: &str) -> Scratch {
         let path = std::env::temp_dir().join(format!("forklift-format-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         Scratch(path)
     }
@@ -371,7 +371,7 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.0);
     }
 }
 
@@ -583,7 +583,7 @@ fn freeze_the_current_format_fixtures() {
     for (name, _) in fixtures() {
         let warehouse = at(name);
         // A dead server's lock is the one file a stopped process leaves that no command would.
-        let _ = std::fs::remove_file(warehouse.join(".forklift").join("serve.lock"));
+        let _ = forklift_core::util::file_utils::remove_file(warehouse.join(".forklift").join("serve.lock"));
         let left = unclassified(&warehouse);
         assert!(left.is_empty(), "{}: paths no census row matches: {:?}", name, left);
         pack_fixture(&warehouse, &folder.join(format!("{}.fixture", name)));

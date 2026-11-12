@@ -1015,7 +1015,7 @@ mod subtree_closure_tests {
             let root = std::env::temp_dir().join(format!(
                 "forklift-subtree-closure-test-{}-{}-{}", name, std::process::id(), id
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
 
@@ -1025,7 +1025,7 @@ mod subtree_closure_tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = file_utils::remove_dir_all(&self.root);
         }
     }
 

@@ -2087,7 +2087,7 @@ fn mark_densify_pending(pack_folder: &Path) {
 /// repeated back-to-back on the same store (see the KNOWN GAP note on `retrieve_from_packs`).
 /// Best-effort, same reasoning as `mark_densify_pending`.
 fn clear_densify_pending(pack_folder: &Path) {
-    let _ = std::fs::remove_file(pack_folder.join(FILE_NAME_DENSIFY_MARKER));
+    let _ = crate::util::file_utils::remove_file(pack_folder.join(FILE_NAME_DENSIFY_MARKER));
 }
 
 /// Whether the object store carries the densify-pending marker — surfaced by `store` as a
@@ -2650,7 +2650,7 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
                 (true, false) => {
                     // A prior crash may have published data but not its index. It is invisible;
                     // replace it with the just-verified bytes before publishing the index.
-                    std::fs::remove_file(&data_final)
+                    crate::util::file_utils::remove_file(&data_final)
                         .map_err(|e| format!("Error while replacing incomplete pack data: {}", e))?;
                     file_utils::rename(&pair.data_path, &data_final)
                         .map_err(|e| format!("Error while publishing bundle pack data: {}", e))?;
@@ -2662,7 +2662,7 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
                 (false, true) => {
                     // An index without data is reader-visible corruption. Remove the stale commit
                     // point first, then publish the verified pair data-first/index-last.
-                    std::fs::remove_file(&index_final)
+                    crate::util::file_utils::remove_file(&index_final)
                         .map_err(|e| format!("Error while replacing incomplete pack index: {}", e))?;
                     file_utils::rename(&pair.data_path, &data_final)
                         .map_err(|e| format!("Error while publishing bundle pack data: {}", e))?;
@@ -2698,8 +2698,8 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
     // Published paths were renamed away and return NotFound here; failed/unneeded staging files
     // are removed. Cleanup errors never mask the import's real result.
     for pair in staged {
-        let _ = std::fs::remove_file(pair.data_path);
-        let _ = std::fs::remove_file(pair.index_path);
+        let _ = crate::util::file_utils::remove_file(pair.data_path);
+        let _ = crate::util::file_utils::remove_file(pair.index_path);
     }
 
     result
@@ -4185,7 +4185,7 @@ fn compact_held(all: bool,
         .sum();
 
     for source in &packed_sources {
-        match std::fs::remove_file(source) {
+        match crate::util::file_utils::remove_file(source) {
             Ok(()) => stats.loose_removed += 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!(
@@ -4211,7 +4211,7 @@ fn compact_held(all: bool,
             continue;
         }
         // As with the loose sweep, an old pack another process already removed is not an error.
-        match std::fs::remove_file(old_pack) {
+        match crate::util::file_utils::remove_file(old_pack) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!(
@@ -4580,7 +4580,7 @@ fn sweep_signatures(pack_folder: &Path,
     })?;
     stats.signature_tables_written += published.written;
 
-    let remove = |path: &Path, what: &str| match std::fs::remove_file(path) {
+    let remove = |path: &Path, what: &str| match crate::util::file_utils::remove_file(path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(format!("Error while removing {} \"{}\": {}", what, path.to_string_lossy(), e)),
@@ -6510,7 +6510,7 @@ fn remove_stale_temp_files(pack_folder: &Path) {
             .is_some_and(|age| age.as_secs() >= STALE_TEMP_SECONDS);
 
         if is_temp && is_stale {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = crate::util::file_utils::remove_file(entry.path());
         }
     }
 }
@@ -6622,7 +6622,7 @@ pub(crate) mod tests {
         assert_eq!(artifacts.len(), 1, "one object must make exactly one pack pair");
 
         let (folder, file_name) = file_utils::get_path_for_object(hash).unwrap();
-        std::fs::remove_file(Path::new(&folder).join(file_name)).unwrap();
+        crate::util::file_utils::remove_file(Path::new(&folder).join(file_name)).unwrap();
         invalidate_cache();
 
         artifacts.remove(0)
@@ -6661,7 +6661,7 @@ pub(crate) mod tests {
         };
 
         match how {
-            Unreadable::Quarantined => std::fs::remove_file(&artifact.data_path).unwrap(),
+            Unreadable::Quarantined => crate::util::file_utils::remove_file(&artifact.data_path).unwrap(),
             Unreadable::CorruptBucket => corrupt_record_of(&artifact.index_path, &hash_to_bytes(hash).unwrap()),
             Unreadable::ForeignVersion => rewrite_header(8, &(PACK_FORMAT_VERSION + 1).to_le_bytes()),
             Unreadable::Unparseable => rewrite_header(0, b"NOTAPACK"),
@@ -6820,7 +6820,7 @@ pub(crate) mod tests {
     #[test]
     fn reads_are_cached_and_stay_valid_across_compaction() {
         let temp = std::env::temp_dir().join(format!("forklift-read-cache-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -6838,7 +6838,7 @@ pub(crate) mod tests {
         compact(false, false, false, &Progress::NONE).unwrap();
         assert_eq!(file_utils::retrieve_object_by_hash(&hash).unwrap(), content);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// Mechanism-level probe for a held pack mapping blocking a directory's removal, isolated
@@ -6874,7 +6874,7 @@ pub(crate) mod tests {
     #[test]
     fn an_mmapd_pack_does_not_block_its_own_directory_removal() {
         let temp = std::env::temp_dir().join(format!("forklift-mmap-block-probe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -6895,7 +6895,7 @@ pub(crate) mod tests {
         // The mmap is still held in the process-global registry, with no `invalidate_cache()`
         // call anywhere in this test — yet removal succeeds anyway (see the doc comment above
         // for why: `FILE_SHARE_DELETE` is Rust's own Windows default for `std::fs::File`).
-        let removal_while_mapped = std::fs::remove_dir_all(&temp);
+        let removal_while_mapped = crate::util::file_utils::remove_dir_all(&temp);
         assert!(
             removal_while_mapped.is_ok(),
             "expected remove_dir_all to succeed even while a pack from this directory is still \
@@ -6996,7 +6996,7 @@ pub(crate) mod tests {
         use crate::model::blob::Blob;
 
         let temp = std::env::temp_dir().join(format!("forklift-ingest-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7049,7 +7049,7 @@ pub(crate) mod tests {
         use crate::model::blob::Blob;
 
         let temp = std::env::temp_dir().join(format!("forklift-ingest-skip-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7081,7 +7081,7 @@ pub(crate) mod tests {
         taint_utils::activate();
 
         let temp = std::env::temp_dir().join(format!("forklift-ingest-taint-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7104,7 +7104,7 @@ pub(crate) mod tests {
             assert!(path.starts_with("objects/pack"), "expected a pack path, got {:?}", path);
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// Fire-site e (durable-taint wiring): `import_transport_packs`'s own trailing directory
@@ -7122,7 +7122,7 @@ pub(crate) mod tests {
         taint_utils::activate();
 
         let temp = std::env::temp_dir().join(format!("forklift-transport-taint-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7161,13 +7161,13 @@ pub(crate) mod tests {
             assert!(path.starts_with("objects/pack"), "expected a pack path, got {:?}", path);
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
     fn compact_packs_loose_objects_and_reads_them_back() {
         let temp = std::env::temp_dir().join(format!("forklift-pack-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7206,7 +7206,7 @@ pub(crate) mod tests {
         assert!(!is_in_packs(&absent).unwrap());
         assert!(matches!(retrieve_from_packs(&absent).unwrap(), PackRetrieval::NotLocated));
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// An uppercase spelling of a real hash gets the same answer whether the object is loose or
@@ -7221,7 +7221,7 @@ pub(crate) mod tests {
     #[test]
     fn an_uppercase_hash_is_refused_alike_loose_and_packed() {
         let temp = std::env::temp_dir().join(format!("forklift-pack-case-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7244,7 +7244,7 @@ pub(crate) mod tests {
         let packed = file_utils::does_object_exist(&upper);
         assert!(packed.is_err(), "packed: an uppercase spelling is refused, got {:?}", packed);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// A loose object listed under a respelled fan-out folder (`AB/…`) is packed under its
@@ -7257,7 +7257,7 @@ pub(crate) mod tests {
     #[test]
     fn compact_packs_a_respelled_loose_object_exactly_where_reads_reach_it() {
         let temp = std::env::temp_dir().join(format!("forklift-pack-respelled-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7279,7 +7279,7 @@ pub(crate) mod tests {
         assert_eq!(is_in_packs(&hash).unwrap(), folds, "packed exactly where reads reach it (folds: {})", folds);
         assert_eq!(upper.join(&file_name).exists(), !folds, "the loose entry goes once packed");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -7289,7 +7289,7 @@ pub(crate) mod tests {
         // writes bytes at a good address that decode cleanly but hash to something else
         // entirely (the class `object_utils::verify_object_bytes` exists to catch).
         let temp = std::env::temp_dir().join(format!("forklift-pack-corrupt-loose-hash-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7326,7 +7326,7 @@ pub(crate) mod tests {
         assert!(is_in_packs(&genuine_hash).unwrap());
         assert_eq!(packs_verified(&genuine_hash), genuine_content);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -7337,7 +7337,7 @@ pub(crate) mod tests {
         // (`crates/forklift/src/commands/maintenance.rs`), so one bad file silently wedged
         // background housekeeping for the whole store.
         let temp = std::env::temp_dir().join(format!("forklift-pack-corrupt-loose-decode-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7363,7 +7363,7 @@ pub(crate) mod tests {
         assert!(garbage_path.exists(), "the undecodable file must be left in place, never deleted");
         assert!(!is_in_packs(&garbage_hash).unwrap());
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -7377,7 +7377,7 @@ pub(crate) mod tests {
         // giant fully decodes, verifies, gets packed, and its loose file is swept once the pack
         // is durable — every assertion below flips.
         let temp = std::env::temp_dir().join(format!("forklift-pack-over-ceiling-loose-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7396,7 +7396,7 @@ pub(crate) mod tests {
         assert!(!is_in_packs(&giant_hash).unwrap(),
             "a bounded decode must never produce the bytes to pack an over-ceiling object");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -7413,7 +7413,7 @@ pub(crate) mod tests {
         use crate::model::tree_item::TreeItem;
 
         let temp = std::env::temp_dir().join(format!("forklift-pack-redelta-abort-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7485,7 +7485,7 @@ pub(crate) mod tests {
         assert!(result.is_err(), "a corrupt packed record reached via Reconstruct must abort, not skip");
         assert!(pack_path.exists(), "abort must precede old-pack removal -- the corrupt pack must survive");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// FORK-55 pinning test (spike — expected RED on `main`, no fix applied yet). `collect_targets`'s
@@ -7554,7 +7554,7 @@ pub(crate) mod tests {
         use crate::model::tree_item::TreeItem;
 
         let temp = std::env::temp_dir().join(format!("forklift-fork55-dup-corrupt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7712,7 +7712,7 @@ pub(crate) mod tests {
             .expect("X must still be readable after the repack consolidated the duplicate and the good pack together");
         assert_eq!(read_back, expected, "X must read back its original, correct bytes after the repack");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// FORK-55, T1b (§5 I1) — loose-vs-pack: a corrupt *loose* duplicate of a live packed hash
@@ -7757,7 +7757,7 @@ pub(crate) mod tests {
         use crate::model::tree_item::TreeItem;
 
         let temp = std::env::temp_dir().join(format!("forklift-fork55-loose-dup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7823,7 +7823,7 @@ pub(crate) mod tests {
             .expect("X must still be readable after the repack consolidated the loose duplicate and the good pack");
         assert_eq!(read_back, expected, "X must read back its original, correct bytes after the repack");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// FORK-55, T2 (§5 I2) — no *obtainable* verifiable copy of a live duplicated hash must abort
@@ -7872,7 +7872,7 @@ pub(crate) mod tests {
         use crate::model::tree_item::TreeItem;
 
         let temp = std::env::temp_dir().join(format!("forklift-fork55-both-corrupt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -7979,7 +7979,7 @@ pub(crate) mod tests {
         assert!(pack_a_data.exists() && pack_a_index.exists(),
             "abort must precede the destructive sweep -- pack A must survive");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// FORK-55, T3′ (§5 I3) — the falsifier for the byte-identical-duplicate fast path: when
@@ -8024,7 +8024,7 @@ pub(crate) mod tests {
         use crate::model::tree_item::TreeItem;
 
         let temp = std::env::temp_dir().join(format!("forklift-fork55-identical-corrupt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -8112,7 +8112,7 @@ pub(crate) mod tests {
             "a byte-identical duplicate (even a corrupt one) must keep the verbatim CopyRecord \
             fast path and never abort the repack, got {:?}", result);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// FORK-55, T3 (§5 I3) — property assertion, not a falsifier (its redness under the
@@ -8133,7 +8133,7 @@ pub(crate) mod tests {
         use crate::model::tree_item::TreeItem;
 
         let temp = std::env::temp_dir().join(format!("forklift-fork55-clean-dup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -8212,7 +8212,7 @@ pub(crate) mod tests {
             .expect("X must still be readable after the repack consolidated the clean duplicate");
         assert_eq!(read_back, expected, "X must read back its original, correct bytes after the repack");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -8242,7 +8242,7 @@ pub(crate) mod tests {
         use crate::model::tree_item::TreeItem;
 
         let temp = std::env::temp_dir().join(format!("forklift-fork55-dup-giant-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -8324,7 +8324,7 @@ pub(crate) mod tests {
             .expect("the giant must still be servable after the repack packed its duplicated copy");
         assert_eq!(servable, giant, "the giant must read back its real bytes after the repack");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// Fire-site f (durable-taint wiring): `compact`'s own new-pack directory sync — the last of
@@ -8344,7 +8344,7 @@ pub(crate) mod tests {
         taint_utils::activate();
 
         let temp = std::env::temp_dir().join(format!("forklift-compact-taint-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -8409,13 +8409,13 @@ pub(crate) mod tests {
             "compact must not remove a loose source while a taint is standing, even with a \
             clean directory sync");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
     fn compact_stores_similar_objects_as_deltas_that_round_trip() {
         let temp = std::env::temp_dir().join(format!("forklift-pack-delta-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -8458,7 +8458,7 @@ pub(crate) mod tests {
         assert!(stats.bytes_packed < full_size / 3,
             "deltas should shrink the store: packed {} vs full {}", stats.bytes_packed, full_size);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -8467,7 +8467,7 @@ pub(crate) mod tests {
         // read as version 3, and neither may be silently ignored: the load names the version it
         // found, so the operator knows the warehouse needs re-creating rather than repair.
         let temp = std::env::temp_dir().join(format!("forklift-pack-old-version-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let content = vec![9u8; 3000];
@@ -8514,7 +8514,7 @@ pub(crate) mod tests {
         let error = load_pack_pair(&data_path, &index_path).err().expect("another data version must be refused");
         assert!(error.contains("Pack data") && error.contains("format version 2"), "{}", error);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -8524,7 +8524,7 @@ pub(crate) mod tests {
         // record, or a delta rebuilt against the wrong base). Without the read-side hash check
         // this returns wrong bytes silently; with it, the read must error.
         let temp = std::env::temp_dir().join(format!("forklift-pack-corrupt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         let pack_folder = temp.join(".forklift/objects/pack");
         std::fs::create_dir_all(&pack_folder).unwrap();
         let _scope = StorageRootScope::enter(&temp);
@@ -8562,7 +8562,7 @@ pub(crate) mod tests {
             other => panic!("a record decompressing to the wrong bytes must fail the read, got {:?}", other),
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// A full record of `content`.
@@ -8639,7 +8639,7 @@ pub(crate) mod tests {
         assert_eq!(file_utils::retrieve_object_by_hash(&b_hash).unwrap(), b);
         assert_eq!(verify_calls() - before, 1, "a base read directly hashes once, then serves from the cache");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// On a thread with `WORKER_STACK_SIZE`, a cold read of a chain one delta past
@@ -8690,7 +8690,7 @@ pub(crate) mod tests {
         assert_eq!(at_limit.as_deref(), Ok(contents[links - 1].as_slice()),
                    "a chain exactly at the depth limit must read back");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// Call `f` once the stack in use, measured from `top` (an address in an outer frame), is at
@@ -8729,7 +8729,7 @@ pub(crate) mod tests {
         let error = file_utils::retrieve_object_by_hash(&b_hash).unwrap_err();
         assert!(error.contains(&format!("Object {} is corrupt", b_hash)), "got: {}", error);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// A target encoded against the bytes a corrupt base's record actually decodes to reads,
@@ -8756,7 +8756,7 @@ pub(crate) mod tests {
         assert!(error.contains(&format!("Object {} is corrupt", b_hash)), "got: {}", error);
         assert!(matches!(retrieve_from_packs(&b_hash).unwrap(), PackRetrieval::Failed(_)));
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// Reading the end of a long chain whose root is corrupt reloads the pack registry once, for
@@ -8784,7 +8784,7 @@ pub(crate) mod tests {
         assert!(error.contains(&format!("Object {} is corrupt", hashes[0])), "got: {}", error);
         assert_eq!(FORCED_RELOADS.with(|reloads| reloads.get()) - before, 1);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// `compact --all` never copies a delta verbatim once its base is repacked from a different
@@ -8859,7 +8859,7 @@ pub(crate) mod tests {
             }
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// Rename a just-finalized pack pair's stem, so file-name enumeration order is deterministic
@@ -8890,7 +8890,7 @@ pub(crate) mod tests {
     fn a_broken_record_falls_through_to_a_good_copy_in_a_later_pack() {
         let temp = std::env::temp_dir()
             .join(format!("forklift-pack-broken-then-good-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -8917,7 +8917,7 @@ pub(crate) mod tests {
 
         assert_eq!(packs_verified(&hash), content);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (I5, both-broken companion to the test above) When *every* locating pack's record fails to
@@ -8927,7 +8927,7 @@ pub(crate) mod tests {
     fn when_every_located_copy_is_broken_the_outcome_is_failed_not_verified() {
         let temp = std::env::temp_dir()
             .join(format!("forklift-pack-broken-then-broken-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -8952,7 +8952,7 @@ pub(crate) mod tests {
         assert!(matches!(retrieve_from_packs(&hash).unwrap(), PackRetrieval::Failed(_)),
             "every locating pack failed to resolve — the outcome must be Failed");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -8965,7 +8965,7 @@ pub(crate) mod tests {
         // disk-corrupted or hand-crafted index can still produce this. `read_record_header` must
         // reject it cleanly rather than panic indexing past the record's declared length.
         let temp = std::env::temp_dir().join(format!("forklift-pack-short-delta-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         let pack_folder = temp.join(".forklift/objects/pack");
         std::fs::create_dir_all(&pack_folder).unwrap();
         let _scope = StorageRootScope::enter(&temp);
@@ -8999,7 +8999,7 @@ pub(crate) mod tests {
         let message = result.unwrap_err();
         assert!(message.contains("truncated"), "the error should name the truncation: {}", message);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -9014,7 +9014,7 @@ pub(crate) mod tests {
         // recursively: a real store this ledger exists to repair can already hold a chain deep
         // enough that native call-stack recursion would risk overflow resolving it.
         let temp = std::env::temp_dir().join(format!("forklift-true-depth-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         let pack_folder = temp.join(".forklift/objects/pack");
         std::fs::create_dir_all(&pack_folder).unwrap();
         let _scope = StorageRootScope::enter(&temp);
@@ -9080,7 +9080,7 @@ pub(crate) mod tests {
             .expect("a memoized hash needs no pack lookup");
         assert_eq!(mid_depth, (CHAIN_LEN / 2) as u32);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -9089,7 +9089,7 @@ pub(crate) mod tests {
         // *external* compact would miss an object that compact moved into a new pack and whose
         // loose source it swept — both the cached packs and the loose fallback come up empty.
         let temp = std::env::temp_dir().join(format!("forklift-reload-miss-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -9112,7 +9112,7 @@ pub(crate) mod tests {
             "a read must reload the pack registry and find an externally-packed object",
         );
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -9120,7 +9120,7 @@ pub(crate) mod tests {
         // compact serializes on the shared store lock, so a second compaction (another bay or
         // process) cannot race its deletions.
         let temp = std::env::temp_dir().join(format!("forklift-compact-lock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -9133,7 +9133,7 @@ pub(crate) mod tests {
         drop(held);
         assert!(compact(false, false, false, &Progress::NONE).is_ok(), "compact runs once the store lock is free");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -9151,7 +9151,7 @@ pub(crate) mod tests {
         // pallet refs exist), so every packed object is legitimately unreachable garbage and a
         // repack must drop it all — exercising the exact "mmap it, then delete it" sequence.
         let temp = std::env::temp_dir().join(format!("forklift-repack-removes-old-packs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -9190,7 +9190,7 @@ pub(crate) mod tests {
         assert!(!is_in_packs(&blake3::hash(&content_a).to_hex().to_string()).unwrap());
         assert!(!is_in_packs(&blake3::hash(&content_b).to_hex().to_string()).unwrap());
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -9210,7 +9210,7 @@ pub(crate) mod tests {
         use crate::model::tree_item::TreeItem;
 
         let temp = std::env::temp_dir().join(format!("forklift-pack-corrupt-base-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -9284,7 +9284,7 @@ pub(crate) mod tests {
         assert!(is_in_packs(&blob_v2_hash).unwrap());
         assert_eq!(packs_verified(&blob_v2_hash), blob_v2_content);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -9314,7 +9314,7 @@ pub(crate) mod tests {
         use crate::model::tree_item::TreeItem;
 
         let temp = std::env::temp_dir().join(format!("forklift-pack-over-ceiling-base-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -9398,7 +9398,7 @@ pub(crate) mod tests {
         // over-ceiling base through the unbounded read path, rather than failing or aborting.
         assert_eq!(packs_verified(&blob_v2_hash), blob_v2_content);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (I1, FORK-47, DESIGN.html §3.1.1) An orphaned pack pair — a parseable index whose data
@@ -9418,7 +9418,7 @@ pub(crate) mod tests {
         use crate::util::file_utils::StoreReadOutcome;
 
         let temp = std::env::temp_dir().join(format!("forklift-orphan-load-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -9436,7 +9436,7 @@ pub(crate) mod tests {
         builder_b.append_full(&y_hash, &y_content).unwrap();
         let artifacts_b = builder_b.finish().unwrap();
         assert_eq!(artifacts_b.len(), 1, "test fixture expects exactly one pack pair for B");
-        std::fs::remove_file(&artifacts_b[0].data_path).unwrap();
+        crate::util::file_utils::remove_file(&artifacts_b[0].data_path).unwrap();
 
         // X (an entirely unrelated pack) must still read, despite B's orphan.
         match crate::util::file_utils::read_object_classified(&x_hash).unwrap() {
@@ -9454,7 +9454,7 @@ pub(crate) mod tests {
         // `store` (the read-only census) must not be wedged either.
         assert!(store_status().is_ok(), "store_status must survive an orphaned pack pair");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// Read a pack index file off disk as a [`CheckedIndex`] with no data bound — a test's view of
@@ -9522,7 +9522,7 @@ pub(crate) mod tests {
         use crate::util::file_utils::StoreReadOutcome;
 
         let temp = std::env::temp_dir().join(format!("forklift-corrupt-bucket-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -9583,7 +9583,7 @@ pub(crate) mod tests {
             }
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-118) A quarantined index (its data file gone) with a corrupt bucket: a hash in that
@@ -9598,7 +9598,7 @@ pub(crate) mod tests {
         use crate::util::file_utils::StoreReadOutcome;
 
         let temp = std::env::temp_dir().join(format!("forklift-quarantine-bucket-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -9611,7 +9611,7 @@ pub(crate) mod tests {
         }
         let artifacts = builder.finish().unwrap();
         let index_path = artifacts[0].index_path.clone();
-        std::fs::remove_file(&artifacts[0].data_path).unwrap();
+        crate::util::file_utils::remove_file(&artifacts[0].data_path).unwrap();
 
         let index = index_on_disk(&index_path);
         let bad_bucket = index.bucket_of_hash(&objects[0].1);
@@ -9630,7 +9630,7 @@ pub(crate) mod tests {
         assert!(matches!(file_utils::read_object_classified(&unknown_in_sound).unwrap(), StoreReadOutcome::Absent),
             "a never-stored hash in a sound bucket must still read Absent");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// A pack index of another format version — a store written by another build — fails every
@@ -9646,7 +9646,7 @@ pub(crate) mod tests {
         use crate::util::file_utils::StoreReadOutcome;
 
         let temp = std::env::temp_dir().join(format!("forklift-foreign-version-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -9698,7 +9698,7 @@ pub(crate) mod tests {
         assert_eq!(census.foreign_version_indexes.len(), 1);
         assert!(census.foreign_version_indexes[0].error.contains("format version 2"), "{}", census.foreign_version_indexes[0].error);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194) A full repack run without salvage, as auto-maintenance runs it, leaves a pack
@@ -9760,7 +9760,7 @@ pub(crate) mod tests {
             other => panic!("an object in a sound bucket of the kept pack must stay readable, got {}", outcome_name(&other)),
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// A salvage fixture's warehouse: a fresh storage root with a bay position, entered.
@@ -9912,7 +9912,7 @@ pub(crate) mod tests {
         }
         assert!(store_status().unwrap().damaged_packs.is_empty(), "no damaged pack may remain");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T2) A live blob in the corrupt bucket whose record is destroyed has no copy
@@ -9945,7 +9945,7 @@ pub(crate) mod tests {
         assert!(salvage_read(&blob.hash).starts_with("Unverifiable"), "{}", salvage_read(&blob.hash));
         assert_eq!(salvage_read(&tree.hash), "Verified", "the tree was salvaged");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T3) A delta chain inside the corrupt bucket whose records precede their bases
@@ -9980,7 +9980,7 @@ pub(crate) mod tests {
             assert_eq!(salvage_read(hash), "Verified", "{}", hash);
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T3b) A delta in one damaged pack whose base only another damaged pack holds is
@@ -10016,7 +10016,7 @@ pub(crate) mod tests {
             assert_eq!(salvage_read(hash), "Verified", "{}", hash);
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T4) A live delta in a sound bucket whose base lay in the corrupt bucket survives
@@ -10048,7 +10048,7 @@ pub(crate) mod tests {
         assert_eq!(stats.damaged_packs_dropped.len(), 1, "{:?}", stats);
         assert_eq!(salvage_read(&delta.hash), "Verified");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T5) A pack whose buckets are all sound but whose records do not tile its data
@@ -10082,7 +10082,7 @@ pub(crate) mod tests {
             assert_eq!(salvage_read(hash), "Verified", "{}", hash);
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T6) A live blob that was never fetched hashes into the corrupt bucket of a
@@ -10114,7 +10114,7 @@ pub(crate) mod tests {
         assert_eq!(stats.damaged_packs_dropped.len(), 1, "{:?}", stats);
         assert_eq!(salvage_read(&never_fetched.hash), "Absent");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T7) As T6, but the damaged index names the never-fetched hash at another record's
@@ -10148,7 +10148,7 @@ pub(crate) mod tests {
         assert_eq!(stats.damaged_packs_kept[0].unaccounted, vec![claimed.hash.clone()]);
         assert!(index.exists());
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T9) A legitimately absent subtree (a shallow or narrowed store) hashes into the
@@ -10179,7 +10179,7 @@ pub(crate) mod tests {
         assert!(stats.damaged_packs_kept.is_empty(), "{:?}", stats.damaged_packs_kept);
         assert_eq!(stats.damaged_packs_dropped.len(), 1, "{:?}", stats);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T10) An over-ceiling object sits behind a damaged hash entry: the index names it
@@ -10214,7 +10214,7 @@ pub(crate) mod tests {
         assert_eq!(stats.damaged_packs_kept[0].unaccounted, vec![giant_hash.clone()]);
         assert!(salvage_read(&giant_hash).starts_with("Unverifiable"), "{}", salvage_read(&giant_hash));
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// An eight-bucket damaged pack `<stem>` for the probe tests: 200 fillers, then `base` (whose
@@ -10262,7 +10262,7 @@ pub(crate) mod tests {
         assert_eq!(stats.damaged_packs_kept[0].unaccounted, vec![delta.hash.clone()]);
         assert!(index.exists());
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T11, a corrupt loose copy) As T11, with a corrupt loose copy of the failing
@@ -10287,7 +10287,7 @@ pub(crate) mod tests {
         assert_eq!(stats.damaged_packs_kept[0].unaccounted, vec![delta.hash.clone()]);
         assert!(index.exists());
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T11, a healthy copy) As T11, with a verbatim copy of the failing delta in a
@@ -10323,7 +10323,7 @@ pub(crate) mod tests {
         assert!(damaged.exists());
         assert!(is_stored_as_delta(&delta.hash), "the healthy copy must be carried verbatim");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T12) A healthy pack's live delta whose base fails the probe in a damaged pack's
@@ -10365,7 +10365,7 @@ pub(crate) mod tests {
         assert!(damaged.exists(), "the damaged pack still holds the base");
         assert!(is_stored_as_delta(&dependent.hash), "the dependent must be carried verbatim");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T13) A live object in the corrupt bucket that also has a corrupt loose copy is
@@ -10394,7 +10394,7 @@ pub(crate) mod tests {
         assert_eq!(stats.damaged_packs_dropped.len(), 1, "{:?}", stats);
         assert_eq!(salvage_read(&blob.hash), "Verified");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T14) A live tree in the corrupt bucket whose record is destroyed: the liveness
@@ -10425,7 +10425,7 @@ pub(crate) mod tests {
         assert!(index.exists() && index.with_extension(FILE_EXTENSION_PACK_DATA).exists(), "nothing may be deleted");
         assert!(is_loose(&blob.hash), "the salvaged copy must stay on disk");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T14b) The walk refuses on an unparseable index while an incompletely salvaged pack
@@ -10467,7 +10467,7 @@ pub(crate) mod tests {
         assert!(error.contains("could not be parsed"), "{}", error);
         assert!(!error.contains("could not completely salvage"), "{}", error);
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T14c) A live tree is a sound-bucket delta of a damaged pack whose base sits,
@@ -10497,7 +10497,7 @@ pub(crate) mod tests {
         assert!(error.contains("could not completely salvage"), "{}", error);
         assert!(index.exists());
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (FORK-194, T14d) A healthy pack's live delta has a dead base whose only copy sits, destroyed,
@@ -10532,7 +10532,7 @@ pub(crate) mod tests {
         assert!(damaged.exists(), "nothing may be deleted");
         assert!(is_loose(&salvaged.hash), "the salvaged copy must stay on disk");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (I2, FORK-47, DESIGN.html §3.1.1) A hash named only by a quarantined (data-missing) index
@@ -10557,7 +10557,7 @@ pub(crate) mod tests {
         use crate::util::file_utils::StoreReadOutcome;
 
         let temp = std::env::temp_dir().join(format!("forklift-quarantine-read-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -10570,7 +10570,7 @@ pub(crate) mod tests {
         let artifacts = builder.finish().unwrap();
         assert_eq!(artifacts.len(), 1, "test fixture expects exactly one pack pair");
         let index_name = artifacts[0].index_path.file_name().unwrap().to_str().unwrap().to_string();
-        std::fs::remove_file(&artifacts[0].data_path).unwrap();
+        crate::util::file_utils::remove_file(&artifacts[0].data_path).unwrap();
 
         match crate::util::file_utils::read_object_classified(&y_hash).unwrap() {
             StoreReadOutcome::Unverifiable(message) => assert!(
@@ -10603,7 +10603,7 @@ pub(crate) mod tests {
             StoreReadOutcome::Verified(_) => panic!("a never-stored hash must never classify Verified"),
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (I4, the read/presence half — FORK-47, DESIGN.html §3.1.1) An unenumerable (unparseable)
@@ -10622,7 +10622,7 @@ pub(crate) mod tests {
         use crate::util::file_utils::StoreReadOutcome;
 
         let temp = std::env::temp_dir().join(format!("forklift-unenumerable-inert-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -10670,7 +10670,7 @@ pub(crate) mod tests {
         assert!(loaded.quarantined.is_empty(), "B's index does not parse; it cannot be quarantined");
         assert_eq!(loaded.unenumerable.len(), 1, "B's unparseable index must be recorded as unenumerable");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// The pack set this process has cached for the active warehouse (panics if none is cached).
@@ -10687,7 +10687,7 @@ pub(crate) mod tests {
     /// A fresh, empty warehouse root for one test.
     fn fresh_root(name: &str) -> PathBuf {
         let temp = std::env::temp_dir().join(format!("forklift-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         temp
     }
@@ -10724,7 +10724,7 @@ pub(crate) mod tests {
         assert_eq!(find_hashes_with_prefix(prefix).unwrap(), vec![hash.clone()],
             "a pack published after caching must be seen by prefix resolution");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// FORK-106, the racy half of the folder check: a publish that leaves the folder's mtime equal
@@ -10759,7 +10759,7 @@ pub(crate) mod tests {
 
         assert!(is_in_packs(&hash).unwrap(), "the name compare must catch a publish the mtime hides");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// FORK-106, the `open`-failure kind: a pack whose data file could not be opened (here,
@@ -10784,7 +10784,7 @@ pub(crate) mod tests {
         if std::fs::File::open(&artifact.data_path).is_ok() {
             // Running as root: permissions cannot make the open fail, so there is nothing to test.
             std::fs::set_permissions(&artifact.data_path, readable).unwrap();
-            std::fs::remove_dir_all(&temp).ok();
+            crate::util::file_utils::remove_dir_all(&temp).ok();
             return;
         }
 
@@ -10801,7 +10801,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(&artifact.data_path, readable).unwrap();
         assert!(is_in_packs(&hash).unwrap(), "once the data file opens, the next miss must find the object");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// FORK-106, the retry rule per failure kind, on unchanged files: a post-`open` I/O failure is
@@ -10831,7 +10831,7 @@ pub(crate) mod tests {
         assert!(broken_pair_changed(index, &stamp, FailureKind::Open, now, index),
             "an open failure is retried as soon as its probe opens");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// FORK-106: a change to a broken pair's own files is seen even when the folder's names and
@@ -10850,7 +10850,7 @@ pub(crate) mod tests {
         let _scope = StorageRootScope::enter(&temp);
 
         let (y_hash, artifact) = publish_external_pack(b"named by an index that is corrupt, then repaired");
-        std::fs::remove_file(&artifact.data_path).unwrap();
+        crate::util::file_utils::remove_file(&artifact.data_path).unwrap();
         let good_index = std::fs::read(&artifact.index_path).unwrap();
         let mut corrupt = good_index.clone();
         corrupt[0..8].copy_from_slice(b"NOTAPACK");
@@ -10874,7 +10874,7 @@ pub(crate) mod tests {
             StoreReadOutcome::Verified(_) => panic!("Y's data is missing; it must not read Verified"),
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// FORK-106, the cost half: a fixed-state broken pair (an orphaned index) whose files do not
@@ -10889,7 +10889,7 @@ pub(crate) mod tests {
         let _scope = StorageRootScope::enter(&temp);
 
         let (_, artifact) = publish_external_pack(b"an orphaned index that stays orphaned");
-        std::fs::remove_file(&artifact.data_path).unwrap();
+        crate::util::file_utils::remove_file(&artifact.data_path).unwrap();
         // Backdate the index so its stamp is settled: a stamp inside the file's mtime tick is
         // re-checked once when the tick passes, which a slow runner could hit inside the loop.
         set_mtime(&artifact.index_path, SystemTime::now() - Duration::from_secs(60));
@@ -10906,7 +10906,7 @@ pub(crate) mod tests {
         }
         assert!(Arc::ptr_eq(&first, &cached_pack_set()), "an unchanged orphan must not reload the set on a miss");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// FORK-149: a full repack is serve-exclusive — refused while the serve lock is held (a live
@@ -10931,7 +10931,7 @@ pub(crate) mod tests {
         drop(served);
         assert!(compact(true, false, true, &Progress::NONE).is_ok(), "a repack runs once the root is no longer served");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// FORK-150: a full repack is refused while any writer holds the store, and the packed
@@ -10965,7 +10965,7 @@ pub(crate) mod tests {
         compact(true, false, true, &Progress::NONE).expect("a repack runs once no writer holds the store");
         assert!(!is_in_packs(&hash).unwrap(), "with no writer, the repack drops the unreachable object");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// Incremental compaction moves loose objects into a pack and deletes the loose copies, so it
@@ -10995,7 +10995,7 @@ pub(crate) mod tests {
         compact(false, false, false, &Progress::NONE).expect("incremental compaction runs once the deleter is done");
         assert!(is_in_packs(&hash).unwrap(), "with no deleter, the object is packed");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// FORK-106, the open probe: an unenumerable pair whose index could not be opened is retried
@@ -11022,7 +11022,7 @@ pub(crate) mod tests {
             // Running as root: permissions cannot make the open fail, so there is nothing to test.
             std::fs::set_permissions(&artifact.index_path, readable.clone()).unwrap();
             std::fs::set_permissions(&artifact.data_path, readable).unwrap();
-            std::fs::remove_dir_all(&temp).ok();
+            crate::util::file_utils::remove_dir_all(&temp).ok();
             return;
         }
 
@@ -11042,7 +11042,7 @@ pub(crate) mod tests {
             StoreReadOutcome::Verified(_) => panic!("Y's data cannot be opened; it must not read Verified"),
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// FORK-106, the coarse-mtime half of a pair stamp: a stamp taken within `MTIME_GRANULARITY`
@@ -11074,7 +11074,7 @@ pub(crate) mod tests {
         assert!(!broken_pair_changed(index, &settled, FailureKind::Fixed, now, index),
             "a settled stamp on unchanged files is trusted");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     // FORK-333: signature tables.
@@ -11151,7 +11151,7 @@ pub(crate) mod tests {
             assert_eq!(sign_utils::load_raw_parcel_signature(hash).unwrap().as_ref(), Some(bytes), "{}", hash);
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (ii) A reader whose cached pack set predates a table another handle published, with the
@@ -11180,7 +11180,7 @@ pub(crate) mod tests {
             let entries = vec![(hash_to_bytes(&hash).unwrap(), bytes.clone())];
             let name = format!("{}.{}", signature_table::table_id(&entries), FILE_EXTENSION_SIGNATURE_TABLE);
             std::fs::write(pack_folder().join(name), signature_table::build(&entries)).unwrap();
-            std::fs::remove_file(sidecar_path(&hash)).unwrap();
+            crate::util::file_utils::remove_file(sidecar_path(&hash)).unwrap();
 
             let folder_mtime = if racy { stamped } else { stamped + Duration::from_secs(5) };
             std::fs::File::open(pack_folder()).unwrap().set_modified(folder_mtime).unwrap();
@@ -11188,7 +11188,7 @@ pub(crate) mod tests {
             assert_eq!(sign_utils::load_raw_parcel_signature(&hash).unwrap().as_ref(), Some(&bytes),
                 "racy {}: a table published after caching must be found", racy);
 
-            std::fs::remove_dir_all(&temp).ok();
+            crate::util::file_utils::remove_dir_all(&temp).ok();
         }
     }
 
@@ -11218,7 +11218,7 @@ pub(crate) mod tests {
             assert_eq!(sign_utils::load_raw_parcel_signature(&fake_parcel("", n)).unwrap(), Some(fake_signature(n as u8)));
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// A refusing batch (a fetch's) skips a signature the parcel already carries, and refuses one
@@ -11251,7 +11251,7 @@ pub(crate) mod tests {
         }
         assert_eq!(loose_sidecars(), vec![loose.clone()], "the batch wrote no sidecar");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (iii) A signature is immutable across both layers: once tabled, a different one is refused
@@ -11278,7 +11278,7 @@ pub(crate) mod tests {
         assert!(!sidecar_path(&hash).exists(), "storing the tabled signature again writes nothing");
         assert_eq!(sign_utils::load_raw_parcel_signature(&hash).unwrap(), Some(fake_signature(1)));
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (iv) A sidecar that differs from its parcel's tabled signature stays loose and is named, the
@@ -11312,7 +11312,7 @@ pub(crate) mod tests {
             assert_eq!(sign_utils::load_raw_parcel_signature(hash).unwrap(), Some(fake_signature(n as u8 + 2)));
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// Flip one byte of a signature table at `offset` (negative: from the end).
@@ -11362,7 +11362,7 @@ pub(crate) mod tests {
             assert_eq!(sign_utils::load_raw_parcel_signature(&hash).unwrap(), None,
                 "{}: moved aside, its parcels read as unsigned", what);
 
-            std::fs::remove_dir_all(&temp).ok();
+            crate::util::file_utils::remove_dir_all(&temp).ok();
         }
 
         // Another build writes its own version under its own checksum; rot changes the field alone.
@@ -11394,7 +11394,7 @@ pub(crate) mod tests {
                 assert!(!error.contains("Use a build"), "{}: {}", what, error);
             }
 
-            std::fs::remove_dir_all(&temp).ok();
+            crate::util::file_utils::remove_dir_all(&temp).ok();
         }
     }
 
@@ -11436,7 +11436,7 @@ pub(crate) mod tests {
             assert_eq!(sign_utils::load_raw_parcel_signature(hash).unwrap().as_ref(), Some(bytes), "{}", hash);
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (xiv) Full tables never trigger maintenance, however many there are: there is nothing to
@@ -11458,7 +11458,7 @@ pub(crate) mod tests {
         assert!(matches!(auto_compaction_action_bounded(3).unwrap(), AutoCompaction::None),
             "full tables must not trigger maintenance");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (ix) A store whose only growth is signature sidecars is due for an incremental compaction:
@@ -11479,7 +11479,7 @@ pub(crate) mod tests {
         assert!(matches!(auto_compaction_action_bounded(signature_table::MAX_TABLE_ENTRIES).unwrap(), AutoCompaction::Incremental),
             "pending sidecars alone must make a compaction due");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// A single partial table never makes maintenance due, even at a threshold of 0: a merge
@@ -11500,7 +11500,7 @@ pub(crate) mod tests {
             "one partial table must not trigger maintenance");
         assert!(!store_status().unwrap().incremental_due, "nor may the census report it due");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (xvi) A conflicting sidecar in the sampled folder does not trigger maintenance, since no
@@ -11534,7 +11534,7 @@ pub(crate) mod tests {
         assert!(matches!(auto_compaction_action_bounded(signature_table::MAX_TABLE_ENTRIES).unwrap(), AutoCompaction::None),
             "after the sweep, the conflict alone must not keep maintenance due");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (v) A Repack keeps a tabled signature exactly while its parcel is still present once the
@@ -11591,7 +11591,7 @@ pub(crate) mod tests {
                 "a present parcel keeps its signature: {}", hash);
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// A skipping batch (a bundle import's) skips any copy for a parcel that is already signed,
@@ -11615,7 +11615,7 @@ pub(crate) mod tests {
         batch.add(fake_parcel("", 2), b"not a signature".to_vec()).unwrap();
         assert!(batch.finish().is_err(), "a malformed signature it would store is refused");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// The presence probes a Repack makes return the same answers, each for its own parcel,
@@ -11649,7 +11649,7 @@ pub(crate) mod tests {
         assert_eq!(parcel_presences_from(hashes.clone(), usize::MAX).unwrap(), expected, "serial");
         assert_eq!(parcel_presences_from(hashes, 0).unwrap(), expected, "fanned out");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// (xii) A Repack that drops no signature rewrites every table onto its own name and must
@@ -11680,6 +11680,6 @@ pub(crate) mod tests {
             "a Repack that drops nothing must leave the table in place");
         assert_eq!(sign_utils::load_raw_parcel_signature(&live).unwrap(), Some(fake_signature(1)));
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 }

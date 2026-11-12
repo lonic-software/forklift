@@ -622,7 +622,7 @@ mod tests {
             let root = std::env::temp_dir().join(format!(
                 "forklift-evict-test-{}-{}-{}", name, std::process::id(), id
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = crate::util::file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Cache);
@@ -634,7 +634,7 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = crate::util::file_utils::remove_dir_all(&self.root);
         }
     }
 
@@ -767,7 +767,7 @@ mod tests {
         let gone = store_blob("gone\n");
         let gone_dir = store_tree(&[("gone.bin", &gone, DirEntryType::Normal)]);
         let (folder, file) = file_utils::get_path_for_object(&gone).unwrap();
-        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+        crate::util::file_utils::remove_file(PathBuf::from(folder).join(file)).unwrap();
         sealed_utils::append(&[(SealOp::Record, gone.as_str())]).unwrap();
 
         let a = store_blob("a\n");
@@ -881,7 +881,7 @@ mod tests {
         let _scratch = Scratch::new("absence");
         let h = history();
         let (folder, file) = file_utils::get_path_for_object(&h.shared).unwrap();
-        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+        crate::util::file_utils::remove_file(PathBuf::from(folder).join(file)).unwrap();
         let hold = store_access();
 
         let error = plan_evict(&[h.held.clone()], &HashSet::new(), &hold).err().unwrap();
@@ -1297,7 +1297,7 @@ mod tests {
         let h = history();
         // Only local history reaches `b.txt`, so the plan never meets its absence.
         let (folder, file) = file_utils::get_path_for_object(&h.b).unwrap();
-        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+        crate::util::file_utils::remove_file(PathBuf::from(folder).join(file)).unwrap();
         let hold = store_access();
 
         let stats = carry(&plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap(), &hold).unwrap();
@@ -1320,10 +1320,10 @@ mod tests {
         let _scratch = Scratch::new("bound-roots");
         let staged = store_blob("staged\n");
         let (folder, file) = file_utils::get_path_for_object(&staged).unwrap();
-        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+        crate::util::file_utils::remove_file(PathBuf::from(folder).join(file)).unwrap();
         let kid = store_blob("kid\n");
         let (folder, file) = file_utils::get_path_for_object(&kid).unwrap();
-        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+        crate::util::file_utils::remove_file(PathBuf::from(folder).join(file)).unwrap();
         let staged_dir = store_tree(&[("kid.txt", &kid, DirEntryType::Normal)]);
         crate::util::gc_utils::tests::plant_staged_shard(
             "b", &[("s.txt", &staged, DirEntryType::Normal), ("d", &staged_dir, DirEntryType::Tree)],
@@ -1353,7 +1353,7 @@ mod tests {
     /// Remove `hash`'s object, as the deletion that follows an applied redaction does.
     fn delete_object(hash: &str) {
         let (folder, file) = file_utils::get_path_for_object(hash).unwrap();
-        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+        crate::util::file_utils::remove_file(PathBuf::from(folder).join(file)).unwrap();
     }
 
     /// An absence an applied redaction names is a boundary the plan passes, not damage, and it is

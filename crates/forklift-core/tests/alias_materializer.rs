@@ -41,7 +41,7 @@ fn in_working_tree<T>(root: &Path, body: impl FnOnce() -> T) -> T {
 /// A fresh working tree with an empty metadata folder.
 fn working_tree(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("forklift-alias-materializer-{}-{}", name, std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     std::fs::create_dir_all(root.join(".forklift")).unwrap();
     // A full warehouse, so the main tree checks out every path.
     std::fs::write(root.join(".forklift").join("warehouse"), "/forklift-warehouse 3\nformat 1\nfull\n").unwrap();
@@ -53,7 +53,7 @@ fn folds_case(root: &Path) -> bool {
     std::fs::create_dir_all(&probe).unwrap();
     std::fs::write(probe.join("probe"), "").unwrap();
     let folds = probe.join("PROBE").exists();
-    std::fs::remove_dir_all(&probe).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(&probe).unwrap();
     folds
 }
 
@@ -104,7 +104,7 @@ fn prepared(name: &str, on_disk: &[(&str, &str)], folding: bool) -> Option<PathB
         assert!(folds_case(&root), "the temporary directory is expected to fold case on this OS");
     }
     if folds_case(&root) != folding {
-        std::fs::remove_dir_all(&root).ok();
+        forklift_core::util::file_utils::remove_dir_all(&root).ok();
         return None;
     }
 
@@ -153,7 +153,7 @@ fn a_removal_through_an_alias_writes_the_kept_file_back() {
 
     assert_eq!(listed(&root), BTreeSet::from(["README".to_string()]));
     assert_eq!(std::fs::read_to_string(root.join("README")).unwrap(), "kept\n");
-    std::fs::remove_dir_all(&root).ok();
+    forklift_core::util::file_utils::remove_dir_all(&root).ok();
 }
 
 /// The pair one level down: `Docs/a` beside `docs/a`, the disk holding `docs/a`, the target
@@ -168,7 +168,7 @@ fn a_removal_through_an_aliased_directory_writes_the_kept_file_back() {
     assert_eq!(listed(&root), BTreeSet::from(["Docs".to_string()]));
     assert_eq!(listed(&root.join("Docs")), BTreeSet::from(["a".to_string()]));
     assert_eq!(std::fs::read_to_string(root.join("Docs/a")).unwrap(), "kept\n");
-    std::fs::remove_dir_all(&root).ok();
+    forklift_core::util::file_utils::remove_dir_all(&root).ok();
 }
 
 /// The pair two levels down, the directories differing at the top.
@@ -181,7 +181,7 @@ fn a_removal_through_an_aliased_ancestor_writes_the_kept_file_back() {
 
     assert_eq!(listed(&root), BTreeSet::from(["Docs".to_string()]));
     assert_eq!(std::fs::read_to_string(root.join("Docs/sub/a")).unwrap(), "kept\n");
-    std::fs::remove_dir_all(&root).ok();
+    forklift_core::util::file_utils::remove_dir_all(&root).ok();
 }
 
 /// A kept file the target changes already has its own write: it is written once, with the
@@ -195,7 +195,7 @@ fn a_kept_file_with_its_own_write_is_written_once() {
     assert_eq!(writes, vec!["README".to_string()]);
     assert_eq!(listed(&root), BTreeSet::from(["README".to_string()]));
     assert_eq!(std::fs::read_to_string(root.join("README")).unwrap(), "new\n");
-    std::fs::remove_dir_all(&root).ok();
+    forklift_core::util::file_utils::remove_dir_all(&root).ok();
 }
 
 /// Where the volume tells the spellings apart, removing one never reaches the other: nothing is
@@ -209,7 +209,7 @@ fn a_volume_that_tells_the_spellings_apart_writes_nothing_back() {
     assert_eq!(writes, Vec::<String>::new());
     assert_eq!(listed(&root), BTreeSet::from(["README".to_string()]));
     assert_eq!(std::fs::read_to_string(root.join("README")).unwrap(), "kept\n");
-    std::fs::remove_dir_all(&root).ok();
+    forklift_core::util::file_utils::remove_dir_all(&root).ok();
 }
 
 /// Two hard links, each listed under its own name, are one inode but two entries: removing one
@@ -224,7 +224,7 @@ fn hard_links_under_both_spellings_write_nothing_back() {
 
     assert_eq!(writes, Vec::<String>::new());
     assert_eq!(listed(&root), BTreeSet::from(["README".to_string()]));
-    std::fs::remove_dir_all(&root).ok();
+    forklift_core::util::file_utils::remove_dir_all(&root).ok();
 }
 
 /// The entry the merges call: a deletion of `readme` where the tree left in place still holds
@@ -249,5 +249,5 @@ fn a_merge_deletion_keeps_the_aliased_file_in_scope_only() {
         assert!(shift_utils::kept_through_aliases(&ours, &removed, &planned, &scoped).unwrap().is_empty());
     });
 
-    std::fs::remove_dir_all(&root).ok();
+    forklift_core::util::file_utils::remove_dir_all(&root).ok();
 }

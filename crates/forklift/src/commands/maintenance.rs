@@ -116,7 +116,7 @@ mod tests {
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir()
             .join(format!("forklift-maintenance-test-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

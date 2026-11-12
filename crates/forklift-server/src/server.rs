@@ -2368,7 +2368,7 @@ fn create_warehouse_numbered(base: &std::path::Path, id: &str,
     };
 
     if let Err(error) = prepared {
-        let _ = std::fs::remove_dir_all(&staging);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&staging);
         return Err(internal(error));
     }
 
@@ -2383,12 +2383,12 @@ fn create_warehouse_numbered(base: &std::path::Path, id: &str,
 
     // Unix renames over an empty folder and Windows over no folder at all; removing an empty one
     // first (and nothing else: `remove_dir` refuses a folder with anything in it) makes both agree.
-    let _ = std::fs::remove_dir(&target);
+    let _ = forklift_core::util::file_utils::remove_dir(&target);
 
     // Windows renames over a *file*, replacing it, so anything at the id that is not a folder is
     // refused here rather than left to the rename, which refuses it only on Unix.
     if std::fs::symlink_metadata(&target).is_ok_and(|metadata| !metadata.is_dir()) {
-        let _ = std::fs::remove_dir_all(&staging);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&staging);
         return Err(conflict());
     }
 
@@ -2403,7 +2403,7 @@ fn create_warehouse_numbered(base: &std::path::Path, id: &str,
             Ok(Creation::Created)
         }
         Err(rename_error) => {
-            let _ = std::fs::remove_dir_all(&staging);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&staging);
 
             if holds_warehouse(&target) {
                 Ok(Creation::Existed)
@@ -2435,10 +2435,9 @@ fn sweep_interrupted_creations(base: &std::path::Path) {
         }
 
         let path = entry.path();
-        let removed = match entry.file_type() {
-            Ok(file_type) if file_type.is_dir() => std::fs::remove_dir_all(&path),
-            _ => std::fs::remove_file(&path),
-        };
+        let removed = entry.file_type()
+            .or_else(|_| std::fs::symlink_metadata(&path).map(|metadata| metadata.file_type()))
+            .and_then(|file_type| forklift_core::util::file_utils::remove_entry_unfollowed(&path, file_type));
         match removed {
             Ok(()) => tracing::info!(path = %path.display(), "removed an interrupted warehouse creation"),
             Err(error) => tracing::warn!(
@@ -5188,7 +5187,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "forklift-server-test-{}-{}-{}", name, std::process::id(), id
         ));
-        let _ = std::fs::remove_dir_all(&path);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
     }
@@ -6052,13 +6051,13 @@ mod tests {
         assert_eq!(tokens.get("tok-a"), Some(&"alice".to_string()));
         assert_eq!(tokens.get("tok-b"), Some(&"bob".to_string()));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
     }
 
     #[test]
     fn rejects_a_missing_token_file() {
         let path = std::env::temp_dir().join("forklift-server-test-tokens-does-not-exist.toml");
-        let _ = std::fs::remove_file(&path);
+        let _ = forklift_core::util::file_utils::remove_file(&path);
         assert!(parse_operator_tokens(path.to_str().unwrap()).is_err());
     }
 
@@ -6069,7 +6068,7 @@ mod tests {
         std::fs::write(&path, "not [ valid toml").unwrap();
 
         assert!(parse_operator_tokens(path.to_str().unwrap()).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6080,7 +6079,7 @@ mod tests {
 
         let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
         assert!(error.contains("[operators]"), "{}", error);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6090,7 +6089,7 @@ mod tests {
         std::fs::write(&path, "[operators]\n\"tok-a\" = 42\n").unwrap();
 
         assert!(parse_operator_tokens(path.to_str().unwrap()).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
     }
 
     /// The operator-tokens counterpart of the empty-`--token` fail-open finding: an empty
@@ -6107,7 +6106,7 @@ mod tests {
         assert!(error.contains("empty"), "{}", error);
         assert!(error.contains("alice"), "{}", error);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
     }
 
     /// The round-3 sibling (F1): a whitespace-only token key is exactly as much "not a
@@ -6125,7 +6124,7 @@ mod tests {
         assert!(error.contains("whitespace"), "{}", error);
         assert!(error.contains("alice"), "{}", error);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
     }
 
     /// F4 of PR #124 round 2: `"tok-a" = ""` used to parse fine — only the token (key) side was
@@ -6141,7 +6140,7 @@ mod tests {
         let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
         assert!(error.contains("blank"), "{}", error);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
     }
 
     /// Whitespace-only is exactly as much "not an identity" as empty — the same blank rule
@@ -6158,7 +6157,7 @@ mod tests {
         let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
         assert!(error.contains("blank"), "{}", error);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
     }
 
     /// F6 of PR #124 round 3: the matching control `authenticate_via_hook`'s own identity rule
@@ -6179,7 +6178,7 @@ mod tests {
         let tokens = parse_operator_tokens(path.to_str().unwrap()).unwrap();
         assert_eq!(tokens.get("tok-a").map(String::as_str), Some(" bob "));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
     }
 
     /// PR #124 round 4, F5: the symmetric control for the *key* side of the same claim — the
@@ -6199,7 +6198,7 @@ mod tests {
         let tokens = parse_operator_tokens(path.to_str().unwrap()).unwrap();
         assert_eq!(tokens.get(" tok a ").map(String::as_str), Some("bob"));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
     }
 
     /// The blank-identifier error must never echo the token — unlike the empty-*token* error
@@ -6215,7 +6214,7 @@ mod tests {
         let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
         assert!(!error.contains("super-secret-token"), "{}", error);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
     }
 
     // ---------------------------------------------------------------------------------
@@ -6232,7 +6231,7 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(first.root, root);
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -6246,7 +6245,7 @@ mod tests {
         let error = resolve_handle(&state, &params).err().unwrap();
         assert_eq!(error.0, StatusCode::NOT_FOUND);
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// A name whose folder cannot be listed is not judged empty or full: the lookup answers it as
@@ -6270,7 +6269,7 @@ mod tests {
             assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR, "{}", error.1);
         }
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// A tenant folder without a warehouse marker exists, so it is answered 409, never the 404
@@ -6312,7 +6311,7 @@ mod tests {
             assert_eq!(error.0, status, "{}: {}", id, error.1);
         }
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     #[test]
@@ -6326,7 +6325,7 @@ mod tests {
         let error = resolve_handle(&state, &params).err().unwrap();
         assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     #[test]
@@ -6341,7 +6340,7 @@ mod tests {
         assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(error.1.contains("the lowercase \"acme\" is valid"), "{}", error.1);
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     #[test]
@@ -6357,7 +6356,7 @@ mod tests {
         let second = resolve_handle(&state, &params).unwrap();
         assert!(Arc::ptr_eq(&first, &second), "the same warehouse must reuse one handle");
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     #[test]
@@ -6379,7 +6378,7 @@ mod tests {
         assert_ne!(handle1.root, handle2.root);
         assert_eq!(state.warehouses.lock().unwrap().entries.len(), 2);
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     // ---------------------------------------------------------------------------------
@@ -6446,7 +6445,7 @@ mod tests {
         assert_eq!(live_ids(&state), ["fine".to_string()].into());
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// A warehouse whose format cannot be checked is a server fault, never answered as another
@@ -6461,7 +6460,7 @@ mod tests {
         let base = scratch_dir("format-unchecked");
         let state = capped_state(&base, 8, &["w"]);
         let forklift = base.join("w").join(FOLDER_NAME_FORKLIFT_ROOT);
-        let _ = std::fs::remove_file(forklift.join("format.lock"));
+        let _ = forklift_core::util::file_utils::remove_file(forklift.join("format.lock"));
         std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let error = resolve_handle(&state, &warehouse_params("w")).err().unwrap();
@@ -6469,7 +6468,7 @@ mod tests {
         assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR, "{}", error.1);
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// A served warehouse keeps its format lease until it is let go: an upgrade cannot start under
@@ -6493,7 +6492,7 @@ mod tests {
         assert!(!exclusive("w2"));
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// A warehouse a request still holds is never let go, however full the registry; an idle one
@@ -6529,7 +6528,7 @@ mod tests {
         assert!(serve_lock_exists(&base, "w2"));
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// A warehouse that cannot be served (here: under `gc`, which holds its serve lock) is refused
@@ -6549,7 +6548,7 @@ mod tests {
         assert_eq!(live_ids(&state), ["w1"].map(String::from).into());
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// Restrict the fetch scope of the warehouse at `root`, as `clone --only src` does.
@@ -6588,7 +6587,7 @@ mod tests {
         assert_eq!(live_ids(&state), ["full"].map(String::from).into());
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// The single-root path gets the same refusal from the same funnel, for a sparse root and a
@@ -6642,7 +6641,7 @@ mod tests {
         let gone = base.join("gone");
         mark_warehouse(&gone);
         make_sparse(&gone);
-        std::fs::remove_file(gone.join(FOLDER_NAME_FORKLIFT_ROOT).join("config").join("fetch-scope")).unwrap();
+        forklift_core::util::file_utils::remove_file(gone.join(FOLDER_NAME_FORKLIFT_ROOT).join("config").join("fetch-scope")).unwrap();
         let refused = WarehouseHandle::serving(gone, false).err().expect("a sparse root without its scope is refused");
         assert!(matches!(&refused, ServingRefusal::Unreadable(reason) if reason.contains("is missing")), "{:?}", refused);
 
@@ -6652,7 +6651,7 @@ mod tests {
         let refused = WarehouseHandle::serving(stray, false).err().expect("a full root with a fetch scope is refused");
         assert!(matches!(&refused, ServingRefusal::Unreadable(reason) if reason.contains("holds a fetch scope")), "{:?}", refused);
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// Write the sealed-object record of the warehouse at `root` as the header and one frame per op,
@@ -6729,7 +6728,7 @@ mod tests {
         assert!(message.contains("Clone that origin again into a new root"), "{}", message);
         assert!(!message.contains("origin.example"), "the origin URL never reaches a client: {}", message);
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// A full root lacking content its unavailable record lists is refused, counting only the
@@ -6790,7 +6789,7 @@ mod tests {
         assert!(refused.1.starts_with("Warehouse \"lacking\" lacks 1 file"), "{}", refused.1);
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// A multi-warehouse server refuses a sealed root, and one that records an origin, with the 409
@@ -6822,7 +6821,7 @@ mod tests {
         assert_eq!(live_ids(&state), ["full"].map(String::from).into());
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// A multi-warehouse server refuses an unfinished clone (503) as single mode does: it has
@@ -6853,7 +6852,7 @@ mod tests {
 
         assert!(live_ids(&state).is_empty());
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// The idle warehouse let go is the least recently resolved one.
@@ -6873,7 +6872,7 @@ mod tests {
         assert_eq!(live_ids(&state), ["a", "c"].map(String::from).into());
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// The handshake reports a withheld hash's deletion owed while the store holds a copy, and
@@ -6899,7 +6898,7 @@ mod tests {
         assert!(matches!(states[&gone], ServedWithholdingState::Deleted));
 
         drop(_scope);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// A withheld recipe the store no longer holds is still owed while the chunk journal owes a
@@ -6929,7 +6928,7 @@ mod tests {
         assert!(matches!(served[0].state, ServedWithholdingState::DeletionOwed));
 
         drop(_scope);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// Letting a warehouse go forgets its cached packs. Once it is not live, another process may
@@ -6970,13 +6969,13 @@ mod tests {
         drop(resolve_handle(&state, &warehouse_params("w2")).unwrap());
         assert!(!live_ids(&state).contains("w1"));
         for entry in std::fs::read_dir(&pack_folder).unwrap() {
-            std::fs::remove_file(entry.unwrap().path()).unwrap();
+            forklift_core::util::file_utils::remove_file(entry.unwrap().path()).unwrap();
         }
 
         assert!(!present(&state), "served again, the deleted object must read missing");
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// Letting a warehouse go forgets the objects and trees this process has read from it too: a
@@ -7011,7 +7010,7 @@ mod tests {
         drop(resolve_handle(&state, &warehouse_params("w2")).unwrap());
         assert!(!live_ids(&state).contains("w1"));
         let objects = root.join(FOLDER_NAME_FORKLIFT_ROOT).join("objects");
-        std::fs::remove_dir_all(&objects).unwrap();
+        forklift_core::util::file_utils::remove_dir_all(&objects).unwrap();
         std::fs::create_dir(&objects).unwrap();
 
         let handle = resolve_handle(&state, &warehouse_params("w1")).unwrap();
@@ -7020,7 +7019,7 @@ mod tests {
         assert!(object_utils::load_tree_shared(&tree).is_err(), "the deleted tree must not load");
 
         drop((_scope, handle, state));
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// Wait, up to five seconds, until nothing but the registry holds warehouse `id`'s handle and
@@ -7075,7 +7074,7 @@ mod tests {
         assert!(!live_ids(&state).contains("w1"), "once the body is gone, the warehouse is idle");
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// A drained warehouse is refused with a `503` that says when to try again, and served again
@@ -7100,7 +7099,7 @@ mod tests {
         assert!(Arc::ptr_eq(&again, &handle), "the same handle, never a second one");
 
         drop((again, handle, state));
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// A drain waits for the requests holding the warehouse, and past its bound gives up and serves
@@ -7123,7 +7122,7 @@ mod tests {
         undrain(&state, &handle);
 
         drop((handle, state));
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// The deleter trades the served warehouse's shared store-access hold for the exclusive side,
@@ -7158,7 +7157,7 @@ mod tests {
         assert!(StoreAccessLock::try_exclusive().is_err(), "the served warehouse still holds the store");
 
         drop((_scope, handle, state));
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// Cutting a warehouse's bundle downloads ends one whose client takes nothing in an error,
@@ -7192,7 +7191,7 @@ mod tests {
         assert_eq!(axum::body::to_bytes(whole.into_body(), usize::MAX).await.unwrap().len(), bundle.len());
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// A handle served for the first time starts a redaction run of its own, once, so a deletion
@@ -7217,7 +7216,7 @@ mod tests {
         drop(handle);
         settle(&state, "w1").await;
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// An apply that fails is owed to the redaction run, from a ref write's and from a round's
@@ -7245,7 +7244,7 @@ mod tests {
         assert!(handle.applies_closed(), "and it stays owed for the next round");
 
         drop((handle, state));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// An apply discharges only the owes of writes that returned before it began: one still
@@ -7270,7 +7269,7 @@ mod tests {
         assert!(!handle.applies_closed(), "an apply after it returned discharges it");
 
         drop(handle);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// A content request waiting on an owed apply is answered as soon as one discharges it, and a
@@ -7309,7 +7308,7 @@ mod tests {
         assert_eq!(refused, draining_refusal());
 
         drop((handle, state));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// Asking for a redaction round wakes only a run waiting out a retry: it leaves no permit that
@@ -7330,7 +7329,7 @@ mod tests {
         assert!(waited.is_err(), "no wake was left behind");
 
         drop((handle, state));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// A bundle in another version than this build writes is answered `404`, so a client falls
@@ -7365,7 +7364,7 @@ mod tests {
         assert_eq!(&body[..], current.as_bytes(), "the whole file is served from its first byte");
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// One bundle warehouse `w1` under `base`, and the path its bundle is served from.
@@ -7473,7 +7472,7 @@ mod tests {
         }
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// An `If-Range` must name the current tag: after a rebuild, under a stale or weak tag, past
@@ -7524,7 +7523,7 @@ mod tests {
         }
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// With no tag to compare an `If-Range` with, a conditional range is never honoured; an
@@ -7590,7 +7589,7 @@ mod tests {
         assert_ne!(header(&headers, "etag"), Some(old_tag.as_str()), "the rebuild has a tag of its own");
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     #[test]
@@ -7628,7 +7627,7 @@ mod tests {
         assert_eq!(create_warehouse(&base, "w").unwrap(), Creation::Existed);
         assert!(creation_litter(&base).is_empty(), "nothing is left behind: {:?}", creation_litter(&base));
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// An empty folder at the id is taken over; a folder with anything in it, or a file, is refused
@@ -7665,7 +7664,7 @@ mod tests {
 
         assert!(creation_litter(&base).is_empty(), "nothing is left behind: {:?}", creation_litter(&base));
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// A bay's working directory holds a `.forklift` folder too. The multi-mode lookup does not
@@ -7695,7 +7694,7 @@ mod tests {
         let error = create_warehouse(&base, "broken").err().expect("a broken entry must not read as a warehouse");
         assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// A killed earlier process with this one's id can leave its staging folder at the very name
@@ -7722,7 +7721,7 @@ mod tests {
             assert_eq!(std::fs::read(folder.join("left.txt")).unwrap(), b"litter", "litter is left as it was");
         }
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// Of many creations racing for one new id, exactly one reports `Created`. Supplementary to
@@ -7749,7 +7748,7 @@ mod tests {
         assert_eq!(outcomes.iter().filter(|o| **o == Creation::Created).count(), 1, "{:?}", outcomes);
         assert!(creation_litter(&base).is_empty(), "nothing is left behind: {:?}", creation_litter(&base));
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     #[test]
@@ -7767,7 +7766,7 @@ mod tests {
         assert!(base.join("w").join(FOLDER_NAME_FORKLIFT_ROOT).is_dir());
         assert!(base.join(lock_utils::FILE_NAME_BASE_SERVE_LOCK).exists());
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     // ---------------------------------------------------------------------------------
@@ -7923,7 +7922,7 @@ mod tests {
                 Some(previous) => std::env::set_var("FORKLIFT_KEYS_DIR", previous),
                 None => std::env::remove_var("FORKLIFT_KEYS_DIR"),
             }
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&self.root);
         }
     }
 
@@ -7998,7 +7997,7 @@ mod tests {
         assert!(require_uploader(&Principal::Operator("anyone".to_string())).is_ok());
 
         drop(_scope);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -8021,7 +8020,7 @@ mod tests {
         assert!(require_uploader(&Principal::Operator("anyone".to_string())).is_ok());
 
         drop(_scope);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -8601,7 +8600,7 @@ mod tests {
         );
 
         drop(_scope);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         // `_keys_lock` is NOT dropped here. It must outlive `_keys_restore`, which runs at
         // scope end — releasing the lock first would let another test acquire it and set
         // its own FORKLIFT_KEYS_DIR, only for this test's restore to clobber it mid-run.
@@ -8758,7 +8757,7 @@ mod tests {
         assert_eq!(parked.await.unwrap().status(), StatusCode::OK);
         assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("parked").unwrap(), Some(parked_head));
         assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("free").unwrap(), Some(free_head));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// A ref write whose client hangs up while it is under way still discharges the apply it owed
@@ -8791,7 +8790,7 @@ mod tests {
         assert!(open, "the write landed and its apply was discharged");
 
         drop((handle, state));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// A round reports no apply owed for an owe only a ref write still in flight holds: that
@@ -8811,7 +8810,7 @@ mod tests {
         assert!(handle.applies_closed(), "and it is not discharged");
 
         drop((writing, handle, state));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// A round rebuilds the bundle a write's apply called for even when another round follows, as a
@@ -8885,7 +8884,7 @@ mod tests {
         assert_eq!(handle.redactions_asked.load(Ordering::SeqCst), 1, "and asks for the run");
 
         drop((handle, state));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// A ref write refused or answered as done asks for a redaction run only when it reached its
@@ -8920,7 +8919,7 @@ mod tests {
         assert!(handle.applies_closed());
 
         drop((handle, state));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// A content request refused for what it asks is refused at once, owed apply or not: only a
@@ -8944,7 +8943,7 @@ mod tests {
         assert_eq!(answer.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         drop((handle, state));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     // Revert: one mutex around both post_ref_update's and put_trust's blocking closures → the trust
@@ -8967,7 +8966,7 @@ mod tests {
 
         gate.send(()).unwrap();
         parked.await.unwrap();
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     // Reverts: the final write expects the pallet's current head instead of the request's old head
@@ -8996,7 +8995,7 @@ mod tests {
         let body = body_text(loser).await;
         assert!(body.contains(&winner_head), "the refusal names the head that won: {}", body);
         assert_eq!(ref_update_attempts(&root, "contested"), 2, "one attempt each");
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// A first anchor for an empty warehouse, adopting nothing.
@@ -9068,7 +9067,7 @@ mod tests {
 
             let _scope = StorageRootScope::enter(&root);
             assert!(tombstone_utils::is_served().unwrap(), "a served root carries the mark");
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
         #[tokio::test]
@@ -9085,7 +9084,7 @@ mod tests {
             let info: WarehouseInfo = serde_json::from_str(&body_text(info).await).unwrap();
             assert_eq!(info.tombstones, Some(BTreeMap::from([("side".to_string(), side)])));
             assert!(!info.pallets.contains_key("side"), "a deleted pallet is not listed");
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
         /// Revert: map the moved ref to `pallet_moved` alone → the refusal says "Lower and retry"
@@ -9106,7 +9105,7 @@ mod tests {
             assert!(body.contains("was deleted on this remote") && !body.contains("Lower and retry"), "{}", body);
             assert!(body.contains("tombstone drop --root <warehouse> side"), "{}", body);
             assert!(body.contains(r#""code":"pallet_deleted_on_remote""#), "{}", body);
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
         /// Revert: drop the replay's tombstone check → the retry reads as a moved ref → red.
@@ -9122,7 +9121,7 @@ mod tests {
             let other = delete(&root, "side", &main).await;
             assert_eq!(other.status(), StatusCode::CONFLICT, "a delete at a head the tombstone does not hold is refused");
             assert_eq!(tombstone_utils::read_tombstones().unwrap(), BTreeMap::from([("side".to_string(), side)]));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
         /// Revert: drop the meta refusal → `@tags` is removed (or the request fails otherwise) →
@@ -9148,7 +9147,7 @@ mod tests {
 
             assert_eq!(pallet_utils::get_meta_pallet_head("tags").unwrap(), Some(tags));
             assert!(tombstone_utils::read_tombstones().unwrap().is_empty(), "no refusal leaves a tombstone");
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
         /// Revert: drop the early refusal and pass no tombstone to the write → the unacknowledged
@@ -9177,7 +9176,7 @@ mod tests {
             assert_eq!(acknowledged.status(), StatusCode::OK, "{}", body_text(acknowledged).await);
             assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(on_it));
             assert!(tombstone_utils::read_tombstones().unwrap().is_empty(), "the re-creation clears the tombstone");
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
         /// A re-creation whose history is not all uploaded is refused as missing history (`422`),
@@ -9192,7 +9191,7 @@ mod tests {
             let absent = store_child_parcel(&side, "never uploaded");
             let on_absent = store_child_parcel(&absent, "uploaded");
             let (folder, file) = file_utils::get_path_for_object(&absent).unwrap();
-            std::fs::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
+            forklift_core::util::file_utils::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
 
             let response = create(&root, "side", &on_absent, Some(&side)).await;
 
@@ -9201,7 +9200,7 @@ mod tests {
             // apart and never uploads again → red.
             let body = body_text(response).await;
             assert!(body.contains(r#""code":"remote_history_incomplete""#), "a client branches on the code: {}", body);
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
         /// Revert: walk nothing for an absent ref in `post_holds` → the deleted head reads as not
@@ -9218,7 +9217,7 @@ mod tests {
 
             let holds: HoldsResponse = serde_json::from_str(&body_text(response).await).unwrap();
             assert_eq!(holds.holds.get(&side), Some(&HoldAnswer::Held));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
     }
 
@@ -9314,7 +9313,7 @@ mod tests {
 
             let (status, body) = update(&root, "side", None, &clean, None).await;
             assert_eq!(status, StatusCode::OK, "{}", body);
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
         /// A creation names a wedged parcel as its tombstone when none stands, and builds on it
@@ -9333,7 +9332,7 @@ mod tests {
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
             assert!(body.contains(r#"holds \".forklift\""#), "{}", body);
             assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None);
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
         /// A wedged head deleted here comes back by a restore, whose tree is its stored tombstone's,
@@ -9356,7 +9355,7 @@ mod tests {
 
             assert_eq!(status, StatusCode::OK, "{}", body);
             assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(wedged));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
         /// A pallet planted with a bad name in `d`: an edit in `d` is refused until a repair removes
@@ -9380,7 +9379,7 @@ mod tests {
             let (status, body) = update(&root, "side", Some(&wedged), &elsewhere, None).await;
             assert_eq!(status, StatusCode::OK, "{}", body);
             assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(elsewhere));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
         /// A merge over a repaired head that takes its older, wedged parent's tree. The closure walk
@@ -9400,7 +9399,7 @@ mod tests {
 
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
             assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(repaired));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
         /// A changed tree copied to a second path: at `a` its unchanged subtree `s` is the base's,
@@ -9420,7 +9419,7 @@ mod tests {
 
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
             assert!(body.contains(r#"holds \"b/s/.forklift\""#), "{}", body);
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
     }
 
@@ -9463,7 +9462,7 @@ mod tests {
         assert!(body.contains("not office history") && body.contains(&parcel.hash), "{}", body);
         assert!(!root.join(".forklift").join("trust").exists(), "nothing is written");
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     // Revert: the first anchor installs with `OfficePrecondition::NotConsumed` → the anchor lands
@@ -9483,7 +9482,7 @@ mod tests {
 
         assert_eq!(office_utils::read_trust_anchor().unwrap(), None, "no anchor may be written");
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     // Revert: the first anchor installs with `PalletsPrecondition::NotConsumed` → the anchor lands
@@ -9508,7 +9507,7 @@ mod tests {
             Json(first_anchor(vec![head])),
         ).await.into_response();
         assert!(accepted.status().is_success(), "a boundary holding every head installs: {}", accepted.status());
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// Two first-contact trust PUTs, the first (of [`first_anchor`]) parked at its install while
@@ -9542,7 +9541,7 @@ mod tests {
 
         assert!(office_utils::read_trust_anchor().unwrap().is_some_and(|anchor| TrustAnchorDto::from(&anchor) == second_anchor),
             "the second PUT's anchor must be installed");
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
 
         (parked_status, parked_body, second)
     }
@@ -9669,7 +9668,7 @@ mod tests {
         assert_eq!(response.into_response().status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         drop(_scope);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         // The lock outlives `_keys_restore` by declaration order, as in the bootstrap test.
     }
 
@@ -9857,7 +9856,7 @@ mod tests {
         assert!(error.contains("defines no entries"), "{}", error);
         assert!(!error.contains("no --tokens/tokens file"), "{}", error);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
     }
 
     /// PR #124 round 4, F4: a whitespace-only `authentication_url` used to pass the hook
@@ -9902,7 +9901,7 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("has a blank URL or secret"), "{}", error);
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// The secret-side sibling: a whitespace-only secret is weaker than a real one but must
@@ -9931,7 +9930,7 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("has a blank URL or secret"), "{}", error);
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     /// PR #124 round 5, F2: a non-blank but non-absolute hook URL (scheme omitted) passes the
@@ -9963,7 +9962,7 @@ mod tests {
         assert!(error.contains("is not a valid absolute URL"), "{}", error);
         assert!(error.contains("provider.example/hooks/auth"), "{}", error);
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
     // ---------------------------------------------------------------------------------

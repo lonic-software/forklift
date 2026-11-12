@@ -624,7 +624,7 @@ pub fn collect_collisions(ops: &[FileOp], removed_dirs: &[String]) -> Result<Vec
 /// Apply a diff's file operations to the working directory: every removal first (so a
 /// directory a new file is about to replace is emptied), then `remove_empty_directories`
 /// clears the now-empty source-only directories (deepest first) — the removals themselves
-/// only unlink files and never touch a directory — then every write lands. Writing before a
+/// only unlink files and links, never a real folder — then every write lands. Writing before a
 /// same-path removal would otherwise fail (`EISDIR`/`EEXIST`) for a type flip in either
 /// direction.
 ///
@@ -816,7 +816,7 @@ pub fn apply_file_op(op: &FileOp) -> Result<(), String> {
         FileOp::Remove { path } => {
             check_working_path(path)?;
 
-            match std::fs::remove_file(path) {
+            match file_utils::remove_file_or_link(path) {
                 Ok(()) => Ok(()),
                 // The file being gone already is the desired outcome.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -888,7 +888,7 @@ pub fn write_tracked_file_from(path: &str,
         // unless the path is new, where what resolves there is not ours to remove and
         // `symlink` refuses it on its own.
         if !create {
-            match std::fs::remove_file(fs_path) {
+            match file_utils::remove_file_or_link(fs_path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("Error while replacing \"{}\": {}", path, e)),
@@ -978,8 +978,8 @@ pub fn write_working_file(path: &str, content: &[u8], item_type: DirEntryType, c
 /// Write a regular file in place. A symlink already at the path (one this tree turns into a
 /// regular file) is removed first: writing through it would land in whatever it points at.
 fn write_regular_file(fs_path: &Path, path: &str, content: &[u8], item_type: DirEntryType) -> Result<(), String> {
-    if std::fs::symlink_metadata(fs_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        std::fs::remove_file(fs_path)
+    if let Some(link) = std::fs::symlink_metadata(fs_path).ok().filter(|metadata| metadata.file_type().is_symlink()) {
+        file_utils::remove_entry_unfollowed(fs_path, link.file_type())
             .map_err(|e| format!("Error while replacing the symlink \"{}\": {}", path, e))?;
     }
 
@@ -1238,10 +1238,10 @@ fn write_chunked_file(path: &str,
             }
             Err(e) => Err(format!("Error while finalizing \"{}\": {}", path, e)),
         }
-        .inspect_err(|_| if create { let _ = std::fs::remove_file(fs_path); })
+        .inspect_err(|_| if create { let _ = file_utils::remove_file(fs_path); })
     });
 
-    let _ = std::fs::remove_file(&temp_path);
+    let _ = file_utils::remove_file(&temp_path);
     placed
 }
 
@@ -1282,7 +1282,7 @@ pub(crate) fn clear_assembly_leftovers() {
     let Ok(entries) = std::fs::read_dir(&dir) else { return };
 
     for entry in entries.flatten() {
-        let _ = std::fs::remove_file(entry.path());
+        let _ = file_utils::remove_file(entry.path());
     }
 }
 
@@ -1313,7 +1313,7 @@ fn copy_into_place(assembled: &Path, fs_path: &Path, path: &str, item_type: DirE
     })();
 
     if placed.is_err() {
-        let _ = std::fs::remove_file(&beside);
+        let _ = file_utils::remove_file(&beside);
     }
     placed
 }
@@ -1367,7 +1367,7 @@ pub fn remove_empty_directories(removed_dirs: &[String]) {
         // A refused path is left alone. A failure means the directory is not empty (untracked
         // content) or already gone; both are fine.
         if check_working_path(dir).is_ok() {
-            let _ = std::fs::remove_dir(dir);
+            let _ = file_utils::remove_dir(dir);
         }
     }
 }
@@ -1999,7 +1999,7 @@ mod tests {
     #[test]
     fn a_head_write_another_bay_already_made_stands_and_touches_no_tree() {
         let root = std::env::temp_dir().join(format!("forklift-shift-same-move-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -2017,7 +2017,7 @@ mod tests {
         assert_eq!(crate::util::pallet_utils::get_pallet_head("main").unwrap(), Some(new));
 
         drop(scope);
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2067,7 +2067,7 @@ mod tests {
     #[test]
     fn a_temp_candidate_that_exists_is_skipped_not_opened() {
         let dir = std::env::temp_dir().join(format!("forklift-assembly-temp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let outside = dir.join("outside.txt");
         std::fs::write(&outside, "untouched\n").unwrap();
@@ -2078,7 +2078,7 @@ mod tests {
 
         assert_eq!(temp_path, dir.join("fresh"));
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched\n");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -2087,7 +2087,7 @@ mod tests {
         // The cross-device fallback: the rename from the metadata folder failed, so the assembly
         // is copied beside the file and renamed over it, replacing (not following) a symlink.
         let dir = std::env::temp_dir().join(format!("forklift-copy-into-place-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("work")).unwrap();
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = crate::globals::StorageRootScope::enter(&dir);
@@ -2105,6 +2105,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "assembled\n");
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched\n");
         assert_eq!(std::fs::read_dir(dir.join("work")).unwrap().count(), 1, "a temp file was left beside it");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
     }
 }

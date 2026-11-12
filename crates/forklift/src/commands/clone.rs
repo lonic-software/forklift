@@ -1117,7 +1117,7 @@ mod tests {
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("forklift-clone-cmd-{}-{}", label, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1150,7 +1150,7 @@ mod tests {
         let refusal = finishing.fail("Error while clearing the clone record: EACCES".to_string());
         assert!(matches!(CoreError::from(refusal), CoreError::Refusal { code: RefusalCode::CloneIncomplete, .. }));
         assert_eq!(franchise_utils::read(&forklift).unwrap().unwrap().attempt, Attempt::Failed);
-        std::fs::remove_file(franchise_utils::record_path(&forklift)).unwrap();
+        forklift_core::util::file_utils::remove_file(franchise_utils::record_path(&forklift)).unwrap();
 
         let mut failing = attempt(forklift.clone());
         let refusal = failing.fail("Error while writing: No space left on device".to_string());
@@ -1208,7 +1208,7 @@ mod tests {
         assert_eq!((short.record.bundle, short.bundle_at_start), (BundleState::None, BundleState::None));
 
         // Nor does one whose clearing already took the bundle away.
-        std::fs::remove_dir_all(recorded.join("bundles")).unwrap();
+        forklift_core::util::file_utils::remove_dir_all(recorded.join("bundles")).unwrap();
         let mut cleared = attempt(recorded);
         assert!(start_attempt(&mut cleared, &target, Some(&previous), &BundleState::Imported).is_err());
         assert_eq!((cleared.record.bundle, cleared.bundle_at_start), (BundleState::None, BundleState::None));

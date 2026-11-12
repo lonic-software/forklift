@@ -24,7 +24,7 @@ struct Area {
 impl Area {
     fn new(name: &str) -> Area {
         let base = std::env::temp_dir().join(format!("forklift-marker-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
         let home = base.join("home");
         std::fs::create_dir_all(&home).unwrap();
         // Canonical, so paths compare with the ones forklift reports (macOS's /var is /private/var),
@@ -94,7 +94,7 @@ impl Area {
 
 impl Drop for Area {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.base);
     }
 }
 
@@ -158,7 +158,7 @@ fn an_unmarked_folder_is_refused_and_prepare_will_not_take_it() {
     let area = Area::new("unmarked");
     let root = area.warehouse("old");
     let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
-    std::fs::remove_file(forklift.join("warehouse")).unwrap();
+    forklift_core::util::file_utils::remove_file(forklift.join("warehouse")).unwrap();
     let before = listing(&forklift);
 
     for args in [&["stocktake"][..], &["load", "."], &["prepare"], &["config", "set", "operator.identifier", "x@y"], &["profile", "use", "work"]] {
@@ -210,7 +210,7 @@ fn an_empty_forklift_folder_inside_a_warehouse_points_at_the_warehouse() {
         )
     );
 
-    std::fs::remove_dir(sub.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+    forklift_core::util::file_utils::remove_dir(sub.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
     let status = area.run_ok(&sub, &["--json", "stocktake"]);
     let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(value["ok"], true, "{}", value);
@@ -230,7 +230,7 @@ fn a_bay_of_an_unmarked_warehouse_is_refused_and_nothing_is_written() {
     let bay = area.path("bay");
     area.run_ok(&root, &["bay", "add", "feature", bay.to_str().unwrap()]);
     std::fs::write(bay.join("new.txt"), "new\n").unwrap();
-    std::fs::remove_file(root.join(FOLDER_NAME_FORKLIFT_ROOT).join("warehouse")).unwrap();
+    forklift_core::util::file_utils::remove_file(root.join(FOLDER_NAME_FORKLIFT_ROOT).join("warehouse")).unwrap();
     let (shared, own) = (listing(&root.join(FOLDER_NAME_FORKLIFT_ROOT)), listing(&bay.join(FOLDER_NAME_FORKLIFT_ROOT)));
 
     for args in [&["load", "."][..], &["config", "set", "operator.identifier", "x@y"], &["profile", "use", "work"]] {
@@ -275,7 +275,7 @@ fn an_old_format_bay_is_refused_as_no_warehouse() {
     area.run_ok(&root, &["bay", "add", "feature", bay.to_str().unwrap()]);
     let forklift = bay.join(FOLDER_NAME_FORKLIFT_ROOT);
 
-    std::fs::remove_dir_all(&forklift).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(&forklift).unwrap();
     std::fs::write(&forklift, format!("{}\n", root.to_string_lossy())).unwrap();
     let refusal = area.refused(&bay, &["stocktake"]);
     assert!(refusal.message.contains("written by an older version of Forklift"), "{}", refusal.message);
@@ -360,7 +360,7 @@ fn a_full_warehouse_with_a_fetch_scope_is_refused() {
     assert!(!text(&log.stdout).contains("second"), "the stack must not land: {}", text(&log.stdout));
 
     // The named way out works.
-    std::fs::remove_file(config.join("fetch-scope")).unwrap();
+    forklift_core::util::file_utils::remove_file(config.join("fetch-scope")).unwrap();
     area.run_ok(&root, &["load", "."]);
     area.run_ok(&root, &["stack", "-m", "second"]);
 }
@@ -412,7 +412,7 @@ fn a_bay_without_its_redirect_is_refused() {
     let root = area.warehouse("w");
     let bay = area.path("bay");
     area.run_ok(&root, &["bay", "add", "feature", bay.to_str().unwrap()]);
-    std::fs::remove_file(bay.join(FOLDER_NAME_FORKLIFT_ROOT).join("redirect")).unwrap();
+    forklift_core::util::file_utils::remove_file(bay.join(FOLDER_NAME_FORKLIFT_ROOT).join("redirect")).unwrap();
 
     let refusal = area.refused(&bay, &["stocktake"]);
     assert!(refusal.message.contains(&quoted(&bay.join(FOLDER_NAME_FORKLIFT_ROOT))), "{}", refusal.message);
@@ -446,7 +446,7 @@ fn a_bay_redirecting_to_a_bay_is_refused_and_its_steps_give_a_working_bay() {
     let chained = area.path("chained");
     area.run_ok(&root, &["bay", "add", "chained", chained.to_str().unwrap()]);
     // The old state: the bay is registered in the warehouse, its redirect names the other bay.
-    std::fs::remove_dir_all(chained.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(chained.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
     bay_utils::write_bay_redirect(&chained, &first, "chained").unwrap();
 
     let refusal = area.refused(&chained, &["stocktake"]);
@@ -463,7 +463,7 @@ fn a_bay_redirecting_to_a_bay_is_refused_and_its_steps_give_a_working_bay() {
     // The registration goes; the folder is left, as not this bay's, for the next step to delete.
     let removed = area.run(&root, &["bay", "remove", "chained"]);
     assert!(text(&removed.stderr).contains("The bay \"chained\" was removed."), "{}", text(&removed.stderr));
-    std::fs::remove_dir_all(chained.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(chained.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
     let fresh = area.path("fresh");
     area.run_ok(&root, &["bay", "add", "renewed", fresh.to_str().unwrap()]);
     area.run_ok(&fresh, &["stocktake"]);
@@ -617,11 +617,11 @@ fn a_lost_format_lock_is_made_again_or_refused() {
     let lock = forklift.join("format.lock");
     assert!(lock.exists(), "prepare writes the format lock");
 
-    std::fs::remove_file(&lock).unwrap();
+    forklift_core::util::file_utils::remove_file(&lock).unwrap();
     area.run_ok(&root, &["stocktake"]);
     assert!(lock.exists(), "the first command makes it again");
 
-    std::fs::remove_file(&lock).unwrap();
+    forklift_core::util::file_utils::remove_file(&lock).unwrap();
     std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o555)).unwrap();
     let refused = area.run(&root, &["--json", "pallet", "list"]);
     std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o755)).unwrap();

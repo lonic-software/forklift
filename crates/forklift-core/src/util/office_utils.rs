@@ -1316,7 +1316,7 @@ fn restore_trust_file(previous: Option<&[u8]>) -> Result<(), String> {
     match previous {
         Some(previous) => file_utils::write_file_atomically(&path, previous),
         None => {
-            std::fs::remove_file(&path)
+            file_utils::remove_file(&path)
                 .map_err(|e| format!("Error while removing the trust file: {}", e))?;
             file_utils::sync_dir(&forklift_root())
         }
@@ -2306,7 +2306,7 @@ pub(crate) mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-office-utils-malformed-boundary-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
 
@@ -2325,7 +2325,7 @@ pub(crate) mod tests {
         assert!(error.contains("\"boundary\""), "the error must name the field: {}", error);
         assert!(error.contains("index 1"), "the error must name the offending index: {}", error);
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// The `distrust_boundary` twin of the test above — same lenience, same fix. Unlike
@@ -2515,7 +2515,7 @@ pub(crate) mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-office-utils-malformed-adopts-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
 
@@ -2534,7 +2534,7 @@ pub(crate) mod tests {
         };
         assert!(error.contains("\"adopts\""), "the error must name the field: {}", error);
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// PR #122 round 4 finding F2: `read_string` still said "has no ... entry" for BOTH an
@@ -2637,7 +2637,7 @@ pub(crate) mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-office-utils-malformed-enabled-at-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
 
@@ -2656,7 +2656,7 @@ pub(crate) mod tests {
         assert!(error.contains("trust file"), "the error must name the record kind: {}", error);
         assert!(error.contains("\"enabled_at\""), "the error must name the field: {}", error);
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// PR #122 round 4 finding F5: routing `genesis`/`enabled_at` through the shared reader
@@ -2879,7 +2879,7 @@ pub(crate) mod tests {
 
     fn enter_scratch_warehouse(name: &str) -> (crate::globals::StorageRootScope, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("forklift-office-utils-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&dir);
         crate::util::warehouse_utils::prepare_warehouse(crate::util::warehouse_utils::PrepareMode::Full).unwrap();
@@ -2925,7 +2925,7 @@ pub(crate) mod tests {
         assert_eq!(read_office_state_of(&planted).unwrap().keys[0].key_id, key_id);
 
         drop(scope);
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// The same for user records: filed under any name but the hash of the identifier, refused.
@@ -2950,7 +2950,7 @@ pub(crate) mod tests {
         assert_eq!(read_office_state_of(&planted).unwrap().users.len(), 1);
 
         drop(scope);
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// The trust-pin reader, which only gathers pins that keep history alive, keeps a misfiled
@@ -2971,7 +2971,7 @@ pub(crate) mod tests {
         assert!(pins.contains(&"pin-a") && pins.contains(&"pin-b"), "both records' pins are kept: {:?}", pins);
 
         drop(scope);
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// The writer refuses, before signing, a state no reader would accept: a key whose id is
@@ -3016,7 +3016,7 @@ pub(crate) mod tests {
         assert_eq!(stored(), before, "a refused state must leave nothing in the store");
 
         drop(scope);
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// A folder inside `keys/` or `users/` is refused naming it, rather than skipped: a record
@@ -3070,7 +3070,7 @@ pub(crate) mod tests {
         assert_eq!(read_office_state_of(&planted).unwrap().keys.len(), 1);
 
         drop(scope);
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// A record that does not parse is named by its parcel and file.
@@ -3084,7 +3084,7 @@ pub(crate) mod tests {
             "the error must name the parcel and the file: {}", error);
 
         drop(scope);
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// A `.forklift`, `tracked`, `keys` or `users` entry stored as a file rather than a folder is
@@ -3140,7 +3140,7 @@ pub(crate) mod tests {
         assert_eq!(read_trust_pin_keys().map_err(|e| e.message).unwrap().len(), 1);
 
         drop(scope);
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// The trust-pin reader keeps the pins of a record nested in a folder under `keys/`, which
@@ -3169,7 +3169,7 @@ pub(crate) mod tests {
         assert_eq!(pins, vec!["pin-nested"], "the nested record's pins are kept");
 
         drop(scope);
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// A malformed office tree is worded with the roll-back remedy when heal tolerates it, and
@@ -3195,6 +3195,6 @@ pub(crate) mod tests {
             "gc must refuse a malformed office");
 
         drop(scope);
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 }

@@ -751,7 +751,7 @@ fn run_page(name: &str) {
 
     let stem = name.trim_end_matches(".md");
     let area = std::env::temp_dir().join(format!("forklift-{}-{}", stem, std::process::id()));
-    let _ = std::fs::remove_dir_all(&area);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&area);
     std::fs::create_dir_all(&area).unwrap();
 
     // The run starts on the first block's machine.
@@ -806,7 +806,7 @@ fn run_page(name: &str) {
     assert!(trouble.is_empty(), "{}:{}", label, trouble);
 
     drop(reader);
-    let _ = std::fs::remove_dir_all(&area);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&area);
 }
 
 #[test]

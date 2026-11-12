@@ -2084,14 +2084,8 @@ impl ShardLedger {
 /// folder's place. A link is removed itself, never what it points at. An entry already gone is not
 /// an error.
 fn remove_store_entry(path: &Path) -> std::io::Result<()> {
-    let removed = match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
-        // Windows removes a link to a folder (or a junction) only as a folder.
-        Ok(metadata) if metadata.is_symlink() => std::fs::remove_file(path)
-            .or_else(|e| std::fs::remove_dir(path).map_err(|_| e)),
-        Ok(_) => std::fs::remove_file(path),
-        Err(e) => Err(e),
-    };
+    let removed = std::fs::symlink_metadata(path)
+        .and_then(|metadata| file_utils::remove_entry_unfollowed(path, metadata.file_type()));
 
     match removed {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -3191,7 +3185,7 @@ mod tests {
             let root = std::env::temp_dir().join(format!(
                 "forklift-inventory-test-{}-{}-{}", name, std::process::id(), id
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = crate::globals::StorageRootScope::enter(&root);
 
@@ -3201,7 +3195,7 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = file_utils::remove_dir_all(&self.root);
         }
     }
 
@@ -4345,7 +4339,7 @@ mod tests {
         stamped_chain_with_sibling();
 
         let folder = file_utils::get_inventory_folder_for_key("a/b").unwrap();
-        std::fs::remove_dir_all(&folder).unwrap();
+        file_utils::remove_dir_all(&folder).unwrap();
         std::fs::write(&folder, b"not a folder").unwrap();
 
         remove_inventories_under("a").expect("a file in a registered slot is removable");
@@ -4403,7 +4397,7 @@ mod tests {
         std::fs::write(outside.join("src").join("main.rs"), b"kept").unwrap();
 
         let store_root = file_utils::get_inventory_store_root().unwrap();
-        std::fs::remove_dir_all(&store_root).unwrap();
+        file_utils::remove_dir_all(&store_root).unwrap();
         std::os::unix::fs::symlink(&outside, &store_root).unwrap();
 
         sweep_unregistered_shards();
@@ -4424,7 +4418,7 @@ mod tests {
         std::fs::write(target.join("kept"), b"kept").unwrap();
 
         let folder = file_utils::get_inventory_folder_for_key("a/b").unwrap();
-        std::fs::remove_dir_all(&folder).unwrap();
+        file_utils::remove_dir_all(&folder).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &folder).unwrap();
         #[cfg(windows)]
@@ -4444,7 +4438,7 @@ mod tests {
         stamped_chain_with_sibling();
 
         let store_root = file_utils::get_inventory_store_root().unwrap();
-        std::fs::remove_dir_all(&store_root).unwrap();
+        file_utils::remove_dir_all(&store_root).unwrap();
         std::fs::write(&store_root, b"not a folder").unwrap();
 
         crate::util::operation_utils::raise_for_fixture();
@@ -4634,7 +4628,7 @@ mod tests {
         let _scratch = Scratch::new("diff-unreadable");
         stamped_chain_with_sibling();
         let folder = file_utils::get_inventory_folder_for_key("x").unwrap();
-        std::fs::remove_dir_all(&folder).unwrap();
+        file_utils::remove_dir_all(&folder).unwrap();
         std::fs::write(&folder, b"not a folder").unwrap();
 
         crate::util::operation_utils::raise_for_fixture();
@@ -5156,7 +5150,7 @@ mod tests {
         std::fs::write(outside.join(&fan_out_name).join(&slot_name).join("kept"), b"kept").unwrap();
 
         let store_root = file_utils::get_inventory_store_root().unwrap();
-        std::fs::remove_dir_all(&store_root).unwrap();
+        file_utils::remove_dir_all(&store_root).unwrap();
         std::os::unix::fs::symlink(&outside, &store_root).unwrap();
 
         let result = ShardLedger::read().unwrap().update_shard("new", add_new_txt);
@@ -5169,7 +5163,7 @@ mod tests {
         assert!(error.contains("is not a folder") && error.contains("unload ."), "{error}");
 
         // The way out: remove the link, then reset the staging area to the head (here, empty).
-        std::fs::remove_file(&store_root).unwrap();
+        file_utils::remove_file(&store_root).unwrap();
         ShardLedger::read().unwrap().replace_subtree("", &BTreeMap::from([("".to_string(), Inventory::new())])).unwrap();
         ShardLedger::read().unwrap().update_shard("new", add_new_txt).unwrap();
         assert_eq!(registered_names("new"), ["new.txt"]);
@@ -5308,9 +5302,9 @@ mod tests {
     /// Windows removes a link to a folder as a folder.
     fn unlink(link: &Path, is_dir: bool) {
         if cfg!(windows) && is_dir {
-            std::fs::remove_dir(link).unwrap();
+            file_utils::remove_dir(link).unwrap();
         } else {
-            std::fs::remove_file(link).unwrap();
+            file_utils::remove_file(link).unwrap();
         }
     }
 

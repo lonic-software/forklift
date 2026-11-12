@@ -30,7 +30,7 @@ impl TestArea {
     fn new(name: &str) -> TestArea {
         let root = std::env::temp_dir().join(format!("forklift-mirror-{}-{}", name, std::process::id()));
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
         TestArea { root }
@@ -92,7 +92,7 @@ impl TestArea {
 
 impl Drop for TestArea {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.root);
     }
 }
 
@@ -679,7 +679,7 @@ fn a_deleted_mirror_repository_re_exports_and_pushes_nothing() {
     area.forklift_ok("a", &["git", "mirror"]);
     let mirrored = tip(&fixture.git, "main").unwrap();
 
-    std::fs::remove_dir_all(fixture.mirror_dir("a")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(fixture.mirror_dir("a")).unwrap();
 
     let report = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&report, "main")["status"], "up_to_date", "{}", report);
@@ -716,7 +716,7 @@ fn a_failed_push_resumes_without_re_exporting_after_gc() {
         gc_utils::collect_garbage(0).expect("gc runs");
     }
 
-    std::fs::remove_file(fixture.git.join("hooks").join("pre-receive")).unwrap();
+    forklift_core::util::file_utils::remove_file(fixture.git.join("hooks").join("pre-receive")).unwrap();
     let report = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&report, "feat")["status"], "pushed", "{}", report);
     assert_eq!(outcome(&report, "feat")["exported"], 0, "{}", report);
@@ -955,7 +955,7 @@ fn a_busy_mirror_is_reported_and_a_killed_holder_releases_it() {
 
     holder.kill().unwrap();
     holder.wait().unwrap();
-    std::fs::remove_file(fixture.mirror_dir("a").join("hooks").join("reference-transaction")).unwrap();
+    forklift_core::util::file_utils::remove_file(fixture.mirror_dir("a").join("hooks").join("reference-transaction")).unwrap();
 
     let report = area.json("bay", &["git", "mirror"]);
     assert_eq!(outcome(&report, "main")["status"], "pushed", "{}", report);
@@ -1263,7 +1263,7 @@ fn a_head_the_anchor_does_not_vouch_for_is_never_exported() {
         .find(|entry| entry.file_name().is_some_and(|name| name == "office"))
         .unwrap();
     let stripped: Vec<(PathBuf, Vec<u8>)> = [trust, office].into_iter()
-        .map(|path| { let bytes = std::fs::read(&path).unwrap(); std::fs::remove_file(&path).unwrap(); (path, bytes) })
+        .map(|path| { let bytes = std::fs::read(&path).unwrap(); forklift_core::util::file_utils::remove_file(&path).unwrap(); (path, bytes) })
         .collect();
 
     fixture.franchise("c");
@@ -1606,7 +1606,7 @@ fn a_mirror_leaves_out_a_file_whose_redaction_is_applied_even_under_a_reused_fol
     area.forklift_ok("a", &["config", "set", "mirror.auto", "off"]);
     area.stack("a", "code.txt", "v2\n", "change");
     let change = std::fs::read_to_string(area.path("a/.forklift/pallets/main")).unwrap().trim().to_string();
-    std::fs::remove_file(area.path("a/other/secret.env")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("a/other/secret.env")).unwrap();
     area.forklift_ok("a", &["load", "."]);
     area.forklift_ok("a", &["stack", "-m", "take the leak out"]);
     area.lift("a");

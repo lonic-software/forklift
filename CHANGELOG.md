@@ -407,6 +407,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **On Windows, a delete no longer fails at once on a file another program is reading.** A search
+  indexer, an antivirus scanner or an editor that opens a file without letting others delete it
+  used to fail any Forklift command that removed that file or a folder holding it, such as a
+  sweep, a repack or a bundle install. Deletes now wait up to a second for such a hold
+  to lift, as renames already did, and fail with the same error only if it outlasts that.
+
 - **A load, unload or remove next step for a path starting with `-` runs as printed in Windows
   PowerShell.** Such a path used to follow `--`, and Windows PowerShell 5.1 splits an unquoted
   argument that starts with `-` at its first dot, so `forklift unload -- -draft.txt` reached

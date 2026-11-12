@@ -2001,7 +2001,7 @@ impl Area {
 
 impl Drop for Area {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = file_utils::remove_dir_all(&self.root);
     }
 }
 

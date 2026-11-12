@@ -176,7 +176,7 @@ mod tests {
 
     fn scratch(name: &str) -> (PathBuf, globals::StorageRootScope) {
         let root = std::env::temp_dir().join(format!("forklift-origin-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let scope = globals::StorageRootScope::enter(&root);
         (root, scope)
@@ -216,7 +216,7 @@ mod tests {
         std::fs::write(&path, record_utils::to_bytes(RECORD, VERSION, [""])).unwrap();
         assert!(read_origin().unwrap_err().contains("empty origin"));
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// A partial warehouse dials only its origin, and refuses a missing origin; a full warehouse
@@ -237,7 +237,7 @@ mod tests {
             }
 
             set_url("http://origin.example");
-            let _ = std::fs::remove_file(&path);
+            let _ = file_utils::remove_file(&path);
             assert_eq!(refusal_code(checked_remote().unwrap_err()), RefusalCode::NonOriginRemote, "{:?}: missing", mode);
 
             write_for_tests("http://origin.example");
@@ -253,12 +253,12 @@ mod tests {
             assert!(text.contains("http://origin.example") && text.contains("http://other.example"), "{}", text);
         }
 
-        std::fs::remove_file(globals::forklift_root().join("config").join("fetch-scope")).unwrap();
+        file_utils::remove_file(globals::forklift_root().join("config").join("fetch-scope")).unwrap();
         warehouse_utils::mark_for_test(WarehouseMode::Full);
         assert_eq!(checked_remote().unwrap().0, "http://other.example");
-        let _ = std::fs::remove_file(&path);
+        let _ = file_utils::remove_file(&path);
         assert_eq!(checked_remote().unwrap().0, "http://other.example");
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 }

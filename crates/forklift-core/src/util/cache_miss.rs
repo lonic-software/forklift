@@ -449,7 +449,7 @@ mod tests {
 
     fn fixture(name: &str) -> Fixture {
         let dir = std::env::temp_dir().join(format!("forklift-cache-miss-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let scope = StorageRootScope::enter(&dir);
         warehouse_utils::mark_for_test(WarehouseMode::Cache);
@@ -485,7 +485,7 @@ mod tests {
 
     fn remove(hash: &str) {
         let (folder, file) = file_utils::get_path_for_object(hash).unwrap();
-        std::fs::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
+        file_utils::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
     }
 
     fn held(hash: &str) -> bool {

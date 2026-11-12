@@ -175,7 +175,7 @@ fn write_intent(_lock: &RefLock, intent: &Intent) -> Result<(), String> {
 fn remove_intent(_lock: &RefLock) -> Result<(), String> {
     let path = intent_path();
 
-    match std::fs::remove_file(&path) {
+    match file_utils::remove_file(&path) {
         Ok(()) => file_utils::sync_dir(&globals::forklift_root()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("Error while clearing \"{}\": {}", path.to_string_lossy(), e)),
@@ -406,7 +406,7 @@ mod tests {
     impl Scratch {
         fn new(name: &str) -> Scratch {
             let root = std::env::temp_dir().join(format!("forklift-origin-move-{}-{}", name, std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = globals::StorageRootScope::enter(&root);
 
@@ -416,7 +416,7 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = file_utils::remove_dir_all(&self.root);
         }
     }
 

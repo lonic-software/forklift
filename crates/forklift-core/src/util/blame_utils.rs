@@ -374,7 +374,7 @@ mod tests {
 
         let dir = std::env::temp_dir()
             .join(format!("forklift-blame-unresolvable-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let scope = StorageRootScope::enter(&dir);
 
@@ -421,7 +421,7 @@ mod tests {
         let result = blame(&last, "notes.txt");
         let walks = graph_utils::ENSURE_CALLS.with(|calls| calls.get());
         drop(scope);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
 
         let lines = result.expect("an unreadable merge parent must not fail a first-parent blame");
         let parcels: Vec<&str> = lines.lines.iter().map(|line| line.parcel.as_str()).collect();

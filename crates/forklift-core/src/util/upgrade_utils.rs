@@ -335,7 +335,7 @@ mod tests {
 
     fn fresh_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("forklift-upgrade-{}-{}", label, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::util::file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -444,7 +444,7 @@ mod tests {
         assert_eq!(report, UpgradeReport { from: 1, to: 3, resumed: None, steps_run: 3 });
         assert_eq!(marker_entries(&root), "format 3\nsparse\n");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// Every bay's state folder is handed to the steps, the main tree's first, so a migration never
@@ -472,7 +472,7 @@ mod tests {
         let names: Vec<_> = seen[0].iter().map(|dir| dir.strip_prefix(&root).unwrap().to_path_buf()).collect();
         assert_eq!(names, [PathBuf::from(FOLDER_NAME_FORKLIFT_ROOT), Path::new(FOLDER_NAME_FORKLIFT_ROOT).join("bays").join("feature")]);
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// A failing step leaves the upgrade on record with the steps before it done, and the next run
@@ -497,7 +497,7 @@ mod tests {
         assert_eq!(report, UpgradeReport { from: 1, to: 3, resumed: Some(ResumedUpgrade { target: 2, step: 1, steps: 2 }), steps_run: 2 });
         assert_eq!(marker_entries(&root), "format 3\nfull\n");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     const CRASH_ROOT: &str = "FORKLIFT_TEST_UPGRADE_CRASH_ROOT";
@@ -534,7 +534,7 @@ mod tests {
         assert_eq!(report.resumed, Some(ResumedUpgrade { target: 2, step: 1, steps: 2 }));
         assert_eq!(marker_entries(&root), "format 3\nfull\n");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// While anything holds the format lease the upgrade refuses at once, before it changes anything.
@@ -556,7 +556,7 @@ mod tests {
         chain.run(&root).unwrap();
         assert_eq!(marker_entries(&root), "format 3\nfull\n");
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// A warehouse already in the format the build reads is left as it is.
@@ -569,7 +569,7 @@ mod tests {
         assert_eq!(report, UpgradeReport { from: WAREHOUSE_FORMAT, to: WAREHOUSE_FORMAT, resumed: None, steps_run: 0 });
         assert_eq!(std::fs::read(marker_path(&root)).unwrap(), before);
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// A marker the chain cannot carry to its format is refused with nothing changed: a newer format,
@@ -599,7 +599,7 @@ mod tests {
             assert_eq!(chain.taken(), Vec::<String>::new(), "{}", entries);
             assert_eq!(marker_entries(&root), entries);
 
-            std::fs::remove_dir_all(&root).ok();
+            crate::util::file_utils::remove_dir_all(&root).ok();
         }
     }
 
@@ -622,7 +622,7 @@ mod tests {
 
         assert_eq!(seen.into_inner().unwrap(), Some(root.join(FOLDER_NAME_FORKLIFT_ROOT)));
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// A step may rewrite the mode word, and the finished marker keeps what it wrote; a mode this
@@ -655,7 +655,7 @@ mod tests {
                 assert_eq!(marker_entries(&root), format!("format 1\n{}\nupgrading 2 1\n", word));
             }
 
-            std::fs::remove_dir_all(&root).ok();
+            crate::util::file_utils::remove_dir_all(&root).ok();
         }
     }
 
@@ -685,7 +685,7 @@ mod tests {
         assert!(next_step.starts_with("Move \""), "{}", next_step);
         assert!(next_step.contains("\"forklift prepare\""), "{}", next_step);
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
     /// An unfinished clone is not upgraded: running the clone again finishes it in this build's format.
@@ -716,7 +716,7 @@ mod tests {
         assert_eq!(chain.taken(), Vec::<String>::new());
         assert_eq!(marker_entries(&root), "format 1\nfull\n");
 
-        std::fs::remove_dir_all(&dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// A bay is upgraded with its warehouse, and the refusal names where.
@@ -733,6 +733,6 @@ mod tests {
         assert_eq!(code, RefusalCode::NotAWarehouse);
         assert_eq!(next_step, format!("Run \"forklift upgrade\" in \"{}\".", root.to_string_lossy()));
 
-        std::fs::remove_dir_all(&root).ok();
+        crate::util::file_utils::remove_dir_all(&root).ok();
     }
 }

@@ -161,7 +161,7 @@ const CHUNK_THRESHOLD: usize = 8 * 1024 * 1024;
 
 impl Drop for Area {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = file_utils::remove_dir_all(&self.root);
     }
 }
 
@@ -575,7 +575,7 @@ fn recorded_redactions(area: &Area, dir: &str, contents: &[&str]) -> (Vec<String
         area.forklift(dir, &["load", "loaded.txt"]);
         area.forklift(dir, &["redact", "record", &blob_hash(content), "-m", "a leak"]);
         area.forklift(dir, &["unload", "loaded.txt"]);
-        std::fs::remove_file(area.path(&format!("{}/loaded.txt", dir))).expect("remove the loaded file");
+        file_utils::remove_file(area.path(&format!("{}/loaded.txt", dir))).expect("remove the loaded file");
         heads.push(harvest(&area.path(dir)).head_of("@redactions").expect("a @redactions head"));
     }
 
@@ -1975,8 +1975,8 @@ fn a_pooled_scratch_amortizes_the_mirror_and_is_keyed_by_warehouse() {
 
     // A pooled scratch outlives the request by design; this test owns these two, so it
     // leaves no directories behind.
-    let _ = std::fs::remove_dir_all(alpha.root());
-    let _ = std::fs::remove_dir_all(beta.root());
+    let _ = file_utils::remove_dir_all(alpha.root());
+    let _ = file_utils::remove_dir_all(beta.root());
 }
 
 /// A monotonically increasing suffix, so a scratch key is unique to this run.

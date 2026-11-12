@@ -54,7 +54,7 @@ impl Warehouse {
             .join(format!("forklift-redaction-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
         let home = base.join("home");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
         std::fs::create_dir_all(&home).unwrap();
 
         Warehouse { root, home }
@@ -119,7 +119,7 @@ impl Warehouse {
         let hash = hash_of(content);
         recorded_hash(self, &hash, reason);
         self.run_ok(&["unload", file]);
-        std::fs::remove_file(self.root.join(file)).unwrap();
+        forklift_core::util::file_utils::remove_file(self.root.join(file)).unwrap();
 
         hash
     }
@@ -140,7 +140,7 @@ impl Warehouse {
     /// Remove the loose object `hash` from the store, as no redaction does: damage.
     fn remove_object(&self, hash: &str) {
         let path = self.root.join(".forklift/objects").join(&hash[..2]).join(&hash[2..]);
-        std::fs::remove_file(&path).unwrap_or_else(|error| panic!("{}: {}", path.display(), error));
+        forklift_core::util::file_utils::remove_file(&path).unwrap_or_else(|error| panic!("{}: {}", path.display(), error));
     }
 
     fn head(&self, pallet: &str) -> String {
@@ -275,7 +275,7 @@ fn content_a_pallet_head_names_is_refused_until_the_file_is_taken_out() {
     // A second pallet at the same head, under another name too, and this bay stands on it.
     warehouse.run_ok(&["pallet", "create", "side"]);
     std::fs::write(warehouse.root.join("copy.env"), b"TOKEN=hunter2\n").unwrap();
-    std::fs::remove_file(warehouse.root.join("secret.env")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("secret.env")).unwrap();
     warehouse.run_ok(&["load", "."]);
     warehouse.run_ok(&["stack", "-m", "renamed"]);
 
@@ -479,7 +479,7 @@ fn a_full_audit_counts_an_applied_redaction_as_redacted_and_passes() {
     // Popped and taken out, nothing names it, and `redact apply` deletes it.
     warehouse.run_ok(&["park", "pop"]);
     warehouse.run_ok(&["unload", "held.env"]);
-    std::fs::remove_file(warehouse.root.join("held.env")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("held.env")).unwrap();
     let applied = warehouse.json(&["redact", "apply"]);
     assert_eq!(applied["data"]["deletion"]["deleted"], serde_json::json!([recorded["data"]["hash"]]), "{}", applied);
     let audited = warehouse.json(&["audit", "--full"]);
@@ -545,7 +545,7 @@ fn a_stack_naming_redacted_content_is_refused_until_the_file_is_gone() {
         "nothing was written"
     );
 
-    std::fs::remove_file(warehouse.root.join("secret.env")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("secret.env")).unwrap();
     warehouse.run_ok(&["load", "."]);
     warehouse.run_ok(&["stack", "-m", "without the secret"]);
 }
@@ -634,7 +634,7 @@ fn a_pick_bringing_back_redacted_content_is_refused_before_it_touches_the_bay() 
     let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
     let short = &leak[..12];
     // A parked parcel holds the copy, so the pick's own refusal is what stops it, not a failed read.
-    std::fs::remove_file(warehouse.root.join("secret.env")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("secret.env")).unwrap();
     warehouse.hold_parked(b"TOKEN=hunter2\n");
     let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
     assert!(warehouse.holds_loose(recorded["data"]["hash"].as_str().unwrap()), "{}", recorded);
@@ -665,7 +665,7 @@ fn a_pick_bringing_back_redacted_content_is_refused_before_it_touches_the_bay() 
     warehouse.run_ok(&["shift", "main"]);
     warehouse.run_ok(&["park", "pop"]);
     warehouse.run_ok(&["unload", "held.env"]);
-    std::fs::remove_file(warehouse.root.join("held.env")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("held.env")).unwrap();
     warehouse.run_ok(&["redact", "apply"]);
     assert!(!warehouse.holds_loose(recorded["data"]["hash"].as_str().unwrap()));
     warehouse.run_ok(&["shift", "side"]);
@@ -703,7 +703,7 @@ struct Server {
 
 impl Server {
     fn start(root: &std::path::Path) -> Server {
-        let _ = std::fs::remove_dir_all(root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(root);
         let prepared = std::process::Command::new(common::server_binary()).env("FORKLIFT_FSYNC", "0")
             .args(["prepare", "--root", root.to_str().unwrap()]).output().unwrap();
         assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
@@ -784,7 +784,7 @@ fn a_lift_is_refused_for_a_head_stacked_before_a_redaction_came_down() {
     assert_eq!(error["details"]["path"], "secret.env", "{}", error);
     assert_eq!(warehouse.head("main"), stacked, "nothing was written");
     warehouse.run_ok(&["unload", "todo.txt"]);
-    std::fs::remove_file(warehouse.root.join("todo.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("todo.txt")).unwrap();
 
     let error = content_redacted(&warehouse, &["lift"]);
     assert_eq!(error["details"]["path"], "secret.env", "{}", error);
@@ -936,7 +936,7 @@ fn a_fast_forward_to_a_head_stacked_before_a_redaction_came_down_is_refused() {
     // The next step, as it says.
     warehouse.run_ok(&["shift", "side"]);
     warehouse.run_ok(&["remove", "secret.env"]);
-    std::fs::remove_file(warehouse.root.join("secret.env")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("secret.env")).unwrap();
     warehouse.run_ok(&["stack", "-m", "take the leak out"]);
     warehouse.run_ok(&["shift", "main"]);
     warehouse.run_ok(&["consolidate", "side"]);
@@ -987,7 +987,7 @@ fn a_meta_history_the_remote_serves_is_taken_though_it_names_a_redacted_hash() {
     warehouse.run_ok(&["load", "marker.txt"]);
     recorded_hash(&warehouse, &hash_of(marker), "r");
     warehouse.run_ok(&["unload", "marker.txt"]);
-    std::fs::remove_file(warehouse.root.join("marker.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("marker.txt")).unwrap();
     warehouse.run_ok(&["lift"]);
 
     // A fresh clone takes @redactions and then the remote's @tags, which the remote judged when it
@@ -1107,7 +1107,7 @@ fn a_remote_holds_a_redaction_pending_and_a_head_holds_it_until_the_file_is_out(
     let recorded = recorded_hash(&redactor, &hash, "leaked token");
     assert_eq!(recorded["data"]["status"], serde_json::json!({ "state": "awaiting_remote" }), "{}", recorded);
     redactor.run_ok(&["unload", "secret.env"]);
-    std::fs::remove_file(redactor.root.join("secret.env")).unwrap();
+    forklift_core::util::file_utils::remove_file(redactor.root.join("secret.env")).unwrap();
 
     // Its main is behind the remote's, which it leaves alone; @redactions goes up.
     let lifted = redactor.run(&["lift"]);
@@ -1131,7 +1131,7 @@ fn a_remote_holds_a_redaction_pending_and_a_head_holds_it_until_the_file_is_out(
     let tags = std::fs::read_to_string(holder.root.join(".forklift/meta/tags")).unwrap().trim().to_string();
     let loose = holder.root.join(".forklift/objects").join(&tags[..2]).join(&tags[2..]);
     let parcel = std::fs::read(&loose).unwrap();
-    std::fs::remove_file(&loose).unwrap();
+    forklift_core::util::file_utils::remove_file(&loose).unwrap();
     assert_eq!(holder.redactions()[0]["status"], held);
     std::fs::write(&loose, parcel).unwrap();
 
@@ -1385,7 +1385,7 @@ fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_i
     // The deletion that follows an applied redaction, whether or not the clone fetched the bytes.
     for hash in &hashes {
         for copy in loose_copies(&cached.root.join(".forklift/objects"), hash) {
-            std::fs::remove_file(copy).unwrap();
+            forklift_core::util::file_utils::remove_file(copy).unwrap();
         }
     }
 
@@ -1398,11 +1398,11 @@ fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_i
     // the local leak.
     drop(server);
     let second_root = temp.join(format!("forklift-redaction-applied-cache-copy-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&second_root);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&second_root);
     let copied = std::process::Command::new("cp").arg("-R").arg(&first_root).arg(&second_root).output().unwrap();
     assert!(copied.status.success(), "{:?}", copied);
     // The lock the first server held is not the copy's: no process holds it.
-    std::fs::remove_file(second_root.join(".forklift/serve.lock")).unwrap();
+    forklift_core::util::file_utils::remove_file(second_root.join(".forklift/serve.lock")).unwrap();
     let server = Server::serve(&second_root);
 
     let moved = cached.json(&["remote", "move", &server.url]);
@@ -1681,8 +1681,8 @@ fn crashed_before_apply(name: &str) -> (PathBuf, String, String) {
     assert!(gone, "the server deleted the content");
     drop(server);
 
-    std::fs::remove_file(root.join(".forklift/serve.lock")).unwrap();
-    std::fs::remove_file(root.join(".forklift/redactions-applied")).unwrap();
+    forklift_core::util::file_utils::remove_file(root.join(".forklift/serve.lock")).unwrap();
+    forklift_core::util::file_utils::remove_file(root.join(".forklift/redactions-applied")).unwrap();
     std::fs::create_dir_all(loose.parent().unwrap()).unwrap();
     std::fs::write(&loose, &bytes).unwrap();
 
@@ -1741,7 +1741,7 @@ fn a_server_back_from_a_crash_before_an_apply_serves_none_of_its_content() {
 
     // Back again with nothing left to apply or delete: content is served while the first run is
     // held.
-    std::fs::remove_file(root.join(".forklift/serve.lock")).unwrap();
+    forklift_core::util::file_utils::remove_file(root.join(".forklift/serve.lock")).unwrap();
     let _scope = forklift_core::globals::StorageRootScope::enter(&root);
     let _lock = forklift_core::util::lock_utils::RefLock::acquire().unwrap();
     let server = Server::serve(&root);
@@ -1763,7 +1763,7 @@ fn a_server_serves_no_content_while_an_apply_cannot_decide_a_redaction() {
     let head = std::fs::read_to_string(root.join(".forklift/pallets/main")).unwrap().trim().to_string();
     let parcel = root.join(".forklift/objects").join(&head[..2]).join(&head[2..]);
     let parcel_bytes = std::fs::read(&parcel).unwrap();
-    std::fs::remove_file(&parcel).unwrap();
+    forklift_core::util::file_utils::remove_file(&parcel).unwrap();
 
     let server = Server::serve(&root);
     let (status, body) = http(&server.url, "GET", &object, b"");
@@ -1903,7 +1903,7 @@ fn a_server_owing_a_deletion_serves_the_chunks_only_its_recipe_names_as_absent()
     owner.run_ok(&["lift"]);
     owner.run_ok(&["remove", "dump/big.bin"]);
     owner.run_ok(&["stack", "-m", "take the leak out"]);
-    let _ = std::fs::remove_file(owner.root.join("dump/big.bin"));
+    let _ = forklift_core::util::file_utils::remove_file(owner.root.join("dump/big.bin"));
 
     let recorded = recorded_hash(&owner, &format!("{}:dump/big.bin", leak), "leaked dump");
     let recipe = recorded["data"]["hash"].as_str().unwrap().to_string();
@@ -2035,7 +2035,7 @@ fn a_lower_applies_what_the_remote_reports_applied_and_deletes_the_copy_here() {
     redactor.run_ok(&["load", "secret.env"]);
     recorded_hash(&redactor, &hash, "leaked token");
     redactor.run_ok(&["unload", "secret.env"]);
-    std::fs::remove_file(redactor.root.join("secret.env")).unwrap();
+    forklift_core::util::file_utils::remove_file(redactor.root.join("secret.env")).unwrap();
     let lifted = redactor.run(&["lift"]);
     assert!(String::from_utf8_lossy(&lifted.stdout).contains("Lifted the @redactions pallet"), "{:?}", lifted);
 
@@ -2232,7 +2232,7 @@ fn a_lower_refused_after_applying_a_redaction_warns_it_unsettled() {
 
     let behind = Warehouse::cloned("refused-behind", &server.url);
     behind.leaked("secret.env", content);
-    let _ = std::fs::remove_file(behind.root.join("secret.env"));
+    let _ = forklift_core::util::file_utils::remove_file(behind.root.join("secret.env"));
     behind.stack("more.txt", b"more\n", "more");
     let hash = owner.redact_loaded("secret.env", content, "leaked token");
     owner.run_ok(&["lift"]);
@@ -2249,7 +2249,7 @@ fn a_lower_refused_after_applying_a_redaction_warns_it_unsettled() {
     assert!(warned.contains("\"redactions_unsettled\"") && warned.contains(&hash), "{}", warned);
     assert_eq!(applied_record(&late), format!("/forklift-redactions-applied 1\n{}\n", hash));
 
-    std::fs::remove_file(late.root.join("more.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(late.root.join("more.txt")).unwrap();
     let lowered = late.json(&["lower"]);
     assert_eq!(lowered["ok"], true, "{}", lowered);
     assert_eq!(late.head("main"), server.main());
@@ -2558,7 +2558,7 @@ fn a_lift_naming_withheld_content_lands_without_its_bytes() {
     // A tree that moves the file elsewhere names it again; the write tolerates that too.
     std::fs::create_dir_all(owner.root.join("films")).unwrap();
     std::fs::write(owner.root.join("films/film.mkv"), content).unwrap();
-    std::fs::remove_file(owner.root.join("film.mkv")).unwrap();
+    forklift_core::util::file_utils::remove_file(owner.root.join("film.mkv")).unwrap();
     owner.run_ok(&["load", "."]);
     owner.run_ok(&["stack", "-m", "move the film"]);
     owner.run_ok(&["lift"]);
@@ -2914,7 +2914,7 @@ fn a_served_root_deletes_a_withheld_copy_and_rebuilds_its_bundle() {
     // A killed server leaves its serve lock behind; no process holds it.
     let stop = |server: Server| {
         drop(server);
-        std::fs::remove_file(root.join(".forklift/serve.lock")).unwrap();
+        forklift_core::util::file_utils::remove_file(root.join(".forklift/serve.lock")).unwrap();
     };
     stop(Server::start(&root));
     let server = Server::serve_with(&root, &serve);
@@ -3139,11 +3139,11 @@ fn a_move_to_an_origin_withholding_leaned_on_content_reads_the_previous_origin()
 
     // A copy of the server's root whose host withholds the draft.
     let second_root = temp.join(format!("forklift-takedown-move-copy-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&second_root);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&second_root);
     let copied = std::process::Command::new("cp").arg("-R").arg(&first_root).arg(&second_root).output().unwrap();
     assert!(copied.status.success(), "{:?}", copied);
     // The lock the first server holds is not the copy's.
-    std::fs::remove_file(second_root.join(".forklift/serve.lock")).unwrap();
+    forklift_core::util::file_utils::remove_file(second_root.join(".forklift/serve.lock")).unwrap();
     let added = withhold(&second_root, &["add", &draft, "--statement", statement]);
     assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
     let second = Server::serve(&second_root);
@@ -3772,8 +3772,8 @@ fn git_export_in_a_served_root_leaves_out_content_its_host_withholds() {
             if deleted { "deleted" } else { "stored" });
 
         let target = takedown.server.root.parent().unwrap().join(format!("{}-git", name));
-        let _ = std::fs::remove_dir_all(&target);
-        let _ = std::fs::remove_dir_all(target.with_extension("2"));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&target);
+        let _ = forklift_core::util::file_utils::remove_dir_all(target.with_extension("2"));
         let exported = served.json(&["git", "export", target.to_str().unwrap()]);
         assert_eq!(exported["ok"], true, "{}", exported);
         assert_eq!(exported["data"]["withheld_here"], serde_json::json!([
@@ -3812,7 +3812,7 @@ fn git_mirror_in_a_served_root_leaves_out_content_its_host_withholds() {
     takedown.film = hash_of(b"the new film\n");
     let served = Warehouse { root: takedown.server.root.clone(), home: takedown.owner.home.clone() };
     let git = takedown.server.root.parent().unwrap().join("forklift-takedown-mirror-here-git");
-    let _ = std::fs::remove_dir_all(&git);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&git);
     let initialised = std::process::Command::new("git").args(["init", "-q", "--bare", git.to_str().unwrap()])
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
@@ -3975,7 +3975,7 @@ fn a_chunk_list_redaction_judges_a_withheld_recipe_by_its_recorded_digest() {
     let recorded = recorded_hash(&takedown.owner, &format!("{}:secret.bin", leak), "leaked dump");
     assert_eq!(recorded["data"]["chunked"], true, "{}", recorded);
     assert_eq!(takedown.owner.redactions()[0]["chunks"].as_str().map(str::len), Some(64));
-    let _ = std::fs::remove_file(takedown.owner.root.join("secret.bin"));
+    let _ = forklift_core::util::file_utils::remove_file(takedown.owner.root.join("secret.bin"));
     takedown.owner.run_ok(&["shift", "main"]);
     takedown.owner.run_ok(&["lift"]);
 
@@ -3993,7 +3993,7 @@ fn a_chunk_list_redaction_judges_a_withheld_recipe_by_its_recorded_digest() {
     assert_eq!(takedown.server.main(), takedown.owner.head("main"));
 
     let dir = std::env::temp_dir().join(format!("forklift-redaction-chunkjudge-writer-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let cloned = forklift_command()
         .args(["clone", &takedown.server.url, "warehouse"])

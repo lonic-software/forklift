@@ -249,7 +249,7 @@ fn a_fence_closes_only_on_its_own_kind() {
 #[test]
 fn a_link_to_a_missing_page_or_heading_is_broken() {
     let area = std::env::temp_dir().join(format!("forklift-doc-links-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&area);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&area);
     std::fs::create_dir_all(&area).unwrap();
     let page = area.join("page.md");
     std::fs::write(&page, "# Title\n\n## Title\n\n```sh\n# not a heading\n```\n").unwrap();
@@ -267,5 +267,5 @@ fn a_link_to_a_missing_page_or_heading_is_broken() {
     assert!(broken(&page, "missing.md").is_some());
     assert!(broken(&page, "notes.txt#x").is_some());
 
-    let _ = std::fs::remove_dir_all(&area);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&area);
 }

@@ -412,11 +412,12 @@ pub fn sync_tree(dir: &Path) -> Result<(), String> {
     sync_dir(dir)
 }
 
-/// How long [`rename`] and [`rename_no_replace`] keep retrying a rename that a handle is blocking,
-/// and the first and longest delay between attempts (the delay doubles).
-const HELD_RENAME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
-const HELD_RENAME_FIRST_DELAY: std::time::Duration = std::time::Duration::from_millis(2);
-const HELD_RENAME_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+/// How long [`rename`], [`rename_no_replace`] and the deletes ([`remove_file`], [`remove_dir`],
+/// [`remove_dir_all`]) keep retrying an operation that a handle is blocking, and the first and
+/// longest delay between attempts (the delay doubles).
+const HELD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+const HELD_FIRST_DELAY: std::time::Duration = std::time::Duration::from_millis(2);
+const HELD_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// `std::fs::rename`, retried while an open handle blocks it. Every rename in the workspace goes
 /// through here or [`rename_no_replace`]; clippy refuses a bare `std::fs::rename`.
@@ -424,7 +425,7 @@ const HELD_RENAME_MAX_DELAY: std::time::Duration = std::time::Duration::from_mil
 /// On Windows, a rename fails while a handle on the source or the target lacks
 /// `FILE_SHARE_DELETE` — an editor, a search indexer or an antivirus scanner reading the file —
 /// and also while one is open on a file inside a folder being renamed. Those holds are usually
-/// brief, so the rename is retried with a doubling delay for up to [`HELD_RENAME_DEADLINE`]. Any
+/// brief, so the rename is retried with a doubling delay for up to [`HELD_DEADLINE`]. Any
 /// other error returns at once, and a hold that outlasts the deadline returns its last error
 /// unchanged. A hold this process keeps itself is waited out too, and fails the same way.
 ///
@@ -443,7 +444,7 @@ pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> std::io::Result<(
 /// passed one for the same rename.
 fn rename_held(from: &Path, to: &Path) -> std::io::Result<()> {
     #[allow(clippy::disallowed_methods)] // the one sanctioned call: this is the wrapper
-    retry_while_held(|| std::fs::rename(from, to), is_held_by_another_process, || source_remains(from))
+    retry_while_held(|| std::fs::rename(from, to), is_held_by_another_process, || path_remains(from))
 }
 
 /// The exit code of a process that stopped at its [`crash_point`].
@@ -487,16 +488,122 @@ fn crash_point() {
     }
 }
 
-/// Whether a rename's source still stands, so another attempt can still move it.
-fn source_remains(from: &Path) -> bool {
-    std::fs::symlink_metadata(from).is_ok()
+/// Whether a path still stands: a rename's source another attempt can still move, or a delete's
+/// target another attempt can still remove.
+fn path_remains(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
-/// Whether a failed rename was refused because a handle (another process's, or this process's
-/// own) forbids it. Windows reports a hold on the target as `ERROR_ACCESS_DENIED` and one on the
-/// source (which the rename must open for delete) as `ERROR_SHARING_VIOLATION`;
+/// `std::fs::remove_file`, retried while an open handle blocks it. Every file delete in the
+/// workspace goes through here; clippy refuses a bare `std::fs::remove_file`.
+///
+/// On Windows, a delete fails with `ERROR_SHARING_VIOLATION` while any handle on the file lacks
+/// `FILE_SHARE_DELETE`, which an editor, a search indexer or an antivirus scanner reading it
+/// usually does. Like [`rename`], the delete is retried with a doubling delay for up to
+/// [`HELD_DEADLINE`]; any other error returns at once, a hold that outlasts the deadline returns
+/// its last error unchanged, a held failure whose path is already gone is not retried, and a retry
+/// that finds the path gone (another process removed it meanwhile) succeeds. Writes and truncating
+/// opens are not retried: a handle that shares reading and writing but not delete lets them
+/// through, and only one that refuses writing too stops them. On Unix this is a plain
+/// `std::fs::remove_file`.
+///
+/// On Windows a link to a folder is not a file: this refuses it with `ERROR_ACCESS_DENIED`, which
+/// reads as held and so waits out the deadline. Remove an entry that may be one with
+/// [`remove_entry_unfollowed`].
+pub fn remove_file(path: impl AsRef<Path>) -> std::io::Result<()> {
+    #[allow(clippy::disallowed_methods)] // the one sanctioned call: this is the wrapper
+    delete_while_held(path.as_ref(), |path| std::fs::remove_file(path))
+}
+
+/// `std::fs::remove_dir`, retried while an open handle blocks it, as [`remove_file`] retries. On
+/// Windows a handle on the folder itself without `FILE_SHARE_DELETE` (a shell or a file manager
+/// open in it) refuses its removal.
+pub fn remove_dir(path: impl AsRef<Path>) -> std::io::Result<()> {
+    #[allow(clippy::disallowed_methods)] // the one sanctioned call: this is the wrapper
+    delete_while_held(path.as_ref(), |path| std::fs::remove_dir(path))
+}
+
+/// `std::fs::remove_dir_all`, retried while an open handle blocks it, as [`remove_file`] retries.
+/// On Windows, a held file anywhere in the tree, or a held folder, fails the whole removal; each
+/// retry starts again over what is left. Once the path is gone, a held failure is not retried.
+pub fn remove_dir_all(path: impl AsRef<Path>) -> std::io::Result<()> {
+    #[allow(clippy::disallowed_methods)] // the one sanctioned call: this is the wrapper
+    delete_while_held(path.as_ref(), |path| std::fs::remove_dir_all(path))
+}
+
+/// Remove the entry at `path`, of type `file_type`, without following it: a real folder with
+/// everything in it, a link to a folder (or a junction) as the folder entry Windows takes it for,
+/// and anything else as a file. Asking the platform by type, rather than trying `remove_file` and
+/// falling back, keeps a folder link on Windows from waiting out [`HELD_DEADLINE`] on the
+/// `ERROR_ACCESS_DENIED` its `remove_file` returns.
+pub fn remove_entry_unfollowed(path: impl AsRef<Path>, file_type: std::fs::FileType) -> std::io::Result<()> {
+    let path = path.as_ref();
+    if file_type.is_dir() {
+        remove_dir_all(path)
+    } else if is_folder_link(file_type) {
+        remove_dir(path)
+    } else {
+        remove_file(path)
+    }
+}
+
+/// Remove the file or link at `path` without following it, as [`remove_entry_unfollowed`] does,
+/// for a caller that never means to remove a real folder: one there is refused at once with
+/// `IsADirectory`, never waited on.
+pub fn remove_file_or_link(path: impl AsRef<Path>) -> std::io::Result<()> {
+    let path = path.as_ref();
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Err(std::io::Error::new(
+            std::io::ErrorKind::IsADirectory,
+            "a folder, not a file or a link",
+        )),
+        Ok(metadata) => remove_entry_unfollowed(path, metadata.file_type()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `file_type` is a link Windows removes as a folder: a directory symlink or a junction.
+#[cfg(windows)]
+fn is_folder_link(file_type: std::fs::FileType) -> bool {
+    std::os::windows::fs::FileTypeExt::is_symlink_dir(&file_type)
+}
+
+#[cfg(not(windows))]
+fn is_folder_link(_file_type: std::fs::FileType) -> bool {
+    false
+}
+
+/// Run the delete `op` on `path` through [`retry_while_held`]. A retry that fails `NotFound`
+/// counts as success: the path stood when the held failure was judged and is gone now, which is
+/// the state this call was asked for. (Should a parent have been renamed away meanwhile, the
+/// entry survives under the new name; a held file blocks that rename, so only the last sleep is
+/// exposed.)
+fn delete_while_held(path: &Path, op: impl Fn(&Path) -> std::io::Result<()>) -> std::io::Result<()> {
+    delete_while_held_when(path, op, is_held_by_another_process)
+}
+
+/// [`delete_while_held`] with the held classifier given, so the retry rules run on every platform.
+fn delete_while_held_when(
+    path: &Path,
+    op: impl Fn(&Path) -> std::io::Result<()>,
+    is_held: impl Fn(&std::io::Error) -> bool,
+) -> std::io::Result<()> {
+    let mut first = true;
+    retry_while_held(
+        || match (op(path), std::mem::replace(&mut first, false)) {
+            (Err(error), false) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            (result, _) => result,
+        },
+        is_held,
+        || path_remains(path),
+    )
+}
+
+/// Whether a failed rename or delete was refused because a handle (another process's, or this
+/// process's own) forbids it. Windows reports a hold on a rename's target as `ERROR_ACCESS_DENIED`
+/// and one on its source, or on a file being deleted, as `ERROR_SHARING_VIOLATION`;
 /// `ERROR_LOCK_VIOLATION` is a byte-range lock. `ERROR_ACCESS_DENIED` is also a genuine permission
-/// refusal, which a retry cannot help: that case costs [`HELD_RENAME_DEADLINE`] before failing with
+/// refusal, which a retry cannot help: that case costs [`HELD_DEADLINE`] before failing with
 /// the same error.
 #[cfg(windows)]
 fn is_held_by_another_process(error: &std::io::Error) -> bool {
@@ -514,7 +621,7 @@ fn is_held_by_another_process(_error: &std::io::Error) -> bool {
 }
 
 /// Run `attempt` until it succeeds, fails with an error `is_held` rejects, finds `retryable` false
-/// after a held failure, or [`HELD_RENAME_DEADLINE`] has passed since the first attempt; the result
+/// after a held failure, or [`HELD_DEADLINE`] has passed since the first attempt; the result
 /// is the last attempt's.
 fn retry_while_held<T>(
     mut attempt: impl FnMut() -> std::io::Result<T>,
@@ -522,13 +629,13 @@ fn retry_while_held<T>(
     retryable: impl Fn() -> bool,
 ) -> std::io::Result<T> {
     let started = std::time::Instant::now();
-    let mut delay = HELD_RENAME_FIRST_DELAY;
+    let mut delay = HELD_FIRST_DELAY;
 
     loop {
         match attempt() {
-            Err(error) if is_held(&error) && started.elapsed() < HELD_RENAME_DEADLINE && retryable() => {
+            Err(error) if is_held(&error) && started.elapsed() < HELD_DEADLINE && retryable() => {
                 std::thread::sleep(delay);
-                delay = (delay * 2).min(HELD_RENAME_MAX_DELAY);
+                delay = (delay * 2).min(HELD_MAX_DELAY);
             }
             result => return result,
         }
@@ -556,7 +663,7 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         let moved = retry_while_held(|| match unsafe { MoveFileExW(w_from.as_ptr(), w_to.as_ptr(), 0) } {
             0 => Err(std::io::Error::last_os_error()),
             _ => Ok(()),
-        }, is_held_by_another_process, || source_remains(from));
+        }, is_held_by_another_process, || path_remains(from));
 
         return match moved {
             Err(error) if matches!(error.raw_os_error().map(|code| code as u32), Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS)) =>
@@ -898,12 +1005,7 @@ pub(crate) fn remove_unfollowed(path: &Path) -> Result<(), String> {
         Err(e) => return Err(format!("Error while checking \"{}\": {}", path.to_string_lossy(), e)),
     };
 
-    let removed = if metadata.is_dir() {
-        std::fs::remove_dir_all(path)
-    } else {
-        // A link to a folder is removed as a folder entry on Windows.
-        std::fs::remove_file(path).or_else(|e| if metadata.is_symlink() { std::fs::remove_dir(path) } else { Err(e) })
-    };
+    let removed = remove_entry_unfollowed(path, metadata.file_type());
 
     match removed {
         Ok(()) => Ok(()),
@@ -1192,7 +1294,7 @@ fn publish_replacement(file_path: &Path, content: &[u8], sync: bool) -> Result<(
 
     if let Err(error) = written {
         // Nothing was published; the temporary file is litter, and nobody else knows its name.
-        let _ = std::fs::remove_file(temporary_file_path);
+        let _ = remove_file(temporary_file_path);
         return Err(error);
     }
 
@@ -1755,7 +1857,7 @@ pub(crate) fn sync_folders_before_flushed_write(folders: &BTreeSet<PathBuf>) -> 
 /// this function's), not leaked.
 fn discard_staged_temps(pending: &[(PathBuf, PathBuf)]) {
     for (temp, _) in pending {
-        let _ = std::fs::remove_file(temp);
+        let _ = remove_file(temp);
     }
 }
 
@@ -1855,7 +1957,7 @@ impl WriteBatch {
     pub fn stage(&self, file_path: &Path, content: &[u8]) -> Result<(), String> {
         let temp_path = temp_path_for(file_path)?;
         if let Err(e) = create_and_write_file(&temp_path, content) {
-            let _ = std::fs::remove_file(&temp_path);
+            let _ = remove_file(&temp_path);
             return Err(e);
         }
 
@@ -3249,7 +3351,7 @@ fn probe_executable_bit(folder: &Path) -> Result<bool, String> {
         }
 
         let measured = measure_executable_bit(&path).map_err(|err| failed(&path, err));
-        let removed = match std::fs::remove_file(&path) {
+        let removed = match remove_file(&path) {
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(failed(&path, err)),
             _ => Ok(()),
         };
@@ -4512,8 +4614,8 @@ mod tests {
         let elapsed = started.elapsed();
         assert_eq!(result.unwrap_err().raw_os_error(), Some(7));
         assert!(attempts > 1, "{}", attempts);
-        assert!(elapsed >= HELD_RENAME_DEADLINE, "{:?}", elapsed);
-        assert!(elapsed < HELD_RENAME_DEADLINE * 3, "{:?}", elapsed);
+        assert!(elapsed >= HELD_DEADLINE, "{:?}", elapsed);
+        assert!(elapsed < HELD_DEADLINE * 3, "{:?}", elapsed);
     }
 
     /// A held failure is not retried once the source is gone (a rename that took effect while
@@ -4535,15 +4637,15 @@ mod tests {
     #[test]
     fn a_rename_source_remains_until_it_is_moved() {
         let dir = std::env::temp_dir().join(format!("forklift-source-remains-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (from, to) = (dir.join("from"), dir.join("to"));
         std::fs::write(&from, b"x").unwrap();
 
-        assert!(source_remains(&from));
+        assert!(path_remains(&from));
         rename(&from, &to).unwrap();
-        assert!(!source_remains(&from));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!path_remains(&from));
+        let _ = remove_dir_all(&dir);
     }
 
     /// Off Windows, an open handle never blocks a rename, so nothing is classified as held and no
@@ -4590,7 +4692,7 @@ mod tests {
     #[cfg(windows)]
     fn held_rename_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("forklift-held-rename-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -4616,7 +4718,7 @@ mod tests {
 
         assert_eq!(std::fs::read(&to).unwrap(), b"new");
         assert!(!from.exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
     }
 
     /// The same for a hold on the source, which a rename must open for delete.
@@ -4637,7 +4739,7 @@ mod tests {
         releaser.join().unwrap();
 
         assert_eq!(std::fs::read(&to).unwrap(), b"new");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
     }
 
     /// `rename_no_replace` waits out a held source the same way.
@@ -4657,7 +4759,7 @@ mod tests {
         releaser.join().unwrap();
 
         assert_eq!(std::fs::read(&to).unwrap(), b"new");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
     }
 
     /// A hold that outlasts the deadline fails the rename and moves nothing.
@@ -4676,7 +4778,7 @@ mod tests {
         assert!(is_held_by_another_process(&error), "{:?}", error);
         assert_eq!(std::fs::read(&to).unwrap(), b"old");
         assert_eq!(std::fs::read(&from).unwrap(), b"new");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
     }
 
     /// Both atomic writers ride out a held target: a store write and a config replacement.
@@ -4706,7 +4808,257 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), b"new", "{}", name);
         }
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// Opens the folder `path` the way a shell or a file manager open in it does, without
+    /// FILE_SHARE_DELETE. The hold lasts as long as the returned handle.
+    #[cfg(windows)]
+    fn hold_folder_without_share_delete(path: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path).unwrap()
+    }
+
+    /// Windows refuses to delete a file another process holds without FILE_SHARE_DELETE, with an
+    /// error classified as held; `remove_file` waits for the hold to lift and then deletes it.
+    #[cfg(windows)]
+    #[test]
+    fn a_delete_of_a_held_file_waits_for_the_hold() {
+        let dir = held_rename_dir("delete-file");
+        let file = dir.join("held");
+        std::fs::write(&file, b"x").unwrap();
+        let hold = hold_without_share_delete(&file);
+
+        #[allow(clippy::disallowed_methods)] // the unretried delete the hold is shown to refuse
+        let refused = std::fs::remove_file(&file).unwrap_err();
+        assert!(is_held_by_another_process(&refused), "{:?}", refused);
+        assert!(file.exists());
+
+        let releaser = release_later(hold, std::time::Duration::from_millis(200));
+        remove_file(&file).unwrap();
+        releaser.join().unwrap();
+
+        assert!(!file.exists());
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// A held file inside a tree refuses its removal the same way; `remove_dir_all` waits for the
+    /// hold to lift and then removes the whole tree.
+    #[cfg(windows)]
+    #[test]
+    fn a_tree_holding_a_held_file_is_removed_once_the_hold_lifts() {
+        let dir = held_rename_dir("delete-tree");
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::write(tree.join("loose"), b"x").unwrap();
+        std::fs::write(tree.join("sub").join("held"), b"x").unwrap();
+        let hold = hold_without_share_delete(&tree.join("sub").join("held"));
+
+        #[allow(clippy::disallowed_methods)] // the unretried removal the hold is shown to refuse
+        let refused = std::fs::remove_dir_all(&tree).unwrap_err();
+        assert!(is_held_by_another_process(&refused), "{:?}", refused);
+        assert!(tree.join("sub").join("held").exists());
+
+        let releaser = release_later(hold, std::time::Duration::from_millis(200));
+        remove_dir_all(&tree).unwrap();
+        releaser.join().unwrap();
+
+        assert!(!tree.exists());
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// Removes `folder` while a handle on the folder itself, without FILE_SHARE_DELETE, holds it:
+    /// `unretried` is shown to refuse with a held error, then `remove` waits for the hold to lift.
+    #[cfg(windows)]
+    fn removal_waits_for_a_held_folder(
+        folder: &Path,
+        unretried: impl Fn(&Path) -> std::io::Result<()>,
+        remove: impl Fn(&Path) -> std::io::Result<()>,
+    ) {
+        let hold = hold_folder_without_share_delete(folder);
+
+        let refused = unretried(folder).unwrap_err();
+        assert!(is_held_by_another_process(&refused), "{:?}", refused);
+        assert!(folder.exists());
+
+        let releaser = release_later(hold, std::time::Duration::from_millis(200));
+        remove(folder).unwrap();
+        releaser.join().unwrap();
+
+        assert!(!folder.exists());
+    }
+
+    /// A handle on an empty folder refuses its removal; `remove_dir` waits for the hold to lift.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_empty_folder_is_removed_once_the_hold_lifts() {
+        let dir = held_rename_dir("delete-empty-folder");
+        let folder = dir.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+
+        #[allow(clippy::disallowed_methods)] // the unretried removal the hold is shown to refuse
+        let unretried = |p: &Path| std::fs::remove_dir(p);
+        removal_waits_for_a_held_folder(&folder, unretried, |p| remove_dir(p));
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// The same for a folder with a file in it: `remove_dir_all` is refused while the folder is
+    /// held, and waits for the hold to lift.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_folder_with_contents_is_removed_once_the_hold_lifts() {
+        let dir = held_rename_dir("delete-full-folder");
+        let folder = dir.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("inside"), b"x").unwrap();
+
+        #[allow(clippy::disallowed_methods)] // the unretried removal the hold is shown to refuse
+        let unretried = |p: &Path| std::fs::remove_dir_all(p);
+        removal_waits_for_a_held_folder(&folder, unretried, |p| remove_dir_all(p));
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// A hold that outlasts the deadline fails the delete with the held error and removes nothing.
+    #[cfg(windows)]
+    #[test]
+    fn a_delete_of_a_file_held_past_the_deadline_fails_and_removes_nothing() {
+        let dir = held_rename_dir("delete-past-deadline");
+        let file = dir.join("held");
+        std::fs::write(&file, b"x").unwrap();
+        let hold = hold_without_share_delete(&file);
+
+        let started = std::time::Instant::now();
+        let error = remove_file(&file).unwrap_err();
+        let elapsed = started.elapsed();
+        drop(hold);
+
+        assert!(is_held_by_another_process(&error), "{:?}", error);
+        assert!(elapsed >= HELD_DEADLINE, "{:?}", elapsed);
+        assert_eq!(std::fs::read(&file).unwrap(), b"x");
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// Why writes are not retried: a handle that shares reading and writing but not delete, the
+    /// one that refuses deletes and renames, lets a truncating write through at once.
+    #[cfg(windows)]
+    #[test]
+    fn a_hold_without_share_delete_lets_a_truncating_write_through() {
+        let dir = held_rename_dir("write-through");
+        let file = dir.join("held");
+        std::fs::write(&file, b"old").unwrap();
+        let hold = hold_without_share_delete(&file);
+
+        std::fs::write(&file, b"new").unwrap();
+        std::fs::File::create(&file).unwrap();
+        drop(hold);
+
+        assert_eq!(std::fs::read(&file).unwrap(), b"");
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// The classifier that calls only [`held`]'s error held, so the delete retry rules run on
+    /// every platform.
+    fn is_stand_in_held(error: &std::io::Error) -> bool {
+        error.raw_os_error() == Some(7)
+    }
+
+    /// A delete whose retry finds the path gone (another process removed it after the held
+    /// failure) succeeds, rather than failing `NotFound` on a path that is gone.
+    #[test]
+    fn a_held_delete_whose_retry_finds_the_path_gone_succeeds() {
+        let dir = std::env::temp_dir().join(format!("forklift-delete-gone-on-retry-{}", std::process::id()));
+        let _ = remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("file");
+        std::fs::write(&file, b"x").unwrap();
+
+        let attempts = std::cell::Cell::new(0);
+        let deleted = delete_while_held_when(&file, |path| {
+            attempts.set(attempts.get() + 1);
+            match attempts.get() {
+                1 => Err(held()),
+                #[allow(clippy::disallowed_methods)] // the other process's removal, then this one's retry
+                _ => std::fs::remove_file(path).and_then(|()| std::fs::remove_file(path)),
+            }
+        }, is_stand_in_held);
+
+        deleted.unwrap();
+        assert_eq!(attempts.get(), 2);
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// A held failure on a path that is already gone is not retried, and a first attempt's
+    /// `NotFound` stays an error.
+    #[test]
+    fn a_held_delete_of_a_path_already_gone_is_not_retried() {
+        let dir = std::env::temp_dir().join(format!("forklift-delete-held-gone-{}", std::process::id()));
+        let _ = remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let attempts = std::cell::Cell::new(0);
+        let started = std::time::Instant::now();
+        let refused = delete_while_held_when(&dir.join("absent"), |_| {
+            attempts.set(attempts.get() + 1);
+            Err(held())
+        }, is_stand_in_held).unwrap_err();
+        assert!(is_stand_in_held(&refused), "{:?}", refused);
+        assert_eq!(attempts.get(), 1);
+        assert!(started.elapsed() < HELD_DEADLINE);
+
+        #[allow(clippy::disallowed_methods)] // the first attempt's NotFound, unretried
+        let missing = delete_while_held_when(&dir.join("absent"), |path| std::fs::remove_file(path), is_stand_in_held)
+            .unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// A link to a folder is removed as the link, at once: `remove_file` refuses it on Windows
+    /// with an error that reads as held, so the type decides the call rather than a fallback. On
+    /// Windows both kinds are tried: a directory symlink and a junction.
+    #[test]
+    fn a_folder_link_is_removed_at_once_and_its_target_kept() {
+        let dir = std::env::temp_dir().join(format!("forklift-delete-folder-link-{}", std::process::id()));
+        let _ = remove_dir_all(&dir);
+        let target = dir.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("kept"), b"x").unwrap();
+
+        let mut links = Vec::new();
+        #[cfg(windows)]
+        {
+            let symlink = dir.join("symlink");
+            match std::os::windows::fs::symlink_dir(&target, &symlink) {
+                Ok(()) => links.push(symlink),
+                // Without symlink privilege only the junction is tried; CI has the privilege.
+                Err(error) => assert!(std::env::var_os("CI").is_none(), "symlink_dir: {}", error),
+            }
+            let junction = dir.join("junction");
+            let made = std::process::Command::new("cmd").arg("/c").arg("mklink").arg("/J").arg(&junction).arg(&target)
+                .output().unwrap();
+            assert!(made.status.success(), "mklink /J: {:?}", made);
+            links.push(junction);
+        }
+        #[cfg(unix)]
+        {
+            let symlink = dir.join("symlink");
+            std::os::unix::fs::symlink(&target, &symlink).unwrap();
+            links.push(symlink);
+        }
+
+        for link in &links {
+            let started = std::time::Instant::now();
+            remove_file_or_link(link).unwrap();
+            assert!(started.elapsed() < HELD_DEADLINE, "{}", link.display());
+            assert!(std::fs::symlink_metadata(link).is_err(), "{}", link.display());
+            assert!(target.join("kept").exists());
+        }
+
+        let refused = remove_file_or_link(&target).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::IsADirectory);
+        assert!(target.join("kept").exists());
+        let _ = remove_dir_all(&dir);
     }
 
     /// Keys a volume may fold into one spelling, and keys of any length or depth, get distinct
@@ -4751,19 +5103,19 @@ mod tests {
     #[test]
     fn a_file_anywhere_in_a_shards_folder_chain_is_found() {
         let root = std::env::temp_dir().join(format!("forklift-shard-chain-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = remove_dir_all(&root);
         let data = root.join("inventory/inv_/af/rest/data");
 
         let chain = ["inventory/inv_/af/rest", "inventory/inv_/af", "inventory/inv_", "inventory"];
         for link in chain {
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = remove_dir_all(&root);
             std::fs::create_dir_all(root.join(link).parent().unwrap()).unwrap();
             std::fs::write(root.join(link), b"not a folder").unwrap();
 
             assert_eq!(non_folder_in_shard_chain(&data), Some(root.join(link).as_path()), "{}", link);
         }
 
-        std::fs::remove_dir_all(&root).unwrap();
+        remove_dir_all(&root).unwrap();
         std::fs::create_dir_all(data.parent().unwrap()).unwrap();
         assert_eq!(non_folder_in_shard_chain(&data), None, "an intact chain");
 
@@ -4780,13 +5132,13 @@ mod tests {
             assert_eq!(non_folder_in_shard_chain(&data), Some(root.join("inventory/inv_/af").as_path()),
                        "a linked fan-out folder");
 
-            std::fs::remove_file(root.join("inventory")).unwrap();
+            remove_file(root.join("inventory")).unwrap();
             std::os::unix::fs::symlink(root.join("unmounted"), root.join("inventory")).unwrap();
             assert_eq!(non_folder_in_shard_chain(&data), Some(root.join("inventory").as_path()),
                        "a dangling inventory root");
         }
 
-        std::fs::remove_dir_all(&root).unwrap();
+        remove_dir_all(&root).unwrap();
     }
 
     fn shard_folder_relative_components(keys: &[&str]) -> Vec<Vec<String>> {
@@ -4827,7 +5179,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!("forklift-kind-when-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let tool = dir.join("tool.sh");
         let note = dir.join("note.txt");
@@ -4845,7 +5197,7 @@ mod tests {
         assert_eq!(kind("note.txt", false), DirEntryType::Normal);
         assert_eq!(kind("link", false), DirEntryType::SymbolicLink);
         assert_eq!(kind("link", true), DirEntryType::SymbolicLink);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
     }
 
     /// A volume that keeps the bit (the temp folder's) is measured as keeping it, the probe file is
@@ -4855,7 +5207,7 @@ mod tests {
     #[test]
     fn the_probe_measures_a_volume_that_keeps_the_bit_and_leaves_nothing_behind() {
         let dir = std::env::temp_dir().join(format!("forklift-exec-probe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         assert!(probe_executable_bit(&dir).unwrap());
@@ -4863,7 +5215,7 @@ mod tests {
 
         let error = probe_executable_bit(&dir.join("absent")).unwrap_err();
         assert!(error.contains("Could not probe"), "{}", error);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
     }
 
     /// The answer is kept per device: an entry on the metadata folder's volume is measured there,
@@ -4876,7 +5228,7 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
 
         let dir = std::env::temp_dir().join(format!("forklift-exec-probe-device-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
         let root = dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(dir.join("note.txt"), "note\n").unwrap();
@@ -4904,7 +5256,7 @@ mod tests {
         assert!(failing.read().unwrap().is_empty(), "a failure is not kept");
         assert!(executable_bit_is_observable_in(&failing, note, || root.clone()).unwrap(),
                 "the next caller probes again");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
     }
 
     /// A folder this process may not create files in cannot be measured and reads as the
@@ -4915,7 +5267,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!("forklift-exec-probe-ro-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
@@ -4924,7 +5276,7 @@ mod tests {
             assert!(probe_executable_bit(&dir).unwrap());
         }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
     }
     use crate::globals::StorageRootScope;
 
@@ -4934,7 +5286,7 @@ mod tests {
     #[test]
     fn a_stat_anchor_never_runs_ahead_of_a_later_write_and_is_stamped_once_a_second() {
         let dir = std::env::temp_dir().join(format!("forklift-clock-probe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let probe = dir.join(FILE_NAME_CLOCK_PROBE);
 
@@ -4955,7 +5307,7 @@ mod tests {
         // Within the second, the cached anchor is handed out without touching the probe. A host
         // stalled past most of that second could legitimately re-stamp, so the check only runs
         // when it is still well inside it.
-        std::fs::remove_file(&probe).unwrap();
+        remove_file(&probe).unwrap();
         let reused = take_stat_anchor_at(&probe).unwrap();
         if stamped.elapsed() < std::time::Duration::from_millis(900) {
             assert_eq!(reused, first);
@@ -4970,7 +5322,7 @@ mod tests {
         // A probe that cannot be stamped fails loudly rather than handing out an anchor.
         assert!(take_stat_anchor_at(&dir.join("absent").join(FILE_NAME_CLOCK_PROBE)).is_err());
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
     }
 
     /// An anchor proves only entries on its own device: a stat on any other device is unproven,
@@ -4992,7 +5344,7 @@ mod tests {
         // create must step past them to the fourth, rather than fail with "file exists", and must
         // leave the litter alone.
         let dir = std::env::temp_dir().join(format!("forklift-stale-temp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("metadata");
         let names: Vec<PathBuf> = (0..4).map(|id| dir.join(format!("metadata.tmp~1-{}", id))).collect();
@@ -5013,13 +5365,13 @@ mod tests {
         let mut asked = 0;
         let result = create_fresh_temp(&target, |_| { asked += 1; Ok(missing.clone()) });
         assert!(result.is_err() && asked == 1, "a missing folder must fail at once, asked {} times", asked);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
     }
 
     #[test]
     fn create_first_new_steps_past_taken_names_and_stops_on_any_other_failure() {
         let dir = std::env::temp_dir().join(format!("forklift-first-new-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let names = |stem: &str| -> Vec<PathBuf> { (0..3).map(|n| dir.join(format!("{}-{}", stem, n))).collect() };
 
@@ -5055,7 +5407,7 @@ mod tests {
         assert_eq!(create_first_new_file(candidates).unwrap_err().kind(), std::io::ErrorKind::NotFound);
         assert_eq!(tried, 1, "a failure other than a taken name must not be retried");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = remove_dir_all(&dir);
     }
 
     /// Whether the rules exclude the path, judged as a walk judges it: every directory above it
@@ -5488,7 +5840,7 @@ mod tests {
         // the address they are stored under (a torn or tampered file). The read must error rather
         // than silently hand back the wrong content.
         let temp = std::env::temp_dir().join(format!("forklift-loose-corrupt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
 
@@ -5505,7 +5857,7 @@ mod tests {
         assert!(result.is_err(), "a loose file that hashes wrong must fail the read, got {:?}", result);
         assert!(result.unwrap_err().contains("corrupt"), "the error should name the corruption");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -5513,7 +5865,7 @@ mod tests {
         // The companion to the corruption test: a well-formed loose object round-trips through
         // the now-verifying read path unchanged.
         let temp = std::env::temp_dir().join(format!("forklift-loose-ok-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
 
@@ -5526,7 +5878,7 @@ mod tests {
 
         assert_eq!(retrieve_object_by_hash(&hash).unwrap(), content);
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -5556,7 +5908,7 @@ mod tests {
     #[test]
     fn a_respelled_loose_entry_resolves_only_where_the_lowercase_path_opens_it() {
         let temp = std::env::temp_dir().join(format!("forklift-respelled-entry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(temp.join("ab")).unwrap();
         std::fs::write(temp.join("ab").join("cdef"), b"object").unwrap();
 
@@ -5577,7 +5929,7 @@ mod tests {
                 "a lowercase entry beside it is not this entry");
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -5663,13 +6015,13 @@ mod tests {
         // The durable-rename helper must accept an existing directory (its no-op-on-Windows path
         // returns Ok too, so this holds on every target).
         let temp = std::env::temp_dir().join(format!("forklift-syncdir-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         std::fs::write(temp.join("entry"), b"x").unwrap();
 
         assert!(sync_dir(&temp).is_ok(), "fsync of an existing directory should succeed");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -5680,14 +6032,14 @@ mod tests {
         // attempted path is still observable.
         let temp = std::env::temp_dir()
             .join(format!("forklift-syncdir-fault-recording-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let _guard = SyncDirFaultGuard::recording();
         assert!(sync_dir(&temp).is_ok(), "a successful sync must still succeed while only recording");
         assert_eq!(sync_dir_attempts(), vec![temp.clone()], "the attempted path must still be observed");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -5698,7 +6050,7 @@ mod tests {
         // path. A reader keys on the hash, so that debris must be invisible: the object does not
         // exist, and a genuine object at the same address still reads back cleanly alongside it.
         let temp = std::env::temp_dir().join(format!("forklift-interrupted-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
 
@@ -5719,7 +6071,7 @@ mod tests {
         write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
         assert_eq!(retrieve_object_by_hash(&hash).unwrap(), content);
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -5727,7 +6079,7 @@ mod tests {
         // The rewritten (now fsyncing) atomic write must still publish exactly the target file with
         // the intended bytes and consume its temporary — a crash-window regression guard.
         let temp = std::env::temp_dir().join(format!("forklift-atomic-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let target = temp.join("nested").join("value");
@@ -5746,14 +6098,14 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "no temporary file should survive a successful write");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
     fn a_cached_object_is_shared_by_arc_not_recopied() {
         // P1: the whole point of the shared read is that a hit hands back the *same* allocation.
         let temp = std::env::temp_dir().join(format!("forklift-arc-share-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
 
@@ -5774,7 +6126,7 @@ mod tests {
         // The owned-bytes wrapper still yields correct, independent bytes (copied off the lock).
         assert_eq!(retrieve_object_by_hash(&hash).unwrap(), content);
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -5782,7 +6134,7 @@ mod tests {
         // P1: the pointer-sized critical section must stay correct under contention — many
         // threads hammering the same cached object all see the exact bytes, never a torn read.
         let temp = std::env::temp_dir().join(format!("forklift-arc-conc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
 
@@ -5809,7 +6161,7 @@ mod tests {
             }
         });
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -5820,8 +6172,8 @@ mod tests {
         // across a scope switch.
         let temp_a = std::env::temp_dir().join(format!("forklift-scope-a-{}", std::process::id()));
         let temp_b = std::env::temp_dir().join(format!("forklift-scope-b-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp_a);
-        let _ = std::fs::remove_dir_all(&temp_b);
+        let _ = remove_dir_all(&temp_a);
+        let _ = remove_dir_all(&temp_b);
         std::fs::create_dir_all(&temp_a).unwrap();
         std::fs::create_dir_all(&temp_b).unwrap();
 
@@ -5843,8 +6195,8 @@ mod tests {
                     "warehouse B must not be served warehouse A's cached object");
         }
 
-        std::fs::remove_dir_all(&temp_a).ok();
-        std::fs::remove_dir_all(&temp_b).ok();
+        remove_dir_all(&temp_a).ok();
+        remove_dir_all(&temp_b).ok();
     }
 
     // `WriteBatch` tests (modeled on `tests/bulk_store_session.rs`'s coverage of the same
@@ -5860,7 +6212,7 @@ mod tests {
         // call is a harmless no-op, since the first `finish` already took every staged write out
         // of `pending`. This is also what makes `Drop` safe to run unconditionally afterwards.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-idempotent-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let target = temp.join("staged-object");
@@ -5876,7 +6228,7 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"batch content",
             "a second finish must not disturb the already-published content");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -5884,7 +6236,7 @@ mod tests {
         // Abort semantics, exactly like `BulkStoreSession`: a batch dropped without `finish` must
         // remove its staged temp files and must never let the final name come into existence.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-abort-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let target_a = temp.join("never-published-a");
@@ -5904,7 +6256,7 @@ mod tests {
         assert!(leftovers.is_empty(), "a dropped batch must remove every staged temp, found {:?}",
             leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>());
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -5916,7 +6268,7 @@ mod tests {
         // — since every staged temp is individually consumed by its own rename, even when several
         // renames target the same destination — with none of the (many) temp files left behind.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-duprace-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let target = temp.join("duplicate-object");
@@ -5949,7 +6301,7 @@ mod tests {
             "every staged temp (200 racers) must be consumed by its own rename, found {:?}",
             leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>());
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -5998,7 +6350,7 @@ mod tests {
         // checks — a caller that stages a path directly (not through `reserve_final_path` first)
         // still blocks a later reservation attempt for that same path.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-reserve-stage-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let target = temp.join("object");
@@ -6008,7 +6360,7 @@ mod tests {
         assert!(!batch.reserve_final_path(&target),
             "a path already staged directly must read as already reserved");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6018,7 +6370,7 @@ mod tests {
         // reservations linger and block the second round's otherwise-unrelated write to the same
         // path (e.g. a rewrite of the same file in a later, independent batch).
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-reserve-reuse-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let target = temp.join("object");
@@ -6033,7 +6385,7 @@ mod tests {
         assert!(batch.reserve_final_path(&target),
             "a path must be reservable again after the batch that staged it has finished");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6044,7 +6396,7 @@ mod tests {
         // downstream caller durably name a blob that was never written — `finish` must refuse
         // the whole batch instead, and (like every failed finish) discard what was staged.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-leak-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let leaked = temp.join("promised-but-never-staged");
@@ -6064,7 +6416,7 @@ mod tests {
         assert!(leftovers.is_empty(), "a failed finish must remove every staged temp, found {:?}",
             leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>());
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6080,7 +6432,7 @@ mod tests {
         // make that false pass negligible: about 1 in 8! (~1/40320) even under a uniform-random
         // order, and `HashSet` iteration order is not adversarial.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-leak-detail-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let names = ["zzz", "yyy", "xxx", "www", "vvv", "uuu", "ttt", "sss"];
@@ -6108,7 +6460,7 @@ mod tests {
         assert!(!error.contains("mmm-staged"),
             "a path that was actually staged must not be reported as missing");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6133,7 +6485,7 @@ mod tests {
         // to have drained the reservation set too, or the retry's own `reserve_final_path`
         // would read the dead round's reservations as "already handled" and stand down again.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-retry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let flaky = temp.join("failed-first-round");
@@ -6152,7 +6504,7 @@ mod tests {
         assert_eq!(std::fs::read(&flaky).unwrap(), b"second round, staged this time");
         assert_eq!(std::fs::read(&steady).unwrap(), b"round two");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6165,7 +6517,7 @@ mod tests {
         // entry renamed before the failure is best-effort fsynced before this call returns —
         // not just visible, but no less durable than the same crash point would leave it.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-partway-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let first = temp.join("renamed-before-the-failure");
@@ -6195,7 +6547,7 @@ mod tests {
         assert!(temps.is_empty(), "a failed finish must remove every remaining temp, found {:?}",
             temps.iter().map(|e| e.file_name()).collect::<Vec<_>>());
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6210,7 +6562,7 @@ mod tests {
         // comment) this also asserts against its attempt log and `DIR_SYNC_COUNT` that every
         // directory was actually handed to the kernel, not just renamed into.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-multidir-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let dirs: Vec<_> = ["alpha", "beta", "gamma"].iter().map(|name| temp.join(name)).collect();
@@ -6256,7 +6608,7 @@ mod tests {
                 "the directory-fsync counter must advance by at least one per distinct directory");
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     // The rest of this module exercises `run_write_barrier`'s directory-sync steps directly
@@ -6280,7 +6632,7 @@ mod tests {
         // sync itself ran (rather than the file just happening to already be on disk) is the
         // attempt log below, not the directory layout.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-earlysync-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let dir_a = temp.join("dir-a");
@@ -6313,7 +6665,7 @@ mod tests {
             "the directory of the entry already renamed before the failure must be fsynced \
             before finish returns, attempts: {:?}", attempts);
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6325,7 +6677,7 @@ mod tests {
         // to fail proves the loop does not stop at the first failure — a `?`-short-circuit would
         // leave the last directory never attempted at all.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-besteffort-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let dirs: Vec<_> = ["alpha", "beta", "gamma"].iter().map(|name| temp.join(name)).collect();
@@ -6361,7 +6713,7 @@ mod tests {
             assert!(target.exists(), "a trailing directory-sync failure must not un-rename anything");
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6373,7 +6725,7 @@ mod tests {
         // (`rename_error` first, `sync_error` parenthetically after), and a caller matching on
         // error text must see the rename failure it actually needs to react to up front.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-precedence-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let dir_a = temp.join("dir-a");
@@ -6402,7 +6754,7 @@ mod tests {
             "the rename error must lead the message, with the sync error appended after it, got: {}", error);
         assert_eq!(rename_pos, 0, "the rename error must be at the very start of the message, got: {}", error);
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     // Durable-taint wiring tests: `sync_result_or_taint`/`sync_dir_or_taint`/`taint_after_sync_failure`/
@@ -6430,7 +6782,7 @@ mod tests {
         taint_utils::activate();
 
         let temp = std::env::temp_dir().join(format!("forklift-taint-trailing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
@@ -6460,7 +6812,7 @@ mod tests {
         assert_eq!(state.recorded, expected,
             "the taint must record exactly the batch's final paths, root-relative");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6483,7 +6835,7 @@ mod tests {
         taint_utils::activate();
 
         let temp = std::env::temp_dir().join(format!("forklift-heal-batched-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
@@ -6555,7 +6907,7 @@ mod tests {
         std::fs::create_dir_all(&after_heal_dir).unwrap();
         assert!(write_file_atomically(&after_heal_dir.join("after-heal"), b"ok").is_ok());
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6571,7 +6923,7 @@ mod tests {
         taint_utils::activate();
 
         let temp = std::env::temp_dir().join(format!("forklift-taint-earlysync-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
@@ -6601,7 +6953,7 @@ mod tests {
         assert_eq!(state.recorded, expected,
             "only the visible prefix may be tainted, never an entry that was never renamed");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6613,7 +6965,7 @@ mod tests {
         taint_utils::activate();
 
         let temp = std::env::temp_dir().join(format!("forklift-taint-immediate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
@@ -6632,7 +6984,7 @@ mod tests {
         assert_eq!(state.recorded, expected,
             "the taint must record exactly the single final path, root-relative");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6647,7 +6999,7 @@ mod tests {
         taint_utils::activate();
 
         let temp = std::env::temp_dir().join(format!("forklift-taint-recheck-batch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
@@ -6671,7 +7023,7 @@ mod tests {
         // refuses to let the caller report `Ok`.
         assert!(target.exists(), "the write itself must have landed; only the re-check refuses");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6684,7 +7036,7 @@ mod tests {
 
         let temp = std::env::temp_dir()
             .join(format!("forklift-taint-recheck-immediate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
@@ -6700,7 +7052,7 @@ mod tests {
         assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", error);
         assert!(target.exists(), "the write itself must have landed; only the re-check refuses");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6719,7 +7071,7 @@ mod tests {
         taint_utils::activate();
 
         let temp = std::env::temp_dir().join(format!("forklift-taint-exemption-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
@@ -6748,7 +7100,7 @@ mod tests {
         assert!(error.contains(taint_utils::GATE_TAINT_MARKER),
             "once the guard drops, the identical write must refuse again, got: {}", error);
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6775,7 +7127,7 @@ mod tests {
         taint_utils::activate();
 
         let temp = std::env::temp_dir().join(format!("forklift-taint-exemption-cross-thread-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
@@ -6818,7 +7170,7 @@ mod tests {
             "a write from a different OS thread must still be exempted while the guard \
              armed on the main thread is held — the exemption counter must be process-global");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6832,7 +7184,7 @@ mod tests {
         taint_utils::activate();
 
         let temp = std::env::temp_dir().join(format!("forklift-taint-gate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
@@ -6871,7 +7223,7 @@ mod tests {
         taint_utils::test_clear_gate(&forklift);
         assert!(does_object_exist(&loose_hash).unwrap(), "clearing the gate must restore a normal answer");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -6890,7 +7242,7 @@ mod tests {
         taint_utils::reset_activation_for_test();
 
         let temp = std::env::temp_dir().join(format!("forklift-taint-baseline-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
@@ -6933,7 +7285,7 @@ mod tests {
         write_file_atomically(&target, b"content").unwrap();
         assert!(target.exists(), "an unactivated re-check must never refuse a clean sync");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     /// Rename a just-finalized pack pair's stem, so file-name enumeration order is deterministic
@@ -6977,7 +7329,7 @@ mod tests {
 
         let temp = std::env::temp_dir()
             .join(format!("forklift-classified-failed-reload-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         let folder = crate::util::pack_utils::pack_folder();
@@ -7015,7 +7367,7 @@ mod tests {
             ),
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     /// FORK-106: a presence check must see a pack published after this process cached its pack
@@ -7028,7 +7380,7 @@ mod tests {
 
         let temp = std::env::temp_dir()
             .join(format!("forklift-presence-after-caching-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         let folder = crate::util::pack_utils::pack_folder();
@@ -7054,7 +7406,7 @@ mod tests {
 
         assert!(raw_object_present(&other_hash).unwrap(), "the gate-free presence check must see it too");
 
-        std::fs::remove_dir_all(&temp).ok();
+        remove_dir_all(&temp).ok();
     }
 
     /// (I6) The `Failed`-path fall-through to the loose store is verification-gated, never a
@@ -7078,7 +7430,7 @@ mod tests {
         for case in [LooseCopy::Correct, LooseCopy::WrongContent] {
             let temp = std::env::temp_dir()
                 .join(format!("forklift-classified-failed-loose-{:?}-{}", case, std::process::id()));
-            let _ = std::fs::remove_dir_all(&temp);
+            let _ = remove_dir_all(&temp);
             std::fs::create_dir_all(&temp).unwrap();
             let _scope = StorageRootScope::enter(&temp);
 
@@ -7118,7 +7470,7 @@ mod tests {
                 ),
             }
 
-            std::fs::remove_dir_all(&temp).ok();
+            remove_dir_all(&temp).ok();
         }
     }
 
@@ -7153,7 +7505,7 @@ mod tests {
         ] {
             let temp = std::env::temp_dir()
                 .join(format!("forklift-classified-agreement-{:?}-{}", shape, std::process::id()));
-            let _ = std::fs::remove_dir_all(&temp);
+            let _ = remove_dir_all(&temp);
             std::fs::create_dir_all(&temp).unwrap();
             let _scope = StorageRootScope::enter(&temp);
 
@@ -7258,7 +7610,7 @@ mod tests {
                 }
             }
 
-            std::fs::remove_dir_all(&temp).ok();
+            remove_dir_all(&temp).ok();
         }
     }
 
@@ -7292,7 +7644,7 @@ mod tests {
             let root = std::env::temp_dir().join(format!(
                 "forklift-spike-presence-{}-{}", name, std::process::id()
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
             let scope = StorageRootScope::enter(&root);
             (root, scope)
@@ -7398,7 +7750,7 @@ mod tests {
             );
 
             drop(scope);
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = remove_dir_all(&root);
         }
     }
 }

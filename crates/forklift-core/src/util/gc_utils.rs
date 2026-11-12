@@ -145,13 +145,13 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
                 continue;
             }
 
-            std::fs::remove_file(file.path())
+            file_utils::remove_file(file.path())
                 .map_err(|e| format!("Error while deleting object {}: {}", hash, e))?;
 
             let sidecar = file.path().with_file_name(format!("{}.sig", name));
 
             if sidecar.exists() {
-                std::fs::remove_file(&sidecar)
+                file_utils::remove_file(&sidecar)
                     .map_err(|e| format!("Error while deleting the sidecar of {}: {}", hash, e))?;
             }
 
@@ -458,7 +458,7 @@ pub(crate) mod tests {
             let root = std::env::temp_dir().join(format!(
                 "forklift-gc-test-{}-{}-{}", name, std::process::id(), id
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -540,7 +540,7 @@ pub(crate) mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = file_utils::remove_dir_all(&self.root);
         }
     }
 
@@ -614,7 +614,7 @@ pub(crate) mod tests {
     /// Delete a loose object from the store, simulating an out-of-scope object that a sparse fetch
     /// would never have downloaded. Panics if it was not there (keeps the fixture honest).
     fn delete_object(hash: &str) {
-        std::fs::remove_file(loose_path(hash)).expect("the object to simulate-absent existed");
+        file_utils::remove_file(loose_path(hash)).expect("the object to simulate-absent existed");
     }
 
     /// A warehouse whose `main` head commits an in-scope subtree (`src/api`), a sibling subtree

@@ -76,7 +76,7 @@ pub fn write_parked(hashes: &[String]) -> Result<(), String> {
     let path = get_parked_path();
 
     if hashes.is_empty() {
-        return match std::fs::remove_file(&path) {
+        return match file_utils::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(format!("Error while removing \"{}\": {}", path.to_string_lossy(), e)),
@@ -97,7 +97,7 @@ mod tests {
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("forklift-parked-{}-{}", tag, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -114,7 +114,7 @@ mod tests {
         std::fs::write(dir.join(FILE_NAME_PARKED), parked_bytes(&hashes)).unwrap();
 
         assert_eq!(read_parked_in(&dir).unwrap(), hashes);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
     }
 
     /// A parked file without a header, the shape written before it was a record, is refused, not
@@ -126,7 +126,7 @@ mod tests {
 
         let error = read_parked_in(&dir).unwrap_err();
         assert!(error.contains("has no format header"), "{}", error);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
     }
 
     #[test]
@@ -136,6 +136,6 @@ mod tests {
 
         let error = read_parked_in(&dir).unwrap_err();
         assert!(error.contains("is malformed"), "{}", error);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
     }
 }

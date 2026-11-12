@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn an_absent_applied_recipe_is_never_read_from_the_new_server() {
         let root = std::env::temp_dir().join(format!("forklift-origin-check-applied-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
 
@@ -552,7 +552,7 @@ mod tests {
 
         assert_eq!(walk.recipes, vec![absent]);
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
     }
 
     /// A withheld file is never found held by the new server. A withheld recipe held here leaves
@@ -569,7 +569,7 @@ mod tests {
         use crate::util::gc_utils::tests::store_recipe;
 
         let root = std::env::temp_dir().join(format!("forklift-origin-check-withheld-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
 
@@ -630,7 +630,7 @@ mod tests {
         assert!(!lacks_withheld(&whole).unwrap());
         assert!(lacks_withheld(&withheld_recipe).unwrap() && lacks_withheld(&film).unwrap());
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::util::file_utils::remove_dir_all(&root);
     }
 
     /// A previous origin the record names as the new server is not one the move can ask: it reads

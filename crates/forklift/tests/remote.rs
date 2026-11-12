@@ -30,7 +30,7 @@ impl TestArea {
             .join(format!("forklift-remote-{}-{}", name, std::process::id()));
 
         // A leftover directory from a previous run must not leak state into this one.
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
         TestArea { root }
@@ -91,7 +91,7 @@ const CHUNK_THRESHOLD: usize = 8 * 1024 * 1024;
 
 impl Drop for TestArea {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.root);
     }
 }
 
@@ -226,7 +226,7 @@ impl Server {
     /// Serve `server-root` again at the same address, after [`Server::stop`], whose kill left the
     /// stopped server's lock behind.
     fn restart(&mut self, area: &TestArea) {
-        std::fs::remove_file(area.path("server-root/.forklift/serve.lock")).unwrap();
+        forklift_core::util::file_utils::remove_file(area.path("server-root/.forklift/serve.lock")).unwrap();
         let addr = self.url.trim_start_matches("http://").to_string();
         let restarted = Server::spawn(vec![
             "serve".to_string(),
@@ -720,7 +720,7 @@ fn a_sparse_franchise_holds_the_spine_gitignore_files_and_ignores_what_a_full_on
         assert_eq!(json["data"]["staged_count"], serde_json::json!(0), "{}: {}", checkout, stdout(&status));
         assert_eq!(json["data"]["unstaged"], serde_json::json!([{"kind": "untracked", "path": "src/api/new.txt"}]),
             "{}: {}", checkout, stdout(&status));
-        std::fs::remove_file(area.path(&format!("{}/src/api/new.txt", checkout))).unwrap();
+        forklift_core::util::file_utils::remove_file(area.path(&format!("{}/src/api/new.txt", checkout))).unwrap();
     }
 
     // An edit to a spine .gitignore made in the sparse checkout stacks, lifts and reaches a full one.
@@ -809,7 +809,7 @@ fn narrow_takes_a_spine_gitignore_it_no_longer_needs_and_refuses_while_it_is_edi
     let json: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
     assert_eq!(json["data"]["staged_count"], serde_json::json!(0), "{}", stdout(&status));
     assert_eq!(json["data"]["unstaged"], serde_json::json!([{"kind": "untracked", "path": "src/"}]), "{}", stdout(&status));
-    std::fs::remove_dir_all(area.path("sparse/src")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(area.path("sparse/src")).unwrap();
 
     // A scoped stack goes through, and a full checkout keeps the file.
     area.write_file("sparse/lib/l.txt", "l v2\n");
@@ -1208,15 +1208,15 @@ fn a_lower_keeps_the_local_changes_the_remote_left_alone() {
     assert_success(&area.forklift("a", &["lift"]));
 
     area.write_file("b/staged.txt", "staged mine\n");
-    std::fs::remove_file(area.path("b/gone.txt")).unwrap();
-    std::fs::remove_file(area.path("b/mv/from.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("b/gone.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("b/mv/from.txt")).unwrap();
     area.write_file("b/new/deep/to.txt", "moving\n");
     area.write_file("b/fresh/nested/new.txt", "fresh\n");
     assert_success(&area.forklift("b", &["load", "."]));
     area.write_file("b/bob.txt", "bob mine\n");
     // Old enough that a stat taken now proves whatever hash it is recorded with.
     backdate(&area.path("b/bob.txt"), 60);
-    std::fs::remove_file(area.path("b/lost.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("b/lost.txt")).unwrap();
     let before = stdout(&area.forklift("b", &["--json", "stocktake"]));
 
     assert_success(&area.forklift("b", &["lower"]));
@@ -1256,7 +1256,7 @@ fn a_lower_over_a_local_change_it_would_touch_refuses_and_changes_nothing() {
     area.write_file("a/app2.txt", "app2 v2\n");
     area.write_file("a/flip/inner.txt", "theirs\n");
     area.write_file("a/d", "theirs\n");
-    std::fs::remove_dir_all(area.path("a/old")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(area.path("a/old")).unwrap();
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "-m", "second"]));
     assert_success(&area.forklift("a", &["lift"]));
@@ -1752,7 +1752,7 @@ fn a_scoped_merge_lifts_without_reading_the_out_of_scope_object() {
     // Make the out-of-scope object impossible to read (a sparse store would never have fetched it):
     // the merge already committed its hash, so the lift must not need its bytes.
     let web_tree = path_object_hash(&area, "dev-work", &remote_web_head, "src/web");
-    std::fs::remove_file(object_store_path(&area, "dev", &web_tree))
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "dev", &web_tree))
         .expect("the out-of-scope object existed");
 
     // The lift succeeds: its closure walk prunes the out-of-scope subtree against the merge's
@@ -1858,7 +1858,7 @@ fn signed_history_round_trips_and_the_server_audits() {
 
     let (folder, file) = hash.split_at(2);
     let sidecar = area.path(&format!("a/.forklift/objects/{}/{}.sig", folder, file));
-    std::fs::remove_file(&sidecar).expect("the signature sidecar exists");
+    forklift_core::util::file_utils::remove_file(&sidecar).expect("the signature sidecar exists");
 
     let refused = area.forklift("a", &["lift"]);
     assert!(!refused.status.success());
@@ -1974,7 +1974,7 @@ fn optimistic_lift_refuses_on_an_incomplete_load_before_writing_consolidation_st
     assert!(!area.path("b/from_a.txt").exists(), "the auto-merge must not have applied anything");
 
     // Healing the load lets the lift auto-merge normally.
-    std::fs::remove_file(&marker_path).unwrap();
+    forklift_core::util::file_utils::remove_file(&marker_path).unwrap();
     let healed = area.forklift("b", &["lift"]);
     assert_success(&healed);
     assert!(stdout(&healed).contains("auto-merged"), "{}", stdout(&healed));
@@ -3278,7 +3278,7 @@ fn regenesis_is_gated_by_the_static_token_and_accepted_consciously() {
     assert_success(&area.forklift("b", &["config", "set", "operator.identifier", "worker@forklift"]));
 
     // Total key loss on A's side: nobody can extend the chain anymore.
-    std::fs::remove_dir_all(area.path("shared-keys")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(area.path("shared-keys")).unwrap();
     assert_success(&area.forklift("a", &["office", "regenesis", "--confirm"]));
 
     // Pushing the reset with a per-operator token is refused: its authority comes
@@ -3371,7 +3371,7 @@ fn regenesis_on_remote(area: &TestArea, before_reset: impl FnOnce(&Server)) -> S
 
     before_reset(&server);
 
-    std::fs::remove_dir_all(area.path("shared-keys")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(area.path("shared-keys")).unwrap();
     assert_success(&area.forklift("a", &["office", "regenesis", "--confirm"]));
     assert_success(&area.forklift("a", &["lift"]));
     server
@@ -3519,7 +3519,7 @@ fn enroll_refuses_an_office_with_no_anchor_and_its_ways_out_work() {
     let office_before = office_head(&area);
 
     // Way out one: restore the file from a backup.
-    std::fs::remove_file(&trust).unwrap();
+    forklift_core::util::file_utils::remove_file(&trust).unwrap();
     let refused = area.forklift("a", &["office", "enroll"]);
     assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
     let message = stderr(&refused);
@@ -3537,7 +3537,7 @@ fn enroll_refuses_an_office_with_no_anchor_and_its_ways_out_work() {
     assert_success(&area.forklift("a", &["audit", "@office"]));
 
     // Way out two: a remote that holds the trust.
-    std::fs::remove_file(&trust).unwrap();
+    forklift_core::util::file_utils::remove_file(&trust).unwrap();
     assert!(!area.forklift("a", &["office", "enroll"]).status.success());
     assert_success(&area.forklift("a", &["lower"]));
     assert_eq!(std::fs::read(&trust).unwrap(), held, "lower restores the anchor");
@@ -3557,7 +3557,7 @@ fn a_lost_anchor_over_a_remote_that_reset_its_trust_clones_again() {
     let server = regenesis_on_remote(&area, |server| {
         assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "root"]));
     });
-    std::fs::remove_file(area.path("b/.forklift/trust")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("b/.forklift/trust")).unwrap();
 
     let refused = area.forklift("b", &["office", "enroll"]);
     assert!(stderr(&refused).contains("clone it again"), "{}", stderr(&refused));
@@ -3883,7 +3883,7 @@ fn a_lower_repair_fast_forwards_onto_a_parcel_without_the_name() {
     let status = json_of(&area.forklift("b", &["--json", "stocktake"]));
     assert_eq!(status["data"]["staged"], serde_json::json!([{"kind": "added", "path": "mine.txt"}]), "{}", status);
     assert_success(&area.forklift("b", &["unload", "mine.txt"]));
-    std::fs::remove_file(area.path("b/mine.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("b/mine.txt")).unwrap();
     let value = json_of(&lowered)["data"].clone();
     assert_eq!(value["outcome"], "repaired", "{}", value);
     assert_eq!(value["head"], wedged.as_str(), "{}", value);
@@ -4162,7 +4162,7 @@ fn a_regenesis_lifted_to_a_fresh_remote_carries_its_adopted_history() {
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
-    std::fs::remove_dir_all(area.path("shared-keys")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(area.path("shared-keys")).unwrap();
     assert_success(&area.forklift("a", &["office", "regenesis", "--confirm"]));
     assert_success(&area.forklift("a", &["lift"]));
 
@@ -4329,7 +4329,7 @@ fn a_remote_whose_anchor_was_stripped_is_refused_before_anything_is_fetched() {
     // Strip the anchor from the remote's storage; the office pallet stays.
     let stripped = area.path("server-root/.forklift/trust");
     assert!(stripped.is_file(), "the server keeps its anchor at {}", stripped.display());
-    std::fs::remove_file(&stripped).unwrap();
+    forklift_core::util::file_utils::remove_file(&stripped).unwrap();
 
     let lowered = area.forklift("a", &["--json", "lower"]);
     let details = trust_changed_details(&lowered);
@@ -4564,7 +4564,7 @@ fn gc_is_refused_while_serving_then_sweeps_orphans_once_the_server_stops() {
     // test harness hard-kills the child (SIGKILL), which leaves the lock behind — exactly the
     // stale-lock case an operator clears after a crash — so we clear it here before gc.
     drop(server);
-    let _ = std::fs::remove_file(root.join(".forklift").join("serve.lock"));
+    let _ = forklift_core::util::file_utils::remove_file(root.join(".forklift").join("serve.lock"));
 
     // Within the grace period the orphan is protected...
     let output = server_command()
@@ -5328,7 +5328,7 @@ fn a_sync_walks_the_gap_between_the_heads_not_the_history() {
         &remote_head[2..]
     ));
     assert!(stored.exists(), "the earlier fetch stored the new parcel");
-    std::fs::remove_file(&stored).unwrap();
+    forklift_core::util::file_utils::remove_file(&stored).unwrap();
 
     let healed = sync(&remote_head);
     assert_eq!(healed.walked_parcels, 1, "the un-referenced parcel is still walked");
@@ -5963,7 +5963,7 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
     let franchised = area.forklift(".", &["clone", &server.url, "tmp-clone", "--pallet", "tmp"]);
     assert_success(&franchised);
     assert!(object_present(&area, "tmp-clone", &a1), "the clone fetches the distrust boundary A1");
-    std::fs::remove_file(object_store_path(&area, "tmp-clone", &a1)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "tmp-clone", &a1)).unwrap();
 
     let query_before = area.forklift("tmp-clone", &["--json", "query", "tmp"]);
     assert_success(&query_before);
@@ -6160,7 +6160,7 @@ fn expand_leaves_a_fetched_head_the_remote_can_no_longer_serve_unable_to_become_
     let server = Server::start(&area, None);
     let (up_head, web_blob) = sparse_after_a_diverged_lower(&area, &server);
 
-    std::fs::remove_file(object_store_path(&area, "server-root", &web_blob)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "server-root", &web_blob)).unwrap();
 
     let expanded = area.forklift("sparse", &["scope", "fetch", "src/web"]);
     assert_success(&expanded);
@@ -6181,7 +6181,7 @@ fn expand_checks_its_paths_before_walking_other_histories() {
 
     assert_success(&area.forklift("sparse", &["pallet", "create", "x", &up_head]));
     assert_success(&area.forklift("sparse", &["shift", "main"]));
-    std::fs::remove_file(object_store_path(&area, "server-root", &web_blob)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "server-root", &web_blob)).unwrap();
 
     let refused = area.forklift("sparse", &["scope", "fetch", "src/web", "src/wbe"]);
     assert!(!refused.status.success());
@@ -6338,7 +6338,7 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     //
     // Revert: let a partial warehouse with no origin dial `remote.url` → the lift reaches the
     // remote and fails there, with another code → red.
-    std::fs::remove_file(origin.path("sparse/.forklift/origin")).unwrap();
+    forklift_core::util::file_utils::remove_file(origin.path("sparse/.forklift/origin")).unwrap();
     assert_success(&origin.forklift("sparse", &["config", "set", "remote.url", &server1.url]));
     let forced = origin.forklift("sparse", &["--json", "lift"]);
     assert_eq!(forced.status.code(), Some(11), "an originless sparse lift exits 11: {}", stderr(&forced));
@@ -6455,7 +6455,7 @@ fn a_sparse_warehouse_whose_fetch_scope_is_gone_is_refused() {
     assert_success(&area.forklift("sparse", &["load", "."]));
     assert_success(&area.forklift("sparse", &["stack", "-m", "second"]));
 
-    std::fs::remove_file(area.path("sparse/.forklift/config/fetch-scope")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("sparse/.forklift/config/fetch-scope")).unwrap();
 
     for args in [&["lift"][..], &["scope", "fetch", "docs"], &["lower"]] {
         let refused = area.forklift("sparse", &[&["--json"][..], args].concat());
@@ -6491,7 +6491,7 @@ fn a_sparse_main_tree_whose_scope_is_gone_is_refused() {
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
     area.write_file("sparse/src/api/a.txt", "api v2\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
-    std::fs::remove_file(area.path("sparse/.forklift/scope")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("sparse/.forklift/scope")).unwrap();
 
     for args in [&["stocktake"][..], &["stack", "-m", "second"]] {
         let refused = area.forklift("sparse", &[&["--json"][..], args].concat());
@@ -7035,7 +7035,7 @@ fn lift_feature(area: &TestArea) -> (String, String, [String; 2]) {
     assert_success(&area.forklift("a", &["pallet", "create", "feature"]));
     area.write_file("a/src/feature.txt", "feature\n");
     area.write_file("a/src/more.txt", "more\n");
-    std::fs::remove_file(area.path("a/docs/one.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("a/docs/one.txt")).unwrap();
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "-m", "a feature"]));
     assert_success(&area.forklift("a", &["lift"]));
@@ -7198,7 +7198,7 @@ fn a_cache_merge_fetches_its_trees_by_level_and_its_blobs_in_one_batch() {
     assert_success(&area.forklift("cached", &["lower", "feature"]));
     area.write_file("cached/src/code.txt", "local\n");
     area.write_file("cached/docs/two.txt", "local two\n");
-    std::fs::remove_file(area.path("cached/docs/three.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("cached/docs/three.txt")).unwrap();
     assert_success(&area.forklift("cached", &["load", "."]));
     assert_success(&area.forklift("cached", &["stack", "-m", "local"]));
     for hash in &theirs {
@@ -7530,7 +7530,7 @@ fn a_failed_cache_fill_records_what_it_left_absent() {
             .find(|(name, _)| name.as_str() == "lost.txt").map(|(_, file)| file.hash.clone());
         file.expect("the fixture's file")
     };
-    std::fs::remove_file(object_store_path(&area, "server-root", &lost)).expect("the server holds the file loose");
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "server-root", &lost)).expect("the server holds the file loose");
 
     let lowered = area.forklift("cached", &["lower"]);
     assert!(!lowered.status.success(), "the fill fails: {}", stdout(&lowered));
@@ -7560,7 +7560,7 @@ fn recording_a_present_root_records_what_is_absent_beneath_it() {
         .map(|(_, subtree)| subtree.hash.clone()).next().expect("the fixture's root has a subdirectory");
 
     let loose = area.path(&format!("cached/.forklift/objects/{}/{}", &subtree[0..2], &subtree[2..]));
-    std::fs::remove_file(&loose).expect("the subtree is loose");
+    forklift_core::util::file_utils::remove_file(&loose).expect("the subtree is loose");
     assert!(!forklift_core::util::file_utils::does_object_exist(&subtree).unwrap());
     assert!(!forklift_core::util::sealed_utils::read_sealed().unwrap().contains(&subtree));
 
@@ -7697,7 +7697,7 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
             if phase == Phase::Checking {
                 assert_success(&area.forklift(directory, &["remote", "abort"]));
             } else {
-                std::fs::remove_file(area.path(&format!("{}/.forklift/origin-move", directory))).unwrap();
+                forklift_core::util::file_utils::remove_file(area.path(&format!("{}/.forklift/origin-move", directory))).unwrap();
             }
         }
     }
@@ -7731,9 +7731,9 @@ fn serve_copy(area: &TestArea, from: &str, to: &str) -> Server {
         }
     }
 
-    let _ = std::fs::remove_dir_all(area.path(to));
+    let _ = forklift_core::util::file_utils::remove_dir_all(area.path(to));
     copy_dir(&area.path(from), &area.path(to));
-    let _ = std::fs::remove_file(area.path(&format!("{}/.forklift/serve.lock", to)));
+    let _ = forklift_core::util::file_utils::remove_file(area.path(&format!("{}/.forklift/serve.lock", to)));
 
     Server::spawn(vec![
         "serve".to_string(),
@@ -7968,7 +7968,7 @@ fn bare_remote_shows_the_remote_the_origin_and_what_stops_it() {
     // A missing origin record is damage whether or not a remote is configured.
     let origin = area.path("cached/.forklift/origin");
     let recorded = std::fs::read(&origin).unwrap();
-    std::fs::remove_file(&origin).unwrap();
+    forklift_core::util::file_utils::remove_file(&origin).unwrap();
     assert_success(&area.forklift("cached", &["config", "unset", "remote.url"]));
     let lost = show("cached");
     assert_eq!(lost["remote"], serde_json::Value::Null, "{}", lost);
@@ -8069,7 +8069,7 @@ fn a_stopped_move_is_abandoned_only_while_checking_and_finished_by_the_next() {
         assert!(forklift_dir_snapshot(&area, "cached") == before, "a held move lock leaves everything as it was");
     }
 
-    std::fs::remove_file(area.path("cached/.forklift/origin")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("cached/.forklift/origin")).unwrap();
     let missing = area.forklift("cached", &["--json", "lower"]);
     assert!(json_of(&missing)["error"]["next_step"].as_str().unwrap().contains("remote move <url>"), "{}", stdout(&missing));
     assert_success(&area.forklift("cached", &["remote", "move", &copy.url]));
@@ -8908,7 +8908,7 @@ fn a_sparse_audit_checks_each_path_of_a_shared_spine_tree() {
     assert_success(&area.forklift("sparse", &["audit"]));
 
     // The blob under `b/y` is the only object in scope at `b` and nowhere else.
-    std::fs::remove_file(object_store_path(&area, "sparse", &y_blob)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "sparse", &y_blob)).unwrap();
 
     let audit = area.forklift("sparse", &["audit"]);
     assert!(!audit.status.success(),
@@ -8951,7 +8951,7 @@ fn path_maybe_changed_absorbs_an_absent_out_of_scope_object() {
     assert!(!object_present(&area, "sparse", &web_tree), "the changed out-of-scope subtree must be sealed");
 
     // Force the cold path: drop any precomputed filter so the head parcel's filter is recomputed.
-    let _ = std::fs::remove_dir_all(area.path("sparse/.forklift/graph"));
+    let _ = forklift_core::util::file_utils::remove_dir_all(area.path("sparse/.forklift/graph"));
 
     let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
     // Called directly — no `.unwrap_or(true)` — the function itself must degrade to Ok(true)
@@ -9505,7 +9505,7 @@ fn a_landed_lift_lower_or_franchise_records_its_head_and_a_refused_lift_records_
 
     // The record only names heads to ask about, so removing it is a way out of one that does not
     // parse; an up-to-date lower writes it again.
-    std::fs::remove_file(area.path("clone/.forklift/held-heads")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("clone/.forklift/held-heads")).unwrap();
     assert_success(&area.forklift("clone", &["lower"]));
     assert_eq!(held_heads(&area, "clone"), vec![format!("{} main", ahead)], "an up-to-date lower records the head too");
 }
@@ -9821,7 +9821,7 @@ fn scope_prune_resumes_after_an_interrupted_free_and_completes() {
         let narrowed = forklift_core::util::scope_utils::PathScope::from_prefixes(["src/api"]);
         forklift_core::util::scope_utils::set_fetch_scope(&narrowed).unwrap();
     }
-    std::fs::remove_file(object_store_path(&area, "sparse", &web_blob)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "sparse", &web_blob)).unwrap();
     assert!(object_present(&area, "sparse", &web_tree),
         "the simulated interruption leaves the parent tree behind");
 
@@ -10275,7 +10275,7 @@ fn heal_driven_refetch_recovers_a_dangling_object_the_remote_has() {
     let blob = path_object_hash(&area, "dev", &head, "a.txt");
     let relative = loose_object_relative_path(&blob);
 
-    std::fs::remove_file(object_store_path(&area, "dev", &blob)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "dev", &blob)).unwrap();
     plant_taint(&area, "dev", &[&relative]);
 
     let status = area.forklift("dev", &["--json", "heal"]);
@@ -10318,10 +10318,10 @@ fn heal_driven_refetch_clears_only_the_hash_the_remote_actually_has() {
     let blob_b = path_object_hash(&area, "dev", &head, "b.txt");
 
     // The remote's own copy of b is gone too — genuinely unrecoverable, unlike a.
-    std::fs::remove_file(object_store_path(&area, "server-root", &blob_b)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "server-root", &blob_b)).unwrap();
 
-    std::fs::remove_file(object_store_path(&area, "dev", &blob_a)).unwrap();
-    std::fs::remove_file(object_store_path(&area, "dev", &blob_b)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "dev", &blob_a)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "dev", &blob_b)).unwrap();
 
     let relative_a = loose_object_relative_path(&blob_a);
     let relative_b = loose_object_relative_path(&blob_b);
@@ -10381,8 +10381,8 @@ fn heal_driven_refetch_recovers_every_object_when_more_than_one_is_missing() {
 
     // Both blobs are genuinely gone locally — the remote (which received both via `lift`) is
     // the only thing that can restore them.
-    std::fs::remove_file(object_store_path(&area, "dev", &blob_a)).unwrap();
-    std::fs::remove_file(object_store_path(&area, "dev", &blob_b)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "dev", &blob_a)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "dev", &blob_b)).unwrap();
 
     let relative_a = loose_object_relative_path(&blob_a);
     let relative_b = loose_object_relative_path(&blob_b);
@@ -10465,7 +10465,7 @@ fn heal_pass_one_restoring_a_missing_ancestor_keeps_the_closure_walk_from_falsel
     let h1 = pallet_head(&area, "dev", "main");
     let leaf = path_object_hash(&area, "dev", &h1, "a.txt");
 
-    std::fs::remove_file(area.path("dev/a.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("dev/a.txt")).unwrap();
     area.write_file("dev/c.txt", "unrelated newer content\n");
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "-m", "drop the leaf, add something else"]));
@@ -10476,14 +10476,14 @@ fn heal_pass_one_restoring_a_missing_ancestor_keeps_the_closure_walk_from_falsel
 
     // The ancestry object under test — present on the remote (dev pushed it via the first lift),
     // genuinely absent locally going into the run.
-    std::fs::remove_file(object_store_path(&area, "dev", &h1)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "dev", &h1)).unwrap();
     // The current head must go missing too — see the doc comment above on why, or pass 1 never
     // even looks at H1.
-    std::fs::remove_file(object_store_path(&area, "dev", &h2)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "dev", &h2)).unwrap();
 
     // The leaf: unrecoverable from either side, on purpose (see the doc comment above).
-    std::fs::remove_file(object_store_path(&area, "dev", &leaf)).unwrap();
-    std::fs::remove_file(object_store_path(&area, "server-root", &leaf)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "dev", &leaf)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "server-root", &leaf)).unwrap();
 
     let relative_leaf = loose_object_relative_path(&leaf);
     // Planted on disk via the durable-taint helper, not through the in-process gate — same
@@ -10585,7 +10585,7 @@ fn heal_driven_refetch_leaves_the_taint_intact_on_a_failed_fetch() {
     let blob = path_object_hash(&area, "dev", &head, "a.txt");
     let relative = loose_object_relative_path(&blob);
 
-    std::fs::remove_file(object_store_path(&area, "dev", &blob)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "dev", &blob)).unwrap();
 
     // Point at an unreachable remote (a closed local port) so the fetch itself fails, before any
     // taint exists yet — planting the taint against an already-broken remote configuration.
@@ -10628,7 +10628,7 @@ fn heal_names_an_unreadable_fetch_scope_instead_of_blaming_connectivity() {
     let blob = path_object_hash(&area, "dev", &head, "b.txt");
     let relative = loose_object_relative_path(&blob);
 
-    std::fs::remove_file(object_store_path(&area, "dev", &blob)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "dev", &blob)).unwrap();
     area.write_file("dev/.forklift/config/fetch-scope", "src\n");
     plant_taint(&area, "dev", &[&relative]);
 
@@ -10682,7 +10682,7 @@ fn heal_driven_refetch_recovers_a_hash_referenced_only_by_a_non_current_pallet()
     // Back to `main` before the object vanishes — `heal` runs from here, not from `other`.
     assert_success(&area.forklift("dev", &["shift", "main"]));
 
-    std::fs::remove_file(object_store_path(&area, "dev", &other_blob)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "dev", &other_blob)).unwrap();
     plant_taint(&area, "dev", &[&relative]);
 
     let status = area.forklift("dev", &["--json", "heal"]);
@@ -10907,7 +10907,7 @@ fn an_unfinished_franchise_without_a_warehouse_marker_is_still_franchise_incompl
 
     let failed = area.forklift(".", &["clone", &server.url, "half", "--only", "src/ap"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
-    let _ = std::fs::remove_file(area.path("half/.forklift/warehouse"));
+    let _ = forklift_core::util::file_utils::remove_file(area.path("half/.forklift/warehouse"));
     assert!(!area.path("half/.forklift/warehouse").exists() && area.path("half/.forklift/franchise").is_file());
 
     for args in [&["--json", "status"][..], &["--json", "prepare"]] {
@@ -11110,7 +11110,7 @@ fn a_failure_after_the_bundle_install_keeps_it_and_the_resume_skips_the_download
 
     // The remote's own copy is now genuinely gone: whatever the incremental walk retries, it
     // cannot recover an object the far end no longer has.
-    std::fs::remove_file(object_store_path(&area, "server-root", &blob_b)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "server-root", &blob_b)).unwrap();
 
     let failed = area.forklift(".", &["clone", &server.url, "packed"]);
     assert_eq!(failed.status.code(), Some(30),
@@ -11249,7 +11249,7 @@ fn a_lower_across_a_case_only_rename_keeps_the_file() {
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
 
-    std::fs::remove_file(area.path("a/foo")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("a/foo")).unwrap();
     area.write_file("a/Foo", "upper\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "-m", "rename foo to Foo"]));
@@ -11954,7 +11954,7 @@ fn a_named_lower_whose_fetch_fails_leaves_no_ref() {
     let feat = remote_with_a_side_pallet(&area, &server);
 
     let blob = path_object_hash(&area, "a", &feat, "feat.txt");
-    std::fs::remove_file(object_store_path(&area, "server-root", &blob)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "server-root", &blob)).unwrap();
 
     let failed = area.forklift("b", &["lower", "feat"]);
     assert!(!failed.status.success(), "{}", stdout(&failed));
@@ -12362,7 +12362,7 @@ fn a_bay_on_a_pallet_another_bay_lowered_is_behind_until_it_shifts() {
     assert_eq!(behind.status.code(), Some(26), "{}{}", stdout(&behind), stderr(&behind));
     assert!(stderr(&behind).contains("forklift shift feat"), "{}", stderr(&behind));
 
-    std::fs::remove_file(bay_dir.join("other.txt")).unwrap();
+    forklift_core::util::file_utils::remove_file(bay_dir.join("other.txt")).unwrap();
     assert_success(&area.forklift("b-bay", &["load", "."]));
     assert_success(&area.forklift("b-bay", &["shift", "feat"]));
     assert_eq!(area.read_file("b-bay/feat.txt"), "feat v2\n");
@@ -12540,7 +12540,7 @@ impl StrippedRemote {
         let mut stripped = Vec::new();
         for path in [trust, office[0].clone()] {
             stripped.push((path.clone(), std::fs::read(&path).unwrap()));
-            std::fs::remove_file(&path).unwrap();
+            forklift_core::util::file_utils::remove_file(&path).unwrap();
         }
 
         // An anchorless client lifts an unsigned parcel, and the anchorless server takes it.
@@ -12696,7 +12696,7 @@ fn a_partial_client_fetches_the_trust_boundary_it_lacks() {
 
     // A remote that no longer holds the boundary head cannot vouch for y.
     assert_success(&area.forklift(".", &["clone", &server.url, "c"]));
-    std::fs::remove_file(object_store_path(&area, "server-root", &s2)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "server-root", &s2)).unwrap();
     let refused = area.forklift("c", &["--json", "lower", "y"]);
     let message = history_unverified_message(&refused);
     assert!(message.contains(&s2), "{}", message);

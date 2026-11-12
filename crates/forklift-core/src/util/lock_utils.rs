@@ -296,7 +296,7 @@ impl ServeLock {
     pub fn release(mut self) -> Result<(), String> {
         let path = std::mem::take(&mut self.path);
 
-        match std::fs::remove_file(&path) {
+        match crate::util::file_utils::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(format!("Could not remove the lock file \"{}\": {}", path.display(), e)),
@@ -872,7 +872,7 @@ fn acquire_lock_file(path: &Path, subject: &str) -> Result<(), String> {
 /// Release a lock file. Nothing sensible can be done about a failed removal here; the next
 /// command will report the leftover lock file with the owning process's PID.
 fn release_lock_file(path: &Path) {
-    let _ = std::fs::remove_file(path);
+    let _ = crate::util::file_utils::remove_file(path);
 }
 
 /// Resolve a path against the current directory when it is relative, so it stays valid if
@@ -893,7 +893,7 @@ mod tests {
     #[test]
     fn the_store_lock_is_exclusive_and_releases_on_drop() {
         let temp = std::env::temp_dir().join(format!("forklift-storelock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         // The shared lock lives in `forklift_root` (the `.forklift` folder), which must exist for
         // the atomic `create_new`.
         std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
@@ -907,7 +907,7 @@ mod tests {
         drop(first);
         StoreLock::acquire().expect("after the first is dropped the lock is free again");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// Writers share the store; a deleter's exclusive try is refused beside any of them; a
@@ -917,7 +917,7 @@ mod tests {
     #[test]
     fn store_access_is_shared_among_writers_and_exclusive_against_deleters() {
         let temp = std::env::temp_dir().join(format!("forklift-storeaccess-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&temp);
 
@@ -951,7 +951,7 @@ mod tests {
         assert!(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join(FILE_NAME_STORE_ACCESS_LOCK).is_file(),
             "the sidecar stays: it is never deleted");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// One base folder, one server: a second hold on it is refused while the first lives, and
@@ -969,7 +969,7 @@ mod tests {
         let _again = BaseServeLock::try_acquire(&base).expect("released with its holder");
 
         drop(_again);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = crate::util::file_utils::remove_dir_all(&base);
     }
 
     /// The open-file search against a fake kernel: it lands on the largest limit the ceiling
@@ -1009,7 +1009,7 @@ mod tests {
     #[test]
     fn a_read_only_store_access_sidecar_still_locks_both_ways() {
         let temp = std::env::temp_dir().join(format!("forklift-storeaccess-ro-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         let sidecar = temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join(FILE_NAME_STORE_ACCESS_LOCK);
@@ -1028,7 +1028,7 @@ mod tests {
         #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         std::fs::set_permissions(&sidecar, permissions).unwrap();
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
 
         assert!(writer_ok, "a writer takes the shared side through a read-only sidecar");
         assert!(deleter_ok, "a deleter takes the exclusive side through a read-only sidecar");
@@ -1037,7 +1037,7 @@ mod tests {
     #[test]
     fn the_serve_lock_is_exclusive_releases_on_drop_and_is_distinct_from_the_store_lock() {
         let temp = std::env::temp_dir().join(format!("forklift-servelock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&temp);
 
@@ -1056,7 +1056,7 @@ mod tests {
         drop(first);
         ServeLock::acquire().expect("after the first is dropped the serve lock is free again");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// An explicit release reports a lock file it could not remove, and only that: a missing file
@@ -1065,7 +1065,7 @@ mod tests {
     #[test]
     fn a_serve_lock_release_reports_a_file_it_could_not_remove() {
         let temp = std::env::temp_dir().join(format!("forklift-servelock-release-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&temp);
 
@@ -1075,7 +1075,7 @@ mod tests {
 
         let gone = ServeLock { path: serve_lock_path() };
         std::mem::forget(taken);
-        std::fs::remove_file(serve_lock_path()).unwrap();
+        crate::util::file_utils::remove_file(serve_lock_path()).unwrap();
         gone.release().expect("a missing file counts as released");
 
         // Something that cannot be removed as a file stands where the lock was.
@@ -1083,6 +1083,6 @@ mod tests {
         let stuck = ServeLock { path: serve_lock_path() };
         assert!(stuck.release().is_err(), "a lock file that stays must be reported");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 }

@@ -24,7 +24,7 @@ fn staged_writes_stay_invisible_until_finish_even_with_fsync_disabled() {
     }
 
     let temp = std::env::temp_dir().join(format!("forklift-writebatch-fsync-off-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&temp);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&temp);
     std::fs::create_dir_all(&temp).unwrap();
 
     let target = temp.join("staged-with-fsync-off");
@@ -54,7 +54,7 @@ fn staged_writes_stay_invisible_until_finish_even_with_fsync_disabled() {
     assert!(leftovers.is_empty(), "no temporary file should survive a successful finish, found {:?}",
         leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>());
 
-    std::fs::remove_dir_all(&temp).ok();
+    forklift_core::util::file_utils::remove_dir_all(&temp).ok();
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn a_dropped_batch_publishes_nothing_even_with_fsync_disabled() {
     }
 
     let temp = std::env::temp_dir().join(format!("forklift-writebatch-fsync-off-abort-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&temp);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&temp);
     std::fs::create_dir_all(&temp).unwrap();
 
     let target = temp.join("never-published");
@@ -81,5 +81,5 @@ fn a_dropped_batch_publishes_nothing_even_with_fsync_disabled() {
     assert!(leftovers.is_empty(), "a dropped batch must remove every staged temp, found {:?}",
         leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>());
 
-    std::fs::remove_dir_all(&temp).ok();
+    forklift_core::util::file_utils::remove_dir_all(&temp).ok();
 }

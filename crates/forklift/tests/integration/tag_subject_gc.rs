@@ -50,7 +50,7 @@ impl Warehouse {
             std::env::temp_dir().join(format!("forklift-tag-subject-gc-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
         let home = base.join("home");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = file_utils::remove_dir_all(&base);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
 
@@ -111,7 +111,7 @@ impl Warehouse {
 
     /// What a pallet-deletion verb would do: unlink the ref file.
     fn delete_pallet_ref(&self, pallet: &str) {
-        std::fs::remove_file(self.root.join(".forklift").join("pallets").join(pallet))
+        file_utils::remove_file(self.root.join(".forklift").join("pallets").join(pallet))
             .expect("the ref existed");
     }
 

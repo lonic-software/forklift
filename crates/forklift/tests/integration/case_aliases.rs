@@ -36,7 +36,7 @@ impl Warehouse {
             .join(format!("forklift-case-aliases-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
         let home = base.join("home");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
 
@@ -122,7 +122,7 @@ impl Warehouse {
 
 impl Drop for Warehouse {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.base);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&self.base);
     }
 }
 
@@ -166,7 +166,7 @@ fn folds_case(dir: &Path) -> bool {
     std::fs::create_dir_all(&probe).unwrap();
     std::fs::write(probe.join("probe"), "").unwrap();
     let folds = probe.join("PROBE").exists();
-    std::fs::remove_dir_all(&probe).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(&probe).unwrap();
     folds
 }
 
@@ -176,7 +176,7 @@ fn folds_normalization(dir: &Path) -> bool {
     std::fs::create_dir_all(&probe).unwrap();
     std::fs::write(probe.join("caf\u{e9}"), "").unwrap();
     let folds = probe.join("cafe\u{301}").exists();
-    std::fs::remove_dir_all(&probe).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(&probe).unwrap();
     folds
 }
 
@@ -337,7 +337,7 @@ fn a_case_only_directory_rename_is_refused_while_anything_keeps_the_old_director
 #[test]
 fn park_resets_a_staged_case_only_rename_and_pop_brings_it_back() {
     let warehouse = Warehouse::new("park-rename", &[("app.txt", "app\n"), ("foo", "old\n")]);
-    std::fs::remove_file(warehouse.root.join("foo")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("foo")).unwrap();
     warehouse.write("Foo", "new\n");
     warehouse.run_ok(&["load", "."]);
 
@@ -359,7 +359,7 @@ fn park_resets_a_staged_case_only_rename_and_pop_brings_it_back() {
 fn park_refuses_an_untracked_occupant_of_a_path_its_reset_writes() {
     let warehouse = Warehouse::new("park-occupant", &[("app.txt", "app\n"), ("foo", "old\n")]);
     warehouse.run_ok(&["remove", "foo"]);
-    let _ = std::fs::remove_file(warehouse.root.join("foo"));
+    let _ = forklift_core::util::file_utils::remove_file(warehouse.root.join("foo"));
     warehouse.write("FOO", "untracked\n");
 
     let parked = warehouse.run(&["park"]);
@@ -468,7 +468,7 @@ fn a_file_where_a_new_path_needs_a_directory_is_judged_as_its_occupant() {
     let untracked = warehouse.run(&["shift", "nested"]);
     assert_refused_with(&untracked, UNTRACKED_REFUSAL, &["bar"]);
     assert_eq!(warehouse.read("bar"), "untracked\n");
-    std::fs::remove_file(warehouse.root.join("bar")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("bar")).unwrap();
 
     warehouse.craft("aliased", "main", &[("app.txt", "app\n"), ("Foo", "tracked\n"), ("foo/a", "a\n")]);
     let aliased = warehouse.run(&["shift", "aliased"]);
@@ -552,7 +552,7 @@ fn a_new_directory_pair_differing_only_in_normalization_is_refused_or_materializ
 #[test]
 fn restore_refuses_a_path_beneath_a_file() {
     let warehouse = Warehouse::new("restore-non-directory", &[("app.txt", "app\n"), ("foo/a.txt", "a\n")]);
-    std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write("foo", "mine\n");
 
     for target in ["foo/a.txt", "foo"] {
@@ -980,7 +980,7 @@ fn a_pair_remedy_leaves_a_name_the_volume_keeps_apart() {
     if !warehouse.folds_case() || !names.contains("Strasse") || !names.contains("straße") {
         return;
     }
-    std::fs::remove_file(warehouse.root.join("straße")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join("straße")).unwrap();
     warehouse.rename("Strasse", "strasse");
 
     let loaded = warehouse.run(&["load", "Strasse"]);

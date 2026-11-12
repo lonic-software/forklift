@@ -419,7 +419,7 @@ pub fn finish(forklift: &Path) -> Result<(), String> {
         file_utils::remove_unfollowed(&temp)?;
     }
 
-    match std::fs::remove_file(record_path(forklift)) {
+    match file_utils::remove_file(record_path(forklift)) {
         Ok(()) => (),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
         Err(e) => return Err(format!(
@@ -1075,7 +1075,7 @@ mod tests {
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("forklift-clone-utils-{}-{}", label, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1171,7 +1171,7 @@ mod tests {
         assert!(!bundles.exists());
         assert!(!objects.join("ab/cdef").exists(), "the store another format wrote goes too");
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// A record says which format wrote it; one that does not, or not as a number, is torn rather
@@ -1300,7 +1300,7 @@ mod tests {
         assert_eq!(census(&dir), Ok(3));
         assert_eq!(census(&dir.join("absent")), Ok(0));
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1324,25 +1324,25 @@ mod tests {
         // A torn record is debris only while nothing else stands.
         std::fs::write(record_path(&forklift), b"/forklift-franchise 3\nurl=x").unwrap();
         assert!(admit(&dir).is_err(), "a torn record beside other entries is refused");
-        std::fs::remove_file(dir.join("half-written")).unwrap();
+        file_utils::remove_file(dir.join("half-written")).unwrap();
         std::fs::write(forklift.join("lock"), b"1").unwrap();
         assert_eq!(admit(&dir), Ok(Admission::Resume(None)));
         // The claim's git ignore file, and a temp of it, are the claim's own debris too.
         std::fs::write(forklift.join(".gitignore"), b"*\n").unwrap();
         std::fs::write(forklift.join(".gitignore.tmp~1-0"), b"*").unwrap();
         assert_eq!(admit(&dir), Ok(Admission::Resume(None)));
-        std::fs::remove_file(forklift.join(".gitignore.tmp~1-0")).unwrap();
+        file_utils::remove_file(forklift.join(".gitignore.tmp~1-0")).unwrap();
 
         // A record from another version is refused, never guessed at.
         std::fs::write(record_path(&forklift), b"/forklift-franchise 9\n").unwrap();
         assert!(admit(&dir).is_err());
 
         // A finished warehouse is not a clone to resume.
-        std::fs::remove_file(record_path(&forklift)).unwrap();
+        file_utils::remove_file(record_path(&forklift)).unwrap();
         std::fs::create_dir(forklift.join("pallets")).unwrap();
         assert!(admit(&dir).unwrap_err().contains("is not empty"));
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1387,7 +1387,7 @@ mod tests {
         assert!(objects.join("pack/p.pack").exists());
         assert!(forklift.join("bundles").exists());
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// A resume keeps only the bundle file its record names: the download, cut back to the length
@@ -1427,7 +1427,7 @@ mod tests {
         assert_eq!(prepare_resume(&dir, Some(&record()), &BundleState::None), Ok(BundleState::None));
         assert!(!bundles.exists());
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1461,14 +1461,14 @@ mod tests {
         std::fs::write(record_path(&forklift), b"torn").unwrap();
         assert_eq!(code(gate(&dir)).0, RefusalCode::CloneIncomplete);
 
-        std::fs::remove_file(record_path(&forklift)).unwrap();
+        file_utils::remove_file(record_path(&forklift)).unwrap();
         std::fs::write(forklift.join("franchise.tmp~1-0"), b"x").unwrap();
         assert_eq!(code(gate(&dir)).0, RefusalCode::CloneIncomplete);
 
         finish(&forklift).unwrap();
         assert!(gate(&dir).is_ok(), "finishing clears the temps with the record");
 
-        std::fs::remove_dir_all(&dir).ok();
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1512,7 +1512,7 @@ mod tests {
         assert!(claim(&busy, &record()).unwrap_err().contains("is not empty"));
         assert!(!busy.join(FOLDER_NAME_FORKLIFT_ROOT).exists());
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -1527,7 +1527,7 @@ mod tests {
         assert!(list_names(&target).unwrap().iter().all(|name| !is_staging_leftover(name)),
             "a refused claim removes its staging folder");
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
     /// The claim's rename never replaces a `.forklift` that appeared after the admission, not even
     /// an empty one, which a plain rename onto a folder would.
@@ -1542,11 +1542,11 @@ mod tests {
         assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
         assert!(staged.join("inside").is_dir() && list_names(&placed).unwrap().is_empty());
 
-        std::fs::remove_dir(&placed).unwrap();
+        file_utils::remove_dir(&placed).unwrap();
         file_utils::rename_no_replace(&staged, &placed).unwrap();
         assert!(placed.join("inside").is_dir() && !staged.exists());
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     /// No level below the target is followed: a linked `.forklift` is refused by admission and by
@@ -1595,7 +1595,7 @@ mod tests {
 
         assert_eq!(std::fs::read(outside.join("ab").join("cdef")).unwrap(), b"keep");
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     /// A `.forklift` whose record cannot be read for a reason other than its content is refused
@@ -1613,6 +1613,6 @@ mod tests {
             other => panic!("{:?}", other),
         }
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 }

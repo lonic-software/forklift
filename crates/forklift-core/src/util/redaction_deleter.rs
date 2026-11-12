@@ -770,7 +770,7 @@ mod tests {
             let root = std::env::temp_dir().join(format!(
                 "forklift-redaction-deleter-test-{}-{}-{}", name, std::process::id(), id
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = crate::util::file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -782,7 +782,7 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = crate::util::file_utils::remove_dir_all(&self.root);
         }
     }
 
@@ -877,7 +877,7 @@ mod tests {
         let (folder, name) = file_utils::get_path_for_object(&recipe).unwrap();
         let path = std::path::Path::new(&folder).join(name);
         let bytes = std::fs::read(&path).unwrap();
-        std::fs::remove_file(&path).unwrap();
+        crate::util::file_utils::remove_file(&path).unwrap();
         withholding::withhold(&recipe, "DMCA notice").unwrap();
         std::fs::write(&path, bytes).unwrap();
         assert_eq!(withholding::read_withheld().unwrap().digest(&recipe), Some(&withholding::ChunkDigest::Unknown));

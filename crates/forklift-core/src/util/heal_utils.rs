@@ -274,12 +274,12 @@ fn rewrite_dentry(final_path: &Path, content: &[u8]) -> Result<(), String> {
 
     let write_result = write_and_sync_temp(&temp_path, content);
     if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
+        let _ = file_utils::remove_file(&temp_path);
         return Err(e);
     }
 
     file_utils::rename(&temp_path, final_path).map_err(|e| {
-        let _ = std::fs::remove_file(&temp_path);
+        let _ = file_utils::remove_file(&temp_path);
         format!("Error while restaging \"{}\": {}", final_path.to_string_lossy(), e)
     })
 }
@@ -642,7 +642,7 @@ fn flush_via_anchor(parent: &Path) -> Result<(), String> {
         "Error while creating a cross-volume flush anchor near \"{}\": {}", parent.to_string_lossy(), e
     )).and_then(|()| file_utils::macos_flush_device_cache(&anchor));
 
-    let _ = std::fs::remove_file(&anchor);
+    let _ = file_utils::remove_file(&anchor);
     result
 }
 
@@ -786,7 +786,7 @@ mod tests {
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("forklift-heal-utils-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1502,7 +1502,7 @@ mod tests {
         // cleared it by the time this flush step runs.
         let taint_dir = forklift.join("taint");
         for entry in std::fs::read_dir(&taint_dir).unwrap() {
-            std::fs::remove_file(entry.unwrap().path()).unwrap();
+            file_utils::remove_file(entry.unwrap().path()).unwrap();
         }
         assert!(std::fs::read_dir(&taint_dir).unwrap().next().is_none(), "sanity: no taint file remains");
 

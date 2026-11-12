@@ -1390,7 +1390,7 @@ mod tests {
     /// A fresh scratch directory for one test, unique per process and per test name.
     fn scratch_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("forklift-graph-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1409,7 +1409,7 @@ mod tests {
         if std::fs::File::create(root_path.join("probe")).is_ok() {
             // Running as root: permissions cannot make the write fail, so there is nothing to test.
             std::fs::set_permissions(&root_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let _ = std::fs::remove_dir_all(&dir);
+            let _ = file_utils::remove_dir_all(&dir);
             return;
         }
         let root = root_path.to_string_lossy().into_owned();
@@ -1421,7 +1421,7 @@ mod tests {
         let resident = stored_record(&root, &hash).unwrap().map(|r| r.generation);
         let written = root_path.join("cd").exists();
         std::fs::set_permissions(&root_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
 
         assert!(persisted.is_ok(), "a failed shard write must not fail the persist: {:?}", persisted);
         assert_eq!(resident, Some(1), "the record must stay resident after its write failed");
@@ -1448,7 +1448,7 @@ mod tests {
         std::fs::set_permissions(&shard_file, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::File::open(&shard_file).is_ok() {
             // Running as root: permissions cannot make the read fail, so there is nothing to test.
-            let _ = std::fs::remove_dir_all(&dir);
+            let _ = file_utils::remove_dir_all(&dir);
             return;
         }
 
@@ -1458,7 +1458,7 @@ mod tests {
         let persisted = persist_records(&root, &new);
         std::fs::set_permissions(&shard_file, std::fs::Permissions::from_mode(0o644)).unwrap();
         let after = std::fs::read(&shard_file).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
 
         assert!(persisted.is_ok(), "an unreadable shard must not fail the persist: {:?}", persisted);
         assert_eq!(after, original, "an unreadable shard must never be written over");
@@ -1511,7 +1511,7 @@ mod tests {
             .map(|hash| stored_record(&graph_root, hash).unwrap().is_some())
             .collect();
         drop(_scope);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
 
         assert_eq!(result, Ok(BELOW),
             "the pass must report the parcels below the unreadable merge as the recorded ones");
@@ -1545,7 +1545,7 @@ mod tests {
 
         let dirty = with_shard(&root, "ab", |shard| shard.dirty).unwrap();
         cache().lock().unwrap().shards.remove(&cache_key(&root, "ab"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&dir);
         assert!(dirty, "a snapshot taken before the eviction must not mark the reloaded shard clean");
     }
 
@@ -1565,7 +1565,7 @@ mod tests {
             .join(format!("forklift-graph-conc-{}", std::process::id()))
             .to_string_lossy()
             .into_owned();
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
 
         const THREADS: u64 = 8;
         const PER_THREAD: u64 = 64;
@@ -1602,6 +1602,6 @@ mod tests {
             }
         }
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 }

@@ -356,7 +356,7 @@ mod tests {
 
         // The state a kill inside the rewrite leaves: the shard store removed, its metadata kept,
         // so every registered key reads as empty.
-        std::fs::remove_dir_all(file_utils::get_inventory_store_root().unwrap()).unwrap();
+        file_utils::remove_dir_all(file_utils::get_inventory_store_root().unwrap()).unwrap();
 
         // And a kill part-way through the writes before it: b.txt never reached the target.
         std::fs::write(warehouse.root.join("b.txt"), b"two\n").unwrap();

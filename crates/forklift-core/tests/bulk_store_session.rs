@@ -28,7 +28,7 @@ fn a_bulk_store_session_defers_publication_until_finish() {
     // exists with exactly the written content.
     let _guard = lock_session();
     let temp = std::env::temp_dir().join(format!("forklift-bulk-finish-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&temp);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&temp);
     std::fs::create_dir_all(&temp).unwrap();
 
     let target = temp.join("staged-object");
@@ -42,7 +42,7 @@ fn a_bulk_store_session_defers_publication_until_finish() {
     assert!(target.exists(), "finish must publish the staged write");
     assert_eq!(std::fs::read(&target).unwrap(), b"bulk content");
 
-    std::fs::remove_dir_all(&temp).ok();
+    forklift_core::util::file_utils::remove_dir_all(&temp).ok();
 }
 
 #[test]
@@ -51,7 +51,7 @@ fn dropping_a_bulk_store_session_without_finish_publishes_nothing() {
     // must never let the final name come into existence.
     let _guard = lock_session();
     let temp = std::env::temp_dir().join(format!("forklift-bulk-abort-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&temp);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&temp);
     std::fs::create_dir_all(&temp).unwrap();
 
     let target = temp.join("never-published");
@@ -74,7 +74,7 @@ fn dropping_a_bulk_store_session_without_finish_publishes_nothing() {
     let session = BulkStoreSession::open().unwrap();
     session.finish().unwrap();
 
-    std::fs::remove_dir_all(&temp).ok();
+    forklift_core::util::file_utils::remove_dir_all(&temp).ok();
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn writes_outside_any_session_are_unaffected_by_bulk_sessions() {
     // guard against the registry being left in a stuck "active" state.
     let _guard = lock_session();
     let temp = std::env::temp_dir().join(format!("forklift-bulk-outside-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&temp);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&temp);
     std::fs::create_dir_all(&temp).unwrap();
 
     // Use and finish a session first.
@@ -107,7 +107,7 @@ fn writes_outside_any_session_are_unaffected_by_bulk_sessions() {
         .collect();
     assert!(leftovers.is_empty(), "no temporary file should survive a plain write");
 
-    std::fs::remove_dir_all(&temp).ok();
+    forklift_core::util::file_utils::remove_dir_all(&temp).ok();
 }
 
 #[test]
@@ -121,7 +121,7 @@ fn a_failed_finish_removes_every_staged_temp_and_publishes_nothing() {
     // neither ever got published.
     let _guard = lock_session();
     let temp = std::env::temp_dir().join(format!("forklift-bulk-fail-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&temp);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&temp);
     std::fs::create_dir_all(&temp).unwrap();
 
     let target_a = temp.join("a");
@@ -135,7 +135,7 @@ fn a_failed_finish_removes_every_staged_temp_and_publishes_nothing() {
         .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
         .collect();
     assert_eq!(staged_temps.len(), 2, "expected exactly two staged temp files before sabotage");
-    std::fs::remove_file(staged_temps[0].path()).unwrap();
+    forklift_core::util::file_utils::remove_file(staged_temps[0].path()).unwrap();
 
     let result = session.finish();
     assert!(result.is_err(), "finish must surface the sabotaged fsync as an error");
@@ -154,7 +154,7 @@ fn a_failed_finish_removes_every_staged_temp_and_publishes_nothing() {
     let session = BulkStoreSession::open().unwrap();
     session.finish().unwrap();
 
-    std::fs::remove_dir_all(&temp).ok();
+    forklift_core::util::file_utils::remove_dir_all(&temp).ok();
 }
 
 /// `BulkStoreSession::finish` (the second caller of the shared `run_write_barrier`, alongside
@@ -180,7 +180,7 @@ fn a_trailing_directory_sync_failure_through_bulk_store_session_records_a_taint(
 
     let _guard = lock_session();
     let root = std::env::temp_dir().join(format!("forklift-bulk-taint-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
 
     taint_utils::activate();
@@ -212,7 +212,7 @@ fn a_trailing_directory_sync_failure_through_bulk_store_session_records_a_taint(
     assert!(state.recorded.contains(&std::path::PathBuf::from("objects/bb/blocked-object")),
         "the batch's final path must be recorded as tainted, got {:?}", state.recorded);
 
-    std::fs::remove_dir_all(&root).ok();
+    forklift_core::util::file_utils::remove_dir_all(&root).ok();
 }
 
 #[test]
@@ -224,7 +224,7 @@ fn the_sealed_object_record_is_written_through_an_open_session() {
     // place when it returns, session or not.
     let _guard = lock_session();
     let root = std::env::temp_dir().join(format!("forklift-bulk-sealed-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     std::fs::create_dir_all(root.join(forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
     let _scope = StorageRootScope::enter(&root);
     forklift_core::util::origin_utils::write_for_tests("http://origin.test");
@@ -245,7 +245,7 @@ fn the_sealed_object_record_is_written_through_an_open_session() {
     let set = sealed_utils::read_sealed().unwrap();
     assert!(set.contains(a) && set.contains(b), "the compaction and the appends around it all stand");
 
-    std::fs::remove_dir_all(&root).ok();
+    forklift_core::util::file_utils::remove_dir_all(&root).ok();
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn a_pallet_removal_refuses_inside_a_session() {
     // A removal's records must be durable before the unlink, and a session would only stage them.
     let _guard = lock_session();
     let root = std::env::temp_dir().join(format!("forklift-bulk-remove-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let _scope = StorageRootScope::enter(&root);
     forklift_core::util::warehouse_utils::prepare_warehouse(forklift_core::util::warehouse_utils::PrepareMode::Full).unwrap();
@@ -279,5 +279,5 @@ fn a_pallet_removal_refuses_inside_a_session() {
     assert!(matches!(&refused, Err(RefUpdateError::Failed(message)) if message.contains("bulk store session")), "{:?}", refused);
     assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(parcel.hash.clone()));
 
-    std::fs::remove_dir_all(&root).ok();
+    forklift_core::util::file_utils::remove_dir_all(&root).ok();
 }

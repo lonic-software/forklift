@@ -461,7 +461,7 @@ mod tests {
     impl Scratch {
         fn new(name: &str) -> Scratch {
             let root = std::env::temp_dir().join(format!("forklift-applied-test-{}-{}", name, std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
 
@@ -471,7 +471,7 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = file_utils::remove_dir_all(&self.root);
         }
     }
 

@@ -355,7 +355,7 @@ mod tests {
 
     fn temp_warehouse(name: &str) -> std::path::PathBuf {
         let temp = std::env::temp_dir().join(format!("forklift-load-guard-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         temp
     }
@@ -381,7 +381,7 @@ mod tests {
         mark_load_completed("src");
         assert!(check_no_incomplete_load().is_ok());
 
-        std::fs::remove_dir_all(&temp).ok();
+        file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -401,7 +401,7 @@ mod tests {
             other => panic!("expected a refusal, got {:?}", other),
         }
 
-        std::fs::remove_dir_all(&temp).ok();
+        file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -415,7 +415,7 @@ mod tests {
         mark_load_completed("src"); // now covers the (updated) recorded root — clears
         assert!(check_no_incomplete_load().is_ok());
 
-        std::fs::remove_dir_all(&temp).ok();
+        file_utils::remove_dir_all(&temp).ok();
     }
 
     /// Two disjoint failed loads must both be recorded — a single-path marker could only ever
@@ -454,7 +454,7 @@ mod tests {
         mark_load_completed("src/b");
         assert!(check_no_incomplete_load().is_ok());
 
-        std::fs::remove_dir_all(&temp).ok();
+        file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -464,7 +464,7 @@ mod tests {
 
         assert!(check_no_incomplete_load().is_ok());
 
-        std::fs::remove_dir_all(&temp).ok();
+        file_utils::remove_dir_all(&temp).ok();
     }
 
     /// A malformed marker never blocks a load, but neither the load's write nor the check treats
@@ -498,7 +498,7 @@ mod tests {
         mark_load_completed("");
         assert!(check_no_incomplete_load().is_ok());
 
-        std::fs::remove_dir_all(&temp).ok();
+        file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -511,7 +511,7 @@ mod tests {
 
         assert!(check_no_incomplete_load().is_err());
 
-        std::fs::remove_dir_all(&temp).ok();
+        file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -525,7 +525,7 @@ mod tests {
         clear_all_recorded();
         assert!(check_no_incomplete_load().is_ok());
 
-        std::fs::remove_dir_all(&temp).ok();
+        file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -538,7 +538,7 @@ mod tests {
         assert!(pending_start_marker("src/api").is_none(), "already covered by \"src\"");
         assert!(pending_start_marker("docs").is_some(), "disjoint from \"src\"");
 
-        std::fs::remove_dir_all(&temp).ok();
+        file_utils::remove_dir_all(&temp).ok();
     }
 
     /// The next step's commands take a single recorded root as one argument on each platform: a

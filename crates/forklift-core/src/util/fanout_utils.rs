@@ -494,7 +494,7 @@ mod tests {
     fn every_worker_re_enters_the_callers_storage_scope() {
         let temp = std::env::temp_dir()
             .join(format!("forklift-fanout-scope-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
 
@@ -513,7 +513,7 @@ mod tests {
         assert_eq!(mismatches.load(Ordering::Relaxed), 0,
                    "every worker must see the caller's entered storage root");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// A load whose finishing order differs from the input order: later items finish sooner.
@@ -667,7 +667,7 @@ mod tests {
     fn prefetch_workers_re_enter_the_callers_storage_scope() {
         let temp = std::env::temp_dir()
             .join(format!("forklift-prefetch-scope-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
 
@@ -685,7 +685,7 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert_eq!(mismatches, 0, "every worker must see the caller's entered storage root");
 
-        std::fs::remove_dir_all(&temp).ok();
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     #[test]

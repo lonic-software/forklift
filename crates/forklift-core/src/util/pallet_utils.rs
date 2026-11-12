@@ -1858,7 +1858,7 @@ pub fn remove_pallet_head_in(
 /// namespace folder, syncing each removal's parent through the durability taint. Folder removal
 /// stops at the first that does not go (it holds another ref, or anything else).
 fn unlink_ref(namespace: PalletNamespace, path: &Path) -> Result<(), String> {
-    std::fs::remove_file(path).map_err(|e| format!(
+    file_utils::remove_file(path).map_err(|e| format!(
         "Error while removing the ref file \"{}\": {}", path.to_string_lossy(), e
     ))?;
 
@@ -1868,7 +1868,7 @@ fn unlink_ref(namespace: PalletNamespace, path: &Path) -> Result<(), String> {
     while let Some(parent) = removed.parent() {
         file_utils::sync_dir_or_taint(parent, &[path])?;
 
-        if parent == top || !parent.starts_with(&top) || std::fs::remove_dir(parent).is_err() {
+        if parent == top || !parent.starts_with(&top) || file_utils::remove_dir(parent).is_err() {
             break;
         }
 
@@ -2047,7 +2047,7 @@ pub(crate) mod tests {
     fn scratch(name: &str) -> (PathBuf, StorageRootScope) {
         let root = std::env::temp_dir()
             .join(format!("forklift-pallet-utils-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
@@ -2146,7 +2146,7 @@ pub(crate) mod tests {
 
         pub(super) fn remove(hash: &str) {
             let (folder, file) = file_utils::get_path_for_object(hash).unwrap();
-            std::fs::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
+            file_utils::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
         }
 
         pub(super) fn write(name: &str, expected: Option<&str>, new: &str) -> Result<(), RefUpdateError> {
@@ -2915,7 +2915,7 @@ pub(crate) mod tests {
             let (folder, file) = file_utils::get_path_for_object(&redactions).unwrap();
             let path = std::path::Path::new(&folder).join(file);
             let bytes = std::fs::read(&path).unwrap();
-            std::fs::remove_file(&path).unwrap();
+            file_utils::remove_file(&path).unwrap();
             assert!(matches!(
                 crate::util::redaction_utils::check_head_write(PalletNamespace::User, "main", Some(&base), &head, None).outcome(),
                 Err(RefUpdateError::Failed(_))
@@ -3381,9 +3381,9 @@ pub(crate) mod tests {
         assert!(matches!(write(&within(&boundary, BoundaryScope::UserPallets)), Err(RefUpdateError::PalletsMoved { .. })),
             "a new pallet");
         assert_eq!(get_meta_pallet_head(OFFICE).unwrap(), Some(hash('a')), "a refusal writes nothing");
-        std::fs::remove_file(get_pallet_ref_path(PalletNamespace::User, "new")).unwrap();
+        file_utils::remove_file(get_pallet_ref_path(PalletNamespace::User, "new")).unwrap();
 
-        std::fs::remove_file(get_pallet_ref_path(PalletNamespace::User, "side")).unwrap();
+        file_utils::remove_file(get_pallet_ref_path(PalletNamespace::User, "side")).unwrap();
         let remote_only = hash('e');
         let extra = [boundary.as_slice(), &[remote_only.as_str()]].concat();
         assert_eq!(write(&within(&extra, BoundaryScope::UserPallets)), Ok(()),
@@ -3430,7 +3430,7 @@ pub(crate) mod tests {
             assert!(resolved.is_err(), "no read opens it, so it is no match: {:?}", resolved);
         }
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -3445,7 +3445,7 @@ pub(crate) mod tests {
         assert!(error.contains(&format!("now holds parcel {}", hash('a'))) && error.contains("The parcel stands")
             && error.contains("forklift shift main"), "{}", error);
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -3468,7 +3468,7 @@ pub(crate) mod tests {
             let (other, _other_scope) = scratch("write-log-other");
             update_pallet_head("main", None, &hash('f'), &RefPreconditions::NONE).unwrap();
             assert!(take_write_log().is_empty(), "a root that is not recording must read back nothing");
-            let _ = std::fs::remove_dir_all(&other);
+            let _ = file_utils::remove_dir_all(&other);
         }
 
         assert_eq!(take_write_log(), vec![
@@ -3481,7 +3481,7 @@ pub(crate) mod tests {
         update_pallet_head("main", Some(&hash('c')), &hash('a'), &RefPreconditions::NONE).unwrap();
         assert!(take_write_log().is_empty(), "taking the log must stop recording");
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -3510,7 +3510,7 @@ pub(crate) mod tests {
         update_pallet_head("main", Some(&hash('a')), &hash('c'), &RefPreconditions::NONE).unwrap();
         assert_eq!(get_pallet_head("main").unwrap(), Some(hash('c')));
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -3542,7 +3542,7 @@ pub(crate) mod tests {
         writer.join().unwrap().unwrap();
         assert_eq!(get_pallet_head("main").unwrap(), Some(hash('b')));
 
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -3655,7 +3655,7 @@ pub(crate) mod tests {
         file_utils::rename(folder.join("X"), folder.join("x2")).unwrap();
         assert_eq!(list_pallets_in(PalletNamespace::User).unwrap(), vec!["feature/x2", "main", "mainline"]);
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     /// The files a file browser leaves in any folder it opens are not ref files and never valid
@@ -3672,7 +3672,7 @@ pub(crate) mod tests {
 
         assert_eq!(list_pallets_in(PalletNamespace::User).unwrap(), vec!["feature/x"]);
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     /// The temp an atomic ref write stages beside the ref is never a pallet name, in either
@@ -3699,7 +3699,7 @@ pub(crate) mod tests {
             assert_eq!(file_utils::staged_temp_base(not_a_temp), None, "the recognizer must refuse {}", not_a_temp);
         }
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     /// What a ref write killed between its temp write and its rename leaves beside the ref, at the
@@ -3720,7 +3720,7 @@ pub(crate) mod tests {
         assert!(refs.iter().all(|(_, head)| *head != hash('c')), "a temp's head must not be a ref: {:?}", refs);
         assert_eq!(refs.len(), 2, "{:?}", refs);
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     /// A pallet whose name is a temp name under the old `.tmp<pid>-<n>` spelling survives a write
@@ -3756,7 +3756,7 @@ pub(crate) mod tests {
             for victim in &victims {
                 assert!(listed.contains(victim), "the pallet {} must survive a write to x", victim);
                 assert_eq!(get_pallet_head(victim).unwrap().as_deref(), Some(hash('c').as_str()));
-                std::fs::remove_file(get_pallet_ref_path(PalletNamespace::User, victim)).unwrap();
+                file_utils::remove_file(get_pallet_ref_path(PalletNamespace::User, victim)).unwrap();
             }
             assert_eq!(get_pallet_head("x").unwrap().as_deref(), Some(new.as_str()));
 
@@ -3767,7 +3767,7 @@ pub(crate) mod tests {
         }
         assert!(certified, "the write never drew a counter value inside the victims' window");
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     /// The listing skips only the exact temp spelling of a valid ref name: a ref file whose name
@@ -3784,7 +3784,7 @@ pub(crate) mod tests {
             assert!(error.contains(&format!("\"{}\" is not a valid pallet name", impostor))
                 && error.contains("does not name a valid pallet"), "{}", error);
 
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
     }
 
@@ -3869,7 +3869,7 @@ pub(crate) mod tests {
 
             assert_eq!(get_pallet_head("gone").unwrap(), None);
             assert_eq!(tombstone_utils::read_tombstones().unwrap(), BTreeMap::from([("gone".to_string(), hash('b'))]));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
 
         #[test]
@@ -3881,7 +3881,7 @@ pub(crate) mod tests {
 
             assert!(refused.to_string().contains("never been served"), "{}", refused);
             assert_eq!(get_pallet_head("gone").unwrap(), Some(hash('a')), "nothing was removed");
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
 
         #[test]
@@ -3894,7 +3894,7 @@ pub(crate) mod tests {
 
             assert!(matches!(refused, Err(RefUpdateError::Moved(_))), "{:?}", refused);
             assert!(tombstone_utils::read_tombstones().unwrap().is_empty());
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
 
         /// A served root with pallet "gone" deleted at `hash('a')`.
@@ -3917,7 +3917,7 @@ pub(crate) mod tests {
 
             assert!(matches!(&refused, Err(RefUpdateError::Failed(_))), "{:?}", refused);
             assert_eq!(tombstone_utils::tombstone_heads().unwrap(), vec![hash('a')], "the tombstone stands");
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
 
         #[test]
@@ -3931,7 +3931,7 @@ pub(crate) mod tests {
             assert!(refused.to_string().contains("forklift pallet restore gone"), "{}", refused);
             assert_eq!(get_pallet_head("gone").unwrap(), None);
             assert_eq!(tombstone_utils::tombstone_heads().unwrap(), vec![hash('a')], "the tombstone stands");
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
 
         #[test]
@@ -3945,7 +3945,7 @@ pub(crate) mod tests {
             assert!(matches!(&refused, RefUpdateError::Deleted { acknowledged: false, .. }), "another head acknowledges nothing: {:?}", refused);
 
             assert_eq!(get_pallet_head("gone").unwrap(), None);
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
 
         #[test]
@@ -3957,7 +3957,7 @@ pub(crate) mod tests {
 
             assert_eq!(get_pallet_head("gone").unwrap(), Some(on_it));
             assert!(tombstone_utils::read_tombstones().unwrap().is_empty(), "the re-creation clears the tombstone");
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
 
         #[test]
@@ -3968,7 +3968,7 @@ pub(crate) mod tests {
 
             assert_eq!(get_pallet_head("fresh").unwrap(), Some(hash('z')));
             assert_eq!(tombstone_utils::tombstone_heads().unwrap(), vec![hash('a')]);
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
 
         #[test]
@@ -3989,7 +3989,7 @@ pub(crate) mod tests {
 
             let refused = tombstone_utils::restore_pallet("gone").unwrap_err();
             assert!(refused.contains("No deleted pallet \"gone\""), "{}", refused);
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
     }
 
@@ -4023,7 +4023,7 @@ pub(crate) mod tests {
 
             assert!(matches!(&refused, Err(RefUpdateError::Backward { pallet, head }) if pallet.to_wire() == "main" && *head == next), "{:?}", refused);
             assert_eq!(get_pallet_head("main").unwrap(), Some(next), "nothing was written");
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
 
         // Revert: refuse whatever the mark says → the unserved root's move back is refused.
@@ -4034,7 +4034,7 @@ pub(crate) mod tests {
             update_pallet_head("main", Some(&next), &base, &RefPreconditions::NONE).unwrap();
 
             assert_eq!(get_pallet_head("main").unwrap(), Some(base));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
 
         // Revert: refuse every served move → the move forward is refused.
@@ -4046,7 +4046,7 @@ pub(crate) mod tests {
             update_pallet_head("main", Some(&next), &after, &RefPreconditions::NONE).unwrap();
 
             assert_eq!(get_pallet_head("main").unwrap(), Some(after));
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
 
         /// A served root with meta pallet `name` at `next`, a child of `base`.
@@ -4071,7 +4071,7 @@ pub(crate) mod tests {
             assert!(matches!(&refused, Err(RefUpdateError::Backward { pallet, head }) if pallet.to_wire() == "@kv" && *head == next), "{:?}", refused);
             assert!(refused.unwrap_err().to_string().contains("\"@kv\" off"));
             assert_eq!(get_meta_pallet_head("kv").unwrap(), Some(next), "nothing was written");
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
 
         // Revert: hold meta pallets to the user rule (refuse whatever does not descend) → the
@@ -4094,7 +4094,7 @@ pub(crate) mod tests {
             // And forward, as ever.
             let forward = child_of(&get_meta_pallet_head("kv").unwrap().unwrap(), "forward");
             update_meta_pallet_head("kv", get_meta_pallet_head("kv").unwrap().as_deref(), &forward, &RefPreconditions::NONE).unwrap();
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
 
         // Revert: drop the in-hold re-read of the mark → the move judged unserved before the lock
@@ -4111,7 +4111,7 @@ pub(crate) mod tests {
 
             assert!(matches!(&refused, Err(RefUpdateError::Backward { .. })), "{:?}", refused);
             assert_eq!(get_pallet_head("main").unwrap(), Some(next), "nothing was written");
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = file_utils::remove_dir_all(&root);
         }
     }
 
@@ -4133,7 +4133,7 @@ pub(crate) mod tests {
         assert!(pallets.is_dir(), "the pallets folder itself is never removed");
         assert!(all_pallet_refs().unwrap().is_empty());
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -4145,7 +4145,7 @@ pub(crate) mod tests {
         remove_pallet_head_in(PalletNamespace::User, "gone", &hash('a'), &RefPreconditions::NONE, Some(&deleting("gone", &hash('a')))).unwrap();
 
         assert_eq!(take_write_log(), vec![("gone".to_string(), Some(hash('a')), None)]);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -4174,7 +4174,7 @@ pub(crate) mod tests {
         assert_eq!(get_pallet_head("main").unwrap(), Some(hash('a')));
         assert_eq!(crate::util::journal_utils::peek().unwrap(), None, "nothing is journaled");
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -4200,7 +4200,7 @@ pub(crate) mod tests {
 
         remove_pallet_head_in(PalletNamespace::User, "victim", &hash('a'), &witness("holder", &hash('c')), Some(&deleting("victim", &hash('a')))).unwrap();
         assert_eq!(get_pallet_head("victim").unwrap(), None);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -4222,7 +4222,7 @@ pub(crate) mod tests {
 
         let ledger = crate::util::fetch_ledger::read_ledger().unwrap();
         assert!(ledger.iter().any(|entry| entry.head == hash('b') && entry.pallet == "sparse"), "{:?}", ledger);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     #[test]
@@ -4246,7 +4246,7 @@ pub(crate) mod tests {
         assert!(matches!(update_pallet_head("team", None, &hash('b'), &RefPreconditions::NONE),
                          Err(RefUpdateError::Failed(message)) if message.contains("a folder stands")));
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
     }
 }
 
