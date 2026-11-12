@@ -2500,10 +2500,34 @@ mod tests {
         assert!(store_object_stream(&empty.hash, &mut reader, empty.content.len() as u64).unwrap());
     }
 
+    /// A tree whose header declares it past the whole-object ceiling is never held by the form
+    /// check, while one under it is, and both are judged as before once the stream ends.
+    ///
+    /// Revert: buffer every tree from its header on → the declared-over-ceiling one is held.
+    #[test]
+    fn the_form_check_never_holds_a_tree_declared_past_the_ceiling() {
+        let header = |body_len: usize| {
+            let mut header = byte_utils::number_to_vlq_bytes(LooseObjectVersion::latest().get_code());
+            header.extend(byte_utils::number_to_vlq_bytes(ObjectType::Tree.get_code()));
+            header.extend(byte_utils::number_to_vlq_bytes(body_len as u64));
+            header.push(0);
+            header
+        };
+
+        let mut over = ObjectFormCheck::new("over");
+        over.update(&header(MAX_OBJECT_BYTES)).expect("a header");
+        over.update(&[0u8; 1024]).expect("some body");
+        assert!(over.structured.is_none() && over.over_ceiling, "a declared-over-ceiling tree is held");
+        assert!(over.finish().expect_err("over the ceiling").contains("ceiling"));
+
+        let mut under = ObjectFormCheck::new("under");
+        under.update(&header(16)).expect("a header");
+        assert!(under.structured.is_some() && !under.over_ceiling, "a small tree is held to be parsed");
+    }
+
     /// A tree streamed above the whole-object ceiling is refused only once its bytes are whole and
-    /// verified: a short stream reads as truncation, not as policy. (That it is never buffered
-    /// follows from the refusal replacing the header before the buffer is made; this test does
-    /// not measure memory.)
+    /// verified: a short stream reads as truncation, not as policy. (That it is never buffered is
+    /// the test above's.)
     ///
     /// Revert: refuse it as soon as the header is read → the short stream reports the ceiling.
     #[test]
