@@ -19,7 +19,7 @@ pub enum Kind {
     FlipByte,
     /// Overwrite every byte with zero, keeping the length.
     Zero,
-    /// Remove it.
+    /// Remove it; a folder is removed with everything in it.
     Delete,
     /// Create it, for a lock file that only exists while a command holds it: planting it is how its
     /// scenario creates the path.
@@ -78,6 +78,10 @@ pub fn apply(path: &Path, kind: Kind, seed: u64) -> Result<(), DamageError> {
             std::fs::write(path, b"").map_err(io)
         }
         _ if !exists => Err(DamageError::TargetAbsent(path.display().to_string())),
+        Kind::Delete if std::fs::symlink_metadata(path).map_err(io)?.is_dir() => {
+            #[allow(clippy::disallowed_methods)] // a harness fault, on a scratch copy; no retry is wanted
+            std::fs::remove_dir_all(path).map_err(io)
+        }
         Kind::Delete => {
             #[allow(clippy::disallowed_methods)] // a harness fault, on a scratch copy; no retry is wanted
             std::fs::remove_file(path).map_err(io)
@@ -150,5 +154,22 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), [b'a', !b'b', b'c', b'd']);
         apply(&target, Kind::Truncate, 0).unwrap();
         assert_eq!(std::fs::read(&target).unwrap().len(), 2);
+    }
+
+    /// A folder binding's Delete removes the folder and what it holds; a file's removes the file.
+    ///
+    /// Revert: delete a folder with remove_file → every folder binding errors at run time.
+    #[test]
+    fn delete_removes_a_folder_whole() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("proof-load-damage-folder-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(dir.join("objects/ab")).unwrap();
+        std::fs::write(dir.join("objects/ab/cd"), b"object").unwrap();
+        std::fs::write(dir.join("warehouse"), b"marker").unwrap();
+
+        apply(&dir.join("objects"), Kind::Delete, 0).unwrap();
+        assert!(std::fs::symlink_metadata(dir.join("objects")).is_err());
+        apply(&dir.join("warehouse"), Kind::Delete, 0).unwrap();
+        assert!(std::fs::symlink_metadata(dir.join("warehouse")).is_err());
     }
 }

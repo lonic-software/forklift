@@ -7,7 +7,6 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use proof_load::census::Census;
 use proof_load::corpus;
-use proof_load::damage;
 use proof_load::runner;
 use proof_load::scenario::{self, Tool};
 use proof_load::scrub::Environment;
