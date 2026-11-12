@@ -384,7 +384,7 @@ pub fn endorse_key(public_key_hex: &str,
                    pop_hex: &str,
                    issued_at: i64) -> Result<KeyRecord, String> {
     let pop_signature = sign_utils::from_hex(pop_hex)
-        .map_err(|_| "The proof-of-possession is not valid hex.".to_string())?;
+        .map_err(|_| "The proof-of-possession is not lower-case hex.".to_string())?;
 
     let pop_valid = sign_utils::verify_message(
         public_key_hex,
@@ -1871,7 +1871,7 @@ fn key_id_of(public_key_hex: &str) -> Result<String, String> {
     let key_bytes = sign_utils::from_hex(public_key_hex).map_err(|_| {
         let shown: String = public_key_hex.chars().take(80).collect();
         let more = if shown.len() < public_key_hex.len() { "…" } else { "" };
-        format!("The public key {:?}{} is not valid hex.", shown, more)
+        format!("The public key {:?}{} is not lower-case hex.", shown, more)
     })?;
 
     Ok(sign_utils::key_id_for_public_key(&key_bytes))
@@ -3218,7 +3218,7 @@ pub(crate) mod tests {
 
         let error = parse_key_record(&key_record_for(&public_key.to_uppercase(), "")).err()
             .expect("an upper-case public key is a second spelling of the same key");
-        assert!(error.contains("not valid hex"), "{}", error);
+        assert!(error.contains("not lower-case hex"), "{}", error);
     }
 
     /// Any bytes the user- and key-record parsers accept are exactly what their writers produce

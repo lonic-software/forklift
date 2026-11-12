@@ -190,7 +190,9 @@ pub fn admit(operator_id: &str,
         }
     }
 
-    let key_bytes = sign_utils::from_hex(public_key)
+    // Typed input: either case is accepted here, and the record stores the one spelling.
+    let public_key = public_key.to_lowercase();
+    let key_bytes = sign_utils::from_hex(&public_key)
         .map_err(|_| "The public key is not valid hex.".to_string())?;
 
     if key_bytes.len() != 32 {
@@ -201,7 +203,6 @@ pub fn admit(operator_id: &str,
         return Err(format!("\"{}\" is already enrolled.", operator_id));
     }
 
-    let public_key = public_key.to_lowercase();
     let key_id = sign_utils::key_id_for_public_key(&key_bytes);
 
     if state.find_key(&key_id).is_some() {
@@ -216,7 +217,7 @@ pub fn admit(operator_id: &str,
 
     // This key becomes the identity root the office pins; the admin's endorsement
     // authorizes it here, the proof-of-possession proves the operator holds it.
-    let key = office_utils::endorse_key(&public_key, operator_id, &signing_key_id, pop, now)?;
+    let key = office_utils::endorse_key(&public_key, operator_id, &signing_key_id, &pop.to_lowercase(), now)?;
 
     state.users.push(UserRecord {
         identifier: operator_id.to_string(),
@@ -269,14 +270,15 @@ pub fn link(public_key: &str, pop: &str) -> Result<(), String> {
     let actor = config_utils::get_operator()?;
     let SigningActor { mut state, office_head, signing_key_id, actor_id, anchor_bytes } = require_signing_actor(&actor)?;
 
-    let key_bytes = sign_utils::from_hex(public_key)
+    // Typed input: either case is accepted here, and the record stores the one spelling.
+    let public_key = public_key.to_lowercase();
+    let key_bytes = sign_utils::from_hex(&public_key)
         .map_err(|_| "The public key is not valid hex.".to_string())?;
 
     if key_bytes.len() != 32 {
         return Err("The public key must be 32 bytes (64 hex characters).".to_string());
     }
 
-    let public_key = public_key.to_lowercase();
     let key_id = sign_utils::key_id_for_public_key(&key_bytes);
 
     if state.find_key(&key_id).is_some() {
@@ -288,7 +290,7 @@ pub fn link(public_key: &str, pop: &str) -> Result<(), String> {
     // The proof-of-possession binds the new key to the operator id, so it only
     // verifies when the other device is configured with the same operator id
     // (or the same profile).
-    let key = office_utils::endorse_key(&public_key, &actor_id, &signing_key_id, pop, now)?;
+    let key = office_utils::endorse_key(&public_key, &actor_id, &signing_key_id, &pop.to_lowercase(), now)?;
 
     state.keys.push(key);
 
@@ -332,14 +334,15 @@ pub fn authorize(operator_id: &str, public_key: &str, pop: &str) -> Result<(), S
         ));
     }
 
-    let key_bytes = sign_utils::from_hex(public_key)
+    // Typed input: either case is accepted here, and the record stores the one spelling.
+    let public_key = public_key.to_lowercase();
+    let key_bytes = sign_utils::from_hex(&public_key)
         .map_err(|_| "The public key is not valid hex.".to_string())?;
 
     if key_bytes.len() != 32 {
         return Err("The public key must be 32 bytes (64 hex characters).".to_string());
     }
 
-    let public_key = public_key.to_lowercase();
     let key_id = sign_utils::key_id_for_public_key(&key_bytes);
 
     if state.find_key(&key_id).is_some() {
@@ -350,7 +353,7 @@ pub fn authorize(operator_id: &str, public_key: &str, pop: &str) -> Result<(), S
 
     // Cross-identity endorsement: valid because the authorizer is an admin here (the
     // audit enforces the same scope rule on every copy, the remote included).
-    let key = office_utils::endorse_key(&public_key, operator_id, &signing_key_id, pop, now)?;
+    let key = office_utils::endorse_key(&public_key, operator_id, &signing_key_id, &pop.to_lowercase(), now)?;
 
     state.keys.push(key);
 
