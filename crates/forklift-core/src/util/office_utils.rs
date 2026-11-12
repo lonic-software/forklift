@@ -3208,6 +3208,19 @@ pub(crate) mod tests {
         file_utils::remove_dir_all(&dir).ok();
     }
 
+    /// Hex has one spelling too. An upper-cased public key decodes to the same key, and an
+    /// upper-cased signature to the same signature, so accepting either would give a key record a
+    /// second spelling that verifies. Revert: let `from_hex` accept upper-case → the record parses.
+    #[test]
+    fn a_key_record_in_upper_case_hex_is_refused() {
+        let (public_key, _) = bound_key(0xab);
+        assert!(parse_key_record(&key_record_for(&public_key, "")).is_ok());
+
+        let error = parse_key_record(&key_record_for(&public_key.to_uppercase(), "")).err()
+            .expect("an upper-case public key is a second spelling of the same key");
+        assert!(error.contains("not valid hex"), "{}", error);
+    }
+
     /// Any bytes the user- and key-record parsers accept are exactly what their writers produce
     /// for the record they parsed to. Both records are signed through their office parcel, so a
     /// second spelling would be a second byte string carrying one grant or one key's meaning.

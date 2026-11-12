@@ -92,7 +92,8 @@ anything is stored. The spelling is part of the format:
 A cell's lines are its stamp, `schema`, `[value]`, then the value's entries with their keys
 sorted (by their text, also inside nested tables). An office record's fields come in the order
 its example below shows; the comments there are illustration, and a record holding one is
-refused.
+refused. Hex in a record (a key, a signature, a key id) is lower-case: readers refuse upper-case
+hex rather than decode it to the same bytes.
 
 A cell value holds only strings, integers, booleans, arrays and tables. Floats and date-times
 have several spellings of one value, so a cell cannot hold one, and a time is written as integer
@@ -100,8 +101,7 @@ seconds instead. This binds future schemas too: a schema that needs another kind
 with a new `format` marker, which older readers refuse as written by a newer forklift.
 
 Reads are tolerant per cell. A cell with an unknown schema, or one that does not parse or is
-not in its one spelling, is
-reported as that cell's row, and the other cells still read. A missing or unknown `format`
+not in its one spelling, is reported as that cell's row, and the other cells still read. A missing or unknown `format`
 refuses the whole pallet, naming it as written by an older or newer forklift. Writes leave
 every path they do not name byte-for-byte unchanged.
 

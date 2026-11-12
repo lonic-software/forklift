@@ -1779,7 +1779,14 @@ pub fn same_cell_re_signed(ours: &str, theirs: &str, office: &OfficeState) -> Re
 
     Ok(ours_operator == theirs_operator
         && ours.schema == theirs.schema
-        && ours.value.to_string() == theirs.value.to_string())
+        && matches!((value_spelling(&ours.value), value_spelling(&theirs.value)), (Some(a), Some(b)) if a == b))
+}
+
+/// A cell value's entries in their one spelling, or `None` when it holds a kind no cell can.
+fn value_spelling(value: &Table) -> Option<String> {
+    let mut out = String::new();
+    toml_spelling::write_sorted_entries(&mut out, value).ok()?;
+    Some(out)
 }
 
 /// The operator a cell's stamp lets a replay re-sign for: the one an unsigned cell declares, or

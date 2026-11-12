@@ -97,17 +97,29 @@ pub(crate) fn write_sorted_entries(out: &mut String, table: &Table) -> Result<()
     Ok(())
 }
 
+/// A table's entries, `Item::None` left out, sorted by their key's text: the one order for every
+/// table a record holds, top-level or nested, header or inline.
+fn sorted<'a, T>(entries: impl Iterator<Item = (&'a str, T)>) -> Vec<(&'a str, T)> {
+    let mut entries: Vec<(&str, T)> = entries.collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
+}
+
 fn sorted_items(table: &Table) -> Vec<(&str, &Item)> {
-    let mut items: Vec<(&str, &Item)> = table.iter().filter(|(_, item)| !item.is_none()).collect();
-    items.sort_by(|a, b| a.0.cmp(b.0));
-    items
+    sorted(table.iter().filter(|(_, item)| !item.is_none()))
+}
+
+/// A nested table's entry: a header or dotted table holds items, an inline table holds values.
+enum Node<'a> {
+    Item(&'a Item),
+    Value(&'a Value),
 }
 
 fn write_item(out: &mut String, item: &Item) -> Result<(), &'static str> {
     match item {
         Item::None => Ok(()),
         Item::Value(value) => write_value(out, value),
-        Item::Table(table) => write_inline(out, sorted_items(table).into_iter().map(|(key, item)| (key, Entry::Item(item)))),
+        Item::Table(table) => write_inline(out, sorted_items(table).into_iter().map(|(key, item)| (key, Node::Item(item))).collect()),
         Item::ArrayOfTables(tables) => {
             out.push('[');
 
@@ -116,7 +128,7 @@ fn write_item(out: &mut String, item: &Item) -> Result<(), &'static str> {
                     out.push_str(", ");
                 }
 
-                write_item(out, &Item::Table(table.clone()))?;
+                write_inline(out, sorted_items(table).into_iter().map(|(key, item)| (key, Node::Item(item))).collect())?;
             }
 
             out.push(']');
@@ -125,14 +137,8 @@ fn write_item(out: &mut String, item: &Item) -> Result<(), &'static str> {
     }
 }
 
-enum Entry<'a> {
-    Item(&'a Item),
-    Value(&'a Value),
-}
-
-fn write_inline<'a>(out: &mut String, entries: impl Iterator<Item = (&'a str, Entry<'a>)>) -> Result<(), &'static str> {
-    let entries: Vec<_> = entries.collect();
-
+/// Sorted entries written as an inline table.
+fn write_inline(out: &mut String, entries: Vec<(&str, Node)>) -> Result<(), &'static str> {
     if entries.is_empty() {
         out.push_str("{}");
         return Ok(());
@@ -140,7 +146,7 @@ fn write_inline<'a>(out: &mut String, entries: impl Iterator<Item = (&'a str, En
 
     out.push_str("{ ");
 
-    for (index, (key, entry)) in entries.into_iter().enumerate() {
+    for (index, (key, node)) in entries.into_iter().enumerate() {
         if index > 0 {
             out.push_str(", ");
         }
@@ -148,9 +154,9 @@ fn write_inline<'a>(out: &mut String, entries: impl Iterator<Item = (&'a str, En
         write_key(out, key);
         out.push_str(" = ");
 
-        match entry {
-            Entry::Item(item) => write_item(out, item)?,
-            Entry::Value(value) => write_value(out, value)?,
+        match node {
+            Node::Item(item) => write_item(out, item)?,
+            Node::Value(value) => write_value(out, value)?,
         }
     }
 
@@ -176,11 +182,7 @@ fn write_value(out: &mut String, value: &Value) -> Result<(), &'static str> {
 
             out.push(']');
         }
-        Value::InlineTable(table) => {
-            let mut entries: Vec<(&str, &Value)> = table.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
-            return write_inline(out, entries.into_iter().map(|(key, value)| (key, Entry::Value(value))));
-        }
+        Value::InlineTable(table) => return write_inline(out, sorted(table.iter()).into_iter().map(|(key, value)| (key, Node::Value(value))).collect()),
         Value::Float(_) => return Err("a float"),
         Value::Datetime(_) => return Err("a date-time"),
     }

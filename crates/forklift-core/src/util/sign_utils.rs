@@ -841,9 +841,11 @@ pub fn to_hex(bytes: &[u8]) -> String {
     hex
 }
 
-/// Decode a lowercase/uppercase hex string into bytes.
+/// Decode a lower-case hex string, the one spelling [`to_hex`] writes, into bytes. Upper-case
+/// is refused: a signed record holding a key or a signature in hex would otherwise have a
+/// second spelling, with another hash, that decodes and verifies the same.
 pub fn from_hex(hex: &str) -> Result<Vec<u8>, ()> {
-    if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if hex.len() % 2 != 0 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         return Err(());
     }
 
@@ -864,6 +866,7 @@ mod tests {
         assert_eq!(from_hex(&to_hex(&bytes)).unwrap(), bytes);
         assert!(from_hex("0g").is_err());
         assert!(from_hex("abc").is_err());
+        assert!(from_hex("0A").is_err(), "upper-case hex is a second spelling of the same bytes");
     }
 
     #[test]
