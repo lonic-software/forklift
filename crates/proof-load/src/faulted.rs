@@ -94,25 +94,25 @@ pub struct Faulted {
 }
 
 /// The parts of a faulted run that stay fixed across its steps.
-struct Context<'a> {
-    corpus: &'a Corpus,
-    programs: &'a Programs,
-    scratch: &'a Scratch,
-    environment: &'a Environment,
-    limit: Duration,
+pub(crate) struct Context<'a> {
+    pub(crate) corpus: &'a Corpus,
+    pub(crate) programs: &'a Programs,
+    pub(crate) scratch: &'a Scratch,
+    pub(crate) environment: &'a Environment,
+    pub(crate) limit: Duration,
     /// What the faulted command runs after its record.
-    then: &'a [Op],
+    pub(crate) then: &'a [Op],
     /// The host's URL, when the scenario serves one.
-    url: Option<&'a str>,
+    pub(crate) url: Option<&'a str>,
     /// The folder the work tree is scoped to, when a sparse clone left it scoped.
-    scope: Option<&'a str>,
+    pub(crate) scope: Option<&'a str>,
     /// Read the history back through a fresh clone of the host rather than from the work tree:
     /// the damage is the host's.
-    via_host: bool,
+    pub(crate) via_host: bool,
 }
 
 impl Context<'_> {
-    fn run(&self, program: &Path, arguments: Vec<String>, directory: PathBuf) -> Result<Outcome, RunError> {
+    pub(crate) fn run(&self, program: &Path, arguments: Vec<String>, directory: PathBuf) -> Result<Outcome, RunError> {
         let invocation = Invocation { program: program.to_path_buf(), arguments, directory, limit: self.limit };
         tool::run(&invocation, self.scratch, self.environment).map_err(RunError::Tool)
     }
@@ -132,17 +132,8 @@ impl Context<'_> {
     /// The faulted command: corpus record `index` written into the work tree, then the record
     /// operation's lines and those of the scenario's `then` run in order until one fails.
     fn record(&self, index: usize, steps: &mut Vec<Outcome>) -> Result<bool, RunError> {
-        let snapshot = &self.corpus.records[index];
-        let snapshot = match self.scope { Some(scope) => corpus::within(snapshot, scope), None => snapshot.clone() };
-        corpus::write(&snapshot, &self.scratch.work()).map_err(|error| RunError::Io(error.to_string()))?;
-        let mut lines = Vec::new();
-        for op in std::iter::once(&Op::Record { index }).chain(self.then) {
-            for arguments in bind(Tool::Forklift, op).expect("Tool::Forklift binds every operation") {
-                lines.push(runner::fill(arguments, self.url, &self.scratch.work())
-                    .map_err(|placeholder| RunError::Io(format!("{:?} needs {} and the scenario hosts nothing", op, placeholder)))?);
-            }
-        }
-        for arguments in lines {
+        self.write_snapshot(index)?;
+        for arguments in self.lines(index)? {
             let outcome = self.run(&self.programs.forklift, arguments, self.scratch.work())?;
             let succeeded = outcome.succeeded();
             steps.push(outcome);
@@ -151,6 +142,26 @@ impl Context<'_> {
             }
         }
         Ok(true)
+    }
+
+    /// Writes corpus record `index` into the work tree, as the faulted command does first.
+    pub(crate) fn write_snapshot(&self, index: usize) -> Result<(), RunError> {
+        let snapshot = &self.corpus.records[index];
+        let snapshot = match self.scope { Some(scope) => corpus::within(snapshot, scope), None => snapshot.clone() };
+        corpus::write(&snapshot, &self.scratch.work()).map_err(|error| RunError::Io(error.to_string()))
+    }
+
+    /// The command lines of the faulted command for corpus record `index`: the record operation's,
+    /// then those of the scenario's `then`, in the order they run.
+    pub(crate) fn lines(&self, index: usize) -> Result<Vec<Vec<String>>, RunError> {
+        let mut lines = Vec::new();
+        for op in std::iter::once(&Op::Record { index }).chain(self.then) {
+            for arguments in bind(Tool::Forklift, op).expect("Tool::Forklift binds every operation") {
+                lines.push(runner::fill(arguments, self.url, &self.scratch.work())
+                    .map_err(|placeholder| RunError::Io(format!("{:?} needs {} and the scenario hosts nothing", op, placeholder)))?);
+            }
+        }
+        Ok(lines)
     }
 
     /// Reads every record in `marks` back through the tool. `expectation` gives what each may
@@ -368,7 +379,7 @@ fn next_record(acknowledged: &[Mark]) -> usize {
 }
 
 /// The expected trees of one faulted run.
-struct Expected {
+pub(crate) struct Expected {
     acknowledged: Vec<Mark>,
     faulted: Mark,
     before: oracle::Tree,
@@ -437,42 +448,47 @@ impl Trail {
     }
 }
 
-/// Runs one faulted run of `scenario`: damage `kind` to the path `name` resolves to after the
-/// build, then the faulted command, readback, a plain retry, the named remedies, and heal.
-#[allow(clippy::too_many_arguments)]
-pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, seed: u64) -> Result<Faulted, RunError> {
-    let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), scratch, environment, limit)?;
-    // What the build recorded: the corpus rooted under the scenario's scope, when it has one.
-    let corpus = &scenario.corpus(corpus);
-    let (walked, state) = match warehouse {
-        Warehouse::Client => (&built.walked, scratch.work().join(".forklift")),
-        Warehouse::Host if built.host.is_some() => (&built.host_walked, runner::host_root(scratch).join(".forklift")),
-        Warehouse::Host => return Err(RunError::Io(format!("{} damages a host, and {} hosts none", name, scenario.id))),
-    };
-    let target = resolve(name, walked, seed)
-        .ok_or_else(|| RunError::Io(format!("{} resolves to nothing {} built", name, scenario.id)))?;
-    damage::apply(&state.join(&target), kind, seed).map_err(|error| RunError::Io(format!("{:?}", error)))?;
-
+/// What the faulted command of a built scenario must leave readable: the record it writes, and
+/// what every record may then hold. Fails when the corpus has no record after the history's.
+pub(crate) fn expected(scenario: &Scenario, corpus: &Corpus, built: &runner::Built, warehouse: Warehouse) -> Result<(Expected, usize), RunError> {
     let faulted = next_record(&built.acknowledged);
     let snapshot = corpus.records.get(faulted)
         .ok_or_else(|| RunError::Io(format!("the faulted record {} is past the corpus's {} records", faulted, corpus.records.len())))?;
     let before = before_of(&built.acknowledged, corpus);
     let taken = built.taken.iter().map(|taken| (taken.digest.clone(), admissible(taken, scenario.withhold_reader(warehouse)))).collect();
-    let expected = Expected { before, after: corpus::expected(snapshot), acknowledged: built.acknowledged, faulted: Mark::Record(faulted), taken };
-    let context = Context {
-        corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.host.as_ref().map(|host| host.url.as_str()),
-        scope: scenario.scope(), via_host: warehouse == Warehouse::Host,
-    };
+    Ok((Expected { before, after: corpus::expected(snapshot), acknowledged: built.acknowledged.clone(), faulted: Mark::Record(faulted), taken }, faulted))
+}
+
+/// What the steps after a fault established, and the grade they earn.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Graded {
+    pub grade: Grade,
+    pub evidence: Evidence,
+    pub recoverability: Recoverability,
+    /// Every command from the fault on, in order: the faulted command, retries, remedies, heal.
+    pub steps: Vec<Outcome>,
+    pub readbacks: Vec<HistoryReadback>,
+    /// Remedies named in a form the harness does not run.
+    pub unextractable: Vec<String>,
+}
+
+/// Grades a fault: `first` is the faulted command's first attempt, pushing what it ran and saying
+/// whether the tool acknowledged the record. Then the readback, one plain retry, the remedies every
+/// refusal named, and heal.
+pub(crate) fn grade_after(
+    context: &Context, expected: &Expected, faulted: usize,
+    first: impl FnOnce(&Context, &mut Vec<Outcome>) -> Result<bool, RunError>,
+) -> Result<Graded, RunError> {
     let mut trail = Trail::default();
     let mut unextractable = Vec::new();
 
     // The faulted command, then one plain retry of it. Once the tool acknowledged the record it
     // stays owed, so a later attempt that refuses (a re-stack with nothing new) does not unmake it.
-    let mut made = context.record(faulted, &mut trail.steps)?;
-    let mut reads = trail.settle(&context, &expected, made)?;
+    let mut made = first(context, &mut trail.steps)?;
+    let mut reads = trail.settle(context, expected, made)?;
     if !reads {
         made |= context.record(faulted, &mut trail.steps)?;
-        reads = trail.settle(&context, &expected, made)?;
+        reads = trail.settle(context, expected, made)?;
     }
     trail.evidence.healed_by_retry = reads;
 
@@ -490,9 +506,9 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, co
                     if arguments.first().map(String::as_str) != Some("--json") {
                         arguments.insert(0, "--json".into());
                     }
-                    trail.steps.push(context.run(&programs.forklift, arguments, scratch.work())?);
+                    trail.steps.push(context.run(&context.programs.forklift, arguments, context.scratch.work())?);
                 }
-                Remedy::Remove { path } => match remedy::removable(path, scratch.root()) {
+                Remedy::Remove { path } => match remedy::removable(path, context.scratch.root()) {
                     Some(judged) => {
                         trail.recoverability.outside_knowledge.push(format!("remove {}", path.display()));
                         let _ = damage::apply(&judged, Kind::Delete, 0);
@@ -505,7 +521,7 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, co
         }
         if trail.evidence.remedy_named {
             made |= context.record(faulted, &mut trail.steps)?;
-            reads = trail.settle(&context, &expected, made)?;
+            reads = trail.settle(context, expected, made)?;
             trail.evidence.remedy_worked = reads;
             trail.recoverability.named_right_remedy = reads;
         }
@@ -513,14 +529,42 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, co
 
     // Heal last, when an acknowledged record still does not read back.
     if !trail.evidence.acknowledged_readable {
-        trail.steps.push(context.run(&programs.forklift, vec!["--json".into(), "heal".into()], scratch.work())?);
-        trail.settle(&context, &expected, made)?;
+        trail.steps.push(context.run(&context.programs.forklift, vec!["--json".into(), "heal".into()], context.scratch.work())?);
+        trail.settle(context, expected, made)?;
     }
 
-    Ok(Faulted {
-        scenario: scenario.id.clone(), name: name.to_string(), warehouse, kind, target,
+    Ok(Graded {
         grade: oracle::grade(&trail.evidence), evidence: trail.evidence, recoverability: trail.recoverability,
         steps: trail.steps, readbacks: trail.readbacks, unextractable,
+    })
+}
+
+/// Runs one faulted run of `scenario`: damage `kind` to the path `name` resolves to after the
+/// build, then the faulted command, readback, a plain retry, the named remedies, and heal.
+#[allow(clippy::too_many_arguments)]
+pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, seed: u64) -> Result<Faulted, RunError> {
+    let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), scratch, environment, limit)?;
+    // What the build recorded: the corpus rooted under the scenario's scope, when it has one.
+    let corpus = &scenario.corpus(corpus);
+    let (walked, state) = match warehouse {
+        Warehouse::Client => (&built.walked, scratch.work().join(".forklift")),
+        Warehouse::Host if built.host.is_some() => (&built.host_walked, runner::host_root(scratch).join(".forklift")),
+        Warehouse::Host => return Err(RunError::Io(format!("{} damages a host, and {} hosts none", name, scenario.id))),
+    };
+    let target = resolve(name, walked, seed)
+        .ok_or_else(|| RunError::Io(format!("{} resolves to nothing {} built", name, scenario.id)))?;
+    damage::apply(&state.join(&target), kind, seed).map_err(|error| RunError::Io(format!("{:?}", error)))?;
+
+    let (expected, faulted) = expected(scenario, corpus, &built, warehouse)?;
+    let context = Context {
+        corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.host.as_ref().map(|host| host.url.as_str()),
+        scope: scenario.scope(), via_host: warehouse == Warehouse::Host,
+    };
+    let graded = grade_after(&context, &expected, faulted, |context, steps| context.record(faulted, steps))?;
+    Ok(Faulted {
+        scenario: scenario.id.clone(), name: name.to_string(), warehouse, kind, target,
+        grade: graded.grade, evidence: graded.evidence, recoverability: graded.recoverability,
+        steps: graded.steps, readbacks: graded.readbacks, unextractable: graded.unextractable,
     })
 }
 

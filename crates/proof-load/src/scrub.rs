@@ -111,6 +111,17 @@ impl Scratch {
         Ok(scratch)
     }
 
+    /// A copy of this whole area, HOME and TMPDIR included, at `root`, which must not exist yet: the
+    /// fresh start an injected run gets, so runs on copies of one area are independent of each
+    /// other and of it. Symlinks are copied as links, never followed.
+    pub fn copy_to(&self, root: &Path) -> Result<Scratch, CopyOnlyError> {
+        if std::fs::symlink_metadata(root).is_ok() {
+            return Err(CopyOnlyError::ScratchExists(root.to_path_buf()));
+        }
+        copy_tree(&self.root, root)?;
+        Ok(Scratch { root: root.to_path_buf() })
+    }
+
     pub fn root(&self) -> &Path { &self.root }
     pub fn home(&self) -> PathBuf { self.root.join("home") }
     pub fn tmp(&self) -> PathBuf { self.root.join("tmp") }
@@ -119,6 +130,29 @@ impl Scratch {
     pub fn work(&self) -> PathBuf { self.root.join("work") }
     pub fn git_global_config(&self) -> PathBuf { self.root.join("gitconfig-global") }
     pub fn git_system_config(&self) -> PathBuf { self.root.join("gitconfig-system") }
+}
+
+/// Copies the tree at `from` to `to`: folders with their permissions, files with their bytes and
+/// permissions, symlinks as links.
+fn copy_tree(from: &Path, to: &Path) -> Result<(), CopyOnlyError> {
+    let metadata = std::fs::symlink_metadata(from).map_err(io(from))?;
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(from).map_err(io(from))?;
+        #[cfg(unix)]
+        return std::os::unix::fs::symlink(&target, to).map_err(io(to));
+        #[cfg(not(unix))]
+        return Err(CopyOnlyError::Io { path: from.to_path_buf(), reason: format!("a symlink to {} is not copied on this platform", target.display()) });
+    }
+    if metadata.is_dir() {
+        std::fs::create_dir(to).map_err(io(to))?;
+        let mut entries: Vec<_> = std::fs::read_dir(from).map_err(io(from))?.collect::<Result<_, _>>().map_err(io(from))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        return std::fs::set_permissions(to, metadata.permissions()).map_err(io(to));
+    }
+    std::fs::copy(from, to).map(|_| ()).map_err(io(from))
 }
 
 /// The git config the harness writes for both the global and the system level: an identity, so git
@@ -212,6 +246,29 @@ mod tests {
         let path = std::env::temp_dir().join(format!("proof-load-{}-{}-{}", name, std::process::id(), nanos));
         assert!(std::fs::symlink_metadata(&path).is_err(), "the test's path is fresh");
         path
+    }
+
+    /// A copy holds every folder, file and link of the area, is independent of it, and is never
+    /// made over something that exists.
+    ///
+    /// Revert: follow symlinks → the link's target is copied as a file; skip the existence check →
+    /// a copy lands inside an existing area.
+    #[cfg(unix)]
+    #[test]
+    fn a_scratch_copy_is_whole_and_independent() {
+        let scratch = Scratch::create(&fresh("copy-source")).unwrap();
+        std::fs::create_dir_all(scratch.work().join(".forklift/objects/ab")).unwrap();
+        std::fs::write(scratch.work().join(".forklift/objects/ab/cd"), b"object").unwrap();
+        std::fs::write(scratch.home().join("config"), b"home").unwrap();
+        std::os::unix::fs::symlink("objects/ab/cd", scratch.work().join(".forklift/link")).unwrap();
+        let copy = scratch.copy_to(&fresh("copy-target")).unwrap();
+        assert_eq!(std::fs::read(copy.work().join(".forklift/objects/ab/cd")).unwrap(), b"object");
+        assert_eq!(std::fs::read(copy.home().join("config")).unwrap(), b"home");
+        assert_eq!(std::fs::read(copy.git_global_config()).unwrap(), GIT_CONFIG.as_bytes());
+        assert_eq!(std::fs::read_link(copy.work().join(".forklift/link")).unwrap(), PathBuf::from("objects/ab/cd"));
+        std::fs::write(copy.work().join(".forklift/objects/ab/cd"), b"changed").unwrap();
+        assert_eq!(std::fs::read(scratch.work().join(".forklift/objects/ab/cd")).unwrap(), b"object");
+        assert!(matches!(scratch.copy_to(copy.root()), Err(CopyOnlyError::ScratchExists(_))));
     }
 
     /// Revert: accept an existing non-empty directory → the user's data becomes a target.
