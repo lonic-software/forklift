@@ -4806,40 +4806,54 @@ mod tests {
         let _ = remove_dir_all(&dir);
     }
 
-    /// A handle on the folder itself refuses its removal; `remove_dir` (an empty folder) and
-    /// `remove_dir_all` (a folder with a file in it) both wait for the hold to lift.
+    /// Removes `folder` while a handle on the folder itself, without FILE_SHARE_DELETE, holds it:
+    /// `unretried` is shown to refuse with a held error, then `remove` waits for the hold to lift.
+    #[cfg(windows)]
+    fn removal_waits_for_a_held_folder(
+        folder: &Path,
+        unretried: impl Fn(&Path) -> std::io::Result<()>,
+        remove: impl Fn(&Path) -> std::io::Result<()>,
+    ) {
+        let hold = hold_folder_without_share_delete(folder);
+
+        let refused = unretried(folder).unwrap_err();
+        assert!(is_held_by_another_process(&refused), "{:?}", refused);
+        assert!(folder.exists());
+
+        let releaser = release_later(hold, std::time::Duration::from_millis(200));
+        remove(folder).unwrap();
+        releaser.join().unwrap();
+
+        assert!(!folder.exists());
+    }
+
+    /// A handle on an empty folder refuses its removal; `remove_dir` waits for the hold to lift.
     #[cfg(windows)]
     #[test]
-    fn a_held_folder_is_removed_once_the_hold_lifts() {
-        let dir = held_rename_dir("delete-folder");
+    fn a_held_empty_folder_is_removed_once_the_hold_lifts() {
+        let dir = held_rename_dir("delete-empty-folder");
+        let folder = dir.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
 
-        type Remove = fn(&Path) -> std::io::Result<()>;
+        #[allow(clippy::disallowed_methods)] // the unretried removal the hold is shown to refuse
+        let unretried = |p: &Path| std::fs::remove_dir(p);
+        removal_waits_for_a_held_folder(&folder, unretried, |p| remove_dir(p));
+        let _ = remove_dir_all(&dir);
+    }
 
-        #[allow(clippy::disallowed_methods)] // the unretried removals the hold is shown to refuse
-        let cases: [(&str, Remove, Remove); 2] = [
-            ("remove_dir", |p| std::fs::remove_dir(p), |p| remove_dir(p)),
-            ("remove_dir_all", |p| std::fs::remove_dir_all(p), |p| remove_dir_all(p)),
-        ];
+    /// The same for a folder with a file in it: `remove_dir_all` removes the file, is refused the
+    /// folder, and waits for the hold to lift.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_folder_with_contents_is_removed_once_the_hold_lifts() {
+        let dir = held_rename_dir("delete-full-folder");
+        let folder = dir.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("inside"), b"x").unwrap();
 
-        for (name, unretried, remove) in cases {
-            let folder = dir.join(name);
-            std::fs::create_dir_all(&folder).unwrap();
-            if name == "remove_dir_all" {
-                std::fs::write(folder.join("inside"), b"x").unwrap();
-            }
-            let hold = hold_folder_without_share_delete(&folder);
-
-            let refused = unretried(&folder).unwrap_err();
-            assert!(is_held_by_another_process(&refused), "{}: {:?}", name, refused);
-            assert!(folder.exists(), "{}", name);
-
-            let releaser = release_later(hold, std::time::Duration::from_millis(200));
-            remove(&folder).unwrap_or_else(|e| panic!("{}: {}", name, e));
-            releaser.join().unwrap();
-
-            assert!(!folder.exists(), "{}", name);
-        }
-
+        #[allow(clippy::disallowed_methods)] // the unretried removal the hold is shown to refuse
+        let unretried = |p: &Path| std::fs::remove_dir_all(p);
+        removal_waits_for_a_held_folder(&folder, unretried, |p| remove_dir_all(p));
         let _ = remove_dir_all(&dir);
     }
 
