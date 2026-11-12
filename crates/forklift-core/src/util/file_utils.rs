@@ -7402,3 +7402,80 @@ mod tests {
         }
     }
 }
+
+/// FORK-284 probe: which operations a held file refuses on Windows. Temporary; it always fails so
+/// CI prints its table.
+#[cfg(all(test, windows))]
+mod fork284_probe {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    fn outcome(result: std::io::Result<()>) -> String {
+        match result {
+            Ok(()) => "ok".into(),
+            Err(e) => format!("err {:?} ({:?})", e.raw_os_error(), e.kind()),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn fork284_probe_table() {
+        let base = std::env::temp_dir().join(format!("forklift-fork284-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut rows = Vec::new();
+
+        let modes: [(&str, u32); 4] = [
+            ("R|W", FILE_SHARE_READ | FILE_SHARE_WRITE),
+            ("R", FILE_SHARE_READ),
+            ("R|W|D", FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+            ("R|D", FILE_SHARE_READ | FILE_SHARE_DELETE),
+        ];
+
+        type Op = fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>;
+        let ops: [(&str, Op); 10] = [
+            ("remove_file", |f, _| std::fs::remove_file(f)),
+            ("remove_dir_all(parent)", |_, d| std::fs::remove_dir_all(d)),
+            ("File::create", |f, _| std::fs::File::create(f).map(drop)),
+            ("fs::write", |f, _| std::fs::write(f, b"new")),
+            ("open write+truncate", |f, _| std::fs::OpenOptions::new().write(true).truncate(true).open(f).map(drop)),
+            ("open write (no trunc)", |f, _| std::fs::OpenOptions::new().write(true).open(f).map(drop)),
+            ("open create_new sibling", |_, d| std::fs::OpenOptions::new().write(true).create_new(true).open(d.join("sib")).map(drop)),
+            ("fs::copy onto held", |f, d| { std::fs::write(d.join("src"), b"s")?; std::fs::copy(d.join("src"), f).map(drop) }),
+            ("rename held away", |f, d| std::fs::rename(f, d.join("moved"))),
+            ("remove_dir_all(grandparent)", |_, d| std::fs::remove_dir_all(d.parent().unwrap())),
+        ];
+
+        for (mode_name, mode) in modes {
+            for (op_name, op) in ops {
+                let outer = base.join(format!("{}-{}", mode_name.replace('|', ""), op_name.replace(|c: char| !c.is_alphanumeric(), "")));
+                let dir = outer.join("d");
+                std::fs::create_dir_all(&dir).unwrap();
+                let file = dir.join("held");
+                std::fs::write(&file, b"old").unwrap();
+                let hold = std::fs::OpenOptions::new().read(true).share_mode(mode).open(&file).unwrap();
+                let result = outcome(op(&file, &dir));
+                let after = format!("file_exists={} dir_exists={}", file.exists(), dir.exists());
+                drop(hold);
+                let after_drop = format!("file_exists={} dir_exists={}", file.exists(), dir.exists());
+                rows.push(format!("{:6} | {:28} | {:40} | held: {} | released: {}", mode_name, op_name, result, after, after_drop));
+            }
+        }
+
+        // A held *directory* handle (an Explorer window or a shell cwd), opened with backup semantics.
+        for (mode_name, mode) in modes {
+            let outer = base.join(format!("dirhold-{}", mode_name.replace('|', "")));
+            let dir = outer.join("d");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f"), b"x").unwrap();
+            let hold = std::fs::OpenOptions::new().read(true).share_mode(mode)
+                .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS).open(&dir).unwrap();
+            let result = outcome(std::fs::remove_dir_all(&dir));
+            let after = format!("f_exists={} dir_exists={}", dir.join("f").exists(), dir.exists());
+            drop(hold);
+            rows.push(format!("{:6} | {:28} | {:40} | held: {}", mode_name, "dir held: remove_dir_all", result, after));
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+        panic!("FORK-284 probe\n{}", rows.join("\n"));
+    }
+}
