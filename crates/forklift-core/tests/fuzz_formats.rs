@@ -641,6 +641,30 @@ fn rebuild(bytes: &[u8], parsed: &ParsedObject) -> Vec<u8> {
     }
 }
 
+/// Rewrite one byte below `0x80` of a whole object as the two-byte overlong spelling of the same
+/// value (`b | 0x80`, then `00`), fixing up the declared content length when the byte lies in the
+/// body. Where the byte ends a VLQ this is a second spelling of the same number; random mutation
+/// almost never produces one with the length still consistent.
+fn respell_a_vlq_end(bytes: &mut Vec<u8>, rng: &mut Rng) {
+    let mut header_len = 0;
+    for _ in 0..3 {
+        header_len += number_from_vlq_bytes(header_len, bytes).unwrap().1;
+    }
+    header_len += 1;
+    let object_type = ObjectType::from_code(number_from_vlq_bytes(number_from_vlq_bytes(0, bytes).unwrap().1, bytes).unwrap().0).unwrap();
+
+    let candidates: Vec<usize> = (0..bytes.len()).filter(|&at| at + 1 != header_len && bytes[at] < 0x80).collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let at = candidates[rng.below(candidates.len())];
+    let respelled = [bytes[at] | 0x80, 0x00];
+    bytes.splice(at..at + 1, respelled);
+    if at >= header_len {
+        *bytes = wrap(object_type, &bytes[header_len..].to_vec());
+    }
+}
+
 /// Any bytes the loose-object parser accepts are exactly the bytes the format writes for what they
 /// parsed to: an object is named by the hash of its bytes, so a second spelling of one value
 /// would give it a second name, out of reach of a signature or a redaction naming the first.
@@ -649,8 +673,10 @@ fn rebuild(bytes: &[u8], parsed: &ParsedObject) -> Vec<u8> {
 /// this also pins the builders of the older versions: they are part of the format, and changing
 /// what one writes would leave every object it already wrote unreadable.
 ///
-/// Revert: drop any one of the shortest-VLQ rule, the header's null or length checks, or a
-/// parser's canonical comparison → mutated inputs parse to a value that rebuilds differently.
+/// Revert: drop the shortest-VLQ rule, the header's null or length check, or the tree or parcel
+/// canonical comparison → mutated inputs parse to a value that rebuilds differently. The first
+/// recipe version is canonical by construction once its numbers are (fixed-length hashes, no
+/// trailing bytes), so its comparison is reached only with the shortest-VLQ rule dropped too.
 #[test]
 fn every_accepted_object_is_in_its_canonical_form() {
     let mut rng = Rng::new(0xC0DE_0001);
@@ -662,7 +688,11 @@ fn every_accepted_object_is_in_its_canonical_form() {
             assert_eq!(rebuild(&fixture, &parsed), fixture, "{} does not round-trip", label);
 
             let mut bytes = fixture;
-            mutate(&mut bytes, &mut rng);
+            if rng.below(3) == 0 {
+                respell_a_vlq_end(&mut bytes, &mut rng);
+            } else {
+                mutate(&mut bytes, &mut rng);
+            }
             let Ok(parsed) = parse_loose_object(&bytes) else { continue };
             let rebuilt = rebuild(&bytes, &parsed);
             assert!(rebuilt == bytes, "{} mutated to a second spelling\n  in : {:02x?}\n  out: {:02x?}",
