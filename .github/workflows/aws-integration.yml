@@ -54,7 +54,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # The suite drives the `forklift` CLI to build a real warehouse to harvest objects
-      # from (`tests/aws_integration.rs` locates it next to the test binary in `target/`),
+      # from (`tests/support/cli_binary.rs` finds it in the profile directory above the test binary),
       # so it must be built first — `cargo test -p forklift-aws-lambda` alone would not
       # build the CLI's own crate.
       - name: Build the forklift CLI
