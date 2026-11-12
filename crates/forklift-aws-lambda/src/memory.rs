@@ -9,9 +9,10 @@
 //! control plane — the case `verify_and_promote` guards.
 //!
 //! There is deliberately **no way to put unverified bytes at a canonical hash key**: the
-//! only paths into `objects` are `put_verified` and `verify_and_promote`, both of which
-//! check `Blake3(bytes) == hash` first. The fake cannot express the state invariant 1
-//! forbids, so a test cannot accidentally assert it is reachable.
+//! paths into `objects` are `put_verified` and `verify_and_promote`, both of which check
+//! `Blake3(bytes) == hash` first and then the object's form, as the S3 backend does, and
+//! [`MemoryObjectStore::plant_unreadable`], which checks the hash alone. The fake cannot
+//! express the state invariant 1 forbids, so a test cannot accidentally assert it is reachable.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -84,6 +85,14 @@ impl MemoryObjectStore {
     /// not verified and not fetchable; only `verify_and_promote` can make them so.
     pub fn stage(&self, session: &str, hash: &str, bytes: Vec<u8>) {
         self.staged.lock().unwrap().insert((session.to_string(), hash.to_string()), bytes);
+    }
+
+    /// Store `bytes` at the canonical key of `hash` after checking the hash alone, skipping the
+    /// form check: an object written by a newer build, in a form this one cannot read, which
+    /// no upload path of this build admits. Panics if the bytes do not hash to `hash`.
+    pub fn plant_unreadable(&self, hash: &str, bytes: &[u8]) {
+        assert_eq!(object_utils::hash_object_bytes(bytes), hash, "planted bytes must hash to their key");
+        self.objects.lock().unwrap().insert(hash.to_string(), bytes.to_vec());
     }
 
     /// Land `bytes` at the intake key of `hash`, as a client's `PUT` to the URL
@@ -179,6 +188,7 @@ impl ObjectStore for MemoryObjectStore {
                 hash, actual
             ));
         }
+        object_utils::check_object_form(hash, bytes)?;
 
         let mut objects = self.objects.lock().unwrap();
 
@@ -234,8 +244,9 @@ impl ObjectStore for MemoryObjectStore {
         }
     }
 
-    /// Take the staged bytes (so a corrupt upload is *discarded* by the same act that
-    /// rejects it), and promote them only if they hash to `hash`.
+    /// Take the staged bytes (so a corrupt or malformed upload is *discarded* by the same act
+    /// that rejects it), and promote them only if they hash to `hash` and are an object core's
+    /// store takes in.
     ///
     /// The whole check-and-promote runs under the `objects` lock, so the control plane and
     /// the staging verifier racing on one hash serialize: the loser observes the winner's
@@ -264,6 +275,9 @@ impl ObjectStore for MemoryObjectStore {
 
         if actual != hash {
             return Ok(PromoteOutcome::Corrupt { actual });
+        }
+        if let Err(reason) = object_utils::check_object_form(hash, &bytes) {
+            return Ok(PromoteOutcome::Malformed { reason });
         }
 
         objects.insert(hash.to_string(), bytes);
@@ -981,7 +995,8 @@ mod tests {
         let mut withheld: Vec<String> = Vec::new();
 
         for i in 0..400u32 {
-            let bytes = format!("chunk-{i}").into_bytes();
+            let blob = forklift_core::model::blob::Blob { content: format!("chunk-{i}").into_bytes() };
+            let bytes = forklift_core::builder::object::loose_object_builder::LooseObjectBuilder::build_blob(&blob).content;
             let hash = object_utils::hash_object_bytes(&bytes);
             all.push(hash.clone());
 

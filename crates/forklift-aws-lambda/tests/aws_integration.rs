@@ -216,7 +216,7 @@ async fn s3_object_store_upholds_the_object_contract() {
     let warehouse = config.warehouse_id.clone();
 
     tokio::task::spawn_blocking(move || {
-        let bytes = b"a real object".to_vec();
+        let bytes = object_utils::blob_bytes(b"a real object");
         let hash = object_utils::hash_object_bytes(&bytes);
 
         // Absent before it is written.
@@ -300,9 +300,9 @@ async fn two_warehouses_on_one_bucket_never_see_each_others_objects() {
     };
     let (a, b) = (store(&config.warehouse_id), store(&unique("other")));
 
-    let bytes = b"only warehouse a holds this".to_vec();
+    let bytes = object_utils::blob_bytes(b"only warehouse a holds this");
     let hash = object_utils::hash_object_bytes(&bytes);
-    let staged = b"warehouse a staged this".to_vec();
+    let staged = object_utils::blob_bytes(b"warehouse a staged this");
     let staged_hash = object_utils::hash_object_bytes(&staged);
 
     // Staged under `a`'s session, as `a`'s presigned PUT would.
@@ -542,7 +542,7 @@ async fn s3_verify_and_promote_gates_the_canonical_namespace() {
     let bucket = config.bucket.clone();
 
     // Stage bytes straight to the staging prefix, as a client's presigned PUT would.
-    let good = b"a good staged object".to_vec();
+    let good = object_utils::blob_bytes(b"a good staged object");
     let good_hash = object_utils::hash_object_bytes(&good);
     let corrupt_hash = object_utils::hash_object_bytes(b"the declared content");
 
@@ -658,7 +658,7 @@ async fn s3_verify_and_promote_streams_large_staged_objects() {
     // CopyObject path this test exists to exercise, small enough (a few MiB) to keep the
     // test fast — the point is the code path, not the byte count.
     let size = (forklift_aws_lambda::aws::STREAMING_THRESHOLD_BYTES as usize) + 1;
-    let good: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let good = object_utils::blob_bytes(&(0..size).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
     let good_hash = object_utils::hash_object_bytes(&good);
 
     // Bytes that do NOT match the hash they are declared (staged) under — the large-object
@@ -706,6 +706,134 @@ async fn s3_verify_and_promote_streams_large_staged_objects() {
             objects.verify_and_promote("lift-big", &good_hash).expect("retry"),
             PromoteOutcome::AlreadyPresent
         );
+    })
+    .await
+    .expect("the blocking assertions");
+}
+
+/// A staged blob or chunk core would not store is discarded, never promoted, over both paths of
+/// the real store: a respelled blob or chunk read whole, a respelled blob streamed past the
+/// threshold (judged once its hash verifies), and a chunk past the chunk ceiling (refused while it
+/// streams). Each is `Malformed`, absent at its hash, and no longer staged; a respelling is
+/// refused by `put_verified` as well.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_verify_and_promote_discards_an_object_core_would_not_store() {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::model::chunk::Chunk;
+
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (s3, _dynamodb) = raw_clients(&config).await;
+    let (objects, _refs) = build_stores(&config, bridge).await.expect("stores");
+
+    // The version VLQ spelled overlong: the same object under a second hash.
+    let respell = |bytes: Vec<u8>| [&[bytes[0] | 0x80, 0x00][..], &bytes[1..]].concat();
+    let threshold = forklift_aws_lambda::aws::STREAMING_THRESHOLD_BYTES as usize;
+    let chunk = |content: Vec<u8>| LooseObjectBuilder::build_chunk(&Chunk { content }).content;
+    let cases = vec![
+        ("small blob", respell(object_utils::blob_bytes(b"one meaning, one name"))),
+        ("small chunk", respell(chunk(b"one meaning, one name".to_vec()))),
+        ("streamed blob", respell(object_utils::blob_bytes(&vec![7u8; threshold + 1]))),
+        ("streamed chunk past the chunk ceiling", chunk(vec![7u8; threshold + 1])),
+    ];
+
+    let staging = format!("staging/{}/lift-odd", config.warehouse_id);
+    let mut hashes = Vec::new();
+    for (what, bytes) in &cases {
+        let hash = object_utils::hash_object_bytes(bytes);
+        s3.put_object()
+            .bucket(&config.bucket)
+            .key(format!("{}/{}", staging, hash))
+            .body(bytes.clone().into())
+            .send()
+            .await
+            .expect(what);
+        hashes.push((*what, hash));
+    }
+    let respelled = cases[0].1.clone();
+
+    tokio::task::spawn_blocking(move || {
+        for (what, hash) in &hashes {
+            match objects.verify_and_promote("lift-odd", hash).expect(what) {
+                PromoteOutcome::Malformed { .. } => {}
+                other => panic!("{}: expected Malformed, got {:?}", what, other),
+            }
+            assert!(!objects.exists(hash).expect("exists"), "{}: promoted", what);
+            assert_eq!(
+                objects.verify_and_promote("lift-odd", hash).expect(what),
+                PromoteOutcome::Missing,
+                "{}: the staged copy is discarded",
+                what
+            );
+        }
+
+        let hash = object_utils::hash_object_bytes(&respelled);
+        let err = objects.put_verified(&hash, &respelled).expect_err("a respelling");
+        assert!(err.contains("not a well-formed object"), "{}", err);
+        assert!(!objects.exists(&hash).expect("exists"));
+    })
+    .await
+    .expect("the blocking assertions");
+}
+
+/// The verifier's store leaves a staged tree at or above the streaming threshold staged and
+/// unpromoted, so a lift commit's store still finds it; that store judges it (here, malformed: its
+/// body is not a tree's) and discards it.
+///
+/// Revert: drop the `Structured` arm's early return in `verify_and_promote` (or the store's
+/// `holds_large_structured` flag) → the verifier's store discards it.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_the_verifier_store_leaves_a_large_tree_for_the_lift_commit() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (s3, _dynamodb) = raw_clients(&config).await;
+    let (objects, _refs) = build_stores(&config, bridge.clone()).await.expect("stores");
+    let (verifier_s3, _) = build_clients(&config).await.expect("clients");
+    let verifier = S3ObjectStore::new(verifier_s3, config.bucket.clone(), config.warehouse_id.clone(), bridge)
+        .expect("a store")
+        .leaving_large_structured_staged();
+
+    let body_len = forklift_aws_lambda::aws::STREAMING_THRESHOLD_BYTES;
+    let mut tree = forklift_core::util::byte_utils::number_to_vlq_bytes(1);
+    tree.extend(forklift_core::util::byte_utils::number_to_vlq_bytes(
+        forklift_core::enums::object_type::ObjectType::Tree.get_code(),
+    ));
+    tree.extend(forklift_core::util::byte_utils::number_to_vlq_bytes(body_len));
+    tree.push(0);
+    tree.extend(vec![0u8; body_len as usize]);
+    let hash = object_utils::hash_object_bytes(&tree);
+
+    s3.put_object()
+        .bucket(&config.bucket)
+        .key(format!("staging/{}/lift-tree/{}", config.warehouse_id, hash))
+        .body(tree.into())
+        .send()
+        .await
+        .expect("stage the tree");
+
+    tokio::task::spawn_blocking(move || {
+        assert_eq!(verifier.verify_and_promote("lift-tree", &hash).expect("verifier"), PromoteOutcome::LeftStaged);
+        assert!(!verifier.exists(&hash).expect("exists"), "promoted unparsed");
+
+        match objects.verify_and_promote("lift-tree", &hash).expect("lift commit") {
+            PromoteOutcome::Malformed { .. } => {}
+            other => panic!("the lift commit's store: expected Malformed, got {:?}", other),
+        }
+        assert!(!objects.exists(&hash).expect("exists"));
     })
     .await
     .expect("the blocking assertions");

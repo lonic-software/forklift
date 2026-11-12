@@ -1376,8 +1376,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
     /// Whether this invocation's window can take another attempt that took `attempt`, with as
     /// much again to spare and [`REDACTION_ANSWER_RESERVE`] to answer in, so a ref update that keeps
-    /// losing to new redactions answers its `409` rather than run out of time with no answer.
-    /// Without a deadline, always.
+    /// losing to new redactions answers its `409`, and a lift commit promoting large objects its
+    /// not-ready, rather than run out of time with no answer. Without a deadline, always.
     fn affords_another(&self, attempt: std::time::Duration) -> bool {
         self.deadline.is_none_or(|deadline| {
             deadline.duration_since(SystemTime::now()).unwrap_or_default() > attempt * 2 + REDACTION_ANSWER_RESERVE
@@ -1656,7 +1656,15 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 } else {
                     match self.objects.get(hash).map_err(HeadError::internal)? {
                         Some(bytes) => {
-                            object_utils::store_object_bytes(hash, &bytes).map_err(HeadError::internal)?;
+                            // Bytes the store holds that core would not take in are refused by
+                            // name, not answered as a failure of this head's own. Told apart only
+                            // once the store has refused them, so each object is checked once.
+                            if let Err(error) = object_utils::store_object_bytes(hash, &bytes) {
+                                return Err(match object_utils::validate_imported_object(hash, &bytes) {
+                                    Err(refusal) => held_object_refused(refusal),
+                                    Ok(()) => HeadError::internal(error),
+                                });
+                            }
                             Some(bytes)
                         }
                         // The store lacks it: it is simply not in the bundle — the documented
@@ -1723,18 +1731,20 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// prefix, so the control plane never saw the bytes. This is where the small
     /// control-plane objects of `session` are **verified and promoted** to their hash keys
     /// (synchronously, via [`ObjectStore::verify_and_promote`]) — until it runs they are not
-    /// fetchable, and a corrupt one is discarded and stops the lift rather than ever
-    /// becoming visible.
+    /// fetchable, and a corrupt or malformed one is discarded and stops the lift rather than
+    /// ever becoming visible.
     ///
     /// Large blobs are only checked for *presence at their canonical key*, which is itself
     /// the proof they were verified: the staging verifier promotes a blob only after the
-    /// same `Blake3(bytes) == hash` check. A blob absent there is probed in the session's
+    /// same hash and form checks. A blob absent there is probed in the session's
     /// staging area: still staged means the verifier has not caught up, answered as a `503`
     /// with `Forklift-Commit: not-ready` that the client retries; gone from both places means
     /// the upload was discarded (the verifier rejected it) or never sent, a terminal `422`
     /// whose next step is running the lift again.
     ///
-    /// Promotion is idempotent, so a retried commit is safe. Once everything is promoted the
+    /// Promotion is idempotent, so a retried commit is safe. A commit whose promotions would not
+    /// fit the invocation's window answers not-ready once it has promoted what it can, and its
+    /// retry carries on from there. Once everything is promoted the
     /// session's staging prefix is swept — but only on the **final** batch (`more == false`). A
     /// lift touching a maximal chunked file lists too many chunk hashes for one request, so the
     /// client paginates and sets `more: true` on every batch but the last; an early batch verifies
@@ -1766,10 +1776,27 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }
 
         let mut promoted = Vec::new();
+        let mut slowest = std::time::Duration::ZERO;
 
         for hash in control_plane {
+            // A large tree, parcel or recipe is read and parsed here, one at a time, so a batch
+            // of them may not fit the invocation's window. What is promoted stays promoted: the
+            // commit answers not-ready while it still has time, and its retry carries on from there.
+            if !promoted.is_empty() && !self.affords_another(slowest) {
+                self.refuse_applied_promoted(session, &promoted, &withholding)?;
+
+                return Err(HeadError::commit_not_ready(format!(
+                    "The remote promoted {} of the lift's {} objects before running short of time; \
+                    the lift session is not ready to commit.",
+                    promoted.len(),
+                    control_plane.len()
+                )));
+            }
+
+            let started = SystemTime::now();
             let outcome =
                 self.objects.verify_and_promote(session, hash).map_err(HeadError::internal)?;
+            slowest = slowest.max(started.elapsed().unwrap_or_default());
 
             match outcome {
                 PromoteOutcome::Promoted | PromoteOutcome::AlreadyPresent => promoted.push(hash.clone()),
@@ -1778,7 +1805,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     // lost may have discarded it as corrupt or too large.
                     return Err(upload_discarded(format!(
                         "Object {} is not on the remote: its upload was discarded (rejected as \
-                        corrupt or too large) or never arrived. The lift session cannot commit.",
+                        corrupt, malformed or too large) or never arrived. The lift session cannot commit.",
                         hash
                     )))
                 }
@@ -1787,6 +1814,21 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                         "Staged object {} is corrupt (it hashes to {}); it was discarded, not \
                         promoted, and the lift session cannot commit.",
                         hash, actual
+                    )))
+                }
+                // Not `upload_discarded`: the same client would upload the same bytes again. The
+                // refusal is the one a native head gives these bytes on upload.
+                PromoteOutcome::Malformed { reason } => {
+                    return Err(HeadError::unprocessable(format!(
+                        "{} The staged copy was discarded, and the lift session cannot commit.",
+                        reason
+                    )))
+                }
+                // The head's store holds every object it promotes; only the verifier's leaves one.
+                PromoteOutcome::LeftStaged => {
+                    return Err(HeadError::internal(format!(
+                        "The object store left staged object {} unpromoted.",
+                        hash
                     )))
                 }
             }
@@ -1852,7 +1894,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         if let Some(hash) = blobs.iter().find(|hash| gone.contains(hash.as_str())) {
             return Err(upload_discarded(format!(
-                "Blob {} is not on the remote: its upload was discarded (rejected as corrupt or too \
+                "Blob {} is not on the remote: its upload was discarded (rejected as corrupt, malformed or too \
                 large) or never arrived. The lift session cannot commit.",
                 hash
             )));
@@ -2090,6 +2132,12 @@ fn require_object_hash(hash: &str) -> HeadResult<()> {
     }
 
     Err(HeadError::unprocessable(REFUSAL_NOT_AN_OBJECT_HASH))
+}
+
+/// The refusal for an object this warehouse's store holds that core does not take in: a copy
+/// promoted before its form was checked, or written to the bucket by hand.
+fn held_object_refused(reason: String) -> HeadError {
+    HeadError::unprocessable(format!("This remote holds an object it cannot serve: {}", reason))
 }
 
 /// A lift commit's terminal refusal for an upload the remote does not hold: discarded by

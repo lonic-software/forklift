@@ -63,7 +63,8 @@ endpoints, which do return raw bytes through the control-plane Lambda — see "B
 below.
 
 A client `PUT`s straight to `staging/{warehouse}/{session}/{hash}`, never to the canonical
-`objects/{warehouse}/{hash}` key — nothing lands at a hash key until it is hash-verified. Small
+`objects/{warehouse}/{hash}` key — nothing lands at a hash key until it is hash-verified and its
+form checked as core's own store checks it (one spelling per object, within the ceilings). Small
 control-plane objects (parcels, trees, signatures) are verified and promoted **synchronously** by
 the control plane when the client calls `POST /lift/{session}/commit`; large blobs and chunks are
 verified and promoted **asynchronously** by the verifier Lambda, triggered by the S3 event the
@@ -151,24 +152,27 @@ build pipeline already standardizes on x86_64.
 The two functions have different memory profiles, because they exercise different halves of
 `verify_and_promote`'s two-tier promotion strategy (`aws::s3`, `STREAMING_THRESHOLD_BYTES = 8
 MiB`): below the threshold, a staged object is buffered whole and hashed in one shot (bounded by
-the threshold itself); at or above it, the object is **never** buffered — it is stream-hashed in
-chunks and promoted with a server-side `CopyObject`, so memory use there is bounded by one read
-chunk, not by the object's size (up to the hard `MAX_STAGED_OBJECT_BYTES` cap of 5 GiB, S3's own
-single-`PUT` maximum).
+the threshold itself); at or above it, a blob or chunk is **never** buffered — it is
+stream-hashed in chunks and promoted with a server-side `CopyObject`, so memory use there is
+bounded by one read chunk, not by the object's size (up to the hard `MAX_STAGED_OBJECT_BYTES` cap
+of 5 GiB, S3's own single-`PUT` maximum). A tree, parcel or recipe at or above it is held whole and
+parsed, up to `MAX_OBJECT_BYTES` (64 MiB), which takes about three times that at its peak (its
+bytes, the parsed value and the rebuilt bytes compared against them).
 
-* **Verifier Lambda:** only ever calls `verify_and_promote`, so its memory floor is small and
-  flat regardless of blob size. **256 MB** is a reasonable default; there is no legitimate staged
+* **Verifier Lambda:** only ever calls `verify_and_promote`, and leaves a large tree, parcel or
+  recipe staged for the lift commit rather than parse it, so its memory floor is small and flat
+  regardless of blob size. **256 MB** is a reasonable default; there is no legitimate staged
   object whose promotion needs more.
 
-* **Control-plane Lambda:** `verify_and_promote`'s own bound is the same 8 MiB/streaming split,
-  but `Head::ref_update`'s commit-gate closure audit is a second, larger memory sink the
-  verifier never touches. To presence-check a chunked file's chunks or prune an unchanged
+* **Control-plane Lambda:** `verify_and_promote` holds and parses a large tree, parcel or recipe
+  the lift commit names (up to about three times 64 MiB at its peak), and `Head::ref_update`'s
+  commit-gate closure audit is a second memory sink the verifier never touches. To presence-check a chunked file's chunks or prune an unchanged
   subtree, the audit reads a **recipe** or a **tree** object straight off `ObjectStore::get`
   (`Head::ref_update`'s `load_recipe_chunks`/`load_base_tree` closures, and `scratch.rs`'s
   `materialize`) — an unbounded, whole-object buffer, capped only by the write-time ceiling
   `MAX_OBJECT_BYTES` (64 MiB; `forklift-core`'s `object_utils.rs` — the one object type besides a
   very large tree that can legitimately approach it). One such buffer is held at a time (the
-  walk is sequential), so the control plane's floor is "one 64 MiB buffer plus normal JSON/SDK
+  walk is sequential), so the audit's own floor is "one 64 MiB buffer plus normal JSON/SDK
   overhead", not "one 8 MiB buffer".
 
   The `batch` endpoint is the third sink, and the largest: the bundle it answers with is held
@@ -973,10 +977,11 @@ deployer-supplied, out-of-repo mechanism.
   one:** the whole-object write ceiling (`MAX_OBJECT_BYTES`, 64 MiB) is enforced only on the way
   *in* — a pre-existing, over-ceiling object authored before this policy existed stays fully
   readable (a "grandfathered giant"), though no client import admits one any more. This head's
-  own promotion path (`verify_and_promote`) is type-blind and enforces only the coarse, size-only
-  `MAX_STAGED_OBJECT_BYTES` (5 GiB) backstop regardless — so it will happily promote a grandfathered giant if one is ever staged. It is mentioned here only
-  so you are not surprised by it; there is no operator action this document can recommend beyond
-  awareness.
+  own promotion path (`verify_and_promote`) checks a staged object's form as core's streaming
+  store does: a tree, parcel or recipe is held to the ceiling, but a blob above the streaming
+  threshold only to the coarse, size-only `MAX_STAGED_OBJECT_BYTES` (5 GiB) backstop — so it will
+  promote a grandfathered giant blob if one is ever staged. It is mentioned here only so you are
+  not surprised by it; there is no operator action this document can recommend beyond awareness.
 
 * **Upgrading a warehouse's format.** A deployment that reads a newer format refuses every
   warehouse in an older one with a `503` until it is upgraded, so a format break is an outage

@@ -129,12 +129,24 @@ jobs:
           pip3 install blake3
           BUCKET=$(tofu output -raw bucket_name)
 
+          # A real blob object, as Forklift writes it: the verifier promotes nothing else. The
+          # header is the loose-object version (1), the type (1, blob), the body length and a null;
+          # the body is the blob version (1) and the content. Lengths are LEB128-style VLQs.
           content="layer 2 exercise run ${{ github.run_id }}/${{ github.run_attempt }}"
-          printf '%s' "$content" > /tmp/l2_object.txt
-          hash=$(python3 -c "
-          import blake3
-          with open('/tmp/l2_object.txt', 'rb') as f:
-              print(blake3.blake3(f.read()).hexdigest())
+          hash=$(CONTENT="$content" python3 -c "
+          import os, blake3
+          def vlq(n):
+              out = bytearray()
+              while True:
+                  byte = n & 0x7f
+                  n >>= 7
+                  out.append(byte | (0x80 if n else 0))
+                  if not n:
+                      return bytes(out)
+          body = b'\x01' + os.environ['CONTENT'].encode()
+          obj = b'\x01\x01' + vlq(len(body)) + b'\x00' + body
+          open('/tmp/l2_object.txt', 'wb').write(obj)
+          print(blake3.blake3(obj).hexdigest())
           ")
           echo "staging object $hash"
 

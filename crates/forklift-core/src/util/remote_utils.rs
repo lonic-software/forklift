@@ -8131,9 +8131,10 @@ fn commit_deadline_message(last_answer: Option<&CommitAttempt>,
     let headline = match last_answer {
         Some(CommitAttempt::NotReady) => format!(
             "{}; the remote's last answer was that it still holds a staged upload of this lift it \
-            has not accepted into the warehouse. {}. Running the lift again uploads it afresh and \
-            usually clears this; if it keeps happening, the remote's staging verifier is failing \
-            and its operator needs to know.",
+            has not accepted into the warehouse, either because its staging verifier has not caught \
+            up or because the lift's objects take it more than one attempt to accept. {}. Running \
+            the lift again is safe and usually clears this; if it keeps happening, the remote's \
+            operator needs to know.",
             missed, unchanged
         ),
         Some(CommitAttempt::Throttled { retry_after }) => format!(
