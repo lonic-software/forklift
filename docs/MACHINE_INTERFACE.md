@@ -996,6 +996,11 @@ give a declared one the wrong type, or leave out a required one is refused with 
 argument omitted. The arguments become the command's own: an option as `--name=value` and a
 positional after `--`, so no value is ever read as an option.
 
+A message whose JSON names a key twice in one object, at any depth, is refused with JSON-RPC
+`invalid_request` (-32600) and never acted on. A JSON reader that keeps the last spelling would
+otherwise read, for example, a `query` predicate `{"all": [<filter>], "all": []}` as one that
+matches everything. A notification refused this way gets no reply, like any other notification.
+
 **Pagination:** `history` reads in pages — pass `limit`, and the result's `data.next`
 cursor back as `after` for the following page (absent once exhausted). This is the
 agent-facing counterpart of the CLI's pager (agents get a cursor, never a pager).

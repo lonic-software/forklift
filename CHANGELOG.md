@@ -12,6 +12,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **A query predicate that could be read two ways is refused, never widened.** `forklift query
+  --where`, and the MCP server's `query` tool, used to read a JSON object that named a key twice
+  by its last spelling, so `{"all": [<filter>], "all": []}` matched every parcel. An empty
+  `matches` pattern or `--touches` path also matched everything, and a `--signer` or `parcel`
+  prefix that was empty matched every hash, while one in capitals matched none. All of these are
+  now refused with exit 18 (`query_predicate_invalid`). The MCP server answers any message naming
+  a key twice with `invalid_request`. A `--signer` typed in capitals is lower-cased first, and
+  flags given beside `--where` no longer count against its depth limit.
+
 - **Every object has one spelling.** An object is named by the hash of its bytes, but its header
   could carry padding or trailing bytes, a number could be written with redundant bytes, and a tree
   could list its entries in another order, so one file, tree or parcel could be stored under more

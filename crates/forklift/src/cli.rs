@@ -728,7 +728,9 @@ pub enum Command {
             long_help = "A JSON predicate tree AND-ed with the flags (\"-\" reads it from stdin). \
                          A node is {\"all\": [nodes]}, {\"any\": [nodes]}, {\"not\": node} or a \
                          leaf {\"field\", \"op\", \"value\"}; an unknown field is refused with \
-                         the list of fields."
+                         the list of fields. An object that names a key twice is refused, as is \
+                         an empty pattern or path: use \"*\" to match any value, \".\" for the \
+                         current directory."
         )]
         r#where: Option<String>,
 

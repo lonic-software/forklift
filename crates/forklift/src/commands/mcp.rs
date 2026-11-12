@@ -13,6 +13,7 @@
 
 use std::io::{BufRead, Write};
 use serde_json::{json, Value};
+use forklift_core::util::json_utils;
 
 /// The MCP protocol version this server defaults to when a client does not pin one.
 /// The `initialize` handshake echoes the client's version when it sends one.
@@ -140,9 +141,25 @@ impl ServerState {
 /// Handle one JSON-RPC message; `None` for a notification (which gets no reply) or an
 /// unparseable line we choose to ignore rather than crash the session.
 ///
+/// A message that is JSON but names a key twice in one object is answered with an Invalid
+/// Request error rather than read: `serde_json` would keep the last spelling, so a tool's
+/// arguments (a query predicate among them) could mean something other than what the client
+/// meant.
+///
 /// `notify` writes a notification to the client; a `tools/call` uses it for progress.
 fn handle_message(line: &str, state: &mut ServerState, notify: &mut dyn FnMut(&Value)) -> Option<Value> {
-    let message: Value = serde_json::from_str(line).ok()?;
+    let message: Value = match json_utils::parse_strict(line) {
+        Ok(message) => message,
+        Err(reason) => {
+            // Only a request is answered: a notification has no id, and a response from the
+            // client (an id but no method) is never replied to.
+            let loose: Value = serde_json::from_str(line).ok()?;
+            loose.get("method")?;
+            let id = loose.get("id").cloned()?;
+            let error = JsonRpcError::invalid_request(&reason);
+            return Some(json!({ "jsonrpc": "2.0", "id": id, "error": error.to_value() }));
+        }
+    };
 
     let id = message.get("id").cloned();
     let method = message.get("method").and_then(Value::as_str)?;
@@ -816,7 +833,9 @@ const TYPED: &[(&str, &str, Typed)] = &[
     ("query", "where", Typed::Object(
         "A JSON predicate tree AND-ed with the other arguments. A node is {\"all\": [nodes]}, \
          {\"any\": [nodes]}, {\"not\": node} or a leaf {\"field\", \"op\", \"value\"}; an \
-         unknown field is refused with the list of fields.",
+         unknown field is refused with the list of fields. An object that names a key twice is \
+         refused, as is an empty pattern or path: use \"*\" to match any value, \".\" for the \
+         current directory.",
     )),
     ("history", "limit", Typed::Positive),
     ("query", "limit", Typed::Positive),
@@ -1361,6 +1380,10 @@ impl JsonRpcError {
         JsonRpcError { code: -32601, message: format!("Unknown method \"{}\".", method) }
     }
 
+    fn invalid_request(reason: &str) -> JsonRpcError {
+        JsonRpcError { code: -32600, message: format!("Invalid Request: {}.", reason) }
+    }
+
     fn invalid_params(reason: &str) -> JsonRpcError {
         JsonRpcError { code: -32602, message: format!("Invalid params: {}.", reason) }
     }
@@ -1380,6 +1403,33 @@ mod tests {
 
     use super::{ProgressMapper, Reported};
     use serde_json::json;
+
+    #[test]
+    fn a_message_naming_a_key_twice_is_refused_and_never_acted_on() {
+        let mut state = super::ServerState::new();
+        let mut notify = |_: &serde_json::Value| panic!("a refused message must not run anything");
+
+        // The duplicate sits inside a tool's arguments, where the last spelling would widen the
+        // query to everything.
+        let line = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"query","arguments":{"where":{"all":[{"field":"tag","op":"eq","value":"x"}],"all":[]}}}}"#;
+        let reply = super::handle_message(line, &mut state, &mut notify).expect("a request is answered");
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["error"]["code"], -32600);
+        let message = reply["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("Invalid Request: ") && message.contains("\"all\" appears twice"), "{message}");
+
+        // A notification is answered by nothing, refused or not, and nor is a response from the
+        // client.
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{"a":1,"a":2}}"#;
+        assert!(super::handle_message(line, &mut state, &mut notify).is_none());
+        let line = r#"{"jsonrpc":"2.0","id":3,"result":{"a":1,"a":2}}"#;
+        assert!(super::handle_message(line, &mut state, &mut notify).is_none());
+
+        // The same request spelled once is read as usual.
+        let line = r#"{"jsonrpc":"2.0","id":8,"method":"no/such","params":{}}"#;
+        let reply = super::handle_message(line, &mut state, &mut notify).unwrap();
+        assert_eq!(reply["error"]["code"], -32601);
+    }
 
     /// A finished run's status, as `wait` would report it.
     #[cfg(unix)]

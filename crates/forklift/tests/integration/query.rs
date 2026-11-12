@@ -372,6 +372,54 @@ fn predicate_bounds_and_malformed_predicates_refuse_with_exit_18() {
 }
 
 #[test]
+fn a_predicate_that_could_read_as_everything_is_refused_never_widened() {
+    let warehouse = signed_warehouse_with_agent("query-never-widened");
+    let agent_key = key_id_of(&warehouse, "agent@forklift");
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "agent@forklift"]));
+    warehouse.write_file("agent.txt", "by the agent\n");
+    assert_success(&warehouse.run(&["load", "agent.txt"]));
+    let agent_parcel = extract_parcel_hash(&warehouse.run(&["stack", "-m", "agent work"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
+
+    // Each of these once read as a filter that matched every parcel, or as one that matched
+    // none without saying so. A second spelling of a key, an empty pattern, prefix or path,
+    // and a prefix no key id can carry are all refused.
+    for payload in [
+        r#"{"all":[{"field":"signer.key","op":"eq","value":"00"}],"all":[]}"#,
+        r#"{"field":"description","op":"matches","value":""}"#,
+        r#"{"field":"provenance.model","op":"matches","value":""}"#,
+        r#"{"field":"signer.key","op":"eq","value":""}"#,
+        r#"{"field":"parcel","op":"eq","value":"ABC"}"#,
+        r#"{"field":"parcel","op":"eq","value":"xyz"}"#,
+        r#"{"field":"path","op":"touches","value":""}"#,
+    ] {
+        let output = warehouse.run(&["--json", "query", "--where", payload]);
+        assert_eq!(output.status.code(), Some(18), "must refuse: {}", payload);
+        assert_eq!(json(&output)["error"]["code"], "query_predicate_invalid", "for: {}", payload);
+    }
+
+    // A key id typed in capitals names the same key, as it does for the office commands.
+    let upper = json(&warehouse.run(&["--json", "query", "main", "--signer", &agent_key.to_uppercase()]));
+    assert_eq!(
+        matched_hashes(&upper),
+        std::iter::once(agent_parcel.clone()).collect(),
+        "an upper-case --signer matches the agent's parcel and nothing else"
+    );
+
+    // A payload at the depth bound (fourteen "not"s, an "all", then the leaf at depth 16)
+    // stays within it when flags are given alongside it: the flags are conjuncts beside the
+    // payload, not a level above it.
+    let at_depth = format!(
+        "{}{{\"all\":[{{\"field\":\"signer.key\",\"op\":\"eq\",\"value\":\"{}\"}}]}}{}",
+        "{\"not\":".repeat(14),
+        agent_key,
+        "}".repeat(14)
+    );
+    let both = json(&warehouse.run(&["--json", "query", "main", "--class", "agent", "--where", &at_depth]));
+    assert_eq!(matched_hashes(&both), std::iter::once(agent_parcel).collect());
+}
+
+#[test]
 fn query_pages_deterministically_with_a_cursor() {
     let warehouse = TestWarehouse::new("query-pages");
     warehouse.write_file("a.txt", "one\n");
