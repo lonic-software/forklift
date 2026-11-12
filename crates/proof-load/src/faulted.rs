@@ -180,13 +180,18 @@ impl Context<'_> {
         }
         // The listing names the records the export left files out of, so it is read only when the
         // export left something out. When it refuses, the records go unnamed, and each file the
-        // export documents leaving out is admitted as documented in every record: the tool did
-        // tell the user, and the bytes it did serve are still judged.
+        // export documents leaving out is admitted as documented in every record whose
+        // expectation opens that path: the tool did tell the user, and the bytes it did serve are
+        // still judged. A record that never held those bytes there gets no entry, so a correct
+        // read of it is not taken for a silent one.
         let document = runner::document(&export.stdout);
         let left_out = if leaves_out(&document) {
             let listing = self.run(&self.programs.forklift, vec!["--json".into(), "history".into()], bay)?;
-            let described = if listing.succeeded() { runner::described_parcels(&listing.stdout) } else { in_every_record(&document, marks) };
-            left_out(&document, &described)
+            if listing.succeeded() {
+                left_out(&document, &runner::described_parcels(&listing.stdout))
+            } else {
+                where_transformed(left_out(&document, &in_every_record(&document, marks)), marks, &expectation)
+            }
         } else {
             Default::default()
         };
@@ -293,6 +298,21 @@ fn in_every_record(export: &serde_json::Value, marks: &[Mark]) -> Vec<(String, S
         .flat_map(|entry| entry["parcels"].as_array().into_iter().flatten().filter_map(|parcel| parcel.as_str()))
         .collect();
     marks.iter().flat_map(|mark| parcels.iter().map(move |parcel| (mark.message(), parcel.to_string()))).collect()
+}
+
+/// `left_out` keeping, per record, only the paths that record's expectation opens as transformed.
+fn where_transformed(
+    mut left_out: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>, marks: &[Mark],
+    expectation: impl Fn(Mark) -> Expectation,
+) -> std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> {
+    for &mark in marks {
+        if let Some(paths) = left_out.get_mut(&mark.message()) {
+            let opened = expectation(mark).transformed;
+            paths.retain(|path, _| opened.contains_key(path));
+        }
+    }
+    left_out.retain(|_, paths| !paths.is_empty());
+    left_out
 }
 
 /// What the work tree holds before the faulted command: the last record on the corpus's line. A
@@ -557,11 +577,13 @@ mod tests {
     /// An export's left-out files are documented per record by their parcels: withheld content as
     /// `content_withheld`, redacted as `content_redacted`, and only in the records whose parcels
     /// the export names. Only an export that left something out needs the history listing, and
-    /// with no listing every left-out file is admitted as documented in every record.
+    /// with no listing a left-out file is admitted as documented in every record whose expectation
+    /// opens its path, and in no other.
     ///
     /// Revert: key every entry to every record → a record that never held the file expects a
     /// documented code for it, and an export serving it correctly reads silent; pair no record in
-    /// `in_every_record` → a documented left-out file reads silent when the listing refuses.
+    /// `in_every_record` → a documented left-out file reads silent when the listing refuses; keep
+    /// every path in `where_transformed` → a later record that never held the bytes reads silent.
     #[test]
     fn left_out_files_are_documented_in_the_records_naming_them() {
         let export = serde_json::json!({ "data": {
@@ -579,10 +601,25 @@ mod tests {
         assert!(leaves_out(&export));
         assert!(!leaves_out(&serde_json::json!({ "data": { "withheld": [], "redacted": [] } })));
         assert!(!leaves_out(&serde_json::json!({ "data": {} })));
-        let everywhere = super::left_out(&export, &in_every_record(&export, &[Mark::Record(0), Mark::Record(1)]));
-        for message in [Mark::Record(0).message(), Mark::Record(1).message()] {
-            assert_eq!(everywhere.get(&message).map(|paths| paths.keys().cloned().collect::<Vec<_>>()), Some(vec!["b".to_string(), "src/a".to_string()]));
+        let marks = [Mark::Record(0), Mark::Record(1)];
+        let everywhere = super::left_out(&export, &in_every_record(&export, &marks));
+        for mark in marks {
+            assert_eq!(everywhere.get(&mark.message()).map(|paths| paths.keys().cloned().collect::<Vec<_>>()), Some(vec!["b".to_string(), "src/a".to_string()]));
         }
+        // Record 0 held the withheld bytes at src/a; record 1 holds nothing taken.
+        let opened = |mark: Mark| Expectation {
+            transformed: if mark == Mark::Record(0) { BTreeMap::from([("src/a".to_string(), vec![])]) } else { BTreeMap::new() },
+            ..Expectation::acknowledged(BTreeMap::new())
+        };
+        // Judged: record 1 read back correctly (empty, as recorded) under the documented map it gets.
+        let judged = |left_out: &BTreeMap<String, BTreeMap<String, String>>| oracle::judge(
+            &Readback::Served { tree: BTreeMap::new(), documented: left_out.get(&Mark::Record(1).message()).cloned().unwrap_or_default() },
+            &opened(Mark::Record(1)),
+        );
+        assert_eq!(judged(&everywhere), Verdict::Silent);
+        let kept = where_transformed(everywhere, &marks, opened);
+        assert_eq!(kept, BTreeMap::from([(Mark::Record(0).message(), BTreeMap::from([("src/a".to_string(), "content_withheld".to_string())]))]));
+        assert_eq!(judged(&kept), Verdict::Expected);
     }
 
     /// Content taken away opens every path holding its bytes, in every record and in both trees
