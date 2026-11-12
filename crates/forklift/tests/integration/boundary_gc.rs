@@ -1550,7 +1550,7 @@ fn stack_and_park_refuse_a_staged_object_the_store_lost() {
         }
 
         // The remedy the refusal names, as printed.
-        let remedy = if file.starts_with('-') { format!("-- {}", file) } else { file.to_string() };
+        let remedy = if file.starts_with('-') { format!("./{}", file) } else { file.to_string() };
         let printed = format!("\"forklift unload {}\", then \"forklift load {}\"", remedy, remedy);
         if !stderr.contains(&printed) {
             failures.push(format!("{}: the refusal must name the remedy {}; got: {}", arm, printed, stderr));
