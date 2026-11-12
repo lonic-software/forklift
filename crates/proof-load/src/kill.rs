@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn a_counting_trace_yields_its_kill_points() {
         let text = "\
-50 execve(\"/b/forklift\", [\"forklift\", \"stack\"], 0x1 /* 3 vars */) = 0
+50 execve(\"/b/forklift\", [\"forklift\", \"--json\"], 0x1 /* 3 vars */) = 0
 50 chdir(\"/o/s/0001-h-count/work\") = 0
 50 clone(child_stack=0x1, flags=CLONE_VM|CLONE_THREAD) = 51
 51 openat(AT_FDCWD</o/s/0001-h-count/work>, \".forklift/pallets/main\", O_RDONLY|O_CLOEXEC) = 3</o/s/0001-h-count/work/.forklift/pallets/main>
@@ -679,7 +679,7 @@ mod tests {
 50 clone(child_stack=0x1, flags=CLONE_VM|CLONE_THREAD) = 52
 52 openat(AT_FDCWD</o/s/0001-h-count/work>, \".forklift/objects/ab/0123456789abcdef0123.tmp~50-1\", O_WRONLY|O_CREAT, 0666) = 6</o/s/0001-h-count/work/.forklift/objects/ab/0123456789abcdef0123.tmp~50-1>
 50 clone(child_stack=NULL, flags=SIGCHLD) = 60
-60 write(3</o/s/0001-h-count/tmp/x>, \"git\", 3) = 3
+60 write(3</o/s/0001-h-count/tmp/x>, \"abc\", 3) = 3
 ";
         let calls = trace::parse(text).unwrap();
         let enumerated = enumerate(&calls, 1, "stack", &root(), "/o/s/0001-h-count/work", |_| false).unwrap();

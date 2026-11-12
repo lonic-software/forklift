@@ -278,9 +278,12 @@ impl std::fmt::Display for Unsound {
     }
 }
 
+/// A path argument: the index of its directory descriptor, if it has one, and its own index.
+type PathArgument = (Option<usize>, usize);
+
 /// Calls that name a path, by which arguments are a (directory, path) pair, and whether they
 /// mutate it. A directory index of None means the path is relative to the working directory.
-const PATH_CALLS: &[(&str, &[(Option<usize>, usize)], Class)] = &[
+const PATH_CALLS: &[(&str, &[PathArgument], Class)] = &[
     ("mkdirat", &[(Some(0), 1)], Class::Mutating),
     ("mkdir", &[(None, 0)], Class::Mutating),
     ("mknodat", &[(Some(0), 1)], Class::Mutating),
@@ -606,7 +609,7 @@ mod tests {
     /// line refuses the trace.
     #[test]
     fn a_trace_reads_as_calls() {
-        let text = "87    execve(\"/b/forklift\", [\"forklift\", \"stack\"], 0xffff /* 3 vars */) = 0\n\
+        let text = "87    execve(\"/b/forklift\", [\"forklift\", \"--json\"], 0xffff /* 3 vars */) = 0\n\
             88    fsync(12</s/work/.forklift/pallets> <unfinished ...>\n\
             87    unlinkat(AT_FDCWD</s/work>, \".forklift/lock\", 0) = -1 ENOENT (No such file or directory)\n\
             88    <... fsync resumed>) = ?\n\
