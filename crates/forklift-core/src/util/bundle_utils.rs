@@ -2266,8 +2266,9 @@ mod tests {
             let _destination = Scratch::new("bundle-fuzz-case");
             let (result, peak) = std::panic::catch_unwind(|| crate::util::peak_alloc::measure(|| import_bundle_bytes(&mutated)))
                 .unwrap_or_else(|_| panic!("case {} panicked", case));
-            // Measured at about 133 KiB on these inputs, nearly all of it the zstd decoder's
-            // context: a bundle is decoded as it is read, never sized from a length it declares.
+            // Measured at about 133 KiB on these inputs: a bundle is decoded as it is read, never
+            // sized from a length it declares. zstd's own allocations are C-side and not counted;
+            // its window is bounded by the decoders' window limit, tested on its own.
             crate::util::peak_alloc::assert_within("import_bundle_bytes", &format!("mutated case {}", case),
                 mutated.len(), peak, 16, 512 * 1024);
             let held = held_hashes();

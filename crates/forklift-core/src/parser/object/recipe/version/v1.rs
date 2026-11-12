@@ -38,7 +38,11 @@ pub fn parse(offset: usize, input: &[u8]) -> Result<Recipe, String> {
         .map(|(value, read)| { cursor += read; value })
         .map_err(|e| format!("Failed to parse recipe chunk count: {}", e))?;
 
-    let mut chunks = Vec::with_capacity(chunk_count.min(64 * 1024) as usize);
+    // Reserve only as many chunks as the bytes left can spell (a hash and at least one size byte
+    // each), never what the count declares: a short recipe declaring a large count would
+    // otherwise hold memory its bytes do not pay for.
+    let room = input.len().saturating_sub(cursor) / (HASH_HEX_LEN + 1);
+    let mut chunks = Vec::with_capacity((chunk_count.min(room as u64)) as usize);
     let mut size_sum: u64 = 0;
 
     for index in 0..chunk_count {

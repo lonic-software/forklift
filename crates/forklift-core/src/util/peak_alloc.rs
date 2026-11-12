@@ -12,6 +12,15 @@
 //! the thread that calls [`measure`]. That is a precondition on every bound measured with it: the
 //! decoder must do its work on the calling thread. Allocations a decoder makes on a thread it
 //! hands work to are not seen.
+//!
+//! Two more things it does not see, which a bound measured with it must not claim:
+//! * Memory C code allocates with its own `malloc`. zstd's decoder context and window are such
+//!   memory, so a bound on a zstd-reading decoder covers only its Rust side; the window is
+//!   bounded separately, by the decoders' window limit and the tests that refuse a frame past it.
+//! * Memory reused after freeing memory that existed before the measurement. The count is of
+//!   bytes live since the measurement began, so a decoder that drops `n` bytes it was handed can
+//!   then allocate `n` uncounted. Measure a decoder that borrows its input, or keep the input
+//!   alive outside the measurement.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -109,9 +118,13 @@ pub fn measure<R>(f: impl FnOnce() -> R) -> (R, usize) {
     (value, peak.max(0) as usize)
 }
 
+/// Whether [`assert_installed`] has already seen this allocator count an allocation.
+static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Check, by allocating a known size inside a measurement, that this allocator is the one in use.
+/// Once it has passed, it is not checked again in this process.
 fn assert_installed() {
-    if ARMED.with(Cell::get) {
+    if INSTALLED.load(std::sync::atomic::Ordering::Relaxed) || ARMED.with(Cell::get) {
         return;
     }
     ARMED.with(|armed| armed.set(true));
@@ -123,6 +136,7 @@ fn assert_installed() {
     ARMED.with(|armed| armed.set(false));
     assert!(seen >= 4096,
         "the counting allocator is not this binary's global allocator: a 4096-byte allocation was counted as {seen}");
+    INSTALLED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Assert that `peak`, measured while a decoder read `input_len` bytes, is within `factor` times

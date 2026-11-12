@@ -408,6 +408,9 @@ const ENTRY_POINT_BOUNDS: [(&str, usize, usize); 3] = [
     ("meta_cell", 64, 64 * 1024),
 ];
 
+// A row missing from `ENTRY_POINT_BOUNDS` would be dropped by the `zip` below, unbounded.
+const _: () = assert!(ENTRY_POINT_BOUNDS.len() == ENTRY_POINTS.len());
+
 /// Measure every entry point on `bytes` and check it against its bound.
 fn parse_within_bounds(bytes: &[u8], case: &str) {
     for ((label, parse), (bound_label, factor, overhead)) in ENTRY_POINTS.iter().zip(ENTRY_POINT_BOUNDS) {
@@ -422,8 +425,15 @@ fn every_parser_holds_memory_in_proportion_to_its_input() {
     let mut rng = Rng::new(0xF01C_11F7_5EED_0427);
 
     // Small objects, mutated: these reach the length prefixes and counts a hostile input sets.
-    let generators: [fn(&mut Rng) -> Vec<u8>; 5] =
-        [blob_object_bytes, tree_object_bytes, parcel_object_bytes, inventory_bytes, cell_bytes];
+    let generators: [fn(&mut Rng) -> Vec<u8>; 7] = [
+        blob_object_bytes,
+        tree_object_bytes,
+        parcel_object_bytes,
+        |rng| LooseObjectBuilder::build_recipe(&recipe_seed(rng)).content,
+        |rng| LooseObjectBuilder::build_chunk(&Chunk { content: (0..rng.below(64)).map(|_| rng.byte()).collect() }).content,
+        inventory_bytes,
+        cell_bytes,
+    ];
     for case in 0..2000 {
         for generate in generators {
             let mut bytes = generate(&mut rng);
@@ -433,9 +443,15 @@ fn every_parser_holds_memory_in_proportion_to_its_input() {
     }
 
     // Large objects, whole and mutated: these are where a per-byte factor shows.
-    let large: [fn(&mut Rng) -> Vec<u8>; 4] = [
+    let large: [fn(&mut Rng) -> Vec<u8>; 6] = [
         |rng| blob_object_bytes_up_to(rng, 256 * 1024),
         |rng| LooseObjectBuilder::build_tree(&tree_seed_up_to(rng, 2000)).content,
+        |rng| {
+            let mut parcel = parcel_seed(rng);
+            parcel.parents = (0..rng.below(2000)).map(|_| random_hash(rng)).collect();
+            LooseObjectBuilder::build_parcel(&parcel).content
+        },
+        |rng| LooseObjectBuilder::build_recipe(&recipe_seed_up_to(rng, 2000)).content,
         |rng| InventoryBuilder::build(&inventory_seed_up_to(rng, 2000).0),
         |rng| cell_bytes_up_to(rng, 2000),
     ];
@@ -703,7 +719,11 @@ fn wrap(object_type: ObjectType, body: &[u8]) -> Vec<u8> {
 }
 
 fn recipe_seed(rng: &mut Rng) -> Recipe {
-    let chunks: Vec<RecipeChunk> = (0..rng.below(5))
+    recipe_seed_up_to(rng, 5)
+}
+
+fn recipe_seed_up_to(rng: &mut Rng, max_chunks: usize) -> Recipe {
+    let chunks: Vec<RecipeChunk> = (0..rng.below(max_chunks))
         .map(|_| RecipeChunk { hash: random_hash(rng), size: 1 + rng.below(MAX_CHUNK_BYTES) as u64 })
         .collect();
     Recipe {

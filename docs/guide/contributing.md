@@ -156,7 +156,7 @@ decoder measured with it must do its work on the calling thread.
 
 Fuzzed, with a memory bound:
 
-- every loose object (`loose_object_parser::parse`), inventories, meta cells
+- every loose object type (`loose_object_parser::parse`: blobs, trees, parcels, recipes, chunks), inventories, meta cells
   (`meta_tree::parse_cell`) and query predicates (`query_utils::parse_where`), in
   `tests/fuzz_formats.rs`;
 - transport packs (`pack_utils::import_transport_packs`), bundles and record streams
@@ -164,7 +164,13 @@ Fuzzed, with a memory bound:
   (`office_utils::parse_user_record`, `parse_key_record`), in their modules' unit tests;
 - the streaming store (`object_utils::store_object_stream`), measured on large inputs rather
   than fuzzed: a blob holds a constant whatever its size, and a tree, which is parsed whole,
-  about eight times its bytes.
+  eight to nine times its bytes.
+
+The allocator counts only what Rust allocates. zstd's decoder context and window are C
+allocations it does not see, so the pack and bundle bounds cover their Rust side only; the
+window is bounded on its own (below). It also counts bytes live since the measurement began,
+so a decoder that frees memory it was handed could reuse that much uncounted: measure a
+decoder that borrows its input.
 
 Not fuzzed, and why:
 
