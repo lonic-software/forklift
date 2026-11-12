@@ -159,14 +159,8 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
             true => file_utils::remove_dir_all(target),
             false => std::fs::read_dir(target).and_then(|entries| entries.into_iter().try_for_each(|entry| {
                 let entry = entry?;
-                // A link is removed, never followed; Windows removes a link to a folder as a folder.
-                match entry.file_type()?.is_dir() {
-                    true => file_utils::remove_dir_all(entry.path()),
-                    false => file_utils::remove_file(entry.path()).or_else(|error| match entry.file_type()?.is_symlink() {
-                        true => file_utils::remove_dir(entry.path()),
-                        false => Err(error),
-                    }),
-                }
+                // A link is removed, never followed.
+                file_utils::remove_entry_unfollowed(entry.path(), entry.file_type()?)
             })),
         };
         return Err(match removed {

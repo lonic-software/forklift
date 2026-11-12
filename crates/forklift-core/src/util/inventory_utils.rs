@@ -2084,14 +2084,8 @@ impl ShardLedger {
 /// folder's place. A link is removed itself, never what it points at. An entry already gone is not
 /// an error.
 fn remove_store_entry(path: &Path) -> std::io::Result<()> {
-    let removed = match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => file_utils::remove_dir_all(path),
-        // Windows removes a link to a folder (or a junction) only as a folder.
-        Ok(metadata) if metadata.is_symlink() => file_utils::remove_file(path)
-            .or_else(|e| file_utils::remove_dir(path).map_err(|_| e)),
-        Ok(_) => file_utils::remove_file(path),
-        Err(e) => Err(e),
-    };
+    let removed = std::fs::symlink_metadata(path)
+        .and_then(|metadata| file_utils::remove_entry_unfollowed(path, metadata.file_type()));
 
     match removed {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

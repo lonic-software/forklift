@@ -978,8 +978,8 @@ pub fn write_working_file(path: &str, content: &[u8], item_type: DirEntryType, c
 /// Write a regular file in place. A symlink already at the path (one this tree turns into a
 /// regular file) is removed first: writing through it would land in whatever it points at.
 fn write_regular_file(fs_path: &Path, path: &str, content: &[u8], item_type: DirEntryType) -> Result<(), String> {
-    if std::fs::symlink_metadata(fs_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        file_utils::remove_file(fs_path)
+    if let Some(link) = std::fs::symlink_metadata(fs_path).ok().filter(|metadata| metadata.file_type().is_symlink()) {
+        file_utils::remove_entry_unfollowed(fs_path, link.file_type())
             .map_err(|e| format!("Error while replacing the symlink \"{}\": {}", path, e))?;
     }
 
