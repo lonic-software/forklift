@@ -151,7 +151,10 @@ fn handle_message(line: &str, state: &mut ServerState, notify: &mut dyn FnMut(&V
     let message: Value = match json_utils::parse_strict(line) {
         Ok(message) => message,
         Err(reason) => {
+            // Only a request is answered: a notification has no id, and a response from the
+            // client (an id but no method) is never replied to.
             let loose: Value = serde_json::from_str(line).ok()?;
+            loose.get("method")?;
             let id = loose.get("id").cloned()?;
             let error = JsonRpcError::invalid_request(&reason);
             return Some(json!({ "jsonrpc": "2.0", "id": id, "error": error.to_value() }));
@@ -830,7 +833,9 @@ const TYPED: &[(&str, &str, Typed)] = &[
     ("query", "where", Typed::Object(
         "A JSON predicate tree AND-ed with the other arguments. A node is {\"all\": [nodes]}, \
          {\"any\": [nodes]}, {\"not\": node} or a leaf {\"field\", \"op\", \"value\"}; an \
-         unknown field is refused with the list of fields.",
+         unknown field is refused with the list of fields. An object that names a key twice is \
+         refused, as is an empty pattern or path: use \"*\" to match any value, \".\" for the \
+         current directory.",
     )),
     ("history", "limit", Typed::Positive),
     ("query", "limit", Typed::Positive),
@@ -1413,8 +1418,11 @@ mod tests {
         let message = reply["error"]["message"].as_str().unwrap();
         assert!(message.starts_with("Invalid Request: ") && message.contains("\"all\" appears twice"), "{message}");
 
-        // A notification is answered by nothing, refused or not.
+        // A notification is answered by nothing, refused or not, and nor is a response from the
+        // client.
         let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{"a":1,"a":2}}"#;
+        assert!(super::handle_message(line, &mut state, &mut notify).is_none());
+        let line = r#"{"jsonrpc":"2.0","id":3,"result":{"a":1,"a":2}}"#;
         assert!(super::handle_message(line, &mut state, &mut notify).is_none());
 
         // The same request spelled once is read as usual.

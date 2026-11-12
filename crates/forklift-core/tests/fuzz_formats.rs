@@ -42,7 +42,6 @@ use forklift_core::util::byte_utils::{number_from_vlq_bytes, number_to_vlq_bytes
 use forklift_core::util::chunk_utils::MAX_CHUNK_BYTES;
 use forklift_core::util::meta_tree::{encode_cell, parse_cell, Stamp};
 use forklift_core::error::{CoreError, RefusalCode};
-use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::query_utils::{
     parse_where, MAX_GLOB_CHARS, MAX_IN_VALUES, MAX_PREDICATE_DEPTH, MAX_PREDICATE_LEAVES, MAX_WHERE_BYTES,
 };
@@ -833,10 +832,31 @@ fn grammar_accepts_leaf(object: &serde_json::Map<String, Value>) -> bool {
         "tag" => membership(false, &string),
         "path" => {
             op == "touches"
-                && value.as_str().is_some_and(|text| !text.is_empty() && WarehousePath::from_user_input(text).is_ok())
+                && value.as_str().is_some_and(warehouse_relative)
         }
         _ => false,
     }
+}
+
+/// A path the grammar admits, decided without the decoder's own path reader: non-empty, free of
+/// control characters, relative, and never climbing above the root. (The test process stands in
+/// no warehouse, so a relative path is read from the root.)
+fn warehouse_relative(text: &str) -> bool {
+    if text.is_empty() || text.chars().any(char::is_control) || text.starts_with('/') {
+        return false;
+    }
+    let mut depth = 0usize;
+    for segment in text.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => match depth.checked_sub(1) {
+                Some(up) => depth = up,
+                None => return false,
+            },
+            _ => depth += 1,
+        }
+    }
+    true
 }
 
 /// A valid leaf for every field the grammar names.
@@ -880,7 +900,7 @@ fn edge_value(rng: &mut Rng) -> Value {
     let strings = [
         "", "*", "fix*", "9f", "9F", "9g", "ABC", "human", "agent", "admin", "vouched", "suspect", "unresolved",
         DATE, "2026-13-01T00:00:00Z", "yesterday", "all", "any", "not", "eq", "ne", "in", "matches", "touches",
-        "between", "field", "op", "value", "src", ".", "../outside", "a\u{0}b", "\u{e9}",
+        "between", "field", "op", "value", "src", ".", "../outside", "src/..", "src/../..", "./", "a/./b", "/abs", "a\u{0}b", "\u{e9}",
     ];
     match rng.below(12) {
         0 => Value::Null,

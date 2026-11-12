@@ -9,6 +9,7 @@
 use std::fmt;
 
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::map::Entry;
 use serde_json::{Map, Number, Value};
 
 /// Parse `text` as one JSON value, refusing an object that names a key twice at any depth. The
@@ -73,11 +74,15 @@ impl<'de> Visitor<'de> for StrictVisitor {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
         let mut object = Map::new();
         while let Some(key) = map.next_key::<String>()? {
-            if object.contains_key(&key) {
-                return Err(de::Error::custom(format!("the key \"{}\" appears twice in one object", key)));
-            }
             let Strict(value) = map.next_value()?;
-            object.insert(key, value);
+            match object.entry(key) {
+                Entry::Vacant(slot) => {
+                    slot.insert(value);
+                }
+                Entry::Occupied(slot) => {
+                    return Err(de::Error::custom(format!("the key \"{}\" appears twice in one object", slot.key())));
+                }
+            }
         }
         Ok(Value::Object(object))
     }
