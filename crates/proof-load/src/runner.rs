@@ -83,6 +83,7 @@ pub fn host_root(scratch: &Scratch) -> PathBuf {
 #[allow(clippy::too_many_arguments)]
 pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, server: Option<&Path>, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Built, RunError> {
     let work = scratch.work();
+    let corpus = &scenario.corpus(corpus);
     let run_in = |program: &Path, arguments: Vec<String>, directory: PathBuf| -> Result<Outcome, RunError> {
         let invocation = Invocation { program: PathBuf::from(program), arguments, directory, limit };
         let outcome = tool::run(&invocation, scratch, environment).map_err(RunError::Tool)?;
@@ -99,9 +100,12 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
     let mut outcomes = vec![run_in(program, prepare(tool), work.clone())?];
     let mut acknowledged = Vec::new();
     let mut host: Option<Served> = None;
+    // The folder a sparse clone scoped the work tree to, which bounds what a later write may hold.
+    let mut scope: Option<&str> = None;
     for op in &scenario.history {
         if let Some(snapshot) = op.writes(corpus) {
             let snapshot = snapshot.map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?;
+            let snapshot = match scope { Some(scope) => corpus::within(&snapshot, scope), None => snapshot };
             corpus::write(&snapshot, &work).map_err(|error| RunError::Io(error.to_string()))?;
         }
         let mut directory = work.clone();
@@ -131,6 +135,9 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
             let arguments = fill(arguments, host.as_ref().map(|host| host.url.as_str()), &work)
                 .map_err(|placeholder| RunError::Io(format!("scenario {}: {:?} needs {} before a Host", scenario.id, op, placeholder)))?;
             outcomes.push(run_in(program, arguments, directory.clone())?);
+        }
+        if let Op::Clone { kind } = op {
+            scope = match kind { crate::scenario::CloneKind::Only(scope) => Some(scope.as_str()), _ => None };
         }
         if let Some(mark) = op.mark() {
             acknowledged.push(mark);

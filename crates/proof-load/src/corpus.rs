@@ -157,6 +157,29 @@ pub fn variant(snapshot: &Snapshot) -> Snapshot {
     }).collect()
 }
 
+/// The one file a rooted corpus keeps outside its scope, the same in every record, so a sparse
+/// warehouse carries something it does not hold.
+pub const OUTSIDE: &str = "outside-scope.txt";
+
+/// The corpus with every path moved under `scope`, plus `OUTSIDE` at the root. A scoped bay reads
+/// and writes only its scope, and a seed's records need not change anything under any one folder
+/// of the plain corpus, so a scenario with a scope records this one instead: each record changes
+/// the scope, and something outside it stays.
+pub fn rooted(corpus: &Corpus, scope: &str) -> Corpus {
+    let records = corpus.records.iter().map(|snapshot| {
+        let mut rooted: Snapshot = snapshot.iter().map(|(path, bytes)| (format!("{}/{}", scope, path), bytes.clone())).collect();
+        rooted.insert(OUTSIDE.to_string(), format!("outside {}\n", scope).into_bytes());
+        rooted
+    }).collect();
+    Corpus { records, ..corpus.clone() }
+}
+
+/// The part of `snapshot` under `scope`: what a bay scoped to it holds.
+pub fn within(snapshot: &Snapshot, scope: &str) -> Snapshot {
+    let prefix = format!("{}/", scope);
+    snapshot.iter().filter(|(path, _)| path.starts_with(&prefix)).map(|(path, bytes)| (path.clone(), bytes.clone())).collect()
+}
+
 /// Makes the working files under `root` match `snapshot`: writes every file it holds, and removes
 /// every file it does not, leaving the tool's own state folder (`.forklift`, `.git`) alone.
 pub fn write(snapshot: &Snapshot, root: &Path) -> std::io::Result<()> {
@@ -252,5 +275,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A rooted corpus changes its scope in every record of every seed, keeps one file outside it,
+    /// and a bay scoped to it holds every rooted path but that one.
+    ///
+    /// Revert: root only the paths already under the scope → some seed records nothing new there.
+    #[test]
+    fn a_rooted_corpus_changes_its_scope_in_every_record() {
+        for seed in 0..500 {
+            let rooted = rooted(&generate(seed, Shape { records: 4, ..Shape::SMALL }), "src");
+            for pair in rooted.records.windows(2) {
+                assert_ne!(within(&pair[0], "src"), within(&pair[1], "src"), "seed {}", seed);
+            }
+            for snapshot in &rooted.records {
+                let scoped = within(snapshot, "src");
+                assert_eq!(scoped.len() + 1, snapshot.len(), "seed {}: only {} lies outside", seed, OUTSIDE);
+                assert!(snapshot.contains_key(OUTSIDE) && !scoped.contains_key(OUTSIDE));
+            }
+        }
+        assert!(within(&rooted(&generate(1, Shape::SMALL), "src").records[0], "sr").is_empty(), "a scope is a folder, not a prefix");
     }
 }

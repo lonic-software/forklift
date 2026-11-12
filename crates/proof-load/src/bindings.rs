@@ -67,6 +67,9 @@ pub const BINDINGS: &[Binding] = &[
     bound_in("origin", "cached", FILE),
     bound_in("sealed", "cached", FILE),
     bound_in("origin-move.lock", "moved", LOCK_FILE),
+    bound_in("config/fetch-scope", "sparse", FILE),
+    bound_in("fetched-heads", "sparse", FILE),
+    bound_in("{bay}scope", "sparse", FILE),
 ];
 
 const NO_MIRROR_ORACLE: &str = "no mirror oracle: the corpus configures no mirror url, so nothing reads a mirror back";
@@ -96,19 +99,16 @@ pub const EXEMPTIONS: &[Exemption] = &[
 ];
 
 /// Census names no scenario of this build creates yet, so neither bound nor exempted: a run
-/// reports each one missing and fails. They need the sparse-clone, redaction, withhold and host
+/// reports each one missing and fails. They need the redaction, withhold and host
 /// scenarios, or a command interrupted or holding its lock; this list only lets the unit test hold the gap exact, so a name
 /// that joins or leaves it is noticed. It is not an exemption and the run never reads it.
 pub const NOT_YET_CREATED: &[&str] = &[
-    "config/fetch-scope",
-    "fetched-heads",
     "redactions-applied",
     "served",
     "tombstones",
     "unavailable",
     "unvouched-heads",
     "withheld",
-    "{bay}scope",
 ];
 
 /// What the damage completeness check finds missing: census names no binding or exemption covers,

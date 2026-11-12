@@ -223,6 +223,24 @@ impl Scenario {
     pub fn marks(&self) -> Vec<Mark> {
         self.history.iter().filter_map(Op::mark).collect()
     }
+
+    /// The scope the work tree is left scoped to: that of the last clone, when it took one folder.
+    pub fn scope(&self) -> Option<&str> {
+        self.history.iter().rev().find_map(|op| match op {
+            Op::Clone { kind: CloneKind::Only(scope) } => Some(Some(scope.as_str())),
+            Op::Clone { .. } => Some(None),
+            _ => None,
+        }).flatten()
+    }
+
+    /// The corpus this scenario records from `corpus`: rooted under its scope when it has one, so
+    /// every record changes what the scoped bay holds (`corpus::rooted`).
+    pub fn corpus(&self, corpus: &crate::corpus::Corpus) -> crate::corpus::Corpus {
+        match self.scope() {
+            Some(scope) => crate::corpus::rooted(corpus, scope),
+            None => corpus.clone(),
+        }
+    }
 }
 
 impl Op {
@@ -269,6 +287,10 @@ pub fn catalog() -> Vec<Scenario> {
         ]) },
         Scenario { then: vec![Op::Push], ..named("moved", vec![
             Op::Host, record(0), record(1), Op::Push, Op::Clone { kind: CloneKind::Cache }, Op::MoveOrigin,
+        ]) },
+        // A sparse clone of one folder; the faulted command records and lifts from the scoped bay.
+        Scenario { then: vec![Op::Push], ..named("sparse", vec![
+            Op::Host, record(0), record(1), Op::Push, Op::Clone { kind: CloneKind::Only("src".into()) },
         ]) },
         named("signed", vec![record(0), Op::Enroll, record(1), record(2)]),
         named("packed", vec![record(0), Op::Enroll, record(1), record(2), Op::Pack]),
@@ -359,6 +381,25 @@ mod tests {
         assert_eq!(Op::Variant { index: 0 }.writes(&corpus).unwrap().unwrap(), crate::corpus::variant(&corpus.records[0]));
         assert!(Op::Record { index: 2 }.writes(&corpus).unwrap().is_err(), "past the corpus is an error, not a guess");
         assert!(Op::Enroll.writes(&corpus).is_none());
+    }
+
+    /// A scenario is scoped by its last clone, and only when that clone took one folder; a scoped
+    /// scenario records the corpus rooted under its scope, any other the corpus as it is.
+    ///
+    /// Revert: take the first clone's scope → a full clone after a sparse one stays scoped.
+    #[test]
+    fn the_last_clone_decides_the_scope() {
+        let only = |scope: &str| Op::Clone { kind: CloneKind::Only(scope.into()) };
+        let scenario = |history| Scenario { id: "s".into(), history, then: vec![], damage: None };
+        assert_eq!(scenario(vec![Op::Host, only("src")]).scope(), Some("src"));
+        assert_eq!(scenario(vec![only("src"), Op::Clone { kind: CloneKind::Full }]).scope(), None);
+        assert_eq!(scenario(vec![Op::Clone { kind: CloneKind::Cache }, only("docs")]).scope(), Some("docs"));
+        assert_eq!(scenario(vec![Op::Record { index: 0 }]).scope(), None);
+
+        let corpus = crate::corpus::generate(1, crate::corpus::Shape::SMALL);
+        let sparse = catalog().into_iter().find(|scenario| scenario.id == "sparse").unwrap();
+        assert_eq!(sparse.corpus(&corpus), crate::corpus::rooted(&corpus, "src"));
+        assert_eq!(scenario(vec![]).corpus(&corpus), corpus);
     }
 }
 

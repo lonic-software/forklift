@@ -51,7 +51,8 @@ pub struct RecordReadback {
 /// One readback of the whole history.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct HistoryReadback {
-    /// The export's own outcome; a refusal here refuses every record.
+    /// The readback's own command: the export, or in a scoped bay the opening of the side bay it
+    /// reads through. A refusal here refuses every record.
     pub export: Outcome,
     pub records: Vec<RecordReadback>,
 }
@@ -102,6 +103,8 @@ struct Context<'a> {
     then: &'a [Op],
     /// The host's URL, when the scenario serves one.
     url: Option<&'a str>,
+    /// The folder the work tree is scoped to, when a sparse clone left it scoped.
+    scope: Option<&'a str>,
 }
 
 impl Context<'_> {
@@ -125,7 +128,9 @@ impl Context<'_> {
     /// The faulted command: corpus record `index` written into the work tree, then the record
     /// operation's lines and those of the scenario's `then` run in order until one fails.
     fn record(&self, index: usize, steps: &mut Vec<Outcome>) -> Result<bool, RunError> {
-        corpus::write(&self.corpus.records[index], &self.scratch.work()).map_err(|error| RunError::Io(error.to_string()))?;
+        let snapshot = &self.corpus.records[index];
+        let snapshot = match self.scope { Some(scope) => corpus::within(snapshot, scope), None => snapshot.clone() };
+        corpus::write(&snapshot, &self.scratch.work()).map_err(|error| RunError::Io(error.to_string()))?;
         let mut lines = Vec::new();
         for op in std::iter::once(&Op::Record { index }).chain(self.then) {
             for arguments in bind(Tool::Forklift, op).expect("forklift binds every operation") {
@@ -148,6 +153,9 @@ impl Context<'_> {
     /// hold; a record in `required` that an export exiting 0 leaves out was served as missing,
     /// which is silent.
     fn read_back(&self, marks: &[Mark], required: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
+        if let Some(scope) = self.scope {
+            return self.read_back_scoped(scope, marks, required, |mark| within(expectation(mark), scope));
+        }
         let exported = self.fresh("readback");
         let export = self.run(&self.programs.forklift, vec!["--json".into(), "git".into(), "export".into(), exported.display().to_string()], self.scratch.work())?;
         if !export.succeeded() {
@@ -191,6 +199,74 @@ impl Context<'_> {
             records.push(RecordReadback { mark, verdicts });
         }
         Ok(HistoryReadback { export, records })
+    }
+
+    /// The readback of a scoped bay, where `git export` refuses and `show` serves no binary file's
+    /// bytes: a side bay with the same scope, opened fresh, and in it a new pallet at each parcel
+    /// whose description is a record's message, which materializes that record's scope there. The
+    /// work tree under test, dirty or not, is left as it is. The parcels come from the history
+    /// listing; a listing that cannot be read served nothing.
+    fn read_back_scoped(&self, scope: &str, marks: &[Mark], required: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
+        let work = self.scratch.work();
+        let listing = self.run(&self.programs.forklift, vec!["--json".into(), "history".into()], work.clone())?;
+        if !listing.succeeded() {
+            return Ok(HistoryReadback { export: listing, records: Vec::new() });
+        }
+        let parcels = described_parcels(&listing.stdout);
+
+        let side = self.fresh("readback");
+        let name = side.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        let opened = self.run(&self.programs.forklift, vec![
+            "--json".into(), "bay".into(), "add".into(), name.clone(), side.display().to_string(), "--scope".into(), scope.to_string(),
+        ], work)?;
+        if !opened.succeeded() {
+            return Ok(HistoryReadback { export: opened, records: Vec::new() });
+        }
+
+        let mut records = Vec::new();
+        let mut pallets = 0;
+        for &mark in marks {
+            let message = mark.message();
+            let mut wanted: Vec<&String> = parcels.iter().filter(|(description, _)| *description == message).map(|(_, parcel)| parcel).collect();
+            wanted.dedup();
+            let mut verdicts = Vec::new();
+            for parcel in wanted {
+                pallets += 1;
+                let created = self.run(&self.programs.forklift, vec![
+                    "--json".into(), "pallet".into(), "create".into(), format!("{}-{}", name, pallets), parcel.clone(),
+                ], side.clone())?;
+                let readback = if created.succeeded() {
+                    Readback::Served { tree: oracle::read_tree(&side).map_err(|error| RunError::Io(error.to_string()))?, documented: Default::default() }
+                } else {
+                    Readback::Refused { code: created.failure.as_ref().map(|failure| failure.code.clone()) }
+                };
+                verdicts.push(oracle::judge(&readback, &expectation(mark)));
+            }
+            if verdicts.is_empty() && required.contains(&mark) {
+                verdicts.push(Verdict::Silent);
+            }
+            records.push(RecordReadback { mark, verdicts });
+        }
+        Ok(HistoryReadback { export: opened, records })
+    }
+}
+
+/// The (description, parcel) of every entry a `history --json` listing holds, newest first; empty
+/// when the document is not one.
+fn described_parcels(stdout: &[u8]) -> Vec<(String, String)> {
+    let document: serde_json::Value = serde_json::from_slice(stdout).unwrap_or_default();
+    document["data"]["entries"].as_array().map(|entries| entries.iter().filter_map(|entry| {
+        Some((entry["description"].as_str()?.to_string(), entry["parcel"].as_str()?.to_string()))
+    }).collect()).unwrap_or_default()
+}
+
+/// `expectation` restricted to what a bay scoped to `scope` holds.
+fn within(expectation: Expectation, scope: &str) -> Expectation {
+    let prefix = format!("{}/", scope);
+    let inside = |path: &String| path.starts_with(&prefix);
+    Expectation {
+        trees: expectation.trees.into_iter().map(|tree| tree.into_iter().filter(|(path, _)| inside(path)).collect()).collect(),
+        transformed: expectation.transformed.into_iter().filter(|(path, _)| inside(path)).collect(),
     }
 }
 
@@ -259,6 +335,8 @@ impl Trail {
 #[allow(clippy::too_many_arguments)]
 pub fn run(scenario: &Scenario, name: &str, kind: Kind, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, seed: u64) -> Result<Faulted, RunError> {
     let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), scratch, environment, limit)?;
+    // What the build recorded: the corpus rooted under the scenario's scope, when it has one.
+    let corpus = &scenario.corpus(corpus);
     let target = resolve(name, &built.walked, seed)
         .ok_or_else(|| RunError::Io(format!("{} resolves to nothing {} built", name, scenario.id)))?;
     let state = scratch.work().join(".forklift");
@@ -270,7 +348,7 @@ pub fn run(scenario: &Scenario, name: &str, kind: Kind, corpus: &Corpus, program
     // Before the faulted command, the work tree holds what the history recorded last.
     let before = built.acknowledged.last().and_then(|last| last.snapshot(corpus)).map(|snapshot| corpus::expected(&snapshot)).unwrap_or_default();
     let expected = Expected { before, after: corpus::expected(snapshot), acknowledged: built.acknowledged, faulted: Mark::Record(faulted) };
-    let context = Context { corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.host.as_ref().map(|host| host.url.as_str()) };
+    let context = Context { corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.host.as_ref().map(|host| host.url.as_str()), scope: scenario.scope() };
     let mut trail = Trail::default();
     let mut unextractable = Vec::new();
 
