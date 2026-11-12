@@ -548,25 +548,37 @@ pub(crate) fn remedy_path(path: &str) -> Option<String> {
     remedy_path_when(path, cfg!(windows))
 }
 
-/// `path` as one argument of a remedy command. Unchanged when it holds only characters no shell
-/// treats specially, and single-quoted for a POSIX shell otherwise. On Windows there is no quoting
-/// that both `cmd` and PowerShell read as one literal argument (both expand inside double quotes,
-/// and the message already wraps the command in them), so such a path gets `None` and the caller
-/// prints a `<path>` placeholder instead. A path starting with `-` is put after `--`, so it is not
-/// taken for an option.
+/// `path` (relative) as one argument of a remedy command, which never starts with `-`: a path that
+/// does is spelled `./<path>`, the same path, so it is not taken for an option. Not after `--`:
+/// Windows PowerShell 5.1 splits an unquoted argument that starts with `-` at its first `.`, after
+/// a `--` too (`-- -draft.txt` reaches the program as `-draft` and `.txt`), while the `-- <path>`
+/// placeholder callers print for `None` runs once the user quotes the path, as
+/// `a_dash_led_remedy_path_runs_as_printed_in_windows_shells` in the CLI tests shows. Otherwise as
+/// [`remedy_word_when`] quotes it.
 pub fn remedy_path_when(path: &str, windows: bool) -> Option<String> {
+    match path.starts_with('-') {
+        true => remedy_word_when(&format!("./{}", path), windows),
+        false => remedy_word_when(path, windows),
+    }
+}
+
+/// `word` as one shell word in a remedy command, for a caller that puts it where it does not start
+/// an argument (behind a prefix), or that guards a leading `-` itself. Unchanged when it holds only
+/// characters no shell treats specially, and single-quoted for a POSIX shell otherwise. On Windows
+/// there is no quoting that both `cmd` and PowerShell read as one literal argument (both expand
+/// inside double quotes, and the message already wraps the command in them), so such a word gets
+/// `None` and the caller prints a `<path>` placeholder instead.
+pub(crate) fn remedy_word_when(word: &str, windows: bool) -> Option<String> {
     // PowerShell also reads `,` (an array), a leading `@` (splatting) and `+`, `:` in some
     // positions, so Windows keeps to the characters no shell there treats specially.
     let plain = if windows { "._-/" } else { "._-/+@%:," };
-    let quoted = if !path.is_empty() && path.chars().all(|c| c.is_ascii_alphanumeric() || plain.contains(c)) {
-        path.to_string()
+    if !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || plain.contains(c)) {
+        Some(word.to_string())
     } else if windows {
-        return None;
+        None
     } else {
-        format!("'{}'", path.replace('\'', "'\\''"))
-    };
-
-    Some(if path.starts_with('-') { format!("-- {}", quoted) } else { quoted })
+        Some(format!("'{}'", word.replace('\'', "'\\''")))
+    }
 }
 
 /// Splice freshly built in-scope subtree(s) over the current head's spine to produce the
@@ -1105,7 +1117,8 @@ mod subtree_closure_tests {
 
     /// A remedy command's path is one argument: plain paths stay as they are, anything a shell
     /// would split or expand is single-quoted for POSIX (embedded quotes included) and left to a
-    /// placeholder on Windows, and a leading `-` goes after `--`.
+    /// placeholder on Windows, and a leading `-` is guarded by `./`, never by `--` (which PowerShell
+    /// 5.1 does not keep a dotted path whole behind).
     #[test]
     fn a_remedy_path_is_one_argument() {
         let mut failures = Vec::new();
@@ -1118,8 +1131,9 @@ mod subtree_closure_tests {
             ("a,b.txt", Some("a,b.txt"), None),
             ("@notes.txt", Some("@notes.txt"), None),
             ("c++/x:y", Some("c++/x:y"), None),
-            ("-draft.txt", Some("-- -draft.txt"), Some("-- -draft.txt")),
-            ("-my draft", Some("-- '-my draft'"), None),
+            ("-draft.txt", Some("./-draft.txt"), Some("./-draft.txt")),
+            ("-my draft", Some("'./-my draft'"), None),
+            ("dir/-draft.txt", Some("dir/-draft.txt"), Some("dir/-draft.txt")),
             ("", Some("''"), None),
             ("say \"hi\".txt", Some("'say \"hi\".txt'"), None),
         ];

@@ -109,12 +109,15 @@ apply here, and **do not** delete the directory first unless you want to fetch e
 ### `staged_content_missing` (exit 25)
 
 A staged file's content is gone from the store, so no parcel was made. Stage it again from your
-working copy, for each file the message names:
+working copy, for each file the message names, from the working tree's root:
 
 ```sh
-forklift unload -- <path>
-forklift load -- <path>
+forklift unload <path>
+forklift load <path>
 ```
+
+Quote a path your shell would split, and write one starting with `-` as `./<path>`, so it is not
+read as an option.
 
 ### Pack problems
 

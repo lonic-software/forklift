@@ -8960,6 +8960,140 @@ fn a_staged_removal_next_step_runs_as_printed_from_the_working_tree_root() {
     assert_eq!(std::fs::read_to_string(docs.join("my notes.txt")).unwrap(), "original\n");
 }
 
+/// The shells a Windows user pastes a printed next step into.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+enum WindowsShell {
+    /// Windows PowerShell 5.1 (`powershell.exe`), the one every Windows install has.
+    PowerShell,
+    Cmd,
+}
+
+/// Run `command` the way a Windows user pastes a printed next step into `shell`, from the
+/// warehouse root, with a copy of this build's `forklift` alone in the first `PATH` directory and
+/// the test's isolated configuration. PowerShell reads the line from a script file (UTF-8 with a
+/// BOM, which 5.1 needs to decode anything past ASCII), tokenized as at its prompt, and exits with
+/// the last native command's status, or 99 when no native command ran; `cmd` gets the line verbatim
+/// after `/C`.
+#[cfg(windows)]
+fn run_in_windows_shell(warehouse: &TestWarehouse, shell: WindowsShell, command: &str) -> Output {
+    use std::os::windows::process::CommandExt;
+
+    let bin = warehouse.home.join("shell-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let copy = bin.join("forklift.exe");
+    if !copy.exists() {
+        std::fs::copy(FORKLIFT, &copy).unwrap();
+    }
+    let mut dirs = vec![bin];
+    dirs.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+    let path = std::env::join_paths(dirs).unwrap();
+
+    let mut process = match shell {
+        WindowsShell::PowerShell => {
+            let script = warehouse.home.join("pasted.ps1");
+            let body = format!("\u{feff}{}\r\nif ($null -eq $LASTEXITCODE) {{ exit 99 }}\r\nexit $LASTEXITCODE\r\n", command);
+            std::fs::write(&script, body).unwrap();
+            let mut process = common::test_command("powershell.exe");
+            process.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]).arg(&script);
+            process
+        }
+        WindowsShell::Cmd => {
+            let mut process = common::test_command("cmd.exe");
+            process.args(["/D", "/C"]).raw_arg(command);
+            process
+        }
+    };
+
+    process
+        .current_dir(&warehouse.root)
+        .env("PATH", path)
+        .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", warehouse.home.join("test-keys"))
+        .output()
+        .unwrap()
+}
+
+/// A printed next step names a path starting with `-` as `./<path>`, and pasted into Windows
+/// PowerShell 5.1 or `cmd` it runs, also for a path with a `.` in it; one that needs quoting gets
+/// the `-- <path>` placeholder, which runs with the path quoted for that shell. Driven through the
+/// staged-removal remedy `restore` prints: the pasted unload unstages the removal and the restore
+/// then succeeds. Run first, and each refused by `forklift`'s parser with the removal left staged:
+/// the path bare, read as an option; and in PowerShell, for a dotted path, the `--` guard this
+/// replaced, since 5.1 splits `-- -draft.txt` into `-draft` and `.txt`.
+#[cfg(windows)]
+#[test]
+fn a_dash_led_remedy_path_runs_as_printed_in_windows_shells() {
+    for name in ["-draft", "-draft.txt", "-my draft.txt"] {
+        for shell in [WindowsShell::PowerShell, WindowsShell::Cmd] {
+            let warehouse = TestWarehouse::new(&format!("windows-dash-led-{:?}-{}", shell, name.len()));
+            if let WindowsShell::PowerShell = shell {
+                // About 5.1's native-argument passing: on PowerShell 7 it would prove nothing.
+                let version = run_in_windows_shell(&warehouse, shell, "Write-Output $PSVersionTable.PSVersion.ToString()");
+                assert!(stdout(&version).trim().starts_with("5.1."), "powershell.exe is {:?}", stdout(&version).trim());
+            }
+            warehouse.write_file(name, "original\n");
+            assert_success(&warehouse.run(&["prepare"]));
+            configure_operator(&warehouse);
+            assert_success(&warehouse.run(&["load", "."]));
+            assert_success(&warehouse.run(&["stack", "-m", "baseline"]));
+
+            std::fs::remove_file(warehouse.root.join(name)).unwrap();
+            assert_success(&warehouse.run(&["load", "."]));
+
+            let staged = format!("The removal of \"{}\" is staged", name);
+            let refused = warehouse.run(&["restore", "--", name]);
+            let message = stderr(&refused);
+            assert!(!refused.status.success() && message.contains(&staged), "{}", message);
+            let printed = message.split('"').nth(3).expect("the message quotes the unload");
+            let command = if name.contains(' ') {
+                // No quoting reads it as one argument in both shells, so the message prints a
+                // placeholder and says to quote the path: pasted with it quoted for this shell.
+                assert_eq!(printed, "forklift unload -- <path>", "{}", message);
+                assert!(message.contains("with that path quoted for your shell"), "{}", message);
+                let quoted = match shell {
+                    WindowsShell::PowerShell => format!("'{}'", name),
+                    WindowsShell::Cmd => format!("\"{}\"", name),
+                };
+                printed.replace("<path>", &quoted)
+            } else {
+                assert_eq!(printed, format!("forklift unload ./{}", name), "{}", message);
+                printed.to_string()
+            };
+
+            let mut refused_forms = Vec::new();
+            if !name.contains(' ') {
+                refused_forms.push((format!("forklift unload {}", name), "unexpected argument '-d'"));
+                if let (WindowsShell::PowerShell, true) = (shell, name.contains('.')) {
+                    refused_forms.push((format!("forklift unload -- {}", name), "unexpected argument '.txt'"));
+                }
+            }
+            for (form, reason) in refused_forms {
+                let out = run_in_windows_shell(&warehouse, shell, &form);
+                let said = format!("{}{}", stdout(&out), stderr(&out));
+                assert!(
+                    out.status.code() == Some(2) && said.contains(reason),
+                    "{:?} ran {:?}: forklift's parser refuses it ({}): status {:?}\n{}", shell, form, reason, out.status, said
+                );
+                let still = warehouse.run(&["restore", "--", name]);
+                assert!(
+                    !still.status.success() && stderr(&still).contains(&staged),
+                    "{:?} ran {:?}: the refused unload left the removal staged: {}", shell, form, stderr(&still)
+                );
+            }
+
+            let ran = run_in_windows_shell(&warehouse, shell, &command);
+            assert!(
+                ran.status.success(),
+                "{:?} ran {:?}: status {:?}\nstdout: {}\nstderr: {}", shell, command, ran.status, stdout(&ran), stderr(&ran)
+            );
+            let restored = warehouse.run(&["restore", "--", name]);
+            assert!(restored.status.success(), "{:?} {}: after the pasted unload: {}", shell, name, stderr(&restored));
+            assert_eq!(std::fs::read_to_string(warehouse.root.join(name)).unwrap(), "original\n");
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_narrower_clean_load_does_not_heal_a_broader_failed_root() {

@@ -543,8 +543,8 @@ mod tests {
 
     /// The next step's commands take a single recorded root as one argument on each platform: a
     /// plain path bare, one a shell would split single-quoted for POSIX and a placeholder on
-    /// Windows, a leading `-` after `--`; several roots are each named, past the description's cap,
-    /// as their own command where every one quotes and in a listed placeholder step otherwise.
+    /// Windows, a leading `-` guarded by `./`; several roots are each named, past the description's
+    /// cap, as their own command where every one quotes and in a listed placeholder step otherwise.
     #[test]
     fn the_next_step_names_a_recorded_root_as_one_argument() {
         let mut failures = Vec::new();
@@ -556,8 +556,8 @@ mod tests {
             (&["my dir"], false, "run \"forklift load 'my dir'\" again, or \"forklift unload 'my dir'\""),
             (&["my dir"], true, "run \"forklift load -- <path>\" again, or \"forklift unload -- <path>\" to \
                 abandon it, with that path quoted for your shell."),
-            (&["-draft"], false, "run \"forklift load -- -draft\" again, or \"forklift unload -- -draft\""),
-            (&["-draft"], true, "run \"forklift load -- -draft\" again, or \"forklift unload -- -draft\""),
+            (&["-draft"], false, "run \"forklift load ./-draft\" again, or \"forklift unload ./-draft\""),
+            (&["-draft"], true, "run \"forklift load ./-draft\" again, or \"forklift unload ./-draft\""),
             (&["a, b", "c"], false, "run each of these again, or \"forklift unload\" with the same path \
                 to abandon it: \"forklift load 'a, b'\", \"forklift load c\"."),
             (&["a", "b", "c", "d", "e"], false, "run each of these again, or \"forklift unload\" with the \

@@ -407,11 +407,16 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **A load, unload or remove next step for a path starting with `-` runs as printed in Windows
+  PowerShell.** Such a path used to follow `--`, and Windows PowerShell 5.1 splits an unquoted
+  argument that starts with `-` at its first dot, so `forklift unload -- -draft.txt` reached
+  Forklift as two paths. These next steps now spell it `./-draft.txt` instead, on every platform.
+
 - **Three more next steps quote the path they name.** The next step of an `incomplete_load`
   refusal, of `restore` on a file whose removal is staged, and of an inventory that cannot be read
   used to paste the path in bare, so a path with a space or a character a shell reads specially
-  gave a command that did not run as printed. They now quote it for a POSIX shell and put a path
-  starting with `-` after `--`. On Windows, where no quoting reads such a path as one argument,
+  gave a command that did not run as printed. They now quote it for a POSIX shell and spell a path
+  starting with `-` as `./<path>`. On Windows, where no quoting reads such a path as one argument,
   they print a placeholder instead and say to quote the path for your shell. All three now name
   the path relative to the working tree's root and say to run the step from there, and an
   `incomplete_load` over several paths names a command for every one of them, not only the first

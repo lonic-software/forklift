@@ -1485,7 +1485,7 @@ fn chunkable_content() -> Vec<u8> {
 /// file unchanged and stores nothing, so the fixture really is in the state the named remedy is
 /// for); and that the named remedy, `unload` then `load`, lets the verb through with the
 /// file restorable afterwards. The blob arm's file starts with `-`, so the remedy as printed (the
-/// path after `--`) is what gets run.
+/// path spelled `./-wip.txt`) is what gets run.
 ///
 /// Red with the `require_staged_content_present` call removed from `stack_parcel` (every stack arm
 /// goes through) or from `park` (the park arm does), and with its chunk check removed (the chunk
@@ -1550,13 +1550,13 @@ fn stack_and_park_refuse_a_staged_object_the_store_lost() {
         }
 
         // The remedy the refusal names, as printed.
-        let remedy = if file.starts_with('-') { format!("-- {}", file) } else { file.to_string() };
+        let remedy = if file.starts_with('-') { format!("./{}", file) } else { file.to_string() };
         let printed = format!("\"forklift unload {}\", then \"forklift load {}\"", remedy, remedy);
         if !stderr.contains(&printed) {
             failures.push(format!("{}: the refusal must name the remedy {}; got: {}", arm, printed, stderr));
         }
-        let unstaged = warehouse.run(&["unload", "--", file]);
-        let reloaded = warehouse.run(&["load", "--", file]);
+        let unstaged = warehouse.run(&["unload", &remedy]);
+        let reloaded = warehouse.run(&["load", &remedy]);
         let again = warehouse.run(verb);
         if !unstaged.status.success() || !reloaded.status.success() || !again.status.success() {
             failures.push(format!(
