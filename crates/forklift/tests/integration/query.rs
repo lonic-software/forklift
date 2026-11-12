@@ -410,9 +410,9 @@ fn a_predicate_that_could_read_as_everything_is_refused_never_widened() {
     // stays within it when flags are given alongside it: the flags are conjuncts beside the
     // payload, not a level above it.
     let at_depth = format!(
-        "{}{}{}",
+        "{}{{\"all\":[{{\"field\":\"signer.key\",\"op\":\"eq\",\"value\":\"{}\"}}]}}{}",
         "{\"not\":".repeat(14),
-        format!("{{\"all\":[{{\"field\":\"signer.key\",\"op\":\"eq\",\"value\":\"{}\"}}]}}", agent_key),
+        agent_key,
         "}".repeat(14)
     );
     let both = json(&warehouse.run(&["--json", "query", "main", "--class", "agent", "--where", &at_depth]));
