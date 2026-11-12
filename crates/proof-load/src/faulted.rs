@@ -178,13 +178,19 @@ impl Context<'_> {
         if !export.succeeded() {
             return Ok(HistoryReadback { export, records: Vec::new() });
         }
-        // The listing names the records the export left files out of; one that cannot be read
-        // leaves those unnamed, so the read refuses, as in a scoped bay.
-        let listing = self.run(&self.programs.forklift, vec!["--json".into(), "history".into()], bay)?;
-        if !listing.succeeded() {
-            return Ok(HistoryReadback { export: listing, records: Vec::new() });
-        }
-        let left_out = left_out(&runner::document(&export.stdout), &runner::described_parcels(&listing.stdout));
+        // The listing names the records the export left files out of, so it is read only when the
+        // export left something out. One that refuses then leaves those records unnamed, and the
+        // read refuses, as in a scoped bay.
+        let document = runner::document(&export.stdout);
+        let left_out = if leaves_out(&document) {
+            let listing = self.run(&self.programs.forklift, vec!["--json".into(), "history".into()], bay)?;
+            if !listing.succeeded() {
+                return Ok(HistoryReadback { export: listing, records: Vec::new() });
+            }
+            left_out(&document, &runner::described_parcels(&listing.stdout))
+        } else {
+            Default::default()
+        };
 
         let git = |arguments: &[&str]| self.run(&self.programs.git, arguments.iter().map(|argument| argument.to_string()).collect(), exported.clone());
         let log = git(&["log", "--all", "--format=%H%x09%s"])?;
@@ -273,6 +279,11 @@ impl Context<'_> {
         }
         Ok(HistoryReadback { export: opened, records })
     }
+}
+
+/// Whether an export reported leaving any file out, withheld or redacted.
+fn leaves_out(export: &serde_json::Value) -> bool {
+    ["withheld", "redacted"].iter().any(|key| export["data"][*key].as_array().is_some_and(|entries| !entries.is_empty()))
 }
 
 /// What the work tree holds before the faulted command: the last record on the corpus's line. A
@@ -534,7 +545,7 @@ mod tests {
 
     /// An export's left-out files are documented per record by their parcels: withheld content as
     /// `content_withheld`, redacted as `content_redacted`, and only in the records whose parcels
-    /// the export names.
+    /// the export names. Only an export that left something out needs the history listing.
     ///
     /// Revert: key every entry to every record → a record that never held the file expects a
     /// documented code for it, and an export serving it correctly reads silent.
@@ -552,6 +563,9 @@ mod tests {
         ])));
         assert_eq!(left_out.get("r0"), None);
         assert!(super::left_out(&serde_json::json!({ "data": {} }), &described).is_empty());
+        assert!(leaves_out(&export));
+        assert!(!leaves_out(&serde_json::json!({ "data": { "withheld": [], "redacted": [] } })));
+        assert!(!leaves_out(&serde_json::json!({ "data": {} })));
     }
 
     /// Content taken away opens every path holding its bytes, in every record and in both trees
