@@ -472,6 +472,30 @@ pub struct Graded {
     pub unextractable: Vec<String>,
 }
 
+/// How many rounds of named remedies a fault gets: each round runs what the refusals so far named
+/// and nothing run before.
+const REMEDY_ROUNDS: usize = 3;
+
+/// Runs named remedies in rounds: each round the remedies `named` finds that no earlier round ran,
+/// through `run`, which says whether the history then reads; until it reads, nothing new is named,
+/// or [`REMEDY_ROUNDS`] have run. One remedy can uncover the next: a stale lock removed, the bay is
+/// found behind its pallet.
+fn follow_remedies<S, E>(state: &mut S, named: impl Fn(&mut S) -> Vec<Remedy>, mut run: impl FnMut(&mut S, &[Remedy]) -> Result<bool, E>) -> Result<bool, E> {
+    let mut ran: Vec<Remedy> = Vec::new();
+    for _ in 0..REMEDY_ROUNDS {
+        let fresh: Vec<Remedy> = named(state).into_iter().filter(|remedy| !ran.contains(remedy)).collect();
+        if fresh.is_empty() {
+            return Ok(false);
+        }
+        let reads = run(state, &fresh)?;
+        ran.extend(fresh);
+        if reads {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Grades a fault: `first` is the faulted command's first attempt, pushing what it ran and saying
 /// whether the tool acknowledged the record. Then the readback, one plain retry, the remedies every
 /// refusal named, and heal.
@@ -492,39 +516,53 @@ pub(crate) fn grade_after(
     }
     trail.evidence.healed_by_retry = reads;
 
-    // The remedies every refusal so far named, run in order, then the faulted command again.
+    // The remedies every refusal so far named, run in order, then the faulted command again; and
+    // again for any remedy a refusal in that round named first, since one remedy can uncover the
+    // next (a stale lock removed, the bay is found behind its pallet). Bounded, and never the same
+    // remedy twice.
     if !reads {
-        let texts: Vec<String> = trail.steps.iter().chain(trail.readbacks.iter().map(|readback| &readback.export))
-            .flat_map(|outcome| outcome.remedy_texts().into_iter().map(str::to_string)).collect();
-        let extracted = remedy::extract(&texts.iter().map(String::as_str).collect::<Vec<_>>());
-        unextractable = extracted.unextractable;
-        trail.evidence.remedy_named = !extracted.remedies.is_empty();
-        for named in &extracted.remedies {
-            match named {
-                Remedy::Command { arguments } => {
-                    let mut arguments = arguments.clone();
-                    if arguments.first().map(String::as_str) != Some("--json") {
-                        arguments.insert(0, "--json".into());
-                    }
-                    trail.steps.push(context.run(&context.programs.forklift, arguments, context.scratch.work())?);
+        let named = |(trail, unextractable): &mut (Trail, Vec<String>)| {
+            let texts: Vec<String> = trail.steps.iter().chain(trail.readbacks.iter().map(|readback| &readback.export))
+                .flat_map(|outcome| outcome.remedy_texts().into_iter().map(str::to_string)).collect();
+            let extracted = remedy::extract(&texts.iter().map(String::as_str).collect::<Vec<_>>());
+            for text in extracted.unextractable {
+                if !unextractable.contains(&text) {
+                    unextractable.push(text);
                 }
-                Remedy::Remove { path } => match remedy::removable(path, context.scratch.root()) {
-                    Some(judged) => {
-                        trail.recoverability.outside_knowledge.push(format!("remove {}", path.display()));
-                        let _ = damage::apply(&judged, Kind::Delete, 0);
-                    }
-                    None => {
-                        trail.recoverability.outside_knowledge.push(format!("remove {} (outside the run root; not run)", path.display()));
-                    }
-                },
             }
-        }
-        if trail.evidence.remedy_named {
+            extracted.remedies
+        };
+        let run = |(trail, _): &mut (Trail, Vec<String>), fresh: &[Remedy]| -> Result<bool, RunError> {
+            trail.evidence.remedy_named = true;
+            for named in fresh {
+                match named {
+                    Remedy::Command { arguments } => {
+                        let mut arguments = arguments.clone();
+                        if arguments.first().map(String::as_str) != Some("--json") {
+                            arguments.insert(0, "--json".into());
+                        }
+                        trail.steps.push(context.run(&context.programs.forklift, arguments, context.scratch.work())?);
+                    }
+                    Remedy::Remove { path } => match remedy::removable(path, context.scratch.root()) {
+                        Some(judged) => {
+                            trail.recoverability.outside_knowledge.push(format!("remove {}", path.display()));
+                            let _ = damage::apply(&judged, Kind::Delete, 0);
+                        }
+                        None => {
+                            trail.recoverability.outside_knowledge.push(format!("remove {} (outside the run root; not run)", path.display()));
+                        }
+                    },
+                }
+            }
             made |= context.record(faulted, &mut trail.steps)?;
-            reads = trail.settle(context, expected, made)?;
+            let reads = trail.settle(context, expected, made)?;
             trail.evidence.remedy_worked = reads;
             trail.recoverability.named_right_remedy = reads;
-        }
+            Ok(reads)
+        };
+        let mut state = (std::mem::take(&mut trail), std::mem::take(&mut unextractable));
+        follow_remedies(&mut state, named, run)?;
+        (trail, unextractable) = state;
     }
 
     // Heal last, when an acknowledged record still does not read back.
@@ -719,4 +757,37 @@ mod tests {
         assert_eq!(before_of(&[Mark::Record(0), Mark::Variant(0), Mark::Record(1)], &corpus), corpus::expected(&corpus.records[1]));
         assert!(before_of(&[], &corpus).is_empty());
     }
+
+    /// A remedy that uncovers another refusal gets the next one run too, each remedy once, and the
+    /// rounds stop as soon as the history reads or nothing new is named.
+    ///
+    /// Revert: one round → the shift the second refusal names never runs and the history never
+    /// reads; drop the filter on remedies already run → the lock removal runs every round.
+    #[test]
+    fn a_remedy_that_uncovers_another_gets_it_run() {
+        let lock = Remedy::Remove { path: "/s/work/.forklift/lock".into() };
+        let shift = Remedy::Command { arguments: vec!["shift".into(), "main".into()] };
+        // The state: what the refusals so far name, and every remedy run, in order.
+        let mut state = (vec![lock.clone()], Vec::<Remedy>::new());
+        let named = |(named, _): &mut (Vec<Remedy>, Vec<Remedy>)| named.clone();
+        let run = |(named, ran): &mut (Vec<Remedy>, Vec<Remedy>), fresh: &[Remedy]| -> Result<bool, ()> {
+            ran.extend(fresh.iter().cloned());
+            // The lock gone, the retry finds the bay behind; once shifted, the history reads.
+            if fresh.contains(&lock) {
+                named.push(shift.clone());
+            }
+            Ok(ran.contains(&shift))
+        };
+        assert_eq!(follow_remedies(&mut state, named, run), Ok(true));
+        assert_eq!(state.1, vec![lock.clone(), shift.clone()]);
+
+        let mut stuck = (vec![lock.clone()], Vec::<Remedy>::new());
+        let never = |(_, ran): &mut (Vec<Remedy>, Vec<Remedy>), fresh: &[Remedy]| -> Result<bool, ()> {
+            ran.extend(fresh.iter().cloned());
+            Ok(false)
+        };
+        assert_eq!(follow_remedies(&mut stuck, named, never), Ok(false));
+        assert_eq!(stuck.1, vec![lock], "a remedy that did not help is not run again");
+    }
+
 }

@@ -340,6 +340,9 @@ pub struct Killed {
     pub landing: Landing,
     /// The grade, when the kill landed.
     pub graded: Option<Graded>,
+    /// The injected runs it took, each on a fresh copy: a kill another thread stole is tried again,
+    /// up to [`ATTEMPTS`].
+    pub attempts: usize,
 }
 
 /// Every kill point of one scenario's faulted command.
@@ -461,7 +464,7 @@ pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: 
             scope.spawn(|| loop {
                 let at = next.fetch_add(1, Ordering::SeqCst);
                 let Some(point) = points.get(at) else { break };
-                let result = inject(&shared, point, at)
+                let result = attempt(&shared, point, at)
                     .map_err(|error| format!("{} {}#{}: {}", point.command, point.name, point.when, error));
                 results.lock().expect("no worker panics holding the lock").push((at, result));
             });
@@ -503,7 +506,23 @@ fn context_of<'a>(scenario: &'a Scenario, corpus: &'a Corpus, programs: &'a Prog
 
 /// One injected run: a fresh copy, the lines before the point's run plainly, the point's line run
 /// under strace with the kill injected, the landing judged, and a landed kill graded.
-fn inject(shared: &Shared, point: &Point, at: usize) -> Result<Killed, RunError> {
+/// How many injected runs a kill point gets before it is reported not reached.
+pub const ATTEMPTS: usize = 3;
+
+/// A kill point's injected runs: the first that lands, or the last that did not.
+fn attempt(shared: &Shared, point: &Point, at: usize) -> Result<Killed, RunError> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let mut killed = inject(shared, point, &format!("{}-{}", at, attempts))?;
+        killed.attempts = attempts;
+        if killed.landing == Landing::Landed || attempts == ATTEMPTS {
+            return Ok(killed);
+        }
+    }
+}
+
+fn inject(shared: &Shared, point: &Point, at: &str) -> Result<Killed, RunError> {
     let Shared { scenario, corpus, programs, settings, template, label, lines, expected, faulted, counting_root } = *shared;
     let io = |error: std::io::Error| RunError::Io(error.to_string());
     let copy = template.copy_to(Path::new(&format!("{}-kill-{}", template.root().display(), at))).map_err(|error| RunError::Io(error.to_string()))?;
@@ -555,7 +574,7 @@ fn inject(shared: &Shared, point: &Point, at: usize) -> Result<Killed, RunError>
         #[allow(clippy::disallowed_methods, reason = "a scratch copy the harness made itself, under its own output directory")]
         let _ = std::fs::remove_dir_all(copy.root());
     }
-    Ok(Killed { point: point.clone(), landing, graded })
+    Ok(Killed { point: point.clone(), landing, graded, attempts: 1 })
 }
 
 /// What the kill points of a run add to its report.
@@ -813,7 +832,7 @@ mod tests {
         Killed {
             point,
             landing: if landed { Landing::Landed } else { Landing::NotReached { why: "stolen".into() } },
-            graded: landed.then_some(graded),
+            graded: landed.then_some(graded), attempts: 1,
         }
     }
 
