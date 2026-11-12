@@ -2436,6 +2436,7 @@ fn sweep_interrupted_creations(base: &std::path::Path) {
 
         let path = entry.path();
         let removed = entry.file_type()
+            .or_else(|_| std::fs::symlink_metadata(&path).map(|metadata| metadata.file_type()))
             .and_then(|file_type| forklift_core::util::file_utils::remove_entry_unfollowed(&path, file_type));
         match removed {
             Ok(()) => tracing::info!(path = %path.display(), "removed an interrupted warehouse creation"),

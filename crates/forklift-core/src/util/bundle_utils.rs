@@ -482,6 +482,7 @@ fn remove_stale_staging(parent: &Path) {
         if is_staging && is_stale {
             let path = entry.path();
             let _ = entry.file_type()
+                .or_else(|_| std::fs::symlink_metadata(&path).map(|metadata| metadata.file_type()))
                 .and_then(|kind| crate::util::file_utils::remove_entry_unfollowed(&path, kind));
         }
     }

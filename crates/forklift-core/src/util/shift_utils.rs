@@ -624,7 +624,7 @@ pub fn collect_collisions(ops: &[FileOp], removed_dirs: &[String]) -> Result<Vec
 /// Apply a diff's file operations to the working directory: every removal first (so a
 /// directory a new file is about to replace is emptied), then `remove_empty_directories`
 /// clears the now-empty source-only directories (deepest first) — the removals themselves
-/// only unlink files and never touch a directory — then every write lands. Writing before a
+/// only unlink files and links, never a real folder — then every write lands. Writing before a
 /// same-path removal would otherwise fail (`EISDIR`/`EEXIST`) for a type flip in either
 /// direction.
 ///

@@ -555,7 +555,7 @@ pub fn remove_file_or_link(path: impl AsRef<Path>) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => Err(std::io::Error::new(
             std::io::ErrorKind::IsADirectory,
-            format!("\"{}\" is a folder, not a file or a link", path.to_string_lossy()),
+            "a folder, not a file or a link",
         )),
         Ok(metadata) => remove_entry_unfollowed(path, metadata.file_type()),
         Err(error) => Err(error),
