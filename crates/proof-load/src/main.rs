@@ -11,7 +11,8 @@ use proof_load::runner;
 use proof_load::scenario::{self, Tool};
 use proof_load::scrub::Environment;
 use proof_load::tool;
-use proof_load::report::{Category, Cell, Completeness, CoverageTable, Determinism, Platform, Report};
+use proof_load::faulted::{self, Programs};
+use proof_load::report::{Category, Cell, Completeness, CoverageTable, Determinism, Platform, Report, Row};
 use proof_load::scrub::Output;
 
 #[derive(Parser)]
@@ -40,11 +41,15 @@ enum Command {
         /// are reported as not run.
         #[arg(long)]
         forklift: Option<PathBuf>,
+        /// The git binary the harness lays out exported records with, by path. Without it the
+        /// damaged-file faults are reported as not run.
+        #[arg(long)]
+        git: Option<PathBuf>,
     },
 }
 
 fn main() -> ExitCode {
-    let Command::Run { source, out, seed, only, forklift } = Cli::parse().command;
+    let Command::Run { source, out, seed, only, forklift, git } = Cli::parse().command;
 
     let mut output = match Output::claim(&out) {
         Ok(output) => output,
@@ -112,8 +117,57 @@ fn main() -> ExitCode {
         }
     };
 
+    // Every damage binding, every kind it names, each on a fresh build of its scenario.
+    let mut rows = Vec::new();
+    let mut fault_errors = Vec::new();
+    let damaged_cell = match (&forklift, &git, &census) {
+        (None, _, _) => Cell::not_run("no forklift binary given"),
+        (_, None, _) => Cell::not_run("no git binary given to lay out the readback"),
+        (_, _, None) => Cell::not_run("no census for this version"),
+        (Some(forklift), Some(git), Some(_)) => {
+            let (Ok(forklift), Ok(git)) = (tool::absolute(forklift), tool::absolute(git)) else {
+                eprintln!("proof-load: cannot resolve the tool paths");
+                return ExitCode::from(2);
+            };
+            tools.insert("git".to_string(), git.display().to_string());
+            let programs = Programs { forklift, git };
+            let faulted_corpus = corpus::generate(seed, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL });
+            for binding in proof_load::bindings::BINDINGS {
+                let Some(scenario) = scenarios.iter().find(|scenario| scenario.id == binding.scenario) else { continue };
+                for kind in binding.kinds {
+                    let label = format!("{}-{}-{:?}", binding.scenario, binding.name, kind).replace(['/', '<', '>', '{', '}'], "_");
+                    let result = output.scratch(&label).map_err(|error| error.to_string()).and_then(|scratch| {
+                        let environment = Environment::scrubbed(&scratch, std::env::var_os("PATH"), &BTreeMap::new()).map_err(|error| error.to_string())?;
+                        faulted::run(scenario, binding.name, *kind, &faulted_corpus, &programs, &scratch, &environment, std::time::Duration::from_secs(120), seed)
+                            .map_err(|error| error.to_string())
+                    });
+                    match result {
+                        Ok(run) => {
+                            let detail = serde_json::to_string(&run).unwrap_or_default();
+                            let _ = std::fs::write(output.root().join(format!("{}.json", label)), detail);
+                            rows.push(Row {
+                                scenario: format!("{} {} {:?}", run.scenario, run.target, run.kind),
+                                category: Category::DamagedFiles,
+                                binding: "forklift".to_string(),
+                                grade: run.grade,
+                                recoverability: run.recoverability,
+                                note: (!run.unextractable.is_empty()).then(|| format!("unextractable remedies: {}", run.unextractable.join("; "))),
+                            });
+                        }
+                        Err(error) => fault_errors.push(format!("{} {:?}: {}", binding.name, kind, error)),
+                    }
+                }
+            }
+            Cell::Run
+        }
+    };
+    let fault_check = Completeness { check: "damaged-file faults ran".to_string(), cell: damaged_cell.clone(), missing: fault_errors };
+
     let report = Report {
-        coverage: CoverageTable::new(Platform::current(), |_: Category| Cell::not_run("no scenario runner in this build of the harness")),
+        coverage: CoverageTable::new(Platform::current(), |category: Category| match category {
+            Category::DamagedFiles => damaged_cell.clone(),
+            _ => Cell::not_run("no runner for this fault in this build of the harness"),
+        }),
         determinism: Determinism {
             seed,
             tools,
@@ -121,8 +175,8 @@ fn main() -> ExitCode {
             platform: Platform::current(),
             environment: environment_seen,
         },
-        completeness: vec![damage_check, walk_check],
-        rows: vec![],
+        completeness: vec![damage_check, walk_check, fault_check],
+        rows,
         forklift_only: vec![],
     };
 

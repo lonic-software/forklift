@@ -1,5 +1,6 @@
-//! Remedies a refusal names, extracted in exactly two forms: a quoted `forklift …` command, and a
-//! `remove "<path>"` instruction. Anything else is recorded as unextractable; the harness never
+//! Remedies a refusal names, extracted in exactly two forms: a `forklift …` command, quoted or
+//! standing as a whole text (a next_step that is nothing but the command), and a `remove "<path>"`
+//! instruction. Anything else is recorded as unextractable; the harness never
 //! guesses at a remedy.
 //!
 //! The text comes from a client's JSON error (its message and next_step), and for a restarted
@@ -46,15 +47,26 @@ fn quoted(text: &str) -> Vec<(usize, &str)> {
 pub fn extract(texts: &[&str]) -> Extracted {
     let mut extracted = Extracted { remedies: Vec::new(), unextractable: Vec::new() };
 
+    let mut command = |span: &str, extracted: &mut Extracted| {
+        let arguments: Vec<String> = span.trim_start_matches("forklift ").split_whitespace().map(str::to_string).collect();
+        if arguments.is_empty() || arguments.iter().any(|argument| argument.contains('<') || argument.contains('{')) {
+            extracted.unextractable.push(span.to_string());
+        } else {
+            extracted.remedies.push(Remedy::Command { arguments });
+        }
+    };
+
     for text in texts {
+        // A whole text that is one command, as a next_step often is: its field delimits it the way
+        // quotes delimit one inside prose.
+        let whole = text.trim();
+        if whole.starts_with("forklift ") && !whole.contains(['"', '`']) {
+            command(whole, &mut extracted);
+            continue;
+        }
         for (start, span) in quoted(text) {
-            if let Some(command) = span.strip_prefix("forklift ") {
-                let arguments: Vec<String> = command.split_whitespace().map(str::to_string).collect();
-                if arguments.is_empty() || arguments.iter().any(|argument| argument.contains('<') || argument.contains('{')) {
-                    extracted.unextractable.push(span.to_string());
-                } else {
-                    extracted.remedies.push(Remedy::Command { arguments });
-                }
+            if span.starts_with("forklift ") {
+                command(span, &mut extracted);
             } else if text[..start].to_ascii_lowercase().trim_end().ends_with("remove") && !span.is_empty() {
                 extracted.remedies.push(Remedy::Remove { path: PathBuf::from(span) });
             }
@@ -97,6 +109,19 @@ mod tests {
         let extracted = extract(&["Run \"forklift load -- <path>\" for each folder, or ask an admin."]);
         assert!(extracted.remedies.is_empty());
         assert_eq!(extracted.unextractable, vec!["forklift load -- <path>"]);
+    }
+
+    /// A next_step that is nothing but a command is that command; a prose sentence that merely
+    /// starts with the word is not, and neither is an unquoted command inside a sentence.
+    ///
+    /// Revert: drop the whole-text form → `forklift shift main`, the remedy for a bay behind its
+    /// pallet, is never run.
+    #[test]
+    fn a_next_step_that_is_a_command_is_extracted() {
+        assert_eq!(extract(&["This bay is behind pallet \"main\".", "forklift shift main"]).remedies,
+            vec![Remedy::Command { arguments: vec!["shift".to_string(), "main".to_string()] }]);
+        assert!(extract(&["Run forklift heal when done."]).remedies.is_empty());
+        assert_eq!(extract(&["forklift shift <pallet>"]).unextractable, vec!["forklift shift <pallet>"]);
     }
 
     /// A quoted path that no `remove` precedes is not a remedy.

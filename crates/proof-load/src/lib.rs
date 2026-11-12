@@ -9,6 +9,7 @@ pub mod bindings;
 pub mod census;
 pub mod corpus;
 pub mod damage;
+pub mod faulted;
 pub mod oracle;
 pub mod remedy;
 pub mod report;
