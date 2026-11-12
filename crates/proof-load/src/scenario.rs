@@ -43,6 +43,13 @@ pub enum Op {
     MoveOrigin,
     /// Have the host's server build the bundle a full clone imports.
     Bundle,
+    /// Delete pallet `name` on the remote too, which leaves the host a tombstone for it.
+    DeleteRemote { name: String },
+    /// Have the host's server withhold the content `taken` picks from corpus record `index`.
+    Withhold { index: usize },
+    /// Record a redaction of the content `taken` picks from corpus record `index`, which the
+    /// recording warehouse applies at once.
+    Redact { index: usize },
     /// Replace this warehouse with a clone of the host, of the given kind. What the history
     /// acknowledged before stays acknowledged: the clone holds it from the host.
     Clone { kind: CloneKind },
@@ -112,6 +119,22 @@ pub fn record_message(index: usize) -> String {
 pub const URL: &str = "{url}";
 /// Stands in a binding's line for the work tree's absolute path.
 pub const WORK: &str = "{work}";
+/// Stands in a binding's line for `<parcel>:<path>`, the content a redaction takes away, which is
+/// known only once its record is made.
+pub const TARGET: &str = "{target}";
+
+/// The message a redaction the harness records carries, and the statement a withhold gives.
+pub const TAKEN_BECAUSE: &str = "proof-load takes this content away";
+
+/// The content a withhold or a redaction of corpus record `index` takes away: the first path, in
+/// order, whose bytes no later record holds anywhere, so no later record stores it again. None when
+/// every file of the record lives on.
+pub fn taken(corpus: &crate::corpus::Corpus, index: usize) -> Option<(String, Vec<u8>)> {
+    let record = corpus.records.get(index)?;
+    let later = &corpus.records[index + 1..];
+    record.iter().find(|(_, bytes)| !later.iter().any(|snapshot| snapshot.values().any(|other| other == *bytes)))
+        .map(|(path, bytes)| (path.clone(), bytes.clone()))
+}
 
 fn line(arguments: &[&str]) -> Vec<String> {
     arguments.iter().map(|argument| argument.to_string()).collect()
@@ -148,8 +171,10 @@ pub fn bind(tool: Tool, op: &Op) -> Option<Vec<Vec<String>>> {
                     vec![clone]
                 }
                 Op::MoveOrigin => vec![line(&["remote", "move", URL])],
-                // The server's own command, which the build runs with the server binary.
-                Op::Bundle => vec![],
+                Op::DeleteRemote { name } => vec![line(&["pallet", "delete", name, "--remote"])],
+                Op::Redact { .. } => vec![line(&["redact", "record", "-m", TAKEN_BECAUSE, TARGET])],
+                // The server's own commands, which the build runs with the server binary.
+                Op::Bundle | Op::Withhold { .. } => vec![],
                 Op::Push => vec![line(&["lift"])],
                 Op::Fetch => vec![line(&["lower"])],
                 Op::Verify => vec![line(&["audit", "--full"])],
@@ -175,7 +200,9 @@ pub fn bind(tool: Tool, op: &Op) -> Option<Vec<Vec<String>>> {
                 // failed step; and git signs nothing by enrollment.
                 Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll => return None,
                 // The host is a forklift-server; git has no server of its own to clone from.
-                Op::Host | Op::Bundle | Op::Clone { .. } | Op::MoveOrigin => return None,
+                Op::Host | Op::Bundle | Op::Clone { .. } | Op::MoveOrigin | Op::DeleteRemote { .. } | Op::Withhold { .. } => return None,
+                // Git has no redaction: a rewrite of history is a different operation.
+                Op::Redact { .. } => return None,
             };
             let prefix: &[&str] = if tool == Tool::GitTuned { GIT_TUNED } else { &[] };
             Some(lines.into_iter().map(|arguments| line(prefix).into_iter().chain(arguments).collect()).collect())
@@ -231,6 +258,30 @@ impl Scenario {
             Op::Clone { .. } => Some(None),
             _ => None,
         }).flatten()
+    }
+
+    /// The record whose content the history withholds, if it does.
+    pub fn withheld(&self) -> Option<usize> {
+        self.history.iter().find_map(|op| match op { Op::Withhold { index } => Some(*index), _ => None })
+    }
+
+    /// The record whose content the history redacts, if it does.
+    pub fn redacted(&self) -> Option<usize> {
+        self.history.iter().find_map(|op| match op { Op::Redact { index } => Some(*index), _ => None })
+    }
+
+    /// Who serves a read of the withheld content when `warehouse` is read back: the host's is read
+    /// through a fresh clone, which fetches after the withhold; the client's fetched after it when
+    /// a clone follows the withhold in the history, and held the content before otherwise.
+    pub fn withhold_reader(&self, warehouse: crate::damage::Warehouse) -> crate::oracle::WithholdReader {
+        use crate::oracle::WithholdReader;
+        let withheld_at = self.history.iter().position(|op| matches!(op, Op::Withhold { .. }));
+        let cloned_after = withheld_at.is_some_and(|at| self.history[at..].iter().any(|op| matches!(op, Op::Clone { .. })));
+        match warehouse {
+            crate::damage::Warehouse::Host => WithholdReader::FetchedAfter,
+            crate::damage::Warehouse::Client if cloned_after => WithholdReader::FetchedAfter,
+            crate::damage::Warehouse::Client => WithholdReader::HeldBefore,
+        }
     }
 
     /// The corpus this scenario records from `corpus`: rooted under its scope when it has one, so
@@ -292,6 +343,15 @@ pub fn catalog() -> Vec<Scenario> {
         Scenario { then: vec![Op::Push], ..named("sparse", vec![
             Op::Host, record(0), record(1), Op::Push, Op::Clone { kind: CloneKind::Only("src".into()) },
         ]) },
+        // A host with a tombstone and withheld content, cloned after the withhold, so the clone
+        // records the content unavailable; the faulted command records and lifts from the clone.
+        Scenario { then: vec![Op::Push], ..named("withheld", vec![
+            Op::Host, record(0), record(1), Op::Push, Op::Branch { name: "side".into() }, Op::Switch { name: "side".into() }, Op::Push,
+            Op::Switch { name: "main".into() }, Op::DeleteRemote { name: "side".into() }, Op::Withhold { index: 1 },
+            Op::Clone { kind: CloneKind::Full },
+        ]) },
+        // Content of record 0 no later record holds, redacted once record 1 no longer names it.
+        named("redacted", vec![record(0), record(1), Op::Redact { index: 0 }]),
         named("signed", vec![record(0), Op::Enroll, record(1), record(2)]),
         named("packed", vec![record(0), Op::Enroll, record(1), record(2), Op::Pack]),
         // The variant changes every file of record 0 on the side branch, and record 1 changes at
@@ -317,7 +377,8 @@ mod tests {
             Op::Merge { name: "main".into() }, Op::Push, Op::Fetch, Op::Verify, Op::Repair,
             Op::Variant { index: 0 }, Op::Conflict { name: "side".into() }, Op::Pick { name: "side".into() },
             Op::Park { index: 0 }, Op::Enroll, Op::Pack, Op::Host, Op::Clone { kind: CloneKind::Only("src".into()) },
-            Op::Clone { kind: CloneKind::Cache }, Op::Bundle, Op::MoveOrigin,
+            Op::Clone { kind: CloneKind::Cache }, Op::Bundle, Op::MoveOrigin, Op::DeleteRemote { name: "side".into() },
+            Op::Withhold { index: 0 }, Op::Redact { index: 0 },
         ]
     }
 
@@ -328,8 +389,9 @@ mod tests {
     fn forklift_binds_every_operation_with_json() {
         for op in every_op() {
             let lines = bind(Tool::Forklift, &op).unwrap_or_else(|| panic!("forklift binds {:?}", op));
-            // Bundle is the server's own command, which the build runs with the server binary.
-            assert_eq!(lines.is_empty(), op == Op::Bundle, "{:?}", op);
+            // Bundle and withhold are the server's own commands, which the build runs with the
+            // server binary.
+            assert_eq!(lines.is_empty(), matches!(op, Op::Bundle | Op::Withhold { .. }), "{:?}", op);
             assert!(lines.iter().all(|arguments| arguments[0] == "--json"), "{:?}", lines);
         }
         assert_eq!(bind(Tool::Forklift, &Op::Clone { kind: CloneKind::Cache }).unwrap(),
@@ -347,7 +409,8 @@ mod tests {
     #[test]
     fn git_binds_what_it_has_and_the_rest_is_forklift_only() {
         for op in every_op() {
-            let forklift_only = matches!(op, Op::Repair | Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll | Op::Host | Op::Bundle | Op::Clone { .. } | Op::MoveOrigin);
+            let forklift_only = matches!(op, Op::Repair | Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll | Op::Host | Op::Bundle | Op::Clone { .. } | Op::MoveOrigin
+                | Op::DeleteRemote { .. } | Op::Withhold { .. } | Op::Redact { .. });
             assert_eq!(bind(Tool::Git, &op).is_some(), !forklift_only, "{:?}", op);
         }
         let tuned = bind(Tool::GitTuned, &Op::Verify).unwrap();
@@ -381,6 +444,43 @@ mod tests {
         assert_eq!(Op::Variant { index: 0 }.writes(&corpus).unwrap().unwrap(), crate::corpus::variant(&corpus.records[0]));
         assert!(Op::Record { index: 2 }.writes(&corpus).unwrap().is_err(), "past the corpus is an error, not a guess");
         assert!(Op::Enroll.writes(&corpus).is_none());
+    }
+
+    /// What a withhold or a redaction takes away is content of its record that no later record
+    /// holds anywhere, so no later record stores it again.
+    ///
+    /// Revert: take the record's first path → content a later record still holds is taken away,
+    /// and the faulted record that writes it again is refused.
+    #[test]
+    fn taken_content_is_held_by_no_later_record() {
+        let snapshot = |files: &[(&str, &str)]| files.iter().map(|(path, bytes)| (path.to_string(), bytes.as_bytes().to_vec())).collect();
+        let corpus = crate::corpus::Corpus {
+            seed: 0, shape: crate::corpus::Shape::SMALL,
+            records: vec![snapshot(&[("a", "1"), ("b", "2"), ("c", "3")]), snapshot(&[("a", "1"), ("b", "9"), ("d", "3")])],
+        };
+        assert_eq!(taken(&corpus, 0), Some(("b".to_string(), b"2".to_vec())));
+        assert_eq!(taken(&corpus, 1), Some(("a".to_string(), b"1".to_vec())), "nothing follows the last record");
+        let kept = crate::corpus::Corpus { seed: 0, shape: crate::corpus::Shape::SMALL, records: vec![snapshot(&[("a", "1")]), snapshot(&[("z", "1")])] };
+        assert_eq!(taken(&kept, 0), None, "bytes moved to another path still live on");
+        assert_eq!(taken(&corpus, 2), None);
+    }
+
+    /// A read of withheld content through the host fetches after the withhold; through the client,
+    /// only when a clone follows the withhold.
+    ///
+    /// Revert: read every client as holding the content before → the withheld scenario's clone
+    /// expects bytes it was never sent.
+    #[test]
+    fn the_withhold_reader_follows_the_clone() {
+        use crate::damage::Warehouse;
+        use crate::oracle::WithholdReader;
+        let withheld = catalog().into_iter().find(|scenario| scenario.id == "withheld").unwrap();
+        assert_eq!(withheld.withheld(), Some(1));
+        assert_eq!(withheld.withhold_reader(Warehouse::Client), WithholdReader::FetchedAfter);
+        assert_eq!(withheld.withhold_reader(Warehouse::Host), WithholdReader::FetchedAfter);
+        let held = Scenario { id: "h".into(), history: vec![Op::Host, Op::Clone { kind: CloneKind::Full }, Op::Withhold { index: 0 }], then: vec![], damage: None };
+        assert_eq!(held.withhold_reader(Warehouse::Client), WithholdReader::HeldBefore);
+        assert_eq!(held.withhold_reader(Warehouse::Host), WithholdReader::FetchedAfter);
     }
 
     /// A scenario is scoped by its last clone, and only when that clone took one folder; a scoped

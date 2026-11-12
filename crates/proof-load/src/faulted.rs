@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::corpus::{self, Corpus};
-use crate::damage::{self, Kind};
-use crate::oracle::{self, Evidence, Expectation, Grade, Readback, Recoverability, Verdict};
+use crate::damage::{self, Kind, Warehouse};
+use crate::oracle::{self, Admissible, Evidence, Expectation, Grade, Readback, Recoverability, Verdict};
 use crate::remedy::{self, Remedy};
-use crate::runner::{self, RunError};
+use crate::runner::{self, RunError, Taken, TakenBy};
 use crate::scenario::{bind, Mark, Op, Scenario, Tool};
 use crate::scrub::{Environment, Scratch};
 use crate::tool::{self, Invocation, Outcome};
@@ -79,8 +79,9 @@ impl HistoryReadback {
 pub struct Faulted {
     pub scenario: String,
     pub name: String,
+    pub warehouse: Warehouse,
     pub kind: Kind,
-    /// The damaged path, relative to the state folder.
+    /// The damaged path, relative to the state folder of `warehouse`.
     pub target: String,
     pub grade: Grade,
     pub evidence: Evidence,
@@ -105,6 +106,9 @@ struct Context<'a> {
     url: Option<&'a str>,
     /// The folder the work tree is scoped to, when a sparse clone left it scoped.
     scope: Option<&'a str>,
+    /// Read the history back through a fresh clone of the host rather than from the work tree:
+    /// the damage is the host's.
+    via_host: bool,
 }
 
 impl Context<'_> {
@@ -156,11 +160,26 @@ impl Context<'_> {
         if let Some(scope) = self.scope {
             return self.read_back_scoped(scope, marks, required, |mark| within(expectation(mark), scope));
         }
+        // The warehouse read: the work tree's, or a fresh clone of the host. A clone that fails
+        // refuses every record, as a failed export does.
+        let bay = if self.via_host {
+            let url = self.url.ok_or_else(|| RunError::Io("a host-side readback needs a host".to_string()))?;
+            let clone = self.fresh("clone");
+            let cloned = self.run(&self.programs.forklift, vec!["--json".into(), "clone".into(), url.to_string(), clone.display().to_string()], self.scratch.root().to_path_buf())?;
+            if !cloned.succeeded() {
+                return Ok(HistoryReadback { export: cloned, records: Vec::new() });
+            }
+            clone
+        } else {
+            self.scratch.work()
+        };
         let exported = self.fresh("readback");
-        let export = self.run(&self.programs.forklift, vec!["--json".into(), "git".into(), "export".into(), exported.display().to_string()], self.scratch.work())?;
+        let export = self.run(&self.programs.forklift, vec!["--json".into(), "git".into(), "export".into(), exported.display().to_string()], bay.clone())?;
         if !export.succeeded() {
             return Ok(HistoryReadback { export, records: Vec::new() });
         }
+        let listing = self.run(&self.programs.forklift, vec!["--json".into(), "history".into()], bay)?;
+        let left_out = left_out(&runner::document(&export.stdout), &runner::described_parcels(&listing.stdout));
 
         let git = |arguments: &[&str]| self.run(&self.programs.git, arguments.iter().map(|argument| argument.to_string()).collect(), exported.clone());
         let log = git(&["log", "--all", "--format=%H%x09%s"])?;
@@ -186,7 +205,7 @@ impl Context<'_> {
                 let checkout = git(&[&work_tree, "checkout", "-f", "-q", hash, "--", "."])?;
                 let readback = if checkout.succeeded() {
                     let tree = oracle::read_tree(&laid_out).map_err(|error| RunError::Io(error.to_string()))?;
-                    Readback::Served { tree, documented: Default::default() }
+                    Readback::Served { tree, documented: left_out.get(&message).cloned().unwrap_or_default() }
                 } else {
                     // The export wrote a commit git cannot lay out: what the tool served is broken.
                     Readback::Served { tree: Default::default(), documented: Default::default() }
@@ -212,7 +231,7 @@ impl Context<'_> {
         if !listing.succeeded() {
             return Ok(HistoryReadback { export: listing, records: Vec::new() });
         }
-        let parcels = described_parcels(&listing.stdout);
+        let parcels = runner::described_parcels(&listing.stdout);
 
         let side = self.fresh("readback");
         let name = side.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
@@ -251,13 +270,23 @@ impl Context<'_> {
     }
 }
 
-/// The (description, parcel) of every entry a `history --json` listing holds, newest first; empty
-/// when the document is not one.
-fn described_parcels(stdout: &[u8]) -> Vec<(String, String)> {
-    let document: serde_json::Value = serde_json::from_slice(stdout).unwrap_or_default();
-    document["data"]["entries"].as_array().map(|entries| entries.iter().filter_map(|entry| {
-        Some((entry["description"].as_str()?.to_string(), entry["parcel"].as_str()?.to_string()))
-    }).collect()).unwrap_or_default()
+/// What an export reported leaving out, per record message: path → the documented code of a read
+/// of it. An export lists each file it left out with the parcels naming it, `withheld` content as
+/// the warehouse's own `content_withheld` refusal, `redacted` as `content_redacted`; `described`
+/// maps a parcel to its record's message.
+fn left_out(export: &serde_json::Value, described: &[(String, String)]) -> std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> {
+    let mut left_out: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> = Default::default();
+    for (key, code) in [("withheld", "content_withheld"), ("redacted", "content_redacted")] {
+        for entry in export["data"][key].as_array().into_iter().flatten() {
+            let Some(path) = entry["path"].as_str() else { continue };
+            for parcel in entry["parcels"].as_array().into_iter().flatten().filter_map(|parcel| parcel.as_str()) {
+                for (description, _) in described.iter().filter(|(_, described)| described == parcel) {
+                    left_out.entry(description.clone()).or_default().insert(path.to_string(), code.to_string());
+                }
+            }
+        }
+    }
+    left_out
 }
 
 /// `expectation` restricted to what a bay scoped to `scope` holds.
@@ -267,6 +296,15 @@ fn within(expectation: Expectation, scope: &str) -> Expectation {
     Expectation {
         trees: expectation.trees.into_iter().map(|tree| tree.into_iter().filter(|(path, _)| inside(path)).collect()).collect(),
         transformed: expectation.transformed.into_iter().filter(|(path, _)| inside(path)).collect(),
+    }
+}
+
+/// What a read of `taken` may produce: for withheld content, what `reader` is documented to serve;
+/// for redacted content, what the build found its warehouse reporting.
+fn admissible(taken: &Taken, reader: oracle::WithholdReader) -> Vec<Admissible> {
+    match &taken.by {
+        TakenBy::Withheld => oracle::withheld_admissible(reader, &taken.digest),
+        TakenBy::Redacted { admissible, .. } => admissible.clone(),
     }
 }
 
@@ -282,6 +320,8 @@ struct Expected {
     faulted: Mark,
     before: oracle::Tree,
     after: oracle::Tree,
+    /// Content the history took away, by digest, with what a read of it may now produce.
+    taken: Vec<(String, Vec<Admissible>)>,
 }
 
 impl Expected {
@@ -291,6 +331,20 @@ impl Expected {
 
     /// What `mark` may hold, once the faulted command has (`made`) or has not been acknowledged.
     fn of(&self, corpus: &Corpus, mark: Mark, made: bool) -> Expectation {
+        let mut expectation = self.untransformed(corpus, mark, made);
+        // Every path whose recorded bytes are content taken away is open to what a read of it may
+        // now produce, in whichever record holds it.
+        for (digest, admissible) in &self.taken {
+            for tree in &expectation.trees {
+                for (path, _) in tree.iter().filter(|(_, recorded)| *recorded == digest) {
+                    expectation.transformed.insert(path.clone(), admissible.clone());
+                }
+            }
+        }
+        expectation
+    }
+
+    fn untransformed(&self, corpus: &Corpus, mark: Mark, made: bool) -> Expectation {
         match mark {
             mark if mark != self.faulted => Expectation::acknowledged(mark.snapshot(corpus).map(|snapshot| corpus::expected(&snapshot)).unwrap_or_default()),
             _ if made => Expectation::acknowledged(self.after.clone()),
@@ -333,13 +387,17 @@ impl Trail {
 /// Runs one faulted run of `scenario`: damage `kind` to the path `name` resolves to after the
 /// build, then the faulted command, readback, a plain retry, the named remedies, and heal.
 #[allow(clippy::too_many_arguments)]
-pub fn run(scenario: &Scenario, name: &str, kind: Kind, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, seed: u64) -> Result<Faulted, RunError> {
+pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, seed: u64) -> Result<Faulted, RunError> {
     let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), scratch, environment, limit)?;
     // What the build recorded: the corpus rooted under the scenario's scope, when it has one.
     let corpus = &scenario.corpus(corpus);
-    let target = resolve(name, &built.walked, seed)
+    let (walked, state) = match warehouse {
+        Warehouse::Client => (&built.walked, scratch.work().join(".forklift")),
+        Warehouse::Host if built.host.is_some() => (&built.host_walked, runner::host_root(scratch).join(".forklift")),
+        Warehouse::Host => return Err(RunError::Io(format!("{} damages a host, and {} hosts none", name, scenario.id))),
+    };
+    let target = resolve(name, walked, seed)
         .ok_or_else(|| RunError::Io(format!("{} resolves to nothing {} built", name, scenario.id)))?;
-    let state = scratch.work().join(".forklift");
     damage::apply(&state.join(&target), kind, seed).map_err(|error| RunError::Io(format!("{:?}", error)))?;
 
     let faulted = next_record(&built.acknowledged);
@@ -347,8 +405,12 @@ pub fn run(scenario: &Scenario, name: &str, kind: Kind, corpus: &Corpus, program
         .ok_or_else(|| RunError::Io(format!("the faulted record {} is past the corpus's {} records", faulted, corpus.records.len())))?;
     // Before the faulted command, the work tree holds what the history recorded last.
     let before = built.acknowledged.last().and_then(|last| last.snapshot(corpus)).map(|snapshot| corpus::expected(&snapshot)).unwrap_or_default();
-    let expected = Expected { before, after: corpus::expected(snapshot), acknowledged: built.acknowledged, faulted: Mark::Record(faulted) };
-    let context = Context { corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.host.as_ref().map(|host| host.url.as_str()), scope: scenario.scope() };
+    let taken = built.taken.iter().map(|taken| (taken.digest.clone(), admissible(taken, scenario.withhold_reader(warehouse)))).collect();
+    let expected = Expected { before, after: corpus::expected(snapshot), acknowledged: built.acknowledged, faulted: Mark::Record(faulted), taken };
+    let context = Context {
+        corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.host.as_ref().map(|host| host.url.as_str()),
+        scope: scenario.scope(), via_host: warehouse == Warehouse::Host,
+    };
     let mut trail = Trail::default();
     let mut unextractable = Vec::new();
 
@@ -401,7 +463,7 @@ pub fn run(scenario: &Scenario, name: &str, kind: Kind, corpus: &Corpus, program
     }
 
     Ok(Faulted {
-        scenario: scenario.id.clone(), name: name.to_string(), kind, target,
+        scenario: scenario.id.clone(), name: name.to_string(), warehouse, kind, target,
         grade: oracle::grade(&trail.evidence), evidence: trail.evidence, recoverability: trail.recoverability,
         steps: trail.steps, readbacks: trail.readbacks, unextractable,
     })

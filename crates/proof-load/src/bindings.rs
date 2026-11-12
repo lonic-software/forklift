@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::census::Census;
-use crate::damage::{self, Binding, Exemption, Kind};
+use crate::damage::{self, Binding, Exemption, Kind, Warehouse};
 use crate::scenario::Scenario;
 
 const FILE: &[Kind] = &[Kind::FlipByte, Kind::Truncate, Kind::Zero, Kind::Delete];
@@ -22,7 +22,12 @@ const fn bound(name: &'static str, kinds: &'static [Kind]) -> Binding {
 }
 
 const fn bound_in(name: &'static str, scenario: &'static str, kinds: &'static [Kind]) -> Binding {
-    Binding { name, scenario, kinds }
+    Binding { name, scenario, warehouse: Warehouse::Client, kinds }
+}
+
+/// A binding damaging the host warehouse the scenario serves.
+const fn hosted(name: &'static str, scenario: &'static str, kinds: &'static [Kind]) -> Binding {
+    Binding { name, scenario, warehouse: Warehouse::Host, kinds }
 }
 
 pub const BINDINGS: &[Binding] = &[
@@ -70,6 +75,11 @@ pub const BINDINGS: &[Binding] = &[
     bound_in("config/fetch-scope", "sparse", FILE),
     bound_in("fetched-heads", "sparse", FILE),
     bound_in("{bay}scope", "sparse", FILE),
+    hosted("served", "withheld", FILE),
+    hosted("tombstones", "withheld", FILE),
+    hosted("withheld", "withheld", FILE),
+    bound_in("unavailable", "withheld", FILE),
+    bound_in("redactions-applied", "redacted", FILE),
 ];
 
 const NO_MIRROR_ORACLE: &str = "no mirror oracle: the corpus configures no mirror url, so nothing reads a mirror back";
@@ -99,31 +109,27 @@ pub const EXEMPTIONS: &[Exemption] = &[
 ];
 
 /// Census names no scenario of this build creates yet, so neither bound nor exempted: a run
-/// reports each one missing and fails. They need the redaction, withhold and host
-/// scenarios, or a command interrupted or holding its lock; this list only lets the unit test hold the gap exact, so a name
-/// that joins or leaves it is noticed. It is not an exemption and the run never reads it.
+/// reports each one missing and fails. This list only lets the unit test hold the gap exact, so a
+/// name that joins or leaves it is noticed. It is not an exemption and the run never reads it.
 pub const NOT_YET_CREATED: &[&str] = &[
-    "redactions-applied",
-    "served",
-    "tombstones",
-    "unavailable",
     "unvouched-heads",
-    "withheld",
 ];
 
 /// What the damage completeness check finds missing: census names no binding or exemption covers,
 /// bindings and exemptions the census no longer lists, bindings naming a scenario that does not
-/// exist, and bindings whose scenario was built (`created` holds what each built scenario created)
-/// without creating the name. A scenario that was not built proves nothing either way; its build
-/// failure is the census walk's to report.
-pub fn check(census: &Census, bindings: &[Binding], exemptions: &[Exemption], scenarios: &[Scenario], created: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+/// exist, and bindings whose scenario was built (`created` holds what each built scenario created in
+/// each warehouse, the host's empty when it hosts none) without creating the name in the warehouse
+/// the binding damages. A scenario that was not built proves nothing either way; its build failure
+/// is the census walk's to report.
+pub fn check(census: &Census, bindings: &[Binding], exemptions: &[Exemption], scenarios: &[Scenario], created: &BTreeMap<(String, Warehouse), Vec<String>>) -> Vec<String> {
     let mut missing: Vec<String> = damage::uncovered(census, bindings, exemptions).into_iter().map(|name| name.path).collect();
     missing.extend(damage::stale(census, bindings, exemptions).into_iter().map(|name| format!("stale binding: {}", name)));
     for binding in bindings {
         if !scenarios.iter().any(|scenario| scenario.id == binding.scenario) {
             missing.push(format!("{}: its scenario {} does not exist", binding.name, binding.scenario));
-        } else if created.get(binding.scenario).is_some_and(|names| !names.iter().any(|name| name == binding.name)) {
-            missing.push(format!("{}: its scenario {} does not create it", binding.name, binding.scenario));
+        } else if created.get(&(binding.scenario.to_string(), binding.warehouse)).is_some_and(|names| !names.iter().any(|name| name == binding.name)) {
+            let warehouse = match binding.warehouse { Warehouse::Client => "", Warehouse::Host => " on its host" };
+            missing.push(format!("{}: its scenario {} does not create it{}", binding.name, binding.scenario, warehouse));
         }
     }
     missing
@@ -151,16 +157,25 @@ mod tests {
         let bindings = [bound("warehouse", FILE), bound("objects/<xx>/<hash>", FILE)];
         let exemptions = [Exemption { name: "mirror-roots", reason: NO_MIRROR_ORACLE }];
 
-        let all = BTreeMap::from([("history".to_string(), vec!["warehouse".to_string(), "objects/<xx>/<hash>".to_string()])]);
+        let client = |names: &[&str]| (("history".to_string(), Warehouse::Client), names.iter().map(|name| name.to_string()).collect::<Vec<_>>());
+        let host = |names: &[&str]| (("history".to_string(), Warehouse::Host), names.iter().map(|name| name.to_string()).collect::<Vec<_>>());
+        let all = BTreeMap::from([client(&["warehouse", "objects/<xx>/<hash>"]), host(&[])]);
         assert_eq!(check(&census, &bindings, &exemptions, &scenarios, &all), Vec::<String>::new());
 
-        let some = BTreeMap::from([("history".to_string(), vec!["warehouse".to_string()])]);
+        let some = BTreeMap::from([client(&["warehouse"]), host(&[])]);
         assert_eq!(check(&census, &bindings, &exemptions, &scenarios, &some), vec!["objects/<xx>/<hash>: its scenario history does not create it"]);
 
-        let elsewhere = [Binding { name: "warehouse", scenario: "nowhere", kinds: FILE }, bound("objects/<xx>/<hash>", FILE)];
+        let elsewhere = [Binding { name: "warehouse", scenario: "nowhere", warehouse: Warehouse::Client, kinds: FILE }, bound("objects/<xx>/<hash>", FILE)];
         assert_eq!(check(&census, &elsewhere, &exemptions, &scenarios, &BTreeMap::new()), vec!["warehouse: its scenario nowhere does not exist"]);
 
         assert_eq!(check(&census, &bindings, &[], &scenarios, &all), vec!["mirror-roots"]);
+
+        // A name the client creates does not count for a binding damaging the host, nor the reverse.
+        let on_host = [hosted("warehouse", "history", FILE), bound("objects/<xx>/<hash>", FILE)];
+        assert_eq!(check(&census, &on_host, &exemptions, &scenarios, &all), vec!["warehouse: its scenario history does not create it on its host"]);
+        let hosted_only = BTreeMap::from([client(&["objects/<xx>/<hash>"]), host(&["warehouse"])]);
+        assert_eq!(check(&census, &on_host, &exemptions, &scenarios, &hosted_only), Vec::<String>::new());
+        assert_eq!(check(&census, &bindings, &exemptions, &scenarios, &hosted_only), vec!["warehouse: its scenario history does not create it"]);
     }
 
     /// The bindings file covers this tree's census except for names no scenario of this build

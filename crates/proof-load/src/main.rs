@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use proof_load::damage::Warehouse;
 use proof_load::census::Census;
 use proof_load::corpus;
 use proof_load::runner;
@@ -88,7 +89,7 @@ fn main() -> ExitCode {
 
     // Each scenario's history built with the forklift under test: what it created, and what its
     // walk found that no census row classifies.
-    let mut created: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut created: BTreeMap<(String, Warehouse), Vec<String>> = BTreeMap::new();
     let mut walk_missing = Vec::new();
     let walk_cell = match (&forklift, &census) {
         (None, _) => Cell::not_run("no forklift binary given"),
@@ -113,7 +114,9 @@ fn main() -> ExitCode {
                 match built {
                     Ok(built) => {
                         walk_missing.extend(census.unclassified(&built.walked).into_iter().map(|path| format!("{}: {}", scenario.id, path)));
-                        created.insert(scenario.id.clone(), runner::created_names(census, &built.walked));
+                        walk_missing.extend(census.unclassified(&built.host_walked).into_iter().map(|path| format!("{} host: {}", scenario.id, path)));
+                        created.insert((scenario.id.clone(), Warehouse::Client), runner::created_names(census, &built.walked));
+                        created.insert((scenario.id.clone(), Warehouse::Host), runner::created_names(census, &built.host_walked));
                     }
                     Err(error) => walk_missing.push(format!("{}: not built: {}", scenario.id, error)),
                 }
@@ -152,7 +155,7 @@ fn main() -> ExitCode {
                     let label = format!("{}-{}-{:?}", binding.scenario, binding.name, kind).replace(['/', '<', '>', '{', '}'], "_");
                     let result = output.scratch(&label).map_err(|error| error.to_string()).and_then(|scratch| {
                         let environment = Environment::scrubbed(&scratch, std::env::var_os("PATH"), &BTreeMap::new()).map_err(|error| error.to_string())?;
-                        faulted::run(scenario, binding.name, *kind, &faulted_corpus, &programs, &scratch, &environment, std::time::Duration::from_secs(120), seed)
+                        faulted::run(scenario, binding.name, binding.warehouse, *kind, &faulted_corpus, &programs, &scratch, &environment, std::time::Duration::from_secs(120), seed)
                             .map_err(|error| error.to_string())
                     });
                     match result {
@@ -160,7 +163,7 @@ fn main() -> ExitCode {
                             let detail = serde_json::to_string(&run).unwrap_or_default();
                             let _ = std::fs::write(output.root().join(format!("{}.json", label)), detail);
                             rows.push(Row {
-                                scenario: format!("{} {} {:?}", run.scenario, run.target, run.kind),
+                                scenario: format!("{} {}{} {:?}", run.scenario, if run.warehouse == Warehouse::Host { "host:" } else { "" }, run.target, run.kind),
                                 category: Category::DamagedFiles,
                                 binding: "forklift".to_string(),
                                 grade: run.grade,
@@ -194,8 +197,10 @@ fn main() -> ExitCode {
         forklift_only: vec![],
     };
 
-    for (scenario, names) in &created {
-        eprintln!("proof-load: {} creates {}", scenario, names.join(" "));
+    for ((scenario, warehouse), names) in &created {
+        if !names.is_empty() {
+            eprintln!("proof-load: {} creates{} {}", scenario, if *warehouse == Warehouse::Host { " on its host" } else { "" }, names.join(" "));
+        }
     }
     for (name, text) in [("report.json", report.json()), ("report.md", report.markdown())] {
         if let Err(error) = std::fs::write(output.root().join(name), text) {

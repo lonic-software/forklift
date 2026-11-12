@@ -26,11 +26,22 @@ pub enum Kind {
     Plant,
 }
 
-/// A damage binding: the census name it covers, the scenario that creates the path, the kinds.
+/// The warehouse a binding damages: the client's, beside the work tree, or the host's a scenario
+/// serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Warehouse {
+    Client,
+    Host,
+}
+
+/// A damage binding: the census name it covers, the scenario that creates the path, the warehouse
+/// it is damaged in, the kinds.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Binding {
     pub name: &'static str,
     pub scenario: &'static str,
+    pub warehouse: Warehouse,
     pub kinds: &'static [Kind],
 }
 
@@ -123,7 +134,7 @@ mod tests {
     /// `store.lock` binding.
     #[test]
     fn completeness_is_per_listed_name() {
-        let bindings = [Binding { name: "store.lock", scenario: "stack", kinds: &[Kind::Plant] }];
+        let bindings = [Binding { name: "store.lock", scenario: "stack", warehouse: Warehouse::Client, kinds: &[Kind::Plant] }];
         let exemptions = [Exemption { name: "trust", reason: "test" }];
         let missing: Vec<String> = uncovered(&census(), &bindings, &exemptions).into_iter().map(|name| name.path).collect();
         assert_eq!(missing, vec!["serve.lock"]);
@@ -131,7 +142,7 @@ mod tests {
 
     #[test]
     fn a_binding_for_a_name_the_census_lacks_is_stale() {
-        let bindings = [Binding { name: "gone", scenario: "stack", kinds: &[Kind::Delete] }];
+        let bindings = [Binding { name: "gone", scenario: "stack", warehouse: Warehouse::Client, kinds: &[Kind::Delete] }];
         assert_eq!(stale(&census(), &bindings, &[]), vec!["gone"]);
     }
 
