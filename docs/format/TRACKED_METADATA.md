@@ -68,10 +68,42 @@ operator identifier — plus `schema` and `[value]`, and no timestamp. A writer 
 therefore always produces the same bytes, and two writers of the same value produce different
 cells. A cell with both stamps, or neither, is malformed.
 
-Reads are tolerant per cell. A cell with an unknown schema, or one that does not parse, is
-reported as that cell's row, and the other cells still read. A missing or unknown `format`
-refuses the whole pallet, naming it as written by an older or newer forklift. Writes leave
-every path they do not name byte-for-byte unchanged.
+### One spelling per record
+A cell is content named by its hash and signed through its parcel, and an office record is
+signed through its office parcel. A second byte spelling of one record would be a second
+object carrying the first one's meaning, so every reader accepts only the bytes Forklift's
+writer produces for the data they parse to, and refuses anything else as malformed. That covers
+added comments, blank lines, spacing, quote styles, escapes, number bases, key order, dotted
+keys, header tables and `\r\n` line endings, and, for office records, any field the writer does
+not write. A writer whose parcel would add a cell spelled any other way is refused before
+anything is stored. The spelling is part of the format:
+
+- one `key = value` per line, `\n` line endings and a final newline, nothing else on any line;
+- a key bare when it is non-empty and only ASCII letters, digits, `_` and `-`, otherwise a
+  quoted string;
+- a string in double quotes, with `"` and `\` written `\"` and `\\`, newline, tab, carriage
+  return, backspace and form feed written `\n \t \r \b \f`, any other control character
+  written `\uXXXX` in upper-case hex, and every other character written as itself;
+- an integer in decimal, with `-` for a negative one and never `+`; a boolean as `true` or
+  `false`;
+- an array as `[a, b]` and a nested table inline as `{ k = v, k2 = v2 }`, empty ones as `[]` and
+  `{}`.
+
+A cell's lines are its stamp, `schema`, `[value]`, then the value's entries with their keys
+sorted (by their text, also inside nested tables). An office record's fields come in the order
+its example below shows; the comments there are illustration, and a record holding one is
+refused. A public key, an endorsement and a proof of possession are lower-case hex: readers
+refuse upper-case hex rather than decode it to the same bytes.
+
+A cell value holds only strings, integers, booleans, arrays and tables. Floats and date-times
+have several spellings of one value, so a cell cannot hold one, and a time is written as integer
+seconds instead. This binds future schemas too: a schema that needs another kind of value comes
+with a new `format` marker, which older readers refuse as written by a newer forklift.
+
+Reads are tolerant per cell. A cell with an unknown schema, or one that does not parse or is
+not in its one spelling, is reported as that cell's row, and the other cells still read. A
+missing or unknown `format` refuses the whole pallet, naming it as written by an older or newer
+forklift. Writes leave every path they do not name byte-for-byte unchanged.
 
 Which parcels a pallet accepts depends on the warehouse's trust state:
 
@@ -330,11 +362,11 @@ A user record:
 ```toml
 identifier = "mate@lonic.net"
 enrolled_at = 1782205234
-role = "writer"            # "admin" | "writer" | "reader"; absent = admin (pre-privilege records)
+role = "writer"            # "admin" | "writer" | "reader"; required
 identity_root = "<key id>" # the key the office pins for this operator (§8.5)
-pallets = ["main"]         # writer-only: the pallets they may move; absent = all
 class = "agent"            # "human"(default, absent) | "agent" | "bot" | "service" (§7.1)
 supervisor = "alice@lonic" # automated identities only: the responsible human (agents require one)
+pallets = ["main"]         # writer-only: the pallets they may move; absent = all
 ```
 
 Roles (FORK-10) are tracked, signed metadata like everything else in the office:
@@ -345,7 +377,7 @@ scopes working pallets only:** any operator who is not a `reader` may transport 
 update to any meta pallet whatever their grant list says, because the server never consults
 the grant for one. What lands in
 `@office` is still constrained, per parcel, against the *signer*'s role. A record without a
-`role` predates privileges and reads as admin — exactly the pre-privilege behavior.
+`role` does not parse.
 
 **"May move any pallet" (and the `writer`/`reader` transport rules above it) is a transport
 rule a server enforces only for a caller it resolves to that operator's own identity** — a

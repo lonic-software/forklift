@@ -4707,6 +4707,28 @@ fn manifest_records_signed_post_metadata_on_a_meta_pallet() {
     assert!(!bad.status.success(), "an unknown subject must be refused");
 }
 
+/// A key typed in upper case is still accepted at the command line, and the office records it in
+/// the one spelling its readers accept: an upper-case key or proof of possession in a stored
+/// record would be refused.
+#[test]
+fn office_admit_accepts_an_upper_case_key_and_records_it_in_lower_case() {
+    let warehouse = TestWarehouse::new("admit-upper-case");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "first parcel"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    let dev = keygen_admit_args(&warehouse, "dev@forklift");
+    assert_success(&warehouse.run(&["office", "admit", &dev[0], &dev[1].to_uppercase(), &dev[2].to_uppercase()]));
+
+    let audit = warehouse.run(&["audit", "@office"]);
+    assert_success(&audit);
+    let users = stdout(&warehouse.run(&["office", "list"]));
+    assert!(users.contains("dev@forklift"), "the operator is admitted: {}", users);
+}
+
 #[test]
 fn manifest_provenance_records_forge_proof_machine_authorship() {
     let warehouse = TestWarehouse::new("provenance");

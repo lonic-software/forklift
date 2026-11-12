@@ -25,6 +25,17 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   refuses a pack record that does not hold exactly one zstd frame, and a pack index whose fanout
   width differs from the one Forklift writes. Bundles built by Forklift are unaffected.
 
+- **Every signed meta record has one spelling.** A meta-pallet cell (`@kv`, `@manifest`, `@tags`,
+  `@haul`, `@redactions`) and an office user or key record used to be accepted in any TOML spelling
+  of its data: with comments, blank lines, other quoting, escapes or number bases, keys in another
+  order, and, for office records, fields Forklift does not write. One signed record could
+  therefore be stored as several byte strings. Forklift now writes these records in one documented
+  spelling and refuses any other, when reading and when a parcel would add one. Hex in a key or
+  signature is accepted in lower case only. A cell value can no longer hold a float or a date-time.
+  Earlier builds wrote most cells differently (keys in insertion order, other quoting), so a meta
+  pallet written before this change is refused when it is fetched or verified, and has to be
+  written again.
+
 - **A chunk-list redaction no longer stops a lift or a clone over withheld content.** Where the
   `@redactions` pallet holds a redaction of a chunked file, forklift-server used to refuse a lift
   (`500`), and a full `clone` or `lower` to fail, as soon as a head named a chunked file the host

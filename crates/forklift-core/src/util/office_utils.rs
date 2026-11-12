@@ -19,7 +19,7 @@ use crate::model::operator::Operator;
 use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::model::tree_item::TreeItem;
-use crate::util::{alias_utils, file_utils, object_utils, pallet_utils, sign_utils};
+use crate::util::{alias_utils, file_utils, object_utils, pallet_utils, sign_utils, toml_spelling};
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions, RefUpdateError};
 
 /// The name of the office meta pallet — the tracked-metadata pallet holding users and
@@ -384,7 +384,7 @@ pub fn endorse_key(public_key_hex: &str,
                    pop_hex: &str,
                    issued_at: i64) -> Result<KeyRecord, String> {
     let pop_signature = sign_utils::from_hex(pop_hex)
-        .map_err(|_| "The proof-of-possession is not valid hex.".to_string())?;
+        .map_err(|_| "The proof-of-possession is not lower-case hex.".to_string())?;
 
     let pop_valid = sign_utils::verify_message(
         public_key_hex,
@@ -1678,36 +1678,31 @@ fn resolve_subtree(office_parcel_hash: &str, root_tree_hash: &str, path: &[&str]
     Ok(Some(current))
 }
 
-/// Serialize a user record as TOML.
+/// Serialize a user record in its one spelling (`toml_spelling`), fields in this fixed order.
+/// [`parse_user_record`] refuses any other spelling, because the record is signed through its
+/// office parcel and a second spelling would carry the same grant.
 fn user_record_to_toml(user: &UserRecord) -> String {
-    let mut doc = DocumentMut::new();
+    let mut out = String::new();
 
-    doc["identifier"] = value(user.identifier.as_str());
-    doc["enrolled_at"] = value(user.enrolled_at);
-    doc["role"] = value(user.role.as_str());
-    doc["identity_root"] = value(user.identity_root.as_str());
+    toml_spelling::write_string_line(&mut out, "identifier", &user.identifier);
+    toml_spelling::write_integer_line(&mut out, "enrolled_at", user.enrolled_at);
+    toml_spelling::write_string_line(&mut out, "role", user.role.as_str());
+    toml_spelling::write_string_line(&mut out, "identity_root", &user.identity_root);
 
-    // Human is the default; only automated identities carry the class (and a
-    // supervisor), so human records keep their historical shape.
+    // Human is the default; only automated identities carry the class (and a supervisor).
     if user.class != IdentityClass::Human {
-        doc["class"] = value(user.class.as_str());
+        toml_spelling::write_string_line(&mut out, "class", user.class.as_str());
     }
 
     if let Some(supervisor) = &user.supervisor {
-        doc["supervisor"] = value(supervisor.as_str());
+        toml_spelling::write_string_line(&mut out, "supervisor", supervisor);
     }
 
     if !user.pallets.is_empty() {
-        let mut pallets = toml_edit::Array::new();
-
-        for pallet in &user.pallets {
-            pallets.push(pallet.as_str());
-        }
-
-        doc["pallets"] = value(pallets);
+        toml_spelling::write_strings_line(&mut out, "pallets", user.pallets.iter().map(String::as_str));
     }
 
-    doc.to_string()
+    out
 }
 
 /// Parse a user record from TOML.
@@ -1749,7 +1744,7 @@ fn parse_user_record(toml: &str) -> Result<UserRecord, String> {
     // the one piece of accountability an automated identity's record carries.
     let supervisor = read_optional_string(&doc, "supervisor", "user record")?;
 
-    Ok(UserRecord {
+    let user = UserRecord {
         identifier: read_string(&doc, "identifier", "user record")?,
         enrolled_at: read_integer(&doc, "enrolled_at", "user record")?,
         role,
@@ -1757,40 +1752,41 @@ fn parse_user_record(toml: &str) -> Result<UserRecord, String> {
         identity_root: read_string(&doc, "identity_root", "user record")?,
         class,
         supervisor,
-    })
+    };
+
+    if user_record_to_toml(&user) != toml {
+        return Err(not_one_spelling("user"));
+    }
+
+    Ok(user)
 }
 
-/// Serialize a key record as TOML.
+/// Serialize a key record in its one spelling (`toml_spelling`), fields in this fixed order.
+/// [`parse_key_record`] refuses any other spelling, for the reason [`user_record_to_toml`] gives.
 fn key_record_to_toml(key: &KeyRecord) -> String {
-    let mut doc = DocumentMut::new();
+    let mut out = String::new();
 
-    doc["operator"] = value(key.operator.as_str());
-    doc["public_key"] = value(key.public_key.as_str());
-    doc["issued_at"] = value(key.issued_at);
+    toml_spelling::write_string_line(&mut out, "operator", &key.operator);
+    toml_spelling::write_string_line(&mut out, "public_key", &key.public_key);
+    toml_spelling::write_integer_line(&mut out, "issued_at", key.issued_at);
 
     if let Some(retired_at) = key.retired_at {
-        doc["retired_at"] = value(retired_at);
+        toml_spelling::write_integer_line(&mut out, "retired_at", retired_at);
     }
 
     if let Some(reason) = key.revocation_reason {
-        doc["revocation_reason"] = value(reason.as_str());
+        toml_spelling::write_string_line(&mut out, "revocation_reason", reason.as_str());
     }
 
     if !key.distrust_boundary.is_empty() {
-        let mut boundary = toml_edit::Array::new();
-
-        for hash in &key.distrust_boundary {
-            boundary.push(hash.as_str());
-        }
-
-        doc["distrust_boundary"] = value(boundary);
+        toml_spelling::write_strings_line(&mut out, "distrust_boundary", key.distrust_boundary.iter().map(String::as_str));
     }
 
-    doc["authorized_by"] = value(key.authorized_by.as_str());
-    doc["endorsement"] = value(key.endorsement.as_str());
-    doc["proof_of_possession"] = value(key.proof_of_possession.as_str());
+    toml_spelling::write_string_line(&mut out, "authorized_by", &key.authorized_by);
+    toml_spelling::write_string_line(&mut out, "endorsement", &key.endorsement);
+    toml_spelling::write_string_line(&mut out, "proof_of_possession", &key.proof_of_possession);
 
-    doc.to_string()
+    out
 }
 
 /// Parse a key record from TOML.
@@ -1831,7 +1827,7 @@ fn parse_key_record(toml: &str) -> Result<KeyRecord, String> {
 
     let public_key = read_string(&doc, "public_key", "key record")?;
 
-    Ok(KeyRecord {
+    let key = KeyRecord {
         key_id: key_id_of(&public_key)?,
         operator: read_string(&doc, "operator", "key record")?,
         public_key,
@@ -1850,7 +1846,21 @@ fn parse_key_record(toml: &str) -> Result<KeyRecord, String> {
         authorized_by: read_string(&doc, "authorized_by", "key record")?,
         endorsement: read_string(&doc, "endorsement", "key record")?,
         proof_of_possession: read_string(&doc, "proof_of_possession", "key record")?,
-    })
+    };
+
+    if key_record_to_toml(&key) != toml {
+        return Err(not_one_spelling("key"));
+    }
+
+    Ok(key)
+}
+
+/// The refusal of a record that parses but is not spelled the way forklift writes it. Unknown
+/// fields land here too: the writer emits none, so a record carrying one re-encodes without it.
+fn not_one_spelling(kind: &str) -> String {
+    format!("A {} record is not in the one spelling Forklift writes (its fields in their fixed \
+        order, its strings and numbers in their plain form, no other field and nothing else on any \
+        line). A signed record has exactly one spelling, so any other is refused.", kind)
 }
 
 /// The id of a hex-encoded public key. A key record does not store its id: every lookup
@@ -1861,7 +1871,7 @@ fn key_id_of(public_key_hex: &str) -> Result<String, String> {
     let key_bytes = sign_utils::from_hex(public_key_hex).map_err(|_| {
         let shown: String = public_key_hex.chars().take(80).collect();
         let more = if shown.len() < public_key_hex.len() { "…" } else { "" };
-        format!("The public key {:?}{} is not valid hex.", shown, more)
+        format!("The public key {:?}{} is not lower-case hex.", shown, more)
     })?;
 
     Ok(sign_utils::key_id_for_public_key(&key_bytes))
@@ -2721,9 +2731,9 @@ pub(crate) mod tests {
     /// adds (a stale `key_id` field, a distrust boundary).
     fn key_record_for(public_key: &str, extra: &str) -> String {
         format!(
-            "{}operator = \"op@x\"\npublic_key = \"{}\"\nissued_at = 1\n\
+            "operator = \"op@x\"\npublic_key = \"{}\"\nissued_at = 1\n{}\
              authorized_by = \"k1\"\nendorsement = \"ee\"\nproof_of_possession = \"pp\"\n",
-            extra, public_key
+            public_key, extra
         )
     }
 
@@ -3196,5 +3206,95 @@ pub(crate) mod tests {
 
         drop(scope);
         file_utils::remove_dir_all(&dir).ok();
+    }
+
+    /// Hex has one spelling too. An upper-cased public key decodes to the same key, and an
+    /// upper-cased signature to the same signature, so accepting either would give a key record a
+    /// second spelling that verifies. Revert: let `from_hex` accept upper-case → the record parses.
+    #[test]
+    fn a_key_record_in_upper_case_hex_is_refused() {
+        let (public_key, _) = bound_key(0xab);
+        assert!(parse_key_record(&key_record_for(&public_key, "")).is_ok());
+
+        let error = parse_key_record(&key_record_for(&public_key.to_uppercase(), "")).err()
+            .expect("an upper-case public key is a second spelling of the same key");
+        assert!(error.contains("not lower-case hex"), "{}", error);
+    }
+
+    /// Any bytes the user- and key-record parsers accept are exactly what their writers produce
+    /// for the record they parsed to. Both records are signed through their office parcel, so a
+    /// second spelling would be a second byte string carrying one grant or one key's meaning.
+    ///
+    /// Each fixture is re-spelled by a rewrite that keeps its data (checked independently with
+    /// `toml_data`), or damaged at random. Revert: drop the re-encode comparison from either
+    /// parser → a respelling parses and the property fails.
+    #[test]
+    fn every_accepted_office_record_is_in_its_canonical_form() {
+        use crate::util::fuzz_bytes::{mutate, respell_toml, toml_data, Rng, RESPELLINGS};
+
+        const TEXTS: [&str; 6] = ["op@x", "", "quote \" back \\", "two\nlines", "ünï", "'single'"];
+        const NUMBERS: [i64; 5] = [0, 7, -3, 1_782_205_234, i64::MIN];
+        let mut rng = Rng::new(0x0FF1_CE01);
+        let mut respelled: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        let text = |rng: &mut Rng| TEXTS[rng.below(TEXTS.len())].to_string();
+
+        for iteration in 0..4000 {
+            let user_side = iteration % 2 == 0;
+            let fixture = if user_side {
+                user_record_to_toml(&UserRecord {
+                    identifier: text(&mut rng),
+                    enrolled_at: NUMBERS[rng.below(NUMBERS.len())],
+                    role: [Role::Admin, Role::Writer, Role::Reader][rng.below(3)],
+                    pallets: (0..rng.below(3)).map(|_| text(&mut rng)).collect(),
+                    identity_root: text(&mut rng),
+                    class: [IdentityClass::Human, IdentityClass::Agent, IdentityClass::Bot, IdentityClass::Service][rng.below(4)],
+                    supervisor: (rng.below(2) == 0).then(|| text(&mut rng)),
+                })
+            } else {
+                let public_key = sign_utils::to_hex(&[rng.below(256) as u8; 32]);
+                key_record_to_toml(&KeyRecord {
+                    key_id: key_id_of(&public_key).unwrap(),
+                    operator: text(&mut rng),
+                    public_key,
+                    issued_at: NUMBERS[rng.below(NUMBERS.len())],
+                    retired_at: (rng.below(2) == 0).then(|| NUMBERS[rng.below(NUMBERS.len())]),
+                    revocation_reason: [None, Some(RevocationReason::Retirement), Some(RevocationReason::Compromise)][rng.below(3)],
+                    distrust_boundary: (0..rng.below(3)).map(|_| text(&mut rng)).collect(),
+                    authorized_by: text(&mut rng),
+                    endorsement: text(&mut rng),
+                    proof_of_possession: text(&mut rng),
+                })
+            };
+            let reencode = |toml: &str| if user_side {
+                parse_user_record(toml).map(|user| user_record_to_toml(&user))
+            } else {
+                parse_key_record(toml).map(|key| key_record_to_toml(&key))
+            };
+            assert_eq!(reencode(&fixture).as_deref(), Ok(fixture.as_str()), "a written record does not round-trip");
+
+            let candidate = if rng.below(4) == 0 {
+                let mut bytes = fixture.clone().into_bytes();
+                mutate(&mut bytes, &mut rng);
+                let Ok(candidate) = String::from_utf8(bytes) else { continue };
+                candidate
+            } else {
+                let (kind, rewritten) = respell_toml(&fixture, &mut rng);
+                if rewritten != fixture && toml_data(&rewritten).is_some() && toml_data(&rewritten) == toml_data(&fixture) {
+                    *respelled.entry(kind).or_default() += 1;
+                }
+                rewritten
+            };
+
+            if let Ok(rebuilt) = reencode(&candidate) {
+                assert!(rebuilt == candidate, "a second spelling of an office record was accepted\n  in : {:?}\n  out: {:?}",
+                    candidate, rebuilt);
+            }
+        }
+
+        // The property is only as strong as the second spellings it was offered. A record has
+        // no table header, so the two rewrites that act on one have nothing to apply to.
+        for kind in RESPELLINGS.iter().filter(|kind| !["dotted keys", "inline table"].contains(kind)) {
+            assert!(respelled.get(kind).copied().unwrap_or(0) >= 20, "too few {} respellings: {:?}", kind, respelled);
+        }
     }
 }

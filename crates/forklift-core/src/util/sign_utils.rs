@@ -274,7 +274,7 @@ fn load_signing_key(key_id: &str) -> Result<SigningKey, String> {
         decrypt_seed(trimmed, &passphrase)?
     } else {
         // Plaintext (bare hex seed) — the historical, unprotected form.
-        let bytes = from_hex(trimmed)
+        let bytes = from_hex_any_case(trimmed)
             .map_err(|_| format!("The private key file \"{}\" is not valid hex.", path.to_string_lossy()))?;
 
         bytes.try_into()
@@ -386,7 +386,7 @@ fn decrypt_seed(content: &str, passphrase: &str) -> Result<[u8; 32], String> {
 
     let field = |name: &str| fields.get(name).copied().ok_or_else(corrupt);
     let number = |name: &str| field(name).and_then(|v| v.parse::<u32>().map_err(|_| corrupt()));
-    let bytes = |name: &str| field(name).and_then(|v| from_hex(v).map_err(|_| corrupt()));
+    let bytes = |name: &str| field(name).and_then(|v| from_hex_any_case(v).map_err(|_| corrupt()));
 
     let key = derive_key(
         passphrase,
@@ -461,7 +461,7 @@ pub fn verify_message(public_key_hex: &str,
                       message: &[u8],
                       signature: &[u8]) -> Result<bool, String> {
     let key_bytes: [u8; 32] = from_hex(public_key_hex)
-        .map_err(|_| "The public key is not valid hex.".to_string())?
+        .map_err(|_| "The public key is not lower-case hex.".to_string())?
         .try_into()
         .map_err(|_| "The public key is not 32 bytes.".to_string())?;
 
@@ -841,9 +841,17 @@ pub fn to_hex(bytes: &[u8]) -> String {
     hex
 }
 
-/// Decode a lowercase/uppercase hex string into bytes.
+/// Decode hex in either case, for local input that no signature covers: a key file under
+/// `~/.forklift-keys`. Anything read from a signed record goes through [`from_hex`].
+pub fn from_hex_any_case(hex: &str) -> Result<Vec<u8>, ()> {
+    from_hex(&hex.to_ascii_lowercase())
+}
+
+/// Decode a lower-case hex string, the one spelling [`to_hex`] writes, into bytes. Upper-case
+/// is refused: a signed record holding a key or a signature in hex would otherwise have a
+/// second spelling, with another hash, that decodes and verifies the same.
 pub fn from_hex(hex: &str) -> Result<Vec<u8>, ()> {
-    if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if hex.len() % 2 != 0 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         return Err(());
     }
 
@@ -864,6 +872,8 @@ mod tests {
         assert_eq!(from_hex(&to_hex(&bytes)).unwrap(), bytes);
         assert!(from_hex("0g").is_err());
         assert!(from_hex("abc").is_err());
+        assert!(from_hex("0A").is_err(), "upper-case hex is a second spelling of the same bytes");
+        assert_eq!(from_hex_any_case("0A").unwrap(), vec![10], "a local key file may use either case");
     }
 
     #[test]

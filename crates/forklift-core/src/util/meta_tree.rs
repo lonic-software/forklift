@@ -44,6 +44,7 @@ use crate::model::operator::Operator;
 use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::model::tree_item::TreeItem;
+use crate::util::toml_spelling;
 use crate::util::audit_utils::{self, DistrustBoundaryMemo, SignatureTrust, VerifiedOffice};
 use crate::util::office_utils::{KeyRecord, OfficeState, RevocationReason, TrustAnchor};
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
@@ -252,27 +253,33 @@ pub struct CellEnvelope {
     pub value: Table,
 }
 
-/// Encode a cell envelope. Deterministic: the same stamp, schema and value always give the
-/// same bytes, which is what lets the sync walk read identical cells as agreement.
-pub fn encode_cell(stamp: &Stamp, schema: &str, value: &Table) -> Vec<u8> {
-    let mut document = DocumentMut::new();
+/// Encode a cell envelope in its one spelling (`toml_spelling`): the stamp line, the `schema`
+/// line, then `[value]` and its entries, keys sorted and every nested table written inline. The
+/// same stamp, schema and value therefore always give the same bytes, which is what lets the
+/// sync walk read identical cells as agreement and [`parse_cell`] refuse every other spelling.
+///
+/// A value holding a float or a date-time is refused: each has more than one spelling of one
+/// value (`1.0` and `1e0`, `Z` and `+00:00`), and a time is written as integer seconds instead.
+pub fn encode_cell(stamp: &Stamp, schema: &str, value: &Table) -> Result<Vec<u8>, String> {
+    let mut out = String::new();
 
     match stamp {
-        Stamp::Signer(key_id) => document.insert(FIELD_SIGNER, toml_edit::value(key_id)),
-        Stamp::Operator(identifier) => document.insert(FIELD_OPERATOR, toml_edit::value(identifier)),
-    };
+        Stamp::Signer(key_id) => toml_spelling::write_string_line(&mut out, FIELD_SIGNER, key_id),
+        Stamp::Operator(identifier) => toml_spelling::write_string_line(&mut out, FIELD_OPERATOR, identifier),
+    }
 
-    document.insert(FIELD_SCHEMA, toml_edit::value(schema));
+    toml_spelling::write_string_line(&mut out, FIELD_SCHEMA, schema);
+    out.push_str("[value]\n");
+    toml_spelling::write_sorted_entries(&mut out, value)
+        .map_err(|(key, kind)| format!("the value's field \"{}\" holds {}, which a cell cannot hold", key, kind))?;
 
-    let mut value = value.clone();
-    value.set_implicit(false); // An empty payload still writes its `[value]` header.
-    document.insert(FIELD_VALUE, Item::Table(value));
-
-    document.to_string().into_bytes()
+    Ok(out.into_bytes())
 }
 
 /// Parse a cell envelope, strictly: exactly one stamp — a 64-hex `signer` or a non-empty
-/// `operator` — a non-empty schema string and a `[value]` table, and no other field.
+/// `operator` — a non-empty schema string and a `[value]` table, no other field, and spelled
+/// exactly as [`encode_cell`] writes it. A cell is content named by its hash, so any second
+/// spelling of one envelope would be a second cell with the first one's meaning.
 pub fn parse_cell(bytes: &[u8]) -> Result<CellEnvelope, String> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| "the cell is not valid UTF-8".to_string())?;
@@ -323,7 +330,14 @@ pub fn parse_cell(bytes: &[u8]) -> Result<CellEnvelope, String> {
         None => return Err("the cell has no value table".to_string()),
     };
 
-    Ok(CellEnvelope { stamp, schema: schema.to_string(), value })
+    let envelope = CellEnvelope { stamp, schema: schema.to_string(), value };
+
+    if encode_cell(&envelope.stamp, &envelope.schema, &envelope.value)? != bytes {
+        return Err("the cell is not spelled the one way Forklift writes it (its keys sorted, its \
+            strings and numbers in their plain form, nothing else on any line)".to_string());
+    }
+
+    Ok(envelope)
 }
 
 /// The per-pallet half of the content check, and of reading. Each meta pallet supplies
@@ -583,7 +597,7 @@ impl CellEdit {
 pub fn set_cell(path: &str, stamp: &Stamp, schema: &str, value: &Table) -> Result<CellEdit, String> {
     Ok(CellEdit::Set {
         path: path.to_string(),
-        blob: store_blob(&encode_cell(stamp, schema, value))?,
+        blob: store_blob(&encode_cell(stamp, schema, value)?)?,
     })
 }
 
@@ -1765,7 +1779,14 @@ pub fn same_cell_re_signed(ours: &str, theirs: &str, office: &OfficeState) -> Re
 
     Ok(ours_operator == theirs_operator
         && ours.schema == theirs.schema
-        && ours.value.to_string() == theirs.value.to_string())
+        && matches!((value_spelling(&ours.value), value_spelling(&theirs.value)), (Some(a), Some(b)) if a == b))
+}
+
+/// A cell value's entries in their one spelling, or `None` when it holds a kind no cell can.
+fn value_spelling(value: &Table) -> Option<String> {
+    let mut out = String::new();
+    toml_spelling::write_sorted_entries(&mut out, value).ok()?;
+    Some(out)
 }
 
 /// The operator a cell's stamp lets a replay re-sign for: the one an unsigned cell declares, or
@@ -2054,7 +2075,7 @@ pub fn restamp_for_replay(changes: &[CellChange],
 
         edits.push(CellEdit::Set {
             path: change.path.clone(),
-            blob: store_blob(&encode_cell(&own, &envelope.schema, &envelope.value))?,
+            blob: store_blob(&encode_cell(&own, &envelope.schema, &envelope.value)?)?,
         });
     }
 
@@ -2332,7 +2353,7 @@ mod tests {
 
     /// Store a `kv.text 1` cell stamped with `key_id`.
     fn cell(key_id: &str, content: &str) -> String {
-        store_blob(&encode_cell(&key_stamp(key_id), TEXT, &text(content))).unwrap()
+        store_blob(&encode_cell(&key_stamp(key_id), TEXT, &text(content)).unwrap()).unwrap()
     }
 
     fn set(path: &str, blob: &str) -> CellEdit {
@@ -2732,9 +2753,9 @@ mod tests {
     fn one_signer_writing_one_value_gives_identical_bytes() {
         let signer = "a".repeat(64);
 
-        let first = encode_cell(&key_stamp(&signer), TEXT, &text("hello"));
-        assert_eq!(first, encode_cell(&key_stamp(&signer), TEXT, &text("hello")));
-        assert_ne!(first, encode_cell(&key_stamp(&"b".repeat(64)), TEXT, &text("hello")), "who said it is part of the cell");
+        let first = encode_cell(&key_stamp(&signer), TEXT, &text("hello")).unwrap();
+        assert_eq!(first, encode_cell(&key_stamp(&signer), TEXT, &text("hello")).unwrap());
+        assert_ne!(first, encode_cell(&key_stamp(&"b".repeat(64)), TEXT, &text("hello")).unwrap(), "who said it is part of the cell");
 
         let parsed = parse_cell(&first).unwrap();
         assert_eq!(parsed.stamp, Stamp::Signer(signer.clone()));
@@ -2742,8 +2763,82 @@ mod tests {
         assert_eq!(parsed.value.get("text").and_then(|item| item.as_str()), Some("hello"));
 
         // Re-encoding a parsed cell reproduces it, so a re-stamp changes only the signer.
-        assert_eq!(encode_cell(&parsed.stamp, &parsed.schema, &parsed.value), first);
-        assert_eq!(parse_cell(&encode_cell(&key_stamp(&signer), TEXT, &Table::new())).unwrap().value.len(), 0);
+        assert_eq!(encode_cell(&parsed.stamp, &parsed.schema, &parsed.value).unwrap(), first);
+        assert_eq!(parse_cell(&encode_cell(&key_stamp(&signer), TEXT, &Table::new()).unwrap()).unwrap().value.len(), 0);
+    }
+
+    /// A random cell value: keys that need quoting and keys that do not, and strings, integers,
+    /// booleans, arrays and nested tables, including the characters a string must escape.
+    fn random_value(rng: &mut crate::util::fuzz_bytes::Rng, depth: usize) -> Table {
+        const KEYS: [&str; 8] = ["text", "body", "opened_at", "a b", "ü", "x-y", "head", "n_2"];
+        const TEXTS: [&str; 9] = ["", "hello", "two\nlines", "quote \" and back \\ slash", "tab\there",
+            "\u{1}control", "ünïcödé", "'single'", "#not a comment"];
+        let mut table = Table::new();
+
+        for _ in 0..rng.below(5) {
+            let key = KEYS[rng.below(KEYS.len())];
+            let item = match rng.below(if depth == 0 { 7 } else { 6 }) {
+                0 | 1 => toml_edit::value(TEXTS[rng.below(TEXTS.len())]),
+                2 | 3 => toml_edit::value([0, 7, -3, 1_782_205_234, i64::MAX, i64::MIN][rng.below(6)]),
+                4 => toml_edit::value(rng.below(2) == 0),
+                5 => {
+                    let mut array = toml_edit::Array::new();
+                    (0..rng.below(3)).for_each(|_| array.push(TEXTS[rng.below(TEXTS.len())]));
+                    toml_edit::value(array)
+                }
+                _ => Item::Table(random_value(rng, depth + 1)),
+            };
+            table.insert(key, item);
+        }
+
+        table
+    }
+
+    /// Any bytes `parse_cell` accepts are exactly what `encode_cell` writes for the envelope they
+    /// parsed to. A cell is content named by its hash and signed through its parcel, so a second
+    /// spelling of one value would be a second cell carrying the first one's meaning: it would read
+    /// as a disagreement in the sync walk, and slip past anything naming the first.
+    ///
+    /// Each fixture is re-spelled by a rewrite that keeps its data (checked independently with
+    /// `toml_data`), or damaged at random. Revert: let `parse_cell` accept a cell that does not
+    /// re-encode to its own bytes → a respelling parses and the property fails.
+    #[test]
+    fn every_accepted_cell_is_in_its_canonical_form() {
+        use crate::util::fuzz_bytes::{mutate, respell_toml, toml_data, Rng, RESPELLINGS};
+
+        let mut rng = Rng::new(0xCE11_0001);
+        let mut respelled: BTreeMap<&str, usize> = BTreeMap::new();
+
+        for _ in 0..4000 {
+            let stamp = if rng.below(2) == 0 { key_stamp(&format!("{:064x}", rng.next_u64())) } else { Stamp::Operator("alice".to_string()) };
+            let schema = ["kv.text 1", "haul.opened 1", "newer.shape 9"][rng.below(3)];
+            let fixture = encode_cell(&stamp, schema, &random_value(&mut rng, 0)).unwrap();
+            let parsed = parse_cell(&fixture).unwrap_or_else(|e| panic!("{}: {}", String::from_utf8_lossy(&fixture), e));
+            assert_eq!(encode_cell(&parsed.stamp, &parsed.schema, &parsed.value).unwrap(), fixture, "a written cell does not round-trip");
+
+            let text = String::from_utf8(fixture.clone()).unwrap();
+            let bytes = if rng.below(4) == 0 {
+                let mut bytes = fixture.clone();
+                mutate(&mut bytes, &mut rng);
+                bytes
+            } else {
+                let (kind, rewritten) = respell_toml(&text, &mut rng);
+                if rewritten != text && toml_data(&rewritten).is_some() && toml_data(&rewritten) == toml_data(&text) {
+                    *respelled.entry(kind).or_default() += 1;
+                }
+                rewritten.into_bytes()
+            };
+
+            let Ok(parsed) = parse_cell(&bytes) else { continue };
+            let rebuilt = encode_cell(&parsed.stamp, &parsed.schema, &parsed.value).unwrap();
+            assert!(rebuilt == bytes, "a second spelling of a cell was accepted\n  in : {:?}\n  out: {:?}",
+                String::from_utf8_lossy(&bytes), String::from_utf8_lossy(&rebuilt));
+        }
+
+        // The property is only as strong as the second spellings it was offered.
+        for kind in RESPELLINGS {
+            assert!(respelled.get(kind).copied().unwrap_or(0) >= 20, "too few {} respellings: {:?}", kind, respelled);
+        }
     }
 
     #[test]
@@ -2830,7 +2925,7 @@ mod tests {
         let alice = Key::new("alice", 1);
         let office = office(&[&alice.record]);
 
-        let future = store_blob(&encode_cell(&key_stamp(alice.id()), "kv.future 9", &text("?"))).unwrap();
+        let future = store_blob(&encode_cell(&key_stamp(alice.id()), "kv.future 9", &text("?")).unwrap()).unwrap();
         write(&office, &alice, &[set("x", &cell(alice.id(), "1")), set("future", &future)]).unwrap();
         let head = write(&office, &alice, &[set("y", &cell(alice.id(), "2"))]).unwrap().unwrap();
 
@@ -2877,7 +2972,7 @@ mod tests {
         let signer = alice.signer();
 
         let malformed = blob("signer = [");
-        let unknown = store_blob(&encode_cell(&key_stamp(alice.id()), "kv.future 9", &text("?"))).unwrap();
+        let unknown = store_blob(&encode_cell(&key_stamp(alice.id()), "kv.future 9", &text("?")).unwrap()).unwrap();
         let root = cells(&[("good", &cell(alice.id(), "ok")), ("broken", &malformed), ("future", &unknown)]);
         let head = forge(&[], &kv(), root.as_deref(), &signer);
 
@@ -3077,7 +3172,7 @@ mod tests {
     /// Store a `kv.text 1` cell stamped with the declared operator `operator`, as a warehouse
     /// that never enrolled writes it.
     fn declared_cell(operator: &str, content: &str) -> String {
-        store_blob(&encode_cell(&Stamp::Operator(operator.to_string()), TEXT, &text(content))).unwrap()
+        store_blob(&encode_cell(&Stamp::Operator(operator.to_string()), TEXT, &text(content)).unwrap()).unwrap()
     }
 
     /// An unsigned kv parcel over `cells` whose actions name `operator`, built without the
@@ -3330,7 +3425,7 @@ mod tests {
         assert!(error.contains("malformed cell at bad"), "{}", error);
 
         // An unknown schema is not malformed: a newer forklift may write it, and it is kept.
-        let future = store_blob(&encode_cell(&key_stamp(alice.id()), "kv.future 9", &text("?"))).unwrap();
+        let future = store_blob(&encode_cell(&key_stamp(alice.id()), "kv.future 9", &text("?")).unwrap()).unwrap();
         let newer = forge(&[&head], &kv(), cells(&[("x", &good), ("future", &future)]).as_deref(), &alice.signer());
         verify(&office, Some(&head), &newer).unwrap();
     }
@@ -3746,7 +3841,7 @@ mod tests {
         table.insert("message", toml_edit::value("release"));
         table.insert("tagged_at", toml_edit::value(7));
 
-        store_blob(&encode_cell(&key_stamp(key_id), tag_utils::TAG_SCHEMA, &table)).unwrap()
+        store_blob(&encode_cell(&key_stamp(key_id), tag_utils::TAG_SCHEMA, &table).unwrap()).unwrap()
     }
 
     /// A signed `@tags` parcel on `parents` whose cells are the parent's with `edits` applied.
@@ -3790,7 +3885,7 @@ mod tests {
         table.insert("reason", toml_edit::value(reason));
         table.insert("redacted_at", toml_edit::value(7));
 
-        store_blob(&encode_cell(&key_stamp(key_id), redaction_utils::REDACTION_SCHEMA, &table)).unwrap()
+        store_blob(&encode_cell(&key_stamp(key_id), redaction_utils::REDACTION_SCHEMA, &table).unwrap()).unwrap()
     }
 
     /// A signed `@redactions` parcel on `parent` whose cells are the parent's with `edits` applied.
@@ -3882,7 +3977,7 @@ mod tests {
         table.insert("subject", toml_edit::value(&subject));
         table.insert("message", toml_edit::value("release"));
         table.insert("tagged_at", toml_edit::value(7));
-        let declared = store_blob(&encode_cell(&Stamp::Operator("bob".to_string()), tag_utils::TAG_SCHEMA, &table)).unwrap();
+        let declared = store_blob(&encode_cell(&Stamp::Operator("bob".to_string()), tag_utils::TAG_SCHEMA, &table).unwrap()).unwrap();
         let cells = cells(&[("v1.0", &declared)]);
         let tree = store_meta_tree(MetaKind::Tags.format_marker().as_bytes(), cells.as_deref()).unwrap();
         let legacy = stack_meta_parcel(tree, Vec::new(), &actor("bob"), "tag", None).unwrap();
@@ -3940,7 +4035,7 @@ mod tests {
         let mut table = Table::new();
         table.insert("body", toml_edit::value(body));
 
-        store_blob(&encode_cell(&key_stamp(key_id), kind.schema(), &table)).unwrap()
+        store_blob(&encode_cell(&key_stamp(key_id), kind.schema(), &table).unwrap()).unwrap()
     }
 
     fn note_entry(subject: &str, kind: manifest_utils::ManifestKind, body: &str) -> manifest_utils::ManifestEntry {
@@ -3986,7 +4081,7 @@ mod tests {
 
         // Bob writing into Alice's directory is refused whatever the cell holds — including a
         // schema this build cannot read, which would otherwise squat the id Alice's note derives.
-        let squatted = store_blob(&encode_cell(&key_stamp(bob.id()), "manifest.note 2", &text("lgtm"))).unwrap();
+        let squatted = store_blob(&encode_cell(&key_stamp(bob.id()), "manifest.note 2", &text("lgtm")).unwrap()).unwrap();
         for (path, blob) in [
             (cell_path("alice", &approval), note_cell(bob.id(), ManifestKind::Approval, "")),
             (cell_path("alice", &note), note_cell(bob.id(), ManifestKind::Note, "lgtm")),
@@ -4044,7 +4139,7 @@ mod tests {
 
     /// Store a haul cell of `schema` stamped with `key_id`.
     fn haul_cell(key_id: &str, schema: &str, value: &Table) -> String {
-        store_blob(&encode_cell(&key_stamp(key_id), schema, value)).unwrap()
+        store_blob(&encode_cell(&key_stamp(key_id), schema, value).unwrap()).unwrap()
     }
 
     fn haul_parcel(parent: Option<&str>, key: &Key, edits: &[CellEdit]) -> String {
@@ -4484,7 +4579,7 @@ mod tests {
         let alice = Key::new("alice", 1);
         let office = office_with_roles(&[(&alice, office_utils::Role::Admin)]);
         let subject = "ab".repeat(32);
-        let newer = store_blob(&encode_cell(&key_stamp(alice.id()), "tags.tag 2", &text("from a newer forklift"))).unwrap();
+        let newer = store_blob(&encode_cell(&key_stamp(alice.id()), "tags.tag 2", &text("from a newer forklift")).unwrap()).unwrap();
 
         stack_meta_edits("tags", &tag_utils::TagsRules, &signed_writer(&office, &alice), &[
             set("v1.0", &tag_cell(alice.id(), &subject)),
@@ -4501,7 +4596,7 @@ mod tests {
 
         let note = note_entry(&subject, ManifestKind::Note, "lgtm");
         let newer_path = format!("{}/{}/review/{}", &subject[..2], subject, manifest_utils::operator_leaf("alice"));
-        let newer = store_blob(&encode_cell(&key_stamp(alice.id()), "manifest.review 1", &text("a newer kind"))).unwrap();
+        let newer = store_blob(&encode_cell(&key_stamp(alice.id()), "manifest.review 1", &text("a newer kind")).unwrap()).unwrap();
 
         stack_meta_edits("manifest", &manifest_utils::ManifestRules, &signed_writer(&office, &alice), &[
             set(&cell_path("alice", &note), &note_cell(alice.id(), ManifestKind::Note, "lgtm")),
