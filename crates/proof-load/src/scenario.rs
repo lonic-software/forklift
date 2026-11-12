@@ -121,6 +121,22 @@ impl Scenario {
     }
 }
 
+/// The scenarios this build of the harness runs. A damage binding names one of these as the
+/// scenario that creates its path, and a run checks that it does.
+pub fn catalog() -> Vec<Scenario> {
+    let record = |index| Op::Record { index };
+    let named = |id: &str, history: Vec<Op>| Scenario { id: id.to_string(), history, damage: None };
+    vec![
+        named("history", vec![record(0), record(1), record(2)]),
+        named("branched", vec![
+            record(0), Op::Branch { name: "side".into() }, Op::Switch { name: "side".into() }, record(1),
+            Op::Switch { name: "main".into() }, Op::Merge { name: "side".into() },
+        ]),
+        // No Verify: `audit` refuses a warehouse with no office, and none of these enrolls one.
+        named("repaired", vec![record(0), record(1), Op::Repair]),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

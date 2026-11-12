@@ -5,6 +5,7 @@
 //! Built in slices. This one holds the census reader, the copy-only rule and environment scrub,
 //! the oracle and grades, damaged-file faults with their completeness check, and the report.
 
+pub mod bindings;
 pub mod census;
 pub mod corpus;
 pub mod damage;
