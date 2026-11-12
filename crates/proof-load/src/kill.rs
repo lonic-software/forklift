@@ -623,6 +623,15 @@ mod tests {
         let enumerated = enumerate(&calls, 0, "load", &root(), "/o/s/0001-h-count/work", existed).unwrap();
         let whens: Vec<(&str, usize)> = enumerated.points.iter().map(|point| (point.name.as_str(), point.when)).collect();
         assert_eq!(whens, vec![("openat", 1), ("fsync", 1), ("unlinkat", 1), ("unlinkat", 2)]);
+        // A directory that existed: -P on "d" also selects a call whose directory descriptor is it.
+        let under = trace::parse("\
+50 execve(\"/b\", [], 0x1) = 0
+50 mkdirat(4</o/s/0001-h-count/work/d>, \"e\", 0777) = 0
+50 mkdirat(AT_FDCWD</o/s/0001-h-count/work>, \"d\", 0777) = -1 EEXIST (File exists)
+").unwrap();
+        let existed = |path: &str| path == "/o/s/0001-h-count/work/d";
+        let points = enumerate(&under, 0, "load", &root(), "/o/s/0001-h-count/work", existed).unwrap().points;
+        assert_eq!((&points[1].aim, points[1].when), (&Aim::Path { path: "d".into() }, 2));
 
         let outside = trace::parse("50 execve(\"/b\", [], 0x1) = 0\n50 mkdirat(AT_FDCWD</o/s/0001-h-count/work>, \"/etc/x\", 0777) = 0\n").unwrap();
         let refused = enumerate(&outside, 0, "load", &root(), "/o/s/0001-h-count/work", |_| false).unwrap_err();
