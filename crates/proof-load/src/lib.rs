@@ -10,6 +10,7 @@ pub mod census;
 pub mod corpus;
 pub mod damage;
 pub mod faulted;
+pub mod kill;
 pub mod oracle;
 pub mod remedy;
 pub mod report;
