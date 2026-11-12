@@ -13,7 +13,7 @@ use crate::census::{Census, DamageName};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
-    /// Cut to half its length (an empty file is cut to nothing and recorded as such).
+    /// Cut to half its length. An empty file has nothing to cut, so it is refused, as for a flip.
     Truncate,
     /// Invert one byte, chosen by the seed.
     FlipByte,
@@ -99,6 +99,9 @@ pub fn apply(path: &Path, kind: Kind, seed: u64) -> Result<(), DamageError> {
         }
         Kind::Truncate => {
             let length = std::fs::metadata(path).map_err(io)?.len();
+            if length == 0 {
+                return Err(DamageError::Io(format!("{}: empty, so there is nothing to cut", path.display())));
+            }
             std::fs::OpenOptions::new().write(true).open(path).and_then(|file| file.set_len(length / 2)).map_err(io)
         }
         Kind::FlipByte | Kind::Zero => {
@@ -165,6 +168,24 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), [b'a', !b'b', b'c', b'd']);
         apply(&target, Kind::Truncate, 0).unwrap();
         assert_eq!(std::fs::read(&target).unwrap().len(), 2);
+    }
+
+    /// No kind but Delete applies to an empty file (as the lock files are): each would leave it
+    /// as it was, a fault that damages nothing.
+    ///
+    /// Revert: truncate an empty file to half of nothing → it succeeds and changes nothing.
+    #[test]
+    fn an_empty_file_has_nothing_to_truncate_flip_or_zero() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("proof-load-damage-empty-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("format.lock");
+        std::fs::write(&target, b"").unwrap();
+        for kind in [Kind::Truncate, Kind::FlipByte, Kind::Zero] {
+            assert!(matches!(apply(&target, kind, 1), Err(DamageError::Io(_))), "{:?} of an empty file", kind);
+        }
+        apply(&target, Kind::Delete, 0).unwrap();
+        assert!(std::fs::symlink_metadata(&target).is_err());
     }
 
     /// A folder binding's Delete removes the folder and what it holds; a file's removes the file.

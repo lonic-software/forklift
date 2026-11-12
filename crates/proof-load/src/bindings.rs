@@ -13,8 +13,8 @@ use crate::damage::{self, Binding, Exemption, Kind, Warehouse};
 use crate::scenario::Scenario;
 
 const FILE: &[Kind] = &[Kind::FlipByte, Kind::Truncate, Kind::Zero, Kind::Delete];
-/// A lock file left in place between commands: it may be empty, so no byte is there to flip.
-const LOCK_FILE: &[Kind] = &[Kind::Truncate, Kind::Delete];
+/// A lock file left in place between commands: empty, so there is no byte to flip and nothing to cut.
+const LOCK_FILE: &[Kind] = &[Kind::Delete];
 const FOLDER: &[Kind] = &[Kind::Delete];
 
 const fn bound(name: &'static str, kinds: &'static [Kind]) -> Binding {

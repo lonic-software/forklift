@@ -156,7 +156,7 @@ impl CoverageTable {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Determinism {
     pub seed: u64,
-    /// Each tool's path and its `--version` output.
+    /// Each tool's path, then the first line of its `--version` output in parentheses.
     pub tools: BTreeMap<String, String>,
     pub scenarios: Vec<String>,
     pub platform: Platform,

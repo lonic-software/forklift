@@ -57,6 +57,16 @@ enum Command {
     },
 }
 
+/// A tool as the determinism record names it: its path and the first line of its `--version`.
+/// Asked with nothing inherited but PATH, from the temp directory, so nothing of the user's is read.
+fn described(program: &std::path::Path) -> String {
+    let version = std::process::Command::new(program).arg("--version").env_clear()
+        .envs(std::env::var_os("PATH").map(|path| ("PATH", path))).current_dir(std::env::temp_dir()).output().ok()
+        .and_then(|output| String::from_utf8_lossy(&output.stdout).lines().next().map(|line| line.trim().to_string()))
+        .filter(|line| !line.is_empty()).unwrap_or_else(|| "no --version output".to_string());
+    format!("{} ({})", program.display(), version)
+}
+
 fn main() -> ExitCode {
     let Command::Run { source, out, seed, only, forklift, git, forklift_server, budget } = Cli::parse().command;
     let started = std::time::Instant::now();
@@ -80,6 +90,7 @@ fn main() -> ExitCode {
     let scenarios: Vec<_> = scenario::catalog().into_iter().filter(|scenario| only.as_ref().is_none_or(|only| *only == scenario.id)).collect();
     let corpus = corpus::generate(seed, corpus::Shape::SMALL);
     let mut tools = BTreeMap::new();
+    let search_path = proof_load::scrub::search_path(git.as_deref().and_then(|git| tool::absolute(git).ok()).as_deref(), std::env::var_os("PATH"));
     let mut environment_seen = BTreeMap::new();
     let server = match forklift_server.as_deref().map(tool::absolute).transpose() {
         Ok(server) => server,
@@ -89,7 +100,7 @@ fn main() -> ExitCode {
         }
     };
     if let Some(server) = &server {
-        tools.insert("forklift-server".to_string(), server.display().to_string());
+        tools.insert("forklift-server".to_string(), described(server));
     }
 
     // Each scenario's history built with the forklift under test: what it created, and what its
@@ -107,11 +118,11 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            tools.insert("forklift".to_string(), program.display().to_string());
+            tools.insert("forklift".to_string(), described(&program));
             for scenario in &scenarios {
                 let built = output.scratch(&scenario.id).map_err(|error| error.to_string())
                     .and_then(|scratch| {
-                        let environment = Environment::scrubbed(&scratch, std::env::var_os("PATH"), &BTreeMap::new()).map_err(|error| error.to_string())?;
+                        let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
                         environment_seen = environment.variables.clone();
                         runner::build(scenario, &corpus, Tool::Forklift, &program, server.as_deref(), &scratch, &environment, std::time::Duration::from_secs(120))
                             .map_err(|error| error.to_string())
@@ -151,7 +162,7 @@ fn main() -> ExitCode {
                 eprintln!("proof-load: cannot resolve the tool paths");
                 return ExitCode::from(2);
             };
-            tools.insert("git".to_string(), git.display().to_string());
+            tools.insert("git".to_string(), described(&git));
             let programs = Programs { forklift, git, server: server.clone() };
             let faulted_corpus = corpus::generate(seed, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL });
             for binding in proof_load::bindings::BINDINGS {
@@ -159,7 +170,7 @@ fn main() -> ExitCode {
                 for kind in binding.kinds {
                     let label = format!("{}-{}-{:?}", binding.scenario, binding.name, kind).replace(['/', '<', '>', '{', '}'], "_");
                     let result = output.scratch(&label).map_err(|error| error.to_string()).and_then(|scratch| {
-                        let environment = Environment::scrubbed(&scratch, std::env::var_os("PATH"), &BTreeMap::new()).map_err(|error| error.to_string())?;
+                        let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
                         faulted::run(scenario, binding.name, binding.warehouse, *kind, &faulted_corpus, &programs, &scratch, &environment, std::time::Duration::from_secs(120), seed)
                             .map_err(|error| error.to_string())
                     });

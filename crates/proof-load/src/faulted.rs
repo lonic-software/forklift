@@ -178,7 +178,12 @@ impl Context<'_> {
         if !export.succeeded() {
             return Ok(HistoryReadback { export, records: Vec::new() });
         }
+        // The listing names the records the export left files out of; one that cannot be read
+        // leaves those unnamed, so the read refuses, as in a scoped bay.
         let listing = self.run(&self.programs.forklift, vec!["--json".into(), "history".into()], bay)?;
+        if !listing.succeeded() {
+            return Ok(HistoryReadback { export: listing, records: Vec::new() });
+        }
         let left_out = left_out(&runner::document(&export.stdout), &runner::described_parcels(&listing.stdout));
 
         let git = |arguments: &[&str]| self.run(&self.programs.git, arguments.iter().map(|argument| argument.to_string()).collect(), exported.clone());
@@ -268,6 +273,14 @@ impl Context<'_> {
         }
         Ok(HistoryReadback { export: opened, records })
     }
+}
+
+/// What the work tree holds before the faulted command: the last record on the corpus's line. A
+/// variant is recorded off it, on a side pallet, and every scenario switches back before the
+/// faulted command, so a variant acknowledged last is not what the work tree holds.
+fn before_of(acknowledged: &[Mark], corpus: &Corpus) -> crate::oracle::Tree {
+    acknowledged.iter().rev().find(|mark| matches!(mark, Mark::Record(_)))
+        .and_then(|mark| mark.snapshot(corpus)).map(|snapshot| corpus::expected(&snapshot)).unwrap_or_default()
 }
 
 /// What an export reported leaving out, per record message: path → the documented code of a read
@@ -403,8 +416,7 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, co
     let faulted = next_record(&built.acknowledged);
     let snapshot = corpus.records.get(faulted)
         .ok_or_else(|| RunError::Io(format!("the faulted record {} is past the corpus's {} records", faulted, corpus.records.len())))?;
-    // Before the faulted command, the work tree holds what the history recorded last.
-    let before = built.acknowledged.last().and_then(|last| last.snapshot(corpus)).map(|snapshot| corpus::expected(&snapshot)).unwrap_or_default();
+    let before = before_of(&built.acknowledged, corpus);
     let taken = built.taken.iter().map(|taken| (taken.digest.clone(), admissible(taken, scenario.withhold_reader(warehouse)))).collect();
     let expected = Expected { before, after: corpus::expected(snapshot), acknowledged: built.acknowledged, faulted: Mark::Record(faulted), taken };
     let context = Context {
@@ -414,11 +426,12 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, co
     let mut trail = Trail::default();
     let mut unextractable = Vec::new();
 
-    // The faulted command, then one plain retry of it.
+    // The faulted command, then one plain retry of it. Once the tool acknowledged the record it
+    // stays owed, so a later attempt that refuses (a re-stack with nothing new) does not unmake it.
     let mut made = context.record(faulted, &mut trail.steps)?;
     let mut reads = trail.settle(&context, &expected, made)?;
     if !reads {
-        made = context.record(faulted, &mut trail.steps)?;
+        made |= context.record(faulted, &mut trail.steps)?;
         reads = trail.settle(&context, &expected, made)?;
     }
     trail.evidence.healed_by_retry = reads;
@@ -449,7 +462,7 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, co
             }
         }
         if trail.evidence.remedy_named {
-            made = context.record(faulted, &mut trail.steps)?;
+            made |= context.record(faulted, &mut trail.steps)?;
             reads = trail.settle(&context, &expected, made)?;
             trail.evidence.remedy_worked = reads;
             trail.recoverability.named_right_remedy = reads;
@@ -578,5 +591,20 @@ mod tests {
         assert_eq!(next_record(&[]), 0);
         assert_eq!(next_record(&[Mark::Record(0), Mark::Variant(0), Mark::Record(1)]), 2);
         assert_eq!(next_record(&[Mark::Record(0), Mark::Variant(2)]), 1);
+    }
+
+    /// The tree before the faulted command is the last record's, even when the history ends in a
+    /// variant on a side pallet (as `unvouched` does) and switched back.
+    ///
+    /// Revert: take the last mark → variant 0's tree, so a faulted command that serves the work
+    /// tree as it was grades silent.
+    #[test]
+    fn the_tree_before_the_fault_is_the_last_records() {
+        let corpus = crate::corpus::generate(1, crate::corpus::Shape::SMALL);
+        let record = corpus::expected(&corpus.records[0]);
+        assert_ne!(record, corpus::expected(&crate::corpus::variant(&corpus.records[0])), "the variant differs");
+        assert_eq!(before_of(&[Mark::Record(0), Mark::Variant(0)], &corpus), record);
+        assert_eq!(before_of(&[Mark::Record(0), Mark::Variant(0), Mark::Record(1)], &corpus), corpus::expected(&corpus.records[1]));
+        assert!(before_of(&[], &corpus).is_empty());
     }
 }

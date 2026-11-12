@@ -2,7 +2,8 @@
 //! runs in a scrubbed environment that points it there.
 //!
 //! Paths are half of "never touches the user's data"; the tools also find the user's files through
-//! the environment. So each tool starts from an empty environment plus PATH, with HOME,
+//! the environment. So each tool starts from an empty environment plus PATH (and, on Windows, the
+//! few system variables no program runs without: see [`system_variables_when`]), with HOME,
 //! XDG_CONFIG_HOME and TMPDIR inside the scratch area, every `FORKLIFT_*` variable unset unless the
 //! scenario sets it on purpose (and the report records it), and git reading harness-written global
 //! and system config. An inherited FORKLIFT_FSYNC=0 would otherwise void every power-loss grade.
@@ -149,6 +150,7 @@ impl Environment {
         variables.insert("HOME".to_string(), text(scratch.home()));
         variables.insert("XDG_CONFIG_HOME".to_string(), text(scratch.config_home()));
         variables.insert("TMPDIR".to_string(), text(scratch.tmp()));
+        variables.extend(system_variables_when(cfg!(windows), |name| std::env::var_os(name)));
         if cfg!(windows) {
             variables.insert("USERPROFILE".to_string(), text(scratch.home()));
             variables.insert("TMP".to_string(), text(scratch.tmp()));
@@ -176,6 +178,29 @@ impl Environment {
         command.env_clear();
         command.envs(&self.variables);
     }
+}
+
+/// The inherited variables a Windows program cannot run without, when `windows`: without
+/// SystemRoot, Winsock fails to start (`forklift-server` cannot bind, os error 10106), and git for
+/// Windows and the shell need the rest. None of them points at the user's files. Elsewhere, none.
+pub fn system_variables_when(windows: bool, inherited: impl Fn(&str) -> Option<OsString>) -> Vec<(String, String)> {
+    if !windows {
+        return Vec::new();
+    }
+    ["SystemRoot", "SystemDrive", "windir", "ComSpec", "PATHEXT"].into_iter()
+        .filter_map(|name| Some((name.to_string(), inherited(name)?.to_string_lossy().into_owned())))
+        .collect()
+}
+
+/// The PATH the tools run with: the readback git's own directory first, then the harness's PATH,
+/// so a `git` that forklift itself starts (as `git export` does) is the one the run records.
+pub fn search_path(git: Option<&Path>, inherited: Option<OsString>) -> Option<OsString> {
+    let first = git.and_then(Path::parent).map(Path::to_path_buf);
+    let rest = inherited.iter().flat_map(std::env::split_paths).collect::<Vec<_>>();
+    if first.is_none() && rest.is_empty() {
+        return inherited;
+    }
+    std::env::join_paths(first.into_iter().chain(rest)).ok().or(inherited)
 }
 
 #[cfg(test)]
@@ -245,6 +270,30 @@ mod tests {
         for name in ["HOME", "XDG_CONFIG_HOME", "TMPDIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"] {
             assert!(Path::new(&seen[name]).starts_with(scratch.root()), "{} points into the scratch area: {}", name, seen[name]);
         }
+    }
+
+    /// On Windows the system variables survive the scrub, taken from the harness; elsewhere none
+    /// is added.
+    ///
+    /// Revert: return nothing on Windows → SystemRoot is lost (forklift-server cannot bind there).
+    #[test]
+    fn windows_keeps_the_system_variables_and_nothing_else_does() {
+        let inherited = |name: &str| (name != "PATHEXT").then(|| OsString::from(format!("v-{}", name)));
+        let windows: BTreeMap<String, String> = system_variables_when(true, inherited).into_iter().collect();
+        assert_eq!(windows.get("SystemRoot").map(String::as_str), Some("v-SystemRoot"));
+        assert_eq!(windows.keys().map(String::as_str).collect::<Vec<_>>(), vec!["ComSpec", "SystemDrive", "SystemRoot", "windir"]);
+        assert!(system_variables_when(false, inherited).is_empty());
+    }
+
+    /// The readback git's directory leads PATH, ahead of everything inherited.
+    ///
+    /// Revert: keep the inherited PATH as it is → a `git` earlier on it is the one forklift starts.
+    #[test]
+    fn the_readback_gits_directory_leads_path() {
+        let joined = search_path(Some(Path::new("/opt/git/bin/git")), Some(OsString::from("/usr/bin:/bin"))).unwrap();
+        let parts: Vec<PathBuf> = std::env::split_paths(&joined).collect();
+        assert_eq!(parts, vec![PathBuf::from("/opt/git/bin"), PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+        assert_eq!(search_path(None, Some(OsString::from("/usr/bin"))), Some(OsString::from("/usr/bin")));
     }
 
     /// A scenario's own FORKLIFT_* setting reaches the tool and is recorded; one that would move

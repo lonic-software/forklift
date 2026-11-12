@@ -78,10 +78,16 @@ pub fn extract(texts: &[&str]) -> Extracted {
 }
 
 /// Whether the harness may execute a remove remedy: only for a path inside the run's own root,
-/// judged at path-component boundaries, so a root of `/s` covers `/s/wh` but not `/srv/wh`.
+/// judged at path-component boundaries, so a root of `/s` covers `/s/wh` but not `/srv/wh`. A tool
+/// may print the path resolved (`/private/var/…` for `/var/…` on macOS, `\\?\C:\…` on Windows),
+/// so a path that is not under the root as given is judged again with both resolved.
 pub fn removable(path: &Path, run_root: &Path) -> bool {
-    path.is_absolute() && path.starts_with(run_root) && path != run_root
-        && !path.components().any(|component| matches!(component, std::path::Component::ParentDir))
+    let under = |path: &Path, root: &Path| path.is_absolute() && path.starts_with(root) && path != root
+        && !path.components().any(|component| matches!(component, std::path::Component::ParentDir));
+    under(path, run_root) || match (std::fs::canonicalize(path), std::fs::canonicalize(run_root)) {
+        (Ok(path), Ok(root)) => under(&path, &root),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -140,5 +146,26 @@ mod tests {
         assert!(!removable(Path::new("/s/../home/user/file"), root));
         assert!(!removable(Path::new("/s"), root));
         assert!(!removable(Path::new("wh/.forklift/store.lock"), root));
+    }
+
+    /// A path the tool printed resolved, through a link in the root as given, is still under it;
+    /// one resolving outside the root is not.
+    ///
+    /// Revert: compare only as given → the resolved path is refused, so a named working remedy
+    /// grades as none.
+    #[cfg(unix)]
+    #[test]
+    fn a_resolved_path_under_the_root_is_removable() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("proof-load-remedy-{}-{}", std::process::id(), nanos));
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("wh")).unwrap();
+        std::fs::write(real.join("wh/store.lock"), b"").unwrap();
+        std::fs::write(base.join("elsewhere"), b"").unwrap();
+        std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+        let root = base.join("link");
+        let printed = std::fs::canonicalize(real.join("wh/store.lock")).unwrap();
+        assert!(removable(&printed, &root));
+        assert!(!removable(&std::fs::canonicalize(base.join("elsewhere")).unwrap(), &root));
     }
 }
