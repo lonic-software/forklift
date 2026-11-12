@@ -541,3 +541,38 @@ mod regressions {
         assert!(error.contains("declared"), "{}", error);
     }
 }
+
+#[test]
+#[ignore = "FORK-139 slice 1 spike: fails on main by design; becomes the permanent canonical property"]
+fn spike_canonical() {
+    use forklift_core::enums::object::parsed_object::ParsedObject as P;
+    let mut rng = Rng::new(0xC0DE_0001);
+    let generators: [(&str, fn(&mut Rng) -> Vec<u8>); 3] =
+        [("blob", blob_object_bytes), ("tree", tree_object_bytes), ("parcel", parcel_object_bytes)];
+    let mut found: std::collections::BTreeMap<String, (usize, Vec<u8>, Vec<u8>)> = Default::default();
+    for _ in 0..20000 {
+        for (seed_kind, generate) in generators {
+            let mut bytes = generate(&mut rng);
+            mutate(&mut bytes, &mut rng);
+            let Ok(parsed) = parse_loose_object(&bytes) else { continue };
+            let (kind, rebuilt) = match &parsed {
+                P::Blob(b) => ("blob", LooseObjectBuilder::build_blob(b).content),
+                P::Tree(t) => ("tree", LooseObjectBuilder::build_tree(t).content),
+                P::Parcel(p) => ("parcel", LooseObjectBuilder::build_parcel(p).content),
+                P::Recipe(r) => ("recipe", LooseObjectBuilder::build_recipe(r).content),
+                P::Chunk(c) => ("chunk", LooseObjectBuilder::build_chunk(c).content),
+            };
+            if rebuilt != bytes {
+                let at = rebuilt.iter().zip(&bytes).position(|(a, b)| a != b).unwrap_or(rebuilt.len().min(bytes.len()));
+                let region = if at < 4 { "header".to_string() } else { format!("body@{}", if at < 8 {"start"} else {"later"}) };
+                let key = format!("{seed_kind}->{kind} {region} len{}", if rebuilt.len()==bytes.len(){"="} else if rebuilt.len()<bytes.len(){"<"} else {">"});
+                let e = found.entry(key).or_insert((0, bytes.clone(), rebuilt.clone()));
+                e.0 += 1;
+            }
+        }
+    }
+    for (k, (n, b, r)) in &found {
+        println!("{k}: {n}\n  in : {:02x?}\n  out: {:02x?}", &b[..b.len().min(60)], &r[..r.len().min(60)]);
+    }
+    assert!(found.is_empty());
+}
