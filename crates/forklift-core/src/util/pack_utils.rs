@@ -2772,14 +2772,14 @@ fn verify_incoming_packs(packs: &[LoadedPack])
         let mut hash = [0u8; HASH_LEN];
         hash.copy_from_slice(locator.hash_of(*entry));
         let bytes = resolve_incoming_object(&hash, &locator, &mut cache, &mut visiting, 0)?;
-        // `resolve_incoming_object` has already refused an unknown version. It is refused here too
-        // rather than skipped, since a parcel left out of this set escapes the signature checks.
+        // A header that does not peek is refused rather than skipped, since a parcel left out of
+        // this set escapes the signature checks.
         match object_utils::peek_object_header(&bytes) {
             Ok((ObjectType::Parcel, _)) => {
                 parcels.insert(sign_utils::to_hex(&hash));
             }
-            Ok(_) | Err(object_utils::PeekError::Malformed(_)) => {}
-            Err(error @ object_utils::PeekError::UnknownVersion(_)) => {
+            Ok(_) => {}
+            Err(error) => {
                 return Err(format!("Incoming object {}: {}", sign_utils::to_hex(&hash), error));
             }
         }

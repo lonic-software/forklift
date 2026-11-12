@@ -1,6 +1,6 @@
 use crate::enums::object::recipe_version::RecipeVersion;
 use crate::model::recipe::Recipe;
-use crate::util::byte_utils;
+use crate::util::{byte_utils, object_utils};
 
 /// Parse a recipe object.
 ///
@@ -23,7 +23,9 @@ pub fn parse_recipe(offset: usize, content: &[u8]) -> Result<Recipe, String> {
         .map_err(|e| format!("Failed to parse recipe version: {}", e))?;
 
     let version = RecipeVersion::from_code(version_code)?;
-    let recipe = version.get_parser()(offset + cursor, content);
+    let recipe = version.get_parser()(offset + cursor, content)?;
 
-    recipe
+    object_utils::check_canonical("recipe", &version.get_builder()(&recipe), &content[offset..])?;
+
+    Ok(recipe)
 }

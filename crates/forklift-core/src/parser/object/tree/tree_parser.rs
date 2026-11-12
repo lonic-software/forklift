@@ -50,6 +50,8 @@ pub fn parse_tree(offset: usize, content: &[u8]) -> Result<TreeItem, String> {
         tree.add_child(entry);
     }
 
+    object_utils::check_canonical("tree", &version.get_builder()(&tree), &content[offset..])?;
+
     Ok(tree)
 }
 

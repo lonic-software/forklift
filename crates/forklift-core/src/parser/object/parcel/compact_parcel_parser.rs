@@ -37,6 +37,8 @@ pub fn parse_compact_parcel(offset: usize, content: &[u8]) -> Result<Parcel, Str
         return Err(format!("The parcel's parent {:?} is not an object hash.", parent));
     }
 
+    object_utils::check_canonical("parcel", &version.get_builder()(&parcel), &content[offset..])?;
+
     Ok(parcel)
 }
 #[cfg(test)]
