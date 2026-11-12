@@ -114,7 +114,9 @@ Notes:
   shares, and `--partition count:3/4` there runs a different set.
 - The `proof load` checks (`.github/workflows/proof-load.yml`, one per OS) run the fault-injection
   harness in `crates/proof-load` against forklift and forklift-server built for each OS's release
-  target: damaged files over every census name, graded by reading every record back. They are
+  target: damaged files over every census name, graded by reading every record back, and on Linux
+  process kills at each of forklift's traced write calls of the `history` scenario (`--strace`,
+  `--kill`; the traces are uploaded with the report). They are
   outside `ci passed` and their run step continues on error, so for now they report without failing;
   read the grades in the job summary or the uploaded report. A census row added without a damage
   binding or an exemption in `crates/proof-load/src/bindings.rs` fails the `bindings` unit test

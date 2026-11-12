@@ -36,9 +36,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install musl tools
+      - name: Install musl tools and strace
         if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools strace
 
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable && rustup target add ${{ matrix.target }}
@@ -58,11 +58,13 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          exe=""; git=$(command -v git)
+          exe=""; git=$(command -v git); kill=()
           if [ "$RUNNER_OS" = Windows ]; then exe=".exe"; git=$(cygpath -w "$git"); fi
+          # Kill points need strace, so Linux only; one scenario's keep the lane inside its budget.
+          if [ "$RUNNER_OS" = Linux ]; then kill=(--strace "$(command -v strace)" --kill history); fi
           bin=target/${{ matrix.target }}/release
           target/release/proof-load$exe run --source . --out "$RUNNER_TEMP/proof-load" --budget 2700 \
-            --forklift "$bin/forklift$exe" --forklift-server "$bin/forklift-server$exe" --git "$git"
+            --forklift "$bin/forklift$exe" --forklift-server "$bin/forklift-server$exe" --git "$git" "${kill[@]}"
 
       - name: Summary
         if: ${{ !cancelled() }}
@@ -78,4 +80,5 @@ jobs:
           path: |
             ${{ runner.temp }}/proof-load/*.json
             ${{ runner.temp }}/proof-load/report.md
+            ${{ runner.temp }}/proof-load/traces/
           if-no-files-found: warn

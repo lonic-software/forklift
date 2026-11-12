@@ -13,6 +13,7 @@ use proof_load::scenario::{self, Tool};
 use proof_load::scrub::Environment;
 use proof_load::tool;
 use proof_load::faulted::{self, Programs};
+use proof_load::kill;
 use proof_load::report::{Category, Cell, Completeness, CoverageTable, Determinism, Platform, Report, Row};
 use proof_load::scrub::Output;
 
@@ -54,6 +55,16 @@ enum Command {
         /// then fails.
         #[arg(long)]
         budget: Option<u64>,
+        /// strace, by path: the faulted command killed at each call it makes that changes or syncs
+        /// a file, on Linux. Without it the kill points are reported as not run.
+        #[arg(long)]
+        strace: Option<PathBuf>,
+        /// Kill points of this scenario only; repeatable. Without it, every scenario's.
+        #[arg(long = "kill")]
+        kill: Vec<String>,
+        /// How many injected runs at once. Defaults to the machine's parallelism.
+        #[arg(long)]
+        jobs: Option<usize>,
     },
 }
 
@@ -68,7 +79,7 @@ fn described(program: &std::path::Path) -> String {
 }
 
 fn main() -> ExitCode {
-    let Command::Run { source, out, seed, only, forklift, git, forklift_server, budget } = Cli::parse().command;
+    let Command::Run { source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, jobs } = Cli::parse().command;
     let started = std::time::Instant::now();
 
     let mut output = match Output::claim(&out) {
@@ -87,6 +98,10 @@ fn main() -> ExitCode {
         }
     };
 
+    if let Some(unknown) = kill.iter().find(|id| !scenario::catalog().iter().any(|scenario| &scenario.id == *id)) {
+        eprintln!("proof-load: --kill {}: no such scenario", unknown);
+        return ExitCode::from(2);
+    }
     let scenarios: Vec<_> = scenario::catalog().into_iter().filter(|scenario| only.as_ref().is_none_or(|only| *only == scenario.id)).collect();
     let corpus = corpus::generate(seed, corpus::Shape::SMALL);
     let mut tools = BTreeMap::new();
@@ -164,7 +179,7 @@ fn main() -> ExitCode {
             };
             tools.insert("git".to_string(), described(&git));
             let programs = Programs { forklift, git, server: server.clone() };
-            let faulted_corpus = corpus::generate(seed, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL });
+            let faulted_corpus = faulted_corpus(seed);
             for binding in proof_load::bindings::BINDINGS {
                 let Some(scenario) = scenarios.iter().find(|scenario| scenario.id == binding.scenario) else { continue };
                 for kind in binding.kinds {
@@ -196,11 +211,67 @@ fn main() -> ExitCode {
     };
     let fault_check = Completeness { check: "damaged-file faults ran".to_string(), cell: damaged_cell.clone(), missing: fault_errors };
 
+    // Every scenario's faulted command killed at each call that changes or syncs a file, Linux only.
+    let mut kill_completeness = Vec::new();
+    let mut not_reached = 0;
+    let kill_cell = match (&forklift, &git, &strace) {
+        _ if Platform::current() != Platform::Linux => Cell::not_run("kill points run on Linux only"),
+        (None, _, _) => Cell::not_run("no forklift binary given"),
+        (_, None, _) => Cell::not_run("no git binary given to lay out the readback"),
+        (_, _, None) => Cell::not_run("no strace given"),
+        (Some(forklift), Some(git), Some(strace)) => {
+            let (Ok(forklift), Ok(git), Ok(strace)) = (tool::absolute(forklift), tool::absolute(git), tool::absolute(strace)) else {
+                eprintln!("proof-load: cannot resolve the tool paths");
+                return ExitCode::from(2);
+            };
+            tools.insert("strace".to_string(), described(&strace));
+            let programs = Programs { forklift, git, server: server.clone() };
+            let faulted_corpus = faulted_corpus(seed);
+            let traces = output.root().join("traces");
+            if let Err(error) = std::fs::create_dir_all(&traces) {
+                eprintln!("proof-load: {}: {}", traces.display(), error);
+                return ExitCode::from(2);
+            }
+            let settings = kill::Settings {
+                strace: &strace, search_path: search_path.clone(), limit: std::time::Duration::from_secs(120),
+                jobs: jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from)), traces: &traces,
+            };
+            let mut all = Vec::new();
+            for scenario in scenarios.iter().filter(|scenario| kill.is_empty() || kill.contains(&scenario.id)) {
+                let result = output.scratch(&format!("{}-kill", scenario.id)).map_err(|error| error.to_string())
+                    .and_then(|template| kill::run(scenario, &faulted_corpus, &programs, &settings, &template).map_err(|error| error.to_string()));
+                match result {
+                    Ok(kills) => {
+                        let _ = std::fs::write(output.root().join(format!("kills-{}.json", scenario.id)), serde_json::to_string(&kills).unwrap_or_default());
+                        all.push(kills);
+                    }
+                    Err(error) => all.push(kill::ScenarioKills { scenario: scenario.id.clone(), errors: vec![error], ..Default::default() }),
+                }
+            }
+            let summary = kill::summarize(&all);
+            rows.extend(summary.rows);
+            kill_completeness = summary.completeness;
+            not_reached = summary.not_reached;
+            summary.cell
+        }
+    };
+    if kill_completeness.is_empty() {
+        kill_completeness.push(Completeness { check: "kill-point units".to_string(), cell: kill_cell.clone(), missing: vec![] });
+    }
+
+    let mut coverage = CoverageTable::new(Platform::current(), |category: Category| match category {
+        Category::DamagedFiles => damaged_cell.clone(),
+        Category::KillPointsClient => kill_cell.clone(),
+        _ => Cell::not_run("no runner for this fault in this build of the harness"),
+    });
+    if matches!(kill_cell, Cell::Run | Cell::Sampled) || not_reached > 0 {
+        coverage.not_reached.insert(Category::KillPointsClient, not_reached);
+    }
+    let mut completeness = vec![damage_check, walk_check, fault_check];
+    completeness.extend(kill_completeness);
+    completeness.push(Completeness::budget(started.elapsed(), budget.map(std::time::Duration::from_secs)));
     let report = Report {
-        coverage: CoverageTable::new(Platform::current(), |category: Category| match category {
-            Category::DamagedFiles => damaged_cell.clone(),
-            _ => Cell::not_run("no runner for this fault in this build of the harness"),
-        }),
+        coverage,
         determinism: Determinism {
             seed,
             tools,
@@ -208,7 +279,7 @@ fn main() -> ExitCode {
             platform: Platform::current(),
             environment: environment_seen,
         },
-        completeness: vec![damage_check, walk_check, fault_check, Completeness::budget(started.elapsed(), budget.map(std::time::Duration::from_secs))],
+        completeness,
         rows,
         forklift_only: vec![],
     };
@@ -226,4 +297,10 @@ fn main() -> ExitCode {
     }
 
     if report.failed() { ExitCode::from(1) } else { ExitCode::SUCCESS }
+}
+
+/// The corpus a faulted command runs over, shared by every lane: the small shape with one record
+/// past the history, the one the faulted command writes.
+fn faulted_corpus(seed: u64) -> corpus::Corpus {
+    corpus::generate(seed, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL })
 }
