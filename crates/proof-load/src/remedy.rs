@@ -47,7 +47,7 @@ fn quoted(text: &str) -> Vec<(usize, &str)> {
 pub fn extract(texts: &[&str]) -> Extracted {
     let mut extracted = Extracted { remedies: Vec::new(), unextractable: Vec::new() };
 
-    let mut command = |span: &str, extracted: &mut Extracted| {
+    let command = |span: &str, extracted: &mut Extracted| {
         let arguments: Vec<String> = span.trim_start_matches("forklift ").split_whitespace().map(str::to_string).collect();
         if arguments.is_empty() || arguments.iter().any(|argument| argument.contains('<') || argument.contains('{')) {
             extracted.unextractable.push(span.to_string());
