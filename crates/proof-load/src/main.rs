@@ -175,7 +175,7 @@ fn main() -> ExitCode {
             };
             tools.insert("git".to_string(), described(&git));
             let programs = Programs { forklift, git, server: server.clone() };
-            let faulted_corpus = corpus::generate(seed, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL });
+            let faulted_corpus = faulted_corpus(seed);
             for binding in proof_load::bindings::BINDINGS {
                 let Some(scenario) = scenarios.iter().find(|scenario| scenario.id == binding.scenario) else { continue };
                 for kind in binding.kinds {
@@ -222,7 +222,7 @@ fn main() -> ExitCode {
             };
             tools.insert("strace".to_string(), described(&strace));
             let programs = Programs { forklift, git, server: server.clone() };
-            let faulted_corpus = corpus::generate(seed, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL });
+            let faulted_corpus = faulted_corpus(seed);
             let traces = output.root().join("traces");
             if let Err(error) = std::fs::create_dir_all(&traces) {
                 eprintln!("proof-load: {}: {}", traces.display(), error);
@@ -297,4 +297,10 @@ fn main() -> ExitCode {
     }
 
     if report.failed() { ExitCode::from(1) } else { ExitCode::SUCCESS }
+}
+
+/// The corpus a faulted command runs over, shared by every lane: the small shape with one record
+/// past the history, the one the faulted command writes.
+fn faulted_corpus(seed: u64) -> corpus::Corpus {
+    corpus::generate(seed, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL })
 }
