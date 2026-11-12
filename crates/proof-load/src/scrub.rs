@@ -290,7 +290,7 @@ mod tests {
     /// Revert: keep the inherited PATH as it is → a `git` earlier on it is the one forklift starts.
     #[test]
     fn the_readback_gits_directory_leads_path() {
-        let joined = search_path(Some(Path::new("/opt/git/bin/git")), Some(OsString::from("/usr/bin:/bin"))).unwrap();
+        let joined = search_path(Some(Path::new("/opt/git/bin/git")), Some(std::env::join_paths(["/usr/bin", "/bin"]).unwrap())).unwrap();
         let parts: Vec<PathBuf> = std::env::split_paths(&joined).collect();
         assert_eq!(parts, vec![PathBuf::from("/opt/git/bin"), PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
         assert_eq!(search_path(None, Some(OsString::from("/usr/bin"))), Some(OsString::from("/usr/bin")));
