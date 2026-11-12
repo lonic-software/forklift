@@ -137,8 +137,7 @@ Import is deliberately two-phase, and runs only once the whole file has matched 
 A bundle is refused as a whole: every check, the signature section's included, runs before pack
 publication, and any failure there removes the temporary files and stores nothing. Only a local
 fault after publication — a failed sync, or a signature table that cannot be written — can leave
-the packs installed without the bundle's signatures; the import still fails, and a later fetch
-brings the signatures. A process crash during publication leaves
+the packs installed without the bundle's signatures. The import still fails, and says so. A process crash during publication leaves
 at worst a valid subset of verified packs: an index is never published before its data, and the
 normal history walk fetches anything still missing. Re-import is idempotent; if
 all indexed hashes already exist, the incoming duplicate pack is discarded.
