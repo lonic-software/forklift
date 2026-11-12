@@ -508,7 +508,7 @@ fn path_remains(path: &Path) -> bool {
 pub fn remove_file(path: impl AsRef<Path>) -> std::io::Result<()> {
     let path = path.as_ref();
     #[allow(clippy::disallowed_methods)] // the one sanctioned call: this is the wrapper
-    retry_while_held(|| std::fs::remove_file(path), |_| false, || path_remains(path))
+    retry_while_held(|| std::fs::remove_file(path), is_held_by_another_process, || path_remains(path))
 }
 
 /// `std::fs::remove_dir`, retried while an open handle blocks it, as [`remove_file`] retries. On
@@ -517,7 +517,7 @@ pub fn remove_file(path: impl AsRef<Path>) -> std::io::Result<()> {
 pub fn remove_dir(path: impl AsRef<Path>) -> std::io::Result<()> {
     let path = path.as_ref();
     #[allow(clippy::disallowed_methods)] // the one sanctioned call: this is the wrapper
-    retry_while_held(|| std::fs::remove_dir(path), |_| false, || path_remains(path))
+    retry_while_held(|| std::fs::remove_dir(path), is_held_by_another_process, || path_remains(path))
 }
 
 /// `std::fs::remove_dir_all`, retried while an open handle blocks it, as [`remove_file`] retries.
@@ -527,7 +527,7 @@ pub fn remove_dir(path: impl AsRef<Path>) -> std::io::Result<()> {
 pub fn remove_dir_all(path: impl AsRef<Path>) -> std::io::Result<()> {
     let path = path.as_ref();
     #[allow(clippy::disallowed_methods)] // the one sanctioned call: this is the wrapper
-    retry_while_held(|| std::fs::remove_dir_all(path), |_| false, || path_remains(path))
+    retry_while_held(|| std::fs::remove_dir_all(path), is_held_by_another_process, || path_remains(path))
 }
 
 /// Whether a failed rename or delete was refused because a handle (another process's, or this
