@@ -92,6 +92,8 @@ Notes:
   byte-reproducible repacks, and the warehouse-lock refusal. A parser or
   format change should keep the fuzzer green; if you add a length-prefixed field,
   bound it with a `checked_add` (never `start + length` before the bounds check).
+  The fuzzed decoders also assert how much memory they hold at their peak; see
+  [Decoders of untrusted bytes](#decoders-of-untrusted-bytes).
 - Keep tests fast; see [Keeping tests fast](#keeping-tests-fast) below. Under
   `cargo nextest run`, which CI uses, `.config/nextest.toml` reports a test as SLOW at
   30 s and fails it at two minutes. CI runs twice
@@ -140,6 +142,57 @@ Notes:
     should print 0. Listing the whole directory is itself slow once it is large.
 - To install a working binary (e.g. to dogfood): `cargo install --path
   crates/forklift --force` (lands in `~/.cargo/bin`).
+
+### Decoders of untrusted bytes
+
+A decoder reading bytes another party chose (a remote's objects, packs, bundles and meta
+cells, a client's request, an agent's predicate) must not panic, must accept only the one
+spelling of each record, and must hold memory in proportion to the bytes it was given, never
+to a length or count those bytes declare. The fuzz tests check all three. A counting test
+allocator (`crates/forklift-core/src/util/peak_alloc.rs`, the `#[global_allocator]` of core's
+unit tests and of `fuzz_formats.rs`) measures each fuzzed decoder's peak, and each asserts a
+stated multiple of its input plus a fixed overhead. The allocator counts per thread, so a
+decoder measured with it must do its work on the calling thread.
+
+Fuzzed, with a memory bound:
+
+- every loose object (`loose_object_parser::parse`), inventories, meta cells
+  (`meta_tree::parse_cell`) and query predicates (`query_utils::parse_where`), in
+  `tests/fuzz_formats.rs`;
+- transport packs (`pack_utils::import_transport_packs`), bundles and record streams
+  (`bundle_utils::import_bundle_bytes`, `import_batch_bytes`) and office records
+  (`office_utils::parse_user_record`, `parse_key_record`), in their modules' unit tests;
+- the streaming store (`object_utils::store_object_stream`), measured on large inputs rather
+  than fuzzed: a blob holds a constant whatever its size, and a tree, which is parsed whole,
+  about eight times its bytes.
+
+Not fuzzed, and why:
+
+- **JSON bodies of the remote protocol**, both the client reading a server's answers and
+  `forklift-server` or the Lambda head reading a client's requests. They are decoded by
+  `serde_json` into derived types, with no length prefix of ours to get wrong. The client caps
+  every answer it buffers (`body_utils::read_json_capped`, with per-endpoint caps in
+  `remote_utils`), and `forklift-server` caps every request body (`--max-body-mb`, default
+  64 MiB). The Lambda head's `parse_json` has no cap of its own and relies on the platform's
+  request size limit.
+- **MCP messages**, read one line at a time from stdin and decoded by `json_utils::parse_strict`
+  (`serde_json` plus the duplicate-key refusal). The line has no length cap: the peer is the
+  agent process that started `forklift mcp`, not a network party.
+- **Typed meta records** (hauls, tags, manifests, redactions, key-value cells). Their values
+  are read field by field from a cell `parse_cell` has already decoded, so the bytes are
+  fuzzed there; the readers of individual fields are not.
+- **Parcel signatures** (`sign_utils::parse_parcel_signature`), fetched by the client and
+  accepted by both heads. It is a hand-written fixed layout read under the 64 KiB small-body
+  cap on the client; it is the next candidate for the harness.
+- **zstd frames** are not fuzzed beyond the packs and bundles that carry them. Every decoder of
+  untrusted frames refuses a window above 8 MiB (`object_utils::MAX_DECODE_WINDOW_LOG`), so a
+  frame cannot make its decoder hold more than that; `clippy.toml` bans every other way to build
+  a zstd decoder, outside reads of bytes the store itself wrote.
+- **Local state** Forklift wrote itself (bay files, journals, sealed and withheld lists, record
+  files, config, a head's own DynamoDB items) is out of scope: it is not chosen by another party.
+
+Meta cells are the decoder with the largest factor: `parse_cell` holds about 55 times its input,
+and a cell is capped only by the object ceiling.
 
 ### Keeping tests fast
 
