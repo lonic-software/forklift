@@ -112,6 +112,16 @@ Notes:
   The share holds every fourth test of each test binary, so on another OS a test
   that exists only on some platforms shifts the rest of its binary into other
   shares, and `--partition count:3/4` there runs a different set.
+- The `proof load` checks (`.github/workflows/proof-load.yml`, one per OS) run the fault-injection
+  harness in `crates/proof-load` against forklift and forklift-server built for each OS's release
+  target: damaged files over every census name, graded by reading every record back. They are
+  outside `ci passed` and their run step continues on error, so for now they report without failing;
+  read the grades in the job summary or the uploaded report. A census row added without a damage
+  binding or an exemption in `crates/proof-load/src/bindings.rs` fails the `bindings` unit test
+  in `cargo test -p proof-load`. To run one scenario locally, build forklift, forklift-server and
+  proof-load, then `target/debug/proof-load run --source . --out <new dir> --forklift
+  target/debug/forklift --forklift-server target/debug/forklift-server --git "$(command -v git)"
+  --only <scenario>`.
 - CI links on Windows with `rust-lld` (lld-link) instead of MSVC's `link.exe`, set by
   `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` in `ci.yml` (Linux already links with `rust-lld`
   by default and macOS with Apple's linker). Every push rebuilds all the workspace's test binaries,

@@ -1,0 +1,81 @@
+# Proof Load, the per-PR lane: fault the binaries users get. forklift and forklift-server are built
+# from the pull request's head for the release target of each OS (release.yml's matrix), not the
+# host default the test job builds, and the harness runs its completeness checks and every
+# damaged-file binding against one small seed.
+#
+# Non-blocking while its flake rate is unknown: the run step continues on error, so the job reports
+# its grades without failing the check. Whether and how it gates after the trial is FORK-445.
+name: proof load
+
+on:
+  pull_request:
+
+concurrency:
+  group: proof-load-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # As in ci.yml: an empty RUSTFLAGS replaces the macOS split-debuginfo entry of .cargo/config.toml.
+  RUSTFLAGS: ""
+
+jobs:
+  proof-load:
+    name: proof load (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    # The hang guard. The budget the run is graded on is --budget below, which lets every scenario
+    # finish first.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build the binaries under test
+        run: cargo build --release --locked --target ${{ matrix.target }} -p forklift -p forklift-server
+
+      - name: Build the harness
+        run: cargo build --release --locked -p proof-load
+
+      - name: Run
+        id: run
+        continue-on-error: true
+        shell: bash
+        run: |
+          exe=""; git=$(command -v git)
+          if [ "$RUNNER_OS" = Windows ]; then exe=".exe"; git=$(cygpath -w "$git"); fi
+          bin=target/${{ matrix.target }}/release
+          target/release/proof-load$exe run --source . --out "$RUNNER_TEMP/proof-load" --budget 2700 \
+            --forklift "$bin/forklift$exe" --forklift-server "$bin/forklift-server$exe" --git "$git"
+
+      - name: Summary
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          echo "Run step: ${{ steps.run.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$RUNNER_TEMP/proof-load/report.md" ]; then cat "$RUNNER_TEMP/proof-load/report.md" >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: proof-load-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/proof-load/*.json
+            ${{ runner.temp }}/proof-load/report.md
+          if-no-files-found: warn
