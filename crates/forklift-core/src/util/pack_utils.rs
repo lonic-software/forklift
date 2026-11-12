@@ -11815,7 +11815,13 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
-        let result = import_transport_packs(&mut std::io::Cursor::new(bytes), sections, |_, _| Ok(())).map(|(stats, ())| stats.stored_objects);
+        let input_len = bytes.len();
+        let (result, peak) = crate::util::peak_alloc::measure(|| {
+            import_transport_packs(&mut std::io::Cursor::new(bytes), sections, |_, _| Ok(())).map(|(stats, ())| stats.stored_objects)
+        });
+        // Measured at about 132 KiB on these inputs, nearly all of it the zstd decoder's context:
+        // a section is decoded as it is read, never sized from a length or count it declares.
+        crate::util::peak_alloc::assert_within("import_transport_packs", name, input_len, peak, 16, 512 * 1024);
         let published = std::fs::read_dir(temp.join(".forklift").join("objects").join("pack"))
             .map(|entries| entries.flatten().filter(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();

@@ -47,6 +47,12 @@ use forklift_core::util::query_utils::{
 };
 use serde_json::{json, Value};
 
+#[path = "../src/util/peak_alloc.rs"]
+mod peak_alloc;
+
+#[global_allocator]
+static PEAK_ALLOC: peak_alloc::PeakAlloc = peak_alloc::PeakAlloc;
+
 // ---------------------------------------------------------------------------------------------
 // Deterministic RNG (splitmix64) — no external dependency, reproducible seed → stream.
 // ---------------------------------------------------------------------------------------------
@@ -119,7 +125,11 @@ fn random_hash(rng: &mut Rng) -> String {
 }
 
 fn blob_object_bytes(rng: &mut Rng) -> Vec<u8> {
-    let len = rng.below(64);
+    blob_object_bytes_up_to(rng, 64)
+}
+
+fn blob_object_bytes_up_to(rng: &mut Rng, max_len: usize) -> Vec<u8> {
+    let len = rng.below(max_len);
     let content = (0..len).map(|_| rng.byte()).collect();
     LooseObjectBuilder::build_blob(&Blob { content }).content
 }
@@ -127,9 +137,13 @@ fn blob_object_bytes(rng: &mut Rng) -> Vec<u8> {
 /// A tree with unique child names (the builder keys children by name, so duplicates collapse and
 /// would break a naive round-trip count).
 fn tree_seed(rng: &mut Rng) -> TreeItem {
+    tree_seed_up_to(rng, 6)
+}
+
+fn tree_seed_up_to(rng: &mut Rng, max_entries: usize) -> TreeItem {
     let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
     let mut names = std::collections::HashSet::new();
-    for _ in 0..rng.below(6) {
+    for _ in 0..rng.below(max_entries) {
         // A tree entry is one path component, so the parser refuses a `/` the pool carries for
         // inventory paths.
         let name = random_name(rng).replace('/', ".");
@@ -175,10 +189,14 @@ fn parcel_object_bytes(rng: &mut Rng) -> Vec<u8> {
 }
 
 fn inventory_seed(rng: &mut Rng) -> (Inventory, Vec<String>) {
+    inventory_seed_up_to(rng, 6)
+}
+
+fn inventory_seed_up_to(rng: &mut Rng, max_items: usize) -> (Inventory, Vec<String>) {
     let mut inventory = Inventory::new();
     let mut names = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for _ in 0..rng.below(6) {
+    for _ in 0..rng.below(max_items) {
         let name = random_name(rng);
         if !seen.insert(name.clone()) {
             continue;
@@ -270,10 +288,14 @@ fn mutate(bytes: &mut Vec<u8>, rng: &mut Rng) {
 /// A meta-tree cell as `encode_cell` writes it: a signer or operator stamp, a schema, and a value
 /// of strings, integers, booleans, arrays and a nested table.
 fn cell_bytes(rng: &mut Rng) -> Vec<u8> {
+    cell_bytes_up_to(rng, 5)
+}
+
+fn cell_bytes_up_to(rng: &mut Rng, max_keys: usize) -> Vec<u8> {
     let stamp = if rng.bool() { Stamp::Signer(random_hash(rng)) } else { Stamp::Operator(random_name(rng)) };
     let mut value = toml_edit::Table::new();
 
-    for _ in 0..rng.below(5) {
+    for _ in 0..rng.below(max_keys) {
         let item = match rng.below(5) {
             0 => toml_edit::value(random_name(rng)),
             1 => toml_edit::value(rng.next_u64() as i64),
@@ -299,23 +321,24 @@ fn cell_bytes(rng: &mut Rng) -> Vec<u8> {
 /// error is fine here, only a panic is the bug).
 type ParseEntryPoint = (&'static str, fn(&[u8]));
 
+/// Every public parse entry point for bytes read from storage or a remote.
+const ENTRY_POINTS: [ParseEntryPoint; 3] = [
+    ("loose_object", |b| {
+        let _ = parse_loose_object(b);
+    }),
+    ("inventory", |b| {
+        let _ = parse_inventory(b);
+    }),
+    ("meta_cell", |b| {
+        let _ = parse_cell(b);
+    }),
+];
+
 /// Feed one byte string to every parser under `catch_unwind`. A parse result of `Ok` or `Err` is
 /// equally acceptable; a panic is the bug. Returns the offending description on panic so the
 /// caller can print the reproducing bytes.
 fn parse_never_panics(bytes: &[u8]) -> Result<(), String> {
-    let entry_points: [ParseEntryPoint; 3] = [
-        ("loose_object", |b| {
-            let _ = parse_loose_object(b);
-        }),
-        ("inventory", |b| {
-            let _ = parse_inventory(b);
-        }),
-        ("meta_cell", |b| {
-            let _ = parse_cell(b);
-        }),
-    ];
-
-    for (label, parse) in entry_points {
+    for (label, parse) in ENTRY_POINTS {
         let owned = bytes.to_vec();
         let result = std::panic::catch_unwind(move || parse(&owned));
         if result.is_err() {
@@ -359,6 +382,77 @@ fn parsers_never_panic_on_mutated_or_random_input() {
     }
 
     assert!(cases >= 24_000, "the fuzzer should exercise a large corpus, ran {cases}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The allocation bound: a decoder holds memory in proportion to the bytes it was given.
+// ---------------------------------------------------------------------------------------------
+
+/// Each entry point's bound: at its peak, a parse of `n` bytes holds at most `factor * n +
+/// overhead` bytes, counted by the test allocator (`peak_alloc`) on the calling thread, the
+/// parsed value included. The factor is what a decoder needs to copy its input into a parsed
+/// value; the overhead is the fixed cost of a parse. A decoder that sized an allocation from a
+/// number in its input, rather than from the bytes behind it, would exceed the overhead on the
+/// first such input.
+///
+/// The factors are measured ones with headroom, not derived limits:
+/// * a loose object: a blob holds about its bytes once, a tree about 7.4 times (each parsed entry
+///   owns its name twice, as the entry's and as its map key, and its hash as 64 hex characters);
+/// * an inventory: about 2.2 times;
+/// * a meta cell: about 55 times on a large cell, since every value becomes a `serde_json::Value`
+///   whose nodes outweigh the bytes that spell them. A cell's size is capped only by the blob
+///   ceiling, so this factor is the one a hostile cell can multiply.
+const ENTRY_POINT_BOUNDS: [(&str, usize, usize); 3] = [
+    ("loose_object", 10, 16 * 1024),
+    ("inventory", 3, 16 * 1024),
+    ("meta_cell", 64, 64 * 1024),
+];
+
+/// Measure every entry point on `bytes` and check it against its bound.
+fn parse_within_bounds(bytes: &[u8], case: &str) {
+    for ((label, parse), (bound_label, factor, overhead)) in ENTRY_POINTS.iter().zip(ENTRY_POINT_BOUNDS) {
+        assert_eq!(*label, bound_label, "ENTRY_POINT_BOUNDS lists the entry points in ENTRY_POINTS order");
+        let ((), peak) = peak_alloc::measure(|| parse(bytes));
+        peak_alloc::assert_within(label, case, bytes.len(), peak, factor, overhead);
+    }
+}
+
+#[test]
+fn every_parser_holds_memory_in_proportion_to_its_input() {
+    let mut rng = Rng::new(0xF01C_11F7_5EED_0427);
+
+    // Small objects, mutated: these reach the length prefixes and counts a hostile input sets.
+    let generators: [fn(&mut Rng) -> Vec<u8>; 5] =
+        [blob_object_bytes, tree_object_bytes, parcel_object_bytes, inventory_bytes, cell_bytes];
+    for case in 0..2000 {
+        for generate in generators {
+            let mut bytes = generate(&mut rng);
+            mutate(&mut bytes, &mut rng);
+            parse_within_bounds(&bytes, &format!("mutated case {case}"));
+        }
+    }
+
+    // Large objects, whole and mutated: these are where a per-byte factor shows.
+    let large: [fn(&mut Rng) -> Vec<u8>; 4] = [
+        |rng| blob_object_bytes_up_to(rng, 256 * 1024),
+        |rng| LooseObjectBuilder::build_tree(&tree_seed_up_to(rng, 2000)).content,
+        |rng| InventoryBuilder::build(&inventory_seed_up_to(rng, 2000).0),
+        |rng| cell_bytes_up_to(rng, 2000),
+    ];
+    for case in 0..30 {
+        for generate in large {
+            let mut bytes = generate(&mut rng);
+            parse_within_bounds(&bytes, &format!("large case {case}"));
+            mutate(&mut bytes, &mut rng);
+            parse_within_bounds(&bytes, &format!("large mutated case {case}"));
+        }
+    }
+
+    // Random bytes.
+    for case in 0..2000 {
+        let bytes: Vec<u8> = (0..rng.below(256)).map(|_| rng.byte()).collect();
+        parse_within_bounds(&bytes, &format!("random case {case}"));
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1001,14 +1095,25 @@ fn mutate_predicate(tree: &mut Value, rng: &mut Rng) {
     }
 }
 
-/// The verdict for one payload, under `catch_unwind`: `Ok(accepted)`, or a description of the
+/// The predicate parser's bound, as `ENTRY_POINT_BOUNDS` states its: measured up to about 96 times
+/// its input (a `serde_json::Value` tree, then the predicate built from it), on inputs capped at
+/// `MAX_WHERE_BYTES`, so at most about 8 MiB.
+const PREDICATE_FACTOR: usize = 128;
+const PREDICATE_OVERHEAD: usize = 16 * 1024;
+
+/// The verdict for one payload, under `catch_unwind`, with its memory checked against the
+/// predicate parser's bound: `Ok(accepted)`, or a description of the
 /// panic or of an error that is not the predicate refusal.
 fn decode_predicate(payload: &str) -> Result<bool, String> {
     let owned = payload.to_string();
-    match std::panic::catch_unwind(move || parse_where(&owned).map(|_| ())) {
-        Err(_) => Err("the decoder panicked".to_string()),
-        Ok(Ok(())) => Ok(true),
-        Ok(Err(error)) => match CoreError::from(error) {
+    let (verdict, peak) = std::panic::catch_unwind(move || peak_alloc::measure(|| parse_where(&owned).map(|_| ())))
+        .map_err(|_| "the decoder panicked".to_string())?;
+    // A payload over the size cap is refused before it is read, holding only the refusal.
+    let factor = if payload.len() > MAX_WHERE_BYTES { 0 } else { PREDICATE_FACTOR };
+    peak_alloc::assert_within("parse_where", "a fuzzed predicate", payload.len(), peak, factor, PREDICATE_OVERHEAD);
+    match verdict {
+        Ok(()) => Ok(true),
+        Err(error) => match CoreError::from(error) {
             CoreError::Refusal { code: RefusalCode::QueryPredicateInvalid, .. } => Ok(false),
             other => Err(format!("refused without the predicate code: {:?}", other)),
         },

@@ -2264,8 +2264,12 @@ mod tests {
             let mutated = sealed(mutated);
 
             let _destination = Scratch::new("bundle-fuzz-case");
-            let result = std::panic::catch_unwind(|| import_bundle_bytes(&mutated))
+            let (result, peak) = std::panic::catch_unwind(|| crate::util::peak_alloc::measure(|| import_bundle_bytes(&mutated)))
                 .unwrap_or_else(|_| panic!("case {} panicked", case));
+            // Measured at about 133 KiB on these inputs, nearly all of it the zstd decoder's
+            // context: a bundle is decoded as it is read, never sized from a length it declares.
+            crate::util::peak_alloc::assert_within("import_bundle_bytes", &format!("mutated case {}", case),
+                mutated.len(), peak, 16, 512 * 1024);
             let held = held_hashes();
             match result {
                 Ok(_) => {
@@ -2321,8 +2325,11 @@ mod tests {
             };
 
             let _destination = Scratch::new("stream-fuzz-case");
-            std::panic::catch_unwind(|| { let _ = import_batch_bytes(&bytes, &requested); })
+            let ((), peak) = std::panic::catch_unwind(|| crate::util::peak_alloc::measure(|| { let _ = import_batch_bytes(&bytes, &requested); }))
                 .unwrap_or_else(|_| panic!("case {} panicked", case));
+            // Measured at about 37 KiB on these inputs: records are read one at a time.
+            crate::util::peak_alloc::assert_within("import_batch_bytes", &format!("case {}", case),
+                bytes.len(), peak, 16, 256 * 1024);
             for (hash, content) in hashes.iter().zip(&contents) {
                 if file_utils::does_object_exist(hash).unwrap() {
                     assert_eq!(&file_utils::retrieve_object_by_hash(hash).unwrap(), content, "case {}", case);
