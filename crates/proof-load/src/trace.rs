@@ -458,8 +458,10 @@ pub fn thread_groups(calls: &[Call]) -> BTreeMap<u32, u32> {
         }
         spawned.push((call.tid, child, call.arguments.iter().any(|argument| argument.contains("CLONE_THREAD"))));
     }
-    // A child's clone can print before its parent's: settle until nothing changes.
-    loop {
+    // A child's clone can print before its parent's: settle until nothing changes. A chain settles
+    // within one pass per spawn; a tid reused under two parents never does, so the passes stop
+    // there rather than hang.
+    for _ in 0..=spawned.len() {
         let mut changed = false;
         for (parent, child, thread) in &spawned {
             let Some(&group) = groups.get(parent) else { continue };
@@ -684,7 +686,8 @@ mod tests {
     /// A thread clone joins its parent's group and a process clone starts its own, whichever line
     /// prints first.
     ///
-    /// Revert: take every clone as a thread → a child git's calls count as the tool's own.
+    /// Revert: take every clone as a thread → a child git's calls count as the tool's own; settle
+    /// with no bound → a reused tid hangs the test.
     #[test]
     fn threads_join_their_parents_group() {
         let calls = parse("10 execve(\"/f\", [], 0x0) = 0\n\
@@ -697,6 +700,11 @@ mod tests {
         assert_eq!(groups[&11], 10);
         assert_eq!(groups[&12], 12);
         assert_eq!(groups[&13], 12);
+        // A tid reused under two parents wanting different groups settles nowhere; it must not hang.
+        let reused = parse("10 execve(\"/f\", [], 0x0) = 0\n\
+            10 clone(child_stack=NULL, flags=SIGCHLD) = 60\n\
+            10 clone(child_stack=0x1, flags=CLONE_VM|CLONE_THREAD) = 60\n").unwrap();
+        assert!(thread_groups(&reused).contains_key(&60));
     }
 
     /// A root covers a path only at a component boundary, in either spelling, and rebases keeping
