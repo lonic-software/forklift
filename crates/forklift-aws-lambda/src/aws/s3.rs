@@ -469,8 +469,8 @@ impl S3ObjectStore {
     /// times its bytes (core measured eight to nine for a tree, four for a recipe), so it is left to
     /// the control plane, the larger function (docs/DEPLOYMENT.md "Memory sizing" says what a tree
     /// near the ceiling needs). A client names every tree, parcel and recipe among the objects its
-    /// lift commit promotes, so the commit promotes it there; one named only as a blob stays staged and its commit is never
-    /// ready, and nothing unchecked is promoted either way.
+    /// lift commit promotes, so the commit promotes it there; one named only as a blob stays
+    /// staged and its commit is never ready, and nothing unchecked is promoted either way.
     pub fn leaving_large_structured_staged(mut self) -> S3ObjectStore {
         self.holds_large_structured = false;
         self

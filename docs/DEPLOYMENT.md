@@ -198,11 +198,11 @@ that measurement does not include.
   its signature sidecar when the scratch lacks one.
 
   Recommended default: **512 MB**, which also buys proportionally more CPU (Lambda ties CPU
-  allocation to configured memory) for the audit's own work. The 512 MB default
-  cannot promote a tree near the 64 MiB ceiling: a lift commit that promotes one parses it in eight to
-  nine times its size. If your warehouses may hold a directory that large (several
-  hundred thousand entries), size the function for it, **1024 MB** or more; a batch whose budget
-  is crossed by such a tree or recipe also holds a bundle of nearly 100 MiB.
+  allocation to configured memory) for the audit's own work. The 512 MB default cannot promote a
+  tree near the 64 MiB ceiling: a lift commit that promotes one parses it in eight to nine times
+  its size. If your warehouses may hold a directory that large (several hundred thousand
+  entries), size the function for it, **1024 MB** or more; a batch whose budget is crossed by
+  such a tree or recipe also holds a bundle of nearly 100 MiB.
 
 **Ephemeral storage (`/tmp`).** `Head::pooled`'s shared scratch (`scratch::Scratch::shared`)
 persists on `/tmp`, keyed by warehouse, across warm invocations — so most invocations only add

@@ -1414,7 +1414,9 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
         ));
     }
 
-    let mut sections = Vec::with_capacity(pack_count);
+    // Not pre-sized from the declared count: each section is pushed only after its two lengths
+    // have been read, so the bytes pay for what the list holds.
+    let mut sections = Vec::new();
     for _ in 0..pack_count {
         let data_len = read_u64_be(reader, "native pack length")?;
         let index_len = read_u64_be(reader, "native pack index length")?;
