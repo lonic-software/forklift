@@ -82,6 +82,12 @@ pub fn decompress_delta(base: &[u8], payload: &[u8], capacity: usize) -> Result<
         ));
     }
 
+    // One frame, and nothing after it: one delta has one spelling, and no byte of the record goes
+    // unread.
+    if !crate::util::object_utils::is_one_zstd_frame(payload) {
+        return Err("A delta record's payload is not exactly one zstd frame; refusing to reconstruct it.".to_string());
+    }
+
     let mut decoder = crate::util::object_utils::bounded_zstd_dictionary_decoder(payload, base)
         .map_err(|e| format!("Error while preparing the delta decompressor: {}", e))?;
 

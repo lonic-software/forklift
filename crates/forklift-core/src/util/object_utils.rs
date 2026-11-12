@@ -87,6 +87,15 @@ pub(crate) fn bounded_zstd_dictionary_decoder<'a>(payload: &'a [u8], dictionary:
     Ok(decoder)
 }
 
+/// Whether `bytes` are exactly one zstd data frame, ending where `bytes` end. A zstd decoder reads
+/// on past the end of a frame, decoding a second frame and skipping skippable ones, so without
+/// this check a record could spell its object across several frames, or carry bytes after it
+/// that nothing reads.
+pub(crate) fn is_one_zstd_frame(bytes: &[u8]) -> bool {
+    const ZSTD_FRAME_MAGIC: [u8; 4] = 0xFD2F_B528u32.to_le_bytes();
+    bytes.starts_with(&ZSTD_FRAME_MAGIC) && zstd::zstd_safe::find_frame_compressed_size(bytes) == Ok(bytes.len())
+}
+
 /// Why a bounded zstd decode of untrusted bytes failed.
 #[derive(Debug)]
 pub(crate) enum BoundedDecodeError {

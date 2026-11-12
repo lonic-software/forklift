@@ -802,7 +802,12 @@ mod index_format {
 
     /// Build an index over `records`, which must already be sorted by hash.
     pub(super) fn build(records: &[([u8; HASH_LEN], u64, u64)]) -> Vec<u8> {
-        let bits = fanout_bits_for(records.len());
+        build_with_bits(records, fanout_bits_for(records.len()))
+    }
+
+    /// Build an index over `records` (sorted by hash) with `bits` fanout bits, whatever the writer
+    /// would pick for their count.
+    pub(super) fn build_with_bits(records: &[([u8; HASH_LEN], u64, u64)], bits: u32) -> Vec<u8> {
         let buckets = 1usize << bits;
         let mut bytes = Vec::with_capacity(len_with(records.len() as u64, bits) as usize);
 
@@ -960,6 +965,11 @@ mod index_format {
         /// The number of records.
         pub(super) fn count(&self) -> usize {
             self.layout.count
+        }
+
+        /// Whether the fanout width is the one the writer picks for this many records.
+        pub(super) fn has_writer_fanout(&self) -> bool {
+            self.layout.bits == fanout_bits_for(self.layout.count)
         }
 
         /// The index file's length in bytes.
@@ -2607,8 +2617,13 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
             .collect::<Result<_, _>>()?;
         // Every byte of an incoming pack is accounted for before any of it is trusted: each index
         // is validated in full, not bucket by bucket as a local read would.
+        // The fanout width is the one thing an index's records do not fix, so it is held to the
+        // writer's choice: one record set, one index.
         for pack in &incoming {
             pack.validate_full()?;
+            if !pack.index.has_writer_fanout() {
+                return Err("A pack index declares a fanout width its writer would not pick; refusing the bundle.".to_string());
+            }
         }
 
         let (hashes, parcels) = verify_incoming_packs(&incoming)?;
@@ -2952,6 +2967,14 @@ fn resolve_incoming_object(hash: &[u8; HASH_LEN],
 /// transport role and use the ordinary read path; a new bundle writer never emits a full object
 /// above the import ceiling, so producing one byte beyond it is an immediate refusal.
 fn decode_full_transport_record(record: &[u8], hash: &str) -> Result<Vec<u8>, String> {
+    // One frame, and nothing after it: one object has one spelling as a full record, and no byte
+    // of the record goes unread into the published pack.
+    if !object_utils::is_one_zstd_frame(record) {
+        return Err(format!(
+            "Packed object {} is not exactly one zstd frame; refusing the bundle.", hash
+        ));
+    }
+
     object_utils::decode_object_bounded(record).map_err(|e| match e {
         object_utils::BoundedDecodeError::Malformed(msg) => {
             format!("Error while decompressing packed object {}: {}", hash, msg)
@@ -11722,5 +11745,141 @@ pub(crate) mod tests {
         assert_eq!(sign_utils::load_raw_parcel_signature(&live).unwrap(), Some(fake_signature(1)));
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    // ---- One record set, one transport pack: second spellings are refused ----
+
+    /// A transport pack laid out by hand, so a test can spell a record or the index differently
+    /// from the builder. `bits` overrides the index's fanout width.
+    fn hand_laid_pack(records: &[(&str, Vec<u8>)], bits: Option<u32>) -> (Vec<u8>, Vec<(u64, u64)>) {
+        let mut data = PACK_DATA_MAGIC.to_vec();
+        data.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
+        let mut index_records = Vec::new();
+        for (hash, record) in records {
+            index_records.push((hash_to_bytes(hash).unwrap(), data.len() as u64, record.len() as u64));
+            data.extend_from_slice(record);
+        }
+        index_records.sort();
+        let index = match bits {
+            Some(bits) => index_format::build_with_bits(&index_records, bits),
+            None => index_format::build(&index_records),
+        };
+        let sections = vec![(data.len() as u64, index.len() as u64)];
+        data.extend(index);
+        (data, sections)
+    }
+
+    /// Import a hand-laid pack into a fresh warehouse: the verdict, and how many pack data and index
+    /// files the import left published.
+    fn import_hand_laid(name: &str, records: &[(&str, Vec<u8>)], bits: Option<u32>) -> (Result<usize, String>, usize) {
+        let temp = std::env::temp_dir().join(format!("forklift-hand-laid-{}-{}", name, std::process::id()));
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+        let (bytes, sections) = hand_laid_pack(records, bits);
+        let result = import_transport_packs(&mut std::io::Cursor::new(bytes), &sections).map(|stats| stats.stored_objects);
+        let published = std::fs::read_dir(temp.join(".forklift").join("objects").join("pack"))
+            .map(|entries| entries.flatten().filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                !name.starts_with('.') && name != FILE_NAME_DENSIFY_MARKER
+            })
+            .count())
+            .unwrap_or(0);
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+        (result, published)
+    }
+
+    fn assert_refused_unpublished(verdict: (Result<usize, String>, usize), expected: &str) {
+        let (result, published) = verdict;
+        let message = result.expect_err("a second spelling must be refused");
+        assert!(message.contains(expected), "unexpected refusal: {}", message);
+        assert_eq!(published, 0, "a refused pack must not be published");
+    }
+
+    /// A skippable zstd frame: magic 0x184D2A50, a length, and that many bytes no decoder reads.
+    fn skippable_frame() -> Vec<u8> {
+        let mut frame = 0x184D_2A50u32.to_le_bytes().to_vec();
+        frame.extend(4u32.to_le_bytes());
+        frame.extend(b"junk");
+        frame
+    }
+
+    struct FullFixture {
+        hash: String,
+        content: Vec<u8>,
+        frame: Vec<u8>,
+    }
+
+    fn full_fixture() -> FullFixture {
+        let content = crate::util::object_utils::blob_bytes(b"one record, one spelling; one record, one spelling");
+        let hash = blake3::hash(&content).to_hex().to_string();
+        let frame = zstd::encode_all(&content[..], 3).unwrap();
+        FullFixture { hash, content, frame }
+    }
+
+    fn framed_full_record(frame: &[u8], tail: &[u8]) -> Vec<u8> {
+        let mut record = vec![RECORD_FULL];
+        record.extend(frame);
+        record.extend(tail);
+        record
+    }
+
+    #[test]
+    fn a_full_record_is_its_object_in_exactly_one_zstd_frame() {
+        let fixture = full_fixture();
+        let plain = import_hand_laid("full-plain", &[(&fixture.hash, framed_full_record(&fixture.frame, b""))], None);
+        assert_eq!(plain, (Ok(1), 2), "the writer's spelling imports and publishes data and index");
+
+        let refusal = "is not exactly one zstd frame";
+        for (name, tail) in [("skippable", skippable_frame()), ("garbage", b"\x01\x02".to_vec()), ("zero", vec![0])] {
+            assert_refused_unpublished(import_hand_laid(name, &[(&fixture.hash, framed_full_record(&fixture.frame, &tail))], None), refusal);
+        }
+
+        let (first, second) = fixture.content.split_at(10);
+        let mut two_frames = zstd::encode_all(first, 3).unwrap();
+        two_frames.extend(zstd::encode_all(second, 3).unwrap());
+        assert_refused_unpublished(import_hand_laid("two-frames", &[(&fixture.hash, framed_full_record(&two_frames, b""))], None), refusal);
+
+        let mut led_by_skippable = skippable_frame();
+        led_by_skippable.extend(&fixture.frame);
+        assert_refused_unpublished(import_hand_laid("led", &[(&fixture.hash, framed_full_record(&led_by_skippable, b""))], None), refusal);
+    }
+
+    #[test]
+    fn a_delta_record_payload_is_exactly_one_zstd_frame() {
+        let base = crate::util::object_utils::blob_bytes(&b"base text for the delta ".repeat(40));
+        let base_hash = blake3::hash(&base).to_hex().to_string();
+        let mut target_raw = b"base text for the delta ".repeat(40);
+        target_raw.extend(b"plus a tail");
+        let target = crate::util::object_utils::blob_bytes(&target_raw);
+        let target_hash = blake3::hash(&target).to_hex().to_string();
+        let delta = crate::util::delta_utils::compress_delta(&base, &target).unwrap();
+        let base_record = framed_full_record(&zstd::encode_all(&base[..], 3).unwrap(), b"");
+        let delta_record = |tail: &[u8]| {
+            let mut record = vec![RECORD_DELTA];
+            record.extend(hash_to_bytes(&base_hash).unwrap());
+            record.extend(crate::util::byte_utils::number_to_vlq_bytes(target.len() as u64));
+            record.extend(&delta);
+            record.extend(tail);
+            record
+        };
+        let pack = |tail: &[u8]| vec![(base_hash.as_str(), base_record.clone()), (target_hash.as_str(), delta_record(tail))];
+
+        assert_eq!(import_hand_laid("delta-plain", &pack(b""), None), (Ok(2), 2));
+        for (name, tail) in [("delta-skippable", skippable_frame()), ("delta-garbage", b"\x01\x02".to_vec())] {
+            assert_refused_unpublished(import_hand_laid(name, &pack(&tail), None), "is not exactly one zstd frame");
+        }
+    }
+
+    #[test]
+    fn a_transport_index_carries_the_fanout_width_its_writer_picks() {
+        let fixture = full_fixture();
+        let records = [(fixture.hash.as_str(), framed_full_record(&fixture.frame, b""))];
+        let writer = index_format::fanout_bits_for(1);
+        assert_eq!(import_hand_laid("fanout-writer", &records, Some(writer)), (Ok(1), 2));
+        for bits in [0, 1, 3].into_iter().filter(|bits| *bits != writer) {
+            assert_refused_unpublished(import_hand_laid(&format!("fanout-{}", bits), &records, Some(bits)), "fanout width its writer would not pick");
+        }
     }
 }
