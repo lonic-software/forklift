@@ -519,6 +519,55 @@ mod tests {
         assert!(!refused.reads(&[Mark::Record(0), Mark::Record(1)]));
     }
 
+    /// An export's left-out files are documented per record by their parcels: withheld content as
+    /// `content_withheld`, redacted as `content_redacted`, and only in the records whose parcels
+    /// the export names.
+    ///
+    /// Revert: key every entry to every record → a record that never held the file expects a
+    /// documented code for it, and an export serving it correctly reads silent.
+    #[test]
+    fn left_out_files_are_documented_in_the_records_naming_them() {
+        let export = serde_json::json!({ "data": {
+            "withheld": [{ "hash": "h1", "parcels": ["p1", "p2"], "path": "src/a", "statement": "s" }],
+            "redacted": [{ "hash": "h2", "parcels": ["p2"], "path": "b" }],
+        }});
+        let described = vec![("r2".to_string(), "p2".to_string()), ("r1".to_string(), "p1".to_string()), ("r0".to_string(), "p0".to_string())];
+        let left_out = left_out(&export, &described);
+        assert_eq!(left_out.get("r1"), Some(&BTreeMap::from([("src/a".to_string(), "content_withheld".to_string())])));
+        assert_eq!(left_out.get("r2"), Some(&BTreeMap::from([
+            ("b".to_string(), "content_redacted".to_string()), ("src/a".to_string(), "content_withheld".to_string()),
+        ])));
+        assert_eq!(left_out.get("r0"), None);
+        assert!(super::left_out(&serde_json::json!({ "data": {} }), &described).is_empty());
+    }
+
+    /// Content taken away opens every path holding its bytes, in every record and in both trees
+    /// of the faulted record, to what a read of it may produce; other paths stay fixed.
+    ///
+    /// Revert: open only the path the harness picked → the same bytes at another path, or in an
+    /// earlier record, expect them served though the warehouse reports them taken away.
+    #[test]
+    fn taken_content_opens_every_path_holding_its_bytes() {
+        let snapshot = |files: &[(&str, &str)]| -> crate::corpus::Snapshot { files.iter().map(|(path, bytes)| (path.to_string(), bytes.as_bytes().to_vec())).collect() };
+        let corpus = Corpus { seed: 0, shape: crate::corpus::Shape::SMALL, records: vec![
+            snapshot(&[("a", "x"), ("b", "y")]), snapshot(&[("a", "x"), ("c", "x"), ("b", "z")]), snapshot(&[("b", "w")]),
+        ] };
+        let documented = vec![Admissible::Documented { code: "content_withheld".into() }];
+        let expected = Expected {
+            acknowledged: vec![Mark::Record(0), Mark::Record(1)], faulted: Mark::Record(2),
+            before: corpus::expected(&corpus.records[1]), after: corpus::expected(&corpus.records[2]),
+            taken: vec![(oracle::digest(b"x"), documented.clone())],
+        };
+        let first = expected.of(&corpus, Mark::Record(0), false);
+        assert_eq!(first.transformed, BTreeMap::from([("a".to_string(), documented.clone())]));
+        let second = expected.of(&corpus, Mark::Record(1), false);
+        assert_eq!(second.transformed, BTreeMap::from([("a".to_string(), documented.clone()), ("c".to_string(), documented.clone())]));
+        let faulted = expected.of(&corpus, Mark::Record(2), false);
+        assert_eq!(faulted.trees.len(), 2);
+        assert_eq!(faulted.transformed.keys().collect::<Vec<_>>(), ["a", "c"], "the before tree holds the bytes");
+        assert!(expected.of(&corpus, Mark::Record(2), true).transformed.is_empty(), "the made record holds none of them");
+    }
+
     /// The faulted command writes the record after the last corpus record, whatever variants the
     /// history recorded on a side branch.
     ///
