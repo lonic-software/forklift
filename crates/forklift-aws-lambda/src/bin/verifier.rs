@@ -142,9 +142,9 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
 
             // Read again after anything that may have left a canonical copy: a redaction that
             // applied after the check above may have found no object to delete, and an event
-            // retried after a failed delete finds the copy already promoted. A corrupt copy was
-            // discarded, and is reported as such.
-            if !matches!(outcome, PromoteOutcome::Corrupt { .. }) {
+            // retried after a failed delete finds the copy already promoted. A corrupt or
+            // malformed copy was discarded, and is reported as such.
+            if !matches!(outcome, PromoteOutcome::Corrupt { .. } | PromoteOutcome::Malformed { .. }) {
                 let after = delete_if_redaction_applied(&objects, &refs, &session, &hash)?;
                 if after.applied() {
                     return Ok(Err(Refused::Applied(after)));
@@ -185,6 +185,9 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
             }
             PromoteOutcome::Corrupt { actual } => {
                 eprintln!("verifier: discarded corrupt staged object {} (hashes to {})", key, actual)
+            }
+            PromoteOutcome::Malformed { reason } => {
+                eprintln!("verifier: discarded malformed staged object {}: {}", key, reason)
             }
         }
     }

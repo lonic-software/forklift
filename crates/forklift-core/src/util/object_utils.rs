@@ -766,8 +766,26 @@ thread_local! {
 /// Native transport packs use this after reconstructing a quarantined record: publication must
 /// enforce the same boundary as [`store_object_bytes`], even though the object's final home is an
 /// aggregate pack rather than a loose file.
-pub(crate) fn validate_imported_object(claimed_hash: &str, bytes: &[u8]) -> Result<(), String> {
+pub fn validate_imported_object(claimed_hash: &str, bytes: &[u8]) -> Result<(), String> {
     verify_object_bytes(claimed_hash, bytes)?;
+    check_object_form(claimed_hash, bytes)
+}
+
+/// Check a whole object's form the way every store takes one in from elsewhere: the whole-object
+/// ceiling, then [`enforce_header_policy`] (a version this build reads, a header and a blob version
+/// in their one spelling, a chunk under its ceiling, a tree, parcel or recipe that parses to its
+/// canonical bytes). The hash is the caller's to check first, so damaged bytes are reported as
+/// damage rather than as a malformed object. [`ObjectFormCheck`] is the same check over bytes still
+/// arriving.
+///
+/// # Arguments
+/// * `claimed_hash` - The object's hash (for the messages).
+/// * `bytes`        - The full (uncompressed) object bytes.
+///
+/// # Returns
+/// * `Ok(())`      - If a store may take the object in.
+/// * `Err(String)` - The refusal, naming the object and why.
+pub fn check_object_form(claimed_hash: &str, bytes: &[u8]) -> Result<(), String> {
     enforce_object_ceiling(bytes)?;
     enforce_header_policy(claimed_hash, bytes)
 }
@@ -826,16 +844,11 @@ fn store_object_bytes_impl(claimed_hash: &str, bytes: &[u8], check_presence: boo
         ));
     }
 
-    // Whole-object ceiling: an over-`MAX_OBJECT_BYTES` object is refused on the way in (import and
-    // local write share this policy). Reads never reach here, so a grandfathered giant stays
-    // readable; only new authorship or a fresh import is gated.
-    enforce_object_ceiling(bytes)?;
-
-    // Per-type ceiling (review W2): a `Chunk`-typed object above `MAX_CHUNK_BYTES` is refused on
-    // store as well as on read, even though a larger object would otherwise be a legal object.
-    // Without this a malicious recipe could reference an over-size chunk and the streaming-
-    // assembly memory bound would be far looser than the per-chunk ceiling explicit types buy.
-    enforce_header_policy(claimed_hash, bytes)?;
+    // The whole-object ceiling and the object's form (import and local write share this policy).
+    // Reads never reach here, so a grandfathered giant stays readable; only new authorship or a
+    // fresh import is gated. The chunk ceiling it includes keeps a malicious recipe from naming an
+    // over-size chunk and loosening the streaming-assembly memory bound.
+    check_object_form(claimed_hash, bytes)?;
 
     if check_presence && file_utils::does_object_exist(claimed_hash)? {
         return Ok(false);
@@ -1154,14 +1167,9 @@ struct StreamOutcome {
     /// The Blake3 hex hash of those bytes (to verify against the claimed hash).
     hash: String,
 
-    /// Why the object's form is refused (an unknown version, a malformed header), if it is.
-    /// Refused only once the hash verifies, as the buffered path does, so damaged bytes are
-    /// reported as damage.
-    refusal: Option<StreamRefusal>,
-
-    /// The whole object, when it is a tree, parcel or recipe: its body is parsed before it is
-    /// promoted, as [`enforce_header_policy`] parses it.
-    structured: Option<Vec<u8>>,
+    /// The object's form as it arrived, judged only once the hash verifies, as the buffered path
+    /// judges it, so damaged bytes are reported as damage.
+    form: ObjectFormCheck,
 }
 
 /// Why a streamed object's form is refused.
@@ -1172,7 +1180,7 @@ enum StreamRefusal {
     OverCeiling(ObjectType, u64),
 }
 
-/// How far [`stream_to_temp`] has read the object's header.
+/// How far an [`ObjectFormCheck`] has read the object's header.
 enum StreamHeader {
     /// Not yet whole: the bytes so far are kept to peek again.
     Pending(Vec<u8>),
@@ -1180,6 +1188,147 @@ enum StreamHeader {
     Read { object_type: ObjectType, header_len: usize, content_length: u64 },
     /// Refused; the stream is still read through so its hash can be judged first.
     Refused(StreamRefusal),
+}
+
+/// [`check_object_form`] over an object whose bytes are still arriving, for a store that never
+/// holds a blob or a chunk whole. Feed it every byte of the object in order with
+/// [`update`](Self::update), check the hash, then [`finish`](Self::finish) it.
+///
+/// It holds the header, the start of a blob's body, and the whole of a tree, parcel or recipe up to
+/// the whole-object ceiling, since those are parsed. A blob or chunk is never held, and a blob is
+/// not held to the whole-object ceiling (the streaming store's callers bound a blob's length
+/// themselves). A tree, parcel or recipe longer than the ceiling is refused, and one whose header
+/// declares it so is never held at all.
+pub struct ObjectFormCheck {
+    claimed_hash: String,
+    read_total: u64,
+    header: StreamHeader,
+    /// The object so far, while it is a tree, parcel or recipe under the whole-object ceiling.
+    structured: Option<Vec<u8>>,
+    /// The start of a blob's body, up to the most bytes its version can take.
+    blob_head: Option<Vec<u8>>,
+    /// Whether the object is a tree, parcel or recipe that passed the whole-object ceiling.
+    over_ceiling: bool,
+}
+
+impl ObjectFormCheck {
+    /// A check of the object named `claimed_hash` (the name is for the messages).
+    pub fn new(claimed_hash: &str) -> ObjectFormCheck {
+        ObjectFormCheck {
+            claimed_hash: claimed_hash.to_string(),
+            read_total: 0,
+            header: StreamHeader::Pending(Vec::new()),
+            structured: None,
+            blob_head: None,
+            over_ceiling: false,
+        }
+    }
+
+    /// Take the object's next bytes.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - Nothing is refused yet.
+    /// * `Err(String)` - The object is a chunk past the chunk ceiling: refused at once, so the rest
+    ///                   need not be read.
+    pub fn update(&mut self, data: &[u8]) -> Result<(), String> {
+        self.read_total += data.len() as u64;
+
+        if let Some(bytes) = self.structured.as_mut() {
+            bytes.extend_from_slice(data);
+        }
+        if let Some(head) = self.blob_head.as_mut() {
+            let wanted = MAX_VLQ_BYTES.saturating_sub(head.len()).min(data.len());
+            head.extend_from_slice(&data[..wanted]);
+        }
+
+        // Peek the header until it is whole. It is at most `MAX_HEADER_BYTES` long, so a prefix
+        // that long which still does not peek is malformed; a shorter one may only be short.
+        if let StreamHeader::Pending(prefix) = &mut self.header {
+            prefix.extend_from_slice(data);
+            match peek_object_header_prefix(prefix) {
+                Ok(PeekedHeader { object_type, header_len: Some(header_len), content_length }) => {
+                    if matches!(object_type, ObjectType::Tree | ObjectType::Parcel | ObjectType::Recipe) {
+                        // One that declares itself past the ceiling is refused without ever being
+                        // held; one that only grows past it is let go of below.
+                        if (header_len as u64).saturating_add(content_length) > MAX_OBJECT_BYTES as u64 {
+                            self.over_ceiling = true;
+                        } else {
+                            self.structured = Some(std::mem::take(prefix));
+                        }
+                    } else if object_type == ObjectType::Blob {
+                        let body = &prefix[header_len..];
+                        self.blob_head = Some(body[..body.len().min(MAX_VLQ_BYTES)].to_vec());
+                    }
+                    self.header = StreamHeader::Read { object_type, header_len, content_length };
+                }
+                Ok(PeekedHeader { header_len: None, .. }) => {}
+                // A whole version is judged at once, however short the prefix.
+                Err(PeekError::UnknownVersion(version)) =>
+                    self.header = StreamHeader::Refused(StreamRefusal::UnknownVersion(version)),
+                Err(PeekError::Malformed(reason)) if prefix.len() >= MAX_HEADER_BYTES =>
+                    self.header = StreamHeader::Refused(StreamRefusal::Malformed(reason)),
+                Err(PeekError::Malformed(_)) => {}
+            }
+        }
+
+        // A tree, parcel or recipe past the whole-object ceiling is no longer held: it is refused.
+        if self.structured.as_ref().is_some_and(|bytes| bytes.len() > MAX_OBJECT_BYTES) {
+            self.structured = None;
+            self.over_ceiling = true;
+        }
+
+        // A `Chunk`-typed object whose payload exceeds the per-chunk ceiling is refused mid-stream,
+        // before the whole (bounded) payload is even read.
+        if let StreamHeader::Read { object_type: ObjectType::Chunk, header_len, .. } = self.header {
+            if self.read_total.saturating_sub(header_len as u64) > chunk_utils::MAX_CHUNK_BYTES as u64 {
+                return Err(format!(
+                    "Chunk object {} exceeds the {}-byte chunk ceiling; refusing to store it.",
+                    self.claimed_hash, chunk_utils::MAX_CHUNK_BYTES
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Judge the whole object, once every byte has been fed and its hash has verified.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - If a store may take the object in.
+    /// * `Err(String)` - The refusal: an unknown version, a header or blob version that is not in
+    ///                   its one spelling, a declared length other than the bytes that followed, a
+    ///                   tree, parcel or recipe that does not parse to its canonical bytes or is
+    ///                   above the whole-object ceiling.
+    pub fn finish(self) -> Result<(), String> {
+        let claimed_hash = self.claimed_hash.as_str();
+
+        // The stream is over, so the object is whole: a header still pending is judged as a whole
+        // object's, and a read one is held to the content length it declares.
+        let refusal = match self.header {
+            StreamHeader::Pending(prefix) => match peek_object_header(&prefix) {
+                Ok(_) => None,
+                Err(PeekError::UnknownVersion(version)) => Some(StreamRefusal::UnknownVersion(version)),
+                Err(PeekError::Malformed(reason)) => Some(StreamRefusal::Malformed(reason)),
+            },
+            StreamHeader::Read { object_type, .. } if self.over_ceiling =>
+                Some(StreamRefusal::OverCeiling(object_type, self.read_total)),
+            StreamHeader::Read { header_len, content_length, .. } =>
+                check_declared_length(content_length, self.read_total - header_len as u64)
+                    .map_err(|error| error.to_string())
+                    .and_then(|()| self.blob_head.as_deref().map_or(Ok(()), check_blob_version))
+                    .err()
+                    .map(StreamRefusal::Malformed),
+            StreamHeader::Refused(refusal) => Some(refusal),
+        };
+
+        match refusal {
+            Some(StreamRefusal::UnknownVersion(version)) => Err(unknown_version_error(claimed_hash, version)),
+            Some(StreamRefusal::Malformed(reason)) => Err(malformed_object_error(claimed_hash, &reason)),
+            Some(StreamRefusal::OverCeiling(object_type, length)) =>
+                Err(object_ceiling_error(Some(&object_type), length as usize)),
+            None => self.structured.map_or(Ok(()), |bytes| enforce_structured_body(claimed_hash, &bytes)),
+        }
+    }
 }
 
 /// Store an object streamed from `reader`, bounding memory to a small constant for a blob or a
@@ -1280,14 +1429,7 @@ pub fn store_object_stream(claimed_hash: &str,
         ));
     }
 
-    let refusal = match outcome.refusal {
-        Some(StreamRefusal::UnknownVersion(version)) => Some(unknown_version_error(claimed_hash, version)),
-        Some(StreamRefusal::Malformed(reason)) => Some(malformed_object_error(claimed_hash, &reason)),
-        Some(StreamRefusal::OverCeiling(object_type, length)) =>
-            Some(object_ceiling_error(Some(&object_type), length as usize)),
-        None => outcome.structured.and_then(|bytes| enforce_structured_body(claimed_hash, &bytes).err()),
-    };
-    if let Some(refusal) = refusal {
+    if let Err(refusal) = outcome.form.finish() {
         let _ = file_utils::remove_file(&temp_path);
         return Err(refusal);
     }
@@ -1331,10 +1473,7 @@ fn stream_to_temp(claimed_hash: &str,
 
     let mut hasher = blake3::Hasher::new();
     let mut read_total: u64 = 0;
-    let mut header = StreamHeader::Pending(Vec::new());
-    let mut structured: Option<Vec<u8>> = None;
-    // The start of a blob's body, up to the most bytes its version can take.
-    let mut blob_head: Option<Vec<u8>> = None;
+    let mut form = ObjectFormCheck::new(claimed_hash);
     let mut block = vec![0u8; 64 * 1024];
 
     let mut bounded = reader.take(expected_len);
@@ -1352,72 +1491,8 @@ fn stream_to_temp(claimed_hash: &str,
             .map_err(|e| format!("Error while writing a streamed object: {}", e))?;
         read_total += read as u64;
 
-        if let Some(bytes) = structured.as_mut() {
-            bytes.extend_from_slice(data);
-        }
-        if let Some(head) = blob_head.as_mut() {
-            let wanted = MAX_VLQ_BYTES.saturating_sub(head.len()).min(data.len());
-            head.extend_from_slice(&data[..wanted]);
-        }
-
-        // Peek the header until it is whole. It is at most `MAX_HEADER_BYTES` long, so a prefix
-        // that long which still does not peek is malformed; a shorter one may only be short.
-        if let StreamHeader::Pending(prefix) = &mut header {
-            prefix.extend_from_slice(data);
-            match peek_object_header_prefix(prefix) {
-                Ok(PeekedHeader { object_type, header_len: Some(header_len), content_length }) => {
-                    let structured_type = matches!(object_type, ObjectType::Tree | ObjectType::Parcel | ObjectType::Recipe);
-                    if structured_type && expected_len > MAX_OBJECT_BYTES as u64 {
-                        header = StreamHeader::Refused(StreamRefusal::OverCeiling(object_type, expected_len));
-                    } else {
-                        if structured_type {
-                            structured = Some(std::mem::take(prefix));
-                        } else if object_type == ObjectType::Blob {
-                            let body = &prefix[header_len..];
-                            blob_head = Some(body[..body.len().min(MAX_VLQ_BYTES)].to_vec());
-                        }
-                        header = StreamHeader::Read { object_type, header_len, content_length };
-                    }
-                }
-                Ok(PeekedHeader { header_len: None, .. }) => {}
-                // A whole version is judged at once, however short the prefix.
-                Err(PeekError::UnknownVersion(version)) =>
-                    header = StreamHeader::Refused(StreamRefusal::UnknownVersion(version)),
-                Err(PeekError::Malformed(reason)) if prefix.len() >= MAX_HEADER_BYTES =>
-                    header = StreamHeader::Refused(StreamRefusal::Malformed(reason)),
-                Err(PeekError::Malformed(_)) => {}
-            }
-        }
-
-        // A `Chunk`-typed object whose payload exceeds the per-chunk ceiling is refused mid-stream,
-        // before the whole (bounded) payload is even written — the streaming twin of
-        // `enforce_header_policy`.
-        if let StreamHeader::Read { object_type: ObjectType::Chunk, header_len, .. } = header {
-            if read_total.saturating_sub(header_len as u64) > chunk_utils::MAX_CHUNK_BYTES as u64 {
-                return Err(format!(
-                    "Chunk object {} exceeds the {}-byte chunk ceiling; refusing to store it.",
-                    claimed_hash, chunk_utils::MAX_CHUNK_BYTES
-                ));
-            }
-        }
+        form.update(data)?;
     }
-
-    // The stream is over, so the object is whole: a header still pending is judged as a whole
-    // object's, and a read one is held to the content length it declares.
-    let refusal = match header {
-        StreamHeader::Pending(prefix) => match peek_object_header(&prefix) {
-            Ok(_) => None,
-            Err(PeekError::UnknownVersion(version)) => Some(StreamRefusal::UnknownVersion(version)),
-            Err(PeekError::Malformed(reason)) => Some(StreamRefusal::Malformed(reason)),
-        },
-        StreamHeader::Read { header_len, content_length, .. } =>
-            check_declared_length(content_length, read_total - header_len as u64)
-                .map_err(|error| error.to_string())
-                .and_then(|()| blob_head.as_deref().map_or(Ok(()), check_blob_version))
-                .err()
-                .map(StreamRefusal::Malformed),
-        StreamHeader::Refused(refusal) => Some(refusal),
-    };
 
     let buf_writer = encoder.finish()
         .map_err(|e| format!("Error while finishing a streamed object: {}", e))?;
@@ -1430,7 +1505,7 @@ fn stream_to_temp(claimed_hash: &str,
     // Close the handle before the caller renames it (renaming an open file fails on Windows).
     drop(temp_file);
 
-    Ok(StreamOutcome { read_total, hash: hasher.finalize().to_hex().to_string(), refusal, structured })
+    Ok(StreamOutcome { read_total, hash: hasher.finalize().to_hex().to_string(), form })
 }
 
 /// Whether an ingest should persist the objects it produces (`load`, `park`) or only compute

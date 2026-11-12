@@ -10,8 +10,8 @@
 //!
 //! When bytes bypass the head they land in a **staging prefix** keyed by the lift session,
 //! not at the object's hash key. Only [`ObjectStore::verify_and_promote`] — which checks
-//! `Blake3(bytes) == hash` — moves them to the canonical key, and that is the moment they
-//! become fetchable. So invariant 1 ("nothing unverified is ever fetchable") holds for the
+//! `Blake3(bytes) == hash`, and the object's form as core's own store checks it — moves them to the
+//! canonical key, and that is the moment they become fetchable. So invariant 1 ("nothing unverified is ever fetchable") holds for the
 //! presigned path structurally, not by a later audit: there is no window in which a client
 //! can write arbitrary bytes to a hash key. The staging round trip is the whole reason
 //! `put_target` needs a session.
@@ -116,6 +116,14 @@ pub enum PromoteOutcome {
     Corrupt {
         /// What the staged bytes actually hash to.
         actual: String,
+    },
+    /// The staged bytes hash to `hash` but are not an object core's store would take in
+    /// ([`object_utils::check_object_form`](forklift_core::util::object_utils::check_object_form)):
+    /// a second spelling of an object, an unknown version, an over-size chunk. They are discarded,
+    /// never promoted, so no object gets a second name.
+    Malformed {
+        /// Core's refusal, naming the object and why.
+        reason: String,
     },
 }
 
@@ -479,7 +487,8 @@ pub trait ObjectStore {
         hashes.iter().map(|hash| self.get(hash)).collect()
     }
 
-    /// Verify `Blake3(bytes) == hash` and store the object; nothing unverified may ever
+    /// Verify `Blake3(bytes) == hash` and the object's form, as core's own store does
+    /// (`object_utils::check_object_form`), and store the object; nothing unverified may ever
     /// become fetchable (invariant 1). Storing an already-present hash is a no-op.
     fn put_verified(&self, hash: &str, bytes: &[u8]) -> Result<PutOutcome, String>;
 
@@ -506,9 +515,10 @@ pub trait ObjectStore {
         Ok(PutTarget::Direct)
     }
 
-    /// Verify a staged upload and, only if `Blake3(bytes) == hash`, promote it to its
-    /// canonical hash key — the single moment an uploaded object becomes fetchable
-    /// (invariant 1). Corrupt staged bytes are discarded, never promoted.
+    /// Verify a staged upload and, only if `Blake3(bytes) == hash` and the object's form is one
+    /// core's own store takes in, promote it to its canonical hash key — the single moment an
+    /// uploaded object becomes fetchable (invariant 1). Corrupt or malformed staged bytes are
+    /// discarded, never promoted.
     ///
     /// Both callers of the AWS deployment funnel through here: the control plane runs it
     /// synchronously for the small objects at `POST /lift/{session}/commit`, and the

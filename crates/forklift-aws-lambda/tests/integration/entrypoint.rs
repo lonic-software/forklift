@@ -569,7 +569,7 @@ fn an_empty_segment_outside_a_pallet_name_matches_no_route() {
 fn captured_segments_and_the_session_query_are_percent_decoded() {
     let fixture = Fixture::staging();
 
-    let bytes = b"an object".to_vec();
+    let bytes = object_utils::blob_bytes(b"an object");
     let hash = object_utils::hash_object_bytes(&bytes);
     fixture.objects.put_verified(&hash, &bytes).expect("seed");
     let encoded_hash = format!("%{:02X}{}", hash.as_bytes()[0], &hash[1..]);
@@ -670,7 +670,7 @@ fn the_staging_byte_plane_answers_307_and_refuses_a_session_less_put() {
     let fixture = Fixture::staging();
 
     // Seed one object as if already promoted into S3.
-    let bytes = b"an object".to_vec();
+    let bytes = object_utils::blob_bytes(b"an object");
     let hash = object_utils::hash_object_bytes(&bytes);
     fixture.objects.put_verified(&hash, &bytes).expect("seed");
 
@@ -723,7 +723,7 @@ fn an_empty_session_query_value_is_treated_as_absent() {
 fn upload_targets_negotiates_over_http() {
     let fixture = Fixture::staging();
 
-    let present = b"already here".to_vec();
+    let present = object_utils::blob_bytes(b"already here");
     let present_hash = object_utils::hash_object_bytes(&present);
     fixture.objects.put_verified(&present_hash, &present).expect("seed");
     let wanted_hash = object_utils::hash_object_bytes(b"not here yet");
@@ -778,7 +778,7 @@ fn upload_targets_over_the_router_cap_is_a_422_naming_the_cap() {
 fn commit_lift_verifies_and_promotes_over_http() {
     let fixture = Fixture::staging();
 
-    let good = b"a good control-plane object".to_vec();
+    let good = object_utils::blob_bytes(b"a good control-plane object");
     let good_hash = object_utils::hash_object_bytes(&good);
     let corrupt_hash = object_utils::hash_object_bytes(b"the declared content");
 
@@ -1210,7 +1210,7 @@ fn seeded(harvest: &Harvest) -> Fixture {
 /// Every route by which bytes or refs reach storage, as `token`, against a trusted warehouse
 /// with its office lifted. Each answer is collected, not asserted, so a test reads as a table.
 fn write_routes(fixture: &Fixture, token: &str, office_head: &str, main_head: &str) -> Vec<(&'static str, u16)> {
-    let fresh = b"bytes this operator wants stored".to_vec();
+    let fresh = object_utils::blob_bytes(b"bytes this operator wants stored");
     let fresh_hash = object_utils::hash_object_bytes(&fresh);
     let signed = fixture.objects.get_signature(main_head).expect("read").expect("main is signed");
     let call = |request| status(&fixture.call(bearing(token, request)));
@@ -1340,7 +1340,7 @@ fn an_untrusted_warehouse_admits_any_operator() {
     let main_head = harvest.head_of("main").expect("main head");
     let fixture = seeded(&harvest);
 
-    let fresh = b"bytes from a stranger".to_vec();
+    let fresh = object_utils::blob_bytes(b"bytes from a stranger");
     let fresh_hash = object_utils::hash_object_bytes(&fresh);
     assert_eq!(status(&fixture.call(bearing("nobody-token", put_bytes(&format!("/v1/objects/{}", fresh_hash), fresh)))), 201);
 
@@ -1358,7 +1358,7 @@ fn in_multi_warehouse_routing_an_operator_writes_only_where_the_administrator_se
     let anchor = harvest.trust.clone().expect("trust established");
     let fixture = Fixture { routing: Routing::Multi, ..seeded(&harvest) };
 
-    let fresh = b"bytes for a warehouse nobody set up".to_vec();
+    let fresh = object_utils::blob_bytes(b"bytes for a warehouse nobody set up");
     let fresh_hash = object_utils::hash_object_bytes(&fresh);
     let object = || put_bytes(&format!("/warehouses/new/v1/objects/{}", fresh_hash), fresh.clone());
     let main = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };

@@ -1656,6 +1656,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 } else {
                     match self.objects.get(hash).map_err(HeadError::internal)? {
                         Some(bytes) => {
+                            // Bytes the store holds that core would not take in are refused by
+                            // name, not answered as a failure of this head's own.
+                            object_utils::validate_imported_object(hash, &bytes).map_err(held_object_refused)?;
                             object_utils::store_object_bytes(hash, &bytes).map_err(HeadError::internal)?;
                             Some(bytes)
                         }
@@ -1778,7 +1781,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     // lost may have discarded it as corrupt or too large.
                     return Err(upload_discarded(format!(
                         "Object {} is not on the remote: its upload was discarded (rejected as \
-                        corrupt or too large) or never arrived. The lift session cannot commit.",
+                        corrupt, malformed or too large) or never arrived. The lift session cannot commit.",
                         hash
                     )))
                 }
@@ -1787,6 +1790,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                         "Staged object {} is corrupt (it hashes to {}); it was discarded, not \
                         promoted, and the lift session cannot commit.",
                         hash, actual
+                    )))
+                }
+                // Not `upload_discarded`: the same client would upload the same bytes again. The
+                // refusal is the one a native head gives these bytes on upload.
+                PromoteOutcome::Malformed { reason } => {
+                    return Err(HeadError::unprocessable(format!(
+                        "{} The staged copy was discarded, and the lift session cannot commit.",
+                        reason
                     )))
                 }
             }
@@ -1852,7 +1863,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         if let Some(hash) = blobs.iter().find(|hash| gone.contains(hash.as_str())) {
             return Err(upload_discarded(format!(
-                "Blob {} is not on the remote: its upload was discarded (rejected as corrupt or too \
+                "Blob {} is not on the remote: its upload was discarded (rejected as corrupt, malformed or too \
                 large) or never arrived. The lift session cannot commit.",
                 hash
             )));
@@ -2090,6 +2101,12 @@ fn require_object_hash(hash: &str) -> HeadResult<()> {
     }
 
     Err(HeadError::unprocessable(REFUSAL_NOT_AN_OBJECT_HASH))
+}
+
+/// The refusal for an object this warehouse's store holds that core does not take in: a copy
+/// promoted before its form was checked, or written to the bucket by hand.
+fn held_object_refused(reason: String) -> HeadError {
+    HeadError::unprocessable(format!("This remote holds an object it cannot serve: {}", reason))
 }
 
 /// A lift commit's terminal refusal for an upload the remote does not hold: discarded by

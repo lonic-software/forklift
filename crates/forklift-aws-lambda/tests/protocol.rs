@@ -1457,7 +1457,7 @@ fn a_staging_store_redirects_uploads_to_a_session_staging_key() {
     let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
 
     // Seed one object as if it were already promoted into S3.
-    let bytes = b"an object".to_vec();
+    let bytes = blob_object("an object");
     let hash = object_utils::hash_object_bytes(&bytes);
     store.put_verified(&hash, &bytes).expect("seed a canonical object");
 
@@ -1492,7 +1492,7 @@ fn a_staging_store_redirects_uploads_to_a_session_staging_key() {
 fn a_staged_object_is_not_fetchable_until_it_is_verified_and_promoted() {
     let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
 
-    let good = b"a good control-plane object".to_vec();
+    let good = blob_object("a good control-plane object");
     let good_hash = object_utils::hash_object_bytes(&good);
 
     // Bytes that do NOT match the hash they are staged under — a client uploading garbage
@@ -1558,7 +1558,7 @@ fn refusal_code(message: &str) -> Option<RefusalCode> {
 fn a_blob_still_in_staging_is_not_ready_to_commit() {
     let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
 
-    let blob = b"a large working blob".to_vec();
+    let blob = blob_object("a large working blob");
     let blob_hash = object_utils::hash_object_bytes(&blob);
     store.stage("lift-1", &blob_hash, blob);
 
@@ -1601,7 +1601,7 @@ fn a_blob_in_neither_place_is_refused_as_discarded() {
 #[test]
 fn a_corrupt_staged_blob_turns_not_ready_into_discarded_and_a_fresh_upload_commits() {
     let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
-    let blob = b"the declared blob".to_vec();
+    let blob = blob_object("the declared blob");
     let blob_hash = object_utils::hash_object_bytes(&blob);
     store.stage("lift-1", &blob_hash, b"bytes that are not it".to_vec());
     let head = Head::new(store, MemoryRefStore::new());
@@ -1661,7 +1661,7 @@ impl ObjectStore for PromotesDuringTheStagedProbe {
 #[test]
 fn a_blob_promoted_between_the_probes_commits() {
     let inner = MemoryObjectStore::with_redirect("https://s3.example/bucket");
-    let blob = b"a blob the verifier is about to promote".to_vec();
+    let blob = blob_object("a blob the verifier is about to promote");
     let blob_hash = object_utils::hash_object_bytes(&blob);
     inner.stage("lift-1", &blob_hash, blob);
     let head = Head::new(PromotesDuringTheStagedProbe { inner }, MemoryRefStore::new());
@@ -1678,9 +1678,9 @@ fn a_blob_promoted_between_the_probes_commits() {
 fn an_intermediate_commit_batch_does_not_sweep_a_later_batchs_staged_objects() {
     let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
 
-    let committed = b"a blob in this batch".to_vec();
+    let committed = blob_object("a blob in this batch");
     let committed_hash = object_utils::hash_object_bytes(&committed);
-    let orphan = b"a chunk for a later batch, still staging".to_vec();
+    let orphan = blob_object("a chunk for a later batch, still staging");
     let orphan_hash = object_utils::hash_object_bytes(&orphan);
 
     store.stage("lift-1", &committed_hash, committed);
@@ -1719,7 +1719,7 @@ fn an_intermediate_commit_batch_does_not_sweep_a_later_batchs_staged_objects() {
 fn racing_promoters_serialize_and_never_report_missing() {
     let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
 
-    let bytes = b"an object two promoters both want".to_vec();
+    let bytes = blob_object("an object two promoters both want");
     let hash = object_utils::hash_object_bytes(&bytes);
     store.stage("lift-1", &hash, bytes);
 
@@ -2243,7 +2243,7 @@ fn a_batch_with_time_to_spare_before_the_deadline_answers_whole() {
 /// upload-straight-to-storage, and send-through-the-control-plane — without a single body.
 #[test]
 fn upload_targets_negotiates_without_sending_bodies() {
-    let present = b"an object the remote already has".to_vec();
+    let present = blob_object("an object the remote already has");
     let present_hash = object_utils::hash_object_bytes(&present);
     let wanted_hash = object_utils::hash_object_bytes(b"an object it does not");
 
@@ -2290,7 +2290,7 @@ fn upload_targets_negotiates_without_sending_bodies() {
 fn synthetic_objects(count: usize, seed: &str) -> Vec<(String, Vec<u8>)> {
     (0..count)
         .map(|i| {
-            let bytes = format!("{seed}-{i}").into_bytes();
+            let bytes = blob_object(&format!("{seed}-{i}"));
             (object_utils::hash_object_bytes(&bytes), bytes)
         })
         .collect()
@@ -6533,7 +6533,7 @@ fn a_withheld_object_whose_header_cannot_be_read_is_refused_alone() {
     let main = gate_parcel(&head, &[], vec![gate_file(&head, "x", "1")]);
     plant(&head.refs, "main", &main);
     let odd = object_utils::hash_object_bytes(b"no header at all");
-    head.objects.put_verified(&odd, b"no header at all").expect("seed");
+    head.objects.plant_unreadable(&odd, b"no header at all");
     withhold(&head, &odd);
 
     assert!(served(&head, &main), "other content is served");
@@ -7209,4 +7209,96 @@ fn a_withheld_item_whose_step_fails_never_starves_another() {
     assert!(withheld_item(&head, &other).deleted, "the other item's step ran");
     assert!(!head.objects.exists(&other).expect("exists"));
     assert!(head.objects.exists(&failing).expect("exists"), "an unfinished walk deletes nothing");
+}
+
+/// A blob and a chunk, each with the canonical bytes beside a respelling: the same object with its
+/// version VLQ spelled overlong, which hashes to a second name. Core never writes the respelling
+/// and refuses to store it.
+fn respelled_objects() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::model::chunk::Chunk;
+
+    let blob = blob_object("one meaning, one name");
+    let chunk = LooseObjectBuilder::build_chunk(&Chunk { content: b"one meaning, one name".to_vec() }).content;
+    let respell = |bytes: &[u8]| {
+        assert!(bytes[0] < 0x80, "a one-byte version VLQ");
+        [&[bytes[0] | 0x80, 0x00][..], &bytes[1..]].concat()
+    };
+    vec![("blob", respell(&blob), blob), ("chunk", respell(&chunk), chunk)]
+}
+
+/// A respelled blob or chunk uploaded through the head is refused `422`, as core refuses it, and
+/// is not stored: it would be the same object under a second hash. The canonical bytes are
+/// stored.
+// Revert: drop the form check from the fake's `put_verified` → the respelling is stored → red.
+#[test]
+fn a_direct_upload_of_a_respelled_blob_or_chunk_is_refused() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+
+    for (what, respelled, canonical) in respelled_objects() {
+        let hash = object_utils::hash_object_bytes(&respelled);
+        let err = head.object_put(&Principal::Static, Some("lift-1"), &hash, &respelled).err().expect(what);
+        assert_eq!(err.status, Status::Unprocessable, "{}: {}", what, err.message);
+        assert!(err.message.contains("not a well-formed object"), "{}: {}", what, err.message);
+        assert!(!head.objects.exists(&hash).expect("exists"), "{}: the respelling was stored", what);
+
+        let hash = object_utils::hash_object_bytes(&canonical);
+        head.object_put(&Principal::Static, Some("lift-1"), &hash, &canonical).expect(what);
+        assert!(head.objects.exists(&hash).expect("exists"), "{}: the canonical bytes are stored", what);
+    }
+}
+
+/// A respelled blob or chunk staged past the head is discarded by verification, never promoted
+/// and never fetchable, whether the verifier reaches it or the commit promotes it; the commit
+/// refuses it as malformed, not as a discarded upload to send again. The canonical bytes promote.
+// Revert: drop the form check from the fake's `verify_and_promote` → `Promoted` → red.
+#[test]
+fn a_staged_respelled_blob_or_chunk_is_discarded_not_promoted() {
+    let head = Head::new(MemoryObjectStore::with_redirect("https://s3.example/bucket"), MemoryRefStore::new());
+
+    for (what, respelled, canonical) in respelled_objects() {
+        let hash = object_utils::hash_object_bytes(&respelled);
+
+        // The verifier's path.
+        head.objects.stage("lift-1", &hash, respelled.clone());
+        let outcome = head.objects.verify_and_promote("lift-1", &hash).expect(what);
+        match &outcome {
+            PromoteOutcome::Malformed { reason } => assert!(reason.contains("not a well-formed object"), "{}: {}", what, reason),
+            other => panic!("{}: {:?}", what, other),
+        }
+        assert!(!head.objects.exists(&hash).expect("exists"), "{}: promoted", what);
+        assert_eq!(head.objects.staged_count(), 0, "{}: the staged copy is discarded", what);
+
+        // The commit's own promotion of a control-plane object.
+        head.objects.stage("lift-2", &hash, respelled.clone());
+        let err = head.commit_lift(&Principal::Static, "lift-2", std::slice::from_ref(&hash), &[], false).expect_err(what);
+        assert_eq!(err.status, Status::Unprocessable, "{}: {}", what, err.message);
+        assert!(err.message.contains("not a well-formed object"), "{}: {}", what, err.message);
+        assert_ne!(refusal_code(&err.message), Some(RefusalCode::StagedUploadDiscarded), "{}: {}", what, err.message);
+        assert!(!head.objects.exists(&hash).expect("exists"), "{}: promoted by the commit", what);
+        assert!(head.object_get(&hash).is_err(), "{}: fetchable", what);
+        assert_eq!(head.objects.staged_count(), 0, "{}: the staged copy is discarded", what);
+
+        let hash = object_utils::hash_object_bytes(&canonical);
+        head.objects.stage("lift-3", &hash, canonical);
+        assert_eq!(head.objects.verify_and_promote("lift-3", &hash).expect(what), PromoteOutcome::Promoted, "{}", what);
+    }
+}
+
+/// An object the store holds that core does not take in (one a newer build wrote, or one promoted
+/// before its form was checked) is refused by name in a batch, `422`, not answered as an internal
+/// error of the head's own.
+// Revert: drop the form check before the batch mirror's `store_object_bytes` → the scratch
+// store's own refusal surfaces as a `500` → red.
+#[test]
+fn a_batch_refuses_a_held_object_core_does_not_take_in() {
+    let store = MemoryObjectStore::new();
+    let (_, respelled, _) = respelled_objects().remove(0);
+    let hash = object_utils::hash_object_bytes(&respelled);
+    store.plant_unreadable(&hash, &respelled);
+    let head = Head::new(store, MemoryRefStore::new());
+
+    let err = head.batch(std::slice::from_ref(&hash)).err().expect("batch");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert!(err.message.contains("cannot serve") && err.message.contains("not a well-formed object"), "{}", err.message);
 }
