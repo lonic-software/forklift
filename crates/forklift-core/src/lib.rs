@@ -13,3 +13,9 @@ pub mod parser;
 pub mod traits;
 pub mod types;
 pub mod util;
+
+/// Core's unit tests count each thread's allocations, so the fuzz tests can bound a decoder's
+/// peak memory (see `util::peak_alloc`).
+#[cfg(test)]
+#[global_allocator]
+static PEAK_ALLOC: util::peak_alloc::PeakAlloc = util::peak_alloc::PeakAlloc;

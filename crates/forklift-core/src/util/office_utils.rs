@@ -3285,6 +3285,15 @@ pub(crate) mod tests {
                 rewritten
             };
 
+            let (_, peak) = crate::util::peak_alloc::measure(|| if user_side {
+                parse_user_record(&candidate).map(|_| ())
+            } else {
+                parse_key_record(&candidate).map(|_| ())
+            });
+            // Measured at about 16 KiB on these records: the TOML document and the record built
+            // from it.
+            crate::util::peak_alloc::assert_within("an office record parser", &format!("iteration {}", iteration),
+                candidate.len(), peak, 64, 32 * 1024);
             if let Ok(rebuilt) = reencode(&candidate) {
                 assert!(rebuilt == candidate, "a second spelling of an office record was accepted\n  in : {:?}\n  out: {:?}",
                     candidate, rebuilt);

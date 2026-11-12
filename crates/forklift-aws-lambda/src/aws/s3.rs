@@ -465,11 +465,12 @@ impl S3ObjectStore {
     /// This store, made to leave a staged tree, parcel or recipe at or above
     /// [`STREAMING_THRESHOLD_BYTES`] staged rather than promote it: `verify_and_promote` answers
     /// [`PromoteOutcome::LeftStaged`] for it as soon as its header is read. The verifier Lambda's
-    /// store, whose memory stays flat whatever it is sent: parsing such an object holds up to about
-    /// three times core's whole-object ceiling, which only the control plane is sized for. A client
-    /// names every tree, parcel and recipe among the objects its lift commit promotes, so the
-    /// commit promotes it there; one named only as a blob stays staged and its commit is never
-    /// ready, and nothing unchecked is promoted either way.
+    /// store, whose memory stays flat whatever it is sent: parsing such an object holds several
+    /// times its bytes (core measured eight to nine for a tree, four for a recipe), so it is left to
+    /// the control plane, the larger function (docs/DEPLOYMENT.md "Memory sizing" says what a tree
+    /// near the ceiling needs). A client names every tree, parcel and recipe among the objects its
+    /// lift commit promotes, so the commit promotes it there; one named only as a blob stays
+    /// staged and its commit is never ready, and nothing unchecked is promoted either way.
     pub fn leaving_large_structured_staged(mut self) -> S3ObjectStore {
         self.holds_large_structured = false;
         self

@@ -1357,8 +1357,10 @@ impl ObjectFormCheck {
 
 /// Store an object streamed from `reader`, bounding memory to a small constant for a blob or a
 /// chunk whatever its size or declared length, and for a tree, parcel or recipe, which is parsed
-/// whole, to about three times the whole-object ceiling (its bytes, the parsed value and the
-/// rebuilt bytes it is compared against) — the unconditional defense behind the bundle-import
+/// whole, to a multiple of its bytes (its bytes, the parsed value and the rebuilt bytes it is
+/// compared against): measured at about eight to nine times for a tree, whose parsed entries
+/// outweigh its bytes (nine with the shortest names), and about four for a recipe, so over 512 MiB
+/// for a tree at the whole-object ceiling — the unconditional defense behind the bundle-import
 /// bomb ceiling (DESIGN.html §9.4b, §5.0 row D item 7). Exactly `expected_len` bytes are read (a
 /// shorter stream is reported as truncation), hashed through an incremental Blake3, and
 /// zstd-encoded incrementally to a temp file in the object's own shard folder; the temp file is
@@ -2227,6 +2229,83 @@ mod tests {
         let mut reader = std::io::Cursor::new(raw.clone());
         let stored = store_object_stream(&object.hash, &mut reader, raw.len() as u64).unwrap();
         assert!(!stored, "an already-present object is skipped");
+    }
+
+    /// The most a streamed blob may hold at its peak, whatever its size, in memory the counting
+    /// allocator sees (not zstd's C-side context), with room to spare over the measured ~170 KiB.
+    const STREAMED_BLOB_PEAK_BYTES: usize = 512 * 1024;
+
+    /// The multiple of its bytes a streamed tree, parcel or recipe may hold at its peak: the
+    /// bytes themselves, the parsed value and the rebuilt bytes compared against them. Measured
+    /// at about 8.8 for a tree of the shortest names, whose parsed entries each own their name
+    /// twice and their hash as hex; `store_object_stream`'s doc states the same figure.
+    const STREAMED_STRUCTURED_FACTOR: usize = 10;
+
+    /// The streaming store's memory bound, measured: a blob streams in memory that does not
+    /// grow with its size, and a tree or recipe, which is parsed whole, holds a stated multiple of
+    /// its bytes. A tree measured about 8 times, 8.8 with the shortest names, and a recipe about 4.
+    #[test]
+    fn store_object_stream_holds_the_memory_its_doc_states() {
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::model::tree_item::TreeItem;
+
+        let streamed_peak = |name: &str, raw: &[u8], hash: &str| {
+            let _scratch = Scratch::new(name);
+            let mut reader = std::io::Cursor::new(raw);
+            let (stored, peak) = crate::util::peak_alloc::measure(|| store_object_stream(hash, &mut reader, raw.len() as u64));
+            assert_eq!(stored, Ok(true), "{} streams", name);
+            peak
+        };
+
+        // A blob is hashed and compressed as it arrives, so what it holds does not grow with its
+        // size: measured at about 170 KiB for both sizes. The zstd encoder's own allocations are
+        // C-side and not counted.
+        let mut blob_peaks = Vec::new();
+        for extra in [1 << 20, 8 << 20] {
+            let object = LooseObjectBuilder::build_blob(&Blob { content: vec![0x3Cu8; STREAM_STORE_THRESHOLD_BYTES + extra] });
+            let peak = streamed_peak("stream-bound-blob", &object.content, &object.hash);
+            crate::util::peak_alloc::assert_within("a streamed blob", "a blob", 0, peak, 0, STREAMED_BLOB_PEAK_BYTES);
+            blob_peaks.push(peak);
+        }
+        assert!(blob_peaks[1] <= blob_peaks[0] + 16 * 1024,
+            "a streamed blob's memory grew with its size: {:?} for bodies 1 MiB and 8 MiB above the threshold", blob_peaks);
+
+        let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        for index in 0..60_000 {
+            tree.add_child(TreeItem::new(format!("entry-{:08}", index), format!("{:064x}", index), DirEntryType::Normal));
+        }
+        let object = LooseObjectBuilder::build_tree(&tree);
+        assert!(object.content.len() > STREAM_STORE_THRESHOLD_BYTES, "the tree is large enough to stream");
+        let peak = streamed_peak("stream-bound-tree", &object.content, &object.hash);
+        crate::util::peak_alloc::assert_within("a streamed tree", "60,000 entries", object.content.len(), peak,
+            STREAMED_STRUCTURED_FACTOR, 1 << 20);
+
+        // The shortest names a tree can hold, where each parsed entry outweighs its bytes most.
+        let short_name = |mut index: usize| {
+            let mut name = String::new();
+            loop {
+                name.push(char::from(b"abcdefghijklmnopqrstuvwxyz0123456789"[index % 36]));
+                index /= 36;
+                if index == 0 { return name; }
+            }
+        };
+        let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        for index in 0..240_000 {
+            tree.add_child(TreeItem::new(short_name(index), format!("{:064x}", index), DirEntryType::Normal));
+        }
+        let object = LooseObjectBuilder::build_tree(&tree);
+        assert!(object.content.len() > STREAM_STORE_THRESHOLD_BYTES, "the short-named tree is large enough to stream");
+        let peak = streamed_peak("stream-bound-short-tree", &object.content, &object.hash);
+        crate::util::peak_alloc::assert_within("a streamed tree", "240,000 short names", object.content.len(), peak,
+            STREAMED_STRUCTURED_FACTOR, 1 << 20);
+
+        let chunks = (0..200_000u64).map(|index| RecipeChunk { hash: format!("{:064x}", index), size: 1000 }).collect();
+        let recipe = Recipe { content_hash: format!("{:064x}", 7), total_size: 200_000 * 1000, chunks };
+        let object = LooseObjectBuilder::build_recipe(&recipe);
+        assert!(object.content.len() > STREAM_STORE_THRESHOLD_BYTES, "the recipe is large enough to stream");
+        let peak = streamed_peak("stream-bound-recipe", &object.content, &object.hash);
+        crate::util::peak_alloc::assert_within("a streamed recipe", "200,000 chunks", object.content.len(), peak,
+            STREAMED_STRUCTURED_FACTOR, 1 << 20);
     }
 
     /// Fire-site d (durable-taint wiring): `store_object_stream`'s own promote-then-sync — the

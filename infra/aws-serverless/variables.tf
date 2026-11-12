@@ -162,7 +162,7 @@ variable "architecture" {
 }
 
 variable "control_plane_memory_mb" {
-  description = "Control-plane Lambda memory, in MB. Default 512 per docs/DEPLOYMENT.md \"Memory sizing\"; raise to 1024 if warehouses routinely stack near-maximal (64 MiB) trees or recipes."
+  description = "Control-plane Lambda memory, in MB. Default 512 per docs/DEPLOYMENT.md \"Memory sizing\"; 512 cannot promote a tree near the 64 MiB object ceiling, which takes eight to nine times its size to parse; raise to 1024 or more if warehouses may hold one."
   type        = number
   default     = 512
 

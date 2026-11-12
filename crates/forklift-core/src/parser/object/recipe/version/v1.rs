@@ -38,7 +38,11 @@ pub fn parse(offset: usize, input: &[u8]) -> Result<Recipe, String> {
         .map(|(value, read)| { cursor += read; value })
         .map_err(|e| format!("Failed to parse recipe chunk count: {}", e))?;
 
-    let mut chunks = Vec::with_capacity(chunk_count.min(64 * 1024) as usize);
+    // Reserve only as many chunks as the bytes left can spell (a hash and at least one size byte
+    // each), never what the count declares: a short recipe declaring a large count would
+    // otherwise hold memory its bytes do not pay for.
+    let room = input.len().saturating_sub(cursor) / (HASH_HEX_LEN + 1);
+    let mut chunks = Vec::with_capacity((chunk_count.min(room as u64)) as usize);
     let mut size_sum: u64 = 0;
 
     for index in 0..chunk_count {
@@ -131,6 +135,21 @@ mod tests {
         let (version, read) = byte_utils::number_from_vlq_bytes(0, bytes).unwrap();
         assert_eq!(version, 1);
         parse(read, bytes)
+    }
+
+    #[test]
+    fn a_declared_chunk_count_reserves_only_what_the_bytes_can_spell() {
+        // A header declaring 2^40 chunks and carrying none: the parser must refuse it without
+        // first reserving room for the count it declares.
+        let mut bytes = Vec::new();
+        bytes.extend(byte_utils::number_to_vlq_bytes(1));
+        bytes.extend(CONTENT_HASH.as_bytes());
+        bytes.extend(byte_utils::number_to_vlq_bytes(0));
+        bytes.extend(byte_utils::number_to_vlq_bytes(1u64 << 40));
+        let (result, peak) = crate::util::peak_alloc::measure(|| parse_payload(&bytes));
+        result.expect_err("a recipe missing its declared chunks must be refused");
+        crate::util::peak_alloc::assert_within("recipe v1", "2^40 chunks declared, none present",
+            bytes.len(), peak, 16, 4096);
     }
 
     #[test]

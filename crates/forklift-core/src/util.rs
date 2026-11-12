@@ -9,6 +9,8 @@ pub mod graph_utils;
 pub mod pack_utils;
 #[cfg(test)]
 pub(crate) mod fuzz_bytes;
+#[cfg(test)]
+pub(crate) mod peak_alloc;
 pub(crate) mod toml_spelling;
 pub(crate) mod signature_table;
 pub mod config_utils;

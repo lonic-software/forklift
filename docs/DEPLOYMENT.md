@@ -156,8 +156,12 @@ the threshold itself); at or above it, a blob or chunk is **never** buffered —
 stream-hashed in chunks and promoted with a server-side `CopyObject`, so memory use there is
 bounded by one read chunk, not by the object's size (up to the hard `MAX_STAGED_OBJECT_BYTES` cap
 of 5 GiB, S3's own single-`PUT` maximum). A tree, parcel or recipe at or above it is held whole and
-parsed, up to `MAX_OBJECT_BYTES` (64 MiB), which takes about three times that at its peak (its
-bytes, the parsed value and the rebuilt bytes compared against them).
+parsed, up to `MAX_OBJECT_BYTES` (64 MiB). Parsing holds its bytes, the parsed value and the
+rebuilt bytes compared against them: measured in `forklift-core` at about eight to nine times the
+object's size for a tree (nine with the shortest names, whose parsed entries outweigh their bytes
+most), and about four times for a recipe. A tree at the ceiling therefore takes over 512 MiB at
+its peak; the control plane also holds the body it read from S3 beside it, which
+that measurement does not include.
 
 * **Verifier Lambda:** only ever calls `verify_and_promote`, and leaves a large tree, parcel or
   recipe staged for the lift commit rather than parse it, so its memory floor is small and flat
@@ -165,7 +169,7 @@ bytes, the parsed value and the rebuilt bytes compared against them).
   object whose promotion needs more.
 
 * **Control-plane Lambda:** `verify_and_promote` holds and parses a large tree, parcel or recipe
-  the lift commit names (up to about three times 64 MiB at its peak), and `Head::ref_update`'s
+  the lift commit names (over 512 MiB at its peak for a tree at the 64 MiB ceiling), and `Head::ref_update`'s
   commit-gate closure audit is a second memory sink the verifier never touches. To presence-check a chunked file's chunks or prune an unchanged
   subtree, the audit reads a **recipe** or a **tree** object straight off `ObjectStore::get`
   (`Head::ref_update`'s `load_recipe_chunks`/`load_base_tree` closures, and `scratch.rs`'s
@@ -194,9 +198,11 @@ bytes, the parsed value and the rebuilt bytes compared against them).
   its signature sidecar when the scratch lacks one.
 
   Recommended default: **512 MB**, which also buys proportionally more CPU (Lambda ties CPU
-  allocation to configured memory) for the audit's own work. Bump to **1024 MB** if your
-  warehouses routinely stack near-maximal (64 MiB) trees or recipes: a batch whose budget is
-  crossed by one of those holds a bundle of nearly 100 MiB.
+  allocation to configured memory) for the audit's own work. The 512 MB default cannot promote a
+  tree near the 64 MiB ceiling: a lift commit that promotes one parses it in eight to nine times
+  its size. If your warehouses may hold a directory that large (several hundred thousand
+  entries), size the function for it, **1024 MB** or more; a batch whose budget is crossed by
+  such a tree or recipe also holds a bundle of nearly 100 MiB.
 
 **Ephemeral storage (`/tmp`).** `Head::pooled`'s shared scratch (`scratch::Scratch::shared`)
 persists on `/tmp`, keyed by warehouse, across warm invocations — so most invocations only add
