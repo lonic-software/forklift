@@ -433,10 +433,20 @@ struct Trail {
 
 impl Trail {
     /// Reads the history back and records what it says; true when the faulted record was made and
-    /// every record reads as expected.
-    fn settle(&mut self, context: &Context, expected: &Expected, made: bool) -> Result<bool, RunError> {
+    /// every record reads as expected. The record counts as made from here on once the history
+    /// serves it and the tool's latest answer asks nothing further (see [`answered`]): a command
+    /// killed after its record was durable, retried, is told there is nothing left to do.
+    fn settle(&mut self, context: &Context, expected: &Expected, made: &mut bool) -> Result<bool, RunError> {
+        let mut readback = self.read_back(context, expected, *made)?;
+        if !*made && answered(self.steps.last()) && readback.reads(&[expected.faulted]) {
+            *made = true;
+            // Judged again as acknowledged: the record must now hold exactly its own tree.
+            self.evidence.any_silent |= readback.silent();
+            self.readbacks.push(readback);
+            readback = self.read_back(context, expected, true)?;
+        }
+        let made = *made;
         let required = expected.required(made);
-        let readback = context.read_back(&expected.marks(), &required, |mark| expected.of(context.corpus, mark, made))?;
         self.evidence.any_silent |= readback.silent();
         let reads = made && readback.reads(&required);
         self.evidence.acknowledged_readable = readback.reads(&expected.acknowledged);
@@ -446,6 +456,18 @@ impl Trail {
         }
         Ok(reads)
     }
+
+    fn read_back(&self, context: &Context, expected: &Expected, made: bool) -> Result<HistoryReadback, RunError> {
+        context.read_back(&expected.marks(), &expected.required(made), |mark| expected.of(context.corpus, mark, made))
+    }
+}
+
+/// Whether `last`, the latest command run, answered and asked nothing further: it exited (a kill
+/// is no answer), and either succeeded or refused naming no remedy, as a re-stack of a record
+/// already made is refused with nothing left to stack.
+fn answered(last: Option<&Outcome>) -> bool {
+    last.is_some_and(|outcome| outcome.exit.is_some()
+        && (outcome.succeeded() || remedy::extract(&outcome.remedy_texts()).remedies.is_empty()))
 }
 
 /// What the faulted command of a built scenario must leave readable: the record it writes, and
@@ -509,10 +531,10 @@ pub(crate) fn grade_after(
     // The faulted command, then one plain retry of it. Once the tool acknowledged the record it
     // stays owed, so a later attempt that refuses (a re-stack with nothing new) does not unmake it.
     let mut made = first(context, &mut trail.steps)?;
-    let mut reads = trail.settle(context, expected, made)?;
+    let mut reads = trail.settle(context, expected, &mut made)?;
     if !reads {
         made |= context.record(faulted, &mut trail.steps)?;
-        reads = trail.settle(context, expected, made)?;
+        reads = trail.settle(context, expected, &mut made)?;
     }
     trail.evidence.healed_by_retry = reads;
 
@@ -555,7 +577,7 @@ pub(crate) fn grade_after(
                 }
             }
             made |= context.record(faulted, &mut trail.steps)?;
-            let reads = trail.settle(context, expected, made)?;
+            let reads = trail.settle(context, expected, &mut made)?;
             trail.evidence.remedy_worked = reads;
             trail.recoverability.named_right_remedy = reads;
             Ok(reads)
@@ -568,7 +590,7 @@ pub(crate) fn grade_after(
     // Heal last, when an acknowledged record still does not read back.
     if !trail.evidence.acknowledged_readable {
         trail.steps.push(context.run(&context.programs.forklift, vec!["--json".into(), "heal".into()], context.scratch.work())?);
-        trail.settle(context, expected, made)?;
+        trail.settle(context, expected, &mut made)?;
     }
 
     Ok(Graded {
@@ -788,6 +810,30 @@ mod tests {
         };
         assert_eq!(follow_remedies(&mut stuck, named, never), Ok(false));
         assert_eq!(stuck.1, vec![lock], "a remedy that did not help is not run again");
+    }
+
+
+    fn answer(exit: Option<i32>, message: &str, next_step: Option<&str>) -> Outcome {
+        let failure = (exit != Some(0) && exit.is_some()).then(|| tool::Failure {
+            code: "error".into(), message: message.into(), next_step: next_step.map(str::to_string),
+        });
+        Outcome { arguments: vec![], exit, stdout: vec![], stderr: vec![], failure }
+    }
+
+    /// A served record counts as made only after an answer that asks nothing further: success, or
+    /// a refusal naming no remedy. A kill is no answer, and a refusal naming a remedy sends the user
+    /// through it first.
+    ///
+    /// Revert: count a kill as an answer → a command killed after its record was durable heals
+    /// with no retry; count any refusal → a stale lock's refusal heals before its remedy runs.
+    #[test]
+    fn only_an_answer_asking_nothing_further_settles_a_served_record() {
+        assert!(answered(Some(&answer(Some(0), "", None))));
+        assert!(answered(Some(&answer(Some(1), "Nothing to stack: the inventory matches the head of pallet \"main\".", None))));
+        assert!(!answered(Some(&answer(None, "", None))), "a kill is no answer");
+        assert!(!answered(Some(&answer(Some(26), "This bay is behind pallet \"main\".", Some("forklift shift main")))));
+        assert!(!answered(Some(&answer(Some(6), "If that process is no longer running, remove \"/s/work/.forklift/lock\" and try again.", None))));
+        assert!(!answered(None));
     }
 
 }
