@@ -69,7 +69,9 @@
 //!   [`MAX_STAGED_OBJECT_BYTES`], the hard ceiling regardless of path. The form check holds only
 //!   the header and a blob's version, except for a tree, parcel or recipe, which it holds up to
 //!   core's whole-object ceiling (`MAX_OBJECT_BYTES`) to parse, refusing one past it (and never
-//!   holding one whose header declares it past it). Once the hash
+//!   holding one whose header declares it past it). The verifier Lambda's store never holds one:
+//!   it leaves it staged for the lift commit, in the control plane, sized to parse it
+//!   ([`S3ObjectStore::leaving_large_structured_staged`]). Once the hash
 //!   and the form are known good, promotion moves the bytes with a server-side `CopyObject` rather
 //!   than re-uploading them from a buffer this process would otherwise have had to hold.
 //!
@@ -132,6 +134,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::result::SdkError;
 
+use forklift_core::enums::object_type::ObjectType;
 use forklift_core::util::object_utils::ObjectFormCheck;
 use forklift_core::util::{object_utils, warehouse_utils};
 
@@ -291,6 +294,10 @@ pub struct S3ObjectStore {
     bucket: String,
     warehouse: String,
     bridge: AsyncBridge,
+    /// Whether [`ObjectStore::verify_and_promote`] streams a tree, parcel or recipe at or above
+    /// [`STREAMING_THRESHOLD_BYTES`], holding it to parse it, or leaves it staged
+    /// ([`PromoteOutcome::LeftStaged`]). See [`S3ObjectStore::leaving_large_structured_staged`].
+    holds_large_structured: bool,
 }
 
 /// The outcome of a conditional (`If-None-Match: *`) write: it landed, or the key already
@@ -316,8 +323,11 @@ enum StreamHash {
     /// was abandoned rather than let the transfer keep going indefinitely.
     TooLarge,
     /// The object's form was refused before it finished streaming (a chunk past the chunk
-    /// ceiling): core's refusal.
+    /// ceiling, which no hash would make storable): core's refusal.
     Refused(String),
+    /// The object is a tree, parcel or recipe and the caller does not hold one: the rest of it was
+    /// not read.
+    Structured,
 }
 
 /// The outcome of the ETag-pinned server-side copy in [`S3ObjectStore::copy_staged_to_canonical`].
@@ -343,9 +353,17 @@ enum CopyOutcome {
 /// The same bytes go through core's [`ObjectFormCheck`] for the object named `claimed_hash`, so the
 /// staged object's form is judged by the rules core's own streaming store applies.
 ///
+/// When `holds_structured` is false, a tree, parcel or recipe is answered
+/// [`StreamHash::Structured`] once its header is read, before any of it is held.
+///
 /// A free function (not a method) so a unit test can drive it with a small `cap` and a small
 /// `ByteStream`, without any AWS credentials or a multi-gigabyte payload.
-async fn stream_hash_capped(mut body: ByteStream, cap: u64, claimed_hash: &str) -> Result<StreamHash, String> {
+async fn stream_hash_capped(
+    mut body: ByteStream,
+    cap: u64,
+    claimed_hash: &str,
+    holds_structured: bool,
+) -> Result<StreamHash, String> {
     let mut hasher = blake3::Hasher::new();
     let mut form = ObjectFormCheck::new(claimed_hash);
     let mut total: u64 = 0;
@@ -363,6 +381,12 @@ async fn stream_hash_capped(mut body: ByteStream, cap: u64, claimed_hash: &str) 
 
         if let Err(refusal) = form.update(&chunk) {
             return Ok(StreamHash::Refused(refusal));
+        }
+
+        if !holds_structured
+            && matches!(form.object_type(), Some(ObjectType::Tree | ObjectType::Parcel | ObjectType::Recipe))
+        {
+            return Ok(StreamHash::Structured);
         }
     }
 
@@ -435,7 +459,20 @@ impl S3ObjectStore {
     ) -> Result<S3ObjectStore, String> {
         warehouse_utils::validate_warehouse_id(&warehouse)?;
 
-        Ok(S3ObjectStore { client, bucket, warehouse, bridge })
+        Ok(S3ObjectStore { client, bucket, warehouse, bridge, holds_large_structured: true })
+    }
+
+    /// This store, made to leave a staged tree, parcel or recipe at or above
+    /// [`STREAMING_THRESHOLD_BYTES`] staged rather than promote it: `verify_and_promote` answers
+    /// [`PromoteOutcome::LeftStaged`] for it as soon as its header is read. The verifier Lambda's
+    /// store, whose memory stays flat whatever it is sent: parsing such an object holds up to about
+    /// three times core's whole-object ceiling, which only the control plane is sized for. A client
+    /// names every tree, parcel and recipe among the objects its lift commit promotes, so the
+    /// commit promotes it there; one named only as a blob stays staged and its commit is never
+    /// ready, and nothing unchecked is promoted either way.
+    pub fn leaving_large_structured_staged(mut self) -> S3ObjectStore {
+        self.holds_large_structured = false;
+        self
     }
 
     /// Whether a key exists (an S3 `HEAD`). A `404` is `Ok(false)`, not an error. See
@@ -905,7 +942,11 @@ impl ObjectStore for S3ObjectStore {
                 // Large, or a length S3 did not declare: never buffer a blob or a chunk.
                 // Stream-hash with a hard cap, so memory use is bounded by chunk size — not by
                 // whatever a client claims or actually uploaded.
-                match stream_hash_capped(output.body, MAX_STAGED_OBJECT_BYTES, hash).await? {
+                match stream_hash_capped(output.body, MAX_STAGED_OBJECT_BYTES, hash, self.holds_large_structured)
+                    .await?
+                {
+                    // Left for the lift commit to promote: the staged copy stays.
+                    StreamHash::Structured => return Ok(PromoteOutcome::LeftStaged),
                     StreamHash::TooLarge => {
                         self.drop_staged(&staged).await;
 
@@ -1306,11 +1347,11 @@ mod tests {
         let expected = object_utils::hash_object_bytes(&payload);
 
         let body = ByteStream::from(payload);
-        let outcome = stream_hash_capped(body, MAX_STAGED_OBJECT_BYTES, &expected).await.expect("stream");
+        let outcome = stream_hash_capped(body, MAX_STAGED_OBJECT_BYTES, &expected, true).await.expect("stream");
 
         match outcome {
             StreamHash::Hash { actual, .. } => assert_eq!(actual, expected),
-            StreamHash::TooLarge | StreamHash::Refused(_) => panic!("well under the cap"),
+            StreamHash::TooLarge | StreamHash::Refused(_) | StreamHash::Structured => panic!("well under the cap"),
         }
     }
 
@@ -1323,7 +1364,7 @@ mod tests {
         let payload = vec![0u8; 64];
         let body = ByteStream::from(payload);
 
-        let outcome = stream_hash_capped(body, 16, "unused").await.expect("stream");
+        let outcome = stream_hash_capped(body, 16, "unused", true).await.expect("stream");
 
         assert!(matches!(outcome, StreamHash::TooLarge));
     }
@@ -1337,12 +1378,38 @@ mod tests {
         let expected = object_utils::hash_object_bytes(&payload);
         let body = ByteStream::from(payload);
 
-        let outcome = stream_hash_capped(body, 32, &expected).await.expect("stream");
+        let outcome = stream_hash_capped(body, 32, &expected, true).await.expect("stream");
 
         match outcome {
             StreamHash::Hash { actual, .. } => assert_eq!(actual, expected),
-            StreamHash::TooLarge | StreamHash::Refused(_) => panic!("exactly at the cap must still be accepted"),
+            StreamHash::TooLarge | StreamHash::Refused(_) | StreamHash::Structured => panic!("exactly at the cap must still be accepted"),
         }
+    }
+
+    /// A store that does not hold a tree, parcel or recipe stops reading one at its header, so
+    /// none of it is held; a blob streams on, and a store that holds them streams a tree on too.
+    ///
+    /// Revert: drop the `holds_structured` check → the tree is hashed whole, not `Structured`.
+    #[tokio::test]
+    async fn a_store_that_does_not_hold_a_tree_stops_at_its_header() {
+        let tree = |len: u64| {
+            let mut bytes = forklift_core::util::byte_utils::number_to_vlq_bytes(1);
+            bytes.extend(forklift_core::util::byte_utils::number_to_vlq_bytes(ObjectType::Tree.get_code()));
+            bytes.extend(forklift_core::util::byte_utils::number_to_vlq_bytes(len));
+            bytes.push(0);
+            bytes.extend(vec![0u8; len as usize]);
+            bytes
+        };
+        let blob = object_utils::blob_bytes(b"a file's content");
+
+        let outcome = stream_hash_capped(ByteStream::from(tree(64)), MAX_STAGED_OBJECT_BYTES, "t", false).await.expect("stream");
+        assert!(matches!(outcome, StreamHash::Structured), "a tree is read on");
+
+        let outcome = stream_hash_capped(ByteStream::from(blob.clone()), MAX_STAGED_OBJECT_BYTES, "b", false).await.expect("stream");
+        assert!(matches!(outcome, StreamHash::Hash { .. }), "a blob is not hashed");
+
+        let outcome = stream_hash_capped(ByteStream::from(tree(64)), MAX_STAGED_OBJECT_BYTES, "t", true).await.expect("stream");
+        assert!(matches!(outcome, StreamHash::Hash { .. }), "a store that holds trees stops at one");
     }
 
     /// Builds a synthetic `HeadObject` `SdkError` carrying `status` and `code` — no S3 client, no

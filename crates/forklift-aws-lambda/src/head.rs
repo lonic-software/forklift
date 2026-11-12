@@ -1657,9 +1657,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     match self.objects.get(hash).map_err(HeadError::internal)? {
                         Some(bytes) => {
                             // Bytes the store holds that core would not take in are refused by
-                            // name, not answered as a failure of this head's own.
-                            object_utils::validate_imported_object(hash, &bytes).map_err(held_object_refused)?;
-                            object_utils::store_object_bytes(hash, &bytes).map_err(HeadError::internal)?;
+                            // name, not answered as a failure of this head's own. Told apart only
+                            // once the store has refused them, so each object is checked once.
+                            if let Err(error) = object_utils::store_object_bytes(hash, &bytes) {
+                                return Err(match object_utils::validate_imported_object(hash, &bytes) {
+                                    Err(refusal) => held_object_refused(refusal),
+                                    Ok(()) => HeadError::internal(error),
+                                });
+                            }
                             Some(bytes)
                         }
                         // The store lacks it: it is simply not in the bundle — the documented
@@ -1798,6 +1803,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     return Err(HeadError::unprocessable(format!(
                         "{} The staged copy was discarded, and the lift session cannot commit.",
                         reason
+                    )))
+                }
+                // The head's store holds every object it promotes; only the verifier's leaves one.
+                PromoteOutcome::LeftStaged => {
+                    return Err(HeadError::internal(format!(
+                        "The object store left staged object {} unpromoted.",
+                        hash
                     )))
                 }
             }

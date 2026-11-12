@@ -125,6 +125,10 @@ pub enum PromoteOutcome {
         /// Core's refusal, naming the object and why.
         reason: String,
     },
+    /// The staged object is a large tree, parcel or recipe, which this store does not hold to
+    /// parse: it is still staged, unpromoted, for a store that does (the lift commit's). Only the
+    /// verifier's store answers it.
+    LeftStaged,
 }
 
 /// Whether a commit's decision (a ref update's audit, or a delete's authorization) consumed the

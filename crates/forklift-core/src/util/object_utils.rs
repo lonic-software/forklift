@@ -1271,10 +1271,15 @@ impl ObjectFormCheck {
             }
         }
 
-        // A tree, parcel or recipe past the whole-object ceiling is no longer held: it is refused.
-        if self.structured.as_ref().is_some_and(|bytes| bytes.len() > MAX_OBJECT_BYTES) {
-            self.structured = None;
-            self.over_ceiling = true;
+        // A tree, parcel or recipe longer than its header declares is no longer held: its declared
+        // length is already wrong, and `finish` refuses it on that. Its declared length is under
+        // the ceiling, so it is never held past the ceiling either.
+        if let StreamHeader::Read { header_len, content_length, .. } = self.header {
+            if self.structured.is_some()
+                && self.read_total.saturating_sub(header_len as u64) > content_length
+            {
+                self.structured = None;
+            }
         }
 
         // A `Chunk`-typed object whose payload exceeds the per-chunk ceiling is refused mid-stream,
@@ -1289,6 +1294,14 @@ impl ObjectFormCheck {
         }
 
         Ok(())
+    }
+
+    /// The object's type, once its header has been read.
+    pub fn object_type(&self) -> Option<&ObjectType> {
+        match &self.header {
+            StreamHeader::Read { object_type, .. } => Some(object_type),
+            StreamHeader::Pending(_) | StreamHeader::Refused(_) => None,
+        }
     }
 
     /// Judge the whole object, once every byte has been fed and its hash has verified.
@@ -1310,14 +1323,14 @@ impl ObjectFormCheck {
                 Err(PeekError::UnknownVersion(version)) => Some(StreamRefusal::UnknownVersion(version)),
                 Err(PeekError::Malformed(reason)) => Some(StreamRefusal::Malformed(reason)),
             },
-            StreamHeader::Read { object_type, .. } if self.over_ceiling =>
-                Some(StreamRefusal::OverCeiling(object_type, self.read_total)),
-            StreamHeader::Read { header_len, content_length, .. } =>
-                check_declared_length(content_length, self.read_total - header_len as u64)
-                    .map_err(|error| error.to_string())
-                    .and_then(|()| self.blob_head.as_deref().map_or(Ok(()), check_blob_version))
-                    .err()
-                    .map(StreamRefusal::Malformed),
+            // The declared length is judged first, as the buffered check judges it: a header that
+            // declares more than followed is malformed, not over the ceiling.
+            StreamHeader::Read { object_type, header_len, content_length } =>
+                match check_declared_length(content_length, self.read_total - header_len as u64) {
+                    Err(error) => Some(StreamRefusal::Malformed(error.to_string())),
+                    Ok(()) if self.over_ceiling => Some(StreamRefusal::OverCeiling(object_type, self.read_total)),
+                    Ok(()) => self.blob_head.as_deref().map_or(Ok(()), check_blob_version).err().map(StreamRefusal::Malformed),
+                },
             StreamHeader::Refused(refusal) => Some(refusal),
         };
 
@@ -1350,8 +1363,9 @@ impl ObjectFormCheck {
 /// [`store_object_bytes`] refuses it whole. So is the object's form, as [`enforce_header_policy`]
 /// holds it: a malformed header or blob version is refused, and a tree, parcel or recipe is held
 /// in memory and parsed before it is promoted, or refused when it is above the whole-object
-/// ceiling. Every refusal of form is made only once the hash verifies, so damaged bytes are
-/// reported as damage.
+/// ceiling. Every refusal of form but the chunk ceiling's is made only once the hash verifies, so
+/// damaged bytes are reported as damage; a chunk past its ceiling is refused mid-stream, before
+/// its hash is known, since no hash would make it storable.
 ///
 /// # Arguments
 /// * `claimed_hash` - The hash the streamed bytes must have.
@@ -2501,9 +2515,13 @@ mod tests {
     }
 
     /// A tree whose header declares it past the whole-object ceiling is never held by the form
-    /// check, while one under it is, and both are judged as before once the stream ends.
+    /// check, while one under it is. One that ends short of its declared length is refused as
+    /// malformed, not as over the ceiling, as the buffered check refuses it; one that runs on past
+    /// its declared length is let go of at once.
     ///
-    /// Revert: buffer every tree from its header on → the declared-over-ceiling one is held.
+    /// Revert: buffer every tree from its header on → the declared-over-ceiling one is held; judge
+    /// the ceiling before the declared length → the short one is "over the ceiling"; keep holding
+    /// a tree past its declared length → the overrun one is held.
     #[test]
     fn the_form_check_never_holds_a_tree_declared_past_the_ceiling() {
         let header = |body_len: usize| {
@@ -2518,11 +2536,19 @@ mod tests {
         over.update(&header(MAX_OBJECT_BYTES)).expect("a header");
         over.update(&[0u8; 1024]).expect("some body");
         assert!(over.structured.is_none() && over.over_ceiling, "a declared-over-ceiling tree is held");
-        assert!(over.finish().expect_err("over the ceiling").contains("ceiling"));
+        let err = over.finish().expect_err("short of its declared length");
+        assert!(err.contains("declares") && !err.contains("ceiling"), "{}", err);
 
         let mut under = ObjectFormCheck::new("under");
         under.update(&header(16)).expect("a header");
         assert!(under.structured.is_some() && !under.over_ceiling, "a small tree is held to be parsed");
+
+        let mut overrun = ObjectFormCheck::new("overrun");
+        overrun.update(&header(16)).expect("a header");
+        overrun.update(&[0u8; 17]).expect("one byte past its declared length");
+        assert!(overrun.structured.is_none(), "a tree past its declared length is held");
+        let err = overrun.finish().expect_err("past its declared length");
+        assert!(err.contains("declares"), "{}", err);
     }
 
     /// A tree streamed above the whole-object ceiling is refused only once its bytes are whole and

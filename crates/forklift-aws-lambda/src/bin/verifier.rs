@@ -9,6 +9,9 @@
 //! fetchable (invariant 1), and it is idempotent, so this racing the control plane's
 //! `commit_lift` on one hash is safe.
 //!
+//! A tree, parcel or recipe at or above the streaming threshold is left staged, unread past its
+//! header: parsing one is sized for the control plane, whose lift commit promotes it.
+//!
 //! The warehouse in the key is trusted because the key is: the only presigned `PUT` the control
 //! plane mints is to a staging key of the warehouse the request was authorized for, and the
 //! signature covers the key.
@@ -102,7 +105,9 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
             staged.warehouse.to_string(),
             context.bridge.clone(),
         ) {
-            Ok(objects) => objects,
+            // A large tree, parcel or recipe is left for the lift commit: parsing one is sized for
+            // the control plane, not for this function.
+            Ok(objects) => objects.leaving_large_structured_staged(),
             Err(e) => {
                 eprintln!("verifier: ignoring a staging object of no warehouse: {}: {}", key, e);
                 continue;
@@ -188,6 +193,9 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
             }
             PromoteOutcome::Malformed { reason } => {
                 eprintln!("verifier: discarded malformed staged object {}: {}", key, reason)
+            }
+            PromoteOutcome::LeftStaged => {
+                eprintln!("verifier: left staged object {} for its lift commit: a large tree, parcel or recipe", key)
             }
         }
     }
