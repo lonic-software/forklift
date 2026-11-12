@@ -76,6 +76,11 @@ pub fn number_to_vlq_bytes(mut number: u64) -> Vec<u8> {
 /// The byte sequence is consumed until the number is fully decoded.
 /// If we don't find a number in the first 10 bytes, further bytes are not consumed.
 ///
+/// Only the shortest encoding of a number is accepted, the one [`number_to_vlq_bytes`] writes: a
+/// multi-byte encoding whose last byte is zero (`80 00`, `81 80 00`) carries a group of seven zero
+/// bits that adds nothing, and is refused. Objects are named by the hash of their bytes, so a
+/// second spelling of one number would give one object a second name.
+///
 /// # Arguments
 /// * `offset`  - The offset to start decoding at.
 /// * `content` - The byte sequence.
@@ -83,7 +88,8 @@ pub fn number_to_vlq_bytes(mut number: u64) -> Vec<u8> {
 ///
 /// # Returns
 /// * `Ok(u64)`    - The decoded number.
-/// * `Err(String)`- The error message if the number could not be decoded.
+/// * `Err(String)`- The error message if the number could not be decoded, or is not in its
+///                  shortest encoding.
 pub fn number_from_vlq_bytes(offset: usize, content: &[u8]) -> Result<(u64, usize), String> {
     let mut cursor = 0;
     let mut value: u64 = 0;
@@ -105,6 +111,10 @@ pub fn number_from_vlq_bytes(offset: usize, content: &[u8]) -> Result<(u64, usiz
 
         // If the MSB is not set, the number is fully decoded
         if byte & 0x80 == 0 {
+            if byte == 0 && cursor > 1 {
+                return Err("VLQ encoded value is not in its shortest encoding".to_string());
+            }
+
             return Ok((value, cursor));
         }
 
@@ -163,6 +173,28 @@ mod tests {
         *bytes.last_mut().unwrap() = 0b0000_0011;
 
         assert!(number_from_vlq_bytes(0, &bytes).is_err());
+    }
+
+    /// A number has one spelling: a trailing group of zero bits is refused at every length, while
+    /// a lone zero byte is the number zero.
+    ///
+    /// Revert: accept a final zero byte after a continuation → the padded spellings decode.
+    #[test]
+    fn vlq_decoding_rejects_an_overlong_encoding() {
+        assert_eq!(number_from_vlq_bytes(0, &[0x00]), Ok((0, 1)));
+        assert_eq!(number_from_vlq_bytes(0, &[0x81, 0x01]), Ok((129, 2)));
+
+        for overlong in [&[0x80, 0x00][..], &[0x81, 0x00], &[0x81, 0x80, 0x00], &[0xFF, 0x80, 0x80, 0x00]] {
+            let error = number_from_vlq_bytes(0, overlong).expect_err("an overlong VLQ must be refused");
+            assert!(error.contains("shortest encoding"), "{:02x?}: {}", overlong, error);
+        }
+
+        // The longest legal spelling, u64::MAX, still ends in a non-zero byte.
+        let max = number_to_vlq_bytes(u64::MAX);
+        assert_eq!(max.len(), 10);
+        let mut padded = max.clone();
+        *padded.last_mut().unwrap() = 0x00;
+        assert!(number_from_vlq_bytes(0, &padded).is_err(), "a ten-byte spelling of a smaller number");
     }
 
     #[test]

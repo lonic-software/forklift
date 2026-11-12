@@ -2772,14 +2772,15 @@ fn verify_incoming_packs(packs: &[LoadedPack])
         let mut hash = [0u8; HASH_LEN];
         hash.copy_from_slice(locator.hash_of(*entry));
         let bytes = resolve_incoming_object(&hash, &locator, &mut cache, &mut visiting, 0)?;
-        // `resolve_incoming_object` has already refused an unknown version. It is refused here too
-        // rather than skipped, since a parcel left out of this set escapes the signature checks.
+        // `resolve_incoming_object` has already refused a header that does not peek. It is
+        // refused here too rather than skipped, since a parcel left out of this set escapes the
+        // signature checks.
         match object_utils::peek_object_header(&bytes) {
             Ok((ObjectType::Parcel, _)) => {
                 parcels.insert(sign_utils::to_hex(&hash));
             }
-            Ok(_) | Err(object_utils::PeekError::Malformed(_)) => {}
-            Err(error @ object_utils::PeekError::UnknownVersion(_)) => {
+            Ok(_) => {}
+            Err(error) => {
                 return Err(format!("Incoming object {}: {}", sign_utils::to_hex(&hash), error));
             }
         }
@@ -7160,6 +7161,46 @@ pub(crate) mod tests {
         for path in &state.recorded {
             assert!(path.starts_with("objects/pack"), "expected a pack path, got {:?}", path);
         }
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    /// An incoming pack holding an object in a second spelling (here, padding before its header's
+    /// null) is refused whole: each reconstructed object is held to the same policy as a stored one.
+    ///
+    /// Revert: let `enforce_header_policy` pass a malformed header → the pack is installed.
+    #[test]
+    fn import_transport_packs_refuses_an_object_whose_header_does_not_peek() {
+        let temp = std::env::temp_dir().join(format!("forklift-transport-malformed-{}", std::process::id()));
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+
+        // A blob whose header carries a padding byte before its null.
+        let mut content = crate::util::object_utils::blob_bytes(b"padded header");
+        let null_at = content.iter().position(|&byte| byte == 0).unwrap();
+        content.insert(null_at, b'X');
+        let hash = blake3::hash(&content).to_hex().to_string();
+
+        let staging = temp.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let mut builder = TransportPackBuilder::new(&staging).unwrap();
+        builder.append_full(&hash, &content).unwrap();
+        let artifacts = builder.finish().unwrap();
+
+        let data_bytes = std::fs::read(&artifacts[0].data_path).unwrap();
+        let index_bytes = std::fs::read(&artifacts[0].index_path).unwrap();
+        let sections = vec![(data_bytes.len() as u64, index_bytes.len() as u64)];
+        let mut combined = data_bytes;
+        combined.extend_from_slice(&index_bytes);
+
+        let error = match import_transport_packs(&mut std::io::Cursor::new(combined), &sections) {
+            Err(error) => error,
+            Ok(_) => panic!("a pack holding a malformed object must be refused"),
+        };
+        assert!(error.contains("not a well-formed object") && error.contains("null byte"), "got: {}", error);
+        assert!(!crate::util::file_utils::does_object_exist(&hash).unwrap(), "the object must not be installed");
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }

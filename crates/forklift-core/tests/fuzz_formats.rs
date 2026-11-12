@@ -31,7 +31,15 @@ use forklift_core::model::parcel_action::ParcelAction;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::parser::inventory::inventory_parser::parse_inventory;
 use forklift_core::parser::object::loose_object_parser::parse as parse_loose_object;
-use forklift_core::util::byte_utils::number_to_vlq_bytes;
+use forklift_core::enums::object::compact_parcel_version::CompactParcelVersion;
+use forklift_core::enums::object::loose_object_version::LooseObjectVersion;
+use forklift_core::enums::object::recipe_version::RecipeVersion;
+use forklift_core::enums::object::tree_version::TreeVersion;
+use forklift_core::enums::object_type::ObjectType;
+use forklift_core::model::chunk::Chunk;
+use forklift_core::model::recipe::{Recipe, RecipeChunk};
+use forklift_core::util::byte_utils::{number_from_vlq_bytes, number_to_vlq_bytes};
+use forklift_core::util::chunk_utils::MAX_CHUNK_BYTES;
 
 // ---------------------------------------------------------------------------------------------
 // Deterministic RNG (splitmix64) — no external dependency, reproducible seed → stream.
@@ -539,5 +547,162 @@ mod regressions {
         // And a frame that overruns a small declared length is rejected, not truncated.
         let error = decompress_delta(&base, &delta, 4).expect_err("an overrunning frame");
         assert!(error.contains("declared"), "{}", error);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The canonical property: one value, one spelling.
+// ---------------------------------------------------------------------------------------------
+
+/// A loose object around `body`: the latest header version, the type, the body length, a null.
+fn wrap(object_type: ObjectType, body: &[u8]) -> Vec<u8> {
+    let mut bytes = number_to_vlq_bytes(LooseObjectVersion::latest().get_code());
+    bytes.extend(number_to_vlq_bytes(object_type.get_code()));
+    bytes.extend(number_to_vlq_bytes(body.len() as u64));
+    bytes.push(0);
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+fn recipe_seed(rng: &mut Rng) -> Recipe {
+    let chunks: Vec<RecipeChunk> = (0..rng.below(5))
+        .map(|_| RecipeChunk { hash: random_hash(rng), size: 1 + rng.below(MAX_CHUNK_BYTES) as u64 })
+        .collect();
+    Recipe {
+        content_hash: random_hash(rng),
+        total_size: chunks.iter().map(|chunk| chunk.size).sum(),
+        chunks,
+    }
+}
+
+/// `text` without the bytes the first tree and parcel versions use as terminators (null, end of
+/// text, new line), which those versions cannot hold inside a name or a description; that is why
+/// the second versions length-prefix them.
+fn first_version_text(text: &str) -> String {
+    text.replace(['\u{0}', '\u{3}', '\n'], ".")
+}
+
+/// One valid object of every type in every body version this build reads, each written by that
+/// version's own builder (not by `LooseObjectBuilder`, which writes only the latest versions).
+fn every_version_fixtures(rng: &mut Rng) -> Vec<(String, Vec<u8>)> {
+    let mut fixtures = vec![
+        ("blob".to_string(), blob_object_bytes(rng)),
+        ("chunk".to_string(), LooseObjectBuilder::build_chunk(&Chunk { content: (0..rng.below(64)).map(|_| rng.byte()).collect() }).content),
+    ];
+    for code in 1.. {
+        let Ok(version) = TreeVersion::from_code(code) else { break };
+        let mut tree = tree_seed(rng);
+        if code == 1 {
+            let seed = tree;
+            tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+            for (name, child) in seed.get_subtrees().chain(seed.get_files()) {
+                tree.add_child(TreeItem::new(first_version_text(name), child.hash.clone(), child.item_type));
+            }
+        }
+        fixtures.push((format!("tree v{}", code), wrap(ObjectType::Tree, &version.get_builder()(&tree))));
+    }
+    for code in 1.. {
+        let Ok(version) = CompactParcelVersion::from_code(code) else { break };
+        let mut parcel = parcel_seed(rng);
+        if code == 1 {
+            for action in &mut parcel.actions {
+                action.description = action.description.as_deref().map(first_version_text);
+            }
+            parcel.description = parcel.description.as_deref().map(first_version_text);
+        }
+        fixtures.push((format!("parcel v{}", code), wrap(ObjectType::Parcel, &version.get_builder()(&parcel))));
+    }
+    for code in 1.. {
+        let Ok(version) = RecipeVersion::from_code(code) else { break };
+        fixtures.push((format!("recipe v{}", code), wrap(ObjectType::Recipe, &version.get_builder()(&recipe_seed(rng)))));
+    }
+    fixtures
+}
+
+/// The bytes the format writes for the object `bytes` parsed to, in the body version `bytes`
+/// declares.
+fn rebuild(bytes: &[u8], parsed: &ParsedObject) -> Vec<u8> {
+    let mut at = 0;
+    for _ in 0..3 {
+        at += number_from_vlq_bytes(at, bytes).unwrap().1;
+    }
+    at += 1;
+    let body_version = || number_from_vlq_bytes(at, bytes).unwrap().0;
+
+    match parsed {
+        ParsedObject::Blob(blob) => LooseObjectBuilder::build_blob(blob).content,
+        ParsedObject::Chunk(chunk) => LooseObjectBuilder::build_chunk(chunk).content,
+        ParsedObject::Tree(tree) =>
+            wrap(ObjectType::Tree, &TreeVersion::from_code(body_version()).unwrap().get_builder()(tree)),
+        ParsedObject::Parcel(parcel) =>
+            wrap(ObjectType::Parcel, &CompactParcelVersion::from_code(body_version()).unwrap().get_builder()(parcel)),
+        ParsedObject::Recipe(recipe) =>
+            wrap(ObjectType::Recipe, &RecipeVersion::from_code(body_version()).unwrap().get_builder()(recipe)),
+    }
+}
+
+/// Rewrite one byte below `0x80` of a whole object as the two-byte overlong spelling of the same
+/// value (`b | 0x80`, then `00`), fixing up the declared content length when the byte lies in the
+/// body. Where the byte ends a VLQ this is a second spelling of the same number; random mutation
+/// almost never produces one with the length still consistent.
+fn respell_a_vlq_end(bytes: &mut Vec<u8>, rng: &mut Rng) {
+    let mut header_len = 0;
+    for _ in 0..3 {
+        header_len += number_from_vlq_bytes(header_len, bytes).unwrap().1;
+    }
+    header_len += 1;
+    let object_type = ObjectType::from_code(number_from_vlq_bytes(number_from_vlq_bytes(0, bytes).unwrap().1, bytes).unwrap().0).unwrap();
+
+    let candidates: Vec<usize> = (0..bytes.len()).filter(|&at| at + 1 != header_len && bytes[at] < 0x80).collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let at = candidates[rng.below(candidates.len())];
+    let respelled = [bytes[at] | 0x80, 0x00];
+    bytes.splice(at..at + 1, respelled);
+    if at >= header_len {
+        *bytes = wrap(object_type, &bytes[header_len..].to_vec());
+    }
+}
+
+/// Any bytes the loose-object parser accepts are exactly the bytes the format writes for what they
+/// parsed to: an object is named by the hash of its bytes, so a second spelling of one value
+/// would give it a second name, out of reach of a signature or a redaction naming the first.
+///
+/// The fixtures cover every body version, and the rebuild uses the version the bytes declare, so
+/// this also pins the builders of the older versions: they are part of the format, and changing
+/// what one writes would leave every object it already wrote unreadable.
+///
+/// Revert: drop the shortest-VLQ rule, the header's null or length check, or the tree or parcel
+/// canonical comparison → mutated inputs parse to a value that rebuilds differently. The first
+/// recipe version is canonical by construction once its numbers are (fixed-length hashes, no
+/// trailing bytes), so its comparison is reached only with the shortest-VLQ rule dropped too.
+#[test]
+fn every_accepted_object_is_in_its_canonical_form() {
+    let mut rng = Rng::new(0xC0DE_0001);
+    let mut accepted: std::collections::BTreeMap<String, usize> = Default::default();
+
+    for _ in 0..3000 {
+        for (label, fixture) in every_version_fixtures(&mut rng) {
+            let parsed = parse_loose_object(&fixture).unwrap_or_else(|e| panic!("{}: {}", label, e));
+            assert_eq!(rebuild(&fixture, &parsed), fixture, "{} does not round-trip", label);
+
+            let mut bytes = fixture;
+            if rng.below(3) == 0 {
+                respell_a_vlq_end(&mut bytes, &mut rng);
+            } else {
+                mutate(&mut bytes, &mut rng);
+            }
+            let Ok(parsed) = parse_loose_object(&bytes) else { continue };
+            let rebuilt = rebuild(&bytes, &parsed);
+            assert!(rebuilt == bytes, "{} mutated to a second spelling\n  in : {:02x?}\n  out: {:02x?}",
+                label, bytes, rebuilt);
+            *accepted.entry(label).or_default() += 1;
+        }
+    }
+
+    // The property is only as strong as the mutated inputs that still parse.
+    for label in ["blob", "chunk", "tree v1", "tree v2", "parcel v1", "parcel v2", "recipe v1"] {
+        assert!(accepted.get(label).copied().unwrap_or(0) >= 20, "too few accepted {} mutations: {:?}", label, accepted);
     }
 }

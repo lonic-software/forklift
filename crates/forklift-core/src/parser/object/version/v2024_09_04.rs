@@ -9,8 +9,6 @@ use crate::util::byte_utils;
 /// The header of a loose object (version `v2024_09_04`).
 struct ObjectHeader {
     object_type: ObjectType,
-    // The content length is currently unused. Uncomment it once it is needed.
-    //content_length: u64,
 }
 
 /// Parse a parcel object from the given loose object bytes (version `v2024_09_04`).
@@ -135,7 +133,14 @@ pub fn parse(offset: usize, content: &[u8]) -> Result<ParsedObject, String> {
     parsed_object
 }
 
-/// Read the header part of a loose object (version `v2024_09_04`).
+/// Read the header part of a loose object (version `v2024_09_04`): the type VLQ, the content
+/// length VLQ, then a null byte.
+///
+/// The header has one spelling, the one `LooseObjectBuilder` writes: the null comes right after
+/// the content length, and the content length is exactly the number of bytes after the null. An
+/// object is named by the hash of its bytes, so padding before the null, or bytes the length does
+/// not cover, would give one object a second name; both are refused. The peek in
+/// `object_utils::peek_object_header` reads the header by the same rule.
 ///
 /// # Arguments
 /// * `offset`  - The offset to start parsing at. This should be the byte *after*
@@ -159,17 +164,25 @@ fn read_header(offset: usize, content: &[u8]) -> Result<(ObjectHeader, usize), S
 
     let object_type = ObjectType::from_code(object_type_code)?;
 
-    // We discard the content length, as it is currently unused.
-    byte_utils::number_from_vlq_bytes(offset + cursor, content)
+    let content_length = byte_utils::number_from_vlq_bytes(offset + cursor, content)
         .map(|(value, bytes_read)| {
             cursor += bytes_read;
             value
         })
         .map_err(|e| format!("Failed to parse object content length: {}", e))?;
 
-    // Discard everything until the next null byte, which indicates the end of the header.
-    byte_utils::read_until_byte_value(offset + cursor, content, globals::BYTE_NULL)
-        .inspect(|(_, bytes_read)| cursor += bytes_read);
+    if content.get(offset + cursor) != Some(&globals::BYTE_NULL) {
+        return Err("The object header does not end in a null byte right after its content length.".to_string());
+    }
+    cursor += 1;
+
+    let actual_length = content.len() - (offset + cursor);
+    if content_length != actual_length as u64 {
+        return Err(format!(
+            "The object header declares {} bytes of content, but {} follow it.",
+            content_length, actual_length
+        ));
+    }
 
     let header = ObjectHeader {
         object_type,
