@@ -918,6 +918,27 @@ fn edge_value(rng: &mut Rng) -> Value {
     }
 }
 
+/// Path spellings for a `touches` leaf: some name a place inside the warehouse, the root among
+/// them, and the rest climb out of it, are absolute, empty or carry a control character.
+const PATH_SPELLINGS: &[&str] = &[
+    "src", "src/app.rs", ".", "./", "src/..", "a/./b", "a//b", "src/", "\u{e9}/x",
+    "", "..", "../outside", "src/../..", "a/../../b", "/abs", "/", "a\u{1}b", "a\tb",
+];
+
+/// Give every `touches` leaf in `node` a spelling from [`PATH_SPELLINGS`].
+fn respell_paths(node: &mut Value, rng: &mut Rng) {
+    match node {
+        Value::Object(object) => {
+            if object.get("op") == Some(&json!("touches")) && object.contains_key("value") {
+                object.insert("value".to_string(), json!(PATH_SPELLINGS[rng.below(PATH_SPELLINGS.len())]));
+            }
+            object.values_mut().for_each(|child| respell_paths(child, rng));
+        }
+        Value::Array(items) => items.iter_mut().for_each(|child| respell_paths(child, rng)),
+        _ => {}
+    }
+}
+
 /// Every value position in `node`, as a path of object keys and array indexes.
 fn value_paths(node: &Value, here: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
     out.push(here.clone());
@@ -1001,6 +1022,9 @@ fn predicates_are_accepted_exactly_when_the_grammar_accepts_them() {
 
     for case in 0..30_000 {
         let mut tree = predicate_tree(&mut rng, 5);
+        if case % 3 == 0 {
+            respell_paths(&mut tree, &mut rng);
+        }
         if case % 10 != 0 {
             for _ in 0..1 + rng.below(2) {
                 mutate_predicate(&mut tree, &mut rng);
