@@ -11,3 +11,4 @@ pub mod oracle;
 pub mod remedy;
 pub mod report;
 pub mod scrub;
+pub mod tool;
