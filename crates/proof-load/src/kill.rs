@@ -301,7 +301,9 @@ pub fn recorded_root(root: &Path, needles: &[&str]) -> std::io::Result<Option<St
             std::fs::read(&path)?
         };
         if needles.iter().any(|needle| holds_root(&bytes, needle.as_bytes())) {
-            return Ok(Some(path.strip_prefix(root).unwrap_or(&path).display().to_string()));
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            let parts: Vec<String> = relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
+            return Ok(Some(parts.join("/")));
         }
     }
     Ok(None)
