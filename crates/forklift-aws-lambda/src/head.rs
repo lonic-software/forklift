@@ -1376,8 +1376,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
     /// Whether this invocation's window can take another attempt that took `attempt`, with as
     /// much again to spare and [`REDACTION_ANSWER_RESERVE`] to answer in, so a ref update that keeps
-    /// losing to new redactions answers its `409` rather than run out of time with no answer.
-    /// Without a deadline, always.
+    /// losing to new redactions answers its `409`, and a lift commit promoting large objects its
+    /// not-ready, rather than run out of time with no answer. Without a deadline, always.
     fn affords_another(&self, attempt: std::time::Duration) -> bool {
         self.deadline.is_none_or(|deadline| {
             deadline.duration_since(SystemTime::now()).unwrap_or_default() > attempt * 2 + REDACTION_ANSWER_RESERVE
@@ -1742,7 +1742,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// the upload was discarded (the verifier rejected it) or never sent, a terminal `422`
     /// whose next step is running the lift again.
     ///
-    /// Promotion is idempotent, so a retried commit is safe. Once everything is promoted the
+    /// Promotion is idempotent, so a retried commit is safe. A commit whose promotions would not
+    /// fit the invocation's window answers not-ready once it has promoted what it can, and its
+    /// retry carries on from there. Once everything is promoted the
     /// session's staging prefix is swept — but only on the **final** batch (`more == false`). A
     /// lift touching a maximal chunked file lists too many chunk hashes for one request, so the
     /// client paginates and sets `more: true` on every batch but the last; an early batch verifies
@@ -1774,10 +1776,27 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }
 
         let mut promoted = Vec::new();
+        let mut slowest = std::time::Duration::ZERO;
 
         for hash in control_plane {
+            // A large tree, parcel or recipe is read and parsed here, one at a time, so a batch
+            // of them may not fit the invocation's window. What is promoted stays promoted: the
+            // commit answers not-ready while it still has time, and its retry carries on from there.
+            if !promoted.is_empty() && !self.affords_another(slowest) {
+                self.refuse_applied_promoted(session, &promoted, &withholding)?;
+
+                return Err(HeadError::commit_not_ready(format!(
+                    "The remote promoted {} of the lift's {} objects before running short of time; \
+                    the lift session is not ready to commit.",
+                    promoted.len(),
+                    control_plane.len()
+                )));
+            }
+
+            let started = SystemTime::now();
             let outcome =
                 self.objects.verify_and_promote(session, hash).map_err(HeadError::internal)?;
+            slowest = slowest.max(started.elapsed().unwrap_or_default());
 
             match outcome {
                 PromoteOutcome::Promoted | PromoteOutcome::AlreadyPresent => promoted.push(hash.clone()),

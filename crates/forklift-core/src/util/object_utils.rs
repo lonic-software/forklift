@@ -1203,11 +1203,13 @@ pub struct ObjectFormCheck {
     claimed_hash: String,
     read_total: u64,
     header: StreamHeader,
-    /// The object so far, while it is a tree, parcel or recipe under the whole-object ceiling.
+    /// The object so far, while it is a tree, parcel or recipe whose header declares it under the
+    /// whole-object ceiling and no more has arrived than it declares.
     structured: Option<Vec<u8>>,
     /// The start of a blob's body, up to the most bytes its version can take.
     blob_head: Option<Vec<u8>>,
-    /// Whether the object is a tree, parcel or recipe that passed the whole-object ceiling.
+    /// Whether the object is a tree, parcel or recipe whose header declares it past the
+    /// whole-object ceiling. One that only grows past its declared length is refused on that.
     over_ceiling: bool,
 }
 

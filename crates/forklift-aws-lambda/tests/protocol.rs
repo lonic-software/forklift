@@ -7285,6 +7285,32 @@ fn a_staged_respelled_blob_or_chunk_is_discarded_not_promoted() {
     }
 }
 
+/// A lift commit with no time left for another promotion answers not-ready once it has promoted
+/// one object, leaving the rest staged; its retry, with time, promotes them and commits.
+///
+/// Revert: drop the deadline check in `commit_lift`'s promotion loop → the late commit promotes
+/// both and succeeds.
+#[test]
+fn a_lift_commit_out_of_time_answers_not_ready_and_its_retry_carries_on() {
+    let late = Head::new(MemoryObjectStore::with_redirect("https://s3.example/bucket"), MemoryRefStore::new())
+        .with_deadline(std::time::SystemTime::now());
+    let objects: Vec<Vec<u8>> = vec![object_utils::blob_bytes(b"first"), object_utils::blob_bytes(b"second")];
+    let hashes: Vec<String> = objects.iter().map(|bytes| object_utils::hash_object_bytes(bytes)).collect();
+    for (hash, bytes) in hashes.iter().zip(&objects) {
+        late.objects.stage("lift-1", hash, bytes.clone());
+    }
+
+    let err = late.commit_lift(&Principal::Static, "lift-1", &hashes, &[], false).expect_err("out of time");
+    assert!(err.commit_not_ready, "{}", err.message);
+    assert!(late.objects.exists(&hashes[0]).expect("exists"), "the first is promoted");
+    assert!(!late.objects.exists(&hashes[1]).expect("exists"), "the second is promoted past the deadline");
+
+    let head = late.with_deadline(std::time::SystemTime::now() + std::time::Duration::from_secs(600));
+    head.commit_lift(&Principal::Static, "lift-1", &hashes, &[], false).expect("the retry commits");
+    assert!(head.objects.exists(&hashes[1]).expect("exists"));
+    assert_eq!(head.objects.staged_count(), 0);
+}
+
 /// An object the store holds that core does not take in (one a newer build wrote, or one promoted
 /// before its form was checked) is refused by name in a batch, `422`, not answered as an internal
 /// error of the head's own.
