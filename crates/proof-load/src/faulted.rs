@@ -179,15 +179,14 @@ impl Context<'_> {
             return Ok(HistoryReadback { export, records: Vec::new() });
         }
         // The listing names the records the export left files out of, so it is read only when the
-        // export left something out. One that refuses then leaves those records unnamed, and the
-        // read refuses, as in a scoped bay.
+        // export left something out. When it refuses, the records go unnamed, and each file the
+        // export documents leaving out is admitted as documented in every record: the tool did
+        // tell the user, and the bytes it did serve are still judged.
         let document = runner::document(&export.stdout);
         let left_out = if leaves_out(&document) {
             let listing = self.run(&self.programs.forklift, vec!["--json".into(), "history".into()], bay)?;
-            if !listing.succeeded() {
-                return Ok(HistoryReadback { export: listing, records: Vec::new() });
-            }
-            left_out(&document, &runner::described_parcels(&listing.stdout))
+            let described = if listing.succeeded() { runner::described_parcels(&listing.stdout) } else { in_every_record(&document, marks) };
+            left_out(&document, &described)
         } else {
             Default::default()
         };
@@ -284,6 +283,16 @@ impl Context<'_> {
 /// Whether an export reported leaving any file out, withheld or redacted.
 fn leaves_out(export: &serde_json::Value) -> bool {
     ["withheld", "redacted"].iter().any(|key| export["data"][*key].as_array().is_some_and(|entries| !entries.is_empty()))
+}
+
+/// Every parcel an export names a left-out file in, paired with every record's message: what
+/// [`left_out`] is given when the history listing that maps parcels to records refuses.
+fn in_every_record(export: &serde_json::Value, marks: &[Mark]) -> Vec<(String, String)> {
+    let parcels: std::collections::BTreeSet<&str> = ["withheld", "redacted"].iter()
+        .flat_map(|key| export["data"][*key].as_array().into_iter().flatten())
+        .flat_map(|entry| entry["parcels"].as_array().into_iter().flatten().filter_map(|parcel| parcel.as_str()))
+        .collect();
+    marks.iter().flat_map(|mark| parcels.iter().map(move |parcel| (mark.message(), parcel.to_string()))).collect()
 }
 
 /// What the work tree holds before the faulted command: the last record on the corpus's line. A
@@ -463,13 +472,15 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, co
                     }
                     trail.steps.push(context.run(&programs.forklift, arguments, scratch.work())?);
                 }
-                Remedy::Remove { path } if remedy::removable(path, scratch.root()) => {
-                    trail.recoverability.outside_knowledge.push(format!("remove {}", path.display()));
-                    let _ = damage::apply(path, Kind::Delete, 0);
-                }
-                Remedy::Remove { path } => {
-                    trail.recoverability.outside_knowledge.push(format!("remove {} (outside the run root; not run)", path.display()));
-                }
+                Remedy::Remove { path } => match remedy::removable(path, scratch.root()) {
+                    Some(judged) => {
+                        trail.recoverability.outside_knowledge.push(format!("remove {}", path.display()));
+                        let _ = damage::apply(&judged, Kind::Delete, 0);
+                    }
+                    None => {
+                        trail.recoverability.outside_knowledge.push(format!("remove {} (outside the run root; not run)", path.display()));
+                    }
+                },
             }
         }
         if trail.evidence.remedy_named {
@@ -545,10 +556,12 @@ mod tests {
 
     /// An export's left-out files are documented per record by their parcels: withheld content as
     /// `content_withheld`, redacted as `content_redacted`, and only in the records whose parcels
-    /// the export names. Only an export that left something out needs the history listing.
+    /// the export names. Only an export that left something out needs the history listing, and
+    /// with no listing every left-out file is admitted as documented in every record.
     ///
     /// Revert: key every entry to every record → a record that never held the file expects a
-    /// documented code for it, and an export serving it correctly reads silent.
+    /// documented code for it, and an export serving it correctly reads silent; pair no record in
+    /// `in_every_record` → a documented left-out file reads silent when the listing refuses.
     #[test]
     fn left_out_files_are_documented_in_the_records_naming_them() {
         let export = serde_json::json!({ "data": {
@@ -566,6 +579,10 @@ mod tests {
         assert!(leaves_out(&export));
         assert!(!leaves_out(&serde_json::json!({ "data": { "withheld": [], "redacted": [] } })));
         assert!(!leaves_out(&serde_json::json!({ "data": {} })));
+        let everywhere = super::left_out(&export, &in_every_record(&export, &[Mark::Record(0), Mark::Record(1)]));
+        for message in [Mark::Record(0).message(), Mark::Record(1).message()] {
+            assert_eq!(everywhere.get(&message).map(|paths| paths.keys().cloned().collect::<Vec<_>>()), Some(vec!["b".to_string(), "src/a".to_string()]));
+        }
     }
 
     /// Content taken away opens every path holding its bytes, in every record and in both trees

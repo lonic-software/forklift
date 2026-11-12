@@ -77,17 +77,20 @@ pub fn extract(texts: &[&str]) -> Extracted {
     extracted
 }
 
-/// Whether the harness may execute a remove remedy: only for a path inside the run's own root,
-/// judged at path-component boundaries, so a root of `/s` covers `/s/wh` but not `/srv/wh`. A tool
-/// may print the path resolved (`/private/var/…` for `/var/…` on macOS, `\\?\C:\…` on Windows),
-/// so a path that is not under the root as given is judged again with both resolved.
-pub fn removable(path: &Path, run_root: &Path) -> bool {
+/// The path the harness may remove for a remove remedy, if any: only one inside the run's own
+/// root, judged at path-component boundaries, so a root of `/s` covers `/s/wh` but not `/srv/wh`.
+/// A tool may print the path resolved (`/private/var/…` for `/var/…` on macOS, `\\?\C:\…` on
+/// Windows), so a path that is not under the root as given is judged again with both resolved,
+/// and then the resolved path is the one returned: what is removed is exactly what was judged,
+/// never a link outside the root that resolves into it.
+pub fn removable(path: &Path, run_root: &Path) -> Option<PathBuf> {
     let under = |path: &Path, root: &Path| path.is_absolute() && path.starts_with(root) && path != root
         && !path.components().any(|component| matches!(component, std::path::Component::ParentDir));
-    under(path, run_root) || match (std::fs::canonicalize(path), std::fs::canonicalize(run_root)) {
-        (Ok(path), Ok(root)) => under(&path, &root),
-        _ => false,
+    if under(path, run_root) {
+        return Some(path.to_path_buf());
     }
+    let (resolved, root) = (std::fs::canonicalize(path).ok()?, std::fs::canonicalize(run_root).ok()?);
+    under(&resolved, &root).then_some(resolved)
 }
 
 #[cfg(test)]
@@ -141,18 +144,19 @@ mod tests {
     #[test]
     fn only_paths_under_the_run_root_are_removable() {
         let root = Path::new("/s");
-        assert!(removable(Path::new("/s/wh/.forklift/store.lock"), root));
-        assert!(!removable(Path::new("/srv/wh/.forklift/store.lock"), root));
-        assert!(!removable(Path::new("/s/../home/user/file"), root));
-        assert!(!removable(Path::new("/s"), root));
-        assert!(!removable(Path::new("wh/.forklift/store.lock"), root));
+        assert_eq!(removable(Path::new("/s/wh/.forklift/store.lock"), root), Some(PathBuf::from("/s/wh/.forklift/store.lock")));
+        assert_eq!(removable(Path::new("/srv/wh/.forklift/store.lock"), root), None);
+        assert_eq!(removable(Path::new("/s/../home/user/file"), root), None);
+        assert_eq!(removable(Path::new("/s"), root), None);
+        assert_eq!(removable(Path::new("wh/.forklift/store.lock"), root), None);
     }
 
     /// A path the tool printed resolved, through a link in the root as given, is still under it;
-    /// one resolving outside the root is not.
+    /// one resolving outside the root is not; and a link outside the root that resolves into it is
+    /// judged, and removed, as where it resolves, never as itself.
     ///
     /// Revert: compare only as given → the resolved path is refused, so a named working remedy
-    /// grades as none.
+    /// grades as none; return the path as given → the outside link is what gets removed.
     #[cfg(unix)]
     #[test]
     fn a_resolved_path_under_the_root_is_removable() {
@@ -165,7 +169,10 @@ mod tests {
         std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
         let root = base.join("link");
         let printed = std::fs::canonicalize(real.join("wh/store.lock")).unwrap();
-        assert!(removable(&printed, &root));
-        assert!(!removable(&std::fs::canonicalize(base.join("elsewhere")).unwrap(), &root));
+        assert_eq!(removable(&printed, &root), Some(printed.clone()));
+        assert_eq!(removable(&std::fs::canonicalize(base.join("elsewhere")).unwrap(), &root), None);
+        let outside = base.join("outside-link");
+        std::os::unix::fs::symlink(real.join("wh/store.lock"), &outside).unwrap();
+        assert_eq!(removable(&outside, &root), Some(printed));
     }
 }
