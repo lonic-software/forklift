@@ -4747,6 +4747,140 @@ mod tests {
         let _ = remove_dir_all(&dir);
     }
 
+    /// Opens the folder `path` the way a shell or a file manager open in it does, without
+    /// FILE_SHARE_DELETE. The hold lasts as long as the returned handle.
+    #[cfg(windows)]
+    fn hold_folder_without_share_delete(path: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path).unwrap()
+    }
+
+    /// Windows refuses to delete a file another process holds without FILE_SHARE_DELETE, with an
+    /// error classified as held; `remove_file` waits for the hold to lift and then deletes it.
+    #[cfg(windows)]
+    #[test]
+    fn a_delete_of_a_held_file_waits_for_the_hold() {
+        let dir = held_rename_dir("delete-file");
+        let file = dir.join("held");
+        std::fs::write(&file, b"x").unwrap();
+        let hold = hold_without_share_delete(&file);
+
+        #[allow(clippy::disallowed_methods)] // the unretried delete the hold is shown to refuse
+        let refused = std::fs::remove_file(&file).unwrap_err();
+        assert!(is_held_by_another_process(&refused), "{:?}", refused);
+        assert!(file.exists());
+
+        let releaser = release_later(hold, std::time::Duration::from_millis(200));
+        remove_file(&file).unwrap();
+        releaser.join().unwrap();
+
+        assert!(!file.exists());
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// A held file inside a tree refuses its removal the same way; `remove_dir_all` waits for the
+    /// hold to lift and then removes the whole tree.
+    #[cfg(windows)]
+    #[test]
+    fn a_tree_holding_a_held_file_is_removed_once_the_hold_lifts() {
+        let dir = held_rename_dir("delete-tree");
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::write(tree.join("loose"), b"x").unwrap();
+        std::fs::write(tree.join("sub").join("held"), b"x").unwrap();
+        let hold = hold_without_share_delete(&tree.join("sub").join("held"));
+
+        #[allow(clippy::disallowed_methods)] // the unretried removal the hold is shown to refuse
+        let refused = std::fs::remove_dir_all(&tree).unwrap_err();
+        assert!(is_held_by_another_process(&refused), "{:?}", refused);
+        assert!(tree.join("sub").join("held").exists());
+
+        let releaser = release_later(hold, std::time::Duration::from_millis(200));
+        remove_dir_all(&tree).unwrap();
+        releaser.join().unwrap();
+
+        assert!(!tree.exists());
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// A handle on the folder itself refuses its removal; `remove_dir` (an empty folder) and
+    /// `remove_dir_all` (a folder with a file in it) both wait for the hold to lift.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_folder_is_removed_once_the_hold_lifts() {
+        let dir = held_rename_dir("delete-folder");
+
+        type Remove = fn(&Path) -> std::io::Result<()>;
+
+        #[allow(clippy::disallowed_methods)] // the unretried removals the hold is shown to refuse
+        let cases: [(&str, Remove, Remove); 2] = [
+            ("remove_dir", |p| std::fs::remove_dir(p), |p| remove_dir(p)),
+            ("remove_dir_all", |p| std::fs::remove_dir_all(p), |p| remove_dir_all(p)),
+        ];
+
+        for (name, unretried, remove) in cases {
+            let folder = dir.join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            if name == "remove_dir_all" {
+                std::fs::write(folder.join("inside"), b"x").unwrap();
+            }
+            let hold = hold_folder_without_share_delete(&folder);
+
+            let refused = unretried(&folder).unwrap_err();
+            assert!(is_held_by_another_process(&refused), "{}: {:?}", name, refused);
+            assert!(folder.exists(), "{}", name);
+
+            let releaser = release_later(hold, std::time::Duration::from_millis(200));
+            remove(&folder).unwrap_or_else(|e| panic!("{}: {}", name, e));
+            releaser.join().unwrap();
+
+            assert!(!folder.exists(), "{}", name);
+        }
+
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// A hold that outlasts the deadline fails the delete with the held error and removes nothing.
+    #[cfg(windows)]
+    #[test]
+    fn a_delete_of_a_file_held_past_the_deadline_fails_and_removes_nothing() {
+        let dir = held_rename_dir("delete-past-deadline");
+        let file = dir.join("held");
+        std::fs::write(&file, b"x").unwrap();
+        let hold = hold_without_share_delete(&file);
+
+        let started = std::time::Instant::now();
+        let error = remove_file(&file).unwrap_err();
+        let elapsed = started.elapsed();
+        drop(hold);
+
+        assert!(is_held_by_another_process(&error), "{:?}", error);
+        assert!(elapsed >= HELD_DEADLINE, "{:?}", elapsed);
+        assert_eq!(std::fs::read(&file).unwrap(), b"x");
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// Why writes are not retried: a handle that shares reading and writing but not delete, the
+    /// one that refuses deletes and renames, lets a truncating write through at once.
+    #[cfg(windows)]
+    #[test]
+    fn a_hold_without_share_delete_lets_a_truncating_write_through() {
+        let dir = held_rename_dir("write-through");
+        let file = dir.join("held");
+        std::fs::write(&file, b"old").unwrap();
+        let hold = hold_without_share_delete(&file);
+
+        std::fs::write(&file, b"new").unwrap();
+        std::fs::File::create(&file).unwrap();
+        drop(hold);
+
+        assert_eq!(std::fs::read(&file).unwrap(), b"");
+        let _ = remove_dir_all(&dir);
+    }
+
     /// Keys a volume may fold into one spelling, and keys of any length or depth, get distinct
     /// shard folders of one fixed shape, spelled in characters no volume folds.
     #[test]
