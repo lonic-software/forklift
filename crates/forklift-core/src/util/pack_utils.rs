@@ -11789,13 +11789,20 @@ pub(crate) mod tests {
     /// Import a hand-laid pack into a fresh warehouse: the verdict, and how many pack data and index
     /// files the import left published.
     fn import_hand_laid(name: &str, records: &[(&str, Vec<u8>)], bits: Option<u32>) -> (Result<usize, String>, usize) {
+        let (bytes, sections) = hand_laid_pack(records, bits);
+        let (result, published, _) = import_raw_sections(name, bytes, &sections);
+        (result, published)
+    }
+
+    /// Import `bytes` as `sections` into a fresh warehouse: the verdict, how many pack data and
+    /// index files the import left published, and the packed hashes the store then holds.
+    fn import_raw_sections(name: &str, bytes: Vec<u8>, sections: &[(u64, u64)]) -> (Result<usize, String>, usize, Vec<String>) {
         let temp = std::env::temp_dir().join(format!("forklift-hand-laid-{}-{}", name, std::process::id()));
         let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
-        let (bytes, sections) = hand_laid_pack(records, bits);
-        let result = import_transport_packs(&mut std::io::Cursor::new(bytes), &sections, |_, _| Ok(())).map(|(stats, ())| stats.stored_objects);
+        let result = import_transport_packs(&mut std::io::Cursor::new(bytes), sections, |_, _| Ok(())).map(|(stats, ())| stats.stored_objects);
         let published = std::fs::read_dir(temp.join(".forklift").join("objects").join("pack"))
             .map(|entries| entries.flatten().filter(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -11803,8 +11810,10 @@ pub(crate) mod tests {
             })
             .count())
             .unwrap_or(0);
+        let mut held = find_hashes_with_prefix("").unwrap_or_default();
+        held.sort();
         crate::util::file_utils::remove_dir_all(&temp).ok();
-        (result, published)
+        (result, published, held)
     }
 
     fn assert_refused_unpublished(verdict: (Result<usize, String>, usize), expected: &str) {
@@ -11898,5 +11907,66 @@ pub(crate) mod tests {
         for bits in [0, 1, 3].into_iter().filter(|bits| *bits != writer) {
             assert_refused_unpublished(import_hand_laid(&format!("fanout-{}", bits), &records, Some(bits)), "fanout width its writer would not pick");
         }
+    }
+
+    /// A mutated transport pack is either refused, publishing nothing, or imports exactly the
+    /// objects the original carries: never a panic, and never a partial or altered set. The pack
+    /// holds a full record, a delta against it and a second full record; its data and index are
+    /// mutated apart, with the section lengths declared to match or left as they were.
+    #[test]
+    fn a_mutated_transport_pack_imports_its_objects_exactly_or_nothing() {
+        use crate::util::fuzz_bytes::{mutate, Rng};
+
+        let base = crate::util::object_utils::blob_bytes(&b"base text for the delta ".repeat(40));
+        let mut target_raw = b"base text for the delta ".repeat(40);
+        target_raw.extend(b"plus a tail");
+        let target = crate::util::object_utils::blob_bytes(&target_raw);
+        let other = crate::util::object_utils::blob_bytes(b"an unrelated third object");
+        let [base_hash, target_hash, other_hash] = [&base, &target, &other].map(|object| blake3::hash(object).to_hex().to_string());
+        let mut delta_record = vec![RECORD_DELTA];
+        delta_record.extend(hash_to_bytes(&base_hash).unwrap());
+        delta_record.extend(crate::util::byte_utils::number_to_vlq_bytes(target.len() as u64));
+        delta_record.extend(crate::util::delta_utils::compress_delta(&base, &target).unwrap());
+        let records = [
+            (base_hash.as_str(), framed_full_record(&zstd::encode_all(&base[..], 3).unwrap(), b"")),
+            (target_hash.as_str(), delta_record),
+            (other_hash.as_str(), framed_full_record(&zstd::encode_all(&other[..], 3).unwrap(), b"")),
+        ];
+        let (bytes, sections) = hand_laid_pack(&records, None);
+        let data_len = sections[0].0 as usize;
+        let mut expected = vec![base_hash.clone(), target_hash.clone(), other_hash.clone()];
+        expected.sort();
+
+        let (reference, published, held) = import_raw_sections("fuzz-reference", bytes.clone(), &sections);
+        assert_eq!((reference, published, &held), (Ok(3), 2, &expected), "the unmutated pack imports");
+
+        let mut rng = Rng::new(0xF04C_0423);
+        let mut accepted = 0;
+        for case in 0..400 {
+            let mut data = bytes[..data_len].to_vec();
+            let mut index = bytes[data_len..].to_vec();
+            match rng.below(3) {
+                0 => mutate(&mut data, &mut rng),
+                1 => mutate(&mut index, &mut rng),
+                _ => { mutate(&mut data, &mut rng); mutate(&mut index, &mut rng); }
+            }
+            let declared = if rng.below(4) == 0 { sections.clone() } else { vec![(data.len() as u64, index.len() as u64)] };
+            let mut mutated = data;
+            mutated.extend(index);
+
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                import_raw_sections(&format!("fuzz-{}", case), mutated.clone(), &declared)
+            }));
+            let (result, published, held) = outcome.unwrap_or_else(|_| panic!("case {} panicked", case));
+            match result {
+                Ok(_) => {
+                    accepted += 1;
+                    assert_eq!(held, expected, "case {}: an accepted pack imports exactly its objects", case);
+                }
+                Err(_) => assert_eq!((published, held.len()), (0, 0), "case {}: a refused pack publishes nothing", case),
+            }
+        }
+        // Most mutations must be refused; one accepted in every case would mean the check is blind.
+        assert!(accepted < 400, "every mutation was accepted");
     }
 }

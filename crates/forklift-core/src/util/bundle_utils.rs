@@ -2200,6 +2200,77 @@ mod tests {
         assert!(error.contains("two signatures"), "{}", error);
     }
 
+    /// Every file under the active store's objects folder: packs, loose objects, signatures and
+    /// staging alike. Folders are not files, so an empty pack folder counts as nothing.
+    fn files_under_objects() -> Vec<PathBuf> {
+        fn walk(folder: &Path, files: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() { walk(&path, files) } else { files.push(path) }
+            }
+        }
+
+        let mut files = Vec::new();
+        walk(Path::new(&file_utils::get_path_objects_root()), &mut files);
+        files
+    }
+
+    /// The packed hashes the active store holds, sorted.
+    fn held_hashes() -> Vec<String> {
+        let mut held = pack_utils::find_hashes_with_prefix("").unwrap();
+        held.sort();
+        held
+    }
+
+    /// A mutated native bundle, re-sealed so the import reads past its digest, is either refused
+    /// and leaves nothing behind, or imports exactly the objects the original carries, signatures
+    /// only for parcels it carries: never a panic, and never a partial or altered object set. A
+    /// signature's bytes are not content-addressed, so an accepted mutation may change one; what
+    /// it says is checked against the signer's key when the parcel is verified, not here.
+    #[test]
+    fn a_mutated_native_bundle_imports_its_objects_exactly_or_nothing() {
+        use crate::util::fuzz_bytes::{mutate, Rng};
+
+        let (bundle, signed) = build_signed_line_bundle("bundle-fuzz-src", 3);
+        let parcels: Vec<&str> = signed.iter().map(|(hash, _)| hash.as_str()).collect();
+        let reference = {
+            let _destination = Scratch::new("bundle-fuzz-reference");
+            let stats = import_bundle_bytes(&bundle).unwrap();
+            assert_eq!(stats.stored_signatures, parcels.len());
+            held_hashes()
+        };
+        let header_len = BUNDLE_HEADER.len() + 1;
+        let body = unsealed(&bundle)[header_len..].to_vec();
+
+        let mut rng = Rng::new(0xB0DE_0423);
+        let mut accepted = 0;
+        for case in 0..400 {
+            let mut mutated_body = body.clone();
+            mutate(&mut mutated_body, &mut rng);
+            let mut mutated = bundle[..header_len].to_vec();
+            mutated.extend(mutated_body);
+            let mutated = sealed(mutated);
+
+            let _destination = Scratch::new("bundle-fuzz-case");
+            let result = std::panic::catch_unwind(|| import_bundle_bytes(&mutated))
+                .unwrap_or_else(|_| panic!("case {} panicked", case));
+            let held = held_hashes();
+            match result {
+                Ok(_) => {
+                    accepted += 1;
+                    assert_eq!(held, reference, "case {}: an accepted bundle imports exactly its objects", case);
+                    for hash in held.iter().filter(|hash| !parcels.contains(&hash.as_str())) {
+                        assert_eq!(sign_utils::load_raw_parcel_signature(hash).unwrap(), None,
+                            "case {}: no signature lands for {}, which is not a parcel", case, hash);
+                    }
+                }
+                Err(_) => assert_eq!(files_under_objects(), Vec::<PathBuf>::new(),
+                    "case {}: a refused bundle leaves nothing in the store", case),
+            }
+        }
+        assert!(accepted < 400, "every mutation was accepted");
+    }
+
     /// A native bundle is refused as a whole: a refusal anywhere in its signature section, or
     /// after it, leaves the destination without a pack, an object or a signature from it, though
     /// its packs verified before that section was read.
@@ -2219,7 +2290,7 @@ mod tests {
         let cases: [(&str, Vec<u8>, &str); 5] = [
             ("foreign", with_signature_section(&bundle, &[(&blob_hash, &sidecar)]), "not a parcel it carries"),
             ("repeat", with_signature_section(&bundle, &[(&parcel_hash, &sidecar), (&parcel_hash, &sidecar)]), "two signatures"),
-            ("malformed", with_signature_section(&bundle, &[(parcel_hash.as_str(), &b"\x07"[..])]), "is malformed"),
+            ("malformed", with_signature_section(&bundle, &[(parcel_hash.as_str(), &b"\x01\x05ab"[..])]), "is malformed"),
             ("overcount", with_signature_section(&bundle, &[(parcel_hash.as_str(), sidecar.as_slice()); 4]), "contain only"),
             ("trailing", trailing, "between its signature section and its digest"),
         ];
@@ -2229,14 +2300,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{}: the bundle must be refused", name));
             assert!(error.contains(expected), "{}: {}", name, error);
 
-            let status = pack_utils::store_status().unwrap();
-            assert_eq!((status.packs.len(), status.packed_objects, status.loose_objects), (0, 0, 0),
-                "{}: nothing of a refused bundle is published", name);
-            assert_eq!(signature_files(), (0, 0), "{}: no signature of a refused bundle is stored", name);
-            let leftovers: Vec<_> = std::fs::read_dir(pack_utils::pack_folder()).into_iter().flatten().flatten()
-                .map(|entry| entry.file_name())
-                .collect();
-            assert!(leftovers.is_empty(), "{}: staging is removed: {:?}", name, leftovers);
+            assert_eq!(files_under_objects(), Vec::<PathBuf>::new(),
+                "{}: a refused bundle leaves no pack, object, signature or staging file", name);
         }
     }
 
