@@ -265,7 +265,7 @@ pub fn landing(calls: &[Call], point: &Point, root: &Root, exit: Option<i32>) ->
         let Ok(touched) = trace::touch(call) else { continue };
         let group = groups.get(&call.tid).copied().unwrap_or(call.tid);
         let found = identity(&touched.operands, &touched.detail, root, group);
-        if position == point.when && found == point.target && (point.aim != Aim::Position || group == tool) {
+        if position == point.when && stands_for(&found, &point.target, point.aim == Aim::Position) && (point.aim != Aim::Position || group == tool) {
             return Landing::Landed;
         }
         seen.push(format!("{}#{} {}", call.name, position, found.paths.join(" ")));
@@ -273,6 +273,14 @@ pub fn landing(calls: &[Call], point: &Point, root: &Root, exit: Option<i32>) ->
     Landing::NotReached {
         why: if seen.is_empty() { "no call of the name was killed".to_string() } else { format!("the kill landed on {}", seen.join("; ")) },
     }
+}
+
+/// Whether a killed call stands for the targeted one: the same flags and paths, or, for a temp,
+/// whose name differs per run, the same flags and the same path bases, since where several threads
+/// stage beside one target, which of them stages which object is the scheduler's choice.
+fn stands_for(found: &Identity, target: &Identity, temp: bool) -> bool {
+    let bases = |identity: &Identity| identity.paths.iter().map(|path| trace::base(path)).collect::<Vec<_>>();
+    found == target || (temp && found.detail == target.detail && bases(found) == bases(target))
 }
 
 /// Whether any file under `root` holds one of `needles` at a path-component boundary: a recorded
@@ -723,10 +731,12 @@ mod tests {
 
     /// A kill lands only on the call that is, in its thread, the counted position and the target,
     /// with the root rebased and the temp's pid normalised; a kill on another thread's call, on a
-    /// child, or none at all is not reached.
+    /// child, or none at all is not reached; a sibling temp of the same base stands for a temp target,
+    /// and never for a fixed path.
     ///
     /// Revert: accept any killed call of the name → the worker's object open, killed in place of
-    /// the head's temp, counts as landed.
+    /// the head's temp, counts as landed; compare temps exactly → the sibling object is not reached;
+    /// compare fixed paths by base → the other object lands on a fixed target.
     #[test]
     fn a_kill_lands_only_on_its_target() {
         let injected = Root { given: "/o/s/0001-h-kill-4".into(), canonical: "/o/s/0001-h-kill-4".into() };
@@ -754,6 +764,18 @@ mod tests {
 80 openat(AT_FDCWD</o/s/0001-h-kill-4/work>, \".forklift/pallets/main.tmp~70-0\", O_WRONLY|O_CREAT) = ?
 ").unwrap();
         assert!(matches!(landing(&child, &target, &injected, None), Landing::NotReached { .. }), "a child's call is never the target");
+
+        // Another worker staging a sibling object of the same base stands for the targeted temp.
+        let object = point("openat", Aim::Position, 1, &[".forklift/objects/ab/0123456789abcdef0123.tmp~<pid>-<n>"], "O_WRONLY|O_CREAT");
+        let sibling = trace::parse("\
+70 execve(\"/b/forklift\", [], 0x1) = 0
+70 clone(child_stack=0x1, flags=CLONE_VM|CLONE_THREAD) = 73
+73 openat(AT_FDCWD</o/s/0001-h-kill-4/work>, \".forklift/objects/cd/fedcba9876543210fedc.tmp~70-5\", O_WRONLY|O_CREAT) = ?
+").unwrap();
+        assert_eq!(landing(&sibling, &object, &injected, None), Landing::Landed);
+        let fixed = point("openat", Aim::Path { path: ".forklift/objects/ab/0123456789abcdef0123".into() }, 1, &[".forklift/objects/ab/0123456789abcdef0123"], "O_WRONLY|O_CREAT");
+        let other = trace::parse("73 openat(AT_FDCWD</o/s/0001-h-kill-4/work>, \".forklift/objects/cd/fedcba9876543210fedc\", O_WRONLY|O_CREAT) = ?\n").unwrap();
+        assert!(matches!(landing(&other, &fixed, &injected, None), Landing::NotReached { .. }), "a fixed path is its own target");
 
         let rebased = point("fsync", Aim::Path { path: "/o/s/0001-h-count/work/.forklift/pallets".into() }, 1, &["<root>/work/.forklift/pallets"], "");
         let aimed = trace::parse("71 fsync(5</o/s/0001-h-kill-4/work/.forklift/pallets>) = ?\n").unwrap();
