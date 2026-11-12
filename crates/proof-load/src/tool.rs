@@ -162,8 +162,8 @@ mod tests {
 
     /// A failure document's error is read whole; anything else is not a failure.
     ///
-    /// Revert: drop the `ok == false` check → a success document carrying an `error` key in its
-    /// data is read as a refusal.
+    /// Revert: drop the `ok == false` check → a success document that also carries an `error`
+    /// object is read as a refusal.
     #[test]
     fn a_failure_document_is_read_and_nothing_else_is() {
         let failed = br#"{ "lonic_json": 1, "tool": "forklift", "ok": false,
@@ -175,7 +175,7 @@ mod tests {
         let no_step = br#"{ "ok": false, "error": { "code": "error", "message": "no" } }"#;
         assert_eq!(failure_of(no_step).unwrap().next_step, None);
 
-        let succeeded = br#"{ "ok": true, "data": { "error": { "code": "x", "message": "y" } } }"#;
+        let succeeded = br#"{ "ok": true, "data": {}, "error": { "code": "x", "message": "y" } }"#;
         assert_eq!(failure_of(succeeded), None);
         assert_eq!(failure_of(b"not json"), None);
     }
