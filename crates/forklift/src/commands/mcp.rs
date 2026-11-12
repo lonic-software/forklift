@@ -1399,6 +1399,30 @@ mod tests {
     use super::{ProgressMapper, Reported};
     use serde_json::json;
 
+    #[test]
+    fn a_message_naming_a_key_twice_is_refused_and_never_acted_on() {
+        let mut state = super::ServerState::new();
+        let mut notify = |_: &serde_json::Value| panic!("a refused message must not run anything");
+
+        // The duplicate sits inside a tool's arguments, where the last spelling would widen the
+        // query to everything.
+        let line = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"query","arguments":{"where":{"all":[{"field":"tag","op":"eq","value":"x"}],"all":[]}}}}"#;
+        let reply = super::handle_message(line, &mut state, &mut notify).expect("a request is answered");
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["error"]["code"], -32600);
+        let message = reply["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("Invalid Request: ") && message.contains("\"all\" appears twice"), "{message}");
+
+        // A notification is answered by nothing, refused or not.
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{"a":1,"a":2}}"#;
+        assert!(super::handle_message(line, &mut state, &mut notify).is_none());
+
+        // The same request spelled once is read as usual.
+        let line = r#"{"jsonrpc":"2.0","id":8,"method":"no/such","params":{}}"#;
+        let reply = super::handle_message(line, &mut state, &mut notify).unwrap();
+        assert_eq!(reply["error"]["code"], -32601);
+    }
+
     /// A finished run's status, as `wait` would report it.
     #[cfg(unix)]
     fn exited(code: i32) -> std::process::ExitStatus {
