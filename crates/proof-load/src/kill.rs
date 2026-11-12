@@ -211,10 +211,11 @@ pub fn enumerate(calls: &[Call], line: usize, command: &str, root: &Root, start:
             Some(first) if !temp => {
                 let path = match first { Operand::Named { traced, .. } => traced.clone(), Operand::Held { target } => target.clone() };
                 let mut aims = BTreeSet::from([path.clone()]);
-                // strace adds the resolved form of a path that exists when it starts.
-                let resolved_first = &resolved[0];
-                if let Some(canonical) = root.rebase(resolved_first, &Root { given: root.canonical.clone(), canonical: root.canonical.clone() }) {
-                    if existed(resolved_first) {
+                // strace adds realpath() of the -P string when it starts: resolved from strace's
+                // own working directory, the line's start folder, whatever the call's dirfd.
+                let literal = lexical_join(start, &path);
+                if let Some(canonical) = root.rebase(&literal, &Root { given: root.canonical.clone(), canonical: root.canonical.clone() }) {
+                    if existed(&literal) {
                         aims.insert(canonical);
                     }
                 }
@@ -236,6 +237,22 @@ pub fn enumerate(calls: &[Call], line: usize, command: &str, root: &Root, start:
         enumerated.points.push(Point { line, command: command.to_string(), name: call.name.clone(), aim, when, target, base, sampled });
     }
     Ok(enumerated)
+}
+
+/// `path` resolved against the folder `start` as a path, without the file system: `.` and `..`
+/// folded, an absolute `path` kept.
+fn lexical_join(start: &str, path: &str) -> String {
+    let mut parts: Vec<&str> = if path.starts_with('/') { Vec::new() } else { start.split('/').filter(|part| !part.is_empty()).collect() };
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
 }
 
 /// Whether an injected run's kill landed on `point`.
@@ -717,7 +734,8 @@ mod tests {
     /// unclassified call refuse.
     ///
     /// Revert: drop the resolved form → the fsync on the existing file is counted #1 though -P
-    /// counts the earlier open of it as well.
+    /// counts the earlier open of it as well; resolve against the dirfd → the mkdir of "d" under
+    /// "src" counts the earlier call under src/d, which -P never selects.
     #[test]
     fn a_fixed_path_counts_what_its_filter_selects() {
         let text = "\
@@ -741,6 +759,18 @@ mod tests {
         let existed = |path: &str| path == "/o/s/0001-h-count/work/d";
         let points = enumerate(&under, 0, "load", &root(), "/o/s/0001-h-count/work", existed).unwrap().points;
         assert_eq!((&points[1].aim, points[1].when), (&Aim::Path { path: "d".into() }, 2));
+        // strace resolves the -P string from its own folder, not the call's dirfd: "d" under the
+        // descriptor of "src" adds the start folder's "d", so the call under src/d is not selected.
+        let dirfd = trace::parse("\
+50 execve(\"/b\", [], 0x1) = 0
+50 mkdirat(4</o/s/0001-h-count/work/src/d>, \"e\", 0777) = 0
+50 mkdirat(4</o/s/0001-h-count/work/src>, \"d\", 0777) = -1 EEXIST (File exists)
+").unwrap();
+        let existed = |path: &str| path == "/o/s/0001-h-count/work/src/d";
+        let points = enumerate(&dirfd, 0, "load", &root(), "/o/s/0001-h-count/work", existed).unwrap().points;
+        assert_eq!((&points[1].aim, points[1].when), (&Aim::Path { path: "d".into() }, 1));
+        assert_eq!(lexical_join("/w/x", "../y/./z"), "/w/y/z");
+        assert_eq!(lexical_join("/w", "/abs"), "/abs");
 
         let outside = trace::parse("50 execve(\"/b\", [], 0x1) = 0\n50 mkdirat(AT_FDCWD</o/s/0001-h-count/work>, \"/etc/x\", 0777) = 0\n").unwrap();
         let refused = enumerate(&outside, 0, "load", &root(), "/o/s/0001-h-count/work", |_| false).unwrap_err();
