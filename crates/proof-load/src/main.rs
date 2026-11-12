@@ -98,6 +98,10 @@ fn main() -> ExitCode {
         }
     };
 
+    if let Some(unknown) = kill.iter().find(|id| !scenario::catalog().iter().any(|scenario| &scenario.id == *id)) {
+        eprintln!("proof-load: --kill {}: no such scenario", unknown);
+        return ExitCode::from(2);
+    }
     let scenarios: Vec<_> = scenario::catalog().into_iter().filter(|scenario| only.as_ref().is_none_or(|only| *only == scenario.id)).collect();
     let corpus = corpus::generate(seed, corpus::Shape::SMALL);
     let mut tools = BTreeMap::new();
@@ -232,10 +236,6 @@ fn main() -> ExitCode {
                 strace: &strace, search_path: search_path.clone(), limit: std::time::Duration::from_secs(120),
                 jobs: jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from)), traces: &traces,
             };
-            if let Some(unknown) = kill.iter().find(|id| !scenarios.iter().any(|scenario| &scenario.id == *id)) {
-                eprintln!("proof-load: --kill {}: no such scenario", unknown);
-                return ExitCode::from(2);
-            }
             let mut all = Vec::new();
             for scenario in scenarios.iter().filter(|scenario| kill.is_empty() || kill.contains(&scenario.id)) {
                 let result = output.scratch(&format!("{}-kill", scenario.id)).map_err(|error| error.to_string())
@@ -264,7 +264,7 @@ fn main() -> ExitCode {
         Category::KillPointsClient => kill_cell.clone(),
         _ => Cell::not_run("no runner for this fault in this build of the harness"),
     });
-    if matches!(kill_cell, Cell::Run | Cell::Sampled) {
+    if matches!(kill_cell, Cell::Run | Cell::Sampled) || not_reached > 0 {
         coverage.not_reached.insert(Category::KillPointsClient, not_reached);
     }
     let mut completeness = vec![damage_check, walk_check, fault_check];

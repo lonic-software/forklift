@@ -437,8 +437,11 @@ impl Trail {
     /// serves it and the tool's latest answer asks nothing further (see [`answered`]): a command
     /// killed after its record was durable, retried, is told there is nothing left to do.
     fn settle(&mut self, context: &Context, expected: &Expected, made: &mut bool) -> Result<bool, RunError> {
+        // Only a retry's answer settles a served record: the faulted command's own refusal, its
+        // record served, is a refusal of a committed write and is graded as one.
+        let retry = !self.readbacks.is_empty();
         let mut readback = self.read_back(context, expected, *made)?;
-        if !*made && answered(self.steps.last()) && readback.reads(&[expected.faulted]) {
+        if !*made && settles(retry, self.steps.last()) && readback.reads(&[expected.faulted]) {
             *made = true;
             // Judged again as acknowledged: the record must now hold exactly its own tree.
             self.evidence.any_silent |= readback.silent();
@@ -460,6 +463,11 @@ impl Trail {
     fn read_back(&self, context: &Context, expected: &Expected, made: bool) -> Result<HistoryReadback, RunError> {
         context.read_back(&expected.marks(), &expected.required(made), |mark| expected.of(context.corpus, mark, made))
     }
+}
+
+/// Whether a served record counts as made at this settle: on a retry, after an [`answered`] one.
+fn settles(retry: bool, last: Option<&Outcome>) -> bool {
+    retry && answered(last)
 }
 
 /// Whether `last`, the latest command run, answered and asked nothing further: it exited (a kill
@@ -830,7 +838,8 @@ mod tests {
     /// Revert: count a kill as an answer → a command killed after its record was durable heals
     /// with no retry; count any refusal → a stale lock's refusal heals before its remedy runs;
     /// drop the failure-document or unextractable conditions → a crash or an unreadable remedy
-    /// settles the record.
+    /// settles the record; settle on the first attempt → the faulted command's refusal of a write
+    /// it committed grades as made.
     #[test]
     fn only_an_answer_asking_nothing_further_settles_a_served_record() {
         assert!(answered(Some(&answer(Some(0), "", None))));
@@ -843,6 +852,9 @@ mod tests {
         crashed.failure = None;
         assert!(!answered(Some(&crashed)), "a crash with no failure document is no answer");
         assert!(!answered(Some(&answer(Some(1), "Stuck.", Some("forklift load -- <path>")))), "an unreadable remedy is no answer");
+        let nothing = answer(Some(1), "Nothing to stack.", None);
+        assert!(settles(true, Some(&nothing)));
+        assert!(!settles(false, Some(&nothing)), "the faulted command's own answer is no retry");
     }
 
 }
