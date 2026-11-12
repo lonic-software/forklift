@@ -18,7 +18,11 @@ const LOCK_FILE: &[Kind] = &[Kind::Truncate, Kind::Delete];
 const FOLDER: &[Kind] = &[Kind::Delete];
 
 const fn bound(name: &'static str, kinds: &'static [Kind]) -> Binding {
-    Binding { name, scenario: "history", kinds }
+    bound_in(name, "history", kinds)
+}
+
+const fn bound_in(name: &'static str, scenario: &'static str, kinds: &'static [Kind]) -> Binding {
+    Binding { name, scenario, kinds }
 }
 
 pub const BINDINGS: &[Binding] = &[
@@ -44,6 +48,18 @@ pub const BINDINGS: &[Binding] = &[
     bound("{bay}inventory/inv_/<xx>/<hash>/data", FILE),
     bound("{bay}journal.json", FILE),
     bound("{bay}position", FILE),
+    bound_in("trust", "signed", FILE),
+    bound_in("meta/", "signed", FOLDER),
+    bound_in("meta/<name>", "signed", FILE),
+    bound_in("objects/<xx>/<hash>.sig", "signed", FILE),
+    bound_in("objects/pack/", "packed", FOLDER),
+    bound_in("objects/pack/<name>.pack", "packed", FILE),
+    bound_in("objects/pack/<name>.idx", "packed", FILE),
+    bound_in("objects/pack/<name>.sigs", "packed", FILE),
+    bound_in("{bay}parked", "parked", FILE),
+    bound_in("{bay}consolidation", "conflicted", FILE),
+    bound_in("{bay}consolidation-skeleton", "conflicted", FILE),
+    bound_in("{bay}cherry-pick", "picking", FILE),
 ];
 
 const NO_MIRROR_ORACLE: &str = "no mirror oracle: the corpus configures no mirror url, so nothing reads a mirror back";
@@ -70,13 +86,6 @@ pub const NOT_YET_CREATED: &[&str] = &[
     "fetched-heads",
     "franchise",
     "held-heads",
-    "meta/",
-    "meta/<name>",
-    "objects/<xx>/<hash>.sig",
-    "objects/pack/",
-    "objects/pack/<name>.idx",
-    "objects/pack/<name>.pack",
-    "objects/pack/<name>.sigs",
     "objects/pack/densify-pending",
     "origin",
     "origin-move",
@@ -90,17 +99,12 @@ pub const NOT_YET_CREATED: &[&str] = &[
     "taint/",
     "taint/<name>",
     "tombstones",
-    "trust",
     "unavailable",
     "unvouched-heads",
     "withheld",
-    "{bay}cherry-pick",
-    "{bay}consolidation",
-    "{bay}consolidation-skeleton",
     "{bay}inventory/incomplete-load",
     "{bay}lock",
     "{bay}operation",
-    "{bay}parked",
     "{bay}scope",
 ];
 

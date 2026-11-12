@@ -15,7 +15,7 @@ use crate::damage::{self, Kind};
 use crate::oracle::{self, Evidence, Expectation, Grade, Readback, Recoverability, Verdict};
 use crate::remedy::{self, Remedy};
 use crate::runner::{self, RunError};
-use crate::scenario::{bind, record_message, Op, Scenario, Tool};
+use crate::scenario::{bind, Mark, Op, Scenario, Tool};
 use crate::scrub::{Environment, Scratch};
 use crate::tool::{self, Invocation, Outcome};
 
@@ -41,7 +41,7 @@ pub fn resolve(pattern: &str, walked: &[String], seed: u64) -> Option<String> {
 /// What one record read back as.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct RecordReadback {
-    pub index: usize,
+    pub mark: Mark,
     /// One verdict per exported commit carrying the record's message; empty when none did.
     pub verdicts: Vec<Verdict>,
 }
@@ -65,8 +65,8 @@ impl HistoryReadback {
     }
 
     /// Every record in `wanted` served, and served as expected.
-    fn reads(&self, wanted: &[usize]) -> bool {
-        !self.refused() && wanted.iter().all(|index| self.records.iter().any(|record| record.index == *index
+    fn reads(&self, wanted: &[Mark]) -> bool {
+        !self.refused() && wanted.iter().all(|mark| self.records.iter().any(|record| record.mark == *mark
             && !record.verdicts.is_empty() && record.verdicts.iter().all(|verdict| *verdict == Verdict::Expected)))
     }
 }
@@ -132,10 +132,10 @@ impl Context<'_> {
         Ok(true)
     }
 
-    /// Reads every record in `indices` back through the tool. `expectation` gives what each may
+    /// Reads every record in `marks` back through the tool. `expectation` gives what each may
     /// hold; a record in `required` that an export exiting 0 leaves out was served as missing,
     /// which is silent.
-    fn read_back(&self, indices: &[usize], required: &[usize], expectation: impl Fn(usize) -> Expectation) -> Result<HistoryReadback, RunError> {
+    fn read_back(&self, marks: &[Mark], required: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
         let exported = self.fresh("readback");
         let export = self.run(&self.programs.forklift, vec!["--json".into(), "git".into(), "export".into(), exported.display().to_string()], self.scratch.work())?;
         if !export.succeeded() {
@@ -154,8 +154,8 @@ impl Context<'_> {
         };
 
         let mut records = Vec::new();
-        for &index in indices {
-            let message = record_message(index);
+        for &mark in marks {
+            let message = mark.message();
             let mut verdicts = Vec::new();
             let mut hashes: Vec<&String> = subjects.iter().filter(|(_, subject)| *subject == message).map(|(hash, _)| hash).collect();
             hashes.dedup();
@@ -171,43 +171,48 @@ impl Context<'_> {
                     // The export wrote a commit git cannot lay out: what the tool served is broken.
                     Readback::Served { tree: Default::default(), documented: Default::default() }
                 };
-                verdicts.push(oracle::judge(&readback, &expectation(index)));
+                verdicts.push(oracle::judge(&readback, &expectation(mark)));
             }
-            if verdicts.is_empty() && required.contains(&index) {
+            if verdicts.is_empty() && required.contains(&mark) {
                 verdicts.push(Verdict::Silent);
             }
-            records.push(RecordReadback { index, verdicts });
+            records.push(RecordReadback { mark, verdicts });
         }
         Ok(HistoryReadback { export, records })
     }
 }
 
+/// The corpus record the faulted command writes: the next one after every record the history
+/// made. A variant does not count, since it is off the corpus's line.
+fn next_record(acknowledged: &[Mark]) -> usize {
+    acknowledged.iter().filter_map(|mark| match mark { Mark::Record(index) => Some(index + 1), Mark::Variant(_) => None }).max().unwrap_or(0)
+}
+
 /// The expected trees of one faulted run.
 struct Expected {
-    acknowledged: Vec<usize>,
-    faulted: usize,
+    acknowledged: Vec<Mark>,
+    faulted: Mark,
     before: oracle::Tree,
     after: oracle::Tree,
 }
 
 impl Expected {
-    fn indices(&self) -> Vec<usize> {
+    fn marks(&self) -> Vec<Mark> {
         self.acknowledged.iter().copied().chain([self.faulted]).collect()
     }
 
-    /// What record `index` may hold, once the faulted command has (`made`) or has not been
-    /// acknowledged.
-    fn of(&self, corpus: &Corpus, index: usize, made: bool) -> Expectation {
-        match index {
-            index if index != self.faulted => Expectation::acknowledged(corpus::expected(&corpus.records[index])),
+    /// What `mark` may hold, once the faulted command has (`made`) or has not been acknowledged.
+    fn of(&self, corpus: &Corpus, mark: Mark, made: bool) -> Expectation {
+        match mark {
+            mark if mark != self.faulted => Expectation::acknowledged(mark.snapshot(corpus).map(|snapshot| corpus::expected(&snapshot)).unwrap_or_default()),
             _ if made => Expectation::acknowledged(self.after.clone()),
             _ => Expectation::faulted(self.before.clone(), self.after.clone()),
         }
     }
 
     /// The records that must be served: every acknowledged one, and the faulted one once made.
-    fn required(&self, made: bool) -> Vec<usize> {
-        if made { self.indices() } else { self.acknowledged.clone() }
+    fn required(&self, made: bool) -> Vec<Mark> {
+        if made { self.marks() } else { self.acknowledged.clone() }
     }
 }
 
@@ -225,7 +230,7 @@ impl Trail {
     /// every record reads as expected.
     fn settle(&mut self, context: &Context, expected: &Expected, made: bool) -> Result<bool, RunError> {
         let required = expected.required(made);
-        let readback = context.read_back(&expected.indices(), &required, |index| expected.of(context.corpus, index, made))?;
+        let readback = context.read_back(&expected.marks(), &required, |mark| expected.of(context.corpus, mark, made))?;
         self.evidence.any_silent |= readback.silent();
         let reads = made && readback.reads(&required);
         self.evidence.acknowledged_readable = readback.reads(&expected.acknowledged);
@@ -247,15 +252,12 @@ pub fn run(scenario: &Scenario, name: &str, kind: Kind, corpus: &Corpus, program
     let state = scratch.work().join(".forklift");
     damage::apply(&state.join(&target), kind, seed).map_err(|error| RunError::Io(format!("{:?}", error)))?;
 
-    let faulted = built.acknowledged.iter().max().map_or(0, |last| last + 1);
+    let faulted = next_record(&built.acknowledged);
     let snapshot = corpus.records.get(faulted)
         .ok_or_else(|| RunError::Io(format!("the faulted record {} is past the corpus's {} records", faulted, corpus.records.len())))?;
-    let expected = Expected {
-        before: built.acknowledged.last().map(|last| corpus::expected(&corpus.records[*last])).unwrap_or_default(),
-        after: corpus::expected(snapshot),
-        acknowledged: built.acknowledged,
-        faulted,
-    };
+    // Before the faulted command, the work tree holds what the history recorded last.
+    let before = built.acknowledged.last().and_then(|last| last.snapshot(corpus)).map(|snapshot| corpus::expected(&snapshot)).unwrap_or_default();
+    let expected = Expected { before, after: corpus::expected(snapshot), acknowledged: built.acknowledged, faulted: Mark::Record(faulted) };
     let context = Context { corpus, programs, scratch, environment, limit };
     let mut trail = Trail::default();
     let mut unextractable = Vec::new();
@@ -340,11 +342,11 @@ mod tests {
 
     fn served(subjects: &[(usize, Verdict)]) -> HistoryReadback {
         let export = Outcome { arguments: vec![], exit: Some(0), stdout: vec![], stderr: vec![], failure: None };
-        let mut records: BTreeMap<usize, Vec<Verdict>> = BTreeMap::new();
+        let mut records: BTreeMap<Mark, Vec<Verdict>> = BTreeMap::new();
         for (index, verdict) in subjects {
-            records.entry(*index).or_default().push(*verdict);
+            records.entry(Mark::Record(*index)).or_default().push(*verdict);
         }
-        HistoryReadback { export, records: records.into_iter().map(|(index, verdicts)| RecordReadback { index, verdicts }).collect() }
+        HistoryReadback { export, records: records.into_iter().map(|(mark, verdicts)| RecordReadback { mark, verdicts }).collect() }
     }
 
     /// A history reads only when every wanted record was served and every copy of it expected: a
@@ -354,14 +356,26 @@ mod tests {
     #[test]
     fn a_record_left_out_of_the_export_does_not_read() {
         let full = served(&[(0, Verdict::Expected), (1, Verdict::Expected)]);
-        assert!(full.reads(&[0, 1]));
-        let missing = HistoryReadback { records: vec![RecordReadback { index: 0, verdicts: vec![Verdict::Expected] }, RecordReadback { index: 1, verdicts: vec![] }], ..full.clone() };
-        assert!(!missing.reads(&[0, 1]));
-        assert!(missing.reads(&[0]));
+        assert!(full.reads(&[Mark::Record(0), Mark::Record(1)]));
+        let missing = HistoryReadback { records: vec![RecordReadback { mark: Mark::Record(0), verdicts: vec![Verdict::Expected] }, RecordReadback { mark: Mark::Record(1), verdicts: vec![] }], ..full.clone() };
+        assert!(!missing.reads(&[Mark::Record(0), Mark::Record(1)]));
+        assert!(missing.reads(&[Mark::Record(0)]));
         let doubled = served(&[(0, Verdict::Expected), (0, Verdict::Silent)]);
-        assert!(!doubled.reads(&[0]));
+        assert!(!doubled.reads(&[Mark::Record(0)]));
         assert!(doubled.silent());
         let refused = HistoryReadback { export: Outcome { exit: Some(1), ..full.export.clone() }, ..full };
-        assert!(!refused.reads(&[0, 1]));
+        assert!(!refused.reads(&[Mark::Record(0), Mark::Record(1)]));
+    }
+
+    /// The faulted command writes the record after the last corpus record, whatever variants the
+    /// history recorded on a side branch.
+    ///
+    /// Revert: count a variant as its record → a history ending in variant 2 faults record 3, past
+    /// the one the corpus line reached.
+    #[test]
+    fn the_faulted_record_follows_the_corpus_line_not_a_variant() {
+        assert_eq!(next_record(&[]), 0);
+        assert_eq!(next_record(&[Mark::Record(0), Mark::Variant(0), Mark::Record(1)]), 2);
+        assert_eq!(next_record(&[Mark::Record(0), Mark::Variant(2)]), 1);
     }
 }

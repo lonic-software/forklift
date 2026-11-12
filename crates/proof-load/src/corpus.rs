@@ -138,6 +138,25 @@ pub fn expected(snapshot: &Snapshot) -> Tree {
     snapshot.iter().map(|(path, bytes)| (path.clone(), digest(bytes))).collect()
 }
 
+/// The variant of a snapshot: every file changed, a text file's first line replaced and a binary
+/// file's last byte inverted, so a branch recording it and another recording the next corpus record
+/// change at least one file two ways. A record after the first always modifies a file the one
+/// before holds, and a modification rewrites the whole file, first line included.
+pub fn variant(snapshot: &Snapshot) -> Snapshot {
+    snapshot.iter().map(|(path, bytes)| {
+        let mut bytes = bytes.clone();
+        if path.ends_with(".bin") {
+            if let Some(last) = bytes.last_mut() {
+                *last = !*last;
+            }
+        } else {
+            let rest = bytes.iter().position(|byte| *byte == b'\n').map_or(Vec::new(), |end| bytes[end + 1..].to_vec());
+            bytes = b"proof-load variant\n".iter().copied().chain(rest).collect();
+        }
+        (path.clone(), bytes)
+    }).collect()
+}
+
 /// Makes the working files under `root` match `snapshot`: writes every file it holds, and removes
 /// every file it does not, leaving the tool's own state folder (`.forklift`, `.git`) alone.
 pub fn write(snapshot: &Snapshot, root: &Path) -> std::io::Result<()> {
@@ -213,5 +232,25 @@ mod tests {
             assert_eq!(crate::oracle::read_tree(&root).unwrap(), expected(snapshot));
         }
         assert_eq!(std::fs::read(root.join(".forklift/state")).unwrap(), b"tool state");
+    }
+
+    /// A variant changes every file of its record and keeps its paths, a binary one at its length,
+    /// so a side branch recording it conflicts with any later change to the same file.
+    ///
+    /// Revert: leave a `.bin` file as it is → that file is unchanged.
+    #[test]
+    fn a_variant_changes_every_file_and_keeps_its_paths() {
+        for seed in 0..2000 {
+            for snapshot in &generate(seed, Shape { records: 3, initial_files: 4, max_bytes: 16 }).records {
+                let varied = variant(snapshot);
+                assert_eq!(varied.keys().collect::<Vec<_>>(), snapshot.keys().collect::<Vec<_>>());
+                for (path, bytes) in snapshot {
+                    assert_ne!(&varied[path], bytes, "seed {} leaves {} unchanged", seed, path);
+                    if path.ends_with(".bin") {
+                        assert_eq!(varied[path].len(), bytes.len());
+                    }
+                }
+            }
+        }
     }
 }

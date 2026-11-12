@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::census::{self, Census};
 use crate::corpus::{self, Corpus};
-use crate::scenario::{bind, Op, Scenario, Tool};
+use crate::scenario::{bind, Mark, Scenario, Tool};
 use crate::scrub::{Environment, Scratch};
 use crate::tool::{self, Invocation, Outcome};
 
@@ -21,8 +21,8 @@ pub struct Built {
     pub outcomes: Vec<Outcome>,
     /// The paths under the state folder after the build, as `census::walk` lists them.
     pub walked: Vec<String>,
-    /// Records acknowledged: each record index whose binding exited 0 throughout.
-    pub acknowledged: Vec<usize>,
+    /// Marks acknowledged: each record or variant whose binding exited 0 throughout.
+    pub acknowledged: Vec<Mark>,
 }
 
 #[derive(Debug)]
@@ -83,17 +83,16 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
     let mut outcomes = vec![run(prepare(tool))?];
     let mut acknowledged = Vec::new();
     for op in &scenario.history {
-        if let Op::Record { index } = op {
-            let snapshot = corpus.records.get(*index)
-                .ok_or_else(|| RunError::Io(format!("scenario {} records {}, past the corpus's {} records", scenario.id, index, corpus.records.len())))?;
-            corpus::write(snapshot, &work).map_err(|error| RunError::Io(error.to_string()))?;
+        if let Some(snapshot) = op.writes(corpus) {
+            let snapshot = snapshot.map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?;
+            corpus::write(&snapshot, &work).map_err(|error| RunError::Io(error.to_string()))?;
         }
         let lines = bind(tool, op).ok_or_else(|| RunError::Io(format!("{:?} has no binding for {:?}", tool, op)))?;
         for arguments in lines {
             outcomes.push(run(arguments)?);
         }
-        if let Op::Record { index } = op {
-            acknowledged.push(*index);
+        if let Some(mark) = op.mark() {
+            acknowledged.push(mark);
         }
     }
 
@@ -111,6 +110,7 @@ pub fn created_names(census: &Census, walked: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scenario::Op;
     use std::collections::BTreeMap;
 
     /// The forklift binary to drive, given by path; the harness never builds or links it.
@@ -138,7 +138,7 @@ mod tests {
         };
 
         let built = build(&scenario, &corpus, Tool::Forklift, &program, &scratch, &environment, Duration::from_secs(60)).unwrap();
-        assert_eq!(built.acknowledged, vec![0, 1, 2]);
+        assert_eq!(built.acknowledged, vec![Mark::Record(0), Mark::Record(1), Mark::Record(2)]);
 
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let census = Census::load(&source).unwrap().expect("this tree has a census");
