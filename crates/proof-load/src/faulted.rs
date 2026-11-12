@@ -436,10 +436,10 @@ impl Trail {
     /// every record reads as expected. The record counts as made from here on once the history
     /// serves it and the tool's latest answer asks nothing further (see [`answered`]): a command
     /// killed after its record was durable, retried, is told there is nothing left to do.
-    fn settle(&mut self, context: &Context, expected: &Expected, made: &mut bool) -> Result<bool, RunError> {
-        // Only a retry's answer settles a served record: the faulted command's own refusal, its
-        // record served, is a refusal of a committed write and is graded as one.
-        let retry = !self.readbacks.is_empty();
+    /// `retry` says the latest step re-ran the faulted command: only a retry's answer settles a
+    /// served record, since the faulted command's own refusal of a write it committed is graded as
+    /// a refusal, and heal is no re-run.
+    fn settle(&mut self, context: &Context, expected: &Expected, made: &mut bool, retry: bool) -> Result<bool, RunError> {
         let mut readback = self.read_back(context, expected, *made)?;
         if !*made && settles(retry, self.steps.last()) && readback.reads(&[expected.faulted]) {
             *made = true;
@@ -542,10 +542,10 @@ pub(crate) fn grade_after(
     // The faulted command, then one plain retry of it. Once the tool acknowledged the record it
     // stays owed, so a later attempt that refuses (a re-stack with nothing new) does not unmake it.
     let mut made = first(context, &mut trail.steps)?;
-    let mut reads = trail.settle(context, expected, &mut made)?;
+    let mut reads = trail.settle(context, expected, &mut made, false)?;
     if !reads {
         made |= context.record(faulted, &mut trail.steps)?;
-        reads = trail.settle(context, expected, &mut made)?;
+        reads = trail.settle(context, expected, &mut made, true)?;
     }
     trail.evidence.healed_by_retry = reads;
 
@@ -588,7 +588,7 @@ pub(crate) fn grade_after(
                 }
             }
             made |= context.record(faulted, &mut trail.steps)?;
-            let reads = trail.settle(context, expected, &mut made)?;
+            let reads = trail.settle(context, expected, &mut made, true)?;
             trail.evidence.remedy_worked = reads;
             trail.recoverability.named_right_remedy = reads;
             Ok(reads)
@@ -601,7 +601,7 @@ pub(crate) fn grade_after(
     // Heal last, when an acknowledged record still does not read back.
     if !trail.evidence.acknowledged_readable {
         trail.steps.push(context.run(&context.programs.forklift, vec!["--json".into(), "heal".into()], context.scratch.work())?);
-        trail.settle(context, expected, &mut made)?;
+        trail.settle(context, expected, &mut made, false)?;
     }
 
     Ok(Graded {
