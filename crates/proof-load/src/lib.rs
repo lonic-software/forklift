@@ -23,6 +23,7 @@ pub mod power;
 pub mod proxy;
 pub mod remedy;
 pub mod report;
+pub mod routes;
 pub mod runner;
 pub mod scenario;
 pub mod scrub;

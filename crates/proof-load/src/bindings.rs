@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::census::Census;
 use crate::damage::{self, Binding, Exemption, Kind, Warehouse};
+use crate::routes::Exemption as RouteExemption;
 use crate::scenario::Scenario;
 use crate::writeops::Exemption as WriteExemption;
 use crate::writeops::Exemption::{ReadOnly, Unrunnable};
@@ -144,6 +145,10 @@ pub const WRITE_EXEMPTIONS: &[(&str, WriteExemption)] = &[
     ("upgrade", Unrunnable(NEEDS_OLDER_FORMAT)), ("forklift-server upgrade", Unrunnable(NEEDS_OLDER_FORMAT)),
     ("forklift-server serve", Unrunnable(SERVES)),
 ];
+
+/// The server routes the route check does not require a successful answer of, by the route
+/// table's method and path.
+pub const ROUTE_EXEMPTIONS: &[RouteExemption] = &[];
 
 /// What the damage completeness check finds missing: census names no binding or exemption covers,
 /// bindings and exemptions the census no longer lists, bindings naming a scenario that does not

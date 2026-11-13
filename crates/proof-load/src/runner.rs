@@ -15,6 +15,7 @@ use crate::oracle::{Admissible, RedactionLedger, RedactionState};
 use crate::scenario::{bind, Keep, Mark, Op, Scenario, Tool, Until, SCRATCH, TARGET, URL, WORK};
 use crate::scrub::{Environment, Scratch};
 use crate::host::Host;
+use crate::proxy::Exchange;
 use crate::tool::{self, Invocation, Outcome};
 use crate::writeops::Observer;
 
@@ -34,6 +35,18 @@ pub struct Built {
     /// The server a `Host` operation started, serving until this is dropped.
     #[serde(skip)]
     pub host: Option<Host>,
+    /// What the proxies of hosts the history stopped logged before they went.
+    #[serde(skip)]
+    pub stopped: Vec<Exchange>,
+}
+
+impl Built {
+    /// Every exchange the history's hosts logged: those it stopped, then the one still serving.
+    pub fn exchanges(&self) -> Vec<Exchange> {
+        let mut exchanges = self.stopped.clone();
+        exchanges.extend(self.host.iter().flat_map(|host| host.proxy.log()));
+        exchanges
+    }
 }
 
 impl std::fmt::Debug for Built {
@@ -134,6 +147,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
     let mut outcomes = vec![run_in(program, prepare(tool), scratch.work())?];
     let mut acknowledged = Vec::new();
     let mut host: Option<Host> = None;
+    let mut stopped = Vec::new();
     let mut taken = Vec::new();
     let mut ledger = RedactionLedger::default();
     // The folder a sparse clone scoped the work tree to, which bounds what a later write may hold.
@@ -154,6 +168,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                 let server = server.ok_or_else(|| RunError::Io(format!("scenario {} hosts a warehouse, and no forklift-server binary was given", scenario.id)))?;
                 let root = host_root(scratch);
                 outcomes.push(run_in(server, vec!["prepare".into(), "--root".into(), root.display().to_string()], scratch.root().to_path_buf())?);
+                stopped.extend(host.iter().flat_map(|host| host.proxy.log()));
                 host = Some(Host::start(server, &root, scratch, environment, limit).map_err(RunError::Tool)?);
             }
             Op::Bundle => {
@@ -256,7 +271,9 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                 continue;
             }
             Op::StopHost => {
-                drop(host.take().ok_or_else(|| RunError::Io(format!("scenario {} stops a host it does not serve", scenario.id)))?);
+                let gone = host.take().ok_or_else(|| RunError::Io(format!("scenario {} stops a host it does not serve", scenario.id)))?;
+                stopped.extend(gone.proxy.log());
+                drop(gone);
                 // The kill leaves the server's lock behind, its holder gone: the harness killed
                 // the one holder, so it clears it, as an operator would.
                 let lock = host_root(scratch).join(".forklift").join("serve.lock");
@@ -349,7 +366,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
         Some(_) => census::walk(&host_root(scratch).join(".forklift")).map_err(|error| RunError::Io(error.to_string()))?,
         None => Vec::new(),
     };
-    Ok(Built { outcomes, walked, host_walked, taken, acknowledged, host })
+    Ok(Built { outcomes, walked, host_walked, taken, acknowledged, host, stopped })
 }
 
 /// A tool's JSON document, or null when its stdout is not one.

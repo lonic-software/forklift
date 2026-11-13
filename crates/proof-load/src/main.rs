@@ -131,6 +131,14 @@ fn main() -> ExitCode {
         }
     };
 
+    let routes = match proof_load::routes::RouteTable::load(&source) {
+        Ok(routes) => routes,
+        Err(error) => {
+            eprintln!("proof-load: {}", error);
+            return ExitCode::from(2);
+        }
+    };
+
     for (flag, ids) in [("--kill", &kill), ("--power", &power), ("--disk-full", &disk_full), ("--read-only", &read_only_lane), ("--network", &network_lane)] {
         if let Some(unknown) = ids.iter().find(|id| !scenario::catalog().iter().any(|scenario| &scenario.id == *id)) {
             eprintln!("proof-load: {} {}: no such scenario", flag, unknown);
@@ -209,6 +217,8 @@ fn main() -> ExitCode {
     let mut created: BTreeMap<(String, Warehouse), Vec<String>> = BTreeMap::new();
     let mut walk_missing = Vec::new();
     let mut evidence = Vec::new();
+    // Every exchange the built scenarios' hosts logged, for the route check.
+    let mut exchanges = Vec::new();
     if let (Some(program), Some(schema)) = (&program, &schema) {
         tools.insert("forklift".to_string(), described(program));
         if let Ok(strace) = &traced {
@@ -224,6 +234,9 @@ fn main() -> ExitCode {
                         .map_err(|error| error.to_string())
                 });
             evidence.extend(observer.evidence());
+            if let Ok(built) = &built {
+                exchanges.extend(built.exchanges());
+            }
             match (built, &census) {
                 (Ok(built), Some(census)) => {
                     walk_missing.extend(census.unclassified(&built.walked).into_iter().map(|path| format!("{}: {}", scenario.id, path)));
@@ -256,6 +269,18 @@ fn main() -> ExitCode {
         (Some(_), Some(_)) => Cell::Run,
     };
     let walk_check = Completeness { check: "census walk".to_string(), cell: walk_cell, missing: walk_missing };
+    // Every scenario hosts in single mode, so the routes are matched under the single prefix.
+    let route_check = match (&program, &server, &routes) {
+        (None, _, _) => Completeness { check: "server routes answered".to_string(), cell: Cell::not_run("no forklift binary given"), missing: vec![] },
+        (_, None, _) => Completeness { check: "server routes answered".to_string(), cell: Cell::not_run("no forklift-server binary given"), missing: vec![] },
+        (_, _, None) => Completeness { check: "server routes answered".to_string(), cell: Cell::not_run("no route table for this version"), missing: vec![] },
+        // Run in full only: a filtered run builds too few scenarios to answer every route.
+        _ if only.is_some() => Completeness { check: "server routes answered".to_string(), cell: Cell::not_run("--only builds one scenario"), missing: vec![] },
+        (Some(_), Some(_), Some(routes)) => Completeness {
+            check: "server routes answered".to_string(), cell: Cell::Run,
+            missing: proof_load::routes::check(routes, proof_load::routes::Mode::Single, &exchanges, proof_load::bindings::ROUTE_EXEMPTIONS),
+        },
+    };
 
     let damage_check = match &census {
         None => Completeness { check: "damage bindings".to_string(), cell: Cell::not_run("no census for this version"), missing: vec![] },
@@ -642,7 +667,7 @@ fn main() -> ExitCode {
     if matches!(kill_cell, Cell::Run | Cell::Sampled) || not_reached > 0 {
         coverage.not_reached.insert(Category::KillPointsClient, not_reached);
     }
-    let mut completeness = vec![damage_check, walk_check, fault_check];
+    let mut completeness = vec![damage_check, walk_check, route_check, fault_check];
     completeness.extend(condition_checks);
     completeness.extend(write_checks);
     completeness.extend(kill_completeness);
