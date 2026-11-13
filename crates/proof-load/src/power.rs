@@ -1357,8 +1357,8 @@ mod tests {
     /// is graded once, counted; only the moment after the last line is acknowledged, even when it
     /// leaves the same state as an earlier one.
     ///
-    /// Revert: take the state after the call → the crash at the fsync already holds `new`; drop
-    /// acknowledged from the key → the last line's state merges into an earlier unacknowledged one.
+    /// Revert: take the state after the call → the crash at the fsync already holds `new`; key a
+    /// state by its tree alone → the last line's state merges into an earlier unacknowledged one.
     #[test]
     fn crashes_land_before_each_point_and_after_each_line() {
         let texts = [rewrite(true), "2 openat(AT_FDCWD</s/w>, \"a\", O_RDONLY) = 3</s/w/a>\n".to_string()];
