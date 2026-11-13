@@ -122,7 +122,9 @@ fn under(
 }
 
 /// Runs `scenario`'s faulted command once without a fault on `scratch`, on the capped volume, and
-/// measures by filling it what its lines consume net, the snapshot already written.
+/// measures by filling it what its lines consume at their deepest: the most free space they had
+/// taken after any one line, the snapshot already written. A repack that frees space by its end
+/// has still consumed what its record took first.
 pub fn consumed(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, ballast: &Path) -> Result<u64, String> {
     let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), scratch, environment, limit, None)
         .map_err(|error| error.to_string())?;
@@ -133,18 +135,21 @@ pub fn consumed(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scrat
         scope: scenario.scope(), via_host: false,
     };
     context.write_snapshot(index).map_err(|error| error.to_string())?;
-    let free = |ballast: &Path| -> Result<u64, String> {
+    let free = || -> Result<u64, String> {
         let held = fill(ballast, 0, MAX_BALLAST).map_err(|error| error.to_string())?;
         damage::apply(ballast, Kind::Delete, 0).map_err(|error| format!("{:?}", error))?;
         Ok(held)
     };
-    let before = free(ballast)?;
-    let mut steps = Vec::new();
-    if !context.run_lines(index, &mut steps).map_err(|error| error.to_string())? {
-        let failed = steps.last().map(|outcome| outcome.arguments.join(" ")).unwrap_or_default();
-        return Err(format!("the faulted command refused with no fault set: {}", failed));
+    let before = free()?;
+    let mut deepest = 0;
+    for arguments in context.lines(index).map_err(|error| error.to_string())? {
+        let outcome = context.run(&programs.forklift, arguments, scratch.work()).map_err(|error| error.to_string())?;
+        if !outcome.succeeded() {
+            return Err(format!("the faulted command refused with no fault set: {}", outcome.arguments.join(" ")));
+        }
+        deepest = deepest.max(before.saturating_sub(free()?));
     }
-    Ok(before.saturating_sub(free(ballast)?))
+    Ok(deepest)
 }
 
 /// The disk-full fault: `free` bytes left on the capped volume when the faulted command's lines

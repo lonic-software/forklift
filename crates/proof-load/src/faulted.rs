@@ -132,16 +132,28 @@ impl Context<'_> {
     /// The faulted command: corpus record `index` written into the work tree, then the record
     /// operation's lines and those of the scenario's `then` run in order until one fails.
     pub(crate) fn record(&self, index: usize, steps: &mut Vec<Outcome>) -> Result<bool, RunError> {
+        self.record_from(index, 0, steps)
+    }
+
+    /// The faulted command resumed at line `from`: the snapshot written again, as the user's files
+    /// still hold it, then the lines from `from` on.
+    fn record_from(&self, index: usize, from: usize, steps: &mut Vec<Outcome>) -> Result<bool, RunError> {
         self.write_snapshot(index)?;
-        self.run_lines(index, steps)
+        self.run_lines_from(index, from, steps)
     }
 
     /// The faulted command's lines for corpus record `index`, run in order until one fails, its
     /// snapshot already written: an environment fault is set between the two.
     pub(crate) fn run_lines(&self, index: usize, steps: &mut Vec<Outcome>) -> Result<bool, RunError> {
-        for arguments in self.lines(index)? {
+        self.run_lines_from(index, 0, steps)
+    }
+
+    fn run_lines_from(&self, index: usize, from: usize, steps: &mut Vec<Outcome>) -> Result<bool, RunError> {
+        for arguments in self.lines(index)?.into_iter().skip(from) {
             let outcome = self.run(&self.programs.forklift, arguments, self.scratch.work())?;
-            let succeeded = outcome.succeeded();
+            // A resumed record whose parcel already stands is done, and the user goes on to the
+            // next step, as they would after any line that landed.
+            let succeeded = outcome.succeeded() || already_stacked(&outcome);
             steps.push(outcome);
             if !succeeded {
                 return Ok(false);
@@ -300,6 +312,13 @@ impl Context<'_> {
         }
         Ok(HistoryReadback { export: opened, records })
     }
+}
+
+/// Whether `outcome` is a stack refused because its record already stands: the inventory matches
+/// the pallet's head, so there is nothing left to stack.
+fn already_stacked(outcome: &Outcome) -> bool {
+    outcome.arguments.iter().any(|argument| argument == "stack")
+        && outcome.failure.as_ref().is_some_and(|failure| failure.message.starts_with("Nothing to stack"))
 }
 
 /// Whether an export reported leaving any file out, withheld or redacted.
@@ -511,6 +530,19 @@ pub struct Graded {
     pub unextractable: Vec<String>,
 }
 
+/// The line of the faulted command a retry resumes at, after an attempt that started at line `from`
+/// and ran `ran`, one outcome per line, of the command's `lines`: the first line that did not
+/// succeed, or the first it never reached, as a user re-runs the step that failed rather than the
+/// ones that landed (a record already stacked is refused as nothing to stack, and what follows it
+/// would never run again). An attempt that ran every line resumes at the start.
+fn resume_at(from: usize, ran: &[Outcome], lines: usize) -> usize {
+    match ran.iter().position(|outcome| !outcome.succeeded()) {
+        Some(failed) => from + failed,
+        None if from + ran.len() < lines => from + ran.len(),
+        None => 0,
+    }
+}
+
 /// How many rounds of named remedies a fault gets: each round runs what the refusals so far named
 /// and nothing run before.
 const REMEDY_ROUNDS: usize = 3;
@@ -547,10 +579,18 @@ pub(crate) fn grade_after(
 
     // The faulted command, then one plain retry of it. Once the tool acknowledged the record it
     // stays owed, so a later attempt that refuses (a re-stack with nothing new) does not unmake it.
+    let lines = context.lines(faulted)?.len();
     let mut made = first(context, &mut trail.steps)?;
+    let mut resume = resume_at(0, &trail.steps, lines);
+    let retry = |trail: &mut Trail, resume: &mut usize| -> Result<bool, RunError> {
+        let start = trail.steps.len();
+        let made = context.record_from(faulted, *resume, &mut trail.steps)?;
+        *resume = resume_at(*resume, &trail.steps[start..], lines);
+        Ok(made)
+    };
     let mut reads = trail.settle(context, expected, &mut made, false)?;
     if !reads {
-        made |= context.record(faulted, &mut trail.steps)?;
+        made |= retry(&mut trail, &mut resume)?;
         reads = trail.settle(context, expected, &mut made, true)?;
     }
     trail.evidence.healed_by_retry = reads;
@@ -593,7 +633,7 @@ pub(crate) fn grade_after(
                     },
                 }
             }
-            made |= context.record(faulted, &mut trail.steps)?;
+            made |= retry(trail, &mut resume)?;
             let reads = trail.settle(context, expected, &mut made, true)?;
             trail.evidence.remedy_worked = reads;
             trail.recoverability.named_right_remedy = reads;
@@ -670,6 +710,37 @@ mod tests {
         assert_eq!(resolve("objects/<xx>/", &walked(), 0).as_deref(), Some("objects/ab"));
         assert_eq!(resolve("warehouse", &walked(), 5).as_deref(), Some("warehouse"));
         assert_eq!(resolve("trust", &walked(), 0), None);
+    }
+
+    /// A retry resumes at the line that failed or was cut, at the first never reached after an
+    /// attempt that stopped early, and at the start after one that ran every line.
+    ///
+    /// Revert: always resume at the start → a repack refused after its record stacked is retried
+    /// as a re-stack, which refuses as nothing to stack, and the repack never runs again.
+    #[test]
+    fn a_retry_resumes_at_the_line_that_did_not_land() {
+        let exited = |exit: Option<i32>| Outcome { arguments: vec![], exit, stdout: vec![], stderr: vec![], failure: None };
+        assert_eq!(resume_at(0, &[exited(Some(0)), exited(Some(0)), exited(Some(1))], 3), 2);
+        assert_eq!(resume_at(0, &[exited(Some(0)), exited(None)], 3), 1);
+        assert_eq!(resume_at(0, &[exited(Some(0))], 3), 1);
+        assert_eq!(resume_at(2, &[exited(Some(1))], 3), 2);
+        assert_eq!(resume_at(2, &[exited(Some(0))], 3), 0);
+        assert_eq!(resume_at(0, &[exited(Some(0)), exited(Some(0)), exited(Some(0))], 3), 0);
+    }
+
+    /// A stack refused as nothing to stack is a record that already stands; any other refusal, or
+    /// that message from another command, is not.
+    ///
+    /// Revert: take every refused stack as stacked → a stack refused for a full disk reads as done.
+    #[test]
+    fn only_nothing_to_stack_is_already_stacked() {
+        let refused = |arguments: &[&str], message: &str| Outcome {
+            arguments: arguments.iter().map(|argument| argument.to_string()).collect(), exit: Some(1), stdout: vec![], stderr: vec![],
+            failure: Some(tool::Failure { code: "error".into(), message: message.into(), next_step: None }),
+        };
+        assert!(already_stacked(&refused(&["--json", "stack", "-m", "r"], "Nothing to stack: the inventory matches the head of pallet \"main\".")));
+        assert!(!already_stacked(&refused(&["--json", "stack", "-m", "r"], "Error while writing file: No space left on device (os error 28)")));
+        assert!(!already_stacked(&refused(&["--json", "load", "."], "Nothing to stack")));
     }
 
     fn served(subjects: &[(usize, Verdict)]) -> HistoryReadback {
