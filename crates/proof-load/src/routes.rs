@@ -111,9 +111,16 @@ impl std::error::Error for RoutesError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Exemption {
     pub method: &'static str,
-    /// The path as the route table writes it.
+    /// The path and mount as the route table writes them.
     pub path: &'static str,
+    pub mount: Mount,
     pub reason: &'static str,
+}
+
+impl Exemption {
+    pub fn names(&self, route: &Route) -> bool {
+        self.method == route.method && self.path == route.path && self.mount == route.mount
+    }
 }
 
 /// The rows between `markers`: `Ok(None)` when neither marker is there.
@@ -222,8 +229,7 @@ impl RouteTable {
                 other => return Err(malformed(format!("unknown access {:?}", other))),
             };
             let route = Route { method: method.to_string(), path: path.to_string(), mount, modes, access };
-            // Exemptions name a route by method and path, so no two rows may share them.
-            if routes.iter().any(|listed| listed.method == route.method && listed.path == route.path) {
+            if routes.iter().any(|listed| listed.method == route.method && listed.path == route.path && listed.mount == route.mount) {
                 return Err(malformed(format!("the route {} is listed twice", route.label())));
             }
             routes.push(route);
@@ -324,17 +330,17 @@ pub fn check(table: &RouteTable, mode: Mode, exchanges: &[Exchange], exemptions:
         }
     }
     for route in &table.routes {
-        let exempt = exemptions.iter().find(|exemption| exemption.method == route.method && exemption.path == route.path);
+        let exempt = exemptions.iter().find(|exemption| exemption.names(route));
         match (answered.contains(&route), exempt) {
             (true, Some(_)) => missing.push(format!("stale route exemption: {} was answered with success", route.label())),
-            (false, None) if !route.modes.includes(mode) => missing.push(format!("{}: served only in {} mode, which no scenario serves", route.label(), match mode { Mode::Single => "multi", Mode::Multi => "single" })),
+            (false, None) if !route.modes.includes(mode) => missing.push(format!("{}: not served in the mode the scenarios serve, and no exemption names it", route.label())),
             (false, None) => missing.push(format!("{}: no scenario's request was answered with success", route.label())),
             _ => {}
         }
     }
     for exemption in exemptions {
-        if !table.routes.iter().any(|route| route.method == exemption.method && route.path == exemption.path) {
-            missing.push(format!("stale route exemption: {} {} is not a listed route", exemption.method, exemption.path));
+        if !table.routes.iter().any(|route| exemption.names(route)) {
+            missing.push(format!("stale route exemption: {} {} is not a listed route at that mount", exemption.method, exemption.path));
         }
     }
     missing
@@ -387,7 +393,7 @@ mod tests {
             SAMPLE.replace("<!-- mounts:start -->", "").replace("<!-- mounts:end -->", ""),
             SAMPLE.replace("| `GET` | `/healthz` | `root` | both | public |", "| `GET` | `/warehouse` | `protocol` | both | authenticated |"),
             SAMPLE.replace("`/healthz`", "healthz"),
-            SAMPLE.replace("| `GET` | `/healthz` | `root` | both | public |", "| `GET` | `/healthz` | `root` | both | public |\n| `GET` | `/healthz` | `protocol` | both | public |"),
+            SAMPLE.replace("| `GET` | `/healthz` | `root` | both | public |", "| `GET` | `/healthz` | `root` | both | public |\n| `GET` | `/healthz` | `root` | both | authenticated |"),
         ] {
             assert!(matches!(RouteTable::parse(&broken, PathBuf::from("x")), Err(RoutesError::Malformed { .. })), "{}", broken);
         }
@@ -428,8 +434,8 @@ mod tests {
     fn every_route_needs_a_success_or_an_exemption() {
         let table = sample();
         let exemptions = [
-            Exemption { method: "PUT", path: "/warehouses/{warehouse}", reason: "multi mode" },
-            Exemption { method: "GET", path: "/objects/missing", reason: "not sent" },
+            Exemption { method: "PUT", path: "/warehouses/{warehouse}", mount: Mount::Root, reason: "multi mode" },
+            Exemption { method: "GET", path: "/objects/missing", mount: Mount::Protocol, reason: "not sent" },
         ];
         let all = [
             exchange("GET", "/v1/warehouse", 200), exchange("POST", "/v1/objects/missing", 200),
@@ -441,16 +447,23 @@ mod tests {
         failed[2].status = Some(404);
         failed.push(exchange("GET", "/v1/nowhere", 404));
         failed.push(exchange("GET", "/v1/objects/missing", 200));
-        assert_eq!(check(&table, Mode::Single, &failed, &[Exemption { method: "GET", path: "/gone", reason: "x" }]), vec![
+        assert_eq!(check(&table, Mode::Single, &failed, &[Exemption { method: "GET", path: "/gone", mount: Mount::Root, reason: "x" }]), vec![
             "GET /v1/nowhere (404) matches no listed route".to_string(),
             "GET /objects/{hash}: no scenario's request was answered with success".to_string(),
-            "PUT /warehouses/{warehouse}: served only in multi mode, which no scenario serves".to_string(),
-            "stale route exemption: GET /gone is not a listed route".to_string(),
+            "PUT /warehouses/{warehouse}: not served in the mode the scenarios serve, and no exemption names it".to_string(),
+            "stale route exemption: GET /gone is not a listed route at that mount".to_string(),
         ]);
-        assert_eq!(check(&table, Mode::Single, &failed[..5], &[exemptions[0], Exemption { method: "GET", path: "/healthz", reason: "x" }]), vec![
+        assert_eq!(check(&table, Mode::Single, &failed[..5], &[exemptions[0], Exemption { method: "GET", path: "/healthz", mount: Mount::Root, reason: "x" }]), vec![
             "GET /objects/{hash}: no scenario's request was answered with success".to_string(),
             "GET /objects/missing: no scenario's request was answered with success".to_string(),
             "stale route exemption: GET /healthz was answered with success".to_string(),
+        ]);
+        // An exemption names a route at its mount: the same method and path under another mount
+        // covers nothing.
+        assert_eq!(check(&table, Mode::Single, &all[..4], &[exemptions[0], Exemption { method: "GET", path: "/healthz", mount: Mount::Protocol, reason: "x" }]), vec![
+            "GET /objects/missing: no scenario's request was answered with success".to_string(),
+            "GET /healthz: no scenario's request was answered with success".to_string(),
+            "stale route exemption: GET /healthz is not a listed route at that mount".to_string(),
         ]);
     }
 }
