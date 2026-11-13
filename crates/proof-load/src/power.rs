@@ -14,10 +14,15 @@
 //! with everything synced inside it.
 //!
 //! A crash lands at every kill point of every line, before the call, before every other sync,
-//! children's included, and after each line exits; the state after the last line is the one the
-//! tool acknowledged. A crash state that records the counting area's root stops the scenario as
-//! path-bound, as the run's final tree would. These are POSIX-minimal semantics. A real ext4 in data=ordered mode keeps more than this, so a loss graded here may
-//! survive on a real machine; every row says so.
+//! children's included, after each line's last call before it exits, and after each line exits;
+//! the state after the last line is the one the tool acknowledged. A crash state that records the
+//! counting area's root stops the scenario as path-bound, as the run's final tree would. These are
+//! POSIX-minimal semantics. A real ext4 in data=ordered mode keeps more than this, so a loss
+//! graded here may survive on a real machine; every row says so.
+//!
+//! Each state is written out afresh, so no file keeps the inode or times it had: a stat cache that
+//! trusts an unchanged file finds every entry changed, and a state where it would trust a file
+//! whose object was lost is not exercised. Every row says that too.
 //!
 //! The replay is checked against the run it models: once every line is replayed, the volatile
 //! model must match the counting copy on disk, path by path, or the scenario's power loss is
@@ -40,6 +45,9 @@ use crate::trace::{self, Argument, Call, Class, Returned, Root};
 
 /// What every power-loss row says beside its grade.
 pub const CAVEAT: &str = "POSIX-minimal model: a real ext4 (data=ordered) keeps more, so a loss here may survive on a real machine";
+
+/// What every power-loss row says of what it cannot grade.
+pub const REWRITTEN: &str = "each state is written out afresh: no file keeps its inode or times, so a stat cache trusting a file whose object was lost is not exercised";
 
 /// A model inode.
 type Ino = usize;
@@ -1455,7 +1463,7 @@ pub fn summarize(all: &[ScenarioPower]) -> Summary {
             missing.push(format!("{}: no crash state was graded", scenario.scenario));
         }
         for GradedCrash { crash, graded } in &scenario.crashes {
-            let mut notes = vec![CAVEAT.to_string()];
+            let mut notes = vec![CAVEAT.to_string(), REWRITTEN.to_string()];
             if crash.shared > 1 {
                 notes.push(format!("{} crash moments leave this state", crash.shared));
             }
