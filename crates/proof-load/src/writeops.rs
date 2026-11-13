@@ -10,10 +10,9 @@
 //! covers nothing. A command read-only by design is exempt by name, and every run of it is checked
 //! by a digest of the tree it ran in, before and after, to have changed nothing.
 
-use std::cell::RefCell;
+use std::cell::{Cell as Counter, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::report::{Cell, Completeness};
@@ -63,9 +62,11 @@ impl Schema {
     }
 
     /// The id of the command a forklift line runs: the command whose words are the longest prefix
-    /// of the line's arguments that are not options. None when no command's words are.
+    /// of the line's arguments before any `--` that are not options. None when no command's words
+    /// are.
     pub fn id_of(&self, arguments: &[String]) -> Option<String> {
-        let positional: Vec<&str> = arguments.iter().map(String::as_str).filter(|argument| !argument.starts_with('-')).collect();
+        let positional: Vec<&str> = arguments.iter().map(String::as_str).take_while(|argument| *argument != "--")
+            .filter(|argument| !argument.starts_with('-')).collect();
         self.commands.iter()
             .filter(|command| command.words.len() <= positional.len() && command.words.iter().zip(&positional).all(|(word, given)| word == given))
             .max_by_key(|command| command.words.len())
@@ -227,16 +228,23 @@ pub struct Observer<'a> {
     pub schema: &'a Schema,
     pub leaves: &'a [Vec<String>],
     /// The ids digested around every run: those exempt as read-only.
-    pub read_only: BTreeSet<String>,
+    pub read_only: &'a BTreeSet<String>,
     /// The scenario being built.
     pub scenario: String,
-    pub(crate) next: AtomicUsize,
-    pub(crate) seen: RefCell<Vec<Evidence>>,
+    next: Counter<usize>,
+    seen: RefCell<Vec<Evidence>>,
 }
 
 impl<'a> Observer<'a> {
-    pub fn new(strace: Option<&'a Path>, traces: &'a Path, schema: &'a Schema, leaves: &'a [Vec<String>], read_only: BTreeSet<String>, scenario: &str) -> Observer<'a> {
-        Observer { strace, traces, schema, leaves, read_only, scenario: scenario.to_string(), next: AtomicUsize::new(0), seen: RefCell::new(Vec::new()) }
+    pub fn new(strace: Option<&'a Path>, traces: &'a Path, schema: &'a Schema, leaves: &'a [Vec<String>], read_only: &'a BTreeSet<String>, scenario: &str) -> Observer<'a> {
+        Observer { strace, traces, schema, leaves, read_only, scenario: scenario.to_string(), next: Counter::new(0), seen: RefCell::new(Vec::new()) }
+    }
+
+    /// A fresh trace file's path for this scenario, outside every scratch area.
+    pub fn trace_path(&self, kind: &str) -> PathBuf {
+        let at = self.next.get();
+        self.next.set(at + 1);
+        self.traces.join(format!("{}-{}-{}.trace", self.scenario, kind, at))
     }
 
     /// What the steps observed so far showed.
@@ -249,14 +257,16 @@ impl<'a> Observer<'a> {
     /// must leave unchanged.
     pub fn run(&self, invocation: &Invocation, server: bool, tree: &Path, scratch: &Scratch, environment: &Environment) -> Result<Outcome, ToolError> {
         let id = if server { leaf_of(self.leaves, &invocation.arguments) } else { self.schema.id_of(&invocation.arguments) };
-        let Some(id) = id else { return tool::run(invocation, scratch, environment) };
+        // A line the universe has no name for would go unrecorded: refuse it rather than guess.
+        let Some(id) = id else {
+            return Err(ToolError::Spawn { program: invocation.program.clone(), reason: format!("no command of the version under test is `{}`", invocation.arguments.join(" ")) });
+        };
         let digested = self.read_only.contains(&id);
         let before = if digested { Some(digest(tree).map_err(|error| ToolError::Spawn { program: tree.to_path_buf(), reason: error.to_string() })?) } else { None };
         let mut traced_at = None;
         let mut outcome = match self.strace {
             Some(strace) => {
-                let at = self.next.fetch_add(1, Ordering::SeqCst);
-                let path = self.traces.join(format!("{}-cover-{}.trace", self.scenario, at));
+                let path = self.trace_path("cover");
                 let line = crate::kill::strace_line(&path, &[], &invocation.program, &invocation.arguments);
                 let traced = Invocation { program: strace.to_path_buf(), arguments: line, directory: invocation.directory.clone(), limit: invocation.limit };
                 traced_at = Some(path);
@@ -401,6 +411,7 @@ mod tests {
     fn a_line_maps_to_the_longest_matching_command() {
         let schema = schema();
         assert_eq!(schema.id_of(&strings(&["--json", "park", "pop"])).as_deref(), Some("park-pop"));
+        assert_eq!(schema.id_of(&strings(&["--json", "park", "--", "pop"])).as_deref(), Some("park"), "an operand is no command word");
         assert_eq!(schema.id_of(&strings(&["--json", "park"])).as_deref(), Some("park"));
         assert_eq!(schema.id_of(&strings(&["--json", "pallet", "delete", "--remote", "--", "side"])).as_deref(), Some("pallet-delete"));
         assert_eq!(schema.id_of(&strings(&["--json", "pallet", "side"])).as_deref(), Some("pallet"));

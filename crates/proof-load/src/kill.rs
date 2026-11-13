@@ -411,10 +411,10 @@ pub struct Settings<'a> {
     pub schema: &'a crate::writeops::Schema,
 }
 
-/// The command id of a forklift line, as the schema names it; its first argument after `--json`
-/// when the schema has no command for it.
-pub fn command_id(schema: &crate::writeops::Schema, arguments: &[String]) -> String {
-    schema.id_of(arguments).unwrap_or_else(|| arguments.iter().find(|argument| *argument != "--json").cloned().unwrap_or_default())
+/// The command id of a forklift line, as the schema names it. A line the schema has no command
+/// for refuses the scenario's points rather than naming them by a guess.
+pub fn command_id(schema: &crate::writeops::Schema, arguments: &[String]) -> Result<String, String> {
+    schema.id_of(arguments).ok_or_else(|| format!("the schema has no command for `{}`", arguments.join(" ")))
 }
 
 /// Why a scenario's kill points cannot run in this build of the harness, if they cannot.
@@ -480,7 +480,14 @@ pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: 
         let calls = trace::parse(&text).map_err(RunError::Io)?;
         let start = counting.work().to_string_lossy().into_owned();
         let existed = |path: &str| before.contains(path) || counting_root.rebase(path, &Root { given: counting_root.given.clone(), canonical: counting_root.given.clone() }).is_some_and(|given| before.contains(&given));
-        match enumerate(&calls, index, &command_id(settings.schema, arguments), &counting_root, &start, existed) {
+        let command = match command_id(settings.schema, arguments) {
+            Ok(command) => command,
+            Err(refusal) => {
+                kills.refusals.push(refusal);
+                continue;
+            }
+        };
+        match enumerate(&calls, index, &command, &counting_root, &start, existed) {
             Ok(enumerated) => {
                 points.extend(enumerated.points);
                 kills.children.extend(enumerated.children);

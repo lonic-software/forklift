@@ -181,7 +181,7 @@ fn main() -> ExitCode {
             tools.insert("strace".to_string(), described(strace));
         }
         for scenario in &built_scenarios {
-            let observer = writeops::Observer::new(traced.as_ref().ok().map(PathBuf::as_path), &traces, schema, &leaves, read_only.clone(), &scenario.id);
+            let observer = writeops::Observer::new(traced.as_ref().ok().map(PathBuf::as_path), &traces, schema, &leaves, &read_only, &scenario.id);
             let built = output.scratch(&scenario.id).map_err(|error| error.to_string())
                 .and_then(|scratch| {
                     let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
@@ -202,21 +202,18 @@ fn main() -> ExitCode {
             }
         }
     }
-    let _ = std::fs::write(output.root().join("write-ops.json"), serde_json::to_string(&evidence).unwrap_or_default());
+    let written = serde_json::to_string(&evidence).map_err(|error| error.to_string())
+        .and_then(|text| std::fs::write(output.root().join("write-ops.json"), text).map_err(|error| error.to_string()));
+    if let Err(error) = written {
+        eprintln!("proof-load: cannot write write-ops.json: {}", error);
+        return ExitCode::from(2);
+    }
+    let not_run = |reason: &str| ["write-op coverage", "read-only exemptions"].map(|check| Completeness { check: check.to_string(), cell: Cell::not_run(reason), missing: vec![] }).to_vec();
     let write_checks = match (&schema, &server) {
-        (None, _) => vec![
-            Completeness { check: "write-op coverage".to_string(), cell: Cell::not_run("no forklift binary given"), missing: vec![] },
-            Completeness { check: "read-only exemptions".to_string(), cell: Cell::not_run("no forklift binary given"), missing: vec![] },
-        ],
-        (Some(_), None) => vec![
-            Completeness { check: "write-op coverage".to_string(), cell: Cell::not_run("no forklift-server binary given"), missing: vec![] },
-            Completeness { check: "read-only exemptions".to_string(), cell: Cell::not_run("no forklift-server binary given"), missing: vec![] },
-        ],
+        (None, _) => not_run("no forklift binary given"),
+        (Some(_), None) => not_run("no forklift-server binary given"),
         // Run in full only: a filtered run builds too few scenarios to cover the universe.
-        (Some(_), Some(_)) if only.is_some() => vec![
-            Completeness { check: "write-op coverage".to_string(), cell: Cell::not_run("--only builds one scenario"), missing: vec![] },
-            Completeness { check: "read-only exemptions".to_string(), cell: Cell::not_run("--only builds one scenario"), missing: vec![] },
-        ],
+        (Some(_), Some(_)) if only.is_some() => not_run("--only builds one scenario"),
         (Some(schema), Some(_)) => writeops::check(&writeops::universe(schema, &leaves), &evidence, proof_load::bindings::WRITE_EXEMPTIONS, traced.as_ref().err().copied()),
     };
     let walk_cell = match (&program, &census) {

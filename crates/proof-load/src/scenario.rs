@@ -528,7 +528,8 @@ pub fn coverage() -> Vec<Scenario> {
             // History made after the re-genesis, so no trust pin holds it: deleted on the host, its
             // tombstone dropped, and collected once it is old enough.
             vec![Op::Branch { name: "late".into() }, Op::Switch { name: "late".into() }, Op::Variant { index: 0 }, Op::Push, Op::Switch { name: "main".into() }],
-            vec![serve(&["tombstone", "list"]), serve(&["withhold", "list"]), Op::DeleteRemote { name: "late".into() }, Op::StopHost],
+            // The listings run with the host stopped, so their digests see no write of the server's.
+            vec![Op::DeleteRemote { name: "late".into() }, Op::StopHost, serve(&["tombstone", "list"]), serve(&["withhold", "list"])],
             vec![serve(&["tombstone", "drop", "late"]), Op::Age, serve(&["gc"])],
         ].concat()),
         // A durability taint a failed directory sync leaves, which heal resolves.

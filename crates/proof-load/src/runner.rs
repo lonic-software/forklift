@@ -283,17 +283,20 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
             }
             Op::Inject { line, at, until } => {
                 // Without a tracer the state cannot be built, and nothing that needs it is checked.
-                let Some(strace) = observer.and_then(|observer| observer.strace) else { continue };
+                let Some((observer, strace)) = observer.and_then(|observer| Some((observer, observer.strace?))) else { continue };
                 let directory = scratch.root().join(at);
                 let arguments: Vec<String> = std::iter::once("--json".to_string())
                     .chain(filled(line, &kept, host.as_ref().map(|host| host.url.as_str()), scratch.root(), &work).map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?)
                     .collect();
                 let mut stood = false;
                 for when in 1..=INJECT_ATTEMPTS {
-                    let mut traced = vec!["-f".to_string(), "-qq".into(), "-e".into(), "trace=fsync".into(), "-e".into(), format!("inject=fsync:error=EIO:when={}", when), "--".into(), program.display().to_string()];
-                    traced.extend(arguments.iter().cloned());
+                    let trace = observer.trace_path("inject");
+                    let filter = ["-e".to_string(), "trace=fsync".into(), "-e".into(), format!("inject=fsync:error=EIO:when={}", when)];
+                    let traced = crate::kill::strace_line(&trace, &filter, program, &arguments);
                     // An attempt is meant to fail; what it left is what `until` judges.
                     tool::run(&Invocation { program: strace.to_path_buf(), arguments: traced, directory: directory.clone(), limit }, scratch, environment).map_err(RunError::Tool)?;
+                    #[allow(clippy::disallowed_methods)] // the harness's own trace, which nothing reads
+                    let _ = std::fs::remove_file(&trace);
                     stood = match until {
                         Until::Holds { folder } => std::fs::read_dir(directory.join(folder)).is_ok_and(|mut entries| entries.next().is_some()),
                         Until::Says { line, pointer, equals } => {
@@ -435,6 +438,9 @@ pub fn kept_value(document: &serde_json::Value, keep: &Keep) -> Option<String> {
     text.split_whitespace().nth(keep.word).map(str::to_string)
 }
 
+#[cfg(windows)]
+const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+
 /// Sets every file under `root` back by `by`, so a grace period measured from a write has passed.
 fn age(root: &Path, by: Duration) -> std::io::Result<()> {
     let then = std::time::SystemTime::now() - by;
@@ -445,7 +451,14 @@ fn age(root: &Path, by: Duration) -> std::io::Result<()> {
                 stack.push(entry?.path());
             }
         } else {
-            std::fs::File::open(&path)?.set_modified(then)?;
+            // Windows sets a time only through a handle opened to write attributes, which a
+            // read-only file still grants; elsewhere any handle the owner opens will do.
+            let mut options = std::fs::OpenOptions::new();
+            #[cfg(windows)]
+            std::os::windows::fs::OpenOptionsExt::access_mode(&mut options, FILE_WRITE_ATTRIBUTES);
+            #[cfg(not(windows))]
+            options.read(true);
+            options.open(&path)?.set_modified(then)?;
         }
     }
     Ok(())
