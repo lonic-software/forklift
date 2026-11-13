@@ -148,7 +148,15 @@ pub const WRITE_EXEMPTIONS: &[(&str, WriteExemption)] = &[
 
 /// The server routes the route check does not require a successful answer of, by the route
 /// table's method and path.
-pub const ROUTE_EXEMPTIONS: &[RouteExemption] = &[];
+pub const ROUTE_EXEMPTIONS: &[RouteExemption] = &[
+    RouteExemption { method: "GET", path: "/healthz", reason: "no forklift command sends it: supervisors and load balancers probe it" },
+    RouteExemption { method: "PUT", path: "/warehouses/{warehouse}", reason: "no forklift command sends it: an operator creates a warehouse over HTTP, and no scenario serves more than one" },
+    // FORK-473: delete the route or give it a caller.
+    RouteExemption { method: "GET", path: "/parcels/{parcel}/subtree/{*path}", reason: "no forklift command sends it: the client's method for it has no caller outside its tests" },
+    // FORK-474: the scenario steps that reach these.
+    RouteExemption { method: "POST", path: "/objects/missing", reason: "sent by an origin move over withheld recipes and by heal's refetch into a hosted clone, and no scenario reaches either yet" },
+    RouteExemption { method: "PUT", path: "/withheld/{hash}/recipe", reason: "sent when a lift's new history reaches content the host withholds, and no scenario builds that yet" },
+];
 
 /// What the damage completeness check finds missing: census names no binding or exemption covers,
 /// bindings and exemptions the census no longer lists, bindings naming a scenario that does not
@@ -253,5 +261,18 @@ mod tests {
         let uncovered: Vec<String> = damage::uncovered(&census, BINDINGS, EXEMPTIONS).into_iter().map(|name| name.path).collect();
         assert_eq!(uncovered, Vec::<String>::new());
         assert_eq!(damage::stale(&census, BINDINGS, EXEMPTIONS), Vec::<&str>::new());
+    }
+
+    /// This tree's route table parses, and every route exemption names a route it lists: an
+    /// exemption left behind by a removed route fails here, before any run.
+    ///
+    /// Revert: exempt a route the table does not list → it is reported stale.
+    #[test]
+    fn this_trees_route_exemptions_name_listed_routes() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let table = crate::routes::RouteTable::load(&source).unwrap().unwrap();
+        for exemption in ROUTE_EXEMPTIONS {
+            assert!(table.routes.iter().any(|route| route.method == exemption.method && route.path == exemption.path), "{} {} is not a listed route", exemption.method, exemption.path);
+        }
     }
 }

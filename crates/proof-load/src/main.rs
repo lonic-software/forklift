@@ -255,6 +255,12 @@ fn main() -> ExitCode {
         eprintln!("proof-load: cannot write write-ops.json: {}", error);
         return ExitCode::from(2);
     }
+    let written = serde_json::to_string(&exchanges).map_err(|error| error.to_string())
+        .and_then(|text| std::fs::write(output.root().join("exchanges.json"), text).map_err(|error| error.to_string()));
+    if let Err(error) = written {
+        eprintln!("proof-load: cannot write exchanges.json: {}", error);
+        return ExitCode::from(2);
+    }
     let not_run = |reason: &str| ["write-op coverage", "read-only exemptions"].map(|check| Completeness { check: check.to_string(), cell: Cell::not_run(reason), missing: vec![] }).to_vec();
     let write_checks = match (&schema, &server) {
         (None, _) => not_run("no forklift binary given"),

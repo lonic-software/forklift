@@ -155,6 +155,11 @@ Notes:
   trace (Linux), or be exempt in `WRITE_EXEMPTIONS` in `crates/proof-load/src/bindings.rs`; a
   read-only exemption is still run, and fails if it changes the tree it ran in (every OS). A new
   command needs a step in a `scenario::coverage()` scenario or an exemption, or the check fails.
+  It also checks the server's routes: each route the route table of the `--source` tree's
+  `docs/format/REMOTE_PROTOCOL.md` lists must be answered with success through the proxy while the
+  scenarios are built, or be exempt in `ROUTE_EXEMPTIONS` in the same file, and a request that no
+  listed route matches fails the check too. A new route needs a scenario step that sends it, or an
+  exemption.
   They are outside `ci passed` and their run step continues on error, so for now they report without
   failing; read the grades in the job summary or the uploaded report. A census row added without a
   damage binding or an exemption in `crates/proof-load/src/bindings.rs` fails the `bindings` unit
