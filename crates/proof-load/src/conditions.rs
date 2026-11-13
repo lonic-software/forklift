@@ -48,7 +48,12 @@ impl std::fmt::Display for FillError {
 /// what the ballast took; returns what the ballast held at the full point. Stops at `cap` bytes.
 pub fn fill(ballast: &Path, leave: u64, cap: u64) -> Result<u64, FillError> {
     let io = |error: std::io::Error| FillError::Io(format!("{}: {}", ballast.display(), error));
-    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(ballast).map_err(io)?;
+    let file = match std::fs::OpenOptions::new().write(true).create_new(true).open(ballast) {
+        Ok(file) => file,
+        // A volume too full to make the ballast holds no room for it.
+        Err(error) if is_full(&error) => return Ok(0),
+        Err(error) => return Err(io(error)),
+    };
     let filled = fill_file(file, leave, cap).map_err(|error| match error {
         Some(error) => io(error),
         None => FillError::NotCapped,
@@ -105,16 +110,22 @@ pub struct Lifted {
     pub graded: Graded,
 }
 
-/// Why a fault was refused as not run: the faulted command landed every line under it.
-pub const NOT_SET: &str = "the faulted command landed every line with the condition set, so it did not take";
+/// Why a fault was refused as not run: the condition no longer held once the faulted command's
+/// lines ended, and every one of them landed.
+pub const NOT_SET: &str = "the condition no longer held once the faulted command ended, and every line of it landed: it did not take";
 
 /// Builds `scenario` and grades its faulted command with a condition set: `set` runs between the
 /// snapshot and the lines and returns the lift, which runs once the lines end and before anything
-/// is read back. `lift` names the lift as the outside-knowledge step it is.
+/// is read back, and says whether the condition still held up to it. `lift` names the lift as the
+/// outside-knowledge step it is.
+///
+/// Lines that all landed under a condition that held are an acknowledgement the readback holds the
+/// tool to, the worst case these faults look for (a refused write swallowed, exit 0); only lines
+/// that landed under a condition that did not hold are refused as a fault that never happened.
 #[allow(clippy::too_many_arguments)]
 fn under(
     scenario: &Scenario, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration,
-    lift: &str, set: impl FnOnce(&Context) -> Result<Box<dyn FnOnce() -> Result<(), RunError>>, RunError>,
+    lift: &str, set: impl FnOnce(&Context) -> Result<Box<dyn FnOnce() -> Result<bool, RunError>>, RunError>,
 ) -> Result<Graded, RunError> {
     let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), scratch, environment, limit, None)?;
     let corpus = &scenario.corpus(corpus);
@@ -127,14 +138,12 @@ fn under(
         context.write_snapshot(index)?;
         let lift = set(context)?;
         let made = context.run_lines(index, steps);
-        lift()?;
-        // Every point is set short of what the lines need, and they write into the warehouse:
-        // lines that all landed under the condition mean it did not take, and grading them would
-        // claim a recovery from a fault that never happened.
-        if made? {
+        let held = lift()?;
+        let made = made?;
+        if made && !held {
             return Err(RunError::Io(NOT_SET.to_string()));
         }
-        Ok(false)
+        Ok(made)
     })?;
     graded.recoverability.outside_knowledge.insert(0, lift.to_string());
     Ok(graded)
@@ -211,10 +220,22 @@ pub fn disk_full(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scra
         free_space(ballast).map_err(RunError::Io)?;
         fill(ballast, free, MAX_BALLAST).map_err(|error| RunError::Io(error.to_string()))?;
         let ballast = ballast.to_path_buf();
-        Ok(Box::new(move || damage::apply(&ballast, Kind::Delete, 0).map_err(|error| RunError::Io(format!("lifting the fault: {:?}", error)))))
+        Ok(Box::new(move || {
+            // Held: the volume still had no more room than the point left, give or take what the
+            // fill's last writes and the volume's allocation leave unaccounted.
+            let probe = ballast.with_extension("held");
+            let room = fill(&probe, 0, MAX_BALLAST).map_err(|error| RunError::Io(format!("checking the fault held: {}", error)));
+            let _ = damage::apply(&probe, Kind::Delete, 0);
+            damage::apply(&ballast, Kind::Delete, 0).map_err(|error| RunError::Io(format!("lifting the fault: {:?}", error)))?;
+            Ok(room? <= free + HELD_SLACK)
+        }))
     })?;
     Ok(Lifted { scenario: scenario.id.clone(), condition: format!("free {} B", free), graded })
 }
+
+/// How much more room than a disk-full point left the volume may show once the faulted command
+/// ends and the point still count as held: a few allocation blocks.
+const HELD_SLACK: u64 = 16 << 10;
 
 /// Why a read-only fault did not run: the work folder took a write with its write bits cleared.
 pub const STAYS_WRITABLE: &str = "the work folder still takes a write with its write bits cleared (run as root, or folder attributes that refuse nothing)";
@@ -231,7 +252,11 @@ pub fn read_only(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scra
             thaw(&saved).map_err(|error| RunError::Io(error.to_string()))?;
             return Err(RunError::Io(STAYS_WRITABLE.to_string()));
         }
-        Ok(Box::new(move || thaw(&saved).map_err(|error| RunError::Io(format!("lifting the fault: {}", error)))))
+        Ok(Box::new(move || {
+            let held = !takes_a_write(&work) && !takes_a_write(&work.join(".forklift"));
+            thaw(&saved).map_err(|error| RunError::Io(format!("lifting the fault: {}", error)))?;
+            Ok(held)
+        }))
     });
     match graded {
         Err(_) if writable => Ok(None),
