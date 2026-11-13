@@ -331,7 +331,10 @@ pub fn folded_corpus(corpus: &crate::corpus::Corpus, fold: Fold) -> crate::corpu
     };
     crate::corpus::Corpus {
         records: (0..corpus.records.len().max(2)).map(record).collect(),
-        executable: match fold { Fold::Case => Default::default(), Fold::Exec => [RUN_SH.to_string()].into() },
+        modes: match fold {
+            Fold::Case => crate::corpus::Modes::Unjudged,
+            Fold::Exec => crate::corpus::Modes::Judged([RUN_SH.to_string()].into()),
+        },
         ..corpus.clone()
     }
 }
@@ -740,11 +743,11 @@ mod tests {
         let corpus = crate::corpus::Corpus {
             seed: 0, shape: crate::corpus::Shape::SMALL,
             records: vec![snapshot(&[("a", "1"), ("b", "2"), ("c", "3")]), snapshot(&[("a", "1"), ("b", "9"), ("d", "3")])],
-            executable: Default::default(),
+            modes: Default::default(),
         };
         assert_eq!(taken(&corpus, 0), Some(("b".to_string(), b"2".to_vec())));
         assert_eq!(taken(&corpus, 1), Some(("a".to_string(), b"1".to_vec())), "nothing follows the last record");
-        let kept = crate::corpus::Corpus { seed: 0, shape: crate::corpus::Shape::SMALL, records: vec![snapshot(&[("a", "1")]), snapshot(&[("z", "1")])], executable: Default::default() };
+        let kept = crate::corpus::Corpus { seed: 0, shape: crate::corpus::Shape::SMALL, records: vec![snapshot(&[("a", "1")]), snapshot(&[("z", "1")])], modes: Default::default() };
         assert_eq!(taken(&kept, 0), None, "bytes moved to another path still live on");
         assert_eq!(taken(&corpus, 2), None);
     }
@@ -810,7 +813,7 @@ mod tests {
             let (first, second) = (&folded.records[0], &folded.records[1]);
             match fold {
                 Fold::Case => {
-                    assert!(folded.executable.is_empty());
+                    assert_eq!(folded.modes, crate::corpus::Modes::Unjudged, "a mode fault must not fail the case cell");
                     assert!(folded.records.iter().all(|record| !record.contains_key(RUN_SH)));
                     assert!(first.contains_key(README_BEFORE) && !first.contains_key(README_AFTER));
                     assert!(second.contains_key(README_AFTER) && !second.contains_key(README_BEFORE));
@@ -818,7 +821,7 @@ mod tests {
                     assert_eq!(first[README_BEFORE], second[README_AFTER]);
                 }
                 Fold::Exec => {
-                    assert_eq!(folded.executable, [RUN_SH.to_string()].into());
+                    assert_eq!(folded.modes, crate::corpus::Modes::Judged([RUN_SH.to_string()].into()));
                     assert!(folded.records.iter().all(|record| record[RUN_SH] == first[RUN_SH]));
                     assert!(folded.records.iter().all(|record| record.keys().eq(first.keys())), "no path changes");
                 }

@@ -60,6 +60,12 @@ pub fn mode(metadata: &std::fs::Metadata) -> Option<u32> {
 /// Reads the tree under `root`, skipping the tool's own state folder (`.forklift`, `.git`), each
 /// file's mode read from disk where the platform keeps one.
 pub fn read_tree(root: &std::path::Path) -> std::io::Result<Tree> {
+    read_tree_when(root, MODES)
+}
+
+/// [`read_tree`] with modes `judged` or not: where they are not, no file reads executable, as
+/// [`crate::corpus::expected`] expects of an unjudged corpus.
+pub fn read_tree_when(root: &std::path::Path, judged: bool) -> std::io::Result<Tree> {
     let mut tree = Tree::new();
     for path in crate::census::walk(root)? {
         let first = path.split('/').next().unwrap_or("");
@@ -70,7 +76,7 @@ pub fn read_tree(root: &std::path::Path) -> std::io::Result<Tree> {
         // Only a regular file carries the bit: a link's own mode reads 0o777, and its bytes are
         // read through it.
         let metadata = std::fs::symlink_metadata(&file)?;
-        let executable = executable_when(MODES && metadata.is_file(), mode(&metadata));
+        let executable = executable_when(judged && metadata.is_file(), mode(&metadata));
         tree.insert(path.clone(), entry_digest(&std::fs::read(&file)?, executable));
     }
     Ok(tree)

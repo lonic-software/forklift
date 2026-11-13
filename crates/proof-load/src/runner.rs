@@ -145,7 +145,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
         if let Some(snapshot) = op.writes(corpus) {
             let snapshot = snapshot.map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?;
             let snapshot = match scope { Some(scope) => corpus::within(&snapshot, scope), None => snapshot };
-            corpus::write(&snapshot, &corpus.executable, &work).map_err(|error| RunError::Io(error.to_string()))?;
+            corpus::write(&snapshot, &corpus.modes, &work, scratch.work_moved()).map_err(|error| RunError::Io(error.to_string()))?;
         }
         let mut directory = work.clone();
         match op {
@@ -184,7 +184,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                let digest = crate::corpus::expected_entry(&path, &bytes, &corpus.executable);
+                let digest = crate::corpus::expected_entry(&path, &bytes, &corpus.modes);
                 taken.push(Taken { path, digest, by: TakenBy::Withheld });
             }
             Op::Redact { index } => {
@@ -217,7 +217,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                 if deleted {
                     ledger.observe("client", &hash, RedactionState::Deleted);
                 }
-                let digest = crate::corpus::expected_entry(&path, &bytes, &corpus.executable);
+                let digest = crate::corpus::expected_entry(&path, &bytes, &corpus.modes);
                 let admissible = ledger.admissible("client", &hash, &digest, "content_redacted");
                 taken.push(Taken { path, digest, by: TakenBy::Redacted { hash, admissible } });
                 // Its lines ran above, with the target filled.
@@ -567,6 +567,6 @@ mod tests {
         for name in ["objects/<xx>/<hash>", "pallets/<name>", "{bay}inventory/metadata", "warehouse"] {
             assert!(created.iter().any(|created| created == name), "{} is created: {:?}", name, created);
         }
-        assert_eq!(crate::oracle::read_tree(&scratch.work()).unwrap(), corpus::expected(&corpus.records[2], &corpus.executable));
+        assert_eq!(crate::oracle::read_tree(&scratch.work()).unwrap(), corpus::expected(&corpus.records[2], &corpus.modes));
     }
 }

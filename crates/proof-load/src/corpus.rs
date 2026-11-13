@@ -58,9 +58,39 @@ pub struct Corpus {
     pub seed: u64,
     pub shape: Shape,
     pub records: Vec<Snapshot>,
-    /// The paths recorded executable, in every record that holds them. Empty from [`generate`], so
-    /// a seed means what it always meant; a scenario's own corpus marks the files it needs.
-    pub executable: BTreeSet<String>,
+    /// What the records say of each file's mode. Judged with nothing executable from
+    /// [`generate`], so a seed means what it always meant; a scenario's own corpus marks the files
+    /// it needs, or leaves modes unjudged.
+    pub modes: Modes,
+}
+
+/// What a corpus says of its files' modes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Modes {
+    /// Judged where the platform keeps modes ([`crate::oracle::MODES`]): these paths executable in
+    /// every record that holds them, every other path not.
+    Judged(BTreeSet<String>),
+    /// Not judged at all, neither written nor read back: for a fault that is not about modes, run
+    /// on a volume that may give every file a mode of its own, so its grade answers that fault alone.
+    Unjudged,
+}
+
+impl Default for Modes {
+    fn default() -> Modes {
+        Modes::Judged(BTreeSet::new())
+    }
+}
+
+impl Modes {
+    /// Whether a file's mode is read and compared on this platform.
+    pub fn judged(&self) -> bool {
+        matches!(self, Modes::Judged(_)) && crate::oracle::MODES
+    }
+
+    /// Whether `path` is expected to read executable where modes are judged.
+    pub fn executable(&self, path: &str) -> bool {
+        matches!(self, Modes::Judged(executable) if executable.contains(path))
+    }
 }
 
 const DIRECTORIES: &[&str] = &["", "docs/", "src/", "src/nested/", "assets/"];
@@ -133,29 +163,29 @@ pub fn generate(seed: u64, shape: Shape) -> Corpus {
         records.push(current.clone());
     }
 
-    Corpus { seed, shape, records, executable: BTreeSet::new() }
+    Corpus { seed, shape, records, modes: Modes::default() }
 }
 
-/// The tree a snapshot is expected to read back as, the paths in `executable` executable.
-pub fn expected(snapshot: &Snapshot, executable: &BTreeSet<String>) -> Tree {
-    expected_when(snapshot, executable, crate::oracle::MODES)
+/// The tree a snapshot is expected to read back as under `modes`, read as
+/// [`crate::oracle::read_tree`] reads with `modes.judged()`.
+pub fn expected(snapshot: &Snapshot, modes: &Modes) -> Tree {
+    expected_when(snapshot, modes, modes.judged())
 }
 
-/// [`expected`] where modes are `observed` or not: where they are not, as on Windows, no file
-/// reads executable, so none is expected to.
-pub fn expected_when(snapshot: &Snapshot, executable: &BTreeSet<String>, observed: bool) -> Tree {
-    snapshot.iter().map(|(path, bytes)| (path.clone(), expected_entry_when(path, bytes, executable, observed))).collect()
+/// [`expected`] where modes are `observed` or not: where they are not, as on Windows or for an
+/// unjudged corpus, no file reads executable, so none is expected to.
+pub fn expected_when(snapshot: &Snapshot, modes: &Modes, observed: bool) -> Tree {
+    snapshot.iter().map(|(path, bytes)| (path.clone(), expected_entry_when(path, bytes, modes, observed))).collect()
 }
 
-/// The entry digest `path` holding `bytes` is expected to read back with, the paths in
-/// `executable` executable: the one rule [`expected`] applies per file, for every other digest
-/// that must match a read tree's.
-pub fn expected_entry(path: &str, bytes: &[u8], executable: &BTreeSet<String>) -> String {
-    expected_entry_when(path, bytes, executable, crate::oracle::MODES)
+/// The entry digest `path` holding `bytes` is expected to read back with under `modes`: the one
+/// rule [`expected`] applies per file, for every other digest that must match a read tree's.
+pub fn expected_entry(path: &str, bytes: &[u8], modes: &Modes) -> String {
+    expected_entry_when(path, bytes, modes, modes.judged())
 }
 
-fn expected_entry_when(path: &str, bytes: &[u8], executable: &BTreeSet<String>, observed: bool) -> String {
-    entry_digest(bytes, observed && executable.contains(path))
+fn expected_entry_when(path: &str, bytes: &[u8], modes: &Modes, observed: bool) -> String {
+    entry_digest(bytes, observed && modes.executable(path))
 }
 
 /// The variant of a snapshot: every file changed, a text file's first line replaced and a binary
@@ -191,8 +221,11 @@ pub fn rooted(corpus: &Corpus, scope: &str) -> Corpus {
         rooted.insert(OUTSIDE.to_string(), format!("outside {}\n", scope).into_bytes());
         rooted
     }).collect();
-    let executable = corpus.executable.iter().map(|path| format!("{}/{}", scope, path)).collect();
-    Corpus { records, executable, ..corpus.clone() }
+    let modes = match &corpus.modes {
+        Modes::Judged(executable) => Modes::Judged(executable.iter().map(|path| format!("{}/{}", scope, path)).collect()),
+        Modes::Unjudged => Modes::Unjudged,
+    };
+    Corpus { records, modes, ..corpus.clone() }
 }
 
 /// The part of `snapshot` under `scope`: what a bay scoped to it holds.
@@ -202,12 +235,14 @@ pub fn within(snapshot: &Snapshot, scope: &str) -> Snapshot {
 }
 
 /// Makes the working files under `root` match `snapshot`: writes every file it holds, and removes
-/// every file it does not, leaving the tool's own state folder (`.forklift`, `.git`) alone. Each
-/// file it writes reads executable exactly when `executable` names it, so a bit a tool left on a
-/// file is not carried into the next attempt; a mode is changed only where the file reads
-/// otherwise, and a volume refusing modes at all ([`crate::volume::refuses_modes`], vfat) keeps
-/// what it reads, since nothing written there can hold a bit.
-pub fn write(snapshot: &Snapshot, executable: &BTreeSet<String>, root: &Path) -> std::io::Result<()> {
+/// every file it does not, leaving the tool's own state folder (`.forklift`, `.git`) alone. Where
+/// `modes` are judged, each file it writes reads executable exactly where they mark it, so a bit a
+/// tool left on a file is not carried into the next attempt; a mode is changed only where the file
+/// reads otherwise. A refused change of mode fails the write, except on a folding volume
+/// (`on_folding_volume`) refusing modes at all ([`crate::volume::refuses_modes`], vfat), which
+/// keeps what it reads, since nothing written there can hold a bit. Unjudged modes are never
+/// touched.
+pub fn write(snapshot: &Snapshot, modes: &Modes, root: &Path, on_folding_volume: bool) -> std::io::Result<()> {
     for (path, _) in crate::oracle::read_tree(root)? {
         if !snapshot.contains_key(&path) {
             #[allow(clippy::disallowed_methods)] // a scratch work tree the harness wrote; no retry is wanted
@@ -220,15 +255,16 @@ pub fn write(snapshot: &Snapshot, executable: &BTreeSet<String>, root: &Path) ->
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&target, bytes)?;
-        if crate::oracle::MODES {
-            set_executable(&target, executable.contains(path))?;
+        if modes.judged() {
+            set_executable(&target, modes.executable(path), on_folding_volume)?;
         }
     }
     Ok(())
 }
 
-/// Makes `file` read `executable` or not, changing its mode only where it reads otherwise.
-fn set_executable(file: &Path, executable: bool) -> std::io::Result<()> {
+/// Makes `file` read `executable` or not, changing its mode only where it reads otherwise; a
+/// volume refusing modes is tolerated only where `refusal_tolerated`.
+fn set_executable(file: &Path, executable: bool, refusal_tolerated: bool) -> std::io::Result<()> {
     let metadata = std::fs::metadata(file)?;
     if crate::oracle::executable_when(true, crate::oracle::mode(&metadata)) == executable {
         return Ok(());
@@ -240,7 +276,7 @@ fn set_executable(file: &Path, executable: bool) -> std::io::Result<()> {
         // Execute wherever read is allowed, as `chmod +x` under a usual umask; or execute nowhere.
         let mode = if executable { mode | 0o100 | ((mode & 0o044) >> 2) } else { mode & !0o111 };
         match std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)) {
-            Err(error) if !crate::volume::refuses_modes(&error) => return Err(error),
+            Err(error) if !(refusal_tolerated && crate::volume::refuses_modes(&error)) => return Err(error),
             _ => {}
         }
     }
@@ -299,8 +335,8 @@ mod tests {
             .find(|corpus| corpus.records.windows(2).any(|pair| pair[0].keys().any(|path| !pair[1].contains_key(path))))
             .unwrap();
         for snapshot in &corpus.records {
-            write(snapshot, &BTreeSet::new(), &root).unwrap();
-            assert_eq!(crate::oracle::read_tree(&root).unwrap(), expected(snapshot, &BTreeSet::new()));
+            write(snapshot, &Modes::default(), &root, false).unwrap();
+            assert_eq!(crate::oracle::read_tree(&root).unwrap(), expected(snapshot, &Modes::default()));
         }
         assert_eq!(std::fs::read(root.join(".forklift/state")).unwrap(), b"tool state");
     }
@@ -321,23 +357,55 @@ mod tests {
         let mode = |path: &str| std::fs::metadata(root.join(path)).unwrap().permissions().mode() & 0o777;
         let snapshot: Snapshot = [("run.sh", "#!/bin/sh\n"), ("kept.sh", "kept\n"), ("stray", "stray\n"), ("plain.txt", "plain\n")]
             .into_iter().map(|(path, bytes)| (path.to_string(), bytes.as_bytes().to_vec())).collect();
-        let executable: BTreeSet<String> = ["run.sh".to_string(), "kept.sh".to_string()].into();
+        let modes = Modes::Judged(["run.sh".to_string(), "kept.sh".to_string()].into());
         for (path, preset) in [("kept.sh", 0o700), ("stray", 0o755)] {
             std::fs::write(root.join(path), b"old").unwrap();
             std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(preset)).unwrap();
         }
-        write(&snapshot, &executable, &root).unwrap();
+        write(&snapshot, &modes, &root, false).unwrap();
         assert_eq!(mode("run.sh") & 0o100, 0o100);
         assert_eq!(mode("kept.sh"), 0o700, "already executable: no change of mode");
         assert_eq!(mode("stray"), 0o644, "a stray bit is cleared");
         assert_eq!(mode("plain.txt") & 0o111, 0);
         let read = crate::oracle::read_tree(&root).unwrap();
-        let expected = expected(&snapshot, &executable);
+        let expected = expected(&snapshot, &modes);
         for path in ["run.sh", "kept.sh", "stray", "plain.txt"] {
             assert_eq!(read[path], expected[path], "{}", path);
         }
-        assert_ne!(expected_when(&snapshot, &executable, true), expected_when(&snapshot, &executable, false));
-        assert_eq!(expected_when(&snapshot, &executable, false), expected_when(&snapshot, &BTreeSet::new(), true), "unobserved, no mark counts");
+        assert_ne!(expected_when(&snapshot, &modes, true), expected_when(&snapshot, &modes, false));
+        assert_eq!(expected_when(&snapshot, &modes, false), expected_when(&snapshot, &Modes::default(), true), "unobserved, no mark counts");
+        assert_eq!(super::expected(&snapshot, &Modes::Unjudged), expected_when(&snapshot, &Modes::default(), true), "unjudged, nothing executable");
+
+        // Unjudged modes are never touched: the stray bit stays, and the tree read without modes
+        // matches.
+        std::fs::set_permissions(root.join("stray"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        write(&snapshot, &Modes::Unjudged, &root, false).unwrap();
+        assert_eq!(mode("stray"), 0o755, "unjudged: no change of mode");
+        assert_eq!(crate::oracle::read_tree_when(&root, false).unwrap(), super::expected(&snapshot, &Modes::Unjudged));
+    }
+
+    /// A refused change of mode fails the write off a folding volume, and is tolerated on one: an
+    /// immutable file (`chflags uchg`) answers its owner's chmod with EPERM, as vfat does.
+    ///
+    /// Revert: tolerate a refusal everywhere → the immutable file keeps its stray bit and the
+    /// write passes, so the tool would be graded over a work tree the harness never wrote.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_refused_change_of_mode_fails_off_a_folding_volume() {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("proof-load-corpus-refused-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("stray");
+        std::fs::write(&file, b"stray\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let flags = |flag: &str| assert!(std::process::Command::new("chflags").arg(flag).arg(&file).status().unwrap().success());
+        flags("uchg");
+        let off = set_executable(&file, false, false);
+        let on = set_executable(&file, false, true);
+        flags("nouchg");
+        assert_eq!(off.unwrap_err().raw_os_error(), Some(1), "EPERM fails the write off a folding volume");
+        assert!(on.is_ok(), "and is tolerated on one");
     }
 
     /// A variant changes every file of its record and keeps its paths, a binary one at its length,

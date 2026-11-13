@@ -59,8 +59,12 @@ pub fn probe(folder: &Path) -> Result<Probed, String> {
 fn keeps_executable_bit(file: &Path) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid takes no arguments, cannot fail and touches no memory of ours.
+        let owner = unsafe { libc::geteuid() };
+        let owned = std::fs::symlink_metadata(file)?.uid() == owner;
         keeps_bit_when(
+            owned,
             |mode| std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)),
             || std::fs::symlink_metadata(file).map(|metadata| crate::oracle::executable_when(true, crate::oracle::mode(&metadata))),
         )
@@ -77,21 +81,22 @@ const EPERM: i32 = 1;
 
 /// Whether `error`, from a change of mode of a file the harness owns, is the volume refusing modes
 /// at all: vfat answers EPERM, and a platform without the call answers unsupported. EACCES is not
-/// this (a policy or a server refusing the caller, as an NFS root squash does), nor is any other
-/// error.
+/// this (a policy or a server refusing the caller), nor is any other error. EPERM says this only
+/// of a file the caller owns: it is also what a change of mode of someone else's file answers, as
+/// on a mount that gives every new file a fixed other owner, so the probe checks ownership first.
 pub fn refuses_modes(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(EPERM) || error.kind() == std::io::ErrorKind::Unsupported
 }
 
 /// The two-way bit probe over `set` (change the mode) and `read` (whether the file now reads
 /// executable): mode 0644 must read not executable and then 0755 executable. A change of mode the
-/// volume refuses ([`refuses_modes`]) means it keeps no bit; any other error is no answer and fails
-/// the probe.
-pub fn keeps_bit_when(mut set: impl FnMut(u32) -> std::io::Result<()>, mut read: impl FnMut() -> std::io::Result<bool>) -> std::io::Result<bool> {
+/// volume refuses ([`refuses_modes`]) on a file the caller `owned` means it keeps no bit; any other
+/// error, or that refusal of a file someone else owns, is no answer and fails the probe.
+pub fn keeps_bit_when(owned: bool, mut set: impl FnMut(u32) -> std::io::Result<()>, mut read: impl FnMut() -> std::io::Result<bool>) -> std::io::Result<bool> {
     for (mode, executable) in [(0o644, false), (0o755, true)] {
         match set(mode) {
             Ok(()) => {}
-            Err(error) if refuses_modes(&error) => return Ok(false),
+            Err(error) if owned && refuses_modes(&error) => return Ok(false),
             Err(error) => return Err(error),
         }
         if read()? != executable {
@@ -140,28 +145,32 @@ mod tests {
     }
 
     /// The bit probe reads both directions: a volume reading every file executable keeps no bit,
-    /// though setting the bit "works" there; one refusing the change with EPERM keeps none; EACCES
-    /// and any other error are no answer.
+    /// though setting the bit "works" there; one refusing the change of the caller's own file with
+    /// EPERM keeps none; EPERM on a file someone else owns, EACCES and any other error are no
+    /// answer.
     ///
     /// Revert: probe only that 0755 reads executable → the always-executable volume (exFAT) is
     /// called one that keeps the bit, and the no-exec cell never runs; count every error as no bit
     /// → a failing disk passes as a no-exec volume; count EACCES → a root-squashed NFS folder
-    /// passes as one.
+    /// passes as one; skip the ownership check → a mount giving new files another owner passes
+    /// as one.
     #[test]
     fn the_bit_probe_reads_both_directions() {
         let modes = |answers: &[bool]| {
             let answers = RefCell::new(answers.to_vec());
             move || Ok(answers.borrow_mut().remove(0))
         };
-        assert!(keeps_bit_when(|_| Ok(()), modes(&[false, true])).unwrap(), "an ordinary volume");
-        assert!(!keeps_bit_when(|_| Ok(()), modes(&[true, true])).unwrap(), "every file executable: exFAT");
-        assert!(!keeps_bit_when(|_| Ok(()), modes(&[false, false])).unwrap(), "no file executable");
-        assert!(!keeps_bit_when(|_| Err(std::io::Error::from_raw_os_error(EPERM)), modes(&[])).unwrap(), "vfat answers EPERM");
-        assert!(keeps_bit_when(|_| Err(std::io::Error::from_raw_os_error(13)), modes(&[])).is_err(), "EACCES is no answer");
-        assert!(keeps_bit_when(|_| Err(refused(std::io::ErrorKind::PermissionDenied)), modes(&[])).is_err(), "nor a denial without EPERM");
-        assert!(!keeps_bit_when(|_| Err(refused(std::io::ErrorKind::Unsupported)), modes(&[])).unwrap());
-        assert!(keeps_bit_when(|_| Err(refused(std::io::ErrorKind::Other)), modes(&[])).is_err(), "no answer is not an answer");
-        assert!(keeps_bit_when(|_| Ok(()), || Err(refused(std::io::ErrorKind::NotFound))).is_err());
+        assert!(keeps_bit_when(true, |_| Ok(()), modes(&[false, true])).unwrap(), "an ordinary volume");
+        assert!(!keeps_bit_when(true, |_| Ok(()), modes(&[true, true])).unwrap(), "every file executable: exFAT");
+        assert!(!keeps_bit_when(true, |_| Ok(()), modes(&[false, false])).unwrap(), "no file executable");
+        assert!(!keeps_bit_when(true, |_| Err(std::io::Error::from_raw_os_error(EPERM)), modes(&[])).unwrap(), "vfat answers EPERM");
+        assert!(keeps_bit_when(true, |_| Err(std::io::Error::from_raw_os_error(13)), modes(&[])).is_err(), "EACCES is no answer");
+        assert!(keeps_bit_when(true, |_| Err(refused(std::io::ErrorKind::PermissionDenied)), modes(&[])).is_err(), "nor a denial without EPERM");
+        assert!(!keeps_bit_when(true, |_| Err(refused(std::io::ErrorKind::Unsupported)), modes(&[])).unwrap());
+        assert!(keeps_bit_when(true, |_| Err(refused(std::io::ErrorKind::Other)), modes(&[])).is_err(), "no answer is not an answer");
+        assert!(keeps_bit_when(false, |_| Err(std::io::Error::from_raw_os_error(EPERM)), modes(&[])).is_err(), "EPERM on another's file is no answer");
+        assert!(!keeps_bit_when(false, |_| Ok(()), modes(&[true, true])).unwrap(), "ownership never matters to a mode that reads back");
+        assert!(keeps_bit_when(true, |_| Ok(()), || Err(refused(std::io::ErrorKind::NotFound))).is_err());
     }
 
     /// Each cell runs only where its property holds, so an ordinary folder passed by mistake
