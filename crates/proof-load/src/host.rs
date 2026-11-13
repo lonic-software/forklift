@@ -7,13 +7,19 @@
 //! two forms a client's are, each removal inside the run's roots is carried out and recorded as
 //! outside knowledge, and anything else the refusal said is recorded as unextractable. The
 //! harness never guesses at what a server left behind.
+//!
+//! A traced host is served untraced until it is listening, then strace is attached to the running
+//! server, so its startup never counts toward a trace. The proxy forwards one request at a time
+//! then, so each request's window holds only the writes its own handler, or the server's
+//! background work, made.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::proxy::{lock, Proxy};
+use crate::proxy::{lock, Exchange, Proxy};
 use crate::remedy::{self, Remedy};
 use crate::scrub::{Environment, Scratch};
 use crate::tool::{self, Served, ToolError};
@@ -30,7 +36,77 @@ pub struct Host {
     server: Arc<Mutex<Option<Served>>>,
     program: PathBuf,
     root: PathBuf,
+    tracing: Mutex<Option<Tracing>>,
 }
+
+/// strace attached to one running server.
+struct Attached {
+    child: Child,
+    trace: PathBuf,
+    said: Option<std::thread::JoinHandle<Vec<u8>>>,
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// How a traced host traces each server it starts: strace, by absolute path, attached to each in
+/// turn, the n-th writing `<base>-<n>.trace`.
+struct Tracing {
+    strace: PathBuf,
+    base: PathBuf,
+    attached: Vec<Attached>,
+}
+
+/// Whether every thread of process `pid` has a tracer, as its `/proc` status says.
+fn traced(pid: u32) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{}/task", pid)) else { return false };
+    let mut any = false;
+    for task in tasks.flatten() {
+        // A thread that ended since the folder was listed has no status left to read.
+        let Ok(status) = std::fs::read_to_string(task.path().join("status")) else { continue };
+        any = true;
+        let tracer = status.lines().find_map(|line| line.strip_prefix("TracerPid:")).map(str::trim);
+        if tracer.is_none_or(|tracer| tracer == "0") {
+            return false;
+        }
+    }
+    any
+}
+
+/// Attaches `strace` to the running process `pid`, following every thread it has and makes, its
+/// trace written to `trace`; returns once every thread the process has shows a tracer. What
+/// strace said is the error when it exits first or does not attach within `limit`.
+fn attach(strace: &Path, pid: u32, trace: &Path, limit: Duration) -> Result<Attached, String> {
+    let mut child = Command::new(strace).args(["-f", "-qq", "-y", "-ttt", "-o"]).arg(trace).arg("-p").arg(pid.to_string())
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
+        .map_err(|error| format!("strace could not be started: {}", error))?;
+    let said = tool::drain(child.stderr.take().expect("stderr is piped"));
+    let mut attached = Attached { child, trace: trace.to_path_buf(), said: Some(said) };
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Ok(Some(status)) = attached.child.try_wait() {
+            let said = attached.said.take().map(|said| said.join().unwrap_or_default()).unwrap_or_default();
+            return Err(format!("strace exited ({}) attaching to the server: {}", status, String::from_utf8_lossy(&said).trim()));
+        }
+        if traced(pid) {
+            return Ok(attached);
+        }
+        if Instant::now() >= deadline {
+            let _ = attached.child.kill();
+            let _ = attached.child.wait();
+            let said = attached.said.take().map(|said| said.join().unwrap_or_default()).unwrap_or_default();
+            return Err(format!("strace had not attached to every thread of the server within {:?}: {}", limit, String::from_utf8_lossy(&said).trim()));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// How long a tracer gets to finish its trace once its server is killed.
+const TRACE_END: Duration = Duration::from_secs(30);
 
 /// What a restart took, and whether the server came back.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -65,7 +141,65 @@ impl Host {
         // Weak: a proxy connection thread outliving the host must not keep its server alive.
         let killed: Weak<Mutex<Option<Served>>> = Arc::downgrade(&server);
         proxy.set_killer(move || if let Some(server) = killed.upgrade() { drop(lock(&server).take()) });
-        Ok(Host { url: proxy.url.clone(), proxy, server, program: program.to_path_buf(), root: root.to_path_buf() })
+        Ok(Host { url: proxy.url.clone(), proxy, server, program: program.to_path_buf(), root: root.to_path_buf(), tracing: Mutex::new(None) })
+    }
+
+    /// [`Host::start`], with `strace` attached to the server once it is listening, its trace
+    /// written beside `base`, and the proxy forwarding one request at a time. When strace cannot
+    /// attach, the host serves untraced and the second value is what strace said: the harness never
+    /// falls back to a trace it did not take.
+    pub fn start_traced(program: &Path, root: &Path, scratch: &Scratch, environment: &Environment, limit: Duration, strace: &Path, base: &Path) -> Result<(Host, Option<String>), ToolError> {
+        let host = Host::start(program, root, scratch, environment, limit)?;
+        host.proxy.set_serial(true);
+        *lock(&host.tracing) = Some(Tracing { strace: strace.to_path_buf(), base: base.to_path_buf(), attached: Vec::new() });
+        let failed = host.attach(limit).err();
+        if failed.is_some() {
+            *lock(&host.tracing) = None;
+        }
+        Ok((host, failed))
+    }
+
+    /// Attaches the host's tracer, when it has one, to the server now serving.
+    fn attach(&self, limit: Duration) -> Result<(), String> {
+        let mut tracing = lock(&self.tracing);
+        let Some(tracing) = tracing.as_mut() else { return Ok(()) };
+        let Some(pid) = lock(&self.server).as_ref().map(Served::pid) else { return Err("the server is not running".to_string()) };
+        let trace = PathBuf::from(format!("{}-{}.trace", tracing.base.display(), tracing.attached.len()));
+        tracing.attached.push(attach(&tracing.strace, pid, &trace, limit)?);
+        Ok(())
+    }
+
+    /// Whether the host's servers are traced.
+    pub fn is_traced(&self) -> bool {
+        lock(&self.tracing).is_some()
+    }
+
+    /// Kills the server and ends its traces: everything the proxy logged, and the text of each
+    /// trace in the order its server started, or why it cannot be read. Each trace file is removed
+    /// once read.
+    pub fn finish(self) -> (Vec<Exchange>, Vec<Result<String, String>>) {
+        self.kill();
+        let log = self.proxy.log();
+        let attached = lock(&self.tracing).take().map(|tracing| tracing.attached).unwrap_or_default();
+        let mut traces = Vec::new();
+        for mut tracer in attached {
+            let deadline = Instant::now() + TRACE_END;
+            let ended = loop {
+                match tracer.child.try_wait() {
+                    Ok(Some(_)) => break true,
+                    Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                    _ => break false,
+                }
+            };
+            if !ended {
+                traces.push(Err(format!("strace did not end within {:?} of its server's kill", TRACE_END)));
+                continue;
+            }
+            traces.push(std::fs::read_to_string(&tracer.trace).map_err(|error| format!("{}: {}", tracer.trace.display(), error)));
+            #[allow(clippy::disallowed_methods, reason = "the harness's own trace, read in full above")]
+            let _ = std::fs::remove_file(&tracer.trace);
+        }
+        (log, traces)
     }
 
     /// Kills the server, as a crash would: no shutdown, whatever it holds left behind.
@@ -91,6 +225,9 @@ impl Host {
                     self.proxy.set_upstream(upstream);
                     *lock(&self.server) = Some(served);
                     restarted.refused = None;
+                    // A traced host's restarted server is traced too; one that cannot be is an
+                    // error, never a server serving untraced into a traced run.
+                    self.attach(limit).map_err(|reason| ToolError::Spawn { program: self.program.clone(), reason })?;
                     return Ok(restarted);
                 }
                 Err(ToolError::NotListening { said, .. }) => {

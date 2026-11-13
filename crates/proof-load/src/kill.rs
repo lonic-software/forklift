@@ -149,17 +149,36 @@ impl Directories {
 /// write-op coverage it feeds reports a command only when no traced run of it reaches a placed
 /// write.
 pub fn written(calls: &[Call], start: &str) -> Vec<String> {
+    writes(calls, start).into_iter().map(|write| write.path).collect()
+}
+
+/// One path a successful mutating call named: what it did there, and when the call was entered.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Write {
+    /// Absolute.
+    pub path: String,
+    pub kind: trace::Kind,
+    /// The call's `-ttt` stamp, in microseconds since the Unix epoch, when it has one.
+    pub when: Option<u64>,
+    /// The call as strace named it, for a refusal to quote.
+    pub call: String,
+}
+
+/// [`written`], each path with its kind and stamp, in trace order.
+pub fn writes(calls: &[Call], start: &str) -> Vec<Write> {
     let mut directories = Directories::new(trace::thread_groups(calls), start);
-    let mut paths = Vec::new();
+    let mut writes = Vec::new();
     for call in calls {
         if let Ok(touched) = trace::touch(call) {
             if touched.class == Class::Mutating && matches!(call.returned, Returned::Value(_)) {
-                paths.extend(touched.operands.iter().map(|operand| directories.resolved(operand, call.tid)));
+                // touch refuses a mutating call that has no kind.
+                let kind = trace::kind(&call.name).expect("touch gives every mutating call a kind");
+                writes.extend(touched.operands.iter().map(|operand| Write { path: directories.resolved(operand, call.tid), kind, when: call.when, call: call.name.clone() }));
             }
         }
         directories.follow(call);
     }
-    paths
+    writes
 }
 
 /// `call`'s identity: see [`Identity`].

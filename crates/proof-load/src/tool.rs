@@ -101,7 +101,7 @@ pub fn failure_of(stdout: &[u8]) -> Option<Failure> {
     })
 }
 
-fn drain(mut source: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+pub(crate) fn drain(mut source: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = source.read_to_end(&mut bytes);
@@ -158,6 +158,13 @@ pub struct Served {
     output: Vec<std::thread::JoinHandle<Vec<u8>>>,
 }
 
+impl Served {
+    /// Its process id, for a tracer to attach to.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
 impl Drop for Served {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -185,6 +192,20 @@ pub fn serve(program: &Path, root: &Path, scratch: &Scratch, environment: &Envir
     command.arg("serve").arg("--root").arg(root).args(["--open", "--addr", "127.0.0.1:0"])
         .current_dir(scratch.root()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     environment.apply(&mut command);
+    // Under Yama's ptrace scope 1 only an ancestor may attach to a process, and the tracer the
+    // harness attaches once serve is listening is its sibling: the server names any tracer as
+    // allowed, before it runs. Where Yama is absent the call fails, and nothing needs allowing.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: prctl is async-signal-safe, and the closure allocates nothing.
+        unsafe {
+            command.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0);
+                Ok(())
+            });
+        }
+    }
 
     let spawn = |error: std::io::Error| ToolError::Spawn { program: program.to_path_buf(), reason: error.to_string() };
     let mut child = command.spawn().map_err(spawn)?;
