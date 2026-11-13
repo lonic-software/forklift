@@ -327,7 +327,7 @@ impl std::fmt::Display for Unsound {
         match self {
             Unsound::Unclassified(what) => write!(f, "unclassified syscall {}: add it to a class in trace.rs", what),
             Unsound::Unseen(what) => write!(f, "{} writes without a call strace sees", what),
-            Unsound::Unplaced(what) => write!(f, "{} is relative to a folder strace did not name", what),
+            Unsound::Unplaced(what) => write!(f, "{} is relative to a folder strace could not name", what),
         }
     }
 }

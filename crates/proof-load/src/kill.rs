@@ -145,7 +145,8 @@ impl Directories {
 
 /// Every path a successful mutating call in `calls` named, absolute, from every thread and process
 /// the trace holds: the write-op check's evidence. `start` is the folder the line ran in. A call
-/// that failed, never returned, or the table cannot classify names nothing here.
+/// that failed, never returned, or the table cannot classify or place names nothing here, so the
+/// write-op coverage it feeds reports such a command as reaching no write rather than passing it.
 pub fn written(calls: &[Call], start: &str) -> Vec<String> {
     let mut directories = Directories::new(trace::thread_groups(calls), start);
     let mut paths = Vec::new();
@@ -300,7 +301,13 @@ pub fn landing(calls: &[Call], point: &Point, root: &Root, exit: Option<i32>) ->
             continue;
         }
         let position = calls[..=index].iter().filter(|other| other.tid == call.tid && other.name == point.name).count();
-        let Ok(touched) = trace::touch(call) else { continue };
+        let touched = match trace::touch(call) {
+            Ok(touched) => touched,
+            Err(unsound) => {
+                seen.push(format!("{}#{} {}", call.name, position, unsound));
+                continue;
+            }
+        };
         let group = groups.get(&call.tid).copied().unwrap_or(call.tid);
         let found = identity(&touched.operands, &touched.detail, root, group);
         if position == point.when && stands_for(&found, &point.target, point.aim == Aim::Position) && (point.aim != Aim::Position || group == tool) {
@@ -445,7 +452,8 @@ pub struct CountedLine {
     /// The paths under the counting copy, absolute, as they stood when the line started.
     pub(crate) before: BTreeSet<String>,
     /// The counting copy whole as it stood when the line started, read only when the writes were
-    /// dumped, as the fixture is, and why it could not be read.
+    /// dumped and only for a line after the first, which starts from the fixture, and why it could
+    /// not be read.
     pub(crate) start: Option<Result<crate::power::Image, String>>,
 }
 
@@ -508,7 +516,7 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
     let mut lines = Vec::new();
     for (index, arguments) in counting_context.lines(faulted)?.into_iter().enumerate() {
         let before = listing(counting.root());
-        let start = dumps.then(|| crate::power::scan(counting.root()).map_err(|error| error.to_string()));
+        let start = (dumps && index > 0).then(|| crate::power::scan(counting.root()).map_err(|error| error.to_string()));
         let trace_path = settings.traces.join(format!("{}-count-{}.trace", label, index));
         let extra = if dumps { vec!["-e".to_string(), "write=all".to_string()] } else { Vec::new() };
         let line = strace_line(&trace_path, &extra, &programs.forklift, &arguments);
@@ -918,7 +926,8 @@ mod tests {
     ///
     /// Revert: accept any killed call of the name → the worker's object open, killed in place of
     /// the head's temp, counts as landed; compare temps exactly → the sibling object is not reached;
-    /// compare fixed paths by base → the other object lands on a fixed target.
+    /// compare fixed paths by base → the other object lands on a fixed target; pass over a call
+    /// that cannot be placed → its kill reads as no call killed.
     #[test]
     fn a_kill_lands_only_on_its_target() {
         let injected = Root { given: "/o/s/0001-h-kill-4".into(), canonical: "/o/s/0001-h-kill-4".into() };
@@ -946,6 +955,9 @@ mod tests {
 80 openat(AT_FDCWD</o/s/0001-h-kill-4/work>, \".forklift/pallets/main.tmp~70-0\", O_WRONLY|O_CREAT) = ?
 ").unwrap();
         assert!(matches!(landing(&child, &target, &injected, None), Landing::NotReached { .. }), "a child's call is never the target");
+        // A killed call whose place strace could not name is reported, not passed over.
+        let unplaced = trace::parse("70 openat(9, \".forklift/pallets/main.tmp~70-0\", O_WRONLY|O_CREAT) = ?\n").unwrap();
+        assert!(matches!(landing(&unplaced, &target, &injected, None), Landing::NotReached { why } if why.contains("openat#1 openat of \".forklift/pallets/main.tmp~70-0\" is relative to a folder strace could not name")));
 
         // Another worker staging a sibling object of the same base stands for the targeted temp.
         let object = point("openat", Aim::Position, 1, &[".forklift/objects/ab/0123456789abcdef0123.tmp~<pid>-<n>"], "O_WRONLY|O_CREAT");

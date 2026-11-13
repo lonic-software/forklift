@@ -624,8 +624,8 @@ impl Replay {
                 Some(Argument::Descriptor { target, .. }) => target,
                 Some(Argument::Cwd(Some(cwd))) => cwd,
                 None | Some(Argument::Cwd(None)) => directories.of(call.tid),
-                // A folder descriptor strace did not name: where a relative path lands is not known.
-                Some(_) if !traced.starts_with('/') => return Err(format!("argument {} is relative to a folder strace did not name", index)),
+                // A folder descriptor strace could not name: where a relative path lands is not known.
+                Some(_) if !traced.starts_with('/') => return Err(format!("{} of {:?} is relative to a folder strace could not name", call.name, traced)),
                 Some(_) => String::new(),
             };
             Ok(trace::resolve(&traced, &base))
@@ -648,7 +648,7 @@ impl Replay {
                     _ => (raw(2).to_string(), raw(2).split_once("mode=").map_or_else(|| Err(format!("no mode in {}", raw(2))), |(_, rest)| mode_of(rest))),
                 };
                 let Argument::Descriptor { fd, target } = trace::argument(&returned) else {
-                    return Err(format!("an open returned {}, a descriptor strace did not name", returned));
+                    return Err(format!("an open returned {}, a descriptor strace could not name", returned));
                 };
                 let ino = if self.root.holds(&target) {
                     if flags.contains("O_TMPFILE") {
@@ -1037,15 +1037,15 @@ pub fn difference(replayed: &Image, ran: &Image) -> Option<String> {
     for path in paths {
         let shown = if path.is_empty() { "the root" } else { path.as_str() };
         let differs = match (replayed.get(path), ran.get(path)) {
-            (Some(_), None) => Some("the replay holds it and the run left none".to_string()),
-            (None, Some(_)) => Some("the run left it and the replay holds none".to_string()),
+            (Some(_), None) => Some("the replay holds it and the run had none".to_string()),
+            (None, Some(_)) => Some("the run had it and the replay holds none".to_string()),
             (Some(Entry::Dir { mode: m }), Some(Entry::Dir { mode: n })) => (permissions(m) != permissions(n))
-                .then(|| format!("the replay makes it mode {:o} and the run left {:o}", permissions(m), permissions(n))),
+                .then(|| format!("the replay makes it mode {:o} and the run had {:o}", permissions(m), permissions(n))),
             (Some(Entry::File { data: a, mode: m }), Some(Entry::File { data: b, mode: n })) => {
                 if a != b {
-                    Some(format!("the replay holds {} bytes and the run left {} different ones", a.len(), b.len()))
+                    Some(format!("the replay holds {} bytes and the run had {} different ones", a.len(), b.len()))
                 } else if permissions(m) != permissions(n) {
-                    Some(format!("the replay makes it mode {:o} and the run left {:o}", permissions(m), permissions(n)))
+                    Some(format!("the replay makes it mode {:o} and the run had {:o}", permissions(m), permissions(n)))
                 } else {
                     None
                 }
@@ -1325,19 +1325,6 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
         (power.refusals, power.not_run) = (refusals, not_run);
         return Ok(power);
     }
-    let mut lines = Vec::new();
-    for (index, line) in counted.lines.iter().enumerate() {
-        let command = kill::command_id(settings.schema, &line.arguments).map_err(RunError::Io)?;
-        let before = match &line.start {
-            Some(Ok(start)) => start,
-            Some(Err(why)) => {
-                power.refusals.push(format!("the counting area cannot be read whole before line {}: {}", index + 1, why));
-                return Ok(power);
-            }
-            None => return Err(RunError::Io("the faulted command was counted without its writes dumped".to_string())),
-        };
-        lines.push(Line { calls: &line.calls, command, points: points.iter().filter(|point| point.line == index).collect(), before });
-    }
     let fixture = match &counted.fixture {
         Some(Ok(fixture)) => fixture,
         Some(Err(why)) => {
@@ -1346,6 +1333,21 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
         }
         None => return Err(RunError::Io("the faulted command was counted without its writes dumped".to_string())),
     };
+    let mut lines = Vec::new();
+    for (index, line) in counted.lines.iter().enumerate() {
+        let command = kill::command_id(settings.schema, &line.arguments).map_err(RunError::Io)?;
+        // The first line starts from the fixture, scanned once.
+        let before = match (&line.start, index) {
+            (_, 0) => fixture,
+            (Some(Ok(start)), _) => start,
+            (Some(Err(why)), _) => {
+                power.refusals.push(format!("the counting area cannot be read whole before line {}: {}", index + 1, why));
+                return Ok(power);
+            }
+            (None, _) => return Err(RunError::Io("the faulted command was counted without its writes dumped".to_string())),
+        };
+        lines.push(Line { calls: &line.calls, command, points: points.iter().filter(|point| point.line == index).collect(), before });
+    }
     let start = counted.counting.work().to_string_lossy().into_owned();
     let umask = harness_umask().map_err(RunError::Io)?;
     // Each scenario draws its own variants, not the same corners of every scenario.
@@ -1726,7 +1728,7 @@ mod tests {
         let reused = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3</s/w/a>\n1 write(3<pipe:[9]>, \"x\", 1) = 1\n{}", dump(b"x"));
         assert_eq!(data(&replayed(&[reused]).unwrap().volatile_image(), "w/a").unwrap(), b"old");
         let unnamed = "1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3\n".to_string();
-        assert!(replayed(&[unnamed]).unwrap_err().contains("did not name"));
+        assert!(replayed(&[unnamed]).unwrap_err().contains("could not name"));
     }
 
     /// A close another thread's open overlapped frees only the descriptor it closed: the number
@@ -1758,12 +1760,12 @@ mod tests {
         ran.insert("w/a".into(), Entry::File { data: b"neW".to_vec(), mode: 0o644 });
         assert!(difference(&replayed, &ran).unwrap().starts_with("w/a:"));
         ran.insert("w/a".into(), Entry::File { data: b"new".to_vec(), mode: 0o755 });
-        assert!(difference(&replayed, &ran).unwrap().contains("mode 644 and the run left 755"));
+        assert!(difference(&replayed, &ran).unwrap().contains("mode 644 and the run had 755"));
         ran.insert("w/a".into(), Entry::File { data: b"new".to_vec(), mode: 0o600 });
-        assert!(difference(&replayed, &ran).unwrap().contains("mode 644 and the run left 600"));
+        assert!(difference(&replayed, &ran).unwrap().contains("mode 644 and the run had 600"));
         ran.insert("w/a".into(), Entry::File { data: b"new".to_vec(), mode: 0o644 });
         ran.insert("w".into(), Entry::Dir { mode: 0o700 });
-        assert_eq!(difference(&replayed, &ran).as_deref(), Some("w: the replay makes it mode 755 and the run left 700"));
+        assert_eq!(difference(&replayed, &ran).as_deref(), Some("w: the replay makes it mode 755 and the run had 700"));
         ran.insert("w".into(), Entry::Dir { mode: 0o755 });
         ran.insert("w/a".into(), Entry::File { data: b"new".to_vec(), mode: 0o644 });
         ran.insert("w/z".into(), Entry::Link { target: "a".into() });
@@ -1981,7 +1983,7 @@ mod tests {
     #[test]
     fn what_strace_did_not_name_refuses() {
         let unnamed = replayed(&["1 mkdirat(5, \"x\", 0777) = 0\n".to_string()]).err().unwrap();
-        assert!(unnamed.contains("relative to a folder strace did not name"), "{}", unnamed);
+        assert!(unnamed.contains("mkdirat of \"x\" is relative to a folder strace could not name"), "{}", unnamed);
         let unseen = replayed(&["1 fsync(7) = 0\n".to_string()]).err().unwrap();
         assert!(unseen.contains("strace could not name"), "{}", unseen);
     }
