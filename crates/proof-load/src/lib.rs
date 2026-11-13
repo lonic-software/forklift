@@ -17,6 +17,7 @@ pub mod faulted;
 pub mod kill;
 pub mod oracle;
 pub mod power;
+pub mod proxy;
 pub mod remedy;
 pub mod report;
 pub mod runner;
