@@ -6,7 +6,7 @@
 //! replayed in order, children's included, over a model of the area that carries two states across
 //! lines: the volatile one, what the calls produced, and the durable one, keyed by inode: each
 //! file's last synced contents and each directory's last synced entries. A file fsync promotes that
-//! file's contents; a directory fsync promotes its whole entry set, entries an earlier line left
+//! file's contents and mode, an fdatasync its contents only; a directory fsync promotes its whole entry set, entries an earlier line left
 //! unsynced included; `sync`, and `syncfs` through a descriptor into the area, promote
 //! everything. Files and folders are made under the umask in force. A rename is durable once its parent
 //! is synced, and an entry survives only if its own directory does by the same rule, since the
@@ -193,11 +193,17 @@ impl Model {
         Ok(ino)
     }
 
-    /// An fsync of `ino`: a file's contents, or a folder's entries, become durable.
-    fn sync(&mut self, ino: Ino) {
+    /// An fsync of `ino`: a file's contents, or a folder's entries, become durable; with
+    /// `data_only` (fdatasync) a file's mode keeps its durable value, since retrieving the data
+    /// does not need it.
+    fn sync(&mut self, ino: Ino, data_only: bool) {
         if let Some(node) = self.volatile.get(&ino) {
             if !matches!(node, Node::Link { .. }) {
-                self.durable.insert(ino, node.clone());
+                let mut node = node.clone();
+                if let (true, Node::File { mode, .. }, Some(Node::File { mode: kept, .. })) = (data_only, &mut node, self.durable.get(&ino)) {
+                    *mode = *kept;
+                }
+                self.durable.insert(ino, node);
                 self.truncated.remove(&ino);
                 self.version += 1;
             }
@@ -223,8 +229,13 @@ impl Model {
     /// A seeded state between the durable and the volatile one: each folder entry the two disagree
     /// on is taken from either, and each file whose contents they disagree on keeps its durable
     /// contents, takes its volatile ones, or is torn: a file cut shorter since its sync comes back
-    /// as a prefix of its volatile contents, empty included, and any other grows past its synced
-    /// size with a zero-filled or torn tail.
+    /// as a prefix of its volatile contents, empty included, any other grows past its synced size
+    /// with a zero-filled or torn tail or is torn in place.
+    ///
+    /// Entries are drawn one by one, so an unsynced rename can come back under neither name. That
+    /// is deliberate: POSIX promises nothing of an unsynced rename across a crash, and the durable
+    /// state already drops one whose folders were synced apart; a journalled file system keeps
+    /// one name, which is what the caveat on every row says.
     pub fn variant(&self, rng: &mut Rng) -> Image {
         let mut out = Image::new();
         let mut seen = BTreeSet::new();
@@ -270,10 +281,15 @@ impl Model {
 }
 
 /// `kept` grown toward `made`'s size: a length past the synced one, its tail zeros or `made`'s
-/// bytes. A file the volatile state did not grow keeps its synced contents.
+/// bytes. A file the volatile state did not grow is torn in place instead: a prefix of `made` over
+/// the synced bytes.
 fn grown(kept: &[u8], made: &[u8], rng: &mut Rng) -> Vec<u8> {
+    // Not grown: overwritten in place, and torn there, the first bytes new and the rest synced.
     if made.len() <= kept.len() {
-        return kept.to_vec();
+        let mut out = kept.to_vec();
+        let landed = rng.below(made.len() as u64 + 1) as usize;
+        out[..landed].copy_from_slice(&made[..landed]);
+        return out;
     }
     let length = kept.len() + 1 + rng.below((made.len() - kept.len()) as u64) as usize;
     let mut out = kept.to_vec();
@@ -648,6 +664,13 @@ impl Replay {
                 }
             }
             "close_range" => {
+                // CLOSE_RANGE_UNSHARE gives the caller its own copy of the table first, so what it
+                // closes the processes it shared with keep.
+                if raw(2).contains("CLOSE_RANGE_UNSHARE") && self.table_of[&group] != group {
+                    let copy = self.table(group).clone();
+                    self.tables.insert(group, copy);
+                    self.table_of.insert(group, group);
+                }
                 if !raw(2).contains("CLOSE_RANGE_CLOEXEC") {
                     let first = fd_of(raw(0)).unwrap_or(0);
                     let last = if raw(1).starts_with('~') { i64::MAX } else { fd_of(raw(1)).unwrap_or(i64::MAX) };
@@ -665,6 +688,9 @@ impl Replay {
             "write" | "writev" | "pwrite64" | "pwritev" | "pwritev2" => {
                 let Some(description) = self.held(group, text(0))? else { return Ok(()) };
                 let count = number()? as usize;
+                if let Some(why) = &call.unreadable {
+                    return Err(why.clone());
+                }
                 if call.data.len() < count {
                     return Err(format!("the trace dumped {} of its {} bytes: trace with -e write=all", call.data.len(), count));
                 }
@@ -711,7 +737,7 @@ impl Replay {
                 if let Some(description) = self.held(group, text(0))? {
                     let ino = self.descriptions[description].ino.expect("held returns only descriptions into the area");
                     self.model.overlapped(Some(ino), call.entered)?;
-                    self.model.sync(ino);
+                    self.model.sync(ino, call.name == "fdatasync");
                 }
             }
             // syncfs promises only the file system its descriptor lies on; one outside the area
@@ -1014,8 +1040,8 @@ impl Moment {
 
     fn label(&self) -> String {
         match self {
-            Moment::During { point } => format!("{} {}#{} {}", point.command, point.name, point.when, point.base),
-            Moment::Synced { command, call, name, .. } => format!("{} before {} at traced call {}", command, name, call + 1),
+            Moment::During { point } => format!("line {} {} {}#{} {}", point.line + 1, point.command, point.name, point.when, point.base),
+            Moment::Synced { line, command, call, name } => format!("line {} {} before {} at traced call {}", line + 1, command, name, call + 1),
             Moment::After { line, command } => format!("after line {} {}", line + 1, command),
         }
     }
@@ -1178,8 +1204,13 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
         let command = kill::command_id(settings.schema, &line.arguments).map_err(RunError::Io)?;
         lines.push(Line { calls: &line.calls, command, points: points.iter().filter(|point| point.line == index).collect() });
     }
-    let Some(fixture) = &counted.fixture else {
-        return Err(RunError::Io("the faulted command was counted without its writes dumped".to_string()));
+    let fixture = match &counted.fixture {
+        Some(Ok(fixture)) => fixture,
+        Some(Err(why)) => {
+            power.refusals.push(format!("the counting area cannot be read whole: {}", why));
+            return Ok(power);
+        }
+        None => return Err(RunError::Io("the faulted command was counted without its writes dumped".to_string())),
     };
     let start = counted.counting.work().to_string_lossy().into_owned();
     let umask = harness_umask().map_err(RunError::Io)?;
@@ -1702,6 +1733,67 @@ mod tests {
         let scanned = scan(&area);
         let _ = remove_tree(&area);
         assert!(scanned.unwrap_err().to_string().contains("not UTF-8"));
+    }
+
+    /// A dump row strace printed that cannot be read leaves the trace readable, for the kill
+    /// points, and refuses only a replay of that write's bytes.
+    ///
+    /// Revert: refuse the trace on the row → the kill points of the line are lost with it.
+    #[test]
+    fn an_unreadable_dump_refuses_only_the_replay_of_its_bytes() {
+        let text = "1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3</s/w/a>\n1 write(3</s/w/a>, \"x\", 1) = 1\n | zz\n".to_string();
+        let calls = trace::parse(&text).unwrap();
+        assert!(calls[1].unreadable.as_deref().unwrap().contains("an unreadable dump row"));
+        assert!(replayed(&[text]).unwrap_err().contains("an unreadable dump row"));
+    }
+
+    /// A crash moment's label names its line, so two lines' moments at the same call read apart.
+    ///
+    /// Revert: leave the line out → both read `stack before fsync at traced call 4`.
+    #[test]
+    fn a_moment_label_names_its_line() {
+        let moment = |line| Moment::Synced { line, command: "stack".into(), call: 3, name: "fsync".into() };
+        assert_eq!(moment(1).label(), "line 2 stack before fsync at traced call 4");
+        assert_ne!(moment(0).label(), moment(1).label());
+    }
+
+    /// A close_range that unshares first closes in the caller's own copy: the thread it shared
+    /// the table with keeps its descriptors.
+    ///
+    /// Revert: close in the shared table → the other thread's write refuses as never opened.
+    #[test]
+    fn an_unsharing_close_range_leaves_the_shared_table_whole() {
+        let text = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3</s/w/a>\n\
+            1 clone(child_stack=0x1, flags=CLONE_VM|CLONE_FS|CLONE_FILES|SIGCHLD) = 9\n\
+            9 close_range(3, 4294967295, CLOSE_RANGE_UNSHARE) = 0\n{}", write(1, 3, "/s/w/a", b"x"));
+        assert_eq!(data(&replayed(&[text]).unwrap().volatile_image(), "w/a").unwrap(), b"xld");
+    }
+
+    /// An fdatasync makes a file's bytes durable and not its mode; an fsync makes both.
+    ///
+    /// Revert: promote the whole node on fdatasync → the crash keeps the new mode.
+    #[test]
+    fn an_fdatasync_keeps_the_synced_mode() {
+        let synced = |call: &str| format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3</s/w/a>\n1 fchmod(3</s/w/a>, 0600) = 0\n{}1 {}(3</s/w/a>) = 0\n", write(1, 3, "/s/w/a", b"new"), call);
+        let durable = replayed(&[synced("fdatasync")]).unwrap().durable_image();
+        assert_eq!(durable.get("w/a"), Some(&Entry::File { data: b"new".to_vec(), mode: 0o644 }));
+        let durable = replayed(&[synced("fsync")]).unwrap().durable_image();
+        assert_eq!(durable.get("w/a"), Some(&Entry::File { data: b"new".to_vec(), mode: 0o600 }));
+    }
+
+    /// A file overwritten in place without growing can come back torn there: a prefix of the new
+    /// bytes over the synced ones.
+    ///
+    /// Revert: keep the synced contents of a file that did not grow → only `old` and `new` come
+    /// back.
+    #[test]
+    fn an_overwrite_in_place_tears_in_place() {
+        let overwritten = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3</s/w/a>\n{}", write(1, 3, "/s/w/a", b"new"));
+        let model = replayed(&[overwritten]).unwrap();
+        let mut rng = Rng::new(5);
+        let torn: BTreeSet<Vec<u8>> = (0..200).map(|_| data(&model.variant(&mut rng), "w/a").unwrap()).collect();
+        assert!(torn.iter().any(|held| held != b"old" && held != b"new"), "{:?}", torn);
+        assert!(torn.iter().all(|held| (0..=3).any(|landed| held[..landed] == b"new"[..landed] && held[landed..] == b"old"[landed..])), "{:?}", torn);
     }
 
     /// Files and folders are made under the umask the command started under, or the one it set.

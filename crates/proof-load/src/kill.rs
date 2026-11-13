@@ -457,8 +457,9 @@ pub struct Counted {
     pub(crate) counting: Scratch,
     pub(crate) counting_root: Root,
     /// The counting copy as it stood once the faulted record's files were written, before any
-    /// line: scanned only when the writes were dumped, since only the power loss reads it.
-    pub(crate) fixture: Option<crate::power::Image>,
+    /// line: scanned only when the writes were dumped, since only the power loss reads it, and why
+    /// it could not be read, which fails that lane alone.
+    pub(crate) fixture: Option<Result<crate::power::Image, String>>,
     pub(crate) lines: Vec<CountedLine>,
     /// The file the faulted command recorded the scratch area's root in, when it did: the copies
     /// cannot stand for the run then. Reported only once the trace's own refusals are clear.
@@ -497,7 +498,8 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
     let counting_context = context_of(scenario, &corpus, programs, settings, &counting, &counting_environment);
     let counting_root = Root::of(counting.root()).map_err(io)?;
     counting_context.write_snapshot(faulted)?;
-    let fixture = if dumps { Some(crate::power::scan(counting.root()).map_err(io)?) } else { None };
+    // Only the power loss reads the fixture, so a tree it cannot hold fails that lane alone.
+    let fixture = dumps.then(|| crate::power::scan(counting.root()).map_err(|error| error.to_string()));
     let mut lines = Vec::new();
     for (index, arguments) in counting_context.lines(faulted)?.into_iter().enumerate() {
         let before = listing(counting.root());

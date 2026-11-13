@@ -34,6 +34,9 @@ pub struct Call {
     /// The bytes a write passed, when the trace dumped them (`-e write=all`): every buffer's, in
     /// order. Empty otherwise.
     pub data: Vec<u8>,
+    /// Why a dump row of this call could not be read, if one could not: only a replay of its
+    /// bytes needs them, so that refuses and nothing else does.
+    pub unreadable: Option<String>,
     /// How many calls had finished when this one started: its own index, unless it was printed
     /// unfinished and other calls finished while it ran.
     pub entered: usize,
@@ -70,7 +73,12 @@ pub fn parse(text: &str) -> Result<Vec<Call>, String> {
         let trimmed = line.trim_start();
         if let Some(row) = trimmed.strip_prefix("| ") {
             let last = calls.last_mut().ok_or_else(|| refuse("a dump row before any call"))?;
-            last.data.extend(dump_row(row).ok_or_else(|| refuse("an unreadable dump row"))?);
+            match dump_row(row) {
+                Some(bytes) => last.data.extend(bytes),
+                None => {
+                    last.unreadable.get_or_insert_with(|| refuse("an unreadable dump row"));
+                }
+            }
             continue;
         }
         if trimmed.starts_with("* ") && trimmed.contains(" bytes in buffer ") {
@@ -124,7 +132,7 @@ fn call(tid: u32, text: &str) -> Option<Call> {
     } else {
         Returned::Value(value_token(returned))
     };
-    Some(Call { tid, name: name.to_string(), arguments, returned, data: Vec::new(), entered: 0 })
+    Some(Call { tid, name: name.to_string(), arguments, returned, data: Vec::new(), unreadable: None, entered: 0 })
 }
 
 /// The bytes of one dump row, after its leading `| `: a hex offset of at least five digits (strace
@@ -670,7 +678,7 @@ mod tests {
         assert_eq!(calls[0].arguments.len(), 3);
         assert_eq!(calls[1].name, "unlinkat");
         assert_eq!(calls[1].returned, Returned::Failed("ENOENT".into()));
-        assert_eq!(calls[2], Call { tid: 88, name: "fsync".into(), arguments: vec!["12</s/work/.forklift/pallets>".into()], returned: Returned::Unknown, data: vec![], entered: 1 });
+        assert_eq!(calls[2], Call { tid: 88, name: "fsync".into(), arguments: vec!["12</s/work/.forklift/pallets>".into()], returned: Returned::Unknown, data: vec![], unreadable: None, entered: 1 });
         assert_eq!(calls[3].returned, Returned::Restarted);
         assert!(parse("87    nonsense\n").is_err());
         assert!(parse("87    <... fsync resumed>) = 0\n").is_err(), "a resumed call that never started");
