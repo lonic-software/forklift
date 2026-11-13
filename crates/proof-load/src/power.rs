@@ -8,16 +8,15 @@
 //! file's last synced contents and each directory's last synced entries. A file fsync promotes that
 //! file's contents and mode, an fdatasync its contents only; a directory fsync promotes its whole entry set, entries an earlier line left
 //! unsynced included; `sync`, and `syncfs` through a descriptor into the area, promote
-//! everything. Files and folders are made under the umask in force. A rename is durable once its parent
-//! is synced, and an entry survives only if its own directory does by the same rule, since the
-//! durable tree is walked from the root: a new directory whose entry was never synced vanishes
+//! everything. Files and folders are made under the umask in force. A rename is durable once its
+//! parent is synced, and an entry survives only if its own directory does by the same rule, since
+//! the durable tree is walked from the root: a new directory whose entry was never synced vanishes
 //! with everything synced inside it.
 //!
 //! A crash lands at every kill point of every line, before the call, before every other sync,
 //! children's included, and after each line exits; the state after the last line is the one the
 //! tool acknowledged. A crash state that records the counting area's root stops the scenario as
-//! path-bound, as the run's final tree would. These are POSIX-minimal
-//! semantics. A real ext4 in data=ordered mode keeps more than this, so a loss graded here may
+//! path-bound, as the run's final tree would. These are POSIX-minimal semantics. A real ext4 in data=ordered mode keeps more than this, so a loss graded here may
 //! survive on a real machine; every row says so.
 //!
 //! The replay is checked against the run it models: once every line is replayed, the volatile
@@ -227,7 +226,7 @@ impl Model {
     }
 
     /// A seeded state between the durable and the volatile one: each folder entry the two disagree
-    /// on is taken from either, and each file whose contents they disagree on keeps its durable
+    /// on is taken from either, each file's mode likewise, and each file whose contents they disagree on keeps its durable
     /// contents, takes its volatile ones, or is torn: a file cut shorter since its sync comes back
     /// as a prefix of its volatile contents, empty included, any other grows past its synced size
     /// with a zero-filled or torn tail or is torn in place.
@@ -257,7 +256,8 @@ impl Model {
                         }
                     }
                 }
-                (Some(Node::File { data: kept, mode }), Some(Node::File { data: made, .. })) => {
+                (Some(Node::File { data: kept, mode: synced }), Some(Node::File { data: made, mode: changed })) => {
+                    let mode = if synced == changed || rng.below(2) == 0 { synced } else { changed };
                     let data = if kept == made {
                         kept.clone()
                     } else {
@@ -305,7 +305,9 @@ fn join(path: &str, name: &str) -> String {
     if path.is_empty() { name.to_string() } else { format!("{}/{}", path, name) }
 }
 
-/// The tree `nodes` hold, walked from `root`, each folder once.
+/// The tree `nodes` hold, walked from `root`, each folder once: a folder an unsynced rename left
+/// under two durable names is kept under the one walked first, which is a state a file-system
+/// check could leave as well as the other.
 fn image(nodes: &BTreeMap<Ino, Node>, root: Ino) -> Image {
     let mut out = Image::new();
     let mut seen = BTreeSet::new();
@@ -666,10 +668,12 @@ impl Replay {
             "close_range" => {
                 // CLOSE_RANGE_UNSHARE gives the caller its own copy of the table first, so what it
                 // closes the processes it shared with keep.
-                if raw(2).contains("CLOSE_RANGE_UNSHARE") && self.table_of[&group] != group {
+                if raw(2).contains("CLOSE_RANGE_UNSHARE") {
                     let copy = self.table(group).clone();
-                    self.tables.insert(group, copy);
-                    self.table_of.insert(group, group);
+                    // A fresh id: the caller's own may be the one the others still share.
+                    let id = self.tables.keys().next_back().map_or(0, |last| last + 1).max(u32::MAX / 2);
+                    self.tables.insert(id, copy);
+                    self.table_of.insert(group, id);
                 }
                 if !raw(2).contains("CLOSE_RANGE_CLOEXEC") {
                     let first = fd_of(raw(0)).unwrap_or(0);
@@ -1214,7 +1218,9 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
     };
     let start = counted.counting.work().to_string_lossy().into_owned();
     let umask = harness_umask().map_err(RunError::Io)?;
-    let (crashes, replayed) = match crashes(fixture, &counted.counting_root, &start, umask, &lines, variants, seed) {
+    // Each scenario draws its own variants, not the same corners of every scenario.
+    let drawn = seed ^ u64::from_le_bytes(blake3::hash(scenario.id.as_bytes()).as_bytes()[..8].try_into().expect("eight bytes"));
+    let (crashes, replayed) = match crashes(fixture, &counted.counting_root, &start, umask, &lines, variants, drawn) {
         Ok(found) => found,
         Err(refusal) => {
             power.refusals.push(refusal);
@@ -1757,16 +1763,36 @@ mod tests {
         assert_ne!(moment(0).label(), moment(1).label());
     }
 
-    /// A close_range that unshares first closes in the caller's own copy: the thread it shared
-    /// the table with keeps its descriptors.
+    /// A close_range that unshares first closes in the caller's own copy: the process it shared
+    /// the table with keeps its descriptors, whichever of the two made the table.
     ///
-    /// Revert: close in the shared table → the other thread's write refuses as never opened.
+    /// Revert: close in the shared table → the other process's write refuses as never opened;
+    /// unshare under the caller's own id → the owner's close still reaches the child's table.
     #[test]
     fn an_unsharing_close_range_leaves_the_shared_table_whole() {
         let text = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3</s/w/a>\n\
             1 clone(child_stack=0x1, flags=CLONE_VM|CLONE_FS|CLONE_FILES|SIGCHLD) = 9\n\
             9 close_range(3, 4294967295, CLOSE_RANGE_UNSHARE) = 0\n{}", write(1, 3, "/s/w/a", b"x"));
         assert_eq!(data(&replayed(&[text]).unwrap().volatile_image(), "w/a").unwrap(), b"xld");
+        let owner = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3</s/w/a>\n\
+            1 clone(child_stack=0x1, flags=CLONE_VM|CLONE_FS|CLONE_FILES|SIGCHLD) = 9\n\
+            1 close_range(3, 4294967295, CLOSE_RANGE_UNSHARE) = 0\n{}", write(9, 3, "/s/w/a", b"x"));
+        assert_eq!(data(&replayed(&[owner]).unwrap().volatile_image(), "w/a").unwrap(), b"xld", "the owner unshared, the child keeps it");
+    }
+
+    /// A file chmodded since its sync can come back under either mode.
+    ///
+    /// Revert: take the synced mode always → 0600 never comes back.
+    #[test]
+    fn a_variant_draws_an_unsynced_mode() {
+        let changed = "1 chmod(\"a\", 0600) = 0\n".to_string();
+        let model = replayed(&[changed]).unwrap();
+        let mut rng = Rng::new(1);
+        let modes: BTreeSet<u32> = (0..64).filter_map(|_| match model.variant(&mut rng).get("w/a") {
+            Some(Entry::File { mode, .. }) => Some(*mode),
+            _ => None,
+        }).collect();
+        assert_eq!(modes, BTreeSet::from([0o600, 0o644]));
     }
 
     /// An fdatasync makes a file's bytes durable and not its mode; an fsync makes both.

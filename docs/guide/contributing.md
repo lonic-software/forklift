@@ -120,8 +120,8 @@ Notes:
   after each line (`--power`, with `--power-variants` seeded partial states): the traced calls are
   replayed over a model that keeps only what was fsynced, POSIX-minimal semantics, so a loss there
   may survive on a real ext4, and every power-loss row says so. A call the model cannot replay, or
-  a replay that does not end where the traced run did, refuses the scenario's power loss. Every run also checks write-op completeness:
-  each command `forklift self schema` lists, and each leaf subcommand of `forklift-server --help`,
+  a replay that does not end where the traced run did, refuses the scenario's power loss. Every
+  run also checks write-op completeness: each command `forklift self schema` lists, and each leaf subcommand of `forklift-server --help`,
   must be seen writing to a warehouse in some scenario's trace (Linux), or be exempt in
   `WRITE_EXEMPTIONS` in `crates/proof-load/src/bindings.rs`; a read-only exemption is still run,
   and fails if it changes the tree it ran in (every OS). A new command needs a step in a
