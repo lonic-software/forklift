@@ -511,10 +511,15 @@ fn serve_connection(client: TcpStream, state: &State) {
                 // Unanswered is nothing read at all: the connection ended, or was reset (a server
                 // that closes with the request unread in its buffer resets rather than closes).
                 // A read that fails after the answer began is the server's fault to show, never
-                // hidden behind a resend.
+                // hidden behind a resend. Any other failure (a silent server's timeout) is final
+                // here: read again, it would wait out the timeout a second time.
                 let unanswered = match server.reader.fill_buf() {
                     Ok(bytes) => bytes.is_empty(),
-                    Err(error) => matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted),
+                    Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted) => true,
+                    Err(_) => {
+                        let _ = client.shutdown(Shutdown::Both);
+                        return;
+                    }
                 };
                 if unanswered && reused && matches!(request.first.as_str(), "GET" | "HEAD") {
                     upstream = None;
