@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::census::{self, Census};
 use crate::corpus::{self, Corpus};
-use crate::oracle::{self, Admissible, RedactionLedger, RedactionState};
+use crate::oracle::{Admissible, RedactionLedger, RedactionState};
 use crate::scenario::{bind, Keep, Mark, Op, Scenario, Tool, Until, SCRATCH, TARGET, URL, WORK};
 use crate::scrub::{Environment, Scratch};
 use crate::tool::{self, Invocation, Outcome, Served};
@@ -184,7 +184,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                let digest = oracle::entry_digest(&bytes, corpus.executable.contains(&path));
+                let digest = crate::corpus::expected_entry(&path, &bytes, &corpus.executable);
                 taken.push(Taken { path, digest, by: TakenBy::Withheld });
             }
             Op::Redact { index } => {
@@ -217,7 +217,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                 if deleted {
                     ledger.observe("client", &hash, RedactionState::Deleted);
                 }
-                let digest = oracle::entry_digest(&bytes, corpus.executable.contains(&path));
+                let digest = crate::corpus::expected_entry(&path, &bytes, &corpus.executable);
                 let admissible = ledger.admissible("client", &hash, &digest, "content_redacted");
                 taken.push(Taken { path, digest, by: TakenBy::Redacted { hash, admissible } });
                 // Its lines ran above, with the target filled.

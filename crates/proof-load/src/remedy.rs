@@ -83,7 +83,8 @@ pub fn removable(path: &Path, run_roots: &[&Path]) -> Option<PathBuf> {
     run_roots.iter().find_map(|root| removable_under(path, root))
 }
 
-/// The path the harness may remove under one run root, if any: only one inside it, judged at path-component boundaries, so a root of `/s` covers `/s/wh` but not `/srv/wh`.
+/// The path the harness may remove under one run root, if any: only one inside it, judged at
+/// path-component boundaries, so a root of `/s` covers `/s/wh` but not `/srv/wh`.
 /// A tool may print the path resolved (`/private/var/…` for `/var/…` on macOS, `\\?\C:\…` on
 /// Windows), so a path that is not under the root as given is judged again with both resolved,
 /// and then the resolved path is the one returned: what is removed is exactly what was judged,

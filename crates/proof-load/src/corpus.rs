@@ -144,7 +144,18 @@ pub fn expected(snapshot: &Snapshot, executable: &BTreeSet<String>) -> Tree {
 /// [`expected`] where modes are `observed` or not: where they are not, as on Windows, no file
 /// reads executable, so none is expected to.
 pub fn expected_when(snapshot: &Snapshot, executable: &BTreeSet<String>, observed: bool) -> Tree {
-    snapshot.iter().map(|(path, bytes)| (path.clone(), entry_digest(bytes, observed && executable.contains(path)))).collect()
+    snapshot.iter().map(|(path, bytes)| (path.clone(), expected_entry_when(path, bytes, executable, observed))).collect()
+}
+
+/// The entry digest `path` holding `bytes` is expected to read back with, the paths in
+/// `executable` executable: the one rule [`expected`] applies per file, for every other digest
+/// that must match a read tree's.
+pub fn expected_entry(path: &str, bytes: &[u8], executable: &BTreeSet<String>) -> String {
+    expected_entry_when(path, bytes, executable, crate::oracle::MODES)
+}
+
+fn expected_entry_when(path: &str, bytes: &[u8], executable: &BTreeSet<String>, observed: bool) -> String {
+    entry_digest(bytes, observed && executable.contains(path))
 }
 
 /// The variant of a snapshot: every file changed, a text file's first line replaced and a binary
@@ -191,11 +202,11 @@ pub fn within(snapshot: &Snapshot, scope: &str) -> Snapshot {
 }
 
 /// Makes the working files under `root` match `snapshot`: writes every file it holds, and removes
-/// every file it does not, leaving the tool's own state folder (`.forklift`, `.git`) alone. A path
-/// in `executable` gets the executable bit when it does not already read executable, and no bit is
-/// ever cleared: on a volume where every file reads executable (exFAT, vfat at its default mask)
-/// that issues no change of mode the volume would refuse, and every file written here is new or
-/// rewritten in place, so no other corpus is touched.
+/// every file it does not, leaving the tool's own state folder (`.forklift`, `.git`) alone. Each
+/// file it writes reads executable exactly when `executable` names it, so a bit a tool left on a
+/// file is not carried into the next attempt; a mode is changed only where the file reads
+/// otherwise, and a volume refusing modes at all ([`crate::volume::refuses_modes`], vfat) keeps
+/// what it reads, since nothing written there can hold a bit.
 pub fn write(snapshot: &Snapshot, executable: &BTreeSet<String>, root: &Path) -> std::io::Result<()> {
     for (path, _) in crate::oracle::read_tree(root)? {
         if !snapshot.contains_key(&path) {
@@ -209,25 +220,29 @@ pub fn write(snapshot: &Snapshot, executable: &BTreeSet<String>, root: &Path) ->
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&target, bytes)?;
-        if crate::oracle::MODES && executable.contains(path) {
-            mark_executable(&target)?;
+        if crate::oracle::MODES {
+            set_executable(&target, executable.contains(path))?;
         }
     }
     Ok(())
 }
 
-/// Gives `file` the executable bit, unless it already reads executable.
-fn mark_executable(file: &Path) -> std::io::Result<()> {
+/// Makes `file` read `executable` or not, changing its mode only where it reads otherwise.
+fn set_executable(file: &Path, executable: bool) -> std::io::Result<()> {
     let metadata = std::fs::metadata(file)?;
-    if crate::oracle::executable_when(true, crate::oracle::mode(&metadata)) {
+    if crate::oracle::executable_when(true, crate::oracle::mode(&metadata)) == executable {
         return Ok(());
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = metadata.permissions().mode();
-        // Execute wherever read is allowed, as `chmod +x` under a usual umask.
-        std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode | 0o100 | ((mode & 0o044) >> 2)))?;
+        // Execute wherever read is allowed, as `chmod +x` under a usual umask; or execute nowhere.
+        let mode = if executable { mode | 0o100 | ((mode & 0o044) >> 2) } else { mode & !0o111 };
+        match std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)) {
+            Err(error) if !crate::volume::refuses_modes(&error) => return Err(error),
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -290,15 +305,15 @@ mod tests {
         assert_eq!(std::fs::read(root.join(".forklift/state")).unwrap(), b"tool state");
     }
 
-    /// A path the corpus marks executable is written with the bit and expected with it; a file that
-    /// already reads executable gets no change of mode, and no bit is ever cleared. Where modes are
-    /// not observed, nothing is expected executable.
+    /// A path the corpus marks executable is written with the bit and expected with it, and a stray
+    /// bit on any other path is cleared; a file that already reads as the corpus says gets no
+    /// change of mode. Where modes are not observed, nothing is expected executable.
     ///
     /// Revert: chmod every marked path → the 0700 file becomes 0711, a mode change a volume
-    /// without the bit refuses; clear the bit of unmarked paths → the stray executable loses it.
+    /// without the bit refuses; never clear a bit → the stray executable keeps it.
     #[cfg(unix)]
     #[test]
-    fn a_marked_path_is_written_executable_and_no_bit_is_cleared() {
+    fn a_written_path_reads_executable_exactly_where_marked() {
         use std::os::unix::fs::PermissionsExt;
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("proof-load-corpus-modes-{}-{}", std::process::id(), nanos));
@@ -314,11 +329,11 @@ mod tests {
         write(&snapshot, &executable, &root).unwrap();
         assert_eq!(mode("run.sh") & 0o100, 0o100);
         assert_eq!(mode("kept.sh"), 0o700, "already executable: no change of mode");
-        assert_eq!(mode("stray"), 0o755, "never cleared");
+        assert_eq!(mode("stray"), 0o644, "a stray bit is cleared");
         assert_eq!(mode("plain.txt") & 0o111, 0);
         let read = crate::oracle::read_tree(&root).unwrap();
         let expected = expected(&snapshot, &executable);
-        for path in ["run.sh", "kept.sh", "plain.txt"] {
+        for path in ["run.sh", "kept.sh", "stray", "plain.txt"] {
             assert_eq!(read[path], expected[path], "{}", path);
         }
         assert_ne!(expected_when(&snapshot, &executable, true), expected_when(&snapshot, &executable, false));

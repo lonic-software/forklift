@@ -67,7 +67,10 @@ pub fn read_tree(root: &std::path::Path) -> std::io::Result<Tree> {
             continue;
         }
         let file = root.join(&path);
-        let executable = executable_when(MODES, mode(&std::fs::symlink_metadata(&file)?));
+        // Only a regular file carries the bit: a link's own mode reads 0o777, and its bytes are
+        // read through it.
+        let metadata = std::fs::symlink_metadata(&file)?;
+        let executable = executable_when(MODES && metadata.is_file(), mode(&metadata));
         tree.insert(path.clone(), entry_digest(&std::fs::read(&file)?, executable));
     }
     Ok(tree)

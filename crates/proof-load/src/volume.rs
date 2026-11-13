@@ -16,7 +16,9 @@
 //! What the volume is, is measured, never assumed: a probe writes a file and reads it back under
 //! another case, and sets the executable bit both off and on, as Forklift's own probe does, since
 //! a volume that reads every file executable would pass a one-way check. A cell runs only where
-//! its property holds, so an ordinary folder passed by mistake can never report coverage.
+//! the probe found its property, so a folder lacking it never reports that cell's coverage; one
+//! that has it does, whatever volume it is (the default macOS volume folds case, so a folder there
+//! answers the case-folding cell and not the no-exec one).
 
 use std::path::Path;
 use std::time::Duration;
@@ -70,15 +72,26 @@ fn keeps_executable_bit(file: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// EPERM, the same number on Linux and macOS.
+const EPERM: i32 = 1;
+
+/// Whether `error`, from a change of mode of a file the harness owns, is the volume refusing modes
+/// at all: vfat answers EPERM, and a platform without the call answers unsupported. EACCES is not
+/// this (a policy or a server refusing the caller, as an NFS root squash does), nor is any other
+/// error.
+pub fn refuses_modes(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(EPERM) || error.kind() == std::io::ErrorKind::Unsupported
+}
+
 /// The two-way bit probe over `set` (change the mode) and `read` (whether the file now reads
 /// executable): mode 0644 must read not executable and then 0755 executable. A change of mode the
-/// volume refuses as not permitted or not supported means it keeps no bit (vfat answers EPERM);
-/// any other error is no answer and fails the probe.
+/// volume refuses ([`refuses_modes`]) means it keeps no bit; any other error is no answer and fails
+/// the probe.
 pub fn keeps_bit_when(mut set: impl FnMut(u32) -> std::io::Result<()>, mut read: impl FnMut() -> std::io::Result<bool>) -> std::io::Result<bool> {
     for (mode, executable) in [(0o644, false), (0o755, true)] {
         match set(mode) {
             Ok(()) => {}
-            Err(error) if matches!(error.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported) => return Ok(false),
+            Err(error) if refuses_modes(&error) => return Ok(false),
             Err(error) => return Err(error),
         }
         if read()? != executable {
@@ -127,12 +140,13 @@ mod tests {
     }
 
     /// The bit probe reads both directions: a volume reading every file executable keeps no bit,
-    /// though setting the bit "works" there; one refusing the change as not permitted keeps none;
-    /// any other error is no answer.
+    /// though setting the bit "works" there; one refusing the change with EPERM keeps none; EACCES
+    /// and any other error are no answer.
     ///
     /// Revert: probe only that 0755 reads executable → the always-executable volume (exFAT) is
     /// called one that keeps the bit, and the no-exec cell never runs; count every error as no bit
-    /// → a failing disk passes as a no-exec volume.
+    /// → a failing disk passes as a no-exec volume; count EACCES → a root-squashed NFS folder
+    /// passes as one.
     #[test]
     fn the_bit_probe_reads_both_directions() {
         let modes = |answers: &[bool]| {
@@ -142,7 +156,9 @@ mod tests {
         assert!(keeps_bit_when(|_| Ok(()), modes(&[false, true])).unwrap(), "an ordinary volume");
         assert!(!keeps_bit_when(|_| Ok(()), modes(&[true, true])).unwrap(), "every file executable: exFAT");
         assert!(!keeps_bit_when(|_| Ok(()), modes(&[false, false])).unwrap(), "no file executable");
-        assert!(!keeps_bit_when(|_| Err(refused(std::io::ErrorKind::PermissionDenied)), modes(&[])).unwrap(), "vfat answers EPERM");
+        assert!(!keeps_bit_when(|_| Err(std::io::Error::from_raw_os_error(EPERM)), modes(&[])).unwrap(), "vfat answers EPERM");
+        assert!(keeps_bit_when(|_| Err(std::io::Error::from_raw_os_error(13)), modes(&[])).is_err(), "EACCES is no answer");
+        assert!(keeps_bit_when(|_| Err(refused(std::io::ErrorKind::PermissionDenied)), modes(&[])).is_err(), "nor a denial without EPERM");
         assert!(!keeps_bit_when(|_| Err(refused(std::io::ErrorKind::Unsupported)), modes(&[])).unwrap());
         assert!(keeps_bit_when(|_| Err(refused(std::io::ErrorKind::Other)), modes(&[])).is_err(), "no answer is not an answer");
         assert!(keeps_bit_when(|_| Ok(()), || Err(refused(std::io::ErrorKind::NotFound))).is_err());

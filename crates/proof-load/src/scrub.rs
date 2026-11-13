@@ -25,8 +25,9 @@ pub enum CopyOnlyError {
     ReservedVariable(String),
     /// The work tree was moved off the scratch volume once already; a run moves it once.
     WorkMoved(PathBuf),
-    /// A scratch area whose work tree lives off its root is not copied: the copy would share it.
-    MovedWorkNotCopied(PathBuf),
+    /// A scratch area that moves its work tree onto a folding volume is not copied: before the
+    /// move the copy would build off that volume, after it the copy would share the moved tree.
+    FoldingNotCopied(PathBuf),
     Io { path: PathBuf, reason: String },
 }
 
@@ -38,7 +39,7 @@ impl fmt::Display for CopyOnlyError {
             CopyOnlyError::ScratchExists(path) => write!(f, "the scratch area {} already exists; a run never reuses one", path.display()),
             CopyOnlyError::ReservedVariable(name) => write!(f, "{} is set by the harness and cannot be set by a scenario", name),
             CopyOnlyError::WorkMoved(path) => write!(f, "the work tree already moved to {}; a run moves it once", path.display()),
-            CopyOnlyError::MovedWorkNotCopied(path) => write!(f, "the scratch area's work tree lives at {}, off its root; such an area is not copied", path.display()),
+            CopyOnlyError::FoldingNotCopied(path) => write!(f, "the scratch area moves its work tree onto {}; such an area is not copied", path.display()),
             CopyOnlyError::Io { path, reason } => write!(f, "{}: {}", path.display(), reason),
         }
     }
@@ -125,11 +126,11 @@ impl Scratch {
 
     /// A copy of this whole area, HOME and TMPDIR included, at `root`, which must not exist yet: the
     /// fresh start an injected run gets, so runs on copies of one area are independent of each
-    /// other and of it. Symlinks are copied as links, never followed. An area whose work tree moved
-    /// off its root is refused: the copy would hold none of it.
+    /// other and of it. Symlinks are copied as links, never followed. An area given a folding
+    /// volume is refused, its work tree moved or not ([`CopyOnlyError::FoldingNotCopied`]).
     pub fn copy_to(&self, root: &Path) -> Result<Scratch, CopyOnlyError> {
-        if let Some(moved) = self.moved.get() {
-            return Err(CopyOnlyError::MovedWorkNotCopied(moved.clone()));
+        if let Some(folding) = &self.folding {
+            return Err(CopyOnlyError::FoldingNotCopied(folding.clone()));
         }
         if std::fs::symlink_metadata(root).is_ok() {
             return Err(CopyOnlyError::ScratchExists(root.to_path_buf()));
@@ -327,10 +328,11 @@ mod tests {
 
     /// Without a folding volume the work tree never moves; with one, it moves once, to a fresh
     /// subfolder named after the area, which every later read of the work tree then names, and
-    /// the area is no longer copied.
+    /// such an area is never copied, before the move or after.
     ///
     /// Revert: target the folding folder itself → the work tree is the volume's own folder; drop
-    /// the second-move refusal → a later clone moves it again, away from what earlier steps wrote.
+    /// the second-move refusal → a later clone moves it again, away from what earlier steps wrote;
+    /// refuse only a moved area → an unmoved copy loses its volume and builds on the scratch one.
     #[test]
     fn the_work_tree_moves_once_and_only_onto_a_folding_volume() {
         let plain = Scratch::create(&fresh("unmoved")).unwrap();
@@ -342,13 +344,14 @@ mod tests {
         std::fs::create_dir_all(&folding).unwrap();
         let scratch = Scratch::create(&fresh("moved")).unwrap().with_folding_volume(&folding);
         assert_eq!(scratch.work(), scratch.root().join("work"), "the history before the clone stays on the scratch volume");
+        assert_eq!(scratch.copy_to(&fresh("unmoved-copy")).unwrap_err(), CopyOnlyError::FoldingNotCopied(folding.clone()), "a copy would build off the volume");
         let moved = scratch.move_work().unwrap().unwrap();
         assert_eq!(moved.parent(), Some(folding.as_path()));
         assert_ne!(moved, folding);
         assert_eq!(scratch.work(), moved);
         assert_eq!(scratch.roots(), vec![scratch.root(), moved.as_path()]);
         assert_eq!(scratch.move_work().unwrap_err(), CopyOnlyError::WorkMoved(moved.clone()));
-        assert_eq!(scratch.copy_to(&fresh("moved-copy")).unwrap_err(), CopyOnlyError::MovedWorkNotCopied(moved.clone()));
+        assert_eq!(scratch.copy_to(&fresh("moved-copy")).unwrap_err(), CopyOnlyError::FoldingNotCopied(folding.clone()));
 
         // An area whose target already exists is refused rather than shared.
         let clash = Scratch::create(&fresh("clash")).unwrap().with_folding_volume(&folding);
