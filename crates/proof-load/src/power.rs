@@ -7,13 +7,16 @@
 //! lines: the volatile one, what the calls produced, and the durable one, keyed by inode: each
 //! file's last synced contents and each directory's last synced entries. A file fsync promotes that
 //! file's contents; a directory fsync promotes its whole entry set, entries an earlier line left
-//! unsynced included; `sync` and `syncfs` promote everything. A rename is durable once its parent
+//! unsynced included; `sync`, and `syncfs` through a descriptor into the area, promote
+//! everything. Files and folders are made under the umask in force. A rename is durable once its parent
 //! is synced, and an entry survives only if its own directory does by the same rule, since the
 //! durable tree is walked from the root: a new directory whose entry was never synced vanishes
 //! with everything synced inside it.
 //!
-//! A crash lands at every kill point of every line, before the call, and after each line exits;
-//! the state after the last line is the one the tool acknowledged. These are POSIX-minimal
+//! A crash lands at every kill point of every line, before the call, before every other sync,
+//! children's included, and after each line exits; the state after the last line is the one the
+//! tool acknowledged. A crash state that records the counting area's root stops the scenario as
+//! path-bound, as the run's final tree would. These are POSIX-minimal
 //! semantics. A real ext4 in data=ordered mode keeps more than this, so a loss graded here may
 //! survive on a real machine; every row says so.
 //!
@@ -339,7 +342,13 @@ pub struct Replay {
     /// installed it, and the table each thread group uses.
     tables: BTreeMap<u32, BTreeMap<i64, (usize, usize)>>,
     table_of: BTreeMap<u32, u32>,
+    /// The umask the traced command started under, and each thread group's as it stands.
+    umask: u32,
+    umasks: BTreeMap<u32, u32>,
 }
+
+/// Calls that make something durable.
+const SYNCS: &[&str] = &["fsync", "fdatasync", "sync", "syncfs"];
 
 /// Calls that change only what the model does not hold: times, owners, extended attributes, and a
 /// range writeback that promises nothing durable.
@@ -349,8 +358,9 @@ const IGNORED: &[&str] = &[
 ];
 
 impl Replay {
-    pub fn new(model: Model, root: Root) -> Replay {
-        Replay { model, root, descriptions: Vec::new(), tables: BTreeMap::new(), table_of: BTreeMap::new() }
+    /// A replay over `model` of commands started under `umask`.
+    pub fn new(model: Model, root: Root, umask: u32) -> Replay {
+        Replay { model, root, descriptions: Vec::new(), tables: BTreeMap::new(), table_of: BTreeMap::new(), umask, umasks: BTreeMap::new() }
     }
 
     /// Replays one traced line, run in the folder `start`. `before` sees the model before each
@@ -360,6 +370,7 @@ impl Replay {
         self.descriptions.clear();
         self.tables.clear();
         self.table_of.clear();
+        self.umasks.clear();
         self.model.changed.clear();
         let groups = trace::thread_groups(calls);
         let mut parents: BTreeMap<u32, (u32, bool)> = BTreeMap::new();
@@ -379,7 +390,8 @@ impl Replay {
             before(index, &self.model);
             let group = directories.group(call.tid);
             self.ensure(group, &parents, 0);
-            if matches!(call.returned, Returned::Value(_)) {
+            // A close frees its number even when it fails (EINTR, EIO).
+            if matches!(call.returned, Returned::Value(_)) || (call.name == "close" && matches!(call.returned, Returned::Failed(_))) {
                 self.apply(call, group, &directories, &parents)
                     .map_err(|why| format!("{}({}): {}", call.name, call.arguments.join(", "), why))?;
             }
@@ -389,7 +401,8 @@ impl Replay {
     }
 
     /// Gives `group` its descriptor table: its parent's own when the clone shared it, a copy of
-    /// its parent's as it stands otherwise, an empty one for the traced command itself.
+    /// its parent's as it stands otherwise, an empty one for the traced command itself; and its
+    /// parent's umask, or the one the command started under.
     fn ensure(&mut self, group: u32, parents: &BTreeMap<u32, (u32, bool)>, depth: usize) {
         if self.table_of.contains_key(&group) {
             return;
@@ -397,6 +410,8 @@ impl Replay {
         match parents.get(&group).copied() {
             Some((parent, shares)) if parent != group && depth < 64 => {
                 self.ensure(parent, parents, depth + 1);
+                let inherited = self.umasks[&parent];
+                self.umasks.insert(group, inherited);
                 let table = self.table_of[&parent];
                 if shares {
                     self.table_of.insert(group, table);
@@ -409,6 +424,7 @@ impl Replay {
             _ => {
                 self.tables.insert(group, BTreeMap::new());
                 self.table_of.insert(group, group);
+                self.umasks.insert(group, self.umask);
             }
         }
     }
@@ -437,7 +453,24 @@ impl Replay {
                 self.table(group).remove(&fd);
                 Ok(None)
             }
-            Some(description) if self.descriptions[description].ino.is_some() => Ok(Some(description)),
+            // One strace shows naming another file than the table's was reused through a route the
+            // replay did not see; which file a write through it reaches is not known.
+            Some(description) if self.descriptions[description].ino.is_some() => {
+                let named = match target.as_deref() {
+                    Some(target) if into_area == Some(true) => match self.locate(target, true)? {
+                        Located::At { ino: Some(ino), .. } => Some(ino),
+                        Located::Root => Some(self.model.root),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match named {
+                    Some(ino) if Some(ino) != self.descriptions[description].ino => {
+                        Err(format!("descriptor {} names {}, which is not the file the replay saw opened under it", fd, self.root.tokenized(target.as_deref().unwrap_or_default())))
+                    }
+                    _ => Ok(Some(description)),
+                }
+            }
             _ if into_area == Some(true) => Err(format!("descriptor {} into the area was never seen opened", fd)),
             _ => Ok(None),
         }
@@ -530,6 +563,7 @@ impl Replay {
         };
         let returned = match &call.returned {
             Returned::Value(value) => value.clone(),
+            Returned::Failed(_) if call.name == "close" => String::new(),
             _ => return Ok(()),
         };
         let number = || -> Result<u64, String> {
@@ -563,7 +597,7 @@ impl Replay {
                             Some(ino)
                         }
                         Located::At { parent, name, ino: None } if flags.contains("O_CREAT") => {
-                            Some(self.model.create(parent, &name, Node::File { data: Vec::new(), mode: mode & !0o022 })?)
+                            Some(self.model.create(parent, &name, Node::File { data: Vec::new(), mode: mode & !self.umasks[&group] })?)
                         }
                         _ => return Err(format!("the replay holds nothing at {}", self.root.tokenized(&target))),
                     }
@@ -666,14 +700,18 @@ impl Replay {
                     self.model.sync(ino);
                 }
             }
+            // syncfs promises only the file system its descriptor lies on; one outside the area
+            // promises the area nothing.
             "sync" | "syncfs" => {
-                self.model.overlapped(None, call.entered)?;
-                self.model.sync_all();
+                if call.name == "sync" || self.held(group, text(0))?.is_some() {
+                    self.model.overlapped(None, call.entered)?;
+                    self.model.sync_all();
+                }
             }
             "mkdir" | "mkdirat" => {
                 let (target, mode) = if call.name == "mkdir" { (path(None, 0)?, mode_of(raw(1))) } else { (path(Some(0), 1)?, mode_of(raw(2))) };
                 if let Some((parent, name)) = self.free(&target)? {
-                    self.model.create(parent, &name, Node::Dir { entries: BTreeMap::new(), mode: mode & !0o022 })?;
+                    self.model.create(parent, &name, Node::Dir { entries: BTreeMap::new(), mode: mode & !self.umasks[&group] })?;
                 }
             }
             "rename" | "renameat" | "renameat2" => {
@@ -737,6 +775,10 @@ impl Replay {
                         self.ensure(child, parents, 0);
                     }
                 }
+            }
+            "umask" => {
+                let mask = u32::from_str_radix(raw(0).trim_start_matches("0o"), 8).map_err(|_| format!("no mask in {}", raw(0)))?;
+                self.umasks.insert(group, mask & 0o777);
             }
             name if IGNORED.contains(&name) => {}
             _ => match trace::touch(call) {
@@ -833,22 +875,22 @@ fn mode(_: &std::fs::Metadata, default: u32) -> u32 {
 }
 
 /// The first path where the replay's tree and the run's differ, said plainly: by kind, by a file's
-/// bytes or exec bit, or by a link's target. Folder modes are not compared, since the replay
-/// cannot know the umask a folder was made under.
+/// bytes, by permission bits, or by a link's target.
 pub fn difference(replayed: &Image, ran: &Image) -> Option<String> {
-    let executable = |mode: &u32| mode & 0o111 != 0;
+    let permissions = |mode: &u32| mode & 0o777;
     let paths: BTreeSet<&String> = replayed.keys().chain(ran.keys()).collect();
     for path in paths {
         let shown = if path.is_empty() { "the root" } else { path.as_str() };
         let differs = match (replayed.get(path), ran.get(path)) {
             (Some(_), None) => Some("the replay holds it and the run left none".to_string()),
             (None, Some(_)) => Some("the run left it and the replay holds none".to_string()),
-            (Some(Entry::Dir { .. }), Some(Entry::Dir { .. })) => None,
+            (Some(Entry::Dir { mode: m }), Some(Entry::Dir { mode: n })) => (permissions(m) != permissions(n))
+                .then(|| format!("the replay makes it mode {:o} and the run left {:o}", permissions(m), permissions(n))),
             (Some(Entry::File { data: a, mode: m }), Some(Entry::File { data: b, mode: n })) => {
                 if a != b {
                     Some(format!("the replay holds {} bytes and the run left {} different ones", a.len(), b.len()))
-                } else if executable(m) != executable(n) {
-                    Some("the replay and the run disagree on its exec bit".to_string())
+                } else if permissions(m) != permissions(n) {
+                    Some(format!("the replay makes it mode {:o} and the run left {:o}", permissions(m), permissions(n)))
                 } else {
                     None
                 }
@@ -933,6 +975,9 @@ fn remove_tree(path: &Path) -> std::io::Result<()> {
 pub enum Moment {
     /// At a kill point, before its call.
     During { point: Point },
+    /// Before a sync no kill point stands at, a child's or another thread's: the durable state
+    /// changes only at a sync, so these with the kill points reach every one the line passes.
+    Synced { line: usize, command: String, call: usize, name: String },
     /// After a line of the faulted command exited.
     After { line: usize, command: String },
 }
@@ -943,6 +988,7 @@ impl Moment {
     fn trail(&self) -> (usize, bool) {
         match self {
             Moment::During { point } => (point.line, true),
+            Moment::Synced { line, .. } => (*line, true),
             Moment::After { line, .. } => (line + 1, false),
         }
     }
@@ -950,6 +996,7 @@ impl Moment {
     fn label(&self) -> String {
         match self {
             Moment::During { point } => format!("{} {}#{} {}", point.command, point.name, point.when, point.base),
+            Moment::Synced { command, call, name, .. } => format!("{} before {} at traced call {}", command, name, call + 1),
             Moment::After { line, command } => format!("after line {} {}", line + 1, command),
         }
     }
@@ -981,9 +1028,15 @@ pub struct Line<'a> {
 /// Every distinct state a crash can leave in `lines`, replayed over `fixture` from the folder
 /// `start` under `root`, plus `variants` seeded states drawn at seeded moments. The last element of
 /// the result's pair is the volatile tree the replay ended with, for the check against the run.
-pub fn crashes(fixture: &Image, root: &Root, start: &str, lines: &[Line], variants: usize, seed: u64) -> Result<(Vec<Crash>, Image), String> {
-    let mut replay = Replay::new(Model::of(fixture)?, root.clone());
-    let moments: usize = lines.iter().map(|line| line.points.len() + 1).sum();
+pub fn crashes(fixture: &Image, root: &Root, start: &str, umask: u32, lines: &[Line], variants: usize, seed: u64) -> Result<(Vec<Crash>, Image), String> {
+    let mut replay = Replay::new(Model::of(fixture)?, root.clone(), umask);
+    let synced = |line: &Line| -> BTreeSet<usize> {
+        let at_points: BTreeSet<usize> = line.points.iter().map(|point| point.call).collect();
+        line.calls.iter().enumerate()
+            .filter(|(index, call)| SYNCS.contains(&call.name.as_str()) && matches!(call.returned, Returned::Value(_)) && !at_points.contains(index))
+            .map(|(index, _)| index).collect()
+    };
+    let moments: usize = lines.iter().map(|line| line.points.len() + synced(line).len() + 1).sum();
     let mut rng = Rng::new(seed);
     // The moments a variant is drawn at, with repeats: each draw is its own variant.
     let mut draws: BTreeMap<usize, usize> = BTreeMap::new();
@@ -996,9 +1049,13 @@ pub fn crashes(fixture: &Image, root: &Root, start: &str, lines: &[Line], varian
     let last = lines.len().checked_sub(1).ok_or_else(|| "the faulted command has no lines".to_string())?;
     for (index, line) in lines.iter().enumerate() {
         let here: BTreeMap<usize, &Point> = line.points.iter().map(|point| (point.call, *point)).collect();
+        let syncs = synced(line);
         replay.line(line.calls, start, |call, model| {
             if let Some(point) = here.get(&call) {
                 collector.record(Moment::During { point: (*point).clone() }, model, false);
+            } else if syncs.contains(&call) {
+                let moment = Moment::Synced { line: index, command: line.command.clone(), call, name: line.calls[call].name.clone() };
+                collector.record(moment, model, false);
             }
         }).map_err(|why| format!("line {} {}: {}", index + 1, line.command, why))?;
         collector.record(Moment::After { line: index, command: line.command.clone() }, &replay.model, index == last);
@@ -1106,13 +1163,21 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
         return Err(RunError::Io("the faulted command was counted without its writes dumped".to_string()));
     };
     let start = counted.counting.work().to_string_lossy().into_owned();
-    let (crashes, replayed) = match crashes(fixture, &counted.counting_root, &start, &lines, variants, seed) {
+    let umask = harness_umask().map_err(RunError::Io)?;
+    let (crashes, replayed) = match crashes(fixture, &counted.counting_root, &start, umask, &lines, variants, seed) {
         Ok(found) => found,
         Err(refusal) => {
             power.refusals.push(refusal);
             return Ok(power);
         }
     };
+    // The run's final tree was checked for its own root when counted; a state between holds files
+    // the run later removed, and one naming the counting area would tie its copy to that area.
+    let needles = [counted.counting_root.given.as_str(), counted.counting_root.canonical.as_str()];
+    if let Some((crash, path)) = crashes.iter().find_map(|crash| bound(&crash.image, &needles).map(|path| (crash, path))) {
+        power.not_run = Some(format!("path-bound: the crash state {} records the scratch area's root in {}", crash.moment.label(), path));
+        return Ok(power);
+    }
     let ran = scan(counted.counting.root()).map_err(|error| RunError::Io(error.to_string()))?;
     if let Some(difference) = difference(&replayed, &ran) {
         power.refusals.push(format!("the replay does not reproduce the run: {}", difference));
@@ -1145,6 +1210,27 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
     Ok(power)
 }
 
+/// The first path in `image` whose contents or link target hold one of `needles`, as
+/// [`kill::recorded_root`] judges a tree on disk.
+fn bound(image: &Image, needles: &[&str]) -> Option<String> {
+    image.iter().find_map(|(path, entry)| {
+        let bytes = match entry {
+            Entry::File { data, .. } => data.as_slice(),
+            Entry::Link { target } => target.as_bytes(),
+            Entry::Dir { .. } => return None,
+        };
+        needles.iter().any(|needle| kill::holds_root(bytes, needle.as_bytes())).then(|| path.clone())
+    })
+}
+
+/// The umask this process runs under, which every traced command inherits; read from /proc, since
+/// the call that reads it sets it too.
+fn harness_umask() -> Result<u32, String> {
+    let status = std::fs::read_to_string("/proc/self/status").map_err(|error| format!("reading /proc/self/status for the umask: {}", error))?;
+    status.lines().find_map(|line| line.strip_prefix("Umask:")).and_then(|mask| u32::from_str_radix(mask.trim(), 8).ok())
+        .ok_or_else(|| "/proc/self/status names no umask".to_string())
+}
+
 /// One crash state written into a fresh copy and graded: the lines before the crash stand as the
 /// counting run ran them, a line the crash cut short as killed.
 fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, settings: &Settings, template: &Scratch, crash: &Crash, at: usize) -> Result<Graded, RunError> {
@@ -1156,9 +1242,9 @@ fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, sett
     let context = kill::context_of(scenario, &counted.corpus, programs, settings, &copy, &environment);
     let mut steps: Vec<Outcome> = Vec::new();
     match &crash.moment {
-        Moment::During { point } => {
-            steps.extend(counted.lines[..point.line].iter().map(|line| line.outcome.clone()));
-            let mut cut = counted.lines[point.line].outcome.clone();
+        Moment::During { point: Point { line, .. } } | Moment::Synced { line, .. } => {
+            steps.extend(counted.lines[..*line].iter().map(|line| line.outcome.clone()));
+            let mut cut = counted.lines[*line].outcome.clone();
             (cut.exit, cut.failure) = (None, None);
             cut.stdout.clear();
             cut.stderr.clear();
@@ -1270,7 +1356,7 @@ mod tests {
 
     /// The model after replaying `lines`, each a trace's text, from /s/w.
     fn replayed(lines: &[String]) -> Result<Model, String> {
-        let mut replay = Replay::new(Model::of(&fixture())?, root());
+        let mut replay = Replay::new(Model::of(&fixture())?, root(), 0o022);
         for line in lines {
             replay.line(&trace::parse(line)?, "/s/w", |_, _| {})?;
         }
@@ -1469,7 +1555,9 @@ mod tests {
         ran.insert("w/a".into(), Entry::File { data: b"neW".to_vec(), mode: 0o644 });
         assert!(difference(&replayed, &ran).unwrap().starts_with("w/a:"));
         ran.insert("w/a".into(), Entry::File { data: b"new".to_vec(), mode: 0o755 });
-        assert!(difference(&replayed, &ran).unwrap().contains("exec bit"));
+        assert!(difference(&replayed, &ran).unwrap().contains("mode 644 and the run left 755"));
+        ran.insert("w/a".into(), Entry::File { data: b"new".to_vec(), mode: 0o600 });
+        assert!(difference(&replayed, &ran).unwrap().contains("mode 644 and the run left 600"));
         ran.insert("w/a".into(), Entry::File { data: b"new".to_vec(), mode: 0o644 });
         ran.insert("w/z".into(), Entry::Link { target: "a".into() });
         assert!(difference(&replayed, &ran).unwrap().starts_with("w/z:"));
@@ -1490,13 +1578,88 @@ mod tests {
         assert_eq!(points[0].iter().map(|point| point.name.as_str()).collect::<Vec<_>>(), ["openat", "write", "fsync"]);
         let lines: Vec<Line> = calls.iter().zip(&points)
             .map(|(calls, points)| Line { calls, command: "stack".into(), points: points.iter().collect() }).collect();
-        let (crashes, replayed) = crashes(&fixture(), &root(), "/s/w", &lines, 0, 7).unwrap();
+        let (crashes, replayed) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap();
         assert_eq!(data(&replayed, "w/a").unwrap(), b"new");
         let found: Vec<(Vec<u8>, bool, usize)> = crashes.iter().map(|crash| (data(&crash.image, "w/a").unwrap(), crash.acknowledged, crash.shared)).collect();
         // Before the open, the write and the fsync: old. After line 1: new. After line 2: new, acknowledged.
         assert_eq!(found, vec![(b"old".to_vec(), false, 3), (b"new".to_vec(), false, 1), (b"new".to_vec(), true, 1)]);
         assert!(matches!(&crashes[0].moment, Moment::During { point } if point.name == "openat"));
         assert_eq!(crashes[2].moment, Moment::After { line: 1, command: "stack".into() });
+    }
+
+    /// A child's syncs are crash moments though no kill point stands at them: the state its first
+    /// fsync made durable, before its second, is graded.
+    ///
+    /// Revert: record crashes at kill points only → the child's `new` is never a crash state.
+    #[test]
+    fn a_crash_lands_before_every_sync_a_child_makes() {
+        let text = format!("1 clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD) = 9\n\
+            9 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_TRUNC) = 3</s/w/a>\n{}9 fsync(3</s/w/a>) = 0\n{}9 fsync(3</s/w/a>) = 0\n",
+            write(9, 3, "/s/w/a", b"new"), write(9, 3, "/s/w/a", b"more"));
+        let calls = trace::parse(&text).unwrap();
+        let points = kill::enumerate(&calls, 0, "stack", &root(), "/s/w", |_| false).unwrap().points;
+        assert!(points.iter().all(|point| point.name != "fsync"), "the child's syncs are no kill points");
+        let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect() }];
+        let (crashes, _) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap();
+        let held: Vec<Vec<u8>> = crashes.iter().map(|crash| data(&crash.image, "w/a").unwrap()).collect();
+        assert!(held.contains(&b"new".to_vec()), "{:?}", held);
+        assert!(crashes.iter().any(|crash| matches!(&crash.moment, Moment::Synced { name, .. } if name == "fsync")));
+    }
+
+    /// A crash state that records the counting area's root is found, in a file's bytes or a
+    /// link's target, at a path-component boundary only.
+    ///
+    /// Revert: check only the run's final tree → a lock naming the area mid-line is graded.
+    #[test]
+    fn a_crash_state_naming_the_counting_root_is_found() {
+        let mut image = fixture();
+        assert_eq!(bound(&image, &["/s"]), None);
+        image.insert("w/lock".into(), Entry::File { data: b"held by /s/w".to_vec(), mode: 0o644 });
+        assert_eq!(bound(&image, &["/s"]).as_deref(), Some("w/lock"));
+        image.insert("w/lock".into(), Entry::File { data: b"held by /sx".to_vec(), mode: 0o644 });
+        image.insert("w/z".into(), Entry::Link { target: "/s/w/a".into() });
+        assert_eq!(bound(&image, &["/s"]).as_deref(), Some("w/z"));
+    }
+
+    /// Files and folders are made under the umask the command started under, or the one it set.
+    ///
+    /// Revert: assume 022 → the file comes back 0644 under 077.
+    #[test]
+    fn files_are_made_under_the_umask_in_force() {
+        let made = "1 openat(AT_FDCWD</s/w>, \"n\", O_WRONLY|O_CREAT, 0666) = 3</s/w/n>\n1 mkdir(\"d\", 0777) = 0\n";
+        let mut replay = Replay::new(Model::of(&fixture()).unwrap(), root(), 0o077);
+        replay.line(&trace::parse(made).unwrap(), "/s/w", |_, _| {}).unwrap();
+        let image = replay.model.volatile_image();
+        assert_eq!(image.get("w/n"), Some(&Entry::File { data: Vec::new(), mode: 0o600 }));
+        assert_eq!(image.get("w/d"), Some(&Entry::Dir { mode: 0o700 }));
+        let set = format!("1 umask(027) = 022\n{}", made);
+        let image = replayed(&[set]).unwrap().volatile_image();
+        assert_eq!(image.get("w/n"), Some(&Entry::File { data: Vec::new(), mode: 0o640 }));
+        assert_eq!(image.get("w/d"), Some(&Entry::Dir { mode: 0o750 }));
+    }
+
+    /// A syncfs promises only its own file system: one through a descriptor outside the area makes
+    /// nothing in it durable, and one inside makes everything durable.
+    ///
+    /// Revert: treat every syncfs as sync → the unsynced write reads as durable.
+    #[test]
+    fn a_syncfs_outside_the_area_promises_it_nothing() {
+        let synced = |fd: &str| format!("{}1 openat(AT_FDCWD</s/w>, \"{}\", O_RDONLY) = 4<{}>\n1 syncfs(4<{}>) = 0\n", rewrite(false), fd, fd, fd);
+        assert_eq!(data(&replayed(&[synced("/t/x")]).unwrap().durable_image(), "w/a").unwrap(), b"old");
+        assert_eq!(data(&replayed(&[synced("/s/w/a")]).unwrap().durable_image(), "w/a").unwrap(), b"new");
+    }
+
+    /// A failed close frees its number all the same, and a descriptor strace names as another file
+    /// in the area than the one the table holds refuses rather than write the wrong file.
+    ///
+    /// Revert: skip failed calls → the write lands in `a` through the closed number; trust the
+    /// table → the byte meant for `b` lands in `a`.
+    #[test]
+    fn a_descriptor_is_held_only_while_it_names_its_file() {
+        let closed = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3</s/w/a>\n1 close(3</s/w/a>) = -1 EINTR (Interrupted system call)\n{}", write(1, 3, "/s/w/a", b"x"));
+        assert!(replayed(&[closed]).unwrap_err().contains("never seen opened"));
+        let other = format!("1 openat(AT_FDCWD</s/w>, \"b\", O_WRONLY|O_CREAT, 0644) = 4</s/w/b>\n1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3</s/w/a>\n{}", write(1, 3, "/s/w/b", b"x"));
+        assert!(replayed(&[other]).unwrap_err().contains("not the file the replay saw opened"));
     }
 
     /// A crash is graded with the trail it happens on: a state left after a line finished and
@@ -1513,7 +1676,7 @@ mod tests {
             .map(|(line, calls)| kill::enumerate(calls, line, "stack", &root(), "/s/w", |_| true).unwrap().points).collect();
         let lines: Vec<Line> = calls.iter().zip(&points)
             .map(|(calls, points)| Line { calls, command: "stack".into(), points: points.iter().collect() }).collect();
-        let (crashes, _) = crashes(&fixture(), &root(), "/s/w", &lines, 0, 7).unwrap();
+        let (crashes, _) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap();
         assert!(crashes.iter().all(|crash| data(&crash.image, "w/a").unwrap() == b"old"));
         let trails: Vec<(usize, bool)> = crashes.iter().map(|crash| crash.moment.trail()).collect();
         assert_eq!(trails, [(0, true), (1, false), (1, true), (2, false)]);
@@ -1535,10 +1698,10 @@ mod tests {
         let durable = |crashes: &[Crash]| -> Vec<(String, usize)> {
             crashes.iter().filter(|crash| crash.variant.is_none()).map(|crash| (crash.moment.label(), crash.shared)).collect()
         };
-        let (plain, _) = crashes(&fixture(), &root(), "/s/w", &lines, 0, 0).unwrap();
+        let (plain, _) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 0).unwrap();
         let mut matched = false;
         for seed in 0..64 {
-            let (drawn, _) = crashes(&fixture(), &root(), "/s/w", &lines, 8, seed).unwrap();
+            let (drawn, _) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 8, seed).unwrap();
             assert_eq!(durable(&drawn), durable(&plain), "seed {}", seed);
             matched |= drawn.len() < plain.len() + 8;
         }

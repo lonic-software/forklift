@@ -348,7 +348,7 @@ pub fn recorded_root(root: &Path, needles: &[&str]) -> std::io::Result<Option<St
 }
 
 /// `needle` in `bytes`, not followed by a byte that would continue its last component.
-fn holds_root(bytes: &[u8], needle: &[u8]) -> bool {
+pub(crate) fn holds_root(bytes: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || bytes.len() < needle.len() {
         return false;
     }
