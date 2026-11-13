@@ -282,6 +282,61 @@ pub struct Scenario {
     /// these operations read (a remote's, say) is reached by the command that grades it.
     pub then: Vec<Op>,
     pub damage: Option<Damage>,
+    /// What its records hold: the seed's history, or files of the scenario's own.
+    pub files: Files,
+}
+
+/// What a scenario's records hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Files {
+    /// The seed's generated history.
+    Seeded,
+    /// A volume fault's own history ([`folded_corpus`]): the one thing a work tree on that kind of
+    /// volume can lose, so its grade answers that fault alone.
+    Folded(Fold),
+}
+
+/// Which volume fault a [`Files::Folded`] history exercises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Fold {
+    /// A case-only rename, which a volume that folds case can leave unseen.
+    Case,
+    /// An executable file left untouched, which a volume without the bit can record without it.
+    Exec,
+}
+
+/// The executable file of the [`Fold::Exec`] corpus, in every record.
+pub const RUN_SH: &str = "run.sh";
+/// The [`Fold::Case`] corpus's file under its first case, in record 0.
+pub const README_BEFORE: &str = "docs/Readme.txt";
+/// The same file under its new case, from record 1 on: a case-only rename.
+pub const README_AFTER: &str = "docs/README.txt";
+
+/// The corpus of a [`Files::Folded`] scenario for `fold`, as many records as `corpus` has (at
+/// least two), its seed and shape kept for the report. Every record holds a.txt, edited in each.
+/// [`Fold::Case`]: record 0 holds docs/Readme.txt, and record 1 on renames it to docs/README.txt,
+/// a change of case alone with the same bytes; nothing is executable. [`Fold::Exec`]: every record
+/// holds run.sh, executable and never changed. Record 1 is what such a volume can mis-record: the
+/// rename unseen, or run.sh recorded without its bit, and each corpus holds only its own.
+pub fn folded_corpus(corpus: &crate::corpus::Corpus, fold: Fold) -> crate::corpus::Corpus {
+    let record = |index: usize| -> crate::corpus::Snapshot {
+        let kept = match fold {
+            Fold::Case => (if index == 0 { README_BEFORE } else { README_AFTER }, b"proof-load readme\n".to_vec()),
+            Fold::Exec => (RUN_SH, b"#!/bin/sh\necho proof-load\n".to_vec()),
+        };
+        [kept, ("a.txt", format!("proof-load record {}\n", index).into_bytes())]
+            .into_iter().map(|(path, bytes)| (path.to_string(), bytes)).collect()
+    };
+    crate::corpus::Corpus {
+        records: (0..corpus.records.len().max(2)).map(record).collect(),
+        modes: match fold {
+            Fold::Case => crate::corpus::Modes::Unjudged,
+            Fold::Exec => crate::corpus::Modes::Judged([RUN_SH.to_string()].into()),
+        },
+        ..corpus.clone()
+    }
 }
 
 impl Scenario {
@@ -340,12 +395,17 @@ impl Scenario {
         }
     }
 
-    /// The corpus this scenario records from `corpus`: rooted under its scope when it has one, so
-    /// every record changes what the scoped bay holds (`corpus::rooted`).
+    /// The corpus this scenario records from `corpus`: its own files when it has them, rooted
+    /// under its scope when it has one, so every record changes what the scoped bay holds
+    /// (`corpus::rooted`).
     pub fn corpus(&self, corpus: &crate::corpus::Corpus) -> crate::corpus::Corpus {
+        let corpus = match self.files {
+            Files::Seeded => corpus.clone(),
+            Files::Folded(fold) => folded_corpus(corpus, fold),
+        };
         match self.scope() {
-            Some(scope) => crate::corpus::rooted(corpus, scope),
-            None => corpus.clone(),
+            Some(scope) => crate::corpus::rooted(&corpus, scope),
+            None => corpus,
         }
     }
 }
@@ -374,7 +434,11 @@ impl Op {
 /// scenario that creates its path, and a run checks that it does.
 pub fn catalog() -> Vec<Scenario> {
     let record = |index| Op::Record { index };
-    let named = |id: &str, history: Vec<Op>| Scenario { id: id.to_string(), history, then: vec![], damage: None };
+    let named = |id: &str, history: Vec<Op>| Scenario { id: id.to_string(), history, then: vec![], damage: None, files: Files::Seeded };
+    let folded = |id: &str, fold| Scenario {
+        then: vec![Op::Push], files: Files::Folded(fold),
+        ..named(id, vec![Op::Host, record(0), Op::Push, Op::Clone { kind: CloneKind::Full }])
+    };
     vec![
         named("history", vec![record(0), record(1), record(2)]),
         named("branched", vec![
@@ -430,6 +494,13 @@ pub fn catalog() -> Vec<Scenario> {
             record(0), Op::Branch { name: "side".into() }, Op::Switch { name: "side".into() }, Op::Variant { index: 0 },
             Op::Switch { name: "main".into() }, record(1), Op::Pick { name: "side".into() },
         ]),
+        // The volume faults' scenarios, one per fault: record 0 recorded and lifted on the
+        // scratch volume, then cloned; the faulted command records record 1 (the case-only rename,
+        // or an edit beside the untouched executable) and lifts it. Run with a folding volume, the
+        // clone lands there (`Scratch::move_work`); without one, at the ordinary work folder, so
+        // every other lane builds them as they are.
+        folded("folded-case", Fold::Case),
+        folded("folded-exec", Fold::Exec),
     ]
 }
 
@@ -438,7 +509,7 @@ pub fn catalog() -> Vec<Scenario> {
 /// like every scenario, and never faulted.
 pub fn coverage() -> Vec<Scenario> {
     let record = |index| Op::Record { index };
-    let named = |id: &str, history: Vec<Op>| Scenario { id: id.to_string(), history, then: vec![], damage: None };
+    let named = |id: &str, history: Vec<Op>| Scenario { id: id.to_string(), history, then: vec![], damage: None, files: Files::Seeded };
     let write = |path: &str, text: &str| Op::Write { path: path.to_string(), text: text.to_string() };
     vec![
         // The work tree's own commands, and the read-only ones over a warehouse with history.
@@ -631,10 +702,10 @@ mod tests {
         assert_eq!(tuned[0].last().unwrap(), "--strict");
         assert_eq!(bind(Tool::Git, &Op::Verify).unwrap(), vec![line(&["fsck", "--full", "--strict"])]);
 
-        let plain = Scenario { id: "plain".into(), history: vec![Op::Record { index: 0 }, Op::Verify], then: vec![], damage: None };
+        let plain = Scenario { id: "plain".into(), history: vec![Op::Record { index: 0 }, Op::Verify], then: vec![], damage: None, files: Files::Seeded };
         assert_eq!(plain.tools(), vec![Tool::Forklift, Tool::Git, Tool::GitTuned]);
         assert!(!plain.forklift_only());
-        let repaired = Scenario { id: "repaired".into(), history: vec![Op::Record { index: 0 }, Op::Repair], then: vec![], damage: None };
+        let repaired = Scenario { id: "repaired".into(), history: vec![Op::Record { index: 0 }, Op::Repair], then: vec![], damage: None, files: Files::Seeded };
         assert_eq!(repaired.tools(), vec![Tool::Forklift]);
         assert!(repaired.forklift_only());
         assert_eq!(repaired.records(), vec![0]);
@@ -672,10 +743,11 @@ mod tests {
         let corpus = crate::corpus::Corpus {
             seed: 0, shape: crate::corpus::Shape::SMALL,
             records: vec![snapshot(&[("a", "1"), ("b", "2"), ("c", "3")]), snapshot(&[("a", "1"), ("b", "9"), ("d", "3")])],
+            modes: Default::default(),
         };
         assert_eq!(taken(&corpus, 0), Some(("b".to_string(), b"2".to_vec())));
         assert_eq!(taken(&corpus, 1), Some(("a".to_string(), b"1".to_vec())), "nothing follows the last record");
-        let kept = crate::corpus::Corpus { seed: 0, shape: crate::corpus::Shape::SMALL, records: vec![snapshot(&[("a", "1")]), snapshot(&[("z", "1")])] };
+        let kept = crate::corpus::Corpus { seed: 0, shape: crate::corpus::Shape::SMALL, records: vec![snapshot(&[("a", "1")]), snapshot(&[("z", "1")])], modes: Default::default() };
         assert_eq!(taken(&kept, 0), None, "bytes moved to another path still live on");
         assert_eq!(taken(&corpus, 2), None);
     }
@@ -693,7 +765,7 @@ mod tests {
         assert_eq!(withheld.withheld(), Some(1));
         assert_eq!(withheld.withhold_reader(Warehouse::Client), WithholdReader::FetchedAfter);
         assert_eq!(withheld.withhold_reader(Warehouse::Host), WithholdReader::FetchedAfter);
-        let held = Scenario { id: "h".into(), history: vec![Op::Host, Op::Clone { kind: CloneKind::Full }, Op::Withhold { index: 0 }], then: vec![], damage: None };
+        let held = Scenario { id: "h".into(), history: vec![Op::Host, Op::Clone { kind: CloneKind::Full }, Op::Withhold { index: 0 }], then: vec![], damage: None, files: Files::Seeded };
         assert_eq!(held.withhold_reader(Warehouse::Client), WithholdReader::HeldBefore);
         assert_eq!(held.withhold_reader(Warehouse::Host), WithholdReader::FetchedAfter);
     }
@@ -705,7 +777,7 @@ mod tests {
     #[test]
     fn the_last_clone_decides_the_scope() {
         let only = |scope: &str| Op::Clone { kind: CloneKind::Only(scope.into()) };
-        let scenario = |history| Scenario { id: "s".into(), history, then: vec![], damage: None };
+        let scenario = |history| Scenario { id: "s".into(), history, then: vec![], damage: None, files: Files::Seeded };
         assert_eq!(scenario(vec![Op::Host, only("src")]).scope(), Some("src"));
         assert_eq!(scenario(vec![only("src"), Op::Clone { kind: CloneKind::Full }]).scope(), None);
         assert_eq!(scenario(vec![Op::Clone { kind: CloneKind::Cache }, only("docs")]).scope(), Some("docs"));
@@ -716,5 +788,53 @@ mod tests {
         assert_eq!(sparse.corpus(&corpus), crate::corpus::rooted(&corpus, "src"));
         assert_eq!(scenario(vec![]).corpus(&corpus), corpus);
     }
-}
 
+    /// Each folded corpus keeps its records' count and carries only its own fault. Case: record 1
+    /// is a case-only rename of the readme with the same bytes, plus an edit, and nothing is
+    /// executable. Exec: run.sh is executable and unchanged in every record, beside an edit, and no
+    /// path changes. Each `folded-*` scenario records its corpus, lifts record 0 and clones before
+    /// its faulted command.
+    ///
+    /// Revert: change the readme's bytes in record 1 → the rename is no longer case-only; drop the
+    /// executable mark → no record can lose the bit; give the case corpus run.sh too → its grade
+    /// answers the no-exec fault as well, the misattribution the split exists to stop.
+    #[test]
+    fn each_folded_corpus_carries_its_own_volume_fault() {
+        let seeded = crate::corpus::generate(3, crate::corpus::Shape { records: 4, ..crate::corpus::Shape::SMALL });
+        let short = crate::corpus::generate(3, crate::corpus::Shape { records: 1, ..crate::corpus::Shape::SMALL });
+        for fold in [Fold::Case, Fold::Exec] {
+            let folded = folded_corpus(&seeded, fold);
+            assert_eq!((folded.records.len(), folded.seed), (4, 3));
+            assert_eq!(folded_corpus(&short, fold).records.len(), 2);
+            for pair in folded.records.windows(2) {
+                assert_ne!(pair[0], pair[1]);
+                assert_ne!(pair[0]["a.txt"], pair[1]["a.txt"]);
+            }
+            let (first, second) = (&folded.records[0], &folded.records[1]);
+            match fold {
+                Fold::Case => {
+                    assert_eq!(folded.modes, crate::corpus::Modes::Unjudged, "a mode fault must not fail the case cell");
+                    assert!(folded.records.iter().all(|record| !record.contains_key(RUN_SH)));
+                    assert!(first.contains_key(README_BEFORE) && !first.contains_key(README_AFTER));
+                    assert!(second.contains_key(README_AFTER) && !second.contains_key(README_BEFORE));
+                    assert_eq!(README_BEFORE.to_lowercase(), README_AFTER.to_lowercase());
+                    assert_eq!(first[README_BEFORE], second[README_AFTER]);
+                }
+                Fold::Exec => {
+                    assert_eq!(folded.modes, crate::corpus::Modes::Judged([RUN_SH.to_string()].into()));
+                    assert!(folded.records.iter().all(|record| record[RUN_SH] == first[RUN_SH]));
+                    assert!(folded.records.iter().all(|record| record.keys().eq(first.keys())), "no path changes");
+                }
+            }
+
+            let id = match fold { Fold::Case => "folded-case", Fold::Exec => "folded-exec" };
+            let scenario = catalog().into_iter().find(|scenario| scenario.id == id).unwrap();
+            assert_eq!(scenario.files, Files::Folded(fold));
+            assert_eq!(scenario.corpus(&seeded), folded);
+            assert_eq!(scenario.marks(), vec![Mark::Record(0)]);
+            assert!(matches!(scenario.history.last(), Some(Op::Clone { kind: CloneKind::Full })), "the clone is what moves the work tree");
+            assert_eq!(scenario.then, vec![Op::Push]);
+            assert_eq!(scenario.scope(), None);
+        }
+    }
+}

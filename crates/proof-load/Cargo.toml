@@ -24,3 +24,8 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
+
+# geteuid, for the volume probe: a refused change of mode means a volume without modes only on a
+# file the harness owns.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

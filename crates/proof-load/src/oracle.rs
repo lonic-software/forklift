@@ -12,23 +12,72 @@
 
 use std::collections::BTreeMap;
 
-/// A tree: each file's path (relative, `/`-separated) and the digest of its bytes.
+/// A tree: each file's path (relative, `/`-separated) and its entry digest ([`entry_digest`]).
 pub type Tree = BTreeMap<String, String>;
 
-/// Hashes `bytes` the way trees record them.
+/// Hashes `bytes` the way trees record a normal file.
 pub fn digest(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
-/// Reads the tree under `root`, skipping the tool's own state folder (`.forklift`, `.git`).
+/// What an executable file's entry digest covers ahead of its bytes.
+const EXECUTABLE: &[u8] = b"proof-load mode 100755\0";
+
+/// Hashes one tree entry: a normal file's bytes as [`digest`] does, so every tree of files without
+/// the executable bit keeps the digests it always had; an executable file's mode marker and bytes,
+/// so a record that lost or gained the bit reads as a different tree.
+pub fn entry_digest(bytes: &[u8], executable: bool) -> String {
+    if !executable {
+        return digest(bytes);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(EXECUTABLE);
+    hasher.update(bytes);
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Whether trees on this platform carry the executable bit: Unix keeps it in the file mode, and
+/// Windows has none to read, so there every file reads normal and no expectation marks one.
+pub const MODES: bool = cfg!(unix);
+
+/// Whether a file of `mode` (None where the platform gives none) reads executable, where modes are
+/// `observed`: its owner may execute it. Split from the platform so both arms are tested anywhere.
+pub fn executable_when(observed: bool, mode: Option<u32>) -> bool {
+    observed && mode.is_some_and(|mode| mode & 0o100 != 0)
+}
+
+/// The mode of the file `metadata` describes, on a platform that has one.
+pub fn mode(metadata: &std::fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    return Some(std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()));
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+/// Reads the tree under `root`, skipping the tool's own state folder (`.forklift`, `.git`), each
+/// file's mode read from disk where the platform keeps one.
 pub fn read_tree(root: &std::path::Path) -> std::io::Result<Tree> {
+    read_tree_when(root, MODES)
+}
+
+/// [`read_tree`] with modes `judged` or not: where they are not, no file reads executable, as
+/// [`crate::corpus::expected`] expects of an unjudged corpus.
+pub fn read_tree_when(root: &std::path::Path, judged: bool) -> std::io::Result<Tree> {
     let mut tree = Tree::new();
     for path in crate::census::walk(root)? {
         let first = path.split('/').next().unwrap_or("");
         if path.ends_with('/') || first == ".forklift" || first == ".git" {
             continue;
         }
-        tree.insert(path.clone(), digest(&std::fs::read(root.join(&path))?));
+        let file = root.join(&path);
+        // Only a regular file carries the bit: a link's own mode reads 0o777, and its bytes are
+        // read through it.
+        let metadata = std::fs::symlink_metadata(&file)?;
+        let executable = executable_when(judged && metadata.is_file(), mode(&metadata));
+        tree.insert(path.clone(), entry_digest(&std::fs::read(&file)?, executable));
     }
     Ok(tree)
 }
@@ -261,6 +310,48 @@ pub fn freed_admissible(recorded: &str) -> Vec<Admissible> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A normal file's entry digest is the digest of its bytes, unchanged; an executable file's is
+    /// another, so a tree that lost or gained the bit reads as a different tree. Read from disk, the
+    /// mode decides it where modes are observed, and nowhere else.
+    ///
+    /// Revert: make the entry digest ignore the mode → the executable and the normal tree compare
+    /// equal, and a record that lost run.sh's bit grades as healed.
+    #[test]
+    fn the_entry_digest_covers_the_executable_bit() {
+        assert_eq!(entry_digest(b"x", false), digest(b"x"));
+        assert_ne!(entry_digest(b"x", true), digest(b"x"));
+        assert_ne!(entry_digest(b"x", true), entry_digest(b"y", true));
+        assert!(executable_when(true, Some(0o100755)) && executable_when(true, Some(0o100700)));
+        assert!(!executable_when(true, Some(0o100644)) && !executable_when(true, Some(0o100011)));
+        assert!(!executable_when(false, Some(0o100755)), "where modes are not observed, nothing reads executable");
+        assert!(!executable_when(true, None));
+    }
+
+    /// The same bytes read back as two trees once one of them carries the bit; a link reads as its
+    /// target's bytes and never as executable, whatever its own mode.
+    ///
+    /// Revert: read the bytes only → the two folders read the same; read the bit off a link too →
+    /// the link, whose own mode is 0o755 or 0o777, reads executable over a plain file.
+    #[cfg(unix)]
+    #[test]
+    fn read_tree_sees_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("proof-load-oracle-modes-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("run.sh");
+        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink("run.sh", root.join("link")).unwrap();
+        let normal = read_tree(&root).unwrap();
+        assert_eq!(normal["run.sh"], digest(b"#!/bin/sh\n"));
+        assert_eq!(normal["link"], digest(b"#!/bin/sh\n"), "a link carries no bit of its own");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let executable = read_tree(&root).unwrap();
+        assert_eq!(executable["run.sh"], entry_digest(b"#!/bin/sh\n", true));
+        assert_ne!(normal, executable);
+    }
 
     fn tree(entries: &[(&str, &str)]) -> Tree {
         entries.iter().map(|(path, bytes)| (path.to_string(), digest(bytes.as_bytes()))).collect()

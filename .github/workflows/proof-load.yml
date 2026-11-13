@@ -1,7 +1,7 @@
 # Proof Load, the per-PR lane: fault the binaries users get. forklift and forklift-server are built
 # from the pull request's head for the release target of each OS (release.yml's matrix), not the
 # host default the test job builds, and the harness runs its completeness checks, every
-# damaged-file binding, and the environment faults against one small seed.
+# damaged-file binding, and the environment and volume faults against one small seed.
 #
 # Non-blocking while its flake rate is unknown: the run step continues on error, so the job reports
 # its grades without failing the check. Whether and how it gates after the trial is FORK-445.
@@ -36,9 +36,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install musl tools and strace
+      - name: Install musl tools, strace and dosfstools
         if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools strace
+        run: sudo apt-get update && sudo apt-get install -y musl-tools strace dosfstools
 
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable && rustup target add ${{ matrix.target }}
@@ -70,20 +70,42 @@ jobs:
           df -h "$capped"
           echo "CAPPED=$capped" >> "$GITHUB_ENV"
 
+      # The volume faults need a volume that folds case and keeps no executable bit, for the work
+      # tree a clone moves onto: a loop-mounted vfat on Linux, owned by the runner's user, and an
+      # exFAT image on macOS. Windows builds none. The harness probes what it is given, so a volume
+      # that turns out to keep the bit or the case reports that cell not run, never as coverage.
+      - name: Make the folding volume
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          folding="$RUNNER_TEMP/folding"; mkdir -p "$folding"
+          if [ "$RUNNER_OS" = Linux ]; then
+            truncate -s 64M "$RUNNER_TEMP/folding.img"
+            mkfs.vfat "$RUNNER_TEMP/folding.img"
+            sudo mount -o loop,uid="$(id -u)",gid="$(id -g)" "$RUNNER_TEMP/folding.img" "$folding"
+          else
+            hdiutil create -size 64m -fs ExFAT -volname PLFOLD "$RUNNER_TEMP/folding.dmg"
+            hdiutil attach -nobrowse -mountpoint "$folding" "$RUNNER_TEMP/folding.dmg"
+          fi
+          df -h "$folding"
+          echo "FOLDING=$folding" >> "$GITHUB_ENV"
+
       - name: Run
         id: run
         continue-on-error: true
         shell: bash
         run: |
-          exe=""; git=$(command -v git); kill=(); capped=()
+          exe=""; git=$(command -v git); kill=(); capped=(); folding=()
           if [ "$RUNNER_OS" = Windows ]; then exe=".exe"; git=$(cygpath -w "$git"); fi
           # Kill points need strace, so Linux only; one scenario's keep the lane inside its budget.
           if [ "$RUNNER_OS" = Linux ]; then kill=(--strace "$(command -v strace)" --kill history --power history --power-variants 4); fi
           if [ -n "${CAPPED:-}" ]; then capped=(--capped-volume "$CAPPED/proof-load" --disk-full history --disk-full compacted); fi
+          # A folder inside the volume, never its mount point, which the system may write into.
+          if [ -n "${FOLDING:-}" ]; then folding=(--folding-volume "$FOLDING/proof-load"); fi
           bin=target/${{ matrix.target }}/release
           target/release/proof-load$exe run --source . --out "$RUNNER_TEMP/proof-load" --budget 2700 \
             --forklift "$bin/forklift$exe" --forklift-server "$bin/forklift-server$exe" --git "$git" \
-            --read-only history --read-only compacted "${kill[@]}" "${capped[@]}"
+            --read-only history --read-only compacted "${kill[@]}" "${capped[@]}" "${folding[@]}"
 
       - name: Summary
         if: ${{ !cancelled() }}

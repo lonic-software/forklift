@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::census::{self, Census};
 use crate::corpus::{self, Corpus};
-use crate::oracle::{self, Admissible, RedactionLedger, RedactionState};
+use crate::oracle::{Admissible, RedactionLedger, RedactionState};
 use crate::scenario::{bind, Keep, Mark, Op, Scenario, Tool, Until, SCRATCH, TARGET, URL, WORK};
 use crate::scrub::{Environment, Scratch};
 use crate::tool::{self, Invocation, Outcome, Served};
@@ -109,7 +109,6 @@ pub fn host_root(scratch: &Scratch) -> PathBuf {
 /// With an `observer`, every step goes through it, for the write-op check.
 #[allow(clippy::too_many_arguments)]
 pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, server: Option<&Path>, scratch: &Scratch, environment: &Environment, limit: Duration, observer: Option<&Observer>) -> Result<Built, RunError> {
-    let work = scratch.work();
     let corpus = &scenario.corpus(corpus);
     let run_in = |program: &Path, arguments: Vec<String>, directory: PathBuf| -> Result<Outcome, RunError> {
         let invocation = Invocation { program: PathBuf::from(program), arguments, directory, limit };
@@ -131,7 +130,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
         Ok(outcome)
     };
 
-    let mut outcomes = vec![run_in(program, prepare(tool), work.clone())?];
+    let mut outcomes = vec![run_in(program, prepare(tool), scratch.work())?];
     let mut acknowledged = Vec::new();
     let mut host: Option<Served> = None;
     let mut taken = Vec::new();
@@ -141,10 +140,12 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
     // Values coverage lines kept from earlier documents, by name.
     let mut kept: BTreeMap<String, String> = BTreeMap::new();
     for op in &scenario.history {
+        // Read at each step: a clone onto a folding volume moves the work tree.
+        let mut work = scratch.work();
         if let Some(snapshot) = op.writes(corpus) {
             let snapshot = snapshot.map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?;
             let snapshot = match scope { Some(scope) => corpus::within(&snapshot, scope), None => snapshot };
-            corpus::write(&snapshot, &work).map_err(|error| RunError::Io(error.to_string()))?;
+            corpus::write(&snapshot, &corpus.modes, &work, scratch.work_moved()).map_err(|error| RunError::Io(error.to_string()))?;
         }
         let mut directory = work.clone();
         match op {
@@ -183,7 +184,8 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                taken.push(Taken { path, digest: oracle::digest(&bytes), by: TakenBy::Withheld });
+                let digest = crate::corpus::expected_entry(&path, &bytes, &corpus.modes);
+                taken.push(Taken { path, digest, by: TakenBy::Withheld });
             }
             Op::Redact { index } => {
                 let (path, bytes) = crate::scenario::taken(corpus, *index)
@@ -215,7 +217,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                 if deleted {
                     ledger.observe("client", &hash, RedactionState::Deleted);
                 }
-                let digest = oracle::digest(&bytes);
+                let digest = crate::corpus::expected_entry(&path, &bytes, &corpus.modes);
                 let admissible = ledger.admissible("client", &hash, &digest, "content_redacted");
                 taken.push(Taken { path, digest, by: TakenBy::Redacted { hash, admissible } });
                 // Its lines ran above, with the target filled.
@@ -319,6 +321,11 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                 #[allow(clippy::disallowed_methods)] // a scratch work tree the harness made; no retry is wanted
                 std::fs::remove_dir_all(&work).map_err(|error| RunError::Io(error.to_string()))?;
                 directory = scratch.root().to_path_buf();
+                // With a folding volume, the clone lands there instead, and the work tree stays
+                // there for the rest of the run.
+                if let Some(moved) = scratch.move_work().map_err(|error| RunError::Io(error.to_string()))? {
+                    work = moved;
+                }
             }
             _ => {}
         }
@@ -336,7 +343,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
         }
     }
 
-    let walked = census::walk(&work.join(state_folder(tool))).map_err(|error| RunError::Io(error.to_string()))?;
+    let walked = census::walk(&scratch.work().join(state_folder(tool))).map_err(|error| RunError::Io(error.to_string()))?;
     let host_walked = match host {
         Some(_) => census::walk(&host_root(scratch).join(".forklift")).map_err(|error| RunError::Io(error.to_string()))?,
         None => Vec::new(),
@@ -547,6 +554,7 @@ mod tests {
             history: vec![Op::Record { index: 0 }, Op::Record { index: 1 }, Op::Record { index: 2 }],
             then: vec![],
             damage: None,
+            files: crate::scenario::Files::Seeded,
         };
 
         let built = build(&scenario, &corpus, Tool::Forklift, &program, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
@@ -559,6 +567,6 @@ mod tests {
         for name in ["objects/<xx>/<hash>", "pallets/<name>", "{bay}inventory/metadata", "warehouse"] {
             assert!(created.iter().any(|created| created == name), "{} is created: {:?}", name, created);
         }
-        assert_eq!(crate::oracle::read_tree(&scratch.work()).unwrap(), corpus::expected(&corpus.records[2]));
+        assert_eq!(crate::oracle::read_tree(&scratch.work()).unwrap(), corpus::expected(&corpus.records[2], &corpus.modes));
     }
 }

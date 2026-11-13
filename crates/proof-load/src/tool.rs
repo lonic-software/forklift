@@ -115,7 +115,9 @@ pub fn run(invocation: &Invocation, scratch: &Scratch, environment: &Environment
     if !invocation.program.is_absolute() {
         return Err(ToolError::NotAbsolute(invocation.program.clone()));
     }
-    if !invocation.directory.starts_with(scratch.root()) {
+    // `starts_with` compares components, so a `..` would climb out of a root it seems to be under.
+    let climbs = invocation.directory.components().any(|component| matches!(component, std::path::Component::ParentDir));
+    if climbs || !scratch.roots().iter().any(|root| invocation.directory.starts_with(root)) {
         return Err(ToolError::OutsideScratch(invocation.directory.clone()));
     }
 
@@ -269,6 +271,34 @@ mod tests {
         let program = std::env::current_exe().unwrap();
         let elsewhere = Invocation { program, arguments: vec![], directory: outside.clone(), limit };
         assert_eq!(run(&elsewhere, &scratch, &environment).unwrap_err(), ToolError::OutsideScratch(outside));
+    }
+
+    /// Once a clone moved the work tree onto a folding volume, a tool may run there, and still
+    /// nowhere else on that volume, nor by a `..` out of either root.
+    ///
+    /// Revert: fence on the scratch root alone → the moved work tree is refused; fence on the
+    /// folding volume → a sibling folder on it is admitted; admit a `..` → a path climbing out of
+    /// either root is admitted.
+    #[test]
+    fn a_moved_work_tree_is_inside_the_fence() {
+        let folding = std::env::temp_dir().join(format!("proof-load-tool-fold-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(folding.join("sibling")).unwrap();
+        let scratch = scratch("moved").with_folding_volume(&folding);
+        let moved = scratch.move_work().unwrap().unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        let environment = Environment::scrubbed(&scratch, None, &BTreeMap::new()).unwrap();
+        // A program that does not exist, at a path absolute on every OS: past the fence, the run
+        // fails to start, never refused.
+        let program = folding.join("no-such-program");
+        let at = |directory: PathBuf| run(&Invocation { program: program.clone(), arguments: vec![], directory, limit: Duration::from_secs(10) }, &scratch, &environment);
+        assert!(matches!(at(moved.clone()), Err(ToolError::Spawn { .. })), "{:?}", at(moved.clone()));
+        assert!(matches!(at(scratch.root().to_path_buf()), Err(ToolError::Spawn { .. })));
+        assert_eq!(at(folding.join("sibling")).unwrap_err(), ToolError::OutsideScratch(folding.join("sibling")));
+        assert_eq!(at(folding.clone()).unwrap_err(), ToolError::OutsideScratch(folding.clone()));
+        for climbing in [moved.join("..").join("sibling"), scratch.root().join("..")] {
+            assert_eq!(at(climbing.clone()).unwrap_err(), ToolError::OutsideScratch(climbing));
+        }
     }
 
     /// The run captures exit code, both streams and the working directory it was given, and stdin

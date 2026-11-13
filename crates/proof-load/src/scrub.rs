@@ -23,6 +23,11 @@ pub enum CopyOnlyError {
     ScratchExists(PathBuf),
     /// A scenario asked to set a variable the scrub owns.
     ReservedVariable(String),
+    /// The work tree was moved off the scratch volume once already; a run moves it once.
+    WorkMoved(PathBuf),
+    /// A scratch area that moves its work tree onto a folding volume is not copied: before the
+    /// move the copy would build off that volume, after it the copy would share the moved tree.
+    FoldingNotCopied(PathBuf),
     Io { path: PathBuf, reason: String },
 }
 
@@ -33,6 +38,8 @@ impl fmt::Display for CopyOnlyError {
             CopyOnlyError::OutputNotADirectory(path) => write!(f, "the output path {} is not a directory", path.display()),
             CopyOnlyError::ScratchExists(path) => write!(f, "the scratch area {} already exists; a run never reuses one", path.display()),
             CopyOnlyError::ReservedVariable(name) => write!(f, "{} is set by the harness and cannot be set by a scenario", name),
+            CopyOnlyError::WorkMoved(path) => write!(f, "the work tree already moved to {}; a run moves it once", path.display()),
+            CopyOnlyError::FoldingNotCopied(path) => write!(f, "the scratch area moves its work tree onto {}; such an area is not copied", path.display()),
             CopyOnlyError::Io { path, reason } => write!(f, "{}: {}", path.display(), reason),
         }
     }
@@ -84,10 +91,16 @@ impl Output {
     }
 }
 
-/// One run's scratch area: its warehouses, HOME, TMPDIR and git config all live inside it.
+/// One run's scratch area: its warehouses, HOME, TMPDIR and git config all live inside it, except
+/// a work tree a clone moved onto a folding volume (see [`Scratch::move_work`]).
 #[derive(Debug)]
 pub struct Scratch {
     root: PathBuf,
+    /// The folder on a volume of its own that a clone moves the work tree into, when the run puts
+    /// it there.
+    folding: Option<PathBuf>,
+    /// Where the work tree moved to, once a clone moved it.
+    moved: std::sync::OnceLock<PathBuf>,
 }
 
 impl Scratch {
@@ -101,7 +114,7 @@ impl Scratch {
         }
         std::fs::create_dir(root).map_err(io(root))?;
 
-        let scratch = Scratch { root: root.to_path_buf() };
+        let scratch = Scratch { root: root.to_path_buf(), folding: None, moved: std::sync::OnceLock::new() };
         for dir in [scratch.home(), scratch.tmp(), scratch.config_home(), scratch.work()] {
             std::fs::create_dir_all(&dir).map_err(io(&dir))?;
         }
@@ -113,21 +126,63 @@ impl Scratch {
 
     /// A copy of this whole area, HOME and TMPDIR included, at `root`, which must not exist yet: the
     /// fresh start an injected run gets, so runs on copies of one area are independent of each
-    /// other and of it. Symlinks are copied as links, never followed.
+    /// other and of it. Symlinks are copied as links, never followed. An area given a folding
+    /// volume is refused, its work tree moved or not ([`CopyOnlyError::FoldingNotCopied`]).
     pub fn copy_to(&self, root: &Path) -> Result<Scratch, CopyOnlyError> {
+        if let Some(folding) = &self.folding {
+            return Err(CopyOnlyError::FoldingNotCopied(folding.clone()));
+        }
         if std::fs::symlink_metadata(root).is_ok() {
             return Err(CopyOnlyError::ScratchExists(root.to_path_buf()));
         }
         copy_tree(&self.root, root)?;
-        Ok(Scratch { root: root.to_path_buf() })
+        Ok(Scratch { root: root.to_path_buf(), folding: None, moved: std::sync::OnceLock::new() })
+    }
+
+    /// This area, with `folder` (on a volume of its own) as where a clone moves its work tree.
+    pub fn with_folding_volume(self, folder: &Path) -> Scratch {
+        Scratch { folding: Some(folder.to_path_buf()), ..self }
+    }
+
+    /// Moves the work tree off the scratch volume, for a clone to make it there: to a fresh
+    /// subfolder of the folding volume, never the volume's own folder, named after this area so
+    /// areas sharing the volume never meet. None without a folding volume, where the work tree
+    /// stays at `root/work`. A second move is refused, as is a target that already exists.
+    ///
+    /// Only the clone moves it: the history before it is recorded on the scratch volume, since a
+    /// file first tracked on a volume without an executable bit is recorded without one.
+    pub fn move_work(&self) -> Result<Option<PathBuf>, CopyOnlyError> {
+        let Some(folding) = &self.folding else { return Ok(None) };
+        if let Some(moved) = self.moved.get() {
+            return Err(CopyOnlyError::WorkMoved(moved.clone()));
+        }
+        let name = self.root.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        let target = folding.join(format!("{}-work", name));
+        if std::fs::symlink_metadata(&target).is_ok() {
+            return Err(CopyOnlyError::ScratchExists(target));
+        }
+        self.moved.set(target.clone()).map_err(|_| CopyOnlyError::WorkMoved(target.clone()))?;
+        Ok(Some(target))
+    }
+
+    /// The folders a tool may run in and a remedy may remove under: the scratch root, and the work
+    /// tree once it moved off it. Nothing else.
+    pub fn roots(&self) -> Vec<&Path> {
+        std::iter::once(self.root.as_path()).chain(self.moved.get().map(PathBuf::as_path)).collect()
+    }
+
+    /// Whether the work tree moved off the scratch volume.
+    pub fn work_moved(&self) -> bool {
+        self.moved.get().is_some()
     }
 
     pub fn root(&self) -> &Path { &self.root }
     pub fn home(&self) -> PathBuf { self.root.join("home") }
     pub fn tmp(&self) -> PathBuf { self.root.join("tmp") }
     pub fn config_home(&self) -> PathBuf { self.root.join("home/.config") }
-    /// Where the scenario's warehouses and working folders go.
-    pub fn work(&self) -> PathBuf { self.root.join("work") }
+    /// Where the scenario's work tree is: `root/work`, or where a clone moved it. Read at each use,
+    /// never bound once, since a clone in the history moves it.
+    pub fn work(&self) -> PathBuf { self.moved.get().cloned().unwrap_or_else(|| self.root.join("work")) }
     pub fn git_global_config(&self) -> PathBuf { self.root.join("gitconfig-global") }
     pub fn git_system_config(&self) -> PathBuf { self.root.join("gitconfig-system") }
 }
@@ -269,6 +324,41 @@ mod tests {
         std::fs::write(copy.work().join(".forklift/objects/ab/cd"), b"changed").unwrap();
         assert_eq!(std::fs::read(scratch.work().join(".forklift/objects/ab/cd")).unwrap(), b"object");
         assert!(matches!(scratch.copy_to(copy.root()), Err(CopyOnlyError::ScratchExists(_))));
+    }
+
+    /// Without a folding volume the work tree never moves; with one, it moves once, to a fresh
+    /// subfolder named after the area, which every later read of the work tree then names, and
+    /// such an area is never copied, before the move or after.
+    ///
+    /// Revert: target the folding folder itself → the work tree is the volume's own folder; drop
+    /// the second-move refusal → a later clone moves it again, away from what earlier steps wrote;
+    /// refuse only a moved area → an unmoved copy loses its volume and builds on the scratch one.
+    #[test]
+    fn the_work_tree_moves_once_and_only_onto_a_folding_volume() {
+        let plain = Scratch::create(&fresh("unmoved")).unwrap();
+        assert_eq!(plain.move_work().unwrap(), None);
+        assert_eq!(plain.work(), plain.root().join("work"));
+        assert_eq!(plain.roots(), vec![plain.root()]);
+
+        let folding = fresh("folding");
+        std::fs::create_dir_all(&folding).unwrap();
+        let scratch = Scratch::create(&fresh("moved")).unwrap().with_folding_volume(&folding);
+        assert_eq!(scratch.work(), scratch.root().join("work"), "the history before the clone stays on the scratch volume");
+        assert_eq!(scratch.copy_to(&fresh("unmoved-copy")).unwrap_err(), CopyOnlyError::FoldingNotCopied(folding.clone()), "a copy would build off the volume");
+        let moved = scratch.move_work().unwrap().unwrap();
+        assert_eq!(moved.parent(), Some(folding.as_path()));
+        assert_ne!(moved, folding);
+        assert_eq!(scratch.work(), moved);
+        assert_eq!(scratch.roots(), vec![scratch.root(), moved.as_path()]);
+        assert_eq!(scratch.move_work().unwrap_err(), CopyOnlyError::WorkMoved(moved.clone()));
+        assert_eq!(scratch.copy_to(&fresh("moved-copy")).unwrap_err(), CopyOnlyError::FoldingNotCopied(folding.clone()));
+
+        // An area whose target already exists is refused rather than shared.
+        let clash = Scratch::create(&fresh("clash")).unwrap().with_folding_volume(&folding);
+        let name = clash.root().file_name().unwrap().to_string_lossy().into_owned();
+        std::fs::create_dir(folding.join(format!("{}-work", name))).unwrap();
+        assert!(matches!(clash.move_work(), Err(CopyOnlyError::ScratchExists(_))));
+        assert_eq!(clash.work(), clash.root().join("work"));
     }
 
     /// Revert: accept an existing non-empty directory → the user's data becomes a target.

@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn a_binding_counts_only_when_its_scenario_creates_the_name() {
         let census = Census::parse(SAMPLE, PathBuf::from("sample")).unwrap().unwrap();
-        let scenarios = vec![Scenario { id: "history".into(), history: vec![], then: vec![], damage: None }];
+        let scenarios = vec![Scenario { id: "history".into(), history: vec![], then: vec![], damage: None, files: crate::scenario::Files::Seeded }];
         let bindings = [bound("warehouse", FILE), bound("objects/<xx>/<hash>", FILE)];
         let exemptions = [Exemption { name: "mirror-roots", reason: NO_MIRROR_ORACLE }];
 
@@ -219,7 +219,7 @@ mod tests {
     fn a_planted_binding_is_not_checked_against_what_was_built() {
         let doc = "<!-- census:start -->\n| Path | Class | Names |\n|---|---|---|\n| `{bay}lock` | lock | `a::L` |\n<!-- census:end -->\n";
         let census = Census::parse(doc, PathBuf::from("sample")).unwrap().unwrap();
-        let scenarios = vec![Scenario { id: "history".into(), history: vec![], then: vec![], damage: None }];
+        let scenarios = vec![Scenario { id: "history".into(), history: vec![], then: vec![], damage: None, files: crate::scenario::Files::Seeded }];
         let built = BTreeMap::from([(("history".to_string(), Warehouse::Client), vec!["warehouse".to_string()])]);
         assert_eq!(check(&census, &[bound("{bay}lock", DEAD_HOLDER)], &[], &scenarios, &built), Vec::<String>::new());
         const MIXED: &[Kind] = &[Kind::DeadPidLock, Kind::Delete];
