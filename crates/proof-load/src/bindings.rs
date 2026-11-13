@@ -149,10 +149,10 @@ pub const WRITE_EXEMPTIONS: &[(&str, WriteExemption)] = &[
 /// The server routes the route check does not require a successful answer of, by the route
 /// table's method and path.
 pub const ROUTE_EXEMPTIONS: &[RouteExemption] = &[
-    RouteExemption { method: "GET", path: "/healthz", reason: "no forklift command sends it: supervisors and load balancers probe it" },
-    RouteExemption { method: "PUT", path: "/warehouses/{warehouse}", reason: "no forklift command sends it: an operator creates a warehouse over HTTP, and no scenario serves more than one" },
+    RouteExemption { method: "GET", path: "/healthz", reason: "no client command sends it: supervisors and load balancers probe it" },
+    RouteExemption { method: "PUT", path: "/warehouses/{warehouse}", reason: "no client command sends it: an operator creates a warehouse over HTTP, and no scenario serves more than one" },
     // FORK-473: delete the route or give it a caller.
-    RouteExemption { method: "GET", path: "/parcels/{parcel}/subtree/{*path}", reason: "no forklift command sends it: the client's method for it has no caller outside its tests" },
+    RouteExemption { method: "GET", path: "/parcels/{parcel}/subtree/{*path}", reason: "no client command sends it: the client's method for it has no caller outside its tests" },
     // FORK-474: the scenario steps that reach these.
     RouteExemption { method: "POST", path: "/objects/missing", reason: "sent by an origin move over withheld recipes and by heal's refetch into a hosted clone, and no scenario reaches either yet" },
     RouteExemption { method: "PUT", path: "/withheld/{hash}/recipe", reason: "sent when a lift's new history reaches content the host withholds, and no scenario builds that yet" },
