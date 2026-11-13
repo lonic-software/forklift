@@ -115,7 +115,7 @@ pub struct Model {
     /// Per node, the last call in this line that changed it.
     changed: BTreeMap<Ino, usize>,
     /// Files cut shorter since their last sync, and the shortest length each was cut to: a crash
-    /// may keep the cut and lose what followed, but never what lay below it.
+    /// may keep the cut and lose what followed, but never a synced byte below it.
     truncated: BTreeMap<Ino, usize>,
 }
 
@@ -203,9 +203,12 @@ impl Model {
                 if let (true, Node::File { mode, .. }, Some(Node::File { mode: kept, .. })) = (data_only, &mut node, self.durable.get(&ino)) {
                     *mode = *kept;
                 }
-                self.durable.insert(ino, node);
                 self.truncated.remove(&ino);
-                self.version += 1;
+                // A sync that changes nothing durable leaves the version, so no tree is rebuilt.
+                if self.durable.get(&ino) != Some(&node) {
+                    self.durable.insert(ino, node);
+                    self.version += 1;
+                }
             }
         }
     }
@@ -229,7 +232,7 @@ impl Model {
     /// A seeded state between the durable and the volatile one: each folder entry the two disagree
     /// on is taken from either, each file's and folder's mode likewise, and each file whose contents they disagree on keeps its durable
     /// contents, takes its volatile ones, or is torn: a file cut shorter since its sync comes back
-    /// as a prefix of its volatile contents no shorter than the cut, any other grows past its synced size
+    /// as a prefix of its volatile contents no shorter than the synced bytes below the cut, any other grows past its synced size
     /// with a zero-filled or torn tail or is torn in place.
     ///
     /// Entries are drawn one by one, so an unsynced rename can come back under neither name. That
@@ -273,8 +276,9 @@ impl Model {
                             0 => kept.clone(),
                             1 => made.clone(),
                             _ if self.truncated.contains_key(&ino) => {
-                                let cut = self.truncated[&ino].min(made.len());
-                                made[..cut + rng.below((made.len() - cut) as u64 + 1) as usize].to_vec()
+                                // What lay below the cut was synced only up to the synced length.
+                                let floor = self.truncated[&ino].min(kept.len()).min(made.len());
+                                made[..floor + rng.below((made.len() - floor) as u64 + 1) as usize].to_vec()
                             }
                             _ => grown(kept, made, rng),
                         }
@@ -518,6 +522,7 @@ impl Replay {
                     _ => Ok(Some(description)),
                 }
             }
+            Some(_) if into_area == Some(true) => Err(format!("descriptor {} names {}, which is not the file the replay saw opened under it", fd, self.root.tokenized(target.as_deref().unwrap_or_default()))),
             _ if into_area == Some(true) => Err(format!("descriptor {} into the area was never seen opened", fd)),
             _ => Ok(None),
         }
@@ -806,7 +811,12 @@ impl Replay {
             "mkdir" | "mkdirat" => {
                 let (target, mode) = if call.name == "mkdir" { (path(None, 0)?, mode_of(raw(1))?) } else { (path(Some(0), 1)?, mode_of(raw(2))?) };
                 if let Some((parent, name)) = self.free(&target)? {
-                    self.model.create(parent, &name, Node::Dir { entries: BTreeMap::new(), mode: mode & !self.umasks[&group] })?;
+                    // A folder made in a setgid folder is setgid too, as Linux makes it.
+                    let inherited = match self.model.volatile.get(&parent) {
+                        Some(Node::Dir { mode, .. }) => mode & 0o2000,
+                        _ => 0,
+                    };
+                    self.model.create(parent, &name, Node::Dir { entries: BTreeMap::new(), mode: (mode & !self.umasks[&group]) | inherited })?;
                 }
             }
             "rename" | "renameat" | "renameat2" => {
@@ -977,7 +987,7 @@ fn mode(_: &std::fs::Metadata, default: u32) -> u32 {
 /// The first path where the replay's tree and the run's differ, said plainly: by kind, by a file's
 /// bytes, by permission bits, or by a link's target.
 pub fn difference(replayed: &Image, ran: &Image) -> Option<String> {
-    let permissions = |mode: &u32| mode & 0o777;
+    let permissions = |mode: &u32| mode & 0o7777;
     let paths: BTreeSet<&String> = replayed.keys().chain(ran.keys()).collect();
     for path in paths {
         let shown = if path.is_empty() { "the root" } else { path.as_str() };
@@ -1790,6 +1800,47 @@ mod tests {
         let mut rng = Rng::new(9);
         let torn: BTreeSet<Vec<u8>> = (0..200).map(|_| data(&model.variant(&mut rng), "w/a").unwrap()).collect();
         assert_eq!(torn, BTreeSet::from([b"old".to_vec(), b"ol".to_vec()]));
+    }
+
+    /// A cut below the synced length keeps only the synced bytes: a file born since its sync,
+    /// written and cut, can come back shorter than the cut, since none of it was ever durable.
+    ///
+    /// Revert: floor the tear at the cut → no state shorter than the cut but empty comes back.
+    #[test]
+    fn a_cut_keeps_only_the_synced_bytes_below_it() {
+        let born = format!("1 openat(AT_FDCWD</s/w>, \"n\", O_WRONLY|O_CREAT, 0644) = 3</s/w/n>\n{}1 ftruncate(3</s/w/n>, 4) = 0\n", write(1, 3, "/s/w/n", b"abcdef"));
+        let model = replayed(&[born]).unwrap();
+        let mut rng = Rng::new(5);
+        let torn: BTreeSet<Vec<u8>> = (0..200).filter_map(|_| data(&model.variant(&mut rng), "w/n")).collect();
+        assert!(torn.iter().any(|held| (1..4).contains(&held.len())), "{:?}", torn);
+        assert!(torn.iter().all(|held| b"abcd".starts_with(held)), "{:?}", torn);
+    }
+
+    /// A folder made in a setgid folder is setgid, and a mode bit above the permissions is a
+    /// difference the replay check reports.
+    ///
+    /// Revert: drop the inherited bit → `w/n` is 755; compare 0o777 → 2755 and 755 read alike.
+    #[test]
+    fn a_folder_made_in_a_setgid_folder_is_setgid() {
+        let mut fixture = fixture();
+        fixture.insert("w".into(), Entry::Dir { mode: 0o2755 });
+        let mut replay = Replay::new(Model::of(&fixture).unwrap(), root(), 0o022);
+        replay.line(&trace::parse("1 mkdir(\"n\", 0777) = 0\n").unwrap(), "/s/w", |_, _| {}).unwrap();
+        assert_eq!(replay.model.volatile_image().get("w/n"), Some(&Entry::Dir { mode: 0o2755 }));
+        let ran = Image::from([("w".to_string(), Entry::Dir { mode: 0o755 })]);
+        let replayed = Image::from([("w".to_string(), Entry::Dir { mode: 0o2755 })]);
+        assert!(difference(&replayed, &ran).is_some());
+    }
+
+    /// A descriptor opened outside the area that strace later shows naming a file in it refuses
+    /// as naming another file than the one opened, not as never opened.
+    ///
+    /// Revert: fall through to the never-opened refusal → the message says it was never seen.
+    #[test]
+    fn a_descriptor_opened_outside_that_names_the_area_refuses_as_another_file() {
+        let reused = "1 openat(AT_FDCWD</s/w>, \"/elsewhere/x\", O_RDONLY) = 3</elsewhere/x>\n1 fsync(3</s/w/a>) = 0\n".to_string();
+        let refused = replayed(&[reused]).err().unwrap();
+        assert!(refused.contains("names <root>/w/a, which is not the file"), "{}", refused);
     }
 
     /// A folder chmodded since its sync can come back under either mode.
