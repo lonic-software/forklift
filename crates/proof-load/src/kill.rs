@@ -444,6 +444,9 @@ pub struct CountedLine {
     pub(crate) calls: Vec<Call>,
     /// The paths under the counting copy, absolute, as they stood when the line started.
     pub(crate) before: BTreeSet<String>,
+    /// The counting copy whole as it stood when the line started, read only when the writes were
+    /// dumped, as the fixture is, and why it could not be read.
+    pub(crate) start: Option<Result<crate::power::Image, String>>,
 }
 
 /// A scenario's faulted command traced once, unfaulted, with every write's bytes dumped.
@@ -505,6 +508,7 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
     let mut lines = Vec::new();
     for (index, arguments) in counting_context.lines(faulted)?.into_iter().enumerate() {
         let before = listing(counting.root());
+        let start = dumps.then(|| crate::power::scan(counting.root()).map_err(|error| error.to_string()));
         let trace_path = settings.traces.join(format!("{}-count-{}.trace", label, index));
         let extra = if dumps { vec!["-e".to_string(), "write=all".to_string()] } else { Vec::new() };
         let line = strace_line(&trace_path, &extra, &programs.forklift, &arguments);
@@ -518,7 +522,7 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
         }
         let text = std::fs::read_to_string(&trace_path).map_err(io)?;
         let calls = trace::parse(&text).map_err(RunError::Io)?;
-        lines.push(CountedLine { arguments, outcome, calls, before });
+        lines.push(CountedLine { arguments, outcome, calls, before, start });
     }
     let path_bound = recorded_root(counting.root(), &[&original.given, &original.canonical, &counting_root.given, &counting_root.canonical]).map_err(io)?
         .map(|file| format!("path-bound: the faulted command recorded the scratch area's root in {}", file));

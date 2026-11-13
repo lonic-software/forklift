@@ -318,6 +318,8 @@ pub enum Unsound {
     Unclassified(String),
     /// A write that reaches a file with no call strace sees.
     Unseen(String),
+    /// A change to a path relative to a folder strace did not name.
+    Unplaced(String),
 }
 
 impl std::fmt::Display for Unsound {
@@ -325,6 +327,7 @@ impl std::fmt::Display for Unsound {
         match self {
             Unsound::Unclassified(what) => write!(f, "unclassified syscall {}: add it to a class in trace.rs", what),
             Unsound::Unseen(what) => write!(f, "{} writes without a call strace sees", what),
+            Unsound::Unplaced(what) => write!(f, "{} is relative to a folder strace did not name", what),
         }
     }
 }
@@ -416,8 +419,22 @@ const INERT_IOCTLS: &[&str] = &["TCGETS", "TCGETS2", "TIOCGWINSZ", "TIOCGPGRP", 
 /// ioctl requests that write a file: reflink clone and dedupe.
 const MUTATING_IOCTLS: &[&str] = &["FICLONE", "FICLONERANGE", "FIDEDUPERANGE", "BTRFS_IOC_CLONE", "BTRFS_IOC_CLONE_RANGE"];
 
-/// Reads `call` against the table.
+/// Reads `call` against the table. A change that did not fail, to a path relative to a folder
+/// descriptor strace did not name, is unsound: where it landed is not known, and the working
+/// folder is not guessed in its place.
 pub fn touch(call: &Call) -> Result<Touch, Unsound> {
+    let unplaced = std::cell::Cell::new(None);
+    let touched = classify(call, &unplaced)?;
+    if let Some(traced) = unplaced.take() {
+        if touched.class == Class::Mutating && !matches!(call.returned, Returned::Failed(_)) {
+            return Err(Unsound::Unplaced(format!("{} of {:?}", call.name, traced)));
+        }
+    }
+    Ok(touched)
+}
+
+/// [`touch`], noting in `unplaced` a relative path whose folder descriptor strace did not name.
+fn classify(call: &Call, unplaced: &std::cell::Cell<Option<String>>) -> Result<Touch, Unsound> {
     let inert = Ok(Touch { class: Class::Inert, operands: vec![], detail: String::new() });
     let at = |index: usize| call.arguments.get(index).map(|text| argument(text));
     let named = |directory: Option<usize>, path: usize| -> Option<Operand> {
@@ -425,6 +442,10 @@ pub fn touch(call: &Call) -> Result<Touch, Unsound> {
         let base = match directory.and_then(at) {
             Some(Argument::Descriptor { target, .. }) => Some(target),
             Some(Argument::Cwd(cwd)) => cwd,
+            Some(_) if !traced.starts_with('/') => {
+                unplaced.set(Some(traced.clone()));
+                None
+            }
             _ => None,
         };
         Some(Operand::Named { traced, base })
@@ -767,6 +788,12 @@ mod tests {
         assert_eq!(touch(&one("mmap(NULL, 4096, PROT_READ, MAP_SHARED, 3</s/a>, 0) = 0xffff")).unwrap().class, Class::Inert);
         assert!(matches!(touch(&one("io_uring_setup(8, 0xffff) = 3")), Err(Unsound::Unseen(_))));
         assert_eq!(touch(&one("frobnicate(1) = 0")), Err(Unsound::Unclassified("frobnicate".into())));
+        // A change under a folder descriptor strace did not name is not placed in the working
+        // folder; an absolute path, a failed call or a read needs no folder.
+        assert_eq!(touch(&one("mknodat(5, \"p\", S_IFIFO|0644, 0) = 0")), Err(Unsound::Unplaced("mknodat of \"p\"".into())));
+        assert_eq!(touch(&one("mknodat(5, \"/s/w/p\", S_IFIFO|0644, 0) = 0")).unwrap().class, Class::Mutating);
+        assert_eq!(touch(&one("mknodat(5, \"p\", S_IFIFO|0644, 0) = -1 EBADF (Bad file descriptor)")).unwrap().class, Class::Mutating);
+        assert_eq!(touch(&one("openat(5, \"p\", O_RDONLY) = 3</s/w/p>")).unwrap().class, Class::Inert);
     }
 
     /// A thread clone joins its parent's group and a process clone starts its own, whichever line

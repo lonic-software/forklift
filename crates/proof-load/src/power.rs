@@ -24,9 +24,9 @@
 //! trusts an unchanged file finds every entry changed, and a state where it would trust a file
 //! whose object was lost is not exercised. Every row says that too.
 //!
-//! The replay is checked against the run it models: once every line is replayed, the volatile
-//! model must match the counting copy on disk, path by path, or the scenario's power loss is
-//! refused. A call the model does not understand refuses too, never skipped.
+//! The replay is checked against the run it models: at each line's start and once every line is
+//! replayed, the volatile model must match the counting copy on disk as it stood then, path by
+//! path, or the scenario's power loss is refused. A call the model does not understand refuses too, never skipped.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -535,9 +535,9 @@ impl Replay {
             }
             Some(_) if into_area == Some(true) => Err(format!("descriptor {} names {}, which is not the file the replay saw opened under it", fd, self.root.tokenized(target.as_deref().unwrap_or_default()))),
             _ if into_area == Some(true) => Err(format!("descriptor {} into the area was never seen opened", fd)),
-            // strace names every open descriptor; one it did not name and the replay never saw
-            // opened may be a file in the area.
-            None if target.is_none() && fd >= 0 => Err(format!("descriptor {} strace did not name, which the replay never saw opened", fd)),
+            // A descriptor strace could not name and the replay never saw opened may be a file in
+            // the area.
+            None if target.is_none() && fd >= 0 => Err(format!("descriptor {} strace could not name, which the replay never saw opened", fd)),
             _ => Ok(None),
         }
     }
@@ -1182,9 +1182,9 @@ pub struct Line<'a> {
     pub command: String,
     /// The kill points in it, by their call index.
     pub points: Vec<&'a Point>,
-    /// The area's paths, relative to its root, as the run left them when the line began: the
-    /// replay must hold the same ones there, so a divergence a later line undoes still refuses.
-    pub before: Option<BTreeSet<String>>,
+    /// The area whole as the run left it when the line began: the replay must hold the same tree
+    /// there, paths, kinds, bytes and modes, so a divergence a later line undoes still refuses.
+    pub before: &'a Image,
 }
 
 /// Every distinct state a crash can leave in `lines`, replayed over `fixture` from the folder
@@ -1212,13 +1212,8 @@ pub fn crashes(fixture: &Image, root: &Root, start: &str, umask: u32, lines: &[L
     for (index, line) in lines.iter().enumerate() {
         let here: BTreeMap<usize, &Point> = line.points.iter().map(|point| (point.call, *point)).collect();
         let syncs = synced(line);
-        if let Some(before) = &line.before {
-            let image = replay.model.volatile_image();
-            let held: BTreeSet<&String> = image.keys().collect();
-            if let Some(path) = held.symmetric_difference(&before.iter().collect()).next() {
-                let side = if image.contains_key(*path) { "the replay holds it and the run had none" } else { "the run had it and the replay holds none" };
-                return Err(format!("line {} {}: the replay does not reproduce the run before it: {}: {}", index + 1, line.command, if path.is_empty() { "the root" } else { path.as_str() }, side));
-            }
+        if let Some(why) = difference(&replay.model.volatile_image(), line.before) {
+            return Err(format!("line {} {}: the replay does not reproduce the run before it: {}", index + 1, line.command, why));
         }
         replay.line(line.calls, start, |call, model| {
             if let Some(point) = here.get(&call) {
@@ -1331,12 +1326,17 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
         return Ok(power);
     }
     let mut lines = Vec::new();
-    let area = counted.counting.root().to_string_lossy().into_owned();
     for (index, line) in counted.lines.iter().enumerate() {
         let command = kill::command_id(settings.schema, &line.arguments).map_err(RunError::Io)?;
-        let before = line.before.iter()
-            .filter_map(|path| path.strip_prefix(area.as_str()).map(|rest| rest.trim_start_matches('/').to_string())).collect();
-        lines.push(Line { calls: &line.calls, command, points: points.iter().filter(|point| point.line == index).collect(), before: Some(before) });
+        let before = match &line.start {
+            Some(Ok(start)) => start,
+            Some(Err(why)) => {
+                power.refusals.push(format!("the counting area cannot be read whole before line {}: {}", index + 1, why));
+                return Ok(power);
+            }
+            None => return Err(RunError::Io("the faulted command was counted without its writes dumped".to_string())),
+        };
+        lines.push(Line { calls: &line.calls, command, points: points.iter().filter(|point| point.line == index).collect(), before });
     }
     let fixture = match &counted.fixture {
         Some(Ok(fixture)) => fixture,
@@ -1560,6 +1560,11 @@ mod tests {
         Ok(replay.model)
     }
 
+    /// The tree at each line's start, as the replay of the lines before it leaves it.
+    fn starts(lines: &[String]) -> Vec<Image> {
+        (0..lines.len()).map(|count| replayed(&lines[..count]).unwrap().volatile_image()).collect()
+    }
+
     fn data(image: &Image, path: &str) -> Option<Vec<u8>> {
         match image.get(path)? {
             Entry::File { data, .. } => Some(data.clone()),
@@ -1779,8 +1784,9 @@ mod tests {
         let points: Vec<Vec<Point>> = calls.iter().enumerate()
             .map(|(line, calls)| kill::enumerate(calls, line, "stack", &root(), "/s/w", |_| false).unwrap().points).collect();
         assert_eq!(points[0].iter().map(|point| point.name.as_str()).collect::<Vec<_>>(), ["openat", "write", "fsync"]);
-        let lines: Vec<Line> = calls.iter().zip(&points)
-            .map(|(calls, points)| Line { calls, command: "stack".into(), points: points.iter().collect(), before: None }).collect();
+        let starts = starts(&texts);
+        let lines: Vec<Line> = calls.iter().zip(&points).zip(&starts)
+            .map(|((calls, points), before)| Line { calls, command: "stack".into(), points: points.iter().collect(), before }).collect();
         let (crashes, replayed) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap();
         assert_eq!(data(&replayed, "w/a").unwrap(), b"new");
         let found: Vec<(Vec<u8>, bool, usize)> = crashes.iter().map(|crash| (data(&crash.image, "w/a").unwrap(), crash.acknowledged, crash.shared)).collect();
@@ -1806,7 +1812,8 @@ mod tests {
         let calls = trace::parse(&text).unwrap();
         let points = kill::enumerate(&calls, 0, "stack", &root(), "/s/w", |_| false).unwrap().points;
         assert!(points.iter().all(|point| point.name != "fsync"), "the child's syncs are no kill points");
-        let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect(), before: None }];
+        let first = fixture();
+        let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect(), before: &first }];
         let (crashes, _) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap();
         let held: Vec<Vec<u8>> = crashes.iter().map(|crash| data(&crash.image, "w/a").unwrap()).collect();
         assert!(held.contains(&b"new".to_vec()), "{:?}", held);
@@ -1933,21 +1940,37 @@ mod tests {
         assert!(replayed(&[synchronous]).err().unwrap().contains("synchronous open"));
     }
 
-    /// The replay is held to the run at every line's start, not only at the end: a path the run
-    /// did not have when a line began refuses, though a later line removes it.
+    /// The replay is held to the run at every line's start, not only at the end, and by the whole
+    /// tree, not its names: a path the run did not have when a line began refuses, though a later
+    /// line removes it, and so do bytes the run did not hold, though a later line rewrites them.
     ///
-    /// Revert: skip the check at each line's start → the replay goes on.
+    /// Revert: skip the check at each line's start → both replays go on; compare paths alone →
+    /// the bytes go unseen.
     #[test]
     fn the_replay_is_held_to_the_run_at_each_line() {
-        let texts = ["1 mkdir(\"x\", 0755) = 0\n".to_string(), "1 rmdir(\"x\") = 0\n".to_string()];
-        let calls: Vec<Vec<Call>> = texts.iter().map(|text| trace::parse(text).unwrap()).collect();
-        let listed = |paths: &[&str]| Some(paths.iter().map(|path| path.to_string()).collect::<BTreeSet<String>>());
-        let line = |calls, before| Line { calls, command: "stack".into(), points: Vec::new(), before };
-        let held = [line(&calls[0], listed(&["", "w", "w/a"])), line(&calls[1], listed(&["", "w", "w/a", "w/x"]))];
-        assert!(crashes(&fixture(), &root(), "/s/w", 0o022, &held, 0, 7).is_ok());
-        let missed = [line(&calls[0], listed(&["", "w", "w/a"])), line(&calls[1], listed(&["", "w", "w/a"]))];
-        let refused = crashes(&fixture(), &root(), "/s/w", 0o022, &missed, 0, 7).err().unwrap();
-        assert!(refused.contains("line 2 stack: the replay does not reproduce the run before it: w/x"), "{}", refused);
+        let check = |texts: [String; 2], second: Image| {
+            let calls: Vec<Vec<Call>> = texts.iter().map(|text| trace::parse(text).unwrap()).collect();
+            let first = fixture();
+            let lines = [&first, &second].into_iter().zip(&calls)
+                .map(|(before, calls)| Line { calls, command: "stack".into(), points: Vec::new(), before }).collect::<Vec<_>>();
+            crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).map(|_| ())
+        };
+        let made = ["1 mkdir(\"x\", 0755) = 0\n".to_string(), "1 rmdir(\"x\") = 0\n".to_string()];
+        let mut with_x = fixture();
+        with_x.insert("w/x".into(), Entry::Dir { mode: 0o755 });
+        assert_eq!(check(made.clone(), with_x), Ok(()));
+        let refused = check(made, fixture()).unwrap_err();
+        assert!(refused.contains("line 2 stack: the replay does not reproduce the run before it: w/x: the replay holds it"), "{}", refused);
+
+        let rewritten = [rewrite(false), rewrite(false)];
+        let holding = |bytes: &[u8]| {
+            let mut image = fixture();
+            image.insert("w/a".into(), Entry::File { data: bytes.to_vec(), mode: 0o644 });
+            image
+        };
+        assert_eq!(check(rewritten.clone(), holding(b"new")), Ok(()));
+        let refused = check(rewritten, holding(b"run")).unwrap_err();
+        assert!(refused.contains("line 2 stack: the replay does not reproduce the run before it: w/a: the replay holds 3 bytes"), "{}", refused);
     }
 
     /// What strace did not name is not guessed: a relative path under a folder descriptor it did
@@ -1960,7 +1983,7 @@ mod tests {
         let unnamed = replayed(&["1 mkdirat(5, \"x\", 0777) = 0\n".to_string()]).err().unwrap();
         assert!(unnamed.contains("relative to a folder strace did not name"), "{}", unnamed);
         let unseen = replayed(&["1 fsync(7) = 0\n".to_string()]).err().unwrap();
-        assert!(unseen.contains("strace did not name"), "{}", unseen);
+        assert!(unseen.contains("strace could not name"), "{}", unseen);
     }
 
     /// mkdir keeps only the permission and sticky bits of its mode, as Linux does.
@@ -2218,8 +2241,9 @@ mod tests {
         let calls: Vec<Vec<Call>> = texts.iter().map(|text| trace::parse(text).unwrap()).collect();
         let points: Vec<Vec<Point>> = calls.iter().enumerate()
             .map(|(line, calls)| kill::enumerate(calls, line, "stack", &root(), "/s/w", |_| true).unwrap().points).collect();
-        let lines: Vec<Line> = calls.iter().zip(&points)
-            .map(|(calls, points)| Line { calls, command: "stack".into(), points: points.iter().collect(), before: None }).collect();
+        let starts = starts(&texts);
+        let lines: Vec<Line> = calls.iter().zip(&points).zip(&starts)
+            .map(|((calls, points), before)| Line { calls, command: "stack".into(), points: points.iter().collect(), before }).collect();
         let (crashes, _) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap();
         assert!(crashes.iter().all(|crash| data(&crash.image, "w/a").unwrap() == b"old"));
         let trails: Vec<(usize, bool)> = crashes.iter().map(|crash| crash.moment.trail()).collect();
@@ -2239,7 +2263,8 @@ mod tests {
         let text = format!("{}1 mkdir(\"n\", 0755) = 0\n", rewrite(true).replace("1 close(3</s/w/a>) = 0\n", ""));
         let calls = trace::parse(&text).unwrap();
         let points = kill::enumerate(&calls, 0, "stack", &root(), "/s/w", |_| true).unwrap().points;
-        let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect(), before: None }];
+        let first = fixture();
+        let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect(), before: &first }];
         let durable = |crashes: &[Crash]| -> Vec<(String, usize)> {
             crashes.iter().filter(|crash| crash.variant.is_none()).map(|crash| (crash.moment.label(), crash.shared)).collect()
         };
