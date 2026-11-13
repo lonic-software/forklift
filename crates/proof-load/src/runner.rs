@@ -234,7 +234,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
             Op::Run { line, at, keep } => {
                 let directory = scratch.root().join(at);
                 std::fs::create_dir_all(&directory).map_err(|error| RunError::Io(error.to_string()))?;
-                let arguments = filled(line, &kept, host.as_ref().map(|host| host.url.as_str()), scratch)
+                let arguments = filled(line, &kept, host.as_ref().map(|host| host.url.as_str()), scratch.root(), &work)
                     .map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?;
                 let outcome = run_in(program, std::iter::once("--json".to_string()).chain(arguments).collect(), directory)?;
                 for keep in keep {
@@ -286,7 +286,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                 let Some(strace) = observer.and_then(|observer| observer.strace) else { continue };
                 let directory = scratch.root().join(at);
                 let arguments: Vec<String> = std::iter::once("--json".to_string())
-                    .chain(filled(line, &kept, host.as_ref().map(|host| host.url.as_str()), scratch).map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?)
+                    .chain(filled(line, &kept, host.as_ref().map(|host| host.url.as_str()), scratch.root(), &work).map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?)
                     .collect();
                 let mut stood = false;
                 for when in 1..=INJECT_ATTEMPTS {
@@ -405,10 +405,10 @@ const INJECT_ATTEMPTS: usize = 32;
 
 /// Fills a coverage line's placeholders, anywhere in an argument: kept values by `{name}`, the
 /// host's URL, the scratch root and the work tree. One left unfilled is an error naming it.
-pub fn filled(line: &[String], kept: &BTreeMap<String, String>, url: Option<&str>, scratch: &Scratch) -> Result<Vec<String>, String> {
+pub fn filled(line: &[String], kept: &BTreeMap<String, String>, url: Option<&str>, root: &Path, work: &Path) -> Result<Vec<String>, String> {
     let mut values: Vec<(String, String)> = kept.iter().map(|(name, value)| (format!("{{{}}}", name), value.clone())).collect();
-    values.push((SCRATCH.to_string(), scratch.root().display().to_string()));
-    values.push((WORK.to_string(), scratch.work().display().to_string()));
+    values.push((SCRATCH.to_string(), root.display().to_string()));
+    values.push((WORK.to_string(), work.display().to_string()));
     if let Some(url) = url {
         values.push((URL.to_string(), url.to_string()));
     }
@@ -478,6 +478,37 @@ mod tests {
             strings(&["clone", "http://127.0.0.1:9", "/s/work", "-m", "x{url}"]));
         assert_eq!(fill(strings(&["clone", URL, WORK]), None, work), Err(URL));
         assert_eq!(fill(strings(&["stack", "-m", WORK]), None, work).unwrap(), strings(&["stack", "-m", "/s/work"]));
+    }
+
+    /// A coverage line fills its placeholders anywhere in an argument, kept values by name; one
+    /// left unfilled is an error naming it, never passed on as text.
+    ///
+    /// Revert: fill whole arguments only, as `fill` does → `{parcel}:notes.txt` reaches the tool
+    /// as written.
+    #[test]
+    fn coverage_lines_fill_within_arguments_and_refuse_a_missing_value() {
+        let kept = BTreeMap::from([("parcel".to_string(), "ab12".to_string())]);
+        let (root, work) = (Path::new("/s"), Path::new("/s/work"));
+        assert_eq!(filled(&strings(&["redact", "record", "{parcel}:notes.txt", "{scratch}/mirror", "{url}"]), &kept, Some("http://h"), root, work).unwrap(),
+            strings(&["redact", "record", "ab12:notes.txt", "/s/mirror", "http://h"]));
+        assert_eq!(filled(&strings(&["office", "retire", "--", "{root}"]), &kept, None, root, work), Err("`office retire -- {root}` has no value for {root}".to_string()));
+        assert!(filled(&strings(&["clone", "{url}"]), &kept, None, root, work).is_err(), "no host yet");
+    }
+
+    /// A kept value is the string at its pointer, or one word of the text after a marker in it.
+    ///
+    /// Revert: split the whole string when no marker is given → a kept parcel hash with a space
+    /// in its message keeps only its first word.
+    #[test]
+    fn a_kept_value_is_the_string_or_a_word_after_its_marker() {
+        let document = serde_json::json!({"data": {"parcel": "ab12", "message": "Run: office admit op pk pop. Then: office link pk2 pop2"}});
+        let keep = |pointer: &str, after: Option<&str>, word| Keep { name: "k".into(), pointer: pointer.into(), after: after.map(str::to_string), word };
+        assert_eq!(kept_value(&document, &keep("/data/parcel", None, 0)).as_deref(), Some("ab12"));
+        assert_eq!(kept_value(&document, &keep("/data/message", None, 0)).as_deref(), Some("Run: office admit op pk pop. Then: office link pk2 pop2"));
+        assert_eq!(kept_value(&document, &keep("/data/message", Some("office admit"), 2)).as_deref(), Some("pop."));
+        assert_eq!(kept_value(&document, &keep("/data/message", Some("office link"), 0)).as_deref(), Some("pk2"));
+        assert_eq!(kept_value(&document, &keep("/data/message", Some("absent"), 0)), None);
+        assert_eq!(kept_value(&document, &keep("/data/none", None, 0)), None);
     }
 
     /// The forklift binary to drive, given by path; the harness never builds or links it.

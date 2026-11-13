@@ -2,8 +2,9 @@
 //! subprocesses, found by path, and grades what they read back against an oracle built from the
 //! seed. It never links Forklift: an oracle that shares the code under test inherits its bugs.
 //!
-//! Built in slices. This one holds the census reader, the copy-only rule and environment scrub,
-//! the oracle and grades, damaged-file faults with their completeness check, and the report.
+//! Built in slices. So far: the census reader, the copy-only rule and environment scrub, the oracle
+//! and grades, damaged-file faults with their completeness check, client kill points (Linux), the
+//! write-op completeness check over the version's own schema, and the report.
 
 pub mod bindings;
 pub mod census;

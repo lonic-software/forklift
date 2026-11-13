@@ -9,7 +9,9 @@
 //! its thread. strace's `when=` counter runs per thread, so another thread can reach its own count
 //! first: every injected run is traced too, and a kill that did not land on its target is "not
 //! reached" and grades nothing. A point some other thread or process could have stolen, though it
-//! landed, is "sampled".
+//! landed, is "sampled". This stays a limit of the lane: strace selects injections by call, path
+//! and count, never by thread, and forklift has no setting that runs it on one thread, so a point
+//! another thread keeps reaching first stays not reached after its attempts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;

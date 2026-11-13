@@ -116,7 +116,12 @@ Notes:
   harness in `crates/proof-load` against forklift and forklift-server built for each OS's release
   target: damaged files over every census name, graded by reading every record back, and on Linux
   process kills at each of forklift's traced write calls of the `history` scenario (`--strace`,
-  `--kill`; the traces are uploaded with the report). They are
+  `--kill`; the traces are uploaded with the report). Every run also checks write-op completeness:
+  each command `forklift self schema` lists, and each leaf subcommand of `forklift-server --help`,
+  must be seen writing to a warehouse in some scenario's trace (Linux), or be exempt in
+  `WRITE_EXEMPTIONS` in `crates/proof-load/src/bindings.rs`; a read-only exemption is still run,
+  and fails if it changes the tree it ran in (every OS). A new command needs a step in a
+  `scenario::coverage()` scenario or an exemption, or the check fails. They are
   outside `ci passed` and their run step continues on error, so for now they report without failing;
   read the grades in the job summary or the uploaded report. A census row added without a damage
   binding or an exemption in `crates/proof-load/src/bindings.rs` fails the `bindings` unit test
