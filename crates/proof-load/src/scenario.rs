@@ -588,6 +588,9 @@ pub fn coverage() -> Vec<Scenario> {
             vec![run_at(".", &["clone", "--only", "left", "--only", "right", "--", "{url}", "{scratch}/sparse"])],
             vec![run_at("sparse", &["scope", "narrow", "--", "right"]), run_at("sparse", &["scope", "prune", "--confirm", "--", "right"]), run_at("sparse", &["scope", "fetch", "--", "right"])],
             vec![run_at(".", &["clone", "--cache", "--", "{url}", "{scratch}/cache"]), run_at("cache", &["store", "evict"])],
+            // The host's main moves past the head the cache recorded, so the next evict asks the
+            // host whether it still holds that one; a history beside an office asks it for names.
+            vec![write("left/c.txt", "c\n"), run(&["load", "."]), run(&["stack", "-m", "later"]), Op::Push, run_at("cache", &["store", "evict"]), run(&["history"])],
             vec![
                 Op::Inject { line: line(&["remote", "move", "--", "{url}"]), at: "cache".into(), until: Until::Says { line: line(&["remote"]), pointer: "/data/blocked/code".into(), equals: "origin_move_pending".into() } },
                 run_at("cache", &["remote", "abort"]),

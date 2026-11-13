@@ -7,7 +7,8 @@
 //! write-op completeness check over the version's own schema, client power loss over a
 //! persistence model of the traced calls (Linux), dead-holder locks, disk full on a capped volume
 //! and a read-only warehouse, a work tree on a case-folding or no-exec volume, network faults
-//! through a proxy every host is served behind (with a killed server restarted), and the report.
+//! through a proxy every host is served behind (with a killed server restarted), a check that every
+//! server route the version's route table lists was answered through that proxy, and the report.
 
 pub mod bindings;
 pub mod census;
@@ -23,6 +24,7 @@ pub mod power;
 pub mod proxy;
 pub mod remedy;
 pub mod report;
+pub mod routes;
 pub mod runner;
 pub mod scenario;
 pub mod scrub;
