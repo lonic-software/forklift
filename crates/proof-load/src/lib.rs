@@ -19,3 +19,4 @@ pub mod scenario;
 pub mod scrub;
 pub mod tool;
 pub mod trace;
+pub mod writeops;

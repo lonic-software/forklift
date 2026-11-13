@@ -5,15 +5,17 @@
 //! that follows lists every path in the warehouse's state folder; a path no census row matches
 //! fails the run, and the census names some path matched are the ones this scenario creates.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::census::{self, Census};
 use crate::corpus::{self, Corpus};
 use crate::oracle::{self, Admissible, RedactionLedger, RedactionState};
-use crate::scenario::{bind, Mark, Op, Scenario, Tool, TARGET, URL, WORK};
+use crate::scenario::{bind, Keep, Mark, Op, Scenario, Tool, Until, SCRATCH, TARGET, URL, WORK};
 use crate::scrub::{Environment, Scratch};
 use crate::tool::{self, Invocation, Outcome, Served};
+use crate::writeops::Observer;
 
 /// What building a scenario's history produced.
 #[derive(serde::Serialize)]
@@ -104,13 +106,21 @@ pub fn host_root(scratch: &Scratch) -> PathBuf {
 /// Builds `scenario`'s history with `program` (the binary of `tool`) in `scratch`'s work tree,
 /// with `server` the forklift-server a `Host` operation starts. Every build step must succeed: a
 /// failed one means the scenario's precondition does not hold, which is reported, never graded.
+/// With an `observer`, every step goes through it, for the write-op check.
 #[allow(clippy::too_many_arguments)]
-pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, server: Option<&Path>, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Built, RunError> {
+pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, server: Option<&Path>, scratch: &Scratch, environment: &Environment, limit: Duration, observer: Option<&Observer>) -> Result<Built, RunError> {
     let work = scratch.work();
     let corpus = &scenario.corpus(corpus);
     let run_in = |program: &Path, arguments: Vec<String>, directory: PathBuf| -> Result<Outcome, RunError> {
         let invocation = Invocation { program: PathBuf::from(program), arguments, directory, limit };
-        let outcome = tool::run(&invocation, scratch, environment).map_err(RunError::Tool)?;
+        let outcome = match observer {
+            Some(observer) if tool == Tool::Forklift => {
+                let served = server == Some(program);
+                let tree = if served { host_root(scratch) } else { invocation.directory.clone() };
+                observer.run(&invocation, served, &tree, scratch, environment)
+            }
+            _ => tool::run(&invocation, scratch, environment),
+        }.map_err(RunError::Tool)?;
         if !outcome.succeeded() {
             return Err(RunError::BuildFailed {
                 arguments: outcome.arguments.clone(), exit: outcome.exit,
@@ -128,6 +138,8 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
     let mut ledger = RedactionLedger::default();
     // The folder a sparse clone scoped the work tree to, which bounds what a later write may hold.
     let mut scope: Option<&str> = None;
+    // Values coverage lines kept from earlier documents, by name.
+    let mut kept: BTreeMap<String, String> = BTreeMap::new();
     for op in &scenario.history {
         if let Some(snapshot) = op.writes(corpus) {
             let snapshot = snapshot.map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?;
@@ -219,6 +231,79 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                     outcomes.push(run_in(program, arguments, elsewhere.clone())?);
                 }
             }
+            Op::Run { line, at, keep } => {
+                let directory = scratch.root().join(at);
+                std::fs::create_dir_all(&directory).map_err(|error| RunError::Io(error.to_string()))?;
+                let arguments = filled(line, &kept, host.as_ref().map(|host| host.url.as_str()), scratch)
+                    .map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?;
+                let outcome = run_in(program, std::iter::once("--json".to_string()).chain(arguments).collect(), directory)?;
+                for keep in keep {
+                    let value = kept_value(&document(&outcome.stdout), keep)
+                        .ok_or_else(|| RunError::Io(format!("scenario {}: `{}` gave no {} at {}", scenario.id, line.join(" "), keep.name, keep.pointer)))?;
+                    kept.insert(keep.name.clone(), value);
+                }
+                outcomes.push(outcome);
+                continue;
+            }
+            Op::Serve { line } => {
+                let server = server.ok_or_else(|| RunError::Io(format!("scenario {} runs a server command, and no forklift-server binary was given", scenario.id)))?;
+                let mut arguments = line.clone();
+                arguments.extend(["--root".to_string(), host_root(scratch).display().to_string()]);
+                outcomes.push(run_in(server, arguments, scratch.root().to_path_buf())?);
+                continue;
+            }
+            Op::StopHost => {
+                host.take().ok_or_else(|| RunError::Io(format!("scenario {} stops a host it does not serve", scenario.id)))?;
+                continue;
+            }
+            Op::LoseKeys => {
+                #[allow(clippy::disallowed_methods)] // the scratch home's keys, which this step exists to lose
+                std::fs::remove_dir_all(scratch.home().join(".forklift-keys")).map_err(|error| RunError::Io(format!("scenario {}: losing the keys: {}", scenario.id, error)))?;
+                continue;
+            }
+            Op::Age => {
+                age(&host_root(scratch).join(".forklift").join("objects"), Duration::from_secs(2 * 24 * 60 * 60))
+                    .map_err(|error| RunError::Io(format!("scenario {}: backdating the host's objects: {}", scenario.id, error)))?;
+                continue;
+            }
+            Op::Write { path, text } => {
+                let target = work.join(path);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| RunError::Io(error.to_string()))?;
+                }
+                std::fs::write(&target, text).map_err(|error| RunError::Io(error.to_string()))?;
+                continue;
+            }
+            Op::Inject { line, at, until } => {
+                // Without a tracer the state cannot be built, and nothing that needs it is checked.
+                let Some(strace) = observer.and_then(|observer| observer.strace) else { continue };
+                let directory = scratch.root().join(at);
+                let arguments: Vec<String> = std::iter::once("--json".to_string())
+                    .chain(filled(line, &kept, host.as_ref().map(|host| host.url.as_str()), scratch).map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?)
+                    .collect();
+                let mut stood = false;
+                for when in 1..=INJECT_ATTEMPTS {
+                    let mut traced = vec!["-f".to_string(), "-qq".into(), "-e".into(), "trace=fsync".into(), "-e".into(), format!("inject=fsync:error=EIO:when={}", when), "--".into(), program.display().to_string()];
+                    traced.extend(arguments.iter().cloned());
+                    // An attempt is meant to fail; what it left is what `until` judges.
+                    tool::run(&Invocation { program: strace.to_path_buf(), arguments: traced, directory: directory.clone(), limit }, scratch, environment).map_err(RunError::Tool)?;
+                    stood = match until {
+                        Until::Holds { folder } => std::fs::read_dir(directory.join(folder)).is_ok_and(|mut entries| entries.next().is_some()),
+                        Until::Says { line, pointer, equals } => {
+                            let asked = Invocation { program: program.to_path_buf(), arguments: std::iter::once("--json".to_string()).chain(line.iter().cloned()).collect(), directory: directory.clone(), limit };
+                            let said = tool::run(&asked, scratch, environment).map_err(RunError::Tool)?;
+                            document(&said.stdout).pointer(pointer).and_then(|value| value.as_str()) == Some(equals.as_str())
+                        }
+                    };
+                    if stood {
+                        break;
+                    }
+                }
+                if !stood {
+                    return Err(RunError::Io(format!("scenario {}: no failed fsync of `{}` up to #{} left {:?}", scenario.id, line.join(" "), INJECT_ATTEMPTS, until)));
+                }
+                continue;
+            }
             Op::Clone { .. } => {
                 // A clone makes its target; the work tree it replaces is the harness's own scratch.
                 #[allow(clippy::disallowed_methods)] // a scratch work tree the harness made; no retry is wanted
@@ -308,6 +393,57 @@ pub fn fill(arguments: Vec<String>, url: Option<&str>, work: &Path) -> Result<Ve
     }).collect()
 }
 
+/// How many fsyncs an `Inject` fails in turn, one per attempt, before it gives up on its state.
+const INJECT_ATTEMPTS: usize = 32;
+
+/// Fills a coverage line's placeholders, anywhere in an argument: kept values by `{name}`, the
+/// host's URL, the scratch root and the work tree. One left unfilled is an error naming it.
+pub fn filled(line: &[String], kept: &BTreeMap<String, String>, url: Option<&str>, scratch: &Scratch) -> Result<Vec<String>, String> {
+    let mut values: Vec<(String, String)> = kept.iter().map(|(name, value)| (format!("{{{}}}", name), value.clone())).collect();
+    values.push((SCRATCH.to_string(), scratch.root().display().to_string()));
+    values.push((WORK.to_string(), scratch.work().display().to_string()));
+    if let Some(url) = url {
+        values.push((URL.to_string(), url.to_string()));
+    }
+    line.iter().map(|argument| {
+        let mut argument = argument.clone();
+        for (placeholder, value) in &values {
+            argument = argument.replace(placeholder.as_str(), value);
+        }
+        match (argument.find('{'), argument.find('}')) {
+            (Some(open), Some(close)) if open < close => Err(format!("`{}` has no value for {}", line.join(" "), &argument[open..=close])),
+            _ => Ok(argument),
+        }
+    }).collect()
+}
+
+/// The value `keep` names in a document: the string at its pointer, from the text after its
+/// `after` when it has one, split on whitespace, word `word`.
+pub fn kept_value(document: &serde_json::Value, keep: &Keep) -> Option<String> {
+    let text = document.pointer(&keep.pointer)?.as_str()?;
+    let text = match &keep.after {
+        Some(after) => &text[text.find(after.as_str())? + after.len()..],
+        None => return (keep.word == 0).then(|| text.to_string()),
+    };
+    text.split_whitespace().nth(keep.word).map(str::to_string)
+}
+
+/// Sets every file under `root` back by `by`, so a grace period measured from a write has passed.
+fn age(root: &Path, by: Duration) -> std::io::Result<()> {
+    let then = std::time::SystemTime::now() - by;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        if std::fs::symlink_metadata(&path)?.is_dir() {
+            for entry in std::fs::read_dir(&path)? {
+                stack.push(entry?.path());
+            }
+        } else {
+            std::fs::File::open(&path)?.set_modified(then)?;
+        }
+    }
+    Ok(())
+}
+
 /// The census names some walked path matches: the names this build creates.
 pub fn created_names(census: &Census, walked: &[String]) -> Vec<String> {
     census.damage_names().into_iter().map(|name| name.path)
@@ -362,7 +498,7 @@ mod tests {
             damage: None,
         };
 
-        let built = build(&scenario, &corpus, Tool::Forklift, &program, None, &scratch, &environment, Duration::from_secs(60)).unwrap();
+        let built = build(&scenario, &corpus, Tool::Forklift, &program, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
         assert_eq!(built.acknowledged, vec![Mark::Record(0), Mark::Record(1), Mark::Record(2)]);
 
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

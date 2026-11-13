@@ -139,6 +139,23 @@ impl Directories {
     }
 }
 
+/// Every path a successful mutating call in `calls` named, absolute, from every thread and process
+/// the trace holds: the write-op check's evidence. `start` is the folder the line ran in. A call
+/// that failed, never returned, or the table cannot classify names nothing here.
+pub fn written(calls: &[Call], start: &str) -> Vec<String> {
+    let mut directories = Directories::new(trace::thread_groups(calls), start);
+    let mut paths = Vec::new();
+    for call in calls {
+        if let Ok(touched) = trace::touch(call) {
+            if touched.class == Class::Mutating && matches!(call.returned, Returned::Value(_)) {
+                paths.extend(touched.operands.iter().map(|operand| directories.resolved(operand, call.tid)));
+            }
+        }
+        directories.follow(call);
+    }
+    paths
+}
+
 /// `call`'s identity: see [`Identity`].
 pub fn identity(operands: &[Operand], detail: &str, root: &Root, pid: u32) -> Identity {
     let paths = operands.iter().map(|operand| {
@@ -388,11 +405,14 @@ pub struct Settings<'a> {
     pub jobs: usize,
     /// Where traces go: outside every scratch area, so no scan reads them.
     pub traces: &'a Path,
+    /// The version under test's schema, which names the command a faulted line runs.
+    pub schema: &'a crate::writeops::Schema,
 }
 
-/// The command id of a forklift line: its first argument after `--json`.
-pub fn command_id(arguments: &[String]) -> String {
-    arguments.iter().find(|argument| *argument != "--json").cloned().unwrap_or_default()
+/// The command id of a forklift line, as the schema names it; its first argument after `--json`
+/// when the schema has no command for it.
+pub fn command_id(schema: &crate::writeops::Schema, arguments: &[String]) -> String {
+    schema.id_of(arguments).unwrap_or_else(|| arguments.iter().find(|argument| *argument != "--json").cloned().unwrap_or_default())
 }
 
 /// Why a scenario's kill points cannot run in this build of the harness, if they cannot.
@@ -403,11 +423,12 @@ pub fn not_run(scenario: &Scenario) -> Option<String> {
     None
 }
 
-fn strace_line(trace: &Path, filter: &[String], forklift: &Path, arguments: &[String]) -> Vec<String> {
+/// strace's command line tracing `program` with `arguments`, its trace written to `trace`.
+pub fn strace_line(trace: &Path, filter: &[String], program: &Path, arguments: &[String]) -> Vec<String> {
     let mut line: Vec<String> = vec!["-f".into(), "-qq".into(), "-y".into(), "-o".into(), trace.display().to_string()];
     line.extend(filter.iter().cloned());
     line.push("--".into());
-    line.push(forklift.display().to_string());
+    line.push(program.display().to_string());
     line.extend(arguments.iter().cloned());
     line
 }
@@ -422,7 +443,7 @@ pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: 
     }
     let io = |error: std::io::Error| RunError::Io(error.to_string());
     let environment = environment_of(settings, template)?;
-    let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), template, &environment, settings.limit)?;
+    let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), template, &environment, settings.limit, None)?;
     let corpus = &scenario.corpus(corpus);
     let (expected, faulted) = faulted::expected(scenario, corpus, &built, Warehouse::Client)?;
     let original = Root::of(template.root()).map_err(io)?;
@@ -457,7 +478,7 @@ pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: 
         let calls = trace::parse(&text).map_err(RunError::Io)?;
         let start = counting.work().to_string_lossy().into_owned();
         let existed = |path: &str| before.contains(path) || counting_root.rebase(path, &Root { given: counting_root.given.clone(), canonical: counting_root.given.clone() }).is_some_and(|given| before.contains(&given));
-        match enumerate(&calls, index, &command_id(arguments), &counting_root, &start, existed) {
+        match enumerate(&calls, index, &command_id(settings.schema, arguments), &counting_root, &start, existed) {
             Ok(enumerated) => {
                 points.extend(enumerated.points);
                 kills.children.extend(enumerated.children);

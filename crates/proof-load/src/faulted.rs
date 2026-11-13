@@ -614,7 +614,7 @@ pub(crate) fn grade_after(
 /// build, then the faulted command, readback, a plain retry, the named remedies, and heal.
 #[allow(clippy::too_many_arguments)]
 pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, seed: u64) -> Result<Faulted, RunError> {
-    let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), scratch, environment, limit)?;
+    let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), scratch, environment, limit, None)?;
     // What the build recorded: the corpus rooted under the scenario's scope, when it has one.
     let corpus = &scenario.corpus(corpus);
     let (walked, state) = match warehouse {
