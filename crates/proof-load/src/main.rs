@@ -60,11 +60,12 @@ enum Command {
         /// a file, on Linux. Without it the kill points are reported as not run.
         #[arg(long)]
         strace: Option<PathBuf>,
-        /// Kill points of this scenario only; repeatable. Without it, every scenario's.
+        /// Kill points of this scenario only; repeatable. Without it or `--power`, every
+        /// scenario's; with only `--power` named, none.
         #[arg(long = "kill")]
         kill: Vec<String>,
-        /// Power loss of this scenario only; repeatable. Without it, every scenario's. Needs strace,
-        /// like the kill points.
+        /// Power loss of this scenario only; repeatable. Without it or `--kill`, every scenario's;
+        /// with only `--kill` named, none. Needs strace, like the kill points.
         #[arg(long = "power")]
         power: Vec<String>,
         /// How many seeded states between the durable and the volatile one each scenario's power
@@ -314,8 +315,7 @@ fn main() -> ExitCode {
             // taken only when the power loss will read them.
             let (mut all_kills, mut all_power) = (Vec::new(), Vec::new());
             for scenario in &scenarios {
-                let killing = kill.is_empty() || kill.contains(&scenario.id);
-                let powering = power.is_empty() || power.contains(&scenario.id);
+                let (killing, powering) = kill::lanes(&kill, &power, &scenario.id);
                 if !killing && !powering {
                     continue;
                 }
@@ -352,15 +352,27 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            let summary = kill::summarize(&all_kills);
-            rows.extend(summary.rows);
-            kill_completeness = summary.completeness;
-            not_reached = summary.not_reached;
-
-            let power_summary = proof_load::power::summarize(&all_power);
-            rows.extend(power_summary.rows);
-            power_completeness = power_summary.completeness;
-            Ok((summary.cell, power_summary.cell))
+            // A lane no scenario was picked for is not run, which fails nothing: only the other
+            // lane was asked for.
+            let unasked = || Cell::not_run("no scenario was named for it");
+            let kill_cell = if all_kills.is_empty() {
+                unasked()
+            } else {
+                let summary = kill::summarize(&all_kills);
+                rows.extend(summary.rows);
+                kill_completeness = summary.completeness;
+                not_reached = summary.not_reached;
+                summary.cell
+            };
+            let power_cell = if all_power.is_empty() {
+                unasked()
+            } else {
+                let summary = proof_load::power::summarize(&all_power);
+                rows.extend(summary.rows);
+                power_completeness = summary.completeness;
+                summary.cell
+            };
+            Ok((kill_cell, power_cell))
         }
     };
     let (kill_cell, power_cell) = match traced_lanes {

@@ -108,13 +108,17 @@ pub struct Model {
     next: Ino,
     /// Bumped by every promotion, so an unchanged durable state is not walked again.
     version: u64,
+    /// The index of the call being replayed in its line.
+    now: usize,
+    /// Per node, the last call in this line that changed it.
+    changed: BTreeMap<Ino, usize>,
 }
 
 impl Model {
     /// A model of `image`, all of it durable: the fixture, written and synced whole.
     pub fn of(image: &Image) -> Result<Model, String> {
         let Some(Entry::Dir { mode }) = image.get("") else { return Err("the fixture has no root folder".to_string()) };
-        let mut model = Model { volatile: BTreeMap::new(), durable: BTreeMap::new(), root: 0, next: 1, version: 0 };
+        let mut model = Model { volatile: BTreeMap::new(), durable: BTreeMap::new(), root: 0, next: 1, version: 0, now: 0, changed: BTreeMap::new() };
         model.volatile.insert(0, Node::Dir { entries: BTreeMap::new(), mode: *mode });
         // A parent sorts before everything below it, so it is always made first.
         for (path, entry) in image.iter().filter(|(path, _)| !path.is_empty()) {
@@ -147,7 +151,28 @@ impl Model {
         }
     }
 
+    /// Marks `ino` changed by the call being replayed.
+    fn touch(&mut self, ino: Ino) {
+        self.changed.insert(ino, self.now);
+    }
+
+    /// Refuses a sync of `ino` (every node when `None`) entered at `entered` when a call that
+    /// finished while it ran changed what it syncs: whether the kernel's sync covered that change
+    /// is not known, and promoting it would claim a durability nobody promised.
+    fn overlapped(&self, ino: Option<Ino>, entered: usize) -> Result<(), String> {
+        let late = |at: &usize| *at >= entered && *at < self.now;
+        let overlapping = match ino {
+            Some(ino) => self.changed.get(&ino).is_some_and(late),
+            None => self.changed.values().any(late),
+        };
+        if overlapping {
+            return Err("a sync overlapped a change to what it syncs, which the model does not decide".to_string());
+        }
+        Ok(())
+    }
+
     fn entries_mut(&mut self, ino: Ino) -> Result<&mut BTreeMap<String, Ino>, String> {
+        self.touch(ino);
         match self.volatile.get_mut(&ino) {
             Some(Node::Dir { entries, .. }) => Ok(entries),
             _ => Err("the replay reached a folder it holds as no folder".to_string()),
@@ -334,6 +359,7 @@ impl Replay {
         self.descriptions.clear();
         self.tables.clear();
         self.table_of.clear();
+        self.model.changed.clear();
         let groups = trace::thread_groups(calls);
         let mut parents: BTreeMap<u32, (u32, bool)> = BTreeMap::new();
         for call in calls.iter().filter(|call| matches!(call.name.as_str(), "clone" | "clone3" | "fork" | "vfork")) {
@@ -348,6 +374,7 @@ impl Replay {
         }
         let mut directories = Directories::new(groups, start);
         for (index, call) in calls.iter().enumerate() {
+            self.model.now = index;
             before(index, &self.model);
             let group = directories.group(call.tid);
             self.ensure(group, &parents, 0);
@@ -400,12 +427,18 @@ impl Replay {
             Argument::Other(number) => (number.parse().map_err(|_| format!("no descriptor in {}", text))?, None),
             _ => return Err(format!("no descriptor in {}", text)),
         };
+        let into_area = target.as_deref().map(|target| self.root.holds(target));
         match self.table(group).get(&fd).copied() {
-            Some(description) => Ok(self.descriptions[description].ino.map(|_| description)),
-            None if target.as_deref().is_some_and(|target| self.root.holds(target)) => {
-                Err(format!("descriptor {} into the area was never seen opened", fd))
+            // strace names what the number is now: one it shows outside the area was reused for
+            // something the table never saw opened (a pipe, a socket, a descriptor an exec
+            // closed), so the table's entry is stale.
+            Some(_) if into_area == Some(false) => {
+                self.table(group).remove(&fd);
+                Ok(None)
             }
-            None => Ok(None),
+            Some(description) if self.descriptions[description].ino.is_some() => Ok(Some(description)),
+            _ if into_area == Some(true) => Err(format!("descriptor {} into the area was never seen opened", fd)),
+            _ => Ok(None),
         }
     }
 
@@ -472,6 +505,7 @@ impl Replay {
     }
 
     fn file(&mut self, ino: Ino) -> Result<&mut Vec<u8>, String> {
+        self.model.touch(ino);
         match self.model.volatile.get_mut(&ino) {
             Some(Node::File { data, .. }) => Ok(data),
             _ => Err("a write to what the replay holds as no file".to_string()),
@@ -509,7 +543,9 @@ impl Replay {
                     "openat" => (raw(2).to_string(), mode_of(raw(3))),
                     _ => (raw(2).to_string(), raw(2).split_once("mode=").map_or(0o644, |(_, rest)| mode_of(rest))),
                 };
-                let Argument::Descriptor { fd, target } = trace::argument(&returned) else { return Ok(()) };
+                let Argument::Descriptor { fd, target } = trace::argument(&returned) else {
+                    return Err(format!("an open returned {}, a descriptor strace did not name", returned));
+                };
                 let ino = if self.root.holds(&target) {
                     if flags.contains("O_TMPFILE") {
                         return Err("an unnamed temp file is not modelled".to_string());
@@ -518,6 +554,7 @@ impl Replay {
                         Located::Root => Some(self.model.root),
                         Located::At { ino: Some(ino), .. } => {
                             if flags.contains("O_TRUNC") {
+                                self.model.touch(ino);
                                 if let Node::File { data, .. } = self.model.volatile.get_mut(&ino).expect("located") {
                                     data.clear();
                                 }
@@ -587,7 +624,8 @@ impl Replay {
                 let held = self.descriptions[description].clone();
                 let ino = held.ino.expect("held returns only descriptions into the area");
                 let data = self.file(ino)?;
-                let at = if appending || (!positioned && held.append) {
+                // Linux appends a positioned write on an O_APPEND description too (pwrite(2), BUGS).
+                let at = if appending || held.append {
                     data.len()
                 } else if positioned {
                     fd_of(raw(3)).ok_or_else(|| "no offset".to_string())? as usize
@@ -616,10 +654,14 @@ impl Replay {
             "fsync" | "fdatasync" => {
                 if let Some(description) = self.held(group, text(0))? {
                     let ino = self.descriptions[description].ino.expect("held returns only descriptions into the area");
+                    self.model.overlapped(Some(ino), call.entered)?;
                     self.model.sync(ino);
                 }
             }
-            "sync" | "syncfs" => self.model.sync_all(),
+            "sync" | "syncfs" => {
+                self.model.overlapped(None, call.entered)?;
+                self.model.sync_all();
+            }
             "mkdir" | "mkdirat" => {
                 let (target, mode) = if call.name == "mkdir" { (path(None, 0)?, mode_of(raw(1))) } else { (path(Some(0), 1)?, mode_of(raw(2))) };
                 if let Some((parent, name)) = self.free(&target)? {
@@ -672,6 +714,9 @@ impl Replay {
                     "chmod" => (self.existing(&path(None, 0)?, true)?, mode_of(raw(1))),
                     _ => (self.existing(&path(Some(0), 1)?, !raw(3).contains("AT_SYMLINK_NOFOLLOW"))?, mode_of(raw(2))),
                 };
+                if let Some(ino) = ino {
+                    self.model.touch(ino);
+                }
                 if let Some(Node::File { mode: held, .. } | Node::Dir { mode: held, .. }) = ino.and_then(|ino| self.model.volatile.get_mut(&ino)) {
                     *held = mode;
                 }
@@ -816,8 +861,7 @@ pub fn materialize(image: &Image, root: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
-            #[allow(clippy::disallowed_methods, reason = "a scratch copy the harness made itself, under its own output directory")]
-            std::fs::remove_dir_all(entry.path())?;
+            remove_tree(&entry.path())?;
         } else {
             #[allow(clippy::disallowed_methods)] // a scratch copy the harness made itself; no retry is wanted
             std::fs::remove_file(entry.path())?;
@@ -854,6 +898,25 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn set_mode(_: &Path, _: u32) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Removes a tree the harness wrote itself, its folders made writable first, since a crash state
+/// can hold a read-only folder whose entries could not be removed otherwise. Links are removed,
+/// never followed.
+fn remove_tree(path: &Path) -> std::io::Result<()> {
+    fn open_up(path: &Path) -> std::io::Result<()> {
+        if !std::fs::symlink_metadata(path)?.is_dir() {
+            return Ok(());
+        }
+        set_mode(path, 0o700)?;
+        for entry in std::fs::read_dir(path)? {
+            open_up(&entry?.path())?;
+        }
+        Ok(())
+    }
+    open_up(path)?;
+    #[allow(clippy::disallowed_methods, reason = "a scratch copy the harness made itself, under its own output directory")]
+    std::fs::remove_dir_all(path)
 }
 
 /// When a crash lands.
@@ -1031,8 +1094,11 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
         let command = kill::command_id(settings.schema, &line.arguments).map_err(RunError::Io)?;
         lines.push(Line { calls: &line.calls, command, points: points.iter().filter(|point| point.line == index).collect() });
     }
+    let Some(fixture) = &counted.fixture else {
+        return Err(RunError::Io("the faulted command was counted without its writes dumped".to_string()));
+    };
     let start = counted.counting.work().to_string_lossy().into_owned();
-    let (crashes, replayed) = match crashes(&counted.fixture, &counted.counting_root, &start, &lines, variants, seed) {
+    let (crashes, replayed) = match crashes(fixture, &counted.counting_root, &start, &lines, variants, seed) {
         Ok(found) => found,
         Err(refusal) => {
             power.refusals.push(refusal);
@@ -1098,8 +1164,7 @@ fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, sett
     })?;
     // A copy that graded well holds nothing to look at; one that did not is kept for diagnosis.
     if !graded.grade.is_failure() {
-        #[allow(clippy::disallowed_methods, reason = "a scratch copy the harness made itself, under its own output directory")]
-        let _ = std::fs::remove_dir_all(copy.root());
+        let _ = remove_tree(copy.root());
     }
     Ok(graded)
 }
@@ -1335,6 +1400,39 @@ mod tests {
         assert_eq!(replayed(&[outside]).unwrap().volatile_image(), fixture());
     }
 
+    /// A sync that another thread's change overlapped refuses, since whether the sync covered
+    /// that change is not known; the same change made before the sync started is covered, and
+    /// one to something the sync does not cover is no overlap.
+    ///
+    /// Revert: replay calls where they finished, never asking where they started → the folder's
+    /// new entry reads as durable.
+    #[test]
+    fn a_sync_another_thread_overlapped_refuses() {
+        let threaded = |between: &str, before: &str| format!("1 openat(AT_FDCWD</s/w>, \".\", O_RDONLY|O_DIRECTORY) = 3</s/w>\n\
+            1 clone(child_stack=0x1, flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM) = 2\n\
+            {}2 fsync(3</s/w> <unfinished ...>\n{}2 <... fsync resumed>) = 0\n", before, between);
+        let made = "1 mkdir(\"n\", 0755) = 0\n";
+        assert!(replayed(&[threaded(made, "")]).unwrap_err().contains("overlapped"));
+        let model = replayed(&[threaded("", made)]).unwrap();
+        assert!(model.durable_image().contains_key("w/n"), "made before the sync started");
+        let elsewhere = "1 mkdir(\"/s/m\", 0755) = 0\n";
+        assert!(replayed(&[threaded(elsewhere, "")]).is_ok(), "a change the sync does not cover");
+    }
+
+    /// A descriptor number strace names as something outside the area is no longer the area
+    /// file the table remembers under it, and an open whose descriptor strace did not name
+    /// refuses.
+    ///
+    /// Revert: trust the table over strace's name → the pipe's byte lands in `a`; skip an unnamed
+    /// open → it replays as nothing.
+    #[test]
+    fn a_reused_descriptor_follows_what_strace_names() {
+        let reused = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3</s/w/a>\n1 write(3<pipe:[9]>, \"x\", 1) = 1\n{}", dump(b"x"));
+        assert_eq!(data(&replayed(&[reused]).unwrap().volatile_image(), "w/a").unwrap(), b"old");
+        let unnamed = "1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3\n".to_string();
+        assert!(replayed(&[unnamed]).unwrap_err().contains("did not name"));
+    }
+
     /// The replay is held to the run: any path where its tree and the run's differ is named.
     ///
     /// Revert: compare paths only → a file whose bytes differ passes.
@@ -1423,11 +1521,12 @@ mod tests {
         assert!(matched, "some seed draws a variant that matches a durable state");
     }
 
-    /// pwritev2 at offset -1 writes at the description's offset, RWF_APPEND appends, and an
-    /// O_APPEND set by fcntl after the open makes later writes append.
+    /// pwritev2 at offset -1 writes at the description's offset, RWF_APPEND appends, an O_APPEND
+    /// set by fcntl after the open makes later writes append, and so does a positioned write on
+    /// an O_APPEND description, as Linux does.
     ///
     /// Revert: read pwritev2's -1 as an offset → the replay refuses; ignore F_SETFL → `+x`
-    /// overwrites from the start.
+    /// overwrites from the start; honour pwrite64's offset under O_APPEND → `?` lands at 0.
     #[test]
     fn positioned_and_appending_writes_land_where_the_kernel_puts_them() {
         let vectored = |fd: u32, offset: &str, flags: &str, bytes: &[u8]| format!(
@@ -1437,8 +1536,9 @@ mod tests {
             1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3</s/w/a>\n\
             1 fcntl(3</s/w/a>, F_SETFL, O_WRONLY|O_APPEND) = 0\n{}{}",
             vectored(4, "-1", "0", b"NE"), write(1, 4, "/s/w/a", b"W"), write(1, 3, "/s/w/a", b"+x"), vectored(4, "0", "RWF_APPEND", b"!"));
-        let model = replayed(&[text]).unwrap();
-        assert_eq!(data(&model.volatile_image(), "w/a").unwrap(), b"NEW+x!");
+        let positioned = format!("1 pwrite64(3</s/w/a>, \"?\", 1, 0) = 1\n{}", dump(b"?"));
+        let model = replayed(&[format!("{}{}", text, positioned)]).unwrap();
+        assert_eq!(data(&model.volatile_image(), "w/a").unwrap(), b"NEW+x!?");
     }
 
     /// Seeded variants lie between the durable and the volatile state: each entry and file from
@@ -1467,9 +1567,10 @@ mod tests {
         assert_eq!(draw(5), draw(5));
     }
 
-    /// A tree written out reads back as itself.
+    /// A tree written out reads back as itself, and is removed whole, its read-only folder too.
     ///
-    /// Revert: skip the links → the scan misses `w/l`.
+    /// Revert: skip the links → the scan misses `w/l`; remove without making the folders writable
+    /// → the read-only folder's file cannot be removed.
     #[cfg(unix)]
     #[test]
     fn a_materialized_tree_scans_back_as_itself() {
@@ -1483,10 +1584,11 @@ mod tests {
         image.insert("r".into(), Entry::Dir { mode: 0o555 });
         image.insert("r/in".into(), Entry::File { data: vec![], mode: 0o444 });
         materialize(&image, &scratch).unwrap();
+        // Written again over its own read-only folder, as a second state over one copy would be.
+        materialize(&image, &scratch).unwrap();
         let scanned = scan(&scratch);
-        set_mode(&scratch.join("r"), 0o755).unwrap();
-        #[allow(clippy::disallowed_methods, reason = "the test's own temp folder")]
-        std::fs::remove_dir_all(&scratch).unwrap();
+        remove_tree(&scratch).unwrap();
         assert_eq!(scanned.unwrap(), image);
+        assert!(std::fs::symlink_metadata(&scratch).is_err(), "the read-only folder is removed too");
     }
 }

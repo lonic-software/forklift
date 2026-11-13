@@ -34,6 +34,9 @@ pub struct Call {
     /// The bytes a write passed, when the trace dumped them (`-e write=all`): every buffer's, in
     /// order. Empty otherwise.
     pub data: Vec<u8>,
+    /// How many calls had finished when this one started: its own index, unless it was printed
+    /// unfinished and other calls finished while it ran.
+    pub entered: usize,
 }
 
 /// One argument read as what it names.
@@ -56,7 +59,7 @@ pub enum Argument {
 pub fn parse(text: &str) -> Result<Vec<Call>, String> {
     let mut calls: Vec<Call> = Vec::new();
     // Per thread, the first half of an unfinished call.
-    let mut pending: BTreeMap<u32, String> = BTreeMap::new();
+    let mut pending: BTreeMap<u32, (String, usize)> = BTreeMap::new();
     for (number, line) in text.lines().enumerate() {
         let refuse = |why: &str| format!("trace line {}: {}: {}", number + 1, why, line);
         if line.trim().is_empty() {
@@ -79,23 +82,26 @@ pub fn parse(text: &str) -> Result<Vec<Call>, String> {
         if rest.starts_with("+++") || rest.starts_with("---") {
             continue;
         }
-        let whole = if let Some(resumed) = rest.strip_prefix("<... ") {
+        let (whole, entered) = if let Some(resumed) = rest.strip_prefix("<... ") {
             let (_, tail) = resumed.split_once(" resumed>").ok_or_else(|| refuse("a resumed call without its name"))?;
-            let head = pending.remove(&tid).ok_or_else(|| refuse("a resumed call that never started"))?;
-            format!("{}{}", head, tail)
+            let (head, entered) = pending.remove(&tid).ok_or_else(|| refuse("a resumed call that never started"))?;
+            (format!("{}{}", head, tail), entered)
         } else {
-            rest.to_string()
+            (rest.to_string(), calls.len())
         };
         if let Some(head) = whole.strip_suffix("<unfinished ...>") {
-            pending.insert(tid, head.trim_end().to_string());
+            pending.insert(tid, (head.trim_end().to_string(), entered));
             continue;
         }
-        calls.push(call(tid, &whole).ok_or_else(|| refuse("not a call"))?);
+        let mut finished = call(tid, &whole).ok_or_else(|| refuse("not a call"))?;
+        finished.entered = entered;
+        calls.push(finished);
     }
     // A call still unfinished at the end never returned: its process died in it.
-    for (tid, head) in pending {
+    for (tid, (head, entered)) in pending {
         if let Some(mut started) = call(tid, &format!("{}) = ?", head)) {
             started.returned = Returned::Unknown;
+            started.entered = entered;
             calls.push(started);
         }
     }
@@ -118,7 +124,7 @@ fn call(tid: u32, text: &str) -> Option<Call> {
     } else {
         Returned::Value(value_token(returned))
     };
-    Some(Call { tid, name: name.to_string(), arguments, returned, data: Vec::new() })
+    Some(Call { tid, name: name.to_string(), arguments, returned, data: Vec::new(), entered: 0 })
 }
 
 /// The bytes of one dump row, after its leading `| `: a hex offset of at least five digits (strace
@@ -644,8 +650,12 @@ mod tests {
     /// returns unknown, a failure keeps its errno, an interrupted one is restarted, and exit and
     /// signal lines are no calls. A line that is not a call refuses the trace.
     ///
+    /// An unfinished call keeps where it started, so a call that finished while it ran is seen to
+    /// overlap it.
+    ///
     /// Revert: drop the unfinished/resumed join → the fsync's descriptor is lost and the resumed
-    /// line refuses the trace.
+    /// line refuses the trace; count a call as entered where it finished → the fsync reads as
+    /// entered after the unlinkat.
     #[test]
     fn a_trace_reads_as_calls() {
         let text = "87    execve(\"/b/forklift\", [\"forklift\", \"--json\"], 0xffff /* 3 vars */) = 0\n\
@@ -660,7 +670,7 @@ mod tests {
         assert_eq!(calls[0].arguments.len(), 3);
         assert_eq!(calls[1].name, "unlinkat");
         assert_eq!(calls[1].returned, Returned::Failed("ENOENT".into()));
-        assert_eq!(calls[2], Call { tid: 88, name: "fsync".into(), arguments: vec!["12</s/work/.forklift/pallets>".into()], returned: Returned::Unknown, data: vec![] });
+        assert_eq!(calls[2], Call { tid: 88, name: "fsync".into(), arguments: vec!["12</s/work/.forklift/pallets>".into()], returned: Returned::Unknown, data: vec![], entered: 1 });
         assert_eq!(calls[3].returned, Returned::Restarted);
         assert!(parse("87    nonsense\n").is_err());
         assert!(parse("87    <... fsync resumed>) = 0\n").is_err(), "a resumed call that never started");

@@ -456,8 +456,9 @@ pub struct Counted {
     pub(crate) label: String,
     pub(crate) counting: Scratch,
     pub(crate) counting_root: Root,
-    /// The counting copy as it stood once the faulted record's files were written, before any line.
-    pub(crate) fixture: crate::power::Image,
+    /// The counting copy as it stood once the faulted record's files were written, before any
+    /// line: scanned only when the writes were dumped, since only the power loss reads it.
+    pub(crate) fixture: Option<crate::power::Image>,
     pub(crate) lines: Vec<CountedLine>,
     /// The file the faulted command recorded the scratch area's root in, when it did: the copies
     /// cannot stand for the run then. Reported only once the trace's own refusals are clear.
@@ -496,7 +497,7 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
     let counting_context = context_of(scenario, &corpus, programs, settings, &counting, &counting_environment);
     let counting_root = Root::of(counting.root()).map_err(io)?;
     counting_context.write_snapshot(faulted)?;
-    let fixture = crate::power::scan(counting.root()).map_err(io)?;
+    let fixture = if dumps { Some(crate::power::scan(counting.root()).map_err(io)?) } else { None };
     let mut lines = Vec::new();
     for (index, arguments) in counting_context.lines(faulted)?.into_iter().enumerate() {
         let before = listing(counting.root());
@@ -518,6 +519,15 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
     let path_bound = recorded_root(counting.root(), &[&original.given, &original.canonical, &counting_root.given, &counting_root.canonical]).map_err(io)?
         .map(|file| format!("path-bound: the faulted command recorded the scratch area's root in {}", file));
     Ok(Counting::Counted(Box::new(Counted { corpus, expected, faulted, label, counting, counting_root, fixture, lines, path_bound })))
+}
+
+/// Whether scenario `id` runs its kill points and its power loss, given the scenarios named for
+/// each (`--kill`, `--power`): naming either lane's scenarios picks them for that lane alone, and
+/// naming neither runs both over every scenario.
+pub fn lanes(kill: &[String], power: &[String], id: &str) -> (bool, bool) {
+    let named = !kill.is_empty() || !power.is_empty();
+    let picked = |ids: &[String]| !named || ids.iter().any(|named| named == id);
+    (picked(kill), picked(power))
 }
 
 /// What stops a counted scenario before its faults run, as (refusals, not run): the trace's own
@@ -947,9 +957,19 @@ mod tests {
         assert!(matches!(landing(&[], &rebased, &injected, Some(137)), Landing::NotReached { why } if why == "no call of the name was killed"));
     }
 
-    /// A file names the root only where the root ends a path component, so a sibling copy whose
-    /// name extends the root is no hit.
+    /// Naming one lane's scenarios leaves the other lane off; naming neither runs both everywhere.
     ///
+    /// Revert: read an empty list as every scenario per lane → `--kill h` alone runs every power loss.
+    #[test]
+    fn naming_one_lane_leaves_the_other_off() {
+        let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        assert_eq!(lanes(&[], &[], "h"), (true, true));
+        assert_eq!(lanes(&ids(&["h"]), &[], "h"), (true, false));
+        assert_eq!(lanes(&ids(&["h"]), &[], "g"), (false, false));
+        assert_eq!(lanes(&[], &ids(&["g"]), "g"), (false, true));
+        assert_eq!(lanes(&ids(&["h"]), &ids(&["g"]), "h"), (true, false));
+    }
+
     /// An unsound trace is reported as refused even when it is also path-bound; only a sound one
     /// is set aside as not run.
     ///
@@ -962,6 +982,9 @@ mod tests {
         assert_eq!(stopped(Vec::new(), None), None);
     }
 
+    /// A file names the root only where the root ends a path component, so a sibling copy whose
+    /// name extends the root is no hit.
+    ///
     /// Revert: match a plain substring → every copy's own `…-kill-3` name reads as path-bound.
     #[test]
     fn a_recorded_root_is_found_at_component_boundaries() {
