@@ -335,8 +335,9 @@ pub struct Replay {
     pub model: Model,
     root: Root,
     descriptions: Vec<Description>,
-    /// Descriptor tables by id, and the table each thread group uses.
-    tables: BTreeMap<u32, BTreeMap<i64, usize>>,
+    /// Descriptor tables by id, each descriptor's description with the index of the call that
+    /// installed it, and the table each thread group uses.
+    tables: BTreeMap<u32, BTreeMap<i64, (usize, usize)>>,
     table_of: BTreeMap<u32, u32>,
 }
 
@@ -412,7 +413,7 @@ impl Replay {
         }
     }
 
-    fn table(&mut self, group: u32) -> &mut BTreeMap<i64, usize> {
+    fn table(&mut self, group: u32) -> &mut BTreeMap<i64, (usize, usize)> {
         let id = self.table_of[&group];
         self.tables.get_mut(&id).expect("every table id names a table")
     }
@@ -428,7 +429,7 @@ impl Replay {
             _ => return Err(format!("no descriptor in {}", text)),
         };
         let into_area = target.as_deref().map(|target| self.root.holds(target));
-        match self.table(group).get(&fd).copied() {
+        match self.table(group).get(&fd).map(|(description, _)| *description) {
             // strace names what the number is now: one it shows outside the area was reused for
             // something the table never saw opened (a pipe, a socket, a descriptor an exec
             // closed), so the table's entry is stale.
@@ -571,12 +572,13 @@ impl Replay {
                 };
                 self.descriptions.push(Description { ino, offset: 0, append: flags.contains("O_APPEND") });
                 let description = self.descriptions.len() - 1;
-                self.table(group).insert(fd, description);
+                let now = self.model.now;
+                self.table(group).insert(fd, (description, now));
             }
             "dup" | "dup2" | "dup3" | "fcntl" => {
                 if call.name == "fcntl" && raw(1) == "F_SETFL" {
                     // The status flags belong to the open file description, shared by every dup.
-                    if let Some(description) = fd_of(raw(0)).and_then(|fd| self.table(group).get(&fd).copied()) {
+                    if let Some((description, _)) = fd_of(raw(0)).and_then(|fd| self.table(group).get(&fd).copied()) {
                         self.descriptions[description].append = raw(2).contains("O_APPEND");
                     }
                     return Ok(());
@@ -587,21 +589,27 @@ impl Replay {
                 let old = fd_of(raw(0));
                 let new = number()? as i64;
                 let found = old.and_then(|old| self.table(group).get(&old).copied());
+                let now = self.model.now;
                 match found {
-                    Some(description) => self.table(group).insert(new, description),
+                    Some((description, _)) => self.table(group).insert(new, (description, now)),
                     None => self.table(group).remove(&new),
                 };
             }
+            // A close frees its number before it returns, so a descriptor another thread was
+            // handed under that number while the close ran is not the one it closed.
             "close" => {
                 if let Some(fd) = fd_of(raw(0)) {
-                    self.table(group).remove(&fd);
+                    if self.table(group).get(&fd).is_some_and(|(_, installed)| *installed < call.entered) {
+                        self.table(group).remove(&fd);
+                    }
                 }
             }
             "close_range" => {
                 if !raw(2).contains("CLOSE_RANGE_CLOEXEC") {
                     let first = fd_of(raw(0)).unwrap_or(0);
                     let last = if raw(1).starts_with('~') { i64::MAX } else { fd_of(raw(1)).unwrap_or(i64::MAX) };
-                    self.table(group).retain(|fd, _| *fd < first || *fd > last);
+                    let entered = call.entered;
+                    self.table(group).retain(|fd, (_, installed)| *fd < first || *fd > last || *installed >= entered);
                 }
             }
             "read" | "readv" | "lseek" => {
@@ -1431,6 +1439,22 @@ mod tests {
         assert_eq!(data(&replayed(&[reused]).unwrap().volatile_image(), "w/a").unwrap(), b"old");
         let unnamed = "1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3\n".to_string();
         assert!(replayed(&[unnamed]).unwrap_err().contains("did not name"));
+    }
+
+    /// A close another thread's open overlapped frees only the descriptor it closed: the number
+    /// the open was handed while the close ran is the new file, and writes through it land.
+    ///
+    /// Revert: let a close remove whatever its number holds when it finishes → the write refuses
+    /// as a descriptor never seen opened.
+    #[test]
+    fn an_overlapped_close_leaves_the_descriptor_reopened_under_its_number() {
+        let text = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_RDONLY) = 3</s/w/a>\n\
+            1 clone(child_stack=0x1, flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM) = 2\n\
+            1 close(3</s/w/a> <unfinished ...>\n\
+            2 openat(AT_FDCWD</s/w>, \"b\", O_WRONLY|O_CREAT, 0644) = 3</s/w/b>\n\
+            1 <... close resumed>) = 0\n{}", write(2, 3, "/s/w/b", b"x"));
+        let model = replayed(&[text]).unwrap();
+        assert_eq!(data(&model.volatile_image(), "w/b").unwrap(), b"x");
     }
 
     /// The replay is held to the run: any path where its tree and the run's differ is named.
