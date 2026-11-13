@@ -293,7 +293,7 @@ mod tests {
                 write(&root, Kind::Remove, ".forklift/bundles/older", 700), write(&root, Kind::Write, ".forklift/lock", 800),
             ],
         );
-        assert_eq!(check(&[covered.clone()]), Vec::<String>::new());
+        assert_eq!(check(std::slice::from_ref(&covered)), Vec::<String>::new());
 
         let mut astray = covered.clone();
         astray.writes = vec![

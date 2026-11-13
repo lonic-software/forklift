@@ -15,7 +15,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::host::Host;
+use crate::proxy::Exchange;
 use crate::report::{Cell, Completeness};
+use crate::routewrites::Serving;
 use crate::scrub::{Environment, Scratch};
 use crate::tool::{self, Invocation, Outcome, ToolError};
 use crate::trace::{self, Root};
@@ -233,11 +236,60 @@ pub struct Observer<'a> {
     pub scenario: String,
     next: Counter<usize>,
     seen: RefCell<Vec<Evidence>>,
+    servings: RefCell<Vec<Serving>>,
+    untraced: RefCell<Vec<String>>,
 }
 
 impl<'a> Observer<'a> {
     pub fn new(strace: Option<&'a Path>, traces: &'a Path, schema: &'a Schema, leaves: &'a [Vec<String>], read_only: &'a BTreeSet<String>, scenario: &str) -> Observer<'a> {
-        Observer { strace, traces, schema, leaves, read_only, scenario: scenario.to_string(), next: Counter::new(0), seen: RefCell::new(Vec::new()) }
+        Observer { strace, traces, schema, leaves, read_only, scenario: scenario.to_string(), next: Counter::new(0), seen: RefCell::new(Vec::new()),
+            servings: RefCell::new(Vec::new()), untraced: RefCell::new(Vec::new()) }
+    }
+
+    /// Every traced serving finished so far.
+    pub fn servings(&self) -> Vec<Serving> {
+        self.servings.borrow().clone()
+    }
+
+    /// Why each host that should have been traced was not: strace's own words.
+    pub fn untraced(&self) -> Vec<String> {
+        self.untraced.borrow().clone()
+    }
+
+    /// Serves the warehouse at `root` with `program`, traced when a tracer is given. When strace
+    /// cannot attach, the host serves untraced and what strace said is kept for the report.
+    pub fn host(&self, program: &Path, root: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Host, ToolError> {
+        let Some(strace) = self.strace else { return Host::start(program, root, scratch, environment, limit) };
+        let base = self.trace_path("serve").with_extension("");
+        let (host, failed) = Host::start_traced(program, root, scratch, environment, limit, strace, &base)?;
+        if let Some(failed) = failed {
+            self.untraced.borrow_mut().push(format!("{}: strace could not attach to the server: {}", self.scenario, failed));
+        }
+        Ok(host)
+    }
+
+    /// Kills `host`, serving the warehouse at `root`, and keeps what its traces show: the serving,
+    /// for the server route write check, and the serve's evidence, for the write-op check. What
+    /// its proxy logged is returned.
+    pub fn finish_host(&self, host: Host, root: &Path, scratch: &Scratch) -> Result<Vec<Exchange>, ToolError> {
+        let traced = host.is_traced();
+        let (log, traces) = host.finish();
+        if !traced {
+            return Ok(log);
+        }
+        let spawn = |reason: String| ToolError::Spawn { program: root.to_path_buf(), reason };
+        let start = scratch.root().to_string_lossy().into_owned();
+        let mut writes = Vec::new();
+        for text in traces {
+            let text = text.map_err(|reason| spawn(format!("the server's trace: {}", reason)))?;
+            let calls = trace::parse(&text).map_err(|reason| spawn(format!("the server's trace: {}", reason)))?;
+            writes.extend(crate::kill::writes(&calls, &start));
+        }
+        let scratch_root = Root::of(scratch.root()).map_err(|error| spawn(error.to_string()))?;
+        let paths: Vec<String> = writes.iter().map(|write| write.path.clone()).collect();
+        self.seen.borrow_mut().push(Evidence { scenario: self.scenario.clone(), id: "forklift-server serve".to_string(), traced: true, writes: warehouse_writes(&paths, &scratch_root), changed: None });
+        self.servings.borrow_mut().push(Serving { scenario: self.scenario.clone(), root: root.to_string_lossy().into_owned(), exchanges: log.clone(), writes });
+        Ok(log)
     }
 
     /// A fresh trace file's path for this scenario, outside every scratch area.

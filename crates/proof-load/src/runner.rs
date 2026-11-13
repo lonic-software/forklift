@@ -188,9 +188,12 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
                 // Taken out first, so a new host that fails to start leaves no old one behind to
                 // log a second time.
                 if let Some(old) = host.take() {
-                    stopped.extend(old.proxy.log());
+                    stopped.extend(finish(old, observer, scratch)?);
                 }
-                *host = Some(Host::start(server, &root, scratch, environment, limit).map_err(RunError::Tool)?);
+                *host = Some(match observer {
+                    Some(observer) => observer.host(server, &root, scratch, environment, limit),
+                    None => Host::start(server, &root, scratch, environment, limit),
+                }.map_err(RunError::Tool)?);
             }
             Op::Bundle => {
                 let server = server.filter(|_| host.is_some())
@@ -293,8 +296,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
             }
             Op::StopHost => {
                 let gone = host.take().ok_or_else(|| RunError::Io(format!("scenario {} stops a host it does not serve", scenario.id)))?;
-                stopped.extend(gone.proxy.log());
-                drop(gone);
+                stopped.extend(finish(gone, observer, scratch)?);
                 // The kill leaves the server's lock behind, its holder gone: the harness killed
                 // the one holder, so it clears it, as an operator would.
                 let lock = host_root(scratch).join(".forklift").join("serve.lock");
@@ -387,7 +389,26 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
         Some(_) => census::walk(&host_root(scratch).join(".forklift")).map_err(|error| RunError::Io(error.to_string()))?,
         None => Vec::new(),
     };
+    // Observed, the build's host goes with its build, so its traces are read with the rest.
+    if observer.is_some() {
+        if let Some(last) = host.take() {
+            stopped.extend(finish(last, observer, scratch)?);
+        }
+    }
     Ok(Built { outcomes, walked, host_walked, taken, acknowledged, host: host.take(), stopped: std::mem::take(stopped) })
+}
+
+/// Stops `host`: through `observer` when there is one, so its traces are read, and otherwise by
+/// killing it. What its proxy logged is returned.
+fn finish(host: Host, observer: Option<&Observer>, scratch: &Scratch) -> Result<Vec<Exchange>, RunError> {
+    match observer {
+        Some(observer) => observer.finish_host(host, &host_root(scratch), scratch).map_err(RunError::Tool),
+        None => {
+            let log = host.proxy.log();
+            drop(host);
+            Ok(log)
+        }
+    }
 }
 
 /// A tool's JSON document, or null when its stdout is not one.

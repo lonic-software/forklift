@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use crate::census::Census;
 use crate::damage::{self, Binding, Exemption, Kind, Warehouse};
 use crate::routes::{Exemption as RouteExemption, Mount};
+use crate::routewrites::{Bound, Entry, RouteWrites};
+use crate::trace::Kind as Change;
 use crate::scenario::Scenario;
 use crate::writeops::Exemption as WriteExemption;
 use crate::writeops::Exemption::{ReadOnly, Unrunnable};
@@ -119,7 +121,6 @@ const GLOBAL: &str = "writes only the operator's own configuration and keys, out
 const PRINTS: &str = "prints what the binary is and touches no warehouse";
 const REPLACES_BINARY: &str = "replaces the binary under test, or the shell's aliases for it, outside every warehouse";
 const NEEDS_OLDER_FORMAT: &str = "upgrades a warehouse of an older format, and the version under test writes only its own";
-const SERVES: &str = "serves until stopped; its writes are the hosted scenarios' requests, which the server kill points grade";
 
 /// The commands the write-op check does not require a traced write of, by schema id (a server
 /// leaf as `forklift-server <words>`). A read-only one must still be run by some scenario, and
@@ -143,7 +144,6 @@ pub const WRITE_EXEMPTIONS: &[(&str, WriteExemption)] = &[
     ("version", Unrunnable(PRINTS)), ("self-update", Unrunnable(REPLACES_BINARY)),
     ("self-alias-install", Unrunnable(REPLACES_BINARY)), ("self-alias-uninstall", Unrunnable(REPLACES_BINARY)),
     ("upgrade", Unrunnable(NEEDS_OLDER_FORMAT)), ("forklift-server upgrade", Unrunnable(NEEDS_OLDER_FORMAT)),
-    ("forklift-server serve", Unrunnable(SERVES)),
 ];
 
 /// The server routes the route check does not require a successful answer of, by the route
@@ -158,6 +158,67 @@ pub const ROUTE_EXEMPTIONS: &[RouteExemption] = &[
     RouteExemption { method: "POST", path: "/objects/missing", mount: Mount::Protocol, reason: "sent by an origin move over withheld recipes and by heal's refetch into a hosted clone, and no scenario reaches either yet" },
     RouteExemption { method: "PUT", path: "/withheld/{hash}/recipe", mount: Mount::Protocol, reason: "sent when a lift's new history reaches content the host withholds, and no scenario builds that yet" },
 ];
+
+const fn entry(kind: Change, path: &'static str) -> Entry {
+    Entry { kind, path }
+}
+
+const fn route(method: &'static str, path: &'static str, mount: Mount, bound: Bound) -> RouteWrites {
+    RouteWrites { method, path, mount, bound }
+}
+
+const PUT_OBJECT: &[Entry] = &[
+    entry(Change::Mkdir, ".forklift/objects/**"), entry(Change::Write, ".forklift/objects/**"), entry(Change::Rename, ".forklift/objects/**"),
+];
+const PUT_WITHHELD_RECIPE: &[Entry] = &[
+    entry(Change::Mkdir, ".forklift/withheld/**"), entry(Change::Write, ".forklift/withheld/**"), entry(Change::Rename, ".forklift/withheld/**"),
+];
+const PUT_SIGNATURE: &[Entry] = &[
+    entry(Change::Mkdir, ".forklift/signatures/**"), entry(Change::Write, ".forklift/signatures/**"), entry(Change::Rename, ".forklift/signatures/**"),
+];
+const PUT_TRUST: &[Entry] = &[entry(Change::Write, ".forklift/trust*"), entry(Change::Rename, ".forklift/trust*")];
+const UPDATE_PALLET: &[Entry] = &[
+    entry(Change::Mkdir, ".forklift/pallets/**"), entry(Change::Write, ".forklift/pallets/**"), entry(Change::Rename, ".forklift/pallets/**"),
+];
+const DELETE_PALLET: &[Entry] = &[entry(Change::Remove, ".forklift/pallets/**"), entry(Change::Rename, ".forklift/pallets/**")];
+const POST_HOLD: &[Entry] = &[
+    entry(Change::Mkdir, ".forklift/holds/**"), entry(Change::Write, ".forklift/holds/**"), entry(Change::Rename, ".forklift/holds/**"),
+];
+const PUT_WAREHOUSE: &[Entry] = &[entry(Change::Mkdir, "{warehouse}"), entry(Change::Mkdir, "{warehouse}/**"), entry(Change::Write, "{warehouse}/**"), entry(Change::Rename, "{warehouse}/**")];
+
+/// Every server route the route table lists, bound to what it may write in the warehouse it
+/// serves, as a template relative to the host root filled from the request's captures.
+pub const ROUTE_WRITES: &[RouteWrites] = &[
+    route("GET", "/warehouse", Mount::Protocol, Bound::ReadOnly),
+    route("POST", "/objects/missing", Mount::Protocol, Bound::ReadOnly),
+    route("POST", "/objects/upload-targets", Mount::Protocol, Bound::ReadOnly),
+    route("POST", "/objects/batch", Mount::Protocol, Bound::ReadOnly),
+    route("GET", "/parcels/{parcel}/subtree/{*path}", Mount::Protocol, Bound::ReadOnly),
+    route("GET", "/objects/{hash}", Mount::Protocol, Bound::ReadOnly),
+    route("PUT", "/objects/{hash}", Mount::Protocol, Bound::Writes(PUT_OBJECT)),
+    route("PUT", "/withheld/{hash}/recipe", Mount::Protocol, Bound::Writes(PUT_WITHHELD_RECIPE)),
+    route("GET", "/signatures/{hash}", Mount::Protocol, Bound::ReadOnly),
+    route("PUT", "/signatures/{hash}", Mount::Protocol, Bound::Writes(PUT_SIGNATURE)),
+    route("PUT", "/trust", Mount::Protocol, Bound::Writes(PUT_TRUST)),
+    route("POST", "/pallets/{*name}", Mount::Protocol, Bound::Writes(UPDATE_PALLET)),
+    route("DELETE", "/pallets/{*name}", Mount::Protocol, Bound::Writes(DELETE_PALLET)),
+    route("POST", "/holds/{*name}", Mount::Protocol, Bound::Writes(POST_HOLD)),
+    route("POST", "/resolve", Mount::Protocol, Bound::ReadOnly),
+    route("GET", "/bundles/latest", Mount::Protocol, Bound::ReadOnly),
+    route("PUT", "/warehouses/{warehouse}", Mount::Root, Bound::Writes(PUT_WAREHOUSE)),
+    route("GET", "/healthz", Mount::Root, Bound::ReadOnly),
+];
+
+/// What the server writes on its own, after it answered: work a request started that goes on
+/// running on a timer or in a spawned task.
+pub const BACKGROUND_WRITES: &[Entry] = &[
+    entry(Change::Mkdir, ".forklift/bundles/**"), entry(Change::Write, ".forklift/bundles/**"), entry(Change::Rename, ".forklift/bundles/**"),
+    entry(Change::Remove, ".forklift/bundles/**"),
+];
+
+/// What the server writes admitting a warehouse it serves in multi mode. No scenario serves in
+/// multi mode, so these are expected unused.
+pub const ADMISSION_WRITES: &[Entry] = &[];
 
 /// What the damage completeness check finds missing: census names no binding or exemption covers,
 /// bindings and exemptions the census no longer lists, bindings naming a scenario that does not
