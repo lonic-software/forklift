@@ -1145,6 +1145,8 @@ impl Modes {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Access {
     Authenticated,
+    /// Open to everyone: no layer runs, and a handler without `Extension<Principal>` serves any
+    /// caller. The public routes are pinned by name in the tests.
     Public,
 }
 
@@ -5520,7 +5522,7 @@ mod tests {
             (token_state(ServeMode::Single(Arc::new(WarehouseHandle::new(single)))), false),
             (token_state(ServeMode::Multi { base: multi }), true),
         ];
-        let mut public = 0;
+        let mut public = Vec::new();
 
         for (state, is_multi) in cases {
             let addr = serve_router(state, 1 << 20).await;
@@ -5533,7 +5535,7 @@ mod tests {
                     let status = status_line(&mut stream).await;
 
                     assert!(status.contains(" 200 "), "public {method} {path}: {status}");
-                    public += 1;
+                    public.push((is_multi, format!("{method} {path}")));
                     continue;
                 }
 
@@ -5546,7 +5548,11 @@ mod tests {
             }
         }
 
-        assert_eq!(public, 2, "/healthz is the one public route, asked in both modes");
+        // A literal, not read from ROUTES or the table: making a route public is an edit here too.
+        let expected = [(false, "GET /healthz"), (true, "GET /healthz")]
+            .map(|(is_multi, route)| (is_multi, route.to_string()));
+
+        assert_eq!(public, expected, "the public routes, asked in each mode");
     }
 
     const REMOTE_PROTOCOL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/format/REMOTE_PROTOCOL.md");
@@ -5625,17 +5631,34 @@ mod tests {
     }
 
     /// The axum version the registration method list below was read from: `Router`'s methods that
-    /// register a route, a service, a nested router or a fallback.
+    /// register a route, a service, a nested router or a fallback, or reset one.
     const AXUM_VERSION_READ: &str = "0.8.9";
     const REGISTRATION_METHODS: &[&str] = &[
         "route", "route_service", "nest", "nest_service", "merge", "fallback", "fallback_service",
+        "method_not_allowed_fallback", "reset_fallback",
     ];
 
-    /// Every call of a registration method in non-test source, named by the function it is in.
+    /// Every call of a registration method in non-test source, named by the function it is in. A
+    /// call inside a `for` loop names the loop's iterable too (`route over ROUTES.iter.filter`), so
+    /// the one allowed call is pinned to the list it reads, not only to where it sits. A macro's
+    /// tokens are opaque to syn, so a registration method's name anywhere in a macro counts as a
+    /// call, and so do `include!` and `#[path]`, which compile source this scan does not read.
     #[derive(Default)]
     struct Registrations {
         within: Vec<String>,
+        iterables: Vec<String>,
         found: Vec<(String, String)>,
+    }
+
+    /// A `for` loop's iterable as its method chain, `ROUTES.iter.filter`; `<expr>` for anything
+    /// that is not a chain of method calls on a bare name.
+    fn iterable_shape(expression: &syn::Expr) -> String {
+        match expression {
+            syn::Expr::MethodCall(call) => format!("{}.{}", iterable_shape(&call.receiver), call.method),
+            syn::Expr::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 =>
+                path.path.segments[0].ident.to_string(),
+            _ => "<expr>".to_string(),
+        }
     }
 
     fn is_test_only(attributes: &[syn::Attribute]) -> bool {
@@ -5646,17 +5669,28 @@ mod tests {
     }
 
     impl Registrations {
-        fn note(&mut self, method: &syn::Ident) {
-            if REGISTRATION_METHODS.iter().any(|name| method == name) {
-                let within = self.within.last().cloned().unwrap_or_else(|| "<item>".to_string());
-                self.found.push((within, method.to_string()));
+        fn note(&mut self, method: &str) {
+            if REGISTRATION_METHODS.contains(&method) {
+                self.record(method.to_string());
             }
+        }
+
+        fn record(&mut self, what: String) {
+            let within = self.within.last().cloned().unwrap_or_else(|| "<item>".to_string());
+            let what = match self.iterables.last() {
+                Some(iterable) => format!("{what} over {iterable}"),
+                None => what,
+            };
+            self.found.push((within, what));
         }
     }
 
     impl<'ast> syn::visit::Visit<'ast> for Registrations {
         fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
             if !is_test_only(&item.attrs) {
+                if item.attrs.iter().any(|attribute| attribute.path().is_ident("path")) {
+                    self.record("#[path]".to_string());
+                }
                 syn::visit::visit_item_mod(self, item);
             }
         }
@@ -5684,16 +5718,35 @@ mod tests {
         }
 
         fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-            self.note(&call.method);
+            self.note(&call.method.to_string());
             syn::visit::visit_expr_method_call(self, call);
         }
 
-        /// `Router::route(router, …)`, or the method taken as a value.
+        /// `Router::route(router, …)`, `<Router>::route(router, …)`, or the method taken as a value.
         fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
-            if path.path.segments.len() > 1 {
-                self.note(&path.path.segments.last().unwrap().ident);
+            if path.qself.is_some() || path.path.segments.len() > 1 {
+                self.note(&path.path.segments.last().unwrap().ident.to_string());
             }
             syn::visit::visit_expr_path(self, path);
+        }
+
+        fn visit_expr_for_loop(&mut self, looped: &'ast syn::ExprForLoop) {
+            self.visit_expr(&looped.expr);
+            self.iterables.push(iterable_shape(&looped.expr));
+            self.visit_pat(&looped.pat);
+            self.visit_block(&looped.body);
+            self.iterables.pop();
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            if mac.path.segments.last().is_some_and(|segment| segment.ident == "include") {
+                self.record("include!".to_string());
+            }
+            let tokens = mac.tokens.to_string();
+            for word in tokens.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                self.note(word);
+            }
+            syn::visit::visit_macro(self, mac);
         }
     }
 
@@ -5710,7 +5763,16 @@ mod tests {
         let source = r#"
             fn inline(router: Router) -> Router { router.route("/a", get(a)).merge(other()) }
             fn by_path(router: Router) -> Router { Router::fallback(router, f) }
+            fn by_qself(router: Router) -> Router { <Router>::method_not_allowed_fallback(router, f) }
             impl Server { fn method(self) -> Router { self.router.nest_service("/b", s) } }
+            fn looped(mut router: Router) -> Router {
+                for entry in ROUTES.iter().chain(EXTRA) { router = router.route(entry.path, h()); }
+                router
+            }
+            fn in_macro(router: Router) -> Router { wrap!(router.route("/c", get(c))) }
+            include!("elsewhere.rs");
+            #[path = "elsewhere.rs"]
+            mod elsewhere;
             #[cfg(test)]
             mod tests { fn hook() -> Router { Router::new().route("/hook", post(h)) } }
         "#;
@@ -5718,11 +5780,16 @@ mod tests {
         let found = registrations_in(source);
 
         assert_eq!(found, [
-            ("inline".to_string(), "merge".to_string()),
-            ("inline".to_string(), "route".to_string()),
-            ("by_path".to_string(), "fallback".to_string()),
-            ("method".to_string(), "nest_service".to_string()),
-        ]);
+            ("inline", "merge"),
+            ("inline", "route"),
+            ("by_path", "fallback"),
+            ("by_qself", "method_not_allowed_fallback"),
+            ("method", "nest_service"),
+            ("looped", "route over ROUTES.iter.chain"),
+            ("in_macro", "route"),
+            ("<item>", "include!"),
+            ("<item>", "#[path]"),
+        ].map(|(within, what)| (within.to_string(), what.to_string())));
     }
 
     /// Reverts: any route, service, nested router or fallback registered anywhere in the crate's
@@ -5752,7 +5819,7 @@ mod tests {
 
         found.sort();
         let expected = [
-            ("server.rs", "register", "route"),
+            ("server.rs", "register", "route over ROUTES.iter.filter"),
             ("server.rs", "router", "nest"),
             ("server.rs", "router", "nest"),
         ].map(|(file, within, method)| (file.to_string(), within.to_string(), method.to_string()));
