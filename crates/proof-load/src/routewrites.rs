@@ -29,7 +29,8 @@ use crate::writeops::is_lock;
 
 /// One change a unit may make: its kind, and a path template relative to the host warehouse's
 /// root. A segment may hold `*`, any run of characters but `/`, and `{name}`, the request's
-/// capture of that name; a final `**` stands for one or more segments.
+/// capture of that name, percent-decoded; `{name[a..b]}` takes characters `a` to `b` of it, either
+/// bound left out for its end. A final `**` stands for one or more segments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub kind: Kind,
@@ -63,6 +64,28 @@ pub struct Serving {
     pub writes: Vec<Write>,
 }
 
+/// `text` with each `%XX` escape decoded; an escape that does not decode to UTF-8 is kept as
+/// written.
+fn decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let escape = (bytes[at] == b'%').then(|| text.get(at + 1..at + 3)).flatten().and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escape {
+            Some(byte) => {
+                out.push(byte);
+                at += 3;
+            }
+            None => {
+                out.push(bytes[at]);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+}
+
 /// A piece of a compiled template.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Piece {
@@ -87,8 +110,21 @@ fn compile(template: &str, captures: &BTreeMap<String, String>) -> Option<Vec<Pi
             rest = &rest[1..];
         } else if next == '{' {
             let close = rest.find('}')?;
-            let value = captures.get(&rest[1..close])?;
-            pieces.extend(value.chars().map(Piece::Literal));
+            let (name, range) = match rest[1..close].split_once('[') {
+                Some((name, range)) => (name, Some(range.strip_suffix(']')?)),
+                None => (&rest[1..close], None),
+            };
+            let value: Vec<char> = captures.get(name)?.chars().collect();
+            let value = match range {
+                None => &value[..],
+                Some(range) => {
+                    let (from, to) = range.split_once("..")?;
+                    let from = if from.is_empty() { 0 } else { from.parse().ok()? };
+                    let to = if to.is_empty() { value.len() } else { to.parse().ok()? };
+                    value.get(from..to)?
+                }
+            };
+            pieces.extend(value.iter().copied().map(Piece::Literal));
             rest = &rest[close + 1..];
         } else {
             pieces.push(Piece::Literal(next));
@@ -156,7 +192,7 @@ pub fn check(table: &RouteTable, mode: Mode, servings: &[Serving], bindings: &[R
             let from = exchange.forwarded?;
             let route = table.resolve(mode, &exchange.method, &exchange.path).ok().flatten().and_then(|route| {
                 let binding = bound(route)?;
-                let captures = routes::captures(&table.template(route, mode)?, &exchange.path)?;
+                let captures = routes::captures(&table.template(route, mode)?, &exchange.path)?.into_iter().map(|(name, value)| (name, decoded(&value))).collect();
                 Some((route.label(), binding, captures))
             });
             Some(Window { exchange, route, from, to: exchange.answered.unwrap_or(u64::MAX) })
@@ -266,6 +302,12 @@ mod tests {
         assert!(!fit("a/**", "a/"));
         assert!(fit("pallets/{name}", "pallets/feature/x"));
         assert!(!fit("objects/{missing}", "objects/ab12"));
+        assert!(fit("objects/{hash[..2]}/{hash[2..]}", "objects/ab/12"));
+        assert!(!fit("objects/{hash[..2]}/{hash[2..]}", "objects/ab/13"));
+        assert!(fit("meta/{name[1..5]}", "meta/eatu"));
+        assert!(!fit("objects/{hash[3..9]}", "objects/2"), "a range past the capture's end matches nothing");
+        assert_eq!(decoded("%40office"), "@office");
+        assert_eq!(decoded("a%2Fb%zz%"), "a/b%zz%");
         assert!(!holds(&[Entry { kind: Kind::Rename, path: "a/*" }], Kind::Write, "a/b", &captures), "a kind the entry does not name");
     }
 

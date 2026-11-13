@@ -167,22 +167,42 @@ const fn route(method: &'static str, path: &'static str, mount: Mount, bound: Bo
     RouteWrites { method, path, mount, bound }
 }
 
+// Each set is what a CI trace of the version under test showed its route write, checked against
+// the handler's source. A write is made atomically: a `<name>.tmp~<pid>-<n>` written, then renamed
+// onto the name, so both names are a rename's operands.
+
+// store_object_bytes: the object zstd-compressed at objects/<first two>/<rest>, its fan-out folder
+// made first.
 const PUT_OBJECT: &[Entry] = &[
-    entry(Change::Mkdir, ".forklift/objects/**"), entry(Change::Write, ".forklift/objects/**"), entry(Change::Rename, ".forklift/objects/**"),
+    entry(Change::Mkdir, ".forklift/objects/{hash[..2]}"), entry(Change::Write, ".forklift/objects/{hash[..2]}/{hash[2..]}.tmp~*"),
+    entry(Change::Rename, ".forklift/objects/{hash[..2]}/{hash[2..]}.tmp~*"), entry(Change::Rename, ".forklift/objects/{hash[..2]}/{hash[2..]}"),
 ];
+// withholding::record_digest: the withheld record rewritten whole. No scenario reaches it yet
+// (FORK-474), so this set is from the source alone.
 const PUT_WITHHELD_RECIPE: &[Entry] = &[
-    entry(Change::Mkdir, ".forklift/withheld/**"), entry(Change::Write, ".forklift/withheld/**"), entry(Change::Rename, ".forklift/withheld/**"),
+    entry(Change::Write, ".forklift/withheld.tmp~*"), entry(Change::Rename, ".forklift/withheld.tmp~*"), entry(Change::Rename, ".forklift/withheld"),
 ];
+// store_raw_parcel_signature: a sidecar beside its parcel, objects/<first two>/<rest>.sig.
 const PUT_SIGNATURE: &[Entry] = &[
-    entry(Change::Mkdir, ".forklift/signatures/**"), entry(Change::Write, ".forklift/signatures/**"), entry(Change::Rename, ".forklift/signatures/**"),
+    entry(Change::Write, ".forklift/objects/{hash[..2]}/{hash[2..]}.sig.tmp~*"),
+    entry(Change::Rename, ".forklift/objects/{hash[..2]}/{hash[2..]}.sig.tmp~*"), entry(Change::Rename, ".forklift/objects/{hash[..2]}/{hash[2..]}.sig"),
 ];
-const PUT_TRUST: &[Entry] = &[entry(Change::Write, ".forklift/trust*"), entry(Change::Rename, ".forklift/trust*")];
+// The office's trust file.
+const PUT_TRUST: &[Entry] = &[entry(Change::Write, ".forklift/trust.tmp~*"), entry(Change::Rename, ".forklift/trust.tmp~*"), entry(Change::Rename, ".forklift/trust")];
+// A ref update: the head at pallets/<name>, or meta/<name> for an `@name`, and the commit-graph
+// shards of the parcels it brings, graph/<first two>. `{name[1..]}` drops the `@`; for a user
+// pallet it names a meta head with its first letter cut, which no update writes.
 const UPDATE_PALLET: &[Entry] = &[
-    entry(Change::Mkdir, ".forklift/pallets/**"), entry(Change::Write, ".forklift/pallets/**"), entry(Change::Rename, ".forklift/pallets/**"),
+    entry(Change::Write, ".forklift/pallets/{name}.tmp~*"), entry(Change::Rename, ".forklift/pallets/{name}.tmp~*"), entry(Change::Rename, ".forklift/pallets/{name}"),
+    entry(Change::Mkdir, ".forklift/meta"),
+    entry(Change::Write, ".forklift/meta/{name[1..]}.tmp~*"), entry(Change::Rename, ".forklift/meta/{name[1..]}.tmp~*"), entry(Change::Rename, ".forklift/meta/{name[1..]}"),
+    entry(Change::Mkdir, ".forklift/graph"),
+    entry(Change::Write, ".forklift/graph/*.tmp~*"), entry(Change::Rename, ".forklift/graph/*.tmp~*"), entry(Change::Rename, ".forklift/graph/*"),
 ];
-const DELETE_PALLET: &[Entry] = &[entry(Change::Remove, ".forklift/pallets/**"), entry(Change::Rename, ".forklift/pallets/**")];
-const POST_HOLD: &[Entry] = &[
-    entry(Change::Mkdir, ".forklift/holds/**"), entry(Change::Write, ".forklift/holds/**"), entry(Change::Rename, ".forklift/holds/**"),
+// A ref deletion: the head removed, and its last head kept in the tombstones file.
+const DELETE_PALLET: &[Entry] = &[
+    entry(Change::Remove, ".forklift/pallets/{name}"),
+    entry(Change::Write, ".forklift/tombstones.tmp~*"), entry(Change::Rename, ".forklift/tombstones.tmp~*"), entry(Change::Rename, ".forklift/tombstones"),
 ];
 // create_warehouse: a `.creating-<id>-<pid>-<n>` staging folder prepared in full, an empty folder
 // at the id removed, the staging folder renamed onto it.
@@ -208,19 +228,17 @@ pub const ROUTE_WRITES: &[RouteWrites] = &[
     route("PUT", "/trust", Mount::Protocol, Bound::Writes(PUT_TRUST)),
     route("POST", "/pallets/{*name}", Mount::Protocol, Bound::Writes(UPDATE_PALLET)),
     route("DELETE", "/pallets/{*name}", Mount::Protocol, Bound::Writes(DELETE_PALLET)),
-    route("POST", "/holds/{*name}", Mount::Protocol, Bound::Writes(POST_HOLD)),
+    route("POST", "/holds/{*name}", Mount::Protocol, Bound::ReadOnly),
     route("POST", "/resolve", Mount::Protocol, Bound::ReadOnly),
     route("GET", "/bundles/latest", Mount::Protocol, Bound::ReadOnly),
     route("PUT", "/warehouses/{warehouse}", Mount::Root, Bound::Writes(PUT_WAREHOUSE)),
     route("GET", "/healthz", Mount::Root, Bound::ReadOnly),
 ];
 
-/// What the server writes on its own, after it answered: work a request started that goes on
-/// running on a timer or in a spawned task.
-pub const BACKGROUND_WRITES: &[Entry] = &[
-    entry(Change::Mkdir, ".forklift/bundles/**"), entry(Change::Write, ".forklift/bundles/**"), entry(Change::Rename, ".forklift/bundles/**"),
-    entry(Change::Remove, ".forklift/bundles/**"),
-];
+/// What the server writes on its own, after it answered: work a request or a command started
+/// that goes on running in a spawned task. Its redaction round deletes what a redaction or a
+/// withhold took away once the warehouse drains (`delete_drained`, through the redaction deleter).
+pub const BACKGROUND_WRITES: &[Entry] = &[entry(Change::Remove, ".forklift/objects/*/*")];
 
 /// What the server writes admitting a request: nothing, as admission asks a hook over the network
 /// and writes no file. Kept as its own set so a version that records admissions must declare it.
