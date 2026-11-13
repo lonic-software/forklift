@@ -76,6 +76,16 @@ enum Command {
         /// How many injected runs at once. Defaults to the machine's parallelism.
         #[arg(long)]
         jobs: Option<usize>,
+        /// An empty or new directory on a small volume of its own (a size-capped tmpfs, a RAM disk),
+        /// which the disk-full faults fill. Without it they are reported as not run.
+        #[arg(long)]
+        capped_volume: Option<PathBuf>,
+        /// Disk full under this scenario's faulted command; repeatable. Without it, none.
+        #[arg(long = "disk-full")]
+        disk_full: Vec<String>,
+        /// A read-only warehouse under this scenario's faulted command; repeatable. Without it, none.
+        #[arg(long = "read-only")]
+        read_only: Vec<String>,
     },
 }
 
@@ -90,7 +100,10 @@ fn described(program: &std::path::Path) -> String {
 }
 
 fn main() -> ExitCode {
-    let Command::Run { source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, power, power_variants, jobs } = Cli::parse().command;
+    let Command::Run {
+        source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, power, power_variants, jobs,
+        capped_volume, disk_full, read_only: read_only_lane,
+    } = Cli::parse().command;
     let started = std::time::Instant::now();
 
     let mut output = match Output::claim(&out) {
@@ -109,7 +122,7 @@ fn main() -> ExitCode {
         }
     };
 
-    for (flag, ids) in [("--kill", &kill), ("--power", &power)] {
+    for (flag, ids) in [("--kill", &kill), ("--power", &power), ("--disk-full", &disk_full), ("--read-only", &read_only_lane)] {
         if let Some(unknown) = ids.iter().find(|id| !scenario::catalog().iter().any(|scenario| &scenario.id == *id)) {
             eprintln!("proof-load: {} {}: no such scenario", flag, unknown);
             return ExitCode::from(2);
@@ -273,7 +286,7 @@ fn main() -> ExitCode {
                             let _ = std::fs::write(output.root().join(format!("{}.json", label)), detail);
                             rows.push(Row {
                                 scenario: format!("{} {}{} {:?}", run.scenario, if run.warehouse == Warehouse::Host { "host:" } else { "" }, run.target, run.kind),
-                                category: Category::DamagedFiles,
+                                category: if run.kind.plants() { Category::DeadPidLock } else { Category::DamagedFiles },
                                 binding: "forklift".to_string(),
                                 grade: run.grade,
                                 recoverability: run.recoverability,
@@ -288,6 +301,104 @@ fn main() -> ExitCode {
         }
     };
     let fault_check = Completeness { check: "damaged-file faults ran".to_string(), cell: damaged_cell.clone(), missing: fault_errors };
+
+    // Disk full on the capped volume and a read-only work folder, each under the faulted command of
+    // the scenarios named for it, lifted before the grading readback.
+    let picked = |named: &[String]| -> Vec<&scenario::Scenario> { scenarios.iter().filter(|scenario| named.contains(&scenario.id)).collect() };
+    let resolved = match (&forklift, &git) {
+        (None, _) => Err("no forklift binary given"),
+        (_, None) => Err("no git binary given to lay out the readback"),
+        (Some(forklift), Some(git)) => match (tool::absolute(forklift), tool::absolute(git)) {
+            (Ok(forklift), Ok(git)) => Ok(Programs { forklift, git, server: server.clone() }),
+            _ => {
+                eprintln!("proof-load: cannot resolve the tool paths");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let mut condition_errors: BTreeMap<Category, Vec<String>> = BTreeMap::new();
+    let mut lifted = Vec::new();
+    let disk_full_cell = match (&resolved, &capped_volume) {
+        (Err(reason), _) => Cell::not_run(reason),
+        _ if Platform::current() == Platform::Windows => Cell::not_run("no capped volume is built on Windows in this harness"),
+        (_, None) => Cell::not_run("no capped volume given"),
+        _ if picked(&disk_full).is_empty() => Cell::not_run("no scenario this run picked was named for it"),
+        (Ok(programs), Some(volume)) => {
+            let mut capped = match Output::claim(volume) {
+                Ok(capped) => capped,
+                Err(error) => {
+                    eprintln!("proof-load: the capped volume: {}", error);
+                    return ExitCode::from(2);
+                }
+            };
+            let ballast = capped.root().join("ballast");
+            let errors = condition_errors.entry(Category::DiskFull).or_default();
+            for scenario in picked(&disk_full) {
+                let consumed = discarded_area(&mut capped, &format!("{}-counted", scenario.id), &search_path, |scratch, environment|
+                    proof_load::conditions::consumed(scenario, &faulted_corpus(seed), programs, scratch, environment, limit, &ballast));
+                let consumed = match consumed {
+                    Ok(consumed) => consumed,
+                    Err(error) => {
+                        errors.push(format!("{} disk full: {}", scenario.id, error));
+                        continue;
+                    }
+                };
+                for free in proof_load::conditions::points(consumed) {
+                    let result = discarded_area(&mut capped, &format!("{}-free-{}", scenario.id, free), &search_path, |scratch, environment|
+                        proof_load::conditions::disk_full(scenario, &faulted_corpus(seed), programs, scratch, environment, limit, &ballast, free)
+                            .map_err(|error| error.to_string()));
+                    // A fault that failed part-way may have left its ballast; the next point fills afresh.
+                    let _ = proof_load::damage::apply(&ballast, proof_load::damage::Kind::Delete, 0);
+                    match result {
+                        Ok(run) => lifted.push((Category::DiskFull, format!("of {} B the faulted command consumes", consumed), run)),
+                        Err(error) => errors.push(format!("{} free {} B: {}", scenario.id, free, error)),
+                    }
+                }
+            }
+            // A few points of a continuum of free space, so sampled; none graded is none run.
+            if lifted.iter().any(|(category, _, _)| *category == Category::DiskFull) { Cell::Sampled } else { Cell::not_run("no disk-full fault graded") }
+        }
+    };
+    let mut writable = None;
+    let read_only_cell = match &resolved {
+        Err(reason) => Cell::not_run(reason),
+        _ if picked(&read_only_lane).is_empty() => Cell::not_run("no scenario this run picked was named for it"),
+        Ok(programs) => {
+            let errors = condition_errors.entry(Category::ReadOnly).or_default();
+            for scenario in picked(&read_only_lane) {
+                let result = output.scratch(&format!("{}-read-only", scenario.id)).map_err(|error| error.to_string()).and_then(|scratch| {
+                    let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
+                    proof_load::conditions::read_only(scenario, &faulted_corpus(seed), programs, &scratch, &environment, limit).map_err(|error| error.to_string())
+                });
+                match result {
+                    Ok(Some(run)) => lifted.push((Category::ReadOnly, "write bits cleared on the work folder, no unprivileged remount".to_string(), run)),
+                    Ok(None) => writable = Some(proof_load::conditions::STAYS_WRITABLE),
+                    Err(error) => errors.push(format!("{} read-only: {}", scenario.id, error)),
+                }
+            }
+            match writable {
+                _ if lifted.iter().any(|(category, _, _)| *category == Category::ReadOnly) => Cell::Run,
+                Some(reason) => Cell::not_run(reason),
+                None => Cell::not_run("no read-only fault graded"),
+            }
+        }
+    };
+    for (category, note, run) in lifted {
+        let label = format!("{}-{}", run.scenario, run.condition).replace(' ', "-");
+        let _ = std::fs::write(output.root().join(format!("{}.json", label)), serde_json::to_string(&run).unwrap_or_default());
+        let mut note = note;
+        if !run.graded.unextractable.is_empty() {
+            note.push_str(&format!("; unextractable remedies: {}", run.graded.unextractable.join("; ")));
+        }
+        rows.push(Row {
+            scenario: format!("{} {}", run.scenario, run.condition), category, binding: "forklift".to_string(),
+            grade: run.graded.grade, recoverability: run.graded.recoverability, note: Some(note),
+        });
+    }
+    let condition_checks: Vec<Completeness> = [(Category::DiskFull, "disk-full faults ran", &disk_full_cell), (Category::ReadOnly, "read-only faults ran", &read_only_cell)]
+        .into_iter().map(|(category, check, cell)| Completeness {
+            check: check.to_string(), cell: cell.clone(), missing: condition_errors.remove(&category).unwrap_or_default(),
+        }).collect();
 
     // Every scenario's faulted command killed at each call that changes or syncs a file, and its
     // power loss at each of those moments, Linux only.
@@ -388,15 +499,19 @@ fn main() -> ExitCode {
     }
 
     let mut coverage = CoverageTable::new(Platform::current(), |category: Category| match category {
-        Category::DamagedFiles => damaged_cell.clone(),
+        // The dead-holder locks are planted by the damage lane, binding by binding.
+        Category::DamagedFiles | Category::DeadPidLock => damaged_cell.clone(),
         Category::KillPointsClient => kill_cell.clone(),
         Category::PowerLossClient => power_cell.clone(),
+        Category::DiskFull => disk_full_cell.clone(),
+        Category::ReadOnly => read_only_cell.clone(),
         _ => Cell::not_run("no runner for this fault in this build of the harness"),
     });
     if matches!(kill_cell, Cell::Run | Cell::Sampled) || not_reached > 0 {
         coverage.not_reached.insert(Category::KillPointsClient, not_reached);
     }
     let mut completeness = vec![damage_check, walk_check, fault_check];
+    completeness.extend(condition_checks);
     completeness.extend(write_checks);
     completeness.extend(kill_completeness);
     completeness.extend(power_completeness);
@@ -428,6 +543,23 @@ fn main() -> ExitCode {
     }
 
     if report.failed() { ExitCode::from(1) } else { ExitCode::SUCCESS }
+}
+
+/// Runs `run` in a new scratch area `label` of `volume`, then removes the area, failed or not: what
+/// one leaves on a small capped volume would take the free space of the next, and the details of
+/// each graded fault are written to the output.
+fn discarded_area<T>(
+    volume: &mut Output, label: &str, search_path: &Option<std::ffi::OsString>,
+    run: impl FnOnce(&proof_load::scrub::Scratch, &Environment) -> Result<T, String>,
+) -> Result<T, String> {
+    let scratch = volume.scratch(label).map_err(|error| error.to_string())?;
+    let root = scratch.root().to_path_buf();
+    let result = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())
+        .and_then(|environment| run(&scratch, &environment));
+    drop(scratch);
+    #[allow(clippy::disallowed_methods, reason = "a scratch area the harness made itself on the capped volume; no retry is wanted")]
+    let _ = std::fs::remove_dir_all(&root);
+    result
 }
 
 /// The corpus a faulted command runs over, shared by every lane: the small shape with one record

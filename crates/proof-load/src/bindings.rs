@@ -18,6 +18,8 @@ const FILE: &[Kind] = &[Kind::FlipByte, Kind::Truncate, Kind::Zero, Kind::Delete
 /// A lock file left in place between commands: empty, so there is no byte to flip and nothing to cut.
 const LOCK_FILE: &[Kind] = &[Kind::Delete];
 const FOLDER: &[Kind] = &[Kind::Delete];
+/// A lock file that exists only while a command holds it, planted as a holder killed hard leaves it.
+const DEAD_HOLDER: &[Kind] = &[Kind::DeadPidLock];
 
 const fn bound(name: &'static str, kinds: &'static [Kind]) -> Binding {
     bound_in(name, "history", kinds)
@@ -83,12 +85,14 @@ pub const BINDINGS: &[Binding] = &[
     bound_in("unavailable", "withheld", FILE),
     bound_in("redactions-applied", "redacted", FILE),
     bound_in("unvouched-heads", "unvouched", FILE),
+    bound("{bay}lock", DEAD_HOLDER),
+    bound_in("store.lock", "compacted", DEAD_HOLDER),
+    bound_in("serve.lock", "compacted", DEAD_HOLDER),
 ];
 
 const NO_MIRROR_ORACLE: &str = "no mirror oracle: the corpus configures no mirror url, so nothing reads a mirror back";
 const INTERRUPTED: &str = "present only while a command runs or after one is interrupted, and removed when it finishes: no finished history holds one to damage, so the kill-point faults grade it";
 const SYNC_FAILED: &str = "written only when a directory sync after a rename fails, and cleared by heal: no finished history holds one to damage, so the power-loss and kill-point faults grade it";
-const HELD_LOCK: &str = "removed when the command holding it exits, a hard kill leaving it behind: the dead-process lock fault grades it, not a damaged copy";
 const PATH_BOUND: &str = "path-bound: a bay records its absolute path, so a run on a copy cannot reach it";
 
 pub const EXEMPTIONS: &[Exemption] = &[
@@ -106,9 +110,6 @@ pub const EXEMPTIONS: &[Exemption] = &[
     Exemption { name: "origin-move", reason: INTERRUPTED },
     Exemption { name: "taint/", reason: SYNC_FAILED },
     Exemption { name: "taint/<name>", reason: SYNC_FAILED },
-    Exemption { name: "store.lock", reason: HELD_LOCK },
-    Exemption { name: "serve.lock", reason: HELD_LOCK },
-    Exemption { name: "{bay}lock", reason: HELD_LOCK },
 ];
 
 const READS: &str = "reads the warehouse and writes nothing to it";
@@ -149,13 +150,16 @@ pub const WRITE_EXEMPTIONS: &[(&str, WriteExemption)] = &[
 /// exist, and bindings whose scenario was built (`created` holds what each built scenario created in
 /// each warehouse, the host's empty when it hosts none) without creating the name in the warehouse
 /// the binding damages. A scenario that was not built proves nothing either way; its build failure
-/// is the census walk's to report.
+/// is the census walk's to report. A binding whose kinds all plant their path is not checked against
+/// what the scenario created: the path exists only while a command holds it, and the fault makes it.
 pub fn check(census: &Census, bindings: &[Binding], exemptions: &[Exemption], scenarios: &[Scenario], created: &BTreeMap<(String, Warehouse), Vec<String>>) -> Vec<String> {
     let mut missing: Vec<String> = damage::uncovered(census, bindings, exemptions).into_iter().map(|name| name.path).collect();
     missing.extend(damage::stale(census, bindings, exemptions).into_iter().map(|name| format!("stale binding: {}", name)));
     for binding in bindings {
         if !scenarios.iter().any(|scenario| scenario.id == binding.scenario) {
             missing.push(format!("{}: its scenario {} does not exist", binding.name, binding.scenario));
+        } else if binding.kinds.iter().all(|kind| kind.plants()) {
+            continue;
         } else if created.get(&(binding.scenario.to_string(), binding.warehouse)).is_some_and(|names| !names.iter().any(|name| name == binding.name)) {
             let warehouse = match binding.warehouse { Warehouse::Client => "", Warehouse::Host => " on its host" };
             missing.push(format!("{}: its scenario {} does not create it{}", binding.name, binding.scenario, warehouse));
@@ -205,6 +209,32 @@ mod tests {
         let hosted_only = BTreeMap::from([client(&["objects/<xx>/<hash>"]), host(&["warehouse"])]);
         assert_eq!(check(&census, &on_host, &exemptions, &scenarios, &hosted_only), Vec::<String>::new());
         assert_eq!(check(&census, &bindings, &exemptions, &scenarios, &hosted_only), vec!["warehouse: its scenario history does not create it"]);
+    }
+
+    /// A planted binding names a path its scenario never leaves behind, so the creation check skips
+    /// it; a binding that also damages is still checked.
+    ///
+    /// Revert: drop the planting skip → `{bay}lock` reads as not created by `history`.
+    #[test]
+    fn a_planted_binding_is_not_checked_against_what_was_built() {
+        let doc = "<!-- census:start -->\n| Path | Class | Names |\n|---|---|---|\n| `{bay}lock` | lock | `a::L` |\n<!-- census:end -->\n";
+        let census = Census::parse(doc, PathBuf::from("sample")).unwrap().unwrap();
+        let scenarios = vec![Scenario { id: "history".into(), history: vec![], then: vec![], damage: None }];
+        let built = BTreeMap::from([(("history".to_string(), Warehouse::Client), vec!["warehouse".to_string()])]);
+        assert_eq!(check(&census, &[bound("{bay}lock", DEAD_HOLDER)], &[], &scenarios, &built), Vec::<String>::new());
+        const MIXED: &[Kind] = &[Kind::DeadPidLock, Kind::Delete];
+        assert_eq!(check(&census, &[bound("{bay}lock", MIXED)], &[], &scenarios, &built), vec!["{bay}lock: its scenario history does not create it"]);
+    }
+
+    /// Every planting binding names a literal path once `{bay}` is the main bay's: a planted path is
+    /// absent, so there is no walk to resolve a pattern against.
+    ///
+    /// Revert: plant `objects/<xx>/<hash>` → it names no file.
+    #[test]
+    fn planting_bindings_name_literal_paths() {
+        for binding in BINDINGS.iter().filter(|binding| binding.kinds.iter().any(|kind| kind.plants())) {
+            assert!(!damage::planted(binding.name).contains(['<', '{']), "{} plants a pattern", binding.name);
+        }
     }
 
     /// The bindings file covers this tree's whole census and lists nothing the census does not: a

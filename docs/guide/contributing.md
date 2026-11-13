@@ -124,7 +124,18 @@ Notes:
   so no file keeps its inode or times, and a stat cache trusting an unchanged file over a lost
   object is not exercised; every row says that too. A call the model cannot replay, or
   a replay whose tree differs from the traced run's at any line's start or at its end, refuses
-  the scenario's power loss. Every
+  the scenario's power loss. The environment faults run under the faulted command of the
+  scenarios named for them and are lifted before the readback and retry that grade them: a lock
+  left by a holder that no longer runs is planted as a damage binding (`{bay}lock`, `store.lock`,
+  `serve.lock`); `--read-only` clears the write bits of the work folder, warehouse included, and
+  is not run where that still admits a write (root, Windows); `--disk-full` fills a volume given
+  as `--capped-volume` (an empty or new directory on a small volume of its own, which CI makes as
+  a 128 MiB tmpfs on Linux and a RAM disk on macOS) with a ballast file, leaving none, a quarter,
+  half and three quarters of the most the command consumes after any of its lines, and lifts it
+  by removing the ballast. A fault whose condition no longer held when the command ended, every
+  line of it landed, is listed as missing from its lane's check and fails the run; one that held
+  is graded, so a refused write the tool swallowed counts as an acknowledgement. A retry resumes at the line that did not land, as a user
+  re-runs the step that failed. Every
   run also checks write-op completeness: each command `forklift self schema` lists, and each leaf
   subcommand of `forklift-server --help`, must be seen writing to a warehouse in some scenario's
   trace (Linux), or be exempt in `WRITE_EXEMPTIONS` in `crates/proof-load/src/bindings.rs`; a

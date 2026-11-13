@@ -21,9 +21,34 @@ pub enum Kind {
     Zero,
     /// Remove it; a folder is removed with everything in it.
     Delete,
-    /// Create it, for a lock file that only exists while a command holds it: planting it is how its
-    /// scenario creates the path.
-    Plant,
+    /// Create it holding the PID of a process that has exited, as a holder killed hard leaves a lock
+    /// file that only exists while a command holds it: planting it is how its scenario creates the
+    /// path, so its binding is not checked against what the scenario built.
+    DeadPidLock,
+}
+
+impl Kind {
+    /// Whether the kind creates its target rather than damaging one the scenario built.
+    pub fn plants(self) -> bool {
+        matches!(self, Kind::DeadPidLock)
+    }
+}
+
+/// The path a planting binding's `name` names in the main bay: the name with `{bay}` dropped. A
+/// planted path is absent by definition, so it is never resolved against the walk.
+pub fn planted(name: &str) -> String {
+    name.replace("{bay}", "")
+}
+
+/// The PID of a process this harness started and has already reaped: a holder that no longer
+/// runs. The harness's own binary, asked for its help, is the one program certainly present.
+fn dead_pid() -> std::io::Result<u32> {
+    let mut child = std::process::Command::new(std::env::current_exe()?).arg("--help")
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .spawn()?;
+    let pid = child.id();
+    child.wait()?;
+    Ok(pid)
 }
 
 /// The warehouse a binding damages: the client's, beside the work tree, or the host's a scenario
@@ -82,11 +107,11 @@ pub fn apply(path: &Path, kind: Kind, seed: u64) -> Result<(), DamageError> {
     let exists = std::fs::symlink_metadata(path).is_ok();
 
     match kind {
-        Kind::Plant => {
+        Kind::DeadPidLock => {
             if exists {
                 return Err(DamageError::Io(format!("{}: already present, so planting it creates nothing", path.display())));
             }
-            std::fs::write(path, b"").map_err(io)
+            std::fs::write(path, format!("{}\n", dead_pid().map_err(io)?)).map_err(io)
         }
         _ if !exists => Err(DamageError::TargetAbsent(path.display().to_string())),
         Kind::Delete if std::fs::symlink_metadata(path).map_err(io)?.is_dir() => {
@@ -137,7 +162,7 @@ mod tests {
     /// `store.lock` binding.
     #[test]
     fn completeness_is_per_listed_name() {
-        let bindings = [Binding { name: "store.lock", scenario: "stack", warehouse: Warehouse::Client, kinds: &[Kind::Plant] }];
+        let bindings = [Binding { name: "store.lock", scenario: "stack", warehouse: Warehouse::Client, kinds: &[Kind::DeadPidLock] }];
         let exemptions = [Exemption { name: "trust", reason: "test" }];
         let missing: Vec<String> = uncovered(&census(), &bindings, &exemptions).into_iter().map(|name| name.path).collect();
         assert_eq!(missing, vec!["serve.lock"]);
@@ -159,15 +184,37 @@ mod tests {
             assert_eq!(apply(&target, kind, 3), Err(DamageError::TargetAbsent(target.display().to_string())));
         }
 
-        apply(&target, Kind::Plant, 0).unwrap();
+        apply(&target, Kind::DeadPidLock, 0).unwrap();
         assert!(target.exists());
-        assert!(apply(&target, Kind::Plant, 0).is_err());
+        assert!(apply(&target, Kind::DeadPidLock, 0).is_err());
 
         std::fs::write(&target, b"abcd").unwrap();
         apply(&target, Kind::FlipByte, 5).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), [b'a', !b'b', b'c', b'd']);
         apply(&target, Kind::Truncate, 0).unwrap();
         assert_eq!(std::fs::read(&target).unwrap().len(), 2);
+    }
+
+    /// A planted lock holds the PID of a process that has exited, one line, as forklift writes its
+    /// own; `{bay}` names the main bay's path.
+    ///
+    /// Revert: plant an empty file → the PID line is missing; plant the live harness's own PID →
+    /// it is not a dead holder.
+    #[test]
+    fn a_planted_lock_names_a_dead_holder() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("proof-load-damage-plant-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join(planted("{bay}lock"));
+        assert_eq!(target, dir.join("lock"));
+        apply(&target, Kind::DeadPidLock, 0).unwrap();
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(text.ends_with('\n') && text.lines().count() == 1, "{:?}", text);
+        let pid: u32 = text.trim().parse().unwrap();
+        assert_ne!(pid, std::process::id());
+        #[cfg(target_os = "linux")]
+        assert!(!std::path::Path::new(&format!("/proc/{}", pid)).exists(), "process {} still runs", pid);
+        assert!(Kind::DeadPidLock.plants() && !Kind::Delete.plants());
     }
 
     /// No kind but Delete applies to an empty file (as the lock files are): each would leave it

@@ -418,6 +418,8 @@ pub fn catalog() -> Vec<Scenario> {
         // Enrolled, so the history ends with a full audit.
         named("signed", vec![record(0), Op::Enroll, record(1), record(2), Op::Verify]),
         named("packed", vec![record(0), Op::Enroll, record(1), record(2), Op::Pack]),
+        // The faulted command records and then repacks in full, taking the store and serve locks.
+        Scenario { then: vec![run(&["store", "compact", "--all"])], ..named("compacted", vec![record(0), record(1), record(2)]) },
         // The variant changes every file of record 0 on the side branch, and record 1 changes at
         // least one of them again on main, so the merge and the pick stop on a conflict.
         named("conflicted", vec![

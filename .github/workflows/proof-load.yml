@@ -1,7 +1,7 @@
 # Proof Load, the per-PR lane: fault the binaries users get. forklift and forklift-server are built
 # from the pull request's head for the release target of each OS (release.yml's matrix), not the
-# host default the test job builds, and the harness runs its completeness checks and every
-# damaged-file binding against one small seed.
+# host default the test job builds, and the harness runs its completeness checks, every
+# damaged-file binding, and the environment faults against one small seed.
 #
 # Non-blocking while its flake rate is unknown: the run step continues on error, so the job reports
 # its grades without failing the check. Whether and how it gates after the trial is FORK-445.
@@ -53,18 +53,37 @@ jobs:
       - name: Build the harness
         run: cargo build --release --locked -p proof-load
 
+      # Disk full needs a small volume of its own for the harness to fill: a size-capped tmpfs on
+      # Linux, a RAM disk on macOS. Windows builds none.
+      - name: Make the capped volume
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            capped="$RUNNER_TEMP/capped"; mkdir -p "$capped"
+            sudo mount -t tmpfs -o size=128m,mode=1777 tmpfs "$capped"
+          else
+            device=$(hdiutil attach -nomount ram://262144 | awk '{print $1}')
+            diskutil erasevolume HFS+ PLCAP "$device"
+            capped=/Volumes/PLCAP
+          fi
+          df -h "$capped"
+          echo "CAPPED=$capped" >> "$GITHUB_ENV"
+
       - name: Run
         id: run
         continue-on-error: true
         shell: bash
         run: |
-          exe=""; git=$(command -v git); kill=()
+          exe=""; git=$(command -v git); kill=(); capped=()
           if [ "$RUNNER_OS" = Windows ]; then exe=".exe"; git=$(cygpath -w "$git"); fi
           # Kill points need strace, so Linux only; one scenario's keep the lane inside its budget.
           if [ "$RUNNER_OS" = Linux ]; then kill=(--strace "$(command -v strace)" --kill history --power history --power-variants 4); fi
+          if [ -n "${CAPPED:-}" ]; then capped=(--capped-volume "$CAPPED/proof-load" --disk-full history --disk-full compacted); fi
           bin=target/${{ matrix.target }}/release
           target/release/proof-load$exe run --source . --out "$RUNNER_TEMP/proof-load" --budget 2700 \
-            --forklift "$bin/forklift$exe" --forklift-server "$bin/forklift-server$exe" --git "$git" "${kill[@]}"
+            --forklift "$bin/forklift$exe" --forklift-server "$bin/forklift-server$exe" --git "$git" \
+            --read-only history --read-only compacted "${kill[@]}" "${capped[@]}"
 
       - name: Summary
         if: ${{ !cancelled() }}
