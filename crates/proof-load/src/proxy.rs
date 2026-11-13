@@ -383,6 +383,20 @@ struct Upstream {
 }
 
 impl Upstream {
+    /// Whether the server has closed this kept connection, or sent something no request asked
+    /// for: either way it is not one to send a request on. Looked at without waiting.
+    fn stale(&self) -> bool {
+        if !self.reader.buffer().is_empty() {
+            return true;
+        }
+        if self.writer.set_nonblocking(true).is_err() {
+            return true;
+        }
+        let peeked = self.writer.peek(&mut [0u8; 1]);
+        let restored = self.writer.set_nonblocking(false);
+        !matches!(peeked, Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock) || restored.is_err()
+    }
+
     fn connect(address: SocketAddr) -> std::io::Result<Upstream> {
         let stream = TcpStream::connect_timeout(&address, Duration::from_secs(10))?;
         stream.set_read_timeout(Some(UPSTREAM_TIMEOUT))?;
@@ -450,8 +464,14 @@ fn serve_connection(client: TcpStream, state: &State) {
             let address = *lock(&state.upstream);
             loop {
                 // A kept connection the server has since closed (an idle close, or a close after a
-                // refusal that never said so) is noticed only on use: it is opened again, once, as
-                // a client does. A connection just opened is not.
+                // refusal that never said so) is opened again before anything is sent on it. One
+                // that fails as the request goes out is opened again, once: the server read none
+                // of it. One that closes after the whole request went, before any answer, may have
+                // applied it, so only a request safe to repeat is sent again; a client would not
+                // resend any other. A connection just opened is not tried twice.
+                if upstream.as_ref().is_some_and(Upstream::stale) {
+                    upstream = None;
+                }
                 let reused = upstream.is_some();
                 if upstream.is_none() {
                     upstream = Upstream::connect(address).ok();
@@ -461,7 +481,14 @@ fn serve_connection(client: TcpStream, state: &State) {
                     return;
                 };
                 if fault == Some(Fault::Cut) {
-                    let _ = server.writer.write_all(&request.bytes[..request.bytes.len() / 2]);
+                    if server.writer.write_all(&request.bytes[..request.bytes.len() / 2]).and_then(|_| server.writer.flush()).is_err() {
+                        if reused {
+                            upstream = None;
+                            continue;
+                        }
+                        let _ = client.shutdown(Shutdown::Both);
+                        return;
+                    }
                     let _ = server.writer.shutdown(Shutdown::Both);
                     let _ = client.shutdown(Shutdown::Both);
                     return;
@@ -483,7 +510,7 @@ fn serve_connection(client: TcpStream, state: &State) {
                 }
                 match read_response(&mut server.reader, &request.first) {
                     Ok(Some(response)) => break (index, fault, response),
-                    Ok(None) if reused => upstream = None,
+                    Ok(None) if reused && matches!(request.first.as_str(), "GET" | "HEAD") => upstream = None,
                     _ => {
                         let _ = client.shutdown(Shutdown::Both);
                         return;
@@ -732,6 +759,44 @@ mod tests {
             assert!(response.bytes.ends_with(b"GET /v1/warehouse?x=1"));
         }
         assert_eq!(server.reached.load(Ordering::SeqCst), 2);
+    }
+
+    /// A request that went out whole on a kept connection the server then closed without answering
+    /// may have been applied, so it is not sent again unless it is safe to repeat.
+    ///
+    /// Revert: resend whatever was answered with nothing → the POST reaches the server twice.
+    #[test]
+    fn a_request_the_server_may_have_applied_is_not_sent_twice() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let reached = Arc::new(AtomicUsize::new(0));
+        let counted = reached.clone();
+        // Answers each connection's first request, then reads the next one and closes unanswered.
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                if read_request(&mut reader).ok().flatten().is_none() {
+                    continue;
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+                if read_request(&mut reader).ok().flatten().is_some() {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        let proxy = Proxy::start(address).unwrap();
+        let client: SocketAddr = proxy.url.trim_start_matches("http://").parse().unwrap();
+        let mut stream = TcpStream::connect(client).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        stream.write_all(GET).unwrap();
+        assert!(read_response(&mut reader, "GET").unwrap().is_some());
+        stream.write_all(b"POST /v1/pallets/main HTTP/1.1\r\nhost: h\r\ncontent-length: 2\r\n\r\nok").unwrap();
+        assert!(!matches!(read_response(&mut reader, "POST"), Ok(Some(_))), "the POST is answered with nothing");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(reached.load(Ordering::SeqCst), 2, "the POST reached the server once");
     }
 
     /// An interim response is kept with the final one it precedes, and the final one's status is

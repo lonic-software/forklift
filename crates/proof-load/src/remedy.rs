@@ -116,7 +116,11 @@ pub fn removable_under(path: &Path, run_root: &Path) -> Option<PathBuf> {
     if under(path, run_root) {
         return Some(path.to_path_buf());
     }
-    let (resolved, root) = (std::fs::canonicalize(path).ok()?, std::fs::canonicalize(run_root).ok()?);
+    // A path already gone is resolved through its folder, so a resolved spelling of it is still
+    // judged inside the root it is in, and then found to be gone.
+    let resolved = std::fs::canonicalize(path).ok()
+        .or_else(|| Some(std::fs::canonicalize(path.parent()?).ok()?.join(path.file_name()?)))?;
+    let root = std::fs::canonicalize(run_root).ok()?;
     under(&resolved, &root).then_some(resolved)
 }
 
@@ -241,6 +245,10 @@ mod tests {
             assert!(!done && step.starts_with(&format!("remove {} (", path.display())) && step.contains(why), "{}", step);
         }
         assert!(root.join("folder").is_dir());
+        // Gone, and printed resolved (/private/var/… for /var/… on macOS): still inside the root.
+        let resolved = std::fs::canonicalize(&root).unwrap().join("gone.lock");
+        let (step, done) = remove(&resolved, &roots);
+        assert!(!done && step.contains("nothing there"), "{}", step);
         #[allow(clippy::disallowed_methods)] // the test's own temp folder
         let _ = std::fs::remove_dir_all(&root);
     }
