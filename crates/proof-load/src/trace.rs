@@ -31,6 +31,9 @@ pub struct Call {
     /// Each argument's text as strace printed it.
     pub arguments: Vec<String>,
     pub returned: Returned,
+    /// The bytes a write passed, when the trace dumped them (`-e write=all`): every buffer's, in
+    /// order. Empty otherwise.
+    pub data: Vec<u8>,
 }
 
 /// One argument read as what it names.
@@ -47,15 +50,27 @@ pub enum Argument {
     Other(String),
 }
 
-/// Reads `text`, the output of one `strace -f -qq -y -o` run. A line the harness cannot read
-/// refuses the trace: a guess at a call is a kill point aimed at nothing.
+/// Reads `text`, the output of one `strace -f -qq -y -o` run, with any `-e write=` dumps joined to
+/// the call they follow. A line the harness cannot read refuses the trace: a guess at a call is a
+/// kill point aimed at nothing.
 pub fn parse(text: &str) -> Result<Vec<Call>, String> {
-    let mut calls = Vec::new();
+    let mut calls: Vec<Call> = Vec::new();
     // Per thread, the first half of an unfinished call.
     let mut pending: BTreeMap<u32, String> = BTreeMap::new();
     for (number, line) in text.lines().enumerate() {
         let refuse = |why: &str| format!("trace line {}: {}: {}", number + 1, why, line);
         if line.trim().is_empty() {
+            continue;
+        }
+        // A dump row, and a vectored write's buffer header, carry no thread id: strace prints them
+        // right after the call line they belong to.
+        let trimmed = line.trim_start();
+        if let Some(row) = trimmed.strip_prefix("| ") {
+            let last = calls.last_mut().ok_or_else(|| refuse("a dump row before any call"))?;
+            last.data.extend(dump_row(row).ok_or_else(|| refuse("an unreadable dump row"))?);
+            continue;
+        }
+        if trimmed.starts_with("* ") && trimmed.contains(" bytes in buffer ") {
             continue;
         }
         let (tid, rest) = line.trim_start().split_once(char::is_whitespace).ok_or_else(|| refuse("no thread id"))?;
@@ -103,7 +118,27 @@ fn call(tid: u32, text: &str) -> Option<Call> {
     } else {
         Returned::Value(value_token(returned))
     };
-    Some(Call { tid, name: name.to_string(), arguments, returned })
+    Some(Call { tid, name: name.to_string(), arguments, returned, data: Vec::new() })
+}
+
+/// The bytes of one dump row, after its leading `| `: a five-digit hex offset, two spaces, then up
+/// to sixteen bytes in fixed columns (`xx ` each, one more space after the eighth), padded with
+/// spaces, then the row's text. Read by column, never by token, since the text can look like hex.
+fn dump_row(row: &str) -> Option<Vec<u8>> {
+    let bytes = row.as_bytes();
+    if bytes.len() < 7 || !bytes[..5].iter().all(u8::is_ascii_hexdigit) || &bytes[5..7] != b"  " {
+        return None;
+    }
+    let mut out = Vec::new();
+    for index in 0..16 {
+        let at = 7 + 3 * index + usize::from(index >= 8);
+        let Some(pair) = bytes.get(at..at + 2) else { break };
+        if pair == b"  " {
+            break;
+        }
+        out.push(u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// The leading value of a return, with its `-y` annotation when it has one.
@@ -623,7 +658,7 @@ mod tests {
         assert_eq!(calls[0].arguments.len(), 3);
         assert_eq!(calls[1].name, "unlinkat");
         assert_eq!(calls[1].returned, Returned::Failed("ENOENT".into()));
-        assert_eq!(calls[2], Call { tid: 88, name: "fsync".into(), arguments: vec!["12</s/work/.forklift/pallets>".into()], returned: Returned::Unknown });
+        assert_eq!(calls[2], Call { tid: 88, name: "fsync".into(), arguments: vec!["12</s/work/.forklift/pallets>".into()], returned: Returned::Unknown, data: vec![] });
         assert_eq!(calls[3].returned, Returned::Restarted);
         assert!(parse("87    nonsense\n").is_err());
         assert!(parse("87    <... fsync resumed>) = 0\n").is_err(), "a resumed call that never started");
@@ -649,6 +684,33 @@ mod tests {
         assert_eq!(argument("5</w/gone (deleted)>"), Argument::Descriptor { fd: 5, target: "/w/gone".into() });
         assert_eq!(argument("\"\\303\\237\\x41\"..."), Argument::Text("ßA".into()));
         assert_eq!(split_arguments(") = 0").unwrap().0, Vec::<String>::new());
+    }
+
+    /// A write's dumped bytes join its call, every buffer of a vectored write in order, read by
+    /// column so a row's text that looks like hex is never taken for bytes.
+    ///
+    /// Revert: read the row by whitespace tokens → the text column `ab cd` parses as two more
+    /// bytes; refuse rows without a tid as before → the trace is refused.
+    #[test]
+    fn write_dumps_join_their_call() {
+        let text = "7 write(3</s/a>, \"0123456789abcdef@ABCab\"..., 22) = 22\n \
+            | 00000  30 31 32 33 34 35 36 37  38 39 61 62 63 64 65 66  0123456789abcdef |\n \
+            | 00010  40 41 42 43 61 62                                 @ABCab           |\n\
+            7 writev(3</s/a>, [{iov_base=\"x\", iov_len=1}, {iov_base=\"yz\", iov_len=2}], 2) = 3\n \
+            * 1 bytes in buffer 0\n \
+            | 00000  78                                                x                |\n \
+            * 2 bytes in buffer 1\n \
+            | 00000  79 7a                                             yz               |\n\
+            7 fsync(3</s/a>) = 0\n\
+            7 write(3</s/a>, \"ab cd\", 5) = 5\n \
+            | 00000  61 62 20 63 64                                    ab cd            |\n";
+        let calls = parse(text).unwrap();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0].data, b"0123456789abcdef@ABCab");
+        assert_eq!(calls[1].data, b"xyz");
+        assert!(calls[2].data.is_empty());
+        assert_eq!(calls[3].data, b"ab cd", "text that reads as hex is no bytes");
+        assert!(parse(" | 00000  78   x |\n").is_err(), "a dump row before any call");
     }
 
     fn one(line: &str) -> Call {

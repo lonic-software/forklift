@@ -63,6 +63,14 @@ enum Command {
         /// Kill points of this scenario only; repeatable. Without it, every scenario's.
         #[arg(long = "kill")]
         kill: Vec<String>,
+        /// Power loss of this scenario only; repeatable. Without it, every scenario's. Needs strace,
+        /// like the kill points.
+        #[arg(long = "power")]
+        power: Vec<String>,
+        /// How many seeded states between the durable and the volatile one each scenario's power
+        /// loss also grades, drawn at seeded moments.
+        #[arg(long, default_value_t = 0)]
+        power_variants: usize,
         /// How many injected runs at once. Defaults to the machine's parallelism.
         #[arg(long)]
         jobs: Option<usize>,
@@ -80,7 +88,7 @@ fn described(program: &std::path::Path) -> String {
 }
 
 fn main() -> ExitCode {
-    let Command::Run { source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, jobs } = Cli::parse().command;
+    let Command::Run { source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, power, power_variants, jobs } = Cli::parse().command;
     let started = std::time::Instant::now();
 
     let mut output = match Output::claim(&out) {
@@ -99,9 +107,11 @@ fn main() -> ExitCode {
         }
     };
 
-    if let Some(unknown) = kill.iter().find(|id| !scenario::catalog().iter().any(|scenario| &scenario.id == *id)) {
-        eprintln!("proof-load: --kill {}: no such scenario", unknown);
-        return ExitCode::from(2);
+    for (flag, ids) in [("--kill", &kill), ("--power", &power)] {
+        if let Some(unknown) = ids.iter().find(|id| !scenario::catalog().iter().any(|scenario| &scenario.id == *id)) {
+            eprintln!("proof-load: {} {}: no such scenario", flag, unknown);
+            return ExitCode::from(2);
+        }
     }
     let scenarios: Vec<_> = scenario::catalog().into_iter().filter(|scenario| only.as_ref().is_none_or(|only| *only == scenario.id)).collect();
     let corpus = corpus::generate(seed, corpus::Shape::SMALL);
@@ -277,14 +287,16 @@ fn main() -> ExitCode {
     };
     let fault_check = Completeness { check: "damaged-file faults ran".to_string(), cell: damaged_cell.clone(), missing: fault_errors };
 
-    // Every scenario's faulted command killed at each call that changes or syncs a file, Linux only.
+    // Every scenario's faulted command killed at each call that changes or syncs a file, and its
+    // power loss at each of those moments, Linux only.
     let mut kill_completeness = Vec::new();
+    let mut power_completeness = Vec::new();
     let mut not_reached = 0;
-    let kill_cell = match (&forklift, &git, &strace) {
-        _ if Platform::current() != Platform::Linux => Cell::not_run("kill points run on Linux only"),
-        (None, _, _) => Cell::not_run("no forklift binary given"),
-        (_, None, _) => Cell::not_run("no git binary given to lay out the readback"),
-        (_, _, None) => Cell::not_run("no strace given"),
+    let traced_lanes = match (&forklift, &git, &strace) {
+        _ if Platform::current() != Platform::Linux => Err(("kill points run on Linux only", "power loss runs on Linux only")),
+        (None, _, _) => Err(("no forklift binary given", "no forklift binary given")),
+        (_, None, _) => Err(("no git binary given to lay out the readback", "no git binary given to lay out the readback")),
+        (_, _, None) => Err(("no strace given", "no strace given")),
         (Some(forklift), Some(git), Some(strace)) => {
             let (Ok(forklift), Ok(git), Ok(strace)) = (tool::absolute(forklift), tool::absolute(git), tool::absolute(strace)) else {
                 eprintln!("proof-load: cannot resolve the tool paths");
@@ -314,16 +326,40 @@ fn main() -> ExitCode {
             rows.extend(summary.rows);
             kill_completeness = summary.completeness;
             not_reached = summary.not_reached;
-            summary.cell
+
+            let mut all = Vec::new();
+            for scenario in scenarios.iter().filter(|scenario| power.is_empty() || power.contains(&scenario.id)) {
+                let result = output.scratch(&format!("{}-power", scenario.id)).map_err(|error| error.to_string())
+                    .and_then(|template| proof_load::power::run(scenario, &faulted_corpus, &programs, &settings, &template, power_variants, seed).map_err(|error| error.to_string()));
+                match result {
+                    Ok(power) => {
+                        let _ = std::fs::write(output.root().join(format!("power-{}.json", scenario.id)), serde_json::to_string(&power).unwrap_or_default());
+                        all.push(power);
+                    }
+                    Err(error) => all.push(proof_load::power::ScenarioPower { scenario: scenario.id.clone(), errors: vec![error], ..Default::default() }),
+                }
+            }
+            let power_summary = proof_load::power::summarize(&all);
+            rows.extend(power_summary.rows);
+            power_completeness = power_summary.completeness;
+            Ok((summary.cell, power_summary.cell))
         }
+    };
+    let (kill_cell, power_cell) = match traced_lanes {
+        Ok(cells) => cells,
+        Err((kill, power)) => (Cell::not_run(kill), Cell::not_run(power)),
     };
     if kill_completeness.is_empty() {
         kill_completeness.push(Completeness { check: "kill-point units".to_string(), cell: kill_cell.clone(), missing: vec![] });
+    }
+    if power_completeness.is_empty() {
+        power_completeness.push(Completeness { check: "power-loss states".to_string(), cell: power_cell.clone(), missing: vec![] });
     }
 
     let mut coverage = CoverageTable::new(Platform::current(), |category: Category| match category {
         Category::DamagedFiles => damaged_cell.clone(),
         Category::KillPointsClient => kill_cell.clone(),
+        Category::PowerLossClient => power_cell.clone(),
         _ => Cell::not_run("no runner for this fault in this build of the harness"),
     });
     if matches!(kill_cell, Cell::Run | Cell::Sampled) || not_reached > 0 {
@@ -332,6 +368,7 @@ fn main() -> ExitCode {
     let mut completeness = vec![damage_check, walk_check, fault_check];
     completeness.extend(write_checks);
     completeness.extend(kill_completeness);
+    completeness.extend(power_completeness);
     completeness.push(Completeness::budget(started.elapsed(), budget.map(std::time::Duration::from_secs)));
     let report = Report {
         coverage,

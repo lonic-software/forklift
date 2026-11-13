@@ -61,7 +61,7 @@ jobs:
           exe=""; git=$(command -v git); kill=()
           if [ "$RUNNER_OS" = Windows ]; then exe=".exe"; git=$(cygpath -w "$git"); fi
           # Kill points need strace, so Linux only; one scenario's keep the lane inside its budget.
-          if [ "$RUNNER_OS" = Linux ]; then kill=(--strace "$(command -v strace)" --kill history); fi
+          if [ "$RUNNER_OS" = Linux ]; then kill=(--strace "$(command -v strace)" --kill history --power history --power-variants 4); fi
           bin=target/${{ matrix.target }}/release
           target/release/proof-load$exe run --source . --out "$RUNNER_TEMP/proof-load" --budget 2700 \
             --forklift "$bin/forklift$exe" --forklift-server "$bin/forklift-server$exe" --git "$git" "${kill[@]}"

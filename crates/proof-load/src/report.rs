@@ -101,10 +101,12 @@ pub fn platform_gap(category: Category, platform: Platform) -> Option<&'static s
     match (category, platform) {
         (ClockSkew, _) => Some("no clock-skew mechanism yet"),
         (AwsHead, _) => Some("the AWS head is not driven yet"),
-        (KillPointsClient | KillPointsServer | PowerLossClient | PowerLossServer, Platform::Macos) =>
+        (KillPointsClient | KillPointsServer, Platform::Macos) =>
             Some("no unprivileged syscall injection for an unmodified binary (dtrace needs SIP disabled)"),
-        (KillPointsClient | KillPointsServer | PowerLossClient | PowerLossServer, Platform::Windows) =>
-            Some("no syscall injection on Windows in this harness"),
+        (PowerLossClient | PowerLossServer, Platform::Macos) =>
+            Some("no unprivileged syscall trace of an unmodified binary (dtrace needs SIP disabled)"),
+        (KillPointsClient | KillPointsServer, Platform::Windows) => Some("no syscall injection on Windows in this harness"),
+        (PowerLossClient | PowerLossServer, Platform::Windows) => Some("no syscall trace on Windows in this harness"),
         (DiskFull | CaseFolding | NoExec, Platform::Windows) => Some("no volume of this kind is built on Windows in this harness"),
         _ => None,
     }
