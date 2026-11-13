@@ -1213,7 +1213,8 @@ const ROUTES: &[RouteEntry] = &[
 /// Register every [`ROUTES`] entry for one mount and serving mode. An authenticated entry carries
 /// the authentication layer on its own method router, so the layer runs before any extractor: a
 /// refused caller's request body is never buffered. A handler that needs to know who is calling
-/// takes the `Extension<Principal>` the layer leaves, and refuses without it.
+/// takes the `Extension<Principal>` the layer leaves, and refuses without it. The tests pin this
+/// shape: one `route(entry.path, answer)` inside a `for` loop over `ROUTES.iter().filter(…)`.
 fn register(state: &Arc<AppState>, mount: Mount, multi: bool) -> Router<Arc<AppState>> {
     let mut registered = Router::new();
 
@@ -5650,15 +5651,42 @@ mod tests {
         found: Vec<(String, String)>,
     }
 
-    /// A `for` loop's iterable as its method chain, `ROUTES.iter.filter`; `<expr>` for anything
-    /// that is not a chain of method calls on a bare name.
-    fn iterable_shape(expression: &syn::Expr) -> String {
+    /// An expression as its chain of names: `ROUTES.iter.filter` for a method chain, `entry.path`
+    /// for a field; `<expr>` for anything that is not a chain of calls and fields on a bare name.
+    fn expression_shape(expression: &syn::Expr) -> String {
         match expression {
-            syn::Expr::MethodCall(call) => format!("{}.{}", iterable_shape(&call.receiver), call.method),
+            syn::Expr::MethodCall(call) => format!("{}.{}", expression_shape(&call.receiver), call.method),
+            syn::Expr::Field(field) => match &field.member {
+                syn::Member::Named(name) => format!("{}.{name}", expression_shape(&field.base)),
+                syn::Member::Unnamed(_) => "<expr>".to_string(),
+            },
             syn::Expr::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 =>
                 path.path.segments[0].ident.to_string(),
             _ => "<expr>".to_string(),
         }
+    }
+
+    /// Every identifier in a token stream, groups included; literals and punctuation are not words.
+    fn identifiers(buffer: syn::buffer::TokenBuffer) -> Vec<String> {
+        fn walk(mut cursor: syn::buffer::Cursor, words: &mut Vec<String>) {
+            while !cursor.eof() {
+                if let Some((ident, next)) = cursor.ident() {
+                    words.push(ident.to_string());
+                    cursor = next;
+                } else if let Some((inside, _, _, next)) = cursor.any_group() {
+                    walk(inside, words);
+                    cursor = next;
+                } else if let Some((_, next)) = cursor.token_tree() {
+                    cursor = next;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let mut words = Vec::new();
+        walk(buffer.begin(), &mut words);
+        words
     }
 
     fn is_test_only(attributes: &[syn::Attribute]) -> bool {
@@ -5669,6 +5697,19 @@ mod tests {
     }
 
     impl Registrations {
+        /// A registration call inside a `for` loop also names its arguments, so the call is pinned
+        /// to what it registers as well as to the list it walks.
+        fn note_call(&mut self, method: &syn::Ident, arguments: &[&syn::Expr]) {
+            let method = method.to_string();
+
+            if self.iterables.is_empty() || !REGISTRATION_METHODS.contains(&method.as_str()) {
+                self.note(&method);
+            } else {
+                let arguments: Vec<String> = arguments.iter().map(|argument| expression_shape(argument)).collect();
+                self.record(format!("{method}({})", arguments.join(", ")));
+            }
+        }
+
         fn note(&mut self, method: &str) {
             if REGISTRATION_METHODS.contains(&method) {
                 self.record(method.to_string());
@@ -5688,7 +5729,10 @@ mod tests {
     impl<'ast> syn::visit::Visit<'ast> for Registrations {
         fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
             if !is_test_only(&item.attrs) {
-                if item.attrs.iter().any(|attribute| attribute.path().is_ident("path")) {
+                if item.attrs.iter().any(|attribute| attribute.path().is_ident("path")
+                    || attribute.path().is_ident("cfg_attr") && matches!(&attribute.meta,
+                        syn::Meta::List(list) if identifiers(syn::buffer::TokenBuffer::new2(list.tokens.clone())).iter().any(|word| word == "path")))
+                {
                     self.record("#[path]".to_string());
                 }
                 syn::visit::visit_item_mod(self, item);
@@ -5718,8 +5762,16 @@ mod tests {
         }
 
         fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-            self.note(&call.method.to_string());
+            self.note_call(&call.method, &call.args.iter().collect::<Vec<_>>());
             syn::visit::visit_expr_method_call(self, call);
+        }
+
+        /// `use std::include as inc;` would hide an `inc!` from the `include` check.
+        fn visit_use_rename(&mut self, rename: &'ast syn::UseRename) {
+            if rename.ident == "include" {
+                self.record("use include as".to_string());
+            }
+            syn::visit::visit_use_rename(self, rename);
         }
 
         /// `Router::route(router, …)`, `<Router>::route(router, …)`, or the method taken as a value.
@@ -5732,7 +5784,7 @@ mod tests {
 
         fn visit_expr_for_loop(&mut self, looped: &'ast syn::ExprForLoop) {
             self.visit_expr(&looped.expr);
-            self.iterables.push(iterable_shape(&looped.expr));
+            self.iterables.push(expression_shape(&looped.expr));
             self.visit_pat(&looped.pat);
             self.visit_block(&looped.body);
             self.iterables.pop();
@@ -5742,9 +5794,8 @@ mod tests {
             if mac.path.segments.last().is_some_and(|segment| segment.ident == "include") {
                 self.record("include!".to_string());
             }
-            let tokens = mac.tokens.to_string();
-            for word in tokens.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-                self.note(word);
+            for word in identifiers(syn::buffer::TokenBuffer::new2(mac.tokens.clone())) {
+                self.note(&word);
             }
             syn::visit::visit_macro(self, mac);
         }
@@ -5770,9 +5821,13 @@ mod tests {
                 router
             }
             fn in_macro(router: Router) -> Router { wrap!(router.route("/c", get(c))) }
+            fn in_message() { tracing::debug!("cannot merge or route {name}", name = "nest"); }
             include!("elsewhere.rs");
+            use std::include as inc;
             #[path = "elsewhere.rs"]
             mod elsewhere;
+            #[cfg_attr(unix, path = "elsewhere.rs")]
+            mod conditional;
             #[cfg(test)]
             mod tests { fn hook() -> Router { Router::new().route("/hook", post(h)) } }
         "#;
@@ -5785,9 +5840,11 @@ mod tests {
             ("by_path", "fallback"),
             ("by_qself", "method_not_allowed_fallback"),
             ("method", "nest_service"),
-            ("looped", "route over ROUTES.iter.chain"),
+            ("looped", "route(entry.path, <expr>) over ROUTES.iter.chain"),
             ("in_macro", "route"),
             ("<item>", "include!"),
+            ("<item>", "use include as"),
+            ("<item>", "#[path]"),
             ("<item>", "#[path]"),
         ].map(|(within, what)| (within.to_string(), what.to_string())));
     }
@@ -5819,7 +5876,7 @@ mod tests {
 
         found.sort();
         let expected = [
-            ("server.rs", "register", "route over ROUTES.iter.filter"),
+            ("server.rs", "register", "route(entry.path, answer) over ROUTES.iter.filter"),
             ("server.rs", "router", "nest"),
             ("server.rs", "router", "nest"),
         ].map(|(file, within, method)| (file.to_string(), within.to_string(), method.to_string()));
@@ -5885,6 +5942,45 @@ mod tests {
         }
 
         assert!(asked > 20, "only {asked} paths asked");
+    }
+
+    /// Reverts: `register` registering an entry outside its mount or serving mode, such as a filter
+    /// that drops `entry.modes.includes(multi)` (multi-only routes served by a single server) or
+    /// `entry.mount == mount` (the protocol served at the root, `/healthz` under the prefix). Every
+    /// listed path, asked with its own method at each place the list does not register it, is a 404.
+    #[tokio::test]
+    async fn no_path_answers_where_the_list_does_not_register_it() {
+        let single = scratch_dir("absent-single");
+        let multi = scratch_dir("absent-multi");
+        let cases = [
+            (token_state(ServeMode::Single(Arc::new(WarehouseHandle::new(single)))), false),
+            (token_state(ServeMode::Multi { base: multi }), true),
+        ];
+        let client = reqwest::Client::new();
+        let mut asked = 0;
+
+        for (state, is_multi) in cases {
+            let addr = serve_router(state, 1 << 20).await;
+            let registered: BTreeSet<String> = registered_routes(is_multi).into_iter().map(|(_, path)| path).collect();
+
+            for entry in ROUTES {
+                let path = concrete_path(entry.path);
+
+                for place in [path.clone(), format!("/v1{path}"), format!("/warehouses/w1/v1{path}")] {
+                    if registered.contains(&place) {
+                        continue;
+                    }
+                    let method = reqwest::Method::from_bytes(verb_name(entry.verb).as_bytes()).unwrap();
+                    let response = client.request(method, format!("http://{addr}{place}")).send().await.unwrap();
+
+                    assert_eq!(response.status(), StatusCode::NOT_FOUND,
+                        "{} {place} answers in {} mode", verb_name(entry.verb), if is_multi { "multi" } else { "single" });
+                    asked += 1;
+                }
+            }
+        }
+
+        assert!(asked > 40, "only {asked} places asked");
     }
 
     /// The other half of the same layer: the right caller gets through, and the server does wait
