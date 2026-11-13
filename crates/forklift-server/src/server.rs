@@ -5791,10 +5791,15 @@ mod tests {
         }
 
         fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-            if mac.path.segments.last().is_some_and(|segment| segment.ident == "include") {
+            let words = identifiers(syn::buffer::TokenBuffer::new2(mac.tokens.clone()));
+
+            // An `include!` written inside another macro's tokens, such as a `macro_rules!` body.
+            if mac.path.segments.last().is_some_and(|segment| segment.ident == "include")
+                || words.iter().any(|word| word == "include")
+            {
                 self.record("include!".to_string());
             }
-            for word in identifiers(syn::buffer::TokenBuffer::new2(mac.tokens.clone())) {
+            for word in words {
                 self.note(&word);
             }
             syn::visit::visit_macro(self, mac);
@@ -5823,6 +5828,7 @@ mod tests {
             fn in_macro(router: Router) -> Router { wrap!(router.route("/c", get(c))) }
             fn in_message() { tracing::debug!("cannot merge or route {name}", name = "nest"); }
             include!("elsewhere.rs");
+            macro_rules! pull { ($file:literal) => { include!($file) } }
             use std::include as inc;
             #[path = "elsewhere.rs"]
             mod elsewhere;
@@ -5842,6 +5848,7 @@ mod tests {
             ("method", "nest_service"),
             ("looped", "route(entry.path, <expr>) over ROUTES.iter.chain"),
             ("in_macro", "route"),
+            ("<item>", "include!"),
             ("<item>", "include!"),
             ("<item>", "use include as"),
             ("<item>", "#[path]"),
