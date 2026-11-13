@@ -76,29 +76,29 @@ pub type Image = BTreeMap<String, Entry>;
 
 /// A digest of a tree, for telling states apart.
 fn digest(image: &Image) -> String {
-    let mut bytes = Vec::new();
+    let mut hasher = blake3::Hasher::new();
     for (path, entry) in image {
-        bytes.extend_from_slice(path.as_bytes());
-        bytes.push(0);
+        hasher.update(path.as_bytes());
+        hasher.update(&[0]);
         match entry {
             Entry::File { data, mode } => {
-                bytes.push(b'f');
-                bytes.extend_from_slice(&mode.to_le_bytes());
-                bytes.extend_from_slice(&(data.len() as u64).to_le_bytes());
-                bytes.extend_from_slice(data);
+                hasher.update(b"f");
+                hasher.update(&mode.to_le_bytes());
+                hasher.update(&(data.len() as u64).to_le_bytes());
+                hasher.update(data);
             }
             Entry::Dir { mode } => {
-                bytes.push(b'd');
-                bytes.extend_from_slice(&mode.to_le_bytes());
+                hasher.update(b"d");
+                hasher.update(&mode.to_le_bytes());
             }
             Entry::Link { target } => {
-                bytes.push(b'l');
-                bytes.extend_from_slice(target.as_bytes());
-                bytes.push(0);
+                hasher.update(b"l");
+                hasher.update(target.as_bytes());
+                hasher.update(&[0]);
             }
         }
     }
-    crate::oracle::digest(&bytes)
+    hasher.finalize().to_hex().to_string()
 }
 
 /// The two states of the modelled area.
@@ -1069,6 +1069,9 @@ pub enum Moment {
     /// Before a sync no kill point stands at, a child's or another thread's: the durable state
     /// changes only at a sync, so these with the kill points reach every one the line passes.
     Synced { line: usize, command: String, call: usize, name: String },
+    /// After a line's last call, before it exited: every sync it made has landed, and the line is
+    /// still cut short.
+    Ending { line: usize, command: String },
     /// After a line of the faulted command exited.
     After { line: usize, command: String },
 }
@@ -1079,7 +1082,7 @@ impl Moment {
     fn trail(&self) -> (usize, bool) {
         match self {
             Moment::During { point } => (point.line, true),
-            Moment::Synced { line, .. } => (*line, true),
+            Moment::Synced { line, .. } | Moment::Ending { line, .. } => (*line, true),
             Moment::After { line, .. } => (line + 1, false),
         }
     }
@@ -1088,6 +1091,7 @@ impl Moment {
         match self {
             Moment::During { point } => format!("line {} {} {}#{} {}", point.line + 1, point.command, point.name, point.when, point.base),
             Moment::Synced { line, command, call, name } => format!("line {} {} before {} at traced call {}", line + 1, command, name, call + 1),
+            Moment::Ending { line, command } => format!("line {} {} after its last call, before it exited", line + 1, command),
             Moment::After { line, command } => format!("after line {} {}", line + 1, command),
         }
     }
@@ -1127,7 +1131,7 @@ pub fn crashes(fixture: &Image, root: &Root, start: &str, umask: u32, lines: &[L
             .filter(|(index, call)| SYNCS.contains(&call.name.as_str()) && matches!(call.returned, Returned::Value(_)) && !at_points.contains(index))
             .map(|(index, _)| index).collect()
     };
-    let moments: usize = lines.iter().map(|line| line.points.len() + synced(line).len() + 1).sum();
+    let moments: usize = lines.iter().map(|line| line.points.len() + synced(line).len() + 2).sum();
     let mut rng = Rng::new(seed);
     // The moments a variant is drawn at, with repeats: each draw is its own variant.
     let mut draws: BTreeMap<usize, usize> = BTreeMap::new();
@@ -1149,9 +1153,15 @@ pub fn crashes(fixture: &Image, root: &Root, start: &str, umask: u32, lines: &[L
                 collector.record(moment, model, false);
             }
         }).map_err(|why| format!("line {} {}: {}", index + 1, line.command, why))?;
+        collector.record(Moment::Ending { line: index, command: line.command.clone() }, &replay.model, false);
         collector.record(Moment::After { line: index, command: line.command.clone() }, &replay.model, index == last);
     }
-    Ok((collector.crashes, replay.model.volatile_image()))
+    // A draw a real moment superseded left a gap: number the variants that remain from 1.
+    let mut crashes = collector.crashes;
+    for (number, variant) in crashes.iter_mut().filter_map(|crash| crash.variant.as_mut()).enumerate() {
+        *variant = number + 1;
+    }
+    Ok((crashes, replay.model.volatile_image()))
 }
 
 struct Collector {
@@ -1279,14 +1289,20 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
     let next = AtomicUsize::new(0);
     let results: Mutex<Vec<(usize, Result<GradedCrash, String>)>> = Mutex::new(Vec::new());
     let workers = settings.jobs.clamp(1, crashes.len().max(1));
+    // Each state is taken out to be graded, so its tree is freed once it is.
+    let slots: Vec<Mutex<Option<Crash>>> = crashes.into_iter().map(|crash| Mutex::new(Some(crash))).collect();
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| loop {
                 let at = next.fetch_add(1, Ordering::SeqCst);
-                let Some(crash) = crashes.get(at) else { break };
-                let result = grade(scenario, counted, programs, settings, template, crash, at)
-                    .map(|graded| GradedCrash { crash: crash.clone(), graded })
-                    .map_err(|error| format!("{}: {}", crash.moment.label(), error));
+                let Some(slot) = slots.get(at) else { break };
+                let mut crash = slot.lock().expect("no worker panics holding the lock").take().expect("each state is taken once");
+                let result = grade(scenario, counted, programs, settings, template, &crash, at);
+                crash.image = std::sync::Arc::default();
+                let result = match result {
+                    Ok(graded) => Ok(GradedCrash { crash, graded }),
+                    Err(error) => Err(format!("{}: {}", crash.moment.label(), error)),
+                };
                 results.lock().expect("no worker panics holding the lock").push((at, result));
             });
         }
@@ -1344,7 +1360,7 @@ fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, sett
     let context = kill::context_of(scenario, &counted.corpus, programs, settings, &copy, &environment);
     let mut steps: Vec<Outcome> = Vec::new();
     match &crash.moment {
-        Moment::During { point: Point { line, .. } } | Moment::Synced { line, .. } => {
+        Moment::During { point: Point { line, .. } } | Moment::Synced { line, .. } | Moment::Ending { line, .. } => {
             steps.extend(counted.lines[..*line].iter().map(|line| line.outcome.clone()));
             let mut cut = counted.lines[*line].outcome.clone();
             (cut.exit, cut.failure) = (None, None);
@@ -1670,12 +1686,13 @@ mod tests {
         assert!(difference(&replayed, &ran).unwrap().starts_with("w/z:"));
     }
 
-    /// Crashes land before each kill point's call and after each line; a state many moments leave
-    /// is graded once, counted; only the moment after the last line is acknowledged, even when it
-    /// leaves the same state as an earlier one.
+    /// Crashes land before each kill point's call, after each line's last call while it still runs,
+    /// and after each line; a state many moments leave is graded once, counted; only the moment
+    /// after the last line is acknowledged, even when it leaves the same state as an earlier one.
     ///
     /// Revert: take the state after the call → the crash at the fsync already holds `new`; key a
-    /// state by its tree alone → the last line's state merges into an earlier unacknowledged one.
+    /// state by its tree alone → the last line's state merges into an earlier unacknowledged one;
+    /// drop the moment at a line's end → its synced state is never graded with the line cut short.
     #[test]
     fn crashes_land_before_each_point_and_after_each_line() {
         let texts = [rewrite(true), "2 openat(AT_FDCWD</s/w>, \"a\", O_RDONLY) = 3</s/w/a>\n".to_string()];
@@ -1688,10 +1705,14 @@ mod tests {
         let (crashes, replayed) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap();
         assert_eq!(data(&replayed, "w/a").unwrap(), b"new");
         let found: Vec<(Vec<u8>, bool, usize)> = crashes.iter().map(|crash| (data(&crash.image, "w/a").unwrap(), crash.acknowledged, crash.shared)).collect();
-        // Before the open, the write and the fsync: old. After line 1: new. After line 2: new, acknowledged.
-        assert_eq!(found, vec![(b"old".to_vec(), false, 3), (b"new".to_vec(), false, 1), (b"new".to_vec(), true, 1)]);
+        // Before the open, the write and the fsync: old. At line 1's end and after it: new, the
+        // first cut short. The same for line 2, its last acknowledged.
+        let new = |acknowledged| (b"new".to_vec(), acknowledged, 1);
+        assert_eq!(found, vec![(b"old".to_vec(), false, 3), new(false), new(false), new(false), new(true)]);
         assert!(matches!(&crashes[0].moment, Moment::During { point } if point.name == "openat"));
-        assert_eq!(crashes[2].moment, Moment::After { line: 1, command: "stack".into() });
+        assert_eq!(crashes[1].moment, Moment::Ending { line: 0, command: "stack".into() });
+        assert_eq!(crashes[2].moment, Moment::After { line: 0, command: "stack".into() });
+        assert_eq!(crashes[4].moment, Moment::After { line: 1, command: "stack".into() });
     }
 
     /// A child's syncs are crash moments though no kill point stands at them: the state its first
@@ -1973,10 +1994,11 @@ mod tests {
     }
 
     /// A durable state is never reported as a variant: drawing variants leaves the durable
-    /// crashes exactly as a run with none, even when a draw happens to match a later one.
+    /// crashes exactly as a run with none, even when a draw happens to match a later one, and the
+    /// variants left are numbered from 1 without a gap.
     ///
     /// Revert: count a durable state into the variant it matches → it is missing from the
-    /// durable crashes for some seed.
+    /// durable crashes for some seed; skip the renumbering → a superseded draw leaves a gap.
     #[test]
     fn a_durable_state_a_variant_found_first_stays_durable() {
         // The fsync makes `new` durable; the mkdir after it leaves that state at its own point, so
@@ -1993,6 +2015,8 @@ mod tests {
         for seed in 0..64 {
             let (drawn, _) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 8, seed).unwrap();
             assert_eq!(durable(&drawn), durable(&plain), "seed {}", seed);
+            let numbers: Vec<usize> = drawn.iter().filter_map(|crash| crash.variant).collect();
+            assert_eq!(numbers, (1..=numbers.len()).collect::<Vec<_>>(), "seed {}", seed);
             matched |= drawn.len() < plain.len() + 8;
         }
         assert!(matched, "some seed draws a variant that matches a durable state");
