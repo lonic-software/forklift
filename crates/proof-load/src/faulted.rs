@@ -131,8 +131,14 @@ impl Context<'_> {
 
     /// The faulted command: corpus record `index` written into the work tree, then the record
     /// operation's lines and those of the scenario's `then` run in order until one fails.
-    fn record(&self, index: usize, steps: &mut Vec<Outcome>) -> Result<bool, RunError> {
+    pub(crate) fn record(&self, index: usize, steps: &mut Vec<Outcome>) -> Result<bool, RunError> {
         self.write_snapshot(index)?;
+        self.run_lines(index, steps)
+    }
+
+    /// The faulted command's lines for corpus record `index`, run in order until one fails, its
+    /// snapshot already written: an environment fault is set between the two.
+    pub(crate) fn run_lines(&self, index: usize, steps: &mut Vec<Outcome>) -> Result<bool, RunError> {
         for arguments in self.lines(index)? {
             let outcome = self.run(&self.programs.forklift, arguments, self.scratch.work())?;
             let succeeded = outcome.succeeded();
@@ -622,8 +628,12 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, co
         Warehouse::Host if built.host.is_some() => (&built.host_walked, runner::host_root(scratch).join(".forklift")),
         Warehouse::Host => return Err(RunError::Io(format!("{} damages a host, and {} hosts none", name, scenario.id))),
     };
-    let target = resolve(name, walked, seed)
-        .ok_or_else(|| RunError::Io(format!("{} resolves to nothing {} built", name, scenario.id)))?;
+    // A planted path is absent by definition, so it is named, not resolved against the walk.
+    let target = if kind.plants() {
+        damage::planted(name)
+    } else {
+        resolve(name, walked, seed).ok_or_else(|| RunError::Io(format!("{} resolves to nothing {} built", name, scenario.id)))?
+    };
     damage::apply(&state.join(&target), kind, seed).map_err(|error| RunError::Io(format!("{:?}", error)))?;
 
     let (expected, faulted) = expected(scenario, corpus, &built, warehouse)?;
