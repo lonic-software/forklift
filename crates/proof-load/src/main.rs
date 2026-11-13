@@ -352,9 +352,9 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            // A lane no scenario was picked for is not run, which fails nothing: only the other
-            // lane was asked for.
-            let unasked = || Cell::not_run("no scenario was named for it");
+            // A lane no scenario was picked for is not run, which fails nothing: it was not asked
+            // for, or what it named is not among the scenarios this run picked.
+            let unasked = || Cell::not_run("no scenario this run picked was named for it");
             let kill_cell = if all_kills.is_empty() {
                 unasked()
             } else {

@@ -115,13 +115,15 @@ pub struct Model {
     now: usize,
     /// Per node, the last call in this line that changed it.
     changed: BTreeMap<Ino, usize>,
+    /// Files cut shorter since their last sync: a crash may keep the cut and lose what followed.
+    truncated: BTreeSet<Ino>,
 }
 
 impl Model {
     /// A model of `image`, all of it durable: the fixture, written and synced whole.
     pub fn of(image: &Image) -> Result<Model, String> {
         let Some(Entry::Dir { mode }) = image.get("") else { return Err("the fixture has no root folder".to_string()) };
-        let mut model = Model { volatile: BTreeMap::new(), durable: BTreeMap::new(), root: 0, next: 1, version: 0, now: 0, changed: BTreeMap::new() };
+        let mut model = Model { volatile: BTreeMap::new(), durable: BTreeMap::new(), root: 0, next: 1, version: 0, now: 0, changed: BTreeMap::new(), truncated: BTreeSet::new() };
         model.volatile.insert(0, Node::Dir { entries: BTreeMap::new(), mode: *mode });
         // A parent sorts before everything below it, so it is always made first.
         for (path, entry) in image.iter().filter(|(path, _)| !path.is_empty()) {
@@ -196,6 +198,7 @@ impl Model {
         if let Some(node) = self.volatile.get(&ino) {
             if !matches!(node, Node::Link { .. }) {
                 self.durable.insert(ino, node.clone());
+                self.truncated.remove(&ino);
                 self.version += 1;
             }
         }
@@ -203,6 +206,7 @@ impl Model {
 
     fn sync_all(&mut self) {
         self.durable = self.volatile.clone();
+        self.truncated.clear();
         self.version += 1;
     }
 
@@ -218,8 +222,9 @@ impl Model {
 
     /// A seeded state between the durable and the volatile one: each folder entry the two disagree
     /// on is taken from either, and each file whose contents they disagree on keeps its durable
-    /// contents, takes its volatile ones, or grows past its synced size with a zero-filled or torn
-    /// tail.
+    /// contents, takes its volatile ones, or is torn: a file cut shorter since its sync comes back
+    /// as a prefix of its volatile contents, empty included, and any other grows past its synced
+    /// size with a zero-filled or torn tail.
     pub fn variant(&self, rng: &mut Rng) -> Image {
         let mut out = Image::new();
         let mut seen = BTreeSet::new();
@@ -248,6 +253,7 @@ impl Model {
                         match rng.below(3) {
                             0 => kept.clone(),
                             1 => made.clone(),
+                            _ if self.truncated.contains(&ino) => made[..rng.below(made.len() as u64 + 1) as usize].to_vec(),
                             _ => grown(kept, made, rng),
                         }
                     };
@@ -591,6 +597,9 @@ impl Replay {
                             if flags.contains("O_TRUNC") {
                                 self.model.touch(ino);
                                 if let Node::File { data, .. } = self.model.volatile.get_mut(&ino).expect("located") {
+                                    if !data.is_empty() {
+                                        self.model.truncated.insert(ino);
+                                    }
                                     data.clear();
                                 }
                             }
@@ -690,7 +699,12 @@ impl Replay {
                 };
                 if let Some(ino) = ino {
                     let length = fd_of(raw(1)).ok_or_else(|| "no length".to_string())? as usize;
-                    self.file(ino)?.resize(length, 0);
+                    let data = self.file(ino)?;
+                    let cut = length < data.len();
+                    data.resize(length, 0);
+                    if cut {
+                        self.model.truncated.insert(ino);
+                    }
                 }
             }
             "fsync" | "fdatasync" => {
@@ -839,7 +853,8 @@ fn fd_of(text: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
-/// Reads the tree under `root` as it stands, links as links.
+/// Reads the tree under `root` as it stands, links as links. A name or link target that is not
+/// UTF-8 is an error, never read lossily into another name.
 pub fn scan(root: &Path) -> std::io::Result<Image> {
     let mut out = Image::new();
     let mut stack = vec![(root.to_path_buf(), String::new())];
@@ -847,11 +862,15 @@ pub fn scan(root: &Path) -> std::io::Result<Image> {
         let metadata = std::fs::symlink_metadata(&at)?;
         let kind = metadata.file_type();
         if kind.is_symlink() {
-            out.insert(path, Entry::Link { target: std::fs::read_link(&at)?.to_string_lossy().into_owned() });
+            let target = std::fs::read_link(&at)?;
+            let target = target.to_str().ok_or_else(|| std::io::Error::other(format!("{} links to a path that is not UTF-8, which the model does not hold", at.display())))?;
+            out.insert(path, Entry::Link { target: target.to_string() });
         } else if kind.is_dir() {
             for entry in std::fs::read_dir(&at)? {
                 let entry = entry?;
-                stack.push((entry.path(), join(&path, &entry.file_name().to_string_lossy())));
+                let name = entry.file_name();
+                let name = name.to_str().ok_or_else(|| std::io::Error::other(format!("{} is not UTF-8, which the model does not hold", entry.path().display())))?;
+                stack.push((entry.path(), join(&path, name)));
             }
             out.insert(path, Entry::Dir { mode: mode(&metadata, 0o755) });
         } else if kind.is_file() {
@@ -1171,16 +1190,10 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
             return Ok(power);
         }
     };
-    // The run's final tree was checked for its own root when counted; a state between holds files
-    // the run later removed, and one naming the counting area would tie its copy to that area.
-    let needles = [counted.counting_root.given.as_str(), counted.counting_root.canonical.as_str()];
-    if let Some((crash, path)) = crashes.iter().find_map(|crash| bound(&crash.image, &needles).map(|path| (crash, path))) {
-        power.not_run = Some(format!("path-bound: the crash state {} records the scratch area's root in {}", crash.moment.label(), path));
-        return Ok(power);
-    }
     let ran = scan(counted.counting.root()).map_err(|error| RunError::Io(error.to_string()))?;
-    if let Some(difference) = difference(&replayed, &ran) {
-        power.refusals.push(format!("the replay does not reproduce the run: {}", difference));
+    let needles = [counted.counting_root.given.as_str(), counted.counting_root.canonical.as_str()];
+    if let Some((refusals, not_run)) = stopped(&replayed, &ran, &crashes, &needles) {
+        (power.refusals, power.not_run) = (refusals, not_run);
         return Ok(power);
     }
 
@@ -1208,6 +1221,16 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
         }
     }
     Ok(power)
+}
+
+/// Whether the crash states stop before grading, as [`kill::stopped`] says: refused when the
+/// replay does not reproduce the run, else not run when a state records the counting area's root.
+/// The run's final tree was checked for that root when counted; a state between holds files the
+/// run later removed, and one naming the counting area would tie its copy to that area.
+fn stopped(replayed: &Image, ran: &Image, crashes: &[Crash], needles: &[&str]) -> Option<(Vec<String>, Option<String>)> {
+    let refusals: Vec<String> = difference(replayed, ran).map(|difference| format!("the replay does not reproduce the run: {}", difference)).into_iter().collect();
+    let bound = crashes.iter().find_map(|crash| bound(&crash.image, needles).map(|path| format!("path-bound: the crash state {} records the scratch area's root in {}", crash.moment.label(), path)));
+    kill::stopped(refusals, bound.as_ref())
 }
 
 /// The first path in `image` whose contents or link target hold one of `needles`, as
@@ -1624,6 +1647,61 @@ mod tests {
         image.insert("w/lock".into(), Entry::File { data: b"held by /sx".to_vec(), mode: 0o644 });
         image.insert("w/z".into(), Entry::Link { target: "/s/w/a".into() });
         assert_eq!(bound(&image, &["/s"]).as_deref(), Some("w/z"));
+    }
+
+    /// A file cut short and rewritten since its sync can come back as any prefix of its new
+    /// contents, empty included, and never as its old bytes with the new ones' tail; one only
+    /// appended to keeps its synced bytes.
+    ///
+    /// Revert: tear every file by growing its synced contents → `old` with `newer`'s tail comes
+    /// back, and the empty file never does.
+    #[test]
+    fn a_truncated_file_tears_to_a_prefix_of_its_new_contents() {
+        let rewritten = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_TRUNC) = 3</s/w/a>\n{}", write(1, 3, "/s/w/a", b"newer"));
+        let model = replayed(&[rewritten]).unwrap();
+        let mut rng = Rng::new(3);
+        let torn: BTreeSet<Vec<u8>> = (0..200).map(|_| data(&model.variant(&mut rng), "w/a").unwrap()).collect();
+        assert!(torn.contains(&Vec::new()), "{:?}", torn);
+        assert!(torn.iter().all(|held| held == b"old" || b"newer".starts_with(held)), "{:?}", torn);
+        let appended = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_APPEND) = 3</s/w/a>\n{}", write(1, 3, "/s/w/a", b"er"));
+        let model = replayed(&[appended]).unwrap();
+        let mut rng = Rng::new(3);
+        assert!((0..200).all(|_| data(&model.variant(&mut rng), "w/a").unwrap().starts_with(b"old")));
+    }
+
+    /// The crash states stop before grading: refused when the replay does not reproduce the run,
+    /// which outranks a state that records the counting root, which stops them as not run.
+    ///
+    /// Revert: check the states for the root first → the unreproduced replay reads as not run,
+    /// which fails nothing.
+    #[test]
+    fn an_unreproduced_replay_outranks_a_path_bound_state() {
+        let mut held = fixture();
+        held.insert("w/lock".into(), Entry::File { data: b"/s/w".to_vec(), mode: 0o644 });
+        let moment = Moment::After { line: 0, command: "stack".into() };
+        let crashes = [Crash { moment, acknowledged: false, shared: 1, variant: None, image: std::sync::Arc::new(held) }];
+        assert_eq!(stopped(&fixture(), &fixture(), &[], &["/s"]), None);
+        let (refusals, not_run) = stopped(&fixture(), &fixture(), &crashes, &["/s"]).unwrap();
+        assert!(refusals.is_empty() && not_run.unwrap().contains("w/lock"));
+        let mut ran = fixture();
+        ran.remove("w/a");
+        let (refusals, not_run) = stopped(&fixture(), &ran, &crashes, &["/s"]).unwrap();
+        assert!(refusals[0].contains("does not reproduce") && not_run.is_none(), "{:?}", refusals);
+    }
+
+    /// A name that is not UTF-8 stops the scan rather than read as another name.
+    ///
+    /// Revert: read names lossily → the scan holds a name with a replacement character.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_name_that_is_not_utf8_stops_the_scan() {
+        use std::os::unix::ffi::OsStrExt;
+        let area = std::env::temp_dir().join(format!("proof-load-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&area).unwrap();
+        std::fs::write(area.join(std::ffi::OsStr::from_bytes(b"n\xff")), b"x").unwrap();
+        let scanned = scan(&area);
+        let _ = remove_tree(&area);
+        assert!(scanned.unwrap_err().to_string().contains("not UTF-8"));
     }
 
     /// Files and folders are made under the umask the command started under, or the one it set.
