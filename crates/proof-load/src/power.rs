@@ -1545,7 +1545,8 @@ mod tests {
 
     /// The replay is held to the run: any path where its tree and the run's differ is named.
     ///
-    /// Revert: compare paths only → a file whose bytes differ passes.
+    /// Revert: compare paths only → a file whose bytes differ passes; skip folder modes → a folder
+    /// made under another umask passes.
     #[test]
     fn a_replay_that_does_not_reproduce_the_run_is_named() {
         let replayed = replayed(&[rewrite(false)]).unwrap().volatile_image();
@@ -1558,6 +1559,10 @@ mod tests {
         assert!(difference(&replayed, &ran).unwrap().contains("mode 644 and the run left 755"));
         ran.insert("w/a".into(), Entry::File { data: b"new".to_vec(), mode: 0o600 });
         assert!(difference(&replayed, &ran).unwrap().contains("mode 644 and the run left 600"));
+        ran.insert("w/a".into(), Entry::File { data: b"new".to_vec(), mode: 0o644 });
+        ran.insert("w".into(), Entry::Dir { mode: 0o700 });
+        assert_eq!(difference(&replayed, &ran).as_deref(), Some("w: the replay makes it mode 755 and the run left 700"));
+        ran.insert("w".into(), Entry::Dir { mode: 0o755 });
         ran.insert("w/a".into(), Entry::File { data: b"new".to_vec(), mode: 0o644 });
         ran.insert("w/z".into(), Entry::Link { target: "a".into() });
         assert!(difference(&replayed, &ran).unwrap().starts_with("w/z:"));
