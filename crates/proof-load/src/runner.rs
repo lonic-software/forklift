@@ -504,7 +504,7 @@ mod tests {
         let (root, work) = (Path::new("/s"), Path::new("/s/work"));
         assert_eq!(filled(&strings(&["redact", "record", "{parcel}:notes.txt", "{scratch}/mirror", "{url}"]), &kept, Some("http://h"), root, work).unwrap(),
             strings(&["redact", "record", "ab12:notes.txt", "/s/mirror", "http://h"]));
-        assert_eq!(filled(&strings(&["office", "retire", "--", "{root}"]), &kept, None, root, work), Err("`office retire -- {root}` has no value for {root}".to_string()));
+        assert_eq!(filled(&strings(&["echo", "--", "{root}"]), &kept, None, root, work), Err("`echo -- {root}` has no value for {root}".to_string()));
         assert!(filled(&strings(&["clone", "{url}"]), &kept, None, root, work).is_err(), "no host yet");
     }
 

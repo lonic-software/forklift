@@ -124,7 +124,7 @@ fn main() -> ExitCode {
     let program = match forklift.as_deref().map(tool::absolute).transpose() {
         Ok(program) => program,
         Err(error) => {
-            eprintln!("proof-load: the forklift path: {}", error);
+            eprintln!("proof-load: the client binary's path: {}", error);
             return ExitCode::from(2);
         }
     };
