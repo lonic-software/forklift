@@ -658,15 +658,7 @@ pub(crate) fn grade_after(
                         }
                         trail.steps.push(context.run(&context.programs.forklift, arguments, context.scratch.work())?);
                     }
-                    Remedy::Remove { path } => match remedy::removable(path, &context.scratch.roots()) {
-                        Some(judged) => {
-                            trail.recoverability.outside_knowledge.push(format!("remove {}", path.display()));
-                            let _ = damage::apply(&judged, Kind::Delete, 0);
-                        }
-                        None => {
-                            trail.recoverability.outside_knowledge.push(format!("remove {} (outside the run root; not run)", path.display()));
-                        }
-                    },
+                    Remedy::Remove { path } => trail.recoverability.outside_knowledge.push(remedy::remove(path, &context.scratch.roots()).0),
                 }
             }
             made |= retry(trail, &mut resume)?;

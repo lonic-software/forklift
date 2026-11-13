@@ -10,10 +10,10 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use crate::proxy::Proxy;
+use crate::proxy::{lock, Proxy};
 use crate::remedy::{self, Remedy};
 use crate::scrub::{Environment, Scratch};
 use crate::tool::{self, Served, ToolError};
@@ -32,13 +32,16 @@ pub struct Host {
     root: PathBuf,
 }
 
-/// What a restart took.
+/// What a restart took, and whether the server came back.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Restarted {
-    /// Each removal carried out, as the step a user would have had to know to take.
+    /// Each removal the refusals named, as the step a user would have had to know to take, with
+    /// why when it was not carried out.
     pub outside_knowledge: Vec<String>,
     /// What the refusals named that could not be carried out as written.
     pub unextractable: Vec<String>,
+    /// What the server last said, when it would not start again: it serves nothing from then on.
+    pub refused: Option<String>,
 }
 
 impl std::fmt::Debug for Host {
@@ -52,10 +55,6 @@ fn address_of(url: &str) -> Result<SocketAddr, String> {
     url.trim_start_matches("http://").trim_end_matches('/').parse().map_err(|_| format!("the server printed {:?}, not an http://<address> URL", url))
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 impl Host {
     /// Serves the warehouse at `root` with `program`, behind a new proxy.
     pub fn start(program: &Path, root: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Host, ToolError> {
@@ -63,8 +62,9 @@ impl Host {
         let upstream = address_of(&served.url).map_err(|reason| ToolError::Spawn { program: program.to_path_buf(), reason })?;
         let proxy = Proxy::start(upstream).map_err(|error| ToolError::Spawn { program: program.to_path_buf(), reason: format!("the network proxy: {}", error) })?;
         let server = Arc::new(Mutex::new(Some(served)));
-        let killed = server.clone();
-        proxy.set_killer(move || drop(lock(&killed).take()));
+        // Weak: a proxy connection thread outliving the host must not keep its server alive.
+        let killed: Weak<Mutex<Option<Served>>> = Arc::downgrade(&server);
+        proxy.set_killer(move || if let Some(server) = killed.upgrade() { drop(lock(&server).take()) });
         Ok(Host { url: proxy.url.clone(), proxy, server, program: program.to_path_buf(), root: root.to_path_buf() })
     }
 
@@ -80,35 +80,29 @@ impl Host {
 
     /// Starts the server again over the same warehouse, behind the same URL. A refusal to start
     /// is answered with the removals it names inside the run's roots, then the server is started
-    /// again; a refusal naming none ends the restart in that refusal.
+    /// again; a refusal after which nothing was removed ends the restart, the server down and the
+    /// refusal kept. An error is the harness failing to run the server at all.
     pub fn restart(&self, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Restarted, ToolError> {
         let mut restarted = Restarted::default();
-        let mut refusal = None;
         for _ in 0..STARTS {
             match tool::serve(&self.program, &self.root, scratch, environment, limit) {
                 Ok(served) => {
                     let upstream = address_of(&served.url).map_err(|reason| ToolError::Spawn { program: self.program.clone(), reason })?;
                     self.proxy.set_upstream(upstream);
                     *lock(&self.server) = Some(served);
+                    restarted.refused = None;
                     return Ok(restarted);
                 }
-                Err(ToolError::NotListening { program, limit, said }) => {
+                Err(ToolError::NotListening { said, .. }) => {
                     let extracted = remedy::extract(&[said.as_str()]);
                     let mut removed = false;
                     for named in extracted.remedies {
                         match named {
-                            Remedy::Remove { path } => match remedy::removable(&path, &scratch.roots()) {
-                                Some(path) if path.is_file() => {
-                                    #[allow(clippy::disallowed_methods)] // a removal the server's refusal named, judged inside the run's roots
-                                    let gone = std::fs::remove_file(&path);
-                                    if gone.is_ok() {
-                                        restarted.outside_knowledge.push(format!("remove {}", path.display()));
-                                        removed = true;
-                                    }
-                                }
-                                Some(_) => {}
-                                None => restarted.outside_knowledge.push(format!("remove {} (outside the run root; not run)", path.display())),
-                            },
+                            Remedy::Remove { path } => {
+                                let (step, done) = remedy::remove(&path, &scratch.roots());
+                                restarted.outside_knowledge.push(step);
+                                removed |= done;
+                            }
                             Remedy::Command { arguments } => restarted.unextractable.push(format!("forklift {}", arguments.join(" "))),
                         }
                     }
@@ -117,7 +111,7 @@ impl Host {
                             restarted.unextractable.push(text);
                         }
                     }
-                    refusal = Some(ToolError::NotListening { program, limit, said });
+                    restarted.refused = Some(said);
                     if !removed {
                         break;
                     }
@@ -125,6 +119,13 @@ impl Host {
                 Err(error) => return Err(error),
             }
         }
-        Err(refusal.expect("a restart that never started the server was refused"))
+        Ok(restarted)
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        // Killed here, not when the last handle to it goes: a proxy thread may outlive the host.
+        self.kill();
     }
 }

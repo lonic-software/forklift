@@ -1,12 +1,14 @@
 //! The network fault proxy: a harness-owned TCP proxy on loopback between the client and a
 //! forklift-server, through which every transfer of a hosted scenario runs.
 //!
-//! It reads each HTTP/1.1 request whole before forwarding any of it, and forwards one request at a
-//! time across every connection, holding each later request until the earlier one's response has
-//! been read to its end. A server holding part of a request body never answers it, so a request
-//! read in part would hold every later one behind it; and one request at a time keeps each
-//! request's window apart from the next. Every exchange is logged: its method, its path and the
-//! status the server answered, which is what route coverage reads.
+//! It reads each HTTP/1.1 request whole before forwarding any of it, so a fault can be placed
+//! anywhere in it. Serialized (the network lane), it forwards one request at a time across every
+//! connection, holding each later request until the earlier one's response has been read to its
+//! end: each request's window stays apart from the next, and requests are numbered in the order
+//! they reach the server. Otherwise requests on different connections are forwarded at once, as a
+//! client's parallel transfers reach a server without the proxy, so every other lane still runs
+//! them concurrently. Every exchange is logged: its method, its path and the status the server
+//! answered, which is what route coverage reads.
 //!
 //! One fault can be armed at a time, at the n-th request after arming, and fires once:
 //! - toward the client: delay the response, drop the request unforwarded, truncate the response,
@@ -30,6 +32,10 @@ pub const DELAY: Duration = Duration::from_secs(3);
 /// How long a stalled connection is held open, past any client read timeout, before the proxy
 /// closes it.
 pub const STALL_CAP: Duration = Duration::from_secs(90);
+
+/// How long the proxy waits on the server's socket for a read or a write before giving the
+/// exchange up: past every client timeout, so it ends only an exchange the client gave up on.
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The longest request or response head the proxy reads: anything longer is not a request it
 /// forwards.
@@ -97,9 +103,11 @@ struct Armed {
 
 struct State {
     upstream: Mutex<SocketAddr>,
-    /// Held from forwarding a request until its response is read: one request at a time.
+    /// Whether requests are forwarded one at a time.
+    serial: AtomicBool,
+    /// Held, when serial, from numbering a request until its response is read.
     order: Mutex<()>,
-    /// The fault armed, and the index of the first request read after arming.
+    /// The fault armed, and the index of the first request forwarded after arming.
     armed: Mutex<Option<(Armed, usize)>>,
     log: Mutex<Vec<Exchange>>,
     /// Kills the server, for [`Fault::Kill`].
@@ -122,7 +130,7 @@ impl Proxy {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let state = Arc::new(State {
-            upstream: Mutex::new(upstream), order: Mutex::new(()), armed: Mutex::new(None),
+            upstream: Mutex::new(upstream), serial: AtomicBool::new(false), order: Mutex::new(()), armed: Mutex::new(None),
             log: Mutex::new(Vec::new()), killer: Mutex::new(None), stopped: AtomicBool::new(false),
         });
         let accepting = {
@@ -146,22 +154,28 @@ impl Proxy {
         *lock(&self.state.upstream) = upstream;
     }
 
+    /// Forwards one request at a time from now on, numbered in the order they reach the server, or
+    /// concurrently again.
+    pub fn set_serial(&self, serial: bool) {
+        self.state.serial.store(serial, Ordering::SeqCst);
+    }
+
     /// What [`Fault::Kill`] runs to kill the server.
     pub fn set_killer(&self, killer: impl FnMut() + Send + 'static) {
         *lock(&self.state.killer) = Some(Box::new(killer));
     }
 
-    /// How many requests the proxy has read so far.
+    /// How many requests the proxy has numbered so far.
     pub fn requests(&self) -> usize {
         lock(&self.state.log).len()
     }
 
-    /// Every exchange so far, in the order the requests were read.
+    /// Every exchange so far, in the order the requests were numbered.
     pub fn log(&self) -> Vec<Exchange> {
         lock(&self.state.log).clone()
     }
 
-    /// Arms `fault` for the `at`-th request (from 0) read from now on. It fires once.
+    /// Arms `fault` for the `at`-th request (from 0) numbered from now on. It fires once.
     pub fn arm(&self, fault: Fault, at: usize) {
         let next = self.requests();
         *lock(&self.state.armed) = Some((Armed { fault, at }, next));
@@ -190,7 +204,7 @@ impl Drop for Proxy {
 }
 
 /// A mutex's guard, whether or not a holder panicked: the proxy's state stays usable.
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -322,12 +336,26 @@ fn read_request(reader: &mut impl BufRead) -> std::io::Result<Option<Message>> {
     Ok(Some(Message { bytes, first: method, second: target, closes: closes(&headers) }))
 }
 
-/// Reads one response whole, to the request `method` was: a HEAD response, a 1xx, 204 or 304 has
-/// no body whatever its headers say.
-fn read_response(reader: &mut impl BufRead, method: &str) -> std::io::Result<Message> {
-    let Head { mut bytes, headers, first: [version, status] } = read_head(reader)?
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "the server closed the connection without a response"))?;
-    let code: u16 = status.parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("a bad status {:?}", status)))?;
+/// Reads one response whole, to the request `method` was, with any interim 1xx responses before
+/// it kept in its bytes: a HEAD response, a 204 or 304 has no body whatever its headers say. None
+/// when the connection ended before any byte of it.
+fn read_response(reader: &mut impl BufRead, method: &str) -> std::io::Result<Option<Message>> {
+    let mut bytes = Vec::new();
+    let (headers, version, status, code) = loop {
+        let Some(Head { bytes: head, headers, first: [version, status] }) = read_head(reader)? else {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "the connection ended after an interim response"));
+        };
+        let code: u16 = status.parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("a bad status {:?}", status)))?;
+        bytes.extend_from_slice(&head);
+        // An interim response is followed by the final one on the same request; 101 switches
+        // protocols, and nothing HTTP follows it.
+        if !(100..200).contains(&code) || code == 101 {
+            break (headers, version, status, code);
+        }
+    };
     let mut closing = closes(&headers);
     let body = if method == "HEAD" || (100..200).contains(&code) || code == 204 || code == 304 {
         Body::None
@@ -340,7 +368,7 @@ fn read_response(reader: &mut impl BufRead, method: &str) -> std::io::Result<Mes
         Body::ToEnd
     };
     read_body(reader, body, &mut bytes)?;
-    Ok(Message { bytes, first: version, second: status, closes: closing })
+    Ok(Some(Message { bytes, first: version, second: status, closes: closing }))
 }
 
 /// The path of a request target, without its query.
@@ -357,6 +385,8 @@ struct Upstream {
 impl Upstream {
     fn connect(address: SocketAddr) -> std::io::Result<Upstream> {
         let stream = TcpStream::connect_timeout(&address, Duration::from_secs(10))?;
+        stream.set_read_timeout(Some(UPSTREAM_TIMEOUT))?;
+        stream.set_write_timeout(Some(UPSTREAM_TIMEOUT))?;
         Ok(Upstream { reader: BufReader::new(stream.try_clone()?), writer: stream })
     }
 }
@@ -377,7 +407,7 @@ fn reset(stream: TcpStream) {
     drop(stream);
 }
 
-/// Takes the armed fault when the request just read, at `index`, is the one it was armed for.
+/// Takes the armed fault when the request just numbered, `index`, is the one it was armed for.
 fn take_fault(state: &State, index: usize) -> Option<Fault> {
     let mut armed = lock(&state.armed);
     match *armed {
@@ -400,54 +430,64 @@ fn serve_connection(client: TcpStream, state: &State) {
             Ok(Some(request)) => request,
             _ => return,
         };
-        let index = {
-            let mut log = lock(&state.log);
-            let index = log.len();
-            log.push(Exchange { index, method: request.first.clone(), path: path_of(&request.second), status: None, fault: None });
-            index
-        };
-        let fault = take_fault(state, index);
-        if fault.is_some() {
-            lock(&state.log)[index].fault = fault;
-        }
-        if fault == Some(Fault::Drop) {
-            // A fault toward the client while the request is still arriving forwards nothing.
-            let _ = client.shutdown(Shutdown::Both);
-            return;
-        }
-
-        let response = {
-            let _turn = lock(&state.order);
-            let address = *lock(&state.upstream);
-            if upstream.is_none() {
-                upstream = Upstream::connect(address).ok();
-            }
-            let Some(server) = upstream.as_mut() else {
-                let _ = client.shutdown(Shutdown::Both);
-                return;
+        let (index, fault, response) = {
+            let _turn = state.serial.load(Ordering::SeqCst).then(|| lock(&state.order));
+            let index = {
+                let mut log = lock(&state.log);
+                let index = log.len();
+                log.push(Exchange { index, method: request.first.clone(), path: path_of(&request.second), status: None, fault: None });
+                index
             };
-            if fault == Some(Fault::Cut) {
-                let _ = server.writer.write_all(&request.bytes[..request.bytes.len() / 2]);
-                let _ = server.writer.shutdown(Shutdown::Both);
+            let fault = take_fault(state, index);
+            if fault.is_some() {
+                lock(&state.log)[index].fault = fault;
+            }
+            if fault == Some(Fault::Drop) {
+                // A fault toward the client while the request is still arriving forwards nothing.
                 let _ = client.shutdown(Shutdown::Both);
                 return;
             }
-            if server.writer.write_all(&request.bytes).and_then(|_| server.writer.flush()).is_err() {
-                let _ = client.shutdown(Shutdown::Both);
-                return;
-            }
-            if fault == Some(Fault::Kill) {
-                if let Some(kill) = lock(&state.killer).as_mut() {
-                    kill();
+            let address = *lock(&state.upstream);
+            loop {
+                // A kept connection the server has since closed (an idle close, or a close after a
+                // refusal that never said so) is noticed only on use: it is opened again, once, as
+                // a client does. A connection just opened is not.
+                let reused = upstream.is_some();
+                if upstream.is_none() {
+                    upstream = Upstream::connect(address).ok();
                 }
-                let _ = client.shutdown(Shutdown::Both);
-                return;
-            }
-            match read_response(&mut server.reader, &request.first) {
-                Ok(response) => response,
-                Err(_) => {
+                let Some(server) = upstream.as_mut() else {
                     let _ = client.shutdown(Shutdown::Both);
                     return;
+                };
+                if fault == Some(Fault::Cut) {
+                    let _ = server.writer.write_all(&request.bytes[..request.bytes.len() / 2]);
+                    let _ = server.writer.shutdown(Shutdown::Both);
+                    let _ = client.shutdown(Shutdown::Both);
+                    return;
+                }
+                if server.writer.write_all(&request.bytes).and_then(|_| server.writer.flush()).is_err() {
+                    if reused {
+                        upstream = None;
+                        continue;
+                    }
+                    let _ = client.shutdown(Shutdown::Both);
+                    return;
+                }
+                if fault == Some(Fault::Kill) {
+                    if let Some(kill) = lock(&state.killer).as_mut() {
+                        kill();
+                    }
+                    let _ = client.shutdown(Shutdown::Both);
+                    return;
+                }
+                match read_response(&mut server.reader, &request.first) {
+                    Ok(Some(response)) => break (index, fault, response),
+                    Ok(None) if reused => upstream = None,
+                    _ => {
+                        let _ = client.shutdown(Shutdown::Both);
+                        return;
+                    }
                 }
             }
         };
@@ -501,6 +541,12 @@ mod tests {
     }
 
     fn echo(hold: Duration) -> Echo {
+        echo_closing(hold, false)
+    }
+
+    /// An [`echo`] that, with `closes`, closes each connection after its first response without
+    /// saying so, as a server does after an idle while.
+    fn echo_closing(hold: Duration, closes: bool) -> Echo {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let reached = Arc::new(AtomicUsize::new(0));
@@ -525,7 +571,7 @@ mod tests {
                         let body = format!("{} {}", request.first, request.second);
                         let response = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}", body.len(), body);
                         busy.fetch_sub(1, Ordering::SeqCst);
-                        if stream.write_all(response.as_bytes()).is_err() {
+                        if stream.write_all(response.as_bytes()).is_err() || closes {
                             return;
                         }
                     }
@@ -546,7 +592,7 @@ mod tests {
         let mut buffer = [0u8; 4096];
         loop {
             // A whole response is the answer, whatever follows it.
-            if let Ok(response) = read_response(&mut std::io::Cursor::new(&bytes), "GET") {
+            if let Ok(Some(response)) = read_response(&mut std::io::Cursor::new(&bytes), "GET") {
                 if !response.closes {
                     return (response.bytes, false);
                 }
@@ -584,13 +630,14 @@ mod tests {
             vec![("GET", "/v1/warehouse", Some(200)), ("PUT", "/v1/objects/ab", Some(200)), ("POST", "/v1/pallets/main", Some(200))]);
     }
 
-    /// Requests on concurrent connections reach the server one at a time.
+    /// Serialized, requests on concurrent connections reach the server one at a time.
     ///
     /// Revert: forward without taking the order lock → the server handles several at once.
     #[test]
     fn concurrent_requests_reach_the_server_one_at_a_time() {
         let server = echo(Duration::from_millis(100));
         let proxy = Arc::new(Proxy::start(server.address).unwrap());
+        proxy.set_serial(true);
         let clients: Vec<_> = (0..6).map(|_| {
             let proxy = proxy.clone();
             std::thread::spawn(move || ask(&proxy, GET))
@@ -664,6 +711,40 @@ mod tests {
             assert_eq!(ask(&proxy, GET).0, whole, "{:?}: the request after the faulted one", fault);
             let _ = errored;
         }
+    }
+
+    /// A kept server connection that the server closed without saying so is opened again for the
+    /// next request on the same client connection.
+    ///
+    /// Revert: drop the reconnect on a reused connection → the second request's client
+    /// connection is closed with no answer.
+    #[test]
+    fn a_server_connection_closed_unannounced_is_opened_again() {
+        let server = echo_closing(Duration::ZERO, true);
+        let proxy = Proxy::start(server.address).unwrap();
+        let address: SocketAddr = proxy.url.trim_start_matches("http://").parse().unwrap();
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        for _ in 0..2 {
+            stream.write_all(GET).unwrap();
+            let response = read_response(&mut reader, "GET").unwrap().expect("an answer");
+            assert!(response.bytes.ends_with(b"GET /v1/warehouse?x=1"));
+        }
+        assert_eq!(server.reached.load(Ordering::SeqCst), 2);
+    }
+
+    /// An interim response is kept with the final one it precedes, and the final one's status is
+    /// the response's; a connection ending before any byte is no response.
+    ///
+    /// Revert: take the 100 as the response → its status is read as 100 and the 200 is left over.
+    #[test]
+    fn interim_responses_are_read_with_the_final_one() {
+        let bytes = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+        let mut reader = std::io::Cursor::new(&bytes[..]);
+        let response = read_response(&mut reader, "PUT").unwrap().unwrap();
+        assert_eq!((response.second.as_str(), response.bytes.as_slice()), ("200", &bytes[..]));
+        assert_eq!(read_response(&mut std::io::Cursor::new(&b""[..]), "GET").unwrap(), None);
     }
 
     /// A restarted server is reached at its new address.

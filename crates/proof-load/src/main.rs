@@ -428,7 +428,12 @@ fn main() -> ExitCode {
     for run in networked {
         let label = format!("{}-network-{:?}-{}", run.scenario, run.point.fault, run.point.at);
         let _ = std::fs::write(output.root().join(format!("{}.json", label)), serde_json::to_string(&run).unwrap_or_default());
-        let mut note = format!("through the harness's proxy, one request at a time{}", if run.restarted { "; the killed server restarted before the readback" } else { "" });
+        let mut note = "through the harness's proxy, one request at a time".to_string();
+        match &run.restart {
+            Some(proof_load::network::Restart { refused: None }) => note.push_str("; the killed server restarted before the readback"),
+            Some(proof_load::network::Restart { refused: Some(said) }) => note.push_str(&format!("; the killed server would not start again: {}", said.trim())),
+            None => {}
+        }
         if run.point.fault == proof_load::proxy::Fault::Reset && Platform::current() == Platform::Windows {
             note.push_str("; a plain close on Windows, where no linger is set");
         }

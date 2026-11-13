@@ -2,10 +2,15 @@
 //! faulted command of a hosted scenario makes, each on a fresh build. The faulted command's
 //! requests are counted first by running it once with nothing armed.
 //!
+//! The proxy forwards one request at a time while this lane runs, so requests are numbered in the
+//! order they reach the server and a fault's window is its request's alone.
+//!
 //! The readback is through a fresh clone of the host: what a network fault can lose is what the
 //! client was told the host holds. A server the fault killed is restarted before anything is read
 //! back, as an operator restarts a crashed server; what the restart had to remove first is
-//! outside knowledge, because the restarted server named it and the user would have had to act on it.
+//! outside knowledge, because the restarted server named it and the user would have had to act on
+//! it. A server that will not start again is graded, not an error: it serves nothing from then on,
+//! so every readback through it is refused.
 
 use std::time::Duration;
 
@@ -52,9 +57,16 @@ pub struct Networked {
     pub point: Point,
     /// The exchange the fault fired on.
     pub exchange: Exchange,
-    /// Whether the server was restarted after the fault killed it.
-    pub restarted: bool,
+    /// When the fault killed the server, what restarting it took and whether it came back.
+    pub restart: Option<Restart>,
     pub graded: Graded,
+}
+
+/// What restarting a killed server took.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Restart {
+    /// What the server last said, when it would not start again.
+    pub refused: Option<String>,
 }
 
 impl Networked {
@@ -74,6 +86,7 @@ fn host_of<'a>(scenario: &Scenario, built: &'a runner::Built) -> Result<&'a Host
 pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<usize, RunError> {
     let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), scratch, environment, limit, None)?;
     let host = host_of(scenario, &built)?;
+    host.proxy.set_serial(true);
     let corpus = &scenario.corpus(corpus);
     let (_, index) = faulted::expected(scenario, corpus, &built, Warehouse::Host)?;
     let context = Context {
@@ -98,6 +111,7 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scratch:
 pub fn network(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, point: Point) -> Result<Networked, RunError> {
     let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), scratch, environment, limit, None)?;
     let host = host_of(scenario, &built)?;
+    host.proxy.set_serial(true);
     let corpus = &scenario.corpus(corpus);
     let (expected, index) = faulted::expected(scenario, corpus, &built, Warehouse::Host)?;
     let context = Context {
@@ -122,8 +136,8 @@ pub fn network(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scratc
         Ok(made)
     })?;
     let exchange = fired.ok_or_else(|| RunError::Io("the armed fault was disarmed and never fired".to_string()))?;
-    let restarted_any = restarted.is_some();
-    if let Some(Restarted { outside_knowledge, unextractable }) = restarted {
+    let restart = restarted.as_ref().map(|restarted: &Restarted| Restart { refused: restarted.refused.clone() });
+    if let Some(Restarted { outside_knowledge, unextractable, .. }) = restarted {
         for (at, step) in outside_knowledge.into_iter().enumerate() {
             graded.recoverability.outside_knowledge.insert(at, step);
         }
@@ -133,7 +147,7 @@ pub fn network(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scratc
             }
         }
     }
-    Ok(Networked { scenario: scenario.id.clone(), point, exchange, restarted: restarted_any, graded })
+    Ok(Networked { scenario: scenario.id.clone(), point, exchange, restart, graded })
 }
 
 #[cfg(test)]
