@@ -63,6 +63,48 @@ pub enum Op {
     Verify,
     /// Repair the store from what it can still reach.
     Repair,
+    /// Run one forklift command line, in the folder `at` under the scratch root, keeping what its
+    /// document says for later lines: a coverage scenario's way to reach a command no other
+    /// operation runs. A placeholder `{name}` stands for a kept value.
+    Run { line: Vec<String>, at: String, keep: Vec<Keep> },
+    /// Run one of the host's server commands over the host warehouse: `--root` is added.
+    Serve { line: Vec<String> },
+    /// Stop the host's server, for the server commands refused while it serves. The server is
+    /// killed, and the lock it leaves behind cleared.
+    StopHost,
+    /// Delete every signing key the operator holds, so no one can extend the office chain.
+    LoseKeys,
+    /// Backdate every file of the host's object store by two days, past any grace period.
+    Age,
+    /// Write the variant of corpus record `index` into the work tree and record nothing.
+    Scribble { index: usize },
+    /// Write `text` to the work tree's `path`, recording nothing: a file whose name a line can
+    /// give, which no seed moves.
+    Write { path: String, text: String },
+    /// Build a state only a failed write leaves: run `line` with its `when`-th fsync failing EIO,
+    /// for `when` from 1 up, until `until` holds. Needs strace, and is skipped without it: the
+    /// write-op check that needs the state runs under strace only.
+    Inject { line: Vec<String>, at: String, until: Until },
+}
+
+/// A value kept from a command's document: the string at `pointer`, from the text after `after`
+/// when given, split on whitespace, word `word`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Keep {
+    pub name: String,
+    pub pointer: String,
+    pub after: Option<String>,
+    pub word: usize,
+}
+
+/// When an injected state stands.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "until", rename_all = "kebab-case")]
+pub enum Until {
+    /// A folder under the line's folder holds an entry.
+    Holds { folder: String },
+    /// A forklift line's document holds `equals` at `pointer`.
+    Says { line: Vec<String>, pointer: String, equals: String },
 }
 
 /// The tools a scenario can be bound to.
@@ -123,6 +165,8 @@ pub fn record_message(index: usize) -> String {
 pub const URL: &str = "{url}";
 /// Stands in a binding's line for the work tree's absolute path.
 pub const WORK: &str = "{work}";
+/// Stands in a coverage line for the scratch area's root, where a line names another warehouse.
+pub const SCRATCH: &str = "{scratch}";
 /// Stands in a binding's line for `<parcel>:<path>`, the content a redaction takes away, which is
 /// known only once its record is made.
 pub const TARGET: &str = "{target}";
@@ -185,6 +229,10 @@ pub fn bind(tool: Tool, op: &Op) -> Option<Vec<Vec<String>>> {
                 Op::Fetch => vec![line(&["lower"])],
                 Op::Verify => vec![line(&["audit", "--full"])],
                 Op::Repair => vec![line(&["heal"])],
+                Op::Run { line, .. } | Op::Inject { line, .. } => vec![line.clone()],
+                // The harness's own steps, or the server's commands, which the build runs with
+                // the server binary.
+                Op::Serve { .. } | Op::StopHost | Op::LoseKeys | Op::Age | Op::Scribble { .. } | Op::Write { .. } => vec![],
             };
             Some(lines.into_iter().map(|mut arguments| { arguments.insert(0, "--json".into()); arguments }).collect())
         }
@@ -209,6 +257,8 @@ pub fn bind(tool: Tool, op: &Op) -> Option<Vec<Vec<String>>> {
                 Op::Host | Op::Bundle | Op::Clone { .. } | Op::MoveOrigin | Op::DeleteRemote { .. } | Op::Withhold { .. } | Op::EnrollHost => return None,
                 // Git has no redaction: a rewrite of history is a different operation.
                 Op::Redact { .. } => return None,
+                // Forklift's own commands, and the harness's steps around them.
+                Op::Run { .. } | Op::Serve { .. } | Op::StopHost | Op::LoseKeys | Op::Age | Op::Scribble { .. } | Op::Write { .. } | Op::Inject { .. } => return None,
             };
             let prefix: &[&str] = if tool == Tool::GitTuned { GIT_TUNED } else { &[] };
             Some(lines.into_iter().map(|arguments| line(prefix).into_iter().chain(arguments).collect()).collect())
@@ -313,7 +363,7 @@ impl Op {
     /// The snapshot this operation writes into the work tree before its lines run, if any.
     pub fn writes(&self, corpus: &crate::corpus::Corpus) -> Option<Result<crate::corpus::Snapshot, String>> {
         let mark = match self {
-            Op::Park { index } => Mark::Variant(*index),
+            Op::Park { index } | Op::Scribble { index } => Mark::Variant(*index),
             op => op.mark()?,
         };
         Some(mark.snapshot(corpus).ok_or_else(|| format!("{:?} is past the corpus's {} records", mark, corpus.records.len())))
@@ -381,6 +431,147 @@ pub fn catalog() -> Vec<Scenario> {
     ]
 }
 
+/// The coverage scenarios: histories built only for the write-op check, each reaching commands no
+/// faulted scenario runs, with the precondition each needs built first. They are built and walked
+/// like every scenario, and never faulted.
+pub fn coverage() -> Vec<Scenario> {
+    let record = |index| Op::Record { index };
+    let named = |id: &str, history: Vec<Op>| Scenario { id: id.to_string(), history, then: vec![], damage: None };
+    let write = |path: &str, text: &str| Op::Write { path: path.to_string(), text: text.to_string() };
+    vec![
+        // The work tree's own commands, and the read-only ones over a warehouse with history.
+        named("staging", [
+            // A record writes the whole work tree, so the fixed file follows the records.
+            vec![record(0), record(1), run(&["undo"]), write("notes.txt", "notes\n"), run(&["load", "."]), run_keep(&["stack", "-m", "notes"], &[keep("parcel", "/data/parcel")])],
+            runs(&[
+                &["stocktake"], &["diff"], &["history"], &["blame", "--", "notes.txt"], &["show", "--", "main:notes.txt"],
+                &["query"], &["store"], &["store", "status"], &["store", "peek", "--", "{parcel}"], &["pallet"], &["pallet", "list"],
+                &["park", "list"], &["bay"], &["config"], &["config", "list"], &["config", "get", "--", "operator.identifier"],
+                &["conflicts"], &["scope"], &["scope", "status"], &["remote"], &["tag"], &["tag", "list"], &["redact"],
+                &["redact", "list"], &["office"], &["office", "list"], &["haul"], &["haul", "list"], &["manifest"],
+                &["self", "alias"], &["self", "alias", "status"], &["profile"], &["profile", "list"],
+            ]),
+            vec![Op::Scribble { index: 1 }, run(&["restore", "--confirm", "--", "."]), Op::Scribble { index: 1 }],
+            // A redaction of content only the staged work still holds waits, until a load takes
+            // it out: the head moves on first, since one the head names is refused.
+            vec![write("notes.txt", "later\n"), run(&["load", "."]), run(&["stack", "-m", "later"]), write("notes.txt", "notes\n"), run(&["load", "."])],
+            vec![run(&["redact", "record", "-m", "redacted", "{parcel}:notes.txt"]), write("notes.txt", "later\n"), run(&["load", "."]), run(&["redact", "apply"])],
+            runs(&[&["load", "."], &["unload", "--", "."], &["remove", "--", "notes.txt"]]),
+            runs(&[&["config", "set", "--", "mirror.auto", "true"], &["config", "unset", "--", "mirror.auto"]]),
+            runs(&[&["bay", "add", "--", "extra", "../extra"], &["bay", "remove", "--", "extra"]]),
+        ].concat()),
+        // Pallets: a local delete and its undo, a park popped, a delivery, a stopped merge
+        // abandoned, and an export imported into another warehouse.
+        named("pallets", [
+            vec![record(0), Op::Branch { name: "side".into() }, Op::Switch { name: "side".into() }, Op::Variant { index: 0 }],
+            runs(&[&["deliver", "-m", "delivered", "--", "main"], &["pallet", "delete", "--force", "--", "side"], &["undo"]]),
+            vec![Op::Park { index: 1 }, run(&["park", "pop"]), run(&["load", "."]), run(&["stack", "-m", "popped"])],
+            vec![Op::Switch { name: "side".into() }, Op::Variant { index: 1 }, Op::Switch { name: "main".into() }, record(1), Op::Conflict { name: "side".into() }],
+            runs(&[&["abort", "--confirm"], &["git", "export", "--", "../exported"]]),
+            vec![run_at("imported", &["prepare"]), run_at("imported", &["git", "import", "--", "../exported"])],
+        ].concat()),
+        // The office: signed facts and tags, operators admitted, keys authorized, linked, rotated
+        // and retired, hauls through their life, then every key lost and a re-genesis.
+        named("office", [
+            vec![record(0), Op::Enroll],
+            runs(&[
+                &["manifest", "note", "-m", "noted", "--", "main"], &["manifest", "approve", "-m", "approved", "--", "main"],
+                &["manifest", "provenance", "--model", "m", "--tool", "t", "-m", "made", "--", "main"],
+                &["manifest", "set", "--", "main", "k", "v"], &["manifest", "get", "--", "main", "k"], &["manifest", "keys", "--", "main"],
+                &["manifest", "log", "--", "main", "k"], &["manifest", "show", "--", "main"], &["manifest", "unset", "--", "main", "k"],
+                &["tag", "create", "-m", "released", "--", "v1"], &["tag", "show", "--", "v1"],
+                &["profile", "create", "--", "second"],
+            ]),
+            vec![
+                run_keep(&["profile", "keygen", "--", "second"], &admitted("office admit ", &["who", "key", "pop"])),
+                run_keep(&["office", "admit", "--", "{who}", "{key}", "{pop}"], &[Keep { name: "root".into(), pointer: "/data/message".into(), after: Some("identity root ".into()), word: 0 }]),
+                run_keep(&["profile", "keygen", "--", "second"], &admitted("office admit ", &["who", "key", "pop"])),
+                run(&["office", "authorize", "--", "{who}", "{key}", "{pop}"]), run(&["office", "role", "--", "{who}", "admin"]),
+                run(&["office", "retire", "--", "{root}"]),
+                run_keep(&["config", "get", "--", "operator.identifier"], &[keep("me", "/data/value")]),
+                run(&["profile", "create", "--id", "{me}", "--", "device"]),
+                run_keep(&["profile", "keygen", "--", "device"], &admitted("office link ", &["key", "pop"])),
+                run(&["office", "link", "--", "{key}", "{pop}"]), run(&["office", "rotate"]),
+            ],
+            vec![Op::Branch { name: "side".into() }, Op::Switch { name: "side".into() }, record(1)],
+            vec![run_keep(&["haul", "open", "--target", "main", "--source", "side", "--title", "t", "-m", "opened"], &[keep("haul", "/data/id")]), record(2)],
+            runs(&[
+                &["haul", "update", "--", "{haul}"], &["haul", "show", "--", "{haul}"], &["haul", "comment", "-m", "c", "--", "{haul}"],
+                &["haul", "close", "--", "{haul}"], &["haul", "reopen", "--", "{haul}"],
+            ]),
+            vec![Op::Switch { name: "main".into() }, run(&["haul", "consolidate", "--", "{haul}"])],
+            vec![Op::LoseKeys, run(&["office", "regenesis", "--confirm"]), run(&["profile", "use", "--", "second"])],
+        ].concat()),
+        // A host: a pallet deleted there and restored, sparse and cache clones whose scopes and
+        // store change, a git mirror, a move of the origin stopped and abandoned, a re-genesis
+        // another warehouse accepts, and the server's own commands, the ones refused while it
+        // serves after it stops.
+        named("hosted", [
+            vec![Op::Host, record(0), Op::Enroll, Op::Push, record(1), write("left/a.txt", "a\n"), write("right/b.txt", "b\n")],
+            vec![run(&["load", "."]), run(&["stack", "-m", "folders"]), Op::Push],
+            vec![Op::Branch { name: "side".into() }, Op::Switch { name: "side".into() }, Op::Variant { index: 1 }, Op::Push, Op::Switch { name: "main".into() }],
+            vec![Op::DeleteRemote { name: "side".into() }, run_at("host", &["pallet", "restore", "--", "side"]), run(&["pallet", "list", "--remote"])],
+            vec![run_at(".", &["clone", "--", "{url}", "{scratch}/other"])],
+            vec![run_at(".", &["clone", "--only", "left", "--only", "right", "--", "{url}", "{scratch}/sparse"])],
+            vec![run_at("sparse", &["scope", "narrow", "--", "right"]), run_at("sparse", &["scope", "prune", "--confirm", "--", "right"]), run_at("sparse", &["scope", "fetch", "--", "right"])],
+            vec![run_at(".", &["clone", "--cache", "--", "{url}", "{scratch}/cache"]), run_at("cache", &["store", "evict"])],
+            vec![
+                Op::Inject { line: line(&["remote", "move", "--", "{url}"]), at: "cache".into(), until: Until::Says { line: line(&["remote"]), pointer: "/data/blocked/code".into(), equals: "origin_move_pending".into() } },
+                run_at("cache", &["remote", "abort"]),
+            ],
+            runs(&[&["git", "export", "--", "{scratch}/mirror"], &["config", "set", "--", "mirror.url", "{scratch}/mirror"], &["git", "mirror"]]),
+            vec![
+                Op::LoseKeys,
+                run_keep(&["office", "regenesis", "--confirm"], &[Keep { name: "genesis".into(), pointer: "/data/message".into(), after: Some("New genesis parcel:".into()), word: 0 }]),
+                Op::Push, run_at("other", &["office", "accept-regenesis", "--confirm", "{genesis}"]),
+            ],
+            // History made after the re-genesis, so no trust pin holds it: deleted on the host, its
+            // tombstone dropped, and collected once it is old enough.
+            vec![Op::Branch { name: "late".into() }, Op::Switch { name: "late".into() }, Op::Variant { index: 0 }, Op::Push, Op::Switch { name: "main".into() }],
+            // The listings run with the host stopped, so their digests see no write of the server's.
+            vec![Op::DeleteRemote { name: "late".into() }, Op::StopHost, serve(&["tombstone", "list"]), serve(&["withhold", "list"])],
+            vec![serve(&["tombstone", "drop", "late"]), Op::Age, serve(&["gc"])],
+        ].concat()),
+        // A durability taint a failed directory sync leaves, which heal resolves.
+        named("tainted", vec![
+            record(0), Op::Scribble { index: 0 }, run(&["load", "."]),
+            Op::Inject { line: line(&["stack", "-m", "tainted"]), at: "work".into(), until: Until::Holds { folder: ".forklift/taint".into() } },
+            Op::Repair,
+        ]),
+    ]
+}
+
+/// A coverage line run in the work tree, keeping nothing.
+fn run(arguments: &[&str]) -> Op {
+    run_at("work", arguments)
+}
+
+fn run_at(at: &str, arguments: &[&str]) -> Op {
+    Op::Run { line: line(arguments), at: at.to_string(), keep: vec![] }
+}
+
+fn run_keep(arguments: &[&str], keep: &[Keep]) -> Op {
+    Op::Run { line: line(arguments), at: "work".to_string(), keep: keep.to_vec() }
+}
+
+fn runs(lines: &[&[&str]]) -> Vec<Op> {
+    lines.iter().map(|arguments| run(arguments)).collect()
+}
+
+fn serve(arguments: &[&str]) -> Op {
+    Op::Serve { line: line(arguments) }
+}
+
+/// The string at `pointer`, whole.
+fn keep(name: &str, pointer: &str) -> Keep {
+    Keep { name: name.to_string(), pointer: pointer.to_string(), after: None, word: 0 }
+}
+
+/// The words a keygen's message gives after `after`, one name each: the line it says to hand on.
+fn admitted(after: &str, names: &[&str]) -> Vec<Keep> {
+    names.iter().enumerate().map(|(word, name)| Keep { name: name.to_string(), pointer: "/data/message".into(), after: Some(after.to_string()), word }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +584,9 @@ mod tests {
             Op::Park { index: 0 }, Op::Enroll, Op::Pack, Op::Host, Op::Clone { kind: CloneKind::Only("src".into()) },
             Op::Clone { kind: CloneKind::Cache }, Op::Bundle, Op::MoveOrigin, Op::DeleteRemote { name: "side".into() },
             Op::Withhold { index: 0 }, Op::Redact { index: 0 }, Op::EnrollHost,
+            run(&["undo"]), serve(&["gc"]), Op::StopHost, Op::LoseKeys, Op::Age, Op::Scribble { index: 0 },
+            Op::Write { path: "notes.txt".into(), text: "n".into() },
+            Op::Inject { line: line(&["stack", "-m", "x"]), at: "work".into(), until: Until::Holds { folder: ".forklift/taint".into() } },
         ]
     }
 
@@ -405,7 +599,9 @@ mod tests {
             let lines = bind(Tool::Forklift, &op).unwrap_or_else(|| panic!("Tool::Forklift binds {:?}", op));
             // Bundle and withhold are the server's own commands, which the build runs with the
             // server binary; enrolling the host runs in another warehouse, which the build lays out.
-            assert_eq!(lines.is_empty(), matches!(op, Op::Bundle | Op::Withhold { .. } | Op::EnrollHost), "{:?}", op);
+            // The harness's own steps write files or stop the host, and run no forklift line.
+            let none = matches!(op, Op::Bundle | Op::Withhold { .. } | Op::EnrollHost | Op::Serve { .. } | Op::StopHost | Op::LoseKeys | Op::Age | Op::Scribble { .. } | Op::Write { .. });
+            assert_eq!(lines.is_empty(), none, "{:?}", op);
             assert!(lines.iter().all(|arguments| arguments[0] == "--json"), "{:?}", lines);
         }
         assert_eq!(bind(Tool::Forklift, &Op::Clone { kind: CloneKind::Cache }).unwrap(),
@@ -424,7 +620,8 @@ mod tests {
     fn git_binds_what_it_has_and_the_rest_is_forklift_only() {
         for op in every_op() {
             let forklift_only = matches!(op, Op::Repair | Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll | Op::Host | Op::Bundle | Op::Clone { .. } | Op::MoveOrigin
-                | Op::DeleteRemote { .. } | Op::Withhold { .. } | Op::Redact { .. } | Op::EnrollHost);
+                | Op::DeleteRemote { .. } | Op::Withhold { .. } | Op::Redact { .. } | Op::EnrollHost | Op::Run { .. } | Op::Serve { .. } | Op::StopHost
+                | Op::LoseKeys | Op::Age | Op::Scribble { .. } | Op::Write { .. } | Op::Inject { .. });
             assert_eq!(bind(Tool::Git, &op).is_some(), !forklift_only, "{:?}", op);
         }
         let tuned = bind(Tool::GitTuned, &Op::Verify).unwrap();
@@ -458,6 +655,8 @@ mod tests {
         assert_eq!(Op::Variant { index: 0 }.writes(&corpus).unwrap().unwrap(), crate::corpus::variant(&corpus.records[0]));
         assert!(Op::Record { index: 2 }.writes(&corpus).unwrap().is_err(), "past the corpus is an error, not a guess");
         assert!(Op::Enroll.writes(&corpus).is_none());
+        assert_eq!(Op::Scribble { index: 1 }.writes(&corpus).unwrap().unwrap(), crate::corpus::variant(&corpus.records[1]));
+        assert!(Op::Scribble { index: 1 }.mark().is_none(), "a scribble records nothing");
     }
 
     /// What a withhold or a redaction takes away is content of its record that no later record

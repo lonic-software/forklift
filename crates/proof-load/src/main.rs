@@ -16,6 +16,7 @@ use proof_load::faulted::{self, Programs};
 use proof_load::kill;
 use proof_load::report::{Category, Cell, Completeness, CoverageTable, Determinism, Platform, Report, Row};
 use proof_load::scrub::Output;
+use proof_load::writeops;
 
 #[derive(Parser)]
 #[command(name = "proof-load", about = "Fault-injection harness for Forklift")]
@@ -118,42 +119,107 @@ fn main() -> ExitCode {
         tools.insert("forklift-server".to_string(), described(server));
     }
 
-    // Each scenario's history built with the forklift under test: what it created, and what its
-    // walk found that no census row classifies.
+    // The version under test's write-op universe: its schema's command ids and the server's
+    // leaves. Without a schema command the harness refuses to run; it keeps no list of its own.
+    let program = match forklift.as_deref().map(tool::absolute).transpose() {
+        Ok(program) => program,
+        Err(error) => {
+            eprintln!("proof-load: the client binary's path: {}", error);
+            return ExitCode::from(2);
+        }
+    };
+    let mut asked = |label: &str| -> Result<(proof_load::scrub::Scratch, Environment), String> {
+        let scratch = output.scratch(label).map_err(|error| error.to_string())?;
+        let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
+        Ok((scratch, environment))
+    };
+    let limit = std::time::Duration::from_secs(120);
+    let schema = match &program {
+        None => None,
+        Some(program) => match asked("schema").and_then(|(scratch, environment)| writeops::read_schema(program, &scratch, &environment, limit)) {
+            Ok(schema) => Some(schema),
+            Err(error) => {
+                eprintln!("proof-load: {}", error);
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let leaves = match &server {
+        None => vec![],
+        Some(server) => match asked("server-help").and_then(|(scratch, environment)| writeops::read_server_leaves(server, &scratch, &environment, limit)) {
+            Ok(leaves) => leaves,
+            Err(error) => {
+                eprintln!("proof-load: {}", error);
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let traced = match &strace {
+        _ if Platform::current() != Platform::Linux => Err("write-op traces run on Linux only"),
+        None => Err("no strace given"),
+        Some(strace) => tool::absolute(strace).map_err(|_| "cannot resolve the strace path"),
+    };
+    let traces = writeops::traces_folder(output.root());
+    if let Err(error) = std::fs::create_dir_all(&traces) {
+        eprintln!("proof-load: {}: {}", traces.display(), error);
+        return ExitCode::from(2);
+    }
+    let read_only: std::collections::BTreeSet<String> = proof_load::bindings::WRITE_EXEMPTIONS.iter()
+        .filter(|(_, exemption)| matches!(exemption, writeops::Exemption::ReadOnly(_))).map(|(id, _)| id.to_string()).collect();
+
+    // Each scenario's history built with the forklift under test: what it created, what its walk
+    // found that no census row classifies, and what each step wrote. The coverage scenarios are
+    // built only for what their steps write.
+    let built_scenarios: Vec<_> = scenarios.iter().cloned()
+        .chain(scenario::coverage().into_iter().filter(|scenario| only.as_ref().is_none_or(|only| *only == scenario.id))).collect();
     let mut created: BTreeMap<(String, Warehouse), Vec<String>> = BTreeMap::new();
     let mut walk_missing = Vec::new();
-    let walk_cell = match (&forklift, &census) {
+    let mut evidence = Vec::new();
+    if let (Some(program), Some(schema)) = (&program, &schema) {
+        tools.insert("forklift".to_string(), described(program));
+        if let Ok(strace) = &traced {
+            tools.insert("strace".to_string(), described(strace));
+        }
+        for scenario in &built_scenarios {
+            let observer = writeops::Observer::new(traced.as_ref().ok().map(PathBuf::as_path), &traces, schema, &leaves, &read_only, &scenario.id);
+            let built = output.scratch(&scenario.id).map_err(|error| error.to_string())
+                .and_then(|scratch| {
+                    let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
+                    environment_seen = environment.variables.clone();
+                    runner::build(scenario, &corpus, Tool::Forklift, program, server.as_deref(), &scratch, &environment, limit, Some(&observer))
+                        .map_err(|error| error.to_string())
+                });
+            evidence.extend(observer.evidence());
+            match (built, &census) {
+                (Ok(built), Some(census)) => {
+                    walk_missing.extend(census.unclassified(&built.walked).into_iter().map(|path| format!("{}: {}", scenario.id, path)));
+                    walk_missing.extend(census.unclassified(&built.host_walked).into_iter().map(|path| format!("{} host: {}", scenario.id, path)));
+                    created.insert((scenario.id.clone(), Warehouse::Client), runner::created_names(census, &built.walked));
+                    created.insert((scenario.id.clone(), Warehouse::Host), runner::created_names(census, &built.host_walked));
+                }
+                (Ok(_), None) => {}
+                (Err(error), _) => walk_missing.push(format!("{}: not built: {}", scenario.id, error)),
+            }
+        }
+    }
+    let written = serde_json::to_string(&evidence).map_err(|error| error.to_string())
+        .and_then(|text| std::fs::write(output.root().join("write-ops.json"), text).map_err(|error| error.to_string()));
+    if let Err(error) = written {
+        eprintln!("proof-load: cannot write write-ops.json: {}", error);
+        return ExitCode::from(2);
+    }
+    let not_run = |reason: &str| ["write-op coverage", "read-only exemptions"].map(|check| Completeness { check: check.to_string(), cell: Cell::not_run(reason), missing: vec![] }).to_vec();
+    let write_checks = match (&schema, &server) {
+        (None, _) => not_run("no forklift binary given"),
+        (Some(_), None) => not_run("no forklift-server binary given"),
+        // Run in full only: a filtered run builds too few scenarios to cover the universe.
+        (Some(_), Some(_)) if only.is_some() => not_run("--only builds one scenario"),
+        (Some(schema), Some(_)) => writeops::check(&writeops::universe(schema, &leaves), &evidence, proof_load::bindings::WRITE_EXEMPTIONS, traced.as_ref().err().copied()),
+    };
+    let walk_cell = match (&program, &census) {
         (None, _) => Cell::not_run("no forklift binary given"),
         (Some(_), None) => Cell::not_run("no census for this version"),
-        (Some(program), Some(census)) => {
-            let program = match tool::absolute(program) {
-                Ok(program) => program,
-                Err(error) => {
-                    eprintln!("proof-load: {}: {}", program.display(), error);
-                    return ExitCode::from(2);
-                }
-            };
-            tools.insert("forklift".to_string(), described(&program));
-            for scenario in &scenarios {
-                let built = output.scratch(&scenario.id).map_err(|error| error.to_string())
-                    .and_then(|scratch| {
-                        let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
-                        environment_seen = environment.variables.clone();
-                        runner::build(scenario, &corpus, Tool::Forklift, &program, server.as_deref(), &scratch, &environment, std::time::Duration::from_secs(120))
-                            .map_err(|error| error.to_string())
-                    });
-                match built {
-                    Ok(built) => {
-                        walk_missing.extend(census.unclassified(&built.walked).into_iter().map(|path| format!("{}: {}", scenario.id, path)));
-                        walk_missing.extend(census.unclassified(&built.host_walked).into_iter().map(|path| format!("{} host: {}", scenario.id, path)));
-                        created.insert((scenario.id.clone(), Warehouse::Client), runner::created_names(census, &built.walked));
-                        created.insert((scenario.id.clone(), Warehouse::Host), runner::created_names(census, &built.host_walked));
-                    }
-                    Err(error) => walk_missing.push(format!("{}: not built: {}", scenario.id, error)),
-                }
-            }
-            Cell::Run
-        }
+        (Some(_), Some(_)) => Cell::Run,
     };
     let walk_check = Completeness { check: "census walk".to_string(), cell: walk_cell, missing: walk_missing };
 
@@ -227,14 +293,10 @@ fn main() -> ExitCode {
             tools.insert("strace".to_string(), described(&strace));
             let programs = Programs { forklift, git, server: server.clone() };
             let faulted_corpus = faulted_corpus(seed);
-            let traces = output.root().join("traces");
-            if let Err(error) = std::fs::create_dir_all(&traces) {
-                eprintln!("proof-load: {}: {}", traces.display(), error);
-                return ExitCode::from(2);
-            }
             let settings = kill::Settings {
                 strace: &strace, search_path: search_path.clone(), limit: std::time::Duration::from_secs(120),
                 jobs: jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from)), traces: &traces,
+                schema: schema.as_ref().expect("a forklift binary was given, so its schema was read"),
             };
             let mut all = Vec::new();
             for scenario in scenarios.iter().filter(|scenario| kill.is_empty() || kill.contains(&scenario.id)) {
@@ -268,6 +330,7 @@ fn main() -> ExitCode {
         coverage.not_reached.insert(Category::KillPointsClient, not_reached);
     }
     let mut completeness = vec![damage_check, walk_check, fault_check];
+    completeness.extend(write_checks);
     completeness.extend(kill_completeness);
     completeness.push(Completeness::budget(started.elapsed(), budget.map(std::time::Duration::from_secs)));
     let report = Report {

@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use crate::census::Census;
 use crate::damage::{self, Binding, Exemption, Kind, Warehouse};
 use crate::scenario::Scenario;
+use crate::writeops::Exemption as WriteExemption;
+use crate::writeops::Exemption::{ReadOnly, Unrunnable};
 
 const FILE: &[Kind] = &[Kind::FlipByte, Kind::Truncate, Kind::Zero, Kind::Delete];
 /// A lock file left in place between commands: empty, so there is no byte to flip and nothing to cut.
@@ -107,6 +109,39 @@ pub const EXEMPTIONS: &[Exemption] = &[
     Exemption { name: "store.lock", reason: HELD_LOCK },
     Exemption { name: "serve.lock", reason: HELD_LOCK },
     Exemption { name: "{bay}lock", reason: HELD_LOCK },
+];
+
+const READS: &str = "reads the warehouse and writes nothing to it";
+const LISTS: &str = "a group's bare form or a listing: reads the warehouse and writes nothing to it";
+const GLOBAL: &str = "writes only the operator's own configuration and keys, outside every warehouse";
+const PRINTS: &str = "prints what the binary is and touches no warehouse";
+const REPLACES_BINARY: &str = "replaces the binary under test, or the shell's aliases for it, outside every warehouse";
+const NEEDS_OLDER_FORMAT: &str = "upgrades a warehouse of an older format, and the version under test writes only its own";
+const SERVES: &str = "serves until stopped; its writes are the hosted scenarios' requests, which the server kill points grade";
+
+/// The commands the write-op check does not require a traced write of, by schema id (a server
+/// leaf as `forklift-server <words>`). A read-only one must still be run by some scenario, and
+/// every run of it is checked to change nothing under the tree it ran in.
+pub const WRITE_EXEMPTIONS: &[(&str, WriteExemption)] = &[
+    ("audit", ReadOnly(READS)), ("diff", ReadOnly(READS)), ("history", ReadOnly(READS)),
+    ("query", ReadOnly(READS)), ("show", ReadOnly(READS)), ("stocktake", ReadOnly(READS)),
+    ("bay", ReadOnly(LISTS)), ("config", ReadOnly(LISTS)), ("config-list", ReadOnly(LISTS)), ("config-get", ReadOnly(READS)),
+    ("conflicts", ReadOnly(LISTS)), ("haul", ReadOnly(LISTS)), ("haul-list", ReadOnly(LISTS)), ("haul-show", ReadOnly(READS)),
+    ("manifest", ReadOnly(LISTS)), ("manifest-show", ReadOnly(READS)), ("manifest-get", ReadOnly(READS)), ("manifest-keys", ReadOnly(READS)),
+    ("manifest-log", ReadOnly(READS)), ("office", ReadOnly(LISTS)), ("office-list", ReadOnly(LISTS)),
+    ("pallet", ReadOnly(LISTS)), ("pallet-list", ReadOnly(LISTS)), ("park-list", ReadOnly(LISTS)),
+    ("scope", ReadOnly(LISTS)), ("scope-status", ReadOnly(READS)), ("remote", ReadOnly(READS)),
+    ("store", ReadOnly(LISTS)), ("store-status", ReadOnly(READS)), ("store-peek", ReadOnly(READS)),
+    ("tag", ReadOnly(LISTS)), ("tag-show", ReadOnly(READS)), ("tag-list", ReadOnly(LISTS)),
+    ("redact", ReadOnly(LISTS)), ("redact-list", ReadOnly(LISTS)),
+    ("self-alias", ReadOnly(LISTS)), ("self-alias-status", ReadOnly(READS)),
+    ("profile", ReadOnly(GLOBAL)), ("profile-list", ReadOnly(GLOBAL)), ("profile-create", ReadOnly(GLOBAL)),
+    ("profile-keygen", ReadOnly(GLOBAL)),
+    ("forklift-server tombstone list", ReadOnly(READS)), ("forklift-server withhold list", ReadOnly(READS)),
+    ("version", Unrunnable(PRINTS)), ("self-update", Unrunnable(REPLACES_BINARY)),
+    ("self-alias-install", Unrunnable(REPLACES_BINARY)), ("self-alias-uninstall", Unrunnable(REPLACES_BINARY)),
+    ("upgrade", Unrunnable(NEEDS_OLDER_FORMAT)), ("forklift-server upgrade", Unrunnable(NEEDS_OLDER_FORMAT)),
+    ("forklift-server serve", Unrunnable(SERVES)),
 ];
 
 /// What the damage completeness check finds missing: census names no binding or exemption covers,
