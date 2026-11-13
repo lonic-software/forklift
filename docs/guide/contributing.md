@@ -132,7 +132,11 @@ Notes:
   as `--capped-volume` (an empty or new directory on a small volume of its own, which CI makes as
   a 128 MiB tmpfs on Linux and a RAM disk on macOS) with a ballast file, leaving none, a quarter,
   half and three quarters of the most the command consumes after any of its lines, and lifts it
-  by removing the ballast. A fault whose condition no longer held when the command ended, every
+  by removing the ballast. The volume faults run the `folded` scenario with its clone, and the
+  work tree from then on, on `--folding-volume` (an empty or new directory on a volume that folds
+  case or keeps no executable bit, which CI makes as a vfat loop mount on Linux and an exFAT image
+  on macOS): a probe measures which, a cell whose property does not hold is not run, and the
+  volume is never lifted, since nobody lifts the file system their checkout lives on. A fault whose condition no longer held when the command ended, every
   line of it landed, is listed as missing from its lane's check and fails the run; one that held
   is graded, so a refused write the tool swallowed counts as an acknowledgement. A retry resumes at the line that did not land, as a user
   re-runs the step that failed. Every
