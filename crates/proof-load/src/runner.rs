@@ -253,7 +253,14 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                 continue;
             }
             Op::StopHost => {
-                host.take().ok_or_else(|| RunError::Io(format!("scenario {} stops a host it does not serve", scenario.id)))?;
+                drop(host.take().ok_or_else(|| RunError::Io(format!("scenario {} stops a host it does not serve", scenario.id)))?);
+                // The kill leaves the server's lock behind, its holder gone: the harness killed
+                // the one holder, so it clears it, as an operator would.
+                let lock = host_root(scratch).join(".forklift").join("serve.lock");
+                if std::fs::symlink_metadata(&lock).is_ok() {
+                    #[allow(clippy::disallowed_methods)] // the lock of a server the harness just killed
+                    std::fs::remove_file(&lock).map_err(|error| RunError::Io(format!("scenario {}: clearing the stopped host's lock: {}", scenario.id, error)))?;
+                }
                 continue;
             }
             Op::LoseKeys => {

@@ -106,6 +106,10 @@ pub fn listed_commands(help: &str) -> Vec<String> {
         if !line.starts_with("  ") {
             break;
         }
+        // A description wrapped onto the next line is indented past the names.
+        if line[2..].starts_with(' ') {
+            continue;
+        }
         if let Some(name) = line.split_whitespace().next() {
             if name != "help" {
                 names.push(name.to_string());
@@ -416,13 +420,14 @@ mod tests {
     }
 
     const TOP: &str = "Forklift — the server.\n\nUsage: forklift-server <COMMAND>\n\nCommands:\n  serve      Serve a warehouse\n  tombstone  Tombstones\n  gc         Collect\n  help       Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
-    const TOMBSTONE: &str = "Tombstones.\n\nUsage: forklift-server tombstone <COMMAND>\n\nCommands:\n  list  List them\n  drop  Drop one. Refused while the warehouse is being served\n  help  Print this message\n\nOptions:\n  -h, --help  Print help\n";
+    const TOMBSTONE: &str = "Tombstones.\n\nUsage: forklift-server tombstone <COMMAND>\n\nCommands:\n  list  List them\n  drop  Drop one: the name is free for unrelated history, and the history it held\n        is collected by the next gc. Refused while the warehouse is being served\n  help  Print this message\n\nOptions:\n  -h, --help  Print help\n";
     const LEAF: &str = "Serve.\n\nUsage: forklift-server serve [OPTIONS] --root <ROOT>\n\nOptions:\n  --root <ROOT>  The warehouse\n";
 
     /// The server's leaves are every subcommand its `--help` lists, nested ones walked, `help`
     /// never one; a line maps to its longest leaf.
     ///
-    /// Revert: stop at the top level → `tombstone` is a leaf and `tombstone drop` never one.
+    /// Revert: stop at the top level → `tombstone` is a leaf and `tombstone drop` never one; read
+    /// a wrapped description's words as names → `is` is a leaf.
     #[test]
     fn server_leaves_walk_nested_subcommands() {
         let mut help = |prefix: &[String]| -> Result<String, String> {

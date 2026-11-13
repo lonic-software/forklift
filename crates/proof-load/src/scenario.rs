@@ -69,7 +69,8 @@ pub enum Op {
     Run { line: Vec<String>, at: String, keep: Vec<Keep> },
     /// Run one of the host's server commands over the host warehouse: `--root` is added.
     Serve { line: Vec<String> },
-    /// Stop the host's server, for the server commands refused while it serves.
+    /// Stop the host's server, for the server commands refused while it serves. The server is
+    /// killed, and the lock it leaves behind cleared.
     StopHost,
     /// Delete every signing key the operator holds, so no one can extend the office chain.
     LoseKeys,
@@ -451,6 +452,10 @@ pub fn coverage() -> Vec<Scenario> {
                 &["self", "alias"], &["self", "alias", "status"], &["profile"], &["profile", "list"],
             ]),
             vec![Op::Scribble { index: 1 }, run(&["restore", "--confirm", "--", "."]), Op::Scribble { index: 1 }],
+            // A redaction of content only the staged work still holds waits, until a load takes
+            // it out: the head moves on first, since one the head names is refused.
+            vec![write("notes.txt", "later\n"), run(&["load", "."]), run(&["stack", "-m", "later"]), write("notes.txt", "notes\n"), run(&["load", "."])],
+            vec![run(&["redact", "record", "-m", "redacted", "{parcel}:notes.txt"]), write("notes.txt", "later\n"), run(&["load", "."]), run(&["redact", "apply"])],
             runs(&[&["load", "."], &["unload", "--", "."], &["remove", "--", "notes.txt"]]),
             runs(&[&["config", "set", "--", "mirror.auto", "true"], &["config", "unset", "--", "mirror.auto"]]),
             runs(&[&["bay", "add", "--", "extra", "../extra"], &["bay", "remove", "--", "extra"]]),
@@ -460,7 +465,7 @@ pub fn coverage() -> Vec<Scenario> {
         named("pallets", [
             vec![record(0), Op::Branch { name: "side".into() }, Op::Switch { name: "side".into() }, Op::Variant { index: 0 }],
             runs(&[&["deliver", "-m", "delivered", "--", "main"], &["pallet", "delete", "--force", "--", "side"], &["undo"]]),
-            vec![Op::Park { index: 0 }, run(&["park", "pop"]), run(&["restore", "--confirm", "--", "."])],
+            vec![Op::Park { index: 1 }, run(&["park", "pop"]), run(&["load", "."]), run(&["stack", "-m", "popped"])],
             vec![Op::Switch { name: "side".into() }, Op::Variant { index: 1 }, Op::Switch { name: "main".into() }, record(1), Op::Conflict { name: "side".into() }],
             runs(&[&["abort", "--confirm"], &["git", "export", "--", "../exported"]]),
             vec![run_at("imported", &["prepare"]), run_at("imported", &["git", "import", "--", "../exported"])],
@@ -505,7 +510,7 @@ pub fn coverage() -> Vec<Scenario> {
             vec![Op::Host, record(0), Op::Enroll, Op::Push, record(1), write("left/a.txt", "a\n"), write("right/b.txt", "b\n")],
             vec![run(&["load", "."]), run(&["stack", "-m", "folders"]), Op::Push],
             vec![Op::Branch { name: "side".into() }, Op::Switch { name: "side".into() }, Op::Variant { index: 1 }, Op::Push, Op::Switch { name: "main".into() }],
-            vec![Op::DeleteRemote { name: "side".into() }, run(&["pallet", "restore", "--remote", "--", "side"]), run(&["pallet", "list", "--remote"])],
+            vec![Op::DeleteRemote { name: "side".into() }, run_at("host", &["pallet", "restore", "--", "side"]), run(&["pallet", "list", "--remote"])],
             vec![run_at(".", &["clone", "--", "{url}", "{scratch}/other"])],
             vec![run_at(".", &["clone", "--only", "left", "--only", "right", "--", "{url}", "{scratch}/sparse"])],
             vec![run_at("sparse", &["scope", "narrow", "--", "right"]), run_at("sparse", &["scope", "prune", "--confirm", "--", "right"]), run_at("sparse", &["scope", "fetch", "--", "right"])],
@@ -520,8 +525,11 @@ pub fn coverage() -> Vec<Scenario> {
                 run_keep(&["office", "regenesis", "--confirm"], &[Keep { name: "genesis".into(), pointer: "/data/message".into(), after: Some("New genesis parcel:".into()), word: 0 }]),
                 Op::Push, run_at("other", &["office", "accept-regenesis", "--confirm", "{genesis}"]),
             ],
-            vec![serve(&["tombstone", "list"]), serve(&["withhold", "list"]), Op::DeleteRemote { name: "side".into() }, Op::StopHost],
-            vec![serve(&["tombstone", "drop", "side"]), Op::Age, serve(&["gc"])],
+            // History made after the re-genesis, so no trust pin holds it: deleted on the host, its
+            // tombstone dropped, and collected once it is old enough.
+            vec![Op::Branch { name: "late".into() }, Op::Switch { name: "late".into() }, Op::Variant { index: 0 }, Op::Push, Op::Switch { name: "main".into() }],
+            vec![serve(&["tombstone", "list"]), serve(&["withhold", "list"]), Op::DeleteRemote { name: "late".into() }, Op::StopHost],
+            vec![serve(&["tombstone", "drop", "late"]), Op::Age, serve(&["gc"])],
         ].concat()),
         // A durability taint a failed directory sync leaves, which heal resolves.
         named("tainted", vec![

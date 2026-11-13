@@ -123,7 +123,7 @@ const SERVES: &str = "serves until stopped; its writes are the hosted scenarios'
 /// leaf as `forklift-server <words>`). A read-only one must still be run by some scenario, and
 /// every run of it is checked to change nothing under the tree it ran in.
 pub const WRITE_EXEMPTIONS: &[(&str, WriteExemption)] = &[
-    ("audit", ReadOnly(READS)), ("blame", ReadOnly(READS)), ("diff", ReadOnly(READS)), ("history", ReadOnly(READS)),
+    ("audit", ReadOnly(READS)), ("diff", ReadOnly(READS)), ("history", ReadOnly(READS)),
     ("query", ReadOnly(READS)), ("show", ReadOnly(READS)), ("stocktake", ReadOnly(READS)),
     ("bay", ReadOnly(LISTS)), ("config", ReadOnly(LISTS)), ("config-list", ReadOnly(LISTS)), ("config-get", ReadOnly(READS)),
     ("conflicts", ReadOnly(LISTS)), ("haul", ReadOnly(LISTS)), ("haul-list", ReadOnly(LISTS)), ("haul-show", ReadOnly(READS)),
@@ -136,7 +136,7 @@ pub const WRITE_EXEMPTIONS: &[(&str, WriteExemption)] = &[
     ("redact", ReadOnly(LISTS)), ("redact-list", ReadOnly(LISTS)),
     ("self-alias", ReadOnly(LISTS)), ("self-alias-status", ReadOnly(READS)),
     ("profile", ReadOnly(GLOBAL)), ("profile-list", ReadOnly(GLOBAL)), ("profile-create", ReadOnly(GLOBAL)),
-    ("profile-use", ReadOnly(GLOBAL)), ("profile-keygen", ReadOnly(GLOBAL)),
+    ("profile-keygen", ReadOnly(GLOBAL)),
     ("forklift-server tombstone list", ReadOnly(READS)), ("forklift-server withhold list", ReadOnly(READS)),
     ("version", Unrunnable(PRINTS)), ("self-update", Unrunnable(REPLACES_BINARY)),
     ("self-alias-install", Unrunnable(REPLACES_BINARY)), ("self-alias-uninstall", Unrunnable(REPLACES_BINARY)),
