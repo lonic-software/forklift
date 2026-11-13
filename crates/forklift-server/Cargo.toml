@@ -37,3 +37,5 @@ subtle = { workspace = true }
 # timestamp is a `chrono::DateTime<Utc>`, and forklift-server has no production need
 # for the crate itself.
 chrono = { workspace = true }
+# Only for the route-registration scan over the crate's own source.
+syn = { workspace = true }

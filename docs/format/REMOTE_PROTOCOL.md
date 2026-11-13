@@ -111,6 +111,53 @@ follow redirects for object bodies. The server head serves bytes directly.
    pinning the current office head as `adopts`, accepted only from the server
    operator's static token — a loud, total, visible reset, never a quiet edit.
 
+## forklift-server's routes
+
+The endpoints below describe every head. This section lists exactly what forklift-server registers,
+and nothing more: a route another head serves, such as the serverless head's lift commit, is not here.
+
+A test holds this table and forklift-server's route list to each other, in both directions and on
+each route's access. It also refuses any route registered outside that list, and asks the running
+router which methods each path answers.
+
+A `protocol` path is mounted at the prefix its serving mode gives it:
+
+<!-- mounts:start -->
+| Mount | Serving mode | Prefix |
+|---|---|---|
+| `protocol` | single | `/v1` |
+| `protocol` | multi | `/warehouses/{warehouse}/v1` |
+<!-- mounts:end -->
+
+A `root` path is mounted as written. `both` means single and multi mode. An `authenticated` route
+refuses a caller from the request's headers, before its body is read. A `public` one answers anyone.
+A `GET` route answers `HEAD` too.
+
+<!-- routes:start -->
+| Method | Path | Mount | Serving mode | Access |
+|---|---|---|---|---|
+| `GET` | `/warehouse` | `protocol` | both | authenticated |
+| `POST` | `/objects/missing` | `protocol` | both | authenticated |
+| `POST` | `/objects/upload-targets` | `protocol` | both | authenticated |
+| `POST` | `/objects/batch` | `protocol` | both | authenticated |
+| `GET` | `/parcels/{parcel}/subtree/{*path}` | `protocol` | both | authenticated |
+| `GET` | `/objects/{hash}` | `protocol` | both | authenticated |
+| `PUT` | `/objects/{hash}` | `protocol` | both | authenticated |
+| `PUT` | `/withheld/{hash}/recipe` | `protocol` | both | authenticated |
+| `GET` | `/signatures/{hash}` | `protocol` | both | authenticated |
+| `PUT` | `/signatures/{hash}` | `protocol` | both | authenticated |
+| `PUT` | `/trust` | `protocol` | both | authenticated |
+| `POST` | `/pallets/{*name}` | `protocol` | both | authenticated |
+| `DELETE` | `/pallets/{*name}` | `protocol` | both | authenticated |
+| `POST` | `/holds/{*name}` | `protocol` | both | authenticated |
+| `POST` | `/resolve` | `protocol` | both | authenticated |
+| `GET` | `/bundles/latest` | `protocol` | both | authenticated |
+| `PUT` | `/warehouses/{warehouse}` | `root` | multi | authenticated |
+| `GET` | `/healthz` | `root` | both | public |
+<!-- routes:end -->
+
+`{*name}` matches the rest of the path, slashes included.
+
 ## Endpoints
 
 ### `GET /v1/warehouse`

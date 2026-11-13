@@ -20,7 +20,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{on, MethodFilter, MethodRouter};
 use axum::{Extension, Json, Router};
 use forklift_core::globals::{StorageRootScope, FOLDER_NAME_FORKLIFT_ROOT};
 use forklift_core::model::hooks::{
@@ -1097,39 +1097,152 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         .map_err(|e| format!("The server failed: {}", e))
 }
 
-/// Every route the server answers. Authentication is a layer over all of them except `/healthz`,
-/// so it runs before any extractor: a refused caller's request body is never buffered, and a route
-/// added above the layer cannot forget it. A handler that needs to know who is calling takes the
-/// `Extension<Principal>` the layer leaves, and refuses on a route outside the layer. A handler that
-/// does not take it has no such guard, so a route below the layer is open to everyone.
-fn router(state: Arc<AppState>, body_limit: DefaultBodyLimit) -> Router {
-    let protocol = Router::new()
-        .route("/warehouse", get(get_warehouse))
-        .route("/objects/missing", post(post_missing))
-        .route("/objects/upload-targets", post(post_upload_targets))
-        .route("/objects/batch", post(post_objects_batch))
-        .route("/parcels/{parcel}/subtree/{*path}", get(get_subtree))
-        .route("/objects/{hash}", get(get_object).put(put_object))
-        .route("/withheld/{hash}/recipe", put(put_withheld_recipe))
-        .route("/signatures/{hash}", get(get_signature).put(put_signature))
-        .route("/trust", put(put_trust))
-        .route("/pallets/{*name}", post(post_ref_update).delete(delete_ref))
-        .route("/holds/{*name}", post(post_holds))
-        .route("/resolve", post(post_resolve))
-        .route("/bundles/latest", get(get_bundle));
+/// The method one [`RouteEntry`] answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Verb {
+    Get,
+    Put,
+    Post,
+    Delete,
+}
 
-    let app = if matches!(state.mode, ServeMode::Multi { .. }) {
-        Router::new()
-            .route("/warehouses/{warehouse}", put(put_warehouse))
-            .nest("/warehouses/{warehouse}/v1", protocol)
+impl Verb {
+    fn filter(self) -> MethodFilter {
+        match self {
+            Verb::Get => MethodFilter::GET,
+            Verb::Put => MethodFilter::PUT,
+            Verb::Post => MethodFilter::POST,
+            Verb::Delete => MethodFilter::DELETE,
+        }
+    }
+}
+
+/// Where a [`RouteEntry`]'s path is mounted: at the server's root, or under the protocol prefix,
+/// which is [`SINGLE_PROTOCOL_PREFIX`] in single mode and [`MULTI_PROTOCOL_PREFIX`] in multi mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Mount {
+    Root,
+    Protocol,
+}
+
+/// The serving modes a [`RouteEntry`] is registered in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Modes {
+    Both,
+    Multi,
+}
+
+impl Modes {
+    fn includes(self, multi: bool) -> bool {
+        match self {
+            Modes::Both => true,
+            Modes::Multi => multi,
+        }
+    }
+}
+
+/// Whether a [`RouteEntry`] sits behind the authentication layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Access {
+    Authenticated,
+    Public,
+}
+
+/// One method on one path the server answers. [`ROUTES`] holds every one of them.
+struct RouteEntry {
+    verb: Verb,
+    path: &'static str,
+    mount: Mount,
+    modes: Modes,
+    access: Access,
+    /// Builds the entry's method router from the entry's own method, so an entry cannot answer a
+    /// method it does not name.
+    handler: fn(MethodFilter) -> MethodRouter<Arc<AppState>>,
+}
+
+const SINGLE_PROTOCOL_PREFIX: &str = "/v1";
+const MULTI_PROTOCOL_PREFIX: &str = "/warehouses/{warehouse}/v1";
+
+/// Every route the server answers, and the only place one is registered from: [`router`]
+/// registers each entry and nothing else. `docs/format/REMOTE_PROTOCOL.md` carries the same list
+/// as its route table, and a test holds the two to each other, holds the crate's source to
+/// registering only through this list, and asks the built router which methods each path
+/// answers.
+const ROUTES: &[RouteEntry] = &[
+    RouteEntry { verb: Verb::Get, path: "/warehouse", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, get_warehouse) },
+    RouteEntry { verb: Verb::Post, path: "/objects/missing", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, post_missing) },
+    RouteEntry { verb: Verb::Post, path: "/objects/upload-targets", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, post_upload_targets) },
+    RouteEntry { verb: Verb::Post, path: "/objects/batch", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, post_objects_batch) },
+    RouteEntry { verb: Verb::Get, path: "/parcels/{parcel}/subtree/{*path}", mount: Mount::Protocol,
+        modes: Modes::Both, access: Access::Authenticated, handler: |method| on(method, get_subtree) },
+    RouteEntry { verb: Verb::Get, path: "/objects/{hash}", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, get_object) },
+    RouteEntry { verb: Verb::Put, path: "/objects/{hash}", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, put_object) },
+    RouteEntry { verb: Verb::Put, path: "/withheld/{hash}/recipe", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, put_withheld_recipe) },
+    RouteEntry { verb: Verb::Get, path: "/signatures/{hash}", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, get_signature) },
+    RouteEntry { verb: Verb::Put, path: "/signatures/{hash}", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, put_signature) },
+    RouteEntry { verb: Verb::Put, path: "/trust", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, put_trust) },
+    RouteEntry { verb: Verb::Post, path: "/pallets/{*name}", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, post_ref_update) },
+    RouteEntry { verb: Verb::Delete, path: "/pallets/{*name}", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, delete_ref) },
+    RouteEntry { verb: Verb::Post, path: "/holds/{*name}", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, post_holds) },
+    RouteEntry { verb: Verb::Post, path: "/resolve", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, post_resolve) },
+    RouteEntry { verb: Verb::Get, path: "/bundles/latest", mount: Mount::Protocol, modes: Modes::Both,
+        access: Access::Authenticated, handler: |method| on(method, get_bundle) },
+    RouteEntry { verb: Verb::Put, path: "/warehouses/{warehouse}", mount: Mount::Root, modes: Modes::Multi,
+        access: Access::Authenticated, handler: |method| on(method, put_warehouse) },
+    // Liveness only: unauthenticated and warehouse-free on purpose.
+    RouteEntry { verb: Verb::Get, path: "/healthz", mount: Mount::Root, modes: Modes::Both,
+        access: Access::Public, handler: |method| on(method, || async { "ok" }) },
+];
+
+/// Register every [`ROUTES`] entry for one mount and serving mode. An authenticated entry carries
+/// the authentication layer on its own method router, so the layer runs before any extractor: a
+/// refused caller's request body is never buffered. A handler that needs to know who is calling
+/// takes the `Extension<Principal>` the layer leaves, and refuses without it.
+fn register(state: &Arc<AppState>, mount: Mount, multi: bool) -> Router<Arc<AppState>> {
+    let mut registered = Router::new();
+
+    for entry in ROUTES.iter().filter(|entry| entry.mount == mount && entry.modes.includes(multi)) {
+        let mut answer = (entry.handler)(entry.verb.filter());
+
+        if entry.access == Access::Authenticated {
+            answer = answer.route_layer(middleware::from_fn_with_state(Arc::clone(state), authenticate));
+        }
+
+        // axum merges a second method router on a path it already holds into the first.
+        registered = registered.route(entry.path, answer);
+    }
+
+    registered
+}
+
+/// The server's router: [`ROUTES`], registered by [`register`], with the protocol mounted at its
+/// serving mode's prefix.
+fn router(state: Arc<AppState>, body_limit: DefaultBodyLimit) -> Router {
+    let multi = matches!(state.mode, ServeMode::Multi { .. });
+    let protocol = register(&state, Mount::Protocol, multi);
+    let root = register(&state, Mount::Root, multi);
+
+    let app = if multi {
+        root.nest(MULTI_PROTOCOL_PREFIX, protocol)
     } else {
-        Router::new().nest("/v1", protocol)
+        root.nest(SINGLE_PROTOCOL_PREFIX, protocol)
     };
 
-    app.route_layer(middleware::from_fn_with_state(Arc::clone(&state), authenticate))
-        // Liveness only — deliberately unauthenticated and warehouse-free.
-        .route("/healthz", get(|| async { "ok" }))
-        .layer(body_limit)
+    app.layer(body_limit)
         // Objects travel uncompressed on the wire by format (the hash covers the
         // uncompressed form, §4.4), so transport compression is nearly free wins;
         // bundle/batch responses are already zstd streams and mark themselves
@@ -5016,7 +5129,9 @@ fn bundle_open_test_checkpoint(_root: &std::path::Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use axum::routing::post;
     use forklift_core::globals::{StorageRootScope, FOLDER_NAME_FORKLIFT_ROOT};
     use forklift_core::model::operator::Operator;
     use forklift_core::model::tree_item::TreeItem;
@@ -5336,57 +5451,373 @@ mod tests {
         Arc::new(AppState { token: Some("the-token".to_string()), open: false, ..base_state(mode) })
     }
 
-    /// Every route of the protocol, as `(method, path after the protocol prefix)`. Each is asked
-    /// with no credential, then a wrong one, with a body announced and never sent.
-    const PROTOCOL_ROUTES: &[(&str, &str)] = &[
-        ("GET", "/warehouse"),
-        ("POST", "/objects/missing"),
-        ("POST", "/objects/upload-targets"),
-        ("POST", "/objects/batch"),
-        ("GET", "/parcels/p/subtree/a/b"),
-        ("GET", "/objects/abc"),
-        ("PUT", "/objects/abc"),
-        ("GET", "/signatures/abc"),
-        ("PUT", "/signatures/abc"),
-        ("PUT", "/trust"),
-        ("POST", "/pallets/main"),
-        ("DELETE", "/pallets/main"),
-        ("POST", "/holds/main"),
-        ("POST", "/resolve"),
-        ("GET", "/bundles/latest"),
-    ];
+    fn verb_name(verb: Verb) -> &'static str {
+        match verb {
+            Verb::Get => "GET",
+            Verb::Put => "PUT",
+            Verb::Post => "POST",
+            Verb::Delete => "DELETE",
+        }
+    }
 
-    /// Reverts: the handler-level check, or a route moved outside the layer — then the request
-    /// waits for its body (or, with no principal, answers 500) instead of a 401.
+    fn mount_name(mount: Mount) -> &'static str {
+        match mount {
+            Mount::Root => "root",
+            Mount::Protocol => "protocol",
+        }
+    }
+
+    fn modes_name(modes: Modes) -> &'static str {
+        match modes {
+            Modes::Both => "both",
+            Modes::Multi => "multi",
+        }
+    }
+
+    fn access_name(access: Access) -> &'static str {
+        match access {
+            Access::Authenticated => "authenticated",
+            Access::Public => "public",
+        }
+    }
+
+    /// A path a request can be sent to, with each `{name}` and `{*name}` filled in.
+    fn concrete_path(path: &str) -> String {
+        path.split('/')
+            .map(|segment| match segment {
+                s if s.starts_with("{*") => "a/b".to_string(),
+                s if s.starts_with('{') => "x1".to_string(),
+                s => s.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// Every entry registered in one serving mode, with the concrete path a request reaches it on.
+    fn registered_routes(multi: bool) -> Vec<(&'static RouteEntry, String)> {
+        let prefix = if multi { "/warehouses/w1/v1" } else { "/v1" };
+
+        ROUTES.iter()
+            .filter(|entry| entry.modes.includes(multi))
+            .map(|entry| {
+                let path = concrete_path(entry.path);
+                match entry.mount {
+                    Mount::Root => (entry, path),
+                    Mount::Protocol => (entry, format!("{prefix}{path}")),
+                }
+            })
+            .collect()
+    }
+
+    /// Reverts: the handler-level check, or an authenticated entry registered without the layer —
+    /// then the request waits for its body (or, with no principal, answers 500) instead of a 401.
+    /// The public entries are asked too, so a layer over everything is caught as well.
     #[tokio::test]
     async fn every_route_refuses_a_bad_caller_with_the_body_still_owed() {
         let single = scratch_dir("auth-layer-single");
         let multi = scratch_dir("auth-layer-multi");
         let cases = [
-            (token_state(ServeMode::Single(Arc::new(WarehouseHandle::new(single)))), "/v1"),
-            (token_state(ServeMode::Multi { base: multi }), "/warehouses/w1/v1"),
+            (token_state(ServeMode::Single(Arc::new(WarehouseHandle::new(single)))), false),
+            (token_state(ServeMode::Multi { base: multi }), true),
         ];
+        let mut public = 0;
 
-        for (state, prefix) in cases {
-            let is_multi = prefix != "/v1";
+        for (state, is_multi) in cases {
             let addr = serve_router(state, 1 << 20).await;
-            let mut routes: Vec<(&str, String)> = PROTOCOL_ROUTES.iter()
-                .map(|(method, path)| (*method, format!("{prefix}{path}")))
-                .collect();
 
-            if is_multi {
-                routes.push(("PUT", "/warehouses/w1".to_string()));
-            }
+            for (entry, path) in registered_routes(is_multi) {
+                let method = verb_name(entry.verb);
 
-            for (method, path) in &routes {
+                if entry.access == Access::Public {
+                    let mut stream = send_head(addr, method, &path, None, 0).await;
+                    let status = status_line(&mut stream).await;
+
+                    assert!(status.contains(" 200 "), "public {method} {path}: {status}");
+                    public += 1;
+                    continue;
+                }
+
                 for token in [None, Some("not-the-token")] {
-                    let mut stream = send_head(addr, method, path, token, 1 << 19).await;
+                    let mut stream = send_head(addr, method, &path, token, 1 << 19).await;
                     let status = status_line(&mut stream).await;
 
                     assert!(status.contains(" 401 "), "{method} {path} with {token:?}: {status}");
                 }
             }
         }
+
+        assert_eq!(public, 2, "/healthz is the one public route, asked in both modes");
+    }
+
+    const REMOTE_PROTOCOL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/format/REMOTE_PROTOCOL.md");
+
+    /// The rows of the table between `<!-- {name}:start -->` and `<!-- {name}:end -->`, each a list
+    /// of its cells with the code quotes taken off. Panics when a marker is missing or a row does
+    /// not have `columns` cells, so a damaged table is never read as a shorter one.
+    fn delimited_rows(document: &str, name: &str, columns: usize) -> Vec<Vec<String>> {
+        let start = format!("<!-- {name}:start -->");
+        let end = format!("<!-- {name}:end -->");
+        let begin = document.find(&start).unwrap_or_else(|| panic!("REMOTE_PROTOCOL.md has no {start}"));
+        let body = &document[begin + start.len()..];
+        let body = &body[..body.find(&end).unwrap_or_else(|| panic!("REMOTE_PROTOCOL.md has no {end}"))];
+
+        body.lines()
+            .filter(|line| line.starts_with('|'))
+            .skip(2)
+            .map(|line| {
+                let cells: Vec<String> = line.trim().trim_matches('|').split('|')
+                    .map(|cell| cell.trim().trim_matches('`').to_string())
+                    .collect();
+                assert_eq!(cells.len(), columns, "a {name} row with the wrong number of cells: {line}");
+                cells
+            })
+            .collect()
+    }
+
+    /// Reverts: a route added to `ROUTES` and not to the table, a table row with no route, or an
+    /// entry whose access the table states the other way. Each is its own assertion.
+    #[test]
+    fn the_route_table_is_the_route_list() {
+        let document = std::fs::read_to_string(REMOTE_PROTOCOL).unwrap();
+        let mut table = BTreeMap::new();
+
+        for row in delimited_rows(&document, "routes", 5) {
+            let key = (row[0].clone(), row[1].clone(), row[2].clone(), row[3].clone());
+            assert!(table.insert(key, row[4].clone()).is_none(), "a route listed twice: {row:?}");
+        }
+
+        let mut list = BTreeMap::new();
+
+        for entry in ROUTES {
+            let key = (verb_name(entry.verb).to_string(), entry.path.to_string(),
+                       mount_name(entry.mount).to_string(), modes_name(entry.modes).to_string());
+            assert!(list.insert(key, access_name(entry.access).to_string()).is_none(),
+                    "ROUTES holds {} {} twice", verb_name(entry.verb), entry.path);
+        }
+
+        assert!(table.len() > 10 && list.len() > 10, "a table or list read as nearly empty");
+
+        let unlisted: Vec<_> = list.keys().filter(|key| !table.contains_key(*key)).collect();
+        assert!(unlisted.is_empty(), "routes the REMOTE_PROTOCOL.md table lacks: {unlisted:?}");
+
+        let unregistered: Vec<_> = table.keys().filter(|key| !list.contains_key(*key)).collect();
+        assert!(unregistered.is_empty(), "table rows no route registers: {unregistered:?}");
+
+        let disagreeing: Vec<_> = list.iter()
+            .filter(|(key, access)| table.get(*key) != Some(*access))
+            .map(|(key, access)| (key, access, &table[key]))
+            .collect();
+        assert!(disagreeing.is_empty(), "routes whose access the table states differently \
+            (route, list, table): {disagreeing:?}");
+    }
+
+    /// Reverts: either prefix changed in the source and not in the mounts table, or the other way.
+    #[test]
+    fn the_mount_table_is_the_protocol_prefixes() {
+        let document = std::fs::read_to_string(REMOTE_PROTOCOL).unwrap();
+        let rows: BTreeSet<Vec<String>> = delimited_rows(&document, "mounts", 3).into_iter().collect();
+        let expected: BTreeSet<Vec<String>> = [
+            ["protocol", "single", SINGLE_PROTOCOL_PREFIX],
+            ["protocol", "multi", MULTI_PROTOCOL_PREFIX],
+        ].iter().map(|row| row.iter().map(|cell| cell.to_string()).collect()).collect();
+
+        assert_eq!(rows, expected);
+    }
+
+    /// The axum version the registration method list below was read from: `Router`'s methods that
+    /// register a route, a service, a nested router or a fallback.
+    const AXUM_VERSION_READ: &str = "0.8.9";
+    const REGISTRATION_METHODS: &[&str] = &[
+        "route", "route_service", "nest", "nest_service", "merge", "fallback", "fallback_service",
+    ];
+
+    /// Every call of a registration method in non-test source, named by the function it is in.
+    #[derive(Default)]
+    struct Registrations {
+        within: Vec<String>,
+        found: Vec<(String, String)>,
+    }
+
+    fn is_test_only(attributes: &[syn::Attribute]) -> bool {
+        attributes.iter().any(|attribute| {
+            attribute.path().is_ident("cfg")
+                && attribute.parse_args::<syn::Meta>().is_ok_and(|meta| meta.path().is_ident("test"))
+        })
+    }
+
+    impl Registrations {
+        fn note(&mut self, method: &syn::Ident) {
+            if REGISTRATION_METHODS.iter().any(|name| method == name) {
+                let within = self.within.last().cloned().unwrap_or_else(|| "<item>".to_string());
+                self.found.push((within, method.to_string()));
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Registrations {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !is_test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if !is_test_only(&item.attrs) {
+                syn::visit::visit_item_impl(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !is_test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !is_test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            self.note(&call.method);
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        /// `Router::route(router, …)`, or the method taken as a value.
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if path.path.segments.len() > 1 {
+                self.note(&path.path.segments.last().unwrap().ident);
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+    }
+
+    fn registrations_in(source: &str) -> Vec<(String, String)> {
+        let file = syn::parse_file(source).unwrap();
+        let mut registrations = Registrations::default();
+        syn::visit::Visit::visit_file(&mut registrations, &file);
+        registrations.found
+    }
+
+    /// The scan itself: each way a route can be registered is found, and test code is not.
+    #[test]
+    fn the_registration_scan_finds_every_form() {
+        let source = r#"
+            fn inline(router: Router) -> Router { router.route("/a", get(a)).merge(other()) }
+            fn by_path(router: Router) -> Router { Router::fallback(router, f) }
+            impl Server { fn method(self) -> Router { self.router.nest_service("/b", s) } }
+            #[cfg(test)]
+            mod tests { fn hook() -> Router { Router::new().route("/hook", post(h)) } }
+        "#;
+
+        let found = registrations_in(source);
+
+        assert_eq!(found, [
+            ("inline".to_string(), "merge".to_string()),
+            ("inline".to_string(), "route".to_string()),
+            ("by_path".to_string(), "fallback".to_string()),
+            ("method".to_string(), "nest_service".to_string()),
+        ]);
+    }
+
+    /// Reverts: any route, service, nested router or fallback registered anywhere in the crate's
+    /// non-test source other than `register`'s one call and `router`'s two nests. Nothing can list
+    /// what a built axum router holds, so a registration outside `ROUTES` is found here or nowhere.
+    #[test]
+    fn routes_are_registered_only_from_the_route_list() {
+        let source_root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut pending = vec![PathBuf::from(source_root)];
+        let mut found = Vec::new();
+        let mut files = 0;
+
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(std::fs::read_dir(&path).unwrap().map(|entry| entry.unwrap().path()));
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files += 1;
+                let source = std::fs::read_to_string(&path).unwrap();
+
+                for (within, method) in registrations_in(&source) {
+                    found.push((path.file_name().unwrap().to_string_lossy().into_owned(), within, method));
+                }
+            }
+        }
+
+        assert!(files >= 2, "the scan read {files} source files");
+
+        found.sort();
+        let expected = [
+            ("server.rs", "register", "route"),
+            ("server.rs", "router", "nest"),
+            ("server.rs", "router", "nest"),
+        ].map(|(file, within, method)| (file.to_string(), within.to_string(), method.to_string()));
+
+        assert_eq!(found, expected, "a route registered outside ROUTES");
+    }
+
+    /// Reverts: a Cargo.lock that moves axum without re-reading `REGISTRATION_METHODS` from the new
+    /// version's `Router`.
+    #[test]
+    fn the_registration_methods_were_read_from_the_pinned_axum() {
+        let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock")).unwrap();
+        let versions: Vec<&str> = lock.split("[[package]]")
+            .filter(|package| package.lines().any(|line| line.trim() == "name = \"axum\""))
+            .filter_map(|package| package.lines().find_map(|line| line.trim().strip_prefix("version = ")))
+            .map(|version| version.trim_matches('"'))
+            .collect();
+
+        assert_eq!(versions, [AXUM_VERSION_READ], "Cargo.lock pins another axum: re-read the methods \
+            its Router registers through, update REGISTRATION_METHODS, then AXUM_VERSION_READ");
+    }
+
+    /// Reverts: an entry whose handler answers more than its own method, such as a chained
+    /// `get(a).put(b)` or an `any`. The answer to a method no entry lists is a 405 whose `Allow`
+    /// names exactly the methods `ROUTES` holds on that path, `GET` bringing `HEAD`.
+    #[tokio::test]
+    async fn every_path_answers_exactly_its_listed_methods() {
+        let single = scratch_dir("allow-single");
+        let multi = scratch_dir("allow-multi");
+        let cases = [
+            (token_state(ServeMode::Single(Arc::new(WarehouseHandle::new(single)))), false),
+            (token_state(ServeMode::Multi { base: multi }), true),
+        ];
+        let client = reqwest::Client::new();
+        let unlisted = reqwest::Method::from_bytes(b"PROOFLOAD").unwrap();
+        let mut asked = 0;
+
+        for (state, is_multi) in cases {
+            let addr = serve_router(state, 1 << 20).await;
+            let mut listed: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+
+            for (entry, path) in registered_routes(is_multi) {
+                let methods = listed.entry(path).or_default();
+                methods.insert(verb_name(entry.verb));
+
+                if entry.verb == Verb::Get {
+                    methods.insert("HEAD");
+                }
+            }
+
+            for (path, methods) in listed {
+                let response = client.request(unlisted.clone(), format!("http://{addr}{path}"))
+                    .send().await.unwrap();
+                let allow: BTreeSet<String> = response.headers().get("allow")
+                    .map(|value| value.to_str().unwrap().split(',').map(|m| m.trim().to_string()).collect())
+                    .unwrap_or_default();
+                let methods: BTreeSet<String> = methods.into_iter().map(str::to_string).collect();
+
+                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{path}");
+                assert_eq!(allow, methods, "{path} answers other methods than ROUTES lists");
+                asked += 1;
+            }
+        }
+
+        assert!(asked > 20, "only {asked} paths asked");
     }
 
     /// The other half of the same layer: the right caller gets through, and the server does wait
