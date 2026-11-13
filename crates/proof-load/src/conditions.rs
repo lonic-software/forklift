@@ -234,8 +234,11 @@ pub fn disk_full(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scra
 }
 
 /// How much more room than a disk-full point left the volume may show once the faulted command
-/// ends and the point still count as held: a few allocation blocks.
-const HELD_SLACK: u64 = 16 << 10;
+/// ends and the point still count as held: one allocation block, what the fill's last write and
+/// the cut to the point leave unaccounted. Kept small against what the command consumes: room
+/// given back late enough to let the command land shows as more than this, and the point is
+/// refused rather than graded.
+const HELD_SLACK: u64 = 4 << 10;
 
 /// Why a read-only fault did not run: the work folder took a write with its write bits cleared.
 pub const STAYS_WRITABLE: &str = "the work folder still takes a write with its write bits cleared (run as root, or folder attributes that refuse nothing)";
