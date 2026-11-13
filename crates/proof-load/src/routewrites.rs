@@ -264,7 +264,7 @@ mod tests {
         <!-- routes:end -->\n";
 
     const OBJECT: &[Entry] = &[Entry { kind: Kind::Write, path: ".forklift/objects/{hash}.tmp~*" }, Entry { kind: Kind::Rename, path: ".forklift/objects/{hash}*" }];
-    const PALLET: &[Entry] = &[Entry { kind: Kind::Rename, path: ".forklift/pallets/{name}*" }];
+    const PALLET: &[Entry] = &[Entry { kind: Kind::Rename, path: ".forklift/pallets/{name}*" }, Entry { kind: Kind::Rename, path: ".forklift/meta/{name[1..]}" }];
     const BINDINGS: &[RouteWrites] = &[
         RouteWrites { method: "GET", path: "/objects/{hash}", mount: Mount::Protocol, bound: Bound::ReadOnly },
         RouteWrites { method: "PUT", path: "/objects/{hash}", mount: Mount::Protocol, bound: Bound::Writes(OBJECT) },
@@ -318,7 +318,7 @@ mod tests {
     /// Revert: credit a write by timing alone → the object write in the pallet window covers PUT
     /// /objects/{hash}; place a write by its route set without its captures → a write of another
     /// object's name is credited; close an unanswered window at its forwarding → the late write
-    /// after the cut refuses.
+    /// after the cut refuses; match captures as sent → `%40office` never names `meta/office`.
     #[test]
     fn writes_are_placed_by_window_and_set() {
         let root = std::env::temp_dir().join(format!("routewrites-{}", std::process::id()));
@@ -359,6 +359,10 @@ mod tests {
         let both = serving(vec![exchange("PUT", "/v1/objects/ab", 201, 100, Some(200))], vec![write(&root, Kind::Rename, ".forklift/objects/ab", 150)]);
         assert_eq!(super::check(&table(), Mode::Single, &[both], BINDINGS, overlapping, &[]),
             vec!["PUT /objects/{hash}: answered with success, and no write in its set fell inside any such request".to_string()]);
+
+        // A capture is matched decoded, as the server reads it.
+        let meta = serving(vec![exchange("POST", "/v1/pallets/%40office", 204, 100, Some(200))], vec![write(&root, Kind::Rename, ".forklift/meta/office", 150)]);
+        assert_eq!(check(&[meta]), Vec::<String>::new());
 
         // A request whose response was never read keeps its window open.
         let cut = serving(vec![exchange("POST", "/v1/pallets/main", 204, 100, None)], vec![write(&root, Kind::Rename, ".forklift/pallets/main", 5_000)]);
