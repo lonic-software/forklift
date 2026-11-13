@@ -545,8 +545,6 @@ fn main() -> ExitCode {
     if report.failed() { ExitCode::from(1) } else { ExitCode::SUCCESS }
 }
 
-/// The corpus a faulted command runs over, shared by every lane: the small shape with one record
-/// past the history, the one the faulted command writes.
 /// Runs `run` in a new scratch area `label` of `volume`, then removes the area, failed or not: what
 /// one leaves on a small capped volume would take the free space of the next, and the details of
 /// each graded fault are written to the output.
@@ -564,6 +562,8 @@ fn discarded_area<T>(
     result
 }
 
+/// The corpus a faulted command runs over, shared by every lane: the small shape with one record
+/// past the history, the one the faulted command writes.
 fn faulted_corpus(seed: u64) -> corpus::Corpus {
     corpus::generate(seed, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL })
 }
