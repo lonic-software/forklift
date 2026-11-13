@@ -26,7 +26,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::corpus::{Corpus, Rng};
+use crate::corpus::Rng;
 use crate::faulted::{self, Graded, Programs};
 use crate::kill::{self, Counting, Directories, Point, Settings};
 use crate::report::{Category, Cell, Completeness, Row};
@@ -537,6 +537,13 @@ impl Replay {
                 self.table(group).insert(fd, description);
             }
             "dup" | "dup2" | "dup3" | "fcntl" => {
+                if call.name == "fcntl" && raw(1) == "F_SETFL" {
+                    // The status flags belong to the open file description, shared by every dup.
+                    if let Some(description) = fd_of(raw(0)).and_then(|fd| self.table(group).get(&fd).copied()) {
+                        self.descriptions[description].append = raw(2).contains("O_APPEND");
+                    }
+                    return Ok(());
+                }
                 if call.name == "fcntl" && !raw(1).starts_with("F_DUPFD") {
                     return Ok(());
                 }
@@ -573,14 +580,17 @@ impl Replay {
                 if call.data.len() < count {
                     return Err(format!("the trace dumped {} of its {} bytes: trace with -e write=all", call.data.len(), count));
                 }
-                let positioned = call.name.starts_with('p');
+                // pwritev2 at offset -1 writes at the description's offset, like writev; with
+                // RWF_APPEND it appends whatever the description's own flag says.
+                let positioned = call.name.starts_with('p') && !(call.name == "pwritev2" && raw(3) == "-1");
+                let appending = call.name == "pwritev2" && raw(4).contains("RWF_APPEND");
                 let held = self.descriptions[description].clone();
                 let ino = held.ino.expect("held returns only descriptions into the area");
                 let data = self.file(ino)?;
-                let at = if positioned {
-                    fd_of(raw(3)).ok_or_else(|| "no offset".to_string())? as usize
-                } else if held.append {
+                let at = if appending || (!positioned && held.append) {
                     data.len()
+                } else if positioned {
+                    fd_of(raw(3)).ok_or_else(|| "no offset".to_string())? as usize
                 } else {
                     held.offset as usize
                 };
@@ -857,6 +867,15 @@ pub enum Moment {
 }
 
 impl Moment {
+    /// The step trail a crash here is graded with: how many lines finished before it, and whether
+    /// the next one was cut short. Two moments with one trail grade one state alike.
+    fn trail(&self) -> (usize, bool) {
+        match self {
+            Moment::During { point } => (point.line, true),
+            Moment::After { line, .. } => (line + 1, false),
+        }
+    }
+
     fn label(&self) -> String {
         match self {
             Moment::During { point } => format!("{} {}#{} {}", point.command, point.name, point.when, point.base),
@@ -877,7 +896,7 @@ pub struct Crash {
     /// For a seeded state between the durable and the volatile one, its number.
     pub variant: Option<usize>,
     #[serde(skip)]
-    pub image: Image,
+    pub image: std::sync::Arc<Image>,
 }
 
 /// One traced line as the crash enumeration reads it.
@@ -918,10 +937,10 @@ pub fn crashes(fixture: &Image, root: &Root, start: &str, lines: &[Line], varian
 
 struct Collector {
     crashes: Vec<Crash>,
-    /// Each state's crash, by its tree's digest and whether it was acknowledged.
-    seen: BTreeMap<(String, bool), usize>,
+    /// Each state's crash, by its tree's digest, whether it was acknowledged, and its step trail.
+    seen: BTreeMap<(String, bool, (usize, bool)), usize>,
     /// The durable tree of the last version walked.
-    cached: Option<(u64, Image, String)>,
+    cached: Option<(u64, std::sync::Arc<Image>, String)>,
     draws: BTreeMap<usize, usize>,
     rng: Rng,
     /// The moment being recorded, counted from 0.
@@ -934,27 +953,36 @@ impl Collector {
         if self.cached.as_ref().is_none_or(|(version, _, _)| *version != model.version) {
             let image = model.durable_image();
             let key = digest(&image);
-            self.cached = Some((model.version, image, key));
+            self.cached = Some((model.version, std::sync::Arc::new(image), key));
         }
-        let (_, image, key) = self.cached.clone().expect("cached above");
+        let (_, image, key) = self.cached.as_ref().expect("cached above");
+        let (image, key) = (image.clone(), key.clone());
         self.add(moment.clone(), image, key, acknowledged, None);
         for _ in 0..self.draws.get(&self.moment).copied().unwrap_or_default() {
             let image = model.variant(&mut self.rng);
             let key = digest(&image);
-            if !self.seen.contains_key(&(key.clone(), acknowledged)) {
+            if !self.seen.contains_key(&(key.clone(), acknowledged, moment.trail())) {
                 self.drawn += 1;
-                self.add(moment.clone(), image, key, acknowledged, Some(self.drawn));
+                self.add(moment.clone(), std::sync::Arc::new(image), key, acknowledged, Some(self.drawn));
             }
         }
         self.moment += 1;
     }
 
-    fn add(&mut self, moment: Moment, image: Image, digest: String, acknowledged: bool, variant: Option<usize>) {
-        match self.seen.get(&(digest.clone(), acknowledged)) {
-            Some(&at) if variant.is_none() => self.crashes[at].shared += 1,
+    fn add(&mut self, moment: Moment, image: std::sync::Arc<Image>, digest: String, acknowledged: bool, variant: Option<usize>) {
+        match self.seen.get(&(digest.clone(), acknowledged, moment.trail())) {
+            Some(&at) if variant.is_none() => {
+                let crash = &mut self.crashes[at];
+                // A durable state an earlier draw already found is no variant: it happens with no
+                // torn write at all, so it is reported under this real moment.
+                if crash.variant.is_some() {
+                    (crash.moment, crash.variant, crash.shared) = (moment, None, 0);
+                }
+                crash.shared += 1;
+            }
             Some(_) => {}
             None => {
-                self.seen.insert((digest, acknowledged), self.crashes.len());
+                self.seen.insert((digest, acknowledged, moment.trail()), self.crashes.len());
                 self.crashes.push(Crash { moment, acknowledged, shared: 1, variant, image });
             }
         }
@@ -982,20 +1010,20 @@ pub struct ScenarioPower {
 }
 
 /// Grades every state a power loss during `scenario`'s faulted command can leave, `variants`
-/// seeded ones among them. `template` is a fresh scratch area the history is built in; each state
-/// is written into its own copy of it, `<template>-power-<n>`.
-pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: &Settings, template: &Scratch, variants: usize, seed: u64) -> Result<ScenarioPower, RunError> {
+/// seeded ones among them, from the run [`kill::count`] counted in `template` with its writes
+/// dumped. Each state is written into its own area beside the template, `<template>-power-<n>`.
+pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, template: &Scratch, counting: &Counting, variants: usize, seed: u64) -> Result<ScenarioPower, RunError> {
     let mut power = ScenarioPower { scenario: scenario.id.clone(), ..Default::default() };
-    let counted = match kill::count(scenario, corpus, programs, settings, template)? {
+    let counted = match counting {
         Counting::Counted(counted) => counted,
         Counting::NotRun(reason) => {
-            power.not_run = Some(reason);
+            power.not_run = Some(reason.clone());
             return Ok(power);
         }
     };
-    let (points, _, refusals) = kill::points_of(&counted, settings.schema);
-    if !refusals.is_empty() {
-        power.refusals = refusals;
+    let (points, _, refusals) = kill::points_of(counted, settings.schema);
+    if let Some((refusals, not_run)) = kill::stopped(refusals, counted.path_bound.as_ref()) {
+        (power.refusals, power.not_run) = (refusals, not_run);
         return Ok(power);
     }
     let mut lines = Vec::new();
@@ -1025,7 +1053,7 @@ pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: 
             scope.spawn(|| loop {
                 let at = next.fetch_add(1, Ordering::SeqCst);
                 let Some(crash) = crashes.get(at) else { break };
-                let result = grade(scenario, &counted, programs, settings, template, crash, at)
+                let result = grade(scenario, counted, programs, settings, template, crash, at)
                     .map(|graded| GradedCrash { crash: crash.clone(), graded })
                     .map_err(|error| format!("{}: {}", crash.moment.label(), error));
                 results.lock().expect("no worker panics holding the lock").push((at, result));
@@ -1047,7 +1075,8 @@ pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: 
 /// counting run ran them, a line the crash cut short as killed.
 fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, settings: &Settings, template: &Scratch, crash: &Crash, at: usize) -> Result<Graded, RunError> {
     let io = |error: std::io::Error| RunError::Io(error.to_string());
-    let copy = template.copy_to(Path::new(&format!("{}-power-{}", template.root().display(), at))).map_err(|error| RunError::Io(error.to_string()))?;
+    // The state is the whole area, so the copy starts empty rather than as the template.
+    let copy = Scratch::create(Path::new(&format!("{}-power-{}", template.root().display(), at))).map_err(|error| RunError::Io(error.to_string()))?;
     materialize(&crash.image, copy.root()).map_err(io)?;
     let environment = kill::environment_of(settings, &copy)?;
     let context = kill::context_of(scenario, &counted.corpus, programs, settings, &copy, &environment);
@@ -1346,6 +1375,70 @@ mod tests {
         assert_eq!(found, vec![(b"old".to_vec(), false, 3), (b"new".to_vec(), false, 1), (b"new".to_vec(), true, 1)]);
         assert!(matches!(&crashes[0].moment, Moment::During { point } if point.name == "openat"));
         assert_eq!(crashes[2].moment, Moment::After { line: 1, command: "stack".into() });
+    }
+
+    /// A crash is graded with the trail it happens on: a state left after a line finished and
+    /// again inside the next line, before it changed anything durable, is two crashes, since the
+    /// second is graded with that line cut short.
+    ///
+    /// Revert: key a state by its tree alone → the next line's kill points merge into the crash
+    /// after the first line.
+    #[test]
+    fn one_state_on_two_trails_is_two_crashes() {
+        let texts = [rewrite(false), rewrite(false)];
+        let calls: Vec<Vec<Call>> = texts.iter().map(|text| trace::parse(text).unwrap()).collect();
+        let points: Vec<Vec<Point>> = calls.iter().enumerate()
+            .map(|(line, calls)| kill::enumerate(calls, line, "stack", &root(), "/s/w", |_| true).unwrap().points).collect();
+        let lines: Vec<Line> = calls.iter().zip(&points)
+            .map(|(calls, points)| Line { calls, command: "stack".into(), points: points.iter().collect() }).collect();
+        let (crashes, _) = crashes(&fixture(), &root(), "/s/w", &lines, 0, 7).unwrap();
+        assert!(crashes.iter().all(|crash| data(&crash.image, "w/a").unwrap() == b"old"));
+        let trails: Vec<(usize, bool)> = crashes.iter().map(|crash| crash.moment.trail()).collect();
+        assert_eq!(trails, [(0, true), (1, false), (1, true), (2, false)]);
+    }
+
+    /// A durable state is never reported as a variant: drawing variants leaves the durable
+    /// crashes exactly as a run with none, even when a draw happens to match a later one.
+    ///
+    /// Revert: count a durable state into the variant it matches → it is missing from the
+    /// durable crashes for some seed.
+    #[test]
+    fn a_durable_state_a_variant_found_first_stays_durable() {
+        // The fsync makes `new` durable; the mkdir after it leaves that state at its own point, so
+        // a variant drawn at the fsync that takes `new` matches it.
+        let text = format!("{}1 mkdir(\"n\", 0755) = 0\n", rewrite(true).replace("1 close(3</s/w/a>) = 0\n", ""));
+        let calls = trace::parse(&text).unwrap();
+        let points = kill::enumerate(&calls, 0, "stack", &root(), "/s/w", |_| true).unwrap().points;
+        let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect() }];
+        let durable = |crashes: &[Crash]| -> Vec<(String, usize)> {
+            crashes.iter().filter(|crash| crash.variant.is_none()).map(|crash| (crash.moment.label(), crash.shared)).collect()
+        };
+        let (plain, _) = crashes(&fixture(), &root(), "/s/w", &lines, 0, 0).unwrap();
+        let mut matched = false;
+        for seed in 0..64 {
+            let (drawn, _) = crashes(&fixture(), &root(), "/s/w", &lines, 8, seed).unwrap();
+            assert_eq!(durable(&drawn), durable(&plain), "seed {}", seed);
+            matched |= drawn.len() < plain.len() + 8;
+        }
+        assert!(matched, "some seed draws a variant that matches a durable state");
+    }
+
+    /// pwritev2 at offset -1 writes at the description's offset, RWF_APPEND appends, and an
+    /// O_APPEND set by fcntl after the open makes later writes append.
+    ///
+    /// Revert: read pwritev2's -1 as an offset → the replay refuses; ignore F_SETFL → `+x`
+    /// overwrites from the start.
+    #[test]
+    fn positioned_and_appending_writes_land_where_the_kernel_puts_them() {
+        let vectored = |fd: u32, offset: &str, flags: &str, bytes: &[u8]| format!(
+            "1 pwritev2({}</s/w/a>, [{{iov_base=\"{}\", iov_len={}}}], 1, {}, {}) = {}\n{}",
+            fd, String::from_utf8_lossy(bytes), bytes.len(), offset, flags, bytes.len(), dump(bytes));
+        let text = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 4</s/w/a>\n{}{}\
+            1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3</s/w/a>\n\
+            1 fcntl(3</s/w/a>, F_SETFL, O_WRONLY|O_APPEND) = 0\n{}{}",
+            vectored(4, "-1", "0", b"NE"), write(1, 4, "/s/w/a", b"W"), write(1, 3, "/s/w/a", b"+x"), vectored(4, "0", "RWF_APPEND", b"!"));
+        let model = replayed(&[text]).unwrap();
+        assert_eq!(data(&model.volatile_image(), "w/a").unwrap(), b"NEW+x!");
     }
 
     /// Seeded variants lie between the durable and the volatile state: each entry and file from

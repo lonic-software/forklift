@@ -121,17 +121,19 @@ fn call(tid: u32, text: &str) -> Option<Call> {
     Some(Call { tid, name: name.to_string(), arguments, returned, data: Vec::new() })
 }
 
-/// The bytes of one dump row, after its leading `| `: a five-digit hex offset, two spaces, then up
-/// to sixteen bytes in fixed columns (`xx ` each, one more space after the eighth), padded with
-/// spaces, then the row's text. Read by column, never by token, since the text can look like hex.
+/// The bytes of one dump row, after its leading `| `: a hex offset of at least five digits (strace
+/// widens it for a dump of 1 MiB or more), two spaces, then up to sixteen bytes in fixed columns
+/// (`xx ` each, one more space after the eighth), padded with spaces, then the row's text. Read by
+/// column, never by token, since the text can look like hex.
 fn dump_row(row: &str) -> Option<Vec<u8>> {
     let bytes = row.as_bytes();
-    if bytes.len() < 7 || !bytes[..5].iter().all(u8::is_ascii_hexdigit) || &bytes[5..7] != b"  " {
+    let width = bytes.iter().take_while(|byte| byte.is_ascii_hexdigit()).count();
+    if width < 5 || bytes.get(width..width + 2) != Some(b"  ") {
         return None;
     }
     let mut out = Vec::new();
     for index in 0..16 {
-        let at = 7 + 3 * index + usize::from(index >= 8);
+        let at = width + 2 + 3 * index + usize::from(index >= 8);
         let Some(pair) = bytes.get(at..at + 2) else { break };
         if pair == b"  " {
             break;
@@ -690,7 +692,8 @@ mod tests {
     /// column so a row's text that looks like hex is never taken for bytes.
     ///
     /// Revert: read the row by whitespace tokens → the text column `ab cd` parses as two more
-    /// bytes; refuse rows without a tid as before → the trace is refused.
+    /// bytes; refuse rows without a tid as before → the trace is refused; fix the offset at five
+    /// digits → a dump of 1 MiB or more is unreadable.
     #[test]
     fn write_dumps_join_their_call() {
         let text = "7 write(3</s/a>, \"0123456789abcdef@ABCab\"..., 22) = 22\n \
@@ -710,6 +713,9 @@ mod tests {
         assert_eq!(calls[1].data, b"xyz");
         assert!(calls[2].data.is_empty());
         assert_eq!(calls[3].data, b"ab cd", "text that reads as hex is no bytes");
+        // Past 1 MiB strace pads every offset of the dump to six digits.
+        let wide = "7 write(3</s/a>, \"ab\"..., 2) = 2\n | 000000  61 62                                               ab               |\n";
+        assert_eq!(parse(wide).unwrap()[0].data, b"ab", "a six-digit offset");
         assert!(parse(" | 00000  78   x |\n").is_err(), "a dump row before any call");
     }
 

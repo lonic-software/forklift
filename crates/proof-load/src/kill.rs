@@ -438,39 +438,43 @@ pub fn strace_line(trace: &Path, filter: &[String], program: &Path, arguments: &
 }
 
 /// One line of the faulted command as the counting run ran it.
-pub(crate) struct CountedLine {
-    pub arguments: Vec<String>,
-    pub outcome: Outcome,
-    pub calls: Vec<Call>,
+pub struct CountedLine {
+    pub(crate) arguments: Vec<String>,
+    pub(crate) outcome: Outcome,
+    pub(crate) calls: Vec<Call>,
     /// The paths under the counting copy, absolute, as they stood when the line started.
-    pub before: BTreeSet<String>,
+    pub(crate) before: BTreeSet<String>,
 }
 
 /// A scenario's faulted command traced once, unfaulted, with every write's bytes dumped.
-pub(crate) struct Counted {
+pub struct Counted {
     /// The scenario's own corpus.
-    pub corpus: Corpus,
-    pub expected: faulted::Expected,
-    pub faulted: usize,
+    pub(crate) corpus: Corpus,
+    pub(crate) expected: faulted::Expected,
+    pub(crate) faulted: usize,
     /// The template's folder name, which every trace and copy of it is named after.
-    pub label: String,
-    pub counting: Scratch,
-    pub counting_root: Root,
+    pub(crate) label: String,
+    pub(crate) counting: Scratch,
+    pub(crate) counting_root: Root,
     /// The counting copy as it stood once the faulted record's files were written, before any line.
-    pub fixture: crate::power::Image,
-    pub lines: Vec<CountedLine>,
+    pub(crate) fixture: crate::power::Image,
+    pub(crate) lines: Vec<CountedLine>,
+    /// The file the faulted command recorded the scratch area's root in, when it did: the copies
+    /// cannot stand for the run then. Reported only once the trace's own refusals are clear.
+    pub(crate) path_bound: Option<String>,
 }
 
 /// What counting found: the counted run, or why the scenario's faults cannot run.
-pub(crate) enum Counting {
+pub enum Counting {
     Counted(Box<Counted>),
     NotRun(String),
 }
 
 /// Builds `scenario`'s history in `template`, then runs its faulted command once on a copy beside
-/// it, `<template>-count`, every line traced with its writes dumped. The kill points and the power
-/// loss both start from here.
-pub(crate) fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: &Settings, template: &Scratch) -> Result<Counting, RunError> {
+/// it, `<template>-count`, every line traced, with its writes dumped when `dumps` asks (the power
+/// loss needs them; the kill points do not). The kill points and the power loss both start from
+/// here, from one count.
+pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: &Settings, template: &Scratch, dumps: bool) -> Result<Counting, RunError> {
     if let Some(reason) = not_run(scenario) {
         return Ok(Counting::NotRun(reason));
     }
@@ -497,7 +501,8 @@ pub(crate) fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, s
     for (index, arguments) in counting_context.lines(faulted)?.into_iter().enumerate() {
         let before = listing(counting.root());
         let trace_path = settings.traces.join(format!("{}-count-{}.trace", label, index));
-        let line = strace_line(&trace_path, &["-e".to_string(), "write=all".to_string()], &programs.forklift, &arguments);
+        let extra = if dumps { vec!["-e".to_string(), "write=all".to_string()] } else { Vec::new() };
+        let line = strace_line(&trace_path, &extra, &programs.forklift, &arguments);
         let mut outcome = counting_context.run(settings.strace, line, counting.work())?;
         outcome.arguments = arguments.clone();
         if !outcome.succeeded() {
@@ -510,10 +515,20 @@ pub(crate) fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, s
         let calls = trace::parse(&text).map_err(RunError::Io)?;
         lines.push(CountedLine { arguments, outcome, calls, before });
     }
-    if let Some(file) = recorded_root(counting.root(), &[&original.given, &original.canonical, &counting_root.given, &counting_root.canonical]).map_err(io)? {
-        return Ok(Counting::NotRun(format!("path-bound: the faulted command recorded the scratch area's root in {}", file)));
+    let path_bound = recorded_root(counting.root(), &[&original.given, &original.canonical, &counting_root.given, &counting_root.canonical]).map_err(io)?
+        .map(|file| format!("path-bound: the faulted command recorded the scratch area's root in {}", file));
+    Ok(Counting::Counted(Box::new(Counted { corpus, expected, faulted, label, counting, counting_root, fixture, lines, path_bound })))
+}
+
+/// What stops a counted scenario before its faults run, as (refusals, not run): the trace's own
+/// refusals come first, since they fail the report, and only a sound trace that is path-bound is
+/// set aside as not run, which fails nothing.
+pub(crate) fn stopped(refusals: Vec<String>, path_bound: Option<&String>) -> Option<(Vec<String>, Option<String>)> {
+    if !refusals.is_empty() {
+        Some((refusals, None))
+    } else {
+        path_bound.map(|reason| (Vec::new(), Some(reason.clone())))
     }
-    Ok(Counting::Counted(Box::new(Counted { corpus, expected, faulted, label, counting, counting_root, fixture, lines })))
 }
 
 /// The kill points of every counted line, or what refused them.
@@ -541,21 +556,21 @@ pub(crate) fn points_of(counted: &Counted, schema: &crate::writeops::Schema) -> 
     (points, children, refusals)
 }
 
-/// Runs every kill point of `scenario`'s faulted command. `template` is a fresh scratch area the
-/// history is built in; every counting and injected run works on a copy of it beside it.
-pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: &Settings, template: &Scratch) -> Result<ScenarioKills, RunError> {
+/// Runs every kill point of `scenario`'s faulted command, counted by [`count`] in `template`; every
+/// injected run works on a copy of the template beside it.
+pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, template: &Scratch, counting: &Counting) -> Result<ScenarioKills, RunError> {
     let mut kills = ScenarioKills { scenario: scenario.id.clone(), ..Default::default() };
-    let counted = match count(scenario, corpus, programs, settings, template)? {
+    let counted = match counting {
         Counting::Counted(counted) => counted,
         Counting::NotRun(reason) => {
-            kills.not_run = Some(reason);
+            kills.not_run = Some(reason.clone());
             return Ok(kills);
         }
     };
-    let (points, children, refusals) = points_of(&counted, settings.schema);
+    let (points, children, refusals) = points_of(counted, settings.schema);
     kills.children = children;
-    kills.refusals = refusals;
-    if !kills.refusals.is_empty() {
+    if let Some((refusals, not_run)) = stopped(refusals, counted.path_bound.as_ref()) {
+        (kills.refusals, kills.not_run) = (refusals, not_run);
         return Ok(kills);
     }
     let lines: Vec<Vec<String>> = counted.lines.iter().map(|line| line.arguments.clone()).collect();
@@ -935,6 +950,18 @@ mod tests {
     /// A file names the root only where the root ends a path component, so a sibling copy whose
     /// name extends the root is no hit.
     ///
+    /// An unsound trace is reported as refused even when it is also path-bound; only a sound one
+    /// is set aside as not run.
+    ///
+    /// Revert: check the path-bound record first → the refusals are hidden behind a not-run.
+    #[test]
+    fn refusals_outrank_a_path_bound_copy() {
+        let bound = "path-bound: x".to_string();
+        assert_eq!(stopped(vec!["unsound".into()], Some(&bound)), Some((vec!["unsound".to_string()], None)));
+        assert_eq!(stopped(Vec::new(), Some(&bound)), Some((Vec::new(), Some(bound.clone()))));
+        assert_eq!(stopped(Vec::new(), None), None);
+    }
+
     /// Revert: match a plain substring → every copy's own `…-kill-3` name reads as path-bound.
     #[test]
     fn a_recorded_root_is_found_at_component_boundaries() {

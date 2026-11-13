@@ -310,36 +310,54 @@ fn main() -> ExitCode {
                 jobs: jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from)), traces: &traces,
                 schema: schema.as_ref().expect("a forklift binary was given, so its schema was read"),
             };
-            let mut all = Vec::new();
-            for scenario in scenarios.iter().filter(|scenario| kill.is_empty() || kill.contains(&scenario.id)) {
-                let result = output.scratch(&format!("{}-kill", scenario.id)).map_err(|error| error.to_string())
-                    .and_then(|template| kill::run(scenario, &faulted_corpus, &programs, &settings, &template).map_err(|error| error.to_string()));
-                match result {
-                    Ok(kills) => {
-                        let _ = std::fs::write(output.root().join(format!("kills-{}.json", scenario.id)), serde_json::to_string(&kills).unwrap_or_default());
-                        all.push(kills);
+            // One template and one counting run per scenario feed both lanes; the write dumps are
+            // taken only when the power loss will read them.
+            let (mut all_kills, mut all_power) = (Vec::new(), Vec::new());
+            for scenario in &scenarios {
+                let killing = kill.is_empty() || kill.contains(&scenario.id);
+                let powering = power.is_empty() || power.contains(&scenario.id);
+                if !killing && !powering {
+                    continue;
+                }
+                let counted = output.scratch(&format!("{}-traced", scenario.id)).map_err(|error| error.to_string())
+                    .and_then(|template| kill::count(scenario, &faulted_corpus, &programs, &settings, &template, powering).map(|counting| (template, counting)).map_err(|error| error.to_string()));
+                let (template, counting) = match counted {
+                    Ok(counted) => counted,
+                    Err(error) => {
+                        if killing {
+                            all_kills.push(kill::ScenarioKills { scenario: scenario.id.clone(), errors: vec![error.clone()], ..Default::default() });
+                        }
+                        if powering {
+                            all_power.push(proof_load::power::ScenarioPower { scenario: scenario.id.clone(), errors: vec![error], ..Default::default() });
+                        }
+                        continue;
                     }
-                    Err(error) => all.push(kill::ScenarioKills { scenario: scenario.id.clone(), errors: vec![error], ..Default::default() }),
+                };
+                if killing {
+                    match kill::run(scenario, &programs, &settings, &template, &counting) {
+                        Ok(kills) => {
+                            let _ = std::fs::write(output.root().join(format!("kills-{}.json", scenario.id)), serde_json::to_string(&kills).unwrap_or_default());
+                            all_kills.push(kills);
+                        }
+                        Err(error) => all_kills.push(kill::ScenarioKills { scenario: scenario.id.clone(), errors: vec![error.to_string()], ..Default::default() }),
+                    }
+                }
+                if powering {
+                    match proof_load::power::run(scenario, &programs, &settings, &template, &counting, power_variants, seed) {
+                        Ok(power) => {
+                            let _ = std::fs::write(output.root().join(format!("power-{}.json", scenario.id)), serde_json::to_string(&power).unwrap_or_default());
+                            all_power.push(power);
+                        }
+                        Err(error) => all_power.push(proof_load::power::ScenarioPower { scenario: scenario.id.clone(), errors: vec![error.to_string()], ..Default::default() }),
+                    }
                 }
             }
-            let summary = kill::summarize(&all);
+            let summary = kill::summarize(&all_kills);
             rows.extend(summary.rows);
             kill_completeness = summary.completeness;
             not_reached = summary.not_reached;
 
-            let mut all = Vec::new();
-            for scenario in scenarios.iter().filter(|scenario| power.is_empty() || power.contains(&scenario.id)) {
-                let result = output.scratch(&format!("{}-power", scenario.id)).map_err(|error| error.to_string())
-                    .and_then(|template| proof_load::power::run(scenario, &faulted_corpus, &programs, &settings, &template, power_variants, seed).map_err(|error| error.to_string()));
-                match result {
-                    Ok(power) => {
-                        let _ = std::fs::write(output.root().join(format!("power-{}.json", scenario.id)), serde_json::to_string(&power).unwrap_or_default());
-                        all.push(power);
-                    }
-                    Err(error) => all.push(proof_load::power::ScenarioPower { scenario: scenario.id.clone(), errors: vec![error], ..Default::default() }),
-                }
-            }
-            let power_summary = proof_load::power::summarize(&all);
+            let power_summary = proof_load::power::summarize(&all_power);
             rows.extend(power_summary.rows);
             power_completeness = power_summary.completeness;
             Ok((summary.cell, power_summary.cell))
