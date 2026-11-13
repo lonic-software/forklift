@@ -137,7 +137,15 @@ Notes:
   on `--folding-volume` (an empty or new directory on a volume that folds case or keeps no
   executable bit, which CI makes as a vfat loop mount on Linux and an exFAT image on macOS): a
   probe measures which, a cell whose property does not hold is not run, and the volume is never
-  lifted, since nobody lifts the file system their checkout lives on. A fault whose condition
+  lifted, since nobody lifts the file system their checkout lives on. Every hosted scenario's
+  server is reached only through the harness's TCP proxy, which logs each HTTP/1.1 exchange and,
+  in the network lane only, forwards one request at a time; `--network <scenario>` (CI: `lifted`,
+  every OS) arms one fault of
+  each kind (a delay, a dropped request, a truncated, reset or stalled response, a request cut
+  toward the server, the server killed once the request is forwarded) at a seeded request of the
+  faulted command, each on a fresh build, and reads back through a fresh clone of the host. A
+  killed server is restarted first, and each removal its refusal to start names is carried out
+  and graded as outside knowledge; one that will not start again is graded, not an error. A fault whose condition
   no longer held when the command ended, every line of it landed, is listed as missing from its
   lane's check and fails the run; one that held
   is graded, so a refused write the tool swallowed counts as an acknowledgement. A retry resumes at the line that did not land, as a user

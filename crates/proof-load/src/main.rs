@@ -91,6 +91,10 @@ enum Command {
         /// they are reported as not run.
         #[arg(long)]
         folding_volume: Option<PathBuf>,
+        /// Network faults under this scenario's faulted command, one of each kind at a seeded
+        /// request through the proxy every host is served behind; repeatable. Without it, none.
+        #[arg(long = "network")]
+        network: Vec<String>,
     },
 }
 
@@ -107,7 +111,7 @@ fn described(program: &std::path::Path) -> String {
 fn main() -> ExitCode {
     let Command::Run {
         source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, power, power_variants, jobs,
-        capped_volume, disk_full, read_only: read_only_lane, folding_volume,
+        capped_volume, disk_full, read_only: read_only_lane, folding_volume, network: network_lane,
     } = Cli::parse().command;
     let started = std::time::Instant::now();
 
@@ -127,7 +131,7 @@ fn main() -> ExitCode {
         }
     };
 
-    for (flag, ids) in [("--kill", &kill), ("--power", &power), ("--disk-full", &disk_full), ("--read-only", &read_only_lane)] {
+    for (flag, ids) in [("--kill", &kill), ("--power", &power), ("--disk-full", &disk_full), ("--read-only", &read_only_lane), ("--network", &network_lane)] {
         if let Some(unknown) = ids.iter().find(|id| !scenario::catalog().iter().any(|scenario| &scenario.id == *id)) {
             eprintln!("proof-load: {} {}: no such scenario", flag, unknown);
             return ExitCode::from(2);
@@ -388,6 +392,60 @@ fn main() -> ExitCode {
             }
         }
     };
+    // One fault of each kind the proxy injects, at a seeded request of the faulted command of each
+    // scenario named for it, each on a fresh build.
+    let mut networked = Vec::new();
+    let network_cell = match &resolved {
+        Err(reason) => Cell::not_run(reason),
+        Ok(Programs { server: None, .. }) => Cell::not_run("no forklift-server binary given"),
+        _ if picked(&network_lane).is_empty() => Cell::not_run("no scenario this run picked was named for it"),
+        Ok(programs) => {
+            let errors = condition_errors.entry(Category::Network).or_default();
+            for scenario in picked(&network_lane) {
+                let counted = in_area(&mut output, &format!("{}-network-counted", scenario.id), &search_path, |scratch, environment|
+                    proof_load::network::count(scenario, &faulted_corpus(seed), programs, scratch, environment, limit).map_err(|error| error.to_string()));
+                let requests = match counted {
+                    Ok(requests) => requests,
+                    Err(error) => {
+                        errors.push(format!("{} network: {}", scenario.id, error));
+                        continue;
+                    }
+                };
+                for point in proof_load::network::points(requests, seed, &scenario.id) {
+                    let label = format!("{}-network-{:?}-{}", scenario.id, point.fault, point.at);
+                    let result = in_area(&mut output, &label, &search_path, |scratch, environment|
+                        proof_load::network::network(scenario, &faulted_corpus(seed), programs, scratch, environment, limit, point).map_err(|error| error.to_string()));
+                    match result {
+                        Ok(run) => networked.push(run),
+                        Err(error) => errors.push(format!("{} {} at request {}: {}", scenario.id, point.fault.label(), point.at, error)),
+                    }
+                }
+            }
+            // A few requests of each faulted command, so sampled; none graded is none run.
+            if networked.is_empty() { Cell::not_run("no network fault graded") } else { Cell::Sampled }
+        }
+    };
+    for run in networked {
+        let label = format!("{}-network-{:?}-{}", run.scenario, run.point.fault, run.point.at);
+        let _ = std::fs::write(output.root().join(format!("{}.json", label)), serde_json::to_string(&run).unwrap_or_default());
+        let mut note = "through the harness's proxy, one request at a time".to_string();
+        match &run.restart {
+            Some(proof_load::network::Restart { refused: None }) => note.push_str("; the killed server restarted before the readback"),
+            Some(proof_load::network::Restart { refused: Some(said) }) => note.push_str(&format!("; the killed server would not start again: {}", said.trim())),
+            None => {}
+        }
+        if run.point.fault == proof_load::proxy::Fault::Reset && Platform::current() == Platform::Windows {
+            note.push_str("; a plain close on Windows, where no linger is set");
+        }
+        if !run.graded.unextractable.is_empty() {
+            note.push_str(&format!("; unextractable remedies: {}", run.graded.unextractable.join("; ")));
+        }
+        rows.push(Row {
+            scenario: run.label(), category: Category::Network, binding: "forklift".to_string(),
+            grade: run.graded.grade, recoverability: run.graded.recoverability, note: Some(note),
+        });
+    }
+
     for (category, note, run) in lifted {
         let label = format!("{}-{}", run.scenario, run.condition).replace(' ', "-");
         let _ = std::fs::write(output.root().join(format!("{}.json", label)), serde_json::to_string(&run).unwrap_or_default());
@@ -466,6 +524,7 @@ fn main() -> ExitCode {
     let condition_checks: Vec<Completeness> = [
         (Category::DiskFull, "disk-full faults ran", &disk_full_cell), (Category::ReadOnly, "read-only faults ran", &read_only_cell),
         (Category::CaseFolding, "case-folding faults ran", &case_folding_cell), (Category::NoExec, "no-exec faults ran", &no_exec_cell),
+        (Category::Network, "network faults ran", &network_cell),
     ].into_iter().map(|(category, check, cell)| Completeness {
             check: check.to_string(), cell: cell.clone(), missing: condition_errors.remove(&category).unwrap_or_default(),
         }).collect();
@@ -577,6 +636,7 @@ fn main() -> ExitCode {
         Category::ReadOnly => read_only_cell.clone(),
         Category::CaseFolding => case_folding_cell.clone(),
         Category::NoExec => no_exec_cell.clone(),
+        Category::Network => network_cell.clone(),
         _ => Cell::not_run("no runner for this fault in this build of the harness"),
     });
     if matches!(kill_cell, Cell::Run | Cell::Sampled) || not_reached > 0 {
@@ -615,6 +675,17 @@ fn main() -> ExitCode {
     }
 
     if report.failed() { ExitCode::from(1) } else { ExitCode::SUCCESS }
+}
+
+/// Runs `run` in a new scratch area `label` of `output`, with a scrubbed environment; the area is
+/// kept for its details.
+fn in_area<T>(
+    output: &mut Output, label: &str, search_path: &Option<std::ffi::OsString>,
+    run: impl FnOnce(&proof_load::scrub::Scratch, &Environment) -> Result<T, String>,
+) -> Result<T, String> {
+    let scratch = output.scratch(label).map_err(|error| error.to_string())?;
+    let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
+    run(&scratch, &environment)
 }
 
 /// Runs `run` in a new scratch area `label` of `volume`, then removes the area, failed or not: what

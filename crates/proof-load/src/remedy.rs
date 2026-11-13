@@ -83,6 +83,27 @@ pub fn removable(path: &Path, run_roots: &[&Path]) -> Option<PathBuf> {
     run_roots.iter().find_map(|root| removable_under(path, root))
 }
 
+/// Carries out a remove remedy, the same in every lane: the path judged as [`removable`], and
+/// removed when it is a file there. Returns the step as it is recorded in outside knowledge, saying
+/// why when it was not carried out, and whether a file was removed.
+pub fn remove(path: &Path, run_roots: &[&Path]) -> (String, bool) {
+    let Some(judged) = removable(path, run_roots) else {
+        return (format!("remove {} (outside the run root; not run)", path.display()), false);
+    };
+    match std::fs::symlink_metadata(&judged) {
+        Err(_) => (format!("remove {} (nothing there; not run)", path.display()), false),
+        Ok(metadata) if metadata.is_dir() => (format!("remove {} (a folder, and a remedy removes one file; not run)", path.display()), false),
+        Ok(_) => {
+            #[allow(clippy::disallowed_methods)] // a removal a refusal named, judged inside the run's roots; no retry is wanted
+            let removed = std::fs::remove_file(&judged);
+            match removed {
+                Ok(()) => (format!("remove {}", path.display()), true),
+                Err(error) => (format!("remove {} (failed: {})", path.display(), error), false),
+            }
+        }
+    }
+}
+
 /// The path the harness may remove under one run root, if any: only one inside it, judged at
 /// path-component boundaries, so a root of `/s` covers `/s/wh` but not `/srv/wh`.
 /// A tool may print the path resolved (`/private/var/…` for `/var/…` on macOS, `\\?\C:\…` on
@@ -95,7 +116,11 @@ pub fn removable_under(path: &Path, run_root: &Path) -> Option<PathBuf> {
     if under(path, run_root) {
         return Some(path.to_path_buf());
     }
-    let (resolved, root) = (std::fs::canonicalize(path).ok()?, std::fs::canonicalize(run_root).ok()?);
+    // A path already gone is resolved through its folder, so a resolved spelling of it is still
+    // judged inside the root it is in, and then found to be gone.
+    let resolved = std::fs::canonicalize(path).ok()
+        .or_else(|| Some(std::fs::canonicalize(path.parent()?).ok()?.join(path.file_name()?)))?;
+    let root = std::fs::canonicalize(run_root).ok()?;
     under(&resolved, &root).then_some(resolved)
 }
 
@@ -198,5 +223,33 @@ mod tests {
         let outside = base.join("outside-link");
         std::os::unix::fs::symlink(real.join("wh/store.lock"), &outside).unwrap();
         assert_eq!(removable_under(&outside, &root), Some(printed));
+    }
+
+    /// A removal is carried out only on a file inside a run root, and every one is recorded, with
+    /// why when it was not carried out.
+    ///
+    /// Revert: record only removals carried out → the folder, the missing file and the outside
+    /// path leave no step.
+    #[test]
+    fn every_removal_is_recorded() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("proof-load-remove-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        std::fs::write(root.join("serve.lock"), "").unwrap();
+        let roots = [root.as_path()];
+        let (step, done) = remove(&root.join("serve.lock"), &roots);
+        assert_eq!((step, done), (format!("remove {}", root.join("serve.lock").display()), true));
+        assert!(!root.join("serve.lock").exists());
+        for (path, why) in [(root.join("folder"), "a folder"), (root.join("serve.lock"), "nothing there"), (PathBuf::from("/elsewhere/lock"), "outside the run root")] {
+            let (step, done) = remove(&path, &roots);
+            assert!(!done && step.starts_with(&format!("remove {} (", path.display())) && step.contains(why), "{}", step);
+        }
+        assert!(root.join("folder").is_dir());
+        // Gone, and printed resolved (/private/var/… for /var/… on macOS): still inside the root.
+        let resolved = std::fs::canonicalize(&root).unwrap().join("gone.lock");
+        let (step, done) = remove(&resolved, &roots);
+        assert!(!done && step.contains("nothing there"), "{}", step);
+        #[allow(clippy::disallowed_methods)] // the test's own temp folder
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -105,7 +105,7 @@ jobs:
           bin=target/${{ matrix.target }}/release
           target/release/proof-load$exe run --source . --out "$RUNNER_TEMP/proof-load" --budget 2700 \
             --forklift "$bin/forklift$exe" --forklift-server "$bin/forklift-server$exe" --git "$git" \
-            --read-only history --read-only compacted "${kill[@]}" "${capped[@]}" "${folding[@]}"
+            --read-only history --read-only compacted --network lifted "${kill[@]}" "${capped[@]}" "${folding[@]}"
 
       - name: Summary
         if: ${{ !cancelled() }}

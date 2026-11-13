@@ -14,7 +14,8 @@ use crate::corpus::{self, Corpus};
 use crate::oracle::{Admissible, RedactionLedger, RedactionState};
 use crate::scenario::{bind, Keep, Mark, Op, Scenario, Tool, Until, SCRATCH, TARGET, URL, WORK};
 use crate::scrub::{Environment, Scratch};
-use crate::tool::{self, Invocation, Outcome, Served};
+use crate::host::Host;
+use crate::tool::{self, Invocation, Outcome};
 use crate::writeops::Observer;
 
 /// What building a scenario's history produced.
@@ -32,7 +33,7 @@ pub struct Built {
     pub acknowledged: Vec<Mark>,
     /// The server a `Host` operation started, serving until this is dropped.
     #[serde(skip)]
-    pub host: Option<Served>,
+    pub host: Option<Host>,
 }
 
 impl std::fmt::Debug for Built {
@@ -132,7 +133,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
 
     let mut outcomes = vec![run_in(program, prepare(tool), scratch.work())?];
     let mut acknowledged = Vec::new();
-    let mut host: Option<Served> = None;
+    let mut host: Option<Host> = None;
     let mut taken = Vec::new();
     let mut ledger = RedactionLedger::default();
     // The folder a sparse clone scoped the work tree to, which bounds what a later write may hold.
@@ -153,7 +154,7 @@ pub fn build(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, s
                 let server = server.ok_or_else(|| RunError::Io(format!("scenario {} hosts a warehouse, and no forklift-server binary was given", scenario.id)))?;
                 let root = host_root(scratch);
                 outcomes.push(run_in(server, vec!["prepare".into(), "--root".into(), root.display().to_string()], scratch.root().to_path_buf())?);
-                host = Some(tool::serve(server, &root, scratch, environment, limit).map_err(RunError::Tool)?);
+                host = Some(Host::start(server, &root, scratch, environment, limit).map_err(RunError::Tool)?);
             }
             Op::Bundle => {
                 let server = server.filter(|_| host.is_some())
