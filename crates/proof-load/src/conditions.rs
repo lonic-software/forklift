@@ -48,27 +48,37 @@ impl std::fmt::Display for FillError {
 /// what the ballast took; returns what the ballast held at the full point. Stops at `cap` bytes.
 pub fn fill(ballast: &Path, leave: u64, cap: u64) -> Result<u64, FillError> {
     let io = |error: std::io::Error| FillError::Io(format!("{}: {}", ballast.display(), error));
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(ballast).map_err(io)?;
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(ballast).map_err(io)?;
+    let filled = fill_file(file, leave, cap).map_err(|error| match error {
+        Some(error) => io(error),
+        None => FillError::NotCapped,
+    });
+    // A fill that failed leaves no ballast behind: a full volume would fail every later fault.
+    if filled.is_err() {
+        let _ = damage::apply(ballast, Kind::Delete, 0);
+    }
+    filled
+}
+
+/// What [`fill`] does with the ballast once made: an error, or None at the cap.
+fn fill_file(mut file: std::fs::File, leave: u64, cap: u64) -> Result<u64, Option<std::io::Error>> {
     // Large writes to reach the full point fast, then small ones to take what a large one left.
     for chunk in [1 << 20, 4 << 10, 512] {
         let block = vec![0xa5u8; chunk];
         loop {
-            let held = file.metadata().map_err(io)?.len();
-            if held >= cap {
-                drop(file);
-                let _ = damage::apply(ballast, Kind::Delete, 0);
-                return Err(FillError::NotCapped);
+            if file.metadata()?.len() >= cap {
+                return Err(None);
             }
             match file.write_all(&block).and_then(|()| file.flush()) {
                 Ok(()) => {}
                 Err(error) if is_full(&error) => break,
-                Err(error) => return Err(io(error)),
+                Err(error) => return Err(Some(error)),
             }
         }
     }
-    let held = file.metadata().map_err(io)?.len();
-    file.set_len(held.saturating_sub(leave)).map_err(io)?;
-    file.sync_all().map_err(io)?;
+    let held = file.metadata()?.len();
+    file.set_len(held.saturating_sub(leave))?;
+    file.sync_all()?;
     Ok(held)
 }
 
@@ -122,9 +132,10 @@ fn under(
 }
 
 /// Runs `scenario`'s faulted command once without a fault on `scratch`, on the capped volume, and
-/// measures by filling it what its lines consume at their deepest: the most free space they had
-/// taken after any one line, the snapshot already written. A repack that frees space by its end
-/// has still consumed what its record took first.
+/// measures by filling it what its lines consume: the most free space they had taken after any one
+/// line, the snapshot already written. A repack that frees space by its end has still consumed what
+/// its record took first. Measured between lines only: a peak inside one line, a temporary file
+/// it removes before exiting, is not seen.
 pub fn consumed(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, ballast: &Path) -> Result<u64, String> {
     let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), scratch, environment, limit, None)
         .map_err(|error| error.to_string())?;
@@ -205,11 +216,15 @@ pub fn freeze(root: &Path) -> std::io::Result<Vec<(PathBuf, std::fs::Permissions
         }
         saved.push((path, metadata.permissions()));
     }
-    // Folders last, so each is listed before its write bit goes.
-    for (path, permissions) in &saved {
+    // Everything is listed above before any write bit goes, so the order here does not matter.
+    for (done, (path, permissions)) in saved.iter().enumerate() {
         let mut frozen = permissions.clone();
         frozen.set_readonly(true);
-        std::fs::set_permissions(path, frozen)?;
+        if let Err(error) = std::fs::set_permissions(path, frozen) {
+            // Half frozen is no fault to grade and no state to leave: restore what changed.
+            let _ = thaw(&saved[..done]);
+            return Err(std::io::Error::new(error.kind(), format!("{}: {}", path.display(), error)));
+        }
     }
     Ok(saved)
 }

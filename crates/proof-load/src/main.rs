@@ -334,12 +334,8 @@ fn main() -> ExitCode {
             let ballast = capped.root().join("ballast");
             let errors = condition_errors.entry(Category::DiskFull).or_default();
             for scenario in picked(&disk_full) {
-                let mut area = |label: String| capped.scratch(&label).map_err(|error| error.to_string()).and_then(|scratch| {
-                    let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
-                    Ok((scratch, environment))
-                });
-                let consumed = area(format!("{}-counted", scenario.id)).and_then(|(scratch, environment)|
-                    proof_load::conditions::consumed(scenario, &faulted_corpus(seed), programs, &scratch, &environment, limit, &ballast));
+                let consumed = discarded_area(&mut capped, &format!("{}-counted", scenario.id), &search_path, |scratch, environment|
+                    proof_load::conditions::consumed(scenario, &faulted_corpus(seed), programs, scratch, environment, limit, &ballast));
                 let consumed = match consumed {
                     Ok(consumed) => consumed,
                     Err(error) => {
@@ -348,8 +344,8 @@ fn main() -> ExitCode {
                     }
                 };
                 for free in proof_load::conditions::points(consumed) {
-                    let result = area(format!("{}-free-{}", scenario.id, free)).and_then(|(scratch, environment)|
-                        proof_load::conditions::disk_full(scenario, &faulted_corpus(seed), programs, &scratch, &environment, limit, &ballast, free)
+                    let result = discarded_area(&mut capped, &format!("{}-free-{}", scenario.id, free), &search_path, |scratch, environment|
+                        proof_load::conditions::disk_full(scenario, &faulted_corpus(seed), programs, scratch, environment, limit, &ballast, free)
                             .map_err(|error| error.to_string()));
                     // A fault that failed part-way may have left its ballast; the next point fills afresh.
                     let _ = proof_load::damage::apply(&ballast, proof_load::damage::Kind::Delete, 0);
@@ -359,8 +355,8 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            // A few points of a continuum of free space, so sampled.
-            Cell::Sampled
+            // A few points of a continuum of free space, so sampled; none graded is none run.
+            if lifted.iter().any(|(category, _, _)| *category == Category::DiskFull) { Cell::Sampled } else { Cell::not_run("no disk-full fault graded") }
         }
     };
     let mut writable = None;
@@ -381,8 +377,9 @@ fn main() -> ExitCode {
                 }
             }
             match writable {
-                Some(reason) if !lifted.iter().any(|(category, _, _)| *category == Category::ReadOnly) => Cell::not_run(reason),
-                _ => Cell::Run,
+                _ if lifted.iter().any(|(category, _, _)| *category == Category::ReadOnly) => Cell::Run,
+                Some(reason) => Cell::not_run(reason),
+                None => Cell::not_run("no read-only fault graded"),
             }
         }
     };
@@ -550,6 +547,23 @@ fn main() -> ExitCode {
 
 /// The corpus a faulted command runs over, shared by every lane: the small shape with one record
 /// past the history, the one the faulted command writes.
+/// Runs `run` in a new scratch area `label` of `volume`, then removes the area, failed or not: what
+/// one leaves on a small capped volume would take the free space of the next, and the details of
+/// each graded fault are written to the output.
+fn discarded_area<T>(
+    volume: &mut Output, label: &str, search_path: &Option<std::ffi::OsString>,
+    run: impl FnOnce(&proof_load::scrub::Scratch, &Environment) -> Result<T, String>,
+) -> Result<T, String> {
+    let scratch = volume.scratch(label).map_err(|error| error.to_string())?;
+    let root = scratch.root().to_path_buf();
+    let result = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())
+        .and_then(|environment| run(&scratch, &environment));
+    drop(scratch);
+    #[allow(clippy::disallowed_methods, reason = "a scratch area the harness made itself on the capped volume; no retry is wanted")]
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
 fn faulted_corpus(seed: u64) -> corpus::Corpus {
     corpus::generate(seed, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL })
 }
