@@ -6,7 +6,8 @@
 //! and grades, damaged-file faults with their completeness check, client kill points (Linux), the
 //! write-op completeness check over the version's own schema, client power loss over a
 //! persistence model of the traced calls (Linux), dead-holder locks, disk full on a capped volume
-//! and a read-only warehouse, a work tree on a case-folding or no-exec volume, and the report.
+//! and a read-only warehouse, a work tree on a case-folding or no-exec volume, network faults
+//! through a proxy every host is served behind (with a killed server restarted), and the report.
 
 pub mod bindings;
 pub mod census;

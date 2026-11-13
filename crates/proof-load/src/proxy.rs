@@ -216,8 +216,16 @@ enum Body {
     ToEnd,
 }
 
+/// A message head as read: its bytes, its headers with lowercased names, and its first line's
+/// first two parts.
+struct Head {
+    bytes: Vec<u8>,
+    headers: Vec<(String, String)>,
+    first: [String; 2],
+}
+
 /// Reads one message head: None at a clean end of the connection before any byte.
-fn read_head(reader: &mut impl BufRead) -> std::io::Result<Option<(Vec<u8>, Vec<(String, String)>, [String; 2])>> {
+fn read_head(reader: &mut impl BufRead) -> std::io::Result<Option<Head>> {
     let mut head = Vec::new();
     loop {
         let mut line = Vec::new();
@@ -243,7 +251,7 @@ fn read_head(reader: &mut impl BufRead) -> std::io::Result<Option<(Vec<u8>, Vec<
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("not an HTTP message: {:?}", first)));
     }
     let headers = lines.filter_map(|line| line.split_once(':')).map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string())).collect();
-    Ok(Some((head, headers, [first[0].clone(), first[1].clone()])))
+    Ok(Some(Head { bytes: head, headers, first: [first[0].clone(), first[1].clone()] }))
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -300,7 +308,7 @@ fn closes(headers: &[(String, String)]) -> bool {
 
 /// Reads one request whole; None at a clean end of the connection.
 fn read_request(reader: &mut impl BufRead) -> std::io::Result<Option<Message>> {
-    let Some((mut bytes, headers, [method, target])) = read_head(reader)? else { return Ok(None) };
+    let Some(Head { mut bytes, headers, first: [method, target] }) = read_head(reader)? else { return Ok(None) };
     let body = if chunked(&headers) {
         Body::Chunked
     } else {
@@ -317,7 +325,7 @@ fn read_request(reader: &mut impl BufRead) -> std::io::Result<Option<Message>> {
 /// Reads one response whole, to the request `method` was: a HEAD response, a 1xx, 204 or 304 has
 /// no body whatever its headers say.
 fn read_response(reader: &mut impl BufRead, method: &str) -> std::io::Result<Message> {
-    let (mut bytes, headers, [version, status]) = read_head(reader)?
+    let Head { mut bytes, headers, first: [version, status] } = read_head(reader)?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "the server closed the connection without a response"))?;
     let code: u16 = status.parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("a bad status {:?}", status)))?;
     let mut closing = closes(&headers);
@@ -635,8 +643,8 @@ mod tests {
                 }
                 Fault::Kill => assert_eq!((answer.len(), killed.load(Ordering::SeqCst)), (0, 1)),
                 Fault::Truncate | Fault::Stall => {
-                    let full = format!("HTTP/1.1 200 OK\r\ncontent-length: 34\r\n\r\nPOST /v1/pallets/main");
-                    assert!(!answer.is_empty() && answer.len() < full.len(), "{:?}: {:?}", fault, String::from_utf8_lossy(&answer));
+                    let full = b"HTTP/1.1 200 OK\r\ncontent-length: 21\r\n\r\nPOST /v1/pallets/main".len();
+                    assert!(!answer.is_empty() && answer.len() < full, "{:?}: {:?}", fault, String::from_utf8_lossy(&answer));
                     assert_eq!(fired.status, Some(200), "{:?}: the response was read to its end", fault);
                 }
                 Fault::Reset => {
