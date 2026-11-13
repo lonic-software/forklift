@@ -4,7 +4,8 @@
 //!
 //! Built in slices. So far: the census reader, the copy-only rule and environment scrub, the oracle
 //! and grades, damaged-file faults with their completeness check, client kill points (Linux), the
-//! write-op completeness check over the version's own schema, and the report.
+//! write-op completeness check over the version's own schema, client power loss over a
+//! persistence model of the traced calls (Linux), and the report.
 
 pub mod bindings;
 pub mod census;
@@ -13,6 +14,7 @@ pub mod damage;
 pub mod faulted;
 pub mod kill;
 pub mod oracle;
+pub mod power;
 pub mod remedy;
 pub mod report;
 pub mod runner;

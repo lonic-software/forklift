@@ -55,6 +55,8 @@ pub struct Identity {
 pub struct Point {
     /// The index of the faulted command's line the point is in.
     pub line: usize,
+    /// The index of its call in that line's counting trace.
+    pub call: usize,
     /// The command id: the line's subcommand.
     pub command: String,
     pub name: String,
@@ -85,27 +87,27 @@ pub struct Enumerated {
 }
 
 /// The working directory each process is in as the trace goes, for calls relative to it.
-struct Directories {
+pub(crate) struct Directories {
     groups: BTreeMap<u32, u32>,
     cwd: BTreeMap<u32, String>,
     start: String,
 }
 
 impl Directories {
-    fn new(groups: BTreeMap<u32, u32>, start: &str) -> Directories {
+    pub(crate) fn new(groups: BTreeMap<u32, u32>, start: &str) -> Directories {
         Directories { groups, cwd: BTreeMap::new(), start: start.to_string() }
     }
 
-    fn group(&self, tid: u32) -> u32 {
+    pub(crate) fn group(&self, tid: u32) -> u32 {
         self.groups.get(&tid).copied().unwrap_or(tid)
     }
 
-    fn of(&self, tid: u32) -> String {
+    pub(crate) fn of(&self, tid: u32) -> String {
         self.cwd.get(&self.group(tid)).cloned().unwrap_or_else(|| self.start.clone())
     }
 
     /// Follows a call that changes a working directory or starts a process.
-    fn follow(&mut self, call: &Call) {
+    pub(crate) fn follow(&mut self, call: &Call) {
         let group = self.group(call.tid);
         match (call.name.as_str(), &call.returned) {
             ("chdir", Returned::Value(_)) => {
@@ -133,7 +135,7 @@ impl Directories {
     }
 
     /// Where an operand points, absolute.
-    fn resolved(&self, operand: &Operand, tid: u32) -> String {
+    pub(crate) fn resolved(&self, operand: &Operand, tid: u32) -> String {
         match operand {
             Operand::Named { traced, base } => trace::resolve(traced, base.as_deref().unwrap_or(&self.of(tid))),
             Operand::Held { target } => target.clone(),
@@ -143,7 +145,9 @@ impl Directories {
 
 /// Every path a successful mutating call in `calls` named, absolute, from every thread and process
 /// the trace holds: the write-op check's evidence. `start` is the folder the line ran in. A call
-/// that failed, never returned, or the table cannot classify names nothing here.
+/// that failed, never returned, or the table cannot classify or place names nothing here: the
+/// write-op coverage it feeds reports a command only when no traced run of it reaches a placed
+/// write.
 pub fn written(calls: &[Call], start: &str) -> Vec<String> {
     let mut directories = Directories::new(trace::thread_groups(calls), start);
     let mut paths = Vec::new();
@@ -253,7 +257,7 @@ pub fn enumerate(calls: &[Call], line: usize, command: &str, root: &Root, start:
         let counts = |other: &Call| other.name == call.name && aims.as_ref().is_none_or(|aims| selected(other, aims));
         let when = calls[..=index].iter().filter(|other| other.tid == call.tid && counts(other)).count();
         let sampled = calls.iter().any(|other| other.tid != call.tid && counts(other));
-        enumerated.points.push(Point { line, command: command.to_string(), name: call.name.clone(), aim, when, target, base, sampled });
+        enumerated.points.push(Point { line, call: index, command: command.to_string(), name: call.name.clone(), aim, when, target, base, sampled });
     }
     Ok(enumerated)
 }
@@ -298,7 +302,13 @@ pub fn landing(calls: &[Call], point: &Point, root: &Root, exit: Option<i32>) ->
             continue;
         }
         let position = calls[..=index].iter().filter(|other| other.tid == call.tid && other.name == point.name).count();
-        let Ok(touched) = trace::touch(call) else { continue };
+        let touched = match trace::touch(call) {
+            Ok(touched) => touched,
+            Err(unsound) => {
+                seen.push(format!("{}#{} {}", call.name, position, unsound));
+                continue;
+            }
+        };
         let group = groups.get(&call.tid).copied().unwrap_or(call.tid);
         let found = identity(&touched.operands, &touched.detail, root, group);
         if position == point.when && stands_for(&found, &point.target, point.aim == Aim::Position) && (point.aim != Aim::Position || group == tool) {
@@ -346,7 +356,7 @@ pub fn recorded_root(root: &Path, needles: &[&str]) -> std::io::Result<Option<St
 }
 
 /// `needle` in `bytes`, not followed by a byte that would continue its last component.
-fn holds_root(bytes: &[u8], needle: &[u8]) -> bool {
+pub(crate) fn holds_root(bytes: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || bytes.len() < needle.len() {
         return false;
     }
@@ -435,76 +445,166 @@ pub fn strace_line(trace: &Path, filter: &[String], program: &Path, arguments: &
     line
 }
 
-/// Runs every kill point of `scenario`'s faulted command. `template` is a fresh scratch area the
-/// history is built in; every counting and injected run works on a copy of it beside it.
-pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: &Settings, template: &Scratch) -> Result<ScenarioKills, RunError> {
-    let mut kills = ScenarioKills { scenario: scenario.id.clone(), ..Default::default() };
+/// One line of the faulted command as the counting run ran it.
+pub struct CountedLine {
+    pub(crate) arguments: Vec<String>,
+    pub(crate) outcome: Outcome,
+    pub(crate) calls: Vec<Call>,
+    /// The paths under the counting copy, absolute, as they stood when the line started.
+    pub(crate) before: BTreeSet<String>,
+    /// The counting copy whole as it stood when the line started, read only when the writes were
+    /// dumped and only for a line after the first, which starts from the fixture, and why it could
+    /// not be read.
+    pub(crate) start: Option<Result<crate::power::Image, String>>,
+}
+
+/// A scenario's faulted command traced once, unfaulted, with every write's bytes dumped.
+pub struct Counted {
+    /// The scenario's own corpus.
+    pub(crate) corpus: Corpus,
+    pub(crate) expected: faulted::Expected,
+    pub(crate) faulted: usize,
+    /// The template's folder name, which every trace and copy of it is named after.
+    pub(crate) label: String,
+    pub(crate) counting: Scratch,
+    pub(crate) counting_root: Root,
+    /// The template's root, which a record copied from it may name.
+    pub(crate) original_root: Root,
+    /// The counting copy as it stood once the faulted record's files were written, before any
+    /// line: scanned only when the writes were dumped, since only the power loss reads it, and why
+    /// it could not be read, which fails that lane alone.
+    pub(crate) fixture: Option<Result<crate::power::Image, String>>,
+    pub(crate) lines: Vec<CountedLine>,
+    /// The file the faulted command recorded the scratch area's root in, when it did: the copies
+    /// cannot stand for the run then. Reported only once the trace's own refusals are clear.
+    pub(crate) path_bound: Option<String>,
+}
+
+/// What counting found: the counted run, or why the scenario's faults cannot run.
+pub enum Counting {
+    Counted(Box<Counted>),
+    NotRun(String),
+}
+
+/// Builds `scenario`'s history in `template`, then runs its faulted command once on a copy beside
+/// it, `<template>-count`, every line traced, with its writes dumped when `dumps` asks (the power
+/// loss needs them; the kill points do not). The kill points and the power loss both start from
+/// here, from one count.
+pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: &Settings, template: &Scratch, dumps: bool) -> Result<Counting, RunError> {
     if let Some(reason) = not_run(scenario) {
-        kills.not_run = Some(reason);
-        return Ok(kills);
+        return Ok(Counting::NotRun(reason));
     }
     let io = |error: std::io::Error| RunError::Io(error.to_string());
     let environment = environment_of(settings, template)?;
     let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), template, &environment, settings.limit, None)?;
-    let corpus = &scenario.corpus(corpus);
-    let (expected, faulted) = faulted::expected(scenario, corpus, &built, Warehouse::Client)?;
+    let corpus = scenario.corpus(corpus);
+    let (expected, faulted) = faulted::expected(scenario, &corpus, &built, Warehouse::Client)?;
     let original = Root::of(template.root()).map_err(io)?;
     // Each copy starts byte-identical to the template, so scanning the template once scans every
     // copy before it is used.
     if let Some(file) = recorded_root(template.root(), &[&original.given, &original.canonical]).map_err(io)? {
-        kills.not_run = Some(format!("path-bound: {} records the scratch area's root", file));
-        return Ok(kills);
+        return Ok(Counting::NotRun(format!("path-bound: {} records the scratch area's root", file)));
     }
 
-    // The counting run, on its own copy.
     let label = template.root().file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     let counting = template.copy_to(Path::new(&format!("{}-count", template.root().display()))).map_err(|error| RunError::Io(error.to_string()))?;
     let counting_environment = environment_of(settings, &counting)?;
-    let counting_context = context_of(scenario, corpus, programs, settings, &counting, &counting_environment);
+    let counting_context = context_of(scenario, &corpus, programs, settings, &counting, &counting_environment);
     let counting_root = Root::of(counting.root()).map_err(io)?;
     counting_context.write_snapshot(faulted)?;
-    let lines = counting_context.lines(faulted)?;
-    let mut points = Vec::new();
-    for (index, arguments) in lines.iter().enumerate() {
+    // Only the power loss reads the fixture, so a tree it cannot hold fails that lane alone.
+    let fixture = dumps.then(|| crate::power::scan(counting.root()).map_err(|error| error.to_string()));
+    let mut lines = Vec::new();
+    for (index, arguments) in counting_context.lines(faulted)?.into_iter().enumerate() {
         let before = listing(counting.root());
+        let start = (dumps && index > 0).then(|| crate::power::scan(counting.root()).map_err(|error| error.to_string()));
         let trace_path = settings.traces.join(format!("{}-count-{}.trace", label, index));
-        let line = strace_line(&trace_path, &[], &programs.forklift, arguments);
-        let outcome = counting_context.run(settings.strace, line, counting.work())?;
+        let extra = if dumps { vec!["-e".to_string(), "write=all".to_string()] } else { Vec::new() };
+        let line = strace_line(&trace_path, &extra, &programs.forklift, &arguments);
+        let mut outcome = counting_context.run(settings.strace, line, counting.work())?;
+        outcome.arguments = arguments.clone();
         if !outcome.succeeded() {
             return Err(RunError::BuildFailed {
-                arguments: arguments.clone(), exit: outcome.exit,
+                arguments, exit: outcome.exit,
                 stderr: String::from_utf8_lossy(&outcome.stderr).into_owned(), stdout: String::from_utf8_lossy(&outcome.stdout).into_owned(),
             });
         }
         let text = std::fs::read_to_string(&trace_path).map_err(io)?;
         let calls = trace::parse(&text).map_err(RunError::Io)?;
-        let start = counting.work().to_string_lossy().into_owned();
-        let existed = |path: &str| before.contains(path) || counting_root.rebase(path, &Root { given: counting_root.given.clone(), canonical: counting_root.given.clone() }).is_some_and(|given| before.contains(&given));
-        let command = match command_id(settings.schema, arguments) {
+        lines.push(CountedLine { arguments, outcome, calls, before, start });
+    }
+    let path_bound = recorded_root(counting.root(), &[&original.given, &original.canonical, &counting_root.given, &counting_root.canonical]).map_err(io)?
+        .map(|file| format!("path-bound: the faulted command recorded the scratch area's root in {}", file));
+    Ok(Counting::Counted(Box::new(Counted { corpus, expected, faulted, label, counting, counting_root, original_root: original, fixture, lines, path_bound })))
+}
+
+/// Whether scenario `id` runs its kill points and its power loss, given the scenarios named for
+/// each (`--kill`, `--power`): naming either lane's scenarios picks them for that lane alone, and
+/// naming neither runs both over every scenario.
+pub fn lanes(kill: &[String], power: &[String], id: &str) -> (bool, bool) {
+    let named = !kill.is_empty() || !power.is_empty();
+    let picked = |ids: &[String]| !named || ids.iter().any(|named| named == id);
+    (picked(kill), picked(power))
+}
+
+/// What stops a counted scenario before its faults run, as (refusals, not run): the trace's own
+/// refusals come first, since they fail the report, and only a sound trace that is path-bound is
+/// set aside as not run, which fails nothing.
+pub(crate) fn stopped(refusals: Vec<String>, path_bound: Option<&String>) -> Option<(Vec<String>, Option<String>)> {
+    if !refusals.is_empty() {
+        Some((refusals, None))
+    } else {
+        path_bound.map(|reason| (Vec::new(), Some(reason.clone())))
+    }
+}
+
+/// The kill points of every counted line, or what refused them.
+pub(crate) fn points_of(counted: &Counted, schema: &crate::writeops::Schema) -> (Vec<Point>, BTreeSet<String>, Vec<String>) {
+    let (mut points, mut children, mut refusals) = (Vec::new(), BTreeSet::new(), Vec::new());
+    let counting_root = &counted.counting_root;
+    let start = counted.counting.work().to_string_lossy().into_owned();
+    for (index, line) in counted.lines.iter().enumerate() {
+        let existed = |path: &str| line.before.contains(path) || counting_root.rebase(path, &Root { given: counting_root.given.clone(), canonical: counting_root.given.clone() }).is_some_and(|given| line.before.contains(&given));
+        let command = match command_id(schema, &line.arguments) {
             Ok(command) => command,
             Err(refusal) => {
-                kills.refusals.push(refusal);
+                refusals.push(refusal);
                 continue;
             }
         };
-        match enumerate(&calls, index, &command, &counting_root, &start, existed) {
+        match enumerate(&line.calls, index, &command, counting_root, &start, existed) {
             Ok(enumerated) => {
                 points.extend(enumerated.points);
-                kills.children.extend(enumerated.children);
+                children.extend(enumerated.children);
             }
-            Err(refusals) => kills.refusals.extend(refusals),
+            Err(found) => refusals.extend(found),
         }
     }
-    if !kills.refusals.is_empty() {
+    (points, children, refusals)
+}
+
+/// Runs every kill point of `scenario`'s faulted command, counted by [`count`] in `template`; every
+/// injected run works on a copy of the template beside it.
+pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, template: &Scratch, counting: &Counting) -> Result<ScenarioKills, RunError> {
+    let mut kills = ScenarioKills { scenario: scenario.id.clone(), ..Default::default() };
+    let counted = match counting {
+        Counting::Counted(counted) => counted,
+        Counting::NotRun(reason) => {
+            kills.not_run = Some(reason.clone());
+            return Ok(kills);
+        }
+    };
+    let (points, children, refusals) = points_of(counted, settings.schema);
+    kills.children = children;
+    if let Some((refusals, not_run)) = stopped(refusals, counted.path_bound.as_ref()) {
+        (kills.refusals, kills.not_run) = (refusals, not_run);
         return Ok(kills);
     }
-    if let Some(file) = recorded_root(counting.root(), &[&original.given, &original.canonical, &counting_root.given, &counting_root.canonical]).map_err(io)? {
-        kills.not_run = Some(format!("path-bound: the faulted command recorded the scratch area's root in {}", file));
-        return Ok(kills);
-    }
+    let lines: Vec<Vec<String>> = counted.lines.iter().map(|line| line.arguments.clone()).collect();
+    let (corpus, expected, faulted, label, counting_root) = (&counted.corpus, &counted.expected, counted.faulted, &counted.label, &counted.counting_root);
 
     // The injected runs, in parallel, each on its own copy.
-    let shared = Shared { scenario, corpus, programs, settings, template, label: &label, lines: &lines, expected: &expected, faulted, counting_root: &counting_root };
+    let shared = Shared { scenario, corpus, programs, settings, template, label, lines: &lines, expected, faulted, counting_root };
     let next = AtomicUsize::new(0);
     let results: Mutex<Vec<(usize, Result<Killed, String>)>> = Mutex::new(Vec::new());
     let workers = settings.jobs.clamp(1, points.len().max(1));
@@ -545,11 +645,11 @@ struct Shared<'a> {
     counting_root: &'a Root,
 }
 
-fn environment_of(settings: &Settings, scratch: &Scratch) -> Result<Environment, RunError> {
+pub(crate) fn environment_of(settings: &Settings, scratch: &Scratch) -> Result<Environment, RunError> {
     Environment::scrubbed(scratch, settings.search_path.clone(), &BTreeMap::new()).map_err(|error| RunError::Io(error.to_string()))
 }
 
-fn context_of<'a>(scenario: &'a Scenario, corpus: &'a Corpus, programs: &'a Programs, settings: &Settings, scratch: &'a Scratch, environment: &'a Environment) -> Context<'a> {
+pub(crate) fn context_of<'a>(scenario: &'a Scenario, corpus: &'a Corpus, programs: &'a Programs, settings: &Settings, scratch: &'a Scratch, environment: &'a Environment) -> Context<'a> {
     Context { corpus, programs, scratch, environment, limit: settings.limit, then: &scenario.then, url: None, scope: scenario.scope(), via_host: false }
 }
 
@@ -815,7 +915,7 @@ mod tests {
 
     fn point(name: &str, aim: Aim, when: usize, paths: &[&str], detail: &str) -> Point {
         Point {
-            line: 0, command: "stack".into(), name: name.into(), aim, when, base: String::new(), sampled: false,
+            line: 0, call: 0, command: "stack".into(), name: name.into(), aim, when, base: String::new(), sampled: false,
             target: Identity { detail: detail.into(), paths: paths.iter().map(|path| path.to_string()).collect() },
         }
     }
@@ -827,7 +927,8 @@ mod tests {
     ///
     /// Revert: accept any killed call of the name → the worker's object open, killed in place of
     /// the head's temp, counts as landed; compare temps exactly → the sibling object is not reached;
-    /// compare fixed paths by base → the other object lands on a fixed target.
+    /// compare fixed paths by base → the other object lands on a fixed target; pass over a call
+    /// that cannot be placed → its kill reads as no call killed.
     #[test]
     fn a_kill_lands_only_on_its_target() {
         let injected = Root { given: "/o/s/0001-h-kill-4".into(), canonical: "/o/s/0001-h-kill-4".into() };
@@ -855,6 +956,9 @@ mod tests {
 80 openat(AT_FDCWD</o/s/0001-h-kill-4/work>, \".forklift/pallets/main.tmp~70-0\", O_WRONLY|O_CREAT) = ?
 ").unwrap();
         assert!(matches!(landing(&child, &target, &injected, None), Landing::NotReached { .. }), "a child's call is never the target");
+        // A killed call whose place strace could not name is reported, not passed over.
+        let unplaced = trace::parse("70 openat(9, \".forklift/pallets/main.tmp~70-0\", O_WRONLY|O_CREAT) = ?\n").unwrap();
+        assert!(matches!(landing(&unplaced, &target, &injected, None), Landing::NotReached { why } if why.contains("openat#1 openat of \".forklift/pallets/main.tmp~70-0\" is relative to a folder strace could not name")));
 
         // Another worker staging a sibling object of the same base stands for the targeted temp.
         let object = point("openat", Aim::Position, 1, &[".forklift/objects/ab/0123456789abcdef0123.tmp~<pid>-<n>"], "O_WRONLY|O_CREAT");
@@ -872,6 +976,31 @@ mod tests {
         let aimed = trace::parse("71 fsync(5</o/s/0001-h-kill-4/work/.forklift/pallets>) = ?\n").unwrap();
         assert_eq!(landing(&aimed, &rebased, &injected, Some(137)), Landing::Landed);
         assert!(matches!(landing(&[], &rebased, &injected, Some(137)), Landing::NotReached { why } if why == "no call of the name was killed"));
+    }
+
+    /// Naming one lane's scenarios leaves the other lane off; naming neither runs both everywhere.
+    ///
+    /// Revert: read an empty list as every scenario per lane → `--kill h` alone runs every power loss.
+    #[test]
+    fn naming_one_lane_leaves_the_other_off() {
+        let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        assert_eq!(lanes(&[], &[], "h"), (true, true));
+        assert_eq!(lanes(&ids(&["h"]), &[], "h"), (true, false));
+        assert_eq!(lanes(&ids(&["h"]), &[], "g"), (false, false));
+        assert_eq!(lanes(&[], &ids(&["g"]), "g"), (false, true));
+        assert_eq!(lanes(&ids(&["h"]), &ids(&["g"]), "h"), (true, false));
+    }
+
+    /// An unsound trace is reported as refused even when it is also path-bound; only a sound one
+    /// is set aside as not run.
+    ///
+    /// Revert: check the path-bound record first → the refusals are hidden behind a not-run.
+    #[test]
+    fn refusals_outrank_a_path_bound_copy() {
+        let bound = "path-bound: x".to_string();
+        assert_eq!(stopped(vec!["unsound".into()], Some(&bound)), Some((vec!["unsound".to_string()], None)));
+        assert_eq!(stopped(Vec::new(), Some(&bound)), Some((Vec::new(), Some(bound.clone()))));
+        assert_eq!(stopped(Vec::new(), None), None);
     }
 
     /// A file names the root only where the root ends a path component, so a sibling copy whose

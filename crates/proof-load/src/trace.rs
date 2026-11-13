@@ -31,6 +31,15 @@ pub struct Call {
     /// Each argument's text as strace printed it.
     pub arguments: Vec<String>,
     pub returned: Returned,
+    /// The bytes a write passed, when the trace dumped them (`-e write=all`): every buffer's, in
+    /// order. Empty otherwise.
+    pub data: Vec<u8>,
+    /// Why a dump row of this call could not be read, if one could not: only a replay of its
+    /// bytes needs them, so that refuses and nothing else does.
+    pub unreadable: Option<String>,
+    /// How many calls had finished when this one started: its own index, unless it was printed
+    /// unfinished and other calls finished while it ran.
+    pub entered: usize,
 }
 
 /// One argument read as what it names.
@@ -47,15 +56,32 @@ pub enum Argument {
     Other(String),
 }
 
-/// Reads `text`, the output of one `strace -f -qq -y -o` run. A line the harness cannot read
-/// refuses the trace: a guess at a call is a kill point aimed at nothing.
+/// Reads `text`, the output of one `strace -f -qq -y -o` run, with any `-e write=` dumps joined to
+/// the call they follow. A line the harness cannot read refuses the trace: a guess at a call is a
+/// kill point aimed at nothing.
 pub fn parse(text: &str) -> Result<Vec<Call>, String> {
-    let mut calls = Vec::new();
+    let mut calls: Vec<Call> = Vec::new();
     // Per thread, the first half of an unfinished call.
-    let mut pending: BTreeMap<u32, String> = BTreeMap::new();
+    let mut pending: BTreeMap<u32, (String, usize)> = BTreeMap::new();
     for (number, line) in text.lines().enumerate() {
         let refuse = |why: &str| format!("trace line {}: {}: {}", number + 1, why, line);
         if line.trim().is_empty() {
+            continue;
+        }
+        // A dump row, and a vectored write's buffer header, carry no thread id: strace prints them
+        // right after the call line they belong to.
+        let trimmed = line.trim_start();
+        if let Some(row) = trimmed.strip_prefix("| ") {
+            let last = calls.last_mut().ok_or_else(|| refuse("a dump row before any call"))?;
+            match dump_row(row) {
+                Some(bytes) => last.data.extend(bytes),
+                None => {
+                    last.unreadable.get_or_insert_with(|| refuse("an unreadable dump row"));
+                }
+            }
+            continue;
+        }
+        if trimmed.starts_with("* ") && trimmed.contains(" bytes in buffer ") {
             continue;
         }
         let (tid, rest) = line.trim_start().split_once(char::is_whitespace).ok_or_else(|| refuse("no thread id"))?;
@@ -64,23 +90,26 @@ pub fn parse(text: &str) -> Result<Vec<Call>, String> {
         if rest.starts_with("+++") || rest.starts_with("---") {
             continue;
         }
-        let whole = if let Some(resumed) = rest.strip_prefix("<... ") {
+        let (whole, entered) = if let Some(resumed) = rest.strip_prefix("<... ") {
             let (_, tail) = resumed.split_once(" resumed>").ok_or_else(|| refuse("a resumed call without its name"))?;
-            let head = pending.remove(&tid).ok_or_else(|| refuse("a resumed call that never started"))?;
-            format!("{}{}", head, tail)
+            let (head, entered) = pending.remove(&tid).ok_or_else(|| refuse("a resumed call that never started"))?;
+            (format!("{}{}", head, tail), entered)
         } else {
-            rest.to_string()
+            (rest.to_string(), calls.len())
         };
         if let Some(head) = whole.strip_suffix("<unfinished ...>") {
-            pending.insert(tid, head.trim_end().to_string());
+            pending.insert(tid, (head.trim_end().to_string(), entered));
             continue;
         }
-        calls.push(call(tid, &whole).ok_or_else(|| refuse("not a call"))?);
+        let mut finished = call(tid, &whole).ok_or_else(|| refuse("not a call"))?;
+        finished.entered = entered;
+        calls.push(finished);
     }
     // A call still unfinished at the end never returned: its process died in it.
-    for (tid, head) in pending {
+    for (tid, (head, entered)) in pending {
         if let Some(mut started) = call(tid, &format!("{}) = ?", head)) {
             started.returned = Returned::Unknown;
+            started.entered = entered;
             calls.push(started);
         }
     }
@@ -103,7 +132,29 @@ fn call(tid: u32, text: &str) -> Option<Call> {
     } else {
         Returned::Value(value_token(returned))
     };
-    Some(Call { tid, name: name.to_string(), arguments, returned })
+    Some(Call { tid, name: name.to_string(), arguments, returned, data: Vec::new(), unreadable: None, entered: 0 })
+}
+
+/// The bytes of one dump row, after its leading `| `: a hex offset of at least five digits (strace
+/// widens it for a dump of 1 MiB or more), two spaces, then up to sixteen bytes in fixed columns
+/// (`xx ` each, one more space after the eighth), padded with spaces, then the row's text. Read by
+/// column, never by token, since the text can look like hex.
+fn dump_row(row: &str) -> Option<Vec<u8>> {
+    let bytes = row.as_bytes();
+    let width = bytes.iter().take_while(|byte| byte.is_ascii_hexdigit()).count();
+    if width < 5 || bytes.get(width..width + 2) != Some(b"  ") {
+        return None;
+    }
+    let mut out = Vec::new();
+    for index in 0..16 {
+        let at = width + 2 + 3 * index + usize::from(index >= 8);
+        let Some(pair) = bytes.get(at..at + 2) else { break };
+        if pair == b"  " {
+            break;
+        }
+        out.push(u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// The leading value of a return, with its `-y` annotation when it has one.
@@ -267,6 +318,8 @@ pub enum Unsound {
     Unclassified(String),
     /// A write that reaches a file with no call strace sees.
     Unseen(String),
+    /// A change to a path relative to a folder strace did not name.
+    Unplaced(String),
 }
 
 impl std::fmt::Display for Unsound {
@@ -274,6 +327,7 @@ impl std::fmt::Display for Unsound {
         match self {
             Unsound::Unclassified(what) => write!(f, "unclassified syscall {}: add it to a class in trace.rs", what),
             Unsound::Unseen(what) => write!(f, "{} writes without a call strace sees", what),
+            Unsound::Unplaced(what) => write!(f, "{} is relative to a folder strace could not name", what),
         }
     }
 }
@@ -365,8 +419,22 @@ const INERT_IOCTLS: &[&str] = &["TCGETS", "TCGETS2", "TIOCGWINSZ", "TIOCGPGRP", 
 /// ioctl requests that write a file: reflink clone and dedupe.
 const MUTATING_IOCTLS: &[&str] = &["FICLONE", "FICLONERANGE", "FIDEDUPERANGE", "BTRFS_IOC_CLONE", "BTRFS_IOC_CLONE_RANGE"];
 
-/// Reads `call` against the table.
+/// Reads `call` against the table. A change that did not fail, to a path relative to a folder
+/// descriptor strace did not name, is unsound: where it landed is not known, and the working
+/// folder is not guessed in its place.
 pub fn touch(call: &Call) -> Result<Touch, Unsound> {
+    let unplaced = std::cell::Cell::new(None);
+    let touched = classify(call, &unplaced)?;
+    if let Some(traced) = unplaced.take() {
+        if touched.class == Class::Mutating && !matches!(call.returned, Returned::Failed(_)) {
+            return Err(Unsound::Unplaced(format!("{} of {:?}", call.name, traced)));
+        }
+    }
+    Ok(touched)
+}
+
+/// [`touch`], noting in `unplaced` a relative path whose folder descriptor strace did not name.
+fn classify(call: &Call, unplaced: &std::cell::Cell<Option<String>>) -> Result<Touch, Unsound> {
     let inert = Ok(Touch { class: Class::Inert, operands: vec![], detail: String::new() });
     let at = |index: usize| call.arguments.get(index).map(|text| argument(text));
     let named = |directory: Option<usize>, path: usize| -> Option<Operand> {
@@ -374,6 +442,10 @@ pub fn touch(call: &Call) -> Result<Touch, Unsound> {
         let base = match directory.and_then(at) {
             Some(Argument::Descriptor { target, .. }) => Some(target),
             Some(Argument::Cwd(cwd)) => cwd,
+            Some(_) if !traced.starts_with('/') => {
+                unplaced.set(Some(traced.clone()));
+                None
+            }
             _ => None,
         };
         Some(Operand::Named { traced, base })
@@ -607,8 +679,12 @@ mod tests {
     /// returns unknown, a failure keeps its errno, an interrupted one is restarted, and exit and
     /// signal lines are no calls. A line that is not a call refuses the trace.
     ///
+    /// An unfinished call keeps where it started, so a call that finished while it ran is seen to
+    /// overlap it.
+    ///
     /// Revert: drop the unfinished/resumed join → the fsync's descriptor is lost and the resumed
-    /// line refuses the trace.
+    /// line refuses the trace; count a call as entered where it finished → the fsync reads as
+    /// entered after the unlinkat.
     #[test]
     fn a_trace_reads_as_calls() {
         let text = "87    execve(\"/b/forklift\", [\"forklift\", \"--json\"], 0xffff /* 3 vars */) = 0\n\
@@ -623,7 +699,7 @@ mod tests {
         assert_eq!(calls[0].arguments.len(), 3);
         assert_eq!(calls[1].name, "unlinkat");
         assert_eq!(calls[1].returned, Returned::Failed("ENOENT".into()));
-        assert_eq!(calls[2], Call { tid: 88, name: "fsync".into(), arguments: vec!["12</s/work/.forklift/pallets>".into()], returned: Returned::Unknown });
+        assert_eq!(calls[2], Call { tid: 88, name: "fsync".into(), arguments: vec!["12</s/work/.forklift/pallets>".into()], returned: Returned::Unknown, data: vec![], unreadable: None, entered: 1 });
         assert_eq!(calls[3].returned, Returned::Restarted);
         assert!(parse("87    nonsense\n").is_err());
         assert!(parse("87    <... fsync resumed>) = 0\n").is_err(), "a resumed call that never started");
@@ -649,6 +725,37 @@ mod tests {
         assert_eq!(argument("5</w/gone (deleted)>"), Argument::Descriptor { fd: 5, target: "/w/gone".into() });
         assert_eq!(argument("\"\\303\\237\\x41\"..."), Argument::Text("ßA".into()));
         assert_eq!(split_arguments(") = 0").unwrap().0, Vec::<String>::new());
+    }
+
+    /// A write's dumped bytes join its call, every buffer of a vectored write in order, read by
+    /// column so a row's text that looks like hex is never taken for bytes.
+    ///
+    /// Revert: read the row by whitespace tokens → the text column `ab cd` parses as two more
+    /// bytes; refuse rows without a tid as before → the trace is refused; fix the offset at five
+    /// digits → a dump of 1 MiB or more is unreadable.
+    #[test]
+    fn write_dumps_join_their_call() {
+        let text = "7 write(3</s/a>, \"0123456789abcdef@ABCab\"..., 22) = 22\n \
+            | 00000  30 31 32 33 34 35 36 37  38 39 61 62 63 64 65 66  0123456789abcdef |\n \
+            | 00010  40 41 42 43 61 62                                 @ABCab           |\n\
+            7 writev(3</s/a>, [{iov_base=\"x\", iov_len=1}, {iov_base=\"yz\", iov_len=2}], 2) = 3\n \
+            * 1 bytes in buffer 0\n \
+            | 00000  78                                                x                |\n \
+            * 2 bytes in buffer 1\n \
+            | 00000  79 7a                                             yz               |\n\
+            7 fsync(3</s/a>) = 0\n\
+            7 write(3</s/a>, \"ab cd\", 5) = 5\n \
+            | 00000  61 62 20 63 64                                    ab cd            |\n";
+        let calls = parse(text).unwrap();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0].data, b"0123456789abcdef@ABCab");
+        assert_eq!(calls[1].data, b"xyz");
+        assert!(calls[2].data.is_empty());
+        assert_eq!(calls[3].data, b"ab cd", "text that reads as hex is no bytes");
+        // Past 1 MiB strace pads every offset of the dump to six digits.
+        let wide = "7 write(3</s/a>, \"ab\"..., 2) = 2\n | 000000  61 62                                               ab               |\n";
+        assert_eq!(parse(wide).unwrap()[0].data, b"ab", "a six-digit offset");
+        assert!(parse(" | 00000  78   x |\n").is_err(), "a dump row before any call");
     }
 
     fn one(line: &str) -> Call {
@@ -681,6 +788,12 @@ mod tests {
         assert_eq!(touch(&one("mmap(NULL, 4096, PROT_READ, MAP_SHARED, 3</s/a>, 0) = 0xffff")).unwrap().class, Class::Inert);
         assert!(matches!(touch(&one("io_uring_setup(8, 0xffff) = 3")), Err(Unsound::Unseen(_))));
         assert_eq!(touch(&one("frobnicate(1) = 0")), Err(Unsound::Unclassified("frobnicate".into())));
+        // A change under a folder descriptor strace did not name is not placed in the working
+        // folder; an absolute path, a failed call or a read needs no folder.
+        assert_eq!(touch(&one("mknodat(5, \"p\", S_IFIFO|0644, 0) = 0")), Err(Unsound::Unplaced("mknodat of \"p\"".into())));
+        assert_eq!(touch(&one("mknodat(5, \"/s/w/p\", S_IFIFO|0644, 0) = 0")).unwrap().class, Class::Mutating);
+        assert_eq!(touch(&one("mknodat(5, \"p\", S_IFIFO|0644, 0) = -1 EBADF (Bad file descriptor)")).unwrap().class, Class::Mutating);
+        assert_eq!(touch(&one("openat(5, \"p\", O_RDONLY) = 3</s/w/p>")).unwrap().class, Class::Inert);
     }
 
     /// A thread clone joins its parent's group and a process clone starts its own, whichever line

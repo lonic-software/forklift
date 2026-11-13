@@ -116,17 +116,25 @@ Notes:
   harness in `crates/proof-load` against forklift and forklift-server built for each OS's release
   target: damaged files over every census name, graded by reading every record back, and on Linux
   process kills at each of forklift's traced write calls of the `history` scenario (`--strace`,
-  `--kill`; the traces are uploaded with the report). Every run also checks write-op completeness:
-  each command `forklift self schema` lists, and each leaf subcommand of `forklift-server --help`,
-  must be seen writing to a warehouse in some scenario's trace (Linux), or be exempt in
-  `WRITE_EXEMPTIONS` in `crates/proof-load/src/bindings.rs`; a read-only exemption is still run,
-  and fails if it changes the tree it ran in (every OS). A new command needs a step in a
-  `scenario::coverage()` scenario or an exemption, or the check fails. They are
-  outside `ci passed` and their run step continues on error, so for now they report without failing;
-  read the grades in the job summary or the uploaded report. A census row added without a damage
-  binding or an exemption in `crates/proof-load/src/bindings.rs` fails the `bindings` unit test
-  in `cargo test -p proof-load`. To run one scenario locally, build forklift, forklift-server and
-  proof-load, then `target/debug/proof-load run --source . --out <new dir> --forklift
+  `--kill`; the traces are uploaded with the report), and power loss at each of those moments,
+  before every other sync (children's included), at each line's end before it exits, and after
+  each line (`--power`, with `--power-variants` seeded partial states): the traced calls are
+  replayed over a model that keeps only what was fsynced, POSIX-minimal semantics, so a loss there
+  may survive on a real ext4, and every power-loss row says so. Each state is written out afresh,
+  so no file keeps its inode or times, and a stat cache trusting an unchanged file over a lost
+  object is not exercised; every row says that too. A call the model cannot replay, or
+  a replay whose tree differs from the traced run's at any line's start or at its end, refuses
+  the scenario's power loss. Every
+  run also checks write-op completeness: each command `forklift self schema` lists, and each leaf
+  subcommand of `forklift-server --help`, must be seen writing to a warehouse in some scenario's
+  trace (Linux), or be exempt in `WRITE_EXEMPTIONS` in `crates/proof-load/src/bindings.rs`; a
+  read-only exemption is still run, and fails if it changes the tree it ran in (every OS). A new
+  command needs a step in a `scenario::coverage()` scenario or an exemption, or the check fails.
+  They are outside `ci passed` and their run step continues on error, so for now they report without
+  failing; read the grades in the job summary or the uploaded report. A census row added without a
+  damage binding or an exemption in `crates/proof-load/src/bindings.rs` fails the `bindings` unit
+  test in `cargo test -p proof-load`. To run one scenario locally, build forklift, forklift-server
+  and proof-load, then `target/debug/proof-load run --source . --out <new dir> --forklift
   target/debug/forklift --forklift-server target/debug/forklift-server --git "$(command -v git)"
   --only <scenario>`.
 - CI links on Windows with `rust-lld` (lld-link) instead of MSVC's `link.exe`, set by
