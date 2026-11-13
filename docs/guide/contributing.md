@@ -133,8 +133,8 @@ Notes:
   a 128 MiB tmpfs on Linux and a RAM disk on macOS) with a ballast file, leaving none, a quarter,
   half and three quarters of the most the command consumes after any of its lines, and lifts it
   by removing the ballast. A fault whose condition no longer held when the command ended, every
-  line of it landed, is reported as not run; one that held is graded, so a refused write the tool
-  swallowed counts as an acknowledgement. A retry resumes at the line that did not land, as a user
+  line of it landed, is listed as missing from its lane's check and fails the run; one that held
+  is graded, so a refused write the tool swallowed counts as an acknowledgement. A retry resumes at the line that did not land, as a user
   re-runs the step that failed. Every
   run also checks write-op completeness: each command `forklift self schema` lists, and each leaf
   subcommand of `forklift-server --help`, must be seen writing to a warehouse in some scenario's
