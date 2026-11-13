@@ -217,8 +217,10 @@ fn main() -> ExitCode {
     let mut created: BTreeMap<(String, Warehouse), Vec<String>> = BTreeMap::new();
     let mut walk_missing = Vec::new();
     let mut evidence = Vec::new();
-    // Every exchange the built scenarios' hosts logged, for the route check.
+    // Every exchange the built scenarios' hosts logged, for the route check, and the scenarios
+    // whose build failed: what their hosts logged went with them.
     let mut exchanges = Vec::new();
+    let mut unbuilt = Vec::new();
     if let (Some(program), Some(schema)) = (&program, &schema) {
         tools.insert("forklift".to_string(), described(program));
         if let Ok(strace) = &traced {
@@ -234,8 +236,9 @@ fn main() -> ExitCode {
                         .map_err(|error| error.to_string())
                 });
             evidence.extend(observer.evidence());
-            if let Ok(built) = &built {
-                exchanges.extend(built.exchanges());
+            match &built {
+                Ok(built) => exchanges.extend(built.exchanges()),
+                Err(_) => unbuilt.push(scenario.id.clone()),
             }
             match (built, &census) {
                 (Ok(built), Some(census)) => {
@@ -275,18 +278,21 @@ fn main() -> ExitCode {
         (Some(_), Some(_)) => Cell::Run,
     };
     let walk_check = Completeness { check: "census walk".to_string(), cell: walk_cell, missing: walk_missing };
-    // Every scenario hosts in single mode, so the routes are matched under the single prefix.
-    let route_check = match (&program, &server, &routes) {
-        (None, _, _) => Completeness { check: "server routes answered".to_string(), cell: Cell::not_run("no forklift binary given"), missing: vec![] },
-        (_, None, _) => Completeness { check: "server routes answered".to_string(), cell: Cell::not_run("no forklift-server binary given"), missing: vec![] },
-        (_, _, None) => Completeness { check: "server routes answered".to_string(), cell: Cell::not_run("no route table for this version"), missing: vec![] },
+    // Every scenario hosts in single mode, so the routes are matched under the single prefix. A
+    // scenario that was not built is named, since a route only it answers reads as unanswered.
+    let (route_cell, route_missing) = match (&program, &server, &routes) {
+        (None, _, _) => (Cell::not_run("no forklift binary given"), vec![]),
+        (_, None, _) => (Cell::not_run("no forklift-server binary given"), vec![]),
+        (_, _, None) => (Cell::not_run("no route table for this version"), vec![]),
         // Run in full only: a filtered run builds too few scenarios to answer every route.
-        _ if only.is_some() => Completeness { check: "server routes answered".to_string(), cell: Cell::not_run("--only builds one scenario"), missing: vec![] },
-        (Some(_), Some(_), Some(routes)) => Completeness {
-            check: "server routes answered".to_string(), cell: Cell::Run,
-            missing: proof_load::routes::check(routes, proof_load::routes::Mode::Single, &exchanges, proof_load::bindings::ROUTE_EXEMPTIONS),
-        },
+        _ if only.is_some() => (Cell::not_run("--only builds one scenario"), vec![]),
+        (Some(_), Some(_), Some(routes)) => {
+            let mut missing: Vec<String> = unbuilt.iter().map(|id| format!("{}: not built, so its requests are not counted", id)).collect();
+            missing.extend(proof_load::routes::check(routes, proof_load::routes::Mode::Single, &exchanges, proof_load::bindings::ROUTE_EXEMPTIONS));
+            (Cell::Run, missing)
+        }
     };
+    let route_check = Completeness { check: "server routes answered".to_string(), cell: route_cell, missing: route_missing };
 
     let damage_check = match &census {
         None => Completeness { check: "damage bindings".to_string(), cell: Cell::not_run("no census for this version"), missing: vec![] },

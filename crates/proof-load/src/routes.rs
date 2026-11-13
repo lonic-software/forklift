@@ -222,7 +222,8 @@ impl RouteTable {
                 other => return Err(malformed(format!("unknown access {:?}", other))),
             };
             let route = Route { method: method.to_string(), path: path.to_string(), mount, modes, access };
-            if routes.iter().any(|listed| listed.method == route.method && listed.path == route.path && listed.mount == route.mount) {
+            // Exemptions name a route by method and path, so no two rows may share them.
+            if routes.iter().any(|listed| listed.method == route.method && listed.path == route.path) {
                 return Err(malformed(format!("the route {} is listed twice", route.label())));
             }
             routes.push(route);
@@ -326,6 +327,7 @@ pub fn check(table: &RouteTable, mode: Mode, exchanges: &[Exchange], exemptions:
         let exempt = exemptions.iter().find(|exemption| exemption.method == route.method && exemption.path == route.path);
         match (answered.contains(&route), exempt) {
             (true, Some(_)) => missing.push(format!("stale route exemption: {} was answered with success", route.label())),
+            (false, None) if !route.modes.includes(mode) => missing.push(format!("{}: served only in {} mode, which no scenario serves", route.label(), match mode { Mode::Single => "multi", Mode::Multi => "single" })),
             (false, None) => missing.push(format!("{}: no scenario's request was answered with success", route.label())),
             _ => {}
         }
@@ -385,6 +387,7 @@ mod tests {
             SAMPLE.replace("<!-- mounts:start -->", "").replace("<!-- mounts:end -->", ""),
             SAMPLE.replace("| `GET` | `/healthz` | `root` | both | public |", "| `GET` | `/warehouse` | `protocol` | both | authenticated |"),
             SAMPLE.replace("`/healthz`", "healthz"),
+            SAMPLE.replace("| `GET` | `/healthz` | `root` | both | public |", "| `GET` | `/healthz` | `root` | both | public |\n| `GET` | `/healthz` | `protocol` | both | public |"),
         ] {
             assert!(matches!(RouteTable::parse(&broken, PathBuf::from("x")), Err(RoutesError::Malformed { .. })), "{}", broken);
         }
@@ -415,9 +418,9 @@ mod tests {
         assert_eq!(resolved(Mode::Multi, "GET", "/v1/warehouse"), None);
     }
 
-    /// Every route needs a success or an exemption; a failure answer does not count, an exemption
-    /// that is no longer needed or names no route is stale, and a request no route matches is
-    /// reported.
+    /// Every route needs a success or an exemption; a failure answer does not count, a route the
+    /// checked mode does not serve says so, an exemption that is no longer needed or names no
+    /// route is stale, and a request no route matches is reported.
     ///
     /// Revert: count any answer → a 404 at GET /objects/{hash} would cover it; skip unmatched
     /// exchanges → a client calling a path the table never lists goes unseen.
@@ -438,9 +441,10 @@ mod tests {
         failed[2].status = Some(404);
         failed.push(exchange("GET", "/v1/nowhere", 404));
         failed.push(exchange("GET", "/v1/objects/missing", 200));
-        assert_eq!(check(&table, Mode::Single, &failed, &[exemptions[0], Exemption { method: "GET", path: "/gone", reason: "x" }]), vec![
+        assert_eq!(check(&table, Mode::Single, &failed, &[Exemption { method: "GET", path: "/gone", reason: "x" }]), vec![
             "GET /v1/nowhere (404) matches no listed route".to_string(),
             "GET /objects/{hash}: no scenario's request was answered with success".to_string(),
+            "PUT /warehouses/{warehouse}: served only in multi mode, which no scenario serves".to_string(),
             "stale route exemption: GET /gone is not a listed route".to_string(),
         ]);
         assert_eq!(check(&table, Mode::Single, &failed[..5], &[exemptions[0], Exemption { method: "GET", path: "/healthz", reason: "x" }]), vec![
