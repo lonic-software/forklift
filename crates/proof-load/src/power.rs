@@ -114,15 +114,16 @@ pub struct Model {
     now: usize,
     /// Per node, the last call in this line that changed it.
     changed: BTreeMap<Ino, usize>,
-    /// Files cut shorter since their last sync: a crash may keep the cut and lose what followed.
-    truncated: BTreeSet<Ino>,
+    /// Files cut shorter since their last sync, and the shortest length each was cut to: a crash
+    /// may keep the cut and lose what followed, but never what lay below it.
+    truncated: BTreeMap<Ino, usize>,
 }
 
 impl Model {
     /// A model of `image`, all of it durable: the fixture, written and synced whole.
     pub fn of(image: &Image) -> Result<Model, String> {
         let Some(Entry::Dir { mode }) = image.get("") else { return Err("the fixture has no root folder".to_string()) };
-        let mut model = Model { volatile: BTreeMap::new(), durable: BTreeMap::new(), root: 0, next: 1, version: 0, now: 0, changed: BTreeMap::new(), truncated: BTreeSet::new() };
+        let mut model = Model { volatile: BTreeMap::new(), durable: BTreeMap::new(), root: 0, next: 1, version: 0, now: 0, changed: BTreeMap::new(), truncated: BTreeMap::new() };
         model.volatile.insert(0, Node::Dir { entries: BTreeMap::new(), mode: *mode });
         // A parent sorts before everything below it, so it is always made first.
         for (path, entry) in image.iter().filter(|(path, _)| !path.is_empty()) {
@@ -226,9 +227,9 @@ impl Model {
     }
 
     /// A seeded state between the durable and the volatile one: each folder entry the two disagree
-    /// on is taken from either, each file's mode likewise, and each file whose contents they disagree on keeps its durable
+    /// on is taken from either, each file's and folder's mode likewise, and each file whose contents they disagree on keeps its durable
     /// contents, takes its volatile ones, or is torn: a file cut shorter since its sync comes back
-    /// as a prefix of its volatile contents, empty included, any other grows past its synced size
+    /// as a prefix of its volatile contents no shorter than the cut, any other grows past its synced size
     /// with a zero-filled or torn tail or is torn in place.
     ///
     /// Entries are drawn one by one, so an unsynced rename can come back under neither name. That
@@ -242,10 +243,11 @@ impl Model {
         while let Some((path, ino)) = stack.pop() {
             let (durable, volatile) = (self.durable.get(&ino), self.volatile.get(&ino));
             match (durable, volatile) {
-                (Some(Node::Dir { entries: kept, mode }), Some(Node::Dir { entries: made, .. })) => {
+                (Some(Node::Dir { entries: kept, mode: synced }), Some(Node::Dir { entries: made, mode: changed })) => {
                     if !seen.insert(ino) {
                         continue;
                     }
+                    let mode = if synced == changed || rng.below(2) == 0 { synced } else { changed };
                     out.insert(path.clone(), Entry::Dir { mode: *mode });
                     let names: BTreeSet<&String> = kept.keys().chain(made.keys()).collect();
                     for name in names {
@@ -264,7 +266,10 @@ impl Model {
                         match rng.below(3) {
                             0 => kept.clone(),
                             1 => made.clone(),
-                            _ if self.truncated.contains(&ino) => made[..rng.below(made.len() as u64 + 1) as usize].to_vec(),
+                            _ if self.truncated.contains_key(&ino) => {
+                                let cut = self.truncated[&ino].min(made.len());
+                                made[..cut + rng.below((made.len() - cut) as u64 + 1) as usize].to_vec()
+                            }
                             _ => grown(kept, made, rng),
                         }
                     };
@@ -369,6 +374,8 @@ pub struct Replay {
     /// The umask the traced command started under, and each thread group's as it stands.
     umask: u32,
     umasks: BTreeMap<u32, u32>,
+    /// The processes of this line with more than one thread.
+    threaded: BTreeSet<u32>,
 }
 
 /// Calls that make something durable.
@@ -384,7 +391,7 @@ const IGNORED: &[&str] = &[
 impl Replay {
     /// A replay over `model` of commands started under `umask`.
     pub fn new(model: Model, root: Root, umask: u32) -> Replay {
-        Replay { model, root, descriptions: Vec::new(), tables: BTreeMap::new(), table_of: BTreeMap::new(), umask, umasks: BTreeMap::new() }
+        Replay { model, root, descriptions: Vec::new(), tables: BTreeMap::new(), table_of: BTreeMap::new(), umask, umasks: BTreeMap::new(), threaded: BTreeSet::new() }
     }
 
     /// Replays one traced line, run in the folder `start`. `before` sees the model before each
@@ -397,6 +404,13 @@ impl Replay {
         self.umasks.clear();
         self.model.changed.clear();
         let groups = trace::thread_groups(calls);
+        let mut threads: BTreeMap<u32, usize> = BTreeMap::new();
+        for (tid, group) in &groups {
+            if tid != group {
+                *threads.entry(*group).or_default() += 1;
+            }
+        }
+        self.threaded = threads.into_keys().collect();
         let mut parents: BTreeMap<u32, (u32, bool)> = BTreeMap::new();
         for call in calls.iter().filter(|call| matches!(call.name.as_str(), "clone" | "clone3" | "fork" | "vfork")) {
             let Returned::Value(child) = &call.returned else { continue };
@@ -616,7 +630,7 @@ impl Replay {
                                 self.model.touch(ino);
                                 if let Node::File { data, .. } = self.model.volatile.get_mut(&ino).expect("located") {
                                     if !data.is_empty() {
-                                        self.model.truncated.insert(ino);
+                                        self.model.truncated.insert(ino, 0);
                                     }
                                     data.clear();
                                 }
@@ -669,6 +683,11 @@ impl Replay {
                 // CLOSE_RANGE_UNSHARE gives the caller its own copy of the table first, so what it
                 // closes the processes it shared with keep.
                 if raw(2).contains("CLOSE_RANGE_UNSHARE") {
+                    // The kernel unshares the calling thread alone, and the replay keeps one
+                    // table per process.
+                    if self.threaded.contains(&group) {
+                        return Err("an unsharing close_range in a process of many threads is not modelled".to_string());
+                    }
                     let copy = self.table(group).clone();
                     // A fresh id: the caller's own may be the one the others still share.
                     let id = self.tables.keys().next_back().map_or(0, |last| last + 1).max(u32::MAX / 2);
@@ -680,6 +699,27 @@ impl Replay {
                     let last = if raw(1).starts_with('~') { i64::MAX } else { fd_of(raw(1)).unwrap_or(i64::MAX) };
                     let entered = call.entered;
                     self.table(group).retain(|fd, (_, installed)| *fd < first || *fd > last || *installed >= entered);
+                }
+            }
+            // A preadv2 at offset -1 reads at the file offset and moves it, as a readv does.
+            "preadv2" if raw(3) == "-1" => {
+                if let Some(description) = self.held(group, text(0))? {
+                    let count = number()?;
+                    self.descriptions[description].offset += count;
+                }
+            }
+            // Writing into the area is not replayed; reading from it with no offset given moves
+            // the source's file offset.
+            "sendfile" | "copy_file_range" => {
+                let (source, given, target) = if call.name == "sendfile" { (1, raw(2), 0) } else { (0, raw(1), 2) };
+                if self.held(group, text(target))?.is_some() {
+                    return Err("a change the power-loss model does not replay".to_string());
+                }
+                if given == "NULL" {
+                    if let Some(description) = self.held(group, text(source))? {
+                        let count = number()?;
+                        self.descriptions[description].offset += count;
+                    }
                 }
             }
             "read" | "readv" | "lseek" => {
@@ -733,7 +773,8 @@ impl Replay {
                     let cut = length < data.len();
                     data.resize(length, 0);
                     if cut {
-                        self.model.truncated.insert(ino);
+                        let shortest = self.model.truncated.get(&ino).map_or(length, |&was| was.min(length));
+                        self.model.truncated.insert(ino, shortest);
                     }
                 }
             }
@@ -744,13 +785,14 @@ impl Replay {
                     self.model.sync(ino, call.name == "fdatasync");
                 }
             }
-            // syncfs promises only the file system its descriptor lies on; one outside the area
-            // promises the area nothing.
+            // syncfs promises only the file system its descriptor lies on, and whether one outside
+            // the area shares the area's is not in the trace.
             "sync" | "syncfs" => {
-                if call.name == "sync" || self.held(group, text(0))?.is_some() {
-                    self.model.overlapped(None, call.entered)?;
-                    self.model.sync_all();
+                if call.name == "syncfs" && self.held(group, text(0))?.is_none() {
+                    return Err("a syncfs through a descriptor outside the area, which may or may not cover it".to_string());
                 }
+                self.model.overlapped(None, call.entered)?;
+                self.model.sync_all();
             }
             "mkdir" | "mkdirat" => {
                 let (target, mode) = if call.name == "mkdir" { (path(None, 0)?, mode_of(raw(1))) } else { (path(Some(0), 1)?, mode_of(raw(2))) };
@@ -1706,6 +1748,48 @@ mod tests {
         assert!((0..200).all(|_| data(&model.variant(&mut rng), "w/a").unwrap().starts_with(b"old")));
     }
 
+    /// A file cut shorter and not rewritten keeps every byte below the cut: it comes back at its
+    /// synced length or the cut one.
+    ///
+    /// Revert: tear a cut file to any prefix → it comes back shorter than the cut.
+    #[test]
+    fn a_cut_file_keeps_what_lay_below_the_cut() {
+        let cut = "1 truncate(\"a\", 2) = 0\n".to_string();
+        let model = replayed(&[cut]).unwrap();
+        let mut rng = Rng::new(9);
+        let torn: BTreeSet<Vec<u8>> = (0..200).map(|_| data(&model.variant(&mut rng), "w/a").unwrap()).collect();
+        assert_eq!(torn, BTreeSet::from([b"old".to_vec(), b"ol".to_vec()]));
+    }
+
+    /// A folder chmodded since its sync can come back under either mode.
+    ///
+    /// Revert: take the folder's synced mode always → 0700 never comes back.
+    #[test]
+    fn a_variant_draws_an_unsynced_folder_mode() {
+        let model = replayed(&["1 chmod(\"/s/w\", 0700) = 0\n".to_string()]).unwrap();
+        let mut rng = Rng::new(1);
+        let modes: BTreeSet<u32> = (0..64).filter_map(|_| match model.variant(&mut rng).get("w") {
+            Some(Entry::Dir { mode }) => Some(*mode),
+            _ => None,
+        }).collect();
+        assert_eq!(modes, BTreeSet::from([0o700, 0o755]));
+    }
+
+    /// Reads that move a file offset without a read or readv move it in the replay too: a
+    /// preadv2 at offset -1, and a sendfile with no offset given.
+    ///
+    /// Revert: leave them to the inert calls → the write lands at offset 0.
+    #[test]
+    fn offset_moving_reads_move_the_offset() {
+        let after = |read: &str| format!("1 openat(AT_FDCWD</s/w>, \"a\", O_RDWR) = 3</s/w/a>\n{}{}", read, write(1, 3, "/s/w/a", b"x"));
+        let preadv2 = after("1 preadv2(3</s/w/a>, [{iov_base=\"ol\", iov_len=2}], 1, -1, 0) = 2\n");
+        assert_eq!(data(&replayed(&[preadv2]).unwrap().volatile_image(), "w/a").unwrap(), b"olx");
+        let sent = after("1 sendfile(1<pipe:[4]>, 3</s/w/a>, NULL, 2) = 2\n");
+        assert_eq!(data(&replayed(&[sent]).unwrap().volatile_image(), "w/a").unwrap(), b"olx");
+        let into = "1 openat(AT_FDCWD</s/w>, \"a\", O_RDWR) = 3</s/w/a>\n1 sendfile(3</s/w/a>, 0<pipe:[4]>, NULL, 2) = 2\n".to_string();
+        assert!(replayed(&[into]).unwrap_err().contains("does not replay"));
+    }
+
     /// The crash states stop before grading: refused when the replay does not reproduce the run,
     /// which outranks a state that records the counting root, which stops them as not run.
     ///
@@ -1767,7 +1851,8 @@ mod tests {
     /// the table with keeps its descriptors, whichever of the two made the table.
     ///
     /// Revert: close in the shared table → the other process's write refuses as never opened;
-    /// unshare under the caller's own id → the owner's close still reaches the child's table.
+    /// unshare under the caller's own id → the owner's close still reaches the child's table;
+    /// unshare a whole process for one thread → its other threads lose their descriptors.
     #[test]
     fn an_unsharing_close_range_leaves_the_shared_table_whole() {
         let text = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY) = 3</s/w/a>\n\
@@ -1778,6 +1863,9 @@ mod tests {
             1 clone(child_stack=0x1, flags=CLONE_VM|CLONE_FS|CLONE_FILES|SIGCHLD) = 9\n\
             1 close_range(3, 4294967295, CLOSE_RANGE_UNSHARE) = 0\n{}", write(9, 3, "/s/w/a", b"x"));
         assert_eq!(data(&replayed(&[owner]).unwrap().volatile_image(), "w/a").unwrap(), b"xld", "the owner unshared, the child keeps it");
+        let threaded = "1 clone(child_stack=0x1, flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM) = 2\n\
+            2 close_range(3, 4294967295, CLOSE_RANGE_UNSHARE) = 0\n".to_string();
+        assert!(replayed(&[threaded]).unwrap_err().contains("many threads"));
     }
 
     /// A file chmodded since its sync can come back under either mode.
@@ -1839,14 +1927,15 @@ mod tests {
         assert_eq!(image.get("w/d"), Some(&Entry::Dir { mode: 0o750 }));
     }
 
-    /// A syncfs promises only its own file system: one through a descriptor outside the area makes
-    /// nothing in it durable, and one inside makes everything durable.
+    /// A syncfs through a descriptor into the area makes everything durable; one through a
+    /// descriptor outside it refuses, since whether it shares the area's file system is not known.
     ///
-    /// Revert: treat every syncfs as sync → the unsynced write reads as durable.
+    /// Revert: treat every syncfs as sync → the outside one makes the write durable; skip the
+    /// outside one → it reads as promising nothing.
     #[test]
-    fn a_syncfs_outside_the_area_promises_it_nothing() {
+    fn a_syncfs_outside_the_area_refuses() {
         let synced = |fd: &str| format!("{}1 openat(AT_FDCWD</s/w>, \"{}\", O_RDONLY) = 4<{}>\n1 syncfs(4<{}>) = 0\n", rewrite(false), fd, fd, fd);
-        assert_eq!(data(&replayed(&[synced("/t/x")]).unwrap().durable_image(), "w/a").unwrap(), b"old");
+        assert!(replayed(&[synced("/t/x")]).unwrap_err().contains("may or may not cover"));
         assert_eq!(data(&replayed(&[synced("/s/w/a")]).unwrap().durable_image(), "w/a").unwrap(), b"new");
     }
 

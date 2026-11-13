@@ -69,7 +69,8 @@ enum Command {
         #[arg(long = "power")]
         power: Vec<String>,
         /// How many seeded states between the durable and the volatile one each scenario's power
-        /// loss also grades, drawn at seeded moments.
+        /// loss draws, at seeded moments; a draw that repeats a state already graded is not
+        /// graded again, so fewer may be.
         #[arg(long, default_value_t = 0)]
         power_variants: usize,
         /// How many injected runs at once. Defaults to the machine's parallelism.
