@@ -16,6 +16,7 @@ pub mod damage;
 pub mod faulted;
 pub mod host;
 pub mod kill;
+pub mod network;
 pub mod oracle;
 pub mod power;
 pub mod proxy;
