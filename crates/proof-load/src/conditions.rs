@@ -105,6 +105,9 @@ pub struct Lifted {
     pub graded: Graded,
 }
 
+/// Why a fault was refused as not run: the faulted command landed every line under it.
+pub const NOT_SET: &str = "the faulted command landed every line with the condition set, so it did not take";
+
 /// Builds `scenario` and grades its faulted command with a condition set: `set` runs between the
 /// snapshot and the lines and returns the lift, which runs once the lines end and before anything
 /// is read back. `lift` names the lift as the outside-knowledge step it is.
@@ -125,7 +128,13 @@ fn under(
         let lift = set(context)?;
         let made = context.run_lines(index, steps);
         lift()?;
-        made
+        // Every point is set short of what the lines need, and they write into the warehouse:
+        // lines that all landed under the condition mean it did not take, and grading them would
+        // claim a recovery from a fault that never happened.
+        if made? {
+            return Err(RunError::Io(NOT_SET.to_string()));
+        }
+        Ok(false)
     })?;
     graded.recoverability.outside_knowledge.insert(0, lift.to_string());
     Ok(graded)
@@ -146,11 +155,7 @@ pub fn consumed(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scrat
         scope: scenario.scope(), via_host: false,
     };
     context.write_snapshot(index).map_err(|error| error.to_string())?;
-    let free = || settled(|| {
-        let held = fill(ballast, 0, MAX_BALLAST).map_err(|error| error.to_string())?;
-        damage::apply(ballast, Kind::Delete, 0).map_err(|error| format!("{:?}", error))?;
-        Ok(held)
-    });
+    let free = || free_space(ballast);
     let before = free()?;
     let mut deepest = 0;
     for arguments in context.lines(index).map_err(|error| error.to_string())? {
@@ -166,6 +171,15 @@ pub fn consumed(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scrat
         return Err("the faulted command measured as taking no free space, though it writes its record: the volume's free space is not a measure here".to_string());
     }
     Ok(deepest)
+}
+
+/// The free space of the volume holding `ballast`, measured by filling it, once it has settled.
+fn free_space(ballast: &Path) -> Result<u64, String> {
+    settled(|| {
+        let held = fill(ballast, 0, MAX_BALLAST).map_err(|error| error.to_string())?;
+        damage::apply(ballast, Kind::Delete, 0).map_err(|error| format!("{:?}", error))?;
+        Ok(held)
+    })
 }
 
 /// How many readings of the free space [`settled`] takes before giving up on two agreeing.
@@ -192,6 +206,9 @@ fn settled(mut read: impl FnMut() -> Result<u64, String>) -> Result<u64, String>
 #[allow(clippy::too_many_arguments)]
 pub fn disk_full(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, ballast: &Path, free: u64) -> Result<Lifted, RunError> {
     let graded = under(scenario, corpus, programs, scratch, environment, limit, "free space on the volume (the harness removed its ballast)", |_| {
+        // Space an earlier area gave back late would arrive after the fill and leave the point
+        // with room it was not set to have: fill only once the volume has settled.
+        free_space(ballast).map_err(RunError::Io)?;
         fill(ballast, free, MAX_BALLAST).map_err(|error| RunError::Io(error.to_string()))?;
         let ballast = ballast.to_path_buf();
         Ok(Box::new(move || damage::apply(&ballast, Kind::Delete, 0).map_err(|error| RunError::Io(format!("lifting the fault: {:?}", error)))))
