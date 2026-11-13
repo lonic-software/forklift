@@ -86,6 +86,11 @@ enum Command {
         /// A read-only warehouse under this scenario's faulted command; repeatable. Without it, none.
         #[arg(long = "read-only")]
         read_only: Vec<String>,
+        /// An empty or new directory on a volume that folds case or keeps no executable bit (an
+        /// exFAT or vfat image), which the volume faults clone their work tree onto. Without it
+        /// they are reported as not run.
+        #[arg(long)]
+        folding_volume: Option<PathBuf>,
     },
 }
 
@@ -102,7 +107,7 @@ fn described(program: &std::path::Path) -> String {
 fn main() -> ExitCode {
     let Command::Run {
         source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, power, power_variants, jobs,
-        capped_volume, disk_full, read_only: read_only_lane,
+        capped_volume, disk_full, read_only: read_only_lane, folding_volume,
     } = Cli::parse().command;
     let started = std::time::Instant::now();
 
@@ -395,8 +400,82 @@ fn main() -> ExitCode {
             grade: run.graded.grade, recoverability: run.graded.recoverability, note: Some(note),
         });
     }
-    let condition_checks: Vec<Completeness> = [(Category::DiskFull, "disk-full faults ran", &disk_full_cell), (Category::ReadOnly, "read-only faults ran", &read_only_cell)]
-        .into_iter().map(|(category, check, cell)| Completeness {
+
+    // A work tree on a folding volume, standing throughout: one run of the scenario holding the
+    // volume faults' files answers both cells, each run only where the probe found its property.
+    let volume_categories = [Category::CaseFolding, Category::NoExec];
+    let both = |reason: &str| [Cell::not_run(reason), Cell::not_run(reason)];
+    let folded = scenarios.iter().find(|scenario| scenario.files == scenario::Files::Folded);
+    let [case_folding_cell, no_exec_cell] = match (&resolved, &folding_volume, folded) {
+        (Err(reason), _, _) => both(reason),
+        _ if Platform::current() == Platform::Windows => both("no folding volume is built on Windows in this harness"),
+        (_, None, _) => both("no folding volume given"),
+        (_, _, None) => both("no scenario this run picked holds the volume faults' files"),
+        (Ok(programs), Some(volume), Some(scenario)) => {
+            let folding = match Output::claim(volume) {
+                Ok(folding) => folding,
+                Err(error) => {
+                    eprintln!("proof-load: the folding volume: {}", error);
+                    return ExitCode::from(2);
+                }
+            };
+            let probed = match proof_load::volume::probe(folding.root()) {
+                Ok(probed) => probed,
+                Err(error) => {
+                    eprintln!("proof-load: the folding volume: {}", error);
+                    return ExitCode::from(2);
+                }
+            };
+            let skipped = volume_categories.map(|category| proof_load::volume::not_run_because(&probed, category));
+            if let [Some(case), Some(exec)] = skipped {
+                [Cell::not_run(case), Cell::not_run(exec)]
+            } else {
+                let result = output.scratch(&format!("{}-folding", scenario.id)).map_err(|error| error.to_string()).and_then(|scratch| {
+                    let scratch = scratch.with_folding_volume(folding.root());
+                    let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
+                    proof_load::volume::folded(scenario, &faulted_corpus(seed), programs, &scratch, &environment, limit).map_err(|error| error.to_string())
+                });
+                let running: Vec<Category> = volume_categories.iter().zip(&skipped).filter(|(_, skipped)| skipped.is_none()).map(|(category, _)| *category).collect();
+                let graded = match result {
+                    Ok(graded) => {
+                        let _ = std::fs::write(output.root().join(format!("{}-folding-volume.json", scenario.id)), serde_json::to_string(&graded).unwrap_or_default());
+                        let mut note = format!("work tree cloned onto the folding volume ({}, {}), standing through the retry, remedies and heal",
+                            if probed.folds_case { "folds case" } else { "keeps case" },
+                            if probed.keeps_executable_bit { "keeps the executable bit" } else { "no executable bit" });
+                        if running.len() > 1 {
+                            note.push_str("; one run answers both volume cells");
+                        }
+                        if !graded.unextractable.is_empty() {
+                            note.push_str(&format!("; unextractable remedies: {}", graded.unextractable.join("; ")));
+                        }
+                        for category in &running {
+                            rows.push(Row {
+                                scenario: format!("{} on a {}", scenario.id, category.label()), category: *category, binding: "forklift".to_string(),
+                                grade: graded.grade, recoverability: graded.recoverability.clone(), note: Some(note.clone()),
+                            });
+                        }
+                        true
+                    }
+                    Err(error) => {
+                        for category in &running {
+                            condition_errors.entry(*category).or_default().push(format!("{} on the folding volume: {}", scenario.id, error));
+                        }
+                        false
+                    }
+                };
+                skipped.map(|skipped| match skipped {
+                    Some(reason) => Cell::not_run(reason),
+                    None if graded => Cell::Run,
+                    None => Cell::not_run("no volume fault graded"),
+                })
+            }
+        }
+    };
+
+    let condition_checks: Vec<Completeness> = [
+        (Category::DiskFull, "disk-full faults ran", &disk_full_cell), (Category::ReadOnly, "read-only faults ran", &read_only_cell),
+        (Category::CaseFolding, "case-folding faults ran", &case_folding_cell), (Category::NoExec, "no-exec faults ran", &no_exec_cell),
+    ].into_iter().map(|(category, check, cell)| Completeness {
             check: check.to_string(), cell: cell.clone(), missing: condition_errors.remove(&category).unwrap_or_default(),
         }).collect();
 
@@ -505,6 +584,8 @@ fn main() -> ExitCode {
         Category::PowerLossClient => power_cell.clone(),
         Category::DiskFull => disk_full_cell.clone(),
         Category::ReadOnly => read_only_cell.clone(),
+        Category::CaseFolding => case_folding_cell.clone(),
+        Category::NoExec => no_exec_cell.clone(),
         _ => Cell::not_run("no runner for this fault in this build of the harness"),
     });
     if matches!(kill_cell, Cell::Run | Cell::Sampled) || not_reached > 0 {

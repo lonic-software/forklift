@@ -163,7 +163,7 @@ impl Context<'_> {
     pub(crate) fn write_snapshot(&self, index: usize) -> Result<(), RunError> {
         let snapshot = &self.corpus.records[index];
         let snapshot = match self.scope { Some(scope) => corpus::within(snapshot, scope), None => snapshot.clone() };
-        corpus::write(&snapshot, &self.scratch.work()).map_err(|error| RunError::Io(error.to_string()))
+        corpus::write(&snapshot, &self.corpus.executable, &self.scratch.work()).map_err(|error| RunError::Io(error.to_string()))
     }
 
     /// The command lines of the faulted command for corpus record `index`: the record operation's,
@@ -353,7 +353,7 @@ fn where_transformed(
 /// faulted command, so a variant acknowledged last is not what the work tree holds.
 fn before_of(acknowledged: &[Mark], corpus: &Corpus) -> crate::oracle::Tree {
     acknowledged.iter().rev().find(|mark| matches!(mark, Mark::Record(_)))
-        .and_then(|mark| mark.snapshot(corpus)).map(|snapshot| corpus::expected(&snapshot)).unwrap_or_default()
+        .and_then(|mark| mark.snapshot(corpus)).map(|snapshot| corpus::expected(&snapshot, &corpus.executable)).unwrap_or_default()
 }
 
 /// What an export reported leaving out, per record message: path → the documented code of a read
@@ -432,7 +432,7 @@ impl Expected {
 
     fn untransformed(&self, corpus: &Corpus, mark: Mark, made: bool) -> Expectation {
         match mark {
-            mark if mark != self.faulted => Expectation::acknowledged(mark.snapshot(corpus).map(|snapshot| corpus::expected(&snapshot)).unwrap_or_default()),
+            mark if mark != self.faulted => Expectation::acknowledged(mark.snapshot(corpus).map(|snapshot| corpus::expected(&snapshot, &corpus.executable)).unwrap_or_default()),
             _ if made => Expectation::acknowledged(self.after.clone()),
             _ => Expectation::faulted(self.before.clone(), self.after.clone()),
         }
@@ -511,7 +511,7 @@ pub(crate) fn expected(scenario: &Scenario, corpus: &Corpus, built: &runner::Bui
         .ok_or_else(|| RunError::Io(format!("the faulted record {} is past the corpus's {} records", faulted, corpus.records.len())))?;
     let before = before_of(&built.acknowledged, corpus);
     let taken = built.taken.iter().map(|taken| (taken.digest.clone(), admissible(taken, scenario.withhold_reader(warehouse)))).collect();
-    Ok((Expected { before, after: corpus::expected(snapshot), acknowledged: built.acknowledged.clone(), faulted: Mark::Record(faulted), taken }, faulted))
+    Ok((Expected { before, after: corpus::expected(snapshot, &corpus.executable), acknowledged: built.acknowledged.clone(), faulted: Mark::Record(faulted), taken }, faulted))
 }
 
 /// What the steps after a fault established, and the grade they earn.
@@ -658,7 +658,7 @@ pub(crate) fn grade_after(
                         }
                         trail.steps.push(context.run(&context.programs.forklift, arguments, context.scratch.work())?);
                     }
-                    Remedy::Remove { path } => match remedy::removable(path, context.scratch.root()) {
+                    Remedy::Remove { path } => match remedy::removable(path, &context.scratch.roots()) {
                         Some(judged) => {
                             trail.recoverability.outside_knowledge.push(format!("remove {}", path.display()));
                             let _ = damage::apply(&judged, Kind::Delete, 0);
@@ -905,11 +905,11 @@ mod tests {
         let snapshot = |files: &[(&str, &str)]| -> crate::corpus::Snapshot { files.iter().map(|(path, bytes)| (path.to_string(), bytes.as_bytes().to_vec())).collect() };
         let corpus = Corpus { seed: 0, shape: crate::corpus::Shape::SMALL, records: vec![
             snapshot(&[("a", "x"), ("b", "y")]), snapshot(&[("a", "x"), ("c", "x"), ("b", "z")]), snapshot(&[("b", "w")]),
-        ] };
+        ], executable: Default::default() };
         let documented = vec![Admissible::Documented { code: "content_withheld".into() }];
         let expected = Expected {
             acknowledged: vec![Mark::Record(0), Mark::Record(1)], faulted: Mark::Record(2),
-            before: corpus::expected(&corpus.records[1]), after: corpus::expected(&corpus.records[2]),
+            before: corpus::expected(&corpus.records[1], &corpus.executable), after: corpus::expected(&corpus.records[2], &corpus.executable),
             taken: vec![(oracle::digest(b"x"), documented.clone())],
         };
         let first = expected.of(&corpus, Mark::Record(0), false);
@@ -942,10 +942,10 @@ mod tests {
     #[test]
     fn the_tree_before_the_fault_is_the_last_records() {
         let corpus = crate::corpus::generate(1, crate::corpus::Shape::SMALL);
-        let record = corpus::expected(&corpus.records[0]);
-        assert_ne!(record, corpus::expected(&crate::corpus::variant(&corpus.records[0])), "the variant differs");
+        let record = corpus::expected(&corpus.records[0], &corpus.executable);
+        assert_ne!(record, corpus::expected(&crate::corpus::variant(&corpus.records[0]), &corpus.executable), "the variant differs");
         assert_eq!(before_of(&[Mark::Record(0), Mark::Variant(0)], &corpus), record);
-        assert_eq!(before_of(&[Mark::Record(0), Mark::Variant(0), Mark::Record(1)], &corpus), corpus::expected(&corpus.records[1]));
+        assert_eq!(before_of(&[Mark::Record(0), Mark::Variant(0), Mark::Record(1)], &corpus), corpus::expected(&corpus.records[1], &corpus.executable));
         assert!(before_of(&[], &corpus).is_empty());
     }
 

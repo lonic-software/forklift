@@ -77,13 +77,18 @@ pub fn extract(texts: &[&str]) -> Extracted {
     extracted
 }
 
-/// The path the harness may remove for a remove remedy, if any: only one inside the run's own
-/// root, judged at path-component boundaries, so a root of `/s` covers `/s/wh` but not `/srv/wh`.
+/// The path the harness may remove for a remove remedy, if any: only one inside one of the run's
+/// own roots (the scratch root, and a work tree moved off it), each judged as [`removable_under`].
+pub fn removable(path: &Path, run_roots: &[&Path]) -> Option<PathBuf> {
+    run_roots.iter().find_map(|root| removable_under(path, root))
+}
+
+/// The path the harness may remove under one run root, if any: only one inside it, judged at path-component boundaries, so a root of `/s` covers `/s/wh` but not `/srv/wh`.
 /// A tool may print the path resolved (`/private/var/…` for `/var/…` on macOS, `\\?\C:\…` on
 /// Windows), so a path that is not under the root as given is judged again with both resolved,
 /// and then the resolved path is the one returned: what is removed is exactly what was judged,
 /// never a link outside the root that resolves into it.
-pub fn removable(path: &Path, run_root: &Path) -> Option<PathBuf> {
+pub fn removable_under(path: &Path, run_root: &Path) -> Option<PathBuf> {
     let under = |path: &Path, root: &Path| path.is_absolute() && path.starts_with(root) && path != root
         && !path.components().any(|component| matches!(component, std::path::Component::ParentDir));
     if under(path, run_root) {
@@ -142,13 +147,31 @@ mod tests {
     /// Revert: compare as strings → `/srv/wh` passes under `/s`; allow `..` → an escape passes.
     #[cfg(unix)]
     #[test]
-    fn only_paths_under_the_run_root_are_removable() {
+    fn only_paths_under_the_run_root_are_removable_under() {
         let root = Path::new("/s");
-        assert_eq!(removable(Path::new("/s/wh/.forklift/store.lock"), root), Some(PathBuf::from("/s/wh/.forklift/store.lock")));
-        assert_eq!(removable(Path::new("/srv/wh/.forklift/store.lock"), root), None);
-        assert_eq!(removable(Path::new("/s/../home/user/file"), root), None);
-        assert_eq!(removable(Path::new("/s"), root), None);
-        assert_eq!(removable(Path::new("wh/.forklift/store.lock"), root), None);
+        assert_eq!(removable_under(Path::new("/s/wh/.forklift/store.lock"), root), Some(PathBuf::from("/s/wh/.forklift/store.lock")));
+        assert_eq!(removable_under(Path::new("/srv/wh/.forklift/store.lock"), root), None);
+        assert_eq!(removable_under(Path::new("/s/../home/user/file"), root), None);
+        assert_eq!(removable_under(Path::new("/s"), root), None);
+        assert_eq!(removable_under(Path::new("wh/.forklift/store.lock"), root), None);
+    }
+
+    /// A run with its work tree moved off the scratch root may remove under either root, and
+    /// nowhere else: not beside the moved work tree, not the moved folder itself.
+    ///
+    /// Revert: judge against the scratch root only → a lock in the moved work tree is refused, so a
+    /// named working remedy grades as none; admit the moved folder's parent → a sibling passes.
+    #[cfg(unix)]
+    #[test]
+    fn a_moved_work_tree_is_a_second_run_root() {
+        let roots = [Path::new("/s"), Path::new("/fold/0001-x-work")];
+        assert_eq!(removable(Path::new("/s/host/.forklift/serve.lock"), &roots), Some(PathBuf::from("/s/host/.forklift/serve.lock")));
+        assert_eq!(removable(Path::new("/fold/0001-x-work/.forklift/store.lock"), &roots), Some(PathBuf::from("/fold/0001-x-work/.forklift/store.lock")));
+        assert_eq!(removable(Path::new("/fold/0002-y-work/.forklift/store.lock"), &roots), None);
+        assert_eq!(removable(Path::new("/fold/0001-x-work"), &roots), None);
+        assert_eq!(removable(Path::new("/fold"), &roots), None);
+        assert_eq!(removable(Path::new("/s/x"), &roots[..1]), Some(PathBuf::from("/s/x")));
+        assert_eq!(removable(Path::new("/fold/0001-x-work/x"), &roots[..1]), None);
     }
 
     /// A path the tool printed resolved, through a link in the root as given, is still under it;
@@ -159,7 +182,7 @@ mod tests {
     /// grades as none; return the path as given → the outside link is what gets removed.
     #[cfg(unix)]
     #[test]
-    fn a_resolved_path_under_the_root_is_removable() {
+    fn a_resolved_path_under_the_root_is_removable_under() {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("proof-load-remedy-{}-{}", std::process::id(), nanos));
         let real = base.join("real");
@@ -169,10 +192,10 @@ mod tests {
         std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
         let root = base.join("link");
         let printed = std::fs::canonicalize(real.join("wh/store.lock")).unwrap();
-        assert_eq!(removable(&printed, &root), Some(printed.clone()));
-        assert_eq!(removable(&std::fs::canonicalize(base.join("elsewhere")).unwrap(), &root), None);
+        assert_eq!(removable_under(&printed, &root), Some(printed.clone()));
+        assert_eq!(removable_under(&std::fs::canonicalize(base.join("elsewhere")).unwrap(), &root), None);
         let outside = base.join("outside-link");
         std::os::unix::fs::symlink(real.join("wh/store.lock"), &outside).unwrap();
-        assert_eq!(removable(&outside, &root), Some(printed));
+        assert_eq!(removable_under(&outside, &root), Some(printed));
     }
 }

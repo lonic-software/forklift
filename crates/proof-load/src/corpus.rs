@@ -5,10 +5,10 @@
 //! a library's stream would silently change what a seed means, and a seed in a report must replay
 //! the same history for as long as the report is read.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::oracle::{digest, Tree};
+use crate::oracle::{entry_digest, Tree};
 
 /// splitmix64 (Steele, Lea and Flood, 2014), the whole of the harness's randomness.
 #[derive(Clone, Debug)]
@@ -58,6 +58,9 @@ pub struct Corpus {
     pub seed: u64,
     pub shape: Shape,
     pub records: Vec<Snapshot>,
+    /// The paths recorded executable, in every record that holds them. Empty from [`generate`], so
+    /// a seed means what it always meant; a scenario's own corpus marks the files it needs.
+    pub executable: BTreeSet<String>,
 }
 
 const DIRECTORIES: &[&str] = &["", "docs/", "src/", "src/nested/", "assets/"];
@@ -130,12 +133,18 @@ pub fn generate(seed: u64, shape: Shape) -> Corpus {
         records.push(current.clone());
     }
 
-    Corpus { seed, shape, records }
+    Corpus { seed, shape, records, executable: BTreeSet::new() }
 }
 
-/// The tree a snapshot is expected to read back as.
-pub fn expected(snapshot: &Snapshot) -> Tree {
-    snapshot.iter().map(|(path, bytes)| (path.clone(), digest(bytes))).collect()
+/// The tree a snapshot is expected to read back as, the paths in `executable` executable.
+pub fn expected(snapshot: &Snapshot, executable: &BTreeSet<String>) -> Tree {
+    expected_when(snapshot, executable, crate::oracle::MODES)
+}
+
+/// [`expected`] where modes are `observed` or not: where they are not, as on Windows, no file
+/// reads executable, so none is expected to.
+pub fn expected_when(snapshot: &Snapshot, executable: &BTreeSet<String>, observed: bool) -> Tree {
+    snapshot.iter().map(|(path, bytes)| (path.clone(), entry_digest(bytes, observed && executable.contains(path)))).collect()
 }
 
 /// The variant of a snapshot: every file changed, a text file's first line replaced and a binary
@@ -171,7 +180,8 @@ pub fn rooted(corpus: &Corpus, scope: &str) -> Corpus {
         rooted.insert(OUTSIDE.to_string(), format!("outside {}\n", scope).into_bytes());
         rooted
     }).collect();
-    Corpus { records, ..corpus.clone() }
+    let executable = corpus.executable.iter().map(|path| format!("{}/{}", scope, path)).collect();
+    Corpus { records, executable, ..corpus.clone() }
 }
 
 /// The part of `snapshot` under `scope`: what a bay scoped to it holds.
@@ -181,8 +191,12 @@ pub fn within(snapshot: &Snapshot, scope: &str) -> Snapshot {
 }
 
 /// Makes the working files under `root` match `snapshot`: writes every file it holds, and removes
-/// every file it does not, leaving the tool's own state folder (`.forklift`, `.git`) alone.
-pub fn write(snapshot: &Snapshot, root: &Path) -> std::io::Result<()> {
+/// every file it does not, leaving the tool's own state folder (`.forklift`, `.git`) alone. A path
+/// in `executable` gets the executable bit when it does not already read executable, and no bit is
+/// ever cleared: on a volume where every file reads executable (exFAT, vfat at its default mask)
+/// that issues no change of mode the volume would refuse, and every file written here is new or
+/// rewritten in place, so no other corpus is touched.
+pub fn write(snapshot: &Snapshot, executable: &BTreeSet<String>, root: &Path) -> std::io::Result<()> {
     for (path, _) in crate::oracle::read_tree(root)? {
         if !snapshot.contains_key(&path) {
             #[allow(clippy::disallowed_methods)] // a scratch work tree the harness wrote; no retry is wanted
@@ -194,7 +208,26 @@ pub fn write(snapshot: &Snapshot, root: &Path) -> std::io::Result<()> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(target, bytes)?;
+        std::fs::write(&target, bytes)?;
+        if crate::oracle::MODES && executable.contains(path) {
+            mark_executable(&target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Gives `file` the executable bit, unless it already reads executable.
+fn mark_executable(file: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(file)?;
+    if crate::oracle::executable_when(true, crate::oracle::mode(&metadata)) {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode();
+        // Execute wherever read is allowed, as `chmod +x` under a usual umask.
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode | 0o100 | ((mode & 0o044) >> 2)))?;
     }
     Ok(())
 }
@@ -251,10 +284,45 @@ mod tests {
             .find(|corpus| corpus.records.windows(2).any(|pair| pair[0].keys().any(|path| !pair[1].contains_key(path))))
             .unwrap();
         for snapshot in &corpus.records {
-            write(snapshot, &root).unwrap();
-            assert_eq!(crate::oracle::read_tree(&root).unwrap(), expected(snapshot));
+            write(snapshot, &BTreeSet::new(), &root).unwrap();
+            assert_eq!(crate::oracle::read_tree(&root).unwrap(), expected(snapshot, &BTreeSet::new()));
         }
         assert_eq!(std::fs::read(root.join(".forklift/state")).unwrap(), b"tool state");
+    }
+
+    /// A path the corpus marks executable is written with the bit and expected with it; a file that
+    /// already reads executable gets no change of mode, and no bit is ever cleared. Where modes are
+    /// not observed, nothing is expected executable.
+    ///
+    /// Revert: chmod every marked path → the 0700 file becomes 0711, a mode change a volume
+    /// without the bit refuses; clear the bit of unmarked paths → the stray executable loses it.
+    #[cfg(unix)]
+    #[test]
+    fn a_marked_path_is_written_executable_and_no_bit_is_cleared() {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("proof-load-corpus-modes-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&root).unwrap();
+        let mode = |path: &str| std::fs::metadata(root.join(path)).unwrap().permissions().mode() & 0o777;
+        let snapshot: Snapshot = [("run.sh", "#!/bin/sh\n"), ("kept.sh", "kept\n"), ("stray", "stray\n"), ("plain.txt", "plain\n")]
+            .into_iter().map(|(path, bytes)| (path.to_string(), bytes.as_bytes().to_vec())).collect();
+        let executable: BTreeSet<String> = ["run.sh".to_string(), "kept.sh".to_string()].into();
+        for (path, preset) in [("kept.sh", 0o700), ("stray", 0o755)] {
+            std::fs::write(root.join(path), b"old").unwrap();
+            std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(preset)).unwrap();
+        }
+        write(&snapshot, &executable, &root).unwrap();
+        assert_eq!(mode("run.sh") & 0o100, 0o100);
+        assert_eq!(mode("kept.sh"), 0o700, "already executable: no change of mode");
+        assert_eq!(mode("stray"), 0o755, "never cleared");
+        assert_eq!(mode("plain.txt") & 0o111, 0);
+        let read = crate::oracle::read_tree(&root).unwrap();
+        let expected = expected(&snapshot, &executable);
+        for path in ["run.sh", "kept.sh", "plain.txt"] {
+            assert_eq!(read[path], expected[path], "{}", path);
+        }
+        assert_ne!(expected_when(&snapshot, &executable, true), expected_when(&snapshot, &executable, false));
+        assert_eq!(expected_when(&snapshot, &executable, false), expected_when(&snapshot, &BTreeSet::new(), true), "unobserved, no mark counts");
     }
 
     /// A variant changes every file of its record and keeps its paths, a binary one at its length,
