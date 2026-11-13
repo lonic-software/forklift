@@ -184,7 +184,13 @@ const DELETE_PALLET: &[Entry] = &[entry(Change::Remove, ".forklift/pallets/**"),
 const POST_HOLD: &[Entry] = &[
     entry(Change::Mkdir, ".forklift/holds/**"), entry(Change::Write, ".forklift/holds/**"), entry(Change::Rename, ".forklift/holds/**"),
 ];
-const PUT_WAREHOUSE: &[Entry] = &[entry(Change::Mkdir, "{warehouse}"), entry(Change::Mkdir, "{warehouse}/**"), entry(Change::Write, "{warehouse}/**"), entry(Change::Rename, "{warehouse}/**")];
+// create_warehouse: a `.creating-<id>-<pid>-<n>` staging folder prepared in full, an empty folder
+// at the id removed, the staging folder renamed onto it.
+const PUT_WAREHOUSE: &[Entry] = &[
+    entry(Change::Mkdir, ".creating-{warehouse}-*"), entry(Change::Mkdir, ".creating-{warehouse}-*/**"),
+    entry(Change::Write, ".creating-{warehouse}-*/**"), entry(Change::Rename, ".creating-{warehouse}-*/**"),
+    entry(Change::Remove, "{warehouse}"), entry(Change::Rename, ".creating-{warehouse}-*"), entry(Change::Rename, "{warehouse}"),
+];
 
 /// Every server route the route table lists, bound to what it may write in the warehouse it
 /// serves, as a template relative to the host root filled from the request's captures.
@@ -216,8 +222,8 @@ pub const BACKGROUND_WRITES: &[Entry] = &[
     entry(Change::Remove, ".forklift/bundles/**"),
 ];
 
-/// What the server writes admitting a warehouse it serves in multi mode. No scenario serves in
-/// multi mode, so these are expected unused.
+/// What the server writes admitting a request: nothing, as admission asks a hook over the network
+/// and writes no file. Kept as its own set so a version that records admissions must declare it.
 pub const ADMISSION_WRITES: &[Entry] = &[];
 
 /// What the damage completeness check finds missing: census names no binding or exemption covers,

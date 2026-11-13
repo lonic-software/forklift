@@ -393,6 +393,18 @@ mod tests {
     ///
     /// Revert: return None for a malformed row → a renamed column or an unknown mode would be read
     /// as no table, and the run would say "not run" instead of failing.
+    /// A capture takes its one segment and a final rest capture every segment after it; a path
+    /// the template does not match captures nothing.
+    ///
+    /// Revert: take the rest capture's first segment only → `feature/x` captures as `feature`.
+    #[test]
+    fn captures_name_what_the_path_gives() {
+        let got = captures("/warehouses/{warehouse}/v1/pallets/{*name}", "/warehouses/w/v1/pallets/feature/x").unwrap();
+        assert_eq!(got, [("warehouse".to_string(), "w".to_string()), ("name".to_string(), "feature/x".to_string())].into());
+        assert_eq!(captures("/v1/objects/{hash}", "/v1/objects/ab").unwrap(), [("hash".to_string(), "ab".to_string())].into());
+        assert_eq!(captures("/v1/objects/{hash}", "/v1/signatures/ab"), None);
+    }
+
     #[test]
     fn tables_parse_and_malformed_ones_refuse() {
         let table = sample();
