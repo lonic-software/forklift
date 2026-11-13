@@ -146,11 +146,11 @@ pub fn consumed(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scrat
         scope: scenario.scope(), via_host: false,
     };
     context.write_snapshot(index).map_err(|error| error.to_string())?;
-    let free = || -> Result<u64, String> {
+    let free = || settled(|| {
         let held = fill(ballast, 0, MAX_BALLAST).map_err(|error| error.to_string())?;
         damage::apply(ballast, Kind::Delete, 0).map_err(|error| format!("{:?}", error))?;
         Ok(held)
-    };
+    });
     let before = free()?;
     let mut deepest = 0;
     for arguments in context.lines(index).map_err(|error| error.to_string())? {
@@ -160,7 +160,31 @@ pub fn consumed(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scrat
         }
         deepest = deepest.max(before.saturating_sub(free()?));
     }
+    // Every faulted command writes at least its record: nothing measured is a measurement gone
+    // wrong, and grading its one point as the whole sample would claim more than was run.
+    if deepest == 0 {
+        return Err("the faulted command measured as taking no free space, though it writes its record: the volume's free space is not a measure here".to_string());
+    }
     Ok(deepest)
+}
+
+/// How many readings of the free space [`settled`] takes before giving up on two agreeing.
+const SETTLE_READS: usize = 8;
+
+/// A free-space reading taken until two in a row agree: a volume can give back what was removed
+/// from it a while after the removal (HFS+ after a scratch area of an earlier fault went), and a
+/// reading taken meanwhile is low.
+fn settled(mut read: impl FnMut() -> Result<u64, String>) -> Result<u64, String> {
+    let mut last = read()?;
+    for _ in 1..SETTLE_READS {
+        std::thread::sleep(Duration::from_millis(200));
+        let next = read()?;
+        if next == last {
+            return Ok(next);
+        }
+        last = next;
+    }
+    Err(format!("the free space did not settle over {} readings", SETTLE_READS))
 }
 
 /// The disk-full fault: `free` bytes left on the capped volume when the faulted command's lines
@@ -264,6 +288,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("proof-load-conditions-{}-{}-{}", label, std::process::id(), nanos));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A reading counts once two in a row agree; one that keeps moving is refused.
+    ///
+    /// Revert: take the first reading → a volume still giving space back reads low.
+    #[test]
+    fn a_free_space_reading_waits_for_two_that_agree() {
+        let mut readings = [100, 140, 160, 160, 160].into_iter();
+        assert_eq!(settled(|| Ok(readings.next().unwrap())), Ok(160));
+        let mut moving = 0;
+        assert!(settled(|| { moving += 1; Ok(moving) }).is_err());
     }
 
     /// The points are none left and three fractions of what the command needs, each once.
