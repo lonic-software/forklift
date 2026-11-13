@@ -387,6 +387,9 @@ pub struct Replay {
     umasks: BTreeMap<u32, u32>,
     /// The processes of this line with more than one thread.
     threaded: BTreeSet<u32>,
+    /// Whether a file in the area was mapped shared: a later mprotect could make the mapping
+    /// writable, and writes through it are no calls.
+    mapped: bool,
 }
 
 /// Calls that make something durable.
@@ -402,7 +405,7 @@ const IGNORED: &[&str] = &[
 impl Replay {
     /// A replay over `model` of commands started under `umask`.
     pub fn new(model: Model, root: Root, umask: u32) -> Replay {
-        Replay { model, root, descriptions: Vec::new(), tables: BTreeMap::new(), table_of: BTreeMap::new(), umask, umasks: BTreeMap::new(), threaded: BTreeSet::new() }
+        Replay { model, root, descriptions: Vec::new(), tables: BTreeMap::new(), table_of: BTreeMap::new(), umask, umasks: BTreeMap::new(), threaded: BTreeSet::new(), mapped: false }
     }
 
     /// Replays one traced line, run in the folder `start`. `before` sees the model before each
@@ -637,6 +640,10 @@ impl Replay {
                     if flags.contains("O_TMPFILE") {
                         return Err("an unnamed temp file is not modelled".to_string());
                     }
+                    // Each write through it is durable once it returns, which the model does not hold.
+                    if ["O_SYNC", "O_DSYNC", "O_RSYNC"].iter().any(|flag| flags.contains(flag)) {
+                        return Err(format!("a synchronous open of {}, whose writes the model does not make durable", self.root.tokenized(&target)));
+                    }
                     match self.locate(&target, false)? {
                         Located::Root => Some(self.model.root),
                         Located::At { ino: Some(ino), .. } => {
@@ -735,6 +742,30 @@ impl Replay {
                         self.descriptions[description].offset += count;
                     }
                 }
+            }
+            // Into the area is not replayed; out of a file in it with no offset given moves the
+            // source's file offset.
+            "splice" => {
+                if self.held(group, text(2))?.is_some() {
+                    return Err("a change the power-loss model does not replay".to_string());
+                }
+                if raw(1) == "NULL" {
+                    if let Some(description) = self.held(group, text(0))? {
+                        let count = number()?;
+                        self.descriptions[description].offset += count;
+                    }
+                }
+            }
+            // A shared mapping read-only is no change, but one made writable after writes unseen.
+            "mmap" | "mmap2" => {
+                // A shared writable mapping refuses, as the trace's own reading says.
+                trace::touch(call).map_err(|unsound| unsound.to_string())?;
+                if raw(3).contains("MAP_SHARED") && self.held(group, text(4))?.is_some() {
+                    self.mapped = true;
+                }
+            }
+            "mprotect" if self.mapped && raw(2).contains("PROT_WRITE") => {
+                return Err("a mapping made writable after a file in the area was mapped shared".to_string());
             }
             "read" | "readv" | "lseek" => {
                 if let Some(description) = self.held(group, text(0))? {
@@ -1841,6 +1872,37 @@ mod tests {
         let reused = "1 openat(AT_FDCWD</s/w>, \"/elsewhere/x\", O_RDONLY) = 3</elsewhere/x>\n1 fsync(3</s/w/a>) = 0\n".to_string();
         let refused = replayed(&[reused]).err().unwrap();
         assert!(refused.contains("names <root>/w/a, which is not the file"), "{}", refused);
+    }
+
+    /// A splice out of a file in the area with no offset given moves its file offset, so a later
+    /// write lands past what it read; one into the area refuses.
+    ///
+    /// Revert: leave the offset → `+` lands at 0 and the file reads `+ld`.
+    #[test]
+    fn a_splice_out_of_the_area_moves_the_offset() {
+        let spliced = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_RDWR) = 3</s/w/a>\n\
+            1 splice(3</s/w/a>, NULL, 5<pipe:[9]>, NULL, 2, 0) = 2\n{}", write(1, 3, "/s/w/a", b"+"));
+        let model = replayed(&[spliced]).unwrap();
+        assert_eq!(data(&model.volatile_image(), "w/a").unwrap(), b"ol+");
+        let into = "1 openat(AT_FDCWD</s/w>, \"a\", O_RDWR) = 3</s/w/a>\n1 splice(5<pipe:[9]>, NULL, 3</s/w/a>, NULL, 2, 0) = 2\n".to_string();
+        assert!(replayed(&[into]).is_err());
+    }
+
+    /// A file in the area mapped shared read-only and then made writable refuses, since writes
+    /// through the mapping are no calls; a synchronous open refuses too.
+    ///
+    /// Revert: take mmap and mprotect as inert → the replay goes on past the writable mapping;
+    /// replay an O_SYNC open → its writes are held volatile.
+    #[test]
+    fn a_shared_mapping_made_writable_and_a_synchronous_open_refuse() {
+        let mapped = "1 openat(AT_FDCWD</s/w>, \"a\", O_RDWR) = 3</s/w/a>\n\
+            1 mmap(NULL, 4096, PROT_READ, MAP_SHARED, 3</s/w/a>, 0) = 0x7f00\n\
+            1 mprotect(0x7f00, 4096, PROT_READ|PROT_WRITE) = 0\n".to_string();
+        assert!(replayed(&[mapped]).err().unwrap().contains("made writable"));
+        let private = "1 mmap(NULL, 4096, PROT_READ, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f00\n1 mprotect(0x7f00, 4096, PROT_READ|PROT_WRITE) = 0\n".to_string();
+        assert!(replayed(&[private]).is_ok());
+        let synchronous = "1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_DSYNC) = 3</s/w/a>\n".to_string();
+        assert!(replayed(&[synchronous]).err().unwrap().contains("synchronous open"));
     }
 
     /// A folder chmodded since its sync can come back under either mode.
