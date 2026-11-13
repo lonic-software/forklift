@@ -285,8 +285,9 @@ mod tests {
         let moved = scratch.move_work().unwrap().unwrap();
         std::fs::create_dir(&moved).unwrap();
         let environment = Environment::scrubbed(&scratch, None, &BTreeMap::new()).unwrap();
-        // A program that does not exist: past the fence, the run fails to start, never refused.
-        let program = PathBuf::from("/nonexistent/proof-load-none");
+        // A program that does not exist, at a path absolute on every OS: past the fence, the run
+        // fails to start, never refused.
+        let program = folding.join("no-such-program");
         let at = |directory: PathBuf| run(&Invocation { program: program.clone(), arguments: vec![], directory, limit: Duration::from_secs(10) }, &scratch, &environment);
         assert!(matches!(at(moved.clone()), Err(ToolError::Spawn { .. })), "{:?}", at(moved.clone()));
         assert!(matches!(at(scratch.root().to_path_buf()), Err(ToolError::Spawn { .. })));
