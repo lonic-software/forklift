@@ -456,6 +456,8 @@ pub struct Counted {
     pub(crate) label: String,
     pub(crate) counting: Scratch,
     pub(crate) counting_root: Root,
+    /// The template's root, which a record copied from it may name.
+    pub(crate) original_root: Root,
     /// The counting copy as it stood once the faulted record's files were written, before any
     /// line: scanned only when the writes were dumped, since only the power loss reads it, and why
     /// it could not be read, which fails that lane alone.
@@ -520,7 +522,7 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
     }
     let path_bound = recorded_root(counting.root(), &[&original.given, &original.canonical, &counting_root.given, &counting_root.canonical]).map_err(io)?
         .map(|file| format!("path-bound: the faulted command recorded the scratch area's root in {}", file));
-    Ok(Counting::Counted(Box::new(Counted { corpus, expected, faulted, label, counting, counting_root, fixture, lines, path_bound })))
+    Ok(Counting::Counted(Box::new(Counted { corpus, expected, faulted, label, counting, counting_root, original_root: original, fixture, lines, path_bound })))
 }
 
 /// Whether scenario `id` runs its kill points and its power loss, given the scenarios named for

@@ -239,6 +239,8 @@ impl Model {
     pub fn variant(&self, rng: &mut Rng) -> Image {
         let mut out = Image::new();
         let mut seen = BTreeSet::new();
+        // A file's draw, so each of its hard links comes back the same: one inode, one state.
+        let mut files: BTreeMap<Ino, (Vec<u8>, u32)> = BTreeMap::new();
         let mut stack = vec![(String::new(), self.root)];
         while let Some((path, ino)) = stack.pop() {
             let (durable, volatile) = (self.durable.get(&ino), self.volatile.get(&ino));
@@ -259,6 +261,10 @@ impl Model {
                     }
                 }
                 (Some(Node::File { data: kept, mode: synced }), Some(Node::File { data: made, mode: changed })) => {
+                    if let Some((data, mode)) = files.get(&ino) {
+                        out.insert(path, Entry::File { data: data.clone(), mode: *mode });
+                        continue;
+                    }
                     let mode = if synced == changed || rng.below(2) == 0 { synced } else { changed };
                     let data = if kept == made {
                         kept.clone()
@@ -273,6 +279,7 @@ impl Model {
                             _ => grown(kept, made, rng),
                         }
                     };
+                    files.insert(ino, (data.clone(), *mode));
                     out.insert(path, Entry::File { data, mode: *mode });
                 }
                 (Some(Node::Link { target }), _) => {
@@ -494,8 +501,10 @@ impl Replay {
             // One strace shows naming another file than the table's was reused through a route the
             // replay did not see; which file a write through it reaches is not known.
             Some(description) if self.descriptions[description].ino.is_some() => {
+                // An unlinked file is no longer at its path: what is there now, a file renamed
+                // over it, is another, and the table's is the one held.
                 let named = match target.as_deref() {
-                    Some(target) if into_area == Some(true) => match self.locate(target, true)? {
+                    Some(target) if into_area == Some(true) && !text.contains(" (deleted)>") => match self.locate(target, true)? {
                         Located::At { ino: Some(ino), .. } => Some(ino),
                         Located::Root => Some(self.model.root),
                         _ => None,
@@ -614,7 +623,7 @@ impl Replay {
                     "open" => (raw(1).to_string(), mode_of(raw(2))),
                     "creat" => ("O_CREAT|O_WRONLY|O_TRUNC".to_string(), mode_of(raw(1))),
                     "openat" => (raw(2).to_string(), mode_of(raw(3))),
-                    _ => (raw(2).to_string(), raw(2).split_once("mode=").map_or(0o644, |(_, rest)| mode_of(rest))),
+                    _ => (raw(2).to_string(), raw(2).split_once("mode=").map_or_else(|| Err(format!("no mode in {}", raw(2))), |(_, rest)| mode_of(rest))),
                 };
                 let Argument::Descriptor { fd, target } = trace::argument(&returned) else {
                     return Err(format!("an open returned {}, a descriptor strace did not name", returned));
@@ -638,7 +647,7 @@ impl Replay {
                             Some(ino)
                         }
                         Located::At { parent, name, ino: None } if flags.contains("O_CREAT") => {
-                            Some(self.model.create(parent, &name, Node::File { data: Vec::new(), mode: mode & !self.umasks[&group] })?)
+                            Some(self.model.create(parent, &name, Node::File { data: Vec::new(), mode: mode? & !self.umasks[&group] })?)
                         }
                         _ => return Err(format!("the replay holds nothing at {}", self.root.tokenized(&target))),
                     }
@@ -795,7 +804,7 @@ impl Replay {
                 self.model.sync_all();
             }
             "mkdir" | "mkdirat" => {
-                let (target, mode) = if call.name == "mkdir" { (path(None, 0)?, mode_of(raw(1))) } else { (path(Some(0), 1)?, mode_of(raw(2))) };
+                let (target, mode) = if call.name == "mkdir" { (path(None, 0)?, mode_of(raw(1))?) } else { (path(Some(0), 1)?, mode_of(raw(2))?) };
                 if let Some((parent, name)) = self.free(&target)? {
                     self.model.create(parent, &name, Node::Dir { entries: BTreeMap::new(), mode: mode & !self.umasks[&group] })?;
                 }
@@ -842,9 +851,9 @@ impl Replay {
             }
             "chmod" | "fchmodat" | "fchmodat2" | "fchmod" => {
                 let (ino, mode) = match call.name.as_str() {
-                    "fchmod" => (self.held(group, text(0))?.and_then(|description| self.descriptions[description].ino), mode_of(raw(1))),
-                    "chmod" => (self.existing(&path(None, 0)?, true)?, mode_of(raw(1))),
-                    _ => (self.existing(&path(Some(0), 1)?, !raw(3).contains("AT_SYMLINK_NOFOLLOW"))?, mode_of(raw(2))),
+                    "fchmod" => (self.held(group, text(0))?.and_then(|description| self.descriptions[description].ino), mode_of(raw(1))?),
+                    "chmod" => (self.existing(&path(None, 0)?, true)?, mode_of(raw(1))?),
+                    _ => (self.existing(&path(Some(0), 1)?, !raw(3).contains("AT_SYMLINK_NOFOLLOW"))?, mode_of(raw(2))?),
                 };
                 if let Some(ino) = ino {
                     self.model.touch(ino);
@@ -913,10 +922,10 @@ impl Replay {
     }
 }
 
-/// A mode as strace prints it, octal; 0644 when it printed none.
-fn mode_of(text: &str) -> u32 {
+/// A mode as strace prints it, octal; one it printed none of is not guessed.
+fn mode_of(text: &str) -> Result<u32, String> {
     let digits: String = text.trim().chars().take_while(|c| c.is_digit(8)).collect();
-    u32::from_str_radix(&digits, 8).unwrap_or(0o644) & 0o7777
+    u32::from_str_radix(&digits, 8).map(|mode| mode & 0o7777).map_err(|_| format!("no octal mode in {:?}", text))
 }
 
 /// A descriptor or a number, as the argument's leading digits.
@@ -1280,7 +1289,8 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
         }
     };
     let ran = scan(counted.counting.root()).map_err(|error| RunError::Io(error.to_string()))?;
-    let needles = [counted.counting_root.given.as_str(), counted.counting_root.canonical.as_str()];
+    // The same roots the counting run's final tree was checked for.
+    let needles = [&counted.original_root, &counted.counting_root].map(|root| [root.given.as_str(), root.canonical.as_str()]).concat();
     if let Some((refusals, not_run)) = stopped(&replayed, &ran, &crashes, &needles) {
         (power.refusals, power.not_run) = (refusals, not_run);
         return Ok(power);
@@ -1902,6 +1912,49 @@ mod tests {
             _ => None,
         }).collect();
         assert_eq!(modes, BTreeSet::from([0o600, 0o644]));
+    }
+
+    /// A file's hard links come back alike in a variant: one inode holds one state, whichever
+    /// name it is reached under.
+    ///
+    /// Revert: draw each path on its own → `a` and `b` come back with different bytes.
+    #[test]
+    fn a_variant_draws_a_hard_linked_file_once() {
+        let linked = format!("1 link(\"a\", \"b\") = 0\n1 openat(AT_FDCWD</s/w>, \".\", O_RDONLY|O_DIRECTORY) = 4</s/w>\n1 fsync(4</s/w>) = 0\n{}", rewrite(false));
+        let model = replayed(&[linked]).unwrap();
+        let mut rng = Rng::new(3);
+        let mut both = 0;
+        for _ in 0..64 {
+            let variant = model.variant(&mut rng);
+            if let (Some(a), Some(b)) = (data(&variant, "w/a"), data(&variant, "w/b")) {
+                assert_eq!(a, b);
+                both += 1;
+            }
+        }
+        assert!(both > 0, "the synced link is in every variant");
+    }
+
+    /// A descriptor on a file another was renamed over is the file it was opened on: strace marks
+    /// it deleted, and its path names the newcomer, which the replay does not take for it.
+    ///
+    /// Revert: look the deleted path up → the fsync refuses as naming another file.
+    #[test]
+    fn a_descriptor_on_a_replaced_file_holds_the_old_one() {
+        let replaced = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_RDONLY) = 3</s/w/a>\n\
+            1 openat(AT_FDCWD</s/w>, \"a.tmp\", O_WRONLY|O_CREAT|O_EXCL, 0644) = 4</s/w/a.tmp>\n{}\
+            1 rename(\"a.tmp\", \"a\") = 0\n1 fsync(3</s/w/a (deleted)>) = 0\n", write(1, 4, "/s/w/a.tmp", b"new"));
+        let model = replayed(&[replaced]).unwrap();
+        assert_eq!(data(&model.volatile_image(), "w/a").unwrap(), b"new");
+    }
+
+    /// A file created with no mode strace printed refuses: the replay does not guess one.
+    ///
+    /// Revert: fall back to 0644 → the replay goes on with a mode the trace never stated.
+    #[test]
+    fn a_create_with_no_mode_refuses() {
+        let unstated = "1 openat(AT_FDCWD</s/w>, \"n\", O_WRONLY|O_CREAT) = 3</s/w/n>\n".to_string();
+        let refused = replayed(&[unstated]).err().unwrap();
+        assert!(refused.contains("no octal mode"), "{}", refused);
     }
 
     /// An fdatasync makes a file's bytes durable and not its mode; an fsync makes both.

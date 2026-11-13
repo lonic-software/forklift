@@ -127,12 +127,11 @@ Notes:
   trace (Linux), or be exempt in `WRITE_EXEMPTIONS` in `crates/proof-load/src/bindings.rs`; a
   read-only exemption is still run, and fails if it changes the tree it ran in (every OS). A new
   command needs a step in a `scenario::coverage()` scenario or an exemption, or the check fails.
-  They are
-  outside `ci passed` and their run step continues on error, so for now they report without failing;
-  read the grades in the job summary or the uploaded report. A census row added without a damage
-  binding or an exemption in `crates/proof-load/src/bindings.rs` fails the `bindings` unit test
-  in `cargo test -p proof-load`. To run one scenario locally, build forklift, forklift-server and
-  proof-load, then `target/debug/proof-load run --source . --out <new dir> --forklift
+  They are outside `ci passed` and their run step continues on error, so for now they report without
+  failing; read the grades in the job summary or the uploaded report. A census row added without a
+  damage binding or an exemption in `crates/proof-load/src/bindings.rs` fails the `bindings` unit
+  test in `cargo test -p proof-load`. To run one scenario locally, build forklift, forklift-server
+  and proof-load, then `target/debug/proof-load run --source . --out <new dir> --forklift
   target/debug/forklift --forklift-server target/debug/forklift-server --git "$(command -v git)"
   --only <scenario>`.
 - CI links on Windows with `rust-lld` (lld-link) instead of MSVC's `link.exe`, set by
