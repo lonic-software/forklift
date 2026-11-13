@@ -537,6 +537,11 @@ tracked-metadata formats each have a spec in `format/`. When you change one:
 - Update the spec in `format/` so it stays byte-accurate.
 - Additive protocol endpoints (old servers `404`, clients fall back) don't need a
   version bump; document the fallback.
+- A forklift-server route is an entry in `ROUTES` in `crates/forklift-server/src/server.rs`
+  and a row in the route table of
+  [the remote protocol](../format/REMOTE_PROTOCOL.md#forklift-servers-routes). The server's tests
+  fail when the two disagree, when a route is registered any other way, or when a path answers a
+  method its entries do not name.
 - A new file or folder name is a `FILE_NAME_*`, `FOLDER_NAME_*`, `FILE_SUFFIX_*` or
   `FILE_EXTENSION_*` constant with a row in the census of
   [the format contract](../format/WAREHOUSE_FORMAT.md#the-census); a test fails
