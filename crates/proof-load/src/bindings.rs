@@ -147,7 +147,8 @@ pub const WRITE_EXEMPTIONS: &[(&str, WriteExemption)] = &[
 ];
 
 /// The server routes the route check does not require a successful answer of, by the route
-/// table's method and path.
+/// table's method, path and mount: an exemption at the wrong mount covers nothing and is reported
+/// stale.
 pub const ROUTE_EXEMPTIONS: &[RouteExemption] = &[
     RouteExemption { method: "GET", path: "/healthz", mount: Mount::Root, reason: "no client command sends it: supervisors and load balancers probe it" },
     RouteExemption { method: "PUT", path: "/warehouses/{warehouse}", mount: Mount::Root, reason: "no client command sends it: an operator creates a warehouse over HTTP, and no scenario serves more than one" },

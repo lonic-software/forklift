@@ -185,7 +185,11 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
                 let server = server.ok_or_else(|| RunError::Io(format!("scenario {} hosts a warehouse, and no forklift-server binary was given", scenario.id)))?;
                 let root = host_root(scratch);
                 outcomes.push(run_in(server, vec!["prepare".into(), "--root".into(), root.display().to_string()], scratch.root().to_path_buf())?);
-                stopped.extend(host.iter().flat_map(|host| host.proxy.log()));
+                // Taken out first, so a new host that fails to start leaves no old one behind to
+                // log a second time.
+                if let Some(old) = host.take() {
+                    stopped.extend(old.proxy.log());
+                }
                 *host = Some(Host::start(server, &root, scratch, environment, limit).map_err(RunError::Tool)?);
             }
             Op::Bundle => {

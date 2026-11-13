@@ -508,11 +508,20 @@ fn serve_connection(client: TcpStream, state: &State) {
                     let _ = client.shutdown(Shutdown::Both);
                     return;
                 }
+                // Unanswered is nothing read at all: the connection ended, or was reset (a server
+                // that closes with the request unread in its buffer resets rather than closes).
+                // A read that fails after the answer began is the server's fault to show, never
+                // hidden behind a resend.
+                let unanswered = match server.reader.fill_buf() {
+                    Ok(bytes) => bytes.is_empty(),
+                    Err(error) => matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted),
+                };
+                if unanswered && reused && matches!(request.first.as_str(), "GET" | "HEAD") {
+                    upstream = None;
+                    continue;
+                }
                 match read_response(&mut server.reader, &request.first) {
                     Ok(Some(response)) => break (index, fault, response),
-                    // A server that closes with the request unread in its buffer resets rather
-                    // than closes, so the read fails instead of ending: the same unanswered case.
-                    Ok(None) | Err(_) if reused && matches!(request.first.as_str(), "GET" | "HEAD") => upstream = None,
                     _ => {
                         let _ = client.shutdown(Shutdown::Both);
                         return;
@@ -804,6 +813,49 @@ mod tests {
             assert!(response.bytes.ends_with(b"GET /v1/warehouse?x=1"));
         }
         assert_eq!(reached.load(Ordering::SeqCst), 3, "the reset GET was sent again on a new connection");
+    }
+
+    /// An answer the server began and then cut off is the server's fault, shown to the client: the
+    /// safe request is not sent again to hide it behind a clean answer.
+    ///
+    /// Revert: resend a GET on any failed read of a reused connection → the cut answer is replaced
+    /// by a whole one from a third request.
+    #[cfg(unix)]
+    #[test]
+    fn an_answer_cut_off_after_it_began_is_not_hidden_by_a_resend() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let reached = Arc::new(AtomicUsize::new(0));
+        let counted = reached.clone();
+        // Answers each connection's first request whole, then begins the next answer and resets.
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                if read_request(&mut reader).ok().flatten().is_none() {
+                    continue;
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+                if read_request(&mut reader).ok().flatten().is_some() {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabc").and_then(|_| stream.flush());
+                    std::thread::sleep(Duration::from_millis(100));
+                    reset(stream);
+                }
+            }
+        });
+        let proxy = Proxy::start(address).unwrap();
+        let client: SocketAddr = proxy.url.trim_start_matches("http://").parse().unwrap();
+        let mut stream = TcpStream::connect(client).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        stream.write_all(GET).unwrap();
+        assert!(read_response(&mut reader, "GET").unwrap().is_some());
+        stream.write_all(GET).unwrap();
+        assert!(!matches!(read_response(&mut reader, "GET"), Ok(Some(_))), "the cut answer reaches the client as no whole answer");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(reached.load(Ordering::SeqCst), 2, "the GET was not sent a third time");
     }
 
     /// A request that went out whole on a kept connection the server then closed without answering
