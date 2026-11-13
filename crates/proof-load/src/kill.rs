@@ -145,8 +145,9 @@ impl Directories {
 
 /// Every path a successful mutating call in `calls` named, absolute, from every thread and process
 /// the trace holds: the write-op check's evidence. `start` is the folder the line ran in. A call
-/// that failed, never returned, or the table cannot classify or place names nothing here, so the
-/// write-op coverage it feeds reports such a command as reaching no write rather than passing it.
+/// that failed, never returned, or the table cannot classify or place names nothing here: the
+/// write-op coverage it feeds reports a command only when no traced run of it reaches a placed
+/// write.
 pub fn written(calls: &[Call], start: &str) -> Vec<String> {
     let mut directories = Directories::new(trace::thread_groups(calls), start);
     let mut paths = Vec::new();
