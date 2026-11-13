@@ -322,9 +322,11 @@ mod tests {
         assert!(!executable_when(true, None));
     }
 
-    /// The same bytes read back as two trees once one of them carries the bit.
+    /// The same bytes read back as two trees once one of them carries the bit; a link reads as its
+    /// target's bytes and never as executable, whatever its own mode.
     ///
-    /// Revert: read the bytes only → the two folders read the same.
+    /// Revert: read the bytes only → the two folders read the same; read the bit off a link too →
+    /// the link, whose own mode is 0o755 or 0o777, reads executable over a plain file.
     #[cfg(unix)]
     #[test]
     fn read_tree_sees_the_executable_bit() {
@@ -335,8 +337,10 @@ mod tests {
         let script = root.join("run.sh");
         std::fs::write(&script, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink("run.sh", root.join("link")).unwrap();
         let normal = read_tree(&root).unwrap();
         assert_eq!(normal["run.sh"], digest(b"#!/bin/sh\n"));
+        assert_eq!(normal["link"], digest(b"#!/bin/sh\n"), "a link carries no bit of its own");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let executable = read_tree(&root).unwrap();
         assert_eq!(executable["run.sh"], entry_digest(b"#!/bin/sh\n", true));
