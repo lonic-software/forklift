@@ -123,7 +123,8 @@ Notes:
   may survive on a real ext4, and every power-loss row says so. Each state is written out afresh,
   so no file keeps its inode or times, and a stat cache trusting an unchanged file over a lost
   object is not exercised; every row says that too. A call the model cannot replay, or
-  a replay that does not end where the traced run did, refuses the scenario's power loss. Every
+  a replay whose tree differs from the traced run's at any line's start or at its end, refuses
+  the scenario's power loss. Every
   run also checks write-op completeness: each command `forklift self schema` lists, and each leaf
   subcommand of `forklift-server --help`, must be seen writing to a warehouse in some scenario's
   trace (Linux), or be exempt in `WRITE_EXEMPTIONS` in `crates/proof-load/src/bindings.rs`; a
