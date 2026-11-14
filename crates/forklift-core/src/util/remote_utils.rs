@@ -2781,6 +2781,18 @@ impl RemoteClient {
         Ok(RemoteClient::new(&url, token)?)
     }
 
+    /// [`for_warehouse`](RemoteClient::for_warehouse) for `heal --fetch-scope`, which must reach
+    /// the origin while the fetch scope cannot be read ([`origin_utils::checked_remote_by_mode`]).
+    ///
+    /// # Returns
+    /// * `Ok(RemoteClient)` - The client.
+    /// * `Err(CoreError)`   - As for [`for_warehouse`](RemoteClient::for_warehouse).
+    pub fn for_fetch_scope_repair() -> Result<RemoteClient, CoreError> {
+        let (url, token) = origin_utils::checked_remote_by_mode()?;
+
+        Ok(RemoteClient::new(&url, token)?)
+    }
+
     /// Whether a remote URL is configured at all for this warehouse — independent of whether
     /// [`RemoteClient::from_config`] could actually *build* a client from it. A malformed
     /// `remote.url`/`remote.token` config read, or a URL [`RemoteClient::new`] rejects, still
@@ -6131,6 +6143,44 @@ impl Expansion {
         self.walked_heads.insert(head.to_string());
 
         Ok(added)
+    }
+}
+
+/// Walks of whole ref heads at a fetch scope the caller names, for `heal --fetch-scope`, which sets
+/// a scope that cannot be read from disk: every parcel of each head (no bound at a closure already
+/// known complete, since none is known at a new scope), fetching what is missing. A head's walk is
+/// kept apart until it succeeds, as [`Expansion`]'s are, so a failed head hides nothing from the
+/// heads after it. Nothing here reads the fetch-scope file.
+pub struct ScopedWalk {
+    scope: PathScope,
+    seen: WalkSeen,
+    fetched_objects: usize,
+}
+
+impl ScopedWalk {
+    /// Start walking at `scope`.
+    pub fn new(scope: PathScope) -> ScopedWalk {
+        ScopedWalk { scope, seen: WalkSeen::default(), fetched_objects: 0 }
+    }
+
+    /// The objects fetched so far.
+    pub fn fetched_objects(&self) -> usize {
+        self.fetched_objects
+    }
+
+    /// Fetch whatever `head`'s history lacks at the scope.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - The walk finished.
+    /// * `Err(String)` - A transfer failed, or the remote could not serve an object.
+    pub async fn walk(&mut self, client: &RemoteClient, head: &str) -> Result<(), String> {
+        let mut seen = WalkSeen::default();
+        let stats = fetch_scoped_from(client, head, &self.scope, &[], &self.seen, &mut seen, &Progress::NONE).await?;
+
+        self.seen.absorb(seen);
+        self.fetched_objects += stats.fetched_objects;
+
+        Ok(())
     }
 }
 

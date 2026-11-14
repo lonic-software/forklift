@@ -364,6 +364,12 @@ refusal_codes! {
     /// that evidence does not settle one head, refuses with this code, listing what it found, so
     /// `heal --ref <pallet>=<parcel>` can set it.
     RefDamaged => "ref_damaged",
+
+    /// A sparse warehouse's fetch scope is lost or damaged and `heal` could not rebuild it from
+    /// the checkouts' scopes alone: none could be read, the history at their union is not all
+    /// present, or a checkout's scope lies outside a fetch scope that parses. Nothing was changed.
+    /// `heal --fetch-scope <prefix>`, once per prefix, sets it, fetching what the history at those prefixes lacks.
+    FetchScopeDamaged => "fetch_scope_damaged",
 }
 
 impl RefusalCode {

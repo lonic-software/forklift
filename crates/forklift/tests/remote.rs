@@ -880,7 +880,8 @@ fn a_sparse_warehouse_with_an_unversioned_scope_file_is_refused() {
             let refused = area.forklift("sparse", verb);
             assert!(!refused.status.success(), "{:?} must refuse {:?}: {}", verb, contents, stdout(&refused));
             assert!(stderr(&refused).contains("older version of Forklift"), "{:?}: {}", verb, stderr(&refused));
-            assert!(stderr(&refused).contains("Clone the remote again"), "{:?}: {}", verb, stderr(&refused));
+            // The fetch scope is read first, and heal is its way out.
+            assert!(stderr(&refused).contains("\"forklift heal\""), "{:?}: {}", verb, stderr(&refused));
         }
     }
 }
@@ -11300,6 +11301,10 @@ fn franchise_into_an_absolute_target_path_succeeds() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[path = "channel/mod.rs"]
 mod channel;
+
+/// `heal` rebuilds or sets a sparse warehouse's damaged fetch scope.
+#[path = "fetch_scope_heal/mod.rs"]
+mod fetch_scope_heal;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod progress_events {

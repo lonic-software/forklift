@@ -52,8 +52,9 @@ Where:
   which wrote prefixes raw, so a prefix holding a line break read back as two, and format 3,
   whose scopes left out the `.gitignore` of each folder above a prefix: read under today's
   meaning, each would show as removed in the same way. Nothing is migrated.
-  The way out depends on the file: for the fetch scope or the main tree's scope, clone
-  the remote again, into a new directory; for a bay's scope, remove the bay with `bay remove`
+  The way out depends on the file: for the fetch scope, `forklift heal`, which rebuilds it
+  from the checkouts' scopes; for the main tree's scope, clone the remote again, into a new
+  directory; for a bay's scope, remove the bay with `bay remove`
   and add a new one under another name (a removed bay keeps its pallet, so its name stays
   taken; copy any uncommitted work across by hand).
 
@@ -63,8 +64,8 @@ out.
 
 | File | Full or cache warehouse | Sparse warehouse | Way out |
 |---|---|---|---|
-| Fetch scope | absent | present, naming a prefix | absent where required: clone again; present where not: delete it |
-| Main-tree scope | absent | present, naming a prefix, ⊆ the fetch scope | the same |
+| Fetch scope | absent | present, naming a prefix | absent where required: `forklift heal`; present where not: delete it |
+| Main-tree scope | absent | present, naming a prefix, ⊆ the fetch scope | absent where required: clone again; present where not: delete it |
 | Bay scope | present, any scope | present, naming a prefix, ⊆ the fetch scope | remove the bay, add a new one under another name |
 
 The main tree's scope follows the mode, as the fetch scope does: only a sparse clone

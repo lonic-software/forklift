@@ -286,7 +286,8 @@ impl PathScope {
     ///
     /// # Arguments
     /// * `bytes`  - The file's contents.
-    /// * `remedy` - The way out for a file in the older format, which depends on whose file it is.
+    /// * `remedy` - The way out for a file that is damaged or in the older format, which depends
+    ///   on whose file it is.
     fn from_bytes(bytes: &[u8], remedy: &str) -> Result<PathScope, String> {
         if bytes.is_empty() {
             return Ok(PathScope::full());
@@ -294,25 +295,20 @@ impl PathScope {
 
         let lines = record_utils::from_bytes(bytes, SCOPE_RECORD, SCOPE_VERSION).map_err(|e| match e {
             RecordError::Unversioned => format!(
-                "was written by an older version of Forklift, whose sparse checkouts left out \
-                the ignore files, so it cannot be read safely. {}",
+                "has no format header: it is damaged, or an older version of Forklift wrote it, whose \
+                sparse checkouts left out the ignore files, so it cannot be read safely. {}",
                 remedy
             ),
-            RecordError::OtherVersion(ref header) => {
-                let older = header.rsplit(' ').next()
-                    .and_then(|version| version.trim().parse::<u32>().ok())
-                    .is_some_and(|version| version < SCOPE_VERSION);
-                if older {
-                    format!(
-                        "{} An older version of Forklift wrote it, whose sparse checkouts left out \
-                        ignore files this one holds in scope. {}",
-                        e.describe(), remedy
-                    )
-                } else {
-                    format!("{} Use the Forklift that wrote it.", e.describe())
-                }
-            }
-            _ => e.describe(),
+            RecordError::OtherVersion(ref header) => match header_version(header) {
+                Some(version) if version > SCOPE_VERSION => format!("{} Use the Forklift that wrote it.", e.describe()),
+                Some(version) if version < SCOPE_VERSION => format!(
+                    "{} An older version of Forklift wrote it, whose sparse checkouts left out \
+                    ignore files this one holds in scope. {}",
+                    e.describe(), remedy
+                ),
+                _ => format!("{} Its header is malformed, so it is damaged. {}", e.describe(), remedy),
+            },
+            _ => format!("{} {}", e.describe(), remedy),
         })?;
 
         let scope = PathScope::from_prefixes(lines);
@@ -327,6 +323,72 @@ impl PathScope {
 
         Ok(scope)
     }
+}
+
+/// Whether a scope header names a version newer than this build's. A header whose version cannot
+/// be read is not newer: no Forklift wrote it.
+fn is_newer_header(header: &str) -> bool {
+    header_version(header).is_some_and(|version| version > SCOPE_VERSION)
+}
+
+/// The version a scope file's header names, when it is written as Forklift writes one: the tag, one
+/// space, and a number without a leading zero. Any other header is damaged, whatever number it holds.
+fn header_version(header: &str) -> Option<u32> {
+    let digits = header.strip_prefix(&format!("/forklift-{} ", SCOPE_RECORD))?;
+    let plain = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) && (digits == "0" || !digits.starts_with('0'));
+
+    if plain { digits.parse().ok() } else { None }
+}
+
+/// A scope file as `heal` reads it: on its own, never against the warehouse's mode or another
+/// scope, so that each one can be judged whatever the others hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RawScope {
+    /// There is no file.
+    Missing,
+
+    /// The file parses. An empty one is the full scope.
+    Read(PathScope),
+
+    /// The file does not parse, for the reason given (phrased to follow "The scope file").
+    Damaged(String),
+
+    /// A newer Forklift wrote it. It is not damage: it is left as it is.
+    Newer(String),
+}
+
+/// Read the scope file at `path` as [`RawScope`].
+///
+/// # Returns
+/// * `Ok(RawScope)` - What the file holds.
+/// * `Err(String)`  - It could not be read (other than being absent).
+pub(crate) fn read_scope_raw(path: &Path) -> Result<RawScope, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RawScope::Missing),
+        Err(e) => return Err(format!("Error while reading the scope file \"{}\": {}", path.to_string_lossy(), e)),
+    };
+
+    if let Err(error @ RecordError::OtherVersion(_)) = record_utils::from_bytes(&bytes, SCOPE_RECORD, SCOPE_VERSION) {
+        if matches!(&error, RecordError::OtherVersion(header) if is_newer_header(header)) {
+            return Ok(RawScope::Newer(error.describe()));
+        }
+    }
+
+    Ok(match PathScope::from_bytes(&bytes, "") {
+        Ok(scope) => RawScope::Read(scope),
+        Err(reason) => RawScope::Damaged(reason.trim_end().to_string()),
+    })
+}
+
+/// The path of the main working tree's scope file.
+pub(crate) fn main_tree_scope_path() -> PathBuf {
+    globals::forklift_root().join(FILE_NAME_BAY_SCOPE)
+}
+
+/// The path of the scope file of the bay `name`.
+pub(crate) fn named_bay_scope_path(name: &str) -> PathBuf {
+    crate::util::bay_utils::bay_state_dir(name).join(FILE_NAME_BAY_SCOPE)
 }
 
 /// The implicit members of a scope with these normalized prefixes (see
@@ -463,9 +525,9 @@ fn read_fetch_state() -> Result<(WarehouseMode, PathScope), String> {
     let missing = |found: &str| format!(
         "The warehouse is recorded as sparse but its fetch scope (\"{}\") {}, so Forklift cannot tell \
          what it has fetched. {}",
-        path.to_string_lossy(), found, REMEDY_REFRANCHISE
+        path.to_string_lossy(), found, REMEDY_HEAL_FETCH_SCOPE
     );
-    match read_scope_file_if_present(&path, REMEDY_REFRANCHISE)? {
+    match read_scope_file_if_present(&path, REMEDY_HEAL_FETCH_SCOPE)? {
         Some(scope) if !scope.is_full() => Ok((mode, scope)),
         Some(_) => Err(missing("names no path")),
         None => Err(missing("is missing")),
@@ -489,7 +551,7 @@ fn mode_kind(mode: WarehouseMode) -> &'static str {
 /// # Arguments
 /// * `name` - The bay's name (as listed by `bay_utils::list_bays`).
 pub fn read_bay_scope(name: &str) -> Result<PathScope, String> {
-    read_bay_scope_at(&crate::util::bay_utils::bay_state_dir(name).join(FILE_NAME_BAY_SCOPE))
+    read_bay_scope_at(&named_bay_scope_path(name))
 }
 
 fn read_bay_scope_at(path: &Path) -> Result<PathScope, String> {
@@ -508,7 +570,7 @@ fn read_bay_scope_at(path: &Path) -> Result<PathScope, String> {
             return Err(refused("names no path, which only a bay of a warehouse that is not sparse may do"));
         }
         if !scope.subset_of(&fetch) {
-            return Err(refused("is not within the warehouse's fetch scope"));
+            return Err(outside_fetch_scope("bay's", path));
         }
     }
 
@@ -527,7 +589,7 @@ fn read_bay_scope_at(path: &Path) -> Result<PathScope, String> {
 /// cannot make the main tree read as holding every path.
 pub fn read_main_tree_scope() -> Result<PathScope, String> {
     let (mode, fetch) = read_fetch_state()?;
-    let path = globals::forklift_root().join(FILE_NAME_BAY_SCOPE);
+    let path = main_tree_scope_path();
 
     if mode != WarehouseMode::Sparse {
         if !scope_file_is_present(&path)? {
@@ -549,14 +611,27 @@ pub fn read_main_tree_scope() -> Result<PathScope, String> {
     match read_scope_file_if_present(&path, REMEDY_REFRANCHISE)? {
         None => Err(refused("is missing")),
         Some(scope) if scope.is_full() => Err(refused("names no path")),
-        Some(scope) if !scope.subset_of(&fetch) => Err(refused("is not within the warehouse's fetch scope")),
+        Some(scope) if !scope.subset_of(&fetch) => Err(outside_fetch_scope("main tree's", &path)),
         Some(scope) => Ok(scope),
     }
 }
 
-/// The way out for a warehouse's fetch scope or main-tree scope Forklift cannot use: both are
-/// written when the warehouse is prepared, so it is cloned again.
+/// The refusal for a checkout scope that is not within the fetch scope, which no write leaves: one
+/// of the two files is damaged, and `heal` offers the way out for each.
+fn outside_fetch_scope(whose: &str, path: &Path) -> String {
+    format!(
+        "The {} scope (\"{}\") is not within the warehouse's fetch scope, so one of the two is damaged. \
+         Run \"forklift heal\", which names the way out for each.",
+        whose, path.to_string_lossy()
+    )
+}
+
+/// The way out for a warehouse's main-tree scope Forklift cannot use: it is written when the
+/// warehouse is prepared, so it is cloned again.
 const REMEDY_REFRANCHISE: &str = "Clone the remote again, into a new directory.";
+/// The way out for a sparse warehouse's fetch scope Forklift cannot use: `heal` rebuilds it from
+/// the checkouts' scopes.
+const REMEDY_HEAL_FETCH_SCOPE: &str = "Run \"forklift heal\", which rebuilds it from the scopes of the warehouse's checkouts.";
 /// The way out for a bay's scope Forklift cannot use. A removed bay keeps its pallet, so its name
 /// stays taken and the new bay needs another.
 const REMEDY_READD_BAY: &str = "Remove the bay with \"forklift bay remove\" and add a new one under another name; \
@@ -926,6 +1001,38 @@ pub fn refuse_if_over_object_ceiling(what: &str, len: usize) -> Result<(), CoreE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A header whose version cannot be read, or names this build's version but does not match its
+    /// header exactly, is damaged, never "written by an older Forklift", and
+    /// names the remedy; an older version names it as older, and a newer one names no remedy.
+    ///
+    /// Revert: send an unreadable version down the older arm, or the newer arm → red.
+    #[test]
+    fn a_header_version_is_read_as_older_newer_or_damaged() {
+        for header in [
+            "/forklift-scope x7".to_string(), format!("/forklift-scope  {}", SCOPE_VERSION), format!("/forklift-scope junk {}", SCOPE_VERSION),
+            "/forklift-scope junk 2".to_string(), format!("/forklift-scope junk {}", SCOPE_VERSION + 1), format!("/forklift-scope 0{}", SCOPE_VERSION + 1),
+        ] {
+            let damaged = PathScope::from_bytes(format!("{}\ndocs\n", header).as_bytes(), "REMEDY").unwrap_err();
+            assert!(damaged.contains("damaged") && damaged.contains("REMEDY") && !damaged.contains("older version"), "{:?}: {}", header, damaged);
+        }
+
+        let older = PathScope::from_bytes(b"/forklift-scope 2\ndocs\n", "REMEDY").unwrap_err();
+        assert!(older.contains("An older version") && older.contains("REMEDY"), "{}", older);
+
+        let newer = PathScope::from_bytes(format!("/forklift-scope {}\ndocs\n", SCOPE_VERSION + 1).as_bytes(), "REMEDY").unwrap_err();
+        assert!(newer.contains("Use the Forklift that wrote it") && !newer.contains("REMEDY"), "{}", newer);
+
+        // heal leaves a newer file alone, so a garbled header that ends in a higher number is not one.
+        let dir = std::env::temp_dir().join(format!("forklift-scope-header-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scope");
+        std::fs::write(&path, format!("/forklift-scope junk {}\ndocs\n", SCOPE_VERSION + 1)).unwrap();
+        assert!(matches!(read_scope_raw(&path).unwrap(), RawScope::Damaged(_)), "{:?}", read_scope_raw(&path));
+        std::fs::write(&path, format!("/forklift-scope {}\ndocs\n", SCOPE_VERSION + 1)).unwrap();
+        assert!(matches!(read_scope_raw(&path).unwrap(), RawScope::Newer(_)), "{:?}", read_scope_raw(&path));
+        crate::util::file_utils::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn full_scope_classifies_everything_in_scope() {
@@ -1313,8 +1420,8 @@ mod tests {
         // A stray file in a full warehouse or a cache is refused unparsed, so a garbled one says
         // "delete it" too.
         for (mode, file, found, remedy) in [
-            (WarehouseMode::Sparse, None, "is missing", REMEDY_REFRANCHISE),
-            (WarehouseMode::Sparse, Some(Vec::new()), "names no path", REMEDY_REFRANCHISE),
+            (WarehouseMode::Sparse, None, "is missing", REMEDY_HEAL_FETCH_SCOPE),
+            (WarehouseMode::Sparse, Some(Vec::new()), "names no path", REMEDY_HEAL_FETCH_SCOPE),
             (WarehouseMode::Full, Some(sparse.clone()), "holds a fetch scope", "Delete that file"),
             (WarehouseMode::Full, Some(Vec::new()), "holds a fetch scope", "Delete that file"),
             (WarehouseMode::Full, Some(b"not a scope file".to_vec()), "holds a fetch scope", "Delete that file"),

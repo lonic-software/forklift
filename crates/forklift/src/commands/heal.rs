@@ -1,5 +1,6 @@
 use serde::Serialize;
 use forklift_core::util::lock_utils::StoreAccessLock;
+use forklift_core::util::scope_heal::{self, ScopeRebuilt};
 use forklift_core::util::operation_utils::{self, RecoveryOutcome};
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::util::ref_heal::{self, Pass};
@@ -12,6 +13,11 @@ use crate::output::{self, CommandOutput};
 /// bay before it finished, if one is recorded (`forklift_core::util::operation_utils::recover`),
 /// then clear the sealed-object record of every object the store holds again
 /// (`forklift_core::util::sealed_utils::unseal`).
+///
+/// In a sparse warehouse whose fetch scope is lost or damaged, it first rebuilds the fetch scope
+/// from the checkouts' scopes ([`scope_heal::repair`]), or, under `--fetch-scope`, sets it to the
+/// paths given ([`scope_heal::set_chosen`]), holding the store exclusively meanwhile. A damaged
+/// fetch scope it cannot settle makes the run a `fetch_scope_damaged` refusal (exit 54).
 ///
 /// Around the taint recovery it rebuilds every lost or damaged user pallet ref it can
 /// ([`ref_heal`]): once before, for what nothing still missing could change, and once after,
@@ -30,19 +36,31 @@ use crate::output::{self, CommandOutput};
 ///
 /// # Arguments
 /// * `store_access` - The command's shared store-access hold, which the record's push-down needs.
+///   `None` under `--fetch-scope`, which takes the exclusive hold first and the shared one after.
+/// * `fetch_scope`  - The paths `--fetch-scope` names, if any.
 ///
 /// # Returns
 /// * `Ok(())`      - Nothing was tainted, or the taint is now fully cleared.
 /// * `Err(String)` - A `durability_taint` refusal (torn, or an unresolved dangling reference), or
 ///                   the sealed-object record is damaged and could not be rebuilt, which stops
 ///                   the run before anything else.
-pub async fn handle_command(store_access: &StoreAccessLock, set_ref: &[String], remove_ref: &[String]) -> Result<(), String> {
+pub async fn handle_command(store_access: Option<&StoreAccessLock>,
+                            set_ref: &[String],
+                            remove_ref: &[String],
+                            fetch_scope: &[String]) -> Result<(), String> {
     // Every spec is read before anything is written, so a malformed one changes nothing.
     let set_ref = set_ref.iter()
         .map(|spec| spec.split_once('=').ok_or_else(|| format!(
             "--ref takes PALLET=PARCEL, not \"{}\". Nothing was changed.", spec
         )))
         .collect::<Result<Vec<_>, _>>()?;
+
+    // Taken before anything is read: the choice may narrow the fetch scope, so no other process may
+    // use the store until it is written.
+    let exclusive = match fetch_scope.is_empty() {
+        true => None,
+        false => Some(StoreAccessLock::try_exclusive()?),
+    };
 
     let mut ref_notes: Vec<String> = Vec::new();
     let mut refs_rebuilt: Vec<ref_heal::Rebuilt> = Vec::new();
@@ -59,6 +77,26 @@ pub async fn handle_command(store_access: &StoreAccessLock, set_ref: &[String], 
         ))?
         .map(RecordRebuilt::from);
 
+    // After the record, which the check of the history leans on, and before everything else, which
+    // reads the fetch scope.
+    let scope_rebuilt = match &exclusive {
+        Some(exclusive) => Some(scope_heal::set_chosen(fetch_scope, exclusive).await),
+        None => scope_heal::repair().transpose(),
+    }.transpose().map_err(|error| match &record_rebuilt {
+        Some(record) => forklift_core::error::append_to_message(String::from(error), &record.sentence()),
+        None => String::from(error),
+    })?;
+    drop(exclusive);
+
+    let shared;
+    let store_access = match store_access {
+        Some(store_access) => store_access,
+        None => {
+            shared = StoreAccessLock::shared(crate::announce_store_access_wait)?;
+            &shared
+        }
+    };
+
     // What the user chose goes after the record, which it reads, and before the passes, so they
     // judge only what is left. A refusal says what this run already changed: its own "Nothing was
     // changed" speaks only for the write it refused. Its notes go along: a check they say was
@@ -67,6 +105,9 @@ pub async fn handle_command(store_access: &StoreAccessLock, set_ref: &[String], 
         let mut error = error;
         if let Some(record) = &record_rebuilt {
             error = forklift_core::error::append_to_message(error, &record.sentence());
+        }
+        if let Some(scope) = &scope_rebuilt {
+            error = forklift_core::error::append_to_message(error, &scope_sentence(scope));
         }
         for rebuilt in rebuilt {
             error = forklift_core::error::append_to_message(error, &rebuilt_sentence(rebuilt));
@@ -177,6 +218,7 @@ pub async fn handle_command(store_access: &StoreAccessLock, set_ref: &[String], 
 
     let report = HealReport {
         record_rebuilt,
+        fetch_scope_rebuilt: scope_rebuilt,
         was_tainted: outcome.was_tainted,
         restaged: outcome.restaged,
         resolved: outcome.resolved,
@@ -225,6 +267,28 @@ fn ref_refusal(report: &HealReport) -> CoreError {
         format!("forklift heal --ref {}=<parcel>", first),
         serde_json::json!(report),
     )
+}
+
+fn scope_sentence(rebuilt: &ScopeRebuilt) -> String {
+    let prefixes = scope_heal::listed(&rebuilt.scope);
+
+    let mut sentence = match rebuilt.chosen {
+        true => format!(
+            "The fetch scope {} and is set to {}, as chosen; {} object(s) were fetched for it.",
+            rebuilt.was.trim_end_matches('.'), prefixes, rebuilt.fetched_objects
+        ),
+        false => format!(
+            "The fetch scope {} and is rebuilt as {}, the paths {} check out. Paths fetched beyond those \
+            are no longer checked for loss; \"forklift scope fetch\" adds one back.",
+            rebuilt.was.trim_end_matches('.'), prefixes, rebuilt.from.join(" and ")
+        ),
+    };
+
+    for unread in &rebuilt.left_out {
+        sentence.push_str(&format!(" The scope of {} was left out: {}.", unread.checkout, unread.reason));
+    }
+
+    sentence
 }
 
 fn rebuilt_sentence(rebuilt: &ref_heal::Rebuilt) -> String {
@@ -302,6 +366,11 @@ pub(crate) struct HealReport {
     /// before the damage. An object whose record was dropped reads as missing if it is absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     record_rebuilt: Option<RecordRebuilt>,
+
+    /// The fetch scope of a sparse warehouse, which was lost or damaged and this run wrote: rebuilt
+    /// from the checkouts' scopes, or set to the paths `--fetch-scope` gave.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fetch_scope_rebuilt: Option<ScopeRebuilt>,
 
     /// Whether a durability taint was actually standing (an already-healthy warehouse reports
     /// `false`, with `restaged` and `resolved` empty).
@@ -440,6 +509,10 @@ impl CommandOutput for HealReport {
             println!("{}", rebuilt.sentence());
         }
 
+        if let Some(rebuilt) = &self.fetch_scope_rebuilt {
+            println!("{}", scope_sentence(rebuilt));
+        }
+
         for rebuilt in &self.refs_rebuilt {
             println!("{}", rebuilt_sentence(rebuilt));
         }
@@ -466,6 +539,7 @@ impl CommandOutput for HealReport {
             }
         } else if self.operation.is_none() && self.unsealed.is_empty() && self.newly_held_by_hash.is_empty()
             && self.notes.is_empty() && self.unseal_failed.is_none() && self.record_rebuilt.is_none()
+            && self.fetch_scope_rebuilt.is_none()
             && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
         {
             println!("Nothing to heal — no durability taint is standing.");

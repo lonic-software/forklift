@@ -94,6 +94,23 @@ pub fn write_for_tests(url: &str) {
 ///   refusal when the configured remote is not the origin or no origin is recorded; or the config,
 ///   the mode or the origin record cannot be read.
 pub fn checked_remote() -> Result<(String, Option<String>), CoreError> {
+    checked_remote_for(scope_utils::content_may_be_absent)
+}
+
+/// [`checked_remote`] judged by the warehouse mode alone, from the marker, never the fetch scope:
+/// for `heal --fetch-scope`, which dials to replace a fetch scope that cannot be read. Every other
+/// command reads the fetch scope first, so a damaged one refuses before it dials.
+///
+/// # Returns
+/// * `Ok((url, token))` - The remote to dial.
+/// * `Err(CoreError)`   - As for [`checked_remote`], with the marker read instead of the scope.
+pub fn checked_remote_by_mode() -> Result<(String, Option<String>), CoreError> {
+    checked_remote_for(|| Ok(crate::util::warehouse_utils::warehouse_mode()? != crate::util::warehouse_utils::WarehouseMode::Full))
+}
+
+/// [`checked_remote`], with `partial` saying whether the warehouse may lack content, read only
+/// once a remote is known to be configured.
+fn checked_remote_for(partial: impl FnOnce() -> Result<bool, String>) -> Result<(String, Option<String>), CoreError> {
     // A move of the origin is checking the new server against what this warehouse holds, or has
     // started rewriting which remote that is: no client talks to either until it finishes.
     origin_move::ensure_none_pending()?;
@@ -105,7 +122,7 @@ pub fn checked_remote() -> Result<(String, Option<String>), CoreError> {
             config_utils::KEY_REMOTE_URL
         ))?;
 
-    if scope_utils::content_may_be_absent()? {
+    if partial()? {
         let Some(origin) = read_origin()? else {
             return Err(missing_origin_refusal());
         };

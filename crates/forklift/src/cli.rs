@@ -331,7 +331,7 @@ pub enum Command {
         action: Option<HaulAction>,
     },
 
-    /// Resolve a standing durability taint, rebuild a damaged pallet ref, or finish or undo an interrupted operation
+    /// Resolve a standing durability taint, rebuild a damaged pallet ref or fetch scope, or finish or undo an interrupted operation
     #[command(
         long_about = "Resolve a standing durability taint (\"durability_taint\" refusals, exit \
                       21): a write's final path(s) were left visible after a failed durability \
@@ -358,7 +358,14 @@ pub enum Command {
                       and what the damaged ref's own bytes still name. When the evidence does not \
                       agree it changes nothing and lists what it found; --ref sets the ref to a \
                       parcel you choose, and --remove-ref drops an unreadable ref that nothing \
-                      names a head for."
+                      names a head for.\n\n\
+                      In a sparse warehouse whose fetch scope is lost or damaged, it rebuilds the \
+                      fetch scope from the scopes of its checkouts, once the history there is \
+                      all present. Paths fetched beyond those are then no longer checked for \
+                      loss; \"forklift scope fetch\" adds them back. When the checkouts cannot \
+                      settle it, it refuses with \"fetch_scope_damaged\" (exit 54), and \
+                      --fetch-scope, once per path, sets the fetch scope to the paths you name, \
+                      fetching from the origin what the history at them lacks."
     )]
     Heal {
         /// Set a damaged pallet ref to a parcel (a pallet, a parcel hash or a unique prefix of one)
@@ -368,6 +375,10 @@ pub enum Command {
         /// Remove a damaged pallet ref that nothing names a head for, keeping its bytes aside
         #[arg(long, value_name = "PALLET")]
         remove_ref: Vec<String>,
+
+        /// Set a sparse warehouse's damaged fetch scope to these paths, fetching what their history lacks
+        #[arg(long, value_name = "PATH")]
+        fetch_scope: Vec<String>,
     },
 
     /// Print the command list, or detailed help about one command
@@ -2286,6 +2297,9 @@ impl Command {
     /// that list that sets a pallet head, and it writes into a store it has just created, which
     /// no other process uses yet.
     ///
+    /// `heal --fetch-scope` is excluded too: it takes the exclusive side while it sets the fetch
+    /// scope, which it may narrow, and the shared one after.
+    ///
     /// `store compact`, `store evict`, `scope prune`, `redact record` and `redact apply` are
     /// excluded because they host deleters, which take the exclusive side; their own shared hold
     /// would refuse them. They take the side they need themselves: a full repack, evict, scope
@@ -2303,6 +2317,7 @@ impl Command {
                     | Command::Scope { action: Some(ScopeAction::Prune { .. }) }
                     | Command::Redact { action: Some(RedactAction::Record { .. } | RedactAction::Apply) }
             )
+            && !matches!(self, Command::Heal { fetch_scope, .. } if !fetch_scope.is_empty())
     }
 
     /// Whether finishing this command should kick off background object-store maintenance

@@ -66,4 +66,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `content_withheld` | 51 | The remote's host withholds content the command needed (a takedown, not a redaction), so the remote neither serves nor takes it, or refused to move a pallet whose new history names a withheld chunked file it cannot judge; a copy this warehouse holds is kept |
 | `remote_history_incomplete` | 52 | The remote refused to move a pallet because part of the new head's history is absent there or unreadable, even after the lift negotiated and uploaded again; nothing moved |
 | `ref_damaged` | 53 | A pallet ref is lost or damaged: its file holds no parcel hash, or it is missing while a checkout stands on that pallet. Nothing was changed; heal rebuilds it from what the bays and the ref's own bytes still name, or lists what it found |
+| `fetch_scope_damaged` | 54 | A sparse warehouse's fetch scope is lost or damaged, and heal could not rebuild it from the checkouts' scopes alone. Nothing was changed; heal --fetch-scope sets it, fetching what the history there lacks |
 

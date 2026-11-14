@@ -64,6 +64,7 @@ pub mod taint_utils;
 pub mod heal_utils;
 pub mod recovery_utils;
 pub mod ref_heal;
+pub mod scope_heal;
 pub mod trust_utils;
 pub mod path_utils;
 pub mod remote_utils;
