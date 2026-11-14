@@ -322,7 +322,7 @@ fn a_divergence_is_cleared_by_the_commands_the_page_lists() {
 }
 
 #[test]
-fn a_quarantined_pack_comes_back_from_its_file_or_a_fresh_clone_and_not_from_heal_or_lower() {
+fn a_quarantined_pack_comes_back_from_its_file_or_a_fresh_clone_and_heal_names_what_is_lost() {
     let area = Area::new("quarantine");
     let server = two_clones(&area);
     area.ok("a", &["store", "compact", "--all"]);
@@ -333,11 +333,17 @@ fn a_quarantined_pack_comes_back_from_its_file_or_a_fresh_clone_and_not_from_hea
     let status: serde_json::Value = serde_json::from_str(&area.ok("a", &["--json", "store", "status"])).unwrap();
     assert_eq!(status["data"]["quarantined_packs"].as_array().unwrap().len(), 1, "{}", status);
 
-    assert!(!area.run("a", &["stocktake"]).status.success(), "the store is missing what it needs");
-    for not_a_way_out in [&["heal"][..], &["lower"][..]] {
-        area.ok("a", not_a_way_out);
-        assert!(!area.run("a", &["stocktake"]).status.success(), "{:?} would be a way out", not_a_way_out);
-    }
+    let error = area.refused("a", &["stocktake"], "object_unreadable", 57);
+    assert_eq!(error["next_step"], "forklift heal", "{}", error);
+
+    // Heal cannot rebuild an index whose data file is gone: it names what is lost and where it is.
+    let error = area.refused("a", &["heal"], "objects_lost", 58);
+    let lost = &error["details"]["objects_lost"];
+    assert!(lost["unreadable"].as_u64().unwrap() > 0, "{}", error);
+    assert_eq!(lost["pallets"], serde_json::json!(["main"]), "{}", error);
+    assert!(error["next_step"].as_str().unwrap().starts_with("restore the warehouse from a backup"), "{}", error);
+    area.ok("a", &["lower"]);
+    assert!(!area.run("a", &["stocktake"]).status.success(), "lower would be a way out");
 
     area.ok(".", &["clone", &server.url, "fresh", "--token", "secret"]);
     area.ok("fresh", &["stocktake"]);
@@ -347,7 +353,7 @@ fn a_quarantined_pack_comes_back_from_its_file_or_a_fresh_clone_and_not_from_hea
 }
 
 #[test]
-fn a_damaged_pack_is_salvaged_and_an_unenumerable_index_is_moved_aside() {
+fn heal_rebuilds_a_lost_unparseable_or_damaged_index_from_its_data_file() {
     let area = Area::new("packs");
     area.prepare("w");
     area.stack("w", "f.txt", "one\n");
@@ -359,32 +365,41 @@ fn a_damaged_pack_is_salvaged_and_an_unenumerable_index_is_moved_aside() {
         let value: serde_json::Value = serde_json::from_str(&area.ok("w", &["--json", "store", "status"])).unwrap();
         value["data"][list].as_array().unwrap().len()
     };
+    let kept_aside = || std::fs::read_dir(index.parent().unwrap()).unwrap()
+        .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().contains(".idx.damaged-"))
+        .count();
 
     let mut unparsable = original.clone();
     unparsable[0] ^= 0xff;
-    std::fs::write(&index, &unparsable).unwrap();
-    assert_eq!(status("unenumerable_indexes"), 1);
-    let aside = area.path("aside.idx");
-    forklift_core::util::file_utils::rename(&index, &aside).unwrap();
-    assert_eq!(status("unenumerable_indexes"), 0);
-    assert!(!area.run("w", &["history"]).status.success(), "the page warns this index may hold what is needed");
-    forklift_core::util::file_utils::rename(&aside, &index).unwrap();
-    assert_eq!(status("unenumerable_indexes"), 1, "putting it back restores what was there");
-
-    // The damaged half starts from the good index; a real warehouse would clone afresh here, which
-    // the quarantine test runs.
-    std::fs::write(&index, &original).unwrap();
-    area.ok("w", &["history"]);
-
     let mut damaged = original.clone();
     let near_end = damaged.len() - 40;
     damaged[near_end] ^= 0xff;
-    std::fs::write(&index, &damaged).unwrap();
-    assert_eq!(status("damaged_packs"), 1);
-    area.ok("w", &["store", "compact", "--all"]);
-    assert_eq!(status("damaged_packs"), 0);
-    area.ok("w", &["stocktake"]);
-    area.ok("w", &["history"]);
+
+    for (what, bytes, list) in [("lost", None, None), ("unparsable", Some(&unparsable), Some("unenumerable_indexes")), ("damaged", Some(&damaged), Some("damaged_packs"))] {
+        match bytes {
+            Some(bytes) => std::fs::write(&index, bytes).unwrap(),
+            None => forklift_core::util::file_utils::remove_file(&index).unwrap(),
+        }
+        if let Some(list) = list {
+            assert_eq!(status(list), 1, "{}", what);
+        }
+        let aside = kept_aside();
+        area.refused("w", &["history"], "object_unreadable", 57);
+        // A stack reads the head's tree to build on it, so it meets the damage the same way. Only
+        // the first round's head is packed; each later round's head is the loose parcel stacked here.
+        area.write(&format!("w/{}.txt", what), "new\n");
+        area.ok("w", &["load", &format!("{}.txt", what)]);
+        if bytes.is_none() {
+            area.refused("w", &["stack", "-m", what], "object_unreadable", 57);
+        }
+
+        area.ok("w", &["heal"]);
+        assert_eq!(std::fs::read(&index).unwrap(), original, "{}: the index is rebuilt as it was written", what);
+        assert_eq!(kept_aside(), aside + usize::from(bytes.is_some()), "{}: a replaced index is kept", what);
+        area.ok("w", &["history"]);
+        area.ok("w", &["stack", "-m", what]);
+        area.ok("w", &["stocktake"]);
+    }
 }
 
 #[test]

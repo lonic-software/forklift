@@ -8485,7 +8485,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 45);
+    assert_eq!(value["schema"], 46);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -8527,7 +8527,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 45);
+    assert_eq!(value["schema"], 46);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -8571,7 +8571,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 45);
+    assert_eq!(value["schema"], 46);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -8779,7 +8779,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 45,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 46,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);
@@ -11459,9 +11459,8 @@ fn compact_all_repacks_consolidates_and_drops_garbage() {
 }
 
 /// (FORK-194) A pack whose index has a corrupt bucket but whose data is intact: `store` lists it as
-/// damaged and names `forklift store compact --all` as the remedy, saying what a kept pack or a refusal
-/// means; `compact --all` salvages it, lists it as dropped in `--json`, and the history still
-/// reads in full.
+/// damaged and names `forklift heal`'s rebuild as the remedy; `compact --all` still salvages it,
+/// lists it as dropped in `--json`, and the history still reads in full.
 #[test]
 fn compact_all_salvages_a_pack_with_a_corrupt_index_bucket() {
     let warehouse = TestWarehouse::new("salvage-damaged-pack");
@@ -11493,8 +11492,7 @@ fn compact_all_salvages_a_pack_with_a_corrupt_index_bucket() {
     assert_success(&store);
     let text = stdout(&store);
     assert!(text.contains("damaged:") && text.contains(&index_name), "{}", text);
-    assert!(text.contains("\"forklift store compact --all\" salvages it"), "{}", text);
-    assert!(text.contains("refuses because the pack could not be completely salvaged"), "{}", text);
+    assert!(text.contains("\"forklift heal\" rebuilds a damaged or unenumerable index from its pack's data file"), "{}", text);
     assert_eq!(json(&warehouse.run(&["--json", "store"]))["data"]["damaged_packs"].as_array().unwrap().len(), 1);
 
     let repack = warehouse.run(&["--json", "store", "compact", "--all"]);

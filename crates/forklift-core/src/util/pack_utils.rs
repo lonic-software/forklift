@@ -1844,12 +1844,14 @@ fn broken_pair_changed(index_path: &Path,
 /// its reads by name rather than reading its objects as absent.
 ///
 /// # Returns
-/// * `Ok(Some(message))` - `hash` is named by a quarantined index, or a foreign-version index
-///   may hold it; `message` is ready to use as the [`file_utils::StoreReadOutcome::Unverifiable`]
-///   payload, naming the index file and its error.
+/// * `Ok(Some((message, cause)))` - `hash` is named by a quarantined index
+///   ([`file_utils::Unreadable::PackDamage`]), or a foreign-version index may hold it
+///   ([`file_utils::Unreadable::Other`]: no heal of this build reads it); `message` is ready to
+///   use as the [`file_utils::StoreReadOutcome::Unverifiable`] payload, naming the index file and
+///   its error.
 /// * `Ok(None)`          - No quarantined index names `hash`, and no foreign-version index exists.
 /// * `Err(String)`       - The pack registry itself could not be loaded.
-pub(crate) fn quarantine_reason(hash: &str) -> Result<Option<String>, String> {
+pub(crate) fn quarantine_reason(hash: &str) -> Result<Option<(String, file_utils::Unreadable)>, String> {
     let Some(hash_bytes) = hash_to_bytes(hash) else {
         return Ok(None);
     };
@@ -1858,19 +1860,19 @@ pub(crate) fn quarantine_reason(hash: &str) -> Result<Option<String>, String> {
 
     for quarantined in pack_set.quarantined.iter() {
         if quarantined.contains(&hash_bytes) {
-            return Ok(Some(format!(
+            return Ok(Some((format!(
                 "named by pack index \"{}\" whose data file could not be loaded: {}",
                 quarantined.index_path.to_string_lossy(), quarantined.error
-            )));
+            ), file_utils::Unreadable::PackDamage)));
         }
     }
 
     // A pack index of another format version may hold any hash, so it can rule none out.
     if let Some(foreign) = pack_set.unenumerable.iter().find(|pack| pack.foreign_version) {
-        return Ok(Some(format!(
+        return Ok(Some((format!(
             "possibly held by pack index \"{}\", which this build cannot read: {}",
             foreign.index_path.to_string_lossy(), foreign.error
-        )));
+        ), file_utils::Unreadable::Other)));
     }
 
     Ok(None)
@@ -1891,7 +1893,7 @@ pub(crate) fn quarantine_reason(hash: &str) -> Result<Option<String>, String> {
 /// * `Ok(None)`         - No pack index could hold `hash` unseen.
 /// * `Err(String)`      - The pack registry itself could not be loaded.
 pub(crate) fn sweep_unreadable_reason(hash: &str) -> Result<Option<String>, String> {
-    if let Some(reason) = quarantine_reason(hash)? {
+    if let Some((reason, _)) = quarantine_reason(hash)? {
         return Ok(Some(reason));
     }
 
@@ -1920,6 +1922,41 @@ pub(crate) fn sweep_unreadable_reason(hash: &str) -> Result<Option<String>, Stri
     }
 
     Ok(None)
+}
+
+/// The pack files that might hold a hash the read path found absent, though no verdict leans on
+/// them (I4): every index that could not be parsed, other than one of another format version
+/// (which [`quarantine_reason`] answers for), and every data file with no index beside it. An
+/// absent read names them, so its reader knows the object may not be lost, and `forklift heal`
+/// rebuilds such an index from its data file where it can. Answers from the cached set, current
+/// right after a read's miss revalidated it.
+///
+/// # Returns
+/// * `Ok(Vec<PathBuf>)` - The files, indexes first, each in name order.
+/// * `Err(String)`      - The pack registry itself could not be loaded.
+pub(crate) fn unindexed_holders() -> Result<Vec<PathBuf>, String> {
+    let pack_set = loaded_packs()?;
+    let mut holders: Vec<PathBuf> = pack_set.unenumerable.iter()
+        .filter(|pack| !pack.foreign_version)
+        .map(|pack| pack.index_path.clone())
+        .collect();
+    holders.sort();
+    holders.extend(orphan_data_files(&pack_folder(), &pack_set.stamp.names));
+    Ok(holders)
+}
+
+/// Every data file among `names` (a pack folder's listing) with no index of the same stem.
+fn orphan_data_files(folder: &Path, names: &[OsString]) -> Vec<PathBuf> {
+    let mut orphans: Vec<PathBuf> = names.iter()
+        .map(|name| folder.join(name))
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some(FILE_EXTENSION_PACK_DATA))
+        .filter(|data| {
+            let index = data.with_extension(FILE_EXTENSION_PACK_INDEX);
+            !names.iter().any(|name| index.file_name() == Some(name.as_os_str()))
+        })
+        .collect();
+    orphans.sort();
+    orphans
 }
 
 /// What the running full repack's salvage ([`salvage_damaged_packs`]) concluded about each damaged
@@ -1990,6 +2027,8 @@ pub(crate) struct PackHealthSnapshot {
     pub unenumerable: Vec<(PathBuf, String)>,
     pub damaged: Vec<(PathBuf, String)>,
     pub foreign: Vec<(PathBuf, String)>,
+    /// Data files with no index beside them, whose objects no read can reach.
+    pub orphans: Vec<PathBuf>,
 }
 
 /// A point-in-time snapshot of the pack folder's problem lists (FORK-47, DESIGN.html §3.1.1):
@@ -2013,7 +2052,8 @@ pub(crate) struct PackHealthSnapshot {
 /// * `Err(String)`            - The pack folder itself could not be enumerated (an environment
 ///                              failure — see [`load_packs_from_disk`]).
 pub(crate) fn pack_health_snapshot() -> Result<PackHealthSnapshot, String> {
-    let PackSet { quarantined, unenumerable, damaged, .. } = load_packs_from_disk(&pack_folder(), IndexCheck::Full)?;
+    let folder = pack_folder();
+    let PackSet { quarantined, unenumerable, damaged, stamp, .. } = load_packs_from_disk(&folder, IndexCheck::Full)?;
     let (foreign, unenumerable): (Vec<_>, Vec<_>) = unenumerable.into_iter().partition(|u| u.foreign_version);
 
     Ok(PackHealthSnapshot {
@@ -2021,6 +2061,7 @@ pub(crate) fn pack_health_snapshot() -> Result<PackHealthSnapshot, String> {
         unenumerable: unenumerable.into_iter().map(|u| (u.index_path, u.error)).collect(),
         foreign: foreign.into_iter().map(|u| (u.index_path, u.error)).collect(),
         damaged: damaged.into_iter().map(|d| (d.index_path, d.error)).collect(),
+        orphans: orphan_data_files(&folder, &stamp.names),
     })
 }
 
@@ -3024,8 +3065,9 @@ pub(crate) enum PackRetrieval {
     Verified(Vec<u8>),
     /// At least one loaded pack located the hash, but every located record failed to resolve.
     /// Carries the *first* such error — later, redundant failures for the same hash add no
-    /// information once one is on record.
-    Failed(String),
+    /// information once one is on record — except that a corrupt bucket, which `forklift heal`
+    /// can act on, is preferred over a record that does not rebuild to its hash.
+    Failed(String, file_utils::Unreadable),
     /// No loaded pack's index names the hash.
     NotLocated,
 }
@@ -3065,6 +3107,7 @@ pub(crate) fn retrieve_from_packs(hash: &str) -> Result<PackRetrieval, String> {
 /// [`retrieve_from_packs`] against one already-loaded set, with no revalidation.
 fn retrieve_from(packs: &PackSet, hash_bytes: &[u8; HASH_LEN], hash: &str) -> Result<PackRetrieval, String> {
     let mut first_error: Option<String> = None;
+    let mut first_damage: Option<String> = None;
 
     for pack in packs.packs.iter() {
         let (offset, length) = match pack.locate(hash_bytes) {
@@ -3073,8 +3116,8 @@ fn retrieve_from(packs: &PackSet, hash_bytes: &[u8; HASH_LEN], hash: &str) -> Re
             // This pack cannot say whether it holds the object. Another pack may still serve it
             // (a good copy wins); if none does, the read fails rather than reporting it absent.
             Located::CorruptBucket(bucket) => {
-                if first_error.is_none() {
-                    first_error = Some(pack.corrupt_bucket_error(bucket));
+                if first_damage.is_none() {
+                    first_damage = Some(pack.corrupt_bucket_error(bucket));
                 }
                 continue;
             }
@@ -3097,9 +3140,12 @@ fn retrieve_from(packs: &PackSet, hash_bytes: &[u8; HASH_LEN], hash: &str) -> Re
         }
     }
 
-    Ok(match first_error {
-        Some(e) => PackRetrieval::Failed(e),
-        None => PackRetrieval::NotLocated,
+    // A damaged index is preferred: heal can rebuild it, while a record that does not rebuild to
+    // its hash is beyond what heal mends.
+    Ok(match (first_damage, first_error) {
+        (Some(e), _) => PackRetrieval::Failed(e, file_utils::Unreadable::PackDamage),
+        (None, Some(e)) => PackRetrieval::Failed(e, file_utils::Unreadable::Other),
+        (None, None) => PackRetrieval::NotLocated,
     })
 }
 
@@ -5169,6 +5215,249 @@ fn decode_salvaged_record(record: &[u8]) -> Result<SalvagedRecord, String> {
     })
 }
 
+/// What [`rebuild_pack_indexes`] did.
+#[derive(Debug, Default)]
+pub(crate) struct IndexRebuild {
+    /// Each index rebuilt, with where the index it replaced was moved aside (none when the data
+    /// file had no index).
+    pub rebuilt: Vec<(PathBuf, Option<PathBuf>)>,
+    /// Each data file whose index could not be rebuilt, with the reason.
+    pub failed: Vec<(PathBuf, String)>,
+    /// Why the rebuild did not run at all: the object-store lock could not be taken.
+    pub skipped: Option<String>,
+}
+
+/// Rebuild, from its data file, every pack index that is missing, does not parse (and is not of
+/// another format version) or fails full validation (`forklift heal`, FORK-449). A data file is
+/// rebuilt only when its records walk end to end and every one decodes, and only when the
+/// rebuilt layout re-derives the file's own name ([`compute_pack_id`]): the name is a hash of
+/// the layout, so a match proves the index is the one the writer published. Candidates are taken
+/// in rounds, so a delta whose base sits in another candidate decodes once that one is rebuilt.
+///
+/// A published index is written to a temp file and synced first; the index it replaces is moved
+/// aside to `<name>.idx.damaged-<nanos>`, never deleted. Runs under [`lock_utils::StoreLock`],
+/// so it never races a compaction; when the lock is held the rebuild is skipped and says why.
+///
+/// # Returns
+/// * `Ok(IndexRebuild)` - What was rebuilt, what could not be and why, or why nothing ran.
+/// * `Err(String)`      - The pack folder could not be listed.
+pub(crate) fn rebuild_pack_indexes() -> Result<IndexRebuild, String> {
+    let folder = pack_folder();
+    if rebuild_candidates(&folder)?.is_empty() {
+        return Ok(IndexRebuild::default());
+    }
+
+    let _store = match lock_utils::StoreLock::acquire() {
+        Ok(lock) => lock,
+        Err(error) => return Ok(IndexRebuild { skipped: Some(error), ..IndexRebuild::default() }),
+    };
+
+    let mut report = IndexRebuild::default();
+    let mut remaining = rebuild_candidates(&folder)?;
+    loop {
+        let mut failed = Vec::new();
+        let mut published = false;
+        for data_path in std::mem::take(&mut remaining) {
+            match rebuild_index(&folder, &data_path) {
+                Ok(set_aside) => {
+                    published = true;
+                    report.rebuilt.push((data_path.with_extension(FILE_EXTENSION_PACK_INDEX), set_aside));
+                }
+                Err(reason) => failed.push((data_path, reason)),
+            }
+        }
+        if !published || failed.is_empty() {
+            report.failed = failed;
+            break;
+        }
+        remaining = failed.into_iter().map(|(path, _)| path).collect();
+    }
+
+    Ok(report)
+}
+
+/// The data files whose index [`rebuild_pack_indexes`] would rebuild, in name order: those with
+/// no index, an index that does not parse and is not of another version, or an index that fails
+/// full validation. Only `<64 hex>.pack` names qualify, the names a writer gives.
+fn rebuild_candidates(folder: &Path) -> Result<Vec<PathBuf>, String> {
+    let PackSet { unenumerable, damaged, stamp, .. } = load_packs_from_disk(folder, IndexCheck::Full)?;
+
+    let mut candidates: Vec<PathBuf> = unenumerable.iter()
+        .filter(|pack| !pack.foreign_version)
+        .map(|pack| &pack.index_path)
+        .chain(damaged.iter().map(|pack| &pack.index_path))
+        .map(|index| index.with_extension(FILE_EXTENSION_PACK_DATA))
+        .filter(|data| data.is_file())
+        .chain(orphan_data_files(folder, &stamp.names))
+        .filter(|data| data.file_stem().and_then(|stem| stem.to_str()).and_then(hash_to_bytes).is_some())
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
+}
+
+/// Rebuild one data file's index and publish it (see [`rebuild_pack_indexes`]).
+///
+/// # Returns
+/// * `Ok(Option<PathBuf>)` - Published; where the replaced index was moved, if there was one.
+/// * `Err(String)`         - Why this file's index was not rebuilt.
+fn rebuild_index(folder: &Path, data_path: &Path) -> Result<Option<PathBuf>, String> {
+    let data = std::fs::read(data_path)
+        .map_err(|e| format!("its data file could not be read: {}", e))?;
+    if data.len() < PACK_DATA_HEADER_LEN as usize || &data[0..8] != PACK_DATA_MAGIC {
+        return Err("its data file is not a pack data file".to_string());
+    }
+    let version = read_u32_le(&data, 8);
+    if version != PACK_FORMAT_VERSION {
+        return Err(format!("its data file has format version {}, but this build reads only version {}", version, PACK_FORMAT_VERSION));
+    }
+
+    let (ranges, gap) = walk_pack_records(&data, &[]);
+    if gap {
+        return Err("its data file is damaged: its records do not parse end to end".to_string());
+    }
+
+    let records = rebuilt_records(&data, &ranges)?;
+    let stem = data_path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
+    if compute_pack_id(&records) != stem {
+        return Err("its data file is damaged: the records it holds do not re-derive its name".to_string());
+    }
+
+    publish_rebuilt_index(folder, data_path, &build_index_bytes(&records))
+}
+
+/// Decode every record of a walked data file and give the sorted index records for it. A delta's
+/// base is looked for in the same file first, then in the store; a base found in neither leaves
+/// the file unrebuilt for this round.
+fn rebuilt_records(data: &[u8], ranges: &[std::ops::Range<usize>]) -> Result<Vec<([u8; HASH_LEN], u64, u64)>, String> {
+    let mut hashes: Vec<Option<[u8; HASH_LEN]>> = vec![None; ranges.len()];
+    let mut in_file: HashMap<[u8; HASH_LEN], usize> = HashMap::new();
+
+    loop {
+        let mut progress = false;
+        for (at, slot) in hashes.iter_mut().enumerate() {
+            if slot.is_some() {
+                continue;
+            }
+            match decode_in_file(data, ranges, &in_file, at, 0)? {
+                Some(bytes) => {
+                    let hash = hash_to_bytes(&object_utils::hash_object_bytes(&bytes))
+                        .ok_or_else(|| "an object hash could not be read back".to_string())?;
+                    *slot = Some(hash);
+                    in_file.entry(hash).or_insert(at);
+                    progress = true;
+                }
+                None => continue,
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+
+    let unresolved = hashes.iter().filter(|hash| hash.is_none()).count();
+    if unresolved > 0 {
+        return Err(format!("{} of its delta records name a base that no readable copy holds", unresolved));
+    }
+
+    let mut records: Vec<([u8; HASH_LEN], u64, u64)> = hashes.into_iter().zip(ranges)
+        .map(|(hash, range)| (hash.expect("every record resolved"), range.start as u64, range.len() as u64))
+        .collect();
+    records.sort_by_key(|record| record.0);
+    Ok(records)
+}
+
+/// Decode the walked record at `ranges[at]`: `Ok(None)` while its delta base reads from neither
+/// the decoded part of this file (`in_file`) nor the store. A record that does not decode refuses
+/// the whole file.
+fn decode_in_file(data: &[u8],
+                  ranges: &[std::ops::Range<usize>],
+                  in_file: &HashMap<[u8; HASH_LEN], usize>,
+                  at: usize,
+                  depth: u32) -> Result<Option<Vec<u8>>, String> {
+    if depth > MAX_DELTA_CHAIN {
+        return Err("its data file is damaged: a delta chain in it is longer than any writer makes".to_string());
+    }
+    let undecodable = || "its data file is damaged: a record in it does not decode".to_string();
+    let Some((&kind, body)) = data[ranges[at].clone()].split_first() else {
+        return Err(undecodable());
+    };
+
+    match kind {
+        RECORD_FULL => object_utils::decode_object_bounded(body).map(Some).map_err(|_| undecodable()),
+        RECORD_DELTA if body.len() >= HASH_LEN => {
+            let (target_len, read) = byte_utils::number_from_vlq_bytes(HASH_LEN, body).map_err(|_| undecodable())?;
+            let base_hash: [u8; HASH_LEN] = body[..HASH_LEN].try_into().expect("the length was checked");
+            let base = match in_file.get(&base_hash) {
+                Some(&base_at) => decode_in_file(data, ranges, in_file, base_at, depth + 1)?,
+                None => match file_utils::read_object_classified(&sign_utils::to_hex(&base_hash))? {
+                    file_utils::StoreReadOutcome::Verified(base) => Some(base),
+                    _ => None,
+                },
+            };
+            let Some(base) = base else {
+                return Ok(None);
+            };
+            delta_utils::decompress_delta(&base, &body[HASH_LEN + read..], target_len as usize)
+                .map(Some)
+                .map_err(|_| undecodable())
+        }
+        _ => Err(undecodable()),
+    }
+}
+
+/// Publish a rebuilt index beside `data_path`: written and synced under a temp name, the index it
+/// replaces moved aside, then renamed in, unless an index appeared meanwhile.
+fn publish_rebuilt_index(folder: &Path, data_path: &Path, index_bytes: &[u8]) -> Result<Option<PathBuf>, String> {
+    let index_path = data_path.with_extension(FILE_EXTENSION_PACK_INDEX);
+    let temp = temp_path(folder, FILE_EXTENSION_PACK_INDEX);
+    write_and_sync(&temp, index_bytes).inspect_err(|_| { let _ = file_utils::remove_file(&temp); })?;
+
+    // Any mapping of the old index goes before it is moved.
+    invalidate_cache();
+    let set_aside = match std::fs::symlink_metadata(&index_path) {
+        Ok(_) => Some(set_index_aside(&index_path).inspect_err(|_| { let _ = file_utils::remove_file(&temp); })?),
+        Err(_) => None,
+    };
+    // Where the replaced index now lies, for an error that leaves it there.
+    let kept_at = |aside: &Option<PathBuf>| match aside {
+        Some(aside) => format!("; the index it replaces is kept at \"{}\"", aside.to_string_lossy()),
+        None => String::new(),
+    };
+    if std::fs::symlink_metadata(&index_path).is_ok() {
+        // The index that appeared is newer than the one set aside, so it stays.
+        let _ = file_utils::remove_file(&temp);
+        return Err(format!("an index for it appeared while it was rebuilt{}", kept_at(&set_aside)));
+    }
+
+    if let Err(e) = file_utils::rename(&temp, &index_path) {
+        let _ = file_utils::remove_file(&temp);
+        // Put the replaced index back, so the folder is no worse than before; a failure to do so
+        // is reported by where it still lies.
+        let restored = match &set_aside {
+            // An index that appeared meanwhile is newer than the one set aside, so it stays.
+            Some(aside) => std::fs::symlink_metadata(&index_path).is_err() && file_utils::rename(aside, &index_path).is_ok(),
+            None => true,
+        };
+        let kept = if restored { String::new() } else { kept_at(&set_aside) };
+        return Err(format!("its rebuilt index could not be put in place: {}{}", e, kept));
+    }
+    file_utils::sync_dir(folder)?;
+    invalidate_cache();
+    Ok(set_aside)
+}
+
+/// Move a replaced index aside to `<name>.damaged-<nanos>`, keeping it for inspection.
+fn set_index_aside(index_path: &Path) -> Result<PathBuf, String> {
+    let stamp = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_nanos()).unwrap_or_default();
+    let name = format!("{}.damaged-{}", index_path.file_name().unwrap_or_default().to_string_lossy(), stamp);
+    let target = index_path.with_file_name(name);
+    file_utils::rename(index_path, &target).map_err(|e| format!(
+        "the index it replaces could not be moved aside to \"{}\": {}", target.to_string_lossy(), e
+    ))?;
+    Ok(target)
+}
+
 /// The result of [`collect_targets`]: what to pack, what a repack supersedes, and the packs a
 /// `Source::CopyRecord` among `targets` borrows its bytes from.
 struct CollectedTargets {
@@ -6691,6 +6980,12 @@ pub(crate) mod tests {
         };
 
         (!right).then(|| format!("{:?}: {}", how, error))
+    }
+
+    /// Whether `forklift heal` rebuilds a pack index unreadable as `how` from its data file before
+    /// anything reads through it.
+    pub(crate) fn heal_rebuilds(how: Unreadable) -> bool {
+        matches!(how, Unreadable::CorruptBucket | Unreadable::Unparseable)
     }
 
     /// Run `case` once per [`Unreadable`] kind and fail with every arm's failure together, so a red
@@ -8652,7 +8947,7 @@ pub(crate) mod tests {
         assert!(is_in_packs(&hash_a).unwrap(), "the record is indexed under hash A");
         let result = retrieve_from_packs(&hash_a).unwrap();
         match &result {
-            PackRetrieval::Failed(e) => assert!(e.contains("corrupt"), "the error should name the corruption: {}", e),
+            PackRetrieval::Failed(e, _) => assert!(e.contains("corrupt"), "the error should name the corruption: {}", e),
             other => panic!("a record decompressing to the wrong bytes must fail the read, got {:?}", other),
         }
 
@@ -8848,7 +9143,7 @@ pub(crate) mod tests {
         assert_eq!(file_utils::retrieve_object_by_hash(&t_hash).unwrap(), t);
         let error = file_utils::retrieve_object_by_hash(&b_hash).unwrap_err();
         assert!(error.contains(&format!("Object {} is corrupt", b_hash)), "got: {}", error);
-        assert!(matches!(retrieve_from_packs(&b_hash).unwrap(), PackRetrieval::Failed(_)));
+        assert!(matches!(retrieve_from_packs(&b_hash).unwrap(), PackRetrieval::Failed(..)));
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
@@ -9043,7 +9338,7 @@ pub(crate) mod tests {
 
         invalidate_cache();
 
-        assert!(matches!(retrieve_from_packs(&hash).unwrap(), PackRetrieval::Failed(_)),
+        assert!(matches!(retrieve_from_packs(&hash).unwrap(), PackRetrieval::Failed(..)),
             "every locating pack failed to resolve — the outcome must be Failed");
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
@@ -9535,7 +9830,7 @@ pub(crate) mod tests {
         // X (an entirely unrelated pack) must still read, despite B's orphan.
         match crate::util::file_utils::read_object_classified(&x_hash).unwrap() {
             StoreReadOutcome::Verified(bytes) => assert_eq!(bytes, x_content),
-            StoreReadOutcome::Unverifiable(e) => panic!("expected X Verified, got Unverifiable: {}", e),
+            StoreReadOutcome::Unverifiable(e, _) => panic!("expected X Verified, got Unverifiable: {}", e),
             StoreReadOutcome::Absent => panic!("expected X Verified, got Absent"),
         }
 
@@ -9585,7 +9880,7 @@ pub(crate) mod tests {
         use crate::util::file_utils::StoreReadOutcome;
         match outcome {
             StoreReadOutcome::Verified(_) => "Verified".to_string(),
-            StoreReadOutcome::Unverifiable(message) => format!("Unverifiable({})", message),
+            StoreReadOutcome::Unverifiable(message, _) => format!("Unverifiable({})", message),
             StoreReadOutcome::Absent => "Absent".to_string(),
         }
     }
@@ -9646,7 +9941,7 @@ pub(crate) mod tests {
 
         for hex in [&bad_hex, &neighbour.2] {
             match file_utils::read_object_classified(hex).unwrap() {
-                StoreReadOutcome::Unverifiable(message) => assert!(
+                StoreReadOutcome::Unverifiable(message, _) => assert!(
                     message.contains(&index_name) && message.contains(&format!("bucket {}", bad_bucket)),
                     "the message must name the index and the bucket: {}", message
                 ),
@@ -9718,7 +10013,7 @@ pub(crate) mod tests {
         let (_, unknown_in_sound) = content_in_bucket(&index, sound_bucket, "unknown sound");
 
         for hex in [&objects[0].2, &unknown_in_bad, &sound.2] {
-            assert!(matches!(file_utils::read_object_classified(hex).unwrap(), StoreReadOutcome::Unverifiable(_)),
+            assert!(matches!(file_utils::read_object_classified(hex).unwrap(), StoreReadOutcome::Unverifiable(..)),
                 "{} must read Unverifiable: the quarantined index names it or cannot rule it out", hex);
         }
         assert!(matches!(file_utils::read_object_classified(&unknown_in_sound).unwrap(), StoreReadOutcome::Absent),
@@ -9755,7 +10050,7 @@ pub(crate) mod tests {
 
         let never_stored = blake3::hash(b"held only by the old pack, perhaps").to_hex().to_string();
         match file_utils::read_object_classified(&never_stored).unwrap() {
-            StoreReadOutcome::Unverifiable(message) => assert!(
+            StoreReadOutcome::Unverifiable(message, _) => assert!(
                 message.contains("format version 2, but this build reads only version 3"), "{}", message
             ),
             other => panic!("a read an old-version index might answer must fail by name, got {}", outcome_name(&other)),
@@ -10667,7 +10962,7 @@ pub(crate) mod tests {
         crate::util::file_utils::remove_file(&artifacts[0].data_path).unwrap();
 
         match crate::util::file_utils::read_object_classified(&y_hash).unwrap() {
-            StoreReadOutcome::Unverifiable(message) => assert!(
+            StoreReadOutcome::Unverifiable(message, _) => assert!(
                 message.contains(&index_name),
                 "expected the Unverifiable message to name \"{}\", got: {}", index_name, message
             ),
@@ -10690,7 +10985,7 @@ pub(crate) mod tests {
         let never_stored_hash = "9".repeat(64);
         match crate::util::file_utils::read_object_classified(&never_stored_hash).unwrap() {
             StoreReadOutcome::Absent => {}
-            StoreReadOutcome::Unverifiable(message) => panic!(
+            StoreReadOutcome::Unverifiable(message, _) => panic!(
                 "a hash the quarantined index does not name must classify Absent, not \
                 Unverifiable (QuarantinedPack::contains over-matched): {}", message
             ),
@@ -10743,7 +11038,7 @@ pub(crate) mod tests {
         // A sibling pack keeps serving.
         match crate::util::file_utils::read_object_classified(&x_hash).unwrap() {
             StoreReadOutcome::Verified(bytes) => assert_eq!(bytes, x_content),
-            StoreReadOutcome::Unverifiable(e) => panic!("expected X Verified, got Unverifiable: {}", e),
+            StoreReadOutcome::Unverifiable(e, _) => panic!("expected X Verified, got Unverifiable: {}", e),
             StoreReadOutcome::Absent => panic!("expected X Verified, got Absent"),
         }
 
@@ -10753,7 +11048,7 @@ pub(crate) mod tests {
         match crate::util::file_utils::read_object_classified(&never_stored).unwrap() {
             StoreReadOutcome::Absent => {}
             StoreReadOutcome::Verified(_) => panic!("a never-stored hash must never classify Verified"),
-            StoreReadOutcome::Unverifiable(e) => panic!(
+            StoreReadOutcome::Unverifiable(e, _) => panic!(
                 "a never-stored hash must classify Absent, not Unverifiable (an unenumerable index must not poison it): {}", e
             ),
         }
@@ -10884,7 +11179,7 @@ pub(crate) mod tests {
 
         invalidate_cache();
         match file_utils::read_object_classified(&hash).unwrap() {
-            StoreReadOutcome::Unverifiable(_) => {}
+            StoreReadOutcome::Unverifiable(..) => {}
             StoreReadOutcome::Verified(_) => panic!("an unopenable pack must not read Verified"),
             StoreReadOutcome::Absent => panic!("a quarantine-named hash must read Unverifiable, not Absent"),
         }
@@ -10963,7 +11258,7 @@ pub(crate) mod tests {
         set_mtime(&artifact.index_path, stamped_mtime + Duration::from_secs(5));
 
         match file_utils::read_object_classified(&y_hash).unwrap() {
-            StoreReadOutcome::Unverifiable(_) => {}
+            StoreReadOutcome::Unverifiable(..) => {}
             StoreReadOutcome::Absent => panic!("a repaired index naming Y must turn its read Unverifiable, not leave it Absent"),
             StoreReadOutcome::Verified(_) => panic!("Y's data is missing; it must not read Verified"),
         }
@@ -11131,7 +11426,7 @@ pub(crate) mod tests {
         let outcome = file_utils::read_object_classified(&y_hash).unwrap();
         std::fs::set_permissions(&artifact.data_path, readable).unwrap();
         match outcome {
-            StoreReadOutcome::Unverifiable(_) => {}
+            StoreReadOutcome::Unverifiable(..) => {}
             StoreReadOutcome::Absent => panic!("once the index opens, Y is quarantine-named and must read Unverifiable, not Absent"),
             StoreReadOutcome::Verified(_) => panic!("Y's data cannot be opened; it must not read Verified"),
         }
@@ -11988,5 +12283,254 @@ pub(crate) mod tests {
         }
         // Most mutations must be refused; one accepted in every case would mean the check is blind.
         assert!(accepted < 400, "every mutation was accepted");
+    }
+    // ---- FORK-449: a damaged pack's reads refuse with a code; heal rebuilds its index ----
+
+    /// Write a pack of `records` (hex hash, framed record) under the name its layout derives, as a
+    /// writer would. Returns its data and index paths.
+    fn write_named_pack(records: &[(String, Vec<u8>)]) -> (PathBuf, PathBuf) {
+        let mut data = PACK_DATA_MAGIC.to_vec();
+        data.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
+        let mut index_records = Vec::new();
+        for (hash, record) in records {
+            index_records.push((hash_to_bytes(hash).unwrap(), data.len() as u64, record.len() as u64));
+            data.extend_from_slice(record);
+        }
+        index_records.sort_by_key(|record| record.0);
+        let stem = compute_pack_id(&index_records);
+        let folder = pack_folder();
+        std::fs::create_dir_all(&folder).unwrap();
+        let (data_path, index_path) = (folder.join(format!("{}.pack", stem)), folder.join(format!("{}.idx", stem)));
+        std::fs::write(&data_path, &data).unwrap();
+        std::fs::write(&index_path, build_index_bytes(&index_records)).unwrap();
+        invalidate_cache();
+        (data_path, index_path)
+    }
+
+    /// One blob's bytes and hash, for a pack fixture.
+    fn blob449(content: &str) -> (Vec<u8>, String) {
+        let bytes = object_utils::blob_bytes(content.as_bytes());
+        let hash = object_utils::hash_object_bytes(&bytes);
+        (bytes, hash)
+    }
+
+    /// The refusal code an ordinary uncached read of `hash` fails with, if it is framed.
+    fn read_code(hash: &str) -> (Option<String>, String) {
+        let error = file_utils::retrieve_object_by_hash_uncached(hash).expect_err("the read must fail");
+        (crate::error::deframe(&error).map(|(code, _, _)| code.to_string()), error)
+    }
+
+    /// Every file in the pack folder whose name starts with `prefix`.
+    fn set_aside_copies(prefix: &str) -> Vec<PathBuf> {
+        std::fs::read_dir(pack_folder()).unwrap().flatten().map(|entry| entry.path())
+            .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with(prefix)).collect()
+    }
+
+    /// A read heal can act on refuses `object_unreadable` naming `forklift heal`: a hash a
+    /// quarantined pair names, one in a corrupt bucket, and an absent hash, whose message also
+    /// names an unparseable index and a data file with no index that might hold it. Mutation:
+    /// classify either Unverifiable shape as `Other`, or leave the absent arm unframed → red.
+    #[test]
+    fn a_read_heal_can_act_on_refuses_object_unreadable() {
+        let (temp, _scope) = salvage_root("fork449-read-codes");
+
+        let (quarantined, q_hash) = blob449("named by a quarantined pair");
+        let (data, _) = write_named_pack(&[(q_hash.clone(), full_record(&quarantined))]);
+        file_utils::remove_file(&data).unwrap();
+        invalidate_cache();
+        let (code, error) = read_code(&q_hash);
+        assert_eq!(code.as_deref(), Some("object_unreadable"), "{}", error);
+        assert!(crate::error::deframe(&error).is_some_and(|(_, _, step)| step == "forklift heal"), "{}", error);
+
+        let (bucketed, b_hash) = blob449("in a corrupt bucket");
+        let (_, index) = write_named_pack(&[(b_hash.clone(), full_record(&bucketed))]);
+        corrupt_salvage_bucket(&index, &b_hash);
+        let (code, error) = read_code(&b_hash);
+        assert_eq!(code.as_deref(), Some("object_unreadable"), "{}", error);
+        // A corrupt bucket rules out no hash it covers, so the rest runs without it.
+        crate::util::file_utils::remove_dir_all(pack_folder()).unwrap();
+        invalidate_cache();
+
+        let never = "7".repeat(64);
+        let (code, error) = read_code(&never);
+        assert_eq!(code.as_deref(), Some("object_unreadable"), "{}", error);
+        assert!(!error.contains("cannot use"), "nothing unindexed is named while the folder holds none: {}", error);
+
+        let (unparsed, u_hash) = blob449("behind an unparseable index");
+        let (_, index) = write_named_pack(&[(u_hash.clone(), full_record(&unparsed))]);
+        std::fs::write(&index, b"not an index").unwrap();
+        let (orphaned, o_hash) = blob449("in a data file with no index");
+        let (orphan, orphan_index) = write_named_pack(&[(o_hash.clone(), full_record(&orphaned))]);
+        file_utils::remove_file(&orphan_index).unwrap();
+        invalidate_cache();
+        let (code, error) = read_code(&u_hash);
+        assert_eq!(code.as_deref(), Some("object_unreadable"), "{}", error);
+        let name = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(error.contains(&name(&index)) && error.contains(&name(&orphan)), "{}", error);
+        assert!(matches!(file_utils::read_object_classified(&u_hash).unwrap(), file_utils::StoreReadOutcome::Absent),
+            "the verdict stays Absent (I4)");
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    /// What heal cannot act on keeps its own wording, with no `object_unreadable` code: an index of
+    /// another pack format, and a present loose object whose bytes are not its own. Mutation: frame
+    /// the foreign case (or every Unverifiable) → red.
+    #[test]
+    fn a_read_heal_cannot_act_on_keeps_its_own_wording() {
+        let (temp, _scope) = salvage_root("fork449-read-untyped");
+
+        let (foreign, f_hash) = blob449("behind a foreign index");
+        let (_, index) = write_named_pack(&[(f_hash.clone(), full_record(&foreign))]);
+        let mut bytes = std::fs::read(&index).unwrap();
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        std::fs::write(&index, bytes).unwrap();
+        invalidate_cache();
+        let (code, error) = read_code(&f_hash);
+        assert_ne!(code.as_deref(), Some("object_unreadable"), "{}", error);
+        assert!(error.contains("version"), "{}", error);
+        crate::util::file_utils::remove_dir_all(pack_folder()).unwrap();
+        invalidate_cache();
+
+        let (_, l_hash) = blob449("a loose object");
+        let (folder, file) = file_utils::get_path_for_object(&l_hash).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(Path::new(&folder).join(file), zstd::encode_all(&b"other bytes"[..], 0).unwrap()).unwrap();
+        let (code, error) = read_code(&l_hash);
+        assert_ne!(code.as_deref(), Some("object_unreadable"), "{}", error);
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    /// Heal's rebuild re-derives a deleted, an unparseable and a damaged index from the data file,
+    /// keeping a replaced index aside, after which every object reads verified. Mutation: skip
+    /// the damaged candidates, or delete instead of setting aside → red.
+    #[test]
+    fn the_rebuild_restores_a_deleted_an_unparseable_and_a_damaged_index() {
+        let (temp, _scope) = salvage_root("fork449-rebuild");
+
+        let objects: Vec<(Vec<u8>, String)> = ["deleted", "unparseable", "damaged"].iter()
+            .map(|tag| blob449(&format!("rebuild {}", tag))).collect();
+        let indexes: Vec<PathBuf> = objects.iter()
+            .map(|(bytes, hash)| write_named_pack(&[(hash.clone(), full_record(bytes))]).1).collect();
+        file_utils::remove_file(&indexes[0]).unwrap();
+        std::fs::write(&indexes[1], b"garbage").unwrap();
+        corrupt_salvage_bucket(&indexes[2], &objects[2].1);
+        invalidate_cache();
+        for (_, hash) in &objects {
+            assert_ne!(salvage_read(hash), "Verified", "{}", hash);
+        }
+
+        let report = rebuild_pack_indexes().unwrap();
+
+        assert!(report.failed.is_empty() && report.skipped.is_none(), "{:?}", report);
+        let mut rebuilt: Vec<&PathBuf> = report.rebuilt.iter().map(|(index, _)| index).collect();
+        rebuilt.sort();
+        let mut expected: Vec<&PathBuf> = indexes.iter().collect();
+        expected.sort();
+        assert_eq!(rebuilt, expected);
+        for (index, set_aside) in &report.rebuilt {
+            assert_eq!(set_aside.is_some(), index != &indexes[0], "{:?}", report);
+            if let Some(old) = set_aside {
+                assert!(old.is_file(), "the replaced index is kept: {}", old.display());
+            }
+        }
+        for (_, hash) in &objects {
+            assert_eq!(salvage_read(hash), "Verified", "{}", hash);
+        }
+        assert!(rebuild_pack_indexes().unwrap().rebuilt.is_empty(), "a second run has nothing to do");
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    /// A delta whose base sits in another pack with a lost index rebuilds once that pack has: the
+    /// candidates are taken in rounds. The packs are chosen so the delta's pack is taken first.
+    /// Mutation: one round only → the delta's pack is left unrebuilt → red.
+    #[test]
+    fn a_delta_whose_base_is_in_another_rebuilt_pack_rebuilds_in_a_later_round() {
+        let (temp, _scope) = salvage_root("fork449-rounds");
+
+        let (base, base_hash) = blob449(&format!("a base long enough to delta against {}", "x".repeat(400)));
+        let (target, target_hash) = blob449(&format!("a base long enough to delta against {} and more", "x".repeat(400)));
+        let (base_index, delta_index) = (0..).find_map(|i| {
+            let (filler, filler_hash) = blob449(&format!("filler {}", i));
+            let (base_data, base_index) = write_named_pack(&[(base_hash.clone(), full_record(&base))]);
+            let (delta_data, delta_index) = write_named_pack(&[
+                (target_hash.clone(), delta_record(&base_hash, &base, &target)),
+                (filler_hash, full_record(&filler)),
+            ]);
+            if delta_data < base_data {
+                return Some((base_index, delta_index));
+            }
+            file_utils::remove_file(&delta_data).unwrap();
+            file_utils::remove_file(&delta_index).unwrap();
+            None
+        }).unwrap();
+        file_utils::remove_file(&base_index).unwrap();
+        file_utils::remove_file(&delta_index).unwrap();
+        invalidate_cache();
+
+        let report = rebuild_pack_indexes().unwrap();
+
+        assert!(report.failed.is_empty(), "{:?}", report);
+        assert_eq!(report.rebuilt.len(), 2, "{:?}", report);
+        assert_eq!(salvage_read(&target_hash), "Verified");
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    /// A data file whose records do not re-derive its name is not given an index, and the rebuild
+    /// says why; so is one whose records do not walk end to end. Mutation: drop the name check →
+    /// an index is published for the renamed file → red.
+    #[test]
+    fn the_rebuild_refuses_a_data_file_that_does_not_re_derive_its_name() {
+        let (temp, _scope) = salvage_root("fork449-rebuild-refuses");
+
+        let (bytes, hash) = blob449("in a renamed data file");
+        let (data, index) = write_named_pack(&[(hash.clone(), full_record(&bytes))]);
+        file_utils::remove_file(&index).unwrap();
+        let renamed = pack_folder().join(format!("{}.pack", "a".repeat(64)));
+        file_utils::rename(&data, &renamed).unwrap();
+        let (gap_bytes, gap_hash) = blob449("in a data file with a gap");
+        let (gapped, gapped_index) = write_named_pack(&[(gap_hash, full_record(&gap_bytes))]);
+        file_utils::remove_file(&gapped_index).unwrap();
+        let mut body = std::fs::read(&gapped).unwrap();
+        body[PACK_DATA_HEADER_LEN as usize] = 0xEE;
+        std::fs::write(&gapped, body).unwrap();
+        invalidate_cache();
+
+        let report = rebuild_pack_indexes().unwrap();
+
+        assert!(report.rebuilt.is_empty(), "{:?}", report);
+        let reason = |path: &Path| report.failed.iter().find(|(failed, _)| failed == path).map(|(_, reason)| reason.clone());
+        assert!(reason(&renamed).is_some_and(|reason| reason.contains("re-derive its name")), "{:?}", report);
+        assert!(reason(&gapped).is_some_and(|reason| reason.contains("do not parse end to end")), "{:?}", report);
+        assert!(!renamed.with_extension("idx").exists());
+        assert!(set_aside_copies(&format!("{}.idx", "a".repeat(64))).is_empty());
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    /// While another process holds the object-store lock the rebuild does not run and says why.
+    /// Mutation: rebuild without the lock → the index is published → red.
+    #[test]
+    fn the_rebuild_is_skipped_while_the_store_lock_is_held() {
+        let (temp, _scope) = salvage_root("fork449-rebuild-busy");
+
+        let (bytes, hash) = blob449("rebuilt once the lock is free");
+        let (_, index) = write_named_pack(&[(hash.clone(), full_record(&bytes))]);
+        file_utils::remove_file(&index).unwrap();
+        invalidate_cache();
+
+        let held = lock_utils::StoreLock::acquire().unwrap();
+        let report = rebuild_pack_indexes().unwrap();
+        assert!(report.skipped.is_some() && report.rebuilt.is_empty(), "{:?}", report);
+        assert!(!index.exists());
+        drop(held);
+
+        assert_eq!(rebuild_pack_indexes().unwrap().rebuilt.len(), 1);
+        assert_eq!(salvage_read(&hash), "Verified");
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 }

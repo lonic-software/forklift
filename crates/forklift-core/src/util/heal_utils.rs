@@ -217,7 +217,7 @@ pub(crate) fn restage_object(root: &Path, relative_path: &Path) -> Result<Restag
                 Some(hash) => match file_utils::read_object_classified(&hash) {
                     Ok(file_utils::StoreReadOutcome::Verified(_)) => Ok(RestageOutcome::RecoveredPacked),
                     Ok(file_utils::StoreReadOutcome::Absent)
-                    | Ok(file_utils::StoreReadOutcome::Unverifiable(_)) => Ok(RestageOutcome::Vanished),
+                    | Ok(file_utils::StoreReadOutcome::Unverifiable(..)) => Ok(RestageOutcome::Vanished),
                     Err(e) => Ok(RestageOutcome::Unreadable(format!(
                         "Error while checking whether \"{}\" survives in a pack: {}",
                         final_path.to_string_lossy(), e
@@ -1256,7 +1256,7 @@ mod tests {
         builder.append_delta(&h_hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
         builder.finish().unwrap();
         assert!(pack_utils::is_in_packs(&h_hash).unwrap(), "sanity: H is a pack membership hit");
-        assert!(matches!(pack_utils::retrieve_from_packs(&h_hash).unwrap(), pack_utils::PackRetrieval::Failed(_)),
+        assert!(matches!(pack_utils::retrieve_from_packs(&h_hash).unwrap(), pack_utils::PackRetrieval::Failed(..)),
             "sanity: H's record cannot actually be reconstructed");
 
         let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);

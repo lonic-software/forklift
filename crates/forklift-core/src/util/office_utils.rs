@@ -970,7 +970,7 @@ fn load_object_classified<T>(
             kind: OfficeReadErrorKind::AbsentObject,
             message: format!("object {} is not present", hash),
         }),
-        Ok(file_utils::StoreReadOutcome::Unverifiable(reason)) => Err(OfficeReadError::other(reason)),
+        Ok(file_utils::StoreReadOutcome::Unverifiable(reason, _)) => Err(OfficeReadError::other(reason)),
         Err(e) => Err(OfficeReadError::other(e)),
     }
 }

@@ -12,6 +12,17 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **A damaged pack file is refused with a code, `heal` rebuilds a lost or damaged index, and `heal`
+  says when objects are lost.** A read that met a lost, cut-short or corrupt pack index, a missing
+  pack data file or a damaged index entry failed with an uncoded message, or reported the object as
+  simply missing. Now it is refused with exit 57 (`object_unreadable`), naming `forklift heal`.
+  `heal` rebuilds a lost or damaged index from its pack's data file, keeping a replaced index beside
+  it, and the refused command then works. When objects that history still reaches cannot be read
+  after every repair, `heal` refuses with exit 58 (`objects_lost`), counting them, listing up to 20
+  hashes and naming the pallets that reach them, instead of reporting success. Remotes answer
+  `object_unreadable` as a 503 naming their operator's `forklift heal`, which clients do not retry.
+  The `--json` schema is now 46.
+
 - **A served warehouse's lost or damaged record of withheld content is refused, and its operator can
   repair it.** The record of legal takedowns on a server, `.forklift/withheld`, says which content it
   must never serve. A record that did not read made every handshake fail with an uncoded HTTP 500

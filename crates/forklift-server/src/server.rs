@@ -1804,11 +1804,12 @@ fn server_fault(message: String) -> HandlerError {
     (StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
-/// The refusal codes of a host record that is lost or damaged, which only the server's operator
-/// repairs.
+/// The refusal codes of a host record that is lost or damaged, or of an object its store cannot
+/// read (a damaged pack file), which only the server's operator repairs.
 const DAMAGE_CODES: &[forklift_core::error::RefusalCode] = &[
     forklift_core::error::RefusalCode::TombstonesDamaged,
     forklift_core::error::RefusalCode::WithheldDamaged,
+    forklift_core::error::RefusalCode::ObjectUnreadable,
 ];
 
 /// Whether `message` is a refusal of one of the [`DAMAGE_CODES`].
@@ -1822,7 +1823,18 @@ fn operator_remedy(code: forklift_core::error::RefusalCode) -> &'static str {
     match code {
         forklift_core::error::RefusalCode::TombstonesDamaged => "forklift-server tombstone repair --root <warehouse>",
         forklift_core::error::RefusalCode::WithheldDamaged => "forklift-server withhold repair --root <warehouse>",
+        forklift_core::error::RefusalCode::ObjectUnreadable => "forklift heal",
         _ => unreachable!("not a damage code"),
+    }
+}
+
+/// What a client is told of the damage. An unreadable object's own message names the store's
+/// pack files, which are not named over the wire, so it is replaced; a host record's is kept.
+fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> String {
+    match code {
+        forklift_core::error::RefusalCode::ObjectUnreadable =>
+            "An object this request needs cannot be read from the warehouse's store: it is missing there, or a pack file holding it is damaged.".to_string(),
+        _ => human,
     }
 }
 
@@ -1833,14 +1845,14 @@ fn operator_remedy(code: forklift_core::error::RefusalCode) -> &'static str {
 /// ([`server_fault`]). The damage itself is logged, with the local next step.
 fn damage_refusal(message: String) -> HandlerError {
     // A caller may have wrapped the damage in its own words; the frame inside still names it.
-    let frames = std::iter::once(0).chain(message.match_indices(forklift_core::error::REFUSAL_PREFIX).map(|(at, _)| at).filter(|at| *at > 0));
-    let damage = frames.filter_map(|at| forklift_core::error::deframe(&message[at..])).find_map(|(code, human, _)| {
+    let damage = forklift_core::error::frames_in(&message).find_map(|(code, human, _)| {
         DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, human.to_string()))
     });
 
     match damage {
         Some((code, human)) => {
-            tracing::error!(%message, "a host record is damaged");
+            tracing::error!(%message, "a host record or the store is damaged");
+            let human = damage_message(code, human);
             (StatusCode::SERVICE_UNAVAILABLE, forklift_core::error::CoreError::refusal(code, human, operator_remedy(code)).into())
         }
         None => server_fault(message),
@@ -5220,6 +5232,27 @@ fn bundle_open_test_checkpoint(_root: &std::path::Path) {}
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// FORK-449: an object the store cannot read is a `503` `object_unreadable` naming the
+    /// operator's `forklift heal`, wherever its frame sits in the message, and the store's own
+    /// pack paths are not passed on. Mutation: drop the code from `DAMAGE_CODES` → a `500` → red;
+    /// pass the human message on → the pack path reaches the client → red.
+    #[test]
+    fn an_unreadable_object_is_a_503_naming_the_operators_heal() {
+        let framed: String = forklift_core::error::CoreError::refusal(
+            forklift_core::error::RefusalCode::ObjectUnreadable,
+            "Object abc cannot be read: pack index \"/srv/wh/.forklift/objects/pack/x.idx\" is corrupt.",
+            "forklift heal",
+        ).into();
+
+        for message in [framed.clone(), format!("Error while reading the tree: {}", framed)] {
+            let (status, body) = internal(message);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            let (code, human, next_step) = forklift_core::error::deframe(&body).expect("a framed refusal");
+            assert_eq!((code, next_step), ("object_unreadable", "forklift heal"));
+            assert!(!human.contains("/srv/wh"), "{}", human);
+        }
+    }
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use axum::routing::post;
     use forklift_core::globals::{StorageRootScope, FOLDER_NAME_FORKLIFT_ROOT};

@@ -47,12 +47,11 @@ pub(crate) struct StoreReport {
     /// durability taint, and restoring the data file or cloning afresh recovers the rest. Empty on a healthy store.
     quarantined_packs: Vec<PackIndexIssue>,
     /// Packs that load but whose index is damaged in places: their sound parts are still read,
-    /// and an object in a damaged part reads as unverifiable. `forklift store compact --all` salvages
-    /// what the pack's data file still holds, and removes the pack when every live object it may
-    /// hold reads from another copy. Empty on a healthy store.
+    /// and a read of an object in a damaged part refuses as `object_unreadable`. `forklift heal`
+    /// rebuilds the index from the pack's data file. Empty on a healthy store.
     damaged_packs: Vec<PackIndexIssue>,
-    /// Pack index files that could not even be parsed — move the file aside and
-    /// re-run. Empty on a healthy store.
+    /// Pack index files that could not even be parsed: `forklift heal` rebuilds each from its
+    /// pack's data file. Empty on a healthy store.
     unenumerable_indexes: Vec<PackIndexIssue>,
     /// Pack indexes written by a build with another pack format version: every read one might
     /// answer fails naming the version. Re-create the warehouse with this build; moving one aside
@@ -267,14 +266,11 @@ impl CommandOutput for StoreReport {
                 println!("    other format:  \"{}\" — {}", issue.index_path, issue.error);
             }
             println!(
-                "    a quarantined pack needs its data file restored or a fresh clone (\"forklift heal\" \
-                refetches only objects under a durability taint); a damaged pack's \
-                sound parts are still read, and \"forklift store compact --all\" salvages it, recovering \
-                what its data file still holds (if it keeps the pack, or refuses because the pack \
-                could not be completely salvaged, the objects it reports cannot be recovered from \
-                this store); an unenumerable index should be moved aside, then re-run; \
-                an index of another format means re-creating the warehouse with this build (moving \
-                it aside would make its objects read as missing)."
+                "    \"forklift heal\" rebuilds a damaged or unenumerable index from its pack's data \
+                file; a quarantined pack needs its data file restored or a fresh clone (\"forklift heal\" \
+                refetches only objects under a durability taint); an index of another format means \
+                re-creating the warehouse with this build (moving it aside would make its objects \
+                read as missing)."
             );
         }
 

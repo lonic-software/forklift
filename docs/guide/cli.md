@@ -2616,11 +2616,11 @@ failing the census: the objects it named are not lost, only unreachable through 
 `heal` can refetch from a configured remote any of them still under a durability taint (for the
 rest, restore the pack's data file or clone afresh). `store` checks every index in full: a pack whose
 index is damaged in places is listed under `damaged_packs` (same shape) and left out of the counts.
-Ordinary reads keep using its sound parts; an object in a damaged part reads as unverifiable.
-`forklift store compact --all` salvages it (see [`store compact`](#store-compact--pack-the-object-store)). `unenumerable_indexes` — the same `[{index_path,
-error}]` shape — lists any `.idx` file that could not even be parsed (its own magic/version/shape
-is wrong); its hash set is unknown, so nothing can be recovered through it automatically — move it
-aside and re-run. `foreign_version_indexes` (same shape) lists an index written by a build with a
+Ordinary reads keep using its sound parts; a read of an object in a damaged part refuses as
+`object_unreadable` (exit 57), and `forklift heal` rebuilds the index from the pack's data file.
+`unenumerable_indexes` — the same `[{index_path, error}]` shape — lists any `.idx` file that could
+not even be parsed (its own magic/version/shape is wrong); `heal` rebuilds it the same way.
+`foreign_version_indexes` (same shape) lists an index written by a build with a
 different pack format, naming its version. Every read it might answer fails with that error rather
 than reporting the object missing, so re-create the warehouse with this build — do not move the
 file aside, which would make its objects read as missing. In the human view all four appear as a `pack problems:` section, only when non-empty.
@@ -2714,23 +2714,42 @@ so the loss stays reported until the object is restored:
   index that does not parse). What that object references is unknown, so `heal` clears no vanished
   object on that run: every one it could not confirm is safe to drop keeps its taint, not only those
   beneath the object (paths it restaged or read back verified still clear). The note names the
-  objects and the index. `heal` does not refetch these objects itself, so fix the index by hand:
-  restore its pack files from a good copy (a missing data file or a damaged index); move an index
-  that does not parse out of the pack folder if it holds nothing this warehouse needs; or, for an
-  index of another format version, re-create the warehouse — never move that one aside, which would
-  make its objects read as missing. Then re-run `heal`. A torn record is likewise left standing.
+  objects and the index. A lost or damaged index whose data file is sound never gets this far:
+  `heal` rebuilds it first (see below). What is left is a missing or damaged data file, which
+  `heal` cannot rebuild, so restore the pack files from a good copy; or, for an index of another
+  format version, re-create the warehouse — never move that one aside, which would make its objects
+  read as missing. Then re-run `heal`. A torn record is likewise left standing.
+
+Last, once every repair has run, `heal` walks what pallets, parked changes, bays and trust pins
+still reach and checks the store gives each object back. When one is absent, or sits in a pack
+file the run could not repair, `heal` refuses with `objects_lost` (exit 58), after printing its
+report: it counts the objects, lists up to 20 hashes with the reason for each, and names the
+pallets whose history reaches them. Every repair before it still landed. The next step is to
+restore the warehouse from a backup or clone it afresh, to re-create it when the pack folder holds
+another build's index, or to run `heal` again when the store lock was busy. A walk that cannot
+finish (an unreadable staged shard, say) exits non-zero saying it could not finish its
+reachability check, and claims nothing lost.
 
 `heal` and the read-only `audit` are the only two commands that run while a taint is standing —
 every other command refuses first, precisely so nothing durable is ever recorded on top of
 unproven state.
 
-Every `heal` run also checks the pack folder for the same problem indexes `store` reports (see
+Every `heal` run first rebuilds each lost, unparseable or damaged pack index whose data file is
+sound, from that data file: it checks the file's records parse end to end, decodes each object
+(a delta's base from the same file first, then the store), and publishes the index only when it
+re-derives the pack's name. A replaced index is kept beside it as `<name>.idx.damaged-<time>`.
+Packs whose delta bases sit in another rebuilt pack are rebuilt in a later round of the same run.
+The rebuild takes the store lock; when another process holds it, `heal` skips the rebuild, says
+so, and asks to be re-run once that process finishes.
+
+It then checks the pack folder for the same problem indexes `store` reports (see
 above) and prints a warning line for each one it finds — unconditionally, whether or not anything
 else was tainted this run, and whether or not that index is what caused the taint. A quarantined
 index's objects are left recoverable (`heal` refetches those under a durability taint, and
-restoring the pack's data file recovers the rest); a damaged pack still serves its
-sound parts, and once no taint is standing `forklift store compact --all` salvages it; an index of another format means re-creating the warehouse; an unenumerable one names
-the file to move aside. This appears even when `heal` still has to refuse — as a
+restoring the pack's data file recovers the rest); a damaged or unenumerable index that is still
+listed is one the rebuild could not restore, and its line says why; a pack data file with no index
+is named too, since no read reaches what it holds; an index of another format means re-creating
+the warehouse. This appears even when `heal` still has to refuse — as a
 clearly-separated "Pack index problems in this store (clear each as its line says)" section. An
 index the refusal itself names (see the bullet above) is part of its cause; the time one coincides
 with a refusal is exactly when an operator most needs to be told about it.

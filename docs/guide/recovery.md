@@ -214,20 +214,37 @@ forklift load <path>
 Quote a path your shell would split, and write one starting with `-` as `./<path>`, so it is not
 read as an option.
 
-### Pack problems
+### `object_unreadable` (exit 57)
 
-Commands failing with "whose data file could not be loaded", "is corrupt", "which could not be parsed"
-or "which this build cannot read" point here. Run
-`forklift store status`, whose `pack problems:` section names each file:
+An object the command needs cannot be read from the store. Either a pack file holding it is
+damaged (an index is lost, cut short or corrupt, a pack's data file is missing, or one index entry is
+damaged), or the object is missing altogether. Nothing was changed. Run:
 
-| Listed as | What to do |
-|---|---|
-| `quarantined` | The pack's data file is missing. Restore it from a backup, or clone afresh from a remote. `heal` and `lower` do not bring it back: `heal` only refetches objects under a durability taint, and `lower` sees nothing new to fetch. |
-| `damaged` | Run `forklift store compact --all`, which salvages the pack. If it keeps the pack or refuses, the objects it reports cannot be recovered from this store. |
-| `unenumerable` | Move the `.idx` file it names out of the pack folder, then run the command again. If a command then reports objects missing, put it back and clone afresh. |
-| another format | The warehouse was written by a build with another pack format. Re-create it with this build. **Do not** move the file aside, which makes its objects read as missing. |
+```sh
+forklift heal
+```
 
-Keep a copy of anything before you move it.
+`heal` rebuilds a lost or damaged index from the pack's data file, keeping a replaced index beside it
+as `<name>.idx.damaged-<time>`, and the command then works. If the data file itself is damaged or
+gone, or the object is missing altogether, nothing in this store can bring it back; when history
+still reaches it, `heal` refuses with `objects_lost`.
+`forklift store status` lists each damaged pack file under `pack problems:`.
+
+### `objects_lost` (exit 58)
+
+`heal` ran every repair it could, and objects that history still reaches cannot be read from this
+store. The message counts them, lists up to 20 hashes with the reason for each, and names the pallets
+whose history reaches them. `--json` carries the same in `details.objects_lost`. Do what the next
+step names:
+
+- **Restore the warehouse from a backup, or clone it afresh** from a remote that holds these objects.
+  The store cannot give them back.
+- **Re-create the warehouse with this build** when the pack folder holds an index another build of
+  Forklift wrote. **Do not** move that index aside, which makes its objects read as missing.
+- **Run `forklift heal` again** when the message says another process held the store, so the
+  indexes were not rebuilt this run.
+
+Every other repair in the run still landed: a lost ref rebuilt before the refusal stays rebuilt.
 
 ### A journal that cannot be read
 

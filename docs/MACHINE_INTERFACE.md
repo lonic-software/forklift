@@ -85,7 +85,21 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 45** (current): a new refusal code, `withheld_damaged` (exit 56): a served warehouse's
+**Schema 46** (current): two new refusal codes. `object_unreadable` (exit 57): an object the command
+needs cannot be read from the store: it is missing there, or a pack file holding it is damaged (a
+lost, cut-short or corrupt index, a missing data file, a damaged index entry). Nothing was changed,
+and `next_step` is `forklift heal`, which rebuilds a lost or damaged index from its pack's data
+file. A remote sends it as a 503 naming its operator's `forklift heal`, which the client does not
+retry; the AWS head answers a frame-free 500 instead. `objects_lost` (exit 58), from `heal` only:
+after every repair the run could make, objects that history still reaches cannot be read from this
+store. `details` is the whole heal report, with `objects_lost` carrying the `absent` and
+`unreadable` counts, up to 20 `hashes` (each a `hash` and a `reason`), and the `pallets` whose
+history reaches them. `next_step` is to restore from a backup or clone afresh, to re-create the
+warehouse when another build's index is in the pack folder, or `forklift heal` when another process
+held the store and the indexes were not rebuilt. A heal whose reachability walk cannot finish exits
+non-zero without claiming anything lost.
+
+**Schema 45**: a new refusal code, `withheld_damaged` (exit 56): a served warehouse's
 record of withheld content is lost or damaged, so what its head withholds cannot be told. Nothing
 was served or changed. `next_step` is the operator's
 `forklift-server withhold repair --root <warehouse>`. Locally the warehouse is named in full. When
