@@ -437,13 +437,19 @@ fn judge(matches: Vec<String>, tainted: &Tainted) -> Salvage {
         }
     }
 
-    match (parcels.as_slice(), unknown.as_slice()) {
-        ([_, _, ..], _) => Salvage::Ambiguous(parcels.clone(), !unknown.is_empty()),
-        (_, [hash, ..]) => Salvage::Unknown(format!(
+    if parcels.len() > 1 {
+        return Salvage::Ambiguous(parcels, !unknown.is_empty());
+    }
+
+    if let Some(hash) = unknown.first() {
+        return Salvage::Unknown(format!(
             "what its bytes name may be object {}, which is possibly lost or cannot be read", hash
-        )),
-        ([hash], []) => Salvage::Found(hash.clone()),
-        ([], []) => Salvage::Nothing,
+        ));
+    }
+
+    match parcels.pop() {
+        Some(hash) => Salvage::Found(hash),
+        None => Salvage::Nothing,
     }
 }
 
@@ -717,14 +723,32 @@ fn refuse_below_a_floor(damaged: &DamagedRef, head: &str, notes: &mut Vec<String
     }
 
     if !evidence.salvage_ambiguous.is_empty() {
-        let answers: Vec<Result<bool, String>> = evidence.salvage_ambiguous.iter().map(|parcel| at_or_below(parcel, head)).collect();
+        let mut below_one = None;
+        let mut unanswered = false;
 
-        if answers.iter().any(|answer| answer.is_err()) {
-            partial = true;
+        for parcel in &evidence.salvage_ambiguous {
+            match at_or_below(parcel, head) {
+                Ok(true) => {
+                    below_one = Some(parcel);
+                    break;
+                }
+                Ok(false) => {}
+                Err(_) => unanswered = true,
+            }
+        }
+
+        partial |= unanswered;
+
+        // Which match the bytes name cannot be told, so the one satisfied is said.
+        if let Some(parcel) = below_one {
+            push_note(notes, format!(
+                "This warehouse is served, and the ref of pallet \"{}\" may have named any of {}: {} was checked only against {}.",
+                damaged.pallet, evidence.salvage_ambiguous.join(", "), head, parcel
+            ));
         }
 
         // A lost match may be the one the bytes name, so only a "no" from every match refuses.
-        if !evidence.salvage_dropped && answers.iter().all(|answer| answer == &Ok(false)) {
+        if below_one.is_none() && !unanswered && !evidence.salvage_dropped {
             return Err(below(format!(
                 "any of the parcels the ref's own bytes may name ({})", evidence.salvage_ambiguous.join(", ")
             )));

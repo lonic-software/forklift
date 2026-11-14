@@ -61,8 +61,9 @@ pub async fn handle_command(store_access: &StoreAccessLock, set_ref: &[String], 
 
     // What the user chose goes after the record, which it reads, and before the passes, so they
     // judge only what is left. A refusal says what this run already changed: its own "Nothing was
-    // changed" speaks only for the write it refused.
-    let changed = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed]| {
+    // changed" speaks only for the write it refused. Its notes go along: a check they say was
+    // skipped would otherwise go unreported.
+    let changed = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String]| {
         let mut error = error;
         if let Some(record) = &record_rebuilt {
             error = forklift_core::error::append_to_message(error, &record.sentence());
@@ -73,26 +74,29 @@ pub async fn handle_command(store_access: &StoreAccessLock, set_ref: &[String], 
         for removed in removed {
             error = forklift_core::error::append_to_message(error, &removed_sentence(removed));
         }
+        for note in notes {
+            error = forklift_core::error::append_to_message(error, &format!("Note: {}", note));
+        }
         error
     };
 
     for (pallet, parcel) in set_ref {
         match ref_heal::set_damaged_ref(pallet, parcel, &mut ref_notes) {
             Ok(rebuilt) => refs_rebuilt.push(rebuilt),
-            Err(error) => return Err(changed(error, &refs_rebuilt, &refs_removed)),
+            Err(error) => return Err(changed(error, &refs_rebuilt, &refs_removed, &ref_notes)),
         }
     }
 
     for pallet in remove_ref {
         match ref_heal::remove_damaged_ref(pallet, &mut ref_notes) {
             Ok(removed) => refs_removed.push(removed),
-            Err(error) => return Err(changed(error, &refs_rebuilt, &refs_removed)),
+            Err(error) => return Err(changed(error, &refs_rebuilt, &refs_removed, &ref_notes)),
         }
     }
 
     // Before the taint recovery, whose closure walk reads every ref: a ref rebuilt here roots
     // what it reaches for that walk.
-    let first = ref_heal::repair(Pass::BeforeTaint).map_err(|error| changed(error, &refs_rebuilt, &refs_removed))?;
+    let first = ref_heal::repair(Pass::BeforeTaint).map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(first.rebuilt);
     ref_notes.extend(first.notes);
 
@@ -105,7 +109,7 @@ pub async fn handle_command(store_access: &StoreAccessLock, set_ref: &[String], 
         Err(error) => {
             // An interrupted operation waits for the taint (below), so the refusal says so: it
             // is not the only thing left standing.
-            let mut error = changed(String::from(error), &refs_rebuilt, &refs_removed);
+            let mut error = changed(String::from(error), &refs_rebuilt, &refs_removed, &ref_notes);
             if ref_heal::detect(&mut Vec::new()).is_ok_and(|damaged| !damaged.is_empty()) {
                 error = forklift_core::error::append_to_message(error,
                     "A damaged pallet ref also stands; heal rebuilds it once the taint is resolved.");
@@ -122,7 +126,7 @@ pub async fn handle_command(store_access: &StoreAccessLock, set_ref: &[String], 
 
     // After the taint, which may have refetched what a candidate lacked; before the operation
     // recovery, whose landed test reads the ref.
-    let second = ref_heal::repair(Pass::AfterTaint).map_err(|error| changed(error, &refs_rebuilt, &refs_removed))?;
+    let second = ref_heal::repair(Pass::AfterTaint).map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(second.rebuilt);
     ref_notes.extend(second.notes);
     let refs_refused = second.refused;
@@ -140,7 +144,7 @@ pub async fn handle_command(store_access: &StoreAccessLock, set_ref: &[String], 
     let recovered = match waits {
         Some(_) => Ok(None),
         None => operation_utils::recover(),
-    }.map_err(|error| changed(error, &refs_rebuilt, &refs_removed))?;
+    }.map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     let operation = recovered.map(|recovery| OperationRecovery {
         operation: recovery.operation.as_str().to_string(),
         outcome: match recovery.outcome {

@@ -583,8 +583,10 @@ fn a_served_warehouses_ref_is_never_set_below_what_its_own_bytes_name() {
 fn meta_history_is_refused_however_spelled_and_a_refusal_names_what_the_run_already_set() {
     // Mutation: drop refuse_meta_history → main is set to the office head → red.
     // Mutation: return the bare refusal from the --ref loop → the earlier rebuild goes unreported → red.
+    // Mutation: leave the notes out of that refusal → the skipped @tags check goes unreported → red.
     let area = Area::new("set-partial");
     let (root, side) = side_only_its_bytes_name(&area);
+    area.run_ok(&root, &["tag", "create", "v1"]);
     area.run_ok(&root, &["office", "enroll"]);
     let office = {
         let _scope = forklift_core::globals::StorageRootScope::enter(&root);
@@ -602,9 +604,14 @@ fn meta_history_is_refused_however_spelled_and_a_refusal_names_what_the_run_alre
     area.run_ok(&root, &["heal", "--ref", &format!("main={}", main)]);
 
     std::fs::write(ref_path(&root, "side"), &side.as_bytes()[..20]).unwrap();
+    let tags = root.join(".forklift").join("pallets").join("@tags");
+    let tags = if tags.exists() { tags } else { root.join(".forklift").join("meta").join("tags") };
+    assert!(tags.is_file(), "the fixture must find the @tags ref");
+    std::fs::write(&tags, b"not a hash").unwrap();
     let partial = area.run(&root, &["heal", "--ref", &format!("side={}", side), "--ref", &format!("main={}", main)]);
     assert!(!partial.status.success(), "{}", text(&partial.stdout));
     let stderr = text(&partial.stderr);
     assert!(stderr.contains("is not damaged") && stderr.contains("Rebuilt the ref of pallet \"side\""), "{}", stderr);
+    assert!(stderr.contains("Note: Whether") && stderr.contains("\"@tags\""), "{}", stderr);
     assert_eq!(head(&root, "side"), side);
 }
