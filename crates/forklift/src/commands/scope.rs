@@ -52,8 +52,9 @@ pub fn explain_unfetched(root_tree: &str, path: &str, error: String) -> String {
     }
 }
 
-/// The `out_of_scope` refusal [`explain_unfetched`] gives, or `None` when the path stays inside
-/// the fetch scope, or a tree above the boundary does not load.
+/// The `out_of_scope` refusal [`explain_unfetched`] gives; `None` when the path stays inside the
+/// fetch scope or an entry above the boundary is not a directory, and an error when a tree above
+/// the boundary does not load. The caller keeps the read's own error in both of those cases.
 fn unfetched_refusal(fetch: &scope_utils::PathScope, root_tree: &str, path: &str) -> Result<Option<String>, String> {
     let key = WarehousePath::from_user_input(path)?.as_key().to_string();
     let components: Vec<&str> = key.split('/').collect();
