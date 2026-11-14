@@ -1792,14 +1792,24 @@ impl Drop for RefWriteCounted {
     }
 }
 
-/// Map an internal storage error to a 500.
+/// Map an internal storage error to a 500, unless it is a host record's damage: that is the `503`
+/// of [`damage_refusal`], wherever it surfaced, so no read of a damaged record is answered as a
+/// fault of the server's own.
 fn internal(message: String) -> HandlerError {
+    damage_refusal(message)
+}
+
+/// A 500 for `message`, with no regard for its code.
+fn server_fault(message: String) -> HandlerError {
     (StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
 /// The refusal codes of a host record that is lost or damaged, which only the server's operator
 /// repairs.
-const DAMAGE_CODES: &[forklift_core::error::RefusalCode] = &[forklift_core::error::RefusalCode::TombstonesDamaged];
+const DAMAGE_CODES: &[forklift_core::error::RefusalCode] = &[
+    forklift_core::error::RefusalCode::TombstonesDamaged,
+    forklift_core::error::RefusalCode::WithheldDamaged,
+];
 
 /// Whether `message` is a refusal of one of the [`DAMAGE_CODES`].
 fn is_damage(message: &str) -> bool {
@@ -1811,16 +1821,20 @@ fn is_damage(message: &str) -> bool {
 fn operator_remedy(code: forklift_core::error::RefusalCode) -> &'static str {
     match code {
         forklift_core::error::RefusalCode::TombstonesDamaged => "forklift-server tombstone repair --root <warehouse>",
+        forklift_core::error::RefusalCode::WithheldDamaged => "forklift-server withhold repair --root <warehouse>",
         _ => unreachable!("not a damage code"),
     }
 }
 
 /// Map an error from a read of a host record: a `503` carrying its code and the operator's remedy
-/// ([`operator_remedy`]) when the record is damaged ([`is_damage`]), with no `Retry-After`
-/// ([`error_response`]), since only the operator's repair mends it; any other error is
-/// [`internal`]. The damage itself is logged, with the local next step.
+/// ([`operator_remedy`]) when the record is damaged (a frame of one of the [`DAMAGE_CODES`], at the
+/// start of `message` or wrapped inside it), with no `Retry-After`
+/// ([`error_response`]), since only the operator's repair mends it; any other error is a 500
+/// ([`server_fault`]). The damage itself is logged, with the local next step.
 fn damage_refusal(message: String) -> HandlerError {
-    let damage = forklift_core::error::deframe(&message).and_then(|(code, human, _)| {
+    // A caller may have wrapped the damage in its own words; the frame inside still names it.
+    let frames = std::iter::once(0).chain(message.match_indices(forklift_core::error::REFUSAL_PREFIX).map(|(at, _)| at).filter(|at| *at > 0));
+    let damage = frames.filter_map(|at| forklift_core::error::deframe(&message[at..])).find_map(|(code, human, _)| {
         DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, human.to_string()))
     });
 
@@ -1829,7 +1843,7 @@ fn damage_refusal(message: String) -> HandlerError {
             tracing::error!(%message, "a host record is damaged");
             (StatusCode::SERVICE_UNAVAILABLE, forklift_core::error::CoreError::refusal(code, human, operator_remedy(code)).into())
         }
-        None => internal(message),
+        None => server_fault(message),
     }
 }
 

@@ -299,7 +299,7 @@ fn salvage(bytes: &[u8]) -> (Tombstones, usize) {
 }
 
 /// Move a damaged file aside, beside itself, under a name no other repair uses.
-fn set_aside(path: &std::path::Path) -> Result<PathBuf, String> {
+pub(crate) fn set_aside(path: &std::path::Path) -> Result<PathBuf, String> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())

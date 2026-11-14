@@ -2517,7 +2517,7 @@ fn classify_remote_error(status: u16, action: &str, message: String,
 
     match code.as_deref().and_then(RefusalCode::from_code) {
         // The remote's own records are damaged: its step is for its operator, never this user's.
-        Some(code @ RefusalCode::TombstonesDamaged) => String::from(CoreError::remote_refusal(code, wrapped, format!(
+        Some(code @ (RefusalCode::TombstonesDamaged | RefusalCode::WithheldDamaged)) => String::from(CoreError::remote_refusal(code, wrapped, format!(
             "Ask the remote's operator to repair it where the warehouse is served from{}; nothing here can.",
             next_step.filter(|step| !step.is_empty()).map(|step| format!(" (\"{}\")", step)).unwrap_or_default()
         ))),
@@ -2567,7 +2567,7 @@ pub const MUTATION_RERUN_CONVERGES: &str =
 /// have wrapped it). Never a local failure, whatever its text quotes.
 pub fn is_transient_failure(message: &str) -> bool {
     // A remote's damaged records are mended by its operator, not by time.
-    if crate::util::tombstone_utils::is_damage(message) {
+    if crate::util::tombstone_utils::is_damage(message) || crate::util::withholding::is_damage(message) {
         return false;
     }
 
