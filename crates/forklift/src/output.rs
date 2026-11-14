@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 41;
+pub const SCHEMA_VERSION: u32 = 42;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -579,6 +579,9 @@ error_codes! {
     /// The remote refused to move a pallet because the new head's history is not all there, even
     /// after the lift uploaded it again; nothing moved.
     RemoteHistoryIncomplete,
+
+    /// A pallet ref is lost or damaged; `heal` rebuilds it or names what it found.
+    RefDamaged,
 }
 
 impl ErrorCode {
@@ -636,6 +639,7 @@ impl ErrorCode {
             ErrorCode::HeadNamesContent => RefusalCode::HeadNamesContent.as_str(),
             ErrorCode::ContentWithheld => RefusalCode::ContentWithheld.as_str(),
             ErrorCode::RemoteHistoryIncomplete => RefusalCode::RemoteHistoryIncomplete.as_str(),
+            ErrorCode::RefDamaged => RefusalCode::RefDamaged.as_str(),
         }
     }
 
@@ -696,6 +700,7 @@ impl ErrorCode {
             ErrorCode::HeadNamesContent => 50,
             ErrorCode::ContentWithheld => 51,
             ErrorCode::RemoteHistoryIncomplete => 52,
+            ErrorCode::RefDamaged => 53,
         }
     }
 
@@ -831,6 +836,8 @@ impl ErrorCode {
                 "The remote's host withholds content the command needed (a takedown, not a redaction), so the remote neither serves nor takes it, or refused to move a pallet whose new history names a withheld chunked file it cannot judge; a copy this warehouse holds is kept",
             ErrorCode::RemoteHistoryIncomplete =>
                 "The remote refused to move a pallet because part of the new head's history is absent there or unreadable, even after the lift negotiated and uploaded again; nothing moved",
+            ErrorCode::RefDamaged =>
+                "A pallet ref is lost or damaged: its file holds no parcel hash, or it is missing while a checkout stands on that pallet. Nothing was changed; heal rebuilds it from what the bays and the ref's own bytes still name, or lists what it found",
         }
     }
 
@@ -889,6 +896,7 @@ impl ErrorCode {
             RefusalCode::HeadNamesContent => ErrorCode::HeadNamesContent,
             RefusalCode::ContentWithheld => ErrorCode::ContentWithheld,
             RefusalCode::RemoteHistoryIncomplete => ErrorCode::RemoteHistoryIncomplete,
+            RefusalCode::RefDamaged => ErrorCode::RefDamaged,
         }
     }
 }
@@ -1534,6 +1542,7 @@ mod tests {
             (RefusalCode::HeadNamesContent, "head_names_content", 50),
             (RefusalCode::ContentWithheld, "content_withheld", 51),
             (RefusalCode::RemoteHistoryIncomplete, "remote_history_incomplete", 52),
+            (RefusalCode::RefDamaged, "ref_damaged", 53),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

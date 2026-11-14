@@ -318,8 +318,13 @@ impl BayPosition {
 }
 
 /// Why a bay standing on `base` may not move `pallet`, whose head is `head`: see
-/// [`BayPosition::require_current`].
+/// [`BayPosition::require_current`]. A pallet with no head under a bay standing on a parcel is
+/// not behind but lost: its ref is gone, and [`ref_lost_refusal`] says so.
 pub fn behind_refusal(pallet: &str, base: Option<&str>, head: Option<&str>, operation: &str) -> CoreError {
+    if let (Some(base), None) = (base, head) {
+        return ref_lost_refusal(pallet, base, operation);
+    }
+
     CoreError::refusal(
         RefusalCode::Behind,
         format!(
@@ -331,6 +336,25 @@ pub fn behind_refusal(pallet: &str, base: Option<&str>, head: Option<&str>, oper
             operation
         ),
         catch_up_step(pallet),
+    )
+}
+
+/// The [`RefusalCode::RefDamaged`] refusal for user pallet `pallet`, which has no ref while a bay
+/// stands on its parcel `base`. A checkout keeps its pallet from being deleted, so the ref was
+/// lost rather than removed, and the shift a behind bay would take refuses too. `heal` rebuilds
+/// it.
+///
+/// # Arguments
+/// * `operation` - What is refused, such as "stacked" ("Nothing was <operation>.").
+pub fn ref_lost_refusal(pallet: &str, base: &str, operation: &str) -> CoreError {
+    CoreError::refusal(
+        RefusalCode::RefDamaged,
+        format!(
+            "Pallet \"{}\" has no ref, but this bay's files stand on its parcel {}: the ref was lost \
+            or damaged. Nothing was {}.",
+            pallet, base, operation
+        ),
+        "forklift heal",
     )
 }
 
@@ -601,8 +625,8 @@ pub fn get_meta_pallet_head(name: &str) -> Result<Option<String>, String> {
 /// # Returns
 /// * `Ok(Some(String))` - The hash of the pallet's head parcel.
 /// * `Ok(None)`         - If the pallet is unborn (it has no ref file yet).
-/// * `Err(String)`      - If the name is invalid, or the ref file could not be read or
-///                        does not contain a valid hash.
+/// * `Err(String)`      - If the name is invalid, or the ref file could not be read, or it
+///                        does not contain a valid hash (a [`RefusalCode::RefDamaged`] refusal).
 pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Option<String>, String> {
     validate_pallet_name(name)?;
 
@@ -612,22 +636,30 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
         return Ok(None);
     }
 
-    let content = std::fs::read_to_string(&path)
+    let bytes = std::fs::read(&path)
         .map_err(|e| format!("Error while reading the ref of pallet \"{}\": {}", name, e))?;
-    let hash = content.trim_end_matches('\n').to_string();
 
-    let is_valid_hash = object_utils::is_object_hash(&hash);
-
-    if !is_valid_hash {
-        return Err(format!(
-            "The ref of pallet \"{}\" does not contain a valid parcel hash. The warehouse \
-            may be corrupted; fix \"{}\" by hand.",
-            name,
-            path.to_string_lossy()
-        ));
+    match parse_ref_bytes(&bytes) {
+        Some(hash) => Ok(Some(hash)),
+        None => Err(CoreError::refusal(
+            RefusalCode::RefDamaged,
+            format!(
+                "The ref of pallet \"{}\" (\"{}\") is damaged: it does not hold a parcel hash. Nothing \
+                was changed.",
+                PalletRef { namespace, name: name.to_string() }.to_wire(),
+                path.to_string_lossy()
+            ),
+            "forklift heal",
+        ).into()),
     }
+}
 
-    Ok(Some(hash))
+/// The head a ref file's `bytes` hold: one object hash, followed by any number of newlines.
+/// `None` for anything else, which the reader refuses as damaged.
+pub(crate) fn parse_ref_bytes(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?.trim_end_matches('\n');
+
+    object_utils::is_object_hash(text).then(|| text.to_string())
 }
 
 /// A ref write refused because the ref no longer held the head the writer's work was based on:
@@ -650,6 +682,10 @@ impl RefMoved {
     /// (a delivery's target) is retried, not caught up with.
     pub fn behind_refusal(&self) -> CoreError {
         let pallet = self.reference.to_wire();
+
+        if let (Some(base), None) = (&self.expected, &self.found) {
+            return ref_lost_refusal(&pallet, base, "changed");
+        }
 
         CoreError::refusal(
             RefusalCode::Behind,
@@ -1125,7 +1161,7 @@ pub fn update_meta_pallet_head_served(name: &str,
                                       preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
     let served = crate::util::redaction_utils::Served::chain(served);
 
-    update_pallet_head_checked(PalletNamespace::Meta, name, expected, new, preconditions, None, None, Some(served))
+    update_pallet_head_checked(PalletNamespace::Meta, name, expected, new, preconditions, None, None, Some(served), None)
 }
 
 /// [`update_pallet_head`] for a client adopting `served`, what the remote served for this user
@@ -1140,7 +1176,7 @@ pub fn adopt_pallet_head(name: &str,
                          new: &str,
                          served: crate::util::redaction_utils::Served,
                          preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(PalletNamespace::User, name, expected, new, preconditions, None, None, Some(served))
+    update_pallet_head_checked(PalletNamespace::User, name, expected, new, preconditions, None, None, Some(served), None)
 }
 
 /// Move the head of a pallet from `expected` to `new`: a compare-and-set, and the only way a
@@ -1198,7 +1234,7 @@ pub fn update_pallet_head_in(
     new: &str,
     preconditions: &RefPreconditions,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, expected, new, preconditions, None, None, None)
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, None, None, None, None)
 }
 
 /// Create user pallet `name` at `new`, acknowledging the tombstone a delete in this served
@@ -1209,7 +1245,7 @@ pub fn recreate_pallet_head(name: &str,
                             new: &str,
                             preconditions: &RefPreconditions,
                             tombstone: &str) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, Some(tombstone), None)
+    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, Some(tombstone), None, None)
 }
 
 /// [`update_pallet_head_in`] for a caller that has just verified `new`'s closure itself (a
@@ -1226,7 +1262,57 @@ pub fn update_pallet_head_verified(
     verified: &VerifiedClosure,
     tombstone: Option<&str>,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified), tombstone, None)
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified), tombstone, None, None)
+}
+
+/// How a user pallet's ref is damaged, as [`repair_pallet_head`] expects to find it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefDamage {
+    /// No ref file stands where the ref belongs.
+    Missing,
+
+    /// The ref file holds these bytes, which are not a head the reader accepts.
+    Unreadable(Vec<u8>),
+}
+
+/// Set damaged user pallet `name` to `new`: the repair of a ref that is missing or does not hold
+/// a hash. The compare-and-set of [`update_pallet_head_in`], expecting `damage` in place of a head,
+/// re-read inside the hold, so a ref anything wrote or removed since it was judged is refused as
+/// moved. The write is judged as a creation: `new`'s closure is verified, and the tombstone and
+/// redaction checks apply.
+pub fn repair_pallet_head(name: &str, damage: &RefDamage, new: &str) -> Result<(), RefUpdateError> {
+    update_pallet_head_checked(PalletNamespace::User, name, None, new, &RefPreconditions::NONE, None, None, None, Some(damage))
+}
+
+/// Refuse with [`RefUpdateError::Moved`] unless the ref of `name` is damaged exactly as `damage`
+/// says: still absent, or still holding exactly those bytes.
+fn require_damage(namespace: PalletNamespace, name: &str, damage: &RefDamage) -> Result<(), RefUpdateError> {
+    let path = get_pallet_ref_path(namespace, name);
+
+    let holds = match damage {
+        RefDamage::Missing => !path.exists(),
+        RefDamage::Unreadable(bytes) => path.is_file() && std::fs::read(&path).map_err(|e| RefUpdateError::Failed(format!(
+            "Error while reading the ref of pallet \"{}\": {}", name, e
+        )))? == *bytes,
+    };
+
+    if !holds {
+        return Err(RefUpdateError::Moved(RefMoved {
+            reference: PalletRef { namespace, name: name.to_string() },
+            expected: None,
+            found: get_pallet_head_in(namespace, name).ok().flatten(),
+        }));
+    }
+
+    Ok(())
+}
+
+/// The heads of every user pallet whose ref can be read; a damaged ref is skipped. The bound of a
+/// closure walk, which a missing bound only makes check more.
+pub(crate) fn readable_user_heads() -> Result<Vec<String>, String> {
+    Ok(list_pallets_in(PalletNamespace::User)?.into_iter()
+        .filter_map(|name| get_pallet_head_in(PalletNamespace::User, &name).ok().flatten())
+        .collect())
 }
 
 /// That a head's closure was verified, at which fetch scope, and down to which bound. The bound matters
@@ -1283,7 +1369,11 @@ fn update_pallet_head_checked(
     verified: Option<&VerifiedClosure>,
     acknowledged: Option<&str>,
     served: Option<crate::util::redaction_utils::Served>,
+    damaged: Option<&RefDamage>,
 ) -> Result<(), RefUpdateError> {
+    // A repair judges the write as a creation: nothing it replaces is a head.
+    debug_assert!(damaged.is_none() || expected.is_none(), "a repair expects no head");
+
     // Checked before the lock too, so an invalid write never waits for it.
     validate_head_write(name, new)?;
 
@@ -1327,7 +1417,10 @@ fn update_pallet_head_checked(
         // The ref's own compare goes first: a ref another writer moved, perhaps to this very
         // parcel (which callers read as landed), reports that move, never a precondition it
         // would mask.
-        require_head(namespace, name, expected)?;
+        match damaged {
+            Some(damage) => require_damage(namespace, name, damage)?,
+            None => { require_head(namespace, name, expected)?; }
+        }
         check_preconditions(&lock, preconditions)?;
 
         if tombstone_of(namespace, name, expected)? != tombstone.as_ref().map(|(head, _)| head.clone()) {
@@ -1399,7 +1492,7 @@ fn update_pallet_head_checked(
 
         let check = redaction.outcome()?;
 
-        let written = update_pallet_head_locked(&lock, namespace, name, expected, new, left, check);
+        let written = write_head_locked(&lock, namespace, name, expected, new, left, check, damaged);
 
         // A write can land and still report a failure, so the ref is read back before the
         // tombstone is kept. Once it has landed, a tombstone that cannot be cleared fails nothing:
@@ -1509,10 +1602,9 @@ fn verify_new_head(name: &str,
                    expected: Option<&str>,
                    new: &str,
                    scope: &PathScope) -> Result<Option<Tolerated>, RefUpdateError> {
-    let heads: Vec<String> = all_pallet_refs()?.into_iter()
-        .filter(|(pallet, _)| pallet.namespace == PalletNamespace::User)
-        .map(|(_, head)| head)
-        .collect();
+    // Bounded by the readable user refs only: a damaged ref bounds nothing, and a narrower bound
+    // only makes the walk check more, so a damaged ref never reads as "history incomplete".
+    let heads = readable_user_heads()?;
 
     let verify = |sealed| crate::util::audit_utils::verify_ref_head_closure(new, &heads, expected, scope, sealed);
     let incomplete = |missing| RefUpdateError::Incomplete {
@@ -1632,6 +1724,22 @@ pub(crate) fn update_pallet_head_locked(
     left: Option<&str>,
     redaction: &crate::util::redaction_utils::RedactionCheck,
 ) -> Result<(), RefUpdateError> {
+    write_head_locked(lock, namespace, name, expected, new, left, redaction, None)
+}
+
+/// [`update_pallet_head_locked`], or with `damaged`, the repair of a ref damaged that way
+/// ([`repair_pallet_head`]): the compare inside the hold expects the damage, not a head.
+#[allow(clippy::too_many_arguments)]
+fn write_head_locked(
+    lock: &crate::util::lock_utils::RefLock,
+    namespace: PalletNamespace,
+    name: &str,
+    expected: Option<&str>,
+    new: &str,
+    left: Option<&str>,
+    redaction: &crate::util::redaction_utils::RedactionCheck,
+    damaged: Option<&RefDamage>,
+) -> Result<(), RefUpdateError> {
     validate_head_write(name, new)?;
 
     if !redaction.is_for(namespace, name, expected, new) || !redaction.holds(lock)? {
@@ -1643,7 +1751,10 @@ pub(crate) fn update_pallet_head_locked(
         )));
     }
 
-    let found = require_head(namespace, name, expected)?;
+    let found = match damaged {
+        Some(damage) => { require_damage(namespace, name, damage)?; None }
+        None => require_head(namespace, name, expected)?,
+    };
 
     if let Some(old) = left {
         crate::util::fetch_ledger::record_fetch(lock, old, name)?;
