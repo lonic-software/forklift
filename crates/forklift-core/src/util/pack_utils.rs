@@ -3066,7 +3066,7 @@ pub(crate) enum PackRetrieval {
     /// At least one loaded pack located the hash, but every located record failed to resolve.
     /// Carries the *first* such error — later, redundant failures for the same hash add no
     /// information once one is on record — except that a corrupt bucket, which `forklift heal`
-    /// can act on, is preferred over a record that does not rebuild to its hash.
+    /// can rebuild, is preferred over a record that does not rebuild to its hash.
     Failed(String, file_utils::Unreadable),
     /// No loaded pack's index names the hash.
     NotLocated,
@@ -3106,7 +3106,7 @@ pub(crate) fn retrieve_from_packs(hash: &str) -> Result<PackRetrieval, String> {
 
 /// [`retrieve_from_packs`] against one already-loaded set, with no revalidation.
 fn retrieve_from(packs: &PackSet, hash_bytes: &[u8; HASH_LEN], hash: &str) -> Result<PackRetrieval, String> {
-    let mut first_error: Option<String> = None;
+    let mut first_error: Option<(String, file_utils::Unreadable)> = None;
     let mut first_damage: Option<String> = None;
 
     for pack in packs.packs.iter() {
@@ -3141,10 +3141,10 @@ fn retrieve_from(packs: &PackSet, hash_bytes: &[u8; HASH_LEN], hash: &str) -> Re
     }
 
     // A damaged index is preferred: heal can rebuild it, while a record that does not rebuild to
-    // its hash is beyond what heal mends.
+    // its hash is beyond what heal mends (heal names it lost).
     Ok(match (first_damage, first_error) {
         (Some(e), _) => PackRetrieval::Failed(e, file_utils::Unreadable::PackDamage),
-        (None, Some(e)) => PackRetrieval::Failed(e, file_utils::Unreadable::Other),
+        (None, Some((e, cause))) => PackRetrieval::Failed(e, cause),
         (None, None) => PackRetrieval::NotLocated,
     })
 }
@@ -3254,7 +3254,14 @@ enum Bases {
 /// verbatim once the base is repacked from another copy (`collect_targets`): it reads the object
 /// first, and either re-encodes it or fails loudly — the delta is never kept pointing at bytes
 /// the repack has thrown away.
-fn resolve_record(record: &[u8], hash: &str) -> Result<Vec<u8>, String> {
+///
+/// # Returns
+/// * `Ok(Vec<u8>)`                         - The object's bytes; they hash to `hash`.
+/// * `Err((String, file_utils::Unreadable))` - Why the record does not rebuild to `hash`, and what
+///   heal makes of it: [`file_utils::Unreadable::RecordDamage`] when the record itself is damaged
+///   or its delta base read fails decisively, [`file_utils::Unreadable::Other`] when the base read
+///   fails for a reason that says nothing about the record (see [`reconstruct_record`]).
+fn resolve_record(record: &[u8], hash: &str) -> Result<Vec<u8>, (String, file_utils::Unreadable)> {
     if record.first() == Some(&RECORD_DELTA) && !in_reconstruction() {
         if let Ok(bytes) = reconstruct_record(record, hash, Bases::Unverified) {
             if object_utils::verify_object_bytes(hash, &bytes).is_ok() {
@@ -3264,8 +3271,13 @@ fn resolve_record(record: &[u8], hash: &str) -> Result<Vec<u8>, String> {
     }
 
     let bytes = reconstruct_record(record, hash, Bases::Verified)?;
-    object_utils::verify_object_bytes(hash, &bytes)?;
+    object_utils::verify_object_bytes(hash, &bytes).map_err(record_damage)?;
     Ok(bytes)
+}
+
+/// `message` as a failure of the record itself: [`file_utils::Unreadable::RecordDamage`].
+fn record_damage(message: String) -> (String, file_utils::Unreadable) {
+    (message, file_utils::Unreadable::RecordDamage)
 }
 
 /// Reconstruct an object's bytes from its data-file record, *without* verifying the result —
@@ -3277,7 +3289,13 @@ fn resolve_record(record: &[u8], hash: &str) -> Result<Vec<u8>, String> {
 /// loose, in another pack, or itself a delta) or through [`unverified_delta_base`]. The chain is
 /// bounded well below `MAX_RECONSTRUCT_DEPTH`, which guards only against a corrupt pack chaining
 /// without end.
-fn reconstruct_record(record: &[u8], hash: &str, bases: Bases) -> Result<Vec<u8>, String> {
+///
+/// A failure of the record's own bytes is [`file_utils::Unreadable::RecordDamage`]. So is a
+/// verified base read refused with a code (the base is lost, damaged or behind a damaged index,
+/// so this object cannot be rebuilt either); a base read that fails uncoded (an index of another
+/// format version, or the store not consulted) is [`file_utils::Unreadable::Other`], since it
+/// says nothing about this record.
+fn reconstruct_record(record: &[u8], hash: &str, bases: Bases) -> Result<Vec<u8>, (String, file_utils::Unreadable)> {
     // Trusted bytes: a local pack record is self-written or transport-verified (see
     // `decode_full_transport_record`), and a grandfathered giant must stay readable — bounding
     // this read would make a pre-existing over-ceiling packed object unreadable.
@@ -3286,36 +3304,47 @@ fn reconstruct_record(record: &[u8], hash: &str, bases: Bases) -> Result<Vec<u8>
         .map_err(|e| format!("Error while decompressing packed object {}: {}", hash, e));
 
     let (&kind, body) = record.split_first()
-        .ok_or_else(|| format!("Packed object {} has an empty record.", hash))?;
+        .ok_or_else(|| record_damage(format!("Packed object {} has an empty record.", hash)))?;
 
     match kind {
-        RECORD_FULL => decode_full(body),
+        RECORD_FULL => decode_full(body).map_err(record_damage),
         RECORD_DELTA => {
             if body.len() < HASH_LEN {
-                return Err(format!("Packed delta {} is truncated (no base hash).", hash));
+                return Err(record_damage(format!("Packed delta {} is truncated (no base hash).", hash)));
             }
 
             let depth = RECONSTRUCT_DEPTH.with(|d| { let n = d.get() + 1; d.set(n); n });
             let _guard = DepthGuard;
             if depth > MAX_RECONSTRUCT_DEPTH {
-                return Err(format!("Packed delta {} exceeds the reconstruction depth limit (corrupt pack?).", hash));
+                return Err(record_damage(format!(
+                    "Packed delta {} exceeds the reconstruction depth limit (corrupt pack?).", hash
+                )));
             }
 
             let base_bytes: [u8; HASH_LEN] = body[0..HASH_LEN].try_into().expect("checked above");
             let base_hash = sign_utils::to_hex(&base_bytes);
-            let (target_len, read) = byte_utils::number_from_vlq_bytes(HASH_LEN, body)?;
+            let (target_len, read) = byte_utils::number_from_vlq_bytes(HASH_LEN, body).map_err(record_damage)?;
             let payload = &body[HASH_LEN + read..];
 
             // Borrow-only: the delta base is only read to reconstruct against, so share the
             // cached `Arc` instead of copying the base out (hot on packed-delta reads and compact).
             let base = match bases {
-                Bases::Verified => file_utils::retrieve_object_by_hash_shared(&base_hash)?,
-                Bases::Unverified => unverified_delta_base(&base_hash, &base_bytes)?,
+                // A base the store refuses as unreadable leaves the delta unreadable with it; any
+                // other failure says nothing about this record and keeps its own wording.
+                Bases::Verified => file_utils::retrieve_object_by_hash_shared(&base_hash).map_err(|error| {
+                    match crate::error::deframe(&error) {
+                        Some((code, message, _)) if code == crate::error::RefusalCode::ObjectUnreadable.as_str() => {
+                            record_damage(format!("its delta base {} cannot be read: {}", base_hash, message))
+                        }
+                        _ => (error, file_utils::Unreadable::Other),
+                    }
+                })?,
+                Bases::Unverified => unverified_delta_base(&base_hash, &base_bytes).map_err(record_damage)?,
             };
 
-            delta_utils::decompress_delta(&base, payload, target_len as usize)
+            delta_utils::decompress_delta(&base, payload, target_len as usize).map_err(record_damage)
         }
-        other => Err(format!("Packed object {} has an unknown record kind {}.", hash, other)),
+        other => Err(record_damage(format!("Packed object {} has an unknown record kind {}.", hash, other))),
     }
 }
 
@@ -3345,7 +3374,7 @@ fn unverified_delta_base(hash: &str, hash_bytes: &[u8; HASH_LEN]) -> Result<Arc<
     let packs = loaded_packs()?;
     for pack in packs.packs.iter() {
         let Some((offset, length)) = pack.locate(hash_bytes).found() else { continue };
-        let bytes = Arc::new(reconstruct_record(pack.slice(offset, length)?, hash, Bases::Unverified)?);
+        let bytes = Arc::new(reconstruct_record(pack.slice(offset, length)?, hash, Bases::Unverified).map_err(|(error, _)| error)?);
         let weight = bytes.len();
         unverified_base_cache().put(&key, Arc::clone(&bytes), weight);
         return Ok(bytes);
@@ -3580,6 +3609,57 @@ pub(crate) fn packed_delta_bases() -> Result<PackedDeltaBases, PackScanError> {
     }
 
     Ok(PackedDeltaBases(bases))
+}
+
+/// A loaded pack's record that does not rebuild to its object, from [`undecodable_records`].
+#[derive(Debug)]
+pub(crate) struct UndecodableRecord {
+    /// The object the record is filed under.
+    pub(crate) hash: String,
+    /// Why it does not rebuild.
+    pub(crate) why: String,
+    /// [`file_utils::Unreadable::RecordDamage`] when the record or its chain is damaged;
+    /// [`file_utils::Unreadable::Other`] when its base could not be read for a reason that says
+    /// nothing about the record.
+    pub(crate) cause: file_utils::Unreadable,
+}
+
+/// How many records a scan resolves on the calling thread before it fans out.
+const PARALLEL_RECORD_SCAN_THRESHOLD: usize = 256;
+
+/// Every record of every loaded pack that does not rebuild to the object it is filed under:
+/// heal's check of the packed store's bytes, which a reachability walk, reading a leaf's presence
+/// only, never looks at. Each record is resolved on its own, so a hash two packs hold is listed
+/// once for each record that fails, and a good copy elsewhere is the caller's to look for. Only
+/// the buckets of an index that pass validation are read: a damaged bucket is already reported
+/// unreadable to the walk, and a pack the registry could not load is not here at all. This
+/// decodes every packed object, in parallel above a threshold.
+///
+/// # Returns
+/// * `Ok(Vec<UndecodableRecord>)` - The records that fail, in pack then index order.
+/// * `Err(String)`                - The pack registry could not be loaded.
+pub(crate) fn undecodable_records() -> Result<Vec<UndecodableRecord>, String> {
+    let packs = loaded_packs()?;
+    let records: Vec<(&LoadedPack, [u8; HASH_LEN], u64, u64)> = packs.packs.iter()
+        .flat_map(|pack| pack.index.valid_bucket_records().into_iter().filter_map(move |record| {
+            let hash: [u8; HASH_LEN] = record.hash.try_into().ok()?;
+            Some((pack, hash, record.offset, record.length))
+        }))
+        .collect();
+
+    let judge = |(pack, hash_bytes, offset, length): &(&LoadedPack, [u8; HASH_LEN], u64, u64)| {
+        let hash = sign_utils::to_hex(hash_bytes);
+        let failure = match pack.slice(*offset, *length) {
+            Ok(record) => resolve_record(record, &hash).err()?,
+            Err(error) => record_damage(error),
+        };
+        Some(UndecodableRecord { hash, why: failure.0, cause: failure.1 })
+    };
+    let judged: Vec<Option<UndecodableRecord>> = match records.len() >= PARALLEL_RECORD_SCAN_THRESHOLD {
+        true => fanout_utils::fanout_map(&records, judge),
+        false => records.iter().map(judge).collect(),
+    };
+    Ok(judged.into_iter().flatten().collect())
 }
 
 /// Refuse a pack the registry could not load: it may hold deltas nothing can list, and its data may
@@ -8955,14 +9035,21 @@ pub(crate) mod tests {
     }
 
     /// A full record of `content`.
-    fn full_record(content: &[u8]) -> Vec<u8> {
+    pub(crate) fn full_record(content: &[u8]) -> Vec<u8> {
         let mut record = vec![RECORD_FULL];
         record.extend_from_slice(&zstd::encode_all(content, 0).unwrap());
         record
     }
 
+    /// A full record whose payload does not decompress.
+    pub(crate) fn garbled_full_record() -> Vec<u8> {
+        let mut record = vec![RECORD_FULL];
+        record.extend_from_slice(b"not zstd at all");
+        record
+    }
+
     /// A delta record that decodes to `target` against `base` (whatever hash it names).
-    fn delta_record(base_hash: &str, base: &[u8], target: &[u8]) -> Vec<u8> {
+    pub(crate) fn delta_record(base_hash: &str, base: &[u8], target: &[u8]) -> Vec<u8> {
         let mut record = vec![RECORD_DELTA];
         record.extend_from_slice(&hash_to_bytes(base_hash).unwrap());
         record.extend_from_slice(&byte_utils::number_to_vlq_bytes(target.len() as u64));
@@ -12288,7 +12375,7 @@ pub(crate) mod tests {
 
     /// Write a pack of `records` (hex hash, framed record) under the name its layout derives, as a
     /// writer would. Returns its data and index paths.
-    fn write_named_pack(records: &[(String, Vec<u8>)]) -> (PathBuf, PathBuf) {
+    pub(crate) fn write_named_pack(records: &[(String, Vec<u8>)]) -> (PathBuf, PathBuf) {
         let mut data = PACK_DATA_MAGIC.to_vec();
         data.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
         let mut index_records = Vec::new();
@@ -12461,6 +12548,101 @@ pub(crate) mod tests {
             expected.sort();
             expected
         }, "a loose file a verified pack copy stands in for is not corrupt");
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    /// A pack record that does not rebuild to its object, one that does not decompress, one that
+    /// decompresses to other bytes, and a delta whose base record is such a one, refuses
+    /// `object_unreadable` naming the object and `forklift heal` (FORK-495); the scan lists each as
+    /// damaged, and a sound record in the same pack still reads. Mutation: classify a record's own
+    /// failure as `Other`, or a framed base failure as `Other` → red.
+    #[test]
+    fn a_damaged_pack_record_refuses_object_unreadable() {
+        let (temp, _scope) = salvage_root("fork495-record-damage");
+
+        let (_, garbled) = blob449("a packed record that does not decompress");
+        let (_, other) = blob449("a packed record holding other bytes");
+        let (base, base_hash) = blob449("a delta base whose record is damaged, padded to be a fit base");
+        let (target, delta) = blob449("a delta target over a damaged base, padded to be a fit target");
+        let (sound, sound_hash) = blob449("a sound record beside them");
+        let garbage = garbled_full_record();
+        write_named_pack(&[
+            (garbled.clone(), garbage.clone()),
+            (other.clone(), full_record(b"other bytes")),
+            (base_hash.clone(), garbage),
+            (delta.clone(), delta_record(&base_hash, &base, &target)),
+            (sound_hash.clone(), full_record(&sound)),
+        ]);
+
+        for hash in [&garbled, &other, &base_hash, &delta] {
+            let (code, error) = read_code(hash);
+            assert_eq!(code.as_deref(), Some("object_unreadable"), "{}: {}", hash, error);
+            let (_, message, step) = crate::error::deframe(&error).unwrap();
+            assert!(message.contains(hash.as_str()), "{}", message);
+            assert_eq!(step, "forklift heal");
+        }
+        assert_eq!(file_utils::retrieve_object_by_hash_uncached(&sound_hash).unwrap(), sound);
+
+        let mut listed: Vec<(String, file_utils::Unreadable)> =
+            undecodable_records().unwrap().into_iter().map(|record| (record.hash, record.cause)).collect();
+        listed.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected: Vec<(String, file_utils::Unreadable)> = [&garbled, &other, &base_hash, &delta].into_iter()
+            .map(|hash| (hash.clone(), file_utils::Unreadable::RecordDamage)).collect();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(listed, expected);
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    /// A delta whose base the store refuses as unreadable is unreadable with it, named by its own
+    /// hash and its base's, while a delta whose base fails some other way, here behind an index of
+    /// another format version, keeps that wording with no code: the scan lists it with cause
+    /// `Other`, which heal reports unchecked rather than damaged. Mutation: type every base failure
+    /// as record damage, or none → red.
+    #[test]
+    fn a_delta_is_damaged_only_by_a_base_refused_as_unreadable() {
+        let (temp, _scope) = salvage_root("fork495-delta-bases");
+        let listed = || {
+            let mut listed: Vec<(String, file_utils::Unreadable)> =
+                undecodable_records().unwrap().into_iter().map(|record| (record.hash, record.cause)).collect();
+            listed.sort_by(|a, b| a.0.cmp(&b.0));
+            listed
+        };
+
+        let (absent_base, absent_hash) = blob449("a delta base never stored, padded to be a fit base");
+        let (over_absent, over_absent_hash) = blob449("a delta over an absent base, padded to be a fit target");
+        write_named_pack(&[(over_absent_hash.clone(), delta_record(&absent_hash, &absent_base, &over_absent))]);
+        let (code, error) = read_code(&over_absent_hash);
+        assert_eq!(code.as_deref(), Some("object_unreadable"), "{}", error);
+        let (_, message, _) = crate::error::deframe(&error).unwrap();
+        assert!(message.contains(over_absent_hash.as_str()) && message.contains(absent_hash.as_str()), "{}", message);
+        assert_eq!(listed(), vec![(over_absent_hash.clone(), file_utils::Unreadable::RecordDamage)]);
+        let scan = crate::util::recovery_utils::corrupt_packed_objects().unwrap();
+        assert_eq!(scan.corrupt.keys().collect::<Vec<_>>(), vec![&over_absent_hash], "{:?}", scan);
+
+        // An index of another version might hold either base: neither delta is judged.
+        let (foreign_base, foreign_hash) = blob449("a delta base behind a foreign index, padded to be a fit base");
+        let (over_foreign, over_foreign_hash) = blob449("a delta over a foreign base, padded to be a fit target");
+        let (_, index) = write_named_pack(&[(foreign_hash.clone(), full_record(&foreign_base))]);
+        let mut bytes = std::fs::read(&index).unwrap();
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        std::fs::write(&index, bytes).unwrap();
+        write_named_pack(&[(over_foreign_hash.clone(), delta_record(&foreign_hash, &foreign_base, &over_foreign))]);
+        file_utils::forget_cached_objects();
+        let (code, error) = read_code(&over_foreign_hash);
+        assert_ne!(code.as_deref(), Some("object_unreadable"), "{}", error);
+        assert!(error.contains("version"), "{}", error);
+
+        let mut expected = vec![
+            (over_absent_hash.clone(), file_utils::Unreadable::Other),
+            (over_foreign_hash.clone(), file_utils::Unreadable::Other),
+        ];
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(listed(), expected);
+        let scan = crate::util::recovery_utils::corrupt_packed_objects().unwrap();
+        assert!(scan.corrupt.is_empty(), "{:?}", scan);
+        assert_eq!(scan.unchecked.len(), 2, "{:?}", scan);
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }

@@ -2525,8 +2525,11 @@ pub(crate) enum Unreadable {
     /// A loose file at the address whose bytes do not decompress, or decompress to other content.
     /// Heal names the object as lost; the file is kept where it is.
     LooseCorrupt,
-    /// Anything else: a pack record whose bytes do not rebuild to the address, or an index of
-    /// another format version.
+    /// A pack record whose bytes do not rebuild to the address, or a delta whose base the store
+    /// refuses as unreadable. Heal names the object as lost; the pack is kept as it is.
+    RecordDamage,
+    /// Anything else: an index of another format version, or a delta whose base read failed
+    /// some other way.
     Other,
 }
 
@@ -2751,10 +2754,11 @@ fn read_loose_if_verified(hash: &str) -> Result<Option<Vec<u8>>, String> {
 /// same core structurally impossible (DESIGN.html §3.1.1).
 ///
 /// The one place an ordinary read's failure gets its code: pack damage ([`Unreadable::PackDamage`]),
-/// a corrupt loose file ([`Unreadable::LooseCorrupt`]) and an absence nothing else accounts for are
-/// framed [`RefusalCode::ObjectUnreadable`], whose next step is `forklift heal`. What heal cannot act
-/// on stays untyped: a pack record whose bytes do not rebuild to the address, an index of another
-/// format version, an absence a redaction or a withholding explains. A hash the caller was
+/// a corrupt loose file ([`Unreadable::LooseCorrupt`]), a pack record that does not rebuild to the
+/// address ([`Unreadable::RecordDamage`]) and an absence nothing else accounts for are framed
+/// [`RefusalCode::ObjectUnreadable`], whose next step is `forklift heal`. What heal cannot act on
+/// stays untyped: an index of another format version, a delta whose base read failed uncoded, an
+/// absence a redaction or a withholding explains. A hash the caller was
 /// handed rather than reached through history is read by [`retrieve_named_object_by_hash`], whose
 /// plain absence is untyped too. Classified readers never see the frame, so a reason heal itself
 /// reports never embeds one.
@@ -2880,18 +2884,20 @@ pub(crate) fn verify_loose(hash: &str, reader: impl std::io::Read) -> std::io::R
 }
 
 /// The ordinary read's error for an [`StoreReadOutcome::Unverifiable`] outcome: framed
-/// [`RefusalCode::ObjectUnreadable`] for pack damage and a corrupt loose file (whose message
-/// already names the object), `error` itself otherwise.
+/// [`RefusalCode::ObjectUnreadable`] for pack damage, a damaged pack record and a corrupt loose
+/// file (whose message already names the object), `error` itself otherwise.
 fn unverifiable_read_error(hash: &str, error: String, cause: Unreadable) -> String {
     match cause {
         Unreadable::LooseCorrupt => object_unreadable(error),
-        Unreadable::PackDamage => object_unreadable(format!("Object {} cannot be read: {}", hash, error)),
+        Unreadable::PackDamage | Unreadable::RecordDamage => {
+            object_unreadable(format!("Object {} cannot be read: {}", hash, error))
+        }
         Unreadable::Other => error,
     }
 }
 
-/// `message` framed as [`RefusalCode::ObjectUnreadable`]. A message already framed is a delta's
-/// base failing, which keeps its own code.
+/// `message` framed as [`RefusalCode::ObjectUnreadable`]. A message already framed keeps its own
+/// code.
 fn object_unreadable(message: String) -> String {
     if crate::error::deframe(&message).is_some() {
         return message;

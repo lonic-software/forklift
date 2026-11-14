@@ -232,9 +232,23 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                 lost.damaged_held
             ));
         }
-        // A refusal lists it among the reasons its check may be short.
-        if let (Some(unchecked), true) = (&lost.loose_unchecked, lost.is_empty()) {
-            notes.push(format!("The check for lost objects may be short: {}", unchecked));
+        if lost.damaged_records_unreached > 0 {
+            notes.push(format!(
+                "{} damaged pack record(s) that no history needs are left in place; storing the same content again would keep the damaged record.",
+                lost.damaged_records_unreached
+            ));
+        }
+        if lost.damaged_records_held > 0 {
+            notes.push(format!(
+                "{} damaged pack record(s) sit at addresses this warehouse holds by hash alone, redacted or withheld, so they are not counted lost; they are left in place, and a read of one fails.",
+                lost.damaged_records_held
+            ));
+        }
+        // A refusal lists them among the reasons its check may be short.
+        if lost.is_empty() {
+            for unchecked in &lost.unchecked {
+                notes.push(format!("The check for lost objects may be short: {}", unchecked));
+            }
         }
     }
     let objects_lost = match &lost {
