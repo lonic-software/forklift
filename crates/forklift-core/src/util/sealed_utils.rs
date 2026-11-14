@@ -1019,31 +1019,16 @@ pub struct Walked {
     /// The file contents (blobs and recipes) among `absent`: what a host may have withheld, where
     /// an absent tree or chunk never was.
     pub absent_files: HashSet<String>,
-    /// The absent file contents a hold on a file's content (a redaction, a takedown, an
-    /// unavailability) holds: met again as a tree or a chunk of the same bytes, they are judged
-    /// again, since no such hold covers one.
-    held_as_file: HashSet<String>,
 }
 
 impl Walked {
     /// Note `hash` as referenced and say what it was met as.
     fn meet(&mut self, hash: &str, at: At, tolerated: &Tolerated, unrecorded: Unrecorded) -> Result<Met, String> {
         if !self.referenced.insert(hash.to_string()) {
-            // The same bytes may be met as a file and as a tree or a chunk, and a hold on a file's
-            // content holds neither of those, so the absence is judged again for the other kind.
-            if at == At::File {
-                if self.absent.contains(hash) && tolerated.held(hash, At::File).is_none() {
-                    self.absent_files.insert(hash.to_string());
-                }
-            } else if self.held_as_file.remove(hash) {
-                match tolerated.held(hash, at) {
-                    Some(_) => {}
-                    None if unrecorded == Unrecorded::Damage => return Ok(Met::Unrecorded),
-                    None => {
-                        self.absent.insert(hash.to_string());
-                    }
-                }
-                return Ok(Met::Absent);
+            // Met first as a tree or chunk of the same bytes and held by nothing, it is a file's
+            // content too. (Met first as a held file, a chunk or tree of it is not judged again.)
+            if at == At::File && self.absent.contains(hash) && tolerated.held(hash, At::File).is_none() {
+                self.absent_files.insert(hash.to_string());
             }
             return Ok(Met::Again);
         }
@@ -1054,10 +1039,7 @@ impl Walked {
 
         match tolerated.held(hash, at) {
             // A boundary too, but never one a remote is leaned on for, so not among `absent`.
-            Some(Held::Redacted | Held::Withheld | Held::Unavailable) => {
-                self.held_as_file.insert(hash.to_string());
-                return Ok(Met::Absent);
-            }
+            Some(Held::Redacted | Held::Withheld | Held::Unavailable) => return Ok(Met::Absent),
             Some(Held::Sealed) => {}
             None if unrecorded == Unrecorded::Damage => return Ok(Met::Unrecorded),
             None => {}
@@ -2201,13 +2183,12 @@ mod tests {
         assert!(walked.absent_files.contains(&hash), "the same bytes are a file's content too");
     }
 
-    /// A hold on a file's content holds that file wherever it is met, and never a chunk or a tree
-    /// of the same bytes, whichever is met first.
+    /// A file the record holds is not listed among the absent files when its bytes were met first
+    /// as a chunk.
     /// Revert: drop the `held()` check of the `Met::Again` file arm → the withheld file is listed
-    /// as unheld → red; drop the re-judging of a file hold met again as a chunk → the chunk is
-    /// tolerated → red.
+    /// as unheld → red.
     #[test]
-    fn a_hold_on_a_file_holds_neither_a_chunk_nor_a_tree_of_the_same_bytes() {
+    fn a_held_file_met_after_a_chunk_of_the_same_bytes_is_not_an_absent_file() {
         let (_root, _scope) = scratch("met-again-held");
         let hash = "8".repeat(64);
         withholding::withhold(&hash, "court order 7").unwrap();
@@ -2217,18 +2198,6 @@ mod tests {
         assert!(matches!(walked.meet(&hash, At::Chunk, &tolerated, Unrecorded::Boundary).unwrap(), Met::Absent));
         assert!(matches!(walked.meet(&hash, At::File, &tolerated, Unrecorded::Boundary).unwrap(), Met::Again));
         assert!(walked.absent_files.is_empty(), "the record holds the file");
-
-        for at in [At::Chunk, At::Tree] {
-            let mut walked = Walked::default();
-            assert!(matches!(walked.meet(&hash, At::File, &tolerated, Unrecorded::Damage).unwrap(), Met::Absent));
-            assert!(matches!(walked.meet(&hash, at, &tolerated, Unrecorded::Damage).unwrap(), Met::Unrecorded), "{:?}", at);
-
-            let mut walked = Walked::default();
-            assert!(matches!(walked.meet(&hash, At::File, &tolerated, Unrecorded::Boundary).unwrap(), Met::Absent));
-            assert!(matches!(walked.meet(&hash, at, &tolerated, Unrecorded::Boundary).unwrap(), Met::Absent));
-            assert!(walked.absent.contains(&hash) && walked.absent_files.is_empty(), "{:?}", at);
-            assert!(matches!(walked.meet(&hash, at, &tolerated, Unrecorded::Boundary).unwrap(), Met::Again));
-        }
     }
 
     /// Revert: drop the withheld arm of `held` → the withheld-only hash is held by nothing → red;
