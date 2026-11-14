@@ -1359,7 +1359,7 @@ fn walk_loose_object_paths(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), St
     }
 
     for folder in file_utils::read_directory(&objects_root)? {
-        let folder = folder.map_err(|e| format!("Error while listing the objects folder: {}", e))?;
+        let folder = folder.map_err(|e| format!("Error while listing the objects folder {}: {}", objects_root.display(), e))?;
         if !folder.path().is_dir() {
             continue;
         }
@@ -1372,7 +1372,7 @@ fn walk_loose_object_paths(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), St
         }
 
         for file in file_utils::read_directory(&folder.path())? {
-            let file = file.map_err(|e| format!("Error while listing an objects folder: {}", e))?;
+            let file = file.map_err(|e| format!("Error while listing the objects folder {}: {}", folder.path().display(), e))?;
             let name = file.file_name().to_string_lossy().to_string();
 
             // Signature sidecars are not restaged on their own (they ride along with their

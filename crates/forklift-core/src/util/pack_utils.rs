@@ -6276,10 +6276,10 @@ fn enumerate_loose_objects() -> Result<Vec<PackTarget>, String> {
     let mut loose = Vec::new();
 
     let folders = std::fs::read_dir(&objects_root)
-        .map_err(|e| format!("Error while reading the objects folder: {}", e))?;
+        .map_err(|e| format!("Error while reading the objects folder {}: {}", objects_root.display(), e))?;
 
     for folder in folders {
-        let folder = folder.map_err(|e| format!("Error while listing the objects folder: {}", e))?;
+        let folder = folder.map_err(|e| format!("Error while listing the objects folder {}: {}", objects_root.display(), e))?;
         let prefix = folder.file_name().to_string_lossy().to_string();
 
         // The object store fans out on the first two hex characters of the hash; the pack

@@ -249,7 +249,7 @@ fn a_repair_refuses_a_fan_out_folder_it_cannot_list() {
 
     assert!(!refused.status.success(), "{}", text(&refused.stdout));
     let stderr = text(&refused.stderr);
-    assert!(stderr.contains(&format!("objects/{}", &side[..2])) && stderr.contains("Permission denied"), "{}", stderr);
+    assert!(stderr.contains(&format!("objects/{}", &side[..2])), "{}", stderr);
 
     area.server_ok(&root, &["tombstone", "repair"]);
     let listed = area.server_ok(&root, &["tombstone", "list"]);

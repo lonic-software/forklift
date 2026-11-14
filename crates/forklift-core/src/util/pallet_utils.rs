@@ -3602,9 +3602,11 @@ pub(crate) mod tests {
     }
 
     /// A fan-out folder that is there but cannot be listed is an error naming it, not an empty
-    /// answer; an absent one holds nothing. Skipped as root, which lists any folder.
+    /// answer; an absent one, or a file in its place, holds nothing. The unlistable half is skipped
+    /// as root, which lists any folder.
     ///
-    /// Revert: treat every listing error as an absent folder → `Ok([])` → red.
+    /// Revert: treat every listing error as an absent folder → `Ok([])` → red. Revert: treat only
+    /// `NotFound` as absent → the stray file is an error → red.
     #[cfg(unix)]
     #[test]
     fn an_unlistable_fan_out_folder_is_an_error_and_an_absent_one_holds_nothing() {
@@ -3616,6 +3618,8 @@ pub(crate) mod tests {
         file_utils::write_object_to_file(Path::new(&folder), &file_name, b"bytes".to_vec()).unwrap();
         assert_eq!(object_hashes_with_prefix("ab"), Ok(vec![hash.clone()]), "the folder lists while it is readable");
         assert_eq!(object_hashes_with_prefix("ef"), Ok(vec![]), "an absent folder holds nothing");
+        std::fs::write(Path::new(&file_utils::get_path_objects_root()).join("12"), b"stray").unwrap();
+        assert_eq!(object_hashes_with_prefix("12"), Ok(vec![]), "a file in a folder's place holds nothing");
 
         std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
         let listed = object_hashes_with_prefix("ab");
@@ -4538,9 +4542,9 @@ fn resolve_object_hash_prefix(prefix: &str) -> Result<String, String> {
 /// The hashes of every stored object, loose or packed, that start with `prefix`: lowercase hex of
 /// at least 2 characters. Sorted, each once.
 ///
-/// An absent fan-out folder holds nothing. One that is there but cannot be listed is an error,
-/// never an empty answer: a caller that enumerates the whole store would otherwise miss what
-/// sits in it without being told.
+/// An absent fan-out folder holds nothing, and so does a file in its place, which every sweep
+/// skips. A folder that is there but cannot be listed is an error, never an empty answer: a
+/// caller that enumerates the whole store would otherwise miss what sits in it without being told.
 pub(crate) fn object_hashes_with_prefix(prefix: &str) -> Result<Vec<String>, String> {
     let mut matches: Vec<String> = Vec::new();
 
@@ -4552,7 +4556,7 @@ pub(crate) fn object_hashes_with_prefix(prefix: &str) -> Result<Vec<String>, Str
 
     let entries = match std::fs::read_dir(&folder) {
         Ok(entries) => Some(entries),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => None,
         Err(error) => return Err(unlisted(error)),
     };
 
