@@ -649,7 +649,11 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
                 PalletRef { namespace, name: name.to_string() }.to_wire(),
                 path.to_string_lossy()
             ),
-            "forklift heal",
+            // `heal` rebuilds user refs only; a meta ref has no checkout or journal to rebuild from.
+            match namespace {
+                PalletNamespace::User => "forklift heal",
+                PalletNamespace::Meta => "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.",
+            },
         ).into()),
     }
 }
@@ -3087,7 +3091,11 @@ pub(crate) mod tests {
             let next = parcel(&tree(&[("more", &blob("more"), DirEntryType::Normal)]), &[&base]);
             let written = update_meta_pallet_head("notes", Some(&base), &next, &RefPreconditions::NONE);
             match &written {
-                Err(RefUpdateError::Failed(why)) => assert!(why.contains("pallet \"redactions\""), "{}", why),
+                Err(RefUpdateError::Failed(why)) => {
+                    assert!(why.contains("pallet \"@redactions\""), "{}", why);
+                    // `heal` does not rebuild a meta ref, so it is not the way out.
+                    assert!(why.contains("by hand") && !why.contains("forklift heal"), "{}", why);
+                }
                 other => panic!("expected the @redactions read's failure, got {:?}", other),
             }
             assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(base.as_str()), "nothing was written");

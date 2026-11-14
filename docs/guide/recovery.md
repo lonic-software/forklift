@@ -116,6 +116,9 @@ what only that ref reached is then no longer kept by any pallet.
 
 **Do not** write the ref file by hand: `heal --ref` checks that the parcel's history is complete.
 
+A meta pallet's ref (a name starting with `@`, such as `@redactions`) is not rebuilt: no checkout or
+journal records its head. Restore its file from a backup, or write the head parcel's hash into it.
+
 ### `clone_incomplete` (exit 30)
 
 A clone stopped part-way, and the directory keeps what it fetched. Run the same `forklift clone`
