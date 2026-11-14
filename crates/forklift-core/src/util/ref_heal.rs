@@ -656,7 +656,17 @@ pub fn set_damaged_ref(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> R
     let head = pallet_utils::resolve_revision(parcel)?;
     refuse_meta_history(pallet, parcel, &head, notes)?;
 
-    if crate::util::tombstone_utils::is_served()? {
+    // Damaged tombstones cannot tell whether the warehouse was served, so it is held to the floors
+    // a served one is, with a note naming the repair.
+    let served = crate::util::tombstone_utils::is_served().unwrap_or_else(|error| {
+        push_note(notes, format!(
+            "Whether this warehouse has been served could not be told, so it was taken as served: {}",
+            crate::error::CoreError::from(error)
+        ));
+        true
+    });
+
+    if served {
         refuse_below_a_floor(&damaged, &head, notes)?;
     }
 

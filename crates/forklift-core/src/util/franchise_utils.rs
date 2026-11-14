@@ -914,7 +914,7 @@ pub fn resume_command(url: &str, directory: &str, request: &Request) -> String {
 }
 
 /// Quote `arg` for a POSIX shell when it holds anything but plain characters.
-fn quote(arg: &str) -> String {
+pub(crate) fn quote(arg: &str) -> String {
     let plain = !arg.is_empty() && arg.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:@%+=,~".contains(c));
 
     if plain {

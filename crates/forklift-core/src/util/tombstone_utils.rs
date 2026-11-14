@@ -11,18 +11,29 @@
 //! served root's own disk drops it ([`drop_tombstone`]). Nothing expires one: a clone that pruned
 //! against it would lose the only copy.
 //!
+//! Besides its named tombstones the list can hold *kept heads*: heads with no name, written by
+//! [`repair_tombstones`](crate::util::tombstone_repair::repair_tombstones) for history a lost list
+//! may have held when no record still names its pallet. A kept head is a root like a tombstone,
+//! but the handshake does not list it, since its name would be a guess, and it reserves no name.
+//! [`drop_kept_head`] releases one.
+//!
 //! Only a served root carries tombstones. `forklift-server` marks a root as served before it first
 //! serves it ([`mark_served`]) and nothing clears the mark; a root never served writes none,
-//! because no clone can have pruned against what nobody served. The mark is read fail-closed: one
-//! that exists but cannot be read is an error, never "not served".
+//! because no clone can have pruned against what nobody served. Two files witness a served root,
+//! so that losing either one is told apart from a root never served ([`served_state`]): the mark,
+//! and the tombstone list, which [`mark_served`] creates empty before it writes the mark. In a
+//! served root a list that is missing or does not read is damage, refused with
+//! [`RefusalCode::TombstonesDamaged`]; so is a mark that does not read, and a missing mark beside a
+//! list that holds anything. Only losing both files at once reads as a root never served.
 //!
 //! Both files live in the shared forklift root, so every bay sees them, and both are
 //! [`record_utils`] files: the mark has no entries, and the tombstone list one `<head> <pallet>`
-//! entry per line. Every write of the list is made under the
-//! [`RefLock`], which orders it against every ref write.
+//! entry per tombstone and one bare `<head>` entry per kept head. Every write of either is made
+//! under the [`RefLock`], which orders it against every ref write.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use crate::error::{CoreError, RefusalCode};
 use crate::globals;
 use crate::util::lock_utils::{RefLock, ServeLock};
 use crate::util::{file_utils, object_utils, pallet_utils, record_utils};
@@ -32,21 +43,79 @@ const FILE_NAME_SERVED: &str = "served";
 const SERVED_RECORD: &str = "served";
 const SERVED_VERSION: u32 = 1;
 
-/// The tombstone list's file name in the shared forklift root, and its kind and version.
+/// The tombstone list's file name in the shared forklift root, and its kind and version. Version 2
+/// added kept heads; a list of any other version reads as damage, never as empty.
 const FILE_NAME_TOMBSTONES: &str = "tombstones";
 const TOMBSTONES_RECORD: &str = "tombstones";
-const TOMBSTONES_VERSION: u32 = 1;
+pub(crate) const TOMBSTONES_VERSION: u32 = 2;
 
-fn served_path() -> PathBuf {
+pub(crate) fn served_path() -> PathBuf {
     globals::forklift_root().join(FILE_NAME_SERVED)
 }
 
-fn tombstones_path() -> PathBuf {
+pub(crate) fn tombstones_path() -> PathBuf {
     globals::forklift_root().join(FILE_NAME_TOMBSTONES)
 }
 
+/// The tombstones of a warehouse: each deleted pallet's wire name mapped to the head its ref held,
+/// and the kept heads, which no name holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Tombstones {
+    /// Each deleted pallet's wire name, mapped to the head its ref held.
+    pub named: BTreeMap<String, String>,
+    /// Heads kept with no name (see the module doc).
+    pub kept: BTreeSet<String>,
+}
+
+impl Tombstones {
+    /// Whether the list holds neither a tombstone nor a kept head.
+    pub fn is_empty(&self) -> bool {
+        self.named.is_empty() && self.kept.is_empty()
+    }
+
+    /// Every head the list keeps, named or not, each once.
+    pub fn heads(&self) -> Vec<String> {
+        self.named.values().chain(self.kept.iter()).cloned().collect::<BTreeSet<_>>().into_iter().collect()
+    }
+}
+
+/// What the two witness files say of the warehouse at the current storage root (see the module
+/// doc). Every other combination is damage, refused by [`served_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServedState {
+    /// Neither file is there: the root has never been served.
+    Never,
+    /// An empty list and no mark: a first serve that stopped between the two writes, or a served
+    /// root that kept no tombstone and lost its mark. [`mark_served`] completes it; a ref removal
+    /// is refused until then, since it could not tell whether to leave a tombstone.
+    Unfinished,
+    /// The mark is there, and so is a list that reads.
+    Served,
+}
+
+/// The command that repairs the tombstones of the warehouse at the current storage root.
+fn repair_command() -> String {
+    let root = globals::forklift_root();
+    let warehouse = root.parent().unwrap_or(&root);
+
+    format!("forklift-server tombstone repair --root {}", crate::util::franchise_utils::quote(&warehouse.to_string_lossy()))
+}
+
+/// The refusal for damaged tombstones, `detail` saying what is wrong.
+pub(crate) fn damaged(detail: &str) -> String {
+    CoreError::refusal(
+        RefusalCode::TombstonesDamaged,
+        format!(
+            "{} Which deleted pallets' heads this served warehouse keeps cannot be told, so nothing \
+            was changed, and nothing that frees history runs here until the list is repaired.",
+            detail
+        ),
+        repair_command(),
+    ).into()
+}
+
 /// Read a record file's entries; `None` when the file is absent.
-fn read_record(path: &PathBuf, kind: &str, version: u32) -> Result<Option<Vec<String>>, String> {
+fn read_record(path: &Path, kind: &str, version: u32) -> Result<Option<Vec<String>>, String> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -58,33 +127,133 @@ fn read_record(path: &PathBuf, kind: &str, version: u32) -> Result<Option<Vec<St
         .map_err(|e| format!("The file \"{}\" {}", path.to_string_lossy(), e.describe()))
 }
 
-/// Whether the warehouse at the current storage root has been served.
+/// One entry of the tombstone list, as written.
+pub(crate) enum Entry<'a> {
+    /// `<head> <pallet>`.
+    Named(&'a str, &'a str),
+    /// A bare `<head>`.
+    Kept(&'a str),
+}
+
+/// Parse one entry of the tombstone list, `None` when it is neither form.
+pub(crate) fn parse_entry(line: &str) -> Option<Entry<'_>> {
+    match line.split_once(' ') {
+        Some((head, pallet)) if object_utils::is_object_hash(head) && pallet_utils::validate_pallet_name(pallet).is_ok() => {
+            Some(Entry::Named(head, pallet))
+        }
+        None if object_utils::is_object_hash(line) => Some(Entry::Kept(line)),
+        _ => None,
+    }
+}
+
+/// Read the tombstone list, `None` when it is absent. The error is the plain reason it does not
+/// read: the file cannot be read, is not a list of this version, holds an entry of neither form,
+/// or names a pallet or keeps a head twice.
+fn read_list() -> Result<Option<Tombstones>, String> {
+    let path = tombstones_path();
+    let Some(lines) = read_record(&path, TOMBSTONES_RECORD, TOMBSTONES_VERSION)? else {
+        return Ok(None);
+    };
+
+    let mut tombstones = Tombstones::default();
+
+    for line in lines {
+        match parse_entry(&line) {
+            // Two tombstones of one name would leave one head unrooted, so neither is chosen.
+            Some(Entry::Named(head, pallet)) => if tombstones.named.insert(pallet.to_string(), head.to_string()).is_some() {
+                return Err(format!("The file \"{}\" holds two tombstones of pallet \"{}\".", path.to_string_lossy(), pallet));
+            },
+            Some(Entry::Kept(head)) => if !tombstones.kept.insert(head.to_string()) {
+                return Err(format!("The file \"{}\" keeps head {} twice.", path.to_string_lossy(), head));
+            },
+            None => return Err(format!(
+                "The file \"{}\" holds an entry that is neither a parcel hash and a pallet name nor a \
+                parcel hash alone: \"{}\".",
+                path.to_string_lossy(), line.escape_debug()
+            )),
+        }
+    }
+
+    Ok(Some(tombstones))
+}
+
+/// Read both witness files of the warehouse at the current storage root.
+///
+/// # Returns
+/// * `Ok((ServedState, Tombstones))` - What they say, and the list (empty unless served).
+/// * `Err(String)`                   - A [`RefusalCode::TombstonesDamaged`] refusal: the mark does
+///                                     not read, the list does not read, a served root has no list,
+///                                     or a list that holds anything has no mark beside it.
+fn load() -> Result<(ServedState, Tombstones), String> {
+    let mark = read_record(&served_path(), SERVED_RECORD, SERVED_VERSION).map_err(|e| damaged(&e))?;
+    let list = read_list().map_err(|e| damaged(&e))?;
+
+    match (mark, list) {
+        (Some(_), Some(tombstones)) => Ok((ServedState::Served, tombstones)),
+        (Some(_), None) => Err(damaged(&format!(
+            "This warehouse has been served, but its tombstone list \"{}\" is missing.",
+            tombstones_path().to_string_lossy()
+        ))),
+        (None, None) => Ok((ServedState::Never, Tombstones::default())),
+        (None, Some(tombstones)) if tombstones.is_empty() => Ok((ServedState::Unfinished, tombstones)),
+        (None, Some(_)) => Err(damaged(&format!(
+            "The tombstone list \"{}\" holds tombstones, but the served mark \"{}\" beside it is missing.",
+            tombstones_path().to_string_lossy(), served_path().to_string_lossy()
+        ))),
+    }
+}
+
+/// What the witness files say of the warehouse at the current storage root; see [`load`] for the
+/// damage refused.
+pub fn served_state() -> Result<ServedState, String> {
+    load().map(|(state, _)| state)
+}
+
+/// Whether the warehouse at the current storage root has been served: [`ServedState::Served`]. An
+/// unfinished first serve is not, since nothing was served before the mark.
 ///
 /// # Returns
 /// * `Ok(bool)`    - Whether the mark is there.
-/// * `Err(String)` - The mark exists but could not be read, or is not a mark this build reads.
+/// * `Err(String)` - The damage [`load`] refuses.
 pub fn is_served() -> Result<bool, String> {
-    read_record(&served_path(), SERVED_RECORD, SERVED_VERSION).map(|mark| mark.is_some())
+    Ok(served_state()? == ServedState::Served)
 }
 
-/// Mark the warehouse at the current storage root as served, durably, unless it is already. Under
-/// the [`RefLock`], so a ref removal in a bay reads the mark either before it is written (and the
-/// server then serves a root without that ref) or after it (and the removal leaves a tombstone).
-/// A root already marked is answered without the lock. Unless `wait`, the lock is tried, never
-/// waited for: the server's multi-root registry calls this under its mutex, so a bay holding the
-/// lock makes the first serve retry rather than stall every other warehouse.
+/// Whether a ref removal in the warehouse at the current storage root must leave a tombstone: the
+/// root is served. An unfinished first serve is refused, with the damage code, since the removal
+/// cannot tell whether a clone was served the head it removes.
+pub(crate) fn served_for_removal() -> Result<bool, String> {
+    match served_state()? {
+        ServedState::Served => Ok(true),
+        ServedState::Never => Ok(false),
+        ServedState::Unfinished => Err(damaged(&format!(
+            "The served mark \"{}\" is missing beside an empty tombstone list: a first serve did not \
+            finish, or the mark was lost.",
+            served_path().to_string_lossy()
+        ))),
+    }
+}
+
+/// Mark the warehouse at the current storage root as served, durably, unless it is already: first
+/// an empty tombstone list, only when there is none, then the mark. An unfinished first serve is
+/// completed by writing the mark. Under the [`RefLock`], so a ref removal in a bay reads the mark
+/// either before it is written (and the server then serves a root without that ref) or after it
+/// (and the removal leaves a tombstone). A root already marked is answered without the lock.
+/// Unless `wait`, the lock is tried, never waited for: the server's multi-root registry calls this
+/// under its mutex, so a bay holding the lock makes the first serve retry rather than stall every
+/// other warehouse.
 ///
 /// # Returns
 /// * `Ok(true)`    - The root is marked.
 /// * `Ok(false)`   - Not `wait`, the root is unmarked and a bay holds the ref lock; nothing was
 ///                   written.
-/// * `Err(String)` - The mark could not be read or written.
+/// * `Err(String)` - The damage [`load`] refuses, or a file could not be written.
 pub fn mark_served(wait: bool) -> Result<bool, String> {
     if is_served()? {
         return Ok(true);
     }
 
-    let _lock = match wait {
+    let lock = match wait {
         true => RefLock::acquire()?,
         false => match RefLock::try_acquire_in(&globals::forklift_root())? {
             Some(lock) => lock,
@@ -92,85 +261,99 @@ pub fn mark_served(wait: bool) -> Result<bool, String> {
         },
     };
 
-    if is_served()? {
-        return Ok(true);
+    match served_state()? {
+        ServedState::Served => return Ok(true),
+        // Every write of the list is made under the ref lock, so it is still absent here.
+        ServedState::Never => write_tombstones(&lock, &Tombstones::default())?,
+        ServedState::Unfinished => {}
     }
 
-    file_utils::write_file_atomically(&served_path(), &record_utils::to_bytes(SERVED_RECORD, SERVED_VERSION, Vec::<String>::new()))?;
+    write_mark(&lock)?;
 
     Ok(true)
 }
 
-/// The tombstones of the warehouse at the current storage root: each removed pallet's wire name,
-/// mapped to the head its ref held. Empty when there are none, as in every root never served.
-/// Lock-free: the file is replaced atomically, so a reader sees one whole version; a caller that
-/// decides a write from what it read reads again under the lock.
-///
-/// # Returns
-/// * `Ok(BTreeMap<String, String>)` - The tombstones.
-/// * `Err(String)`                  - The list exists but could not be read, holds an entry that is
-///                                    not a parcel hash and a pallet name, or names a pallet twice.
-pub fn read_tombstones() -> Result<BTreeMap<String, String>, String> {
-    let path = tombstones_path();
-    let mut tombstones = BTreeMap::new();
-
-    for line in read_record(&path, TOMBSTONES_RECORD, TOMBSTONES_VERSION)?.unwrap_or_default() {
-        match line.split_once(' ') {
-            Some((head, pallet)) if object_utils::is_object_hash(head) && pallet_utils::validate_pallet_name(pallet).is_ok() => {
-                // Two tombstones of one name would leave one head unrooted, so neither is chosen.
-                if tombstones.insert(pallet.to_string(), head.to_string()).is_some() {
-                    return Err(format!(
-                        "The file \"{}\" holds two tombstones of pallet \"{}\".",
-                        path.to_string_lossy(), pallet
-                    ));
-                }
-            }
-            _ => return Err(format!(
-                "The file \"{}\" holds an entry that is not a parcel hash and a pallet name: \"{}\".",
-                path.to_string_lossy(), line.escape_debug()
-            )),
-        }
-    }
-
-    Ok(tombstones)
+/// Write the served mark, durably. Only under the ref lock.
+pub(crate) fn write_mark(_lock: &RefLock) -> Result<(), String> {
+    file_utils::write_file_atomically(&served_path(), &record_utils::to_bytes(SERVED_RECORD, SERVED_VERSION, Vec::<String>::new()))
 }
 
-/// The heads every tombstone holds, which gc, compaction and prune keep (see [`read_tombstones`]).
+/// The tombstones of the warehouse at the current storage root. Empty in a root never served, or
+/// one whose first serve did not finish. Lock-free: each file is replaced atomically, so a reader
+/// sees one whole version; a caller that decides a write from what it read reads again under the
+/// lock.
+///
+/// # Returns
+/// * `Ok(Tombstones)` - The tombstones and kept heads.
+/// * `Err(String)`    - The damage [`load`] refuses.
+pub fn read_tombstones() -> Result<Tombstones, String> {
+    load().map(|(_, tombstones)| tombstones)
+}
+
+/// The heads every tombstone and kept head holds, which gc, compaction and prune keep (see
+/// [`read_tombstones`]).
 pub fn tombstone_heads() -> Result<Vec<String>, String> {
-    Ok(read_tombstones()?.into_values().collect())
+    Ok(read_tombstones()?.heads())
 }
 
 /// Replace the tombstone list, durably. Only under the ref lock.
-pub(crate) fn write_tombstones(_lock: &RefLock, tombstones: &BTreeMap<String, String>) -> Result<(), String> {
-    let lines = tombstones.iter().map(|(pallet, head)| format!("{} {}", head, pallet));
+pub(crate) fn write_tombstones(_lock: &RefLock, tombstones: &Tombstones) -> Result<(), String> {
+    let named = tombstones.named.iter().map(|(pallet, head)| format!("{} {}", head, pallet));
+    let lines: Vec<String> = named.chain(tombstones.kept.iter().cloned()).collect();
 
     file_utils::write_file_atomically(&tombstones_path(), &record_utils::to_bytes(TOMBSTONES_RECORD, TOMBSTONES_VERSION, lines))
 }
 
+/// Take the serve lock, then the ref lock, for a rewrite of the list at the served root's own disk.
+/// The serve lock is the one gc takes, so the rewrite refuses while a server serves the root; the
+/// ref lock keeps a removal in a bay meanwhile from losing its own tombstone.
+fn rewrite_locks(what: &str) -> Result<(ServeLock, RefLock), String> {
+    let serve_lock = ServeLock::acquire().map_err(|e| format!("Refusing to {}: {}", what, e))?;
+
+    Ok((serve_lock, RefLock::acquire()?))
+}
+
 /// Drop the tombstone of pallet `wire` in the warehouse at the current storage root: an explicit,
 /// destructive act at the served root's own disk. The name is free for unrelated history from then
-/// on, and the history the tombstone held is collectable unless something else reaches it. Takes
-/// the serve lock, as gc does, so it refuses while a server serves the root, then rewrites the list
-/// under the ref lock, so a removal in a bay meanwhile keeps its own tombstone.
+/// on, and the history the tombstone held is collectable unless something else reaches it.
+/// Refused while a server serves the root ([`rewrite_locks`]).
 ///
 /// # Returns
 /// * `Ok(String)`  - The head the dropped tombstone held.
 /// * `Err(String)` - The root is being served, no tombstone has that name, or the list could not
 ///                   be read or written.
 pub fn drop_tombstone(wire: &str) -> Result<String, String> {
-    let _serve_lock = ServeLock::acquire()
-        .map_err(|e| format!("Refusing to drop a tombstone: {}", e))?;
-    let lock = RefLock::acquire()?;
+    let (_serve_lock, lock) = rewrite_locks("drop a tombstone")?;
 
     let mut tombstones = read_tombstones()?;
 
-    let Some(head) = tombstones.remove(wire) else {
+    let Some(head) = tombstones.named.remove(wire) else {
         return Err(format!("No deleted pallet \"{}\" has a tombstone in this warehouse.", wire));
     };
 
     write_tombstones(&lock, &tombstones)?;
 
     Ok(head)
+}
+
+/// Release kept head `head` in the warehouse at the current storage root, as [`drop_tombstone`]
+/// drops a tombstone: the history it held is collectable from then on unless something else
+/// reaches it.
+///
+/// # Returns
+/// * `Ok(())`      - The head is no longer kept.
+/// * `Err(String)` - The root is being served, the list keeps no such head, or it could not be
+///                   read or written.
+pub fn drop_kept_head(head: &str) -> Result<(), String> {
+    let (_serve_lock, lock) = rewrite_locks("drop a kept head")?;
+
+    let mut tombstones = read_tombstones()?;
+
+    if !tombstones.kept.remove(head) {
+        return Err(format!("The tombstone list of this warehouse keeps no head {} without a name.", head));
+    }
+
+    write_tombstones(&lock, &tombstones)
 }
 
 /// Bring deleted pallet `wire` back at the head its tombstone holds, in the warehouse at the
@@ -198,7 +381,7 @@ pub fn restore_pallet(wire: &str) -> Result<String, String> {
         ));
     }
 
-    let Some(head) = read_tombstones()?.remove(wire) else {
+    let Some(head) = read_tombstones()?.named.remove(wire) else {
         return Err(format!("No deleted pallet \"{}\" has a tombstone in this warehouse.", wire));
     };
 
@@ -240,7 +423,7 @@ pub fn refuse_a_tombstoned_name(wire: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    match read_tombstones()?.get(wire) {
+    match read_tombstones()?.named.get(wire) {
         Some(head) => Err(format!(
             "Pallet \"{}\" was deleted in this served warehouse, at {}, and the name is kept for it. \
             Choose another name, or bring the pallet back with \"forklift pallet restore {}\". \
@@ -252,17 +435,17 @@ pub fn refuse_a_tombstoned_name(wire: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
 
-    struct Scratch {
+    pub(crate) struct Scratch {
         root: PathBuf,
         _scope: StorageRootScope,
     }
 
     impl Scratch {
-        fn new(name: &str) -> Scratch {
+        pub(crate) fn new(name: &str) -> Scratch {
             let root = std::env::temp_dir().join(format!("forklift-tombstone-test-{}-{}", name, std::process::id()));
             let _ = file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
@@ -278,6 +461,31 @@ mod tests {
         }
     }
 
+    fn named(pairs: &[(&str, &str)]) -> Tombstones {
+        Tombstones {
+            named: pairs.iter().map(|(name, head)| (name.to_string(), head.to_string())).collect(),
+            kept: BTreeSet::new(),
+        }
+    }
+
+    /// Mark the scratch root served and write `tombstones` as its list.
+    fn served_with(tombstones: &Tombstones) {
+        assert!(mark_served(false).unwrap());
+        let lock = RefLock::acquire().unwrap();
+        write_tombstones(&lock, tombstones).unwrap();
+    }
+
+    fn write_list(lines: &[&str]) {
+        std::fs::write(tombstones_path(), record_utils::to_bytes(TOMBSTONES_RECORD, TOMBSTONES_VERSION, lines.iter().copied())).unwrap();
+    }
+
+    fn assert_damaged(error: &str, needle: &str) {
+        let (code, human, next_step) = crate::error::deframe(error).unwrap_or_else(|| panic!("not a coded refusal: {}", error));
+        assert_eq!(code, "tombstones_damaged", "{}", error);
+        assert!(human.contains(needle), "{}", human);
+        assert!(next_step.starts_with("forklift-server tombstone repair --root "), "{}", next_step);
+    }
+
     #[test]
     fn the_mark_is_written_once_and_read_fail_closed() {
         let _scratch = Scratch::new("mark");
@@ -288,8 +496,60 @@ mod tests {
         assert!(is_served().unwrap(), "the mark stands");
 
         std::fs::write(served_path(), b"something else\n").unwrap();
-        let error = is_served().unwrap_err();
-        assert!(error.contains(FILE_NAME_SERVED), "an unreadable mark is an error, never \"not served\": {}", error);
+        assert_damaged(&is_served().unwrap_err(), FILE_NAME_SERVED);
+    }
+
+    #[test]
+    fn a_first_mark_creates_a_missing_list_and_never_overwrites_one() {
+        let _scratch = Scratch::new("mark-list");
+
+        assert!(!tombstones_path().exists());
+        assert!(mark_served(false).unwrap());
+        assert_eq!(read_record(&tombstones_path(), TOMBSTONES_RECORD, TOMBSTONES_VERSION).unwrap(), Some(Vec::new()), "the mark brings an empty list");
+
+        // A list already there, beside a lost mark, is never overwritten: it is damage.
+        let head = "a".repeat(64);
+        std::fs::remove_file(served_path()).unwrap();
+        write_list(&[&format!("{} gone", head)]);
+        assert_damaged(&mark_served(false).unwrap_err(), "the served mark");
+        assert_eq!(read_record(&tombstones_path(), TOMBSTONES_RECORD, TOMBSTONES_VERSION).unwrap(), Some(vec![format!("{} gone", head)]));
+    }
+
+    #[test]
+    fn a_torn_first_serve_is_completed_by_the_next_mark() {
+        let _scratch = Scratch::new("torn");
+
+        write_list(&[]);
+        assert_eq!(served_state().unwrap(), ServedState::Unfinished);
+        assert!(!is_served().unwrap(), "nothing was served before the mark");
+        assert_damaged(&served_for_removal().unwrap_err(), "did not finish");
+
+        assert!(mark_served(false).unwrap());
+        assert_eq!(served_state().unwrap(), ServedState::Served);
+        assert!(served_for_removal().unwrap());
+    }
+
+    #[test]
+    fn a_lost_mark_beside_tombstones_is_damage() {
+        let _scratch = Scratch::new("lost-mark");
+
+        served_with(&named(&[("gone", &"a".repeat(64))]));
+        std::fs::remove_file(served_path()).unwrap();
+
+        for error in [is_served().unwrap_err(), served_for_removal().unwrap_err(), read_tombstones().unwrap_err()] {
+            assert_damaged(&error, "the served mark");
+        }
+    }
+
+    #[test]
+    fn a_served_root_without_a_list_is_damage() {
+        let _scratch = Scratch::new("lost-list");
+
+        assert!(mark_served(false).unwrap());
+        std::fs::remove_file(tombstones_path()).unwrap();
+
+        assert_damaged(&read_tombstones().unwrap_err(), "is missing");
+        assert_damaged(&tombstone_heads().unwrap_err(), "is missing");
     }
 
     #[test]
@@ -299,6 +559,7 @@ mod tests {
         let lock = RefLock::acquire().unwrap();
         assert!(!mark_served(false).unwrap(), "a bay holds the ref lock, so the mark must not wait");
         assert!(!is_served().unwrap(), "nothing is written while the lock is held");
+        assert!(!tombstones_path().exists(), "nor the list");
 
         drop(lock);
         assert!(mark_served(false).unwrap());
@@ -334,24 +595,21 @@ mod tests {
 
         refuse_a_tombstoned_name("gone").unwrap();
 
-        let lock = RefLock::acquire().unwrap();
-        write_tombstones(&lock, &BTreeMap::from([("gone".to_string(), head.clone())])).unwrap();
-        drop(lock);
-        refuse_a_tombstoned_name("gone").unwrap();
-
-        assert!(mark_served(false).unwrap());
+        served_with(&named(&[("gone", &head)]));
         let refused = refuse_a_tombstoned_name("gone").unwrap_err();
         assert!(refused.contains(&head) && refused.contains("forklift pallet restore gone"), "{}", refused);
         refuse_a_tombstoned_name("other").unwrap();
+
+        // A kept head reserves no name.
+        let lock = RefLock::acquire().unwrap();
+        write_tombstones(&lock, &Tombstones { named: BTreeMap::new(), kept: BTreeSet::from([head]) }).unwrap();
+        drop(lock);
+        refuse_a_tombstoned_name("gone").unwrap();
     }
 
     #[test]
     fn a_restore_in_a_root_never_served_is_refused() {
         let _scratch = Scratch::new("restore-unserved");
-
-        let lock = RefLock::acquire().unwrap();
-        write_tombstones(&lock, &BTreeMap::from([("gone".to_string(), "a".repeat(64))])).unwrap();
-        drop(lock);
 
         let refused = restore_pallet("gone").unwrap_err();
         assert!(refused.contains("never been served"), "{}", refused);
@@ -361,30 +619,39 @@ mod tests {
     #[test]
     fn tombstones_round_trip_and_a_malformed_entry_is_refused() {
         let _scratch = Scratch::new("list");
-        let head = "a".repeat(64);
+        let (head, kept) = ("a".repeat(64), "c".repeat(64));
 
-        assert!(read_tombstones().unwrap().is_empty(), "an absent list is empty");
+        assert!(read_tombstones().unwrap().is_empty(), "a root never served has none");
 
-        let lock = RefLock::acquire().unwrap();
-        write_tombstones(&lock, &BTreeMap::from([("feature/x".to_string(), head.clone())])).unwrap();
-        drop(lock);
+        let written = Tombstones {
+            named: BTreeMap::from([("feature/x".to_string(), head.clone())]),
+            kept: BTreeSet::from([kept.clone()]),
+        };
+        served_with(&written);
 
-        assert_eq!(read_tombstones().unwrap(), BTreeMap::from([("feature/x".to_string(), head.clone())]));
-        assert_eq!(tombstone_heads().unwrap(), vec![head.clone()]);
+        assert_eq!(read_tombstones().unwrap(), written);
+        assert_eq!(tombstone_heads().unwrap(), vec![head.clone(), kept.clone()], "kept heads are kept too");
 
-        std::fs::write(tombstones_path(), record_utils::to_bytes(TOMBSTONES_RECORD, TOMBSTONES_VERSION, ["nothash main"])).unwrap();
-        let error = read_tombstones().unwrap_err();
-        assert!(error.contains("not a parcel hash"), "{}", error);
+        write_list(&["nothash main"]);
+        assert_damaged(&read_tombstones().unwrap_err(), "neither a parcel hash and a pallet name");
 
         let bad_name = format!("{} bad name", head);
-        std::fs::write(tombstones_path(), record_utils::to_bytes(TOMBSTONES_RECORD, TOMBSTONES_VERSION, [bad_name.as_str()])).unwrap();
-        let error = read_tombstones().unwrap_err();
-        assert!(error.contains("not a parcel hash and a pallet name"), "{}", error);
+        write_list(&[bad_name.as_str()]);
+        assert_damaged(&read_tombstones().unwrap_err(), "neither a parcel hash and a pallet name");
 
         let (first, second) = (format!("{} main", head), format!("{} main", "b".repeat(64)));
-        std::fs::write(tombstones_path(), record_utils::to_bytes(TOMBSTONES_RECORD, TOMBSTONES_VERSION, [first.as_str(), second.as_str()])).unwrap();
-        let error = read_tombstones().unwrap_err();
-        assert!(error.contains("two tombstones of pallet \"main\""), "a duplicate is refused, never collapsed: {}", error);
+        write_list(&[first.as_str(), second.as_str()]);
+        assert_damaged(&read_tombstones().unwrap_err(), "two tombstones of pallet \"main\"");
+
+        write_list(&[kept.as_str(), kept.as_str()]);
+        assert_damaged(&read_tombstones().unwrap_err(), "twice");
+
+        std::fs::write(tombstones_path(), b"\xff\xfe not text").unwrap();
+        assert_damaged(&read_tombstones().unwrap_err(), FILE_NAME_TOMBSTONES);
+
+        // A list of the version before kept heads is not read as this one.
+        std::fs::write(tombstones_path(), record_utils::to_bytes(TOMBSTONES_RECORD, 1, [first.as_str()])).unwrap();
+        assert_damaged(&read_tombstones().unwrap_err(), FILE_NAME_TOMBSTONES);
     }
 
     #[test]
@@ -392,27 +659,40 @@ mod tests {
         let _scratch = Scratch::new("drop");
         let (a, b) = ("a".repeat(64), "b".repeat(64));
 
-        let lock = RefLock::acquire().unwrap();
-        write_tombstones(&lock, &BTreeMap::from([("x".to_string(), a.clone()), ("y".to_string(), b.clone())])).unwrap();
-        drop(lock);
+        served_with(&named(&[("x", &a), ("y", &b)]));
 
         assert_eq!(drop_tombstone("x").unwrap(), a);
-        assert_eq!(read_tombstones().unwrap(), BTreeMap::from([("y".to_string(), b)]));
+        assert_eq!(read_tombstones().unwrap(), named(&[("y", &b)]));
 
         let error = drop_tombstone("x").unwrap_err();
         assert!(error.contains("No deleted pallet \"x\""), "{}", error);
     }
 
     #[test]
+    fn a_kept_head_is_dropped_by_its_head() {
+        let _scratch = Scratch::new("drop-kept");
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+
+        served_with(&Tombstones { named: BTreeMap::from([("x".to_string(), a.clone())]), kept: BTreeSet::from([b.clone()]) });
+
+        let error = drop_kept_head(&a).unwrap_err();
+        assert!(error.contains("keeps no head"), "a tombstone's head is not a kept head: {}", error);
+
+        drop_kept_head(&b).unwrap();
+        assert_eq!(read_tombstones().unwrap(), named(&[("x", &a)]), "only the kept head went");
+        assert!(drop_kept_head(&b).unwrap_err().contains("keeps no head"));
+    }
+
+    #[test]
     fn a_drop_refuses_while_the_root_is_served() {
         let _scratch = Scratch::new("drop-served");
-        let lock = RefLock::acquire().unwrap();
-        write_tombstones(&lock, &BTreeMap::from([("x".to_string(), "a".repeat(64))])).unwrap();
-        drop(lock);
+        served_with(&Tombstones { named: BTreeMap::from([("x".to_string(), "a".repeat(64))]), kept: BTreeSet::from(["b".repeat(64)]) });
 
         let _server = ServeLock::acquire().unwrap();
         let error = drop_tombstone("x").unwrap_err();
         assert!(error.starts_with("Refusing to drop a tombstone"), "{}", error);
-        assert_eq!(read_tombstones().unwrap().len(), 1, "nothing was dropped");
+        let error = drop_kept_head(&"b".repeat(64)).unwrap_err();
+        assert!(error.starts_with("Refusing to drop a kept head"), "{}", error);
+        assert_eq!(read_tombstones().unwrap().heads().len(), 2, "nothing was dropped");
     }
 }

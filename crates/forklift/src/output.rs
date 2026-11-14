@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 43;
+pub const SCHEMA_VERSION: u32 = 44;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -585,6 +585,9 @@ error_codes! {
 
     /// A sparse warehouse's fetch scope is damaged and `heal` could not rebuild it alone.
     FetchScopeDamaged,
+
+    /// A served warehouse's tombstone list or served mark is lost or damaged.
+    TombstonesDamaged,
 }
 
 impl ErrorCode {
@@ -644,6 +647,7 @@ impl ErrorCode {
             ErrorCode::RemoteHistoryIncomplete => RefusalCode::RemoteHistoryIncomplete.as_str(),
             ErrorCode::RefDamaged => RefusalCode::RefDamaged.as_str(),
             ErrorCode::FetchScopeDamaged => RefusalCode::FetchScopeDamaged.as_str(),
+            ErrorCode::TombstonesDamaged => RefusalCode::TombstonesDamaged.as_str(),
         }
     }
 
@@ -706,6 +710,7 @@ impl ErrorCode {
             ErrorCode::RemoteHistoryIncomplete => 52,
             ErrorCode::RefDamaged => 53,
             ErrorCode::FetchScopeDamaged => 54,
+            ErrorCode::TombstonesDamaged => 55,
         }
     }
 
@@ -845,6 +850,8 @@ impl ErrorCode {
                 "A pallet ref is lost or damaged: its file holds no parcel hash, or it is missing while a checkout stands on that pallet. Nothing was changed; heal rebuilds it from what the bays and the ref's own bytes still name, or lists what it found",
             ErrorCode::FetchScopeDamaged =>
                 "A sparse warehouse's fetch scope is lost or damaged, and heal could not rebuild it from the checkouts' scopes alone. Nothing was changed; heal --fetch-scope sets it, fetching what the history there lacks",
+            ErrorCode::TombstonesDamaged =>
+                "A served warehouse's tombstone list or served mark is lost or damaged, so which deleted pallets' heads it keeps cannot be told. Nothing was changed, and nothing that frees history runs there; its operator repairs it with forklift-server tombstone repair while it is not served",
         }
     }
 
@@ -905,6 +912,7 @@ impl ErrorCode {
             RefusalCode::RemoteHistoryIncomplete => ErrorCode::RemoteHistoryIncomplete,
             RefusalCode::RefDamaged => ErrorCode::RefDamaged,
             RefusalCode::FetchScopeDamaged => ErrorCode::FetchScopeDamaged,
+            RefusalCode::TombstonesDamaged => ErrorCode::TombstonesDamaged,
         }
     }
 }
@@ -1552,6 +1560,7 @@ mod tests {
             (RefusalCode::RemoteHistoryIncomplete, "remote_history_incomplete", 52),
             (RefusalCode::RefDamaged, "ref_damaged", 53),
             (RefusalCode::FetchScopeDamaged, "fetch_scope_damaged", 54),
+            (RefusalCode::TombstonesDamaged, "tombstones_damaged", 55),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

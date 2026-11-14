@@ -370,6 +370,13 @@ refusal_codes! {
     /// present, or a checkout's scope lies outside a fetch scope that parses. Nothing was changed.
     /// `heal --fetch-scope <prefix>`, once per prefix, sets it, fetching what the history at those prefixes lacks.
     FetchScopeDamaged => "fetch_scope_damaged",
+
+    /// A served warehouse's tombstone list or its served mark is lost or damaged, so which deleted
+    /// pallets' heads it keeps cannot be told. Nothing was changed. Its operator repairs it with
+    /// `forklift-server tombstone repair` while the warehouse is not served; until then nothing
+    /// that frees history (gc, compaction, prune) runs there, and its server answers every request
+    /// that reads the list with this code.
+    TombstonesDamaged => "tombstones_damaged",
 }
 
 impl RefusalCode {
