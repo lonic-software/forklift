@@ -2144,6 +2144,10 @@ pub(crate) struct ClosureWalkResult {
     /// Zero for every other walk. Folded into a note on the `Ok` path only — see
     /// [`unavailable_absent_note`].
     pub unavailable_absent: usize,
+    /// The corrupt-boundary hashes in `hashes` that the walk's own read of the sealed record holds
+    /// by hash, a blob's, a tree's or a chunk's: their remote holds the content, so a caller that
+    /// judges loss does not count them lost. Empty for every other walk.
+    pub held_corrupt: BTreeSet<String>,
 }
 
 /// Walk every durable ref source's closure looking for `targets`, returning the subset actually
@@ -2161,6 +2165,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
             unwalked_hashes: BTreeMap::new(), never_held_pins: BTreeSet::new(), never_held_tags: Vec::new(), tags_unread: None,
             redacted_absent: 0,
             unavailable_absent: 0,
+            held_corrupt: BTreeSet::new(),
         });
     }
 
@@ -2184,6 +2189,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
         tags_unread: roots.tags_unread,
         redacted_absent: 0,
         unavailable_absent: 0,
+        held_corrupt: BTreeSet::new(),
     })
 }
 
@@ -2264,8 +2270,15 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
     let unavailable_absent = absent_count(&mut sealed.unavailable.entries()
         .map(|(hash, _)| hash)
         .filter(|hash| !sealed.applied.contains(hash) && !sealed.withheld.contains(hash)));
+    // Read against the same record the walk held by, so the two never disagree.
+    let held_corrupt = absent.iter()
+        .filter(|hash| corrupt.contains(*hash))
+        .filter(|hash| [At::File, At::Tree, At::Chunk].into_iter().any(|at| sealed.held(hash, at).is_some()))
+        .cloned()
+        .collect();
 
     Ok(ClosureWalkResult {
+        held_corrupt,
         hashes: absent,
         degraded_sources: roots.degraded_sources,
         unwalked: unwalked_notes(&outcome.unwalked),
@@ -2337,12 +2350,10 @@ pub fn find_lost_objects() -> Result<LostObjects, String> {
         walk.hashes.into_iter().partition(|hash| scan.corrupt.contains_key(hash));
     // A corrupt file at an address the sealed record holds by hash does not lose the object: its
     // remote holds it. An unreadable record holds nothing, as the walk's own degraded note says.
-    let sealed = sealed_utils::read_tolerated().unwrap_or_default();
-    let held = |hash: &str| [At::File, At::Tree, At::Chunk].into_iter().any(|at| sealed.held(hash, at).is_some());
     let mut corrupt = BTreeMap::new();
     let (mut damaged_unreached, mut damaged_held) = (0, 0);
     for (hash, why) in scan.corrupt {
-        match (reached.contains(&hash), held(&hash)) {
+        match (reached.contains(&hash), walk.held_corrupt.contains(&hash)) {
             (true, false) => { corrupt.insert(hash, why); }
             (true, true) => damaged_held += 1,
             (false, _) => damaged_unreached += 1,
