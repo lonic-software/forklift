@@ -1025,6 +1025,10 @@ impl Walked {
     /// Note `hash` as referenced and say what it was met as.
     fn meet(&mut self, hash: &str, at: At, tolerated: &Tolerated, unrecorded: Unrecorded) -> Result<Met, String> {
         if !self.referenced.insert(hash.to_string()) {
+            // Met first as a tree or chunk of the same bytes, it is a file's content too.
+            if at == At::File && self.absent.contains(hash) {
+                self.absent_files.insert(hash.to_string());
+            }
             return Ok(Met::Again);
         }
 

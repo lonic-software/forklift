@@ -37,9 +37,9 @@ pub struct Repaired {
     /// Each file content (blob or recipe) the history kept here names that is absent and that no
     /// record holds: content a lost entry may have withheld, once its copy was deleted.
     pub absent: Vec<String>,
-    /// How many absent trees and chunks no record holds: damage to the store, since a takedown never
+    /// Each absent tree and chunk no record holds: damage to the store, since a takedown never
     /// withholds one.
-    pub absent_other: usize,
+    pub absent_other: Vec<String>,
     /// The warehouse repaired, quoted for a command line.
     pub warehouse: String,
 }
@@ -85,13 +85,15 @@ impl Repaired {
 
         lines.extend(self.absent.iter().map(|hash| format!("  {}", hash)));
 
-        if self.absent_other > 0 {
+        if !self.absent_other.is_empty() {
+            let n = self.absent_other.len();
             lines.push(format!(
                 "{} folder{} or chunk{} the history here names {} absent too, which no takedown withholds: that is \
-                damage to the store, not a lost entry.",
-                self.absent_other, if self.absent_other == 1 { "" } else { "s" }, if self.absent_other == 1 { "" } else { "s" },
-                if self.absent_other == 1 { "is" } else { "are" }
+                damage to the store, not a lost entry. Restore {} from a copy of this warehouse:",
+                n, if n == 1 { "" } else { "s" }, if n == 1 { "" } else { "s" }, if n == 1 { "is" } else { "are" },
+                if n == 1 { "it" } else { "them" }
             ));
+            lines.extend(self.absent_other.iter().map(|hash| format!("  {}", hash)));
         }
 
         lines.push(
@@ -204,8 +206,9 @@ fn copy_aside(path: &std::path::Path, bytes: &[u8]) -> Result<PathBuf, String> {
 /// Every entry of a damaged record that still reads whole, and each hash kept with the
 /// placeholder from an entry that does not but opens with one. A first line that is a record
 /// header is skipped; an escaped entry reads as written, since a statement is one plain line. A
-/// line is whole only when it is valid UTF-8 and ends in its newline: a record cut inside its last
-/// entry would otherwise keep a cut statement as the takedown's words.
+/// line is whole only when it is valid UTF-8, its escapes read, and it ends in its newline: a
+/// record cut inside its last entry, or a lost backslash, would otherwise keep an altered
+/// statement as the takedown's words.
 fn salvage(bytes: &[u8]) -> (WithheldSet, usize, Vec<String>, usize) {
     let mut entries = std::collections::BTreeMap::new();
     let mut placeholders = Vec::new();
@@ -219,11 +222,12 @@ fn salvage(bytes: &[u8]) -> (WithheldSet, usize, Vec<String>, usize) {
 
         // The piece after the last newline is a line the record was cut inside.
         let terminated = index + 1 < lines.len();
-        let whole = terminated && std::str::from_utf8(raw).is_ok();
+        let raw_text = String::from_utf8_lossy(raw);
+        let unescaped = record_utils::unescape(&raw_text);
+        let whole = terminated && std::str::from_utf8(raw).is_ok() && unescaped.is_some();
 
         // An entry is escaped as written; a line whose escape is broken is read raw, for its hash.
-        let raw = String::from_utf8_lossy(raw);
-        let line = record_utils::unescape(&raw).unwrap_or_else(|| raw.to_string());
+        let line = unescaped.unwrap_or_else(|| raw_text.to_string());
 
         match withholding::parse_entry(&line).filter(|_| whole) {
             Some((hash, statement, digest)) => {
@@ -250,8 +254,8 @@ fn salvage(bytes: &[u8]) -> (WithheldSet, usize, Vec<String>, usize) {
 
 /// Every file content the history this root keeps names that is absent and that no record holds,
 /// the sealed record and `withheld`, the salvaged record, included, sorted; and how many absent
-/// trees and chunks no record holds.
-fn absent_unheld(withheld: &WithheldSet) -> Result<(Vec<String>, usize), String> {
+/// trees and chunks no record holds, sorted.
+fn absent_unheld(withheld: &WithheldSet) -> Result<(Vec<String>, Vec<String>), String> {
     let tolerated = sealed_utils::Tolerated {
         sealed: sealed_utils::read_sealed()?,
         applied: applied_redactions::read_applied()?,
@@ -264,7 +268,8 @@ fn absent_unheld(withheld: &WithheldSet) -> Result<(Vec<String>, usize), String>
     let unheld = |hash: &&String| !tolerated.sealed.contains(hash);
     let mut absent: Vec<String> = walked.absent_files.iter().filter(unheld).cloned().collect();
     absent.sort();
-    let other = walked.absent.iter().filter(unheld).filter(|hash| !walked.absent_files.contains(*hash)).count();
+    let mut other: Vec<String> = walked.absent.iter().filter(unheld).filter(|hash| !walked.absent_files.contains(*hash)).cloned().collect();
+    other.sort();
 
     Ok((absent, other))
 }
@@ -305,6 +310,7 @@ mod tests {
     const C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const D: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const E: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const F: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
     fn record() -> PathBuf {
         globals::forklift_root().join("withheld")
@@ -331,6 +337,7 @@ mod tests {
         let mut bytes = format!("/forklift-withheld 2\n{} - court order 7\n{} 12\nnot a hash at all\n{} - path a\\\\b\n", A, B, C).into_bytes();
         bytes.extend_from_slice(format!("{} - caf", E).as_bytes());
         bytes.extend_from_slice(b"\xff\n");
+        bytes.extend_from_slice(format!("{} - path a\\b\n", F).as_bytes());
         bytes.extend_from_slice(format!("{} - DMCA notice\n{} - DM", A, D).as_bytes());
         std::fs::write(record(), &bytes).unwrap();
         assert!(withholding::is_damage(&withholding::read_withheld().unwrap_err()));
@@ -344,8 +351,9 @@ mod tests {
         assert_eq!(set.statement(C), Some("path a\\b"), "read unescaped");
         assert_eq!(set.statement(E), Some(PLACEHOLDER_STATEMENT), "a statement of bad UTF-8 is not the operator's words");
         assert_eq!(set.statement(D), Some(PLACEHOLDER_STATEMENT), "a statement cut short is not the operator's words");
+        assert_eq!(set.statement(F), Some(PLACEHOLDER_STATEMENT), "a statement whose escape lost its backslash is not either");
         assert_eq!((repaired.salvaged, repaired.placeholders.clone(), repaired.unreadable_lines),
-                   (2, vec![B.to_string(), E.to_string(), D.to_string()], 1));
+                   (2, vec![B.to_string(), E.to_string(), F.to_string(), D.to_string()], 1));
 
         let moved = aside();
         assert_eq!(moved.len(), 1);
@@ -393,7 +401,7 @@ mod tests {
         assert_eq!(repair_withheld(true).unwrap().salvaged, 1, "the operator says no newer Forklift wrote it");
         assert_eq!(withholding::read_withheld().unwrap().statement(A), Some("statement"));
 
-        for header in ["/forklift-withheld 1", "/forklift-withheld ", "/forklift-withheld 2x"] {
+        for header in ["/forklift-withheld 1", "/forklift-withheld ", "/forklift-withheld 2x", "/forklift-withheld 03", "/forklift-withheld +3"] {
             std::fs::write(record(), format!("{}\n{} - statement\n", header, B)).unwrap();
             assert_eq!(repair_withheld(false).unwrap().salvaged, 1, "{:?} is damage, not a newer version", header);
             assert_eq!(withholding::read_withheld().unwrap().statement(B), Some("statement"));

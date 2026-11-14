@@ -279,11 +279,11 @@ pub fn mark_served(wait: bool) -> Result<bool, String> {
             withholding::read_withheld()?;
             write_tombstones(&lock, &Tombstones::default())?
         }
-        ServedState::Unfinished => {}
+        // Never completed over a record lost after the first serve began, or one that does not read.
+        ServedState::Unfinished => {
+            withholding::read_withheld()?;
+        }
     }
-
-    // Never served over a record that does not read, or one lost after an unfinished first serve.
-    withholding::read_withheld()?;
 
     write_mark(&lock)?;
 

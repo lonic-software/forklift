@@ -59,7 +59,7 @@ pub const STATEMENT_MAX_CHARS: usize = 1000;
 /// record of withheld content, as a newer Forklift writes it, rather than being damaged.
 pub(crate) fn newer_version(header: &str) -> bool {
     header.strip_prefix(&format!("/forklift-{} ", WITHHELD_RECORD))
-        .and_then(|version| version.parse::<u32>().ok())
+        .and_then(|text| text.parse::<u32>().ok().filter(|version| version.to_string() == text))
         .is_some_and(|version| version > WITHHELD_VERSION)
 }
 
