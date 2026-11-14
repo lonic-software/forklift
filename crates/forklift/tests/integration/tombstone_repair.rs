@@ -163,7 +163,7 @@ fn a_served_root_whose_list_is_lost_refuses_whatever_frees_history() {
     assert_eq!(error["code"], "tombstones_damaged", "{}", error);
     assert_eq!(
         error["next_step"].as_str().unwrap(),
-        format!("forklift-server tombstone repair --root {}", root.to_str().unwrap()),
+        format!("forklift-server tombstone repair --root {}", forklift_core::util::franchise_utils::quote(root.to_str().unwrap())),
         "the warehouse is named whole, wherever the remedy is run from"
     );
 }
