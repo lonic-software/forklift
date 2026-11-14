@@ -1163,4 +1163,24 @@ mod subtree_closure_tests {
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
+
+    /// A head tree the store cannot give back keeps the read's own code through the stack's
+    /// wrap, so the refusal still names `forklift heal`.
+    /// Mutation: wrap the read's error with `format!` → an uncoded error → red.
+    #[test]
+    fn an_unreadable_head_tree_keeps_its_code_through_the_staged_content_check() {
+        let _scratch = Scratch::new("unreadable-head-tree");
+        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root.add_child(TreeItem::new("f".to_string(), store_blob("staged"), DirEntryType::Normal));
+        let lost_head = "a".repeat(64);
+
+        match require_staged_content_present(&root, Some(&lost_head)) {
+            Err(CoreError::Refusal { code, message, next_step, .. }) => {
+                assert_eq!(code, crate::error::RefusalCode::ObjectUnreadable, "{}", message);
+                assert!(message.contains("The head's tree") && message.contains("No parcel was made."), "{}", message);
+                assert_eq!(next_step, "forklift heal");
+            }
+            other => panic!("expected an object_unreadable refusal, got {:?}", other),
+        }
+    }
 }
