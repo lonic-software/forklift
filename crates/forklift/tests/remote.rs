@@ -10599,13 +10599,29 @@ fn a_truncated_ref_is_salvaged_once_the_refetch_completes_its_head() {
 
 #[test]
 fn a_truncated_ref_whose_own_parcel_was_lost_waits_for_its_refetch() {
-    // As above, with the head parcel itself lost and no journal entry left: only the taint and
-    // the truncated bytes name it. The first pass defers; the taint recovery refetches the parcel
-    // under a walk the unreadable ref degrades, and the rebuild lands at the salvage.
-    // Mutation: drop the taint's hashes from `salvage`'s matches and the second pass → red.
+    // The head parcel itself is lost and no journal entry is left: only the taint and the
+    // truncated bytes name it, while a bay stands on `side` one parcel behind. The first pass may
+    // not rebuild at the bay's base; the taint recovery refetches the parcel under a walk the
+    // unreadable ref degrades, and the rebuild lands at the salvage.
+    // Mutation: drop the taint's hashes from `salvage`'s matches → the first pass rebuilds at the
+    // bay's base → red.
     let area = TestArea::new("ref-heal-parcel-refetch");
     let server = Server::start(&area, None);
-    let side = side_ahead(&area, &server);
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/a.txt", "base\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_success(&area.forklift("dev", &["bay", "add", "side", area.path("bay").to_str().unwrap()]));
+    assert_success(&area.forklift("dev", &["shift", "side"]));
+    let behind = pallet_head(&area, "dev", "side");
+    area.write_file("dev/s.txt", "side\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "side"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_success(&area.forklift("dev", &["shift", "main"]));
+    let side = pallet_head(&area, "dev", "side");
+    assert_ne!(side, behind);
 
     std::fs::remove_file(area.path("dev/.forklift/journal.json")).unwrap();
     lose_object(&area, &side);

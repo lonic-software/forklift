@@ -85,7 +85,13 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 41** (current): `git export` and each pallet of `git mirror` also carry `withheld_here`,
+**Schema 42** (current): a new refusal code, `ref_damaged` (exit 53): a pallet ref is missing
+under a checkout that stands on it, or does not hold a parcel hash. `heal` carries `refs_rebuilt`
+(each `{pallet, head, source}`) and `refs_removed` (each `{pallet, kept}`), and refuses with
+`ref_damaged` while a damaged ref stands, its `details` the whole report with `refs_refused`
+(each `{pallet, reason, candidates: [{head, source}]}`).
+
+**Schema 41**: `git export` and each pallet of `git mirror` also carry `withheld_here`,
 the files left out of the commits written because this warehouse's own host withholds their
 content (the withheld record of a served root, `forklift-server withhold`), whether or not the
 store still holds a copy: each `{path, hash, statement, parcels}`, beside `withheld`. Before, an
