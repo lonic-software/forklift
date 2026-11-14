@@ -214,18 +214,19 @@ fn selected(call: &Call, aims: &BTreeSet<String>) -> bool {
 /// that exists then. A call the table cannot classify, or a write outside the root, refuses.
 pub fn enumerate(calls: &[Call], line: usize, command: &str, root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
     let tool = calls.first().map(|call| call.tid).unwrap_or_default();
-    enumerate_in(calls, trace::thread_groups(calls), tool, line, &|_| command.to_string(), root, start, existed)
+    enumerate_in(calls, trace::thread_groups(calls), tool, line, &|_| (command.to_string(), 0), root, start, existed)
 }
 
 /// The kill points of a trace attached to the running server `pid`: [`enumerate`], every thread
-/// the server already had counted as its own, and each point's command the unit `unit` names for
-/// its call.
-pub fn enumerate_served(calls: &[Call], pid: u32, unit: &dyn Fn(&Call) -> String, root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
+/// the server already had counted as its own. `unit` names each call's unit, the point's command,
+/// and the moment its position is counted from: the injecting trace is attached then, so only the
+/// calls from that moment on count toward `when`, and only those can steal it.
+pub fn enumerate_served(calls: &[Call], pid: u32, unit: &dyn Fn(&Call) -> (String, u64), root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
     enumerate_in(calls, trace::attached_groups(calls, pid), pid, 0, unit, root, start, existed)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, tool: u32, line: usize, command: &dyn Fn(&Call) -> String, root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
+fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, tool: u32, line: usize, command: &dyn Fn(&Call) -> (String, u64), root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
     let mut directories = Directories::new(groups, start);
     let mut refusals = Vec::new();
     let mut enumerated = Enumerated::default();
@@ -236,7 +237,7 @@ fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, tool: u32, line: usi
         let touched = match trace::touch(call) {
             Ok(touched) => touched,
             Err(unsound) => {
-                refusals.push(format!("{}: {}", command(call), unsound));
+                refusals.push(format!("{}: {}", command(call).0, unsound));
                 continue;
             }
         };
@@ -253,7 +254,7 @@ fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, tool: u32, line: usi
             continue;
         }
         if let Some(outside) = files.iter().map(|at| &resolved[*at]).find(|path| !root.holds(path)) {
-            refusals.push(format!("{}: {} writes outside its scratch area: {}", command(call), call.name, outside));
+            refusals.push(format!("{}: {} writes outside its scratch area: {}", command(call).0, call.name, outside));
             continue;
         }
         let group = directories.group(call.tid);
@@ -289,10 +290,11 @@ fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, tool: u32, line: usi
 
     for (index, aims, aim, target, base) in candidates {
         let call = &calls[index];
-        let counts = |other: &Call| other.name == call.name && aims.as_ref().is_none_or(|aims| selected(other, aims));
+        let (command, origin) = command(call);
+        let counts = |other: &Call| other.name == call.name && other.when.is_none_or(|when| when >= origin) && aims.as_ref().is_none_or(|aims| selected(other, aims));
         let when = calls[..=index].iter().filter(|other| other.tid == call.tid && counts(other)).count();
         let sampled = calls.iter().any(|other| other.tid != call.tid && counts(other));
-        enumerated.points.push(Point { line, call: index, command: command(call), name: call.name.clone(), aim, when, target, base, sampled });
+        enumerated.points.push(Point { line, call: index, command, name: call.name.clone(), aim, when, target, base, sampled });
     }
     Ok(enumerated)
 }
@@ -875,14 +877,6 @@ mod tests {
         Root { given: "/o/s/0001-h-count".into(), canonical: "/o/s/0001-h-count".into() }
     }
 
-    /// A counting trace yields one kill point per mutating or syncing call of the tool's process:
-    /// a fixed path aimed with -P as traced and counted among the calls -P selects in its thread,
-    /// a temp counted among every call of its name in its thread, a pipe write and a read-only
-    /// open none, a child's write listed and not targeted, and a point other threads could steal
-    /// sampled.
-    ///
-    /// Revert: count positions across threads → the worker's temp open is #3, not #1; aim the temp
-    /// with -P → its pid-bearing path never fires; target the child → git's write is a point.
     /// A mutating call the table cannot place is refused aloud, never dropped: the server route
     /// write check must see every write or say why it cannot.
     ///
@@ -896,6 +890,14 @@ mod tests {
         assert!(refused[0].contains("unlinkat"), "{:?}", refused);
     }
 
+    /// A counting trace yields one kill point per mutating or syncing call of the tool's process:
+    /// a fixed path aimed with -P as traced and counted among the calls -P selects in its thread,
+    /// a temp counted among every call of its name in its thread, a pipe write and a read-only
+    /// open none, a child's write listed and not targeted, and a point other threads could steal
+    /// sampled.
+    ///
+    /// Revert: count positions across threads → the worker's temp open is #3, not #1; aim the temp
+    /// with -P → its pid-bearing path never fires; target the child → git's write is a point.
     #[test]
     fn a_counting_trace_yields_its_kill_points() {
         let text = "\
@@ -932,6 +934,29 @@ mod tests {
         });
         assert_eq!(enumerated.children, BTreeSet::from(["write <root>/tmp/x".to_string()]));
         assert!(enumerated.points.iter().all(|point| point.line == 1 && point.command == "stack"));
+    }
+
+    /// A served trace counts every thread the server already had as its own, and a point's
+    /// position from its unit's start: the injecting trace is attached then, so an earlier call of
+    /// the name neither moves it nor steals it.
+    ///
+    /// Revert: drop the origin from the counter → the second request's write is #2 and the first
+    /// request's thread steals it; count only traced clones → the pooled thread's calls vanish.
+    #[test]
+    fn a_served_point_counts_from_its_unit_start() {
+        let text = "\
+70 1731542400.000100 openat(AT_FDCWD</o/s/0001-h-count>, \"wh/pallets/main.tmp~70-0\", O_WRONLY|O_CREAT, 0666) = 4</o/s/0001-h-count/wh/pallets/main.tmp~70-0>
+71 1731542400.000300 openat(AT_FDCWD</o/s/0001-h-count>, \"wh/pallets/main.tmp~70-1\", O_WRONLY|O_CREAT, 0666) = 5</o/s/0001-h-count/wh/pallets/main.tmp~70-1>
+";
+        let calls = trace::parse(text).unwrap();
+        let unit = |call: &Call| match call.when {
+            Some(when) if when >= 1731542400000200 => ("serve second".to_string(), 1731542400000200),
+            _ => ("serve first".to_string(), 0),
+        };
+        let enumerated = enumerate_served(&calls, 70, &unit, &root(), "/o/s/0001-h-count", |_| false).unwrap();
+        let points: Vec<(&str, usize, bool)> = enumerated.points.iter().map(|point| (point.command.as_str(), point.when, point.sampled)).collect();
+        assert_eq!(points, vec![("serve first", 1, true), ("serve second", 1, false)]);
+        assert!(enumerated.children.is_empty(), "{:?}", enumerated.children);
     }
 
     /// A fixed path counts only the calls -P would select, including a descriptor on the path's

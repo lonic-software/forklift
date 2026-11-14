@@ -5,14 +5,16 @@
 //! The server is never traced from its start. Each run builds the scenario's history on a fresh
 //! scratch area with its own host, attaches strace to the listening server, and runs the faulted
 //! command through the proxy, which forwards one request at a time. The counting run attaches a
-//! plain trace; every mutating or syncing call in it is a kill point, enumerated as a client's
-//! are, every thread the server already had counted as its own. Each point's unit is the request
-//! whose window its call fell in, by the route the table resolves it to, or the server's
-//! background work when it fell in none. An injected run attaches a trace that kills the server at
-//! the point; the run counts only when the server was killed and its own trace shows the kill on
-//! the point's target. The server is then restarted through [`Host::restart`], whose remedies are
-//! the outside knowledge the grade records, and the record is read back through a fresh clone of
-//! the host.
+//! plain trace before the faulted command; every mutating or syncing call in it is a kill point,
+//! enumerated as a client's are, every thread the server already had counted as its own, and
+//! positioned among the calls made since its unit began. Each point's unit is the request whose
+//! window its call fell in, by the route the table resolves it to, or the server's background work
+//! when it fell in none. An injected run attaches a trace that kills the server at the point, the
+//! moment its unit begins: just before the proxy forwards the point's request, or before the
+//! faulted command for a background point; the run counts only when the server was killed and its
+//! own trace shows the kill on the point's target. The server is then restarted through
+//! [`Host::restart`], whose remedies are the outside knowledge the grade records, and the record is
+//! read back through a fresh clone of the host.
 //!
 //! A fresh build per run, not a copy: a copy's work tree names the URL of the server it was copied
 //! beside. The server's handlers run on pooled threads, so a point another thread can reach first
@@ -52,8 +54,10 @@ pub struct Counted {
     faulted: usize,
     /// The counting run's scratch root, which absolute aims are rebased from.
     root: Root,
-    /// Each point, and how long after the faulted command's last answered request its call came.
-    points: Vec<(Point, Duration)>,
+    /// Each point; the request, by its number among the faulted command's, whose window held its
+    /// call, when one did; and how long after the faulted command's last answered request the
+    /// call came.
+    points: Vec<(Point, Option<usize>, Duration)>,
     children: BTreeSet<String>,
     /// What refused the counting trace: an unclassified call, a write outside the scratch area.
     refusals: Vec<String>,
@@ -70,23 +74,45 @@ pub fn hosted(scenario: &Scenario) -> bool {
     scenario.history.iter().any(|op| matches!(op, Op::Host))
 }
 
-/// The unit a server call belongs to: the request whose window holds its moment, named by the
-/// route `table` resolves it to, or the background work when no window holds it.
-fn unit_of(call: &Call, windows: &[(u64, u64, String)]) -> String {
-    let Some(when) = call.when else { return "serve unstamped".to_string() };
-    windows.iter().find(|(from, to, _)| (*from..=*to).contains(&when))
-        .map(|(_, _, route)| format!("serve {}", route))
-        .unwrap_or_else(|| "serve background".to_string())
+/// One request's window in the counting run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Window {
+    /// Its number among the faulted command's requests.
+    at: usize,
+    from: u64,
+    to: u64,
+    route: String,
 }
 
-/// Each exchange's window and what names it.
-fn windows(exchanges: &[Exchange], table: Option<&RouteTable>) -> Vec<(u64, u64, String)> {
-    exchanges.iter().filter_map(|exchange| {
+/// The window whose span holds `call`'s moment, ends included.
+fn window_of<'a>(call: &Call, windows: &'a [Window]) -> Option<&'a Window> {
+    let when = call.when?;
+    windows.iter().find(|window| (window.from..=window.to).contains(&when))
+}
+
+/// The unit a server call belongs to, named by the route `table` resolved its request to, or the
+/// background work when no window holds it; and the moment its position is counted from: its
+/// window's opening, or the trace's start for the background's.
+fn unit_of(call: &Call, windows: &[Window]) -> (String, u64) {
+    if call.when.is_none() {
+        return ("serve unstamped".to_string(), 0);
+    }
+    window_of(call, windows).map_or_else(|| ("serve background".to_string(), 0), |window| (format!("serve {}", window.route), window.from))
+}
+
+/// Each exchange's window and what names it, numbered in order.
+fn windows(exchanges: &[Exchange], table: Option<&RouteTable>) -> Vec<Window> {
+    exchanges.iter().enumerate().filter_map(|(at, exchange)| {
         let from = exchange.forwarded?;
         let route = table.and_then(|table| table.resolve(Mode::Single, &exchange.method, &exchange.path).ok().flatten()).map(|route| route.label())
             .unwrap_or_else(|| format!("{} (no listed route)", exchange.method));
-        Some((from, exchange.answered.unwrap_or(u64::MAX), route))
+        Some(Window { at, from, to: exchange.answered.unwrap_or(u64::MAX), route })
     }).collect()
+}
+
+/// Writes a server trace back where the run's traces are kept: the host removes each it reads.
+fn keep(settings: &Settings, name: &str, text: &str) {
+    let _ = std::fs::write(settings.traces.join(format!("{}.trace", name)), text);
 }
 
 fn host_of<'a>(scenario: &Scenario, built: &'a runner::Built) -> Result<&'a Host, RunError> {
@@ -127,6 +153,7 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
     let (exchanges, traces) = host.finish();
     let exchanges: Vec<Exchange> = exchanges.into_iter().filter(|exchange| exchange.forwarded.is_some_and(|forwarded| forwarded >= since)).collect();
     let text = traces.into_iter().next().ok_or_else(|| RunError::Io("the counting server left no trace".to_string()))?.map_err(RunError::Io)?;
+    keep(settings, &format!("{}-serve-count", label), &text);
     let calls = trace::parse(&text).map_err(RunError::Io)?;
     let windows = windows(&exchanges, table);
     let last = exchanges.iter().filter_map(|exchange| exchange.answered).max().unwrap_or(since);
@@ -137,8 +164,9 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
         Err(refusals) => (kill::Enumerated::default(), refusals),
     };
     let points = enumerated.points.into_iter().map(|point| {
-        let after = calls[point.call].when.map_or(Duration::ZERO, |when| Duration::from_micros(when.saturating_sub(last)));
-        (point, after)
+        let call = &calls[point.call];
+        let after = call.when.map_or(Duration::ZERO, |when| Duration::from_micros(when.saturating_sub(last)));
+        (point, window_of(call, &windows).map(|window| window.at), after)
     }).collect();
     Ok(Counting::Counted(Box::new(Counted { corpus, expected, faulted, root, points, children: enumerated.children, refusals })))
 }
@@ -166,8 +194,8 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
         for _ in 0..workers {
             scope.spawn(|| loop {
                 let at = next.fetch_add(1, Ordering::SeqCst);
-                let Some((point, after)) = counted.points.get(at) else { break };
-                let result = attempt(scenario, programs, settings, template, counted, point, *after, at)
+                let Some((point, window, after)) = counted.points.get(at) else { break };
+                let result = attempt(scenario, programs, settings, template, counted, point, *window, *after, at)
                     .map_err(|error| format!("{} {}#{}: {}", point.command, point.name, point.when, error));
                 results.lock().expect("no worker panics holding the lock").push((at, result));
             });
@@ -185,11 +213,11 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
 }
 
 #[allow(clippy::too_many_arguments)]
-fn attempt(scenario: &Scenario, programs: &Programs, settings: &Settings, template: &Scratch, counted: &Counted, point: &Point, after: Duration, at: usize) -> Result<Killed, RunError> {
+fn attempt(scenario: &Scenario, programs: &Programs, settings: &Settings, template: &Scratch, counted: &Counted, point: &Point, window: Option<usize>, after: Duration, at: usize) -> Result<Killed, RunError> {
     let mut attempts = 0;
     loop {
         attempts += 1;
-        let mut killed = inject(scenario, programs, settings, template, counted, point, after, &format!("{}-{}", at, attempts))?;
+        let mut killed = inject(scenario, programs, settings, template, counted, point, window, after, &format!("{}-{}", at, attempts))?;
         killed.attempts = attempts;
         if killed.landing == Landing::Landed || attempts == ATTEMPTS {
             return Ok(killed);
@@ -231,7 +259,7 @@ fn killed_within(host: &Host, limit: Duration) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn inject(scenario: &Scenario, programs: &Programs, settings: &Settings, template: &Scratch, counted: &Counted, point: &Point, after: Duration, at: &str) -> Result<Killed, RunError> {
+fn inject(scenario: &Scenario, programs: &Programs, settings: &Settings, template: &Scratch, counted: &Counted, point: &Point, window: Option<usize>, after: Duration, at: &str) -> Result<Killed, RunError> {
     let io = |error: std::io::Error| RunError::Io(error.to_string());
     let scratch = Scratch::create(Path::new(&format!("{}-kill-{}", template.root().display(), at))).map_err(|error| RunError::Io(error.to_string()))?;
     let environment = kill::environment_of(settings, &scratch)?;
@@ -240,22 +268,57 @@ fn inject(scenario: &Scenario, programs: &Programs, settings: &Settings, templat
     let label = scratch.root().file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     let host = host_of(scenario, &built)?;
     let filter = filter(point, &counted.root, &root).map_err(RunError::Io)?;
-    host.trace_once(settings.strace, &settings.traces.join(&label), &filter, settings.limit).map_err(RunError::Io)?;
     let pid = host.pid().ok_or_else(|| RunError::Io("the injected server is not running".to_string()))?;
+    let base = settings.traces.join(&label);
+    let attach = || host.trace_once(settings.strace, &base, &filter, settings.limit).map_err(RunError::Io);
+    // A point in a request's window is counted from that request's start, so the trace is attached
+    // just before the proxy forwards it; a background point's, before the faulted command starts.
+    let (go, went) = std::sync::mpsc::channel::<()>();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    match window {
+        Some(at) => host.proxy.before(host.proxy.requests() + at, move || {
+            if go.send(()).is_ok() {
+                let _ = finished.recv();
+            }
+        }),
+        None => {
+            drop(go);
+            attach()?;
+        }
+    }
     let context = Context {
         corpus: &counted.corpus, programs, scratch: &scratch, environment: &environment, limit: settings.limit, then: &scenario.then,
         url: Some(host.url.as_str()), scope: scenario.scope(), via_host: true,
     };
     let settle = (after + SETTLE).min(SETTLE_CAP);
     let mut restarted = None;
-    let graded = faulted::grade_after(&context, &counted.expected, counted.faulted, |context, steps| {
-        let made = context.record(counted.faulted, steps);
-        if !killed_within(host, settle) {
-            return Err(RunError::Io(NOT_KILLED.to_string()));
-        }
-        restarted = Some(host.restart(&scratch, &environment, settings.limit).map_err(RunError::Tool)?);
-        made
+    let mut attached = Ok(());
+    let graded = std::thread::scope(|scope| {
+        // Attaches when the proxy reaches the point's request, then lets it go on; ends once the
+        // hook is dropped unrun.
+        let attach = &attach;
+        let waiter = scope.spawn(move || {
+            if went.recv().is_ok() {
+                let attached = attach();
+                let _ = done.send(());
+                return attached;
+            }
+            Ok(())
+        });
+        let graded = faulted::grade_after(&context, &counted.expected, counted.faulted, |context, steps| {
+            let made = context.record(counted.faulted, steps);
+            host.proxy.clear_before();
+            if !killed_within(host, settle) {
+                return Err(RunError::Io(NOT_KILLED.to_string()));
+            }
+            restarted = Some(host.restart(&scratch, &environment, settings.limit).map_err(RunError::Tool)?);
+            made
+        });
+        host.proxy.clear_before();
+        attached = waiter.join().unwrap_or_else(|_| Err(RunError::Io("the attaching thread panicked".to_string())));
+        graded
     });
+    attached?;
     let host = built.host.take().expect("the host was found above");
     let (_, traces) = host.finish();
     let graded = match graded {
@@ -267,6 +330,7 @@ fn inject(scenario: &Scenario, programs: &Programs, settings: &Settings, templat
         graded => graded?,
     };
     let text = traces.into_iter().next().ok_or_else(|| RunError::Io("the injected server left no trace".to_string()))?.map_err(RunError::Io)?;
+    keep(settings, &label, &text);
     let calls = trace::parse(&text).map_err(RunError::Io)?;
     let landing = kill::landing_served(&calls, point, &root, pid);
     let mut graded = (landing == Landing::Landed).then_some(graded);
@@ -298,20 +362,26 @@ mod tests {
         call
     }
 
-    /// A call is the unit of the request whose window holds its moment, ends included, and the
-    /// background's outside every window.
+    /// A call is the unit of the request whose window holds its moment, ends included, counted
+    /// from that window's opening, and the background's outside every window, counted from the
+    /// trace's start.
     ///
     /// Revert: an open-ended window → a write after the response is credited to the request;
     /// a strict end → a write at the response's moment falls to the background.
     #[test]
     fn calls_are_placed_in_their_request_window() {
-        let windows = vec![(10, 20, "PUT /objects/{hash}".to_string()), (30, u64::MAX, "POST /pallets/{name}".to_string())];
-        assert_eq!(unit_of(&call(Some(15)), &windows), "serve PUT /objects/{hash}");
-        assert_eq!(unit_of(&call(Some(20)), &windows), "serve PUT /objects/{hash}");
-        assert_eq!(unit_of(&call(Some(25)), &windows), "serve background");
-        assert_eq!(unit_of(&call(Some(9)), &windows), "serve background");
-        assert_eq!(unit_of(&call(Some(40)), &windows), "serve POST /pallets/{name}");
-        assert_eq!(unit_of(&call(None), &windows), "serve unstamped");
+        let windows = vec![
+            Window { at: 0, from: 10, to: 20, route: "PUT /objects/{hash}".to_string() },
+            Window { at: 1, from: 30, to: u64::MAX, route: "POST /pallets/{name}".to_string() },
+        ];
+        let unit = |when| unit_of(&call(when), &windows);
+        assert_eq!(unit(Some(15)), ("serve PUT /objects/{hash}".to_string(), 10));
+        assert_eq!(unit(Some(20)), ("serve PUT /objects/{hash}".to_string(), 10));
+        assert_eq!(unit(Some(25)), ("serve background".to_string(), 0));
+        assert_eq!(unit(Some(9)), ("serve background".to_string(), 0));
+        assert_eq!(unit(Some(40)), ("serve POST /pallets/{name}".to_string(), 30));
+        assert_eq!(unit(None), ("serve unstamped".to_string(), 0));
+        assert_eq!(window_of(&call(Some(40)), &windows).map(|window| window.at), Some(1));
     }
 
     /// A path aim is rebased onto the injected run's root, and the kill is counted at the point's

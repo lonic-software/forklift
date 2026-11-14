@@ -123,6 +123,8 @@ struct State {
     log: Mutex<Vec<Exchange>>,
     /// Kills the server, for [`Fault::Kill`].
     killer: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Run once, before the request it names (by its index) is forwarded.
+    before: Mutex<Option<(usize, Box<dyn FnOnce() + Send>)>>,
     stopped: AtomicBool,
 }
 
@@ -141,7 +143,7 @@ impl Proxy {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let state = Arc::new(State {
-            upstream: Mutex::new(upstream), serial: AtomicBool::new(false), order: Mutex::new(()), armed: Mutex::new(None),
+            upstream: Mutex::new(upstream), serial: AtomicBool::new(false), order: Mutex::new(()), armed: Mutex::new(None), before: Mutex::new(None),
             log: Mutex::new(Vec::new()), killer: Mutex::new(None), stopped: AtomicBool::new(false),
         });
         let accepting = {
@@ -174,6 +176,18 @@ impl Proxy {
     /// What [`Fault::Kill`] runs to kill the server.
     pub fn set_killer(&self, killer: impl FnMut() + Send + 'static) {
         *lock(&self.state.killer) = Some(Box::new(killer));
+    }
+
+    /// Runs `hook` once the request numbered `index` (from the proxy's start) has been read whole,
+    /// before any of it is forwarded; a serial proxy forwards nothing else until it returns. It
+    /// replaces any hook not yet run.
+    pub fn before(&self, index: usize, hook: impl FnOnce() + Send + 'static) {
+        *lock(&self.state.before) = Some((index, Box::new(hook)));
+    }
+
+    /// Drops a hook [`Proxy::before`] set that has not run.
+    pub fn clear_before(&self) {
+        lock(&self.state.before).take();
     }
 
     /// How many requests the proxy has numbered so far.
@@ -463,6 +477,19 @@ fn serve_connection(client: TcpStream, state: &State) {
                 log.push(Exchange { index, method: request.first.clone(), path: path_of(&request.second), status: None, fault: None, forwarded: None, answered: None });
                 index
             };
+            let hook = {
+                let mut before = lock(&state.before);
+                match before.take() {
+                    Some((at, hook)) if at == index => Some(hook),
+                    other => {
+                        *before = other;
+                        None
+                    }
+                }
+            };
+            if let Some(hook) = hook {
+                hook();
+            }
             let fault = take_fault(state, index);
             if fault.is_some() {
                 lock(&state.log)[index].fault = fault;
@@ -687,6 +714,29 @@ mod tests {
         let log = proxy.log();
         assert_eq!(log.iter().map(|exchange| (exchange.method.as_str(), exchange.path.as_str(), exchange.status)).collect::<Vec<_>>(),
             vec![("GET", "/v1/warehouse", Some(200)), ("PUT", "/v1/objects/ab", Some(200)), ("POST", "/v1/pallets/main", Some(200))]);
+    }
+
+    /// A hook set for a request runs once, before that request reaches the server and after the
+    /// one before it was answered; a cleared hook never runs.
+    ///
+    /// Revert: run the hook after forwarding → the server has seen the request when it runs; run
+    /// it on every request → it runs twice.
+    #[test]
+    fn a_hook_runs_once_before_its_request_is_forwarded() {
+        let server = echo(Duration::ZERO);
+        let proxy = Proxy::start(server.address).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (reached, log) = (server.reached.clone(), seen.clone());
+        proxy.before(1, move || lock(&log).push(reached.load(Ordering::SeqCst)));
+        for _ in 0..3 {
+            ask(&proxy, GET);
+        }
+        assert_eq!(*lock(&seen), vec![1], "it ran once, with only the first request served");
+        let log = seen.clone();
+        proxy.before(3, move || lock(&log).push(99));
+        proxy.clear_before();
+        ask(&proxy, GET);
+        assert_eq!(*lock(&seen), vec![1]);
     }
 
     /// Serialized, requests on concurrent connections reach the server one at a time, and each
