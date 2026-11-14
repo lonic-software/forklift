@@ -214,20 +214,18 @@ fn selected(call: &Call, aims: &BTreeSet<String>) -> bool {
 /// that exists then. A call the table cannot classify, or a write outside the root, refuses.
 pub fn enumerate(calls: &[Call], line: usize, command: &str, root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
     let tool = calls.first().map(|call| call.tid).unwrap_or_default();
-    enumerate_in(calls, trace::thread_groups(calls), tool, line, &|_| command.to_string(), false, root, start, existed)
+    enumerate_in(calls, trace::thread_groups(calls), tool, line, &|_| command.to_string(), root, start, existed)
 }
 
 /// The kill points of a trace attached to the running server `pid`: [`enumerate`], every thread
 /// the server already had counted as its own, and each point's command the unit `unit` names for
-/// its call. A temp is aimed by its path too: the server is one process whose requests arrive one
-/// at a time, so an injected run's server names the same temp with its own pid, which the aim is
-/// given before it is attached.
+/// its call.
 pub fn enumerate_served(calls: &[Call], pid: u32, unit: &dyn Fn(&Call) -> String, root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
-    enumerate_in(calls, trace::attached_groups(calls, pid), pid, 0, unit, true, root, start, existed)
+    enumerate_in(calls, trace::attached_groups(calls, pid), pid, 0, unit, root, start, existed)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, tool: u32, line: usize, command: &dyn Fn(&Call) -> String, temps_by_path: bool, root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
+fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, tool: u32, line: usize, command: &dyn Fn(&Call) -> String, root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
     let mut directories = Directories::new(groups, start);
     let mut refusals = Vec::new();
     let mut enumerated = Enumerated::default();
@@ -268,7 +266,7 @@ fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, tool: u32, line: usi
         // Judged below the root, so digits in the scratch area's own name are never taken for a temp.
         let temp = resolved.iter().any(|path| trace::without_temp(&root.tokenized(path), group).1);
         let (aim, aims) = match touched.operands.first() {
-            Some(first) if !temp || temps_by_path => {
+            Some(first) if !temp => {
                 let path = match first { Operand::Named { traced, .. } => traced.clone(), Operand::Held { target } => target.clone() };
                 let mut aims = BTreeSet::from([path.clone()]);
                 // strace adds realpath() of the -P string when it starts: resolved from strace's
