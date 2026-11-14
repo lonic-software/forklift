@@ -36,7 +36,7 @@ pub fn handle_command(target: &str) -> Result<(), String> {
     // A sparse warehouse that never fetched the path fails the read as a lost object: say what it
     // is and how to fetch it.
     let shown = read_shown(parcel_hash, &tree_hash, path, revision).map_err(|error| {
-        crate::commands::scope::explain_unfetched(&tree_hash, path, crate::commands::scope::PathRead::Content, error)
+        crate::commands::scope::explain_unfetched(&tree_hash, path, error)
     })?;
 
     output::emit(&shown);

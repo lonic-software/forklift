@@ -19,56 +19,38 @@ pub fn ensure_path_in_scope(key: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// What a read of a path at a revision loads below the root tree, which decides what a sparse
-/// warehouse must have fetched for it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PathRead {
-    /// The file's content, as `show` reads it: every directory on the path, and the file.
-    Content,
-
-    /// The file's entry in its directory, the hash naming its content, as `redact record` reads
-    /// it: the directories on the path only.
-    Entry,
-}
-
 /// Tell a failed read of `path` in the tree `root_tree` what it is when the store lacks what this
 /// sparse warehouse never fetched: a refusal with the stable `out_of_scope` code and how to fetch
 /// it, in place of an `object_unreadable` that names `forklift heal`, which finds nothing lost.
 ///
 /// Decided after the read, from what it failed on, so a read the store can serve (content shared
 /// with a fetched path, a path that does not exist) is never refused. Only an `object_unreadable`
-/// is told again, and only when the path leaves the fetch scope at a directory or file the read
-/// loads and every tree above that point loads: a lost tree that should be here stays damage.
+/// is told again, and only when the path leaves the fetch scope and every tree above that point
+/// loads: a lost tree that should be here stays damage.
 /// Every other error, and every error in a warehouse that is not sparse, is returned as it is.
 ///
 /// # Arguments
 /// * `root_tree` - The root tree of the revision the read walked.
 /// * `path`      - The path as the user gave it.
-/// * `read`      - What the read loads.
 /// * `error`     - The read's error.
-pub fn explain_unfetched(root_tree: &str, path: &str, read: PathRead, error: String) -> String {
+pub fn explain_unfetched(root_tree: &str, path: &str, error: String) -> String {
     if forklift_core::error::deframe(&error).map(|(code, _, _)| code) != Some("object_unreadable") {
         return error;
     }
 
-    match unfetched_refusal(root_tree, path, read) {
+    match unfetched_refusal(root_tree, path) {
         Ok(Some(refusal)) => refusal,
         _ => error,
     }
 }
 
 /// The `out_of_scope` refusal [`explain_unfetched`] gives, or `None` when the path stays inside
-/// the fetch scope as far as the read loads, or a tree above the boundary does not load.
-fn unfetched_refusal(root_tree: &str, path: &str, read: PathRead) -> Result<Option<String>, String> {
+/// the fetch scope, or a tree above the boundary does not load.
+fn unfetched_refusal(root_tree: &str, path: &str) -> Result<Option<String>, String> {
     let fetch = scope_utils::read_fetch_scope()?;
     let key = WarehousePath::from_user_input(path)?.as_key().to_string();
     let components: Vec<&str> = key.split('/').collect();
-    let loaded = match read {
-        PathRead::Content => components.len(),
-        PathRead::Entry => components.len() - 1,
-    };
-
-    let Some(depth) = (1..=loaded)
+    let Some(depth) = (1..=components.len())
         .find(|&depth| fetch.classify(&components[..depth].join("/")) == ScopeClass::OutOfScope)
     else {
         return Ok(None);

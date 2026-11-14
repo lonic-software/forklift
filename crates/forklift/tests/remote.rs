@@ -9156,8 +9156,8 @@ fn a_read_outside_the_fetch_scope_names_the_fetch_that_reaches_it() {
     let output = area.forklift("sparse", &["--json", "show", "main:src/api/a.txt"]);
     assert_eq!(json_of(&output)["error"]["code"], "object_unreadable", "{}", stdout(&output));
 
-    // Redacting needs only the entry, which the fetched root tree holds, never the content: the
-    // scope check passes, and redact refuses for its own reason, a head still naming the file.
+    // Redacting needs only the entry, which the fetched root tree holds, never the content: redact
+    // refuses for its own reason, a head still naming the file.
     let output = area.forklift("sparse", &["--json", "redact", "record", "main:top.txt", "-m", "x"]);
     let message = json_of(&output)["error"]["message"].as_str().unwrap().to_string();
     assert!(message.contains("is in the head of pallet"), "{}", message);
