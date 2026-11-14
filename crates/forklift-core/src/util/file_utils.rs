@@ -1656,6 +1656,10 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
 /// shared device flush — the same aggregation [`run_write_barrier`] already applies to file data,
 /// applied here to directory *entries* instead.
 ///
+/// Each folder between a touched directory and the storage root is synced too, once (see
+/// [`ancestors_to_storage_root`]): a folder created on the way to a rename has its own entry in
+/// the folder above, which nothing else syncs.
+///
 /// Best-effort across the whole set: every directory in `touched_parents` is attempted even after
 /// an earlier one fails — a caller catching the returned error still needs as much of the batch
 /// made durable as the filesystem will allow, not just a prefix ending at the first failure. Only
@@ -1664,9 +1668,7 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
 /// surfaces when no per-directory fsync already failed.
 ///
 /// # Arguments
-/// * `touched_parents` - Every distinct directory a rename just landed in. Each folder between
-///                       one of them and the storage root is synced too, once (see
-///                       [`ancestors_to_storage_root`]).
+/// * `touched_parents` - Every distinct directory a rename just landed in, synced with each folder above it.
 /// * `flush_via`       - A regular file (a final, already-renamed path) to open write-mode for
 ///                       the macOS device flush — a directory cannot be opened write-mode
 ///                       (`EISDIR`), so the flush borrows any file guaranteed to already exist.
