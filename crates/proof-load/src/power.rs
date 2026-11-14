@@ -29,9 +29,9 @@
 //! a synced file never comes back empty. A file's torn forms are kept once per durable version and
 //! step trail, from that span's last moment, rather than once per write. A state two kinds leave
 //! is reported as the more realistic: durable, then ordered, then torn, then a seeded variant.
-//! Each scenario that graded states says in its report how many of each kind were asked for
-//! and how many distinct ones were graded. A scenario that runs lines after its record is not run: a crash past the record's
-//! own lines would be graded as owing nothing.
+//! Each scenario that graded states says in its report how many of each kind were asked for and
+//! how many distinct ones were graded. A scenario that runs lines after its record is not run: a
+//! crash past the record's own lines would be graded as owing nothing.
 //!
 //! Each state is written out afresh, so no file keeps the inode or times it had: a stat cache that
 //! trusts an unchanged file finds every entry changed, and a state where it would trust a file
@@ -415,8 +415,8 @@ pub enum Form {
     ZeroTail,
     /// The synced bytes and the first half of what followed them.
     HalfTail,
-    /// Overwritten in place at its synced length, the first half of the changed synced bytes new
-    /// and the rest as synced.
+    /// Overwritten in place at its synced length, or cut where a truncate cut it, the first half
+    /// of the changed synced bytes new and the rest as synced.
     HalfOverwritten,
 }
 
@@ -455,19 +455,16 @@ fn torn_forms(kept: &[u8], made: &[u8], truncated: Option<usize>) -> Vec<Torn> {
             forms.push((Form::HalfTail, prefix));
         }
     }
-    if truncated.is_none() {
-        // The first half of the synced bytes the writes changed, from the first that differs to
-        // the last, at the synced length, whether or not the file grew too; a change of one byte
-        // has no half and does not tear.
-        let common = kept.len().min(made.len());
-        let differs = |at: &usize| kept[*at] != made[*at];
-        if let (Some(first), Some(last)) = ((0..common).find(differs), (0..common).rev().find(differs)) {
-            let end = first + (last + 1 - first) / 2;
-            if end > first {
-                let mut overwritten = kept.to_vec();
-                overwritten[first..end].copy_from_slice(&made[first..end]);
-                forms.push((Form::HalfOverwritten, overwritten));
-            }
+    // The first half of the synced bytes the writes changed, from the first that differs to the
+    // last, over the synced length, or a truncate's cut on its cut base, whether or not the file
+    // grew too; a change of one byte has no half and does not tear.
+    let mut overwritten = if truncated.is_some() { base.to_vec() } else { kept.to_vec() };
+    let differs = |at: &usize| kept[*at] != made[*at];
+    if let (Some(first), Some(last)) = ((0..floor).find(differs), (0..floor).rev().find(differs)) {
+        let end = first + (last + 1 - first) / 2;
+        if end > first {
+            overwritten[first..end].copy_from_slice(&made[first..end]);
+            forms.push((Form::HalfOverwritten, overwritten));
         }
     }
     let mut out: Vec<Torn> = Vec::new();
@@ -2721,7 +2718,7 @@ mod tests {
     /// → a rewritten file keeps `old` under the new bytes' zeros; overwrite the file's first half
     /// → a change in its second half tears to the synced bytes and is left out; round the half up
     /// → a one-byte change tears to the whole write; tear in place only a file that did not grow
-    /// → the grown file's new header never tears.
+    /// → the grown file's new header never tears, and neither does a cut file's.
     #[test]
     fn a_torn_file_never_loses_a_synced_byte() {
         let forms = |kept: &[u8], made: &[u8], cut| torn_forms(kept, made, cut).into_iter().map(|(form, data)| (form, String::from_utf8(data).unwrap())).collect::<Vec<_>>();
@@ -2731,6 +2728,8 @@ mod tests {
         assert_eq!(forms(b"old", b"new", None), [(Form::HalfOverwritten, "nld".to_string())]);
         // A change of one byte has no half: it lands whole or not at all.
         assert!(forms(b"old", b"olx", None).is_empty());
+        // A file cut part way and rewritten below the cut tears in place on the cut base.
+        assert_eq!(forms(b"abcdefgh", b"XYcd", Some(4)), [(Form::Cut, "abcd".to_string()), (Form::HalfOverwritten, "Xbcd".to_string())]);
         // A file rewritten in place and grown tears in place too, at its synced length.
         assert_eq!(forms(b"HDR1body", b"NEW2bodyMORE", None),
             [(Form::ZeroTail, "HDR1body\0\0\0\0".to_string()), (Form::HalfTail, "HDR1bodyMO".to_string()), (Form::HalfOverwritten, "NER1body".to_string())]);
