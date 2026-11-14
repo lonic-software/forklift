@@ -20,7 +20,7 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `conflict` | 4 | Changes to tracked files block the operation, which would write over them; nothing was changed |
 | `diverged` | 5 | The local pallet and the remote's both hold parcels the other lacks; nothing was lifted or lowered |
 | `warehouse_locked` | 6 | Another forklift process holds the warehouse lock |
-| `out_of_scope` | 7 | A path argument is outside a scoped (sparse) bay's scope |
+| `out_of_scope` | 7 | A path argument is outside a scoped (sparse) bay's scope, or a read needs content the warehouse never fetched |
 | `scope_path_type_changed` | 8 | A scoped bay's spine path flipped dir↔file; scope no longer valid |
 | `sparse_workspace` | 9 | A whole-tree verb is not supported in a scoped (sparse) bay yet |
 | `out_of_scope_conflict` | 10 | A scoped bay merge hit an out-of-scope entry changed on both sides |

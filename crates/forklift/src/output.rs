@@ -394,7 +394,8 @@ error_codes! {
     /// Another forklift process holds the warehouse lock.
     WarehouseLocked,
 
-    /// A path argument is outside the bay's checkout scope (§7.6).
+    /// A path argument is outside the bay's checkout scope, or a read needs content outside the
+    /// warehouse's fetch scope (§7.6).
     OutOfScope,
 
     /// A scoped bay's spine path flipped between a directory and a file (§7.6): the scope
@@ -745,7 +746,7 @@ impl ErrorCode {
                 "The local pallet and the remote's both hold parcels the other lacks; nothing was \
                  lifted or lowered",
             ErrorCode::WarehouseLocked => "Another forklift process holds the warehouse lock",
-            ErrorCode::OutOfScope => "A path argument is outside a scoped (sparse) bay's scope",
+            ErrorCode::OutOfScope => "A path argument is outside a scoped (sparse) bay's scope, or a read needs content the warehouse never fetched",
             ErrorCode::ScopePathTypeChanged =>
                 "A scoped bay's spine path flipped dir\u{2194}file; scope no longer valid",
             ErrorCode::SparseWorkspace =>

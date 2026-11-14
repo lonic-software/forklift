@@ -9101,7 +9101,7 @@ fn a_read_outside_the_fetch_scope_names_the_fetch_that_reaches_it() {
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "-m", "first"]));
     let first = pallet_head(&area, "dev", "main");
-    std::fs::remove_dir_all(area.path("dev/old")).unwrap();
+    forklift_core::util::file_utils::remove_dir_all(area.path("dev/old")).unwrap();
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "-m", "second"]));
     assert_success(&area.forklift("dev", &["lift"]));
@@ -9139,7 +9139,7 @@ fn a_read_outside_the_fetch_scope_names_the_fetch_that_reaches_it() {
     // An in-scope object that is gone is still damage heal acts on.
     let head = pallet_head(&area, "sparse", "main");
     let blob = path_object_hash(&area, "sparse", &head, "src/api/a.txt");
-    std::fs::remove_file(object_store_path(&area, "sparse", &blob)).unwrap();
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "sparse", &blob)).unwrap();
     let output = area.forklift("sparse", &["--json", "show", "main:src/api/a.txt"]);
     assert_eq!(json_of(&output)["error"]["code"], "object_unreadable", "{}", stdout(&output));
 
