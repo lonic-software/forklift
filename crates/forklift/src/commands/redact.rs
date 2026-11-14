@@ -256,8 +256,11 @@ fn resolve_target(target: &str) -> Result<(String, RedactedKind), String> {
 
     let parcel_hash = pallet_utils::resolve_revision(revision)?;
     let tree_hash = object_utils::load_parcel(&parcel_hash)?.tree_hash;
+    let resolved = object_utils::resolve_tree_file(&tree_hash, path).map_err(|error| {
+        crate::commands::scope::explain_unfetched(&tree_hash, path, error)
+    })?;
 
-    let Some((hash, entry_type)) = object_utils::resolve_tree_file(&tree_hash, path)? else {
+    let Some((hash, entry_type)) = resolved else {
         return Err(format!(
             "\"{}\" was not found at revision \"{}\" ({}).",
             path, revision, parcel_hash

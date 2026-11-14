@@ -112,7 +112,8 @@ macro_rules! refusal_codes {
 }
 
 refusal_codes! {
-    /// A path argument is outside the bay's checkout scope (§7.6).
+    /// A path argument is outside the bay's checkout scope, or a read needs content outside the
+    /// warehouse's fetch scope (§7.6).
     OutOfScope => "out_of_scope",
 
     /// A merge in a scoped bay hit an out-of-scope entry that changed on both sides: there is no

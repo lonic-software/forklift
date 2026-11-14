@@ -111,7 +111,9 @@ impl CommandOutput for PeekInventory {
 /// * `Ok(())`      - If the object was peeked into successfully.
 /// * `Err(String)` - If an error occurred while peeking into the object.
 fn peek_object(hash: &str) -> Result<(), String> {
-    let object_bytes = file_utils::retrieve_object_by_hash(hash)?;
+    // The user typed the hash, so a store that lacks it says only that: nothing here knows
+    // whether this warehouse ever held it.
+    let object_bytes = file_utils::retrieve_named_object_by_hash(hash)?;
     let object = parser::object::loose_object_parser::parse(&object_bytes)?;
 
     if output::is_json() {

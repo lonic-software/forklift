@@ -1,7 +1,9 @@
 use serde::Serialize;
-use forklift_core::error::CoreError;
+use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::globals;
 use forklift_core::util::scope_utils::{self, ScopeClass};
+use forklift_core::util::path_utils::WarehousePath;
+use forklift_core::util::{object_utils, pallet_utils};
 use crate::output::{self, CommandOutput};
 
 /// Refuse a path argument that is outside the active checkout's scope (§7.6),
@@ -15,6 +17,126 @@ pub fn ensure_path_in_scope(key: &str) -> Result<(), CoreError> {
     }
 
     Ok(())
+}
+
+/// Tell a failed read of `path` in the tree `root_tree` what it is when the store lacks what this
+/// sparse warehouse never fetched: a refusal with the stable `out_of_scope` code and how to fetch
+/// it, in place of an `object_unreadable` that names `forklift heal`, which finds nothing lost.
+///
+/// Decided after the read, from what it failed on, so a read the store can serve (content shared
+/// with a fetched path, a path that does not exist) is never refused. Only an `object_unreadable`
+/// is told again, and only when the path leaves the fetch scope and every tree above that point
+/// loads: a lost tree that should be here stays damage.
+/// Every other error, and every error in a warehouse that is not sparse, is returned as it is; a
+/// fetch scope that cannot be read is returned in its place.
+///
+/// # Arguments
+/// * `root_tree` - The root tree of the revision the read walked.
+/// * `path`      - The path as the user gave it.
+/// * `error`     - The read's error.
+pub fn explain_unfetched(root_tree: &str, path: &str, error: String) -> String {
+    if forklift_core::error::deframe(&error).map(|(code, _, _)| code) != Some("object_unreadable") {
+        return error;
+    }
+
+    // A fetch scope that cannot be read is the problem to report, never hidden behind the read's.
+    let fetch = match scope_utils::read_fetch_scope() {
+        Ok(fetch) => fetch,
+        Err(scope_error) => return scope_error,
+    };
+
+    // Anything else that stops the refusal being decided leaves the read's own error standing.
+    match unfetched_refusal(&fetch, root_tree, path) {
+        Ok(Some(refusal)) => refusal,
+        _ => error,
+    }
+}
+
+/// The `out_of_scope` refusal [`explain_unfetched`] gives; `None` when the path stays inside the
+/// fetch scope or an entry above the boundary is not a directory, and an error when a tree above
+/// the boundary does not load. The caller keeps the read's own error in both of those cases.
+fn unfetched_refusal(fetch: &scope_utils::PathScope, root_tree: &str, path: &str) -> Result<Option<String>, String> {
+    let key = WarehousePath::from_user_input(path)?.as_key().to_string();
+    let components: Vec<&str> = key.split('/').collect();
+    let Some(depth) = (1..=components.len())
+        .find(|&depth| fetch.classify(&components[..depth].join("/")) == ScopeClass::OutOfScope)
+    else {
+        return Ok(None);
+    };
+
+    // Every tree above the boundary is one this warehouse holds: one that does not load is damage.
+    let mut tree = object_utils::load_tree(root_tree)?;
+
+    for component in &components[..depth - 1] {
+        let Some(hash) = subtree_hash(&tree, component) else {
+            return Ok(None);
+        };
+        tree = object_utils::load_tree(&hash)?;
+    }
+
+    // The directory a fetch would bring in: the first one on the path outside the fetch scope, or,
+    // for a file at a level the fetch scope only passes through, the directory holding it.
+    let directory = match depth < components.len() {
+        true => components[..depth].join("/"),
+        false => components[..depth - 1].join("/"),
+    };
+
+    let next_step = match directory.is_empty() {
+        true => "Clone the remote again without --only, into a new directory.".to_string(),
+        false => match is_directory_at_base(&directory)? {
+            true => format!("forklift scope fetch {}", directory),
+            false => format!(
+                "Read it in a full clone: \"forklift scope fetch\" takes a directory at this checkout's \
+                base, and \"{}\" is not one there.",
+                directory
+            ),
+        },
+    };
+
+    Ok(Some(CoreError::refusal(
+        RefusalCode::OutOfScope,
+        format!(
+            "The path \"{}\" is outside this warehouse's fetch scope: reading it needs \"{}\", which was \
+            never fetched.",
+            key, components[..depth].join("/")
+        ),
+        next_step,
+    ).into()))
+}
+
+/// The hash of the subtree `name` in `tree`, if it has one.
+fn subtree_hash(tree: &forklift_core::model::tree_item::TreeItem, name: &str) -> Option<String> {
+    tree.get_subtrees().find(|(entry, _)| entry.as_str() == name).map(|(_, item)| item.hash.clone())
+}
+
+/// Whether `directory` is a directory at this checkout's base, the tree `scope fetch` widens
+/// against. Only the trees holding its entry are read, never its own, which a sparse warehouse
+/// may not have fetched.
+pub(crate) fn is_directory_at_base(directory: &str) -> Result<bool, String> {
+    let Some(base) = pallet_utils::read_position()?.base else {
+        return Ok(false);
+    };
+
+    names_directory(&object_utils::load_parcel(&base)?.tree_hash, directory)
+}
+
+/// Whether the warehouse path `key` names a directory in the root tree `root_tree`. Only the trees
+/// holding its entry are read, never its own, which a sparse warehouse may not have fetched.
+pub(crate) fn names_directory(root_tree: &str, key: &str) -> Result<bool, String> {
+    let mut tree = object_utils::load_tree(root_tree)?;
+    let (parents, name) = match key.rsplit_once('/') {
+        Some((parents, name)) => (Some(parents), name),
+        None => (None, key),
+    };
+
+    for component in parents.into_iter().flat_map(|parents| parents.split('/')) {
+        match subtree_hash(&tree, component) {
+            Some(hash) => tree = object_utils::load_tree(&hash)?,
+            None => return Ok(false),
+        }
+    }
+
+    Ok(subtree_hash(&tree, name).is_some())
 }
 
 /// Refuse a whole-tree verb that does not yet support running in a scoped (sparse) bay

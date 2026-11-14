@@ -2071,6 +2071,11 @@ origin (`non_origin_remote`).
 Every checkout's scope stays as it is: after fetching, a bay can be scoped to the new path
 (`bay add --scope`). A full warehouse already holds everything, so there is nothing to fetch.
 
+Reading a path the fetch scope leaves out (`show main:docs/guide.md`, `redact record`) is refused
+with `out_of_scope`, and the refusal names the `scope fetch` that brings it in. A file at the root,
+or a directory that only an older revision has, cannot be fetched this way, since `scope fetch` takes
+a directory at the checkout's base. Read those in a full clone.
+
 Every history the warehouse holds is widened, not just the current pallet's: every pallet, and
 every remote head a `lower` or `lift` fetched without a pallet yet (such as the head of a
 diverged `lower`, which you may make a pallet of later), and every head a pallet moved off that `undo`

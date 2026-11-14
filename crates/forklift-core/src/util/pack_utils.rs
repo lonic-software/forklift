@@ -12373,6 +12373,38 @@ pub(crate) mod tests {
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
+    /// A hash the caller was handed reads as plain absence when nothing accounts for it: uncoded,
+    /// naming no step, while the same hash read as history's keeps `object_unreadable`. Anything
+    /// left undecided keeps the frame: a data file with no index, an unreadable redaction record.
+    /// Mutations: read named as history, drop the holders or the records test → red.
+    #[test]
+    fn a_named_read_of_an_absent_hash_says_only_that() {
+        let (temp, _scope) = salvage_root("fork490-named-absent");
+
+        let never = "7".repeat(64);
+        let error = file_utils::retrieve_named_object_by_hash(&never).expect_err("absent");
+        assert_eq!(error, format!("Object {} is not in this store.", never));
+        assert!(crate::error::deframe(&error).is_none(), "{}", error);
+        assert_eq!(read_code(&never).0.as_deref(), Some("object_unreadable"));
+
+        let (orphaned, o_hash) = blob449("in a data file with no index");
+        let (_, orphan_index) = write_named_pack(&[(o_hash.clone(), full_record(&orphaned))]);
+        file_utils::remove_file(&orphan_index).unwrap();
+        invalidate_cache();
+        let error = file_utils::retrieve_named_object_by_hash(&o_hash).expect_err("unindexed");
+        assert_eq!(crate::error::deframe(&error).map(|(code, _, _)| code), Some("object_unreadable"), "{}", error);
+        crate::util::file_utils::remove_dir_all(pack_folder()).unwrap();
+        invalidate_cache();
+
+        let record = temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join("redactions-applied");
+        std::fs::write(&record, "/forklift-redactions-applied 99\n").unwrap();
+        invalidate_cache();
+        let error = file_utils::retrieve_named_object_by_hash(&never).expect_err("undecided");
+        assert_eq!(crate::error::deframe(&error).map(|(code, _, _)| code), Some("object_unreadable"), "{}", error);
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
     /// What heal cannot act on keeps its own wording, with no `object_unreadable` code: an index of
     /// another pack format. Mutation: frame the foreign case (or every Unverifiable) → red.
     #[test]

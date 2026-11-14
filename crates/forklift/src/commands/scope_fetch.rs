@@ -104,7 +104,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     let tree = object_utils::load_parcel(&head)?.tree_hash;
 
     for prefix in expansion.added() {
-        if !is_directory_in_tree(&tree, prefix)? {
+        if !crate::commands::scope::names_directory(&tree, prefix)? {
             return Err(format!(
                 "\"{}\" is not a directory in pallet \"{}\" at its head, so it cannot be a fetch \
                 scope. Nothing was recorded.",
@@ -146,24 +146,6 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
         "The warehouse kept changing while \"forklift scope fetch\" ran, so the fetch scope was not widened; run it \
         again.".to_string()
     )
-}
-
-/// Whether a warehouse path resolves to a subtree (directory) in the given root tree.
-fn is_directory_in_tree(root_tree_hash: &str, key: &str) -> Result<bool, String> {
-    let mut current = object_utils::load_tree(root_tree_hash)?;
-
-    for component in key.split('/') {
-        let subtree = current.get_subtrees()
-            .find(|(name, _)| name.as_str() == component)
-            .map(|(_, item)| item.hash.clone());
-
-        match subtree {
-            Some(hash) => current = object_utils::load_tree(&hash)?,
-            None => return Ok(false),
-        }
-    }
-
-    Ok(true)
 }
 
 /// The result of a `scope fetch`: what was added to the fetch scope and how much was fetched.
