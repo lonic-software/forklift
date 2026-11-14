@@ -355,6 +355,18 @@ fn inject(scenario: &Scenario, programs: &Programs, settings: &Settings, templat
     Ok(Killed { point: point.clone(), landing, graded, attempts: 1 })
 }
 
+/// Whether `status` is a SIGKILL's: the injected kill's.
+#[cfg(unix)]
+fn killed_by_signal(status: &std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal() == Some(9)
+}
+
+#[cfg(not(unix))]
+fn killed_by_signal(_: &std::process::ExitStatus) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,16 +433,4 @@ mod tests {
         let positional = Point { aim: Aim::Position, ..point };
         assert_eq!(filter(&positional, &counting, &root).expect("no path")[1], "trace=renameat2,clone,clone3,fork,vfork");
     }
-}
-
-/// Whether `status` is a SIGKILL's: the injected kill's.
-#[cfg(unix)]
-fn killed_by_signal(status: &std::process::ExitStatus) -> bool {
-    use std::os::unix::process::ExitStatusExt;
-    status.signal() == Some(9)
-}
-
-#[cfg(not(unix))]
-fn killed_by_signal(_: &std::process::ExitStatus) -> bool {
-    false
 }
