@@ -450,6 +450,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **A power loss no longer drops a folder that was just written into.** The first object, ref or
+  shard written into a new folder under `.forklift` synced the folder but not its own entry in the
+  folder above, so a power loss soon after could drop the folder, and every file in it, while a
+  pallet head written later still named what was in it. Clients and forklift-server alike now
+  sync every folder from the one written into up to `.forklift`.
+
 - **The AWS head no longer stores a file or a chunk under a second hash.** A client uploading
   straight to the AWS head's storage could respell a file's or a chunk's header, and the head
   stored it under the new hash, where a redaction of the file's own hash did not reach it. The head
