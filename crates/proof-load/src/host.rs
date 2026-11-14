@@ -81,9 +81,21 @@ fn traced(pid: u32) -> bool {
     any
 }
 
+/// Whether `pid` has ended: no longer listed, or a zombie its parent has not reaped.
+fn gone(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/stat", pid)).map_or(true, |stat| state_of(&stat).is_none_or(|state| state == 'Z' || state == 'X'))
+}
+
+/// The state letter of a `/proc/<pid>/stat` line: the first field after the command's closing
+/// parenthesis, which may itself hold spaces and parentheses.
+fn state_of(stat: &str) -> Option<char> {
+    stat.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next())
+}
+
 /// Attaches `strace` to the running process `pid`, following every thread it has and makes, its
-/// trace written to `trace`; returns once every thread the process has shows a tracer. What
-/// strace said is the error when it exits first or does not attach within `limit`.
+/// trace written to `trace`; returns once every thread the process has shows a tracer, or once
+/// strace has ended cleanly with the process gone. What strace said is the error when it exits
+/// otherwise first, or does not attach within `limit`.
 fn attach(strace: &Path, pid: u32, trace: &Path, filter: &[String], limit: Duration) -> Result<Attached, String> {
     let mut child = Command::new(strace).args(["-f", "-qq", "-y", "-ttt", "-o"]).arg(trace).args(filter).arg("-p").arg(pid.to_string())
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
@@ -93,6 +105,11 @@ fn attach(strace: &Path, pid: u32, trace: &Path, filter: &[String], limit: Durat
     let deadline = Instant::now() + limit;
     loop {
         if let Ok(Some(status)) = attached.child.try_wait() {
+            // An injecting trace can kill the server before every thread is attached: strace then
+            // ends with its tracee, and the trace, not the attach, says where the kill landed.
+            if status.success() && gone(pid) {
+                return Ok(attached);
+            }
             let said = attached.said.take().map(|said| said.join().unwrap_or_default()).unwrap_or_default();
             return Err(format!("strace exited ({}) attaching to the server: {}", status, String::from_utf8_lossy(&said).trim()));
         }
@@ -302,5 +319,22 @@ impl Drop for Host {
     fn drop(&mut self) {
         // Killed here, not when the last handle to it goes: a proxy thread may outlive the host.
         self.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A process's state is read past the last parenthesis, so a command name holding ") Z" is
+    /// never taken for a zombie.
+    ///
+    /// Revert: split at the first ')' → the odd name reads as state 'Z'.
+    #[test]
+    fn a_state_is_read_past_the_command_name() {
+        assert_eq!(state_of("12 (forklift-server) S 1 12"), Some('S'));
+        assert_eq!(state_of("12 (a) Z (b) R 1 12"), Some('R'));
+        assert_eq!(state_of("12 (forklift-server) Z 1 12"), Some('Z'));
+        assert_eq!(state_of("garbled"), None);
     }
 }
