@@ -30,6 +30,16 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   loose file `heal` cannot read at all is not judged: it says its check may be short. The `--json`
   schema is now 47.
 
+- **A damaged pack record is refused with a code, and `heal` names it as lost.** An object whose
+  record in a pack did not decompress or rebuilt to other content, or a delta standing on such an
+  object, failed reads with an uncoded message; `heal` exited 0 over a damaged file record, and
+  stopped with an error, naming nothing, over a damaged directory record. Now such a read is refused
+  with exit 57 (`object_unreadable`), and `heal` decodes every pack record: one that history still
+  reaches and that no other copy stands in for is counted as `corrupt` in its `objects_lost`
+  refusal (exit 58). The pack is left as it is; a damaged record no history needs, or one the
+  warehouse holds by hash alone, is noted, not counted lost. This makes `heal` read the whole pack
+  store.
+
 - **A damaged pack file is refused with a code, `heal` rebuilds a lost or damaged index, and `heal`
   says when objects are lost.** A read that met a lost, cut-short or corrupt pack index, a missing
   pack data file or a damaged index entry failed with an uncoded message, or reported the object as
