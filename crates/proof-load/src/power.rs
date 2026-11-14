@@ -17,8 +17,8 @@
 //! children's included, after each line's last call before it exits, and after each line exits;
 //! every state once the lines that acknowledge the record have exited is graded as owing it (see
 //! [`faulted::acknowledging`]): the record's own lines, before any the scenario runs after them.
-//! A crash state that records the
-//! counting area's root stops the scenario as path-bound, as the run's final tree would. These are
+//! A crash state that records the counting area's root stops the scenario as path-bound, as the
+//! run's final tree would. These are
 //! POSIX-minimal semantics. A real ext4 in data=ordered mode keeps more than this, so a loss
 //! graded here may survive on a real machine; every row says so.
 //!
