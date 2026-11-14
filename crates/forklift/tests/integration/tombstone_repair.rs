@@ -70,17 +70,20 @@ impl Area {
         text(&output.stdout)
     }
 
-    /// A prepared warehouse with one parcel on `main`, marked served as a server marks it.
-    fn served(&self) -> PathBuf {
+    /// A prepared warehouse with one parcel on `main`, never served.
+    fn warehouse(&self) -> PathBuf {
         let root = self.base.join("wh");
         std::fs::create_dir_all(&root).unwrap();
         self.run_ok(&root, &["prepare"]);
         self.run_ok(&root, &["config", "set", "operator.identifier", "tombstone-repair@forklift"]);
         self.stack(&root, "a.txt", "one");
-        {
-            let _scope = forklift_core::globals::StorageRootScope::enter(&root);
-            assert!(forklift_core::util::tombstone_utils::mark_served(true).unwrap());
-        }
+        root
+    }
+
+    /// [`Area::warehouse`], marked served as a server marks it.
+    fn served(&self) -> PathBuf {
+        let root = self.warehouse();
+        mark_served(&root);
         root
     }
 
@@ -114,6 +117,11 @@ fn text(bytes: &[u8]) -> String {
 
 fn head(root: &Path, pallet: &str) -> String {
     std::fs::read_to_string(root.join(".forklift").join("pallets").join(pallet)).unwrap().trim_end().to_string()
+}
+
+fn mark_served(root: &Path) {
+    let _scope = forklift_core::globals::StorageRootScope::enter(root);
+    assert!(forklift_core::util::tombstone_utils::mark_served(true).unwrap());
 }
 
 fn list_path(root: &Path) -> PathBuf {
@@ -199,24 +207,25 @@ fn a_repair_keeps_a_head_held_only_in_a_pack() {
     assert!(holds(&area, &root, &side));
 }
 
-/// Revert: adopt a journal's name without checking it against the tip and the other journal
-/// entries → H1's name is given to the later H2, or H1 is listed as "side" → red.
+/// Revert: adopt a journal's name without checking every head the journals name for it → H1 is
+/// listed as "side", though the lost list held side at H2 → red. Revert: take every deleted name
+/// as a candidate for every tip → no tip has one candidate, so "gone" is not named → red.
 #[test]
 fn a_repair_names_a_deletion_only_where_the_journals_settle_it() {
+    use forklift_core::util::pallet_utils::{self, PalletNamespace, RefPreconditions};
     let area = Area::new("named");
-    let root = area.served();
-    let gone = area.deleted(&root, "gone");
+    let root = area.warehouse();
 
-    // "side" deleted at H1 in this bay, restored, moved on to H2 and deleted again where no
-    // journal saw it (as over the protocol).
+    // Before the first serve, "side" is deleted at H1 and made again at H2, which is not H1's
+    // descendant; once served, it is deleted at H2 where no journal saw it (as over the protocol).
     let h1 = area.deleted(&root, "side");
-    area.run_ok(&root, &["pallet", "restore", "side"]);
-    area.run_ok(&root, &["shift", "side"]);
-    area.stack(&root, "more.txt", "more");
+    area.run_ok(&root, &["pallet", "create", "side"]);
+    area.stack(&root, "other.txt", "other");
     let h2 = head(&root, "side");
     area.run_ok(&root, &["shift", "main"]);
+    mark_served(&root);
+    let gone = area.deleted(&root, "gone");
     {
-        use forklift_core::util::pallet_utils::{self, PalletNamespace, RefPreconditions};
         let _scope = forklift_core::globals::StorageRootScope::enter(&root);
         pallet_utils::remove_pallet_head_in(PalletNamespace::User, "side", &h2, &RefPreconditions::NONE, None).unwrap();
     }
@@ -225,10 +234,11 @@ fn a_repair_names_a_deletion_only_where_the_journals_settle_it() {
     let report = area.server_ok(&root, &["tombstone", "repair"]);
 
     let listed = area.server_ok(&root, &["tombstone", "list"]);
-    assert!(listed.contains(&format!("gone {}", gone)) || listed.lines().any(|line| line.contains("gone") && line.contains(&gone)), "{}", listed);
-    assert!(listed.lines().any(|line| line.contains(&h2) && line.contains("(kept, no name)")), "H2 has no name: {}", listed);
-    assert!(!listed.contains(&h1), "H1 is H2's ancestor, so it is no tip: {}", listed);
-    assert!(!listed.lines().any(|line| line.contains("side")), "nothing is named side: {}\n{}", listed, report);
+    let line_of = |head: &str| listed.lines().find(|line| line.contains(head)).unwrap_or_else(|| panic!("{} is not kept: {}\n{}", head, listed, report)).to_string();
+    assert!(line_of(&gone).contains("gone"), "{}", listed);
+    assert!(line_of(&h1).contains("(kept, no name)"), "the journals do not settle H1: {}", listed);
+    assert!(line_of(&h2).contains("(kept, no name)"), "no journal names H2 deleted: {}", listed);
+    assert!(!listed.lines().any(|line| line.contains("side")), "nothing is named side: {}", listed);
 }
 
 /// Revert: write only the kept heads → the entries that still read are lost → red.
