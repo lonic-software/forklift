@@ -272,11 +272,10 @@ fn inject(scenario: &Scenario, programs: &Programs, settings: &Settings, templat
     // just before the proxy forwards it; a background point's, before the faulted command starts.
     let (go, went) = std::sync::mpsc::channel::<()>();
     let (done, finished) = std::sync::mpsc::channel::<()>();
-    match window {
-        // Serial from the start, as the counting run was: requests are numbered in the order they
-        // are forwarded, and the hook runs once the request before it is answered.
-        Some(_) => host.proxy.set_serial(true),
-        None => {}
+    // Serial from the start, as the counting run was: requests are numbered in the order they are
+    // forwarded, and the hook runs once the request before it is answered.
+    if window.is_some() {
+        host.proxy.set_serial(true);
     }
     match window {
         Some(at) => host.proxy.before(host.proxy.requests() + at, move || {
