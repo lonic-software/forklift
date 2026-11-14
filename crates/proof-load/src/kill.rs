@@ -877,14 +877,6 @@ mod tests {
         Root { given: "/o/s/0001-h-count".into(), canonical: "/o/s/0001-h-count".into() }
     }
 
-    /// A counting trace yields one kill point per mutating or syncing call of the tool's process:
-    /// a fixed path aimed with -P as traced and counted among the calls -P selects in its thread,
-    /// a temp counted among every call of its name in its thread, a pipe write and a read-only
-    /// open none, a child's write listed and not targeted, and a point other threads could steal
-    /// sampled.
-    ///
-    /// Revert: count positions across threads → the worker's temp open is #3, not #1; aim the temp
-    /// with -P → its pid-bearing path never fires; target the child → git's write is a point.
     /// A mutating call the table cannot place is refused aloud, never dropped: the server route
     /// write check must see every write or say why it cannot.
     ///
@@ -898,6 +890,14 @@ mod tests {
         assert!(refused[0].contains("unlinkat"), "{:?}", refused);
     }
 
+    /// A counting trace yields one kill point per mutating or syncing call of the tool's process:
+    /// a fixed path aimed with -P as traced and counted among the calls -P selects in its thread,
+    /// a temp counted among every call of its name in its thread, a pipe write and a read-only
+    /// open none, a child's write listed and not targeted, and a point other threads could steal
+    /// sampled.
+    ///
+    /// Revert: count positions across threads → the worker's temp open is #3, not #1; aim the temp
+    /// with -P → its pid-bearing path never fires; target the child → git's write is a point.
     #[test]
     fn a_counting_trace_yields_its_kill_points() {
         let text = "\
@@ -934,6 +934,28 @@ mod tests {
         });
         assert_eq!(enumerated.children, BTreeSet::from(["write <root>/tmp/x".to_string()]));
         assert!(enumerated.points.iter().all(|point| point.line == 1 && point.command == "stack"));
+    }
+
+    /// A trace attached to the running server counts every thread it already had as the server's,
+    /// with no execve to find it by, names each point's unit by its call, and aims a temp by its
+    /// path like a fixed one.
+    ///
+    /// Revert: aim a served temp by position → the object temp's open is no path aim; group from
+    /// the first thread → thread 52's calls are a child's and no point.
+    #[test]
+    fn a_served_trace_aims_its_temps_by_path() {
+        let text = "\
+51 openat(AT_FDCWD</o/s/0001-h-count>, \"/o/s/0001-h-count/host/.forklift/pallets/main.tmp~50-0\", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 4</o/s/0001-h-count/host/.forklift/pallets/main.tmp~50-0>
+52 openat(AT_FDCWD</o/s/0001-h-count>, \"/o/s/0001-h-count/host/.forklift/objects/ab/0123456789abcdef0123.tmp~50-1\", O_WRONLY|O_CREAT, 0666) = 6</o/s/0001-h-count/host/.forklift/objects/ab/0123456789abcdef0123.tmp~50-1>
+";
+        let calls = trace::parse(text).unwrap();
+        let enumerated = enumerate_served(&calls, 50, &|call| format!("serve {}", call.tid), &root(), "/o/s/0001-h-count", |_| false).unwrap();
+        let points: Vec<(&str, &Aim, &str)> = enumerated.points.iter().map(|point| (point.command.as_str(), &point.aim, point.base.as_str())).collect();
+        assert_eq!(points, vec![
+            ("serve 51", &Aim::Path { path: "/o/s/0001-h-count/host/.forklift/pallets/main.tmp~50-0".into() }, "<root>/host/.forklift/pallets/main.tmp~<pid>-<n>"),
+            ("serve 52", &Aim::Path { path: "/o/s/0001-h-count/host/.forklift/objects/ab/0123456789abcdef0123.tmp~50-1".into() }, "<root>/host/.forklift/objects/<hex>/<hex>.tmp~<pid>-<n>"),
+        ]);
+        assert!(enumerated.children.is_empty());
     }
 
     /// A fixed path counts only the calls -P would select, including a descriptor on the path's
