@@ -251,14 +251,14 @@ a durability taint records it.
 
 **Durability taint** (git: none). A record of paths whose durability could not be proven after a
 rare kind of write failure. See
-[`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-operation).
+[`heal`](cli.md#heal--resolve-a-durability-taint-a-damaged-ref-or-an-interrupted-operation).
 
 **Torn taint.** A taint record that was itself cut off by a crash.
 
 **Restage.** Reading an object back, checking its hash, and rewriting it durably.
 
-**heal** (git: none). The recovery command for taints and interrupted operations.
-See [`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-operation).
+**heal** (git: none). The recovery command for taints, damaged pallet refs and interrupted operations.
+See [`heal`](cli.md#heal--resolve-a-durability-taint-a-damaged-ref-or-an-interrupted-operation).
 
 **Operation marker.** A record a multi-step command writes before it starts and removes when it
 finishes. One left behind marks an **interrupted operation**. See
@@ -406,7 +406,7 @@ signed. See [Establishing trust](trust-and-identity.md#2-establishing-trust).
 [Establishing trust](trust-and-identity.md#2-establishing-trust).
 
 **Trust pin.** A point in history the trust state keeps alive, so gc never deletes what it reaches.
-See [`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-operation).
+See [`heal`](cli.md#heal--resolve-a-durability-taint-a-damaged-ref-or-an-interrupted-operation).
 
 **First contact, TOFU** (like an SSH host key). Adopting a remote's genesis the first time you
 connect. See [First contact](trust-and-identity.md#joining-a-trusted-warehouse-first-contact).

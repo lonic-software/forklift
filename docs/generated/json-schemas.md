@@ -2186,6 +2186,24 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$defs": {
+    "Candidate": {
+      "description": "A head the evidence names, and where it was found.",
+      "properties": {
+        "head": {
+          "description": "The parcel.",
+          "type": "string"
+        },
+        "source": {
+          "description": "Where it was found, in words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "head",
+        "source"
+      ],
+      "type": "object"
+    },
     "OperationOutcome": {
       "description": "How `heal` settled an interrupted operation.",
       "oneOf": [
@@ -2247,6 +2265,29 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "Rebuilt": {
+      "description": "A ref this run rebuilt.",
+      "properties": {
+        "head": {
+          "description": "The head its ref holds now.",
+          "type": "string"
+        },
+        "pallet": {
+          "description": "The pallet.",
+          "type": "string"
+        },
+        "source": {
+          "description": "Where that head was found, in words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pallet",
+        "head",
+        "source"
+      ],
+      "type": "object"
+    },
     "RecordRebuilt": {
       "description": "What `heal` dropped from a damaged sealed-object record.",
       "properties": {
@@ -2266,6 +2307,50 @@ A command not listed here either reports only the generic human-message shape `{
       "required": [
         "at",
         "dropped_bytes"
+      ],
+      "type": "object"
+    },
+    "Refused": {
+      "description": "A damaged ref this run left alone.",
+      "properties": {
+        "candidates": {
+          "description": "Every head the evidence named.",
+          "items": {
+            "$ref": "#/$defs/Candidate"
+          },
+          "type": "array"
+        },
+        "pallet": {
+          "description": "The pallet.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why no head was chosen.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pallet",
+        "reason",
+        "candidates"
+      ],
+      "type": "object"
+    },
+    "Removed": {
+      "description": "A ref `--remove-ref` removed, and where its bytes were kept.",
+      "properties": {
+        "kept": {
+          "description": "The file its unreadable bytes were moved to.",
+          "type": "string"
+        },
+        "pallet": {
+          "description": "The pallet.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pallet",
+        "kept"
       ],
       "type": "object"
     }
@@ -2308,6 +2393,27 @@ A command not listed here either reports only the generic human-message shape `{
         }
       ],
       "description": "What this run dropped from a damaged sealed-object record, which it rebuilt as the part\nbefore the damage. An object whose record was dropped reads as missing if it is absent."
+    },
+    "refs_rebuilt": {
+      "description": "Pallet refs that were lost or damaged and this run set: rebuilt at the head the evidence\nagreed on, or set to the parcel `--ref` gave.",
+      "items": {
+        "$ref": "#/$defs/Rebuilt"
+      },
+      "type": "array"
+    },
+    "refs_refused": {
+      "description": "Damaged pallet refs this run left alone, with every head the evidence named. Present only\non a `ref_damaged` refusal's details.",
+      "items": {
+        "$ref": "#/$defs/Refused"
+      },
+      "type": "array"
+    },
+    "refs_removed": {
+      "description": "Unreadable pallet refs `--remove-ref` removed, and where their bytes were kept.",
+      "items": {
+        "$ref": "#/$defs/Removed"
+      },
+      "type": "array"
     },
     "resolved": {
       "description": "Recorded paths (or hashes) resolved without a rewrite: proven absent and unreferenced by\nthe closure walk, or a vanished inventory shard (a staging concern, never an object-trust\none — see `notes`).",

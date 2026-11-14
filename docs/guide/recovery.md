@@ -96,7 +96,7 @@ Exit 0 means nothing needed is lost, and you can carry on. If it names something
 needed, `heal` has already tried your remote: clone afresh if a remote might hold it, or re-create it
 with `load` and `stack` if the content is still in your working tree. `audit` also runs while a taint
 stands, but says nothing about this damage; see
-[`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-operation) for the rarer cases.
+[`heal`](cli.md#heal--resolve-a-durability-taint-a-damaged-ref-or-an-interrupted-operation) for the rarer cases.
 
 ### `ref_damaged` (exit 53)
 
