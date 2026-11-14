@@ -870,7 +870,7 @@ impl ErrorCode {
             ErrorCode::WithheldDamaged =>
                 "A served warehouse's record of withheld content is lost or damaged, so what its head withholds cannot be told. Nothing was served or changed; its operator repairs it with forklift-server withhold repair while it is not served",
             ErrorCode::ObjectUnreadable =>
-                "An object could not be read: no file holds it, or the only pack index that names it is damaged or has lost its data file. Nothing was changed; heal rebuilds a damaged index from its data file, or names what is lost",
+                "An object could not be read: no file holds it, or the only pack index that names it is damaged or has lost its data file. Nothing was changed; heal rebuilds a damaged index from its data file, or names what is lost when history still reaches it",
             ErrorCode::ObjectsLost =>
                 "Heal found objects the history reaches that no file holds, or that only a pack index it could not rebuild names. Nothing was claimed repaired for them; restore them from a backup or a copy that holds them",
         }

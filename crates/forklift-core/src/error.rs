@@ -387,7 +387,8 @@ refusal_codes! {
     /// An object could not be read: no file holds it, or the only pack index that names it is
     /// damaged or has lost its data file. Nothing was changed. `forklift heal` rebuilds a damaged
     /// index from its data file, or refuses with [`RefusalCode::ObjectsLost`] when history still
-    /// reaches an object the store cannot give back. A content mismatch on an object that is present carries no code.
+    /// reaches an object the store cannot give back. A content mismatch on an object that is
+    /// present carries no code.
     ObjectUnreadable => "object_unreadable",
 
     /// `forklift heal` found objects the history reaches that no file holds, or that only a pack
