@@ -145,7 +145,12 @@ Notes:
   toward the server, the server killed once the request is forwarded) at a seeded request of the
   faulted command, each on a fresh build, and reads back through a fresh clone of the host. A
   killed server is restarted first, and each removal its refusal to start names is carried out
-  and graded as outside knowledge; one that will not start again is graded, not an error. A fault whose condition
+  and graded as outside knowledge; one that will not start again is graded, not an error. With
+  `--kill` on Linux, each hosted scenario it names also has its server killed at each mutating or
+  syncing call the server makes while the faulted command runs (the `kill points (server)` row):
+  each point on a fresh build with strace attached to the listening server, the server restarted
+  as above, and each point's unit the route whose request held the call, or the server's
+  background work; a scenario whose command only reads from the server owes none. A fault whose condition
   no longer held when the command ended, every line of it landed, is listed as missing from its
   lane's check and fails the run; one that held
   is graded, so a refused write the tool swallowed counts as an acknowledgement. A retry resumes at the line that did not land, as a user

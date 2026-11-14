@@ -61,7 +61,8 @@ enum Command {
         #[arg(long)]
         strace: Option<PathBuf>,
         /// Kill points of this scenario only; repeatable. Without it or `--power`, every
-        /// scenario's; with only `--power` named, none.
+        /// scenario's; with only `--power` named, none. A hosted scenario's server is killed at
+        /// each of its own calls too, given a forklift-server.
         #[arg(long = "kill")]
         kill: Vec<String>,
         /// Power loss of this scenario only; repeatable. Without it or `--kill`, every scenario's;
