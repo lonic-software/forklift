@@ -2193,6 +2193,29 @@ mod tests {
         assert_eq!(crashes[4].moment, Moment::After { line: 1, command: "stack".into() });
     }
 
+    /// A record its first line acknowledges is owed by every crash once that line exited, those
+    /// cut short in the lines after it included, and by none before.
+    ///
+    /// Revert: acknowledge after the last line only → the state after line 1 and every one in
+    /// line 2 owe nothing; acknowledge a line's own moments as it runs → its end, before it
+    /// exited, owes the record.
+    #[test]
+    fn crashes_past_the_acknowledging_lines_owe_the_record() {
+        let texts = [rewrite(true), "2 openat(AT_FDCWD</s/w>, \"a\", O_RDONLY) = 3</s/w/a>\n".to_string()];
+        let calls: Vec<Vec<Call>> = texts.iter().map(|text| trace::parse(text).unwrap()).collect();
+        let points: Vec<Vec<Point>> = calls.iter().enumerate()
+            .map(|(line, calls)| kill::enumerate(calls, line, "stack", &root(), "/s/w", |_| false).unwrap().points).collect();
+        let starts = starts(&texts);
+        let lines: Vec<Line> = calls.iter().zip(&points).zip(&starts)
+            .map(|((calls, points), before)| Line { calls, command: "stack".into(), points: points.iter().collect(), before }).collect();
+        let crashes = durable(crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 1, 0, 7).unwrap().crashes);
+        let found: Vec<(Moment, bool)> = crashes.iter().map(|crash| (crash.moment.clone(), crash.acknowledged)).collect();
+        assert_eq!(found.iter().map(|(_, acknowledged)| *acknowledged).collect::<Vec<_>>(), [false, false, true, true, true]);
+        assert_eq!(found[1].0, Moment::Ending { line: 0, command: "stack".into() });
+        assert_eq!(found[2].0, Moment::After { line: 0, command: "stack".into() });
+        assert_eq!(found[3].0, Moment::Ending { line: 1, command: "stack".into() });
+    }
+
     /// A child's syncs are crash moments though no kill point stands at them: the state its first
     /// fsync made durable, before its second, is graded.
     ///

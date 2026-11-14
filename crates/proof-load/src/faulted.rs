@@ -1104,4 +1104,83 @@ mod tests {
         assert!(!settles(false, Some(&nothing)), "the faulted command's own answer is no retry");
     }
 
+    /// A record is acknowledged by its own lines, before any the scenario runs after them; read
+    /// back through the host, by every line through the last of the last push; and a host-side
+    /// readback of a command that pushes nothing has no acknowledging line.
+    ///
+    /// Revert: count every line → the store compaction after the record acknowledges it (3, not
+    /// 2); count the record's own lines through the host too → the lift is not owed (2, not 3);
+    /// stop at the first push → the second is not owed (3, not 5); default a host-side command
+    /// with no push to its record's lines → it is graded, not refused.
+    #[test]
+    fn a_record_is_acknowledged_by_its_own_lines_or_through_its_last_push() {
+        assert_eq!(acknowledging(&[Op::Pack], false), Ok(2));
+        assert_eq!(acknowledging(&[Op::Push], false), Ok(2));
+        assert_eq!(acknowledging(&[], false), Ok(2));
+        assert_eq!(acknowledging(&[Op::Push], true), Ok(3));
+        assert_eq!(acknowledging(&[Op::Push, Op::Pack], true), Ok(3));
+        assert_eq!(acknowledging(&[Op::Push, Op::Pack, Op::Push, Op::Pack], true), Ok(5));
+        assert!(acknowledging(&[], true).unwrap_err().contains("pushes nothing"));
+        assert!(acknowledging(&[Op::Pack], true).is_err());
+    }
+
+    /// A first attempt acknowledges its record once the acknowledging lines landed, and completes
+    /// once every line did; a line that did not land ends what the attempt established, a kill as
+    /// much as a refusal.
+    ///
+    /// Revert: key completed on acknowledged → a run killed in its last line completes; key
+    /// acknowledged on every line → a run that stacked and was refused its compaction owes nothing;
+    /// count every success rather than the leading ones → a line after a refused one lands.
+    #[test]
+    fn an_attempt_acknowledges_through_its_own_lines_and_completes_through_every_line() {
+        let (ok, killed, refused) = (answer(Some(0), "", None), answer(None, "", None), answer(Some(1), "no", None));
+        let made = |acknowledged, completed| Made { acknowledged, completed };
+        assert_eq!(Made::of(&[ok.clone(), ok.clone()], 2, 3), made(true, false));
+        assert_eq!(Made::of(&[ok.clone(), ok.clone(), refused.clone()], 2, 3), made(true, false));
+        assert_eq!(Made::of(&[ok.clone(), ok.clone(), killed.clone()], 2, 3), made(true, false));
+        assert_eq!(Made::of(&[ok.clone(), ok.clone(), ok.clone()], 2, 3), made(true, true));
+        assert_eq!(Made::of(&[ok.clone(), killed], 2, 3), made(false, false));
+        assert_eq!(Made::of(&[refused, ok.clone(), ok.clone()], 2, 3), made(false, false));
+        assert_eq!(Made::of(&[ok.clone(), ok], 2, 2), made(true, true));
+    }
+
+    /// A retry adds what it landed, every line before where the next resumes, and never takes back
+    /// what an earlier attempt established.
+    ///
+    /// Revert: take a stopped retry as acknowledging nothing → a retry refused its compaction does
+    /// not owe the record it stacked; assign instead of adding → a later refusal unmakes it.
+    #[test]
+    fn a_retry_adds_what_it_landed_and_unmakes_nothing() {
+        let at = |at| Resume { at, may_have_stacked: false };
+        let retried = |mut made: Made, landed, next| { made.retried(landed, next, 2, 3); made };
+        let made = |acknowledged, completed| Made { acknowledged, completed };
+        assert_eq!(retried(Made::default(), false, at(2)), made(true, false));
+        assert_eq!(retried(Made::default(), false, at(1)), made(false, false));
+        assert_eq!(retried(Made::default(), true, Resume::START), made(true, true));
+        assert_eq!(retried(made(true, false), false, at(0)), made(true, false));
+        assert_eq!(retried(made(true, true), false, at(1)), made(true, true));
+    }
+
+    /// A settle that finds the record served after an answer asking nothing further owes it, and
+    /// completes the command only when no line follows the record's own; the lines that do follow
+    /// then run once from the first of them, unless the attempt already reached them.
+    ///
+    /// Revert: complete on promotion → a compaction refused for good grades healed though it never
+    /// ran; run the rest whenever the record is newly owed → a retry that stacked and was refused
+    /// its compaction runs it twice; resume the rest anywhere but its first line → it is skipped
+    /// or the stack re-run.
+    #[test]
+    fn a_settled_record_is_owed_and_the_lines_after_it_still_run() {
+        let made = |acknowledged, completed| Made { acknowledged, completed };
+        let promoted = |promoted: Made| { let mut made = Made::default(); made.promote(promoted); made };
+        assert_eq!(promoted(Made::through(2, 2, 3)), made(true, false));
+        assert_eq!(promoted(Made::through(2, 2, 2)), made(true, true));
+        let at = |at| Resume { at, may_have_stacked: false };
+        assert_eq!(made(true, false).rest(Made::default(), at(1), 2), Some(at(2)));
+        assert_eq!(made(true, false).rest(Made::default(), at(0), 2), Some(at(2)));
+        assert_eq!(made(true, false).rest(Made::default(), at(2), 2), None, "the attempt ran the compaction");
+        assert_eq!(made(true, false).rest(made(true, false), at(1), 2), None, "owed before this settle");
+        assert_eq!(made(true, true).rest(Made::default(), at(1), 2), None);
+    }
+
 }
