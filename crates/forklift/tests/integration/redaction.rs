@@ -1924,18 +1924,22 @@ fn a_server_owing_a_deletion_serves_the_chunks_only_its_recipe_names_as_absent()
     };
     assert!(!own.is_empty() && !shared.is_empty(), "own {:?}, shared {:?}", own, shared);
 
-    // Waits out the drain a deletion attempt serves 503 through.
-    let report = || {
+    // Waits out the drain each deletion attempt serves 503 through. While the deletion is owed the
+    // deleter keeps retrying, so any request can meet a fresh drain, not only the first.
+    let served = |method: &str, path: &str, body: &[u8]| {
         for _ in 0..500 {
-            let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
-            if status.starts_with("HTTP/1.1 503") {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                continue;
+            let (status, reply) = http(&server.url, method, path, body);
+            if !status.starts_with("HTTP/1.1 503") {
+                return (status, reply);
             }
-            assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
-            return serde_json::from_str::<serde_json::Value>(&info).unwrap()["redactions"].clone();
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("the warehouse stayed drained");
+    };
+    let report = || {
+        let (status, info) = served("GET", "/v1/warehouse", b"");
+        assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
+        serde_json::from_str::<serde_json::Value>(&info).unwrap()["redactions"].clone()
     };
     let objects = server.root.join(".forklift/objects");
 
@@ -1947,16 +1951,16 @@ fn a_server_owing_a_deletion_serves_the_chunks_only_its_recipe_names_as_absent()
         owner.run_ok(&["lift"]);
         assert_eq!(report(), serde_json::json!([{ "hash": recipe, "state": "deletion_owed" }]));
 
-        let (status, body) = http(&server.url, "GET", &format!("/v1/objects/{}", own[0]), b"");
+        let (status, body) = served("GET", &format!("/v1/objects/{}", own[0]), b"");
         assert!(status.starts_with("HTTP/1.1 404"), "{}, {} bytes", status, body.len());
         assert!(objects.join(&own[0][..2]).join(&own[0][2..]).exists(), "the server still holds the chunk");
 
-        let (status, _) = http(&server.url, "GET", &format!("/v1/objects/{}", shared[0]), b"");
+        let (status, _) = served("GET", &format!("/v1/objects/{}", shared[0]), b"");
         assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
 
         // A bundle of the leak's own chunks holds none of them; one of the shared chunks holds them.
         let batch = |hashes: &[String]| {
-            let (status, body) = http(&server.url, "POST", "/v1/objects/batch",
+            let (status, body) = served("POST", "/v1/objects/batch",
                                       serde_json::json!({ "hashes": hashes }).to_string().as_bytes());
             assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
             body.len()
@@ -1966,14 +1970,14 @@ fn a_server_owing_a_deletion_serves_the_chunks_only_its_recipe_names_as_absent()
 
         // And missing, so a lift naming one uploads it.
         let asked = [own[0].clone(), shared[0].clone()];
-        let (status, body) = http(&server.url, "POST", "/v1/objects/missing",
+        let (status, body) = served("POST", "/v1/objects/missing",
                                   serde_json::json!({ "hashes": asked }).to_string().as_bytes());
         assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
         let missing: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(missing["missing"], serde_json::json!([own[0]]), "{}", body);
 
         // And upload-targets answers it to be uploaded, as missing does.
-        let (status, body) = http(&server.url, "POST", "/v1/objects/upload-targets",
+        let (status, body) = served("POST", "/v1/objects/upload-targets",
                                   serde_json::json!({ "session": "s", "hashes": asked }).to_string().as_bytes());
         assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
         let targets: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1995,7 +1999,7 @@ fn a_server_owing_a_deletion_serves_the_chunks_only_its_recipe_names_as_absent()
     }
     assert_eq!(state, serde_json::json!([{ "hash": recipe, "state": "deleted" }]));
     assert!(!objects.join(&own[0][..2]).join(&own[0][2..]).exists(), "the chunk is deleted");
-    let (status, _) = http(&server.url, "GET", &format!("/v1/objects/{}", shared[0]), b"");
+    let (status, _) = served("GET", &format!("/v1/objects/{}", shared[0]), b"");
     assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
 }
 

@@ -1633,18 +1633,39 @@ pub(crate) fn gc_root_sources(
 ) -> Result<GcRootSources, String> {
     let mut parcels: Vec<String> = Vec::new();
     let mut meta_heads: Vec<String> = Vec::new();
+    let mut degraded: Vec<String> = Vec::new();
 
-    for (pallet_ref, head) in pallet_utils::all_pallet_refs()? {
-        match pallet_ref.namespace {
-            pallet_utils::PalletNamespace::User => parcels.push(head),
-            pallet_utils::PalletNamespace::Meta => meta_heads.push(head),
+    // A ref that cannot be read is a degraded source under `Tolerate`, as an unreadable bay is:
+    // heal walks past it (and rebuilds it, when it is a user ref), and its negative answers clear nothing that run.
+    for namespace in [pallet_utils::PalletNamespace::User, pallet_utils::PalletNamespace::Meta] {
+        for name in pallet_utils::list_pallets_in(namespace)? {
+            let head = match pallet_utils::get_pallet_head_in(namespace, &name) {
+                Ok(head) => head,
+                Err(e) => match bay_policy {
+                    bay_utils::BayReadPolicy::FailClosed => return Err(e),
+                    bay_utils::BayReadPolicy::Tolerate => {
+                        degraded.push(format!(
+                            "the ref of pallet \"{}\" could not be read this run ({}); what only it \
+                            reaches was treated as held by nothing rather than blocking this command.",
+                            pallet_utils::PalletRef { namespace, name: name.clone() }.to_wire(),
+                            crate::error::CoreError::from(e)
+                        ));
+                        None
+                    }
+                },
+            };
+
+            match (namespace, head) {
+                (pallet_utils::PalletNamespace::User, Some(head)) => parcels.push(head),
+                (pallet_utils::PalletNamespace::Meta, Some(head)) => meta_heads.push(head),
+                (_, None) => {}
+            }
         }
     }
 
     // A haul's proposed head is merged from the recorded hash, whatever its source pallet holds
     // now. Read under `bay_policy`: like a bay's state, it is a record outside the pallet refs
     // that names a head a later command reads.
-    let mut degraded: Vec<String> = Vec::new();
     let haul_heads = match haul_utils::unmerged_haul_heads() {
         Ok(heads) => heads,
         Err(e) => match bay_policy {

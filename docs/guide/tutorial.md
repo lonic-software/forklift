@@ -339,5 +339,5 @@ Reference: [Working with remotes](cli.md#6-working-with-remotes).
 - [`cli.md`](cli.md): every command and flag, by workflow.
 - [`trust-and-identity.md`](trust-and-identity.md): users, roles, agents, and key protection.
 - When a command refuses: its message names the way out, [Exit codes](cli.md#11-exit-codes) lists
-  what each code means, and [`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-operation)
+  what each code means, and [`heal`](cli.md#heal--resolve-a-durability-taint-a-damaged-ref-or-an-interrupted-operation)
   resolves an interrupted operation.

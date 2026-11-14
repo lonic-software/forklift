@@ -331,7 +331,7 @@ pub enum Command {
         action: Option<HaulAction>,
     },
 
-    /// Resolve a standing durability taint, or finish or undo an interrupted operation
+    /// Resolve a standing durability taint, rebuild a damaged pallet ref, or finish or undo an interrupted operation
     #[command(
         long_about = "Resolve a standing durability taint (\"durability_taint\" refusals, exit \
                       21): a write's final path(s) were left visible after a failed durability \
@@ -351,9 +351,24 @@ pub enum Command {
                       rolled back otherwise. Either way it rewrites only files that still hold \
                       one side's content or are missing; any other file (an edit made since, or \
                       a merge's combination of both sides) is left and reported as a local \
-                      change, never staged."
+                      change, never staged.\n\n\
+                      It also rebuilds a pallet ref that was lost or damaged (\"ref_damaged\" \
+                      refusals, exit 53), at the one head the warehouse's own evidence agrees on: \
+                      the bases checkouts stand on, their journals, an interrupted operation, \
+                      and what the damaged ref's own bytes still name. When the evidence does not \
+                      agree it changes nothing and lists what it found; --ref sets the ref to a \
+                      parcel you choose, and --remove-ref drops an unreadable ref that nothing \
+                      names a head for."
     )]
-    Heal,
+    Heal {
+        /// Set a damaged pallet ref to a parcel (a pallet, a parcel hash or a unique prefix of one)
+        #[arg(long = "ref", value_name = "PALLET=PARCEL")]
+        set_ref: Vec<String>,
+
+        /// Remove a damaged pallet ref that nothing names a head for, keeping its bytes aside
+        #[arg(long, value_name = "PALLET")]
+        remove_ref: Vec<String>,
+    },
 
     /// Print the command list, or detailed help about one command
     Help {
@@ -2131,7 +2146,7 @@ impl Command {
                 | Command::Deliver { .. }
                 | Command::Diff { .. }
                 | Command::Git { .. }
-                | Command::Heal
+                | Command::Heal { .. }
                 | Command::History { .. }
                 | Command::Lift { .. }
                 | Command::Load { .. }
@@ -2182,7 +2197,7 @@ impl Command {
     /// * `true`  - The chokepoint must be bypassed for this command.
     /// * `false` - The command refuses normally while a taint stands.
     pub fn bypasses_taint_heal(&self) -> bool {
-        matches!(self, Command::Heal | Command::Audit { .. })
+        matches!(self, Command::Heal { .. } | Command::Audit { .. })
     }
 
     /// Whether the command refuses while an operation interrupted before it finished is recorded
@@ -2237,7 +2252,7 @@ impl Command {
                 | Command::Pick { .. }
                 | Command::Consolidate { .. }
                 | Command::Deliver { .. }
-                | Command::Heal
+                | Command::Heal { .. }
                 | Command::Git { action: GitAction::Import { .. } | GitAction::Mirror }
                 | Command::Lift { .. }
                 | Command::Load { .. }

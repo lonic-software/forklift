@@ -76,6 +76,11 @@ async fn moved_under_merge(pallet: &str, found: Option<&str>) -> Result<Option<S
         (None, None) => return Ok(None),
     };
 
+    // No head at all is not another bay's move: the ref was lost or damaged, and heal rebuilds it.
+    if found.is_none() {
+        return Ok(Some(forklift_core::util::pallet_utils::ref_lost_refusal(pallet, &base, "stacked").into()));
+    }
+
     let left = match left_untracked(&base).await {
         Ok(left) if left.is_empty() => String::new(),
         Ok(left) => format!(

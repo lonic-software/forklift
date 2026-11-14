@@ -97,6 +97,7 @@ pub const BINDINGS: &[Binding] = &[
 const NO_MIRROR_ORACLE: &str = "no mirror oracle: the corpus configures no mirror url, so nothing reads a mirror back";
 const INTERRUPTED: &str = "present only while a command runs or after one is interrupted, and removed when it finishes: no finished history holds one to damage, so the kill-point faults grade it";
 const SYNC_FAILED: &str = "written only when a directory sync after a rename fails, and cleared by heal: no finished history holds one to damage, so the power-loss and kill-point faults grade it";
+const KEPT_ONLY: &str = "written only by heal --remove-ref, the removed ref's bytes kept for the operator, and never read back: no outcome depends on it";
 const PATH_BOUND: &str = "path-bound: a bay records its absolute path, so a run on a copy cannot reach it";
 
 pub const EXEMPTIONS: &[Exemption] = &[
@@ -114,6 +115,9 @@ pub const EXEMPTIONS: &[Exemption] = &[
     Exemption { name: "origin-move", reason: INTERRUPTED },
     Exemption { name: "taint/", reason: SYNC_FAILED },
     Exemption { name: "taint/<name>", reason: SYNC_FAILED },
+    Exemption { name: "removed-refs/", reason: KEPT_ONLY },
+    Exemption { name: "removed-refs/<name>", reason: KEPT_ONLY },
+    Exemption { name: "removed-refs/<name>.<n>", reason: KEPT_ONLY },
 ];
 
 const READS: &str = "reads the warehouse and writes nothing to it";

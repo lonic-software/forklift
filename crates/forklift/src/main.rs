@@ -497,9 +497,9 @@ async fn dispatch(cli: Cli, store_access: &mut Option<lock_utils::StoreAccessLoc
         Command::Help { .. } => unreachable!("help is answered in `forklift`, before dispatch"),
         Command::Clone { url, directory, pallet, token, only, cache, expect, repair } =>
             commands::clone::handle_command(&url, &directory, pallet, token, only, cache, expect, repair).await,
-        Command::Heal => {
+        Command::Heal { set_ref, remove_ref } => {
             let store_access = store_access.as_ref().ok_or("heal ran without its store-access hold.")?;
-            commands::heal::handle_command(store_access).await
+            commands::heal::handle_command(store_access, &set_ref, &remove_ref).await
         }
         Command::History { revision, limit, after, oneline } => commands::history::handle_command(revision, limit, after, oneline).await,
         Command::Query { revisions, from, class, unsupervised, supervisor, signer, author_after, author_before, merges, no_merges, grep, model, tool, tag, touches, verify: _, recorded, r#where, limit, after, oneline } =>

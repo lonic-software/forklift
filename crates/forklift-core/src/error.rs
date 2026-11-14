@@ -357,6 +357,13 @@ refusal_codes! {
     /// upload this is most often content the remote deleted after the negotiation answered it
     /// present (a deletion it owed), so a lift negotiates and uploads again, once, by itself.
     RemoteHistoryIncomplete => "remote_history_incomplete",
+
+    /// A pallet ref is lost or damaged: its file does not hold a parcel hash, or it is missing
+    /// while a checkout still stands on a parcel of that pallet. Nothing was changed. `heal`
+    /// rebuilds it from what the bays, their journals and the ref's own bytes still name, or, when
+    /// that evidence does not settle one head, refuses with this code, listing what it found, so
+    /// `heal --ref <pallet>=<parcel>` can set it.
+    RefDamaged => "ref_damaged",
 }
 
 impl RefusalCode {

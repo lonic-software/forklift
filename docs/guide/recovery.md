@@ -96,7 +96,28 @@ Exit 0 means nothing needed is lost, and you can carry on. If it names something
 needed, `heal` has already tried your remote: clone afresh if a remote might hold it, or re-create it
 with `load` and `stack` if the content is still in your working tree. `audit` also runs while a taint
 stands, but says nothing about this damage; see
-[`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-operation) for the rarer cases.
+[`heal`](cli.md#heal--resolve-a-durability-taint-a-damaged-ref-or-an-interrupted-operation) for the rarer cases.
+
+### `ref_damaged` (exit 53)
+
+A pallet's ref is missing although a checkout stands on it, or its file does not hold a parcel hash:
+a crash, a disk fault or a hand edit damaged it. Run:
+
+```sh
+forklift heal
+```
+
+`heal` rebuilds the ref at the head the warehouse agrees on: the bases your checkouts stand on, their
+journals, an interrupted operation, and what the damaged file still names. If those disagree or name
+nothing, it changes nothing and lists every head it found. Pick one with
+`forklift heal --ref <pallet>=<parcel>`. If nothing names a head and no checkout stands on the pallet,
+`forklift heal --remove-ref <pallet>` drops the ref and keeps its bytes under `.forklift/removed-refs`;
+what only that ref reached is then no longer kept by any pallet.
+
+**Do not** write the ref file by hand: `heal --ref` checks that the parcel's history is complete.
+
+A meta pallet's ref (a name starting with `@`, such as `@redactions`) is not rebuilt: no checkout or
+journal records its head. Restore its file from a backup, or write the head parcel's hash into it.
 
 ### `clone_incomplete` (exit 30)
 

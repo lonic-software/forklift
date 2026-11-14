@@ -12,6 +12,18 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **A lost or damaged pallet ref is rebuilt by `forklift heal`.** A ref file that was deleted,
+  truncated, zeroed or had a byte changed, or a `pallets` folder that was removed, used to leave the
+  warehouse unable to stack: `stack` refused as behind and named a `shift` that refused too, or
+  failed with "fix it by hand", while `heal` reported nothing to heal. Every command that meets such
+  a ref now refuses with exit 53 (`ref_damaged`) and names `forklift heal`, which rebuilds it at the
+  one head the warehouse's own evidence agrees on: the bases checkouts stand on, their journals, an
+  interrupted operation, and what the damaged file's bytes still name. When the evidence diverges,
+  names nothing, or records the pallet as deleted, `heal` changes nothing, exits 53 and lists every
+  head it found; `heal --ref <pallet>=<parcel>` then sets the ref, and `heal --remove-ref <pallet>`
+  drops an unreadable ref that nothing names a head for, keeping its bytes under
+  `.forklift/removed-refs`. A lost ref that no checkout stands on is not found.
+
 - **Losing the warehouse marker no longer loses the warehouse.** `.forklift/warehouse` now ends
   in a digest of its own bytes and is kept twice, beside `.forklift/warehouse-copy`, each written
   in turn. A marker that is deleted, truncated or damaged is read from its copy and rewritten at

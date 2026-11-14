@@ -42,7 +42,7 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `haul consolidate` |  | `merge` | Land a proposal: consolidate its source into the target |
 | `haul close` |  |  | Close a proposal without merging |
 | `haul reopen` |  |  | Reopen a closed proposal |
-| `heal` |  |  | Resolve a standing durability taint, or finish or undo an interrupted operation |
+| `heal` |  |  | Resolve a standing durability taint, rebuild a damaged pallet ref, or finish or undo an interrupted operation |
 | `help` |  |  | Print the command list, or detailed help about one command |
 | `history` | `hi` | `log` | Print the parcels of a revision, newest first |
 | `lift` | `li` | `push` | Upload the current pallet's new parcels to the remote (push) |
