@@ -332,7 +332,8 @@ pub fn read_withheld() -> Result<WithheldSet, String> {
         Err(e) => return Err(damaged(&format!("The record of withheld content could not be read: {}.", e))),
     };
 
-    parse(&bytes).map_err(|e| damaged(&format!("{} This version of Forklift never writes over it.", e.describe())))
+    // Only the operator's repair writes over it, keeping what still reads.
+    parse(&bytes).map_err(|e| damaged(&e.describe()))
 }
 
 /// Write an empty record of withheld content unless one is there, under the ref lock `lock` the
