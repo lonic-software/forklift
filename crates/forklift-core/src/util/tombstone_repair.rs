@@ -16,7 +16,13 @@
 //! not, since a parcel parked on a deleted head leaves that head a parent): a delete entry removed
 //! that pallet at that head, every head any journal names for that pallet is that head or one of
 //! its ancestors, and the name has no pallet and no tombstone now. Every lost tip not so named is
-//! kept with no name. Nothing is listed on a guess, and nothing the lost list may have held is
+//! kept with no name.
+//!
+//! The journals cannot tell a deletion the lost list held from one whose tombstone the operator
+//! dropped, so a dropped name a journal still settles comes back; the report lists each name it
+//! gives back, to drop again. A deletion no journal recorded (one over the protocol) at a head
+//! another pallet still reaches is not found: that pallet keeps its history only until it moves
+//! on, and then gc may free it. Nothing is listed on a guess, and nothing the lost list may have held is
 //! freed: the cost is history kept that no clone relies on, which `tombstone drop --head`
 //! releases.
 
@@ -106,9 +112,11 @@ impl Repaired {
 /// * `Err(String)`  - Both files read, so there is nothing to repair; the root is being served; the
 ///                    store holds packs whose objects cannot all be listed; or a ref, a pin, the
 ///                    list or an object could not be read, or a file could not be written. Nothing
-///                    was changed, unless a write failed after the damaged files were moved aside:
-///                    the list is then absent, and a repair run again keeps less by name, so the
-///                    moved-aside copy is named in the error to put back first.
+///                    was changed, unless the list's write failed after the damaged files were
+///                    moved aside: the list is then absent, and a repair run again keeps less by
+///                    name, so the moved-aside copies are named in the error to put back first. A
+///                    failed write of the mark after the list's leaves the repaired list, which a
+///                    rerun finds whole.
 ///
 /// A root with neither file reads as never served, and is not refused here: losing both is the
 /// one loss the files cannot show (see [`tombstone_utils::served_state`]), so an operator who knows
@@ -150,7 +158,7 @@ pub fn repair_tombstones() -> Result<Repaired, String> {
             repaired.set_aside.push(set_aside(&tombstone_utils::served_path())?);
         }
 
-        tombstone_utils::write_mark(&lock)?;
+        tombstone_utils::write_mark(&lock).map_err(|e| format!("{} Run the repair again.", e))?;
         repaired.mark_written = true;
 
         return Ok(repaired);
@@ -182,12 +190,17 @@ pub fn repair_tombstones() -> Result<Repaired, String> {
     };
     let live: BTreeSet<String> = pallet_utils::list_pallets()?.into_iter().collect();
 
-    // A name comes back at any unheld head a journal deleted it at, a tip or not: a head the lost
-    // list held can have unheld descendants, such as a parcel parked on it.
+    // A name comes back at any head a journal deleted it at that the store still holds: a tip or
+    // not, since a head the lost list held can have unheld descendants, such as a parcel parked on
+    // it; and held or not, since what holds it now (another pallet standing there) may move on.
     let mut named_heads: BTreeSet<String> = BTreeSet::new();
 
     if let Some(evidence) = &evidence {
-        for head in evidence.deleted_heads().filter(|head| lost.unheld.contains(*head)) {
+        for head in evidence.deleted_heads() {
+            if !lost.unheld.contains(head) && !pallet_utils::object_hashes_with_prefix(head)?.iter().any(|stored| stored == head) {
+                continue;
+            }
+
             if let Some(name) = evidence.name_of(head, &live, &tombstones)? {
                 tombstones.named.insert(name.clone(), head.clone());
                 repaired.named.push((name, head.clone()));
@@ -201,12 +214,13 @@ pub fn repair_tombstones() -> Result<Repaired, String> {
         repaired.kept.push(tip);
     }
 
-    if list.is_some() {
-        repaired.set_aside.push(set_aside(&list_path)?);
-    }
-
+    // The mark first: a repair stopped between the two still finds the list damaged, as before.
     if mark.is_ok() && !mark_reads {
         repaired.set_aside.push(set_aside(&tombstone_utils::served_path())?);
+    }
+
+    if list.is_some() {
+        repaired.set_aside.push(set_aside(&list_path)?);
     }
 
     let moved = |error: String| match repaired.set_aside.is_empty() {
@@ -220,8 +234,9 @@ pub fn repair_tombstones() -> Result<Repaired, String> {
 
     tombstone_utils::write_tombstones(&lock, &tombstones).map_err(moved)?;
 
+    // The repaired list is in place, so a rerun finds it whole and writes only the mark.
     if !mark_reads {
-        tombstone_utils::write_mark(&lock).map_err(moved)?;
+        tombstone_utils::write_mark(&lock).map_err(|e| format!("{} The tombstone list was repaired; run the repair again to write the mark.", e))?;
         repaired.mark_written = true;
     }
 

@@ -269,6 +269,24 @@ fn a_repair_names_a_deleted_head_that_unheld_history_descends_from() {
     assert!(line_of(&side).contains("side"), "{}", listed);
 }
 
+/// Revert: name only heads no durable holder reaches → "gone" was deleted where "main" stands, so
+/// its name is not given back, and once main moves on nothing keeps that head → red.
+#[test]
+fn a_repair_names_a_deletion_at_a_head_another_pallet_still_holds() {
+    let area = Area::new("held");
+    let root = area.served();
+    let main = head(&root, "main");
+    area.run_ok(&root, &["pallet", "create", "gone"]);
+    area.run_ok(&root, &["shift", "main"]);
+    area.run_ok(&root, &["pallet", "delete", "gone", "--force"]);
+    forklift_core::util::file_utils::remove_file(list_path(&root)).unwrap();
+
+    area.server_ok(&root, &["tombstone", "repair"]);
+
+    let listed = area.server_ok(&root, &["tombstone", "list"]);
+    assert!(listed.lines().any(|line| line.contains(&main) && line.contains("gone")), "{}", listed);
+}
+
 /// Revert: run the whole repair when only the mark was lost → the journal settles "gone", whose
 /// tombstone the operator dropped, so it is named again → red.
 #[test]
