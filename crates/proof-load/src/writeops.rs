@@ -280,15 +280,28 @@ impl<'a> Observer<'a> {
         let spawn = |reason: String| ToolError::Spawn { program: root.to_path_buf(), reason };
         let start = scratch.root().to_string_lossy().into_owned();
         let mut writes = Vec::new();
+        // What keeps this serving's writes from being known in full: each refuses the server
+        // route write check, and the proxy's log is kept whatever it holds.
+        let mut unsound = Vec::new();
+        // A window is closed by its server's end, so the windows of one serving belong to one
+        // server: a restarted one's are not told apart.
+        if traces.len() > 1 {
+            unsound.push(format!("its server was restarted {} time(s), and a request's window cannot be split between their traces", traces.len() - 1));
+        }
         for text in traces {
-            let text = text.map_err(|reason| spawn(format!("the server's trace: {}", reason)))?;
-            let calls = trace::parse(&text).map_err(|reason| spawn(format!("the server's trace: {}", reason)))?;
-            writes.extend(crate::kill::writes(&calls, &start));
+            match text.and_then(|text| trace::parse(&text)) {
+                Ok(calls) => {
+                    let (found, refused) = crate::kill::writes(&calls, &start);
+                    writes.extend(found);
+                    unsound.extend(refused.into_iter().map(|reason| format!("the server's trace: {}", reason)));
+                }
+                Err(reason) => unsound.push(format!("the server's trace: {}", reason)),
+            }
         }
         let scratch_root = Root::of(scratch.root()).map_err(|error| spawn(error.to_string()))?;
         let paths: Vec<String> = writes.iter().map(|write| write.path.clone()).collect();
         self.seen.borrow_mut().push(Evidence { scenario: self.scenario.clone(), id: "forklift-server serve".to_string(), traced: true, writes: warehouse_writes(&paths, &scratch_root), changed: None });
-        self.servings.borrow_mut().push(Serving { scenario: self.scenario.clone(), root: root.to_string_lossy().into_owned(), exchanges: log.clone(), writes });
+        self.servings.borrow_mut().push(Serving { scenario: self.scenario.clone(), root: root.to_string_lossy().into_owned(), exchanges: log.clone(), writes, unsound });
         Ok(log)
     }
 

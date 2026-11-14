@@ -189,19 +189,25 @@ const PUT_SIGNATURE: &[Entry] = &[
 ];
 // The office's trust file.
 const PUT_TRUST: &[Entry] = &[entry(Change::Write, ".forklift/trust.tmp~*"), entry(Change::Rename, ".forklift/trust.tmp~*"), entry(Change::Rename, ".forklift/trust")];
-// A ref update: the head at pallets/<name>, or meta/<name> for an `@name`, and the commit-graph
-// shards of the parcels it brings, graph/<first two>. `{name[1..]}` drops the `@`; for a user
-// pallet it names a meta head with its first letter cut, which no update writes.
+// A ref update: the head at pallets/<name>, or meta/<name> for an `@name`, its parent folders made
+// for a nested name, and the commit-graph shards of the parcels it brings, graph/<first two>.
+// `{name[1..]}` drops the `@`; for a user pallet it names a meta head with its first letter cut,
+// which no update writes. Recreating a deleted pallet clears its tombstone (`clear_tombstone`).
+// The parent folders and the tombstone are from the source alone: no scenario nests a name or
+// lifts a deleted pallet again.
 const UPDATE_PALLET: &[Entry] = &[
+    entry(Change::Mkdir, ".forklift/pallets/**"), entry(Change::Mkdir, ".forklift/meta/**"),
+    entry(Change::Write, ".forklift/tombstones.tmp~*"), entry(Change::Rename, ".forklift/tombstones.tmp~*"), entry(Change::Rename, ".forklift/tombstones"),
     entry(Change::Write, ".forklift/pallets/{name}.tmp~*"), entry(Change::Rename, ".forklift/pallets/{name}.tmp~*"), entry(Change::Rename, ".forklift/pallets/{name}"),
     entry(Change::Mkdir, ".forklift/meta"),
     entry(Change::Write, ".forklift/meta/{name[1..]}.tmp~*"), entry(Change::Rename, ".forklift/meta/{name[1..]}.tmp~*"), entry(Change::Rename, ".forklift/meta/{name[1..]}"),
     entry(Change::Mkdir, ".forklift/graph"),
     entry(Change::Write, ".forklift/graph/*.tmp~*"), entry(Change::Rename, ".forklift/graph/*.tmp~*"), entry(Change::Rename, ".forklift/graph/*"),
 ];
-// A ref deletion: the head removed, and its last head kept in the tombstones file.
+// A ref deletion: the head removed, each parent folder it leaves empty removed (`unlink_ref`, from
+// the source alone), and its last head kept in the tombstones file.
 const DELETE_PALLET: &[Entry] = &[
-    entry(Change::Remove, ".forklift/pallets/{name}"),
+    entry(Change::Remove, ".forklift/pallets/{name}"), entry(Change::Remove, ".forklift/pallets/**"), entry(Change::Remove, ".forklift/meta/**"),
     entry(Change::Write, ".forklift/tombstones.tmp~*"), entry(Change::Rename, ".forklift/tombstones.tmp~*"), entry(Change::Rename, ".forklift/tombstones"),
 ];
 // create_warehouse: a `.creating-<id>-<pid>-<n>` staging folder prepared in full, an empty folder
@@ -237,8 +243,16 @@ pub const ROUTE_WRITES: &[RouteWrites] = &[
 
 /// What the server writes on its own, after it answered: work a request or a command started
 /// that goes on running in a spawned task. Its redaction round deletes what a redaction or a
-/// withhold took away once the warehouse drains (`delete_drained`, through the redaction deleter).
-pub const BACKGROUND_WRITES: &[Entry] = &[entry(Change::Remove, ".forklift/objects/*/*")];
+/// withhold took away once the warehouse drains (`delete_drained`, through the redaction deleter):
+/// loose copies removed (seen in a trace), and from the source alone, packs repacked without them,
+/// the chunks-owed journal written or removed, and a withheld recipe's digest recorded.
+pub const BACKGROUND_WRITES: &[Entry] = &[
+    entry(Change::Remove, ".forklift/objects/*/*"),
+    entry(Change::Write, ".forklift/objects/pack/*"), entry(Change::Rename, ".forklift/objects/pack/*"), entry(Change::Remove, ".forklift/objects/pack/*"),
+    entry(Change::Write, ".forklift/redactions-chunks-owed.tmp~*"), entry(Change::Rename, ".forklift/redactions-chunks-owed.tmp~*"),
+    entry(Change::Rename, ".forklift/redactions-chunks-owed"), entry(Change::Remove, ".forklift/redactions-chunks-owed"),
+    entry(Change::Write, ".forklift/withheld.tmp~*"), entry(Change::Rename, ".forklift/withheld.tmp~*"), entry(Change::Rename, ".forklift/withheld"),
+];
 
 /// What the server writes admitting a request: nothing, as admission asks a hook over the network
 /// and writes no file. Kept as its own set so a version that records admissions must declare it.

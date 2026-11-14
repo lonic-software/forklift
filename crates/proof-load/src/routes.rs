@@ -388,11 +388,6 @@ mod tests {
         Exchange { index: 0, method: method.to_string(), path: path.to_string(), status: Some(status), fault: None, forwarded: None, answered: None }
     }
 
-    /// The tables parse into routes and both prefixes; a document without route markers has no
-    /// table, and one whose table is present but wrong is refused, never guessed at.
-    ///
-    /// Revert: return None for a malformed row → a renamed column or an unknown mode would be read
-    /// as no table, and the run would say "not run" instead of failing.
     /// A capture takes its one segment and a final rest capture every segment after it; a path
     /// the template does not match captures nothing.
     ///
@@ -405,6 +400,11 @@ mod tests {
         assert_eq!(captures("/v1/objects/{hash}", "/v1/signatures/ab"), None);
     }
 
+    /// The tables parse into routes and both prefixes; a document without route markers has no
+    /// table, and one whose table is present but wrong is refused, never guessed at.
+    ///
+    /// Revert: return None for a malformed row → a renamed column or an unknown mode would be read
+    /// as no table, and the run would say "not run" instead of failing.
     #[test]
     fn tables_parse_and_malformed_ones_refuse() {
         let table = sample();

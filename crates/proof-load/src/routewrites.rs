@@ -62,28 +62,14 @@ pub struct Serving {
     pub root: String,
     pub exchanges: Vec<Exchange>,
     pub writes: Vec<Write>,
+    /// Why its writes are not known in full: an unreadable trace, a call the table cannot place.
+    pub unsound: Vec<String>,
 }
 
-/// `text` with each `%XX` escape decoded; an escape that does not decode to UTF-8 is kept as
-/// written.
+/// `text` with each `%XX` escape decoded, as the server's router decodes a path capture; one
+/// that does not decode to UTF-8 is kept as written.
 fn decoded(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::new();
-    let mut at = 0;
-    while at < bytes.len() {
-        let escape = (bytes[at] == b'%').then(|| text.get(at + 1..at + 3)).flatten().and_then(|hex| u8::from_str_radix(hex, 16).ok());
-        match escape {
-            Some(byte) => {
-                out.push(byte);
-                at += 3;
-            }
-            None => {
-                out.push(bytes[at]);
-                at += 1;
-            }
-        }
-    }
-    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+    percent_encoding::percent_decode_str(text).decode_utf8().map(|text| text.into_owned()).unwrap_or_else(|_| text.to_string())
 }
 
 /// A piece of a compiled template.
@@ -184,6 +170,7 @@ pub fn check(table: &RouteTable, mode: Mode, servings: &[Serving], bindings: &[R
     let mut answered: BTreeSet<String> = BTreeSet::new();
     let mut credited: BTreeSet<String> = BTreeSet::new();
     for serving in servings {
+        missing.extend(serving.unsound.iter().map(|reason| format!("{}: {}", serving.scenario, reason)));
         let Ok(root) = Root::of(std::path::Path::new(&serving.root)) else {
             missing.push(format!("{}: the host warehouse {} is gone, so its writes cannot be placed", serving.scenario, serving.root));
             continue;
@@ -318,13 +305,14 @@ mod tests {
     /// Revert: credit a write by timing alone → the object write in the pallet window covers PUT
     /// /objects/{hash}; place a write by its route set without its captures → a write of another
     /// object's name is credited; close an unanswered window at its forwarding → the late write
-    /// after the cut refuses; match captures as sent → `%40office` never names `meta/office`.
+    /// after the cut refuses; drop a serving's unsound reasons → an unplaceable write passes
+    /// unseen; match captures as sent → `%40office` never names `meta/office`.
     #[test]
     fn writes_are_placed_by_window_and_set() {
         let root = std::env::temp_dir().join(format!("routewrites-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let root = std::fs::canonicalize(&root).unwrap().to_string_lossy().into_owned();
-        let serving = |exchanges: Vec<Exchange>, writes: Vec<Write>| Serving { scenario: "s".into(), root: root.clone(), exchanges, writes };
+        let serving = |exchanges: Vec<Exchange>, writes: Vec<Write>| Serving { scenario: "s".into(), root: root.clone(), exchanges, writes, unsound: vec![] };
         let check = |servings: &[Serving]| check(&table(), Mode::Single, servings, BINDINGS, BACKGROUND, &[]);
 
         let covered = serving(
@@ -363,6 +351,11 @@ mod tests {
         // A capture is matched decoded, as the server reads it.
         let meta = serving(vec![exchange("POST", "/v1/pallets/%40office", 204, 100, Some(200))], vec![write(&root, Kind::Rename, ".forklift/meta/office", 150)]);
         assert_eq!(check(&[meta]), Vec::<String>::new());
+
+        // A serving whose writes are not known in full refuses, naming why.
+        let mut untold = serving(vec![], vec![]);
+        untold.unsound = vec!["the server's trace: unplaced".into()];
+        assert_eq!(check(&[untold]), vec!["s: the server's trace: unplaced".to_string()]);
 
         // A request whose response was never read keeps its window open.
         let cut = serving(vec![exchange("POST", "/v1/pallets/main", 204, 100, None)], vec![write(&root, Kind::Rename, ".forklift/pallets/main", 5_000)]);

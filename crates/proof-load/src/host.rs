@@ -222,12 +222,16 @@ impl Host {
             match tool::serve(&self.program, &self.root, scratch, environment, limit) {
                 Ok(served) => {
                     let upstream = address_of(&served.url).map_err(|reason| ToolError::Spawn { program: self.program.clone(), reason })?;
-                    self.proxy.set_upstream(upstream);
                     *lock(&self.server) = Some(served);
                     restarted.refused = None;
-                    // A traced host's restarted server is traced too; one that cannot be is an
-                    // error, never a server serving untraced into a traced run.
-                    self.attach(limit).map_err(|reason| ToolError::Spawn { program: self.program.clone(), reason })?;
+                    // A traced host's restarted server is traced before the proxy reaches it; one
+                    // that cannot be is killed and an error, never a server serving untraced into
+                    // a traced run.
+                    if let Err(reason) = self.attach(limit) {
+                        self.kill();
+                        return Err(ToolError::Spawn { program: self.program.clone(), reason });
+                    }
+                    self.proxy.set_upstream(upstream);
                     return Ok(restarted);
                 }
                 Err(ToolError::NotListening { said, .. }) => {
