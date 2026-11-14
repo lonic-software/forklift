@@ -18,9 +18,8 @@
 //! every state once the lines that acknowledge the record have exited is graded as owing it (see
 //! [`faulted::acknowledging`]): the record's own lines, before any the scenario runs after them.
 //! A crash state that records the counting area's root stops the scenario as path-bound, as the
-//! run's final tree would. These are
-//! POSIX-minimal semantics. A real ext4 in data=ordered mode keeps more than this, so a loss
-//! graded here may survive on a real machine; every row says so.
+//! run's final tree would. These are POSIX-minimal semantics. A real ext4 in data=ordered mode
+//! keeps more than this, so a loss graded here may survive on a real machine; every row says so.
 //!
 //! Between the durable state and the volatile one, each moment also leaves two deterministic
 //! kinds of state. One has the namespace the calls left, every name, folder, mode and link, with

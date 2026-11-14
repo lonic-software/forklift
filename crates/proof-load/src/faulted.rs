@@ -456,24 +456,25 @@ impl Made {
         Made::through(ran.iter().take_while(|outcome| outcome.succeeded()).count(), acknowledging, lines)
     }
 
-    /// Settled as acknowledged by an answer asking nothing further, as `promoted`, the record's
-    /// own lines landing, establishes: completed too only when no line follows them.
+    /// Settled as acknowledged by an answer asking nothing further, as `promoted`, the
+    /// acknowledging lines landing (through the last push, read back through the host),
+    /// establishes: completed too only when no line follows them.
     fn promote(&mut self, promoted: Made) {
         self.acknowledged = true;
         self.completed |= promoted.completed;
     }
 
-    /// Where the lines after the record's own resume, when the attempt that stopped at `stopped`
-    /// left it, from `before`, acknowledged only by a settle ([`Made::promote`]): it stopped in the
-    /// record's own lines, so none after them ran, and they resume at the first. Keyed on the
-    /// record's own lines, not the acknowledging ones: read back through the host, the lines up to
-    /// the last push are after the record's own too, and an attempt that stopped short of them ran
-    /// none of them either. An attempt that stopped at one of them already ran it, and resumes
-    /// there on the next retry as any does.
-    fn rest(&self, before: Made, stopped: Resume) -> Option<Resume> {
-        let own = own_lines();
-        (!before.acknowledged && self.acknowledged && !self.completed && stopped.at < own)
-            .then_some(Resume { at: own, may_have_stacked: false })
+    /// Where the rest of the lines resume when the attempt that stopped at `stopped` left the
+    /// record, from `before`, acknowledged by a settle ([`Made::promote`]) rather than by landing:
+    /// it stopped short of the acknowledging lines, at a line whose answer asked nothing further.
+    /// That line is done, so the rest resume after it, and never inside the record's own lines,
+    /// which the settle says are done too. Read back through the host, a line between the
+    /// record's own and the last push (a push told there is nothing to push) is answered so, and
+    /// the lines after it still run. An attempt acknowledged by landing stopped at or past the
+    /// acknowledging lines, at a line refused for good, and is not run again.
+    fn rest(&self, before: Made, stopped: Resume, acknowledging: usize) -> Option<Resume> {
+        (!before.acknowledged && self.acknowledged && !self.completed && stopped.at < acknowledging)
+            .then_some(Resume { at: own_lines().max(stopped.at + 1), may_have_stacked: false })
     }
 
     /// Adds what a retry established, which landed every line or stopped where `next` resumes:
@@ -545,8 +546,8 @@ impl Trail {
     /// and every record reads as expected, the faulted one held to its own tree once acknowledged.
     /// A served record counts as acknowledged from here on once the tool's latest answer asks
     /// nothing further (see [`answered`]): a command killed after its record was durable, retried,
-    /// is told there is nothing left to stack. That is `promoted`, what the record's lines landing
-    /// establishes; it says nothing of any line after them, which completes only by landing.
+    /// is told there is nothing left to stack. That is `promoted`, what the acknowledging lines
+    /// landing establishes; it says nothing of any line after them, which completes only by landing.
     /// `retry` says the latest step re-ran the faulted command: only a retry's answer settles a
     /// served record, since the faulted command's own refusal of a write it committed is graded as
     /// a refusal, and heal is no re-run.
@@ -726,7 +727,7 @@ pub(crate) fn grade_after(
         };
         let before = *made;
         let reads = again(trail, resume, made)?;
-        match made.rest(before, *resume) {
+        match made.rest(before, *resume, acknowledging) {
             Some(rest) => {
                 *resume = rest;
                 again(trail, resume, made)
@@ -1173,14 +1174,15 @@ mod tests {
     }
 
     /// A settle that finds the record served after an answer asking nothing further owes it, and
-    /// completes the command only when no line follows the record's own; the lines that do follow
-    /// then run once from the first of them, unless the attempt already reached them.
+    /// completes the command only when no line follows the acknowledging ones; the rest then run
+    /// once, after the line whose answer settled it, unless the attempt landed the record itself.
     ///
     /// Revert: complete on promotion → a compaction refused for good grades healed though it never
     /// ran; run the rest whenever the record is newly owed → a retry that stacked and was refused
-    /// its compaction runs it twice; resume the rest anywhere but its first line → it is skipped
-    /// or the stack re-run; key the rest on the acknowledging lines → read back through the host,
-    /// an attempt that stopped at the stack skips the lines before the last push.
+    /// its compaction runs it twice; resume the rest at the acknowledging lines → read back
+    /// through the host, the lines between an answered push and the last are skipped; resume it at
+    /// the answered line → that line is re-run and refused again; resume it inside the record's
+    /// own lines → the stack is re-run.
     #[test]
     fn a_settled_record_is_owed_and_the_lines_after_it_still_run() {
         let made = |acknowledged, completed| Made { acknowledged, completed };
@@ -1189,12 +1191,14 @@ mod tests {
         assert_eq!(promoted(Made::through(2, 2, 2)), made(true, true));
         let at = |at| Resume { at, may_have_stacked: false };
         assert_eq!(own_lines(), 2);
-        assert_eq!(made(true, false).rest(Made::default(), at(1)), Some(at(2)));
-        assert_eq!(made(true, false).rest(Made::default(), at(0)), Some(at(2)));
-        assert_eq!(made(true, false).rest(Made::default(), at(2)), None, "the attempt ran the line after the record");
-        assert_eq!(made(true, false).rest(Made::default(), at(4)), None, "the attempt ran up to the last push");
-        assert_eq!(made(true, false).rest(made(true, false), at(1)), None, "owed before this settle");
-        assert_eq!(made(true, true).rest(Made::default(), at(1)), None);
+        assert_eq!(made(true, false).rest(Made::default(), at(1), 2), Some(at(2)));
+        assert_eq!(made(true, false).rest(Made::default(), at(0), 2), Some(at(2)));
+        assert_eq!(made(true, false).rest(Made::default(), at(2), 2), None, "acknowledged by landing: the compaction was refused for good");
+        // Read back through the host, then [push, pack, push]: the acknowledging lines run through 5.
+        assert_eq!(made(true, false).rest(Made::default(), at(2), 5), Some(at(3)), "the answered push is done, the pack and last push run");
+        assert_eq!(made(true, false).rest(Made::default(), at(1), 5), Some(at(2)));
+        assert_eq!(made(true, false).rest(made(true, false), at(1), 2), None, "owed before this settle");
+        assert_eq!(made(true, true).rest(Made::default(), at(1), 2), None);
     }
 
 }
