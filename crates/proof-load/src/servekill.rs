@@ -334,7 +334,7 @@ fn inject(scenario: &Scenario, programs: &Programs, settings: &Settings, templat
                 return Err(RunError::Io(NOT_KILLED.to_string()));
             }
             restarted = Some(host.restart(&scratch, &environment, settings.limit).map_err(RunError::Tool)?);
-            made
+            made.map(drop)
         });
         host.proxy.clear_before();
         attached = waiter.join().unwrap_or_else(|_| Err(RunError::Io("the attaching thread panicked".to_string())));

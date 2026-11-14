@@ -15,10 +15,11 @@
 //!
 //! A crash lands at every kill point of every line, before the call, before every other sync,
 //! children's included, after each line's last call before it exits, and after each line exits;
-//! the state after the last line is the one the tool acknowledged. A crash state that records the
-//! counting area's root stops the scenario as path-bound, as the run's final tree would. These are
-//! POSIX-minimal semantics. A real ext4 in data=ordered mode keeps more than this, so a loss
-//! graded here may survive on a real machine; every row says so.
+//! every state once the lines that acknowledge the record have exited is graded as owing it (see
+//! [`faulted::acknowledging`]): the record's own lines, before any the scenario runs after them.
+//! A crash state that records the counting area's root stops the scenario as path-bound, as the
+//! run's final tree would. These are POSIX-minimal semantics. A real ext4 in data=ordered mode
+//! keeps more than this, so a loss graded here may survive on a real machine; every row says so.
 //!
 //! Between the durable state and the volatile one, each moment also leaves two deterministic
 //! kinds of state. One has the namespace the calls left, every name, folder, mode and link, with
@@ -30,8 +31,7 @@
 //! step trail, from that span's last moment, rather than once per write. A state two kinds leave
 //! is reported as the more realistic: durable, then ordered, then torn, then a seeded variant.
 //! Each scenario that graded states says in its report how many of each kind were asked for and
-//! how many distinct ones were graded. A scenario that runs lines after its record is not run: a
-//! crash past the record's own lines would be graded as owing nothing.
+//! how many distinct ones were graded.
 //!
 //! Each state is written out afresh, so no file keeps the inode or times it had: a stat cache that
 //! trusts an unchanged file finds every entry changed, and a state where it would trust a file
@@ -1357,7 +1357,7 @@ pub struct Crash {
     /// The moment it is reported at: the first that leaves it as its kind, or for a torn state
     /// the last of its span, which tears the most of what the calls wrote.
     pub moment: Moment,
-    /// Whether the faulted command had finished every line: the record was acknowledged.
+    /// Whether the lines that acknowledge the faulted record had exited: the record is owed.
     pub acknowledged: bool,
     /// How many crash moments leave this same state.
     pub shared: usize,
@@ -1445,8 +1445,10 @@ pub struct Found {
 
 /// Every distinct state a crash can leave in `lines`, replayed over `fixture` from the folder
 /// `start` under `root`: the durable state at each moment, the states between it and the volatile
-/// one that [`Collector`] adds, and `variants` seeded states drawn at seeded moments.
-pub fn crashes(fixture: &Image, root: &Root, start: &str, umask: u32, lines: &[Line], variants: usize, seed: u64) -> Result<Found, String> {
+/// one that [`Collector`] adds, and `variants` seeded states drawn at seeded moments. A state is
+/// acknowledged once the first `acknowledging` lines have exited.
+#[allow(clippy::too_many_arguments)]
+pub fn crashes(fixture: &Image, root: &Root, start: &str, umask: u32, lines: &[Line], acknowledging: usize, variants: usize, seed: u64) -> Result<Found, String> {
     let mut replay = Replay::new(Model::of(fixture)?, root.clone(), umask);
     let synced = |line: &Line| -> BTreeSet<usize> {
         let at_points: BTreeSet<usize> = line.points.iter().map(|point| point.call).collect();
@@ -1456,8 +1458,13 @@ pub fn crashes(fixture: &Image, root: &Root, start: &str, umask: u32, lines: &[L
     };
     let moments: usize = lines.iter().map(|line| line.points.len() + synced(line).len() + 2).sum();
     let mut collector = Collector::new(moments, variants, seed);
-    let last = lines.len().checked_sub(1).ok_or_else(|| "the faulted command has no lines".to_string())?;
+    if lines.is_empty() {
+        return Err("the faulted command has no lines".to_string());
+    }
     for (index, line) in lines.iter().enumerate() {
+        // Line `index` still running: acknowledged once every line acknowledging the record has
+        // exited before it.
+        let running = index >= acknowledging;
         let here: BTreeMap<usize, &Point> = line.points.iter().map(|point| (point.call, *point)).collect();
         let syncs = synced(line);
         if let Some(why) = difference(&replay.model.volatile_image(), line.before) {
@@ -1465,14 +1472,14 @@ pub fn crashes(fixture: &Image, root: &Root, start: &str, umask: u32, lines: &[L
         }
         replay.line(line.calls, start, |call, model| {
             if let Some(point) = here.get(&call) {
-                collector.record(Moment::During { point: (*point).clone() }, model, false);
+                collector.record(Moment::During { point: (*point).clone() }, model, running);
             } else if syncs.contains(&call) {
                 let moment = Moment::Synced { line: index, command: line.command.clone(), call, name: line.calls[call].name.clone() };
-                collector.record(moment, model, false);
+                collector.record(moment, model, running);
             }
         }).map_err(|why| format!("line {} {}: {}", index + 1, line.command, why))?;
-        collector.record(Moment::Ending { line: index, command: line.command.clone() }, &replay.model, false);
-        collector.record(Moment::After { line: index, command: line.command.clone() }, &replay.model, index == last);
+        collector.record(Moment::Ending { line: index, command: line.command.clone() }, &replay.model, running);
+        collector.record(Moment::After { line: index, command: line.command.clone() }, &replay.model, index + 1 >= acknowledging);
     }
     let (crashes, requested) = collector.finish();
     Ok(Found { crashes, requested, replayed: replay.model.volatile_image() })
@@ -1657,16 +1664,6 @@ pub struct ScenarioPower {
     pub crashes: Vec<GradedCrash>,
 }
 
-/// Why `scenario`'s power loss cannot be graded, if it cannot. A crash is graded acknowledged only
-/// once the last line exited, but the record's own lines acknowledge it before any line the
-/// scenario runs after them: a state past them would be graded as owing nothing.
-pub fn not_run(scenario: &Scenario) -> Option<String> {
-    if !scenario.then.is_empty() {
-        return Some("runs lines after its record, and a crash past the record's own lines would not be graded as acknowledged".to_string());
-    }
-    None
-}
-
 /// Grades every state a power loss during `scenario`'s faulted command can leave, `variants`
 /// seeded ones among them, from the run [`kill::count`] counted in `template` with its writes
 /// dumped. Each state is written into its own area beside the template, `<template>-power-<n>`.
@@ -1679,10 +1676,6 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
             return Ok(power);
         }
     };
-    if let Some(reason) = not_run(scenario) {
-        power.not_run = Some(reason);
-        return Ok(power);
-    }
     let (points, _, refusals) = kill::points_of(counted, settings.schema);
     if let Some((refusals, not_run)) = kill::stopped(refusals, counted.path_bound.as_ref()) {
         (power.refusals, power.not_run) = (refusals, not_run);
@@ -1715,7 +1708,9 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
     let umask = harness_umask().map_err(RunError::Io)?;
     // Each scenario draws its own variants, not the same corners of every scenario.
     let drawn = seed ^ u64::from_le_bytes(blake3::hash(scenario.id.as_bytes()).as_bytes()[..8].try_into().expect("eight bytes"));
-    let Found { crashes, requested, replayed } = match crashes(fixture, &counted.counting_root, &start, umask, &lines, variants, drawn) {
+    // A client's copy is read back from its own work tree, as [`kill::context_of`] reads it.
+    let acknowledging = faulted::acknowledging(&scenario.then, false).map_err(RunError::Io)?;
+    let Found { crashes, requested, replayed } = match crashes(fixture, &counted.counting_root, &start, umask, &lines, acknowledging, variants, drawn) {
         Ok(found) => found,
         Err(refusal) => {
             power.refusals.push(refusal);
@@ -1816,9 +1811,15 @@ fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, sett
         Moment::After { line, .. } => steps.extend(counted.lines[..=*line].iter().map(|line| line.outcome.clone())),
         Moment::Served { .. } => return Err(RunError::Io("a server's crash state is graded through its host, not a client's copy".to_string())),
     }
+    // The state was keyed by whether it owes the record; the grade reads that off the steps it
+    // is given, and the two must agree.
+    let made = faulted::Made::of(&steps, context.acknowledging()?, context.lines(counted.faulted)?.len());
+    if made.acknowledged != crash.acknowledged {
+        return Err(RunError::Io(format!("the state was found {}acknowledged, and its steps say otherwise", if crash.acknowledged { "" } else { "un" })));
+    }
     let graded = faulted::grade_after(&context, &counted.expected, counted.faulted, |_, first| {
         first.append(&mut steps);
-        Ok(crash.acknowledged)
+        Ok(())
     })?;
     // A copy that graded well holds nothing to look at; one that did not is kept for diagnosis.
     if !graded.grade.is_failure() {
@@ -2177,7 +2178,7 @@ mod tests {
         let starts = starts(&texts);
         let lines: Vec<Line> = calls.iter().zip(&points).zip(&starts)
             .map(|((calls, points), before)| Line { calls, command: "stack".into(), points: points.iter().collect(), before }).collect();
-        let Found { crashes, replayed, .. } = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap();
+        let Found { crashes, replayed, .. } = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, lines.len(), 0, 7).unwrap();
         let crashes = durable(crashes);
         assert_eq!(data(&replayed, "w/a").unwrap(), b"new");
         let found: Vec<(Vec<u8>, bool, usize)> = crashes.iter().map(|crash| (data(&crash.image, "w/a").unwrap(), crash.acknowledged, crash.shared)).collect();
@@ -2189,6 +2190,29 @@ mod tests {
         assert_eq!(crashes[1].moment, Moment::Ending { line: 0, command: "stack".into() });
         assert_eq!(crashes[2].moment, Moment::After { line: 0, command: "stack".into() });
         assert_eq!(crashes[4].moment, Moment::After { line: 1, command: "stack".into() });
+    }
+
+    /// A record its first line acknowledges is owed by every crash once that line exited, those
+    /// cut short in the lines after it included, and by none before.
+    ///
+    /// Revert: acknowledge after the last line only → the state after line 1 and every one in
+    /// line 2 owe nothing; acknowledge a line's own moments as it runs → its end, before it
+    /// exited, owes the record.
+    #[test]
+    fn crashes_past_the_acknowledging_lines_owe_the_record() {
+        let texts = [rewrite(true), "2 openat(AT_FDCWD</s/w>, \"a\", O_RDONLY) = 3</s/w/a>\n".to_string()];
+        let calls: Vec<Vec<Call>> = texts.iter().map(|text| trace::parse(text).unwrap()).collect();
+        let points: Vec<Vec<Point>> = calls.iter().enumerate()
+            .map(|(line, calls)| kill::enumerate(calls, line, "stack", &root(), "/s/w", |_| false).unwrap().points).collect();
+        let starts = starts(&texts);
+        let lines: Vec<Line> = calls.iter().zip(&points).zip(&starts)
+            .map(|((calls, points), before)| Line { calls, command: "stack".into(), points: points.iter().collect(), before }).collect();
+        let crashes = durable(crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 1, 0, 7).unwrap().crashes);
+        let found: Vec<(Moment, bool)> = crashes.iter().map(|crash| (crash.moment.clone(), crash.acknowledged)).collect();
+        assert_eq!(found.iter().map(|(_, acknowledged)| *acknowledged).collect::<Vec<_>>(), [false, false, true, true, true]);
+        assert_eq!(found[1].0, Moment::Ending { line: 0, command: "stack".into() });
+        assert_eq!(found[2].0, Moment::After { line: 0, command: "stack".into() });
+        assert_eq!(found[3].0, Moment::Ending { line: 1, command: "stack".into() });
     }
 
     /// A child's syncs are crash moments though no kill point stands at them: the state its first
@@ -2205,7 +2229,7 @@ mod tests {
         assert!(points.iter().all(|point| point.name != "fsync"), "the child's syncs are no kill points");
         let first = fixture();
         let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect(), before: &first }];
-        let crashes = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap().crashes;
+        let crashes = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, lines.len(), 0, 7).unwrap().crashes;
         let held: Vec<Vec<u8>> = crashes.iter().map(|crash| data(&crash.image, "w/a").unwrap()).collect();
         assert!(held.contains(&b"new".to_vec()), "{:?}", held);
         assert!(crashes.iter().any(|crash| matches!(&crash.moment, Moment::Synced { name, .. } if name == "fsync")));
@@ -2344,7 +2368,7 @@ mod tests {
             let first = fixture();
             let lines = [&first, &second].into_iter().zip(&calls)
                 .map(|(before, calls)| Line { calls, command: "stack".into(), points: Vec::new(), before }).collect::<Vec<_>>();
-            crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).map(|_| ())
+            crashes(&fixture(), &root(), "/s/w", 0o022, &lines, lines.len(), 0, 7).map(|_| ())
         };
         let made = ["1 mkdir(\"x\", 0755) = 0\n".to_string(), "1 rmdir(\"x\") = 0\n".to_string()];
         let mut with_x = fixture();
@@ -2686,7 +2710,7 @@ mod tests {
         let starts = starts(&texts);
         let lines: Vec<Line> = calls.iter().zip(&points).zip(&starts)
             .map(|((calls, points), before)| Line { calls, command: "stack".into(), points: points.iter().collect(), before }).collect();
-        let crashes = durable(crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap().crashes);
+        let crashes = durable(crashes(&fixture(), &root(), "/s/w", 0o022, &lines, lines.len(), 0, 7).unwrap().crashes);
         assert!(crashes.iter().all(|crash| data(&crash.image, "w/a").unwrap() == b"old"));
         let trails: Vec<(usize, bool)> = crashes.iter().map(|crash| crash.moment.trail()).collect();
         assert_eq!(trails, [(0, true), (1, false), (1, true), (2, false)]);
@@ -2746,7 +2770,7 @@ mod tests {
         let points = kill::enumerate(&calls, 0, "stack", &root(), "/s/w", |_| true).unwrap().points;
         let first = fixture();
         let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect(), before: &first }];
-        crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 0).unwrap()
+        crashes(&fixture(), &root(), "/s/w", 0o022, &lines, lines.len(), 0, 0).unwrap()
     }
 
     /// A torn file is torn under every name the durable tree gives its inode, whatever the calls
@@ -2819,17 +2843,6 @@ mod tests {
         assert!(requested.ordered.0 > ordered, "every moment asks for one");
     }
 
-    /// A scenario that runs lines after its record is not graded for power loss, and one that
-    /// runs none is.
-    ///
-    /// Revert: grade every scenario → the scenario with a later line is run.
-    #[test]
-    fn a_scenario_with_lines_after_its_record_is_not_run() {
-        let scenario = |then| Scenario { id: "s".into(), history: vec![], then, damage: None, files: crate::scenario::Files::Seeded };
-        assert_eq!(not_run(&scenario(vec![])), None);
-        assert!(not_run(&scenario(vec![crate::scenario::Op::Record { index: 0 }])).unwrap().contains("lines after its record"));
-    }
-
     /// A file cut and written back to its synced bytes still tears at the cut: the truncate can
     /// land without the write, in every durable state after it too.
     ///
@@ -2890,10 +2903,10 @@ mod tests {
         let durable = |crashes: &[Crash]| -> Vec<(String, usize)> {
             crashes.iter().filter(|crash| !matches!(crash.state, State::Seeded { .. })).map(|crash| (crash.moment.label(), crash.shared)).collect()
         };
-        let plain = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 0).unwrap().crashes;
+        let plain = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, lines.len(), 0, 0).unwrap().crashes;
         let mut matched = false;
         for seed in 0..64 {
-            let drawn = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 8, seed).unwrap().crashes;
+            let drawn = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, lines.len(), 8, seed).unwrap().crashes;
             assert_eq!(durable(&drawn), durable(&plain), "seed {}", seed);
             let numbers: Vec<usize> = drawn.iter().filter_map(|crash| match crash.state { State::Seeded { number } => Some(number), _ => None }).collect();
             assert_eq!(numbers, (1..=numbers.len()).collect::<Vec<_>>(), "seed {}", seed);
