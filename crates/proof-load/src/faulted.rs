@@ -1008,7 +1008,7 @@ mod tests {
         let faulted = expected.of(&corpus, Mark::Record(2), false);
         assert_eq!(faulted.trees.len(), 2);
         assert_eq!(faulted.transformed.keys().collect::<Vec<_>>(), ["a", "c"], "the before tree holds the bytes");
-        assert!(expected.of(&corpus, Mark::Record(2), true).transformed.is_empty(), "the made record holds none of them");
+        assert!(expected.of(&corpus, Mark::Record(2), true).transformed.is_empty(), "the acknowledged record holds none of them");
     }
 
     /// The faulted command writes the record after the last corpus record, whatever variants the
@@ -1078,7 +1078,7 @@ mod tests {
         Outcome { arguments: vec![], exit, stdout: vec![], stderr: vec![], failure }
     }
 
-    /// A served record counts as made only after an answer that asks nothing further: success, or
+    /// A served record counts as acknowledged only after an answer that asks nothing further: success, or
     /// a refusal naming no remedy. A kill is no answer, and a refusal naming a remedy sends the user
     /// through it first.
     ///
@@ -1086,7 +1086,7 @@ mod tests {
     /// with no retry; count any refusal → a stale lock's refusal heals before its remedy runs;
     /// drop the failure-document or unextractable conditions → a crash or an unreadable remedy
     /// settles the record; settle on the first attempt → the faulted command's refusal of a write
-    /// it committed grades as made.
+    /// it committed grades as acknowledged.
     #[test]
     fn only_an_answer_asking_nothing_further_settles_a_served_record() {
         assert!(answered(Some(&answer(Some(0), "", None))));
