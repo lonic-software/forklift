@@ -700,6 +700,17 @@ fn a_corrupt_loose_object_refuses_reads_and_heal_names_it_lost() {
 
     let human = area.run(&root, &["heal"]);
     assert!(text(&human.stderr).contains("0 absent, 0 unreadable, 1 corrupt"), "{}", text(&human.stderr));
+
+    // A damaged file no history needs is not counted lost, only noted as left in place.
+    let stray = loose_object(&root, &blob_hash("never stored\n"));
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    std::fs::write(&stray, b"not zstd").unwrap();
+    let again = area.run(&root, &["--json", "heal"]);
+    assert_eq!(again.status.code(), Some(58), "{}", text(&again.stdout));
+    let value: serde_json::Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(value["error"]["details"]["objects_lost"]["corrupt"], 1, "{}", value);
+    assert!(value["error"]["details"]["notes"].as_array().unwrap().iter()
+        .any(|note| note.as_str().unwrap().starts_with("1 damaged loose object file(s) that no history needs are left in place")), "{}", value);
 }
 
 #[test]

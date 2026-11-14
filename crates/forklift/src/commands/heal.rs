@@ -219,6 +219,14 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // Last, once every repair before it has run: what a durable ref still reaches and this store
     // cannot give back. A walk that cannot finish claims nothing lost.
     let lost = recovery_utils::find_lost_objects();
+    if let Ok(lost) = &lost {
+        if lost.damaged_unreached > 0 {
+            notes.push(format!(
+                "{} damaged loose object file(s) that no history needs are left in place; storing the same content again would keep the damaged file.",
+                lost.damaged_unreached
+            ));
+        }
+    }
     let objects_lost = match &lost {
         Ok(lost) if !lost.is_empty() => Some(ObjectsLost::of(lost)),
         _ => None,

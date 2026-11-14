@@ -2801,6 +2801,30 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Whether a loose file's bytes decompress to content that hashes to `hash`: what
+/// [`decode_loose`] decides, streamed into the hasher so a giant object is never held whole.
+///
+/// # Returns
+/// * `Ok(())`       - They do.
+/// * `Err(String)`  - They do not decompress, or decompress to other content; the message names
+///                    `hash`, as [`decode_loose`]'s does.
+pub(crate) fn verify_loose(hash: &str, compressed: &[u8]) -> Result<(), String> {
+    // Trusted bytes, read back from this store's own loose files, as in `decode_loose`, whose
+    // unbounded decode this mirrors.
+    #[allow(clippy::disallowed_methods)]
+    let decoder = zstd::stream::read::Decoder::new(compressed);
+    let mut hasher = blake3::Hasher::new();
+    decoder.and_then(|mut decoder| std::io::copy(&mut decoder, &mut hasher))
+        .map_err(|e| format!("Object {} is corrupt: its stored bytes do not decompress ({}).", hash, e))?;
+    let actual = hasher.finalize().to_hex().to_string();
+    match actual == hash {
+        true => Ok(()),
+        false => Err(format!(
+            "Object {} is corrupt: its stored bytes hash to {} instead (content-addressing violated).", hash, actual
+        )),
+    }
+}
+
 /// The ordinary read's error for an [`StoreReadOutcome::Unverifiable`] outcome: framed
 /// [`RefusalCode::ObjectUnreadable`] for pack damage and a corrupt loose file (whose message
 /// already names the object), `error` itself otherwise.

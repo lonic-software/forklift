@@ -90,7 +90,9 @@ copy of an object is a loose file that does not decompress, or decompresses to o
 refuses with `object_unreadable` (exit 57), where it failed with an uncoded message. `heal`'s closing
 check reads every loose file, and one that history still reaches counts as lost: `objects_lost`
 (exit 58) gains a `corrupt` count beside `absent` and `unreadable`, and lists such a hash with the
-reason `corrupt`. The file is left where it is.
+reason `corrupt`; a loose file that cannot be read at all counts as `unreadable`. The file is left
+where it is. A damaged loose file no history reaches is not lost: the report's `notes` count it as
+left in place.
 
 **Schema 46**: two new refusal codes. `object_unreadable` (exit 57): an object the command
 needs cannot be read from the store: it is missing there, or a pack file holding it is damaged (a

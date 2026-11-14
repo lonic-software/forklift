@@ -229,7 +229,7 @@ forklift heal
 as `<name>.idx.damaged-<time>`, and the command then works. If the data file itself is damaged or
 gone, the loose file is corrupt, or the object is missing altogether, nothing in this store can
 bring it back; when history still reaches it, `heal` refuses with `objects_lost`. A corrupt loose
-file is left where it is.
+file is left where it is, and `heal` notes one that no history needs.
 `forklift store status` lists each damaged pack file under `pack problems:`.
 
 ### `objects_lost` (exit 58)
