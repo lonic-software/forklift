@@ -301,12 +301,12 @@ impl PathScope {
             ),
             RecordError::OtherVersion(ref header) => match header_version(header) {
                 Some(version) if version > SCOPE_VERSION => format!("{} Use the Forklift that wrote it.", e.describe()),
-                Some(_) => format!(
+                Some(version) if version < SCOPE_VERSION => format!(
                     "{} An older version of Forklift wrote it, whose sparse checkouts left out \
                     ignore files this one holds in scope. {}",
                     e.describe(), remedy
                 ),
-                None => format!("{} Its version cannot be read, so it is damaged. {}", e.describe(), remedy),
+                _ => format!("{} Its version cannot be read, so it is damaged. {}", e.describe(), remedy),
             },
             _ => format!("{} {}", e.describe(), remedy),
         })?;
@@ -998,14 +998,17 @@ pub fn refuse_if_over_object_ceiling(what: &str, len: usize) -> Result<(), CoreE
 mod tests {
     use super::*;
 
-    /// A header whose version cannot be read is damaged, never "written by an older Forklift", and
+    /// A header whose version cannot be read, or names this build's version but does not match its
+    /// header exactly, is damaged, never "written by an older Forklift", and
     /// names the remedy; an older version names it as older, and a newer one names no remedy.
     ///
     /// Revert: send an unreadable version down the older arm, or the newer arm → red.
     #[test]
     fn a_header_version_is_read_as_older_newer_or_damaged() {
-        let damaged = PathScope::from_bytes(b"/forklift-scope x7\ndocs\n", "REMEDY").unwrap_err();
-        assert!(damaged.contains("damaged") && damaged.contains("REMEDY") && !damaged.contains("older version"), "{}", damaged);
+        for header in ["/forklift-scope x7".to_string(), format!("/forklift-scope  {}", SCOPE_VERSION), format!("/forklift-scope junk {}", SCOPE_VERSION)] {
+            let damaged = PathScope::from_bytes(format!("{}\ndocs\n", header).as_bytes(), "REMEDY").unwrap_err();
+            assert!(damaged.contains("damaged") && damaged.contains("REMEDY") && !damaged.contains("older version"), "{:?}: {}", header, damaged);
+        }
 
         let older = PathScope::from_bytes(b"/forklift-scope 2\ndocs\n", "REMEDY").unwrap_err();
         assert!(older.contains("An older version") && older.contains("REMEDY"), "{}", older);
