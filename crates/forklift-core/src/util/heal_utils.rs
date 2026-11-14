@@ -559,7 +559,8 @@ pub(crate) fn finish_clean_heal(
 pub(crate) fn sync_restaged_parents(parents: &BTreeSet<PathBuf>) -> Result<(), String> {
     let mut first_error: Option<String> = None;
 
-    for parent in parents {
+    // The flush below keeps the leaf folders: its anchor rule holds for shard folders only.
+    for parent in &file_utils::with_ancestors_to_storage_root(parents) {
         if let Err(e) = file_utils::fsync_dir_data(parent) {
             first_error.get_or_insert(e);
         }

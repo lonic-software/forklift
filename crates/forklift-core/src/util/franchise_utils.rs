@@ -675,10 +675,11 @@ pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep: &Bu
         }
 
         for folder in touched {
-            match file_utils::sync_dir(&folder) {
-                // A folder an earlier removal in this loop took with it.
-                Err(_) if std::fs::symlink_metadata(&folder).is_err() => (),
-                synced => synced?,
+            match std::fs::symlink_metadata(&folder) {
+                // A folder an earlier removal in this loop took with it: the entry change is in
+                // the folders above it.
+                Err(_) => file_utils::sync_ancestors_within(&folder, &forklift)?,
+                Ok(_) => file_utils::sync_dir_within(&folder, &forklift)?,
             }
         }
     }

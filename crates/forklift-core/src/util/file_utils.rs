@@ -707,14 +707,108 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The folders strictly above `dir`, nearest first, up to and including the storage root
+/// ([`forklift_root`]). Empty when `dir` is the root itself or lies outside it.
+///
+/// A folder's own entry lives in its parent, so a file synced into a folder that a power loss
+/// drops is lost with it. Syncing these too makes a folder created on the way to a write durable,
+/// whoever created it: a folder found already present may have been made by a writer that never
+/// finished syncing its parent, or by a process that died first. The bound is the root's path,
+/// never a folder name, because a pallet or bay name may itself contain a `.forklift` component.
+///
+/// The comparison is by spelling, so `dir` must be spelled from [`forklift_root`]; a caller that
+/// names its folders from a root of its own passes that root to [`ancestors_within`] instead.
+pub(crate) fn ancestors_to_storage_root(dir: &Path) -> Vec<PathBuf> {
+    ancestors_within(dir, &forklift_root())
+}
+
+/// The folders strictly above `dir`, nearest first, up to and including `root`, compared by
+/// spelling. Empty when `dir` is `root` itself or is not spelled under it.
+pub(crate) fn ancestors_within(dir: &Path, root: &Path) -> Vec<PathBuf> {
+    dir.ancestors().skip(1)
+        .take_while(|folder| folder.starts_with(root))
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+/// `folders` together with every folder between each of them and the storage root (see
+/// [`ancestors_to_storage_root`]), each once.
+pub(crate) fn with_ancestors_to_storage_root(folders: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    folders.iter()
+        .flat_map(|folder| std::iter::once(folder.clone()).chain(ancestors_to_storage_root(folder)))
+        .collect()
+}
+
 /// fsync a directory so a create/rename/unlink inside it is durable across power loss, not merely a
 /// process crash. Renaming a file into place makes its *contents* reachable, but the directory
 /// entry recording the new name is itself only on disk once the directory is fsynced — without this
 /// a post-crash directory could be missing an object, ref, or pack whose data was already synced.
 ///
+/// Every folder above `dir` up to the storage root is fsynced first
+/// ([`sync_ancestors_to_storage_root`]), and `dir` itself last ([`sync_dir_alone`]), whose
+/// `sync_all` flushes the device on macOS for them all. Best-effort across the chain, like the
+/// batched syncs: `dir` is attempted even after an ancestor fails, and the first error is returned.
+///
 /// A no-op when [`fsync_enabled`] is false, and on non-Unix targets, where a directory handle
 /// cannot be opened for `sync_all` (NTFS gives the ordering this buys on other filesystems).
 pub fn sync_dir(dir: &Path) -> Result<(), String> {
+    sync_dir_within(dir, &forklift_root())
+}
+
+/// [`sync_dir`] with the walk bounded by `root` instead of [`forklift_root`], for a caller that
+/// spells its folders from a root of its own (see [`ancestors_within`]).
+pub(crate) fn sync_dir_within(dir: &Path, root: &Path) -> Result<(), String> {
+    let ancestors = sync_ancestors_within(dir, root);
+    let leaf = sync_dir_alone(dir);
+
+    ancestors.and(leaf)
+}
+
+/// A plain fsync of every folder above `dir` up to the storage root (see
+/// [`ancestors_to_storage_root`]), nearest first, with no device flush of its own. Every folder is
+/// attempted; the first error is returned. For a caller whose `dir` may itself be gone, such as a
+/// folder a removal took with it: its parent's entry change still needs syncing.
+pub(crate) fn sync_ancestors_to_storage_root(dir: &Path) -> Result<(), String> {
+    sync_ancestors_within(dir, &forklift_root())
+}
+
+/// [`sync_ancestors_to_storage_root`] with the walk bounded by `root` (see [`ancestors_within`]).
+pub(crate) fn sync_ancestors_within(dir: &Path, root: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        if !fsync_enabled() {
+            return Ok(());
+        }
+
+        let mut first_error: Option<String> = None;
+
+        for ancestor in ancestors_within(dir, root) {
+            #[cfg(test)]
+            if let Some(injected) = injected_sync_dir_fault(&ancestor) {
+                first_error.get_or_insert(injected);
+                continue;
+            }
+
+            if let Err(e) = plain_fsync_dir(&ancestor) {
+                first_error.get_or_insert(e);
+            }
+        }
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, root);
+        Ok(())
+    }
+}
+
+/// [`sync_dir`] for `dir` alone, without the folders above it. Only for the taint folder, whose
+/// record must survive the very ancestor failure it is recording.
+pub(crate) fn sync_dir_alone(dir: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         if !fsync_enabled() {
@@ -722,12 +816,7 @@ pub fn sync_dir(dir: &Path) -> Result<(), String> {
         }
 
         #[cfg(test)]
-        if let Some(injected) = SYNC_DIR_FAULT.with(|f| {
-            let mut f = f.borrow_mut();
-            f.attempted.push(dir.to_path_buf());
-            f.fails(dir)
-                .then(|| format!("injected directory-sync failure for \"{}\"", dir.to_string_lossy()))
-        }) {
+        if let Some(injected) = injected_sync_dir_fault(dir) {
             return Err(injected);
         }
 
@@ -740,6 +829,17 @@ pub fn sync_dir(dir: &Path) -> Result<(), String> {
         let _ = dir;
         Ok(())
     }
+}
+
+/// Record `folder` with [`SYNC_DIR_FAULT`], and the injected error if it is armed to fail.
+#[cfg(all(test, unix))]
+fn injected_sync_dir_fault(folder: &Path) -> Option<String> {
+    SYNC_DIR_FAULT.with(|f| {
+        let mut f = f.borrow_mut();
+        f.attempted.push(folder.to_path_buf());
+        f.fails(folder)
+            .then(|| format!("injected directory-sync failure for \"{}\"", folder.to_string_lossy()))
+    })
 }
 
 #[cfg(test)]
@@ -784,6 +884,19 @@ impl SyncDirFaultGuard {
             attempted: Vec::new(),
             fail_needle: Some(needle.to_string()),
             fail_exact: false,
+        });
+        SyncDirFaultGuard { _syncs: syncs }
+    }
+
+    /// Record every directory, and fail only `dir` itself (see
+    /// [`DirSyncFaultGuard::failing_exactly`]).
+    pub(crate) fn failing_exactly(dir: &Path) -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = real_syncs();
+        SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState {
+            attempted: Vec::new(),
+            fail_needle: Some(dir.to_string_lossy().into_owned()),
+            fail_exact: true,
         });
         SyncDirFaultGuard { _syncs: syncs }
     }
@@ -849,7 +962,7 @@ fn taint_after_sync_failure(sync_error: String, final_paths: &[&Path]) -> String
     match taint_utils::record_taint(final_paths) {
         Ok(()) => sync_error,
         Err(taint_error) => format!(
-            "{} (additionally, failed to record a durability taint for the affected object(s): {})",
+            "{} (additionally, while recording a durability taint for the affected object(s): {})",
             sync_error, taint_error
         ),
     }
@@ -1615,6 +1728,10 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
 /// shared device flush — the same aggregation [`run_write_barrier`] already applies to file data,
 /// applied here to directory *entries* instead.
 ///
+/// Each folder between a touched directory and the storage root is synced too, once (see
+/// [`ancestors_to_storage_root`]): a folder created on the way to a rename has its own entry in
+/// the folder above, which nothing else syncs.
+///
 /// Best-effort across the whole set: every directory in `touched_parents` is attempted even after
 /// an earlier one fails — a caller catching the returned error still needs as much of the batch
 /// made durable as the filesystem will allow, not just a prefix ending at the first failure. Only
@@ -1623,7 +1740,7 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
 /// surfaces when no per-directory fsync already failed.
 ///
 /// # Arguments
-/// * `touched_parents` - Every distinct directory a rename just landed in.
+/// * `touched_parents` - Every distinct directory a rename just landed in, synced with each folder above it.
 /// * `flush_via`       - A regular file (a final, already-renamed path) to open write-mode for
 ///                       the macOS device flush — a directory cannot be opened write-mode
 ///                       (`EISDIR`), so the flush borrows any file guaranteed to already exist.
@@ -1634,7 +1751,7 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
 #[cfg(unix)]
 fn sync_touched_directories(touched_parents: &BTreeSet<PathBuf>, flush_via: &Path) -> Result<(), String> {
     let mut first_error: Option<String> = None;
-    for parent in touched_parents {
+    for parent in &with_ancestors_to_storage_root(touched_parents) {
         if let Err(e) = fsync_dir_data(parent) {
             first_error.get_or_insert(e);
         }
@@ -1787,8 +1904,6 @@ pub(crate) fn dir_sync_attempts() -> Vec<PathBuf> {
 /// own success re-check would refuse while the very taint the heal is resolving still stands).
 #[cfg(unix)]
 pub(crate) fn fsync_dir_data(dir: &Path) -> Result<(), String> {
-    use std::os::unix::io::AsRawFd;
-
     #[cfg(test)]
     if let Some(injected) = DIR_SYNC_FAULT.with(|f| {
         let mut f = f.borrow_mut();
@@ -1799,6 +1914,18 @@ pub(crate) fn fsync_dir_data(dir: &Path) -> Result<(), String> {
         return Err(injected);
     }
 
+    plain_fsync_dir(dir)?;
+
+    DIR_SYNC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// A plain `fsync` of one directory: its entries reach the device's queue, with no device flush
+/// of its own (see [`fsync_dir_data`]).
+#[cfg(unix)]
+fn plain_fsync_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+
     let file = std::fs::File::open(dir)
         .map_err(|e| format!("Error while opening directory \"{}\" to sync it: {}", dir.to_string_lossy(), e))?;
 
@@ -1808,11 +1935,11 @@ pub(crate) fn fsync_dir_data(dir: &Path) -> Result<(), String> {
         ));
     }
 
-    DIR_SYNC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
-/// Fsync each of `folders` once, so every entry change already made inside them (an unlink
+/// Fsync each of `folders`, and every folder between one of them and the storage root (see
+/// [`ancestors_to_storage_root`]), once, so every entry change already made inside them (an unlink
 /// included) is durable before the caller's next write. No device flush: the caller's next write
 /// must be one whose own file sync flushes the device, such as [`replace_file_atomically`]
 /// (`sync_all`, which is `F_FULLFSYNC` on macOS), and it borrows that flush for these folders.
@@ -1832,7 +1959,7 @@ pub(crate) fn sync_folders_before_flushed_write(folders: &BTreeSet<PathBuf>) -> 
             return Ok(());
         }
 
-        for folder in folders {
+        for folder in &with_ancestors_to_storage_root(folders) {
             fsync_dir_data(folder)?;
         }
 
@@ -6769,6 +6896,230 @@ mod tests {
 
     fn lock_taint_activation() -> std::sync::MutexGuard<'static, ()> {
         taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A fresh, empty storage root for the folder-chain tests below.
+    #[cfg(unix)]
+    fn chain_test_root(name: &str) -> PathBuf {
+        let temp = std::env::temp_dir().join(format!("forklift-chain-{}-{}", name, std::process::id()));
+        let _ = remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        temp
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_write_into_a_fresh_shard_syncs_every_folder_up_to_the_storage_root() {
+        // The first object in a shard lands in a folder whose own entry in `objects/` nothing
+        // else syncs; a power loss would drop the folder and the object with it.
+        let temp = chain_test_root("barrier");
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let shard = forklift.join("objects").join("44");
+        create_folder_if_not_exists(&shard).unwrap();
+
+        let batch = WriteBatch::new();
+        batch.stage(&shard.join("441a2e45"), b"object").unwrap();
+
+        let _guard = DirSyncFaultGuard::recording();
+        batch.finish().unwrap();
+
+        let attempts = dir_sync_attempts();
+        for folder in [shard.clone(), forklift.join("objects"), forklift.clone()] {
+            assert_eq!(attempts.iter().filter(|attempt| **attempt == folder).count(), 1,
+                "{:?} must be synced exactly once, attempts {:?}", folder, attempts);
+        }
+        assert!(attempts.iter().all(|attempt| attempt.starts_with(&forklift)),
+            "nothing above the storage root may be synced, attempts {:?}", attempts);
+
+        remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sync_dir_walks_to_the_storage_root_past_a_folder_named_like_it() {
+        // A pallet name may hold a `.forklift` component, so the walk is bounded by the root's
+        // path, never by a folder name.
+        let temp = chain_test_root("named");
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let folder = forklift.join("pallets").join("team").join(".forklift");
+        std::fs::create_dir_all(&folder).unwrap();
+
+        let _guard = SyncDirFaultGuard::recording();
+        sync_dir(&folder).unwrap();
+
+        assert_eq!(sync_dir_attempts(), vec![
+            forklift.join("pallets").join("team"),
+            forklift.join("pallets"),
+            forklift.clone(),
+            folder.clone(),
+        ], "every folder up to the root, then the folder itself last");
+
+        remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sync_dir_outside_the_storage_root_syncs_only_the_folder() {
+        let temp = chain_test_root("outside");
+        let outside = temp.join("export").join("nested");
+        std::fs::create_dir_all(&outside).unwrap();
+        let _scope = StorageRootScope::enter(&temp.join("warehouse"));
+
+        let _guard = SyncDirFaultGuard::recording();
+        sync_dir(&outside).unwrap();
+
+        assert_eq!(sync_dir_attempts(), vec![outside.clone()]);
+
+        remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sync_dir_of_the_storage_root_syncs_nothing_above_it() {
+        let temp = chain_test_root("root");
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+        std::fs::create_dir_all(&forklift).unwrap();
+
+        let _guard = SyncDirFaultGuard::recording();
+        sync_dir(&forklift).unwrap();
+
+        assert_eq!(sync_dir_attempts(), vec![forklift.clone()], "the warehouse folder above is outside the root");
+
+        remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_walk_bounded_by_its_own_root_reaches_it_whatever_the_storage_root_is() {
+        // A clone's resume sweep spells its folders from the target it was given, which need
+        // not match the CLI's relative storage root; it passes that root as the bound. Nothing
+        // is created: each folder is recorded, then fails to open.
+        let root = std::env::temp_dir().join(format!("forklift-chain-own-{}", std::process::id())).join(".forklift");
+        let folder = root.join("objects").join("44");
+        assert!(ancestors_to_storage_root(&folder).is_empty(), "this test needs the bound to come from the caller");
+
+        let _guard = SyncDirFaultGuard::recording();
+        let _ = sync_dir_within(&folder, &root);
+
+        assert_eq!(sync_dir_attempts(), vec![root.join("objects"), root.clone(), folder.clone()]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sync_dir_still_syncs_the_folder_after_an_ancestor_fails() {
+        let temp = chain_test_root("best-effort");
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+        let folder = forklift.join("pallets").join("team");
+        std::fs::create_dir_all(&folder).unwrap();
+
+        let _guard = SyncDirFaultGuard::failing_exactly(&forklift.join("pallets"));
+        let error = sync_dir(&folder).unwrap_err();
+
+        assert!(error.contains("pallets"), "got: {}", error);
+        assert_eq!(sync_dir_attempts().last(), Some(&folder), "the folder itself must still be attempted");
+
+        remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_flushed_write_syncs_its_folders_up_to_the_storage_root() {
+        let temp = chain_test_root("flushed");
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+        let folder = forklift.join("inventory").join("inv_");
+        std::fs::create_dir_all(&folder).unwrap();
+
+        let _guard = DirSyncFaultGuard::recording();
+        sync_folders_before_flushed_write(&BTreeSet::from([folder.clone()])).unwrap();
+
+        let attempts: BTreeSet<PathBuf> = dir_sync_attempts().into_iter().collect();
+        assert_eq!(attempts, BTreeSet::from([folder, forklift.join("inventory"), forklift.clone()]));
+
+        remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_heal_restage_syncs_its_folders_up_to_the_storage_root() {
+        let temp = chain_test_root("heal");
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+        let shard = forklift.join("objects").join("44");
+        std::fs::create_dir_all(&shard).unwrap();
+
+        let _guard = DirSyncFaultGuard::recording();
+        crate::util::heal_utils::sync_restaged_parents(&BTreeSet::from([shard.clone()])).unwrap();
+
+        let attempts: BTreeSet<PathBuf> = dir_sync_attempts().into_iter().collect();
+        assert_eq!(attempts, BTreeSet::from([shard, forklift.join("objects"), forklift.clone()]));
+
+        remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failing_storage_root_still_leaves_the_taint_record() {
+        // The root's own fsync fails for the barrier and for every later sync_dir alike. The taint
+        // record's write must not be undone by the very failure it records.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = chain_test_root("root-taint");
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let shard = forklift.join("objects").join("44");
+        create_folder_if_not_exists(&shard).unwrap();
+
+        let batch = WriteBatch::new();
+        batch.stage(&shard.join("441a2e45"), b"object").unwrap();
+
+        let _barrier = DirSyncFaultGuard::failing_exactly(&forklift);
+        let _single = SyncDirFaultGuard::failing_exactly(&forklift);
+        batch.finish().unwrap_err();
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        let expected: BTreeSet<PathBuf> = [PathBuf::from("objects/44/441a2e45")].into_iter().collect();
+        assert_eq!(state.recorded, expected);
+
+        remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_ancestor_sync_taints_the_batchs_final_once_activated() {
+        // `objects/` itself fails: the object is renamed into place but its shard folder's entry
+        // is not durable, so the object must be recorded as tainted. Only the barrier's rig is
+        // armed, so the taint record's own write is unaffected.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = chain_test_root("ancestor-taint");
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let shard = forklift.join("objects").join("44");
+        create_folder_if_not_exists(&shard).unwrap();
+
+        let batch = WriteBatch::new();
+        batch.stage(&shard.join("441a2e45"), b"object").unwrap();
+
+        let _guard = DirSyncFaultGuard::failing_exactly(&forklift.join("objects"));
+        let error = batch.finish().unwrap_err();
+        assert!(error.contains("objects"), "got: {}", error);
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        let expected: BTreeSet<PathBuf> = [PathBuf::from("objects/44/441a2e45")].into_iter().collect();
+        assert_eq!(state.recorded, expected);
+
+        remove_dir_all(&temp).ok();
     }
 
     #[test]

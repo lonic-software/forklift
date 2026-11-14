@@ -774,22 +774,19 @@ fn ensure_inventory_folder_and_build(inventory: &Inventory, inventory_path: &Pat
     Ok(InventoryBuilder::build(inventory))
 }
 
-/// Make sure the folder of the shard at `inventory_path` exists. A folder created here is made
-/// durable with every folder above it up to the inventory root, so a shard renamed into it by the
-/// batch that follows cannot vanish with its folder in a power loss; that batch's own device flush
-/// covers these syncs.
+/// Make sure the folder of the shard at `inventory_path` exists. The batch that renames the shard
+/// into it syncs every folder up to the storage root again; a folder created here is synced up
+/// front as well, so a failing sync refuses before anything is renamed instead of tainting the
+/// shard after. That batch's own device flush covers these syncs.
 fn create_shard_folder(inventory_path: &Path) -> Result<(), String> {
     let Some(shard_folder) = inventory_path.parent() else {
         return Ok(());
     };
 
     if file_utils::create_folder_if_not_exists(shard_folder)? {
-        let inventory_root = std::path::PathBuf::from(file_utils::get_path_inventory_root());
-        let created_in: BTreeSet<std::path::PathBuf> = shard_folder.ancestors().skip(1)
-            .take_while(|folder| folder.starts_with(&inventory_root))
-            .map(Path::to_path_buf)
-            .collect();
-        file_utils::sync_folders_before_flushed_write(&created_in)?;
+        if let Some(created_in) = shard_folder.parent() {
+            file_utils::sync_folders_before_flushed_write(&BTreeSet::from([created_in.to_path_buf()]))?;
+        }
     }
 
     Ok(())
