@@ -126,8 +126,8 @@ fn damage(root: &Path, pallet: &str, damage: Damage) {
     let bytes = std::fs::read(&path).unwrap();
 
     match damage {
-        Damage::Delete => std::fs::remove_file(&path).unwrap(),
-        Damage::DeleteFolder => std::fs::remove_dir_all(root.join(".forklift").join("pallets")).unwrap(),
+        Damage::Delete => forklift_core::util::file_utils::remove_file(&path).unwrap(),
+        Damage::DeleteFolder => forklift_core::util::file_utils::remove_dir_all(root.join(".forklift").join("pallets")).unwrap(),
         Damage::Truncate => std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap(),
         Damage::Zero => std::fs::write(&path, vec![0u8; bytes.len()]).unwrap(),
         Damage::FlipByte => std::fs::write(&path, flipped(&bytes, 20)).unwrap(),
@@ -188,7 +188,7 @@ fn side_only_its_bytes_name(area: &Area) -> (PathBuf, String) {
     area.run_ok(&root, &["shift", "side"]);
     area.stack(&root, "s.txt", "side");
     area.run_ok(&root, &["shift", "main"]);
-    std::fs::remove_file(root.join(".forklift").join("journal.json")).unwrap();
+    forklift_core::util::file_utils::remove_file(root.join(".forklift").join("journal.json")).unwrap();
     let side = head(&root, "side");
     (root, side)
 }
@@ -223,7 +223,7 @@ fn a_prefix_too_short_or_naming_no_parcel_salvages_nothing() {
     let blob_hash = forklift_core::util::object_utils::hash_object_bytes(&forklift_core::util::object_utils::blob_bytes(b"side\n"));
     assert!(root.join(".forklift").join("objects").join(&blob_hash[..2]).join(&blob_hash[2..]).is_file(), "the fixture must name the blob");
 
-    let cases = vec![("short", side[..7].as_bytes().to_vec()), ("blob", blob_hash[..16].as_bytes().to_vec())];
+    let cases = vec![("short", side.as_bytes()[..7].to_vec()), ("blob", blob_hash.as_bytes()[..16].to_vec())];
 
     for (name, bytes) in cases {
         std::fs::write(ref_path(&root, "side"), &bytes).unwrap();
@@ -248,7 +248,7 @@ fn a_second_checkout_ahead_on_the_same_pallet_wins() {
     area.stack(&bay, "f.txt", "ahead");
     let ahead = head(&root, "main");
 
-    std::fs::remove_file(ref_path(&root, "main")).unwrap();
+    forklift_core::util::file_utils::remove_file(ref_path(&root, "main")).unwrap();
 
     let data = healed(&area, &root);
     assert_eq!(head(&root, "main"), ahead, "{}", data);
@@ -269,7 +269,7 @@ fn a_journal_head_whose_parcel_is_gone_is_dropped() {
     std::fs::write(&journal, text.replace(&format!("\"main\":\"{}\"", base), &format!("\"main\":\"{}\"", gone))).unwrap();
     assert!(std::fs::read_to_string(&journal).unwrap().contains(&gone), "the fixture must plant the head");
 
-    std::fs::remove_file(ref_path(&root, "main")).unwrap();
+    forklift_core::util::file_utils::remove_file(ref_path(&root, "main")).unwrap();
 
     healed(&area, &root);
     assert_eq!(head(&root, "main"), base);
@@ -305,7 +305,7 @@ fn diverged_evidence_is_refused_and_ref_settles_it() {
     area.stack(&root, "m.txt", "main");
     let base = head(&root, "main");
     let side = head(&root, "side");
-    std::fs::remove_file(root.join(".forklift").join("journal.json")).unwrap();
+    forklift_core::util::file_utils::remove_file(root.join(".forklift").join("journal.json")).unwrap();
     std::fs::write(ref_path(&root, "main"), &side.as_bytes()[..20]).unwrap();
 
     let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
@@ -375,7 +375,7 @@ fn a_damaged_tags_ref_does_not_stop_the_rebuild() {
     std::fs::write(&tags, b"not a hash").unwrap();
 
     let base = head(&root, "main");
-    std::fs::remove_file(ref_path(&root, "main")).unwrap();
+    forklift_core::util::file_utils::remove_file(ref_path(&root, "main")).unwrap();
 
     let _ = area.run(&root, &["heal"]);
     assert_eq!(head(&root, "main"), base);
@@ -408,7 +408,7 @@ fn a_rolling_back_lowers_take_is_never_landed() {
     operation.expected = Some(start.clone());
     operation_utils::raise_in(&root.join(".forklift"), &operation).unwrap();
 
-    std::fs::remove_file(ref_path(&root, "main")).unwrap();
+    forklift_core::util::file_utils::remove_file(ref_path(&root, "main")).unwrap();
 
     let _ = area.run(&root, &["heal"]);
     assert_eq!(head(&root, "main"), start);
@@ -436,7 +436,7 @@ fn stacking_a_merge_over_a_lost_ref_is_refused_as_damaged() {
     // Mutation: let `moved_under_merge` report a missing head as `behind` → red.
     let area = Area::new("merge-lost");
     let root = consolidating(&area);
-    std::fs::remove_file(ref_path(&root, "main")).unwrap();
+    forklift_core::util::file_utils::remove_file(ref_path(&root, "main")).unwrap();
 
     let refused = ref_damaged(&area.run(&root, &["--json", "stack", "-m", "merge"]));
     assert_eq!(refused["error"]["next_step"], "forklift heal", "{}", refused);
@@ -484,8 +484,8 @@ fn an_interrupted_consolidation_is_rebuilt_at_its_parcel_and_rolled_forward() {
         }
 
         // A stopped process leaves its lock behind, as a power loss would; the operator clears it.
-        let _ = std::fs::remove_file(root.join(".forklift").join("lock"));
-        std::fs::remove_file(ref_path(&root, "main")).unwrap();
+        let _ = forklift_core::util::file_utils::remove_file(root.join(".forklift").join("lock"));
+        forklift_core::util::file_utils::remove_file(ref_path(&root, "main")).unwrap();
 
         let data = healed(&area, &root);
         assert_eq!(head(&root, "main"), moved, "{}", data);

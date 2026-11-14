@@ -626,7 +626,7 @@ pub fn get_meta_pallet_head(name: &str) -> Result<Option<String>, String> {
 /// * `Ok(Some(String))` - The hash of the pallet's head parcel.
 /// * `Ok(None)`         - If the pallet is unborn (it has no ref file yet).
 /// * `Err(String)`      - If the name is invalid, or the ref file could not be read, or it
-///                        does not contain a valid hash (a [`RefusalCode::RefDamaged`] refusal).
+///   does not contain a valid hash (a [`RefusalCode::RefDamaged`] refusal).
 pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Option<String>, String> {
     validate_pallet_name(name)?;
 

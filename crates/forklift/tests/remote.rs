@@ -10517,7 +10517,7 @@ fn destroy_ref(area: &TestArea, pallet: &str, truncate: bool) {
             let bytes = std::fs::read(&path).unwrap();
             std::fs::write(&path, &bytes[..20]).unwrap();
         }
-        false => std::fs::remove_file(&path).unwrap(),
+        false => forklift_core::util::file_utils::remove_file(&path).unwrap(),
     }
 }
 
@@ -10623,7 +10623,7 @@ fn a_truncated_ref_whose_own_parcel_was_lost_waits_for_its_refetch() {
     let side = pallet_head(&area, "dev", "side");
     assert_ne!(side, behind);
 
-    std::fs::remove_file(area.path("dev/.forklift/journal.json")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.path("dev/.forklift/journal.json")).unwrap();
     lose_object(&area, &side);
     destroy_ref(&area, "side", true);
 
