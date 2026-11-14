@@ -32,6 +32,7 @@ pub fn handle_command(target: &str) -> Result<(), String> {
 
     let parcel_hash = pallet_utils::resolve_revision(revision)?;
     let tree_hash = object_utils::load_parcel(&parcel_hash)?.tree_hash;
+    crate::commands::scope::ensure_fetched(path, crate::commands::scope::PathRead::Content)?;
 
     let Some((hash, item_type)) = object_utils::resolve_tree_file(&tree_hash, path)? else {
         return Err(format!(

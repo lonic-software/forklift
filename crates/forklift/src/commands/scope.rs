@@ -1,7 +1,8 @@
 use serde::Serialize;
-use forklift_core::error::CoreError;
+use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::globals;
 use forklift_core::util::scope_utils::{self, ScopeClass};
+use forklift_core::util::{object_utils, pallet_utils};
 use crate::output::{self, CommandOutput};
 
 /// Refuse a path argument that is outside the active checkout's scope (§7.6),
@@ -15,6 +16,97 @@ pub fn ensure_path_in_scope(key: &str) -> Result<(), CoreError> {
     }
 
     Ok(())
+}
+
+/// What a read of a path at a revision loads below the root tree, which decides what a sparse
+/// warehouse must have fetched for it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PathRead {
+    /// The file's content, as `show` reads it: every directory on the path, and the file.
+    Content,
+
+    /// The file's entry in its directory, the hash naming its content, as `redact record` reads
+    /// it: the directories on the path only.
+    Entry,
+}
+
+/// Refuse a read of `path` at a revision that would load what this sparse warehouse never
+/// fetched, with the stable `out_of_scope` code and how to fetch it. Unrefused, the read fails as a
+/// lost object and names `forklift heal`, which finds nothing lost. Decided from the fetch scope
+/// before anything is read, as [`ensure_path_in_scope`] decides from the checkout scope. A no-op in
+/// a warehouse that is not sparse.
+///
+/// # Arguments
+/// * `path` - The path as the read walks it, split on "/".
+/// * `read` - What the read loads.
+pub fn ensure_fetched(path: &str, read: PathRead) -> Result<(), String> {
+    let fetch = scope_utils::read_fetch_scope()?;
+    let components: Vec<&str> = path.split('/').collect();
+    let loaded = match read {
+        PathRead::Content => components.len(),
+        PathRead::Entry => components.len() - 1,
+    };
+
+    let Some(depth) = (1..=loaded)
+        .find(|&depth| fetch.classify(&components[..depth].join("/")) == ScopeClass::OutOfScope)
+    else {
+        return Ok(());
+    };
+
+    // The directory a fetch would bring in: the first one on the path outside the fetch scope, or,
+    // for a file at a level the fetch scope only passes through, the directory holding it.
+    let directory = match depth < components.len() {
+        true => components[..depth].join("/"),
+        false => components[..depth - 1].join("/"),
+    };
+
+    let next_step = match directory.is_empty() {
+        true => "Clone the remote again without --only, into a new directory.".to_string(),
+        false => match is_directory_at_base(&directory)? {
+            true => format!("forklift scope fetch {}", directory),
+            false => format!(
+                "Read it in a full clone: \"forklift scope fetch\" takes a directory at this checkout's \
+                base, and \"{}\" is not one there.",
+                directory
+            ),
+        },
+    };
+
+    Err(CoreError::refusal(
+        RefusalCode::OutOfScope,
+        format!(
+            "The path \"{}\" is outside this warehouse's fetch scope, so its content was never fetched.",
+            path
+        ),
+        next_step,
+    ).into())
+}
+
+/// Whether `directory` is a directory at this checkout's base, the tree `scope fetch` widens
+/// against. Only the trees holding its entry are read, never its own, which a sparse warehouse
+/// may not have fetched.
+fn is_directory_at_base(directory: &str) -> Result<bool, String> {
+    let Some(base) = pallet_utils::read_position()?.base else {
+        return Ok(false);
+    };
+    let mut tree = object_utils::load_tree(&object_utils::load_parcel(&base)?.tree_hash)?;
+    let (parents, name) = match directory.rsplit_once('/') {
+        Some((parents, name)) => (Some(parents), name),
+        None => (None, directory),
+    };
+
+    for component in parents.into_iter().flat_map(|parents| parents.split('/')) {
+        let subtree = tree.get_subtrees()
+            .find(|(name, _)| name.as_str() == component)
+            .map(|(_, item)| item.hash.clone());
+
+        match subtree {
+            Some(hash) => tree = object_utils::load_tree(&hash)?,
+            None => return Ok(false),
+        }
+    }
+
+    Ok(tree.get_subtrees().any(|(entry, _)| entry.as_str() == name))
 }
 
 /// Refuse a whole-tree verb that does not yet support running in a scoped (sparse) bay

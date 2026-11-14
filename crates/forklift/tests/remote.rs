@@ -9083,6 +9083,67 @@ fn sparse_with_docs(area: &TestArea) -> Server {
     server
 }
 
+/// FORK-490: a read of a path a sparse clone never fetched refuses `out_of_scope` naming the step
+/// that fetches it, never `object_unreadable` and a heal that finds nothing lost. The step fits the
+/// path: `scope fetch` for a directory at the base, a fresh clone for a file at the root, and
+/// prose for a directory only an older revision has. Mutations: drop either command's check, or
+/// the base walk → red.
+#[test]
+fn a_read_outside_the_fetch_scope_names_the_fetch_that_reaches_it() {
+    let area = TestArea::new("read-out-of-scope");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    area.write_file("dev/old/gone.txt", "only in the first revision\n");
+    area.write_file("dev/top.txt", "at the root\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "first"]));
+    let first = pallet_head(&area, "dev", "main");
+    std::fs::remove_dir_all(area.path("dev/old")).unwrap();
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "second"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
+
+    let refused = |args: &[&str]| {
+        let output = area.forklift("sparse", &[&["--json"][..], args].concat());
+        assert_eq!(output.status.code(), Some(7), "{}{}", stdout(&output), stderr(&output));
+        let value = json_of(&output);
+        assert_eq!(value["error"]["code"], "out_of_scope", "{}", value);
+        value["error"].clone()
+    };
+
+    let error = refused(&["show", "main:docs/guide.md"]);
+    assert_eq!(error["next_step"], "forklift scope fetch docs", "{}", error);
+    assert!(error["message"].as_str().unwrap().contains("docs/guide.md"), "{}", error);
+    let error = refused(&["redact", "record", "main:docs/guide.md", "-m", "x"]);
+    assert_eq!(error["next_step"], "forklift scope fetch docs", "{}", error);
+
+    let error = refused(&["show", "main:top.txt"]);
+    assert_eq!(error["next_step"], "Clone the remote again without --only, into a new directory.", "{}", error);
+
+    let error = refused(&["show", &format!("{}:old/gone.txt", first)]);
+    let step = error["next_step"].as_str().unwrap();
+    assert!(step.starts_with("Read it in a full clone") && step.contains("\"old\""), "{}", error);
+
+    // The named step works, and the read it was refused for then succeeds.
+    let error = refused(&["show", "main:docs/guide.md"]);
+    let step: Vec<&str> = error["next_step"].as_str().unwrap().split(' ').collect();
+    assert_success(&area.forklift("sparse", &step[1..]));
+    let shown = area.forklift("sparse", &["--json", "show", "main:docs/guide.md"]);
+    assert_success(&shown);
+    assert_eq!(json_of(&shown)["data"]["content"], "guide v1\n");
+
+    // An in-scope object that is gone is still damage heal acts on.
+    let head = pallet_head(&area, "sparse", "main");
+    let blob = path_object_hash(&area, "sparse", &head, "src/api/a.txt");
+    std::fs::remove_file(object_store_path(&area, "sparse", &blob)).unwrap();
+    let output = area.forklift("sparse", &["--json", "show", "main:src/api/a.txt"]);
+    assert_eq!(json_of(&output)["error"]["code"], "object_unreadable", "{}", stdout(&output));
+}
+
 #[test]
 fn scope_prune_keeps_work_never_lifted_and_frees_it_once_lifted() {
     // FORK-251: a change stacked under the pruned path and never lifted exists only here. The

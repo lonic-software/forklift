@@ -2467,6 +2467,33 @@ pub fn retrieve_object_by_hash_uncached(hash: &str) -> Result<Vec<u8>, String> {
     read_object_uncached(hash)
 }
 
+/// Retrieve an object by a hash the caller was handed, such as one a user typed, rather than one
+/// history reached. It reads as [`retrieve_object_by_hash`] does, cache refill and refusals
+/// included, except for an absence nothing accounts for: the store simply not holding the hash
+/// says that alone, uncoded and naming no remedy, since nothing says this warehouse ever held it.
+/// An absence that leaves something undecided (a pack this read cannot use, a redaction or
+/// withholding record it cannot read) keeps the ordinary [`RefusalCode::ObjectUnreadable`]
+/// refusal, since heal acts on those.
+///
+/// Not cached: a caller-named read is one read, never a walk.
+pub fn retrieve_named_object_by_hash(hash: &str) -> Result<Vec<u8>, String> {
+    if let Some(bytes) = read_cache_get(hash) {
+        return Ok(bytes.as_ref().clone());
+    }
+    read_object_as(hash, Absence::Named)
+}
+
+/// Who named the hash a read is for, which decides what an absence nothing accounts for is told.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Absence {
+    /// History reached it, so the store should hold it: refused
+    /// [`RefusalCode::ObjectUnreadable`], naming `forklift heal`.
+    History,
+
+    /// The caller was handed it: the store not holding it is all that is known.
+    Named,
+}
+
 /// The classified outcome of [`read_object_classified`] — the one shape every taint recheck (see
 /// `recovery_utils`/`heal_utils`) is built from, so a recheck can never disagree with what an
 /// ordinary read of the same hash would actually do.
@@ -2727,9 +2754,16 @@ fn read_loose_if_verified(hash: &str) -> Result<Option<Vec<u8>>, String> {
 /// a corrupt loose file ([`Unreadable::LooseCorrupt`]) and an absence nothing else accounts for are
 /// framed [`RefusalCode::ObjectUnreadable`], whose next step is `forklift heal`. What heal cannot act
 /// on stays untyped: a pack record whose bytes do not rebuild to the address, an index of another
-/// format version, an absence a redaction or a withholding explains. Classified
-/// readers never see the frame, so a reason heal itself reports never embeds one.
+/// format version, an absence a redaction or a withholding explains. A hash the caller was
+/// handed rather than reached through history is read by [`retrieve_named_object_by_hash`], whose
+/// plain absence is untyped too. Classified readers never see the frame, so a reason heal itself
+/// reports never embeds one.
 fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
+    read_object_as(hash, Absence::History)
+}
+
+/// [`read_object_uncached`], with the final absence told as `absence` says.
+fn read_object_as(hash: &str, absence: Absence) -> Result<Vec<u8>, String> {
     match read_object_classified(hash)? {
         StoreReadOutcome::Verified(bytes) => Ok(bytes),
         StoreReadOutcome::Unverifiable(e, cause) => Err(unverifiable_read_error(hash, e, cause)),
@@ -2766,6 +2800,7 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
             // reconstructed here (rather than carried on the `Absent` variant, which is bare by
             // design) since nothing about the message depends on which of the two `Absent`
             // sources in `read_object_classified` produced it.
+            let records_decided = applied.is_ok() && unavailable.is_ok();
             let (path, file_name) = get_path_for_object(hash)?;
             let file_path = path.add(PATH_SEPARATOR).add(&file_name);
             let missing = format!(
@@ -2789,6 +2824,13 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
             // (I4), only what the reader is told; a folder that cannot be listed adds nothing, so
             // the read still names the missing object.
             let holders = crate::util::pack_utils::unindexed_holders().unwrap_or_default();
+
+            // Nothing left undecided and nothing says the store ever held it: a hash the caller
+            // was handed is simply not here.
+            if absence == Absence::Named && records_decided && holders.is_empty() {
+                return Err(format!("Object {} is not in this store.", hash));
+            }
+
             let missing = match holders.is_empty() {
                 true => missing,
                 false => format!(

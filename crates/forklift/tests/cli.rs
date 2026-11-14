@@ -8532,6 +8532,21 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
 
+/// FORK-490: peeking a hash the store does not hold says only that. The user typed it, so nothing
+/// says the warehouse ever held it, and `heal` is no remedy. Mutation: peek reads it as history's → red.
+#[test]
+fn peeking_an_absent_hash_names_no_heal() {
+    let warehouse = TestWarehouse::new("peek-absent");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let absent = "0123456789abcdef".repeat(4);
+    let output = warehouse.run(&["--json", "store", "peek", &absent]);
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    let value = json(&output);
+    assert_eq!(value["error"]["message"], format!("Object {} is not in this store.", absent), "{}", value);
+    assert!(value["error"].get("next_step").is_none_or(|step| step.is_null()), "{}", value);
+}
+
 /// A person at a terminal gets the same recovery a `--json` consumer reads from `next_step`: on a
 /// line of its own under the message, labelled.
 #[test]
