@@ -26,6 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Work run before a request is forwarded.
+type Hook = Box<dyn FnOnce() + Send>;
+
 /// How long a delayed response is held before it is delivered.
 pub const DELAY: Duration = Duration::from_secs(3);
 
@@ -124,7 +127,7 @@ struct State {
     /// Kills the server, for [`Fault::Kill`].
     killer: Mutex<Option<Box<dyn FnMut() + Send>>>,
     /// Run once, before the request it names (by its index) is forwarded.
-    before: Mutex<Option<(usize, Box<dyn FnOnce() + Send>)>>,
+    before: Mutex<Option<(usize, Hook)>>,
     stopped: AtomicBool,
 }
 
