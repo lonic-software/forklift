@@ -775,14 +775,17 @@ fn ensure_inventory_folder_and_build(inventory: &Inventory, inventory_path: &Pat
 }
 
 /// Make sure the folder of the shard at `inventory_path` exists. The batch that renames the shard
-/// into it syncs the folder and every folder above it to the storage root, so a folder created
-/// here needs no sync of its own.
+/// into it syncs every folder up to the storage root again; a folder created here is synced up
+/// front as well, so a failing sync refuses before anything is renamed instead of tainting the
+/// shard after. That batch's own device flush covers these syncs.
 fn create_shard_folder(inventory_path: &Path) -> Result<(), String> {
     let Some(shard_folder) = inventory_path.parent() else {
         return Ok(());
     };
 
-    file_utils::create_folder_if_not_exists(shard_folder)?;
+    if file_utils::create_folder_if_not_exists(shard_folder)? {
+        file_utils::sync_folders_before_flushed_write(&file_utils::ancestors_to_storage_root(shard_folder).into_iter().collect())?;
+    }
 
     Ok(())
 }

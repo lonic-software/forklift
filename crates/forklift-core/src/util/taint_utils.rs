@@ -286,13 +286,17 @@ fn write_taint_file(root: &Path, relative_paths: &BTreeSet<PathBuf>) -> Result<(
     }
 
     // The directory counterpart of the fsync above: the taint file's own bytes durable is not
-    // enough if its directory entry (the name itself) is not. Reuses `file_utils::sync_dir`
-    // unchanged — a plain fsync-of-a-directory-handle helper, never itself a barrier that could
-    // fail a rename and recurse back into tainting.
-    if let Err(e) = file_utils::sync_dir(&taint_dir) {
+    // enough if its directory entry (the name itself) is not. A plain fsync-of-a-directory-handle
+    // helper, never itself a barrier that could fail a rename and recurse back into tainting.
+    if let Err(e) = file_utils::sync_dir_alone(&taint_dir) {
         let _ = file_utils::remove_file(&candidate);
         return Err(e);
     }
+
+    // The folders above, best-effort: the failure being recorded may be one of theirs, and a
+    // record whose folder entry is not yet durable still gates every later command, where a
+    // removed one gates nothing.
+    let _ = file_utils::sync_ancestors_to_storage_root(&taint_dir);
 
     Ok(())
 }
