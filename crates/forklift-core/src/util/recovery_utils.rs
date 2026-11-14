@@ -2270,10 +2270,12 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
     let unavailable_absent = absent_count(&mut sealed.unavailable.entries()
         .map(|(hash, _)| hash)
         .filter(|hash| !sealed.applied.contains(hash) && !sealed.withheld.contains(hash)));
-    // Read against the same record the walk held by, so the two never disagree.
+    // Read against the same record the walk held by, so the two never disagree. `At::File` asks
+    // every set: the sealed one holds a hash met anywhere, and a hash the others name is file
+    // content, since a hash names its content, so no tree or chunk can share it.
     let held_corrupt = absent.iter()
         .filter(|hash| corrupt.contains(*hash))
-        .filter(|hash| [At::File, At::Tree, At::Chunk].into_iter().any(|at| sealed.held(hash, at).is_some()))
+        .filter(|hash| sealed.held(hash, At::File).is_some())
         .cloned()
         .collect();
 

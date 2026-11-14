@@ -4790,6 +4790,39 @@ fn get_regex_for_pattern(pattern: &str) -> Result<Regex, String> {
 mod tests {
     use super::*;
 
+    /// FORK-447: `verify_loose` tells a reader's own failure (nothing known) from bytes that do not
+    /// decode (corrupt), and an interruption, which the readers above it retry, is neither. Each
+    /// verdict agrees with `decode_loose`. Mutation: fold the reader's failure into a decode
+    /// failure, or record an interruption → red.
+    #[test]
+    fn verify_loose_tells_a_reader_failure_from_corrupt_bytes() {
+        struct Scripted { interrupt: bool, fail: bool, bytes: std::io::Cursor<Vec<u8>> }
+        impl std::io::Read for Scripted {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.interrupt) {
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                match self.fail {
+                    true => Err(std::io::Error::other("the disk failed")),
+                    false => self.bytes.read(buf),
+                }
+            }
+        }
+        let scripted = |interrupt, fail, bytes: &[u8]| Scripted { interrupt, fail, bytes: std::io::Cursor::new(bytes.to_vec()) };
+        let bytes = crate::util::object_utils::blob_bytes(b"verify_loose");
+        let hash = crate::util::object_utils::hash_object_bytes(&bytes);
+        let good = zstd::encode_all(bytes.as_slice(), 0).unwrap();
+        let other = zstd::encode_all(&b"other content"[..], 0).unwrap();
+
+        assert_eq!(verify_loose(&hash, scripted(true, false, &good)).unwrap(), Ok(()));
+        assert!(decode_loose(&hash, &good).is_ok());
+        for corrupt in [&b"not zstd"[..], &other] {
+            let verdict = verify_loose(&hash, scripted(true, false, corrupt)).expect("bytes that do not decode are a verdict");
+            assert_eq!(verdict, decode_loose(&hash, corrupt).map(|_| ()), "the streamed check agrees with the read");
+        }
+        assert!(verify_loose(&hash, scripted(false, true, &good)).is_err(), "a reader's failure is no verdict");
+    }
+
     /// A distinguishable error for the retry tests: raw code 7 is no error Windows reports for a
     /// held file, so only the test's own classifier calls it held.
     fn held() -> std::io::Error {
