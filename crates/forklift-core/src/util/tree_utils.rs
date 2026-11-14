@@ -476,10 +476,14 @@ fn collect_changed_files(tree: &TreeItem,
 
     let path_of = |name: &str| if prefix.is_empty() { name.to_string() } else { format!("{}/{}", prefix, name) };
     let head_tree = match head_tree_hash {
-        Some(hash) => Some(object_utils::load_tree(hash).map_err(|e| format!(
-            "The head's tree {} for \"{}\" could not be read, so staged changes there cannot be told \
-            apart from what the head already holds: {}. No parcel was made.",
-            hash, if prefix.is_empty() { "." } else { prefix }, e.trim_end_matches('.')
+        // The read's own code survives, so a damaged store still names its remedy.
+        Some(hash) => Some(object_utils::load_tree(hash).map_err(|e| crate::error::append_to_message(
+            crate::error::prefix_message(&format!(
+                "The head's tree {} for \"{}\" could not be read, so staged changes there cannot be told \
+                apart from what the head already holds",
+                hash, if prefix.is_empty() { "." } else { prefix }
+            ), e),
+            "No parcel was made.",
         ))?),
         None => None,
     };

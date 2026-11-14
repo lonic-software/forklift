@@ -1008,8 +1008,10 @@ const COMMIT_NOT_READY_RETRY_AFTER_SECONDS: &str = "1";
 fn error_response(error: HeadError) -> Response<Vec<u8>> {
     // The head's [`Status`] numeric values *are* the protocol's HTTP status codes, so this is
     // the single point its taxonomy meets `http`.
-    let status = StatusCode::from_u16(error.status.as_u16())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = match names_unreadable_object(&error.message) {
+        true => StatusCode::INTERNAL_SERVER_ERROR,
+        false => StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+    };
 
     let commit_not_ready = error.commit_not_ready;
     let retry_after = error.retry_after_seconds;
@@ -1059,7 +1061,16 @@ fn error_response(error: HeadError) -> Response<Vec<u8>> {
 /// requester whose action triggered it — never third-party or attacker-supplied content. Keep it
 /// that way: a future error path that let outside-influenced text reach byte zero of a handler's
 /// message could spoof a `code`/`next_step` pair here.
+///
+/// An `object_unreadable` refusal, at any status and wrapped or not, is the exception: this head's
+/// store is S3, so the refusal is about a scratch pack of the function's own, an internal fault
+/// with no remedy a client or operator could run. It is hidden and logged like a raw `500`.
 fn error_body(status: StatusCode, message: String) -> ErrorResponse {
+    if status == StatusCode::INTERNAL_SERVER_ERROR && names_unreadable_object(&message) {
+        eprintln!("forklift-aws-lambda: internal error: {}", message);
+        return ErrorResponse { error: "An internal error occurred.".to_string(), code: None, next_step: None };
+    }
+
     if let Some((code, human, next_step)) = forklift_core::error::deframe(&message) {
         return ErrorResponse {
             error: human.to_string(),
@@ -1080,10 +1091,44 @@ fn error_body(status: StatusCode, message: String) -> ErrorResponse {
     ErrorResponse { error: message, code: None, next_step: None }
 }
 
+/// Whether `message` carries an `object_unreadable` refusal frame, at its start or wrapped inside
+/// it (see [`error_body`]).
+fn names_unreadable_object(message: &str) -> bool {
+    let code = forklift_core::error::RefusalCode::ObjectUnreadable.as_str();
+    std::iter::once(0)
+        .chain(message.match_indices(forklift_core::error::REFUSAL_PREFIX).map(|(at, _)| at).filter(|at| *at > 0))
+        .filter_map(|at| forklift_core::error::deframe(&message[at..]))
+        .any(|(framed, _, _)| framed == code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use forklift_core::util::scope_utils;
+
+    /// FORK-449: an `object_unreadable` refusal, framed at the start or wrapped inside another
+    /// message, at a status other than 500 too, is answered as a hidden 500 with no code, so a
+    /// scratch pack's path never reaches a client. Mutation: drop the check from `error_body`
+    /// or from `error_response` → the code (or the 404) reaches the client → red.
+    #[test]
+    fn an_unreadable_object_is_a_hidden_internal_error_at_any_status() {
+        let framed: String = forklift_core::error::CoreError::refusal(
+            forklift_core::error::RefusalCode::ObjectUnreadable,
+            "Object abc cannot be read: pack index \"/tmp/scratch/x.idx\" is corrupt.",
+            "forklift heal",
+        ).into();
+        let wrapped = format!("Error while serving the fetch: {}", framed);
+
+        for message in [framed, wrapped] {
+            for error in [HeadError::not_found(message.clone()), HeadError::internal(message.clone())] {
+                let response = error_response(error);
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR, "{}", message);
+                let body = String::from_utf8(response.body().clone()).unwrap();
+                assert!(body.contains("An internal error occurred."), "{}", body);
+                assert!(!body.contains("object_unreadable") && !body.contains("scratch"), "{}", body);
+            }
+        }
+    }
 
     /// A classified refusal (§7.4) is decoded onto the wire regardless of status — its human message
     /// is a controlled taxonomy diagnostic, safe to expose even at `500`, so both heads carry the

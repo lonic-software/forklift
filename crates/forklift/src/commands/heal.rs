@@ -216,6 +216,14 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let (unsealed, unseal_failed) = unseal_present(store_access, &mut notes);
     drop_present_unavailable(&mut notes);
 
+    // Last, once every repair before it has run: what a durable ref still reaches and this store
+    // cannot give back. A walk that cannot finish claims nothing lost.
+    let lost = recovery_utils::find_lost_objects();
+    let objects_lost = match &lost {
+        Ok(lost) if !lost.is_empty() => Some(ObjectsLost::of(lost)),
+        _ => None,
+    };
+
     let report = HealReport {
         record_rebuilt,
         fetch_scope_rebuilt: scope_rebuilt,
@@ -230,9 +238,20 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         refs_rebuilt,
         refs_removed,
         refs_refused,
+        objects_lost,
     };
 
-    if report.refs_refused.is_empty() {
+    if let Err(error) = lost {
+        if !output::is_json() {
+            report.render_human();
+        }
+        return Err(format!(
+            "heal could not finish its reachability check, so whether any object is lost is not known: {}",
+            error
+        ));
+    }
+
+    if report.refs_refused.is_empty() && report.objects_lost.is_none() {
         output::emit(&report);
         return Ok(());
     }
@@ -241,7 +260,135 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         report.render_human();
     }
 
+    if let Some(lost) = &report.objects_lost {
+        return Err(objects_lost_refusal(&report, lost, outcome.index_rebuild_skipped).into());
+    }
+
     Err(ref_refusal(&report).into())
+}
+
+/// The most hashes an `objects_lost` refusal lists.
+const LOST_HASHES_LISTED: usize = 20;
+
+/// What a `heal` run found lost: reachable objects the store cannot give back.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct ObjectsLost {
+    /// How many reachable objects the store does not hold at all.
+    absent: usize,
+
+    /// How many reachable objects the store could not read.
+    unreadable: usize,
+
+    /// Up to 20 of them, grouped by why each is lost.
+    hashes: Vec<LostObject>,
+
+    /// The pallets whose history reaches any of them.
+    pallets: Vec<String>,
+
+    /// Why `pallets` is missing or short, if the walk that finds them could not finish.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pallets_unknown: Option<String>,
+
+    /// Sources the check could not read this run, so the counts may be short.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    degraded_sources: Vec<String>,
+
+    /// Whether the pack folder holds an index of another pack format.
+    #[serde(skip)]
+    foreign_index: bool,
+}
+
+/// One lost object and why it is lost.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct LostObject {
+    hash: String,
+
+    /// "absent", or why the object could not be read.
+    reason: String,
+}
+
+impl ObjectsLost {
+    fn of(lost: &recovery_utils::LostObjects) -> ObjectsLost {
+        let mut hashes: Vec<LostObject> = lost.absent.iter()
+            .map(|hash| LostObject { hash: hash.clone(), reason: "absent".to_string() })
+            .chain(lost.unreadable.iter().map(|(hash, reason)| LostObject { hash: hash.clone(), reason: reason.clone() }))
+            .collect();
+        hashes.sort_by(|a, b| (&a.reason, &a.hash).cmp(&(&b.reason, &b.hash)));
+        hashes.truncate(LOST_HASHES_LISTED);
+
+        let all: std::collections::BTreeSet<String> = lost.absent.iter().chain(lost.unreadable.keys()).cloned().collect();
+        let (pallets, pallets_unknown) = match recovery_utils::pallets_reaching(&all) {
+            Ok(pallets) => (pallets, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+
+        ObjectsLost {
+            absent: lost.absent.len(),
+            unreadable: lost.unreadable.len(),
+            hashes,
+            pallets,
+            pallets_unknown,
+            degraded_sources: lost.degraded_sources.clone(),
+            foreign_index: lost.foreign_index,
+        }
+    }
+
+    /// The report's lines, for the refusal's message.
+    fn lines(&self) -> Vec<String> {
+        let total = self.absent + self.unreadable;
+        let mut lines = vec![format!(
+            "{} object(s) that history still reaches cannot be read from this store: {} absent, {} unreadable.",
+            total, self.absent, self.unreadable
+        )];
+        let mut reason: Option<&str> = None;
+        for object in &self.hashes {
+            if reason != Some(object.reason.as_str()) {
+                lines.push(format!("  {}:", object.reason));
+                reason = Some(object.reason.as_str());
+            }
+            lines.push(format!("    {}", object.hash));
+        }
+        if total > self.hashes.len() {
+            lines.push(format!("  and {} more.", total - self.hashes.len()));
+        }
+        match (&self.pallets_unknown, self.pallets.is_empty()) {
+            (Some(error), _) => lines.push(format!("Which pallets reach them could not be told: {}", error)),
+            (None, false) => lines.push(format!("History that reaches them: {}.", self.pallets.join(", "))),
+            (None, true) => lines.push("No pallet's history reaches them; other refs (parked work, a bay's operation, a tombstone) do.".to_string()),
+        }
+        for source in &self.degraded_sources {
+            lines.push(format!("This check may be short: {}", source));
+        }
+        lines
+    }
+}
+
+/// The `objects_lost` refusal of a run that found reachable objects the store cannot give back,
+/// carrying the whole report. A damaged ref left standing is listed too.
+fn objects_lost_refusal(report: &HealReport, lost: &ObjectsLost, rebuild_skipped: bool) -> CoreError {
+    let mut lines = lost.lines();
+    if !report.refs_refused.is_empty() {
+        if let CoreError::Refusal { message, .. } = ref_refusal(report) {
+            lines.push(message);
+        }
+    }
+
+    let next_step = if lost.foreign_index {
+        "re-create the warehouse with this build of Forklift: the pack folder holds an index another build wrote"
+    } else if rebuild_skipped {
+        "forklift heal"
+    } else {
+        "restore the warehouse from a backup, or clone it afresh from a remote that holds these objects"
+    };
+
+    CoreError::refusal_with_details(
+        RefusalCode::ObjectsLost,
+        lines.join("\n"),
+        next_step,
+        serde_json::json!(report),
+    )
 }
 
 /// The `ref_damaged` refusal of a run that left a damaged ref standing, carrying the whole report.
@@ -432,6 +579,11 @@ pub(crate) struct HealReport {
     /// on a `ref_damaged` refusal's details.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     refs_refused: Vec<ref_heal::Refused>,
+
+    /// The reachable objects this store cannot give back. Present only on an `objects_lost`
+    /// refusal's details.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    objects_lost: Option<ObjectsLost>,
 }
 
 /// What `heal` dropped from a damaged sealed-object record.
@@ -541,6 +693,7 @@ impl CommandOutput for HealReport {
             && self.notes.is_empty() && self.unseal_failed.is_none() && self.record_rebuilt.is_none()
             && self.fetch_scope_rebuilt.is_none()
             && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
+            && self.objects_lost.is_none()
         {
             println!("Nothing to heal — no durability taint is standing.");
         }

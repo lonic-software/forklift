@@ -304,11 +304,17 @@ pub struct HealOutcome {
     /// [`run`]'s own doc comment) — and (F6, PR #120 round 2) one line per trust-pin root this run
     /// confirmed is genuinely never held locally (see [`never_held_pin_note`]).
     pub notes: Vec<String>,
+    /// Whether the pack-index rebuild ([`pack_utils::rebuild_pack_indexes`]) had work to do but
+    /// did not run because another process held the object-store lock, so a re-run may recover
+    /// what this one could not read.
+    pub index_rebuild_skipped: bool,
 }
 
 impl HealOutcome {
     fn nothing() -> HealOutcome {
-        HealOutcome { was_tainted: false, restaged: Vec::new(), resolved: Vec::new(), notes: Vec::new() }
+        HealOutcome {
+            was_tainted: false, restaged: Vec::new(), resolved: Vec::new(), notes: Vec::new(), index_rebuild_skipped: false,
+        }
     }
 }
 
@@ -355,14 +361,23 @@ pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, CoreErr
     // the same "could not be checked this run" spirit `resolve_the_rest`'s own per-candidate
     // sibling-independence already applies (PR #74) — an unknown is reported, never silently
     // dropped, but never lets one advisory read block the recovery this function exists to run.
-    let pack_warnings = match pack_health_warning_lines() {
-        Ok(lines) => lines,
-        Err(e) => vec![format!("pack health could not be determined this run: {}", e)],
-    };
+    //
+    // The index rebuild goes first, so the snapshot and the passes after it see what it rebuilt.
+    let mut pack_warnings = Vec::new();
+    let rebuild = pack_utils::rebuild_pack_indexes().unwrap_or_else(|e| {
+        pack_warnings.push(format!("pack indexes could not be rebuilt this run: {}", e));
+        pack_utils::IndexRebuild::default()
+    });
+    pack_warnings.extend(index_rebuild_lines(&rebuild));
+    match pack_health_warning_lines(&rebuild) {
+        Ok(lines) => pack_warnings.extend(lines),
+        Err(e) => pack_warnings.push(format!("pack health could not be determined this run: {}", e)),
+    }
 
     match run_pass(&root, progress).await {
         Ok(mut outcome) => {
             outcome.notes.extend(pack_warnings);
+            outcome.index_rebuild_skipped = rebuild.skipped.is_some();
             Ok(outcome)
         }
         Err(error) => Err(with_pack_warnings(error, &pack_warnings)),
@@ -411,6 +426,7 @@ async fn run_pass(root: &Path, progress: Option<&dyn Fn(&str)>) -> Result<HealOu
             // like a vanished-and-unreferenced hash, not in `restaged`.
             resolved: display_paths(attempt.recovered_packed.iter()),
             notes: Vec::new(),
+            index_rebuild_skipped: false,
         });
     }
 
@@ -426,17 +442,54 @@ async fn run_pass(root: &Path, progress: Option<&dyn Fn(&str)>) -> Result<HealOu
     resolve_the_rest(root, &state.recorded, &attempt, &state.files).await
 }
 
+/// The lines saying what [`pack_utils::rebuild_pack_indexes`] did: each index rebuilt, and why
+/// the rebuild did not run. A data file it could not rebuild is named by
+/// [`pack_health_warning_lines`], beside the problem that made it a candidate.
+fn index_rebuild_lines(rebuild: &pack_utils::IndexRebuild) -> Vec<String> {
+    let mut lines: Vec<String> = rebuild.rebuilt.iter().map(|(index_path, set_aside)| match set_aside {
+        Some(old) => format!(
+            "pack index \"{}\" was rebuilt from its data file; the index it replaced was kept as \"{}\"",
+            index_path.to_string_lossy(), old.to_string_lossy()
+        ),
+        None => format!("pack index \"{}\" was rebuilt from its data file", index_path.to_string_lossy()),
+    }).collect();
+    if let Some(reason) = &rebuild.skipped {
+        lines.push(format!(
+            "pack indexes were not rebuilt this run because the object store is busy ({}); \
+            re-run \"forklift heal\" once the other process finishes",
+            reason.trim_end_matches('.')
+        ));
+    }
+    lines
+}
+
 /// Load an uncached snapshot of the pack folder's problem indexes
 /// ([`pack_utils::pack_health_snapshot`]) and render it into the warning lines [`run`] folds into
-/// every outgoing result. Wording mirrors `quarantine_reason`'s own for the quarantined case (names
-/// the index and its data-load error); each other case is worded as its own remedy: a damaged
-/// pack still serves its sound parts, a foreign-version index means re-creating the warehouse
-/// (moving it aside would hide its objects), and an unparseable one is a file to move aside.
-fn pack_health_warning_lines() -> Result<Vec<String>, String> {
+/// every outgoing result, after this run's index rebuild. Wording mirrors `quarantine_reason`'s own
+/// for the quarantined case (names the index and its data-load error); each other case is worded as
+/// its own remedy: a damaged pack still serves its sound parts, a foreign-version index means
+/// re-creating the warehouse (moving it aside would hide its objects), and an unparseable index or
+/// a data file without one says why the rebuild could not recover it.
+fn pack_health_warning_lines(rebuild: &pack_utils::IndexRebuild) -> Result<Vec<String>, String> {
     let snapshot = pack_utils::pack_health_snapshot()?;
     let mut lines = Vec::with_capacity(
         snapshot.quarantined.len() + snapshot.unenumerable.len() + snapshot.damaged.len() + snapshot.foreign.len()
+            + snapshot.orphans.len()
     );
+    // Why the rebuild left the pack whose data file is `data_path`, worded to follow a semicolon.
+    let not_rebuilt = |data_path: &Path| -> String {
+        if let Some((_, reason)) = rebuild.failed.iter().find(|(failed, _)| failed == data_path) {
+            return format!("it could not be rebuilt from its data file: {}", reason);
+        }
+        if rebuild.skipped.is_some() {
+            return "it was not rebuilt from its data file this run because the object store is busy".to_string();
+        }
+        match data_path.is_file() {
+            true => "it could not be rebuilt from its data file".to_string(),
+            false => "it has no data file to rebuild it from".to_string(),
+        }
+    };
+    let data_of = |index_path: &Path| index_path.with_extension(pack_utils::FILE_EXTENSION_PACK_DATA);
 
     for (index_path, error) in &snapshot.quarantined {
         lines.push(format!(
@@ -449,13 +502,13 @@ fn pack_health_warning_lines() -> Result<Vec<String>, String> {
     }
     for (index_path, error) in &snapshot.damaged {
         lines.push(format!(
-            "pack index \"{}\" is damaged ({}); its sound parts are still read, but an object in a \
+            "pack index \"{}\" is damaged ({}); {}; its sound parts are still read, but an object in a \
             damaged part reads as unverifiable; once no durability taint is standing, \
             \"forklift store compact --all\" salvages what the pack's data file still holds and removes \
             the pack when every live object it may hold reads from another copy; if it keeps the \
             pack, or refuses because the pack could not be completely salvaged, the objects it \
             reports cannot be recovered from this store",
-            index_path.to_string_lossy(), error
+            index_path.to_string_lossy(), error, not_rebuilt(&data_of(index_path))
         ));
     }
     for (index_path, error) in &snapshot.foreign {
@@ -468,9 +521,16 @@ fn pack_health_warning_lines() -> Result<Vec<String>, String> {
     }
     for (index_path, error) in &snapshot.unenumerable {
         lines.push(format!(
-            "pack index \"{}\" could not be parsed ({}); objects it may have named cannot be \
-            distinguished from vanished ones — move the file aside and re-run",
-            index_path.to_string_lossy(), error
+            "pack index \"{}\" could not be parsed ({}); {}; objects it may have named cannot be \
+            distinguished from vanished ones",
+            index_path.to_string_lossy(), error, not_rebuilt(&data_of(index_path))
+        ));
+    }
+    for data_path in &snapshot.orphans {
+        lines.push(format!(
+            "pack data file \"{}\" has no index, so no read reaches the objects it holds; {}",
+            data_path.to_string_lossy(), not_rebuilt(data_path).replacen("it could not be rebuilt", "an index could not be rebuilt", 1)
+                .replacen("it was not rebuilt", "an index was not rebuilt", 1)
         ));
     }
 
@@ -721,7 +781,7 @@ async fn resolve_the_rest(
         match file_utils::read_object_classified(hash) {
             Ok(file_utils::StoreReadOutcome::Verified(_)) => resolved.push(hash.clone()),
             Ok(file_utils::StoreReadOutcome::Absent) => { truly_missing.insert(hash.clone()); }
-            Ok(file_utils::StoreReadOutcome::Unverifiable(reason)) => {
+            Ok(file_utils::StoreReadOutcome::Unverifiable(reason, _)) => {
                 // Present, but an ordinary read of it would fail — never a false "recovered"
                 // (never `resolved`), but also not distinguishable from a genuine vanish for the
                 // closure walk's own "still referenced" question below, so it travels the same
@@ -825,7 +885,7 @@ async fn resolve_the_rest(
             Ok(file_utils::StoreReadOutcome::Verified(_)) => {
                 resolved.push(relative.to_string_lossy().into_owned());
             }
-            Ok(file_utils::StoreReadOutcome::Unverifiable(reason)) => {
+            Ok(file_utils::StoreReadOutcome::Unverifiable(reason, _)) => {
                 // Present, but an ordinary read fails on it — the mechanical failure, never the
                 // fixed "corrupt (content does not match its own hash)" wording: that phrase is
                 // reserved for a verdict actually downstream of a hash-compare on these bytes,
@@ -941,6 +1001,7 @@ async fn resolve_the_rest(
             restaged: display_paths(attempt.restaged.iter()),
             resolved,
             notes,
+            index_rebuild_skipped: false,
         })
     } else {
         Err(dangling_refusal(root, &dangling_lines, &incomplete_reasons))
@@ -1221,6 +1282,7 @@ fn rescan_torn_taint(
             restaged: Vec::new(),
             resolved: Vec::new(),
             notes,
+            index_rebuild_skipped: false,
         })
     } else {
         report(format!(
@@ -2052,6 +2114,9 @@ pub(crate) struct ClosureWalkResult {
     /// `degraded_sources`, a non-empty list makes `hashes` conservative: a target missing from it
     /// may still be referenced beneath one of these nodes.
     pub unwalked: Vec<String>,
+    /// The same nodes as `unwalked`, by hash, each mapped to why it could not be read: the hashes
+    /// a caller counts as unreadable, as `forklift heal`'s verdict does.
+    pub unwalked_hashes: BTreeMap<String, String>,
     /// Every `Gap`-policy trust-pin root (F6, PR #120 round 2) this run could confirm is
     /// genuinely never held locally: absent, and never resolved by any genuine ancestry edge
     /// either — see [`walk_closure_for`]'s own doc comment for exactly what "confirm" means here.
@@ -2092,7 +2157,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
     if targets.is_empty() {
         return Ok(ClosureWalkResult {
             hashes: BTreeSet::new(), degraded_sources: Vec::new(), unwalked: Vec::new(),
-            never_held_pins: BTreeSet::new(), never_held_tags: Vec::new(), tags_unread: None,
+            unwalked_hashes: BTreeMap::new(), never_held_pins: BTreeSet::new(), never_held_tags: Vec::new(), tags_unread: None,
             redacted_absent: 0,
             unavailable_absent: 0,
         });
@@ -2112,6 +2177,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
         hashes: outcome.referenced,
         degraded_sources: roots.degraded_sources,
         unwalked: unwalked_notes(&outcome.unwalked),
+        unwalked_hashes: outcome.unwalked,
         never_held_pins: outcome.never_held_pins,
         never_held_tags: outcome.never_held_tags,
         tags_unread: roots.tags_unread,
@@ -2202,12 +2268,91 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
         hashes: absent,
         degraded_sources: roots.degraded_sources,
         unwalked: unwalked_notes(&outcome.unwalked),
+        unwalked_hashes: outcome.unwalked,
         never_held_pins: outcome.never_held_pins,
         never_held_tags: outcome.never_held_tags,
         tags_unread: roots.tags_unread,
         redacted_absent,
         unavailable_absent,
     })
+}
+
+/// What `forklift heal`'s closing check ([`find_lost_objects`]) found: the objects some durable
+/// ref still reaches that this store cannot give back.
+#[derive(Debug, Default)]
+pub struct LostObjects {
+    /// Reachable hashes the store does not hold at all.
+    pub absent: BTreeSet<String>,
+    /// Reachable hashes the walk could not read, each with why: a pack index that does not parse,
+    /// a data file with no index, a damaged index.
+    pub unreadable: BTreeMap<String, String>,
+    /// Sources the walk could not read this run, so the lists above may be short.
+    pub degraded_sources: Vec<String>,
+    /// Whether the pack folder holds an index of another pack format, so what it holds reads
+    /// as lost to this build only.
+    pub foreign_index: bool,
+}
+
+impl LostObjects {
+    /// Whether nothing reachable is lost.
+    pub fn is_empty(&self) -> bool {
+        self.absent.is_empty() && self.unreadable.is_empty()
+    }
+}
+
+/// Walk every durable ref's history and report what it reaches that the store cannot give back
+/// (FORK-449): `forklift heal`'s closing check, run once the taint and every repair before it
+/// have finished, so an object they recovered is never reported. Sealed, redacted, unavailable and
+/// out-of-scope objects are not lost and are not listed.
+///
+/// # Returns
+/// * `Ok(LostObjects)` - What is lost, possibly nothing.
+/// * `Err(String)`     - The walk could not finish: nothing may be concluded about loss.
+pub fn find_lost_objects() -> Result<LostObjects, String> {
+    let walk = enumerate_absent_reachable(&BTreeSet::new())?;
+    let foreign_index = pack_utils::pack_health_snapshot().is_ok_and(|snapshot| !snapshot.foreign.is_empty());
+
+    Ok(LostObjects {
+        absent: walk.hashes,
+        unreadable: walk.unwalked_hashes,
+        degraded_sources: walk.degraded_sources,
+        foreign_index,
+    })
+}
+
+/// The pallets (user then meta, as wire names) whose history reaches any of `hashes`, for a
+/// report of lost objects. One targeted walk per pallet, so it is run only when something is lost.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The pallets, in name order within each namespace.
+/// * `Err(String)`     - The pallets could not be listed, or a walk could not finish.
+pub fn pallets_reaching(hashes: &BTreeSet<String>) -> Result<Vec<String>, String> {
+    let scope = scope_utils::read_fetch_scope().unwrap_or_else(|_| PathScope::full());
+    let sealed = sealed_utils::read_tolerated().unwrap_or_default();
+    let mut reaching = Vec::new();
+
+    for namespace in [pallet_utils::PalletNamespace::User, pallet_utils::PalletNamespace::Meta] {
+        for name in pallet_utils::list_pallets_in(namespace)? {
+            let Ok(Some(head)) = pallet_utils::get_pallet_head_in(namespace, &name) else {
+                continue;
+            };
+            let (parcels, meta_heads) = match namespace {
+                pallet_utils::PalletNamespace::User => (vec![head], Vec::new()),
+                _ => (Vec::new(), vec![head]),
+            };
+            let roots = WalkRoots {
+                parcels, meta_heads, tag_subjects: Vec::new(), tags_unread: None, pin_parcels: Vec::new(),
+                haul_heads: Vec::new(), tombstone_heads: Vec::new(), mirror_roots: Vec::new(),
+                shard_referenced: Vec::new(), degraded_sources: Vec::new(),
+            };
+            let outcome = walk_closure_for(hashes, &roots, &BTreeSet::new(), &scope, Some(&sealed), None)?;
+            if !outcome.referenced.is_empty() {
+                reaching.push(pallet_utils::PalletRef { namespace, name }.to_wire());
+            }
+        }
+    }
+
+    Ok(reaching)
 }
 
 /// Re-borrow an `Option<&mut dyn FnMut(&str)>` for one call, without moving the original out of
@@ -6682,7 +6827,7 @@ mod tests {
         builder.append_delta(&h_hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
         builder.finish().unwrap();
         assert!(pack_utils::is_in_packs(&h_hash).unwrap(), "sanity: H is a pack membership hit");
-        assert!(matches!(pack_utils::retrieve_from_packs(&h_hash).unwrap(), pack_utils::PackRetrieval::Failed(_)),
+        assert!(matches!(pack_utils::retrieve_from_packs(&h_hash).unwrap(), pack_utils::PackRetrieval::Failed(..)),
             "sanity: H's record cannot actually be reconstructed");
 
         let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
@@ -6778,7 +6923,7 @@ mod tests {
         builder.append_delta(&h_hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
         builder.finish().unwrap();
         assert!(pack_utils::is_in_packs(&h_hash).unwrap(), "sanity: H is a pack membership hit");
-        assert!(matches!(pack_utils::retrieve_from_packs(&h_hash).unwrap(), pack_utils::PackRetrieval::Failed(_)),
+        assert!(matches!(pack_utils::retrieve_from_packs(&h_hash).unwrap(), pack_utils::PackRetrieval::Failed(..)),
             "sanity: H's pack record cannot actually be reconstructed");
 
         // Read-path witness: the ordinary read now succeeds, served by the verified loose copy
@@ -8223,7 +8368,7 @@ mod tests {
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
             let chunk = store_chunk(b"a chunk in a damaged pack");
             pack_as_unreadable(&chunk, Unreadable::CorruptBucket);
-            pack_health_warning_lines().unwrap()
+            pack_health_warning_lines(&pack_utils::IndexRebuild::default()).unwrap()
         };
         crate::util::file_utils::remove_dir_all(&dir).ok();
 
@@ -8311,7 +8456,7 @@ mod tests {
     #[test]
     fn heal_keeps_a_taint_whose_only_reference_lies_beneath_an_unreadable_tree() {
         use crate::globals::StorageRootScope;
-        use crate::util::pack_utils::tests::for_each_unreadable;
+        use crate::util::pack_utils::tests::{for_each_unreadable, heal_rebuilds};
 
         let _serial = lock_activation();
         taint_utils::activate();
@@ -8340,6 +8485,12 @@ mod tests {
                                 Some(format!("{:?}: sanity: the bay's saved state must read cleanly: {}", how, message))
                             } else if code != RefusalCode::DurabilityTaint {
                                 Some(format!("{:?}: wrong code {:?}: {}", how, code, message))
+                            } else if heal_rebuilds(how) {
+                                // Heal rebuilt the index first, so the tree reads and names the
+                                // vanished object as still referenced.
+                                (!(message.contains(&vanished_hash) && message.contains("vanished and still referenced")
+                                    && message.contains("was rebuilt from its data file")))
+                                    .then(|| format!("{:?}: the rebuilt tree must name the object as referenced: {}", how, message))
                             } else if !(message.contains(&vanished_hash) && message.contains(&web_tree)
                                 && message.contains("could not confirm it is safe to drop")) {
                                 Some(format!("{:?}: the refusal must name the object, the unreadable tree and \
@@ -8366,7 +8517,7 @@ mod tests {
     #[test]
     fn torn_rescan_leaves_the_record_standing_over_an_unreadable_tree() {
         use crate::globals::StorageRootScope;
-        use crate::util::pack_utils::tests::for_each_unreadable;
+        use crate::util::pack_utils::tests::{for_each_unreadable, heal_rebuilds};
 
         let _serial = lock_activation();
         taint_utils::activate();
@@ -8382,7 +8533,13 @@ mod tests {
 
                 let result = run_heal();
                 let state = taint_utils::read_taints(&forklift).unwrap();
-                if !state.torn {
+                if heal_rebuilds(how) {
+                    // Heal rebuilt the index first, so the rescan finishes and records exactly what
+                    // the tree still references.
+                    let vanished = format!("objects/99/{}", "9".repeat(62));
+                    (state.torn || state.recorded.len() != 1 || !state.recorded.iter().any(|path| *path == vanished) || result.is_ok())
+                        .then(|| format!("{:?}: the rescan over the rebuilt index must record the vanished object: {:?}", how, state.recorded))
+                } else if !state.torn {
                     Some(format!("{:?}: the torn record must be left standing, got {:?}", how, state.recorded))
                 } else {
                     match result {

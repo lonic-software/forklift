@@ -2204,6 +2204,75 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "LostObject": {
+      "description": "One lost object and why it is lost.",
+      "properties": {
+        "hash": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "\"absent\", or why the object could not be read.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "hash",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "ObjectsLost": {
+      "description": "What a `heal` run found lost: reachable objects the store cannot give back.",
+      "properties": {
+        "absent": {
+          "description": "How many reachable objects the store does not hold at all.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "degraded_sources": {
+          "description": "Sources the check could not read this run, so the counts may be short.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "hashes": {
+          "description": "Up to 20 of them, grouped by why each is lost.",
+          "items": {
+            "$ref": "#/$defs/LostObject"
+          },
+          "type": "array"
+        },
+        "pallets": {
+          "description": "The pallets whose history reaches any of them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "pallets_unknown": {
+          "description": "Why `pallets` is missing or short, if the walk that finds them could not finish.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unreadable": {
+          "description": "How many reachable objects the store could not read.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "absent",
+        "unreadable",
+        "hashes",
+        "pallets"
+      ],
+      "type": "object"
+    },
     "OperationOutcome": {
       "description": "How `heal` settled an interrupted operation.",
       "oneOf": [
@@ -2446,6 +2515,17 @@ A command not listed here either reports only the generic human-message shape `{
         "type": "string"
       },
       "type": "array"
+    },
+    "objects_lost": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ObjectsLost"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The reachable objects this store cannot give back. Present only on an `objects_lost`\nrefusal's details."
     },
     "operation": {
       "anyOf": [
@@ -6303,7 +6383,7 @@ A command not listed here either reports only the generic human-message shape `{
   "description": "The object-store census. The `Serialize` shape is the public `--json` schema; byte counts\nare exact integers there (the human view renders them in binary units).",
   "properties": {
     "damaged_packs": {
-      "description": "Packs that load but whose index is damaged in places: their sound parts are still read,\nand an object in a damaged part reads as unverifiable. `forklift store compact --all` salvages\nwhat the pack's data file still holds, and removes the pack when every live object it may\nhold reads from another copy. Empty on a healthy store.",
+      "description": "Packs that load but whose index is damaged in places: their sound parts are still read,\nand a read of an object in a damaged part refuses as `object_unreadable`. `forklift heal`\nrebuilds the index from the pack's data file. Empty on a healthy store.",
       "items": {
         "$ref": "#/$defs/PackIndexIssue"
       },
@@ -6406,7 +6486,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "unenumerable_indexes": {
-      "description": "Pack index files that could not even be parsed — move the file aside and\nre-run. Empty on a healthy store.",
+      "description": "Pack index files that could not even be parsed: `forklift heal` rebuilds each from its\npack's data file. Empty on a healthy store.",
       "items": {
         "$ref": "#/$defs/PackIndexIssue"
       },

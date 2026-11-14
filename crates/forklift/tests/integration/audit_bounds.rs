@@ -170,6 +170,17 @@ impl Warehouse {
     }
 
     /// Write the sealed-by-hash record holding exactly `hashes`, as the record's writers would.
+    /// Delete `paths` from the working tree and stack that, so only history reaches their content.
+    /// A keeper file stays, so the parcel is not empty.
+    fn drop_from_checkout(&self, paths: &[&str]) {
+        std::fs::write(self.root.join("keeper.txt"), "keeper\n").unwrap();
+        for path in paths {
+            forklift_core::util::file_utils::remove_file(self.root.join(path)).unwrap();
+        }
+        self.run_ok(&["load", "."]);
+        self.run_ok(&["stack", "-m", "drop"]);
+    }
+
     fn seal(&self, hashes: &[&str]) {
         let mut bytes = sealed_utils::header_bytes();
         for hash in hashes {
@@ -1326,6 +1337,8 @@ fn heal_pushes_a_present_recorded_trees_coverage_down() {
     let head = warehouse.stack_files(&[("dir/a.txt", "a\n"), ("dir/b.txt", "b\n")], "K");
 
     let (dir, a) = warehouse.scoped(|| (subtree(&head, "dir"), file_hash(&head, "dir/a.txt")));
+    // Eviction never frees a staged leaf, so a file held by hash alone is in history only.
+    warehouse.drop_from_checkout(&["dir/a.txt", "dir/b.txt"]);
     warehouse.delete_object(&a);
     warehouse.seal(&[&dir]);
 
@@ -1380,6 +1393,8 @@ fn a_damaged_record_names_heal_and_heal_rebuilds_it() {
     let head = warehouse.stack_files(&[("a.txt", "a\n"), ("b.txt", "b\n")], "K");
 
     let (a, b) = warehouse.scoped(|| (file_hash(&head, "a.txt"), file_hash(&head, "b.txt")));
+    // Eviction never frees a staged leaf, so a file held by hash alone is in history only.
+    warehouse.drop_from_checkout(&["a.txt", "b.txt"]);
     warehouse.delete_object(&a);
     let (bytes, at) = plant_damaged_record(&warehouse, &a, &b);
 
@@ -1400,7 +1415,10 @@ fn a_damaged_record_names_heal_and_heal_rebuilds_it() {
     warehouse.delete_object(&b);
     assert!(!warehouse.run(&["audit", "--full"]).status.success(), "b's record was dropped with the damage");
 
-    let human = warehouse.run_ok(&["heal"]);
+    // Nothing holds `b` now, so heal names it lost; the sound record is not rebuilt again.
+    let human = warehouse.run(&["heal"]);
+    assert_eq!(human.status.code(), Some(58), "{}", String::from_utf8_lossy(&human.stderr));
+    assert!(String::from_utf8_lossy(&human.stderr).contains(&b), "{}", String::from_utf8_lossy(&human.stderr));
     assert!(!String::from_utf8_lossy(&human.stdout).contains("rebuilt"), "a sound record is not rebuilt again");
 }
 

@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use regex::Regex;
+use crate::error::{CoreError, RefusalCode};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_GRAPH_ROOT, FOLDER_NAME_INVENTORY_ROOT, FOLDER_NAME_OBJECTS_ROOT};
 use crate::util::load_guard_utils;
@@ -2480,8 +2481,23 @@ pub(crate) enum StoreReadOutcome {
     /// read of this hash *will* fail the same way. (Except when it was produced inside a delta
     /// reconstruction, for another object's base: there the forced reload is left to the read that
     /// started the reconstruction — see [`read_object_classified`]. Every taint recheck and every
-    /// ordinary read a caller makes runs outside one.)
-    Unverifiable(String),
+    /// ordinary read a caller makes runs outside one.) The [`Unreadable`] says whether
+    /// `forklift heal` can act on it.
+    Unverifiable(String, Unreadable),
+}
+
+/// Why an [`StoreReadOutcome::Unverifiable`] read failed, as far as `forklift heal` is concerned:
+/// what [`read_object_uncached`] frames as [`RefusalCode::ObjectUnreadable`] and what it leaves
+/// untyped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unreadable {
+    /// A pack index heal acts on: one whose data file did not load (a quarantined pair), or one
+    /// with a corrupt bucket. Heal rebuilds such an index from its data file, or names what it
+    /// held as lost.
+    PackDamage,
+    /// Anything else: bytes at the address that do not rebuild to it (a corrupt loose file or
+    /// pack record), or an index of another format version.
+    Other,
 }
 
 /// The classifying read core (DESIGN.html §3.1.1): the single predicate [`read_object_uncached`]
@@ -2539,7 +2555,7 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
     match crate::util::pack_utils::retrieve_from_packs(hash)? {
         PackRetrieval::Verified(bytes) => return Ok(StoreReadOutcome::Verified(bytes)),
         PackRetrieval::NotLocated => {}
-        PackRetrieval::Failed(pack_error) => {
+        PackRetrieval::Failed(pack_error, cause) => {
             // Every pack that located the hash failed to resolve it. A verified loose copy at
             // this hash's own fan-out path legitimately wins here (see the doc comment above: no
             // *unverified* fall-through, not no fall-through at all) — try it before giving up.
@@ -2552,7 +2568,7 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
                 // the whole chain; reloading here as well, at every level, doubles the work per
                 // level — 2^depth reloads behind one corrupt chain root.
                 Ok(None) if crate::util::pack_utils::in_reconstruction() => {
-                    return Ok(StoreReadOutcome::Unverifiable(pack_error));
+                    return Ok(StoreReadOutcome::Unverifiable(pack_error, cause));
                 }
                 Err(loose_io) if crate::util::pack_utils::in_reconstruction() => {
                     return Err(format!(
@@ -2578,7 +2594,7 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
                     // below no longer shares it, since it revalidates rather than reloading.
                     return Ok(match crate::util::pack_utils::retrieve_from_packs_reloading(hash) {
                         Ok(PackRetrieval::Verified(bytes)) => StoreReadOutcome::Verified(bytes),
-                        _ => StoreReadOutcome::Unverifiable(pack_error),
+                        _ => StoreReadOutcome::Unverifiable(pack_error, cause),
                     });
                 }
                 Err(loose_io) => {
@@ -2632,10 +2648,10 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
                 // never consulted here — its hash set is unknown, so it can only ever change what
                 // gets surfaced (a later leg), never this verdict (I4).
                 Ok(PackRetrieval::NotLocated) => match crate::util::pack_utils::quarantine_reason(hash)? {
-                    Some(reason) => Ok(StoreReadOutcome::Unverifiable(reason)),
+                    Some((reason, cause)) => Ok(StoreReadOutcome::Unverifiable(reason, cause)),
                     None => Ok(StoreReadOutcome::Absent),
                 },
-                Ok(PackRetrieval::Failed(e)) => Ok(StoreReadOutcome::Unverifiable(e)),
+                Ok(PackRetrieval::Failed(e, cause)) => Ok(StoreReadOutcome::Unverifiable(e, cause)),
                 // The reload itself could not consult the store at all — an environment unknown,
                 // not a decisive verdict about this hash, so it must propagate as `Err` rather
                 // than being misclassified `Unverifiable` (a stale reload-registry conflation).
@@ -2651,14 +2667,14 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
     #[allow(clippy::disallowed_methods)]
     let bytes = match zstd::stream::decode_all(compressed.as_slice()) {
         Ok(bytes) => bytes,
-        Err(e) => return Ok(StoreReadOutcome::Unverifiable(format!("Error while decompressing object: {}", e))),
+        Err(e) => return Ok(StoreReadOutcome::Unverifiable(format!("Error while decompressing object: {}", e), Unreadable::Other)),
     };
 
     // Same content-addressing guarantee the pack path enforces: a corrupt loose file fails the
     // read rather than silently returning wrong bytes.
     Ok(match crate::util::object_utils::verify_object_bytes(hash, &bytes) {
         Ok(()) => StoreReadOutcome::Verified(bytes),
-        Err(e) => StoreReadOutcome::Unverifiable(e),
+        Err(e) => StoreReadOutcome::Unverifiable(e, Unreadable::Other),
     })
 }
 
@@ -2705,16 +2721,22 @@ fn read_loose_if_verified(hash: &str) -> Result<Option<Vec<u8>>, String> {
 /// A plain match over [`read_object_classified`] — not a parallel implementation of its own —
 /// which is what makes disagreement between an ordinary read and a taint recheck built on the
 /// same core structurally impossible (DESIGN.html §3.1.1).
+///
+/// The one place an ordinary read's failure gets its code: pack damage ([`Unreadable::PackDamage`])
+/// and an absence nothing else accounts for are framed [`RefusalCode::ObjectUnreadable`], whose
+/// next step is `forklift heal`. What heal cannot act on stays untyped: a content mismatch, an
+/// index of another format version, an absence a redaction or a withholding explains. Classified
+/// readers never see the frame, so a reason heal itself reports never embeds one.
 fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
     match read_object_classified(hash)? {
         StoreReadOutcome::Verified(bytes) => Ok(bytes),
-        StoreReadOutcome::Unverifiable(e) => Err(e),
+        StoreReadOutcome::Unverifiable(e, cause) => Err(unverifiable_read_error(hash, e, cause)),
         StoreReadOutcome::Absent => {
             // A cache warehouse fetches an object it holds by hash, then reads it as stored.
             if super::cache_miss::refill_recorded(hash)? {
                 return match read_object_classified(hash)? {
                     StoreReadOutcome::Verified(bytes) => Ok(bytes),
-                    StoreReadOutcome::Unverifiable(e) => Err(e),
+                    StoreReadOutcome::Unverifiable(e, cause) => Err(unverifiable_read_error(hash, e, cause)),
                     StoreReadOutcome::Absent => Err(format!(
                         "Object {} was fetched from the origin and stored, yet the store does not hold it.", hash
                     )),
@@ -2754,14 +2776,49 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
                 ),
                 Ok(_) => missing,
             };
-            Err(match unavailable {
+            let missing = match unavailable {
                 Err(record) => format!(
                     "{}. Whether its remote withholds it could not be told: {}", missing, record
                 ),
                 Ok(_) => missing,
-            })
+            };
+
+            // Pack files whose hash set is unknown may hold it; they never change the verdict
+            // (I4), only what the reader is told.
+            let holders = crate::util::pack_utils::unindexed_holders()?;
+            let missing = match holders.is_empty() {
+                true => missing,
+                false => format!(
+                    "{}. It may be in a pack file this read cannot use: {}",
+                    missing.trim_end_matches('.'),
+                    holders.iter().map(|path| format!("\"{}\"", path.to_string_lossy())).collect::<Vec<_>>().join(", ")
+                ),
+            };
+            Err(object_unreadable(missing))
         }
     }
+}
+
+/// The ordinary read's error for an [`StoreReadOutcome::Unverifiable`] outcome: framed
+/// [`RefusalCode::ObjectUnreadable`] for pack damage, `error` itself otherwise.
+fn unverifiable_read_error(hash: &str, error: String, cause: Unreadable) -> String {
+    match cause {
+        Unreadable::PackDamage => object_unreadable(format!("Object {} cannot be read: {}", hash, error)),
+        Unreadable::Other => error,
+    }
+}
+
+/// `message` framed as [`RefusalCode::ObjectUnreadable`]. A message already framed is a delta's
+/// base failing, which keeps its own code.
+fn object_unreadable(message: String) -> String {
+    if crate::error::deframe(&message).is_some() {
+        return message;
+    }
+    let message = match message.ends_with('.') {
+        true => message,
+        false => format!("{}.", message),
+    };
+    CoreError::refusal(RefusalCode::ObjectUnreadable, message, "forklift heal").into()
 }
 
 /// The read cache's byte budget. When the live generation reaches it, it is retired to the
@@ -7710,7 +7767,7 @@ mod tests {
         match read_object_classified(&hash).unwrap() {
             StoreReadOutcome::Verified(bytes) => assert_eq!(bytes, content,
                 "the good copy's bytes must be the ones served"),
-            StoreReadOutcome::Unverifiable(e) => panic!(
+            StoreReadOutcome::Unverifiable(e, _) => panic!(
                 "expected Verified via the Failed-path reload, got Unverifiable: {}", e
             ),
             StoreReadOutcome::Absent => panic!(
@@ -7812,7 +7869,7 @@ mod tests {
                         "[{:?}] a wrong-content loose file must never verify", case);
                     assert_eq!(bytes, content, "[{:?}] the verified loose copy's bytes", case);
                 }
-                StoreReadOutcome::Unverifiable(_) => {
+                StoreReadOutcome::Unverifiable(..) => {
                     assert!(matches!(case, LooseCopy::WrongContent),
                         "[{:?}] a correct loose copy must be served, not left Unverifiable", case);
                 }
@@ -7948,7 +8005,7 @@ mod tests {
                         "[{:?}] classified Verified but the ordinary read failed: {:?}", shape, ordinary);
                 }
                 Shape::CorruptLoose | Shape::PackedUnreconstructable => {
-                    assert!(matches!(classified, StoreReadOutcome::Unverifiable(_)),
+                    assert!(matches!(classified, StoreReadOutcome::Unverifiable(..)),
                         "[{:?}] expected Unverifiable, got a different classification", shape);
                     assert!(ordinary.is_err(),
                         "[{:?}] classified Unverifiable but the ordinary read succeeded", shape);

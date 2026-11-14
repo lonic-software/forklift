@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 45;
+pub const SCHEMA_VERSION: u32 = 46;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -591,6 +591,12 @@ error_codes! {
 
     /// A served warehouse's record of withheld content is lost or damaged.
     WithheldDamaged,
+
+    /// An object could not be read: no file holds it, or only a damaged pack index names it.
+    ObjectUnreadable,
+
+    /// Heal found objects the history reaches that cannot be read.
+    ObjectsLost,
 }
 
 impl ErrorCode {
@@ -652,6 +658,8 @@ impl ErrorCode {
             ErrorCode::FetchScopeDamaged => RefusalCode::FetchScopeDamaged.as_str(),
             ErrorCode::TombstonesDamaged => RefusalCode::TombstonesDamaged.as_str(),
             ErrorCode::WithheldDamaged => RefusalCode::WithheldDamaged.as_str(),
+            ErrorCode::ObjectUnreadable => RefusalCode::ObjectUnreadable.as_str(),
+            ErrorCode::ObjectsLost => RefusalCode::ObjectsLost.as_str(),
         }
     }
 
@@ -716,6 +724,8 @@ impl ErrorCode {
             ErrorCode::FetchScopeDamaged => 54,
             ErrorCode::TombstonesDamaged => 55,
             ErrorCode::WithheldDamaged => 56,
+            ErrorCode::ObjectUnreadable => 57,
+            ErrorCode::ObjectsLost => 58,
         }
     }
 
@@ -859,6 +869,10 @@ impl ErrorCode {
                 "A served warehouse's tombstone list or served mark is lost or damaged, so which deleted pallets' heads it keeps cannot be told. Nothing was changed, and nothing that frees history runs there; its operator repairs it with forklift-server tombstone repair while it is not served",
             ErrorCode::WithheldDamaged =>
                 "A served warehouse's record of withheld content is lost or damaged, so what its head withholds cannot be told. Nothing was served or changed; its operator repairs it with forklift-server withhold repair while it is not served",
+            ErrorCode::ObjectUnreadable =>
+                "An object could not be read: no file holds it, or the only pack index that names it is damaged or has lost its data file. Nothing was changed; heal rebuilds a damaged index from its data file, or names what is lost",
+            ErrorCode::ObjectsLost =>
+                "Heal found objects the history reaches that no file holds, or that only a pack index it could not rebuild names. Nothing was claimed repaired for them; restore them from a backup or a copy that holds them",
         }
     }
 
@@ -921,6 +935,8 @@ impl ErrorCode {
             RefusalCode::FetchScopeDamaged => ErrorCode::FetchScopeDamaged,
             RefusalCode::TombstonesDamaged => ErrorCode::TombstonesDamaged,
             RefusalCode::WithheldDamaged => ErrorCode::WithheldDamaged,
+            RefusalCode::ObjectUnreadable => ErrorCode::ObjectUnreadable,
+            RefusalCode::ObjectsLost => ErrorCode::ObjectsLost,
         }
     }
 }
@@ -1570,6 +1586,8 @@ mod tests {
             (RefusalCode::FetchScopeDamaged, "fetch_scope_damaged", 54),
             (RefusalCode::TombstonesDamaged, "tombstones_damaged", 55),
             (RefusalCode::WithheldDamaged, "withheld_damaged", 56),
+            (RefusalCode::ObjectUnreadable, "object_unreadable", 57),
+            (RefusalCode::ObjectsLost, "objects_lost", 58),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

@@ -70,7 +70,10 @@ unreachable. The request can be sent again after the wait. One `503` from forkli
 deleted pallets (and so which history it keeps for them) cannot be read, or `withheld_damaged`, one
 whose record of withheld content cannot be. It is refused, nothing changed, and waiting does not end
 it: the server's operator must repair the record, and `next_step` names the command with
-`<warehouse>` in place of the server's directory. The
+`<warehouse>` in place of the server's directory. `object_unreadable` is one too: an object the
+request needs sits in a damaged pack file in the server's store, and `next_step` names the operator's
+`forklift heal`, run where the warehouse is served from. The serverless head answers that case as a
+`500` whose body names no store path. The
 serverless head's `503`s are described with the endpoints that send them.
 
 **Refused for now, on either head:** a `429`, and a `503` that carries `Retry-After`, are

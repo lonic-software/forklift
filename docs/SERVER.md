@@ -396,6 +396,12 @@ revocation by more than about a day.
   as `gc` — it drops unreachable packed objects with no grace period at all — so it also
   belongs in the maintenance window. Plain `forklift store compact` (incremental) never drops an
   object and is safe beside a live server.
+- **Damaged packs:** a request that needs an object from a damaged pack file in the root's store
+  (a lost, cut-short or corrupt index, a missing data file, a damaged index entry) answers 503 with
+  `object_unreadable` and no `Retry-After`, and clients stop rather than retry. The log names the
+  file; the response does not. Run `forklift heal` in the root: it rebuilds a lost or damaged index
+  from its pack's data file. When the data file itself is lost or damaged, `heal` refuses with
+  `objects_lost`, naming what cannot be read; restore the root from a backup.
 - **Shutdown:** SIGINT/SIGTERM drain in-flight requests before exiting.
 
 ## Updating
