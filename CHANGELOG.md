@@ -12,6 +12,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **Losing the warehouse marker no longer loses the warehouse.** `.forklift/warehouse` now ends
+  in a digest of its own bytes and is kept twice, beside `.forklift/warehouse-copy`, each written
+  in turn. A marker that is deleted, truncated or damaged is read from its copy and rewritten at
+  the next command, where it used to make the folder "not a warehouse" (exit 3) with a way out
+  that set the store aside, or, when a changed byte still parsed, was read silently. Only when
+  both are missing is the folder not a warehouse; one that is present but unreadable is refused
+  as damaged. A warehouse made by an earlier unreleased build, whose marker carries no digest, is
+  refused and must be made again.
+
 - **A query predicate that could be read two ways is refused, never widened.** `forklift query
   --where`, and the MCP server's `query` tool, used to read a JSON object that named a key twice
   by its last spelling, so `{"all": [<filter>], "all": []}` matched every parcel. An empty

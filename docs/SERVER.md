@@ -65,9 +65,10 @@ not served either (`503` from a `--warehouses` server) until it is resumed or de
 A root is a warehouse only once `prepare` has marked it: its `.forklift` folder holds the
 warehouse marker, written last. `serve --root`, `bundle` and `gc` refuse any other root before
 touching it, and a `--warehouses` server answers `409` for a folder whose `.forklift` holds no
-marker. An empty `.forklift` is prepared with `forklift-server prepare --root …`. One with content
-but no marker dates from before warehouses were marked, or is not a warehouse: move it aside and
-prepare the root. A marker an older Forklift wrote, before the marker recorded what the warehouse
+marker. The marker is kept twice, as `warehouse` and `warehouse-copy`, and either one whole is
+enough: the other is rewritten from it when the warehouse is next opened. An empty `.forklift` is
+prepared with `forklift-server prepare --root …`. One with content but neither file is not a
+warehouse Forklift can open: move it aside and prepare the root. A marker an older Forklift wrote, before the marker recorded what the warehouse
 holds or its format, is refused too: prepare a new root. The new warehouse starts empty and holds
 only what clients lift into it again; nothing is carried over from the folder moved aside.
 

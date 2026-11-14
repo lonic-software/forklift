@@ -39,8 +39,9 @@ and bays.
 
 **Warehouse marker.** The file `.forklift/warehouse`, written last by `prepare`, which marks the
 folder as a complete warehouse rather than a half-built one, and records what it holds: everything
-(full), a sparse clone's paths (sparse), or what a cache has fetched so far (cache). A `.forklift/`
-folder without it is not a warehouse, and commands refuse to run there.
+(full), a sparse clone's paths (sparse), or what a cache has fetched so far (cache). It is kept
+twice, beside `.forklift/warehouse-copy`, so losing one file loses nothing. A `.forklift/` folder
+with neither is not a warehouse, and commands refuse to run there.
 
 **Parcel** (git: commit). One immutable recorded snapshot: a root tree, its parents, who made it,
 and a description. Facts learned later go into [post-metadata](#meta-pallets-and-metadata), never

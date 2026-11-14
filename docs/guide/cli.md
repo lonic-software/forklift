@@ -53,16 +53,18 @@ piece created.
 The last thing `prepare` writes is `.forklift/warehouse`, a marker saying the folder
 is a complete warehouse and what it holds: everything (`full`), or, for a clone
 made with `--only` or `--cache`, only part of it (`sparse` or `cache`). Nothing changes
-the mode afterwards. A marker written by an older Forklift, before it recorded the
-mode, is refused: make the warehouse again, by cloning it again or by preparing a
-new one and lowering its history into it. Every command needs the marker: a
-`.forklift/` without it is no warehouse, and commands run there refuse with
-`not_a_warehouse` (exit 3) and a next step that names the folder. An empty `.forklift/` is one `prepare` can take; when it
+the mode afterwards. The marker is kept twice, beside `.forklift/warehouse-copy`, and
+ends in a digest of its own bytes: a marker that is deleted or damaged is read from its
+copy and rewritten by the next command. A marker written by an older Forklift, before
+it carried a digest, is refused: make the warehouse again, by cloning it again or by
+preparing a new one and lowering its history into it. Every command needs the marker:
+a `.forklift/` with neither file is no warehouse, and commands run there refuse with
+`not_a_warehouse` (exit 3) and a next step that names the folder; one whose marker is
+damaged with no whole copy is refused as damaged, and never answered with `prepare`. An empty `.forklift/` is one `prepare` can take; when it
 sits inside another warehouse, the next step says to remove it first, so the folder
 uses that warehouse. `prepare` refuses a `.forklift/` with something in it but no
-marker, such as one made by a Forklift that did not mark warehouses yet: move it
-aside, run `prepare`, then import the history again (`git import`) or clone it
-again. It refuses a bay's folder too. A new `.forklift/` (or one that is there but empty) is built under the name
+marker or its copy: move it aside, run `prepare`, then import the history again
+(`git import <git-repository>`) or clone it again. It refuses a bay's folder too. A new `.forklift/` (or one that is there but empty) is built under the name
 `.forklift.tmp~<pid>-<n>` and renamed into place when it is complete, so an interrupted
 `prepare` leaves no half-built warehouse, only that folder. It is never tracked, and
 the next `prepare` in the same directory removes it; one it cannot tell is abandoned

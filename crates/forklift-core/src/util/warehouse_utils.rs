@@ -175,8 +175,8 @@ impl Head {
     pub(crate) fn recreate_step(self, forklift: &Path, root: &Path) -> String {
         match self {
             Head::Client => format!(
-                "Move \"{}\" aside, run {}, then import the history again (\"forklift git import <git \
-                repository>\") or clone it again; or, if it was a bay's, restore its redirect.",
+                "Move \"{}\" aside, run {}, then import the history again (\"forklift git import \
+                <git-repository>\") or clone it again; or, if it was a bay's, restore its redirect.",
                 forklift.to_string_lossy(), self.prepare_command(root)
             ),
             // A bay is never served, so its redirect is no way out here; and the old folder is refused
@@ -412,12 +412,12 @@ fn open_bay_warehouse(bay_root: &Path, redirect: &bay_utils::BayRedirect) -> Res
             Err(CoreError::refusal(
                 RefusalCode::NotAWarehouse,
                 format!(
-                    "The bay \"{}\" belongs to \"{}\", whose \"{}\" holds no warehouse marker.",
+                    "The bay \"{}\" belongs to \"{}\", whose \"{}\" holds neither a warehouse marker nor its copy.",
                     bay.to_string_lossy(), target.to_string_lossy(), FOLDER_NAME_FORKLIFT_ROOT
                 ),
                 format!(
                     "Re-create the warehouse at \"{}\" (move its \"{}\" aside, run \"forklift prepare\" there, \
-                    then import the history again with \"forklift git import\" or clone it again), then move \
+                    then import the history again with \"forklift git import <git-repository>\" or clone it again), then move \
                     \"{}\" aside and add the bay again with \"forklift bay add\" in \"{}\".",
                     target.to_string_lossy(), FOLDER_NAME_FORKLIFT_ROOT,
                     bay.to_string_lossy(), target.to_string_lossy()
@@ -791,8 +791,8 @@ fn decode_marker(bytes: &[u8], path: &Path, forklift: &Path) -> Result<Warehouse
     );
     let older = |what: &str| format!(
         "The warehouse marker \"{}\" was written by an older version of Forklift, before the marker {}, \
-        so Forklift does not use \"{}\". Make the warehouse again with this version: clone it again, or \
-        prepare a new one and lower its history into it.",
+        so Forklift does not use \"{}\". No upgrade reaches back that far. Make the warehouse again with \
+        this version: clone it again, or prepare a new one and lower its history into it.",
         path.to_string_lossy(), what, forklift.to_string_lossy()
     );
 
@@ -1724,6 +1724,74 @@ mod tests {
             assert_eq!(read_warehouse_marker(&forklift), Ok(Some(mode)));
             assert_eq!(bay_utils::classify_forklift(&forklift), Ok(bay_utils::ForkliftKind::Warehouse));
         }
+
+        file_utils::remove_dir_all(&root).ok();
+    }
+
+    /// Each file fault on one file of the marker pair is read through its twin and healed back to
+    /// it; the same fault beside an absent twin, or on both files, is an error, never no marker.
+    ///
+    /// Revert: drop the copy fallback → a faulted primary is an error → red; take an unusable file
+    /// beside an absent one for none → the lone fault reads as no marker → red.
+    #[test]
+    fn a_fault_on_one_marker_file_is_read_through_its_twin() {
+        let root = fresh_dir("marker-pair");
+        let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir_all(&forklift).unwrap();
+        let marker = WarehouseMarker { format: WAREHOUSE_FORMAT, mode: "full".to_string(), upgrade: None };
+        let good = encode_marker(&marker);
+        let lay = |name: &str, bytes: Option<Vec<u8>>| match bytes {
+            Some(bytes) => std::fs::write(forklift.join(name), bytes).unwrap(),
+            None => file_utils::remove_file(forklift.join(name)).unwrap(),
+        };
+        type Fault = fn(&[u8]) -> Option<Vec<u8>>;
+        let faults: [(&str, Fault); 5] = [
+            ("delete", |_| None),
+            ("flip", |bytes| { let mut bytes = bytes.to_vec(); let middle = bytes.len() / 2; bytes[middle] ^= 1; Some(bytes) }),
+            ("truncate", |bytes| Some(bytes[..bytes.len() / 2].to_vec())),
+            ("zero", |bytes| Some(vec![0; bytes.len()])),
+            ("empty", |_| Some(Vec::new())),
+        ];
+        let (primary, copy) = (FILE_NAME_WAREHOUSE_MARKER, FILE_NAME_WAREHOUSE_MARKER_COPY);
+
+        for (fault, damage) in faults {
+            for (hit, twin) in [(primary, copy), (copy, primary)] {
+                write_marker(&forklift, &marker).unwrap();
+                lay(hit, damage(&good));
+                let pair = read_marker_pair(&forklift).unwrap();
+                assert_eq!(pair.chosen, Some((marker.clone(), good.clone())), "{} on {}", fault, hit);
+                assert_eq!(pair.stale, vec![hit], "{} on {}", fault, hit);
+                heal_marker_pair(&forklift, &good, &pair.stale);
+                assert_eq!(std::fs::read(forklift.join(hit)).unwrap(), good, "{} on {} healed", fault, hit);
+
+                lay(twin, None);
+                lay(hit, damage(&good));
+                match damage(&good) {
+                    None => assert!(read_marker_pair(&forklift).unwrap().chosen.is_none(), "both deleted"),
+                    Some(_) => {
+                        assert!(read_marker_pair(&forklift).is_err(), "{} on {} beside an absent twin", fault, hit);
+                        lay(twin, damage(&good));
+                        assert!(read_marker_pair(&forklift).is_err(), "{} on both", fault);
+                    }
+                }
+            }
+        }
+
+        // Both valid and differing, as a stop between the copy's write and the primary's leaves them:
+        // the primary is the marker and the copy is brought back to it, whichever is the later.
+        let upgrading = WarehouseMarker { upgrade: Some(MarkerUpgrade { target: WAREHOUSE_FORMAT + 1, step: 1 }), ..marker.clone() };
+        for (in_primary, in_copy) in [(&marker, &upgrading), (&upgrading, &marker)] {
+            lay(primary, Some(encode_marker(in_primary)));
+            lay(copy, Some(encode_marker(in_copy)));
+            let pair = read_marker_pair(&forklift).unwrap();
+            assert_eq!(pair.chosen.map(|(chosen, _)| chosen).as_ref(), Some(in_primary));
+            assert_eq!(pair.stale, vec![copy]);
+        }
+
+        // A marker from before the digest stands in for no missing twin.
+        lay(primary, None);
+        lay(copy, Some(b"/forklift-warehouse 3\nformat 1\nfull\n".to_vec()));
+        assert!(read_marker_pair(&forklift).unwrap_err().contains("carried a digest"));
 
         file_utils::remove_dir_all(&root).ok();
     }

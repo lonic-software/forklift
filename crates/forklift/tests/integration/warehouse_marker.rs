@@ -239,7 +239,7 @@ fn a_bay_of_an_unmarked_warehouse_is_refused_and_nothing_is_written() {
         let refusal = area.refused(&bay, args);
         assert_eq!(
             refusal.message,
-            format!("The bay {} belongs to {}, whose \".forklift\" holds no warehouse marker.", quoted(&bay), quoted(&root)),
+            format!("The bay {} belongs to {}, whose \".forklift\" holds neither a warehouse marker nor its copy.", quoted(&bay), quoted(&root)),
             "{:?}", args
         );
         // Prepare's remedy alone would leave a warehouse that does not know the bay.
@@ -247,7 +247,7 @@ fn a_bay_of_an_unmarked_warehouse_is_refused_and_nothing_is_written() {
             refusal.next_step,
             format!(
                 "Re-create the warehouse at {} (move its \".forklift\" aside, run \"forklift prepare\" there, then \
-                import the history again with \"forklift git import\" or clone it again), then move {} aside and add \
+                import the history again with \"forklift git import <git-repository>\" or clone it again), then move {} aside and add \
                 the bay again with \"forklift bay add\" in {}.",
                 quoted(&root), quoted(&bay), quoted(&root)
             ),
@@ -389,7 +389,7 @@ fn the_server_prints_a_refusal_without_its_frame() {
     // The root as the server resolved it (canonical: on Windows, with the verbatim prefix).
     let (message, next_step) = stderr.split_once('\n').expect("a message line");
     assert!(message.starts_with('"') && message.ends_with(&format!(
-        "{}\" holds no warehouse marker: it was made before warehouses were marked, or is not a warehouse.",
+        "{}\" holds neither a warehouse marker nor its copy, so it is not a warehouse Forklift can open.",
         std::path::MAIN_SEPARATOR_STR.to_string() + FOLDER_NAME_FORKLIFT_ROOT
     )), "{:?}", stderr);
     assert!(next_step.starts_with("Next step: Move "), "{:?}", stderr);
@@ -889,4 +889,64 @@ fn the_server_upgrades_only_a_warehouse_it_is_not_serving() {
     let older = upgrade();
     assert!(!older.status.success());
     assert!(text(&older.stderr).contains("\"forklift-server prepare\""), "{}", text(&older.stderr));
+}
+
+/// The three faults that used to cost a warehouse: a deleted marker (refused as no warehouse, with
+/// a way out that set the store aside), a format changed from 1 to 7 (refused as newer), and a mode
+/// changed from `full` to `cache` (read silently). Each is now read through the copy and rewritten
+/// by the next command, which runs as it would have.
+///
+/// Revert: drop the copy fallback → the deleted marker is "not a warehouse" again (exit 3) → red;
+/// drop the digest check → the flipped format is refused as newer → red.
+#[test]
+fn a_faulted_marker_is_read_through_its_copy_and_rewritten() {
+    let area = Area::new("faulted");
+    let root = area.warehouse("w");
+    let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+    let (marker, copy) = (forklift.join("warehouse"), forklift.join("warehouse-copy"));
+    let whole = std::fs::read(&marker).unwrap();
+    assert_eq!(std::fs::read(&copy).unwrap(), whole, "both files are written");
+
+    for (fault, target) in [("deleted", &marker), ("format 1 to 7", &marker), ("full to cache", &marker), ("deleted", &copy),
+                            ("format 1 to 7", &copy), ("full to cache", &copy)] {
+        match fault {
+            "deleted" => std::fs::remove_file(target).unwrap(),
+            "format 1 to 7" => std::fs::write(target, text(&whole).replace("format 1\n", "format 7\n")).unwrap(),
+            _ => std::fs::write(target, text(&whole).replace("\nfull\n", "\ncache\n")).unwrap(),
+        }
+        area.run_ok(&root, &["load", "."]);
+        area.run_ok(&root, &["history"]);
+        assert_eq!(std::fs::read(&marker).unwrap(), whole, "{} in {:?}: the marker is rewritten", fault, target);
+        assert_eq!(std::fs::read(&copy).unwrap(), whole, "{} in {:?}: the copy is rewritten", fault, target);
+    }
+}
+
+/// With the copy gone too, the changed format and the changed mode are refused as damage, and
+/// never read as a newer warehouse or a cache; what the refusal points to works from that state.
+///
+/// Revert: drop the digest check → the changed format is refused as newer (exit 41) and the changed
+/// mode is read as a cache → red.
+#[test]
+fn a_changed_marker_with_no_copy_is_refused_as_damaged() {
+    let area = Area::new("changed");
+    let root = area.warehouse("w");
+    let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+    let marker = forklift.join("warehouse");
+    let whole = text(&std::fs::read(&marker).unwrap());
+    std::fs::remove_file(forklift.join("warehouse-copy")).unwrap();
+
+    for changed in [whole.replace("format 1\n", "format 7\n"), whole.replace("\nfull\n", "\ncache\n")] {
+        std::fs::write(&marker, &changed).unwrap();
+        let before = listing(&root);
+        for args in [&["load", "."][..], &["history"], &["heal"], &["prepare"]] {
+            let output = area.run(&root, &[&["--json"][..], args].concat());
+            assert!(!output.status.success(), "{:?} over {:?}", args, changed);
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let message = value["error"]["message"].as_str().unwrap();
+            assert!(message.contains("is damaged: it does not match its digest"), "{:?}: {}", args, value);
+            assert_ne!(value["error"]["code"], "warehouse_format_newer", "{:?}: {}", args, value);
+            assert!(!value["error"]["next_step"].as_str().unwrap_or("").contains("prepare"), "{:?}: {}", args, value);
+        }
+        assert_eq!(listing(&root), before, "a refused command writes nothing");
+    }
 }
