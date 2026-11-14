@@ -940,8 +940,8 @@ mod tests {
     /// position from its unit's start: the injecting trace is attached then, so an earlier call of
     /// the name neither moves it nor steals it.
     ///
-    /// Revert: drop the origin from the counter → the second request's write is #2 and the first
-    /// request's thread steals it; count only traced clones → the pooled thread's calls vanish.
+    /// Revert: drop the origin from the counter → the first request's thread steals the second's
+    /// point; count only traced clones → the pooled thread's calls vanish.
     #[test]
     fn a_served_point_counts_from_its_unit_start() {
         let text = "\
