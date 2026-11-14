@@ -9120,7 +9120,7 @@ fn a_read_outside_the_fetch_scope_names_the_fetch_that_reaches_it() {
 
     let error = refused(&["show", "main:docs/guide.md"]);
     assert_eq!(error["next_step"], "forklift scope fetch docs", "{}", error);
-    assert!(error["message"].as_str().unwrap().contains("docs/guide.md"), "{}", error);
+    assert!(error["message"].as_str().unwrap().contains("reading it needs \"docs\""), "{}", error);
     let error = refused(&["redact", "record", "main:docs/guide.md", "-m", "x"]);
     assert_eq!(error["next_step"], "forklift scope fetch docs", "{}", error);
 
@@ -9167,6 +9167,12 @@ fn a_read_outside_the_fetch_scope_names_the_fetch_that_reaches_it() {
     forklift_core::util::file_utils::remove_file(object_store_path(&area, "sparse", &src)).unwrap();
     let output = area.forklift("sparse", &["--json", "show", "main:src/lib.rs"]);
     assert_eq!(json_of(&output)["error"]["code"], "object_unreadable", "{}", stdout(&output));
+
+    // A fetch scope that cannot be read is what the refusal reports, not the read's lost object.
+    std::fs::write(area.path("sparse/.forklift/config/fetch-scope"), b"\xff\xfe").unwrap();
+    let output = area.forklift("sparse", &["--json", "show", "main:top.txt"]);
+    let message = json_of(&output)["error"]["message"].as_str().unwrap().to_string();
+    assert!(message.contains("fetch-scope"), "{}", message);
 }
 
 #[test]

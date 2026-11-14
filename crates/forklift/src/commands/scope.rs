@@ -27,7 +27,8 @@ pub fn ensure_path_in_scope(key: &str) -> Result<(), CoreError> {
 /// with a fetched path, a path that does not exist) is never refused. Only an `object_unreadable`
 /// is told again, and only when the path leaves the fetch scope and every tree above that point
 /// loads: a lost tree that should be here stays damage.
-/// Every other error, and every error in a warehouse that is not sparse, is returned as it is.
+/// Every other error, and every error in a warehouse that is not sparse, is returned as it is; a
+/// fetch scope that cannot be read is returned in its place.
 ///
 /// # Arguments
 /// * `root_tree` - The root tree of the revision the read walked.
@@ -38,9 +39,11 @@ pub fn explain_unfetched(root_tree: &str, path: &str, error: String) -> String {
         return error;
     }
 
+    // A fetch scope that cannot be read is the problem to report, never hidden behind the read's.
     match unfetched_refusal(root_tree, path) {
         Ok(Some(refusal)) => refusal,
-        _ => error,
+        Ok(None) => error,
+        Err(scope_error) => scope_error,
     }
 }
 
@@ -88,8 +91,9 @@ fn unfetched_refusal(root_tree: &str, path: &str) -> Result<Option<String>, Stri
     Ok(Some(CoreError::refusal(
         RefusalCode::OutOfScope,
         format!(
-            "The path \"{}\" is outside this warehouse's fetch scope, so its content was never fetched.",
-            key
+            "The path \"{}\" is outside this warehouse's fetch scope: reading it needs \"{}\", which was \
+            never fetched.",
+            key, components[..depth].join("/")
         ),
         next_step,
     ).into()))
