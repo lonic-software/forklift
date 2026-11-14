@@ -2167,6 +2167,21 @@ mod tests {
     /// Withheld content holds a file's content only, below an applied redaction of the same hash
     /// and above the record: both of the others are read beside it.
     ///
+    /// An absent hash met first as a chunk and then as a file is a file's content a host may have
+    /// withheld, not only damage to the store.
+    /// Revert: drop the `Met::Again` file arm of `meet` → the file never joins `absent_files` → red.
+    #[test]
+    fn an_absent_chunk_met_again_as_a_file_is_an_absent_file() {
+        let (_root, _scope) = scratch("met-again-as-file");
+        let hash = "7".repeat(64);
+        let tolerated = Tolerated::default();
+        let mut walked = Walked::default();
+        assert!(matches!(walked.meet(&hash, At::Chunk, &tolerated, Unrecorded::Boundary).unwrap(), Met::Absent));
+        assert!(walked.absent_files.is_empty());
+        assert!(matches!(walked.meet(&hash, At::File, &tolerated, Unrecorded::Boundary).unwrap(), Met::Again));
+        assert!(walked.absent_files.contains(&hash), "the same bytes are a file's content too");
+    }
+
     /// Revert: drop the withheld arm of `held` → the withheld-only hash is held by nothing → red;
     /// look it up before the applied set → the redacted hash reads as withheld → red.
     #[test]
