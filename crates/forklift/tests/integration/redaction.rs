@@ -2903,6 +2903,123 @@ fn a_server_withholds_content_on_its_hosts_statement_while_it_serves() {
     assert_eq!(withhold(&server.root, &["list"]).stdout, listed.stdout);
 }
 
+/// The raw response to a `GET` of `path`: status line, headers and body.
+fn http_raw(url: &str, path: &str) -> String {
+    use std::io::{Read, Write};
+
+    let address = url.strip_prefix("http://").unwrap();
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    write!(stream, "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, address).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+/// A served root whose record of withheld content is lost or damaged never serves the content it
+/// withheld, nor answers as if nothing were withheld: every request that reads the record, the
+/// handshake and a read of the content alike, is a `503` `withheld_damaged` naming the operator's
+/// repair, with no `Retry-After` and no path of the server's; a clone of it exits 56 and is told
+/// to ask the operator. The repair keeps a hash whose entry lost its statement
+/// withheld, and lists content a lost entry withheld whose copy the server already deleted.
+///
+/// Revert: read a missing record as nothing withheld → the content still stored is a `200`;
+/// leave the damage uncoded → a `500` naming the server's path; drop the client's arm → the next
+/// step is the operator's command alone; drop the placeholder → the content is served again after
+/// the repair; drop the walk → the deleted content is not listed.
+#[test]
+fn a_served_root_whose_withheld_record_is_lost_or_damaged_refuses_until_its_operator_repairs_it() {
+    let root = std::env::temp_dir().join(format!("forklift-withheld-damaged-{}", std::process::id()));
+    // A killed server leaves its serve lock behind; no process holds it.
+    let stop = |server: Server| {
+        drop(server);
+        forklift_core::util::file_utils::remove_file(root.join(".forklift/serve.lock")).unwrap();
+    };
+    let record = root.join(".forklift/withheld");
+    let server = Server::start(&root);
+
+    let owner = Warehouse::cloned("withheld-damaged-owner", &server.url);
+    let film = b"leaked film 4\n";
+    owner.stack("film.mkv", film, "film");
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+    let film = hash_of(film);
+    stop(server);
+
+    // Withheld while nothing serves the root, so its copy is still stored, and then lost.
+    let added = withhold(&root, &["add", &film, "--statement", "court order 2026-90"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    std::fs::remove_file(&record).unwrap();
+
+    let refuses = |server: &Server, what: &str| {
+        for path in ["/v1/warehouse".to_string(), format!("/v1/objects/{}", film)] {
+            let response = http_raw(&server.url, &path);
+            let (head, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(head.starts_with("HTTP/1.1 503"), "{} {}: {}", what, path, response);
+            assert!(!head.to_ascii_lowercase().contains("retry-after"), "{} {}: {}", what, path, head);
+            assert!(body.contains(r#""code":"withheld_damaged""#), "{} {}: {}", what, path, body);
+            assert!(body.contains("forklift-server withhold repair --root <warehouse>"), "{} {}: {}", what, path, body);
+            assert!(!body.contains(&*root.to_string_lossy()), "{} {}: no server path: {}", what, path, body);
+        }
+    };
+
+    let server = Server::serve(&root);
+    refuses(&server, "lost");
+
+    // Damaged: the film's entry cut inside its digest column.
+    std::fs::write(&record, format!("/forklift-withheld 2\n{} 1", film)).unwrap();
+    refuses(&server, "damaged");
+
+    let clone = Warehouse::empty("withheld-damaged-clone");
+    let cloned = forklift_command()
+        .args(["--json", "clone", &server.url, clone.root.to_str().unwrap()])
+        .env("FORKLIFT_GLOBAL_CONFIG", clone.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", clone.home.join("keys"))
+        .output().unwrap();
+    assert_eq!(cloned.status.code(), Some(56), "{}{}", String::from_utf8_lossy(&cloned.stdout), String::from_utf8_lossy(&cloned.stderr));
+    let error = &serde_json::from_slice::<serde_json::Value>(&cloned.stdout).unwrap()["error"];
+    assert_eq!(error["code"], "withheld_damaged", "{}", error);
+    let next_step = error["next_step"].as_str().unwrap();
+    assert!(next_step.starts_with("Ask the remote's operator"), "{}", error);
+    assert!(next_step.contains("forklift-server withhold repair --root <warehouse>"), "{}", error);
+
+    // The repair refuses while the root is served, then keeps the film withheld under a placeholder.
+    let refused = withhold(&root, &["repair"]);
+    assert!(!refused.status.success(), "{:?}", refused);
+    stop(server);
+    let repaired = withhold(&root, &["repair"]);
+    assert!(repaired.status.success(), "{}", String::from_utf8_lossy(&repaired.stderr));
+    let report = String::from_utf8_lossy(&repaired.stdout).into_owned();
+    assert!(report.contains(&format!("forklift-server withhold add {} <statement>", film)), "{}", report);
+
+    let server = Server::serve(&root);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let state = loop {
+        let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+        // The deletion drains the warehouse: a handshake meanwhile is refused for now.
+        if status.starts_with("HTTP/1.1 200") {
+            let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+            assert_eq!(info["withheld"][0]["hash"], film.as_str(), "{}", info);
+            assert_eq!(info["withheld"][0]["statement"], forklift_core::util::withheld_repair::PLACEHOLDER_STATEMENT, "{}", info);
+            if info["withheld"][0]["state"] == "deleted" {
+                break info;
+            }
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for the deletion: {} / {}", status, info);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let (status, body) = http(&server.url, "GET", &format!("/v1/objects/{}", film), b"");
+    assert!(status.starts_with("HTTP/1.1 451"), "{} / {} after {}", status, body, state);
+
+    // Lost again once its copy is deleted: the repair lists the content history names and lacks.
+    stop(server);
+    std::fs::remove_file(&record).unwrap();
+    let repaired = withhold(&root, &["repair"]);
+    assert!(repaired.status.success(), "{}", String::from_utf8_lossy(&repaired.stderr));
+    let report = String::from_utf8_lossy(&repaired.stdout).into_owned();
+    assert!(report.contains(&format!("  {}", film)), "{}", report);
+}
+
 /// A takedown deletes the copy on a served root, though the head still names the file: the server
 /// notices the record the withhold command wrote and deletes the copy, then rebuilds the bundle
 /// the takedown withdrew. One withheld while nothing serves the root is deleted, and the bundle
