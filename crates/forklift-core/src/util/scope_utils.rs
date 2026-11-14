@@ -299,17 +299,15 @@ impl PathScope {
                 sparse checkouts left out the ignore files, so it cannot be read safely. {}",
                 remedy
             ),
-            RecordError::OtherVersion(ref header) => {
-                if !is_newer_header(header) {
-                    format!(
-                        "{} An older version of Forklift wrote it, whose sparse checkouts left out \
-                        ignore files this one holds in scope. {}",
-                        e.describe(), remedy
-                    )
-                } else {
-                    format!("{} Use the Forklift that wrote it.", e.describe())
-                }
-            }
+            RecordError::OtherVersion(ref header) => match header_version(header) {
+                Some(version) if version > SCOPE_VERSION => format!("{} Use the Forklift that wrote it.", e.describe()),
+                Some(_) => format!(
+                    "{} An older version of Forklift wrote it, whose sparse checkouts left out \
+                    ignore files this one holds in scope. {}",
+                    e.describe(), remedy
+                ),
+                None => format!("{} Its version cannot be read, so it is damaged. {}", e.describe(), remedy),
+            },
             _ => format!("{} {}", e.describe(), remedy),
         })?;
 
@@ -330,9 +328,12 @@ impl PathScope {
 /// Whether a scope header names a version newer than this build's. A header whose version cannot
 /// be read is not newer: no Forklift wrote it.
 fn is_newer_header(header: &str) -> bool {
-    header.rsplit(' ').next()
-        .and_then(|version| version.trim().parse::<u32>().ok())
-        .is_some_and(|version| version > SCOPE_VERSION)
+    header_version(header).is_some_and(|version| version > SCOPE_VERSION)
+}
+
+/// The version a scope file's header names, if it can be read as one.
+fn header_version(header: &str) -> Option<u32> {
+    header.rsplit(' ').next().and_then(|version| version.trim().parse::<u32>().ok())
 }
 
 /// A scope file as `heal` reads it: on its own, never against the warehouse's mode or another
@@ -546,7 +547,7 @@ fn mode_kind(mode: WarehouseMode) -> &'static str {
 /// # Arguments
 /// * `name` - The bay's name (as listed by `bay_utils::list_bays`).
 pub fn read_bay_scope(name: &str) -> Result<PathScope, String> {
-    read_bay_scope_at(&crate::util::bay_utils::bay_state_dir(name).join(FILE_NAME_BAY_SCOPE))
+    read_bay_scope_at(&named_bay_scope_path(name))
 }
 
 fn read_bay_scope_at(path: &Path) -> Result<PathScope, String> {
@@ -584,7 +585,7 @@ fn read_bay_scope_at(path: &Path) -> Result<PathScope, String> {
 /// cannot make the main tree read as holding every path.
 pub fn read_main_tree_scope() -> Result<PathScope, String> {
     let (mode, fetch) = read_fetch_state()?;
-    let path = globals::forklift_root().join(FILE_NAME_BAY_SCOPE);
+    let path = main_tree_scope_path();
 
     if mode != WarehouseMode::Sparse {
         if !scope_file_is_present(&path)? {
@@ -996,6 +997,22 @@ pub fn refuse_if_over_object_ceiling(what: &str, len: usize) -> Result<(), CoreE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A header whose version cannot be read is damaged, never "written by an older Forklift", and
+    /// names the remedy; an older version names it as older, and a newer one names no remedy.
+    ///
+    /// Revert: send an unreadable version down the older arm, or the newer arm → red.
+    #[test]
+    fn a_header_version_is_read_as_older_newer_or_damaged() {
+        let damaged = PathScope::from_bytes(b"/forklift-scope x7\ndocs\n", "REMEDY").unwrap_err();
+        assert!(damaged.contains("damaged") && damaged.contains("REMEDY") && !damaged.contains("older version"), "{}", damaged);
+
+        let older = PathScope::from_bytes(b"/forklift-scope 2\ndocs\n", "REMEDY").unwrap_err();
+        assert!(older.contains("An older version") && older.contains("REMEDY"), "{}", older);
+
+        let newer = PathScope::from_bytes(format!("/forklift-scope {}\ndocs\n", SCOPE_VERSION + 1).as_bytes(), "REMEDY").unwrap_err();
+        assert!(newer.contains("Use the Forklift that wrote it") && !newer.contains("REMEDY"), "{}", newer);
+    }
 
     #[test]
     fn full_scope_classifies_everything_in_scope() {

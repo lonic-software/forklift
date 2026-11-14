@@ -270,7 +270,7 @@ fn ref_refusal(report: &HealReport) -> CoreError {
 }
 
 fn scope_sentence(rebuilt: &ScopeRebuilt) -> String {
-    let prefixes = rebuilt.scope.iter().map(|prefix| format!("\"{}\"", prefix)).collect::<Vec<_>>().join(", ");
+    let prefixes = scope_heal::listed(&rebuilt.scope);
 
     let mut sentence = match rebuilt.chosen {
         true => format!(

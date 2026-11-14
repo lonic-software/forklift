@@ -141,18 +141,15 @@ fn read_fetch_file() -> Result<FetchFile, String> {
 type Checkouts = (Vec<(String, PathScope)>, Vec<Unread>);
 
 /// The checkouts' scopes: those that parse and name a path, and the rest with why. A bays folder
-/// that cannot be listed leaves only the working tree, with the bays noted as unread.
+/// that cannot be listed is an error: the fetch scope is never judged against only some checkouts.
 fn checkout_scopes() -> Result<Checkouts, String> {
     let mut checkouts: Vec<(String, PathBuf)> = vec![
         ("the warehouse's own working tree".to_string(), scope_utils::main_tree_scope_path()),
     ];
     let mut unread: Vec<Unread> = Vec::new();
 
-    match bay_utils::list_bays() {
-        Ok(bays) => checkouts.extend(bays.into_iter()
-            .map(|name| (format!("bay \"{}\"", name), scope_utils::named_bay_scope_path(&name)))),
-        Err(error) => unread.push(Unread { checkout: "the bays".to_string(), reason: error }),
-    }
+    let bays = bay_utils::list_bays().map_err(|error| format!("{}. Nothing was changed.", error.trim_end_matches('.')))?;
+    checkouts.extend(bays.into_iter().map(|name| (format!("bay \"{}\"", name), scope_utils::named_bay_scope_path(&name))));
 
     let mut read: Vec<(String, PathScope)> = Vec::new();
 
@@ -222,8 +219,9 @@ fn check_history_at(scope: &PathScope) -> Result<(), String> {
 fn fetch_scope_command(scope: &PathScope) -> String {
     let mut command = "forklift heal".to_string();
 
+    // A path that starts with "-" would be read as an option on its own, so it goes after "=".
     for prefix in scope.prefixes() {
-        command.push_str(" --fetch-scope ");
+        command.push_str(if prefix.starts_with('-') { " --fetch-scope=" } else { " --fetch-scope " });
         command.push_str(&shell_word(prefix));
     }
 
@@ -261,7 +259,8 @@ fn describe_read(read: &[(String, PathScope)]) -> Vec<ReadScope> {
     read.iter().map(|(checkout, scope)| ReadScope { checkout: checkout.clone(), scope: scope.prefixes().to_vec() }).collect()
 }
 
-fn listed(prefixes: &[String]) -> String {
+/// `prefixes` quoted and joined with commas, as a sentence names them.
+pub fn listed(prefixes: &[String]) -> String {
     prefixes.iter().map(|prefix| format!("\"{}\"", prefix)).collect::<Vec<_>>().join(", ")
 }
 
@@ -311,6 +310,11 @@ pub fn repair() -> Result<Option<ScopeRebuilt>, CoreError> {
     }
 
     let fetch = read_fetch_file()?;
+
+    if matches!(fetch, FetchFile::Newer) {
+        return Ok(None);
+    }
+
     let (read, unread) = checkout_scopes()?;
 
     let was = match fetch {
@@ -537,4 +541,20 @@ pub async fn set_chosen(prefixes: &[String], _exclusive: &StoreAccessExclusive) 
         left_out: unread,
         fetched_objects: walk.fetched_objects(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A path that starts with "-" goes after "=", so the step is not read as another option; one
+    /// a shell would split is quoted.
+    ///
+    /// Revert: write every path after a space → red.
+    #[test]
+    fn a_fetch_scope_step_keeps_each_path_one_value() {
+        let scope = PathScope::from_prefixes(["-build", "docs", "my docs"]);
+
+        assert_eq!(fetch_scope_command(&scope), "forklift heal --fetch-scope=-build --fetch-scope docs --fetch-scope 'my docs'");
+    }
 }
