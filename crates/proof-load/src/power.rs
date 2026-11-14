@@ -1621,6 +1621,16 @@ pub struct ScenarioPower {
     pub crashes: Vec<GradedCrash>,
 }
 
+/// Why `scenario`'s power loss cannot be graded, if it cannot. A crash is graded acknowledged only
+/// once the last line exited, but the record's own lines acknowledge it before any line the
+/// scenario runs after them: a state past them would be graded as owing nothing.
+pub fn not_run(scenario: &Scenario) -> Option<String> {
+    if !scenario.then.is_empty() {
+        return Some("runs lines after its record, and a crash past the record's own lines would not be graded as acknowledged".to_string());
+    }
+    None
+}
+
 /// Grades every state a power loss during `scenario`'s faulted command can leave, `variants`
 /// seeded ones among them, from the run [`kill::count`] counted in `template` with its writes
 /// dumped. Each state is written into its own area beside the template, `<template>-power-<n>`.
@@ -1633,11 +1643,8 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
             return Ok(power);
         }
     };
-    // A crash is graded acknowledged only once the last line exited, but the record's own lines
-    // acknowledge it before any line the scenario runs after them: a state past them would be
-    // graded as owing nothing.
-    if !scenario.then.is_empty() {
-        power.not_run = Some("runs lines after its record, and a crash past the record's own lines would not be graded as acknowledged".to_string());
+    if let Some(reason) = not_run(scenario) {
+        power.not_run = Some(reason);
         return Ok(power);
     }
     let (points, _, refusals) = kill::points_of(counted, settings.schema);
@@ -2641,6 +2648,128 @@ mod tests {
         assert!(crashes.iter().all(|crash| data(&crash.image, "w/a").unwrap() == b"old"));
         let trails: Vec<(usize, bool)> = crashes.iter().map(|crash| crash.moment.trail()).collect();
         assert_eq!(trails, [(0, true), (1, false), (1, true), (2, false)]);
+    }
+
+    /// A file system that commits metadata in order but allocates data late leaves the calls'
+    /// names with each file's synced bytes: a new file empty, a renamed one under its new name
+    /// with what it held, a rewritten one cut where its truncate cut it.
+    ///
+    /// Revert: take the bytes from the volatile state → `b` holds `bb`; ignore the cut → `a` comes
+    /// back `old` though its truncate landed.
+    #[test]
+    fn the_ordered_state_has_the_calls_names_and_the_synced_bytes() {
+        let created = format!("1 openat(AT_FDCWD</s/w>, \"b\", O_WRONLY|O_CREAT|O_EXCL, 0644) = 3</s/w/b>\n{}1 close(3</s/w/b>) = 0\n1 rename(\"a\", \"c\") = 0\n",
+            write(1, 3, "/s/w/b", b"bb"));
+        let model = replayed(&[created]).unwrap();
+        let ordered = model.ordered_image();
+        assert_eq!(data(&ordered, "w/b").unwrap(), b"");
+        assert_eq!(data(&ordered, "w/c").unwrap(), b"old");
+        assert!(!ordered.contains_key("w/a"));
+        assert!(model.durable_image().contains_key("w/a"));
+        let ordered = replayed(&[rewrite(false)]).unwrap().ordered_image();
+        assert_eq!(data(&ordered, "w/a").unwrap(), b"");
+    }
+
+    /// No torn form loses a synced byte: below the synced length, or a truncate's cut since the
+    /// sync, every form holds what was synced; a form the same as the synced file is left out.
+    ///
+    /// Revert: floor every form at 0 → an appended file tears to `ol`; drop the cut from the floor
+    /// → a rewritten file keeps `old` under the new bytes' zeros.
+    #[test]
+    fn a_torn_file_never_loses_a_synced_byte() {
+        let forms = |kept: &[u8], made: &[u8], cut| torn_forms(kept, made, cut).into_iter().map(|(form, data)| (form, String::from_utf8(data).unwrap())).collect::<Vec<_>>();
+        assert_eq!(forms(b"old", b"olders", None), [(Form::ZeroTail, "old\0\0\0".to_string()), (Form::HalfTail, "olde".to_string())]);
+        assert_eq!(forms(b"old", b"newer", Some(0)), [(Form::Cut, String::new()), (Form::ZeroTail, "\0\0\0\0\0".to_string()), (Form::HalfTail, "ne".to_string())]);
+        assert_eq!(forms(b"old", b"olx", Some(2)), [(Form::Cut, "ol".to_string()), (Form::ZeroTail, "ol\0".to_string())]);
+        assert_eq!(forms(b"old", b"new", None), [(Form::HalfOverwritten, "nld".to_string())]);
+        assert!(forms(b"old", b"old", None).is_empty());
+    }
+
+    /// The crash states of one line, every kind among them.
+    fn found(text: &str) -> Found {
+        let calls = trace::parse(text).unwrap();
+        let points = kill::enumerate(&calls, 0, "stack", &root(), "/s/w", |_| true).unwrap().points;
+        let first = fixture();
+        let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect(), before: &first }];
+        crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 0).unwrap()
+    }
+
+    /// A torn file is torn under every name the durable tree gives its inode, whatever the calls
+    /// renamed it to since, and nothing else in the tree changes.
+    ///
+    /// Revert: tear by volatile path → the torn bytes land at `c`, a name the durable tree lacks;
+    /// tear one path of the inode → `b` keeps `old` beside a torn `a`.
+    #[test]
+    fn a_file_is_torn_under_every_durable_name_of_its_inode() {
+        let text = format!("1 link(\"a\", \"b\") = 0\n1 openat(AT_FDCWD</s/w>, \".\", O_RDONLY|O_DIRECTORY) = 4</s/w>\n1 fsync(4</s/w>) = 0\n\
+            1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_APPEND) = 3</s/w/a>\n{}1 close(3</s/w/a>) = 0\n1 rename(\"a\", \"c\") = 0\n", write(1, 3, "/s/w/a", b"er"));
+        let torn: Vec<Crash> = found(&text).crashes.into_iter().filter(|crash| matches!(crash.state, State::Torn { .. })).collect();
+        assert!(!torn.is_empty());
+        for crash in &torn {
+            assert!(!crash.image.contains_key("w/c"), "{:?}", crash.state);
+            let (a, b) = (data(&crash.image, "w/a").unwrap(), data(&crash.image, "w/b").unwrap());
+            assert_eq!(a, b);
+            assert!(a.starts_with(b"old") && a != b"old");
+            assert!(matches!(&crash.state, State::Torn { path, .. } if path == "w/a"));
+        }
+    }
+
+    /// A file written in many chunks while nothing else changes tears once per form and trail,
+    /// from the last chunk, not once per chunk; the count of torn states graded says as much.
+    ///
+    /// Revert: add each moment's torn forms as it is recorded → a state per chunk and form.
+    #[test]
+    fn a_file_written_in_chunks_tears_once_per_form() {
+        let chunks: String = (0..4).map(|_| write(1, 3, "/s/w/a", b"ab")).collect();
+        let text = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_APPEND) = 3</s/w/a>\n{}1 close(3</s/w/a>) = 0\n", chunks);
+        let Found { crashes, requested, .. } = found(&text);
+        let torn: Vec<((usize, bool), Form, Vec<u8>)> = crashes.iter().filter_map(|crash| match &crash.state {
+            State::Torn { form, .. } => Some((crash.moment.trail(), *form, data(&crash.image, "w/a").unwrap())),
+            _ => None,
+        }).collect();
+        let kept: BTreeSet<((usize, bool), Form)> = torn.iter().map(|(trail, form, _)| (*trail, *form)).collect();
+        assert_eq!(kept.len(), torn.len(), "{:?}", torn);
+        // Inside the line, and after it.
+        assert_eq!(kept.iter().map(|(trail, _)| *trail).collect::<BTreeSet<_>>().len(), 2, "{:?}", torn);
+        for (_, form, held) in &torn {
+            match form {
+                Form::ZeroTail => assert_eq!(held, b"old\0\0\0\0\0\0\0\0"),
+                Form::HalfTail => assert_eq!(held, b"oldabab"),
+                other => panic!("{:?}", other),
+            }
+        }
+        assert_eq!(requested.torn.1, torn.len());
+        assert!(requested.torn.0 >= requested.torn.1);
+    }
+
+    /// A state a more realistic kind also leaves is reported once, as that kind: an ordered
+    /// state no different from the durable one is the durable one.
+    ///
+    /// Revert: keep a state per kind → an ordered state with the durable one's tree is reported.
+    #[test]
+    fn a_state_two_kinds_leave_is_the_more_realistic_one() {
+        let Found { crashes, requested, .. } = found(&rewrite(false));
+        let durable: BTreeSet<(String, bool, (usize, bool))> = crashes.iter().filter(|crash| crash.state == State::Durable)
+            .map(|crash| (digest(&crash.image), crash.acknowledged, crash.moment.trail())).collect();
+        let mut ordered = 0;
+        for crash in crashes.iter().filter(|crash| crash.state == State::Ordered) {
+            assert!(!durable.contains(&(digest(&crash.image), crash.acknowledged, crash.moment.trail())), "{}", crash.moment.label());
+            ordered += 1;
+        }
+        assert!(ordered > 0, "the truncate leaves an ordered state of its own");
+        assert_eq!(requested.ordered.1, ordered);
+        assert!(requested.ordered.0 > ordered, "every moment asks for one");
+    }
+
+    /// A scenario that runs lines after its record is not graded for power loss, and one that
+    /// runs none is.
+    ///
+    /// Revert: grade every scenario → the scenario with a later line is run.
+    #[test]
+    fn a_scenario_with_lines_after_its_record_is_not_run() {
+        let scenario = |then| Scenario { id: "s".into(), history: vec![], then, damage: None, files: crate::scenario::Files::Seeded };
+        assert_eq!(not_run(&scenario(vec![])), None);
+        assert!(not_run(&scenario(vec![crate::scenario::Op::Record { index: 0 }])).unwrap().contains("lines after its record"));
     }
 
     /// A state found without a draw is never reported as a variant: drawing variants leaves every
