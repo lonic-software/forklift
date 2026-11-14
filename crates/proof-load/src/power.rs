@@ -25,8 +25,8 @@
 //! each file's synced bytes, cut where a truncate since its sync cut it: metadata committed in
 //! order, data not yet allocated. The other has one file of the durable tree torn, under every
 //! durable name of its inode: cut where a truncate cut it, zeros past its synced bytes, or half of
-//! what followed them, or half overwritten in place, but never short of a byte the file synced, so
-//! a synced file never comes back empty. A file's torn forms are kept once per durable version and
+//! what followed them, or half overwritten in place, but never cut below the bytes the file
+//! synced, so a synced file never comes back empty. A file's torn forms are kept once per durable version and
 //! step trail, from that span's last moment, rather than once per write. A state two kinds leave
 //! is reported as the more realistic: durable, then ordered, then torn, then a seeded variant.
 //! Each scenario that graded states says in its report how many of each kind were asked for and
@@ -404,7 +404,7 @@ type Torn = (Form, Vec<u8>);
 /// Each file's paths, by inode.
 type Names = BTreeMap<Ino, Vec<String>>;
 
-/// How one file comes back torn, never losing a synced byte.
+/// How one file comes back torn, never cut below its synced bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Form {
@@ -432,8 +432,9 @@ impl Form {
 }
 
 /// The torn forms of a file synced as `kept` and since written to `made`, `truncated` the shortest
-/// length a truncate since the sync cut it to. Every form keeps the synced bytes below the floor,
-/// the synced length or that cut; a form equal to `kept`, the durable state itself, is left out.
+/// length a truncate since the sync cut it to. No form is shorter than the floor, the synced
+/// length or that cut, and below it every form holds the synced bytes but those a half overwrite
+/// in place rewrote; a form equal to `kept`, the durable state itself, is left out.
 fn torn_forms(kept: &[u8], made: &[u8], truncated: Option<usize>) -> Vec<Torn> {
     let floor = match truncated {
         Some(cut) => cut.min(kept.len()).min(made.len()),
@@ -2711,8 +2712,9 @@ mod tests {
         assert_eq!(data(&ordered, "w/a").unwrap(), b"");
     }
 
-    /// No torn form loses a synced byte: below the synced length, or a truncate's cut since the
-    /// sync, every form holds what was synced; a form the same as the synced file is left out.
+    /// No torn form is cut below the synced bytes: below the synced length, or a truncate's cut
+    /// since the sync, every form holds what was synced but the half an overwrite in place
+    /// rewrote; a form the same as the synced file is left out.
     ///
     /// Revert: floor every form at 0 → an appended file tears to `ol`; drop the cut from the floor
     /// → a rewritten file keeps `old` under the new bytes' zeros; overwrite the file's first half
@@ -2720,7 +2722,7 @@ mod tests {
     /// → a one-byte change tears to the whole write; tear in place only a file that did not grow
     /// → the grown file's new header never tears, and neither does a cut file's.
     #[test]
-    fn a_torn_file_never_loses_a_synced_byte() {
+    fn a_torn_file_is_never_cut_below_its_synced_bytes() {
         let forms = |kept: &[u8], made: &[u8], cut| torn_forms(kept, made, cut).into_iter().map(|(form, data)| (form, String::from_utf8(data).unwrap())).collect::<Vec<_>>();
         assert_eq!(forms(b"old", b"olders", None), [(Form::ZeroTail, "old\0\0\0".to_string()), (Form::HalfTail, "olde".to_string())]);
         assert_eq!(forms(b"old", b"newer", Some(0)), [(Form::Cut, String::new()), (Form::ZeroTail, "\0\0\0\0\0".to_string()), (Form::HalfTail, "ne".to_string())]);

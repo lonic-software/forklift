@@ -122,12 +122,12 @@ Notes:
   fsynced, POSIX-minimal semantics, so a loss there may survive on a real ext4, and every
   power-loss row says so. Between that durable state and the volatile one, each moment also
   leaves the calls' names over the synced bytes (metadata committed, data not), and each file
-  changed since its sync torn under its durable names without losing a synced byte, kept once per
-  durable version rather than per write; `--power-variants` adds seeded partial states, and each
-  scenario that graded states counts in its report those of each kind asked for and graded. A
-  scenario that runs lines after its record is not run for power loss. Each state is written out
-  afresh, so no file keeps its inode or times, and a stat cache trusting an unchanged file over a lost
-  object is not exercised; every row says that too. A call the model cannot replay, or
+  changed since its sync torn under its durable names, never cut below its synced bytes, kept
+  once per durable version rather than per write; `--power-variants` adds seeded partial states,
+  and each scenario that graded states counts in its report those of each kind asked for and
+  graded. A scenario that runs lines after its record is not run for power loss. Each state is
+  written out afresh, so no file keeps its inode or times, and a stat cache trusting an unchanged
+  file over a lost object is not exercised; every row says that too. A call the model cannot replay, or
   a replay whose tree differs from the traced run's at any line's start or at its end, refuses
   the scenario's power loss. The environment faults run under the faulted command of the
   scenarios named for them and are lifted before the readback and retry that grade them: a lock
