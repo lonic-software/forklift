@@ -3498,6 +3498,25 @@ pub(crate) mod tests {
         })));
     }
 
+    // Revert: drop the lost-ref arm of `RefMoved::behind_refusal` → the vanished ref reads as
+    // `behind`, whose catch-up shift cannot run → red.
+    #[test]
+    fn a_ref_that_vanished_under_a_writer_is_refused_as_damaged_not_behind() {
+        let code = |moved: RefMoved| match moved.behind_refusal() {
+            crate::error::CoreError::Refusal { code, .. } => code,
+            other => panic!("expected a framed refusal, got {:?}", other),
+        };
+
+        let vanished = RefMoved { reference: PalletRef::user("main"), expected: Some(hash('1')), found: None };
+        assert_eq!(code(vanished), crate::error::RefusalCode::RefDamaged);
+
+        let moved = RefMoved { reference: PalletRef::user("main"), expected: Some(hash('1')), found: Some(hash('2')) };
+        assert_eq!(code(moved), crate::error::RefusalCode::Behind);
+
+        let created = RefMoved { reference: PalletRef::user("main"), expected: None, found: Some(hash('2')) };
+        assert_eq!(code(created), crate::error::RefusalCode::Behind);
+    }
+
     // Revert: drop the boundary check → the first two land. Compare the boundary as a snapshot of
     // the heads rather than by membership → the last two are refused.
     #[test]
