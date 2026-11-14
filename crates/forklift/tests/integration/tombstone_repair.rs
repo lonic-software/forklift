@@ -214,9 +214,10 @@ fn a_repair_keeps_a_head_held_only_in_a_pack() {
 /// refuses, naming the folder, rather than finishing without it; once the folder lists again it
 /// keeps the tip. Skipped as root, which lists any folder.
 ///
-/// Two listings guard it: the store status the pack check reads first, then the lost-tip
-/// enumeration. Revert: let both read an unlistable folder as empty → the repair finishes keeping
-/// nothing → red. Either alone stays green.
+/// Three listings guard it: the store status the pack check reads first lists the loose objects
+/// and the signature sidecars, and then the lost-tip enumeration lists the folder again. Revert:
+/// let all three read an unlistable folder as empty → the repair finishes keeping nothing → red.
+/// Any one of them alone keeps it green.
 #[cfg(unix)]
 #[test]
 fn a_repair_refuses_a_fan_out_folder_it_cannot_list() {
