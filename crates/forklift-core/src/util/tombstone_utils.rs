@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
 use crate::globals;
 use crate::util::lock_utils::{RefLock, ServeLock};
-use crate::util::{file_utils, object_utils, pallet_utils, record_utils};
+use crate::util::{file_utils, object_utils, pallet_utils, record_utils, withholding};
 
 /// The mark's file name in the shared forklift root, and its [`record_utils`] kind and version.
 const FILE_NAME_SERVED: &str = "served";
@@ -241,7 +241,8 @@ pub(crate) fn served_for_removal() -> Result<bool, String> {
 }
 
 /// Mark the warehouse at the current storage root as served, durably, unless it is already: first
-/// an empty tombstone list, only when there is none, then the mark. An unfinished first serve is
+/// an empty record of withheld content and an empty tombstone list, only when there are none, then
+/// the mark, once the record of withheld content reads. An unfinished first serve is
 /// completed by writing the mark. Under the [`RefLock`], so a ref removal in a bay reads the mark
 /// either before it is written (and the server then serves a root without that ref) or after it
 /// (and the removal leaves a tombstone). A root already marked is answered without the lock.
@@ -253,7 +254,8 @@ pub(crate) fn served_for_removal() -> Result<bool, String> {
 /// * `Ok(true)`    - The root is marked.
 /// * `Ok(false)`   - Not `wait`, the root is unmarked and a bay holds the ref lock; nothing was
 ///                   written.
-/// * `Err(String)` - The damage [`load`] refuses, or a file could not be written.
+/// * `Err(String)` - The damage [`load`] refuses, the record of withheld content's
+///                   ([`withholding::read_withheld`]), or a file could not be written.
 pub fn mark_served(wait: bool) -> Result<bool, String> {
     if is_served()? {
         return Ok(true);
@@ -269,9 +271,18 @@ pub fn mark_served(wait: bool) -> Result<bool, String> {
 
     match served_state()? {
         ServedState::Served => return Ok(true),
-        // Every write of the list is made under the ref lock, so it is still absent here.
-        ServedState::Never => write_tombstones(&lock, &Tombstones::default())?,
-        ServedState::Unfinished => {}
+        // Every write of the list is made under the ref lock, so it is still absent here. The
+        // record of withheld content comes first: a served root without one has lost it. One that
+        // does not read refuses before the list is written, so the root stays never served.
+        ServedState::Never => {
+            withholding::create_if_absent(&lock)?;
+            withholding::read_withheld()?;
+            write_tombstones(&lock, &Tombstones::default())?
+        }
+        // Never completed over a record lost after the first serve began, or one that does not read.
+        ServedState::Unfinished => {
+            withholding::read_withheld()?;
+        }
     }
 
     write_mark(&lock)?;
@@ -525,6 +536,8 @@ pub(crate) mod tests {
     fn a_torn_first_serve_is_completed_by_the_next_mark() {
         let _scratch = Scratch::new("torn");
 
+        // A first serve writes the record of withheld content before the list.
+        withholding::create_if_absent(&RefLock::acquire().unwrap()).unwrap();
         write_list(&[]);
         assert_eq!(served_state().unwrap(), ServedState::Unfinished);
         assert!(!is_served().unwrap(), "nothing was served before the mark");
@@ -533,6 +546,36 @@ pub(crate) mod tests {
         assert!(mark_served(false).unwrap());
         assert_eq!(served_state().unwrap(), ServedState::Served);
         assert!(served_for_removal().unwrap());
+    }
+
+    // Revert: write the record of withheld content not at all → the first serve leaves a served
+    // root with none, read as nothing withheld; skip the read before the mark → a root is marked
+    // served over a lost record; or read it only after the list → a damaged record in a root never
+    // served leaves it half served, refusing ref removals for the wrong record.
+    #[test]
+    fn the_first_serve_writes_the_withheld_record_first_and_never_marks_over_a_lost_one() {
+        let _scratch = Scratch::new("withheld-witness");
+
+        std::fs::write(globals::forklift_root().join("withheld"), b"garbage").unwrap();
+        assert!(withholding::is_damage(&mark_served(true).unwrap_err()));
+        assert_eq!(served_state().unwrap(), ServedState::Never, "a record that does not read is refused before the list");
+        file_utils::remove_file(globals::forklift_root().join("withheld")).unwrap();
+
+        assert!(withholding::read_withheld().unwrap().is_empty(), "a root never served reads none as nothing withheld");
+        assert!(mark_served(true).unwrap());
+        assert!(globals::forklift_root().join("withheld").is_file(), "the first serve writes the record");
+        assert!(withholding::read_withheld().unwrap().is_empty());
+
+        file_utils::remove_file(globals::forklift_root().join("withheld")).unwrap();
+        assert!(withholding::is_damage(&withholding::read_withheld().unwrap_err()), "lost from a served root");
+        assert!(mark_served(true).unwrap(), "a marked root is answered without reading the record");
+        assert!(!globals::forklift_root().join("withheld").exists(), "never written anew over a loss");
+
+        // A torn first serve that lost its record is not completed over the loss.
+        file_utils::remove_file(served_path()).unwrap();
+        assert_eq!(served_state().unwrap(), ServedState::Unfinished);
+        assert!(withholding::is_damage(&mark_served(true).unwrap_err()));
+        assert_eq!(served_state().unwrap(), ServedState::Unfinished, "no mark written");
     }
 
     #[test]

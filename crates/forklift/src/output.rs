@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 44;
+pub const SCHEMA_VERSION: u32 = 45;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -588,6 +588,9 @@ error_codes! {
 
     /// A served warehouse's tombstone list or served mark is lost or damaged.
     TombstonesDamaged,
+
+    /// A served warehouse's record of withheld content is lost or damaged.
+    WithheldDamaged,
 }
 
 impl ErrorCode {
@@ -648,6 +651,7 @@ impl ErrorCode {
             ErrorCode::RefDamaged => RefusalCode::RefDamaged.as_str(),
             ErrorCode::FetchScopeDamaged => RefusalCode::FetchScopeDamaged.as_str(),
             ErrorCode::TombstonesDamaged => RefusalCode::TombstonesDamaged.as_str(),
+            ErrorCode::WithheldDamaged => RefusalCode::WithheldDamaged.as_str(),
         }
     }
 
@@ -711,6 +715,7 @@ impl ErrorCode {
             ErrorCode::RefDamaged => 53,
             ErrorCode::FetchScopeDamaged => 54,
             ErrorCode::TombstonesDamaged => 55,
+            ErrorCode::WithheldDamaged => 56,
         }
     }
 
@@ -852,6 +857,8 @@ impl ErrorCode {
                 "A sparse warehouse's fetch scope is lost or damaged, and heal could not rebuild it from the checkouts' scopes alone. Nothing was changed; heal --fetch-scope sets it, fetching what the history there lacks",
             ErrorCode::TombstonesDamaged =>
                 "A served warehouse's tombstone list or served mark is lost or damaged, so which deleted pallets' heads it keeps cannot be told. Nothing was changed, and nothing that frees history runs there; its operator repairs it with forklift-server tombstone repair while it is not served",
+            ErrorCode::WithheldDamaged =>
+                "A served warehouse's record of withheld content is lost or damaged, so what its head withholds cannot be told. Nothing was served or changed; its operator repairs it with forklift-server withhold repair while it is not served",
         }
     }
 
@@ -913,6 +920,7 @@ impl ErrorCode {
             RefusalCode::RefDamaged => ErrorCode::RefDamaged,
             RefusalCode::FetchScopeDamaged => ErrorCode::FetchScopeDamaged,
             RefusalCode::TombstonesDamaged => ErrorCode::TombstonesDamaged,
+            RefusalCode::WithheldDamaged => ErrorCode::WithheldDamaged,
         }
     }
 }
@@ -1561,6 +1569,7 @@ mod tests {
             (RefusalCode::RefDamaged, "ref_damaged", 53),
             (RefusalCode::FetchScopeDamaged, "fetch_scope_damaged", 54),
             (RefusalCode::TombstonesDamaged, "tombstones_damaged", 55),
+            (RefusalCode::WithheldDamaged, "withheld_damaged", 56),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

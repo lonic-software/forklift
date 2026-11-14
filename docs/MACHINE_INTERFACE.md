@@ -85,7 +85,15 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 44** (current): a new refusal code, `tombstones_damaged` (exit 55): a served warehouse's
+**Schema 45** (current): a new refusal code, `withheld_damaged` (exit 56): a served warehouse's
+record of withheld content is lost or damaged, so what its head withholds cannot be told. Nothing
+was served or changed. `next_step` is the operator's
+`forklift-server withhold repair --root <warehouse>`. Locally the warehouse is named in full. When
+a remote refuses with this code, `next_step` asks its operator to run the command, with
+`<warehouse>` as a placeholder. The remote sends it as a 503 with no `Retry-After`, which the
+client does not retry.
+
+**Schema 44**: a new refusal code, `tombstones_damaged` (exit 55): a served warehouse's
 tombstone list or `served` mark is lost or damaged, so which deleted pallets' heads it keeps cannot
 be told. Nothing that frees history runs until the list is repaired. `next_step` is the
 operator's `forklift-server tombstone repair --root <warehouse>`. Locally the warehouse is named in

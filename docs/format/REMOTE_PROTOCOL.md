@@ -66,10 +66,11 @@ and is a refusal for now, sent before the request changed anything. The warehous
 while content redacted or withheld from it is deleted (below), settling which redacted content it no
 longer serves (below), under maintenance, or not yet servable, or a hook it depends on may be
 unreachable. The request can be sent again after the wait. One `503` from forklift-server has no
-`Retry-After`: `code` `tombstones_damaged`, a warehouse whose list of deleted pallets (and so which
-history it keeps for them) cannot be read. It is refused, nothing changed, and waiting does not end
-it: the server's operator must repair the list, and `next_step` names the command with `<warehouse>`
-in place of the server's directory. The
+`Retry-After`: a damaged host record, `code` `tombstones_damaged`, a warehouse whose list of
+deleted pallets (and so which history it keeps for them) cannot be read, or `withheld_damaged`, one
+whose record of withheld content cannot be. It is refused, nothing changed, and waiting does not end
+it: the server's operator must repair the record, and `next_step` names the command with
+`<warehouse>` in place of the server's directory. The
 serverless head's `503`s are described with the endpoints that send them.
 
 **Refused for now, on either head:** a `429`, and a `503` that carries `Retry-After`, are

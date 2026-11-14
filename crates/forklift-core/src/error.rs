@@ -377,6 +377,12 @@ refusal_codes! {
     /// that frees history (gc, compaction, prune) runs there, and its server answers every request
     /// that reads the list with this code.
     TombstonesDamaged => "tombstones_damaged",
+
+    /// A served warehouse's record of withheld content is lost or damaged, so what its head
+    /// withholds cannot be told. Nothing was served or changed. Its operator repairs it with
+    /// `forklift-server withhold repair` while the warehouse is not served; until then its server
+    /// answers every request that reads the record with this code.
+    WithheldDamaged => "withheld_damaged",
 }
 
 impl RefusalCode {

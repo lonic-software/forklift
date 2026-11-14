@@ -12,6 +12,27 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **A served warehouse's lost or damaged record of withheld content is refused, and its operator can
+  repair it.** The record of legal takedowns on a server, `.forklift/withheld`, says which content it
+  must never serve. A record that did not read made every handshake fail with an uncoded HTTP 500
+  naming the server's path. A deleted record was read as nothing withheld, so clones failed on
+  content the server had already deleted, and content it still stored was served again. Now a served
+  warehouse's first serve writes an empty record, so a record lost later is damage. Every request
+  that reads it is refused with exit 56 (`withheld_damaged`), naming
+  `forklift-server withhold repair --root <warehouse>`. The server answers 503 with that code and no
+  `Retry-After`, so clients stop and name the remote's operator instead of retrying. The repair runs
+  while the warehouse is not served:
+  - It keeps a copy of the damaged record beside it and keeps every entry that still reads.
+  - It keeps a hash whose entry lost its statement withheld under a placeholder statement, to
+    restate with `withhold add`. A line cut short or not valid UTF-8 counts as having lost it.
+  - It lists files the history names that are absent and that no record holds: what a lost entry
+    withheld once its copy was deleted, for the operator to withhold again.
+  - A record whose header names a newer version is left for that Forklift; `--header-damaged`
+    salvages it when none wrote it.
+
+  A lost entry whose content is still stored cannot be found, and the report says so. Warehouses
+  served before this change have no record, so they have to be repaired before they are served.
+
 - **A served warehouse's lost or damaged tombstone list is refused, and its operator can repair it.**
   The list of pallets deleted on a server, `.forklift/tombstones`, keeps their heads from gc. A list
   that did not read made every handshake fail with an uncoded HTTP 500. A deleted list was read as

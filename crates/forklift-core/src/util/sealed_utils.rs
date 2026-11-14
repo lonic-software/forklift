@@ -1016,12 +1016,20 @@ pub struct Walked {
     /// boundaries the walk stopped at that a remote is leaned on for. Absent parcels are not among
     /// them.
     pub absent: HashSet<String>,
+    /// The file contents (blobs and recipes) among `absent`: what a host may have withheld, where
+    /// an absent tree or chunk never was.
+    pub absent_files: HashSet<String>,
 }
 
 impl Walked {
     /// Note `hash` as referenced and say what it was met as.
     fn meet(&mut self, hash: &str, at: At, tolerated: &Tolerated, unrecorded: Unrecorded) -> Result<Met, String> {
         if !self.referenced.insert(hash.to_string()) {
+            // Met first as a tree or chunk of the same bytes and held by nothing, it is a file's
+            // content too. (Met first as a held file, a chunk or tree of it is not judged again.)
+            if at == At::File && self.absent.contains(hash) && tolerated.held(hash, At::File).is_none() {
+                self.absent_files.insert(hash.to_string());
+            }
             return Ok(Met::Again);
         }
 
@@ -1038,6 +1046,9 @@ impl Walked {
         }
 
         self.absent.insert(hash.to_string());
+        if at == At::File {
+            self.absent_files.insert(hash.to_string());
+        }
         Ok(Met::Absent)
     }
 
@@ -2157,6 +2168,38 @@ mod tests {
     /// Withheld content holds a file's content only, below an applied redaction of the same hash
     /// and above the record: both of the others are read beside it.
     ///
+    /// An absent hash met first as a chunk and then as a file is a file's content a host may have
+    /// withheld, not only damage to the store.
+    /// Revert: drop the `Met::Again` file arm of `meet` → the file never joins `absent_files` → red.
+    #[test]
+    fn an_absent_chunk_met_again_as_a_file_is_an_absent_file() {
+        let (_root, _scope) = scratch("met-again-as-file");
+        let hash = "7".repeat(64);
+        let tolerated = Tolerated::default();
+        let mut walked = Walked::default();
+        assert!(matches!(walked.meet(&hash, At::Chunk, &tolerated, Unrecorded::Boundary).unwrap(), Met::Absent));
+        assert!(walked.absent_files.is_empty());
+        assert!(matches!(walked.meet(&hash, At::File, &tolerated, Unrecorded::Boundary).unwrap(), Met::Again));
+        assert!(walked.absent_files.contains(&hash), "the same bytes are a file's content too");
+    }
+
+    /// A file the record holds is not listed among the absent files when its bytes were met first
+    /// as a chunk.
+    /// Revert: drop the `held()` check of the `Met::Again` file arm → the withheld file is listed
+    /// as unheld → red.
+    #[test]
+    fn a_held_file_met_after_a_chunk_of_the_same_bytes_is_not_an_absent_file() {
+        let (_root, _scope) = scratch("met-again-held");
+        let hash = "8".repeat(64);
+        withholding::withhold(&hash, "court order 7").unwrap();
+        let tolerated = read_tolerated().unwrap();
+
+        let mut walked = Walked::default();
+        assert!(matches!(walked.meet(&hash, At::Chunk, &tolerated, Unrecorded::Boundary).unwrap(), Met::Absent));
+        assert!(matches!(walked.meet(&hash, At::File, &tolerated, Unrecorded::Boundary).unwrap(), Met::Again));
+        assert!(walked.absent_files.is_empty(), "the record holds the file");
+    }
+
     /// Revert: drop the withheld arm of `held` → the withheld-only hash is held by nothing → red;
     /// look it up before the applied set → the redacted hash reads as withheld → red.
     #[test]

@@ -29,8 +29,13 @@
 //! is the only way left to tell whether the file repeats a redacted recipe's chunk list. It is written whole and atomically under the
 //! [`RefLock`], re-read under that lock first, so two writers never drop each other's entries. A
 //! record this build cannot read, of another version or with an entry that is not a hash and a
-//! statement, fails every read and is never written over: withheld content must never read as
-//! served.
+//! statement, fails every read with [`RefusalCode::WithheldDamaged`] and is never written over:
+//! withheld content must never read as served. Nor may a lost record: a root's first serve writes
+//! an empty one before the served mark ([`tombstone_utils::mark_served`]), so in a served root a
+//! missing record is damage too, and only a root never served reads none as nothing withheld. A
+//! record lost before the first serve cannot be told from none, but nothing was served yet. The
+//! operator repairs a damaged record with `forklift-server withhold repair`
+//! ([`withheld_repair`](crate::util::withheld_repair)).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -38,6 +43,8 @@ use crate::globals;
 use crate::util::applied_redactions::{self, AppliedSet};
 use crate::util::lock_utils::RefLock;
 use crate::enums::object_type::ObjectType;
+use crate::error::{CoreError, RefusalCode};
+use crate::util::tombstone_utils::{self, ServedState};
 use crate::util::{bundle_utils, file_utils, object_utils, record_utils, redaction_utils};
 
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
@@ -48,7 +55,15 @@ const WITHHELD_VERSION: u32 = 2;
 /// The longest statement a takedown may carry, in characters: every handshake carries it.
 pub const STATEMENT_MAX_CHARS: usize = 1000;
 
-fn withheld_path() -> PathBuf {
+/// Whether `header`, a record header this build does not read, names a newer version of the
+/// record of withheld content, as a newer Forklift writes it, rather than being damaged.
+pub(crate) fn newer_version(header: &str) -> bool {
+    header.strip_prefix(&format!("/forklift-{} ", WITHHELD_RECORD))
+        .and_then(|text| text.parse::<u32>().ok().filter(|version| version.to_string() == text))
+        .is_some_and(|version| version > WITHHELD_VERSION)
+}
+
+pub(crate) fn withheld_path() -> PathBuf {
     globals::forklift_root().join(FILE_NAME_WITHHELD)
 }
 
@@ -197,7 +212,7 @@ impl WithheldSet {
     }
 
     /// Write this set whole as the record. The caller holds the ref lock and read the set under it.
-    fn write(&self, _lock: &RefLock) -> Result<(), String> {
+    pub(crate) fn write(&self, _lock: &RefLock) -> Result<(), String> {
         let entries = self.entries.iter()
             .map(|(hash, entry)| format!("{} {} {}", hash, entry.digest.column(), entry.statement));
         let bytes = record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, entries);
@@ -205,47 +220,134 @@ impl WithheldSet {
     }
 }
 
-/// Read the withheld record. No record reads as nothing withheld.
-///
-/// # Returns
-/// * `Ok(WithheldSet)` - The withheld hashes and their statements.
-/// * `Err(String)`     - The record exists but cannot be read, is of a version this build does not
-///                       know, or holds an entry that is not a hash and a statement.
-pub fn read_withheld() -> Result<WithheldSet, String> {
-    let path = withheld_path();
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(WithheldSet::default()),
-        Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
-    };
+/// The command that repairs the record of withheld content of the warehouse at the current storage
+/// root.
+fn repair_command() -> String {
+    format!("forklift-server withhold repair --root {}", quoted_warehouse())
+}
 
-    let entries = record_utils::from_bytes(&bytes, WITHHELD_RECORD, WITHHELD_VERSION).map_err(|e| format!(
-        "The record of withheld content \"{}\" {} This version of Forklift never writes over it.",
-        path.to_string_lossy(), e.describe()
-    ))?;
+/// The warehouse at the current storage root, absolute and quoted for a command line.
+pub(crate) fn quoted_warehouse() -> String {
+    // The storage root may be relative to where the command runs, and the remedy is run elsewhere.
+    let root = std::path::absolute(globals::forklift_root()).unwrap_or_else(|_| globals::forklift_root());
+    let warehouse = root.parent().unwrap_or(&root);
 
+    crate::util::franchise_utils::quote(&warehouse.to_string_lossy())
+}
+
+/// The refusal for a lost or damaged record of withheld content, `detail` saying what is wrong.
+fn damaged(detail: &str) -> String {
+    CoreError::refusal(
+        RefusalCode::WithheldDamaged,
+        format!(
+            "{} What this warehouse's head withholds cannot be told, so nothing was served or \
+            changed, and every read of the record refuses until it is repaired.",
+            detail
+        ),
+        repair_command(),
+    ).into()
+}
+
+/// Whether `error` is the refusal of a lost or damaged record of withheld content ([`damaged`]).
+pub fn is_damage(error: &str) -> bool {
+    crate::error::deframe(error).is_some_and(|(code, _, _)| code == RefusalCode::WithheldDamaged.as_str())
+}
+
+/// Why a record's bytes do not read as a set of withheld content.
+pub(crate) enum Unparsed {
+    /// The file as a whole does not read as a record of this kind and version.
+    Record(record_utils::RecordError),
+    /// An entry is not a hash, a chunk-list digest and a statement.
+    Entry(String),
+}
+
+impl Unparsed {
+    /// The reason, naming the record.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Unparsed::Record(e) => format!("The record of withheld content {}", e.describe()),
+            Unparsed::Entry(entry) => format!(
+                "The record of withheld content holds an entry that is not an object hash, a chunk-list \
+                digest and a statement: \"{}\".",
+                entry.escape_debug()
+            ),
+        }
+    }
+}
+
+/// Parse one entry, `None` when it is not a hash, a chunk-list digest and a statement. A host never
+/// records Conflicted: every digest it fills comes from bytes of the entry's hash.
+pub(crate) fn parse_entry(entry: &str) -> Option<(&str, &str, ChunkDigest)> {
+    let (hash, rest) = entry.split_once(' ')?;
+    let (column, statement) = rest.split_once(' ')?;
+    let digest = ChunkDigest::parse_column(column)?;
+
+    (object_utils::is_object_hash(hash) && valid_statement(statement) && digest != ChunkDigest::Conflicted)
+        .then_some((hash, statement, digest))
+}
+
+/// Parse the record's bytes whole.
+pub(crate) fn parse(bytes: &[u8]) -> Result<WithheldSet, Unparsed> {
+    let entries = record_utils::from_bytes(bytes, WITHHELD_RECORD, WITHHELD_VERSION).map_err(Unparsed::Record)?;
     let mut set = WithheldSet::default();
 
-    // A host never records Conflicted: every digest it fills comes from bytes of the entry's hash.
     for entry in entries {
-        let parsed = entry.split_once(' ')
-            .and_then(|(hash, rest)| rest.split_once(' ').map(|(column, statement)| (hash, column, statement)))
-            .and_then(|(hash, column, statement)| Some((hash, ChunkDigest::parse_column(column)?, statement)));
-
-        match parsed {
-            Some((hash, digest, statement)) if object_utils::is_object_hash(hash) && valid_statement(statement)
-                && digest != ChunkDigest::Conflicted => {
+        match parse_entry(&entry) {
+            Some((hash, statement, digest)) => {
                 set.entries.insert(hash.to_string(), WithheldEntry { statement: statement.to_string(), digest });
             }
-            _ => return Err(format!(
-                "The record of withheld content \"{}\" holds an entry that is not an object hash, a \
-                chunk-list digest and a statement: \"{}\". This version of Forklift never writes over it.",
-                path.to_string_lossy(), entry.escape_debug()
-            )),
+            None => return Err(Unparsed::Entry(entry)),
         }
     }
 
     Ok(set)
+}
+
+/// Read the withheld record. No record reads as nothing withheld only in a warehouse never served:
+/// its first serve writes an empty record before it marks the root served
+/// ([`tombstone_utils::mark_served`]), so a served root without one has lost it, and what its
+/// head withholds cannot be told.
+///
+/// # Returns
+/// * `Ok(WithheldSet)` - The withheld hashes and their statements.
+/// * `Err(String)`     - A [`RefusalCode::WithheldDamaged`] refusal: the record cannot be read, is
+///                       of a version this build does not know, holds an entry that is not a hash,
+///                       a digest and a statement, or is missing from a served root; or the
+///                       tombstones' damage, when a missing record makes the served state matter.
+pub fn read_withheld() -> Result<WithheldSet, String> {
+    let bytes = match std::fs::read(withheld_path()) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match tombstone_utils::served_state()? {
+            ServedState::Never => return Ok(WithheldSet::default()),
+            // A first serve may have landed between the two reads, the record durably before the
+            // mark, so the record is read once more before it is judged lost.
+            ServedState::Unfinished | ServedState::Served => match std::fs::read(withheld_path()) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(damaged(
+                    "This warehouse has been served, but its record of withheld content is missing."
+                )),
+                Err(e) => return Err(damaged(&format!("The record of withheld content could not be read: {}.", e))),
+            },
+        },
+        Err(e) => return Err(damaged(&format!("The record of withheld content could not be read: {}.", e))),
+    };
+
+    // Only the operator's repair writes over it, keeping what still reads.
+    parse(&bytes).map_err(|e| damaged(&e.describe()))
+}
+
+/// Write an empty record of withheld content unless one is there, under the ref lock `lock` the
+/// caller holds: the first serve's witness that a served root has a record ([`read_withheld`]).
+///
+/// # Returns
+/// * `Ok(())`      - A record is there.
+/// * `Err(String)` - Whether one is there could not be told, or it could not be written.
+pub(crate) fn create_if_absent(lock: &RefLock) -> Result<(), String> {
+    match std::fs::symlink_metadata(withheld_path()) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => WithheldSet::default().write(lock),
+        Err(e) => Err(format!("Error while reading \"{}\": {}", withheld_path().to_string_lossy(), e)),
+    }
 }
 
 /// `statement`, trimmed, when it may be a takedown's ([`valid_statement`]), as every head that
@@ -638,6 +740,21 @@ mod tests {
 
         std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [A])).unwrap();
         assert!(read_withheld().unwrap_err().contains("not an object hash, a chunk-list digest and a statement"));
+
+        // Revert: an uncoded error → a server answers it as its own fault, a 500 naming its path.
+        let good = record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} - statement", A)]);
+        let mut flipped = good.clone();
+        flipped[3] ^= 0x80;
+        for bytes in [good[..good.len() - 1].to_vec(), flipped, vec![0; good.len()], b"\xff\xfe".to_vec(),
+                      record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [A])] {
+            std::fs::write(withheld_path(), &bytes).unwrap();
+            let refused = read_withheld().unwrap_err();
+            let (code, human, next_step) = crate::error::deframe(&refused).unwrap_or_else(|| panic!("uncoded: {}", refused));
+            assert_eq!(code, "withheld_damaged", "{}", refused);
+            assert!(is_damage(&refused));
+            assert!(!human.contains(globals::FOLDER_NAME_FORKLIFT_ROOT), "no host path in the message: {}", human);
+            assert!(next_step.starts_with("forklift-server withhold repair --root "), "{}", next_step);
+        }
 
         // A version-1 entry, with no digest column, and a host entry recorded Conflicted.
         std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} statement", A)])).unwrap();

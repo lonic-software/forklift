@@ -168,6 +168,31 @@ releases it. A deleted pallet whose name was not recovered can be created again 
 **If a remote refused**, only its operator can repair it. Your warehouse is unchanged. Try again once
 they have.
 
+### `withheld_damaged` (exit 56)
+
+The record of content a server withholds (`.forklift/withheld`, its legal takedowns) is lost or
+damaged, so what it must not serve cannot be told. Nothing was served or changed.
+
+**If you run the server**, stop it, then run the next step the message names:
+
+```sh
+forklift-server withhold repair --root <warehouse>
+```
+
+It keeps a copy of the damaged record beside it and keeps every entry that still reads. A hash whose
+entry lost its statement, or whose line was cut short or is not valid UTF-8, stays withheld under a
+placeholder statement; restate it with
+`forklift-server withhold add --root <warehouse> <hash> --statement "…"`. It then lists the files
+the history names that are absent and that no record holds: what a lost entry withheld, once its copy
+was deleted. Withhold each one that was again. Absent folders or chunks are listed apart: no
+takedown withholds one, so they are damage to the store, to restore from a copy of the warehouse. If the record's header names a newer
+version of Forklift, the repair leaves it for that version; when none wrote it, the header is
+damaged, and `--header-damaged` salvages the entries below it. A lost entry whose content is still stored cannot be
+found, so withhold anything you know of again before serving.
+
+**If a remote refused**, only its operator can repair it. Your warehouse is unchanged. Try again once
+they have.
+
 ### `clone_incomplete` (exit 30)
 
 A clone stopped part-way, and the directory keeps what it fetched. Run the same `forklift clone`

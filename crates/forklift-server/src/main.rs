@@ -172,6 +172,19 @@ enum WithholdAction {
         #[arg(long)]
         root: String,
     },
+
+    /// Rebuild a lost or damaged record of withheld content while the warehouse is not served.
+    /// A copy of the damaged record is kept aside and every entry that still reads is kept; a hash
+    /// whose entry lost its statement stays withheld under a placeholder to restate, and every
+    /// absent file the history names that no record holds is listed, to withhold again
+    Repair {
+        /// The warehouse root to repair
+        #[arg(long)]
+        root: String,
+        /// Salvage a record whose header names a newer version, when no newer Forklift wrote it
+        #[arg(long)]
+        header_damaged: bool,
+    },
 }
 
 /// What `forklift-server tombstone` does.
@@ -238,6 +251,7 @@ async fn async_main() {
         Command::Tombstone { action: TombstoneAction::Repair { root } } => repair_tombstones(&root),
         Command::Withhold { action: WithholdAction::Add { root, hash, statement } } => withhold(&root, &hash, &statement),
         Command::Withhold { action: WithholdAction::List { root } } => list_withheld(&root),
+        Command::Withhold { action: WithholdAction::Repair { root, header_damaged } } => repair_withheld(&root, header_damaged),
     };
 
     if let Err(e) = result {
@@ -828,6 +842,20 @@ fn withhold(root: &str, hash: &str, statement: &str) -> Result<(), String> {
         ),
         Withheld::Restated => println!("{} was withheld already; its statement is replaced.", hash),
         Withheld::Unchanged => println!("{} is withheld already, with this statement.", hash),
+    }
+
+    Ok(())
+}
+
+/// Repair the record of withheld content of the warehouse at `root`.
+fn repair_withheld(root: &str, header_damaged: bool) -> Result<(), String> {
+    let opened = server::open_root(root)?;
+    let _scope = forklift_core::globals::StorageRootScope::enter(&opened.root);
+
+    let repaired = forklift_core::util::withheld_repair::repair_withheld(header_damaged)?;
+
+    for line in repaired.report() {
+        println!("{}", line);
     }
 
     Ok(())
