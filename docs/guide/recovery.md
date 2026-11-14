@@ -179,11 +179,15 @@ damaged, so what it must not serve cannot be told. Nothing was served or changed
 forklift-server withhold repair --root <warehouse>
 ```
 
-It moves the damaged record aside and keeps every entry that still reads. A hash whose entry lost
-its statement stays withheld under a placeholder statement; restate it with
-`forklift-server withhold add --root <warehouse> <hash> --statement "…"`. It then lists the content
-the history names that is absent and that no record holds: what a lost entry withheld, once its copy
-was deleted. Withhold each one that was again. A lost entry whose content is still stored cannot be
+It keeps a copy of the damaged record beside it and keeps every entry that still reads. A hash whose
+entry lost its statement, or whose line was cut short or is not valid UTF-8, stays withheld under a
+placeholder statement; restate it with
+`forklift-server withhold add --root <warehouse> <hash> --statement "…"`. It then lists the files
+the history names that are absent and that no record holds: what a lost entry withheld, once its copy
+was deleted. Withhold each one that was again. Absent folders or chunks are counted apart: no
+takedown withholds one, so they are damage to the store. If the record's header names a newer
+version of Forklift, the repair leaves it for that version; when none wrote it, the header is
+damaged, and `--header-damaged` salvages the entries below it. A lost entry whose content is still stored cannot be
 found, so withhold anything you know of again before serving.
 
 **If a remote refused**, only its operator can repair it. Your warehouse is unchanged. Try again once

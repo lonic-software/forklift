@@ -359,10 +359,12 @@ revocation by more than about a day.
   empty record, so a record lost or damaged later is refused: every request that reads it, the
   handshake and a read of the content alike, answers 503 with `withheld_damaged`, and nothing
   withheld is served, until `forklift-server withhold repair --root …` has run with the root not
-  served. It keeps every entry that still reads, keeps a hash whose entry lost its statement
-  withheld under a placeholder (restate it with `withhold add`), and lists the absent content the
-  history names that no record holds, to withhold again. A lost entry whose copy is still stored
-  cannot be found: withhold it again before serving. Not yet: if a hash withheld before it arrived turns out to be a chunked
+  served. It keeps a copy of the damaged record beside it, keeps every entry that still reads (a
+  line cut short or not valid UTF-8 does not), keeps a hash whose entry lost its statement withheld
+  under a placeholder (restate it with `withhold add`), and lists the absent files the history names
+  that no record holds, to withhold again. A record whose header names a newer version is left for
+  that Forklift; `--header-damaged` salvages it when none wrote it. A lost entry whose copy is still
+  stored cannot be found: withhold it again before serving. Not yet: if a hash withheld before it arrived turns out to be a chunked
   file's, its chunks are still taken and served; and there is no command to lift a takedown.
 - **Redactions:** after every pallet update or deletion, the server applies each redaction
   recorded on `@redactions` that no pallet head, tombstone or metadata history it holds still

@@ -1016,6 +1016,9 @@ pub struct Walked {
     /// boundaries the walk stopped at that a remote is leaned on for. Absent parcels are not among
     /// them.
     pub absent: HashSet<String>,
+    /// The file contents (blobs and recipes) among `absent`: what a host may have withheld, where
+    /// an absent tree or chunk never was.
+    pub absent_files: HashSet<String>,
 }
 
 impl Walked {
@@ -1038,6 +1041,9 @@ impl Walked {
         }
 
         self.absent.insert(hash.to_string());
+        if at == At::File {
+            self.absent_files.insert(hash.to_string());
+        }
         Ok(Met::Absent)
     }
 

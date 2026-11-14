@@ -55,7 +55,15 @@ const WITHHELD_VERSION: u32 = 2;
 /// The longest statement a takedown may carry, in characters: every handshake carries it.
 pub const STATEMENT_MAX_CHARS: usize = 1000;
 
-fn withheld_path() -> PathBuf {
+/// Whether `header`, a record header this build does not read, names a newer version of the
+/// record of withheld content, as a newer Forklift writes it, rather than being damaged.
+pub(crate) fn newer_version(header: &str) -> bool {
+    header.strip_prefix(&format!("/forklift-{} ", WITHHELD_RECORD))
+        .and_then(|version| version.parse::<u32>().ok())
+        .is_some_and(|version| version > WITHHELD_VERSION)
+}
+
+pub(crate) fn withheld_path() -> PathBuf {
     globals::forklift_root().join(FILE_NAME_WITHHELD)
 }
 
@@ -215,11 +223,16 @@ impl WithheldSet {
 /// The command that repairs the record of withheld content of the warehouse at the current storage
 /// root.
 fn repair_command() -> String {
+    format!("forklift-server withhold repair --root {}", quoted_warehouse())
+}
+
+/// The warehouse at the current storage root, absolute and quoted for a command line.
+pub(crate) fn quoted_warehouse() -> String {
     // The storage root may be relative to where the command runs, and the remedy is run elsewhere.
     let root = std::path::absolute(globals::forklift_root()).unwrap_or_else(|_| globals::forklift_root());
     let warehouse = root.parent().unwrap_or(&root);
 
-    format!("forklift-server withhold repair --root {}", crate::util::franchise_utils::quote(&warehouse.to_string_lossy()))
+    crate::util::franchise_utils::quote(&warehouse.to_string_lossy())
 }
 
 /// The refusal for a lost or damaged record of withheld content, `detail` saying what is wrong.

@@ -3019,6 +3019,7 @@ fn a_served_root_whose_withheld_record_is_lost_or_damaged_refuses_until_its_oper
     assert!(repaired.status.success(), "{}", String::from_utf8_lossy(&repaired.stderr));
     let report = String::from_utf8_lossy(&repaired.stdout).into_owned();
     assert!(report.contains(&format!("  {}", film)), "{}", report);
+    assert!(report.contains("1 file the history here names is absent") && !report.contains("damage to the store"), "only the file is listed: {}", report);
 }
 
 /// A takedown deletes the copy on a served root, though the head still names the file: the server

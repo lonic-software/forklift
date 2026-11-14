@@ -22,11 +22,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   `forklift-server withhold repair --root <warehouse>`. The server answers 503 with that code and no
   `Retry-After`, so clients stop and name the remote's operator instead of retrying. The repair runs
   while the warehouse is not served:
-  - It moves the damaged record aside and keeps every entry that still reads.
+  - It keeps a copy of the damaged record beside it and keeps every entry that still reads.
   - It keeps a hash whose entry lost its statement withheld under a placeholder statement, to
-    restate with `withhold add`.
-  - It lists content the history names that is absent and that no record holds: what a lost entry
+    restate with `withhold add`. A line cut short or not valid UTF-8 counts as having lost it.
+  - It lists files the history names that are absent and that no record holds: what a lost entry
     withheld once its copy was deleted, for the operator to withhold again.
+  - A record whose header names a newer version is left for that Forklift; `--header-damaged`
+    salvages it when none wrote it.
 
   A lost entry whose content is still stored cannot be found, and the report says so. Warehouses
   served before this change have no record, so they have to be repaired before they are served.

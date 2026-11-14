@@ -272,9 +272,11 @@ pub fn mark_served(wait: bool) -> Result<bool, String> {
     match served_state()? {
         ServedState::Served => return Ok(true),
         // Every write of the list is made under the ref lock, so it is still absent here. The
-        // record of withheld content comes first: a served root without one has lost it.
+        // record of withheld content comes first: a served root without one has lost it. One that
+        // does not read refuses before the list is written, so the root stays never served.
         ServedState::Never => {
             withholding::create_if_absent(&lock)?;
+            withholding::read_withheld()?;
             write_tombstones(&lock, &Tombstones::default())?
         }
         ServedState::Unfinished => {}
@@ -546,12 +548,18 @@ pub(crate) mod tests {
         assert!(served_for_removal().unwrap());
     }
 
-    // Revert: write the record of withheld content after the list, or not at all → the first
-    // serve leaves a served root with none, read as nothing withheld; or skip the read before the
-    // mark → a root is marked served over a lost record.
+    // Revert: write the record of withheld content not at all → the first serve leaves a served
+    // root with none, read as nothing withheld; skip the read before the mark → a root is marked
+    // served over a lost record; or read it only after the list → a damaged record in a root never
+    // served leaves it half served, refusing ref removals for the wrong record.
     #[test]
     fn the_first_serve_writes_the_withheld_record_first_and_never_marks_over_a_lost_one() {
         let _scratch = Scratch::new("withheld-witness");
+
+        std::fs::write(globals::forklift_root().join("withheld"), b"garbage").unwrap();
+        assert!(withholding::is_damage(&mark_served(true).unwrap_err()));
+        assert_eq!(served_state().unwrap(), ServedState::Never, "a record that does not read is refused before the list");
+        file_utils::remove_file(globals::forklift_root().join("withheld")).unwrap();
 
         assert!(withholding::read_withheld().unwrap().is_empty(), "a root never served reads none as nothing withheld");
         assert!(mark_served(true).unwrap());

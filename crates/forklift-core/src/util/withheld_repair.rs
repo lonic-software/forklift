@@ -15,7 +15,6 @@
 //! report says so.
 
 use std::path::PathBuf;
-use crate::globals;
 use crate::util::lock_utils::{RefLock, ServeLock};
 use crate::util::sealed_utils::{self, Unrecorded};
 use crate::util::withholding::{self, ChunkDigest, WithheldSet};
@@ -27,17 +26,20 @@ pub const PLACEHOLDER_STATEMENT: &str = "Withheld by this host; the statement wa
 /// What a repair did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Repaired {
-    /// Where the damaged record was moved to, if it was there.
+    /// Where the damaged record was copied to, if it was there.
     pub set_aside: Option<PathBuf>,
     /// How many entries still read whole and were kept.
     pub salvaged: usize,
     /// Each hash kept withheld with the placeholder statement, from an entry that did not read whole.
     pub placeholders: Vec<String>,
-    /// How many lines held no object hash at all, left only in the moved-aside copy.
+    /// How many lines held no object hash at all, left only in the copy set aside.
     pub unreadable_lines: usize,
-    /// Each object the history kept here names that is absent and that no record holds: content a
-    /// lost entry may have withheld, once its copy was deleted.
+    /// Each file content (blob or recipe) the history kept here names that is absent and that no
+    /// record holds: content a lost entry may have withheld, once its copy was deleted.
     pub absent: Vec<String>,
+    /// How many absent trees and chunks no record holds: damage to the store, since a takedown never
+    /// withholds one.
+    pub absent_other: usize,
     /// The warehouse repaired, quoted for a command line.
     pub warehouse: String,
 }
@@ -48,7 +50,7 @@ impl Repaired {
         let mut lines = Vec::new();
 
         match &self.set_aside {
-            Some(path) => lines.push(format!("Moved the damaged \"{}\" aside.", path.to_string_lossy())),
+            Some(path) => lines.push(format!("Kept a copy of the damaged record at \"{}\".", path.to_string_lossy())),
             None => lines.push("The record of withheld content was missing; wrote it anew.".to_string()),
         }
 
@@ -58,7 +60,7 @@ impl Repaired {
             if self.salvaged == 1 { "y" } else { "ies" },
             match self.unreadable_lines {
                 0 => String::new(),
-                n => format!("; {} line{} named no object and {} only in the copy moved aside", n, if n == 1 { "" } else { "s" }, if n == 1 { "is" } else { "are" }),
+                n => format!("; {} line{} named no object and {} only in the copy set aside", n, if n == 1 { "" } else { "s" }, if n == 1 { "is" } else { "are" }),
             }
         ));
 
@@ -71,9 +73,9 @@ impl Repaired {
         }
 
         match self.absent.len() {
-            0 => lines.push("No object the history here names is absent without a record holding it.".to_string()),
+            0 => lines.push("No file the history here names is absent without a record holding it.".to_string()),
             n => lines.push(format!(
-                "{} object{} the history here names {} absent, and no record holds {}: content a lost entry may \
+                "{} file{} the history here names {} absent, and no record holds {}: content a lost entry may \
                 have withheld, once its copy was deleted. Withhold each one that was with \"forklift-server \
                 withhold add --root {} <hash> --statement <statement>\":",
                 n, if n == 1 { "" } else { "s" }, if n == 1 { "is" } else { "are" }, if n == 1 { "it" } else { "them" },
@@ -82,6 +84,15 @@ impl Repaired {
         }
 
         lines.extend(self.absent.iter().map(|hash| format!("  {}", hash)));
+
+        if self.absent_other > 0 {
+            lines.push(format!(
+                "{} folder{} or chunk{} the history here names {} absent too, which no takedown withholds: that is \
+                damage to the store, not a lost entry.",
+                self.absent_other, if self.absent_other == 1 { "" } else { "s" }, if self.absent_other == 1 { "" } else { "s" },
+                if self.absent_other == 1 { "is" } else { "are" }
+            ));
+        }
 
         lines.push(
             "Content a lost entry withheld whose copy is still stored is served again once this warehouse is, \
@@ -100,15 +111,19 @@ impl Repaired {
 /// # Returns
 /// * `Ok(Repaired)` - What was repaired.
 /// * `Err(String)`  - The record reads, or is absent from a root never served, so there is nothing
-///                    to repair; it is of a version this build does not know, which a newer
-///                    Forklift repairs; the root is being served; the history could not be walked;
-///                    or a file could not be read or written. The damaged record is left in
+///                    to repair; its header names a newer version, which a newer Forklift repairs,
+///                    and not `header_damaged`; the root is being served; the history could not be
+///                    walked; or a file could not be read or written. The damaged record is left in
 ///                    place until the repaired one replaces it, so a rerun finds it as it was.
-pub fn repair_withheld() -> Result<Repaired, String> {
+///
+/// # Arguments
+/// * `header_damaged` - The operator knows no newer Forklift wrote the record, so a header naming a
+///                      newer version is damage too, and the entries below it are salvaged.
+pub fn repair_withheld(header_damaged: bool) -> Result<Repaired, String> {
     let _serve_lock = ServeLock::acquire().map_err(|e| format!("Refusing to repair the record of withheld content: {}", e))?;
     let lock = RefLock::acquire()?;
 
-    let path = globals::forklift_root().join("withheld");
+    let path = withholding::withheld_path();
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => Some(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -118,9 +133,11 @@ pub fn repair_withheld() -> Result<Repaired, String> {
     match &bytes {
         Some(bytes) => match withholding::parse(bytes) {
             Ok(_) => return Err("The record of withheld content reads whole; there is nothing to repair.".to_string()),
-            Err(withholding::Unparsed::Record(record_utils::RecordError::OtherVersion(header))) => return Err(format!(
-                "The record of withheld content is in a format this version of Forklift does not know (\"{}\"): \
-                a newer Forklift wrote it, and repairs it.",
+            Err(withholding::Unparsed::Record(record_utils::RecordError::OtherVersion(header)))
+                if !header_damaged && withholding::newer_version(&header) => return Err(format!(
+                "The record of withheld content says a newer version of Forklift wrote it (\"{}\"); that \
+                Forklift repairs it. If none did, its header is damaged: run this again with --header-damaged \
+                to keep the entries below it.",
                 header.escape_debug()
             )),
             Err(_) => {}
@@ -150,44 +167,65 @@ pub fn repair_withheld() -> Result<Repaired, String> {
 
     set.write(&lock)?;
 
-    // The storage root may be relative to where the command runs.
-    let root = std::path::absolute(globals::forklift_root()).unwrap_or_else(|_| globals::forklift_root());
-    let warehouse = crate::util::franchise_utils::quote(&root.parent().unwrap_or(&root).to_string_lossy());
+    let warehouse = withholding::quoted_warehouse();
+    let (absent, absent_other) = absent;
 
-    Ok(Repaired { set_aside, salvaged, placeholders, unreadable_lines, absent, warehouse })
+    Ok(Repaired { set_aside, salvaged, placeholders, unreadable_lines, absent, absent_other, warehouse })
 }
 
-/// Keep `bytes`, the damaged record at `path`, beside it under a name no other repair uses.
+/// Keep `bytes`, the damaged record at `path`, beside it under a name no earlier repair took: an
+/// earlier copy may hold the only words of a lost statement. Only under the serve and ref locks,
+/// so no other repair picks a name meanwhile.
 fn copy_aside(path: &std::path::Path, bytes: &[u8]) -> Result<PathBuf, String> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
-    let target = path.with_file_name(format!("{}.damaged-{}", path.file_name().unwrap_or_default().to_string_lossy(), stamp));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
 
-    file_utils::replace_file_atomically(&target, bytes)?;
+    for attempt in 0u32.. {
+        let target = path.with_file_name(match attempt {
+            0 => format!("{}.damaged-{}", name, stamp),
+            n => format!("{}.damaged-{}-{}", name, stamp, n),
+        });
+        match std::fs::symlink_metadata(&target) {
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                file_utils::replace_file_atomically(&target, bytes)?;
+                return Ok(target);
+            }
+            Err(e) => return Err(format!("Error while reading \"{}\": {}", target.to_string_lossy(), e)),
+        }
+    }
 
-    Ok(target)
+    unreachable!("a free name is found before the counter runs out")
 }
 
 /// Every entry of a damaged record that still reads whole, and each hash kept with the
 /// placeholder from an entry that does not but opens with one. A first line that is a record
-/// header is skipped; an escaped entry reads as written, since a statement is one plain line.
+/// header is skipped; an escaped entry reads as written, since a statement is one plain line. A
+/// line is whole only when it is valid UTF-8 and ends in its newline: a record cut inside its last
+/// entry would otherwise keep a cut statement as the takedown's words.
 fn salvage(bytes: &[u8]) -> (WithheldSet, usize, Vec<String>, usize) {
     let mut entries = std::collections::BTreeMap::new();
     let mut placeholders = Vec::new();
     let mut unreadable = 0;
 
-    for (index, raw) in bytes.split(|byte| *byte == b'\n').enumerate() {
+    let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    for (index, raw) in lines.iter().enumerate() {
         if raw.is_empty() || (index == 0 && raw.starts_with(b"/forklift-")) {
             continue;
         }
+
+        // The piece after the last newline is a line the record was cut inside.
+        let terminated = index + 1 < lines.len();
+        let whole = terminated && std::str::from_utf8(raw).is_ok();
 
         // An entry is escaped as written; a line whose escape is broken is read raw, for its hash.
         let raw = String::from_utf8_lossy(raw);
         let line = record_utils::unescape(&raw).unwrap_or_else(|| raw.to_string());
 
-        match withholding::parse_entry(&line) {
+        match withholding::parse_entry(&line).filter(|_| whole) {
             Some((hash, statement, digest)) => {
                 entries.insert(hash.to_string(), (statement.to_string(), digest));
             }
@@ -210,9 +248,10 @@ fn salvage(bytes: &[u8]) -> (WithheldSet, usize, Vec<String>, usize) {
     (set, salvaged, placeholders, unreadable)
 }
 
-/// Every object the history this root keeps names that is absent and that no record holds, the
-/// sealed record and `withheld`, the salvaged record, included, sorted.
-fn absent_unheld(withheld: &WithheldSet) -> Result<Vec<String>, String> {
+/// Every file content the history this root keeps names that is absent and that no record holds,
+/// the sealed record and `withheld`, the salvaged record, included, sorted; and how many absent
+/// trees and chunks no record holds.
+fn absent_unheld(withheld: &WithheldSet) -> Result<(Vec<String>, usize), String> {
     let tolerated = sealed_utils::Tolerated {
         sealed: sealed_utils::read_sealed()?,
         applied: applied_redactions::read_applied()?,
@@ -222,16 +261,18 @@ fn absent_unheld(withheld: &WithheldSet) -> Result<Vec<String>, String> {
     let walked = sealed_utils::walk(&[], &tolerated, Unrecorded::Boundary)?
         .map_err(|damage| format!("object {} is absent, named by {}", damage.hash, damage.named_by))?;
 
-    let mut absent: Vec<String> = walked.absent.into_iter().filter(|hash| !tolerated.sealed.contains(hash)).collect();
+    let unheld = |hash: &&String| !tolerated.sealed.contains(*hash);
+    let mut absent: Vec<String> = walked.absent_files.iter().filter(unheld).cloned().collect();
     absent.sort();
+    let other = walked.absent.iter().filter(unheld).filter(|hash| !walked.absent_files.contains(*hash)).count();
 
-    Ok(absent)
+    Ok((absent, other))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::globals::StorageRootScope;
+    use crate::globals::{self, StorageRootScope};
     use crate::util::pallet_utils;
 
     struct Scratch {
@@ -262,6 +303,8 @@ mod tests {
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const D: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const E: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
     fn record() -> PathBuf {
         globals::forklift_root().join("withheld")
@@ -274,67 +317,87 @@ mod tests {
             .collect()
     }
 
-    // Revert: drop the placeholder → a hash whose entry lost its statement is served again; or
-    // keep nothing of a broken record → every takedown in it is.
+    // Revert: drop the placeholder → a hash whose entry lost its statement is served again; keep
+    // nothing of a broken record → every takedown in it is; or read a cut last line or a line of
+    // bad UTF-8 as whole → a cut or garbled statement is kept as the takedown's words.
     #[test]
     fn a_damaged_record_keeps_every_hash_it_can_still_tell() {
         let _scratch = Scratch::new("salvage");
         assert!(tombstone_utils::mark_served(true).unwrap());
 
         // A whole entry, one cut inside its digest column, a line naming no object, one that
-        // escapes a backslash, and no line ending at the end: cut short.
-        let bytes = format!("/forklift-withheld 2\n{} - court order 7\n{} 12\nnot a hash at all\n{} - path a\\\\b\n{} - DMCA", A, B, C, A);
+        // escapes a backslash, one of bad UTF-8, a second entry of the first hash, and no line
+        // ending at the end: cut short inside its statement.
+        let mut bytes = format!("/forklift-withheld 2\n{} - court order 7\n{} 12\nnot a hash at all\n{} - path a\\\\b\n", A, B, C).into_bytes();
+        bytes.extend_from_slice(format!("{} - caf", E).as_bytes());
+        bytes.extend_from_slice(b"\xff\n");
+        bytes.extend_from_slice(format!("{} - DMCA notice\n{} - DM", A, D).as_bytes());
         std::fs::write(record(), &bytes).unwrap();
         assert!(withholding::is_damage(&withholding::read_withheld().unwrap_err()));
 
-        let repaired = repair_withheld().unwrap();
+        let repaired = repair_withheld(false).unwrap();
         let set = withholding::read_withheld().unwrap();
 
-        assert_eq!(set.statement(A), Some("DMCA"), "a whole entry read later is kept as written");
+        assert_eq!(set.statement(A), Some("DMCA notice"), "a whole entry read later is kept as written");
         assert_eq!(set.statement(B), Some(PLACEHOLDER_STATEMENT));
         assert_eq!(set.digest(B), Some(&ChunkDigest::Unknown));
         assert_eq!(set.statement(C), Some("path a\\b"), "read unescaped");
-        assert_eq!((repaired.salvaged, repaired.placeholders.clone(), repaired.unreadable_lines), (2, vec![B.to_string()], 1));
+        assert_eq!(set.statement(E), Some(PLACEHOLDER_STATEMENT), "a statement of bad UTF-8 is not the operator's words");
+        assert_eq!(set.statement(D), Some(PLACEHOLDER_STATEMENT), "a statement cut short is not the operator's words");
+        assert_eq!((repaired.salvaged, repaired.placeholders.clone(), repaired.unreadable_lines),
+                   (2, vec![B.to_string(), E.to_string(), D.to_string()], 1));
 
         let moved = aside();
         assert_eq!(moved.len(), 1);
-        assert_eq!(std::fs::read_to_string(&moved[0]).unwrap(), bytes, "the damaged bytes are kept aside");
+        assert_eq!(std::fs::read(&moved[0]).unwrap(), bytes, "the damaged bytes are kept aside");
         assert_eq!(repaired.set_aside.as_ref(), Some(&moved[0]));
 
         let report = repaired.report().join("\n");
         assert!(report.contains(&format!("forklift-server withhold add --root {} {} --statement <statement>", repaired.warehouse, B)), "{}", report);
         assert!(report.contains("served again"), "{}", report);
 
-        assert!(repair_withheld().unwrap_err().contains("nothing to repair"), "a record that reads is left alone");
+        assert!(repair_withheld(false).unwrap_err().contains("nothing to repair"), "a record that reads is left alone");
     }
 
     // Revert: read a missing record as nothing to repair → a served root wedged on the loss.
     #[test]
     fn a_lost_record_in_a_served_root_is_written_anew_and_a_root_never_served_is_left_alone() {
         let _scratch = Scratch::new("lost");
-        assert!(repair_withheld().unwrap_err().contains("never been served"));
+        assert!(repair_withheld(false).unwrap_err().contains("never been served"));
         assert!(!record().exists());
 
         assert!(tombstone_utils::mark_served(true).unwrap());
         file_utils::remove_file(record()).unwrap();
 
-        let repaired = repair_withheld().unwrap();
+        let repaired = repair_withheld(false).unwrap();
         assert_eq!(repaired.set_aside, None);
         assert!(withholding::read_withheld().unwrap().is_empty());
         assert!(aside().is_empty());
     }
 
-    // Revert: set aside a record of a version this build does not know → a newer Forklift's
-    // takedowns are moved out of its reach.
+    // Revert: rewrite a record whose header names a newer version → a newer Forklift's takedowns
+    // are rewritten in a format it did not choose; refuse every header this build does not read
+    // as newer → a damaged header wedges the root, the named repair refusing; or ignore
+    // --header-damaged → a header damaged into a newer version's does.
     #[test]
-    fn a_record_of_another_version_is_left_for_the_forklift_that_wrote_it() {
+    fn a_newer_record_is_left_for_the_forklift_that_wrote_it_and_a_damaged_header_is_repaired() {
         let _scratch = Scratch::new("version");
-        let bytes = record_utils::to_bytes("withheld", 3, [format!("{} - statement", A)]);
-        std::fs::write(record(), &bytes).unwrap();
+        let newer = record_utils::to_bytes("withheld", 3, [format!("{} - statement", A)]);
+        std::fs::write(record(), &newer).unwrap();
 
-        assert!(repair_withheld().unwrap_err().contains("a newer Forklift wrote it"));
-        assert_eq!(std::fs::read(record()).unwrap(), bytes);
+        let refusal = repair_withheld(false).unwrap_err();
+        assert!(refusal.contains("a newer version of Forklift wrote it") && refusal.contains("--header-damaged"), "{}", refusal);
+        assert_eq!(std::fs::read(record()).unwrap(), newer);
         assert!(aside().is_empty());
+
+        assert_eq!(repair_withheld(true).unwrap().salvaged, 1, "the operator says no newer Forklift wrote it");
+        assert_eq!(withholding::read_withheld().unwrap().statement(A), Some("statement"));
+
+        for header in ["/forklift-withheld 1", "/forklift-withheld ", "/forklift-withheld 2x"] {
+            std::fs::write(record(), format!("{}\n{} - statement\n", header, B)).unwrap();
+            assert_eq!(repair_withheld(false).unwrap().salvaged, 1, "{:?} is damage, not a newer version", header);
+            assert_eq!(withholding::read_withheld().unwrap().statement(B), Some("statement"));
+        }
     }
 
     // Revert: take no serve lock → the record is rewritten under a server answering from it.
@@ -344,7 +407,7 @@ mod tests {
         std::fs::write(record(), b"garbage").unwrap();
 
         let _serving = ServeLock::acquire().unwrap();
-        assert!(repair_withheld().unwrap_err().starts_with("Refusing to repair the record of withheld content"));
+        assert!(repair_withheld(false).unwrap_err().starts_with("Refusing to repair the record of withheld content"));
         assert_eq!(std::fs::read(record()).unwrap(), b"garbage");
     }
 }
