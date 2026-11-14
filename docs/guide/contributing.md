@@ -118,9 +118,14 @@ Notes:
   process kills at each of forklift's traced write calls of the `history` scenario (`--strace`,
   `--kill`; the traces are uploaded with the report), and power loss at each of those moments,
   before every other sync (children's included), at each line's end before it exits, and after
-  each line (`--power`, with `--power-variants` seeded partial states): the traced calls are
-  replayed over a model that keeps only what was fsynced, POSIX-minimal semantics, so a loss there
-  may survive on a real ext4, and every power-loss row says so. Each state is written out afresh,
+  each line (`--power`): the traced calls are replayed over a model that keeps only what was
+  fsynced, POSIX-minimal semantics, so a loss there may survive on a real ext4, and every
+  power-loss row says so. Between that durable state and the volatile one, each moment also
+  leaves the calls' names over the synced bytes (metadata committed, data not), and each file
+  changed since its sync torn under its durable names without losing a synced byte, kept once per
+  durable version rather than per write; `--power-variants` adds seeded partial states, and each
+  scenario's report counts the states of each kind asked for and graded. A scenario that runs
+  lines after its record is not run for power loss. Each state is written out afresh,
   so no file keeps its inode or times, and a stat cache trusting an unchanged file over a lost
   object is not exercised; every row says that too. A call the model cannot replay, or
   a replay whose tree differs from the traced run's at any line's start or at its end, refuses

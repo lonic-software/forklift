@@ -20,6 +20,19 @@
 //! POSIX-minimal semantics. A real ext4 in data=ordered mode keeps more than this, so a loss
 //! graded here may survive on a real machine; every row says so.
 //!
+//! Between the durable state and the volatile one, each moment also leaves two deterministic
+//! kinds of state. One has the namespace the calls left, every name, folder, mode and link, with
+//! each file's synced bytes, cut where a truncate since its sync cut it: metadata committed in
+//! order, data not yet allocated. The other has one file of the durable tree torn, under every
+//! durable name of its inode: cut where a truncate cut it, zeros past its synced bytes, or half of
+//! what followed them, or half overwritten in place, but never short of a byte the file synced, so
+//! a synced file never comes back empty. A file's torn forms are kept once per durable version and
+//! step trail, from that span's last moment, rather than once per write. A state two kinds leave
+//! is reported as the more realistic: durable, then ordered, then torn, then a seeded variant.
+//! Each scenario's report says how many of each kind were asked for and how many distinct ones
+//! were graded. A scenario that runs lines after its record is not run: a crash past the record's
+//! own lines would be graded as owing nothing.
+//!
 //! Each state is written out afresh, so no file keeps the inode or times it had: a stat cache that
 //! trusts an unchanged file finds every entry changed, and a state where it would trust a file
 //! whose object was lost is not exercised. Every row says that too.

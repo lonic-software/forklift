@@ -101,7 +101,7 @@ jobs:
           # (lifted is hosted, so it has no client points), keep the lane inside its budget.
           # The server is traced by attaching to it, which Yama's ptrace scope governs.
           if [ "$RUNNER_OS" = Linux ]; then echo "kernel.yama.ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope 2>&1)"; fi
-          if [ "$RUNNER_OS" = Linux ]; then kill=(--strace "$(command -v strace)" --kill history --kill lifted --power history --power lifted --power-variants 4); fi
+          if [ "$RUNNER_OS" = Linux ]; then kill=(--strace "$(command -v strace)" --kill history --kill lifted --power history --power lifted); fi
           if [ -n "${CAPPED:-}" ]; then capped=(--capped-volume "$CAPPED/proof-load" --disk-full history --disk-full compacted); fi
           # A folder inside the volume, never its mount point, which the system may write into.
           if [ -n "${FOLDING:-}" ]; then folding=(--folding-volume "$FOLDING/proof-load"); fi
