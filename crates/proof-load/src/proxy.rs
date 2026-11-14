@@ -65,6 +65,10 @@ pub enum Fault {
     /// The whole request forwarded, then the server killed before its response is read; the
     /// client's connection closed.
     Kill,
+    /// The response read whole, then the server killed with none of it delivered; the client's
+    /// connection closed. The crash just after the server answered, which the server power-loss
+    /// lane cuts its runs at: not one of the network lane's faults.
+    Crash,
 }
 
 impl Fault {
@@ -79,6 +83,7 @@ impl Fault {
             Fault::Stall => "stall",
             Fault::Cut => "cut toward the server",
             Fault::Kill => "server killed",
+            Fault::Crash => "server killed once it answered",
         }
     }
 }
@@ -586,6 +591,13 @@ fn serve_connection(client: TcpStream, state: &State) {
         }
 
         match fault {
+            Some(Fault::Crash) => {
+                if let Some(kill) = lock(&state.killer).as_mut() {
+                    kill();
+                }
+                let _ = client.shutdown(Shutdown::Both);
+                return;
+            }
             Some(Fault::Truncate) => {
                 let _ = client.write_all(&response.bytes[..response.bytes.len() / 2]);
                 let _ = client.shutdown(Shutdown::Both);
@@ -780,7 +792,8 @@ mod tests {
     ///
     /// Revert: fire at the arming index instead of the n-th after it → the first request is
     /// faulted; forward a dropped request → the server is reached; deliver the whole response on
-    /// truncation → the client reads it all.
+    /// truncation → the client reads it all; kill on a crash before its response is read → the
+    /// exchange has no status.
     #[test]
     fn each_fault_fires_once_where_it_was_armed() {
         let whole = {
@@ -788,7 +801,7 @@ mod tests {
             let proxy = Proxy::start(server.address).unwrap();
             ask(&proxy, GET).0
         };
-        for fault in Fault::ALL {
+        for fault in Fault::ALL.into_iter().chain([Fault::Crash]) {
             let server = echo(Duration::ZERO);
             let proxy = Proxy::start(server.address).unwrap();
             let killed = Arc::new(AtomicUsize::new(0));
@@ -813,6 +826,10 @@ mod tests {
                     assert_eq!(reached, 2);
                 }
                 Fault::Kill => assert_eq!((answer.len(), killed.load(Ordering::SeqCst)), (0, 1)),
+                Fault::Crash => {
+                    assert_eq!((answer.len(), killed.load(Ordering::SeqCst)), (0, 1));
+                    assert_eq!(fired.status, Some(200), "the server answered before it was killed");
+                }
                 Fault::Truncate | Fault::Stall => {
                     let full = b"HTTP/1.1 200 OK\r\ncontent-length: 21\r\n\r\nPOST /v1/pallets/main".len();
                     assert!(!answer.is_empty() && answer.len() < full, "{:?}: {:?}", fault, String::from_utf8_lossy(&answer));
@@ -828,7 +845,7 @@ mod tests {
                     assert!(took >= DELAY, "{:?}", took);
                 }
             }
-            if fault != Fault::Kill {
+            if !matches!(fault, Fault::Kill | Fault::Crash) {
                 assert_eq!(killed.load(Ordering::SeqCst), 0);
             }
             // And it fires once: the next request goes through.
