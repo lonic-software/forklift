@@ -357,7 +357,7 @@ impl Model {
     /// Every file the durable tree names whose contents the calls changed since its last sync,
     /// with each way it can come back torn: one inode, under every durable name it has, whatever
     /// the volatile namespace now calls it.
-    pub fn torn(&self) -> Vec<(Ino, Vec<(Form, Vec<u8>)>)> {
+    pub fn torn(&self) -> Vec<(Ino, Vec<Torn>)> {
         let mut out = Vec::new();
         for ino in self.durable_files().into_keys() {
             if let (Some(Node::File { data: kept, .. }), Some(Node::File { data: made, .. })) = (self.durable.get(&ino), self.volatile.get(&ino)) {
@@ -396,6 +396,12 @@ impl Model {
     }
 }
 
+/// A torn form of one file, with the contents it comes back with.
+type Torn = (Form, Vec<u8>);
+
+/// Each file's paths, by inode.
+type Names = BTreeMap<Ino, Vec<String>>;
+
 /// How one file comes back torn, never losing a synced byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -425,7 +431,7 @@ impl Form {
 /// The torn forms of a file synced as `kept` and since written to `made`, `truncated` the shortest
 /// length a truncate since the sync cut it to. Every form keeps the synced bytes below the floor,
 /// the synced length or that cut; a form equal to `kept`, the durable state itself, is left out.
-fn torn_forms(kept: &[u8], made: &[u8], truncated: Option<usize>) -> Vec<(Form, Vec<u8>)> {
+fn torn_forms(kept: &[u8], made: &[u8], truncated: Option<usize>) -> Vec<Torn> {
     let floor = match truncated {
         Some(cut) => cut.min(kept.len()).min(made.len()),
         None => kept.len().min(made.len()),
@@ -452,7 +458,7 @@ fn torn_forms(kept: &[u8], made: &[u8], truncated: Option<usize>) -> Vec<(Form, 
         overwritten[..half].copy_from_slice(&made[..half]);
         forms.push((Form::HalfOverwritten, overwritten));
     }
-    let mut out: Vec<(Form, Vec<u8>)> = Vec::new();
+    let mut out: Vec<Torn> = Vec::new();
     for (form, data) in forms {
         if data != kept && out.iter().all(|(_, other)| *other != data) {
             out.push((form, data));
@@ -1475,7 +1481,7 @@ pub(crate) struct Collector {
     /// Each state's crash, by its tree's digest, whether it was acknowledged, and its step trail.
     seen: BTreeMap<(String, bool, (usize, bool)), usize>,
     /// The durable tree of the last version walked, its digest and its files' paths.
-    cached: Option<(u64, std::sync::Arc<Image>, String, std::sync::Arc<BTreeMap<Ino, Vec<String>>>)>,
+    cached: Option<(u64, std::sync::Arc<Image>, String, std::sync::Arc<Names>)>,
     /// The torn forms of the span being recorded: its version, acknowledgement and trail, its
     /// durable tree and files, and per (file, form) the last moment and contents.
     pending: Option<Span>,
@@ -1490,7 +1496,7 @@ pub(crate) struct Collector {
 struct Span {
     key: (u64, bool, (usize, bool)),
     image: std::sync::Arc<Image>,
-    files: std::sync::Arc<BTreeMap<Ino, Vec<String>>>,
+    files: std::sync::Arc<Names>,
     torn: BTreeMap<(Ino, Form), (Moment, Vec<u8>)>,
 }
 
