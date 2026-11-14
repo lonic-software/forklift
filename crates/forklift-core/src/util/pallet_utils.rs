@@ -4071,7 +4071,7 @@ pub(crate) mod tests {
         fn a_removal_beside_tombstones_whose_mark_was_lost_is_refused_as_damage() {
             let (root, _scope) = deleted_in_a_served_root("tombstone-mark-lost");
             update_pallet_head("other", None, &hash('b'), &RefPreconditions::NONE).unwrap();
-            std::fs::remove_file(tombstone_utils::served_path()).unwrap();
+            crate::util::file_utils::remove_file(tombstone_utils::served_path()).unwrap();
 
             let refused = remove_pallet_head_in(
                 PalletNamespace::User, "other", &hash('b'), &RefPreconditions::NONE, Some(&deleting("other", &hash('b'))),

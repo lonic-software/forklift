@@ -122,7 +122,7 @@ pub fn repair_tombstones() -> Result<Repaired, String> {
         Err(e) => return Err(format!("Error while reading \"{}\": {}", list_path.to_string_lossy(), e)),
     };
 
-    let strict = list.as_deref().map(|bytes| strict_list(bytes));
+    let strict = list.as_deref().map(strict_list);
 
     if mark_reads && matches!(strict, Some(Some(_))) {
         return Err(
@@ -251,7 +251,7 @@ fn set_aside(path: &std::path::Path) -> Result<PathBuf, String> {
     let name = format!("{}.damaged-{}", path.file_name().unwrap_or_default().to_string_lossy(), stamp);
     let target = path.with_file_name(name);
 
-    std::fs::rename(path, &target).map_err(|e| format!(
+    file_utils::rename(path, &target).map_err(|e| format!(
         "Error while moving \"{}\" aside to \"{}\": {}", path.to_string_lossy(), target.to_string_lossy(), e
     ))?;
 

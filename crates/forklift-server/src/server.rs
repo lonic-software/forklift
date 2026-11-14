@@ -9745,7 +9745,7 @@ mod tests {
         async fn a_root_whose_mark_was_lost_beside_its_tombstones_is_not_served() {
             let (root, scope, side) = served_with_side("mark-lost");
             assert_eq!(delete(&root, "side", &side).await.status(), StatusCode::OK);
-            std::fs::remove_file(forklift_core::globals::forklift_root().join("served")).unwrap();
+            forklift_core::util::file_utils::remove_file(forklift_core::globals::forklift_root().join("served")).unwrap();
             drop(scope);
 
             let refused = WarehouseHandle::serving(root.clone(), false).err().expect("the root is refused");
@@ -9798,7 +9798,7 @@ mod tests {
             for (what, bytes) in damages {
                 match bytes {
                     Some(bytes) => std::fs::write(&list, bytes).unwrap(),
-                    None => std::fs::remove_file(&list).unwrap(),
+                    None => forklift_core::util::file_utils::remove_file(&list).unwrap(),
                 }
 
                 let response = get_warehouse(State(Arc::new(single_mode_state(root.clone()))), Path(PathParams::new()))

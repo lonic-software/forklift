@@ -515,7 +515,7 @@ pub(crate) mod tests {
 
         // A list already there, beside a lost mark, is never overwritten: it is damage.
         let head = "a".repeat(64);
-        std::fs::remove_file(served_path()).unwrap();
+        crate::util::file_utils::remove_file(served_path()).unwrap();
         write_list(&[&format!("{} gone", head)]);
         assert_damaged(&mark_served(false).unwrap_err(), "the served mark");
         assert_eq!(read_record(&tombstones_path(), TOMBSTONES_RECORD, TOMBSTONES_VERSION).unwrap(), Some(vec![format!("{} gone", head)]));
@@ -540,7 +540,7 @@ pub(crate) mod tests {
         let _scratch = Scratch::new("lost-mark");
 
         served_with(&named(&[("gone", &"a".repeat(64))]));
-        std::fs::remove_file(served_path()).unwrap();
+        crate::util::file_utils::remove_file(served_path()).unwrap();
 
         for error in [is_served().unwrap_err(), served_for_removal().unwrap_err(), read_tombstones().unwrap_err()] {
             assert_damaged(&error, "the served mark");
@@ -571,7 +571,7 @@ pub(crate) mod tests {
         let _scratch = Scratch::new("lost-list");
 
         assert!(mark_served(false).unwrap());
-        std::fs::remove_file(tombstones_path()).unwrap();
+        crate::util::file_utils::remove_file(tombstones_path()).unwrap();
 
         assert_damaged(&read_tombstones().unwrap_err(), "is missing");
         assert_damaged(&tombstone_heads().unwrap_err(), "is missing");

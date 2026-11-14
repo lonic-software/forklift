@@ -111,6 +111,9 @@ impl Area {
     }
 }
 
+/// A way to damage a served root's tombstones, and its name.
+type Damage = (&'static str, fn(&Path));
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -130,7 +133,7 @@ fn list_path(root: &Path) -> PathBuf {
 
 /// Forget every undo journal, as when a delete's entry has fallen off the end.
 fn forget_journals(root: &Path) {
-    std::fs::remove_file(root.join(".forklift").join("journal.json")).unwrap();
+    forklift_core::util::file_utils::remove_file(root.join(".forklift").join("journal.json")).unwrap();
 }
 
 /// Whether the store still holds `hash`, loose or packed.
@@ -148,7 +151,7 @@ fn a_served_root_whose_list_is_lost_refuses_whatever_frees_history() {
     let area = Area::new("refuses");
     let root = area.served();
     area.deleted(&root, "side");
-    std::fs::remove_file(list_path(&root)).unwrap();
+    forklift_core::util::file_utils::remove_file(list_path(&root)).unwrap();
 
     let gc = area.server(&root, &["gc", "--grace-hours", "0"]);
     assert!(!gc.status.success(), "{}", text(&gc.stdout));
@@ -174,7 +177,7 @@ fn a_repair_keeps_a_deleted_head_no_journal_names_until_it_is_dropped() {
     let root = area.served();
     let side = area.deleted(&root, "side");
     forget_journals(&root);
-    std::fs::remove_file(list_path(&root)).unwrap();
+    forklift_core::util::file_utils::remove_file(list_path(&root)).unwrap();
 
     let report = area.server_ok(&root, &["tombstone", "repair"]);
     assert!(report.contains("Kept 1 head with no name"), "{}", report);
@@ -198,7 +201,7 @@ fn a_repair_keeps_a_head_held_only_in_a_pack() {
     let side = area.deleted(&root, "side");
     area.run_ok(&root, &["store", "compact"]);
     forget_journals(&root);
-    std::fs::remove_file(list_path(&root)).unwrap();
+    forklift_core::util::file_utils::remove_file(list_path(&root)).unwrap();
     assert!(!root.join(".forklift").join("objects").join(&side[..2]).join(&side[2..]).exists(), "the tip is packed only");
 
     area.server_ok(&root, &["tombstone", "repair"]);
@@ -229,7 +232,7 @@ fn a_repair_names_a_deletion_only_where_the_journals_settle_it() {
         let _scope = forklift_core::globals::StorageRootScope::enter(&root);
         pallet_utils::remove_pallet_head_in(PalletNamespace::User, "side", &h2, &RefPreconditions::NONE, None).unwrap();
     }
-    std::fs::remove_file(list_path(&root)).unwrap();
+    forklift_core::util::file_utils::remove_file(list_path(&root)).unwrap();
 
     let report = area.server_ok(&root, &["tombstone", "repair"]);
 
@@ -277,9 +280,9 @@ fn heal_over_damaged_tombstones_answers_with_the_repair_and_rebuilds_once_it_is_
     let main_ref = root.join(".forklift").join("pallets").join("main");
     std::fs::write(&main_ref, &main.as_bytes()[..20]).unwrap();
 
-    let damages: [(&str, fn(&Path)); 2] = [
+    let damages: [Damage; 2] = [
         ("a damaged list", |root| std::fs::write(list_path(root), b"\xff\xfe not a list").unwrap()),
-        ("a lost mark", |root| std::fs::remove_file(root.join(".forklift").join("served")).unwrap()),
+        ("a lost mark", |root| forklift_core::util::file_utils::remove_file(root.join(".forklift").join("served")).unwrap()),
     ];
 
     for (what, damage) in damages {
@@ -312,7 +315,7 @@ fn a_redaction_is_held_while_only_a_kept_head_holds_its_content() {
     area.run_ok(&root, &["office", "enroll"]);
     let side = area.deleted(&root, "side");
     forget_journals(&root);
-    std::fs::remove_file(list_path(&root)).unwrap();
+    forklift_core::util::file_utils::remove_file(list_path(&root)).unwrap();
     area.server_ok(&root, &["tombstone", "repair"]);
 
     area.run_ok(&root, &["redact", "record", "-m", "secret", &format!("{}:side.txt", side)]);
