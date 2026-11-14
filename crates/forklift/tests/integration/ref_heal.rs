@@ -497,3 +497,60 @@ fn an_interrupted_consolidation_is_rebuilt_at_its_parcel_and_rolled_forward() {
 
     panic!("no rename stops the consolidation between its ref write and its position write");
 }
+
+/// A rebuilt or chosen head becomes a local head, which a take does not verify again, so it must
+/// pass the trust check as an undone delete's does. Unsigned work left out of the enrollment is
+/// what the damaged ref's own bytes still name: `heal` refuses to rebuild at it, and so does
+/// `--ref`, while a head the office admits is set.
+/// Revert: drop the trust check from the rebuild → it lands at the unsigned parcel → red. Drop it
+/// from `--ref` → the unsigned parcel is set → red.
+#[test]
+fn a_head_that_fails_the_trust_check_is_never_written() {
+    let area = Area::new("trust");
+    let root = area.warehouse();
+    let admitted = head(&root, "main");
+    area.run_ok(&root, &["pallet", "create", "side"]);
+    area.run_ok(&root, &["shift", "side"]);
+    area.stack(&root, "side.txt", "unsigned");
+    let unsigned = head(&root, "side");
+    area.run_ok(&root, &["shift", "main"]);
+    area.run_ok(&root, &["pallet", "delete", "side", "--force"]);
+    area.run_ok(&root, &["pallet", "create", "side"]);
+    area.run_ok(&root, &["office", "enroll"]);
+
+    std::fs::write(ref_path(&root, "side"), &unsigned.as_bytes()[..20]).unwrap();
+
+    let refused = area.run(&root, &["--json", "heal"]);
+    let value = ref_damaged(&refused);
+    assert!(text(&refused.stdout).contains("trust check"), "{}", value);
+    assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), &unsigned.as_bytes()[..20], "the ref is left alone");
+
+    let set = format!("side={}", unsigned);
+    let refused = area.run(&root, &["heal", "--ref", &set]);
+    assert!(!refused.status.success());
+    assert!(text(&refused.stderr).contains("trust check"), "{}{}", text(&refused.stdout), text(&refused.stderr));
+    assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), &unsigned.as_bytes()[..20], "the ref is left alone");
+
+    area.run_ok(&root, &["heal", "--ref", &format!("side={}", admitted)]);
+    assert_eq!(head(&root, "side"), admitted);
+}
+
+/// `pallet create` leaves no journal entry, so the latest entry about a pallet made again after a
+/// delete is still that delete. A checkout standing on it proves it was made again (a delete is
+/// refused under one), so its lost ref is rebuilt at the checkout's base.
+/// Revert: let a journaled delete refuse although a checkout stands on the pallet → red.
+#[test]
+fn a_pallet_made_again_after_a_delete_is_rebuilt_under_its_checkout() {
+    let area = Area::new("made-again");
+    let root = area.warehouse();
+    let base = head(&root, "main");
+    area.run_ok(&root, &["pallet", "create", "side"]);
+    area.stack(&root, "side.txt", "gone");
+    area.run_ok(&root, &["shift", "main"]);
+    area.run_ok(&root, &["pallet", "delete", "side", "--force"]);
+    area.run_ok(&root, &["pallet", "create", "side"]);
+    forklift_core::util::file_utils::remove_file(ref_path(&root, "side")).unwrap();
+
+    let data = healed(&area, &root);
+    assert_eq!(head(&root, "side"), base, "{}", data);
+}

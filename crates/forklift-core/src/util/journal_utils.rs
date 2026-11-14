@@ -672,6 +672,16 @@ pub(crate) fn refuse_a_bay_out_of_step(name: &str,
 /// are now, and both must still hold when the ref is written; without one, there must still be
 /// none, so an enrollment cannot slip in between and miss the head. `closing` ends a refusal.
 pub(crate) fn trust_preconditions(wire: &str, head: &str, closing: &str) -> Result<pallet_utils::RefPreconditions, String> {
+    trust_preconditions_saying(
+        &format!("The history of deleted pallet \"{}\" no longer passes this warehouse's trust check:", wire),
+        head,
+        closing,
+    )
+}
+
+/// [`trust_preconditions`] for any head about to be written, a failed check refused as `refused`
+/// followed by why and `closing`.
+pub(crate) fn trust_preconditions_saying(refused: &str, head: &str, closing: &str) -> Result<pallet_utils::RefPreconditions, String> {
     use crate::util::{audit_utils, office_utils};
     use pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 
@@ -687,10 +697,7 @@ pub(crate) fn trust_preconditions(wire: &str, head: &str, closing: &str) -> Resu
         return Err(format!("Trust is established but the office pallet is missing. {}", closing));
     };
 
-    let untrusted = |e: String| format!(
-        "The history of deleted pallet \"{}\" no longer passes this warehouse's trust check: {} {}",
-        wire, e, closing
-    );
+    let untrusted = |e: String| format!("{} {} {}", refused, e, closing);
 
     let office_state = audit_utils::verify_office_chain(&anchor, &office_head).map_err(|e| untrusted(e.into()))?;
     audit_utils::verify_pallet_history(head, &anchor, &office_state, &[]).map_err(|e| untrusted(e.into()))?;

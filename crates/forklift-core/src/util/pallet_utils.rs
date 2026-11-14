@@ -1283,9 +1283,10 @@ pub enum RefDamage {
 /// a hash. The compare-and-set of [`update_pallet_head_in`], expecting `damage` in place of a head,
 /// re-read inside the hold, so a ref anything wrote or removed since it was judged is refused as
 /// moved. The write is judged as a creation: `new`'s closure is verified, and the tombstone and
-/// redaction checks apply.
-pub fn repair_pallet_head(name: &str, damage: &RefDamage, new: &str) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(PalletNamespace::User, name, None, new, &RefPreconditions::NONE, None, None, None, Some(damage))
+/// redaction checks apply. `preconditions` pins the trust state `new` was verified against (a
+/// rebuilt head becomes a local head, which a take does not verify again).
+pub fn repair_pallet_head(name: &str, damage: &RefDamage, new: &str, preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
+    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, None, None, Some(damage))
 }
 
 /// Remove the unreadable ref of user pallet `name`, which must still hold exactly `bytes` inside

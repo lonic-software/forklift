@@ -467,7 +467,9 @@ fn listed(candidates: &[(String, Source)]) -> Vec<Candidate> {
 
 /// Choose the head to rebuild `pallet` at from `evidence`.
 fn choose(pallet: &str, evidence: &Evidence, pass: Pass) -> Choice {
-    if !evidence.deleted_in.is_empty() {
+    // A checkout standing on the pallet means it was made again after the delete, since a delete
+    // is refused while one stands on it, and `pallet create` leaves no journal entry to say so.
+    if !evidence.deleted_in.is_empty() && !evidence.stood_on {
         return Choice::Refuse(format!(
             "the latest journal entry of {} deleted the pallet, so a rebuild could undo that delete",
             evidence.deleted_in.join(" and ")
@@ -572,7 +574,10 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
                 reason,
                 candidates: listed(&evidence.candidates),
             }),
-            Choice::Rebuild(head, source) => match pallet_utils::repair_pallet_head(&damaged.pallet, &damaged.damage, &head) {
+            Choice::Rebuild(head, source) => match trusted(&damaged.pallet, &head)
+                .map_err(RefUpdateError::Failed)
+                .and_then(|preconditions| pallet_utils::repair_pallet_head(&damaged.pallet, &damaged.damage, &head, &preconditions))
+            {
                 Ok(()) => report.rebuilt.push(Rebuilt { pallet: damaged.pallet.clone(), head, source }),
                 // The first pass leaves a failed write to the second, which reports it.
                 Err(_) if pass == Pass::BeforeTaint => {}
@@ -586,6 +591,17 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
     }
 
     Ok(report)
+}
+
+/// The trust state a ref of `pallet` rebuilt or set at `head` is written under: in a warehouse
+/// with an anchor, `head`'s history verifies against the anchor and office as they are now, as
+/// an undone delete's does, since the written head is a local head no take verifies again.
+fn trusted(pallet: &str, head: &str) -> Result<pallet_utils::RefPreconditions, String> {
+    journal_utils::trust_preconditions_saying(
+        &format!("The history of parcel {} does not pass this warehouse's trust check, so the ref of pallet \"{}\" is not set to it:", head, pallet),
+        head,
+        "Nothing was changed.",
+    )
 }
 
 /// Find `pallet` among the damaged refs, refusing a ref that is not damaged.
@@ -605,7 +621,8 @@ pub fn set_damaged_ref(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> R
     let damaged = damaged_ref(pallet, notes)?;
     let head = pallet_utils::resolve_revision(parcel)?;
 
-    pallet_utils::repair_pallet_head(&damaged.pallet, &damaged.damage, &head).map_err(|error| error.to_string())?;
+    let preconditions = trusted(&damaged.pallet, &head)?;
+    pallet_utils::repair_pallet_head(&damaged.pallet, &damaged.damage, &head, &preconditions).map_err(|error| error.to_string())?;
 
     Ok(Rebuilt { pallet: damaged.pallet, head, source: "the parcel given".to_string() })
 }
