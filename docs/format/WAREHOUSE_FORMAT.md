@@ -26,10 +26,12 @@ digest <blake3 of every byte before this line, in lowercase hex>
 `.forklift/warehouse-copy` holds the same bytes. Every write replaces the copy first and the marker
 second, each atomically and synced, so at every instant at least one of them is whole. A build reads
 the marker if it is whole and the copy otherwise; when the two differ, or one is missing or damaged,
-the next open of the warehouse rewrites the stale one from the one it read. A folder is a warehouse
-when either file is whole. Only when both are missing is it refused as not a warehouse; one that is
-present but unreadable or damaged, with no whole twin, is refused as damaged and is never answered
-with `prepare`. A version-3 marker, from before the marker carried a digest, is refused with its own
+the next open of the warehouse rewrites the stale one from the one it read. A file the file system
+refuses to read (a folder in its place, a permission the build lacks) is stood in for the same way,
+but never rewritten. A folder is a warehouse when either file is whole. Only when both are missing
+is it refused as not a warehouse. One that is damaged, with no whole twin, is refused as damaged; one
+that cannot be read is refused with the error that stopped the read. Neither is ever answered with
+`prepare`. A version-3 marker, from before the marker carried a digest, is refused with its own
 message: the warehouse is made again.
 
 This framing is frozen, so any future build can read any marker well enough to refuse it correctly.

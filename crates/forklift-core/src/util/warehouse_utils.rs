@@ -731,6 +731,20 @@ enum MarkerFile {
     Valid(WarehouseMarker, Vec<u8>),
     /// A file that is no marker this build can use: the refusal saying why.
     Unusable(String),
+    /// A file the file system will not let this build read, for a reason of the file's own (a folder
+    /// in its place, a permission it lacks): a twin stands in for it, but no rewrite would make it
+    /// readable, so it is never healed.
+    Unreadable(String),
+}
+
+impl MarkerFile {
+    /// The refusal of a file that is there but holds no marker this build can use.
+    fn refusal(self) -> Option<String> {
+        match self {
+            MarkerFile::Unusable(refusal) | MarkerFile::Unreadable(refusal) => Some(refusal),
+            MarkerFile::Absent | MarkerFile::Valid(..) => None,
+        }
+    }
 }
 
 /// The marker pair of a `.forklift` folder, resolved.
@@ -751,39 +765,56 @@ struct MarkerPair {
 fn read_marker_pair(forklift: &Path) -> Result<MarkerPair, String> {
     let names = [FILE_NAME_WAREHOUSE_MARKER, FILE_NAME_WAREHOUSE_MARKER_COPY];
     let [primary, copy] = names.map(|name| read_marker_file(forklift, name));
+    let (primary, copy) = (primary?, copy?);
 
     let (marker, bytes, other, other_name) = match (primary, copy) {
         (MarkerFile::Valid(marker, bytes), copy) => (marker, bytes, copy, FILE_NAME_WAREHOUSE_MARKER_COPY),
         (primary, MarkerFile::Valid(marker, bytes)) => (marker, bytes, primary, FILE_NAME_WAREHOUSE_MARKER),
-        (MarkerFile::Absent, MarkerFile::Absent) => return Ok(MarkerPair { chosen: None, stale: Vec::new() }),
-        (MarkerFile::Unusable(refusal), MarkerFile::Unusable(copy_refusal)) => return Err(format!(
-            "{} Its copy cannot be used either, so nothing records what the warehouse holds: {}",
-            refusal, copy_refusal
-        )),
-        (MarkerFile::Unusable(refusal), MarkerFile::Absent) | (MarkerFile::Absent, MarkerFile::Unusable(refusal)) => return Err(refusal),
+        (primary, copy) => return match (primary.refusal(), copy.refusal()) {
+            (None, None) => Ok(MarkerPair { chosen: None, stale: Vec::new() }),
+            (Some(refusal), Some(copy_refusal)) => Err(format!(
+                "{} Its copy cannot be used either, so nothing records what the warehouse holds: {}",
+                refusal, copy_refusal
+            )),
+            (Some(refusal), None) | (None, Some(refusal)) => Err(refusal),
+        },
     };
 
-    let other_holds_it = matches!(&other, MarkerFile::Valid(_, other_bytes) if *other_bytes == bytes);
-    let stale = if other_holds_it { Vec::new() } else { vec![other_name] };
+    // A file the file system will not let this build read stays as it is: rewriting it would only
+    // give it the same mode, or fail over the folder in its place, at every opening.
+    let other_needs_no_rewrite = match &other {
+        MarkerFile::Valid(_, other_bytes) => *other_bytes == bytes,
+        MarkerFile::Unreadable(_) => true,
+        MarkerFile::Absent | MarkerFile::Unusable(_) => false,
+    };
+    let stale = if other_needs_no_rewrite { Vec::new() } else { vec![other_name] };
 
     Ok(MarkerPair { chosen: Some((marker, bytes)), stale })
 }
 
-/// Read one file of the marker pair. A file that is there but cannot be read is unusable like a
-/// damaged one, so its twin can stand in for it.
-fn read_marker_file(forklift: &Path, name: &str) -> MarkerFile {
+/// Read one file of the marker pair. A file the file system will not let this build read, for a
+/// reason of the file's own, is [`MarkerFile::Unreadable`], so its twin can stand in; any other
+/// failure to read it (out of descriptors or memory, an I/O error) is an error, reported as itself
+/// rather than as a lost marker, since trying again may succeed.
+fn read_marker_file(forklift: &Path, name: &str) -> Result<MarkerFile, String> {
     let path = forklift.join(name);
 
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return MarkerFile::Absent,
-        Err(e) => return MarkerFile::Unusable(format!("Error while reading the warehouse marker \"{}\": {}.", path.to_string_lossy(), e)),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Ok(MarkerFile::Absent),
+        Err(e) => {
+            let refusal = format!("Error while reading the warehouse marker \"{}\": {}.", path.to_string_lossy(), e);
+            return match e.kind() {
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::IsADirectory => Ok(MarkerFile::Unreadable(refusal)),
+                _ => Err(refusal),
+            };
+        }
     };
 
-    match decode_marker(&bytes, &path, forklift) {
+    Ok(match decode_marker(&bytes, &path, forklift) {
         Ok(marker) => MarkerFile::Valid(marker, bytes),
         Err(refusal) => MarkerFile::Unusable(refusal),
-    }
+    })
 }
 
 /// The marker `bytes` (read from `path` in `forklift`) record, through the framing frozen at
@@ -1801,9 +1832,27 @@ mod tests {
             std::fs::create_dir(forklift.join(hit)).unwrap();
             let pair = read_marker_pair(&forklift).unwrap();
             assert_eq!(pair.chosen, Some((marker.clone(), good.clone())), "a folder as {}", hit);
+            assert!(pair.stale.is_empty(), "a folder as {} is not rewritten at every opening", hit);
             lay(twin, None);
             assert!(read_marker_pair(&forklift).is_err(), "a folder as {} beside an absent twin", hit);
             file_utils::remove_dir(forklift.join(hit)).unwrap();
+        }
+
+        // A primary without read permission is stood in for, and left as it is: a rewrite would carry
+        // the same mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            write_marker(&forklift, &marker).unwrap();
+            std::fs::set_permissions(forklift.join(primary), std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read(forklift.join(primary)).is_err() {
+                let pair = read_marker_pair(&forklift).unwrap();
+                assert_eq!(pair.chosen, Some((marker.clone(), good.clone())), "an unreadable primary");
+                assert!(pair.stale.is_empty(), "an unreadable primary is not rewritten at every opening");
+            }
+            std::fs::set_permissions(forklift.join(primary), std::fs::Permissions::from_mode(0o644)).unwrap();
+            lay(primary, None);
+            lay(copy, None);
         }
 
         // A marker from before the digest stands in for no missing twin.
