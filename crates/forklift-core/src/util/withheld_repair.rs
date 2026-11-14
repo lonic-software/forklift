@@ -261,7 +261,7 @@ fn absent_unheld(withheld: &WithheldSet) -> Result<(Vec<String>, usize), String>
     let walked = sealed_utils::walk(&[], &tolerated, Unrecorded::Boundary)?
         .map_err(|damage| format!("object {} is absent, named by {}", damage.hash, damage.named_by))?;
 
-    let unheld = |hash: &&String| !tolerated.sealed.contains(*hash);
+    let unheld = |hash: &&String| !tolerated.sealed.contains(hash);
     let mut absent: Vec<String> = walked.absent_files.iter().filter(unheld).cloned().collect();
     absent.sort();
     let other = walked.absent.iter().filter(unheld).filter(|hash| !walked.absent_files.contains(*hash)).count();
