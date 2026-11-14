@@ -2470,8 +2470,8 @@ pub(crate) fn corrupt_loose_objects() -> Result<StoreScan, String> {
 
 /// Every packed object whose records do not rebuild to it and that the store cannot read another
 /// way (FORK-495): [`corrupt_loose_objects`]'s twin for the packs. A record failing for a reason
-/// that says nothing about it (its delta base read failed uncoded), or one whose other copies
-/// could not be consulted, is listed unchecked, never corrupt.
+/// that says nothing about it (its delta base read failed some other way than unreadable), or one
+/// whose other copies could not be consulted, is listed unchecked, never corrupt.
 ///
 /// # Returns
 /// * `Ok(StoreScan)` - What was found, possibly nothing.
@@ -2484,18 +2484,16 @@ pub(crate) fn corrupt_packed_objects() -> Result<StoreScan, String> {
 
     let mut scan = StoreScan::default();
     for (hash, record) in failing {
-        if record.cause != file_utils::Unreadable::RecordDamage {
-            scan.unchecked.push((hash, record.why));
-            continue;
-        }
+        // The whole store's read judges it: another good copy stands in, and a failure that says
+        // nothing about the record (its cause `Other`) is the read's to explain.
         match file_utils::read_object_classified(&hash) {
             Ok(file_utils::StoreReadOutcome::Verified(_) | file_utils::StoreReadOutcome::Absent) => {}
-            Ok(file_utils::StoreReadOutcome::Unverifiable(_, file_utils::Unreadable::Other)) => {
-                scan.unchecked.push((hash, format!("its pack record is damaged, but another copy could not be checked: {}", record.why)));
+            Ok(file_utils::StoreReadOutcome::Unverifiable(error, file_utils::Unreadable::Other)) => {
+                scan.unchecked.push((hash, error));
             }
             Ok(file_utils::StoreReadOutcome::Unverifiable(..)) => { scan.corrupt.insert(hash, record.why); }
             Err(error) => scan.unchecked.push((hash, format!(
-                "its pack record is damaged, but its other copies could not be consulted: {}", error
+                "its pack record does not rebuild, but its other copies could not be consulted: {}", error
             ))),
         }
     }
