@@ -623,7 +623,7 @@ fn main() -> ExitCode {
                     continue;
                 }
                 // The host's server killed while the faulted command runs, on fresh builds of its own.
-                if killing && server.is_some() && proof_load::servekill::hosted(scenario) {
+                if killing && server.is_some() && scenario.hosts() {
                     let served = output.scratch(&format!("{}-served", scenario.id)).map_err(|error| error.to_string())
                         .and_then(|template| proof_load::servekill::count(scenario, &faulted_corpus, &programs, &settings, &template, routes.as_ref()).map(|counting| (template, counting)).map_err(|error| error.to_string()));
                     let kills = match served {

@@ -340,6 +340,11 @@ pub fn folded_corpus(corpus: &crate::corpus::Corpus, fold: Fold) -> crate::corpu
 }
 
 impl Scenario {
+    /// Whether it serves a host its faulted command reaches.
+    pub fn hosts(&self) -> bool {
+        self.history.iter().any(|op| matches!(op, Op::Host))
+    }
+
     /// The tools this scenario runs against: Forklift always; git, both ways, only when git binds
     /// every operation of the history.
     pub fn tools(&self) -> Vec<Tool> {

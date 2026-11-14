@@ -25,7 +25,7 @@ use crate::damage::Warehouse;
 use crate::faulted::{self, Context, Graded, Programs};
 use crate::report::{Category, Cell, Completeness, Row};
 use crate::runner::{self, RunError};
-use crate::scenario::{Op, Scenario, Tool};
+use crate::scenario::{Scenario, Tool};
 use crate::scrub::{Environment, Scratch};
 use crate::tool::Outcome;
 use crate::trace::{self, Argument, Call, Class, Operand, Returned, Root};
@@ -214,19 +214,29 @@ fn selected(call: &Call, aims: &BTreeSet<String>) -> bool {
 /// that exists then. A call the table cannot classify, or a write outside the root, refuses.
 pub fn enumerate(calls: &[Call], line: usize, command: &str, root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
     let tool = calls.first().map(|call| call.tid).unwrap_or_default();
-    enumerate_in(calls, trace::thread_groups(calls), tool, line, &|_| (command.to_string(), 0), root, start, existed)
+    enumerate_in(calls, trace::thread_groups(calls), tool, line, &|_| (command.to_string(), 0), root, start, Some(&existed))
 }
 
 /// The kill points of a trace attached to the running server `pid`: [`enumerate`], every thread
 /// the server already had counted as its own. `unit` names each call's unit, the point's command,
 /// and the moment its position is counted from: the injecting trace is attached then, so only the
-/// calls from that moment on count toward `when`, and only those can steal it.
-pub fn enumerate_served(calls: &[Call], pid: u32, unit: &dyn Fn(&Call) -> (String, u64), root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
-    enumerate_in(calls, trace::attached_groups(calls, pid), pid, 0, unit, root, start, existed)
+/// calls from that moment on count toward `when`, and only those can steal it. Since that moment
+/// is not the counting trace's start, what existed when strace resolves a -P path is unknown: a
+/// path whose resolved form could differ from it is counted by position instead.
+pub fn enumerate_served(calls: &[Call], pid: u32, unit: &dyn Fn(&Call) -> (String, u64), root: &Root, start: &str) -> Result<Enumerated, Vec<String>> {
+    enumerate_in(calls, trace::attached_groups(calls, pid), pid, 0, unit, root, start, None)
+}
+
+/// The resolved form strace adds to a -P `path` that exists when it starts, from its working
+/// directory `start`: under the root's canonical form.
+fn resolved_aim(start: &str, path: &str, root: &Root) -> (String, Option<String>) {
+    let literal = lexical_join(start, path);
+    let canonical = root.rebase(&literal, &Root { given: root.canonical.clone(), canonical: root.canonical.clone() });
+    (literal, canonical)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, tool: u32, line: usize, command: &dyn Fn(&Call) -> (String, u64), root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
+fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, tool: u32, line: usize, command: &dyn Fn(&Call) -> (String, u64), root: &Root, start: &str, existed: Option<&dyn Fn(&str) -> bool>) -> Result<Enumerated, Vec<String>> {
     let mut directories = Directories::new(groups, start);
     let mut refusals = Vec::new();
     let mut enumerated = Enumerated::default();
@@ -266,20 +276,19 @@ fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, tool: u32, line: usi
         let target = identity(&touched.operands, &touched.detail, root, group);
         // Judged below the root, so digits in the scratch area's own name are never taken for a temp.
         let temp = resolved.iter().any(|path| trace::without_temp(&root.tokenized(path), group).1);
-        let (aim, aims) = match touched.operands.first() {
-            Some(first) if !temp => {
-                let path = match first { Operand::Named { traced, .. } => traced.clone(), Operand::Held { target } => target.clone() };
+        let path = touched.operands.first().filter(|_| !temp).map(|first| match first { Operand::Named { traced, .. } => traced.clone(), Operand::Held { target } => target.clone() });
+        // strace adds realpath() of the -P string when it starts: resolved from strace's own
+        // working directory, the line's start folder, whatever the call's dirfd.
+        let (aim, aims) = match (path, existed) {
+            (Some(path), Some(existed)) => {
                 let mut aims = BTreeSet::from([path.clone()]);
-                // strace adds realpath() of the -P string when it starts: resolved from strace's
-                // own working directory, the line's start folder, whatever the call's dirfd.
-                let literal = lexical_join(start, &path);
-                if let Some(canonical) = root.rebase(&literal, &Root { given: root.canonical.clone(), canonical: root.canonical.clone() }) {
-                    if existed(&literal) {
-                        aims.insert(canonical);
-                    }
+                let (literal, canonical) = resolved_aim(start, &path, root);
+                if let Some(canonical) = canonical.filter(|_| existed(&literal)) {
+                    aims.insert(canonical);
                 }
                 (Aim::Path { path }, Some(aims))
             }
+            (Some(path), None) if resolved_aim(start, &path, root).1.as_deref() == Some(path.as_str()) => (Aim::Path { path: path.clone() }, Some(BTreeSet::from([path]))),
             _ => (Aim::Position, None),
         };
         candidates.push((index, aims, aim, target, base));
@@ -412,7 +421,7 @@ pub(crate) fn holds_root(bytes: &[u8], needle: &[u8]) -> bool {
 }
 
 /// The paths under `root`, absolute, as they stand.
-pub(crate) fn listing(root: &Path) -> BTreeSet<String> {
+fn listing(root: &Path) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
@@ -474,7 +483,7 @@ pub fn command_id(schema: &crate::writeops::Schema, arguments: &[String]) -> Res
 
 /// Why a scenario's kill points cannot run in this build of the harness, if they cannot.
 pub fn not_run(scenario: &Scenario) -> Option<String> {
-    if scenario.history.iter().any(|op| matches!(op, Op::Host)) {
+    if scenario.hosts() {
         return Some("hosted: every copy would share one server and its warehouse, and the copy's work tree names that server's URL".to_string());
     }
     None
@@ -953,10 +962,27 @@ mod tests {
             Some(when) if when >= 1731542400000200 => ("serve second".to_string(), 1731542400000200),
             _ => ("serve first".to_string(), 0),
         };
-        let enumerated = enumerate_served(&calls, 70, &unit, &root(), "/o/s/0001-h-count", |_| false).unwrap();
+        let enumerated = enumerate_served(&calls, 70, &unit, &root(), "/o/s/0001-h-count").unwrap();
         let points: Vec<(&str, usize, bool)> = enumerated.points.iter().map(|point| (point.command.as_str(), point.when, point.sampled)).collect();
         assert_eq!(points, vec![("serve first", 1, true), ("serve second", 1, false)]);
         assert!(enumerated.children.is_empty(), "{:?}", enumerated.children);
+    }
+
+    /// A served point keeps its -P aim only where strace's resolved form of it is the path itself:
+    /// a relative path, whose resolved form depends on what existed when the injecting trace was
+    /// attached, is counted by position.
+    ///
+    /// Revert: aim every served path as a client's → the relative mkdir is aimed by path.
+    #[test]
+    fn a_served_aim_is_kept_only_when_it_resolves_to_itself() {
+        let text = "\
+70 1731542400.000100 mkdirat(AT_FDCWD</o/s/0001-h-count>, \"/o/s/0001-h-count/wh/a\", 0777) = 0
+70 1731542400.000200 mkdirat(AT_FDCWD</o/s/0001-h-count>, \"wh/b\", 0777) = 0
+";
+        let calls = trace::parse(text).unwrap();
+        let enumerated = enumerate_served(&calls, 70, &|_| ("serve".to_string(), 0), &root(), "/o/s/0001-h-count").unwrap();
+        let aims: Vec<&Aim> = enumerated.points.iter().map(|point| &point.aim).collect();
+        assert_eq!(aims, vec![&Aim::Path { path: "/o/s/0001-h-count/wh/a".into() }, &Aim::Position]);
     }
 
     /// A fixed path counts only the calls -P would select, including a descriptor on the path's

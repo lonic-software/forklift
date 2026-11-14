@@ -93,10 +93,10 @@ fn state_of(stat: &str) -> Option<char> {
 }
 
 /// Attaches `strace` to the running process `pid`, following every thread it has and makes, its
-/// trace written to `trace`; returns once every thread the process has shows a tracer, or once
-/// strace has ended cleanly with the process gone. What strace said is the error when it exits
+/// trace written to `trace`; returns once every thread the process has shows a tracer, or, for an
+/// `injecting` trace, once strace has ended cleanly with the process gone. What strace said is the error when it exits
 /// otherwise first, or does not attach within `limit`.
-fn attach(strace: &Path, pid: u32, trace: &Path, filter: &[String], limit: Duration) -> Result<Attached, String> {
+fn attach(strace: &Path, pid: u32, trace: &Path, filter: &[String], injecting: bool, limit: Duration) -> Result<Attached, String> {
     let mut child = Command::new(strace).args(["-f", "-qq", "-y", "-ttt", "-o"]).arg(trace).args(filter).arg("-p").arg(pid.to_string())
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
         .map_err(|error| format!("strace could not be started: {}", error))?;
@@ -107,7 +107,7 @@ fn attach(strace: &Path, pid: u32, trace: &Path, filter: &[String], limit: Durat
         if let Ok(Some(status)) = attached.child.try_wait() {
             // An injecting trace can kill the server before every thread is attached: strace then
             // ends with its tracee, and the trace, not the attach, says where the kill landed.
-            if status.success() && gone(pid) {
+            if injecting && status.success() && gone(pid) {
                 return Ok(attached);
             }
             let said = attached.said.take().map(|said| said.join().unwrap_or_default()).unwrap_or_default();
@@ -206,7 +206,8 @@ impl Host {
         }
         let Some(pid) = lock(&self.server).as_ref().map(Served::pid) else { return Err("the server is not running".to_string()) };
         let trace = PathBuf::from(format!("{}-{}.trace", tracing.base.display(), tracing.attached.len()));
-        tracing.attached.push(attach(&tracing.strace, pid, &trace, &tracing.filter, limit)?);
+        let injecting = tracing.filter.iter().any(|part| part.starts_with("inject="));
+        tracing.attached.push(attach(&tracing.strace, pid, &trace, &tracing.filter, injecting, limit)?);
         Ok(())
     }
 
@@ -256,11 +257,16 @@ impl Host {
     /// Whether the server has been killed and not restarted: by the harness, or by anything else
     /// that ended its process, such as an injected kill.
     pub fn killed(&self) -> bool {
+        lock(&self.server).is_none()
+    }
+
+    /// How the server ended, once it has ended without the harness killing it; the host then has
+    /// no server until it is restarted.
+    pub fn ended(&self) -> Option<std::process::ExitStatus> {
         let mut server = lock(&self.server);
-        if server.as_mut().is_some_and(Served::exited) {
-            *server = None;
-        }
-        server.is_none()
+        let status = server.as_mut().and_then(Served::ended)?;
+        *server = None;
+        Some(status)
     }
 
     /// Starts the server again over the same warehouse, behind the same URL. A refusal to start

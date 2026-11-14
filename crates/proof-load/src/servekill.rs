@@ -35,7 +35,7 @@ use crate::kill::{self, Aim, Killed, Landing, Point, ScenarioKills, Settings, AT
 use crate::proxy::{self, Exchange};
 use crate::routes::{Mode, RouteTable};
 use crate::runner::{self, RunError};
-use crate::scenario::{Op, Scenario, Tool};
+use crate::scenario::{Scenario, Tool};
 use crate::scrub::Scratch;
 use crate::trace::{self, Call, Root};
 
@@ -67,11 +67,6 @@ pub struct Counted {
 pub enum Counting {
     Counted(Box<Counted>),
     NotRun(String),
-}
-
-/// Whether `scenario` serves a host its faulted command reaches.
-pub fn hosted(scenario: &Scenario) -> bool {
-    scenario.history.iter().any(|op| matches!(op, Op::Host))
 }
 
 /// One request's window in the counting run.
@@ -122,7 +117,7 @@ fn host_of<'a>(scenario: &Scenario, built: &'a runner::Built) -> Result<&'a Host
 /// Builds `scenario` in `template` and runs its faulted command once against its host with a plain
 /// trace attached, every mutating or syncing call of the server a point.
 pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: &Settings, template: &Scratch, table: Option<&RouteTable>) -> Result<Counting, RunError> {
-    if !hosted(scenario) {
+    if !scenario.hosts() {
         return Ok(Counting::NotRun("hosts no warehouse".to_string()));
     }
     let io = |error: std::io::Error| RunError::Io(error.to_string());
@@ -133,7 +128,6 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
     let root = Root::of(template.root()).map_err(io)?;
     let label = template.root().file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     let host = host_of(scenario, &built)?;
-    let before = kill::listing(template.root());
     let base = settings.traces.join(format!("{}-serve-count", label));
     if let Err(said) = host.trace_once(settings.strace, &base, &[], settings.limit) {
         return Ok(Counting::NotRun(format!("strace could not attach to the server: {}", said)));
@@ -158,8 +152,7 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
     let windows = windows(&exchanges, table);
     let last = exchanges.iter().filter_map(|exchange| exchange.answered).max().unwrap_or(since);
     let start = template.root().to_string_lossy().into_owned();
-    let existed = |path: &str| before.contains(path) || root.rebase(path, &Root { given: root.given.clone(), canonical: root.given.clone() }).is_some_and(|given| before.contains(&given));
-    let (enumerated, refusals) = match kill::enumerate_served(&calls, pid, &|call| unit_of(call, &windows), &root, &start, existed) {
+    let (enumerated, refusals) = match kill::enumerate_served(&calls, pid, &|call| unit_of(call, &windows), &root, &start) {
         Ok(enumerated) => (enumerated, Vec::new()),
         Err(refusals) => (kill::Enumerated::default(), refusals),
     };
@@ -244,15 +237,19 @@ pub fn filter(point: &Point, counting: &Root, root: &Root) -> Result<Vec<String>
     Ok(filter)
 }
 
-/// Waits until the host's server is killed, up to `limit`; says whether it was.
-fn killed_within(host: &Host, limit: Duration) -> bool {
+/// Waits until the host's server ends, up to `limit`: whether it was killed. A server that ended
+/// any other way crashed on its own, which is an error, never a kill that missed.
+fn killed_within(host: &Host, limit: Duration) -> Result<bool, RunError> {
     let deadline = Instant::now() + limit;
     loop {
-        if host.killed() {
-            return true;
+        if let Some(status) = host.ended() {
+            if !killed_by_signal(&status) {
+                return Err(RunError::Io(format!("the server ended on its own ({}) while the faulted command ran", status)));
+            }
+            return Ok(true);
         }
         if Instant::now() >= deadline {
-            return false;
+            return Ok(false);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -275,6 +272,12 @@ fn inject(scenario: &Scenario, programs: &Programs, settings: &Settings, templat
     // just before the proxy forwards it; a background point's, before the faulted command starts.
     let (go, went) = std::sync::mpsc::channel::<()>();
     let (done, finished) = std::sync::mpsc::channel::<()>();
+    match window {
+        // Serial from the start, as the counting run was: requests are numbered in the order they
+        // are forwarded, and the hook runs once the request before it is answered.
+        Some(_) => host.proxy.set_serial(true),
+        None => {}
+    }
     match window {
         Some(at) => host.proxy.before(host.proxy.requests() + at, move || {
             if go.send(()).is_ok() {
@@ -308,7 +311,7 @@ fn inject(scenario: &Scenario, programs: &Programs, settings: &Settings, templat
         let graded = faulted::grade_after(&context, &counted.expected, counted.faulted, |context, steps| {
             let made = context.record(counted.faulted, steps);
             host.proxy.clear_before();
-            if !killed_within(host, settle) {
+            if !killed_within(host, settle)? {
                 return Err(RunError::Io(NOT_KILLED.to_string()));
             }
             restarted = Some(host.restart(&scratch, &environment, settings.limit).map_err(RunError::Tool)?);
@@ -362,6 +365,19 @@ mod tests {
         call
     }
 
+    /// Only a SIGKILL is the injected kill; a server that exited, or died of another signal,
+    /// crashed on its own.
+    ///
+    /// Revert: take any end for the kill → the panic's exit reads as killed.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_sigkill_is_the_injected_kill() {
+        use std::os::unix::process::ExitStatusExt;
+        assert!(killed_by_signal(&std::process::ExitStatus::from_raw(9)));
+        assert!(!killed_by_signal(&std::process::ExitStatus::from_raw(101 << 8)));
+        assert!(!killed_by_signal(&std::process::ExitStatus::from_raw(6)));
+    }
+
     /// A call is the unit of the request whose window holds its moment, ends included, counted
     /// from that window's opening, and the background's outside every window, counted from the
     /// trace's start.
@@ -405,4 +421,16 @@ mod tests {
         let positional = Point { aim: Aim::Position, ..point };
         assert_eq!(filter(&positional, &counting, &root).expect("no path")[1], "trace=renameat2,clone,clone3,fork,vfork");
     }
+}
+
+/// Whether `status` is a SIGKILL's: the injected kill's.
+#[cfg(unix)]
+fn killed_by_signal(status: &std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal() == Some(9)
+}
+
+#[cfg(not(unix))]
+fn killed_by_signal(_: &std::process::ExitStatus) -> bool {
+    false
 }

@@ -164,9 +164,10 @@ impl Served {
         self.child.id()
     }
 
-    /// Whether its process has ended: a kill the harness did not make, such as an injected one.
-    pub fn exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
+    /// How its process ended, if it has: a kill the harness did not make, such as an injected one,
+    /// or a crash.
+    pub fn ended(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
     }
 }
 
