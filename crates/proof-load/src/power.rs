@@ -20,6 +20,19 @@
 //! POSIX-minimal semantics. A real ext4 in data=ordered mode keeps more than this, so a loss
 //! graded here may survive on a real machine; every row says so.
 //!
+//! Between the durable state and the volatile one, each moment also leaves two deterministic
+//! kinds of state. One has the namespace the calls left, every name, folder, mode and link, with
+//! each file's synced bytes, cut where a truncate since its sync cut it: metadata committed in
+//! order, data not yet allocated. The other has one file of the durable tree torn, under every
+//! durable name of its inode: cut where a truncate cut it, zeros past its synced bytes, or half of
+//! what followed them, or half overwritten in place, but never cut below the bytes the file
+//! synced, so a synced file never comes back empty. A file's torn forms are kept once per durable version and
+//! step trail, from that span's last moment, rather than once per write. A state two kinds leave
+//! is reported as the more realistic: durable, then ordered, then torn, then a seeded variant.
+//! Each scenario that graded states says in its report how many of each kind were asked for and
+//! how many distinct ones were graded. A scenario that runs lines after its record is not run: a
+//! crash past the record's own lines would be graded as owing nothing.
+//!
 //! Each state is written out afresh, so no file keeps the inode or times it had: a stat cache that
 //! trusts an unchanged file finds every entry changed, and a state where it would trust a file
 //! whose object was lost is not exercised. Every row says that too.
@@ -302,6 +315,166 @@ impl Model {
         }
         out
     }
+
+    /// The namespace as the calls left it, every file at its durable contents: what a file system
+    /// that commits metadata in order but allocates data late leaves. Every name, folder, mode and
+    /// link target comes from the volatile state, each file's bytes from its last sync, cut where
+    /// a truncate since that sync cut it, since the cut is metadata too.
+    pub fn ordered_image(&self) -> Image {
+        let mut out = Image::new();
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![(String::new(), self.root)];
+        while let Some((path, ino)) = stack.pop() {
+            match self.volatile.get(&ino) {
+                Some(Node::File { mode, .. }) => {
+                    let mut data = match self.durable.get(&ino) {
+                        Some(Node::File { data, .. }) => data.clone(),
+                        _ => Vec::new(),
+                    };
+                    if let Some(cut) = self.truncated.get(&ino) {
+                        data.truncate(*cut);
+                    }
+                    out.insert(path, Entry::File { data, mode: *mode });
+                }
+                Some(Node::Link { target }) => {
+                    out.insert(path, Entry::Link { target: target.clone() });
+                }
+                Some(Node::Dir { entries, mode }) => {
+                    if !seen.insert(ino) {
+                        continue;
+                    }
+                    out.insert(path.clone(), Entry::Dir { mode: *mode });
+                    for (name, child) in entries {
+                        stack.push((join(&path, name), *child));
+                    }
+                }
+                None => {}
+            }
+        }
+        out
+    }
+
+    /// Every file the durable tree names whose contents the calls changed since its last sync,
+    /// with each way it can come back torn: one inode, under every durable name it has, whatever
+    /// the volatile namespace now calls it.
+    /// `files` is [`Model::durable_files`] of this durable version.
+    fn torn(&self, files: &Names) -> Vec<(Ino, Vec<Torn>)> {
+        let mut out = Vec::new();
+        for &ino in files.keys() {
+            if let (Some(Node::File { data: kept, .. }), Some(Node::File { data: made, .. })) = (self.durable.get(&ino), self.volatile.get(&ino)) {
+                // A file cut and written back to its synced bytes still tears at the cut.
+                if kept != made || self.truncated.contains_key(&ino) {
+                    let forms = torn_forms(kept, made, self.truncated.get(&ino).copied());
+                    if !forms.is_empty() {
+                        out.push((ino, forms));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Each file of the durable tree, walked from the root as [`Model::durable_image`] walks it,
+    /// with every path it is reached at.
+    fn durable_files(&self) -> BTreeMap<Ino, Vec<String>> {
+        let mut out: BTreeMap<Ino, Vec<String>> = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![(String::new(), self.root)];
+        while let Some((path, ino)) = stack.pop() {
+            match self.durable.get(&ino) {
+                Some(Node::File { .. }) => out.entry(ino).or_default().push(path),
+                Some(Node::Dir { entries, .. }) => {
+                    if !seen.insert(ino) {
+                        continue;
+                    }
+                    for (name, child) in entries {
+                        stack.push((join(&path, name), *child));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// A torn form of one file, with the contents it comes back with.
+type Torn = (Form, Vec<u8>);
+
+/// Each file's paths, by inode.
+type Names = BTreeMap<Ino, Vec<String>>;
+
+/// How one file comes back torn, never cut below its synced bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Form {
+    /// Cut where a truncate since its sync cut it, nothing written after landing.
+    Cut,
+    /// At its full new length, everything past the synced bytes zeros: the size landed, the data
+    /// blocks did not.
+    ZeroTail,
+    /// The synced bytes and the first half of what followed them.
+    HalfTail,
+    /// Overwritten in place at its synced length, or cut where a truncate cut it, the first half
+    /// of the changed synced bytes new and the rest as synced.
+    HalfOverwritten,
+}
+
+impl Form {
+    fn label(self) -> &'static str {
+        match self {
+            Form::Cut => "cut, nothing after the cut landed",
+            Form::ZeroTail => "zeros past the synced bytes",
+            Form::HalfTail => "half of what followed the synced bytes",
+            Form::HalfOverwritten => "half overwritten in place",
+        }
+    }
+}
+
+/// The torn forms of a file synced as `kept` and since written to `made`, `truncated` the shortest
+/// length a truncate since the sync cut it to. No form is shorter than the floor, the synced
+/// length or that cut, and below it every form holds the synced bytes but those a half overwrite
+/// in place rewrote; a form equal to `kept`, the durable state itself, is left out.
+fn torn_forms(kept: &[u8], made: &[u8], truncated: Option<usize>) -> Vec<Torn> {
+    let floor = match truncated {
+        Some(cut) => cut.min(kept.len()).min(made.len()),
+        None => kept.len().min(made.len()),
+    };
+    let base = &kept[..floor];
+    let mut forms = Vec::new();
+    if truncated.is_some() {
+        forms.push((Form::Cut, base.to_vec()));
+    }
+    if made.len() > floor {
+        let mut zeros = base.to_vec();
+        zeros.resize(made.len(), 0);
+        forms.push((Form::ZeroTail, zeros));
+        let half = (made.len() - floor) / 2;
+        if half > 0 {
+            let mut prefix = base.to_vec();
+            prefix.extend_from_slice(&made[floor..floor + half]);
+            forms.push((Form::HalfTail, prefix));
+        }
+    }
+    // The first half of the synced bytes the writes changed, from the first that differs to the
+    // last, over the synced length, or a truncate's cut on its cut base, whether or not the file
+    // grew too; a change of one byte has no half and does not tear.
+    let mut overwritten = if truncated.is_some() { base.to_vec() } else { kept.to_vec() };
+    let differs = |at: &usize| kept[*at] != made[*at];
+    if let (Some(first), Some(last)) = ((0..floor).find(differs), (0..floor).rev().find(differs)) {
+        let end = first + (last + 1 - first) / 2;
+        if end > first {
+            overwritten[first..end].copy_from_slice(&made[first..end]);
+            forms.push((Form::HalfOverwritten, overwritten));
+        }
+    }
+    let mut out: Vec<Torn> = Vec::new();
+    for (form, data) in forms {
+        if data != kept && out.iter().all(|(_, other)| *other != data) {
+            out.push((form, data));
+        }
+    }
+    out
 }
 
 /// `kept` grown toward `made`'s size: a length past the synced one, its tail zeros or `made`'s
@@ -1181,16 +1354,74 @@ impl Moment {
 /// One state a crash can leave.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Crash {
-    /// The first moment that leaves it.
+    /// The moment it is reported at: the first that leaves it as its kind, or for a torn state
+    /// the last of its span, which tears the most of what the calls wrote.
     pub moment: Moment,
     /// Whether the faulted command had finished every line: the record was acknowledged.
     pub acknowledged: bool,
     /// How many crash moments leave this same state.
     pub shared: usize,
-    /// For a seeded state between the durable and the volatile one, its number.
-    pub variant: Option<usize>,
+    /// Which state it is: the durable one, or one between it and the volatile one.
+    pub state: State,
     #[serde(skip)]
     pub image: std::sync::Arc<Image>,
+}
+
+/// Which state a crash leaves, most realistic first: one state reached as two keeps the first.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum State {
+    /// What was synced, walked from the root.
+    Durable,
+    /// The namespace as the calls left it, each file's contents as synced: [`Model::ordered_image`].
+    Ordered,
+    /// The durable state but one file, torn under its durable name: [`Model::torn`].
+    Torn { path: String, form: Form },
+    /// A seeded draw between the two, numbered from 1.
+    Seeded { number: usize },
+}
+
+impl State {
+    fn rank(&self) -> u8 {
+        match self {
+            State::Durable => 0,
+            State::Ordered => 1,
+            State::Torn { .. } => 2,
+            State::Seeded { .. } => 3,
+        }
+    }
+
+    /// What a row says of the state beside its moment.
+    pub fn label(&self) -> String {
+        match self {
+            State::Durable => String::new(),
+            State::Ordered => " metadata committed, data not (delayed allocation)".to_string(),
+            State::Torn { path, form } => format!(" {} torn: {}", path, form.label()),
+            State::Seeded { number } => format!(" variant {}", number),
+        }
+    }
+}
+
+/// How many states between the durable and the volatile one each kind asked for, before states
+/// already found were set aside, and how many distinct ones were left to grade.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Requested {
+    pub ordered: (usize, usize),
+    pub torn: (usize, usize),
+    pub seeded: (usize, usize),
+}
+
+impl Requested {
+    pub(crate) fn add(&mut self, other: Requested) {
+        for (mine, theirs) in [(&mut self.ordered, other.ordered), (&mut self.torn, other.torn), (&mut self.seeded, other.seeded)] {
+            (mine.0, mine.1) = (mine.0 + theirs.0, mine.1 + theirs.1);
+        }
+    }
+
+    pub fn label(&self) -> String {
+        let one = |name: &str, (requested, graded): (usize, usize)| format!("{}: requested {}, graded {} distinct", name, requested, graded);
+        [one("metadata committed, data not", self.ordered), one("one file torn", self.torn), one("seeded variants", self.seeded)].join("; ")
+    }
 }
 
 /// One traced line as the crash enumeration reads it.
@@ -1204,10 +1435,18 @@ pub struct Line<'a> {
     pub before: &'a Image,
 }
 
+/// What [`crashes`] found: every distinct state, how many of each kind between were asked for,
+/// and the volatile tree the replay ended with, for the check against the run.
+pub struct Found {
+    pub crashes: Vec<Crash>,
+    pub requested: Requested,
+    pub replayed: Image,
+}
+
 /// Every distinct state a crash can leave in `lines`, replayed over `fixture` from the folder
-/// `start` under `root`, plus `variants` seeded states drawn at seeded moments. The last element of
-/// the result's pair is the volatile tree the replay ended with, for the check against the run.
-pub fn crashes(fixture: &Image, root: &Root, start: &str, umask: u32, lines: &[Line], variants: usize, seed: u64) -> Result<(Vec<Crash>, Image), String> {
+/// `start` under `root`: the durable state at each moment, the states between it and the volatile
+/// one that [`Collector`] adds, and `variants` seeded states drawn at seeded moments.
+pub fn crashes(fixture: &Image, root: &Root, start: &str, umask: u32, lines: &[Line], variants: usize, seed: u64) -> Result<Found, String> {
     let mut replay = Replay::new(Model::of(fixture)?, root.clone(), umask);
     let synced = |line: &Line| -> BTreeSet<usize> {
         let at_points: BTreeSet<usize> = line.points.iter().map(|point| point.call).collect();
@@ -1235,21 +1474,41 @@ pub fn crashes(fixture: &Image, root: &Root, start: &str, umask: u32, lines: &[L
         collector.record(Moment::Ending { line: index, command: line.command.clone() }, &replay.model, false);
         collector.record(Moment::After { line: index, command: line.command.clone() }, &replay.model, index == last);
     }
-    Ok((collector.finish(), replay.model.volatile_image()))
+    let (crashes, requested) = collector.finish();
+    Ok(Found { crashes, requested, replayed: replay.model.volatile_image() })
 }
 
-/// Every distinct state the moments recorded leave, with seeded variants drawn at seeded moments.
+/// Every distinct state the moments recorded leave: at each moment the durable state, the
+/// namespace committed over the durable contents, and each dirty file of the durable tree torn;
+/// with seeded variants drawn at seeded moments.
+///
+/// A torn file's form changes at every write, so a file written in many chunks would give a state
+/// per chunk; the forms are instead kept once per durable version and step trail, from the last
+/// moment of that span, which tears the most of what the calls wrote while nothing else changed.
 pub(crate) struct Collector {
-    crashes: Vec<Crash>,
+    /// The states found in the order first found as their kind; a state a more realistic kind
+    /// took over leaves a hole, so the order never depends on what was drawn.
+    crashes: Vec<Option<Crash>>,
     /// Each state's crash, by its tree's digest, whether it was acknowledged, and its step trail.
     seen: BTreeMap<(String, bool, (usize, bool)), usize>,
-    /// The durable tree of the last version walked.
-    cached: Option<(u64, std::sync::Arc<Image>, String)>,
+    /// The durable tree of the last version walked, its digest and its files' paths.
+    cached: Option<(u64, std::sync::Arc<Image>, String, std::sync::Arc<Names>)>,
+    /// The torn forms of the span being recorded: its version, acknowledgement and trail, its
+    /// durable tree and files, and per (file, form) the last moment and contents.
+    pending: Option<Span>,
     draws: BTreeMap<usize, usize>,
     rng: Rng,
     /// The moment being recorded, counted from 0.
     moment: usize,
     drawn: usize,
+    requested: Requested,
+}
+
+struct Span {
+    key: (u64, bool, (usize, bool)),
+    image: std::sync::Arc<Image>,
+    files: std::sync::Arc<Names>,
+    torn: BTreeMap<(Ino, Form), (Moment, Vec<u8>)>,
 }
 
 impl Collector {
@@ -1263,56 +1522,114 @@ impl Collector {
                 *draws.entry(rng.below(moments as u64) as usize).or_default() += 1;
             }
         }
-        Collector { crashes: Vec::new(), seen: BTreeMap::new(), cached: None, draws, rng, moment: 0, drawn: 0 }
+        Collector {
+            crashes: Vec::new(), seen: BTreeMap::new(), cached: None, pending: None, draws, rng, moment: 0, drawn: 0,
+            requested: Requested::default(),
+        }
     }
 
-    /// The states found, the variants among them numbered from 1: a draw a real moment superseded
-    /// left a gap.
-    pub(crate) fn finish(self) -> Vec<Crash> {
-        let mut crashes = self.crashes;
-        for (number, variant) in crashes.iter_mut().filter_map(|crash| crash.variant.as_mut()).enumerate() {
-            *variant = number + 1;
+    /// The states found, the seeded ones among them numbered from 1 (a draw a more realistic
+    /// state superseded leaves no gap), and how many of each kind between were asked for.
+    pub(crate) fn finish(mut self) -> (Vec<Crash>, Requested) {
+        self.flush();
+        let mut crashes: Vec<Crash> = self.crashes.into_iter().flatten().collect();
+        let mut numbers = 0;
+        let mut requested = self.requested;
+        for crash in &mut crashes {
+            match &mut crash.state {
+                State::Seeded { number } => {
+                    numbers += 1;
+                    *number = numbers;
+                    requested.seeded.1 += 1;
+                }
+                State::Ordered => requested.ordered.1 += 1,
+                State::Torn { .. } => requested.torn.1 += 1,
+                State::Durable => {}
+            }
         }
-        crashes
+        (crashes, requested)
     }
 
     pub(crate) fn record(&mut self, moment: Moment, model: &Model, acknowledged: bool) {
-        if self.cached.as_ref().is_none_or(|(version, _, _)| *version != model.version) {
+        if self.cached.as_ref().is_none_or(|(version, ..)| *version != model.version) {
             let image = model.durable_image();
             let key = digest(&image);
-            self.cached = Some((model.version, std::sync::Arc::new(image), key));
+            self.cached = Some((model.version, std::sync::Arc::new(image), key, std::sync::Arc::new(model.durable_files())));
         }
-        let (_, image, key) = self.cached.as_ref().expect("cached above");
-        let (image, key) = (image.clone(), key.clone());
-        self.add(moment.clone(), image, key, acknowledged, None);
+        let (_, image, key, files) = self.cached.as_ref().expect("cached above");
+        let (image, key, files) = (image.clone(), key.clone(), files.clone());
+        // The span before this moment is reported before anything this moment leaves.
+        let span = (model.version, acknowledged, moment.trail());
+        if self.pending.as_ref().is_some_and(|pending| pending.key != span) {
+            self.flush();
+        }
+        self.add(moment.clone(), image.clone(), key, acknowledged, State::Durable);
+
+        let ordered = model.ordered_image();
+        let key = digest(&ordered);
+        self.requested.ordered.0 += 1;
+        self.add(moment.clone(), std::sync::Arc::new(ordered), key, acknowledged, State::Ordered);
+
+        let pending = self.pending.get_or_insert_with(|| Span { key: span, image, files, torn: BTreeMap::new() });
+        for (ino, forms) in model.torn(&pending.files) {
+            for (form, data) in forms {
+                pending.torn.insert((ino, form), (moment.clone(), data));
+            }
+        }
+
         for _ in 0..self.draws.get(&self.moment).copied().unwrap_or_default() {
             let image = model.variant(&mut self.rng);
             let key = digest(&image);
-            if !self.seen.contains_key(&(key.clone(), acknowledged, moment.trail())) {
-                self.drawn += 1;
-                self.add(moment.clone(), std::sync::Arc::new(image), key, acknowledged, Some(self.drawn));
-            }
+            self.requested.seeded.0 += 1;
+            self.drawn += 1;
+            self.add(moment.clone(), std::sync::Arc::new(image), key, acknowledged, State::Seeded { number: self.drawn });
         }
         self.moment += 1;
     }
 
-    fn add(&mut self, moment: Moment, image: std::sync::Arc<Image>, digest: String, acknowledged: bool, variant: Option<usize>) {
-        match self.seen.get(&(digest.clone(), acknowledged, moment.trail())) {
-            Some(&at) if variant.is_none() => {
-                let crash = &mut self.crashes[at];
-                // A durable state an earlier draw already found is no variant: it happens with no
-                // torn write at all, so it is reported under this real moment.
-                if crash.variant.is_some() {
-                    (crash.moment, crash.variant, crash.shared) = (moment, None, 0);
+    /// Adds the torn states of the span recorded so far.
+    fn flush(&mut self) {
+        let Some(Span { key: (_, acknowledged, _), image, files, torn }) = self.pending.take() else { return };
+        for ((ino, form), (moment, data)) in torn {
+            let Some(paths) = files.get(&ino) else { continue };
+            let mut state = (*image).clone();
+            for path in paths {
+                if let Some(Entry::File { mode, .. }) = image.get(path) {
+                    state.insert(path.clone(), Entry::File { data: data.clone(), mode: *mode });
                 }
-                crash.shared += 1;
             }
-            Some(_) => {}
-            None => {
-                self.seen.insert((digest, acknowledged, moment.trail()), self.crashes.len());
-                self.crashes.push(Crash { moment, acknowledged, shared: 1, variant, image });
-            }
+            let key = digest(&state);
+            self.requested.torn.0 += 1;
+            let path = paths.iter().min().cloned().unwrap_or_default();
+            self.add(moment, std::sync::Arc::new(state), key, acknowledged, State::Torn { path, form });
         }
+    }
+
+    /// Records a state, or another moment that leaves one already found. A more realistic kind
+    /// takes over a state a less realistic one found first: it happens with less going wrong, so
+    /// it is reported as that, under its own moment, where that kind finds it.
+    fn add(&mut self, moment: Moment, image: std::sync::Arc<Image>, digest: String, acknowledged: bool, state: State) {
+        let key = (digest, acknowledged, moment.trail());
+        if let Some(&at) = self.seen.get(&key) {
+            let crash = self.crashes[at].as_mut().expect("a seen state holds its crash");
+            if state.rank() > crash.state.rank() {
+                return;
+            }
+            if state.rank() == crash.state.rank() {
+                if !matches!(state, State::Seeded { .. }) {
+                    crash.shared += 1;
+                }
+                return;
+            }
+            // The moments that already left this state still do; a seeded draw is not a moment.
+            let before = self.crashes[at].take().expect("a seen state holds its crash");
+            let shared = if matches!(before.state, State::Seeded { .. }) { 1 } else { before.shared + 1 };
+            self.seen.insert(key, self.crashes.len());
+            self.crashes.push(Some(Crash { moment, acknowledged, shared, state, image }));
+            return;
+        }
+        self.seen.insert(key, self.crashes.len());
+        self.crashes.push(Some(Crash { moment, acknowledged, shared: 1, state, image }));
     }
 }
 
@@ -1335,7 +1652,19 @@ pub struct ScenarioPower {
     pub errors: Vec<String>,
     /// For a server's power loss, each run that never reached its cut, with why.
     pub not_reached: Vec<String>,
+    /// How many states between the durable and the volatile one were asked for, and graded.
+    pub requested: Requested,
     pub crashes: Vec<GradedCrash>,
+}
+
+/// Why `scenario`'s power loss cannot be graded, if it cannot. A crash is graded acknowledged only
+/// once the last line exited, but the record's own lines acknowledge it before any line the
+/// scenario runs after them: a state past them would be graded as owing nothing.
+pub fn not_run(scenario: &Scenario) -> Option<String> {
+    if !scenario.then.is_empty() {
+        return Some("runs lines after its record, and a crash past the record's own lines would not be graded as acknowledged".to_string());
+    }
+    None
 }
 
 /// Grades every state a power loss during `scenario`'s faulted command can leave, `variants`
@@ -1350,6 +1679,10 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
             return Ok(power);
         }
     };
+    if let Some(reason) = not_run(scenario) {
+        power.not_run = Some(reason);
+        return Ok(power);
+    }
     let (points, _, refusals) = kill::points_of(counted, settings.schema);
     if let Some((refusals, not_run)) = kill::stopped(refusals, counted.path_bound.as_ref()) {
         (power.refusals, power.not_run) = (refusals, not_run);
@@ -1382,7 +1715,7 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
     let umask = harness_umask().map_err(RunError::Io)?;
     // Each scenario draws its own variants, not the same corners of every scenario.
     let drawn = seed ^ u64::from_le_bytes(blake3::hash(scenario.id.as_bytes()).as_bytes()[..8].try_into().expect("eight bytes"));
-    let (crashes, replayed) = match crashes(fixture, &counted.counting_root, &start, umask, &lines, variants, drawn) {
+    let Found { crashes, requested, replayed } = match crashes(fixture, &counted.counting_root, &start, umask, &lines, variants, drawn) {
         Ok(found) => found,
         Err(refusal) => {
             power.refusals.push(refusal);
@@ -1396,6 +1729,7 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
         (power.refusals, power.not_run) = (refusals, not_run);
         return Ok(power);
     }
+    power.requested = requested;
 
     let next = AtomicUsize::new(0);
     let results: Mutex<Vec<(usize, Result<GradedCrash, String>)>> = Mutex::new(Vec::new());
@@ -1514,7 +1848,7 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
         kill::Side::Client => (Category::PowerLossClient, "forklift", ""),
         kill::Side::Server => (Category::PowerLossServer, "forklift-server", "server "),
     };
-    let mut unreached = Vec::new();
+    let (mut unreached, mut between) = (Vec::new(), Vec::new());
     let (mut rows, mut refusals, mut errors, mut not_run, mut missing) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for scenario in all {
         if let Some(reason) = &scenario.not_run {
@@ -1527,6 +1861,9 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
         if scenario.refusals.is_empty() && scenario.errors.is_empty() && scenario.crashes.is_empty() {
             missing.push(format!("{}: no crash state was graded", scenario.scenario));
         }
+        if !scenario.crashes.is_empty() {
+            between.push(Completeness { check: format!("{}power loss of {}, states between durable and volatile: {}", prefix, scenario.scenario, scenario.requested.label()), cell: Cell::Run, missing: vec![] });
+        }
         for GradedCrash { crash, graded } in &scenario.crashes {
             let mut notes = vec![CAVEAT.to_string(), REWRITTEN.to_string()];
             if crash.shared > 1 {
@@ -1535,9 +1872,8 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
             if !graded.unextractable.is_empty() {
                 notes.push(format!("unextractable remedies: {}", graded.unextractable.join("; ")));
             }
-            let variant = crash.variant.map(|number| format!(" variant {}", number)).unwrap_or_default();
             rows.push(Row {
-                scenario: format!("{} power {}{}", scenario.scenario, crash.moment.label(), variant),
+                scenario: format!("{} power {}{}", scenario.scenario, crash.moment.label(), crash.state.label()),
                 category,
                 binding: binding.to_string(),
                 grade: graded.grade,
@@ -1557,6 +1893,7 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
     if side == kill::Side::Server {
         completeness.push(Completeness { check: "server power-loss cuts reached".to_string(), cell: Cell::Run, missing: unreached });
     }
+    completeness.extend(between);
     completeness.extend(not_run);
     let cell = if rows.is_empty() { Cell::not_run(&format!("no {}power-loss state was graded", prefix)) } else { Cell::Run };
     Summary { cell, rows, completeness }
@@ -1611,6 +1948,11 @@ mod tests {
     /// The tree at each line's start, as the replay of the lines before it leaves it.
     fn starts(lines: &[String]) -> Vec<Image> {
         (0..lines.len()).map(|count| replayed(&lines[..count]).unwrap().volatile_image()).collect()
+    }
+
+    /// The durable states among `crashes`.
+    fn durable(crashes: Vec<Crash>) -> Vec<Crash> {
+        crashes.into_iter().filter(|crash| crash.state == State::Durable).collect()
     }
 
     fn data(image: &Image, path: &str) -> Option<Vec<u8>> {
@@ -1835,7 +2177,8 @@ mod tests {
         let starts = starts(&texts);
         let lines: Vec<Line> = calls.iter().zip(&points).zip(&starts)
             .map(|((calls, points), before)| Line { calls, command: "stack".into(), points: points.iter().collect(), before }).collect();
-        let (crashes, replayed) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap();
+        let Found { crashes, replayed, .. } = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap();
+        let crashes = durable(crashes);
         assert_eq!(data(&replayed, "w/a").unwrap(), b"new");
         let found: Vec<(Vec<u8>, bool, usize)> = crashes.iter().map(|crash| (data(&crash.image, "w/a").unwrap(), crash.acknowledged, crash.shared)).collect();
         // Before the open, the write and the fsync: old. At line 1's end and after it: new, the
@@ -1862,7 +2205,7 @@ mod tests {
         assert!(points.iter().all(|point| point.name != "fsync"), "the child's syncs are no kill points");
         let first = fixture();
         let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect(), before: &first }];
-        let (crashes, _) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap();
+        let crashes = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap().crashes;
         let held: Vec<Vec<u8>> = crashes.iter().map(|crash| data(&crash.image, "w/a").unwrap()).collect();
         assert!(held.contains(&b"new".to_vec()), "{:?}", held);
         assert!(crashes.iter().any(|crash| matches!(&crash.moment, Moment::Synced { name, .. } if name == "fsync")));
@@ -2082,7 +2425,7 @@ mod tests {
         let mut held = fixture();
         held.insert("w/lock".into(), Entry::File { data: b"/s/w".to_vec(), mode: 0o644 });
         let moment = Moment::After { line: 0, command: "stack".into() };
-        let crashes = [Crash { moment, acknowledged: false, shared: 1, variant: None, image: std::sync::Arc::new(held) }];
+        let crashes = [Crash { moment, acknowledged: false, shared: 1, state: State::Durable, image: std::sync::Arc::new(held) }];
         assert_eq!(stopped(&fixture(), &fixture(), &[], &["/s"]), None);
         let (refusals, not_run) = stopped(&fixture(), &fixture(), &crashes, &["/s"]).unwrap();
         assert!(refusals.is_empty() && not_run.unwrap().contains("w/lock"));
@@ -2139,7 +2482,8 @@ mod tests {
     /// named for the server, and each run that never reached its cut is listed missing.
     ///
     /// Revert: report a server's states as a client's → the rows land in the client's category;
-    /// drop the unreached runs → the cut check lists nothing.
+    /// drop the unreached runs → the cut check lists nothing; count the states between for a
+    /// refused scenario → it claims a sweep that never ran.
     #[test]
     fn a_server_s_power_loss_is_reported_as_the_server_s() {
         let graded = Graded {
@@ -2147,7 +2491,7 @@ mod tests {
             steps: vec![], readbacks: vec![], unextractable: vec![],
         };
         let moment = Moment::Served { request: Some(1), route: "POST /v1/pallets/{name}".into(), when: "as the server died".into() };
-        let crash = Crash { moment, acknowledged: false, shared: 1, variant: None, image: Default::default() };
+        let crash = Crash { moment, acknowledged: false, shared: 1, state: State::Durable, image: Default::default() };
         let all = vec![ScenarioPower {
             scenario: "lifted".into(), not_reached: vec!["the run cut at request 3: never request 3".into()],
             crashes: vec![GradedCrash { crash, graded }], ..Default::default()
@@ -2158,11 +2502,15 @@ mod tests {
         assert_eq!((summary.rows[0].category, summary.rows[0].binding.as_str()), (Category::PowerLossServer, "forklift-server"));
         assert_eq!(summary.rows[0].scenario, "lifted power server, run cut at request 2 POST /v1/pallets/{name}: as the server died");
         let checks: Vec<&str> = summary.completeness.iter().map(|check| check.check.as_str()).collect();
-        assert_eq!(checks, ["server power-loss states", "server power-loss soundness", "server power-loss states ran", "server power-loss cuts reached"]);
+        assert_eq!(checks[..4], ["server power-loss states", "server power-loss soundness", "server power-loss states ran", "server power-loss cuts reached"]);
+        assert_eq!(checks[4..], ["server power loss of lifted, states between durable and volatile: metadata committed, data not: requested 0, graded 0 distinct; one file torn: requested 0, graded 0 distinct; seeded variants: requested 0, graded 0 distinct"]);
         assert_eq!(summary.completeness[3].missing, ["lifted: the run cut at request 3: never request 3"]);
         let client = summarize(&all);
         assert_eq!(client.rows[0].category, Category::PowerLossClient);
-        assert_eq!(client.completeness.len(), 3, "a client's power loss has no cuts");
+        assert_eq!(client.completeness.len(), 4, "a client's power loss has no cuts");
+        // A scenario whose replay refused graded no state, so it claims no states between.
+        let refused = vec![ScenarioPower { scenario: "lifted".into(), refusals: vec!["unmodelled".into()], ..Default::default() }];
+        assert!(summarize(&refused).completeness.iter().all(|check| !check.check.contains("states between")));
     }
 
     /// A crash moment's label names its line, so two lines' moments at the same call read apart.
@@ -2338,15 +2686,195 @@ mod tests {
         let starts = starts(&texts);
         let lines: Vec<Line> = calls.iter().zip(&points).zip(&starts)
             .map(|((calls, points), before)| Line { calls, command: "stack".into(), points: points.iter().collect(), before }).collect();
-        let (crashes, _) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap();
+        let crashes = durable(crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 7).unwrap().crashes);
         assert!(crashes.iter().all(|crash| data(&crash.image, "w/a").unwrap() == b"old"));
         let trails: Vec<(usize, bool)> = crashes.iter().map(|crash| crash.moment.trail()).collect();
         assert_eq!(trails, [(0, true), (1, false), (1, true), (2, false)]);
     }
 
-    /// A durable state is never reported as a variant: drawing variants leaves the durable
-    /// crashes exactly as a run with none, even when a draw happens to match a later one, and the
-    /// variants left are numbered from 1 without a gap.
+    /// A file system that commits metadata in order but allocates data late leaves the calls'
+    /// names with each file's synced bytes: a new file empty, a renamed one under its new name
+    /// with what it held, a rewritten one cut where its truncate cut it.
+    ///
+    /// Revert: take the bytes from the volatile state → `b` holds `bb`; ignore the cut → `a` comes
+    /// back `old` though its truncate landed.
+    #[test]
+    fn the_ordered_state_has_the_calls_names_and_the_synced_bytes() {
+        let created = format!("1 openat(AT_FDCWD</s/w>, \"b\", O_WRONLY|O_CREAT|O_EXCL, 0644) = 3</s/w/b>\n{}1 close(3</s/w/b>) = 0\n1 rename(\"a\", \"c\") = 0\n",
+            write(1, 3, "/s/w/b", b"bb"));
+        let model = replayed(&[created]).unwrap();
+        let ordered = model.ordered_image();
+        assert_eq!(data(&ordered, "w/b").unwrap(), b"");
+        assert_eq!(data(&ordered, "w/c").unwrap(), b"old");
+        assert!(!ordered.contains_key("w/a"));
+        assert!(model.durable_image().contains_key("w/a"));
+        let ordered = replayed(&[rewrite(false)]).unwrap().ordered_image();
+        assert_eq!(data(&ordered, "w/a").unwrap(), b"");
+    }
+
+    /// No torn form is cut below the synced bytes: below the synced length, or a truncate's cut
+    /// since the sync, every form holds what was synced but the half an overwrite in place
+    /// rewrote; a form the same as the synced file is left out.
+    ///
+    /// Revert: floor every form at 0 → an appended file tears to `ol`; drop the cut from the floor
+    /// → a rewritten file keeps `old` under the new bytes' zeros; overwrite the file's first half
+    /// → a change in its second half tears to the synced bytes and is left out; round the half up
+    /// → a one-byte change tears to the whole write; tear in place only a file that did not grow
+    /// → the grown file's new header never tears, and neither does a cut file's.
+    #[test]
+    fn a_torn_file_is_never_cut_below_its_synced_bytes() {
+        let forms = |kept: &[u8], made: &[u8], cut| torn_forms(kept, made, cut).into_iter().map(|(form, data)| (form, String::from_utf8(data).unwrap())).collect::<Vec<_>>();
+        assert_eq!(forms(b"old", b"olders", None), [(Form::ZeroTail, "old\0\0\0".to_string()), (Form::HalfTail, "olde".to_string())]);
+        assert_eq!(forms(b"old", b"newer", Some(0)), [(Form::Cut, String::new()), (Form::ZeroTail, "\0\0\0\0\0".to_string()), (Form::HalfTail, "ne".to_string())]);
+        assert_eq!(forms(b"old", b"olx", Some(2)), [(Form::Cut, "ol".to_string()), (Form::ZeroTail, "ol\0".to_string())]);
+        assert_eq!(forms(b"old", b"new", None), [(Form::HalfOverwritten, "nld".to_string())]);
+        // A change of one byte has no half: it lands whole or not at all.
+        assert!(forms(b"old", b"olx", None).is_empty());
+        // A file cut part way and rewritten below the cut tears in place on the cut base.
+        assert_eq!(forms(b"abcdefgh", b"XYcd", Some(4)), [(Form::Cut, "abcd".to_string()), (Form::HalfOverwritten, "Xbcd".to_string())]);
+        // A file rewritten in place and grown tears in place too, at its synced length.
+        assert_eq!(forms(b"HDR1body", b"NEW2bodyMORE", None),
+            [(Form::ZeroTail, "HDR1body\0\0\0\0".to_string()), (Form::HalfTail, "HDR1bodyMO".to_string()), (Form::HalfOverwritten, "NER1body".to_string())]);
+        // Only the changed bytes tear, wherever in the file they lie.
+        assert_eq!(forms(b"AAAAAAAA", b"AAAAAABB", None), [(Form::HalfOverwritten, "AAAAAABA".to_string())]);
+        assert!(forms(b"old", b"old", None).is_empty());
+    }
+
+    /// The crash states of one line, every kind among them.
+    fn found(text: &str) -> Found {
+        let calls = trace::parse(text).unwrap();
+        let points = kill::enumerate(&calls, 0, "stack", &root(), "/s/w", |_| true).unwrap().points;
+        let first = fixture();
+        let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect(), before: &first }];
+        crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 0).unwrap()
+    }
+
+    /// A torn file is torn under every name the durable tree gives its inode, whatever the calls
+    /// renamed it to since, and nothing else in the tree changes.
+    ///
+    /// Revert: find the names in the volatile tree → the torn bytes land only at `b`, `c` being
+    /// a name the durable tree lacks; tear one path of the inode → `b` keeps `old` beside a torn
+    /// `a`.
+    #[test]
+    fn a_file_is_torn_under_every_durable_name_of_its_inode() {
+        // The rename is not synced, but the fsync of `d` after it moves the durable state on.
+        let text = format!("1 link(\"a\", \"b\") = 0\n1 openat(AT_FDCWD</s/w>, \".\", O_RDONLY|O_DIRECTORY) = 4</s/w>\n1 fsync(4</s/w>) = 0\n\
+            1 rename(\"a\", \"c\") = 0\n1 openat(AT_FDCWD</s/w>, \"d\", O_WRONLY|O_CREAT|O_EXCL, 0644) = 5</s/w/d>\n{}1 fsync(5</s/w/d>) = 0\n\
+            1 openat(AT_FDCWD</s/w>, \"c\", O_WRONLY|O_APPEND) = 3</s/w/c>\n{}1 close(3</s/w/c>) = 0\n", write(1, 5, "/s/w/d", b"d"), write(1, 3, "/s/w/c", b"er"));
+        let torn: Vec<Crash> = found(&text).crashes.into_iter().filter(|crash| matches!(crash.state, State::Torn { .. })).collect();
+        assert!(!torn.is_empty());
+        for crash in &torn {
+            assert!(!crash.image.contains_key("w/c"), "{:?}", crash.state);
+            let (a, b) = (data(&crash.image, "w/a").unwrap(), data(&crash.image, "w/b").unwrap());
+            assert_eq!(a, b);
+            assert!(a.starts_with(b"old") && a != b"old");
+            assert!(matches!(&crash.state, State::Torn { path, .. } if path == "w/a"));
+        }
+    }
+
+    /// A file written in many chunks while nothing else changes tears once per form and trail,
+    /// from the last chunk, not once per chunk; the count of torn states graded says as much.
+    ///
+    /// Revert: add each moment's torn forms as it is recorded → a state per chunk and form.
+    #[test]
+    fn a_file_written_in_chunks_tears_once_per_form() {
+        let chunks: String = (0..4).map(|_| write(1, 3, "/s/w/a", b"ab")).collect();
+        let text = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_APPEND) = 3</s/w/a>\n{}1 close(3</s/w/a>) = 0\n", chunks);
+        let Found { crashes, requested, .. } = found(&text);
+        let torn: Vec<((usize, bool), Form, Vec<u8>)> = crashes.iter().filter_map(|crash| match &crash.state {
+            State::Torn { form, .. } => Some((crash.moment.trail(), *form, data(&crash.image, "w/a").unwrap())),
+            _ => None,
+        }).collect();
+        let kept: BTreeSet<((usize, bool), Form)> = torn.iter().map(|(trail, form, _)| (*trail, *form)).collect();
+        assert_eq!(kept.len(), torn.len(), "{:?}", torn);
+        // Inside the line, and after it.
+        assert_eq!(kept.iter().map(|(trail, _)| *trail).collect::<BTreeSet<_>>().len(), 2, "{:?}", torn);
+        for (_, form, held) in &torn {
+            match form {
+                Form::ZeroTail => assert_eq!(held, b"old\0\0\0\0\0\0\0\0"),
+                Form::HalfTail => assert_eq!(held, b"oldabab"),
+                other => panic!("{:?}", other),
+            }
+        }
+        assert_eq!(requested.torn.1, torn.len());
+        assert!(requested.torn.0 >= requested.torn.1);
+    }
+
+    /// A state a more realistic kind also leaves is reported once, as that kind: an ordered
+    /// state no different from the durable one is the durable one.
+    ///
+    /// Revert: keep a state per kind → an ordered state with the durable one's tree is reported.
+    #[test]
+    fn a_state_two_kinds_leave_is_the_more_realistic_one() {
+        let Found { crashes, requested, .. } = found(&rewrite(false));
+        let durable: BTreeSet<(String, bool, (usize, bool))> = crashes.iter().filter(|crash| crash.state == State::Durable)
+            .map(|crash| (digest(&crash.image), crash.acknowledged, crash.moment.trail())).collect();
+        let mut ordered = 0;
+        for crash in crashes.iter().filter(|crash| crash.state == State::Ordered) {
+            assert!(!durable.contains(&(digest(&crash.image), crash.acknowledged, crash.moment.trail())), "{}", crash.moment.label());
+            ordered += 1;
+        }
+        assert!(ordered > 0, "the truncate leaves an ordered state of its own");
+        assert_eq!(requested.ordered.1, ordered);
+        assert!(requested.ordered.0 > ordered, "every moment asks for one");
+    }
+
+    /// A scenario that runs lines after its record is not graded for power loss, and one that
+    /// runs none is.
+    ///
+    /// Revert: grade every scenario → the scenario with a later line is run.
+    #[test]
+    fn a_scenario_with_lines_after_its_record_is_not_run() {
+        let scenario = |then| Scenario { id: "s".into(), history: vec![], then, damage: None, files: crate::scenario::Files::Seeded };
+        assert_eq!(not_run(&scenario(vec![])), None);
+        assert!(not_run(&scenario(vec![crate::scenario::Op::Record { index: 0 }])).unwrap().contains("lines after its record"));
+    }
+
+    /// A file cut and written back to its synced bytes still tears at the cut: the truncate can
+    /// land without the write, in every durable state after it too.
+    ///
+    /// Revert: tear only files whose bytes differ → once the folder's fsync moves the durable
+    /// state on, `a` no longer tears.
+    #[test]
+    fn a_file_rewritten_to_its_synced_bytes_tears_at_the_cut() {
+        // The folder's fsync makes `d` durable; `m` after it keeps the ordered state apart.
+        let text = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_TRUNC) = 3</s/w/a>\n{}1 close(3</s/w/a>) = 0\n\
+            1 openat(AT_FDCWD</s/w>, \"d\", O_WRONLY|O_CREAT|O_EXCL, 0644) = 5</s/w/d>\n1 close(5</s/w/d>) = 0\n\
+            1 openat(AT_FDCWD</s/w>, \".\", O_RDONLY|O_DIRECTORY) = 4</s/w>\n1 fsync(4</s/w>) = 0\n1 mkdir(\"m\", 0755) = 0\n", write(1, 3, "/s/w/a", b"old"));
+        let later: Vec<Vec<u8>> = found(&text).crashes.iter()
+            .filter(|crash| matches!(crash.state, State::Torn { form: Form::Cut, .. }) && crash.image.contains_key("w/d"))
+            .map(|crash| data(&crash.image, "w/a").unwrap()).collect();
+        assert!(!later.is_empty());
+        assert!(later.iter().all(|held| held.is_empty()));
+    }
+
+    /// A state a more realistic kind takes over keeps the moments that already left it, and the
+    /// torn states of a span are reported before anything the moment after it leaves.
+    ///
+    /// Revert: restart the count at the takeover → a seedless run's shared counts drop; flush
+    /// after the moment's own states → a torn row follows the next span's durable one.
+    #[test]
+    fn a_takeover_keeps_its_moments_and_a_span_is_reported_in_order() {
+        let mut collector = Collector::new(0, 0, 0);
+        let image = std::sync::Arc::new(fixture());
+        let moment = |call| Moment::Synced { line: 0, command: "stack".into(), call, name: "fsync".into() };
+        collector.add(moment(1), image.clone(), "x".into(), false, State::Ordered);
+        collector.add(moment(2), image.clone(), "x".into(), false, State::Ordered);
+        collector.add(moment(3), image.clone(), "x".into(), false, State::Durable);
+        let (crashes, _) = collector.finish();
+        assert_eq!(crashes.len(), 1);
+        assert_eq!((crashes[0].state.clone(), crashes[0].shared), (State::Durable, 3));
+        let chunks: String = (0..2).map(|_| write(1, 3, "/s/w/a", b"ab")).collect();
+        let text = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_APPEND) = 3</s/w/a>\n{}1 fsync(3</s/w/a>) = 0\n1 close(3</s/w/a>) = 0\n", chunks);
+        let crashes = found(&text).crashes;
+        let synced = crashes.iter().position(|crash| crash.state == State::Durable && data(&crash.image, "w/a").unwrap() == b"oldabab").unwrap();
+        let torn = crashes.iter().rposition(|crash| matches!(crash.state, State::Torn { .. })).unwrap();
+        assert!(torn < synced, "{:?}", crashes.iter().map(|crash| (crash.moment.label(), crash.state.label())).collect::<Vec<_>>());
+    }
+
+    /// A state found without a draw is never reported as a variant: drawing variants leaves every
+    /// other crash exactly as a run with none, even when a draw happens to match a later one, and
+    /// the variants left are numbered from 1 without a gap.
     ///
     /// Revert: count a durable state into the variant it matches → it is missing from the
     /// durable crashes for some seed; skip the renumbering → a superseded draw leaves a gap.
@@ -2360,14 +2888,14 @@ mod tests {
         let first = fixture();
         let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect(), before: &first }];
         let durable = |crashes: &[Crash]| -> Vec<(String, usize)> {
-            crashes.iter().filter(|crash| crash.variant.is_none()).map(|crash| (crash.moment.label(), crash.shared)).collect()
+            crashes.iter().filter(|crash| !matches!(crash.state, State::Seeded { .. })).map(|crash| (crash.moment.label(), crash.shared)).collect()
         };
-        let (plain, _) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 0).unwrap();
+        let plain = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 0, 0).unwrap().crashes;
         let mut matched = false;
         for seed in 0..64 {
-            let (drawn, _) = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 8, seed).unwrap();
+            let drawn = crashes(&fixture(), &root(), "/s/w", 0o022, &lines, 8, seed).unwrap().crashes;
             assert_eq!(durable(&drawn), durable(&plain), "seed {}", seed);
-            let numbers: Vec<usize> = drawn.iter().filter_map(|crash| crash.variant).collect();
+            let numbers: Vec<usize> = drawn.iter().filter_map(|crash| match crash.state { State::Seeded { number } => Some(number), _ => None }).collect();
             assert_eq!(numbers, (1..=numbers.len()).collect::<Vec<_>>(), "seed {}", seed);
             matched |= drawn.len() < plain.len() + 8;
         }

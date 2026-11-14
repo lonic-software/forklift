@@ -38,7 +38,7 @@ use crate::damage::Warehouse;
 use crate::faulted::{self, Context, Expected, Graded, Programs};
 use crate::host::Host;
 use crate::kill::{self, Settings, ATTEMPTS};
-use crate::power::{self, Collector, Crash, GradedCrash, Image, Model, Moment, Replay, ScenarioPower};
+use crate::power::{self, Collector, Crash, GradedCrash, Image, Model, Moment, Replay, Requested, ScenarioPower};
 use crate::proxy::{Exchange, Fault};
 use crate::routes::RouteTable;
 use crate::runner::{self, RunError};
@@ -162,8 +162,8 @@ fn marked(calls: &[Call], from: u64) -> std::collections::BTreeSet<usize> {
 }
 
 /// Every distinct state a power loss can leave in a run cut at `cut`, `variants` seeded ones drawn
-/// among them, or what refuses the run.
-fn states(run: &Traced, cut: Option<usize>, route: &str, umask: u32, variants: usize, seed: u64) -> Result<Vec<Crash>, Vec<String>> {
+/// among them, and how many of each kind between were asked for; or what refuses the run.
+fn states(run: &Traced, cut: Option<usize>, route: &str, umask: u32, variants: usize, seed: u64) -> Result<(Vec<Crash>, Requested), Vec<String>> {
     let start = run.scratch.root().to_string_lossy().into_owned();
     // Any call the table cannot read, or any write outside the warehouse, refuses: the replay
     // would not see it.
@@ -278,9 +278,9 @@ pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: 
         // The route this run's own request took: a fresh build may order its requests otherwise.
         let route = cut.and_then(|cut| run.exchanges.get(cut)).map(|exchange| servekill::route_of(exchange, table)).unwrap_or_default();
         match states(&run, cut, &route, umask, shares[at], drawn ^ at as u64) {
-            Ok(crashes) => {
+            Ok((crashes, requested)) => {
                 let (graded, errors) = grade(*run, crashes, &corpus, scenario, programs, settings);
-                Share::Graded(graded, errors)
+                Share::Graded(graded, errors, requested)
             }
             Err(refusals) => Share::Refused(refusals),
         }
@@ -322,7 +322,8 @@ pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: 
     for (at, outcome) in results {
         let run = if at == requests { "the run to its end".to_string() } else { format!("the run cut at request {}", at + 1) };
         match outcome {
-            Share::Graded(graded, errors) => {
+            Share::Graded(graded, errors, requested) => {
+                power.requested.add(requested);
                 power.crashes.extend(graded);
                 power.errors.extend(errors);
             }
@@ -336,7 +337,7 @@ pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: 
 
 /// What one run's share of the lane came to.
 enum Share {
-    Graded(Vec<GradedCrash>, Vec<String>),
+    Graded(Vec<GradedCrash>, Vec<String>, Requested),
     Refused(Vec<String>),
     NotReached(String),
     Failed(String),
