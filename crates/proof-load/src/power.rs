@@ -2697,12 +2697,15 @@ mod tests {
     /// A torn file is torn under every name the durable tree gives its inode, whatever the calls
     /// renamed it to since, and nothing else in the tree changes.
     ///
-    /// Revert: tear by volatile path → the torn bytes land at `c`, a name the durable tree lacks;
-    /// tear one path of the inode → `b` keeps `old` beside a torn `a`.
+    /// Revert: find the names in the volatile tree → the torn bytes land only at `b`, `c` being
+    /// a name the durable tree lacks; tear one path of the inode → `b` keeps `old` beside a torn
+    /// `a`.
     #[test]
     fn a_file_is_torn_under_every_durable_name_of_its_inode() {
+        // The rename is not synced, but the fsync of `d` after it moves the durable state on.
         let text = format!("1 link(\"a\", \"b\") = 0\n1 openat(AT_FDCWD</s/w>, \".\", O_RDONLY|O_DIRECTORY) = 4</s/w>\n1 fsync(4</s/w>) = 0\n\
-            1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_APPEND) = 3</s/w/a>\n{}1 close(3</s/w/a>) = 0\n1 rename(\"a\", \"c\") = 0\n", write(1, 3, "/s/w/a", b"er"));
+            1 rename(\"a\", \"c\") = 0\n1 openat(AT_FDCWD</s/w>, \"d\", O_WRONLY|O_CREAT|O_EXCL, 0644) = 5</s/w/d>\n{}1 fsync(5</s/w/d>) = 0\n\
+            1 openat(AT_FDCWD</s/w>, \"c\", O_WRONLY|O_APPEND) = 3</s/w/c>\n{}1 close(3</s/w/c>) = 0\n", write(1, 5, "/s/w/d", b"d"), write(1, 3, "/s/w/c", b"er"));
         let torn: Vec<Crash> = found(&text).crashes.into_iter().filter(|crash| matches!(crash.state, State::Torn { .. })).collect();
         assert!(!torn.is_empty());
         for crash in &torn {
