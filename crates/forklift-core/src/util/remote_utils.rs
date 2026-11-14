@@ -2516,6 +2516,11 @@ fn classify_remote_error(status: u16, action: &str, message: String,
     let wrapped = format!("The remote refused {} ({}): {}", action, status, message);
 
     match code.as_deref().and_then(RefusalCode::from_code) {
+        // The remote's own records are damaged: its step is for its operator, never this user's.
+        Some(code @ RefusalCode::TombstonesDamaged) => String::from(CoreError::remote_refusal(code, wrapped, format!(
+            "Ask the remote's operator to repair it where the warehouse is served from{}; nothing here can.",
+            next_step.filter(|step| !step.is_empty()).map(|step| format!(" (\"{}\")", step)).unwrap_or_default()
+        ))),
         Some(code) => String::from(CoreError::remote_refusal(code, wrapped, next_step.unwrap_or_default())),
         None => crate::error::with_next_step(&wrapped, next_step.as_deref().unwrap_or_default()),
     }
@@ -2561,6 +2566,11 @@ pub const MUTATION_RERUN_CONVERGES: &str =
 /// or a server error (`5xx`) as this module composes them, anywhere in the message (a caller may
 /// have wrapped it). Never a local failure, whatever its text quotes.
 pub fn is_transient_failure(message: &str) -> bool {
+    // A remote's damaged records are mended by its operator, not by time.
+    if crate::util::tombstone_utils::is_damage(message) {
+        return false;
+    }
+
     if message.contains("Timed out while ") || message.contains(&format!(": {}", CONNECTION_FAILED)) {
         return true;
     }

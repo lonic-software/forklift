@@ -414,7 +414,13 @@ pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
 /// Kept apart from [`head_holders`], since a recording is not refused over it: no write here can
 /// take the file out of a deleted pallet.
 pub fn tombstone_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
-    holders_among(redaction, crate::util::tombstone_utils::read_tombstones()?.into_iter().collect(), "deleted pallet")
+    let tombstones = crate::util::tombstone_utils::read_tombstones()?;
+    let mut heads: Vec<(String, String)> = tombstones.named.into_iter().collect();
+
+    // A kept head has no name to give; its head is named in the pallet's place.
+    heads.extend(tombstones.kept.into_iter().map(|head| (format!("(kept head {})", head), head)));
+
+    holders_among(redaction, heads, "deleted pallet")
 }
 
 /// Which of `heads`, each a pallet's name and head, names what `redaction` removes; `what` names

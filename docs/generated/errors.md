@@ -67,4 +67,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `remote_history_incomplete` | 52 | The remote refused to move a pallet because part of the new head's history is absent there or unreadable, even after the lift negotiated and uploaded again; nothing moved |
 | `ref_damaged` | 53 | A pallet ref is lost or damaged: its file holds no parcel hash, or it is missing while a checkout stands on that pallet. Nothing was changed; heal rebuilds it from what the bays and the ref's own bytes still name, or lists what it found |
 | `fetch_scope_damaged` | 54 | A sparse warehouse's fetch scope is lost or damaged, and heal could not rebuild it from the checkouts' scopes alone. Nothing was changed; heal --fetch-scope sets it, fetching what the history there lacks |
+| `tombstones_damaged` | 55 | A served warehouse's tombstone list or served mark is lost or damaged, so which deleted pallets' heads it keeps cannot be told. Nothing was changed, and nothing that frees history runs there; its operator repairs it with forklift-server tombstone repair while it is not served |
 

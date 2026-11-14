@@ -117,13 +117,14 @@ enum Command {
         grace_hours: u64,
     },
 
-    /// List or drop the tombstones that pallets deleted in a served warehouse leave
+    /// List, drop or repair the tombstones that pallets deleted in a served warehouse leave
     #[command(
         long_about = "A pallet deleted in a warehouse that has been served leaves a tombstone: \
                       the head its ref held, which gc keeps, so the clones that freed that \
                       history against the server can fetch it again. The name stays reserved \
                       for that history until a re-creation that acknowledges it clears it, or \
-                      until it is dropped here."
+                      until it is dropped here. A repaired list can also keep heads with no \
+                      name: history the lost list may have held, kept until dropped by head."
     )]
     Tombstone {
         #[command(subcommand)]
@@ -176,23 +177,38 @@ enum WithholdAction {
 /// What `forklift-server tombstone` does.
 #[derive(Subcommand)]
 enum TombstoneAction {
-    /// List each deleted pallet's tombstone and the head it holds
+    /// List each deleted pallet's tombstone and the head it holds, and every kept head
     List {
         /// The warehouse root to read
         #[arg(long)]
         root: String,
     },
 
-    /// Drop a deleted pallet's tombstone: the name is free for unrelated history, and the history
-    /// it held is collected by the next gc unless something else reaches it. Refused while the
-    /// warehouse is being served
+    /// Drop a deleted pallet's tombstone, or a kept head: the name is free for unrelated history,
+    /// and the history it held is collected by the next gc unless something else reaches it.
+    /// Refused while the warehouse is being served
     Drop {
         /// The warehouse root to change
         #[arg(long)]
         root: String,
 
         /// The deleted pallet's name
-        name: String,
+        #[arg(required_unless_present = "head")]
+        name: Option<String>,
+
+        /// Drop this kept head instead of a named tombstone
+        #[arg(long, conflicts_with = "name")]
+        head: Option<String>,
+    },
+
+    /// Rebuild a lost or damaged tombstone list, or a lost served mark, while the warehouse is
+    /// not served. The damaged list is moved aside and every entry that still reads is kept; every
+    /// other history that no pallet, office pin or tombstone holds is kept too, under the name its
+    /// deletion recorded in a bay's undo journal when the journals agree on it, else with no name
+    Repair {
+        /// The warehouse root to repair
+        #[arg(long)]
+        root: String,
     },
 }
 
@@ -218,7 +234,8 @@ async fn async_main() {
         Command::Bundle { root } => bundle(&root),
         Command::Gc { root, grace_hours } => gc(&root, grace_hours),
         Command::Tombstone { action: TombstoneAction::List { root } } => list_tombstones(&root),
-        Command::Tombstone { action: TombstoneAction::Drop { root, name } } => drop_tombstone(&root, &name),
+        Command::Tombstone { action: TombstoneAction::Drop { root, name, head } } => drop_tombstone(&root, name.as_deref(), head.as_deref()),
+        Command::Tombstone { action: TombstoneAction::Repair { root } } => repair_tombstones(&root),
         Command::Withhold { action: WithholdAction::Add { root, hash, statement } } => withhold(&root, &hash, &statement),
         Command::Withhold { action: WithholdAction::List { root } } => list_withheld(&root),
     };
@@ -746,25 +763,53 @@ fn list_tombstones(root: &str) -> Result<(), String> {
         println!("No deleted pallet has a tombstone in this warehouse.");
     }
 
-    for (pallet, head) in tombstones {
+    for (pallet, head) in &tombstones.named {
         println!("{} {}", head, pallet);
+    }
+
+    for head in &tombstones.kept {
+        println!("{} (kept, no name)", head);
     }
 
     Ok(())
 }
 
-/// Drop deleted pallet `name`'s tombstone in the warehouse at `root`.
-fn drop_tombstone(root: &str, name: &str) -> Result<(), String> {
+/// Drop deleted pallet `name`'s tombstone, or kept head `head`, in the warehouse at `root`.
+fn drop_tombstone(root: &str, name: Option<&str>, head: Option<&str>) -> Result<(), String> {
+    use forklift_core::util::tombstone_utils;
+
     let opened = server::open_root(root)?;
     let _scope = forklift_core::globals::StorageRootScope::enter(&opened.root);
 
-    let head = forklift_core::util::tombstone_utils::drop_tombstone(name)?;
+    match (name, head) {
+        (_, Some(head)) => {
+            tombstone_utils::drop_kept_head(head)?;
+            println!("Dropped kept head {}. The next gc collects its history unless something else reaches it.", head);
+        }
+        (Some(name), None) => {
+            let head = tombstone_utils::drop_tombstone(name)?;
+            println!(
+                "Dropped the tombstone of pallet \"{}\" (it held {}). The name is free, and the next gc \
+                collects that history unless something else reaches it.",
+                name, head
+            );
+        }
+        (None, None) => return Err("Name the deleted pallet, or a kept head with --head.".to_string()),
+    }
 
-    println!(
-        "Dropped the tombstone of pallet \"{}\" (it held {}). The name is free, and the next gc \
-        collects that history unless something else reaches it.",
-        name, head
-    );
+    Ok(())
+}
+
+/// Repair the tombstone list and served mark of the warehouse at `root`.
+fn repair_tombstones(root: &str) -> Result<(), String> {
+    let opened = server::open_root(root)?;
+    let _scope = forklift_core::globals::StorageRootScope::enter(&opened.root);
+
+    let repaired = forklift_core::util::tombstone_repair::repair_tombstones()?;
+
+    for line in repaired.report() {
+        println!("{}", line);
+    }
 
     Ok(())
 }

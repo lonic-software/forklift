@@ -1570,7 +1570,7 @@ fn tombstone_of(namespace: PalletNamespace,
         return Ok(None);
     }
 
-    Ok(tombstone_utils::read_tombstones()?.remove(name))
+    Ok(tombstone_utils::read_tombstones()?.named.remove(name))
 }
 
 /// Whether a write of `new` over `expected` moves a pallet of a served warehouse, whose clones may
@@ -1602,7 +1602,7 @@ fn clear_tombstone(lock: &crate::util::lock_utils::RefLock, name: &str) -> Resul
 
     let mut tombstones = tombstone_utils::read_tombstones()?;
 
-    if tombstones.remove(name).is_some() {
+    if tombstones.named.remove(name).is_some() {
         tombstone_utils::write_tombstones(lock, &tombstones)?;
     }
 
@@ -1922,8 +1922,9 @@ pub fn remove_pallet_head_in(
     require_head(namespace, name, Some(expected))?;
     check_preconditions(&lock, preconditions)?;
 
-    // Read before anything is written, so the refusal below leaves the ledger as it was.
-    let served = crate::util::tombstone_utils::is_served()?;
+    // Read before anything is written, so the refusal below leaves the ledger as it was. A first
+    // serve that did not finish is refused: whether a clone was served this head cannot be told.
+    let served = crate::util::tombstone_utils::served_for_removal()?;
 
     if !served && journal.is_none() {
         return Err(RefUpdateError::Failed(format!(
@@ -1941,7 +1942,7 @@ pub fn remove_pallet_head_in(
         true => {
             let read = crate::util::tombstone_utils::read_tombstones()?;
             let mut tombstones = read.clone();
-            tombstones.insert(wire.clone(), expected.to_string());
+            tombstones.named.insert(wire.clone(), expected.to_string());
             crate::util::tombstone_utils::write_tombstones(&lock, &tombstones)?;
 
             Some(read)
@@ -4035,7 +4036,7 @@ pub(crate) mod tests {
             remove_pallet_head_in(PalletNamespace::User, "gone", &hash('b'), &RefPreconditions::NONE, None).unwrap();
 
             assert_eq!(get_pallet_head("gone").unwrap(), None);
-            assert_eq!(tombstone_utils::read_tombstones().unwrap(), BTreeMap::from([("gone".to_string(), hash('b'))]));
+            assert_eq!(tombstone_utils::read_tombstones().unwrap().named, BTreeMap::from([("gone".to_string(), hash('b'))]));
             let _ = file_utils::remove_dir_all(&root);
         }
 
@@ -4061,6 +4062,24 @@ pub(crate) mod tests {
 
             assert!(matches!(refused, Err(RefUpdateError::Moved(_))), "{:?}", refused);
             assert!(tombstone_utils::read_tombstones().unwrap().is_empty());
+            let _ = file_utils::remove_dir_all(&root);
+        }
+
+        /// Revert: read an absent served mark as never served → the removal is made with no
+        /// tombstone (an undo entry is passed, so "never served" does not refuse it) → red.
+        #[test]
+        fn a_removal_beside_tombstones_whose_mark_was_lost_is_refused_as_damage() {
+            let (root, _scope) = deleted_in_a_served_root("tombstone-mark-lost");
+            update_pallet_head("other", None, &hash('b'), &RefPreconditions::NONE).unwrap();
+            crate::util::file_utils::remove_file(tombstone_utils::served_path()).unwrap();
+
+            let refused = remove_pallet_head_in(
+                PalletNamespace::User, "other", &hash('b'), &RefPreconditions::NONE, Some(&deleting("other", &hash('b'))),
+            ).unwrap_err();
+
+            let refused = refused.to_string();
+            assert!(crate::error::deframe(&refused).is_some_and(|(code, _, _)| code == "tombstones_damaged"), "{}", refused);
+            assert_eq!(get_pallet_head("other").unwrap(), Some(hash('b')), "nothing was removed");
             let _ = file_utils::remove_dir_all(&root);
         }
 

@@ -701,6 +701,7 @@ pub fn list_pallets(all: bool) -> Result<(), String> {
 
     // Only a warehouse a server has served keeps tombstones; every other one lists none.
     let deleted = tombstone_utils::read_tombstones()?
+        .named
         .into_iter()
         .map(|(name, head)| DeletedEntry { name, head })
         .collect();

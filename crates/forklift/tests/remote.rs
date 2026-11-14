@@ -12309,6 +12309,30 @@ fn a_stale_clone_restores_a_pallet_deleted_on_the_remote_rather_than_re_creating
     assert!(stderr(&named).contains("unexpected argument '--remote'"), "{}", stderr(&named));
 }
 
+// Revert: send `Retry-After` on every 503 → the client waits the damage out, retrying, well past
+// the bound below → red. Revert: classify the code like any other remote refusal → the next step
+// is the operator's command alone, with no word of whose it is → red.
+#[test]
+fn a_lift_to_a_remote_whose_tombstones_are_damaged_names_its_operator_and_does_not_retry() {
+    let area = TestArea::new("remote-tombstones-damaged");
+    let server = Server::start(&area, None);
+    prepare_warehouse(&area, "a", &server.url);
+    stack_file(&area, "a", "base.txt", "base\n");
+    assert_success(&area.forklift("a", &["lift"]));
+    std::fs::write(area.path("server-root/.forklift/tombstones"), b"\xff\xfe not a list").unwrap();
+    stack_file(&area, "a", "more.txt", "more\n");
+
+    let started = std::time::Instant::now();
+    let refused = refusal_of(&area.forklift("a", &["--json", "lift"]), 55);
+
+    assert!(started.elapsed() < std::time::Duration::from_secs(8), "no retry: {:?}", started.elapsed());
+    assert_eq!(refused["code"], "tombstones_damaged", "{}", refused);
+    let next_step = refused["next_step"].as_str().unwrap();
+    assert!(next_step.starts_with("Ask the remote's operator"), "{}", refused);
+    assert!(next_step.contains("forklift-server tombstone repair --root <warehouse>"), "{}", refused);
+    assert!(!next_step.contains(&*area.path("server-root").to_string_lossy()), "no server path: {}", refused);
+}
+
 // Revert: drop the capability check → the delete is sent, and reaches the server behind the proxy.
 #[test]
 fn a_remote_whose_handshake_lists_no_tombstones_is_never_sent_a_delete() {

@@ -145,6 +145,29 @@ warehouse root. Which step is named depends on why:
 A rebuilt fetch scope may be narrower than what was fetched before: paths only the old one named are
 no longer checked for loss. `forklift scope fetch <path>` adds one back.
 
+### `tombstones_damaged` (exit 55)
+
+The list of pallets deleted on a server (`.forklift/tombstones`) or its `served` mark is lost or
+damaged. That list keeps the deleted pallets' history from gc, since clones may have pruned
+against it, so nothing that frees history runs until it is repaired. Nothing was changed.
+
+**If you run the server**, stop it, then run the next step the message names:
+
+```sh
+forklift-server tombstone repair --root <warehouse>
+```
+
+It moves the damaged files aside, keeps every entry that still reads, and gives a lost deletion its
+name back where a bay's undo journal settles it. All other history that no pallet, office pin or
+tombstone holds is kept with no name, because it may be what the lost list held.
+`forklift-server tombstone list --root <warehouse>` shows those heads as `(kept, no name)`. Once you
+know no clone relies on one, `forklift-server tombstone drop --root <warehouse> --head <hash>`
+releases it. A deleted pallet whose name was not recovered can be created again without a
+`--recreate`. Then run `forklift heal` if a ref was damaged too.
+
+**If a remote refused**, only its operator can repair it. Your warehouse is unchanged. Try again once
+they have.
+
 ### `clone_incomplete` (exit 30)
 
 A clone stopped part-way, and the directory keeps what it fetched. Run the same `forklift clone`

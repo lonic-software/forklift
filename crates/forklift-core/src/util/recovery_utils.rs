@@ -1515,6 +1515,67 @@ struct WalkRoots {
     degraded_sources: Vec<String>,
 }
 
+/// Every user and every meta pallet head, for [`gc_root_sources`] and [`durable_root_sources`]. A
+/// ref that cannot be read is an error under `FailClosed`, and a note in `degraded` under
+/// `Tolerate`.
+fn pallet_ref_heads(bay_policy: &bay_utils::BayReadPolicy, degraded: &mut Vec<String>) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut parcels: Vec<String> = Vec::new();
+    let mut meta_heads: Vec<String> = Vec::new();
+
+    // A ref that cannot be read is a degraded source under `Tolerate`, as an unreadable bay is:
+    // heal walks past it (and rebuilds it, when it is a user ref), and its negative answers clear nothing that run.
+    for namespace in [pallet_utils::PalletNamespace::User, pallet_utils::PalletNamespace::Meta] {
+        for name in pallet_utils::list_pallets_in(namespace)? {
+            let head = match pallet_utils::get_pallet_head_in(namespace, &name) {
+                Ok(head) => head,
+                Err(e) => match bay_policy {
+                    bay_utils::BayReadPolicy::FailClosed => return Err(e),
+                    bay_utils::BayReadPolicy::Tolerate => {
+                        degraded.push(format!(
+                            "the ref of pallet \"{}\" could not be read this run ({}); what only it \
+                            reaches was treated as held by nothing rather than blocking this command.",
+                            pallet_utils::PalletRef { namespace, name: name.clone() }.to_wire(),
+                            crate::error::CoreError::from(e)
+                        ));
+                        None
+                    }
+                },
+            };
+
+            match (namespace, head) {
+                (pallet_utils::PalletNamespace::User, Some(head)) => parcels.push(head),
+                (pallet_utils::PalletNamespace::Meta, Some(head)) => meta_heads.push(head),
+                (_, None) => {}
+            }
+        }
+    }
+
+    Ok((parcels, meta_heads))
+}
+
+/// The roots only durable holders give: every user and meta pallet head, every trust-pin root, and
+/// `tombstone_heads`, the heads the caller's own tombstones keep. Read fail-closed, but for a ref
+/// that does not read: its head cannot be named, so what only it reaches is left unheld, with a
+/// note in `degraded`. Every record that names a head only for a while (journal entries, parked parcels, positions,
+/// hauls, the git mirror's roots, staged shards) is left out on purpose: what only such a record
+/// reaches is what a tombstone repair must still find unheld, because the record expires.
+pub(crate) fn durable_root_sources(tombstone_heads: Vec<String>) -> Result<GcRootSources, String> {
+    let mut degraded: Vec<String> = Vec::new();
+    let (parcels, meta_heads) = pallet_ref_heads(&bay_utils::BayReadPolicy::Tolerate, &mut degraded)?;
+    let trust_pins = office_utils::collect_trust_pin_roots(office_utils::TrustPinReadPolicy::FailClosed)?;
+
+    Ok(GcRootSources {
+        parcels,
+        meta_heads,
+        haul_heads: Vec::new(),
+        tombstone_heads,
+        mirror_roots: Vec::new(),
+        pin_parcels: trust_pins.roots,
+        shard_leaves: Vec::new(),
+        degraded,
+    })
+}
+
 /// [`gc_root_sources`]'s result — see that function's own doc comment.
 pub(crate) struct GcRootSources {
     /// Every user pallet head plus every readable bay's base, parked parcels and in-progress
@@ -1631,37 +1692,8 @@ pub(crate) fn gc_root_sources(
     bay_policy: bay_utils::BayReadPolicy,
     pin_policy: office_utils::TrustPinReadPolicy,
 ) -> Result<GcRootSources, String> {
-    let mut parcels: Vec<String> = Vec::new();
-    let mut meta_heads: Vec<String> = Vec::new();
     let mut degraded: Vec<String> = Vec::new();
-
-    // A ref that cannot be read is a degraded source under `Tolerate`, as an unreadable bay is:
-    // heal walks past it (and rebuilds it, when it is a user ref), and its negative answers clear nothing that run.
-    for namespace in [pallet_utils::PalletNamespace::User, pallet_utils::PalletNamespace::Meta] {
-        for name in pallet_utils::list_pallets_in(namespace)? {
-            let head = match pallet_utils::get_pallet_head_in(namespace, &name) {
-                Ok(head) => head,
-                Err(e) => match bay_policy {
-                    bay_utils::BayReadPolicy::FailClosed => return Err(e),
-                    bay_utils::BayReadPolicy::Tolerate => {
-                        degraded.push(format!(
-                            "the ref of pallet \"{}\" could not be read this run ({}); what only it \
-                            reaches was treated as held by nothing rather than blocking this command.",
-                            pallet_utils::PalletRef { namespace, name: name.clone() }.to_wire(),
-                            crate::error::CoreError::from(e)
-                        ));
-                        None
-                    }
-                },
-            };
-
-            match (namespace, head) {
-                (pallet_utils::PalletNamespace::User, Some(head)) => parcels.push(head),
-                (pallet_utils::PalletNamespace::Meta, Some(head)) => meta_heads.push(head),
-                (_, None) => {}
-            }
-        }
-    }
+    let (mut parcels, meta_heads) = pallet_ref_heads(&bay_policy, &mut degraded)?;
 
     // A haul's proposed head is merged from the recorded hash, whatever its source pallet holds
     // now. Read under `bay_policy`: like a bay's state, it is a record outside the pallet refs
@@ -1683,7 +1715,8 @@ pub(crate) fn gc_root_sources(
     };
 
     // A tombstone is the only holder of a deleted pallet's head in a served root. Read under
-    // `bay_policy` like the hauls: gc and prune refuse on an unreadable list, heal reads past it.
+    // `bay_policy` like the hauls: gc and prune refuse on a damaged list or mark, heal reads past
+    // it. The damage refusal names the operator's repair, which the note keeps.
     let tombstone_heads = match tombstone_utils::tombstone_heads() {
         Ok(heads) => heads,
         Err(e) => match bay_policy {
@@ -1691,9 +1724,8 @@ pub(crate) fn gc_root_sources(
             bay_utils::BayReadPolicy::Tolerate => {
                 degraded.push(format!(
                     "the tombstones could not be read this run ({}); the heads of deleted pallets were \
-                    treated as held by nothing rather than blocking this command. If a newer forklift \
-                    wrote them, upgrade, then run this command again.",
-                    e
+                    treated as held by nothing rather than blocking this command, and nothing was freed.",
+                    crate::error::CoreError::from(e)
                 ));
                 Vec::new()
             }

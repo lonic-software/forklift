@@ -137,6 +137,11 @@ struct WarehouseHandle {
     /// still in flight writes. Each is numbered and added under this mutex.
     applies_in_flight: std::sync::Mutex<std::collections::BTreeSet<u64>>,
 
+    /// The damage refusal ([`damage_refusal`]) the last apply stopped on, while it stands: an apply
+    /// owed then waits for the operator's repair, not for time, so content is refused with it at
+    /// once rather than after [`APPLY_WAIT`]. Each apply's outcome sets or clears it.
+    apply_damage: std::sync::Mutex<Option<String>>,
+
     /// Wakes the requests waiting for the owed applies ([`await_applies`]), when an apply
     /// discharges some and when the warehouse is drained.
     applies_wake: tokio::sync::Notify,
@@ -200,6 +205,7 @@ impl WarehouseHandle {
             applies_discharged: std::sync::atomic::AtomicU64::new(0),
             applies_in_flight: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             applies_wake: tokio::sync::Notify::new(),
+            apply_damage: std::sync::Mutex::new(None),
             chunk_gate: std::sync::Mutex::new(ChunkGate::default()),
             chunk_gate_walk: std::sync::Mutex::new(()),
             ref_writes_started: std::sync::atomic::AtomicU64::new(0),
@@ -1427,12 +1433,14 @@ fn parse_operator_tokens(path: &str) -> Result<HashMap<String, String>, String> 
 
 /// Build the JSON error response of a handler error. A `503` says when to try again: each one is
 /// a refusal for now (a warehouse drained for the redaction deleter, under maintenance, or not
-/// yet servable), never for good.
+/// yet servable), never for good. A [`damage_refusal`] is the exception: no retry mends it, so it
+/// says no time, and a client takes it as an answer.
 fn error_response(error: HandlerError) -> Response {
     let status = error.0;
+    let damaged = is_damage(&error.1);
     let mut response = (status, Json(error_body(error.1))).into_response();
 
-    if status == StatusCode::SERVICE_UNAVAILABLE {
+    if status == StatusCode::SERVICE_UNAVAILABLE && !damaged {
         response.headers_mut().insert(axum::http::header::RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECONDS));
     }
 
@@ -1473,9 +1481,9 @@ fn pallet_moved(current: Option<&str>, expected: Option<&str>) -> HandlerError {
 /// Whether user pallet `bare` is deleted at `head`: its tombstone holds that head. What a retried
 /// delete whose first try landed finds.
 fn already_deleted(bare: &str, head: &str) -> Result<bool, HandlerError> {
-    let tombstones = forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?;
+    let tombstones = forklift_core::util::tombstone_utils::read_tombstones().map_err(damage_refusal)?;
 
-    Ok(tombstones.get(bare).map(String::as_str) == Some(head))
+    Ok(tombstones.named.get(bare).map(String::as_str) == Some(head))
 }
 
 /// [`pallet_moved`], unless the pallet expected at a head is gone because it was deleted here: then
@@ -1490,11 +1498,11 @@ fn pallet_moved_or_deleted(namespace: pallet_utils::PalletNamespace,
     }
 
     match forklift_core::util::tombstone_utils::read_tombstones() {
-        Ok(tombstones) => match tombstones.get(bare) {
+        Ok(tombstones) => match tombstones.named.get(bare) {
             Some(head) => (StatusCode::CONFLICT, pallet_utils::pallet_deleted_refusal(bare, head, true).into()),
             None => pallet_moved(current, expected),
         },
-        Err(error) => internal(error),
+        Err(error) => damage_refusal(error),
     }
 }
 
@@ -1581,7 +1589,7 @@ fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
         }
         // Refused however often it is sent, as a ref update naming redacted content is.
         refused @ RefUpdateError::Redacted { .. } => unprocessable(refused.into()),
-        RefUpdateError::Failed(message) => internal(message),
+        RefUpdateError::Failed(message) => damage_refusal(message),
     }
 }
 
@@ -1787,6 +1795,42 @@ impl Drop for RefWriteCounted {
 /// Map an internal storage error to a 500.
 fn internal(message: String) -> HandlerError {
     (StatusCode::INTERNAL_SERVER_ERROR, message)
+}
+
+/// The refusal codes of a host record that is lost or damaged, which only the server's operator
+/// repairs.
+const DAMAGE_CODES: &[forklift_core::error::RefusalCode] = &[forklift_core::error::RefusalCode::TombstonesDamaged];
+
+/// Whether `message` is a refusal of one of the [`DAMAGE_CODES`].
+fn is_damage(message: &str) -> bool {
+    forklift_core::error::deframe(message).is_some_and(|(code, _, _)| DAMAGE_CODES.iter().any(|damage| damage.as_str() == code))
+}
+
+/// The operator's remedy for a damaged host record, as a client is told it: the server's own
+/// directories are not named over the wire, so the warehouse is a placeholder.
+fn operator_remedy(code: forklift_core::error::RefusalCode) -> &'static str {
+    match code {
+        forklift_core::error::RefusalCode::TombstonesDamaged => "forklift-server tombstone repair --root <warehouse>",
+        _ => unreachable!("not a damage code"),
+    }
+}
+
+/// Map an error from a read of a host record: a `503` carrying its code and the operator's remedy
+/// ([`operator_remedy`]) when the record is damaged ([`is_damage`]), with no `Retry-After`
+/// ([`error_response`]), since only the operator's repair mends it; any other error is
+/// [`internal`]. The damage itself is logged, with the local next step.
+fn damage_refusal(message: String) -> HandlerError {
+    let damage = forklift_core::error::deframe(&message).and_then(|(code, human, _)| {
+        DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, human.to_string()))
+    });
+
+    match damage {
+        Some((code, human)) => {
+            tracing::error!(%message, "a host record is damaged");
+            (StatusCode::SERVICE_UNAVAILABLE, forklift_core::error::CoreError::refusal(code, human, operator_remedy(code)).into())
+        }
+        None => internal(message),
+    }
 }
 
 /// Map a verification failure to a 422.
@@ -2271,7 +2315,7 @@ fn resolve_warehouse(state: &Arc<AppState>,
 }
 
 /// How long a client refused while a warehouse is drained, or otherwise unavailable for now, is
-/// told to wait before trying again (the `Retry-After` of every `503`).
+/// told to wait before trying again (the `Retry-After` of every `503` but a damage refusal).
 const RETRY_AFTER_SECONDS: u64 = 10;
 
 /// The `503` of a request for a warehouse drained for the redaction deleter.
@@ -2389,7 +2433,7 @@ fn resolve_handle(state: &AppState,
                     ),
                 )
             }
-            ServingRefusal::Unreadable(reason) => internal(reason),
+            ServingRefusal::Unreadable(reason) => damage_refusal(reason),
             refusal @ (ServingRefusal::Partial | ServingRefusal::Sealed(_) | ServingRefusal::Origin
                 | ServingRefusal::Unavailable(_)) => (
                 StatusCode::CONFLICT,
@@ -2662,8 +2706,9 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
             // whole like any other loose object).
             chunking: true,
             // This head deletes pallets, and every tombstone it keeps is listed, as widely as the
-            // live refs are.
-            tombstones: Some(forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?),
+            // live refs are. A kept head has no name, so it is not listed: a name would be a guess.
+            // A damaged list refuses the handshake rather than list part of the set.
+            tombstones: Some(forklift_core::util::tombstone_utils::read_tombstones().map_err(damage_refusal)?.named),
             redactions: Some(served_redactions()?),
             withheld: Some(served_withheld()?),
             // `PUT /v1/withheld/{hash}/recipe` records the digest of a withheld recipe this head
@@ -2776,7 +2821,7 @@ async fn post_holds(State(state): State<Arc<AppState>>,
         let head = match pallet_utils::get_pallet_head_in(pallet_ref.namespace, &pallet_ref.name).map_err(internal)? {
             Some(head) => Some(head),
             None if pallet_ref.namespace == pallet_utils::PalletNamespace::User => {
-                forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?.remove(&pallet_ref.name)
+                forklift_core::util::tombstone_utils::read_tombstones().map_err(damage_refusal)?.named.remove(&pallet_ref.name)
             }
             None => None,
         };
@@ -3513,7 +3558,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             let mut recreated: Option<String> = None;
 
             if request.old_head.is_none() && !is_meta {
-                if let Some(head) = forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?.remove(&bare) {
+                if let Some(head) = forklift_core::util::tombstone_utils::read_tombstones().map_err(damage_refusal)?.named.remove(&bare) {
                     let acknowledged = request.tombstone.as_deref() == Some(head.as_str());
 
                     let descends = acknowledged
@@ -3697,7 +3742,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 Err(RefUpdateError::Deleted { pallet, head, acknowledged }) => {
                     return Err(pallet_deleted(&pallet, &head, acknowledged));
                 }
-                Err(RefUpdateError::Failed(e)) => return Err(internal(e)),
+                Err(RefUpdateError::Failed(e)) => return Err(damage_refusal(e)),
             }
 
         }
@@ -3874,7 +3919,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
                 // ref holds now decides.
                 Err(RefUpdateError::Failed(e)) => match pallet_utils::get_pallet_head_in(pallet_utils::PalletNamespace::User, &bare) {
                     Ok(None) => true,
-                    _ => return Err(internal(e)),
+                    _ => return Err(damage_refusal(e)),
                 },
                 // Refused however often it is sent, as the ref update answers it; a removal names
                 // no new head, so this is not reached today.
@@ -4543,6 +4588,16 @@ async fn apply_redactions(warehouse: Arc<WarehouseHandle>) -> Result<ApplyOutcom
         }
 
         let statuses = applied_redactions::apply(&read, None, None).map_err(internal)?;
+
+        // Damage leaves a redaction undecided until the operator repairs it, so it is answered as
+        // the damage, coded, not as a scan to retry.
+        if let Some(damage) = statuses.iter().find_map(|status| match &status.state {
+            applied_redactions::RedactionState::Undecided(why) if is_damage(why) => Some(why.clone()),
+            _ => None,
+        }) {
+            return Err(damage_refusal(damage));
+        }
+
         let undecided = statuses.iter().find_map(|status| match &status.state {
             applied_redactions::RedactionState::Undecided(why) => Some(format!(
                 "Whether anything names the content of redaction {} could not be told: {}", status.hash, why
@@ -4578,8 +4633,21 @@ async fn apply_discharging(warehouse: &Arc<WarehouseHandle>) -> (bool, Result<()
 
     let outcome = match apply_redactions(Arc::clone(warehouse)).await {
         Ok(outcome) => outcome,
-        Err((_, error)) => return (false, Err(error)),
+        Err((_, error)) => {
+            let damage = is_damage(&error).then(|| error.clone());
+            let wake = damage.is_some();
+            *warehouse.apply_damage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = damage;
+
+            if wake {
+                warehouse.applies_wake.notify_waiters();
+            }
+
+            return (false, Err(error));
+        }
     };
+
+    // Whatever stops this apply now, it is not the damage an earlier one stopped on.
+    *warehouse.apply_damage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
     if let Some(why) = outcome.undecided {
         return (outcome.applied, Err(why));
@@ -4598,7 +4666,8 @@ async fn apply_discharging(warehouse: &Arc<WarehouseHandle>) -> (bool, Result<()
 ///
 /// # Returns
 /// * `Ok(())`            - No apply is owed.
-/// * `Err(HandlerError)` - A `503`: one is still owed at the bound, or the warehouse is drained.
+/// * `Err(HandlerError)` - A `503`: one is still owed at the bound, or the warehouse is drained, or
+///                         the last apply stopped on damage ([`WarehouseHandle::apply_damage`]).
 async fn await_applies(warehouse: &WarehouseHandle) -> Result<(), HandlerError> {
     let deadline = tokio::time::Instant::now() + APPLY_WAIT;
 
@@ -4614,6 +4683,10 @@ async fn await_applies(warehouse: &WarehouseHandle) -> Result<(), HandlerError> 
 
         if !warehouse.applies_closed() {
             return Ok(());
+        }
+
+        if let Some(damage) = warehouse.apply_damage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() {
+            return Err(damage_refusal(damage));
         }
 
         tokio::select! {
@@ -9670,6 +9743,29 @@ mod tests {
             let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
+        /// Revert: read an absent served mark as never served → the gate serves the root and
+        /// writes a fresh mark over the tombstones → red. Revert: answer damage as `internal` in
+        /// `damage_refusal` → a 500 → red.
+        #[tokio::test]
+        async fn a_root_whose_mark_was_lost_beside_its_tombstones_is_not_served() {
+            let (root, scope, side) = served_with_side("mark-lost");
+            assert_eq!(delete(&root, "side", &side).await.status(), StatusCode::OK);
+            forklift_core::util::file_utils::remove_file(forklift_core::globals::forklift_root().join("served")).unwrap();
+            drop(scope);
+
+            let refused = WarehouseHandle::serving(root.clone(), false).err().expect("the root is refused");
+            assert!(matches!(&refused, ServingRefusal::Unreadable(reason) if reason.contains("served mark")), "{:?}", refused);
+
+            let (status, message) = damage_refusal(match refused { ServingRefusal::Unreadable(reason) => reason, _ => unreachable!() });
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(forklift_core::error::deframe(&message).is_some_and(|(code, _, _)| code == "tombstones_damaged"), "{}", message);
+
+            let _scope = StorageRootScope::enter(&root);
+            assert!(!forklift_core::globals::forklift_root().join("served").exists(), "no mark is written over the damage");
+            drop(_scope);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+        }
+
         #[tokio::test]
         async fn a_delete_removes_the_ref_and_the_handshake_lists_its_tombstone() {
             let (root, _scope, side) = served_with_side("delete-lands");
@@ -9684,6 +9780,42 @@ mod tests {
             let info: WarehouseInfo = serde_json::from_str(&body_text(info).await).unwrap();
             assert_eq!(info.tombstones, Some(BTreeMap::from([("side".to_string(), side)])));
             assert!(!info.pallets.contains_key("side"), "a deleted pallet is not listed");
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+        }
+
+        /// Revert: map the handshake's list read through `internal` → a 500 with no code → red.
+        /// Revert: add `Retry-After` to every 503 → the damage answer tells the client to wait →
+        /// red.
+        #[tokio::test]
+        async fn a_handshake_over_a_damaged_list_refuses_with_its_code_and_no_retry() {
+            use forklift_core::util::record_utils;
+            let (root, _scope, side) = served_with_side("handshake-damaged");
+            let list = forklift_core::globals::forklift_root().join("tombstones");
+            let (first, second) = (format!("{} gone", side), format!("{} gone", "b".repeat(64)));
+
+            let damages: [(&str, Option<Vec<u8>>); 4] = [
+                ("not text", Some(b"\xff\xfe not text".to_vec())),
+                ("a bad entry", Some(record_utils::to_bytes("tombstones", 2, ["nothash gone"]))),
+                ("a duplicate", Some(record_utils::to_bytes("tombstones", 2, [first.as_str(), second.as_str()]))),
+                ("an absent list", None),
+            ];
+
+            for (what, bytes) in damages {
+                match bytes {
+                    Some(bytes) => std::fs::write(&list, bytes).unwrap(),
+                    None => forklift_core::util::file_utils::remove_file(&list).unwrap(),
+                }
+
+                let response = get_warehouse(State(Arc::new(single_mode_state(root.clone()))), Path(PathParams::new()))
+                    .await.into_response();
+
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{}", what);
+                assert!(response.headers().get(axum::http::header::RETRY_AFTER).is_none(), "{}: no wait mends it", what);
+                let body = body_text(response).await;
+                assert!(body.contains(r#""code":"tombstones_damaged""#), "{}: {}", what, body);
+                assert!(body.contains("forklift-server tombstone repair --root <warehouse>"), "{}: {}", what, body);
+            assert!(!body.contains("repair --root /") && !body.contains("repair --root '"), "{}: no server path: {}", what, body);
+            }
             let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
@@ -9720,7 +9852,7 @@ mod tests {
 
             let other = delete(&root, "side", &main).await;
             assert_eq!(other.status(), StatusCode::CONFLICT, "a delete at a head the tombstone does not hold is refused");
-            assert_eq!(tombstone_utils::read_tombstones().unwrap(), BTreeMap::from([("side".to_string(), side)]));
+            assert_eq!(tombstone_utils::read_tombstones().unwrap().named, BTreeMap::from([("side".to_string(), side)]));
             let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 

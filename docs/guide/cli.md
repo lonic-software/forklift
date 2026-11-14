@@ -2803,6 +2803,11 @@ Both refuse a ref that is readable. A refusal also lists any ref the same run al
 removed. The report lists `refs_rebuilt`, `refs_removed` and
 `refs_refused` under `--json`.
 
+In a served warehouse whose tombstone list or `served` mark is lost or damaged, `heal` does not
+rebuild a ref: the list may record the pallet's deletion. It refuses with `tombstones_damaged`
+(exit 55) and names `forklift-server tombstone repair`, which the server's operator runs; heal the
+refs after that.
+
 #### A damaged fetch scope
 
 In a sparse warehouse, a fetch scope (`.forklift/config/fetch-scope`) that is lost or cannot be read
