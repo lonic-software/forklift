@@ -80,6 +80,6 @@ unavailable::UNAVAILABLE_RECORD = "unavailable"
 unavailable::UNAVAILABLE_VERSION = 2
 warehouse_utils::WAREHOUSE_FORMAT = 1
 warehouse_utils::WAREHOUSE_MARKER_RECORD = "warehouse"
-warehouse_utils::WAREHOUSE_MARKER_VERSION = 3
+warehouse_utils::WAREHOUSE_MARKER_VERSION = 4
 withholding::WITHHELD_RECORD = "withheld"
 withholding::WITHHELD_VERSION = 2

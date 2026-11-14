@@ -355,13 +355,24 @@ mod tests {
         root.join(FOLDER_NAME_FORKLIFT_ROOT).join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER)
     }
 
+    /// Write both files of the marker pair as holding `entries`, framed and digested.
     fn set_marker(root: &Path, entries: &str) {
-        std::fs::write(marker_path(root), format!("/forklift-warehouse 3\n{}", entries)).unwrap();
+        let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+        for name in [warehouse_utils::FILE_NAME_WAREHOUSE_MARKER_COPY, warehouse_utils::FILE_NAME_WAREHOUSE_MARKER] {
+            std::fs::write(forklift.join(name), warehouse_utils::framed_marker_bytes(entries)).unwrap();
+        }
     }
 
+    /// The entries the primary marker holds, which its copy must hold too, between the header and the digest.
     fn marker_entries(root: &Path) -> String {
-        let text = std::fs::read_to_string(marker_path(root)).unwrap();
-        text.strip_prefix("/forklift-warehouse 3\n").unwrap().to_string()
+        let bytes = std::fs::read(marker_path(root)).unwrap();
+        let copy = std::fs::read(root.join(FOLDER_NAME_FORKLIFT_ROOT).join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER_COPY)).unwrap();
+        assert_eq!(bytes, copy, "the marker's copy holds what the marker does");
+        let text = String::from_utf8(bytes).unwrap();
+        let body = text.strip_prefix("/forklift-warehouse 4\n").unwrap();
+        let entries = body.rsplit_once("digest ").unwrap().0.to_string();
+        assert_eq!(warehouse_utils::framed_marker_bytes(&entries), text.as_bytes(), "the marker's digest matches");
+        entries
     }
 
     fn code_of(error: &CoreError) -> Option<RefusalCode> {

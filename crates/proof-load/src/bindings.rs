@@ -39,6 +39,7 @@ const fn hosted(name: &'static str, scenario: &'static str, kinds: &'static [Kin
 
 pub const BINDINGS: &[Binding] = &[
     bound("warehouse", FILE),
+    bound("warehouse-copy", FILE),
     bound("format.lock", LOCK_FILE),
     bound("refs.lock", LOCK_FILE),
     bound("store-access.lock", LOCK_FILE),

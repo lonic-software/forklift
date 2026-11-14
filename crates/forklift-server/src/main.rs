@@ -1503,7 +1503,7 @@ mod tests {
         let refused = server::open_root(root.to_str().unwrap()).unwrap_err();
         assert_eq!(refusal(refused).0, forklift_core::error::RefusalCode::NotAWarehouse);
 
-        std::fs::write(forklift.join(forklift_core::util::warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), b"/forklift-warehouse 3\nformat 1\nfull\n").unwrap();
+        std::fs::write(forklift.join(forklift_core::util::warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), forklift_core::util::warehouse_utils::framed_marker_bytes("format 1\nfull\n")).unwrap();
         assert_eq!(server::open_root(root.to_str().unwrap()).unwrap().root, std::fs::canonicalize(&root).unwrap());
 
         let _ = forklift_core::util::file_utils::remove_dir_all(&root);

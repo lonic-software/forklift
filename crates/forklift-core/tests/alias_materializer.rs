@@ -44,7 +44,7 @@ fn working_tree(name: &str) -> PathBuf {
     let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     std::fs::create_dir_all(root.join(".forklift")).unwrap();
     // A full warehouse, so the main tree checks out every path.
-    std::fs::write(root.join(".forklift").join("warehouse"), "/forklift-warehouse 3\nformat 1\nfull\n").unwrap();
+    std::fs::write(root.join(".forklift").join("warehouse"), forklift_core::util::warehouse_utils::framed_marker_bytes("format 1\nfull\n")).unwrap();
     root
 }
 
