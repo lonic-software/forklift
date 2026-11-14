@@ -179,6 +179,12 @@ impl Context<'_> {
         Ok(lines)
     }
 
+    /// How many of the faulted command's leading lines acknowledge its record, as
+    /// [`acknowledging`] counts them for this run's `then` and readback.
+    pub(crate) fn acknowledging(&self) -> Result<usize, RunError> {
+        acknowledging(self.then, self.via_host).map_err(RunError::Io)
+    }
+
     /// Reads every record in `marks` back through the tool. `expectation` gives what each may
     /// hold; a record in `required` that an export exiting 0 leaves out was served as missing,
     /// which is silent.
@@ -400,6 +406,76 @@ fn next_record(acknowledged: &[Mark]) -> usize {
     acknowledged.iter().filter_map(|mark| match mark { Mark::Record(index) => Some(index + 1), Mark::Variant(_) => None }).max().unwrap_or(0)
 }
 
+/// How many leading lines of a faulted command that runs its record and then `then` acknowledge
+/// the record: the record's own lines, once they exit the tool has recorded it; read back through
+/// the host (`via_host`), every line through the last of the last push, once it exits the host
+/// holds it. A host-side readback of a command that pushes nothing has no line that acknowledges
+/// the record, and is refused rather than graded against one.
+pub(crate) fn acknowledging(then: &[Op], via_host: bool) -> Result<usize, String> {
+    let lines = |op: &Op| bind(Tool::Forklift, op).expect("Tool::Forklift binds every operation").len();
+    let record = lines(&Op::Record { index: 0 });
+    if !via_host {
+        return Ok(record);
+    }
+    let mut through = None;
+    let mut ran = record;
+    for op in then {
+        ran += lines(op);
+        if matches!(op, Op::Push) {
+            through = Some(ran);
+        }
+    }
+    through.ok_or_else(|| "the history is read back through the host, and the faulted command pushes nothing to it".to_string())
+}
+
+/// What the faulted command's attempts have established of its record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Made {
+    /// The lines that acknowledge the record exited: it is owed from here on, so a later loss of
+    /// it is a loss, not a fault the command never got past.
+    pub(crate) acknowledged: bool,
+    /// Every line ran: nothing is left for a retry to do.
+    pub(crate) completed: bool,
+}
+
+impl Made {
+    /// What a command of `lines` lines, its first `acknowledging` acknowledging its record,
+    /// established by landing its first `landed`.
+    pub(crate) fn through(landed: usize, acknowledging: usize, lines: usize) -> Made {
+        Made { acknowledged: landed >= acknowledging, completed: landed >= lines }
+    }
+
+    /// What a first attempt that ran `ran`, one outcome per line from the first, established:
+    /// the lines up to the first that did not succeed landed.
+    pub(crate) fn of(ran: &[Outcome], acknowledging: usize, lines: usize) -> Made {
+        Made::through(ran.iter().take_while(|outcome| outcome.succeeded()).count(), acknowledging, lines)
+    }
+
+    /// Settled as acknowledged by an answer asking nothing further, as `promoted`, the record's
+    /// own lines landing, establishes: completed too only when no line follows them.
+    fn promote(&mut self, promoted: Made) {
+        self.acknowledged = true;
+        self.completed |= promoted.completed;
+    }
+
+    /// Where the lines after the record's own resume, when the attempt that stopped at `stopped`
+    /// left it, from `before`, acknowledged only by a settle ([`Made::promote`]): it stopped short
+    /// of them, so none of them ran, and they resume at the first. An attempt that stopped at one
+    /// of them already ran it, and resumes there on the next retry as any does.
+    fn rest(&self, before: Made, stopped: Resume, acknowledging: usize) -> Option<Resume> {
+        (!before.acknowledged && self.acknowledged && !self.completed && stopped.at < acknowledging)
+            .then_some(Resume { at: acknowledging, may_have_stacked: false })
+    }
+
+    /// Adds what a retry established, which landed every line or stopped where `next` resumes:
+    /// every line before that landed, in it or in an earlier attempt.
+    fn retried(&mut self, landed: bool, next: Resume, acknowledging: usize, lines: usize) {
+        let retried = if landed { Made::through(lines, acknowledging, lines) } else { Made::through(next.at, acknowledging, lines) };
+        self.acknowledged |= retried.acknowledged;
+        self.completed |= retried.completed;
+    }
+}
+
 /// The expected trees of one faulted run.
 pub(crate) struct Expected {
     acknowledged: Vec<Mark>,
@@ -415,9 +491,10 @@ impl Expected {
         self.acknowledged.iter().copied().chain([self.faulted]).collect()
     }
 
-    /// What `mark` may hold, once the faulted command has (`made`) or has not been acknowledged.
-    fn of(&self, corpus: &Corpus, mark: Mark, made: bool) -> Expectation {
-        let mut expectation = self.untransformed(corpus, mark, made);
+    /// What `mark` may hold, once the faulted record has (`acknowledged`) or has not been
+    /// acknowledged.
+    fn of(&self, corpus: &Corpus, mark: Mark, acknowledged: bool) -> Expectation {
+        let mut expectation = self.untransformed(corpus, mark, acknowledged);
         // Every path whose recorded bytes are content taken away is open to what a read of it may
         // now produce, in whichever record holds it.
         for (digest, admissible) in &self.taken {
@@ -430,17 +507,18 @@ impl Expected {
         expectation
     }
 
-    fn untransformed(&self, corpus: &Corpus, mark: Mark, made: bool) -> Expectation {
+    fn untransformed(&self, corpus: &Corpus, mark: Mark, acknowledged: bool) -> Expectation {
         match mark {
             mark if mark != self.faulted => Expectation::acknowledged(mark.snapshot(corpus).map(|snapshot| corpus::expected(&snapshot, &corpus.modes)).unwrap_or_default()),
-            _ if made => Expectation::acknowledged(self.after.clone()),
+            _ if acknowledged => Expectation::acknowledged(self.after.clone()),
             _ => Expectation::faulted(self.before.clone(), self.after.clone()),
         }
     }
 
-    /// The records that must be served: every acknowledged one, and the faulted one once made.
-    fn required(&self, made: bool) -> Vec<Mark> {
-        if made { self.marks() } else { self.acknowledged.clone() }
+    /// The records that must be served: every acknowledged one, the faulted one among them once
+    /// it is.
+    fn required(&self, acknowledged: bool) -> Vec<Mark> {
+        if acknowledged { self.marks() } else { self.acknowledged.clone() }
     }
 }
 
@@ -454,26 +532,27 @@ struct Trail {
 }
 
 impl Trail {
-    /// Reads the history back and records what it says; true when the faulted record was made and
-    /// every record reads as expected. The record counts as made from here on once the history
-    /// serves it and the tool's latest answer asks nothing further (see [`answered`]): a command
-    /// killed after its record was durable, retried, is told there is nothing left to do.
+    /// Reads the history back and records what it says; true when the faulted command completed
+    /// and every record reads as expected, the faulted one held to its own tree once acknowledged.
+    /// A served record counts as acknowledged from here on once the tool's latest answer asks
+    /// nothing further (see [`answered`]): a command killed after its record was durable, retried,
+    /// is told there is nothing left to stack. That is `promoted`, what the record's lines landing
+    /// establishes; it says nothing of any line after them, which completes only by landing.
     /// `retry` says the latest step re-ran the faulted command: only a retry's answer settles a
     /// served record, since the faulted command's own refusal of a write it committed is graded as
     /// a refusal, and heal is no re-run.
-    fn settle(&mut self, context: &Context, expected: &Expected, made: &mut bool, retry: bool) -> Result<bool, RunError> {
-        let mut readback = self.read_back(context, expected, *made)?;
-        if !*made && settles(retry, self.steps.last()) && readback.reads(&[expected.faulted]) {
-            *made = true;
+    fn settle(&mut self, context: &Context, expected: &Expected, made: &mut Made, promoted: Made, retry: bool) -> Result<bool, RunError> {
+        let mut readback = self.read_back(context, expected, made.acknowledged)?;
+        if !made.acknowledged && settles(retry, self.steps.last()) && readback.reads(&[expected.faulted]) {
             // Judged again as acknowledged: the record must now hold exactly its own tree.
             self.evidence.any_silent |= readback.silent();
             self.readbacks.push(readback);
             readback = self.read_back(context, expected, true)?;
+            made.promote(promoted);
         }
-        let made = *made;
-        let required = expected.required(made);
+        let required = expected.required(made.acknowledged);
         self.evidence.any_silent |= readback.silent();
-        let reads = made && readback.reads(&required);
+        let reads = made.completed && readback.reads(&required);
         self.evidence.acknowledged_readable = readback.reads(&expected.acknowledged);
         self.readbacks.push(readback);
         if reads && self.recoverability.commands_to_expected.is_none() {
@@ -482,12 +561,12 @@ impl Trail {
         Ok(reads)
     }
 
-    fn read_back(&self, context: &Context, expected: &Expected, made: bool) -> Result<HistoryReadback, RunError> {
-        context.read_back(&expected.marks(), &expected.required(made), |mark| expected.of(context.corpus, mark, made))
+    fn read_back(&self, context: &Context, expected: &Expected, acknowledged: bool) -> Result<HistoryReadback, RunError> {
+        context.read_back(&expected.marks(), &expected.required(acknowledged), |mark| expected.of(context.corpus, mark, acknowledged))
     }
 }
 
-/// Whether a served record counts as made at this settle: on a retry, after an [`answered`] one.
+/// Whether a served record counts as acknowledged and completed at this settle: on a retry, after an [`answered`] one.
 fn settles(retry: bool, last: Option<&Outcome>) -> bool {
     retry && answered(last)
 }
@@ -604,30 +683,49 @@ fn follow_remedies<S, E>(state: &mut S, named: impl Fn(&mut S) -> Vec<Remedy>, m
     Ok(false)
 }
 
-/// Grades a fault: `first` is the faulted command's first attempt, pushing what it ran and saying
-/// whether the tool acknowledged the record. Then the readback, one plain retry, the remedies every
-/// refusal named, and heal.
+/// Grades a fault: `first` is the faulted command's first attempt, pushing one outcome per line it
+/// ran, from the first. What it established is read off those outcomes ([`Made::of`]), never
+/// taken from the lane. Then the readback, one plain retry, the remedies every refusal named, and
+/// heal.
 pub(crate) fn grade_after(
     context: &Context, expected: &Expected, faulted: usize,
-    first: impl FnOnce(&Context, &mut Vec<Outcome>) -> Result<bool, RunError>,
+    first: impl FnOnce(&Context, &mut Vec<Outcome>) -> Result<(), RunError>,
 ) -> Result<Graded, RunError> {
     let mut trail = Trail::default();
     let mut unextractable = Vec::new();
 
-    // The faulted command, then one plain retry of it. Once the tool acknowledged the record it
-    // stays owed, so a later attempt that refuses (a re-stack with nothing new) does not unmake it.
+    // The faulted command, then one plain retry of it. Once the record is acknowledged it stays
+    // owed, and once every line ran it stays completed, so a later attempt that refuses (a re-stack
+    // with nothing new) unmakes neither.
     let lines = context.lines(faulted)?.len();
-    let mut made = first(context, &mut trail.steps)?;
+    let acknowledging = context.acknowledging()?;
+    first(context, &mut trail.steps)?;
+    let mut made = Made::of(&trail.steps, acknowledging, lines);
     let mut resume = resume_after(&trail.steps, lines);
-    let retry = |trail: &mut Trail, resume: &mut Resume| -> Result<bool, RunError> {
-        let (made, next) = context.retry_from(faulted, *resume, &mut trail.steps)?;
-        *resume = next;
-        Ok(made)
+    let promoted = Made::through(acknowledging, acknowledging, lines);
+    // A retry from where the last attempt stopped, then the readback. A retry whose answer settles
+    // the record as acknowledged ran none of the lines after the record's own, or none that
+    // landed, so they are run once more from the first of them: only landing completes them.
+    let retry = |trail: &mut Trail, resume: &mut Resume, made: &mut Made| -> Result<bool, RunError> {
+        let again = |trail: &mut Trail, resume: &mut Resume, made: &mut Made| -> Result<bool, RunError> {
+            let (landed, next) = context.retry_from(faulted, *resume, &mut trail.steps)?;
+            made.retried(landed, next, acknowledging, lines);
+            *resume = next;
+            trail.settle(context, expected, made, promoted, true)
+        };
+        let before = *made;
+        let reads = again(trail, resume, made)?;
+        match made.rest(before, *resume, acknowledging) {
+            Some(rest) => {
+                *resume = rest;
+                again(trail, resume, made)
+            }
+            None => Ok(reads),
+        }
     };
-    let mut reads = trail.settle(context, expected, &mut made, false)?;
+    let mut reads = trail.settle(context, expected, &mut made, promoted, false)?;
     if !reads {
-        made |= retry(&mut trail, &mut resume)?;
-        reads = trail.settle(context, expected, &mut made, true)?;
+        reads = retry(&mut trail, &mut resume, &mut made)?;
     }
     trail.evidence.healed_by_retry = reads;
 
@@ -661,8 +759,7 @@ pub(crate) fn grade_after(
                     Remedy::Remove { path } => trail.recoverability.outside_knowledge.push(remedy::remove(path, &context.scratch.roots()).0),
                 }
             }
-            made |= retry(trail, &mut resume)?;
-            let reads = trail.settle(context, expected, &mut made, true)?;
+            let reads = retry(trail, &mut resume, &mut made)?;
             trail.evidence.remedy_worked = reads;
             trail.recoverability.named_right_remedy = reads;
             Ok(reads)
@@ -675,7 +772,7 @@ pub(crate) fn grade_after(
     // Heal last, when an acknowledged record still does not read back.
     if !trail.evidence.acknowledged_readable {
         trail.steps.push(context.run(&context.programs.forklift, vec!["--json".into(), "heal".into()], context.scratch.work())?);
-        trail.settle(context, expected, &mut made, false)?;
+        trail.settle(context, expected, &mut made, promoted, false)?;
     }
 
     Ok(Graded {
@@ -709,7 +806,7 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, co
         corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.host.as_ref().map(|host| host.url.as_str()),
         scope: scenario.scope(), via_host: warehouse == Warehouse::Host,
     };
-    let graded = grade_after(&context, &expected, faulted, |context, steps| context.record(faulted, steps))?;
+    let graded = grade_after(&context, &expected, faulted, |context, steps| context.record(faulted, steps).map(drop))?;
     Ok(Faulted {
         scenario: scenario.id.clone(), name: name.to_string(), warehouse, kind, target,
         grade: graded.grade, evidence: graded.evidence, recoverability: graded.recoverability,

@@ -128,12 +128,12 @@ pub fn network(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scratc
         if host.killed() {
             restarted = Some(host.restart(scratch, environment, limit).map_err(RunError::Tool)?);
         }
-        let made = made?;
+        made?;
         if unreached {
             return Err(RunError::Io(NOT_REACHED.to_string()));
         }
         fired = host.proxy.fired();
-        Ok(made)
+        Ok(())
     })?;
     let exchange = fired.ok_or_else(|| RunError::Io("the armed fault was disarmed and never fired".to_string()))?;
     let restart = restarted.as_ref().map(|restarted: &Restarted| Restart { refused: restarted.refused.clone() });

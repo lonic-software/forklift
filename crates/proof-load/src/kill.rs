@@ -770,7 +770,7 @@ fn inject(shared: &Shared, point: &Point, at: &str) -> Result<Killed, RunError> 
     let graded = match landing {
         Landing::Landed => Some(faulted::grade_after(&context, expected, faulted, |_, first| {
             first.append(&mut steps);
-            Ok(false)
+            Ok(())
         })?),
         Landing::NotReached { .. } => None,
     };

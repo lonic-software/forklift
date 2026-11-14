@@ -132,7 +132,7 @@ pub fn folded(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scratch
         corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.host.as_ref().map(|host| host.url.as_str()),
         scope: scenario.scope(), via_host: false,
     };
-    faulted::grade_after(&context, &expected, index, |context, steps| context.record(index, steps))
+    faulted::grade_after(&context, &expected, index, |context, steps| context.record(index, steps).map(drop))
 }
 
 #[cfg(test)]

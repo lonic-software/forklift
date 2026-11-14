@@ -143,7 +143,7 @@ fn under(
         if made && !held {
             return Err(RunError::Io(NOT_SET.to_string()));
         }
-        Ok(made)
+        Ok(())
     })?;
     graded.recoverability.outside_knowledge.insert(0, lift.to_string());
     Ok(graded)

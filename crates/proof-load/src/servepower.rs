@@ -17,7 +17,7 @@
 //! before its cut, or the trace's start for the first, and the server's death: before the server's
 //! first call past that answer, before every sync it made after it, and as it died. Together the
 //! runs reach every moment the server passes through. Each state is graded with the steps its own
-//! run took, acknowledged when the faulted command reported its record made. A run whose replay
+//! run took, acknowledged once the lines that acknowledge its record exited. A run whose replay
 //! does not end at the warehouse the dead server left, path by path, refuses the scenario, as does
 //! a call the model does not understand or a write outside the warehouse, which no state holds.
 //!
@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use crate::corpus::Corpus;
 use crate::damage::Warehouse;
-use crate::faulted::{self, Context, Expected, Graded, Programs};
+use crate::faulted::{self, Context, Expected, Graded, Made, Programs};
 use crate::host::Host;
 use crate::kill::{self, Settings, ATTEMPTS};
 use crate::power::{self, Collector, Crash, GradedCrash, Image, Model, Moment, Replay, Requested, ScenarioPower};
@@ -58,9 +58,9 @@ struct Traced {
     host: Host,
     expected: Expected,
     faulted: usize,
-    /// What the faulted command ran, and whether it reported its record made.
+    /// What the faulted command ran, and whether its record was acknowledged ([`Made::of`]).
     steps: Vec<Outcome>,
-    made: bool,
+    acknowledged: bool,
     /// The faulted command's requests, in the order the proxy forwarded them.
     exchanges: Vec<Exchange>,
     calls: Vec<Call>,
@@ -113,6 +113,7 @@ fn traced(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: &
     };
     let mut steps = Vec::new();
     let made = context.record(faulted, &mut steps)?;
+    let acknowledged = Made::of(&steps, context.acknowledging()?, context.lines(faulted)?.len()).acknowledged;
     if cut.is_none() {
         if !made {
             let refused = steps.last().map(|outcome| outcome.arguments.join(" ")).unwrap_or_default();
@@ -134,7 +135,7 @@ fn traced(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: &
     servekill::keep(settings, &name, &text);
     let calls = trace::parse(&text).map_err(RunError::Io)?;
     let left = power::scan(host.root()).map_err(io)?;
-    Ok(Ran::Traced(Box::new(Traced { scratch, environment, host, expected, faulted, steps, made, exchanges, calls, pid, fixture, area, left })))
+    Ok(Ran::Traced(Box::new(Traced { scratch, environment, host, expected, faulted, steps, acknowledged, exchanges, calls, pid, fixture, area, left })))
 }
 
 /// The moment a run's crash states start from: the answer to the request before its cut, or to
@@ -175,10 +176,10 @@ fn states(run: &Traced, cut: Option<usize>, route: &str, umask: u32, variants: u
     let mut replay = Replay::new(Model::of(&run.fixture).map_err(|why| vec![why])?, run.area.clone(), umask);
     replay.attached(&run.calls, run.pid, &start, |index, model| {
         if marked.contains(&index) {
-            collector.record(moment(format!("before {} at traced call {}", run.calls[index].name, index + 1)), model, run.made);
+            collector.record(moment(format!("before {} at traced call {}", run.calls[index].name, index + 1)), model, run.acknowledged);
         }
     }).map_err(|why| vec![why])?;
-    collector.record(moment("as the server died".to_string()), &replay.model, run.made);
+    collector.record(moment("as the server died".to_string()), &replay.model, run.acknowledged);
     if let Some(why) = power::difference(&replay.model.volatile_image(), &run.left) {
         return Err(vec![format!("the replay does not reproduce the server's run: {}", why)]);
     }
@@ -219,7 +220,7 @@ fn grade_one(run: &Traced, saved: &Scratch, crash: &Crash, index: usize, corpus:
     let graded = faulted::grade_after(&context, &run.expected, run.faulted, |_, first| {
         first.extend(run.steps.iter().cloned());
         restarted = Some(run.host.restart(&restored, &run.environment, settings.limit).map_err(RunError::Tool)?);
-        Ok(crash.acknowledged)
+        Ok(())
     });
     run.host.kill();
     let mut graded = graded?;
