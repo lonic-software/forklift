@@ -192,9 +192,11 @@ fn is_activated() -> bool {
 /// **No re-entry, ever.** The taint's own write below never calls [`file_utils::write_file_atomically`]
 /// or anything that could itself fail a post-rename directory sync and recurse back into this
 /// module — it is its own small, self-contained routine (exclusive-create, write, fsync file,
-/// fsync directory). On any failure of that routine, this returns the error and the routine
-/// removes whatever partial file it created (see [`write_taint_file`]) — a *returned* error
-/// therefore leaves no taint file behind. The one case that can still leave a torn file on disk
+/// fsync directory, fsync the folders above). On a failure up to the directory's own fsync, this
+/// returns the error and the routine removes whatever partial file it created (see
+/// [`write_taint_file`]). A failure syncing the folders above returns the error with the file
+/// kept, since that failure may be the very one being recorded: an `Err` does not mean nothing is
+/// on disk. The one case that can still leave a torn file on disk
 /// is a hard crash (power loss) *during* the write, which runs no cleanup code at all; that
 /// residual — original failure, AND this write's own failure or a crash, AND a retry before any
 /// heal — is exactly the double-failure window this design accepts and documents, never hidden
@@ -202,8 +204,9 @@ fn is_activated() -> bool {
 ///
 /// # Returns
 /// * `Ok(())`      - Not activated, nothing to resolve, or the taint was durably recorded.
-/// * `Err(String)` - Activated, the root resolved, and the durable write itself failed. The gate
-///                   for this root is set regardless (see the ordering note above).
+/// * `Err(String)` - Activated, the root resolved, and the durable write failed, or the record
+///                   was written but the folders above it could not be synced. The gate for this
+///                   root is set regardless (see the ordering note above).
 pub fn record_taint(final_paths: &[&Path]) -> Result<(), String> {
     if !is_activated() || final_paths.is_empty() {
         return Ok(());
@@ -297,7 +300,7 @@ fn write_taint_file(root: &Path, relative_paths: &BTreeSet<PathBuf>) -> Result<(
     // either way (one whose folder entry is not yet durable still gates every later command,
     // where a removed one gates nothing), and the failure is returned beside it.
     file_utils::sync_ancestors_to_storage_root(&taint_dir)
-        .map_err(|e| format!("the record is kept, but its folder may not survive a power loss: {}", e))
+        .map_err(|e| format!("the taint is recorded, but its folder may not survive a power loss: {}", e))
 }
 
 /// The process-global, never-reset source of the `<counter>` suffix in every taint filename this
@@ -815,7 +818,9 @@ pub(crate) fn test_clear_gate(root: &Path) {
 ///                   `remainder` was empty), `old_files` are gone (or were already gone — see
 ///                   [`delete_snapshot_and_sync`]), and the in-memory gate for `root` matches what
 ///                   is now on disk.
-/// * `Err(String)` - The new file could not be durably written (`old_files` are left completely
+/// * `Err(String)` - The new file could not be durably written, or was written but the folders
+///                   above it could not be synced (it then stands beside `old_files`, and reads
+///                   union them, a superset of `remainder`; either way `old_files` are left completely
 ///                   untouched — the original, larger set still stands, never partially deleted
 ///                   before a replacement is durable), a file in `old_files` could not be removed
 ///                   for a reason other than already being gone, or the post-write directory

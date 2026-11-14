@@ -716,18 +716,17 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 /// finished syncing its parent, or by a process that died first. The bound is the root's path,
 /// never a folder name, because a pallet or bay name may itself contain a `.forklift` component.
 ///
-/// The CLI's root is relative to the working directory, while a caller such as a clone's resume
-/// sweep may name its folders absolutely; the root is then made absolute to compare, so the walk
-/// is never silently empty.
+/// The comparison is by spelling, so `dir` must be spelled from [`forklift_root`]; a caller that
+/// names its folders from a root of its own passes that root to [`ancestors_within`] instead.
 pub(crate) fn ancestors_to_storage_root(dir: &Path) -> Vec<PathBuf> {
-    let root = forklift_root();
-    let root = match root.is_relative() && dir.is_absolute() {
-        true => std::path::absolute(&root).unwrap_or(root),
-        false => root,
-    };
+    ancestors_within(dir, &forklift_root())
+}
 
+/// The folders strictly above `dir`, nearest first, up to and including `root`, compared by
+/// spelling. Empty when `dir` is `root` itself or is not spelled under it.
+pub(crate) fn ancestors_within(dir: &Path, root: &Path) -> Vec<PathBuf> {
     dir.ancestors().skip(1)
-        .take_while(|folder| folder.starts_with(&root))
+        .take_while(|folder| folder.starts_with(root))
         .map(Path::to_path_buf)
         .collect()
 }
@@ -753,7 +752,13 @@ pub(crate) fn with_ancestors_to_storage_root(folders: &BTreeSet<PathBuf>) -> BTr
 /// A no-op when [`fsync_enabled`] is false, and on non-Unix targets, where a directory handle
 /// cannot be opened for `sync_all` (NTFS gives the ordering this buys on other filesystems).
 pub fn sync_dir(dir: &Path) -> Result<(), String> {
-    let ancestors = sync_ancestors_to_storage_root(dir);
+    sync_dir_within(dir, &forklift_root())
+}
+
+/// [`sync_dir`] with the walk bounded by `root` instead of [`forklift_root`], for a caller that
+/// spells its folders from a root of its own (see [`ancestors_within`]).
+pub(crate) fn sync_dir_within(dir: &Path, root: &Path) -> Result<(), String> {
+    let ancestors = sync_ancestors_within(dir, root);
     let leaf = sync_dir_alone(dir);
 
     ancestors.and(leaf)
@@ -764,6 +769,11 @@ pub fn sync_dir(dir: &Path) -> Result<(), String> {
 /// attempted; the first error is returned. For a caller whose `dir` may itself be gone, such as a
 /// folder a removal took with it: its parent's entry change still needs syncing.
 pub(crate) fn sync_ancestors_to_storage_root(dir: &Path) -> Result<(), String> {
+    sync_ancestors_within(dir, &forklift_root())
+}
+
+/// [`sync_ancestors_to_storage_root`] with the walk bounded by `root` (see [`ancestors_within`]).
+pub(crate) fn sync_ancestors_within(dir: &Path, root: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         if !fsync_enabled() {
@@ -772,7 +782,7 @@ pub(crate) fn sync_ancestors_to_storage_root(dir: &Path) -> Result<(), String> {
 
         let mut first_error: Option<String> = None;
 
-        for ancestor in ancestors_to_storage_root(dir) {
+        for ancestor in ancestors_within(dir, root) {
             #[cfg(test)]
             if let Some(injected) = injected_sync_dir_fault(&ancestor) {
                 first_error.get_or_insert(injected);
@@ -791,7 +801,7 @@ pub(crate) fn sync_ancestors_to_storage_root(dir: &Path) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        let _ = dir;
+        let _ = (dir, root);
         Ok(())
     }
 }
@@ -952,7 +962,7 @@ fn taint_after_sync_failure(sync_error: String, final_paths: &[&Path]) -> String
     match taint_utils::record_taint(final_paths) {
         Ok(()) => sync_error,
         Err(taint_error) => format!(
-            "{} (additionally, failed to record a durability taint for the affected object(s): {})",
+            "{} (additionally, while recording a durability taint for the affected object(s): {})",
             sync_error, taint_error
         ),
     }
@@ -6985,18 +6995,18 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn an_absolute_folder_under_a_relative_root_walks_to_the_root() {
-        // The CLI's root is the relative `.forklift`; a clone's resume sweep names its folders
-        // absolutely. Nothing is created: the folders do not exist, so each sync fails after
-        // being recorded.
-        assert_eq!(forklift_root(), PathBuf::from(".forklift"), "this test needs no scope and no bay");
-        let root = std::path::absolute(".forklift").unwrap();
+    fn a_walk_bounded_by_its_own_root_reaches_it_whatever_the_storage_root_is() {
+        // A clone's resume sweep spells its folders from the target it was given, which need
+        // not match the CLI's relative storage root; it passes that root as the bound. Nothing
+        // is created: each folder is recorded, then fails to open.
+        let root = std::env::temp_dir().join(format!("forklift-chain-own-{}", std::process::id())).join(".forklift");
         let folder = root.join("objects").join("44");
+        assert!(ancestors_to_storage_root(&folder).is_empty(), "this test needs the bound to come from the caller");
 
         let _guard = SyncDirFaultGuard::recording();
-        let _ = sync_ancestors_to_storage_root(&folder);
+        let _ = sync_dir_within(&folder, &root);
 
-        assert_eq!(sync_dir_attempts(), vec![root.join("objects"), root.clone()]);
+        assert_eq!(sync_dir_attempts(), vec![root.join("objects"), root.clone(), folder.clone()]);
     }
 
     #[test]

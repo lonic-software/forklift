@@ -678,8 +678,8 @@ pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep: &Bu
             match std::fs::symlink_metadata(&folder) {
                 // A folder an earlier removal in this loop took with it: the entry change is in
                 // the folders above it.
-                Err(_) => file_utils::sync_ancestors_to_storage_root(&folder)?,
-                Ok(_) => file_utils::sync_dir(&folder)?,
+                Err(_) => file_utils::sync_ancestors_within(&folder, &forklift)?,
+                Ok(_) => file_utils::sync_dir_within(&folder, &forklift)?,
             }
         }
     }
