@@ -292,7 +292,7 @@ mod tests {
     /// matches nothing.
     ///
     /// Revert: let `*` cross a `/` → `a/b/c` matches `a/*`; give `:parents` the name itself → a
-    /// deletion's handler may remove the ref beside its own; fill a capture as a glob → `{hash}`
+    /// ref update may make a folder where its own ref file goes; fill a capture as a glob → `{hash}`
     /// matches any name.
     #[test]
     fn templates_match_what_they_name() {
