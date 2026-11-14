@@ -226,7 +226,8 @@ forklift heal
 
 `heal` rebuilds a lost or damaged index from the pack's data file, keeping a replaced index beside it
 as `<name>.idx.damaged-<time>`, and the command then works. If the data file itself is damaged or
-gone, or the object is missing altogether, nothing in this store can bring its objects back, and `heal` refuses with `objects_lost`.
+gone, or the object is missing altogether, nothing in this store can bring it back; when history
+still reaches it, `heal` refuses with `objects_lost`.
 `forklift store status` lists each damaged pack file under `pack problems:`.
 
 ### `objects_lost` (exit 58)

@@ -5435,7 +5435,8 @@ fn publish_rebuilt_index(folder: &Path, data_path: &Path, index_bytes: &[u8]) ->
         // Put the replaced index back, so the folder is no worse than before; a failure to do so
         // is reported by where it still lies.
         let restored = match &set_aside {
-            Some(aside) => file_utils::rename(aside, &index_path).is_ok(),
+            // An index that appeared meanwhile is newer than the one set aside, so it stays.
+            Some(aside) => std::fs::symlink_metadata(&index_path).is_err() && file_utils::rename(aside, &index_path).is_ok(),
             None => true,
         };
         let kept = if restored { String::new() } else { kept_at(&set_aside) };
