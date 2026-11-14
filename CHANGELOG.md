@@ -12,6 +12,16 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **A lost or damaged fetch scope is rebuilt by `forklift heal`.** In a sparse warehouse, a
+  `.forklift/config/fetch-scope` that was deleted, emptied, zeroed or no longer valid UTF-8 made
+  every command refuse with "clone the remote again", while `heal` reported nothing to heal. The
+  refusal now names `forklift heal`, which rebuilds the fetch scope from the scopes of the warehouse's
+  checkouts once the history there is all present. When it cannot (an object is lost under them, no
+  checkout's scope can be read, or a readable fetch scope does not hold a checkout's scope), `heal`
+  changes nothing and refuses with exit 54 (`fetch_scope_damaged`), naming a next step:
+  `heal --fetch-scope <path>...` sets the fetch scope to the paths given, fetching from the origin
+  whatever the history at them lacks.
+
 - **A lost or damaged pallet ref is rebuilt by `forklift heal`.** A ref file that was deleted,
   truncated, zeroed or had a byte changed, or a `pallets` folder that was removed, used to leave the
   warehouse unable to stack: `stack` refused as behind and named a `shift` that refused too, or

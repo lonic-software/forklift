@@ -85,7 +85,15 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 42** (current): a new refusal code, `ref_damaged` (exit 53): a pallet ref is missing
+**Schema 43** (current): a new refusal code, `fetch_scope_damaged` (exit 54): a sparse warehouse's
+fetch scope is lost or damaged and the checkouts' scopes cannot rebuild it, or it can be read but
+does not hold a checkout's scope. `next_step` is a whole `heal --fetch-scope` command, and
+`details` names what was read and what was not (`fetch_scope`, `fetch_scope_unreadable`, `read`,
+`unread`, `outside`, `missing`). `heal` carries `fetch_scope_rebuilt`
+(`{scope, chosen, was, from, left_out: [{checkout, reason}], fetched_objects}`), or null when the
+fetch scope was left alone.
+
+**Schema 42**: a new refusal code, `ref_damaged` (exit 53): a pallet ref is missing
 under a checkout that stands on it, or does not hold a parcel hash. `heal` carries `refs_rebuilt`
 (each `{pallet, head, source}`) and `refs_removed` (each `{pallet, kept}`), and refuses with
 `ref_damaged` while a damaged ref stands, its `details` the whole report with `refs_refused`

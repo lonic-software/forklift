@@ -2353,11 +2353,86 @@ A command not listed here either reports only the generic human-message shape `{
         "kept"
       ],
       "type": "object"
+    },
+    "ScopeRebuilt": {
+      "description": "A fetch scope `heal` wrote.",
+      "properties": {
+        "chosen": {
+          "description": "Whether `--fetch-scope` chose them, rather than the checkouts' scopes.",
+          "type": "boolean"
+        },
+        "fetched_objects": {
+          "description": "How many objects `--fetch-scope` fetched.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "from": {
+          "description": "The checkouts whose scopes the rebuilt one is the union of.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "left_out": {
+          "description": "Checkouts whose scope could not be read, and why; they were left out.",
+          "items": {
+            "$ref": "#/$defs/Unread"
+          },
+          "type": "array"
+        },
+        "scope": {
+          "description": "The prefixes of the fetch scope written.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "was": {
+          "description": "What the fetch-scope file held that could not be used.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "chosen",
+        "was"
+      ],
+      "type": "object"
+    },
+    "Unread": {
+      "description": "A checkout whose scope could not be used.",
+      "properties": {
+        "checkout": {
+          "description": "The checkout.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why its scope was not used.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "checkout",
+        "reason"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of a `heal` run that fully resolved (or found nothing to resolve).",
   "properties": {
+    "fetch_scope_rebuilt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ScopeRebuilt"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The fetch scope of a sparse warehouse, which was lost or damaged and this run wrote: rebuilt\nfrom the checkouts' scopes, or set to the paths `--fetch-scope` gave."
+    },
     "newly_held_by_hash": {
       "description": "Absent objects beneath those in `unsealed` that the record now holds by hash alone, so that\nremoving those records left nothing beneath them unaccounted for.",
       "items": {

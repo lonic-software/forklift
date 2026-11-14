@@ -257,7 +257,7 @@ rare kind of write failure. See
 
 **Restage.** Reading an object back, checking its hash, and rewriting it durably.
 
-**heal** (git: none). The recovery command for taints, damaged pallet refs and interrupted operations.
+**heal** (git: none). The recovery command for taints, damaged pallet refs, a damaged fetch scope and interrupted operations.
 See [`heal`](cli.md#heal--resolve-a-durability-taint-a-damaged-ref-or-an-interrupted-operation).
 
 **Operation marker.** A record a multi-step command writes before it starts and removes when it

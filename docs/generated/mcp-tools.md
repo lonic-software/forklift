@@ -31,7 +31,7 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `haul_consolidate` | `forklift haul consolidate` | Land a proposal: consolidate its source into the target | `id` (a string, required) |
 | `haul_close` | `forklift haul close` | Close a proposal without merging | `id` (a string, required) |
 | `haul_reopen` | `forklift haul reopen` | Reopen a closed proposal | `id` (a string, required) |
-| `heal` | `forklift heal` | Resolve a standing durability taint, rebuild a damaged pallet ref, or finish or undo an interrupted operation | `ref` (an array of strings)<br>`remove_ref` (an array of strings) |
+| `heal` | `forklift heal` | Resolve a standing durability taint, rebuild a damaged pallet ref or fetch scope, or finish or undo an interrupted operation | `ref` (an array of strings)<br>`remove_ref` (an array of strings)<br>`fetch_scope` (an array of strings) |
 | `history` | `forklift history` | Print the parcels of a revision, newest first | `revision` (a string)<br>`limit` (an integer of at least 1)<br>`after` (a string)<br>`oneline` (a boolean) |
 | `lift` | `forklift lift` | Upload the current pallet's new parcels to the remote (push) | `recreate` (a boolean) |
 | `load` | `forklift load` | Take the current state of a file or directory into the inventory (stage) | `path` (a string, required) |

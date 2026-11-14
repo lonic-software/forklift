@@ -119,6 +119,32 @@ what only that ref reached is then no longer kept by any pallet.
 A meta pallet's ref (a name starting with `@`, such as `@redactions`) is not rebuilt: no checkout or
 journal records its head. Restore its file from a backup, or write the head parcel's hash into it.
 
+### `fetch_scope_damaged` (exit 54)
+
+A sparse warehouse's fetch scope (`.forklift/config/fetch-scope`, the paths it fetched) is lost or
+damaged, and `heal` could not rebuild it from your checkouts' scopes. Commands that met the damaged
+file first named `forklift heal`; this is what it says when that is not enough. Nothing was changed.
+Run the next step the message names:
+
+```sh
+forklift heal --fetch-scope <path>...
+```
+
+It sets the fetch scope to those paths after fetching from the origin whatever the history there
+lacks, so the origin must be reachable. The paths must hold every checkout's scope and cannot be the
+warehouse root. Which step is named depends on why:
+
+- **History is missing under the checkouts' scopes.** The step names their union; heal fetches what
+  was lost.
+- **No checkout's scope could be read.** The step offers the top-level folders of the working tree.
+  Name fewer or others if you know what this warehouse fetched.
+- **The fetch scope can be read but does not hold a checkout's scope.** One of the two files is
+  damaged. If it is the fetch scope, the step widens it. If it is a checkout's, remove that bay with
+  `forklift bay remove` and add it again, or, for the warehouse's own working tree, clone afresh.
+
+A rebuilt fetch scope may be narrower than what was fetched before: paths only the old one named are
+no longer checked for loss. `forklift scope fetch <path>` adds one back.
+
 ### `clone_incomplete` (exit 30)
 
 A clone stopped part-way, and the directory keeps what it fetched. Run the same `forklift clone`

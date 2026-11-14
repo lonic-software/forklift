@@ -331,7 +331,7 @@ pub enum Command {
         action: Option<HaulAction>,
     },
 
-    /// Resolve a standing durability taint, rebuild a damaged pallet ref, or finish or undo an interrupted operation
+    /// Resolve a standing durability taint, rebuild a damaged pallet ref or fetch scope, or finish or undo an interrupted operation
     #[command(
         long_about = "Resolve a standing durability taint (\"durability_taint\" refusals, exit \
                       21): a write's final path(s) were left visible after a failed durability \

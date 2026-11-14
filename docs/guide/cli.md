@@ -2643,6 +2643,7 @@ under [`store compact`](#store-compact--pack-the-object-store).
 forklift heal
 forklift heal --ref <pallet>=<parcel>
 forklift heal --remove-ref <pallet>
+forklift heal --fetch-scope <path>...
 ```
 
 You will rarely see this: after certain rare write failures (a directory-sync error right
@@ -2801,6 +2802,27 @@ are in `details` under `--json`). Choose one yourself:
 Both refuse a ref that is readable. A refusal also lists any ref the same run already set or
 removed. The report lists `refs_rebuilt`, `refs_removed` and
 `refs_refused` under `--json`.
+
+#### A damaged fetch scope
+
+In a sparse warehouse, a fetch scope (`.forklift/config/fetch-scope`) that is lost or cannot be read
+makes every command refuse and name `heal`. `heal` rebuilds it as the union of the checkouts' scopes
+(the warehouse's own working tree and every bay), once it has checked that the history at those
+paths is all present: the fetch scope is what says which content the store must hold, so it is
+never rebuilt over a loss. Paths fetched beyond the checkouts' scopes are no longer checked for
+loss; the report says so, and `forklift scope fetch` adds one back.
+
+When the rebuild cannot be trusted, `heal` changes nothing and refuses with `fetch_scope_damaged`
+(exit 54), naming a whole `heal --fetch-scope` command as the next step. That happens when history
+is missing at those paths, when no checkout's scope can be read, or when a readable fetch scope does
+not hold a checkout's scope (one of the two files is damaged; the message gives the way out for
+each).
+
+- `forklift heal --fetch-scope <path>...` sets the fetch scope to the paths given. They must hold
+  every checkout's scope and cannot be the warehouse root, and the fetch scope must be damaged or
+  not hold a checkout. It walks each head from the origin under the new scope first, fetching what
+  the history lacks, so it needs the origin; offline, it changes nothing. `--json` reports
+  `fetch_scope_rebuilt`, with `chosen` true and the objects fetched.
 
 #### Interrupted operations
 
