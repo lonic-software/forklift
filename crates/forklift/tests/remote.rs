@@ -9086,8 +9086,9 @@ fn sparse_with_docs(area: &TestArea) -> Server {
 /// FORK-490: a read of a path a sparse clone never fetched refuses `out_of_scope` naming the step
 /// that fetches it, never `object_unreadable` and a heal that finds nothing lost. The step fits the
 /// path: `scope fetch` for a directory at the base, a fresh clone for a file at the root, and
-/// prose for a directory only an older revision has. Mutations: drop either command's check, or
-/// the base walk → red.
+/// prose for a directory only an older revision has. It is decided after the read fails, so what
+/// the store can serve still reads. Mutations: drop either command's check, the base walk, the
+/// code test or the tree walk above the boundary → red.
 #[test]
 fn a_read_outside_the_fetch_scope_names_the_fetch_that_reaches_it() {
     let area = TestArea::new("read-out-of-scope");
@@ -9098,6 +9099,8 @@ fn a_read_outside_the_fetch_scope_names_the_fetch_that_reaches_it() {
     area.write_file("dev/docs/guide.md", "guide v1\n");
     area.write_file("dev/old/gone.txt", "only in the first revision\n");
     area.write_file("dev/top.txt", "at the root\n");
+    area.write_file("dev/same.txt", "api v1\n");
+    area.write_file("dev/src/lib.rs", "beside the api\n");
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "-m", "first"]));
     let first = pallet_head(&area, "dev", "main");
@@ -9120,6 +9123,16 @@ fn a_read_outside_the_fetch_scope_names_the_fetch_that_reaches_it() {
     assert!(error["message"].as_str().unwrap().contains("docs/guide.md"), "{}", error);
     let error = refused(&["redact", "record", "main:docs/guide.md", "-m", "x"]);
     assert_eq!(error["next_step"], "forklift scope fetch docs", "{}", error);
+
+    assert_eq!(refused(&["show", "main:src/lib.rs"])["next_step"], "forklift scope fetch src");
+
+    // Decided by what the read failed on: content the store holds through a fetched path reads, and
+    // a path that does not exist is not found, never out of scope.
+    let shown = area.forklift("sparse", &["--json", "show", "main:same.txt"]);
+    assert_success(&shown);
+    assert_eq!(json_of(&shown)["data"]["content"], "api v1\n");
+    let typo = area.forklift("sparse", &["show", "main:READMEE.md"]);
+    assert!(stderr(&typo).contains("was not found"), "{}", stderr(&typo));
 
     let error = refused(&["show", "main:top.txt"]);
     assert_eq!(error["next_step"], "Clone the remote again without --only, into a new directory.", "{}", error);
@@ -9148,6 +9161,12 @@ fn a_read_outside_the_fetch_scope_names_the_fetch_that_reaches_it() {
     let output = area.forklift("sparse", &["--json", "redact", "record", "main:top.txt", "-m", "x"]);
     let message = json_of(&output)["error"]["message"].as_str().unwrap().to_string();
     assert!(message.contains("is in the head of pallet"), "{}", message);
+
+    // A lost tree the warehouse should hold, above where the path leaves the fetch scope, is damage.
+    let src = path_object_hash(&area, "sparse", &head, "src");
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "sparse", &src)).unwrap();
+    let output = area.forklift("sparse", &["--json", "show", "main:src/lib.rs"]);
+    assert_eq!(json_of(&output)["error"]["code"], "object_unreadable", "{}", stdout(&output));
 }
 
 #[test]

@@ -32,9 +32,21 @@ pub fn handle_command(target: &str) -> Result<(), String> {
 
     let parcel_hash = pallet_utils::resolve_revision(revision)?;
     let tree_hash = object_utils::load_parcel(&parcel_hash)?.tree_hash;
-    crate::commands::scope::ensure_fetched(path, crate::commands::scope::PathRead::Content)?;
 
-    let Some((hash, item_type)) = object_utils::resolve_tree_file(&tree_hash, path)? else {
+    // A sparse warehouse that never fetched the path fails the read as a lost object: say what it
+    // is and how to fetch it.
+    let shown = read_shown(parcel_hash, &tree_hash, path, revision).map_err(|error| {
+        crate::commands::scope::explain_unfetched(&tree_hash, path, crate::commands::scope::PathRead::Content, error)
+    })?;
+
+    output::emit(&shown);
+
+    Ok(())
+}
+
+/// Read the file `path` in the tree `tree_hash` of the parcel `parcel_hash`, named `revision`.
+fn read_shown(parcel_hash: String, tree_hash: &str, path: &str, revision: &str) -> Result<Shown, String> {
+    let Some((hash, item_type)) = object_utils::resolve_tree_file(tree_hash, path)? else {
         return Err(format!(
             "\"{}\" was not found at revision \"{}\" ({}).",
             path, revision, parcel_hash
@@ -78,9 +90,7 @@ pub fn handle_command(target: &str) -> Result<(), String> {
         }
     };
 
-    output::emit(&shown);
-
-    Ok(())
+    Ok(shown)
 }
 
 /// A `show` result: a file's content at a revision, or — when it is binary or a chunked
