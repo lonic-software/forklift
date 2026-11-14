@@ -12,6 +12,14 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **A read the warehouse cannot serve names a remedy that works.** `store peek <hash>` of a hash
+  the store does not hold now says only that, with no next step, where it was refused with exit 57
+  (`object_unreadable`) naming `heal`, which then found nothing to heal. An absence that still leaves
+  something undecided, such as a pack with no index, keeps exit 57. In a sparse clone, `show` and
+  `redact record` of a path outside the fetch scope are refused with exit 7 (`out_of_scope`),
+  naming `forklift scope fetch <directory>` for a directory at the base, or a fresh clone when the
+  path is a file at the root.
+
 - **A corrupt loose object is refused with a code, and `heal` names it as lost.** A loose object
   file whose bytes did not decompress, or decompressed to other content, failed reads with an
   uncoded message, and `heal` exited 0 over it, since its closing check never read a file's bytes.
