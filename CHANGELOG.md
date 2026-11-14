@@ -533,6 +533,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **An object folder that cannot be listed is reported, not read as empty.** Matching a short hash
+  or salvaging a damaged pallet ref skipped a folder of the object store it could not list, so a
+  typed prefix was answered "No object with hash … exists", and `heal` could judge that a damaged
+  ref's bytes named nothing and rebuild it from older evidence. Both now fail naming the folder,
+  and `heal` leaves such a ref alone, saying its salvage is unknown. The store's other listings
+  now name the folder too.
+
 - **A power loss no longer drops a folder that was just written into.** The first object, ref or
   shard written into a new folder under `.forklift` synced the folder but not its own entry in the
   folder above, so a power loss soon after could drop the folder, and every file in it, while a

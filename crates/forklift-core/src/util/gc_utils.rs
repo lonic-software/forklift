@@ -95,10 +95,10 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
         }
 
         let files = std::fs::read_dir(folder.path())
-            .map_err(|e| format!("Error while reading an objects folder: {}", e))?;
+            .map_err(|e| format!("Error while reading the objects folder {}: {}", folder.path().display(), e))?;
 
         for file in files {
-            let file = file.map_err(|e| format!("Error while listing an objects folder: {}", e))?;
+            let file = file.map_err(|e| format!("Error while listing the objects folder {}: {}", folder.path().display(), e))?;
             let listed = file.file_name().to_string_lossy().to_string();
 
             // Sidecars are swept with their object, never on their own.
