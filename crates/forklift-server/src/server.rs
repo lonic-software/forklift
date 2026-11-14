@@ -6997,7 +6997,7 @@ mod tests {
         let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::create_dir_all(forklift.join("config")).unwrap();
         std::fs::write(forklift.join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER),
-            format!("/forklift-warehouse 3\nformat 1\n{}\n", mode)).unwrap();
+            warehouse_utils::framed_marker_bytes(&format!("format 1\n{}\n", mode))).unwrap();
     }
 
     /// A multi-mode state over `base` that keeps at most `cap` warehouses live while any is idle,
@@ -7033,10 +7033,9 @@ mod tests {
     fn a_warehouse_in_another_format_is_unavailable_and_the_others_are_served() {
         let base = scratch_dir("other-format");
         let state = capped_state(&base, 8, &["fine", "newer", "older", "halfway"]);
-        for (id, marker) in [("newer", "/forklift-warehouse 3\nformat 2\nfull\n"),
-                             ("older", "/forklift-warehouse 3\nformat 0\nfull\n"),
-                             ("halfway", "/forklift-warehouse 3\nformat 1\nfull\nupgrading 2 0\n")] {
-            std::fs::write(base.join(id).join(FOLDER_NAME_FORKLIFT_ROOT).join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), marker).unwrap();
+        for (id, marker) in [("newer", "format 2\nfull\n"), ("older", "format 0\nfull\n"), ("halfway", "format 1\nfull\nupgrading 2 0\n")] {
+            std::fs::write(base.join(id).join(FOLDER_NAME_FORKLIFT_ROOT).join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER),
+                warehouse_utils::framed_marker_bytes(marker)).unwrap();
             let error = resolve_handle(&state, &warehouse_params(id)).err().unwrap();
             assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE, "{}: {}", id, error.1);
             assert!(!error.1.contains(base.to_str().unwrap()), "{}: {}", id, error.1);

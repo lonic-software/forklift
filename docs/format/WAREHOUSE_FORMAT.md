@@ -7,12 +7,13 @@ again.
 
 ## The marker
 
-`.forklift/warehouse` is a [state record](STATE_RECORD_FORMAT.md) of kind `warehouse`, version 3:
+`.forklift/warehouse` is a [state record](STATE_RECORD_FORMAT.md) of kind `warehouse`, version 4:
 
 ```text
-/forklift-warehouse 3
+/forklift-warehouse 4
 format 1
 full
+digest <blake3 of every byte before this line, in lowercase hex>
 ```
 
 | Entry | Meaning |
@@ -20,6 +21,16 @@ full
 | `format N` | The format the warehouse is in. Decimal, with no leading zero. |
 | mode word | What the warehouse holds. A build judges this word only at its own format. |
 | `upgrading M S` | Optional: an upgrade to format `M` is under way, with `S` steps done. |
+| `digest H` | Always last. A marker whose digest does not match its bytes is damaged, never read. |
+
+`.forklift/warehouse-copy` holds the same bytes. Every write replaces the copy first and the marker
+second, each atomically and synced, so at every instant at least one of them is whole. A build reads
+the marker if it is whole and the copy otherwise; when the two differ, or one is missing or damaged,
+the next open of the warehouse rewrites the stale one from the one it read. A folder is a warehouse
+when either file is present, and only when both are missing is it refused as not a warehouse; one
+that is present but unreadable, with no whole twin, is refused as damaged and is never answered with
+`prepare`. A version-3 marker, from before the marker carried a digest, is refused with its own
+message: the warehouse is made again.
 
 This framing is frozen, so any future build can read any marker well enough to refuse it correctly.
 So are two others. A bay's redirect is frozen because re-creating a bay would destroy its parked
@@ -226,6 +237,7 @@ name in a row is a constant, and every path in every fixture matches a row.
 | Path | Class | Names |
 |---|---|---|
 | `warehouse` | rewritable | `warehouse_utils::FILE_NAME_WAREHOUSE_MARKER` |
+| `warehouse-copy` | rewritable | `warehouse_utils::FILE_NAME_WAREHOUSE_MARKER_COPY` |
 | `format.lock` | lock | `lock_utils::FILE_NAME_FORMAT_LOCK` |
 | `objects/`, `objects/<xx>/`, `objects/<xx>/<hash>` | history-borne | `globals::FOLDER_NAME_OBJECTS_ROOT` |
 | `objects/<xx>/<hash>.sig` | history-borne | `sign_utils::FILE_SUFFIX_SIGNATURE` |

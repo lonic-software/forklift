@@ -175,8 +175,8 @@ impl Head {
     pub(crate) fn recreate_step(self, forklift: &Path, root: &Path) -> String {
         match self {
             Head::Client => format!(
-                "Move \"{}\" aside, run {}, then import the history again (\"forklift git import\") or \
-                clone it again; or, if it was a bay's, restore its redirect.",
+                "Move \"{}\" aside, run {}, then import the history again (\"forklift git import <git \
+                repository>\") or clone it again; or, if it was a bay's, restore its redirect.",
                 forklift.to_string_lossy(), self.prepare_command(root)
             ),
             // A bay is never served, so its redirect is no way out here; and the old folder is refused
@@ -223,15 +223,20 @@ pub struct OpenedWarehouse {
 /// * `Ok(FormatLease)` - The warehouse is in the one format this build reads, and stays so.
 /// * `Err(CoreError)`  - A refusal of [`judge_format`] or of [`lock_utils::FormatLease::shared`], or
 ///                       the marker could not be read or is gone.
+///
+/// A warehouse it opens has its marker pair made whole again: a copy missing, damaged or behind is
+/// rewritten from the marker the pair resolves to (see [`read_marker_pair`]).
 pub fn hold_warehouse_format(root: &Path, head: Head) -> Result<lock_utils::FormatLease, CoreError> {
     let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
     let lease = lock_utils::FormatLease::shared(&forklift)?;
 
-    let marker = read_marker(&forklift)?.ok_or_else(|| format!(
+    let pair = read_marker_pair(&forklift)?;
+    let (marker, bytes) = pair.chosen.ok_or_else(|| format!(
         "The warehouse marker in \"{}\" was removed while the warehouse was being opened.", forklift.to_string_lossy()
     ))?;
 
     judge_format(&marker, &shown_root(root), head, &upgrade_utils::CHAIN)?;
+    heal_marker_pair(&forklift, &bytes, &pair.stale);
 
     Ok(lease)
 }
@@ -476,7 +481,7 @@ fn forklift_file_refusal(root: &Path, head: Head) -> CoreError {
 /// The refusal for a `.forklift` at `root` with no warehouse marker (and no redirect). An empty one
 /// may sit inside a warehouse, where the user most likely meant that one: then removing it comes
 /// first, so the next step never builds a nested warehouse the outer one would refuse. One with
-/// anything in it is from before warehouses were marked, or not a warehouse; prepare refuses it,
+/// anything in it lost both files of its marker pair, or is not a warehouse; prepare refuses it,
 /// so it is moved aside and the warehouse made again.
 fn unprepared_refusal(root: &Path, head: Head) -> Result<CoreError, CoreError> {
     let shown = shown_root(root);
@@ -486,7 +491,7 @@ fn unprepared_refusal(root: &Path, head: Head) -> Result<CoreError, CoreError> {
         return Ok(CoreError::refusal(
             RefusalCode::NotAWarehouse,
             format!(
-                "\"{}\" holds no warehouse marker: it was made before warehouses were marked, or is not a warehouse.",
+                "\"{}\" holds neither a warehouse marker nor its copy, so it is not a warehouse Forklift can open.",
                 forklift.to_string_lossy()
             ),
             head.recreate_step(&forklift, &shown),
@@ -584,15 +589,22 @@ pub fn cwd_relative_to_root() -> PathBuf {
 
 /// The file in a warehouse's `.forklift` folder that says `prepare` finished building it, and what
 /// the warehouse holds of the history it names ([`WarehouseMode`]): written last, so a folder
-/// holding it holds every piece of a warehouse.
+/// holding it holds every piece of a warehouse. Its twin [`FILE_NAME_WAREHOUSE_MARKER_COPY`] holds
+/// the same bytes, so one lost or damaged file never makes an intact store unreachable.
 pub const FILE_NAME_WAREHOUSE_MARKER: &str = "warehouse";
-/// The record kind and format version of the warehouse marker (see [`record_utils`]). Version 3 is
+/// The second copy of the warehouse marker, written just before [`FILE_NAME_WAREHOUSE_MARKER`] by
+/// the same writer, and read when the primary is missing or damaged.
+pub const FILE_NAME_WAREHOUSE_MARKER_COPY: &str = "warehouse-copy";
+/// The record kind and format version of the warehouse marker (see [`record_utils`]). Version 4 is
 /// frozen: every future build must read it to tell a warehouse of another format from anything else.
 /// It holds `format N`, then the mode's word, then an `upgrading M S` entry while an upgrade to format
-/// `M` stands at step `S`. Versions 1 and 2 recorded no format and are refused: they are older than
-/// the first format any build upgrades from.
+/// `M` stands at step `S`, and last `digest H`, the blake3 hash of every byte before that line, so
+/// damage reads as damage rather than as a format or a mode. Versions 1 to 3 carried no digest and
+/// are refused.
 const WAREHOUSE_MARKER_RECORD: &str = "warehouse";
-const WAREHOUSE_MARKER_VERSION: u32 = 3;
+const WAREHOUSE_MARKER_VERSION: u32 = 4;
+/// The entry prefix of a marker's digest, its last entry.
+const MARKER_DIGEST_PREFIX: &str = "digest ";
 
 /// The one warehouse format this build reads (docs/format/WAREHOUSE_FORMAT.md).
 pub const WAREHOUSE_FORMAT: u32 = 1;
@@ -708,30 +720,114 @@ fn parse_marker_entries(entries: &[String]) -> Result<WarehouseMarker, String> {
 /// * `Ok(None)`         - It holds none.
 /// * `Err(String)`      - The marker cannot be read, or its framing is not the frozen one.
 pub(crate) fn read_marker(forklift: &Path) -> Result<Option<WarehouseMarker>, String> {
-    let path = forklift.join(FILE_NAME_WAREHOUSE_MARKER);
+    read_marker_pair(forklift).map(|pair| pair.chosen.map(|(marker, _)| marker))
+}
+
+/// One file of the marker pair, as read.
+#[derive(Debug)]
+enum MarkerFile {
+    Absent,
+    /// A marker in the frozen framing whose digest matches, with the bytes it was read from.
+    Valid(WarehouseMarker, Vec<u8>),
+    /// A file that is no marker this build can use: the refusal saying why.
+    Unusable(String),
+}
+
+/// The marker pair of a `.forklift` folder, resolved.
+#[derive(Debug)]
+struct MarkerPair {
+    /// The marker the pair records, with its bytes: the primary's when it is valid, else the copy's.
+    chosen: Option<(WarehouseMarker, Vec<u8>)>,
+    /// The files of the pair that do not hold the chosen marker's bytes.
+    stale: Vec<&'static str>,
+}
+
+/// Read both files of the marker pair in `forklift` and resolve them. A valid primary is the
+/// marker; else a valid copy is. Each choice names a state a stopped [`write_marker`] leaves: a copy
+/// alone was written after every piece it vouches for, and a primary one write behind its copy is
+/// what a stop just before that write leaves. Only a pair with neither file holds no marker: a file
+/// that is there and unusable, with no valid twin, is an error, never taken for none, so nothing
+/// marks a warehouse again over damage.
+fn read_marker_pair(forklift: &Path) -> Result<MarkerPair, String> {
+    let names = [FILE_NAME_WAREHOUSE_MARKER, FILE_NAME_WAREHOUSE_MARKER_COPY];
+    let [primary, copy] = names.map(|name| read_marker_file(forklift, name));
+    let (primary, copy) = (primary?, copy?);
+
+    let (marker, bytes, other, other_name) = match (primary, copy) {
+        (MarkerFile::Valid(marker, bytes), copy) => (marker, bytes, copy, FILE_NAME_WAREHOUSE_MARKER_COPY),
+        (primary, MarkerFile::Valid(marker, bytes)) => (marker, bytes, primary, FILE_NAME_WAREHOUSE_MARKER),
+        (MarkerFile::Absent, MarkerFile::Absent) => return Ok(MarkerPair { chosen: None, stale: Vec::new() }),
+        (MarkerFile::Unusable(refusal), _) | (MarkerFile::Absent, MarkerFile::Unusable(refusal)) => return Err(refusal),
+    };
+
+    let other_holds_it = matches!(&other, MarkerFile::Valid(_, other_bytes) if *other_bytes == bytes);
+    let stale = if other_holds_it { Vec::new() } else { vec![other_name] };
+
+    Ok(MarkerPair { chosen: Some((marker, bytes)), stale })
+}
+
+/// Read one file of the marker pair. Only a failure to read it at all is an error.
+fn read_marker_file(forklift: &Path, name: &str) -> Result<MarkerFile, String> {
+    let path = forklift.join(name);
 
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Ok(None),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Ok(MarkerFile::Absent),
         Err(e) => return Err(format!("Error while reading the warehouse marker \"{}\": {}", path.to_string_lossy(), e)),
     };
 
-    let unknown = |reason: String| format!(
+    Ok(match decode_marker(&bytes, &path, forklift) {
+        Ok(marker) => MarkerFile::Valid(marker, bytes),
+        Err(refusal) => MarkerFile::Unusable(refusal),
+    })
+}
+
+/// The marker `bytes` (read from `path` in `forklift`) record, through the framing frozen at
+/// record version 4, or the refusal saying why they are no marker this build can use.
+fn decode_marker(bytes: &[u8], path: &Path, forklift: &Path) -> Result<WarehouseMarker, String> {
+    let unknown = |reason: &str| format!(
         "The warehouse marker \"{}\" {} Forklift cannot tell whether \"{}\" is a warehouse, so it does \
         not use it.", path.to_string_lossy(), reason, forklift.to_string_lossy()
     );
+    let older = |what: &str| format!(
+        "The warehouse marker \"{}\" was written by an older version of Forklift, before the marker {}, \
+        so Forklift does not use \"{}\". Make the warehouse again with this version: clone it again, or \
+        prepare a new one and lower its history into it.",
+        path.to_string_lossy(), what, forklift.to_string_lossy()
+    );
 
-    match record_utils::from_bytes(&bytes, WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION) {
-        Ok(entries) => parse_marker_entries(&entries).map(Some).map_err(unknown),
+    let entries = match record_utils::from_bytes(bytes, WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION) {
+        Ok(entries) => entries,
+        Err(RecordError::OtherVersion(header)) if header == record_utils::header(WAREHOUSE_MARKER_RECORD, 3) =>
+            return Err(older("carried a digest")),
         Err(RecordError::OtherVersion(header))
-            if (1..WAREHOUSE_MARKER_VERSION).any(|version| header == record_utils::header(WAREHOUSE_MARKER_RECORD, version)) => Err(format!(
-            "The warehouse marker \"{}\" was written by an older version of Forklift, before the marker \
-            recorded the warehouse's format, so Forklift does not use \"{}\". No upgrade reaches back that \
-            far. Make the warehouse again with this version: clone it again, or prepare a new one and lower \
-            its history into it.",
-            path.to_string_lossy(), forklift.to_string_lossy()
-        )),
-        Err(e) => Err(unknown(e.describe())),
+            if (1..3).any(|version| header == record_utils::header(WAREHOUSE_MARKER_RECORD, version)) =>
+            return Err(older("recorded the warehouse's format")),
+        Err(e) => return Err(unknown(&e.describe())),
+    };
+
+    let damaged = || unknown("is damaged: it does not match its digest.");
+    let (digest, entries) = entries.split_last().ok_or_else(damaged)?;
+    let hex = digest.strip_prefix(MARKER_DIGEST_PREFIX).ok_or_else(damaged)?;
+    let body = bytes.strip_suffix(format!("{}{}\n", MARKER_DIGEST_PREFIX, hex).as_bytes()).ok_or_else(damaged)?;
+
+    if blake3::hash(body).to_hex().as_str() != hex {
+        return Err(damaged());
+    }
+
+    parse_marker_entries(entries).map_err(|reason| unknown(&reason))
+}
+
+/// Bring the files of the marker pair in `forklift` that do not hold `bytes`, the pair's chosen
+/// marker, back to it, copy first as [`write_marker`] writes. Run under a shared format lease, where
+/// the only other marker writer is [`fill_in_place`], which writes only where neither file is there.
+/// A rewrite that fails leaves the chosen marker as it was, so it is let go and tried at the next
+/// opening.
+fn heal_marker_pair(forklift: &Path, bytes: &[u8], stale: &[&'static str]) {
+    for name in [FILE_NAME_WAREHOUSE_MARKER_COPY, FILE_NAME_WAREHOUSE_MARKER] {
+        if stale.contains(&name) {
+            let _ = file_utils::replace_file_atomically(&forklift.join(name), bytes);
+        }
     }
 }
 
@@ -797,17 +893,41 @@ fn write_warehouse_marker(forklift: &Path, mode: WarehouseMode) -> Result<(), St
     write_marker(forklift, &WarehouseMarker { format: WAREHOUSE_FORMAT, mode: mode.word().to_string(), upgrade: None })
 }
 
-/// Write `marker` as the warehouse marker in `forklift`, in the framing frozen at record version 3,
-/// atomically and synced with its folder.
+/// Write `marker` as the warehouse marker in `forklift`, in the framing frozen at record version 4:
+/// to its copy and then to the primary, each atomically and synced with its folder. A write stopped
+/// between the two leaves the copy one write ahead, which [`read_marker_pair`] resolves.
 pub(crate) fn write_marker(forklift: &Path, marker: &WarehouseMarker) -> Result<(), String> {
+    let bytes = encode_marker(marker);
+
+    for name in [FILE_NAME_WAREHOUSE_MARKER_COPY, FILE_NAME_WAREHOUSE_MARKER] {
+        file_utils::replace_file_atomically(&forklift.join(name), &bytes)
+            .map_err(|e| format!("Error while writing the warehouse marker in \"{}\": {}", forklift.to_string_lossy(), e))?;
+    }
+
+    Ok(())
+}
+
+/// The bytes of `marker` in the framing frozen at record version 4: its entries, then the digest
+/// of every byte before the digest's line.
+pub(crate) fn encode_marker(marker: &WarehouseMarker) -> Vec<u8> {
     let format = format!("format {}", marker.format);
     let upgrade = marker.upgrade.map(|upgrade| format!("upgrading {} {}", upgrade.target, upgrade.step));
     let entries = [Some(format.as_str()), Some(marker.mode.as_str()), upgrade.as_deref()];
 
-    let bytes = record_utils::to_bytes(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, entries.into_iter().flatten());
+    let mut bytes = record_utils::to_bytes(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, entries.into_iter().flatten());
+    let digest = blake3::hash(&bytes).to_hex();
+    bytes.extend_from_slice(format!("{}{}\n", MARKER_DIGEST_PREFIX, digest).as_bytes());
+    bytes
+}
 
-    file_utils::replace_file_atomically(&forklift.join(FILE_NAME_WAREHOUSE_MARKER), &bytes)
-        .map_err(|e| format!("Error while writing the warehouse marker in \"{}\": {}", forklift.to_string_lossy(), e))
+/// Marker bytes holding `entries` (each line ending in `\n`, as they follow the header), framed
+/// and digested as [`write_marker`] frames them, whatever the entries say: for a test that lays down
+/// a `.forklift`, or a marker of another format, by hand. Hand-typed bytes could not carry the digest.
+pub fn framed_marker_bytes(entries: &str) -> Vec<u8> {
+    let mut bytes = format!("{}\n{}", record_utils::header(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION), entries).into_bytes();
+    let digest = blake3::hash(&bytes).to_hex();
+    bytes.extend_from_slice(format!("{}{}\n", MARKER_DIGEST_PREFIX, digest).as_bytes());
+    bytes
 }
 
 /// The origin [`mark_for_test`] records for a partial mode.
@@ -1404,7 +1524,9 @@ mod tests {
         let notes = prepare_at(&root).unwrap();
 
         assert_eq!(has_warehouse_marker(&forklift), Ok(true));
-        assert_eq!(std::fs::read(forklift.join(FILE_NAME_WAREHOUSE_MARKER)).unwrap(), b"/forklift-warehouse 3\nformat 1\nfull\n");
+        for name in [FILE_NAME_WAREHOUSE_MARKER, FILE_NAME_WAREHOUSE_MARKER_COPY] {
+            assert_eq!(std::fs::read(forklift.join(name)).unwrap(), framed_marker_bytes("format 1\nfull\n"), "{}", name);
+        }
         for piece in ["objects", "inventory", "config"] {
             assert!(forklift.join(piece).is_dir(), "{} must be in place", piece);
         }
@@ -1568,29 +1690,37 @@ mod tests {
         let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::create_dir_all(&forklift).unwrap();
 
-        // No mode, two modes, a word this build does not know, no format, a newer version, the
-        // markers from before the format was recorded, and no record header.
-        for bad in ["/forklift-warehouse 3\nformat 1\n", "/forklift-warehouse 3\nformat 1\nfull\nsparse\n",
-                    "/forklift-warehouse 3\nformat 1\nshallow\n", "/forklift-warehouse 3\nfull\n",
-                    "/forklift-warehouse 4\nformat 1\nfull\n", "/forklift-warehouse 2\nfull\n",
-                    "/forklift-warehouse 1\n", "/forklift-warehouse 3", "warehouse\n"] {
-            std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER), bad).unwrap();
+        // No mode, two modes, a word this build does not know, no format, no digest, a newer version,
+        // the markers from before the digest and before the format was recorded, and no record header.
+        let bad: Vec<Vec<u8>> = vec![
+            framed_marker_bytes("format 1\n"), framed_marker_bytes("format 1\nfull\nsparse\n"),
+            framed_marker_bytes("format 1\nshallow\n"), framed_marker_bytes("full\n"),
+            b"/forklift-warehouse 4\nformat 1\nfull\n".to_vec(), b"/forklift-warehouse 5\nformat 1\nfull\n".to_vec(),
+            b"/forklift-warehouse 3\nformat 1\nfull\n".to_vec(), b"/forklift-warehouse 2\nfull\n".to_vec(),
+            b"/forklift-warehouse 1\n".to_vec(), b"/forklift-warehouse 4".to_vec(), b"warehouse\n".to_vec(),
+        ];
+        for bad in bad {
+            std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER), &bad).unwrap();
 
             let error = has_warehouse_marker(&forklift).unwrap_err();
             assert!(error.starts_with("The warehouse marker "), "{}", error);
             assert!(bay_utils::classify_forklift(&forklift).is_err(), "{:?} classified", bad);
             assert!(prepare_at(&root).is_err(), "{:?} prepared over", bad);
-            assert_eq!(std::fs::read_to_string(forklift.join(FILE_NAME_WAREHOUSE_MARKER)).unwrap(), bad);
+            assert_eq!(std::fs::read(forklift.join(FILE_NAME_WAREHOUSE_MARKER)).unwrap(), bad);
+            assert!(!forklift.join(FILE_NAME_WAREHOUSE_MARKER_COPY).exists(), "{:?} copied", bad);
             assert!(!forklift.join("objects").exists(), "{:?} filled around", bad);
         }
 
-        std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER), "/forklift-warehouse 1\n").unwrap();
-        let error = read_warehouse_marker(&forklift).unwrap_err();
-        assert!(error.contains("older version of Forklift"), "a v1 marker must say how it came to be: {}", error);
+        for (old, what) in [("/forklift-warehouse 1\n", "recorded the warehouse's format"),
+                            ("/forklift-warehouse 3\nformat 1\nfull\n", "carried a digest")] {
+            std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER), old).unwrap();
+            let error = read_warehouse_marker(&forklift).unwrap_err();
+            assert!(error.contains("older version of Forklift") && error.contains(what), "an old marker must say how it came to be: {}", error);
+        }
 
         for mode in [WarehouseMode::Full, WarehouseMode::Sparse, WarehouseMode::Cache] {
             std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER),
-                format!("/forklift-warehouse 3\nformat 1\n{}\n", mode.word())).unwrap();
+                framed_marker_bytes(&format!("format 1\n{}\n", mode.word()))).unwrap();
             assert_eq!(read_warehouse_marker(&forklift), Ok(Some(mode)));
             assert_eq!(bay_utils::classify_forklift(&forklift), Ok(bay_utils::ForkliftKind::Warehouse));
         }
@@ -1708,12 +1838,11 @@ mod tests {
     /// Revert: drop the backstop from `fill_in_place` → the missing folders are made → red.
     #[test]
     fn preparing_over_another_format_adds_nothing() {
-        for (marker, expected) in [("/forklift-warehouse 3\nformat 2\nfull\n", "format 2"),
-                                   ("/forklift-warehouse 3\nformat 1\nfull\nupgrading 2 0\n", "upgrade to format 2 unfinished")] {
+        for (marker, expected) in [("format 2\nfull\n", "format 2"), ("format 1\nfull\nupgrading 2 0\n", "upgrade to format 2 unfinished")] {
             let root = fresh_dir("prepare-other-format");
             let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
             std::fs::create_dir_all(&forklift).unwrap();
-            std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER), marker).unwrap();
+            std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER), framed_marker_bytes(marker)).unwrap();
 
             let error = prepare_at(&root).unwrap_err();
             assert!(error.contains(expected), "{}", error);
@@ -1768,13 +1897,12 @@ mod tests {
         std::fs::create_dir_all(&forklift).unwrap();
         let marker = forklift.join(FILE_NAME_WAREHOUSE_MARKER);
 
-        for accepted in ["/forklift-warehouse 3\nformat 2\nfull\n", "/forklift-warehouse 3\nformat 2\nsomething-new\n",
-                         "/forklift-warehouse 3\nformat 0\nsomething-old\n", "/forklift-warehouse 3\nformat 1\nfull\n"] {
-            std::fs::write(&marker, accepted).unwrap();
+        for accepted in ["format 2\nfull\n", "format 2\nsomething-new\n", "format 0\nsomething-old\n", "format 1\nfull\n"] {
+            std::fs::write(&marker, framed_marker_bytes(accepted)).unwrap();
             assert_eq!(has_warehouse_marker(&forklift), Ok(true), "{:?}", accepted);
         }
 
-        std::fs::write(&marker, "/forklift-warehouse 3\nformat 1\nsomething-new\n").unwrap();
+        std::fs::write(&marker, framed_marker_bytes("format 1\nsomething-new\n")).unwrap();
         assert!(has_warehouse_marker(&forklift).is_err());
 
         file_utils::remove_dir_all(&root).ok();

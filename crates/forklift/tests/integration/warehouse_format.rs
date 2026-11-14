@@ -504,7 +504,7 @@ impl Drop for Server {
 }
 
 /// Make the current format's fixtures. Run it once per format, after a bump:
-/// `cargo test -p forklift --test warehouse_format -- --ignored freeze`. It refuses a format that
+/// `cargo test -p forklift --test integration -- --ignored freeze`. It refuses a format that
 /// already has fixtures, since those never change.
 #[test]
 #[ignore]
