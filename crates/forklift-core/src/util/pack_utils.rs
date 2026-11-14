@@ -5335,15 +5335,15 @@ fn rebuilt_records(data: &[u8], ranges: &[std::ops::Range<usize>]) -> Result<Vec
 
     loop {
         let mut progress = false;
-        for at in 0..ranges.len() {
-            if hashes[at].is_some() {
+        for (at, slot) in hashes.iter_mut().enumerate() {
+            if slot.is_some() {
                 continue;
             }
             match decode_in_file(data, ranges, &in_file, at, 0)? {
                 Some(bytes) => {
                     let hash = hash_to_bytes(&object_utils::hash_object_bytes(&bytes))
                         .ok_or_else(|| "an object hash could not be read back".to_string())?;
-                    hashes[at] = Some(hash);
+                    *slot = Some(hash);
                     in_file.entry(hash).or_insert(at);
                     progress = true;
                 }
@@ -5363,7 +5363,7 @@ fn rebuilt_records(data: &[u8], ranges: &[std::ops::Range<usize>]) -> Result<Vec
     let mut records: Vec<([u8; HASH_LEN], u64, u64)> = hashes.into_iter().zip(ranges)
         .map(|(hash, range)| (hash.expect("every record resolved"), range.start as u64, range.len() as u64))
         .collect();
-    records.sort_by(|a, b| a.0.cmp(&b.0));
+    records.sort_by_key(|record| record.0);
     Ok(records)
 }
 
@@ -12282,7 +12282,7 @@ pub(crate) mod tests {
             index_records.push((hash_to_bytes(hash).unwrap(), data.len() as u64, record.len() as u64));
             data.extend_from_slice(record);
         }
-        index_records.sort_by(|a, b| a.0.cmp(&b.0));
+        index_records.sort_by_key(|record| record.0);
         let stem = compute_pack_id(&index_records);
         let folder = pack_folder();
         std::fs::create_dir_all(&folder).unwrap();
@@ -12334,7 +12334,7 @@ pub(crate) mod tests {
         let (code, error) = read_code(&b_hash);
         assert_eq!(code.as_deref(), Some("object_unreadable"), "{}", error);
         // A corrupt bucket rules out no hash it covers, so the rest runs without it.
-        std::fs::remove_dir_all(pack_folder()).unwrap();
+        crate::util::file_utils::remove_dir_all(pack_folder()).unwrap();
         invalidate_cache();
 
         let never = "7".repeat(64);
@@ -12375,7 +12375,7 @@ pub(crate) mod tests {
         let (code, error) = read_code(&f_hash);
         assert_ne!(code.as_deref(), Some("object_unreadable"), "{}", error);
         assert!(error.contains("version"), "{}", error);
-        std::fs::remove_dir_all(pack_folder()).unwrap();
+        crate::util::file_utils::remove_dir_all(pack_folder()).unwrap();
         invalidate_cache();
 
         let (_, l_hash) = blob449("a loose object");
