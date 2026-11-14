@@ -735,6 +735,24 @@ pub fn without_temp(path: &str, pid: u32) -> (String, bool) {
     (out, changed)
 }
 
+/// `path` with each temp name's pid `from` swapped for `to`, its counter kept: the same temp as a
+/// process with pid `to` names it, when it makes its temps in the same order.
+pub fn with_pid(path: &str, from: u32, to: u32) -> String {
+    let needle = format!("{}-", from);
+    let mut out = String::new();
+    let mut rest = path;
+    while let Some(at) = rest.find(&needle) {
+        let before_ok = at == 0 || !rest.as_bytes()[at - 1].is_ascii_digit();
+        let after = &rest[at + needle.len()..];
+        let digits = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+        out.push_str(&rest[..at]);
+        out.push_str(&if before_ok && digits > 0 { format!("{}-", to) } else { needle.clone() });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// A path's base for grouping kill points into units: every hash-like run (a two-character shard
 /// component, or sixteen or more hex digits) replaced by `<hex>`, so every object is one base and a
 /// head publish is another.
@@ -944,6 +962,16 @@ mod tests {
             10 clone(child_stack=NULL, flags=SIGCHLD) = 60\n\
             10 clone(child_stack=0x1, flags=CLONE_VM|CLONE_THREAD) = 60\n").unwrap();
         assert!(thread_groups(&reused).contains_key(&60));
+    }
+
+    /// A temp's pid is swapped and its counter kept, only where a temp name holds it.
+    ///
+    /// Revert: swap every match of the pid → a digit run that merely ends in it is rewritten too.
+    #[test]
+    fn a_temp_takes_another_pid() {
+        assert_eq!(with_pid("/r/41/a.tmp~41-3", 41, 77), "/r/41/a.tmp~77-3");
+        assert_eq!(with_pid("/r/a.tmp~141-3", 41, 77), "/r/a.tmp~141-3");
+        assert_eq!(with_pid("/r/a.tmp~41-", 41, 77), "/r/a.tmp~41-");
     }
 
     /// In a trace attached to a running process, every thread no traced clone made is the

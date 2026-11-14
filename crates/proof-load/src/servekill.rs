@@ -14,6 +14,8 @@
 //! the outside knowledge the grade records, and the record is read back through a fresh clone of
 //! the host.
 //!
+//! Every point is aimed by its path, a temp's too, its name given the injected server's pid: the
+//! requests arrive one at a time, so the server makes its temps in the same order in every run.
 //! A fresh build per run, not a copy: a copy's work tree names the URL of the server it was copied
 //! beside. The server's handlers run on pooled threads, so a point another thread can reach first
 //! is "sampled", and one it keeps reaching first stays "not reached" after its attempts. A hosted
@@ -52,6 +54,8 @@ pub struct Counted {
     faulted: usize,
     /// The counting run's scratch root, which absolute aims are rebased from.
     root: Root,
+    /// The counting server's pid, which its temps' names hold.
+    pid: u32,
     /// Each point, and how long after the faulted command's last answered request its call came.
     points: Vec<(Point, Duration)>,
     children: BTreeSet<String>,
@@ -140,7 +144,7 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
         let after = calls[point.call].when.map_or(Duration::ZERO, |when| Duration::from_micros(when.saturating_sub(last)));
         (point, after)
     }).collect();
-    Ok(Counting::Counted(Box::new(Counted { corpus, expected, faulted, root, points, children: enumerated.children, refusals })))
+    Ok(Counting::Counted(Box::new(Counted { corpus, expected, faulted, root, pid, points, children: enumerated.children, refusals })))
 }
 
 /// Runs every server kill point `count` found, each injected run on a fresh build beside
@@ -197,9 +201,10 @@ fn attempt(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
     }
 }
 
-/// strace's filter for `point` in a run whose scratch root is `root`: its aim, an absolute path
-/// rebased from the counting run's root, and the kill.
-pub fn filter(point: &Point, counting: &Root, root: &Root) -> Result<Vec<String>, String> {
+/// strace's filter for `point` in a run whose scratch root is `root` and whose server is `pid`: its
+/// aim, an absolute path rebased from the counting run's root with each temp's pid the counting
+/// server's `counted` swapped for `pid`, and the kill.
+pub fn filter(point: &Point, counting: &Root, counted: u32, root: &Root, pid: u32) -> Result<Vec<String>, String> {
     let mut filter = Vec::new();
     match &point.aim {
         Aim::Path { path } => {
@@ -208,7 +213,7 @@ pub fn filter(point: &Point, counting: &Root, root: &Root) -> Result<Vec<String>
             } else {
                 path.clone()
             };
-            filter.extend(["-P".to_string(), aimed, "-e".to_string(), format!("trace={}", point.name)]);
+            filter.extend(["-P".to_string(), trace::with_pid(&aimed, counted, pid), "-e".to_string(), format!("trace={}", point.name)]);
         }
         Aim::Position => filter.extend(["-e".to_string(), format!("trace={},clone,clone3,fork,vfork", point.name)]),
     }
@@ -239,9 +244,9 @@ fn inject(scenario: &Scenario, programs: &Programs, settings: &Settings, templat
     let root = Root::of(scratch.root()).map_err(io)?;
     let label = scratch.root().file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     let host = host_of(scenario, &built)?;
-    let filter = filter(point, &counted.root, &root).map_err(RunError::Io)?;
-    host.trace_once(settings.strace, &settings.traces.join(&label), &filter, settings.limit).map_err(RunError::Io)?;
     let pid = host.pid().ok_or_else(|| RunError::Io("the injected server is not running".to_string()))?;
+    let filter = filter(point, &counted.root, counted.pid, &root, pid).map_err(RunError::Io)?;
+    host.trace_once(settings.strace, &settings.traces.join(&label), &filter, settings.limit).map_err(RunError::Io)?;
     let context = Context {
         corpus: &counted.corpus, programs, scratch: &scratch, environment: &environment, limit: settings.limit, then: &scenario.then,
         url: Some(host.url.as_str()), scope: scenario.scope(), via_host: true,
@@ -317,7 +322,8 @@ mod tests {
     /// A path aim is rebased onto the injected run's root, and the kill is counted at the point's
     /// position; a positional aim follows the server's thread spawns.
     ///
-    /// Revert: aim at the counting run's path → the injected server is never selected.
+    /// Revert: aim at the counting run's path, or keep the counting server's pid in a temp's name
+    /// → the injected server is never selected.
     #[test]
     fn the_filter_aims_at_the_injected_root() {
         let counting = Root { given: "/out/a-served".to_string(), canonical: "/out/a-served".to_string() };
@@ -327,12 +333,14 @@ mod tests {
             aim: Aim::Path { path: "/out/a-served/host/.forklift/pallets/main".to_string() }, when: 2,
             target: kill::Identity { detail: String::new(), paths: Vec::new() }, base: String::new(), sampled: false,
         };
-        assert_eq!(filter(&point, &counting, &root).expect("inside the root"), vec![
+        assert_eq!(filter(&point, &counting, 41, &root, 77).expect("inside the root"), vec![
             "-P", "/out/a-served-kill-0-1/host/.forklift/pallets/main", "-e", "trace=renameat2", "-e", "inject=renameat2:signal=KILL:when=2",
         ]);
+        let temp = Point { aim: Aim::Path { path: "/out/a-served/host/.forklift/pallets/main.tmp~41-3".to_string() }, ..point.clone() };
+        assert_eq!(filter(&temp, &counting, 41, &root, 77).expect("inside the root")[1], "/out/a-served-kill-0-1/host/.forklift/pallets/main.tmp~77-3");
         let outside = Point { aim: Aim::Path { path: "/elsewhere/x".to_string() }, ..point.clone() };
-        assert!(filter(&outside, &counting, &root).is_err());
+        assert!(filter(&outside, &counting, 41, &root, 77).is_err());
         let positional = Point { aim: Aim::Position, ..point };
-        assert_eq!(filter(&positional, &counting, &root).expect("no path")[1], "trace=renameat2,clone,clone3,fork,vfork");
+        assert_eq!(filter(&positional, &counting, 41, &root, 77).expect("no path")[1], "trace=renameat2,clone,clone3,fork,vfork");
     }
 }
