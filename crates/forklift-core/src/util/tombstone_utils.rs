@@ -558,13 +558,13 @@ pub(crate) mod tests {
         assert!(globals::forklift_root().join("withheld").is_file(), "the first serve writes the record");
         assert!(withholding::read_withheld().unwrap().is_empty());
 
-        std::fs::remove_file(globals::forklift_root().join("withheld")).unwrap();
+        file_utils::remove_file(globals::forklift_root().join("withheld")).unwrap();
         assert!(withholding::is_damage(&withholding::read_withheld().unwrap_err()), "lost from a served root");
         assert!(mark_served(true).unwrap(), "a marked root is answered without reading the record");
         assert!(!globals::forklift_root().join("withheld").exists(), "never written anew over a loss");
 
         // A torn first serve that lost its record is not completed over the loss.
-        std::fs::remove_file(served_path()).unwrap();
+        file_utils::remove_file(served_path()).unwrap();
         assert_eq!(served_state().unwrap(), ServedState::Unfinished);
         assert!(withholding::is_damage(&mark_served(true).unwrap_err()));
         assert_eq!(served_state().unwrap(), ServedState::Unfinished, "no mark written");

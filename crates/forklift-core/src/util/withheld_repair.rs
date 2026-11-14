@@ -316,7 +316,7 @@ mod tests {
         assert!(!record().exists());
 
         assert!(tombstone_utils::mark_served(true).unwrap());
-        std::fs::remove_file(record()).unwrap();
+        file_utils::remove_file(record()).unwrap();
 
         let repaired = repair_withheld().unwrap();
         assert_eq!(repaired.set_aside, None);

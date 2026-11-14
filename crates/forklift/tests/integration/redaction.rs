@@ -2949,7 +2949,7 @@ fn a_served_root_whose_withheld_record_is_lost_or_damaged_refuses_until_its_oper
     // Withheld while nothing serves the root, so its copy is still stored, and then lost.
     let added = withhold(&root, &["add", &film, "--statement", "court order 2026-90"]);
     assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
-    std::fs::remove_file(&record).unwrap();
+    forklift_core::util::file_utils::remove_file(&record).unwrap();
 
     let refuses = |server: &Server, what: &str| {
         for path in ["/v1/warehouse".to_string(), format!("/v1/objects/{}", film)] {
@@ -3014,7 +3014,7 @@ fn a_served_root_whose_withheld_record_is_lost_or_damaged_refuses_until_its_oper
 
     // Lost again once its copy is deleted: the repair lists the content history names and lacks.
     stop(server);
-    std::fs::remove_file(&record).unwrap();
+    forklift_core::util::file_utils::remove_file(&record).unwrap();
     let repaired = withhold(&root, &["repair"]);
     assert!(repaired.status.success(), "{}", String::from_utf8_lossy(&repaired.stderr));
     let report = String::from_utf8_lossy(&repaired.stdout).into_owned();
