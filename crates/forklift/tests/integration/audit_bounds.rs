@@ -169,7 +169,6 @@ impl Warehouse {
         let _ = forklift_core::util::file_utils::remove_file(objects.join(format!("{}.sig", &hash[2..])));
     }
 
-    /// Write the sealed-by-hash record holding exactly `hashes`, as the record's writers would.
     /// Delete `paths` from the working tree and stack that, so only history reaches their content.
     /// A keeper file stays, so the parcel is not empty.
     fn drop_from_checkout(&self, paths: &[&str]) {
@@ -181,6 +180,7 @@ impl Warehouse {
         self.run_ok(&["stack", "-m", "drop"]);
     }
 
+    /// Write the sealed-by-hash record holding exactly `hashes`, as the record's writers would.
     fn seal(&self, hashes: &[&str]) {
         let mut bytes = sealed_utils::header_bytes();
         for hash in hashes {

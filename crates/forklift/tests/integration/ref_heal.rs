@@ -696,7 +696,35 @@ fn a_reachability_walk_that_cannot_finish_claims_nothing_lost() {
     let root = area.warehouse();
     std::fs::write(root.join("c.txt"), "three\n").unwrap();
     area.run_ok(&root, &["load", "."]);
+    garble_staged_shards(&root);
 
+    let output = area.run(&root, &["--json", "heal"]);
+    assert!(!output.status.success(), "{}", text(&output.stdout));
+    let shown = format!("{}{}", text(&output.stdout), text(&output.stderr));
+    assert!(shown.contains("heal could not finish its reachability check"), "{}", shown);
+    assert!(!shown.contains("objects_lost"), "{}", shown);
+}
+
+#[test]
+fn a_refused_ref_keeps_its_code_when_the_walk_cannot_finish() {
+    // The walk's failure is said, but a ref heal refused still answers `ref_damaged` with its own
+    // next step.
+    // Mutation: return the walk's untyped error ahead of a refused ref → exit 1 → red.
+    let area = Area::new("walk-error-ref");
+    let (root, side) = side_only_its_bytes_name(&area);
+    std::fs::write(ref_path(&root, "side"), &side.as_bytes()[..7]).unwrap();
+    std::fs::write(root.join("c.txt"), "three\n").unwrap();
+    area.run_ok(&root, &["load", "."]);
+    garble_staged_shards(&root);
+
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    assert_eq!(refused["error"]["details"]["refs_refused"][0]["pallet"], "side", "{}", refused);
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("heal could not finish its reachability check"), "{}", refused);
+}
+
+/// Overwrites every staged inventory shard with bytes that do not parse.
+fn garble_staged_shards(root: &Path) {
     let mut shards = Vec::new();
     let mut folders = vec![root.join(".forklift").join("inventory")];
     while let Some(folder) = folders.pop() {
@@ -713,10 +741,4 @@ fn a_reachability_walk_that_cannot_finish_claims_nothing_lost() {
     for shard in &shards {
         std::fs::write(shard, b"not an inventory").unwrap();
     }
-
-    let output = area.run(&root, &["--json", "heal"]);
-    assert!(!output.status.success(), "{}", text(&output.stdout));
-    let shown = format!("{}{}", text(&output.stdout), text(&output.stderr));
-    assert!(shown.contains("heal could not finish its reachability check"), "{}", shown);
-    assert!(!shown.contains("objects_lost"), "{}", shown);
 }

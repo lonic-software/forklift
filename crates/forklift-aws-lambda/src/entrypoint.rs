@@ -1094,11 +1094,7 @@ fn error_body(status: StatusCode, message: String) -> ErrorResponse {
 /// Whether `message` carries an `object_unreadable` refusal frame, at its start or wrapped inside
 /// it (see [`error_body`]).
 fn names_unreadable_object(message: &str) -> bool {
-    let code = forklift_core::error::RefusalCode::ObjectUnreadable.as_str();
-    std::iter::once(0)
-        .chain(message.match_indices(forklift_core::error::REFUSAL_PREFIX).map(|(at, _)| at).filter(|at| *at > 0))
-        .filter_map(|at| forklift_core::error::deframe(&message[at..]))
-        .any(|(framed, _, _)| framed == code)
+    forklift_core::error::frames_code(message, forklift_core::error::RefusalCode::ObjectUnreadable)
 }
 
 #[cfg(test)]

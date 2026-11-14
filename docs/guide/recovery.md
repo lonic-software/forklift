@@ -216,9 +216,9 @@ read as an option.
 
 ### `object_unreadable` (exit 57)
 
-An object the command needs is in the store, but a pack file holding it is damaged: an index is
-lost, cut short or corrupt, a pack's data file is missing, or one index entry is damaged. Nothing was
-changed. Run:
+An object the command needs cannot be read from the store. Either a pack file holding it is
+damaged (an index is lost, cut short or corrupt, a pack's data file is missing, or one index entry is
+damaged), or the object is missing altogether. Nothing was changed. Run:
 
 ```sh
 forklift heal
@@ -226,7 +226,7 @@ forklift heal
 
 `heal` rebuilds a lost or damaged index from the pack's data file, keeping a replaced index beside it
 as `<name>.idx.damaged-<time>`, and the command then works. If the data file itself is damaged or
-gone, nothing in this store can bring its objects back, and `heal` refuses with `objects_lost`.
+gone, or the object is missing altogether, nothing in this store can bring its objects back, and `heal` refuses with `objects_lost`.
 `forklift store status` lists each damaged pack file under `pack problems:`.
 
 ### `objects_lost` (exit 58)

@@ -86,8 +86,8 @@ exit status alone. Forklift has no prompt that handles a cancellation itself, so
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
 **Schema 46** (current): two new refusal codes. `object_unreadable` (exit 57): an object the
-command needs is in the store, but a pack file holding it is damaged (a lost, cut-short or corrupt
-index, a missing data file, a damaged index entry). Nothing was changed, and `next_step` is
+command needs cannot be read from the store: it is missing there, or a pack file holding it is
+damaged (a lost, cut-short or corrupt index, a missing data file, a damaged index entry). Nothing was changed, and `next_step` is
 `forklift heal`, which rebuilds a lost or damaged index from its pack's data file. A remote sends it
 as a 503 naming its operator's `forklift heal`, which the client does not retry; the AWS head
 answers a frame-free 500 instead. `objects_lost` (exit 58), from `heal` only: after every repair

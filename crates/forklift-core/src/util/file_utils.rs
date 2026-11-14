@@ -2784,8 +2784,9 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
             };
 
             // Pack files whose hash set is unknown may hold it; they never change the verdict
-            // (I4), only what the reader is told.
-            let holders = crate::util::pack_utils::unindexed_holders()?;
+            // (I4), only what the reader is told; a folder that cannot be listed adds nothing, so
+            // the read still names the missing object.
+            let holders = crate::util::pack_utils::unindexed_holders().unwrap_or_default();
             let missing = match holders.is_empty() {
                 true => missing,
                 false => format!(

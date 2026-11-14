@@ -773,6 +773,19 @@ fn frame(code: &str, message: &str, next_step: &str, details: Option<&serde_json
     framed
 }
 
+/// Every refusal frame `message` carries, at its start or wrapped inside it by a caller's own
+/// words, decoded as [`deframe`] decodes one, outermost first.
+pub fn frames_in(message: &str) -> impl Iterator<Item = (&str, Cow<'_, str>, &str)> {
+    std::iter::once(0)
+        .chain(message.match_indices(REFUSAL_PREFIX).map(|(at, _)| at).filter(|at| *at > 0))
+        .filter_map(move |at| deframe(&message[at..]))
+}
+
+/// Whether `message` carries a frame of `code`, at its start or wrapped inside it.
+pub fn frames_code(message: &str, code: RefusalCode) -> bool {
+    frames_in(message).any(|(framed, _, _)| framed == code.as_str())
+}
+
 /// Decode a sentinel frame into `(code, message, next_step)`; `None` for any string that is not a
 /// frame. The inverse of [`frame`] without its detail, and the low-level primitive the servers'
 /// wire mapping parses — the wire carries no detail, so a detail field never reaches `next_step`.

@@ -5419,15 +5419,28 @@ fn publish_rebuilt_index(folder: &Path, data_path: &Path, index_bytes: &[u8]) ->
         Ok(_) => Some(set_index_aside(&index_path).inspect_err(|_| { let _ = file_utils::remove_file(&temp); })?),
         Err(_) => None,
     };
+    // Where the replaced index now lies, for an error that leaves it there.
+    let kept_at = |aside: &Option<PathBuf>| match aside {
+        Some(aside) => format!("; the index it replaces is kept at \"{}\"", aside.to_string_lossy()),
+        None => String::new(),
+    };
     if std::fs::symlink_metadata(&index_path).is_ok() {
+        // The index that appeared is newer than the one set aside, so it stays.
         let _ = file_utils::remove_file(&temp);
-        return Err("an index for it appeared while it was rebuilt".to_string());
+        return Err(format!("an index for it appeared while it was rebuilt{}", kept_at(&set_aside)));
     }
 
-    file_utils::rename(&temp, &index_path).map_err(|e| {
+    if let Err(e) = file_utils::rename(&temp, &index_path) {
         let _ = file_utils::remove_file(&temp);
-        format!("its rebuilt index could not be put in place: {}", e)
-    })?;
+        // Put the replaced index back, so the folder is no worse than before; a failure to do so
+        // is reported by where it still lies.
+        let restored = match &set_aside {
+            Some(aside) => file_utils::rename(aside, &index_path).is_ok(),
+            None => true,
+        };
+        let kept = if restored { String::new() } else { kept_at(&set_aside) };
+        return Err(format!("its rebuilt index could not be put in place: {}{}", e, kept));
+    }
     file_utils::sync_dir(folder)?;
     invalidate_cache();
     Ok(set_aside)

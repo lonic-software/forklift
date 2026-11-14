@@ -245,10 +245,15 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         if !output::is_json() {
             report.render_human();
         }
-        return Err(format!(
+        let unfinished = format!(
             "heal could not finish its reachability check, so whether any object is lost is not known: {}",
             error
-        ));
+        );
+        // A refused ref keeps its own code: its remedy does not wait on the walk.
+        if !report.refs_refused.is_empty() {
+            return Err(ref_refusal(&report, Some(&unfinished)).into());
+        }
+        return Err(unfinished);
     }
 
     if report.refs_refused.is_empty() && report.objects_lost.is_none() {
@@ -264,7 +269,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         return Err(objects_lost_refusal(&report, lost, outcome.index_rebuild_skipped).into());
     }
 
-    Err(ref_refusal(&report).into())
+    Err(ref_refusal(&report, None).into())
 }
 
 /// The most hashes an `objects_lost` refusal lists.
@@ -370,7 +375,7 @@ impl ObjectsLost {
 fn objects_lost_refusal(report: &HealReport, lost: &ObjectsLost, rebuild_skipped: bool) -> CoreError {
     let mut lines = lost.lines();
     if !report.refs_refused.is_empty() {
-        if let CoreError::Refusal { message, .. } = ref_refusal(report) {
+        if let CoreError::Refusal { message, .. } = ref_refusal(report, None) {
             lines.push(message);
         }
     }
@@ -392,7 +397,7 @@ fn objects_lost_refusal(report: &HealReport, lost: &ObjectsLost, rebuild_skipped
 }
 
 /// The `ref_damaged` refusal of a run that left a damaged ref standing, carrying the whole report.
-fn ref_refusal(report: &HealReport) -> CoreError {
+fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
     let mut lines = Vec::new();
 
     for refused in &report.refs_refused {
@@ -404,6 +409,10 @@ fn ref_refusal(report: &HealReport) -> CoreError {
         for candidate in &refused.candidates {
             lines.push(format!("  {} ({})", candidate.head, candidate.source));
         }
+    }
+
+    if let Some(unfinished) = unfinished {
+        lines.push(format!("{}.", unfinished.trim_end_matches('.')));
     }
 
     let first = &report.refs_refused[0].pallet;

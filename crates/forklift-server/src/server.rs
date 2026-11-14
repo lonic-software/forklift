@@ -1833,7 +1833,7 @@ fn operator_remedy(code: forklift_core::error::RefusalCode) -> &'static str {
 fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> String {
     match code {
         forklift_core::error::RefusalCode::ObjectUnreadable =>
-            "An object this request needs cannot be read from the warehouse's store: a pack file there is damaged.".to_string(),
+            "An object this request needs cannot be read from the warehouse's store: it is missing there, or a pack file holding it is damaged.".to_string(),
         _ => human,
     }
 }
@@ -1845,8 +1845,7 @@ fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> Str
 /// ([`server_fault`]). The damage itself is logged, with the local next step.
 fn damage_refusal(message: String) -> HandlerError {
     // A caller may have wrapped the damage in its own words; the frame inside still names it.
-    let frames = std::iter::once(0).chain(message.match_indices(forklift_core::error::REFUSAL_PREFIX).map(|(at, _)| at).filter(|at| *at > 0));
-    let damage = frames.filter_map(|at| forklift_core::error::deframe(&message[at..])).find_map(|(code, human, _)| {
+    let damage = forklift_core::error::frames_in(&message).find_map(|(code, human, _)| {
         DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, human.to_string()))
     });
 
