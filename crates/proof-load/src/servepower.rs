@@ -24,7 +24,9 @@
 //! Each state is graded on its run's own area: the area as the run left it, restored at its own
 //! path so every URL and path it records still holds, the warehouse replaced by the state, then
 //! the server restarted through [`Host::restart`], whose remedies are the outside knowledge the
-//! grade records. The model's caveats hold here as they do for a client: every row says so.
+//! grade records. The model's caveats hold here as they do for a client: every row says so. As a
+//! client's fixture is, the warehouse the build left is taken as written and synced whole: a loss
+//! of what the history's own requests left unsynced is not this lane's to find.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -269,12 +271,12 @@ pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: 
         }
     };
     let requests = end.exchanges.len();
-    let routes: Vec<String> = end.exchanges.iter().map(|exchange| servekill::route_of(exchange, table)).collect();
     let shares = shares(variants, requests + 1);
     let results: Mutex<Vec<(usize, Share)>> = Mutex::new(Vec::new());
     let one = |cut: Option<usize>, run: Box<Traced>| -> Share {
         let at = cut.unwrap_or(requests);
-        let route = cut.and_then(|cut| routes.get(cut)).cloned().unwrap_or_default();
+        // The route this run's own request took: a fresh build may order its requests otherwise.
+        let route = cut.and_then(|cut| run.exchanges.get(cut)).map(|exchange| servekill::route_of(exchange, table)).unwrap_or_default();
         match states(&run, cut, &route, umask, shares[at], drawn ^ at as u64) {
             Ok(crashes) => {
                 let (graded, errors) = grade(*run, crashes, &corpus, scenario, programs, settings);
@@ -283,15 +285,22 @@ pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: 
             Err(refusals) => Share::Refused(refusals),
         }
     };
-    results.lock().expect("nothing holds the lock yet").push((requests, one(None, end)));
+    // The run to its end is graded in the pool beside the cuts, as the job past the last cut.
+    let end = Mutex::new(Some(end));
     let next = AtomicUsize::new(0);
-    let workers = settings.jobs.clamp(1, requests.max(1));
+    let workers = settings.jobs.clamp(1, requests + 1);
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| loop {
                 let cut = next.fetch_add(1, Ordering::SeqCst);
-                if cut >= requests {
+                if cut > requests {
                     break;
+                }
+                if cut == requests {
+                    let end = end.lock().expect("no worker panics holding the lock").take().expect("the run to its end is graded once");
+                    let outcome = one(None, end);
+                    results.lock().expect("no worker panics holding the lock").push((cut, outcome));
+                    continue;
                 }
                 let mut outcome = Share::NotReached(String::new());
                 for attempt in 1..=ATTEMPTS {
@@ -311,7 +320,7 @@ pub fn run(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: 
     let mut results = results.into_inner().expect("no worker panics holding the lock");
     results.sort_by_key(|(at, _)| *at);
     for (at, outcome) in results {
-        let run = if at == requests { "the run to its end".to_string() } else { format!("the run cut at request {} {}", at + 1, routes[at]) };
+        let run = if at == requests { "the run to its end".to_string() } else { format!("the run cut at request {}", at + 1) };
         match outcome {
             Share::Graded(graded, errors) => {
                 power.crashes.extend(graded);

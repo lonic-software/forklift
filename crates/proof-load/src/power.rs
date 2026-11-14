@@ -2119,9 +2119,6 @@ mod tests {
         assert!(replayed(&[text]).unwrap_err().contains("an unreadable dump row"));
     }
 
-    /// A crash moment's label names its line, so two lines' moments at the same call read apart.
-    ///
-    /// Revert: leave the line out → both read `stack before fsync at traced call 4`.
     /// An attached trace's threads are the running process's own, whichever of them prints first:
     /// one writes through a descriptor another opened.
     ///
@@ -2168,6 +2165,9 @@ mod tests {
         assert_eq!(client.completeness.len(), 3, "a client's power loss has no cuts");
     }
 
+    /// A crash moment's label names its line, so two lines' moments at the same call read apart.
+    ///
+    /// Revert: leave the line out → both read `stack before fsync at traced call 4`.
     #[test]
     fn a_moment_label_names_its_line() {
         let moment = |line| Moment::Synced { line, command: "stack".into(), call: 3, name: "fsync".into() };
