@@ -364,8 +364,8 @@ pub enum Command {
                       all present. Paths fetched beyond those are then no longer checked for \
                       loss; \"forklift scope fetch\" adds them back. When the checkouts cannot \
                       settle it, it refuses with \"fetch_scope_damaged\" (exit 54), and \
-                      --fetch-scope sets the fetch scope to paths you name, fetching from the \
-                      origin what the history at them lacks."
+                      --fetch-scope, once per path, sets the fetch scope to the paths you name, \
+                      fetching from the origin what the history at them lacks."
     )]
     Heal {
         /// Set a damaged pallet ref to a parcel (a pallet, a parcel hash or a unique prefix of one)
@@ -377,7 +377,7 @@ pub enum Command {
         remove_ref: Vec<String>,
 
         /// Set a sparse warehouse's damaged fetch scope to these paths, fetching what their history lacks
-        #[arg(long, value_name = "PATH", num_args = 1..)]
+        #[arg(long, value_name = "PATH")]
         fetch_scope: Vec<String>,
     },
 

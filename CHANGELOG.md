@@ -19,7 +19,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   checkouts once the history there is all present. When it cannot (an object is lost under them, no
   checkout's scope can be read, or a readable fetch scope does not hold a checkout's scope), `heal`
   changes nothing and refuses with exit 54 (`fetch_scope_damaged`), naming a next step:
-  `heal --fetch-scope <path>...` sets the fetch scope to the paths given, fetching from the origin
+  `heal --fetch-scope <path>`, once per path, sets the fetch scope to the paths given, fetching from the origin
   whatever the history at them lacks.
 
 - **A lost or damaged pallet ref is rebuilt by `forklift heal`.** A ref file that was deleted,

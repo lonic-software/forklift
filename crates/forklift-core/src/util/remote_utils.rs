@@ -2781,6 +2781,18 @@ impl RemoteClient {
         Ok(RemoteClient::new(&url, token)?)
     }
 
+    /// [`for_warehouse`](RemoteClient::for_warehouse) for `heal --fetch-scope`, which must reach
+    /// the origin while the fetch scope cannot be read ([`origin_utils::checked_remote_by_mode`]).
+    ///
+    /// # Returns
+    /// * `Ok(RemoteClient)` - The client.
+    /// * `Err(CoreError)`   - As for [`for_warehouse`](RemoteClient::for_warehouse).
+    pub fn for_fetch_scope_repair() -> Result<RemoteClient, CoreError> {
+        let (url, token) = origin_utils::checked_remote_by_mode()?;
+
+        Ok(RemoteClient::new(&url, token)?)
+    }
+
     /// Whether a remote URL is configured at all for this warehouse — independent of whether
     /// [`RemoteClient::from_config`] could actually *build* a client from it. A malformed
     /// `remote.url`/`remote.token` config read, or a URL [`RemoteClient::new`] rejects, still

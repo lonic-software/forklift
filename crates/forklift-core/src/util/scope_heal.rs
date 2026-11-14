@@ -220,10 +220,10 @@ fn check_history_at(scope: &PathScope) -> Result<(), String> {
 
 /// The `heal --fetch-scope` command that sets `scope`.
 fn fetch_scope_command(scope: &PathScope) -> String {
-    let mut command = "forklift heal --fetch-scope".to_string();
+    let mut command = "forklift heal".to_string();
 
     for prefix in scope.prefixes() {
-        command.push(' ');
+        command.push_str(" --fetch-scope ");
         command.push_str(&shell_word(prefix));
     }
 
@@ -368,13 +368,13 @@ pub fn repair() -> Result<Option<ScopeRebuilt>, CoreError> {
             false => {
                 let offered = PathScope::from_prefixes(folders);
                 lines.push(
-                    "Name the paths this warehouse fetches with \"forklift heal --fetch-scope\": the next \
+                    "Name the paths this warehouse fetches with \"forklift heal --fetch-scope <path>\": the next \
                     step offers the folders of this working tree, and heal fetches what the history at them \
                     lacks.".to_string(),
                 );
                 fetch_scope_command(&offered)
             }
-            true => "Name the paths this warehouse fetches with \"forklift heal --fetch-scope\", followed by each path.".to_string(),
+            true => "Name the paths this warehouse fetches with \"forklift heal --fetch-scope <path>\", once for each path.".to_string(),
         };
 
         return Err(refusal(lines.join("\n"), next_step, &refused));
@@ -398,7 +398,7 @@ pub fn repair() -> Result<Option<ScopeRebuilt>, CoreError> {
         lines.extend(read_lines(&refused));
         lines.push(
             "The next step sets the fetch scope to those paths, fetching what the history there lacks; \
-            \"forklift heal --fetch-scope\" names others the same way.".to_string(),
+            another \"--fetch-scope <path>\" names one more.".to_string(),
         );
 
         return Err(refusal(lines.join("\n"), fetch_scope_command(&scope), &refused));
@@ -494,7 +494,7 @@ pub async fn set_chosen(prefixes: &[String], _exclusive: &StoreAccessExclusive) 
         ).into());
     }
 
-    let client = RemoteClient::for_warehouse()?;
+    let client = RemoteClient::for_fetch_scope_repair()?;
 
     // The handshake sets the client to leave out the content the remote's host withholds, as
     // `scope fetch` does.

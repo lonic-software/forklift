@@ -127,7 +127,7 @@ file first named `forklift heal`; this is what it says when that is not enough. 
 Run the next step the message names:
 
 ```sh
-forklift heal --fetch-scope <path>...
+forklift heal --fetch-scope <path> --fetch-scope <path>
 ```
 
 It sets the fetch scope to those paths after fetching from the origin whatever the history there

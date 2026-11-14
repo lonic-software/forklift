@@ -1383,8 +1383,8 @@ mod tests {
         // A stray file in a full warehouse or a cache is refused unparsed, so a garbled one says
         // "delete it" too.
         for (mode, file, found, remedy) in [
-            (WarehouseMode::Sparse, None, "is missing", REMEDY_REFRANCHISE),
-            (WarehouseMode::Sparse, Some(Vec::new()), "names no path", REMEDY_REFRANCHISE),
+            (WarehouseMode::Sparse, None, "is missing", REMEDY_HEAL_FETCH_SCOPE),
+            (WarehouseMode::Sparse, Some(Vec::new()), "names no path", REMEDY_HEAL_FETCH_SCOPE),
             (WarehouseMode::Full, Some(sparse.clone()), "holds a fetch scope", "Delete that file"),
             (WarehouseMode::Full, Some(Vec::new()), "holds a fetch scope", "Delete that file"),
             (WarehouseMode::Full, Some(b"not a scope file".to_vec()), "holds a fetch scope", "Delete that file"),

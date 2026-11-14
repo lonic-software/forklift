@@ -123,7 +123,7 @@ fn heal_refuses_a_rebuild_over_lost_history_and_its_next_step_fetches_it() {
 
     let error = fetch_scope_damaged(&area.forklift("sparse", &["--json", "heal"]));
     assert!(!area.path(FETCH_SCOPE).exists(), "nothing was written");
-    assert_eq!(error["next_step"], "forklift heal --fetch-scope docs src/api", "{}", error);
+    assert_eq!(error["next_step"], "forklift heal --fetch-scope docs --fetch-scope src/api", "{}", error);
     assert!(error["details"]["missing"].as_str().is_some_and(|missing| !missing.is_empty()), "{}", error);
 
     let healed = run_next_step(&area, "sparse", &error);
@@ -150,7 +150,7 @@ fn heal_with_no_readable_checkout_offers_a_fetch_scope_that_works() {
     std::fs::write(area.path(MAIN_SCOPE), b"\xff\xfe").unwrap();
 
     let error = fetch_scope_damaged(&area.forklift("sparse", &["--json", "heal"]));
-    assert_eq!(error["next_step"], "forklift heal --fetch-scope docs src", "{}", error);
+    assert_eq!(error["next_step"], "forklift heal --fetch-scope docs --fetch-scope src", "{}", error);
     assert!(error["details"]["unread"][0]["reason"].as_str().unwrap().contains("UTF-8"), "{}", error);
 
     server.stop();
@@ -178,7 +178,7 @@ fn heal_refuses_a_fetch_scope_that_does_not_hold_a_checkout() {
     let error = fetch_scope_damaged(&area.forklift("sparse", &["--json", "heal"]));
     let message = error["message"].as_str().unwrap();
     assert!(message.contains("forklift bay remove") && message.contains("clone the remote"), "both ways out: {}", message);
-    assert_eq!(error["next_step"], "forklift heal --fetch-scope docs src/api src/apj", "{}", error);
+    assert_eq!(error["next_step"], "forklift heal --fetch-scope docs --fetch-scope src/api --fetch-scope src/apj", "{}", error);
     assert_eq!(error["details"]["outside"], serde_json::json!(["the warehouse's own working tree"]), "{}", error);
 
     let healed = run_next_step(&area, "sparse", &error);
@@ -197,7 +197,7 @@ fn heal_fetch_scope_refuses_what_it_must_not_write() {
     let _server = sparse_with_docs(&area);
     let original = written_fetch_scope(&area);
 
-    let sound = area.forklift("sparse", &["heal", "--fetch-scope", "docs", "src/api"]);
+    let sound = area.forklift("sparse", &["heal", "--fetch-scope", "docs", "--fetch-scope", "src/api"]);
     assert!(!sound.status.success() && stderr(&sound).contains("leaves it alone"), "{}", stderr(&sound));
     assert_eq!(written_fetch_scope(&area), original);
 
@@ -205,7 +205,7 @@ fn heal_fetch_scope_refuses_what_it_must_not_write() {
 
     let narrower = area.forklift("sparse", &["heal", "--fetch-scope", "docs"]);
     assert!(!narrower.status.success(), "{}", stdout(&narrower));
-    assert!(stderr(&narrower).contains("\"forklift heal --fetch-scope docs src/api\""), "{}", stderr(&narrower));
+    assert!(stderr(&narrower).contains("\"forklift heal --fetch-scope docs --fetch-scope src/api\""), "{}", stderr(&narrower));
     assert!(!area.path(FETCH_SCOPE).exists());
 
     let root = area.forklift("sparse", &["heal", "--fetch-scope", "."]);

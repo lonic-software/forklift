@@ -2643,7 +2643,7 @@ under [`store compact`](#store-compact--pack-the-object-store).
 forklift heal
 forklift heal --ref <pallet>=<parcel>
 forklift heal --remove-ref <pallet>
-forklift heal --fetch-scope <path>...
+forklift heal --fetch-scope <path>
 ```
 
 You will rarely see this: after certain rare write failures (a directory-sync error right
@@ -2818,7 +2818,8 @@ is missing at those paths, when no checkout's scope can be read, or when a reada
 not hold a checkout's scope (one of the two files is damaged; the message gives the way out for
 each).
 
-- `forklift heal --fetch-scope <path>...` sets the fetch scope to the paths given. They must hold
+- `forklift heal --fetch-scope <path>` sets the fetch scope to the paths given, one per
+  `--fetch-scope`. They must hold
   every checkout's scope and cannot be the warehouse root, and the fetch scope must be damaged or
   not hold a checkout. It walks each head from the origin under the new scope first, fetching what
   the history lacks, so it needs the origin; offline, it changes nothing. `--json` reports
