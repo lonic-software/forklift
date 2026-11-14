@@ -204,9 +204,11 @@ fn is_activated() -> bool {
 ///
 /// # Returns
 /// * `Ok(())`      - Not activated, nothing to resolve, or the taint was durably recorded.
-/// * `Err(String)` - Activated, the root resolved, and the durable write failed, or the record
-///                   was written but the folders above it could not be synced. The gate for this
-///                   root is set regardless (see the ordering note above).
+/// * `Err(String)` - Activated, the root resolved, and the durable write itself failed. The gate
+///                   for this root is set regardless (see the ordering note above).
+///
+/// An `Err` can also come with the record written, when the folders above it could not be synced
+/// (see the no-re-entry note above).
 pub fn record_taint(final_paths: &[&Path]) -> Result<(), String> {
     if !is_activated() || final_paths.is_empty() {
         return Ok(());
@@ -818,14 +820,16 @@ pub(crate) fn test_clear_gate(root: &Path) {
 ///                   `remainder` was empty), `old_files` are gone (or were already gone — see
 ///                   [`delete_snapshot_and_sync`]), and the in-memory gate for `root` matches what
 ///                   is now on disk.
-/// * `Err(String)` - The new file could not be durably written, or was written but the folders
-///                   above it could not be synced (it then stands beside `old_files`, and reads
-///                   union them, a superset of `remainder`; either way `old_files` are left completely
+/// * `Err(String)` - The new file could not be durably written (`old_files` are left completely
 ///                   untouched — the original, larger set still stands, never partially deleted
 ///                   before a replacement is durable), a file in `old_files` could not be removed
 ///                   for a reason other than already being gone, or the post-write directory
 ///                   listing that decides the gate failed (the gate is left unchanged in this
 ///                   case too — see above).
+///
+/// The new file can also be written with an `Err`, when the folders above it could not be synced.
+/// It then stands beside the untouched `old_files`, and reads union them: a superset of
+/// `remainder`.
 pub(crate) fn resolve_taints(
     root: &Path,
     remainder: &BTreeSet<PathBuf>,
