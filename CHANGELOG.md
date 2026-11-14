@@ -12,6 +12,25 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **A served warehouse's lost or damaged tombstone list is refused, and its operator can repair it.**
+  The list of pallets deleted on a server, `.forklift/tombstones`, keeps their heads from gc. A list
+  that did not read made every handshake fail with an uncoded HTTP 500. A deleted list was read as
+  empty, so gc or a full compaction could free history that clones had pruned against. Now a served
+  warehouse whose list or `served` mark is lost or damaged refuses whatever frees history: gc, a full
+  compaction, scope prune. These refuse with exit 55 (`tombstones_damaged`), naming
+  `forklift-server tombstone repair --root <warehouse>`. The server answers 503 with that code and no
+  `Retry-After`, so clients stop and name the remote's operator instead of retrying. `heal`, which
+  must not rebuild a ref over a list that may record its deletion, refuses the same way. The repair
+  runs while the warehouse is not served:
+  - It moves the damaged files aside and keeps every entry that still reads.
+  - It gives a lost deletion its name back when the bays' undo journals settle it.
+  - It keeps every other piece of history no pallet, office pin or tombstone holds, with no name,
+    through gc and compaction. `tombstone list` shows these as `(kept, no name)`, and
+    `tombstone drop --head <hash>` releases one.
+
+  The list format is now version 2, which can hold a kept head. Warehouses served before this change
+  have to be repaired, or made again, before they are served.
+
 - **A lost or damaged fetch scope is rebuilt by `forklift heal`.** In a sparse warehouse, a
   `.forklift/config/fetch-scope` that was deleted, emptied, zeroed or no longer valid UTF-8 made
   every command refuse with "clone the remote again", while `heal` reported nothing to heal. The

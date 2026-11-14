@@ -85,7 +85,15 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 43** (current): a new refusal code, `fetch_scope_damaged` (exit 54): a sparse warehouse's
+**Schema 44** (current): a new refusal code, `tombstones_damaged` (exit 55): a served warehouse's
+tombstone list or `served` mark is lost or damaged, so which deleted pallets' heads it keeps cannot
+be told. Nothing that frees history runs until the list is repaired. `next_step` is the
+operator's `forklift-server tombstone repair --root <warehouse>`. Locally the warehouse is named in
+full. When a remote refuses with this code, the server's directories are not named:
+`next_step` asks its operator to run the command, with `<warehouse>` as a placeholder. The remote
+sends it as a 503 with no `Retry-After`, which the client does not retry.
+
+**Schema 43**: a new refusal code, `fetch_scope_damaged` (exit 54): a sparse warehouse's
 fetch scope is lost or damaged and the checkouts' scopes cannot rebuild it, or it can be read but
 does not hold a checkout's scope. `next_step` is a whole `heal --fetch-scope` command, and
 `details` names what was read and what was not (`fetch_scope`, `fetch_scope_unreadable`, `read`,

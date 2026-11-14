@@ -330,6 +330,10 @@ asks again for the rest. See
 history stays safe until the pallet is restored or the tombstone is dropped. See
 [`pallet`](cli.md#pallet--list-create-delete-and-restore-pallets).
 
+**Kept head.** History a tombstone repair keeps with no pallet name, because it may be what a lost
+tombstone list held. It is kept from gc like a tombstone until the operator drops it. See
+[recovery](recovery.md#tombstones_damaged-exit-55).
+
 **Control plane, data plane.** The *control plane* carries requests such as the handshake and refs;
 the *data plane* (also *byte plane*) carries object bytes.
 

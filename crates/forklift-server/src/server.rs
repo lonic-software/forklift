@@ -2315,7 +2315,7 @@ fn resolve_warehouse(state: &Arc<AppState>,
 }
 
 /// How long a client refused while a warehouse is drained, or otherwise unavailable for now, is
-/// told to wait before trying again (the `Retry-After` of every `503`).
+/// told to wait before trying again (the `Retry-After` of every `503` but a damage refusal).
 const RETRY_AFTER_SECONDS: u64 = 10;
 
 /// The `503` of a request for a warehouse drained for the redaction deleter.

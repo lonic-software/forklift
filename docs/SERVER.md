@@ -324,6 +324,12 @@ revocation by more than about a day.
   `forklift-server tombstone list --root …` shows them; `forklift-server tombstone drop --root …
   NAME` frees the name for unrelated history and lets the next `gc` collect what only the
   tombstone held. Dropping is refused while the root is served, like `gc`.
+  If the list (`.forklift/tombstones`) or the mark is lost or damaged, nothing that frees history
+  runs, and the root's handshakes answer 503 with `tombstones_damaged` until
+  `forklift-server tombstone repair --root …` has run with the root not served. It keeps every
+  entry that still reads and names a lost deletion where a bay's undo journal settles it. All other
+  history that nothing else holds is kept as a *kept head*, shown by `tombstone list` as
+  `(kept, no name)`. `tombstone drop --root … --head HASH` releases one.
 - **Withholding:** `forklift-server withhold add --root … HASH --statement "…"` withholds a
   file's content on the host's own authority, as for a legal takedown, and `forklift-server
   withhold list --root …` shows what is withheld. It takes effect at once, while the root is
