@@ -286,8 +286,8 @@ impl PathScope {
     ///
     /// # Arguments
     /// * `bytes`  - The file's contents.
-    /// * `remedy` - The way out for a file that is damaged or in the older format, which depends on
-    ///              whose file it is.
+    /// * `remedy` - The way out for a file that is damaged or in the older format, which depends
+    ///   on whose file it is.
     fn from_bytes(bytes: &[u8], remedy: &str) -> Result<PathScope, String> {
         if bytes.is_empty() {
             return Ok(PathScope::full());

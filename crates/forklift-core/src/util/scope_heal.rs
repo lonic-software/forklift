@@ -137,9 +137,12 @@ fn read_fetch_file() -> Result<FetchFile, String> {
     })
 }
 
+/// Each checkout whose scope was read, with that scope, and each whose was not, with why.
+type Checkouts = (Vec<(String, PathScope)>, Vec<Unread>);
+
 /// The checkouts' scopes: those that parse and name a path, and the rest with why. A bays folder
 /// that cannot be listed leaves only the working tree, with the bays noted as unread.
-fn checkout_scopes() -> Result<(Vec<(String, PathScope)>, Vec<Unread>), String> {
+fn checkout_scopes() -> Result<Checkouts, String> {
     let mut checkouts: Vec<(String, PathBuf)> = vec![
         ("the warehouse's own working tree".to_string(), scope_utils::main_tree_scope_path()),
     ];
@@ -300,8 +303,8 @@ fn capitalized(text: &str) -> String {
 /// # Returns
 /// * `Ok(Some(ScopeRebuilt))` - The fetch scope was rebuilt.
 /// * `Ok(None)`               - Nothing needed rebuilding.
-/// * `Err(CoreError)`         - A `fetch_scope_damaged` refusal, or a file that could not be read
-///                              or written.
+/// * `Err(CoreError)`         - A `fetch_scope_damaged` refusal, or a file that could not be
+///   read or written.
 pub fn repair() -> Result<Option<ScopeRebuilt>, CoreError> {
     if warehouse_utils::warehouse_mode()? != WarehouseMode::Sparse {
         return Ok(None);

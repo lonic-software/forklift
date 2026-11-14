@@ -36,8 +36,7 @@ use crate::output::{self, CommandOutput};
 ///
 /// # Arguments
 /// * `store_access` - The command's shared store-access hold, which the record's push-down needs.
-///                    `None` under `--fetch-scope`, which takes the exclusive hold first and the
-///                    shared one after.
+///   `None` under `--fetch-scope`, which takes the exclusive hold first and the shared one after.
 /// * `fetch_scope`  - The paths `--fetch-scope` names, if any.
 ///
 /// # Returns

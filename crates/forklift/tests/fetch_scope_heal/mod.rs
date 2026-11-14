@@ -24,6 +24,9 @@ fn run_next_step(area: &TestArea, dir: &str, error: &serde_json::Value) -> Outpu
     area.forklift(dir, &[&["--json"][..], &words[1..]].concat())
 }
 
+/// A way of damaging the fetch-scope file, by name.
+type Damage<'a> = (&'a str, &'a dyn Fn(&TestArea));
+
 fn written_fetch_scope(area: &TestArea) -> Vec<u8> {
     std::fs::read(area.path(FETCH_SCOPE)).unwrap()
 }
@@ -40,7 +43,7 @@ fn heal_rebuilds_a_lost_or_damaged_fetch_scope_from_the_checkouts() {
     let _server = sparse_with_docs(&area);
     let original = written_fetch_scope(&area);
 
-    let damages: [(&str, &dyn Fn(&TestArea)); 4] = [
+    let damages: [Damage; 4] = [
         ("deleted", &|area| forklift_core::util::file_utils::remove_file(area.path(FETCH_SCOPE)).unwrap()),
         ("emptied", &|area| std::fs::write(area.path(FETCH_SCOPE), b"").unwrap()),
         ("zeroed", &|area| std::fs::write(area.path(FETCH_SCOPE), vec![0u8; original.len()]).unwrap()),
