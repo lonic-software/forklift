@@ -3371,9 +3371,9 @@ fn reconstruct_record(record: &[u8], hash: &str, bases: Bases) -> Result<Vec<u8>
 
 /// Why a delta cannot be rebuilt when its verified base read failed with `error`, judged by the
 /// base's own cause (read again, on this failure path only). A base that is absent, or whose every
-/// copy is damaged, leaves the delta damaged with it. A base behind a damaged index heal can
-/// rebuild keeps that cause, and any other failure says nothing about this record: both keep the
-/// base's own wording.
+/// copy is damaged, leaves the delta damaged with it, and a base behind a damaged index heal can
+/// rebuild leaves it with that cause: each is reworded to name the base. Any other failure says
+/// nothing about this record and keeps the base's own wording.
 fn delta_base_failure(base_hash: &str, error: String) -> (String, file_utils::Unreadable) {
     let reason = |error: &str| match crate::error::deframe(error) {
         Some((_, message, _)) => message.to_string(),
@@ -3386,9 +3386,10 @@ fn delta_base_failure(base_hash: &str, error: String) -> (String, file_utils::Un
         Ok(file_utils::StoreReadOutcome::Unverifiable(_, file_utils::Unreadable::RecordDamage | file_utils::Unreadable::LooseCorrupt)) => {
             record_damage(format!("its delta base {} cannot be read: {}", base_hash, reason(&error)))
         }
-        Ok(file_utils::StoreReadOutcome::Unverifiable(_, file_utils::Unreadable::PackDamage)) => {
-            (error, file_utils::Unreadable::PackDamage)
-        }
+        Ok(file_utils::StoreReadOutcome::Unverifiable(_, file_utils::Unreadable::PackDamage)) => (
+            format!("its delta base {} cannot be read: {}", base_hash, reason(&error)),
+            file_utils::Unreadable::PackDamage,
+        ),
         _ => (error, file_utils::Unreadable::Other),
     }
 }
@@ -12638,6 +12639,19 @@ pub(crate) mod tests {
         assert_eq!(scan.corrupt.into_keys().collect::<Vec<_>>(), expected);
         assert_eq!(FORCED_RELOADS.with(|reloads| reloads.get()), reloads, "judging the records reloads no registry");
 
+        // A pack published behind a warm registry, as a repair earlier in the run leaves one, is
+        // scanned too.
+        let (_, late) = blob449("a damaged record published after the registry was cached");
+        let (data, index) = write_named_pack(&[(late.clone(), garbled_full_record())]);
+        let (data_bytes, index_bytes) = (std::fs::read(&data).unwrap(), std::fs::read(&index).unwrap());
+        file_utils::remove_file(&data).unwrap();
+        file_utils::remove_file(&index).unwrap();
+        invalidate_cache();
+        assert_eq!(file_utils::retrieve_object_by_hash_uncached(&sound_hash).unwrap(), sound, "the registry is cached");
+        std::fs::write(&data, data_bytes).unwrap();
+        std::fs::write(&index, index_bytes).unwrap();
+        assert!(undecodable_records().unwrap().iter().any(|record| record.hash == late), "the late pack is scanned");
+
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
@@ -12688,15 +12702,27 @@ pub(crate) mod tests {
     fn a_delta_over_a_base_behind_a_damaged_index_is_not_damaged() {
         let (temp, _scope) = salvage_root("fork495-damaged-index-base");
 
+        // Enough records for two buckets, so the delta's own lookup misses the corrupt one.
+        const COUNT: usize = 41;
         let (base, base_hash) = blob449("a delta base in a corrupt bucket, padded to be a fit base");
-        let (target, delta) = blob449("a delta over a bucketed base, padded to be a fit target");
-        let (_, index) = write_named_pack(&[(base_hash.clone(), full_record(&base))]);
+        let base_bucket = salvage_bucket(COUNT, &base_hash);
+        let target_object = salvage_blob_where(b"a delta over a bucketed base, padded to be a fit target", COUNT, |bucket| bucket != base_bucket);
+        let (target, delta) = (target_object.content.clone(), target_object.hash.clone());
+        let mut records = vec![(base_hash.clone(), full_record(&base))];
+        records.extend((1..COUNT).map(|i| {
+            let (filler, hash) = blob449(&format!("filler {}", i));
+            (hash, full_record(&filler))
+        }));
+        let (_, index) = write_named_pack(&records);
         corrupt_salvage_bucket(&index, &base_hash);
+        assert_eq!(salvage_read(&delta), "Absent", "the delta's own bucket in the damaged pack is sound");
         write_named_pack(&[(delta.clone(), delta_record(&base_hash, &base, &target))]);
 
         let (code, error) = read_code(&delta);
         assert_eq!(code.as_deref(), Some("object_unreadable"), "{}", error);
-        assert!(crate::error::deframe(&error).is_some_and(|(_, _, step)| step == "forklift heal"), "{}", error);
+        let (_, message, step) = crate::error::deframe(&error).unwrap();
+        assert!(message.contains(delta.as_str()) && message.contains(base_hash.as_str()), "{}", message);
+        assert_eq!(step, "forklift heal");
         let scan = crate::util::recovery_utils::corrupt_packed_objects().unwrap();
         assert!(scan.corrupt.is_empty(), "{:?}", scan);
         assert_eq!(scan.unchecked.iter().map(|(hash, _)| hash).collect::<Vec<_>>(), vec![&delta], "{:?}", scan);
