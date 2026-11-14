@@ -2478,7 +2478,8 @@ mod tests {
     /// named for the server, and each run that never reached its cut is listed missing.
     ///
     /// Revert: report a server's states as a client's → the rows land in the client's category;
-    /// drop the unreached runs → the cut check lists nothing.
+    /// drop the unreached runs → the cut check lists nothing; count the states between for a
+    /// refused scenario → it claims a sweep that never ran.
     #[test]
     fn a_server_s_power_loss_is_reported_as_the_server_s() {
         let graded = Graded {
@@ -2503,6 +2504,9 @@ mod tests {
         let client = summarize(&all);
         assert_eq!(client.rows[0].category, Category::PowerLossClient);
         assert_eq!(client.completeness.len(), 4, "a client's power loss has no cuts");
+        // A scenario whose replay refused graded no state, so it claims no states between.
+        let refused = vec![ScenarioPower { scenario: "lifted".into(), refusals: vec!["unmodelled".into()], ..Default::default() }];
+        assert!(summarize(&refused).completeness.iter().all(|check| !check.check.contains("states between")));
     }
 
     /// A crash moment's label names its line, so two lines' moments at the same call read apart.
@@ -2813,17 +2817,21 @@ mod tests {
     }
 
     /// A file cut and written back to its synced bytes still tears at the cut: the truncate can
-    /// land without the write, and without the unsynced folder made beside it.
+    /// land without the write, in every durable state after it too.
     ///
-    /// Revert: tear only files whose bytes changed → no torn state.
+    /// Revert: tear only files whose bytes differ → once the folder's fsync moves the durable
+    /// state on, `a` no longer tears.
     #[test]
     fn a_file_rewritten_to_its_synced_bytes_tears_at_the_cut() {
-        let text = format!("1 mkdir(\"n\", 0755) = 0\n1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_TRUNC) = 3</s/w/a>\n{}1 close(3</s/w/a>) = 0\n", write(1, 3, "/s/w/a", b"old"));
-        let torn: Vec<Vec<u8>> = found(&text).crashes.iter().filter(|crash| matches!(crash.state, State::Torn { form: Form::Cut, .. }))
+        // The folder's fsync makes `d` durable; `m` after it keeps the ordered state apart.
+        let text = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_TRUNC) = 3</s/w/a>\n{}1 close(3</s/w/a>) = 0\n\
+            1 openat(AT_FDCWD</s/w>, \"d\", O_WRONLY|O_CREAT|O_EXCL, 0644) = 5</s/w/d>\n1 close(5</s/w/d>) = 0\n\
+            1 openat(AT_FDCWD</s/w>, \".\", O_RDONLY|O_DIRECTORY) = 4</s/w>\n1 fsync(4</s/w>) = 0\n1 mkdir(\"m\", 0755) = 0\n", write(1, 3, "/s/w/a", b"old"));
+        let later: Vec<Vec<u8>> = found(&text).crashes.iter()
+            .filter(|crash| matches!(crash.state, State::Torn { form: Form::Cut, .. }) && crash.image.contains_key("w/d"))
             .map(|crash| data(&crash.image, "w/a").unwrap()).collect();
-        assert!(!torn.is_empty());
-        assert!(torn.iter().all(|held| held.is_empty()));
-        assert!(found(&text).crashes.iter().filter(|crash| matches!(crash.state, State::Torn { .. })).all(|crash| !crash.image.contains_key("w/n")));
+        assert!(!later.is_empty());
+        assert!(later.iter().all(|held| held.is_empty()));
     }
 
     /// A state a more realistic kind takes over keeps the moments that already left it, and the
