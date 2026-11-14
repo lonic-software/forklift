@@ -210,5 +210,5 @@ fn heal_fetch_scope_refuses_what_it_must_not_write() {
     assert!(!area.path(FETCH_SCOPE).exists());
 
     let full = area.forklift("dev", &["heal", "--fetch-scope", "docs"]);
-    assert!(!full.status.success() && stderr(&full).contains("Only a sparse warehouse"), "{}", stderr(&full));
+    assert!(!full.status.success() && stderr(&full).contains("has nothing to set"), "{}", stderr(&full));
 }
