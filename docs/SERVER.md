@@ -401,7 +401,8 @@ revocation by more than about a day.
   `object_unreadable` and no `Retry-After`, and clients stop rather than retry. The log names the
   file; the response does not. Run `forklift heal` in the root: it rebuilds a lost or damaged index
   from its pack's data file. When the data file itself is lost or damaged, `heal` refuses with
-  `objects_lost`, naming what cannot be read; restore the root from a backup.
+  `objects_lost`, naming what cannot be read; restore the root from a backup. An object missing
+  from the store altogether answers the same way.
 - **Shutdown:** SIGINT/SIGTERM drain in-flight requests before exiting.
 
 ## Updating
