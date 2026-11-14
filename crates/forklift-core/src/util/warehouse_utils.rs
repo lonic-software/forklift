@@ -757,7 +757,11 @@ fn read_marker_pair(forklift: &Path) -> Result<MarkerPair, String> {
         (MarkerFile::Valid(marker, bytes), copy) => (marker, bytes, copy, FILE_NAME_WAREHOUSE_MARKER_COPY),
         (primary, MarkerFile::Valid(marker, bytes)) => (marker, bytes, primary, FILE_NAME_WAREHOUSE_MARKER),
         (MarkerFile::Absent, MarkerFile::Absent) => return Ok(MarkerPair { chosen: None, stale: Vec::new() }),
-        (MarkerFile::Unusable(refusal), _) | (MarkerFile::Absent, MarkerFile::Unusable(refusal)) => return Err(refusal),
+        (MarkerFile::Unusable(refusal), MarkerFile::Unusable(_)) => return Err(format!(
+            "{} Its copy \"{}\" cannot be used either, so nothing records what the warehouse holds.",
+            refusal, forklift.join(FILE_NAME_WAREHOUSE_MARKER_COPY).to_string_lossy()
+        )),
+        (MarkerFile::Unusable(refusal), MarkerFile::Absent) | (MarkerFile::Absent, MarkerFile::Unusable(refusal)) => return Err(refusal),
     };
 
     let other_holds_it = matches!(&other, MarkerFile::Valid(_, other_bytes) if *other_bytes == bytes);
@@ -1771,7 +1775,8 @@ mod tests {
                     Some(_) => {
                         assert!(read_marker_pair(&forklift).is_err(), "{} on {} beside an absent twin", fault, hit);
                         lay(twin, damage(&good));
-                        assert!(read_marker_pair(&forklift).is_err(), "{} on both", fault);
+                        let both = read_marker_pair(&forklift).unwrap_err();
+                        assert!(both.contains("Its copy") && both.contains("cannot be used either"), "{} on both: {}", fault, both);
                     }
                 }
             }

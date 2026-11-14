@@ -910,7 +910,7 @@ fn a_faulted_marker_is_read_through_its_copy_and_rewritten() {
     for (fault, target) in [("deleted", &marker), ("format 1 to 7", &marker), ("full to cache", &marker), ("deleted", &copy),
                             ("format 1 to 7", &copy), ("full to cache", &copy)] {
         match fault {
-            "deleted" => std::fs::remove_file(target).unwrap(),
+            "deleted" => forklift_core::util::file_utils::remove_file(target).unwrap(),
             "format 1 to 7" => std::fs::write(target, text(&whole).replace("format 1\n", "format 7\n")).unwrap(),
             _ => std::fs::write(target, text(&whole).replace("\nfull\n", "\ncache\n")).unwrap(),
         }
@@ -933,7 +933,7 @@ fn a_changed_marker_with_no_copy_is_refused_as_damaged() {
     let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
     let marker = forklift.join("warehouse");
     let whole = text(&std::fs::read(&marker).unwrap());
-    std::fs::remove_file(forklift.join("warehouse-copy")).unwrap();
+    forklift_core::util::file_utils::remove_file(forklift.join("warehouse-copy")).unwrap();
 
     for changed in [whole.replace("format 1\n", "format 7\n"), whole.replace("\nfull\n", "\ncache\n")] {
         std::fs::write(&marker, &changed).unwrap();

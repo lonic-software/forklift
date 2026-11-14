@@ -6450,7 +6450,7 @@ fn a_sparse_warehouse_whose_fetch_scope_is_gone_is_refused() {
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
-    assert_eq!(area.read_file("sparse/.forklift/warehouse"), "/forklift-warehouse 3\nformat 1\nsparse\n");
+    assert_eq!(area.read_file("sparse/.forklift/warehouse").into_bytes(), forklift_core::util::warehouse_utils::framed_marker_bytes("format 1\nsparse\n"));
     area.write_file("sparse/src/api/a.txt", "api v2\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
     assert_success(&area.forklift("sparse", &["stack", "-m", "second"]));
@@ -6567,12 +6567,12 @@ fn a_cache_franchise_is_a_partial_warehouse() {
     let full = area.forklift(".", &["--json", "clone", &server.url, "full"]);
     assert_success(&full);
     assert!(json_of(&full)["data"].get("bundle_objects").is_some(), "{}", stdout(&full));
-    assert_eq!(area.read_file("full/.forklift/warehouse"), "/forklift-warehouse 3\nformat 1\nfull\n");
+    assert_eq!(area.read_file("full/.forklift/warehouse").into_bytes(), forklift_core::util::warehouse_utils::framed_marker_bytes("format 1\nfull\n"));
 
     let cached = area.forklift(".", &["--json", "clone", &server.url, "cached", "--cache"]);
     assert_success(&cached);
     assert!(json_of(&cached)["data"].get("bundle_objects").is_none(), "no bundle: {}", stdout(&cached));
-    assert_eq!(area.read_file("cached/.forklift/warehouse"), "/forklift-warehouse 3\nformat 1\ncache\n");
+    assert_eq!(area.read_file("cached/.forklift/warehouse").into_bytes(), forklift_core::util::warehouse_utils::framed_marker_bytes("format 1\ncache\n"));
     assert!(!area.path("cached/.forklift/config/fetch-scope").exists(), "a cache records no fetch scope");
     assert_eq!(origin_of(&area, "cached").as_deref(), Some(server.url.as_str()), "a cache records its origin");
     assert_eq!(origin_of(&area, "full"), None, "a full warehouse records no origin");
