@@ -1636,7 +1636,7 @@ pub(crate) fn gc_root_sources(
     let mut degraded: Vec<String> = Vec::new();
 
     // A ref that cannot be read is a degraded source under `Tolerate`, as an unreadable bay is:
-    // heal walks past it (and repairs it), and its negative answers clear nothing that run.
+    // heal walks past it (and rebuilds it, when it is a user ref), and its negative answers clear nothing that run.
     for namespace in [pallet_utils::PalletNamespace::User, pallet_utils::PalletNamespace::Meta] {
         for name in pallet_utils::list_pallets_in(namespace)? {
             let head = match pallet_utils::get_pallet_head_in(namespace, &name) {

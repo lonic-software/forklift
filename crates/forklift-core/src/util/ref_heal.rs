@@ -20,10 +20,17 @@
 //! The ref is rebuilt at the one candidate whose closure verifies, that equals or descends from
 //! every other verified candidate, and that descends from every floor: the bases, the marker
 //! heads and the salvage, which are what a checkout or the ref's own bytes stand on. A journal
-//! head is not a floor, since a later rewind or a collection may have left it behind. An answer
-//! that cannot be read (an ancestry walk that fails, a salvage match that is tainted or
-//! unreadable) is unknown, never "no". A journal entry that deleted the pallet blocks the rebuild,
-//! since a shift racing a delete leaves exactly this state.
+//! head is not a floor, since a later rewind or a collection may have left it behind. A journal
+//! head that still verifies and lies above every other candidate does win, although a rewind in
+//! another checkout may have moved past it: journals are not ordered across checkouts, and of the
+//! two wrong answers, a rebuild above a rewind loses nothing (the rewind can be run again) while
+//! one below lost work would. An answer that cannot be read (an ancestry walk that fails, a
+//! salvage match that is tainted, unreadable or one of several parcels) is unknown, never "no".
+//!
+//! A latest journal entry that deleted the pallet blocks the rebuild, unless a checkout stands on
+//! the pallet: the pallet was then made again after the delete (`pallet create` leaves no journal
+//! entry), or a shift raced the delete. Either way the rebuild keeps what that checkout stands
+//! on, and the delete can be run again.
 //!
 //! ## Two passes
 //!
@@ -161,7 +168,7 @@ impl Source {
 /// What a damaged file's own bytes still name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Salvage {
-    /// Nothing, or more than one parcel.
+    /// Nothing.
     Nothing,
 
     /// This one parcel.
@@ -396,7 +403,8 @@ fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
 }
 
 /// The salvage among `matches`: the one readable parcel, unless another parcel also matches, or
-/// a match is tainted or cannot be read as any kind of object, which leaves the answer unknown. A
+/// a match is tainted or cannot be read as any kind of object, which leaves the answer unknown
+/// (the bytes then still name a head, only not which). A
 /// match that reads as a tree, blob, recipe or chunk is not a parcel and drops out.
 fn judge(matches: Vec<String>, tainted: &Tainted) -> Salvage {
     let mut parcels = Vec::new();
@@ -415,7 +423,9 @@ fn judge(matches: Vec<String>, tainted: &Tainted) -> Salvage {
     }
 
     match (parcels.as_slice(), unknown.as_slice()) {
-        ([_, _, ..], _) => Salvage::Nothing,
+        ([_, _, ..], _) => Salvage::Unknown(format!(
+            "its bytes match more than one parcel: {}", parcels.join(", ")
+        )),
         (_, [hash, ..]) => Salvage::Unknown(format!(
             "what its bytes name may be object {}, which is possibly lost or cannot be read", hash
         )),
@@ -467,8 +477,7 @@ fn listed(candidates: &[(String, Source)]) -> Vec<Candidate> {
 
 /// Choose the head to rebuild `pallet` at from `evidence`.
 fn choose(pallet: &str, evidence: &Evidence, pass: Pass) -> Choice {
-    // A checkout standing on the pallet means it was made again after the delete, since a delete
-    // is refused while one stands on it, and `pallet create` leaves no journal entry to say so.
+    // A checkout standing on the pallet outweighs the delete: see the module doc.
     if !evidence.deleted_in.is_empty() && !evidence.stood_on {
         return Choice::Refuse(format!(
             "the latest journal entry of {} deleted the pallet, so a rebuild could undo that delete",
@@ -617,14 +626,59 @@ fn damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<DamagedRef, Stri
 /// `forklift heal --ref <pallet>=<parcel>`: set damaged `pallet`'s ref to `parcel` (a revision:
 /// another pallet, a parcel hash or a unique prefix of one), through the same verified
 /// compare-and-set as a rebuild.
+///
+/// A meta pallet's name is refused, since its head is not user history. In a served warehouse,
+/// whose clones may rely on the head the damage hides, `parcel` must descend from every floor the
+/// evidence names, as an ordinary served write may not move back off the head it leaves.
 pub fn set_damaged_ref(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> Result<Rebuilt, String> {
     let damaged = damaged_ref(pallet, notes)?;
+
+    if parcel.starts_with('@') {
+        return Err(format!(
+            "\"{}\" names a meta pallet, whose head is not user history, so the ref of pallet \"{}\" is not set to it. Nothing was changed.",
+            parcel, pallet
+        ));
+    }
+
     let head = pallet_utils::resolve_revision(parcel)?;
+
+    if crate::util::tombstone_utils::is_served()? {
+        refuse_below_a_floor(&damaged, &head, notes)?;
+    }
 
     let preconditions = trusted(&damaged.pallet, &head)?;
     pallet_utils::repair_pallet_head(&damaged.pallet, &damaged.damage, &head, &preconditions).map_err(|error| error.to_string())?;
 
     Ok(Rebuilt { pallet: damaged.pallet, head, source: "the parcel given".to_string() })
+}
+
+/// Refuse `head` for served `damaged` unless it equals or descends from every floor the evidence
+/// names, or when one cannot be told.
+fn refuse_below_a_floor(damaged: &DamagedRef, head: &str, notes: &mut Vec<String>) -> Result<(), String> {
+    let evidence = gather(damaged, &Tainted::read(notes), notes);
+
+    if let Some(reason) = &evidence.salvage_unknown {
+        return Err(format!(
+            "This warehouse is served, and what the ref of pallet \"{}\" last held cannot be told ({}), so it is not set: its clones may rely on that head. Nothing was changed.",
+            damaged.pallet, reason
+        ));
+    }
+
+    for (floor, source) in evidence.candidates.iter().filter(|(_, source)| source.is_floor()) {
+        match at_or_below(floor, head) {
+            Ok(true) => {}
+            Ok(false) => return Err(format!(
+                "This warehouse is served, and {} does not descend from {} ({}), so the ref of pallet \"{}\" is not set to it: its clones may rely on that head. Nothing was changed.",
+                head, floor, source.describe(), damaged.pallet
+            )),
+            Err(error) => return Err(format!(
+                "This warehouse is served, and whether {} descends from {} ({}) could not be told, so the ref of pallet \"{}\" is not set: {} Nothing was changed.",
+                head, floor, source.describe(), damaged.pallet, error
+            )),
+        }
+    }
+
+    Ok(())
 }
 
 /// A ref `--remove-ref` removed, and where its bytes were kept.
@@ -690,4 +744,22 @@ pub fn remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<Remov
     pallet_utils::remove_damaged_ref(pallet, bytes, &kept).map_err(|error| error.to_string())?;
 
     Ok(Removed { pallet: pallet.to_string(), kept: kept.to_string_lossy().into_owned() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::pallet_utils::tests::{scratch, stub_parcel};
+
+    // Mutation: judge two matching parcels as Nothing → the ref's bytes stop being a floor and
+    // `--remove-ref` may drop a ref they name → red.
+    #[test]
+    fn bytes_matching_more_than_one_parcel_are_unknown_not_nothing() {
+        let (_root, _scope) = scratch("ref-heal-judge");
+        let (one, two) = (stub_parcel("1"), stub_parcel("2"));
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false };
+
+        assert_eq!(judge(vec![one.clone()], &clean), Salvage::Found(one.clone()));
+        assert!(matches!(judge(vec![one, two], &clean), Salvage::Unknown(reason) if reason.contains("more than one parcel")));
+    }
 }

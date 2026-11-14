@@ -2188,7 +2188,7 @@ pub(crate) mod tests {
     }
 
     /// A fresh warehouse root (its `.forklift` folder exists) entered for this thread.
-    fn scratch(name: &str) -> (PathBuf, StorageRootScope) {
+    pub(crate) fn scratch(name: &str) -> (PathBuf, StorageRootScope) {
         let root = std::env::temp_dir()
             .join(format!("forklift-pallet-utils-{}-{}", name, std::process::id()));
         let _ = file_utils::remove_dir_all(&root);

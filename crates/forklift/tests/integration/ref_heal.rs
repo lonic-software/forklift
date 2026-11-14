@@ -554,3 +554,50 @@ fn a_pallet_made_again_after_a_delete_is_rebuilt_under_its_checkout() {
     let data = healed(&area, &root);
     assert_eq!(head(&root, "side"), base, "{}", data);
 }
+
+#[test]
+fn a_served_warehouses_ref_is_never_set_below_what_its_own_bytes_name() {
+    // Mutation: skip refuse_below_a_floor → the served ref is set back to the older parcel → red.
+    let area = Area::new("served-floor");
+    let root = area.warehouse();
+    area.stack(&root, "b.txt", "older");
+    let older = head(&root, "main");
+    area.stack(&root, "c.txt", "newer");
+    let newer = head(&root, "main");
+    {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+        assert!(forklift_core::util::tombstone_utils::mark_served(true).unwrap());
+    }
+    std::fs::write(ref_path(&root, "main"), &newer.as_bytes()[..20]).unwrap();
+
+    let refused = area.run(&root, &["heal", "--ref", &format!("main={}", older)]);
+    assert!(!refused.status.success(), "{}", text(&refused.stdout));
+    assert!(text(&refused.stderr).contains("served"), "{}", text(&refused.stderr));
+    assert_eq!(std::fs::read(ref_path(&root, "main")).unwrap(), newer.as_bytes()[..20].to_vec());
+
+    area.run_ok(&root, &["heal", "--ref", &format!("main={}", newer)]);
+    assert_eq!(head(&root, "main"), newer);
+}
+
+#[test]
+fn a_meta_pallet_is_refused_and_a_refusal_names_what_the_run_already_set() {
+    // Mutation: drop the "@" check → main is set to the office head → red.
+    // Mutation: return the bare refusal from the --ref loop → the earlier rebuild goes unreported → red.
+    let area = Area::new("set-partial");
+    let (root, side) = side_only_its_bytes_name(&area);
+    let main = head(&root, "main");
+    std::fs::write(ref_path(&root, "main"), &main.as_bytes()[..20]).unwrap();
+
+    let meta = area.run(&root, &["heal", "--ref", "main=@office"]);
+    assert!(!meta.status.success(), "{}", text(&meta.stdout));
+    assert!(text(&meta.stderr).contains("meta pallet"), "{}", text(&meta.stderr));
+    assert_eq!(std::fs::read(ref_path(&root, "main")).unwrap(), main.as_bytes()[..20].to_vec());
+    area.run_ok(&root, &["heal", "--ref", &format!("main={}", main)]);
+
+    std::fs::write(ref_path(&root, "side"), &side.as_bytes()[..20]).unwrap();
+    let partial = area.run(&root, &["heal", "--ref", &format!("side={}", side), "--ref", &format!("main={}", main)]);
+    assert!(!partial.status.success(), "{}", text(&partial.stdout));
+    let stderr = text(&partial.stderr);
+    assert!(stderr.contains("is not damaged") && stderr.contains("Rebuilt the ref of pallet \"side\""), "{}", stderr);
+    assert_eq!(head(&root, "side"), side);
+}
