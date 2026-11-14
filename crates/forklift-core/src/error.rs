@@ -384,15 +384,16 @@ refusal_codes! {
     /// answers every request that reads the record with this code.
     WithheldDamaged => "withheld_damaged",
 
-    /// An object could not be read: no file holds it, or the only pack index that names it is
-    /// damaged or has lost its data file. Nothing was changed. `forklift heal` rebuilds a damaged
-    /// index from its data file, or refuses with [`RefusalCode::ObjectsLost`] when history still
-    /// reaches an object the store cannot give back. A content mismatch on an object that is
-    /// present carries no code.
+    /// An object could not be read: no file holds it, its loose file is corrupt, or the only pack
+    /// index that names it is damaged or has lost its data file. Nothing was changed. `forklift
+    /// heal` rebuilds a damaged index from its data file, or refuses with
+    /// [`RefusalCode::ObjectsLost`] when history still reaches an object the store cannot give
+    /// back. A pack record whose bytes do not rebuild to its object carries no code.
     ObjectUnreadable => "object_unreadable",
 
-    /// `forklift heal` found objects the history reaches that no file holds, or that only a pack
-    /// index it could not rebuild names, so they cannot be read. Nothing was claimed repaired for
+    /// `forklift heal` found objects the history reaches that no file holds, that only a corrupt
+    /// loose file holds, or that only a pack index it could not rebuild names, so they cannot be
+    /// read. Nothing was claimed repaired for
     /// them. The details list how many, up to twenty hashes grouped by reason, and the pallets
     /// whose history reaches them; the next step restores them from a backup or a copy, or re-runs
     /// heal when its index rebuild could not take the store lock.

@@ -12374,8 +12374,7 @@ pub(crate) mod tests {
     }
 
     /// What heal cannot act on keeps its own wording, with no `object_unreadable` code: an index of
-    /// another pack format, and a present loose object whose bytes are not its own. Mutation: frame
-    /// the foreign case (or every Unverifiable) → red.
+    /// another pack format. Mutation: frame the foreign case (or every Unverifiable) → red.
     #[test]
     fn a_read_heal_cannot_act_on_keeps_its_own_wording() {
         let (temp, _scope) = salvage_root("fork449-read-untyped");
@@ -12389,15 +12388,47 @@ pub(crate) mod tests {
         let (code, error) = read_code(&f_hash);
         assert_ne!(code.as_deref(), Some("object_unreadable"), "{}", error);
         assert!(error.contains("version"), "{}", error);
-        crate::util::file_utils::remove_dir_all(pack_folder()).unwrap();
-        invalidate_cache();
 
-        let (_, l_hash) = blob449("a loose object");
-        let (folder, file) = file_utils::get_path_for_object(&l_hash).unwrap();
-        std::fs::create_dir_all(&folder).unwrap();
-        std::fs::write(Path::new(&folder).join(file), zstd::encode_all(&b"other bytes"[..], 0).unwrap()).unwrap();
-        let (code, error) = read_code(&l_hash);
-        assert_ne!(code.as_deref(), Some("object_unreadable"), "{}", error);
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    /// A loose file whose bytes do not decompress, or decompress to other content, refuses
+    /// `object_unreadable` naming the object and `forklift heal` (FORK-447), while a pack copy that
+    /// verifies is still served over it. Mutation: leave `LooseCorrupt` unframed, or skip the scan's
+    /// pack check → red.
+    #[test]
+    fn a_corrupt_loose_file_refuses_object_unreadable_unless_a_pack_copy_verifies() {
+        let (temp, _scope) = salvage_root("fork447-loose-corrupt");
+        let write_loose = |hash: &str, bytes: &[u8]| {
+            let (folder, file) = file_utils::get_path_for_object(hash).unwrap();
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(Path::new(&folder).join(file), bytes).unwrap();
+        };
+
+        let (_, garbled) = blob449("a loose object that does not decompress");
+        write_loose(&garbled, b"not zstd at all");
+        let (_, other) = blob449("a loose object holding other bytes");
+        write_loose(&other, &zstd::encode_all(&b"other bytes"[..], 0).unwrap());
+        for hash in [&garbled, &other] {
+            let (code, error) = read_code(hash);
+            assert_eq!(code.as_deref(), Some("object_unreadable"), "{}", error);
+            let (_, message, step) = crate::error::deframe(&error).unwrap();
+            assert!(message.contains(hash.as_str()) && message.contains("corrupt"), "{}", message);
+            assert_eq!(step, "forklift heal");
+        }
+
+        let (packed, p_hash) = blob449("a packed object whose loose copy is corrupt");
+        write_named_pack(&[(p_hash.clone(), full_record(&packed))]);
+        write_loose(&p_hash, b"not zstd either");
+        invalidate_cache();
+        assert_eq!(file_utils::retrieve_object_by_hash_uncached(&p_hash).unwrap(), packed);
+
+        let corrupt = crate::util::recovery_utils::corrupt_loose_objects().unwrap().corrupt;
+        assert_eq!(corrupt.keys().collect::<Vec<_>>(), {
+            let mut expected = vec![&garbled, &other];
+            expected.sort();
+            expected
+        }, "a loose file a verified pack copy stands in for is not corrupt");
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }

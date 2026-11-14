@@ -724,6 +724,35 @@ pub fn hash_object_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+/// [`hash_object_bytes`] of everything `reader` yields, streamed, so an object is never held
+/// whole to be hashed.
+///
+/// # Returns
+/// * `Ok(String)`         - The hash (lowercase hex).
+/// * `Err(std::io::Error)` - `reader` failed.
+pub fn hash_object_reader(mut reader: impl std::io::Read) -> std::io::Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut reader, &mut hasher)?;
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// The content-addressing check on an object's computed hash `actual`: what
+/// [`verify_object_bytes`] decides, for a caller that hashed the bytes as a stream.
+///
+/// # Returns
+/// * `Ok(())`      - `actual` is `hash`.
+/// * `Err(String)` - It is not (the object store is corrupt); the message names both.
+pub fn verify_object_hash(hash: &str, actual: &str) -> Result<(), String> {
+    if actual != hash {
+        return Err(format!(
+            "Object {} is corrupt: its stored bytes hash to {} instead (content-addressing violated).",
+            hash, actual
+        ));
+    }
+
+    Ok(())
+}
+
 /// Whether `text` is an object hash in its one canonical spelling: 64 lowercase hex characters,
 /// as every hash in the store is written. Anything else — uppercase included, which would pass as
 /// "a hash" and then miss every byte-for-byte comparison and path lookup — is not.
@@ -752,16 +781,7 @@ pub fn verify_object_bytes(hash: &str, bytes: &[u8]) -> Result<(), String> {
     #[cfg(test)]
     VERIFY_CALLS.with(|calls| calls.set(calls.get() + 1));
 
-    let actual = hash_object_bytes(bytes);
-
-    if actual != hash {
-        return Err(format!(
-            "Object {} is corrupt: its stored bytes hash to {} instead (content-addressing violated).",
-            hash, actual
-        ));
-    }
-
-    Ok(())
+    verify_object_hash(hash, &hash_object_bytes(bytes))
 }
 
 #[cfg(test)]

@@ -219,6 +219,24 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // Last, once every repair before it has run: what a durable ref still reaches and this store
     // cannot give back. A walk that cannot finish claims nothing lost.
     let lost = recovery_utils::find_lost_objects();
+    if let Ok(lost) = &lost {
+        if lost.damaged_unreached > 0 {
+            notes.push(format!(
+                "{} damaged loose object file(s) that no history needs are left in place; storing the same content again would keep the damaged file.",
+                lost.damaged_unreached
+            ));
+        }
+        if lost.damaged_held > 0 {
+            notes.push(format!(
+                "{} damaged loose object file(s) sit at addresses this warehouse holds by hash alone, redacted or withheld, so they are not counted lost; they are left in place, and a read of one fails until the file is removed.",
+                lost.damaged_held
+            ));
+        }
+        // A refusal lists it among the reasons its check may be short.
+        if let (Some(unchecked), true) = (&lost.loose_unchecked, lost.is_empty()) {
+            notes.push(format!("The check for lost objects may be short: {}", unchecked));
+        }
+    }
     let objects_lost = match &lost {
         Ok(lost) if !lost.is_empty() => Some(ObjectsLost::of(lost)),
         _ => None,
@@ -285,6 +303,10 @@ pub(crate) struct ObjectsLost {
     /// How many reachable objects the store could not read.
     unreadable: usize,
 
+    /// How many reachable objects have only a loose file whose bytes are not theirs. The files
+    /// are kept where they are.
+    corrupt: usize,
+
     /// Up to 20 of them, grouped by why each is lost.
     hashes: Vec<LostObject>,
 
@@ -310,7 +332,7 @@ pub(crate) struct ObjectsLost {
 pub(crate) struct LostObject {
     hash: String,
 
-    /// "absent", or why the object could not be read.
+    /// "absent", "corrupt", or why the object could not be read.
     reason: String,
 }
 
@@ -319,11 +341,13 @@ impl ObjectsLost {
         let mut hashes: Vec<LostObject> = lost.absent.iter()
             .map(|hash| LostObject { hash: hash.clone(), reason: "absent".to_string() })
             .chain(lost.unreadable.iter().map(|(hash, reason)| LostObject { hash: hash.clone(), reason: reason.clone() }))
+            .chain(lost.corrupt.keys().map(|hash| LostObject { hash: hash.clone(), reason: "corrupt".to_string() }))
             .collect();
         hashes.sort_by(|a, b| (&a.reason, &a.hash).cmp(&(&b.reason, &b.hash)));
         hashes.truncate(LOST_HASHES_LISTED);
 
-        let all: std::collections::BTreeSet<String> = lost.absent.iter().chain(lost.unreadable.keys()).cloned().collect();
+        let all: std::collections::BTreeSet<String> =
+            lost.absent.iter().chain(lost.unreadable.keys()).chain(lost.corrupt.keys()).cloned().collect();
         let (pallets, pallets_unknown) = match recovery_utils::pallets_reaching(&all) {
             Ok(pallets) => (pallets, None),
             Err(error) => (Vec::new(), Some(error)),
@@ -332,6 +356,7 @@ impl ObjectsLost {
         ObjectsLost {
             absent: lost.absent.len(),
             unreadable: lost.unreadable.len(),
+            corrupt: lost.corrupt.len(),
             hashes,
             pallets,
             pallets_unknown,
@@ -342,10 +367,10 @@ impl ObjectsLost {
 
     /// The report's lines, for the refusal's message.
     fn lines(&self) -> Vec<String> {
-        let total = self.absent + self.unreadable;
+        let total = self.absent + self.unreadable + self.corrupt;
         let mut lines = vec![format!(
-            "{} object(s) that history still reaches cannot be read from this store: {} absent, {} unreadable.",
-            total, self.absent, self.unreadable
+            "{} object(s) that history still reaches cannot be read from this store: {} absent, {} unreadable, {} corrupt.",
+            total, self.absent, self.unreadable, self.corrupt
         )];
         let mut reason: Option<&str> = None;
         for object in &self.hashes {

@@ -649,6 +649,7 @@ fn heal_refuses_as_objects_lost_when_a_reachable_object_is_absent() {
     let lost = &value["error"]["details"]["objects_lost"];
     assert_eq!(lost["absent"], 1, "{}", value);
     assert_eq!(lost["unreadable"], 0, "{}", value);
+    assert_eq!(lost["corrupt"], 0, "{}", value);
     assert_eq!(lost["hashes"][0]["hash"], hash.as_str(), "{}", value);
     assert_eq!(lost["hashes"][0]["reason"], "absent", "{}", value);
     assert_eq!(lost["pallets"], serde_json::json!(["main"]), "{}", value);
@@ -661,6 +662,55 @@ fn heal_refuses_as_objects_lost_when_a_reachable_object_is_absent() {
     // The verdict records nothing: the next run says the same.
     let again = area.run(&root, &["--json", "heal"]);
     assert_eq!(again.status.code(), Some(58), "{}", text(&again.stdout));
+}
+
+#[test]
+fn a_corrupt_loose_object_refuses_reads_and_heal_names_it_lost() {
+    // FORK-447: a reachable blob whose loose file is corrupt fails a read with a code naming
+    // heal, and heal, whose walk reads no leaf's bytes, names it lost instead of passing. The
+    // file is kept.
+    // Mutation: leave a corrupt loose read unframed (exit 1), or skip heal's loose scan (heal
+    // passes) → red.
+    let area = Area::new("corrupt-loose");
+    let root = area.warehouse();
+    healed(&area, &root);
+
+    let hash = blob_hash("one\n");
+    let path = loose_object(&root, &hash);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[0] ^= 0xff;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let out = area.base.join("exported");
+    let read = area.run(&root, &["--json", "git", "export", out.to_str().unwrap()]);
+    assert_eq!(read.status.code(), Some(57), "{}{}", text(&read.stdout), text(&read.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "object_unreadable", "{}", value);
+    assert_eq!(value["error"]["next_step"], "forklift heal", "{}", value);
+
+    let output = area.run(&root, &["--json", "heal"]);
+    assert_eq!(output.status.code(), Some(58), "{}{}", text(&output.stdout), text(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let lost = &value["error"]["details"]["objects_lost"];
+    assert_eq!((&lost["absent"], &lost["unreadable"], &lost["corrupt"]), (&serde_json::json!(0), &serde_json::json!(0), &serde_json::json!(1)), "{}", value);
+    assert_eq!(lost["hashes"][0]["hash"], hash.as_str(), "{}", value);
+    assert_eq!(lost["hashes"][0]["reason"], "corrupt", "{}", value);
+    assert_eq!(lost["pallets"], serde_json::json!(["main"]), "{}", value);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes, "heal keeps the corrupt file");
+
+    let human = area.run(&root, &["heal"]);
+    assert!(text(&human.stderr).contains("0 absent, 0 unreadable, 1 corrupt"), "{}", text(&human.stderr));
+
+    // A damaged file no history needs is not counted lost, only noted as left in place.
+    let stray = loose_object(&root, &blob_hash("never stored\n"));
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    std::fs::write(&stray, b"not zstd").unwrap();
+    let again = area.run(&root, &["--json", "heal"]);
+    assert_eq!(again.status.code(), Some(58), "{}", text(&again.stdout));
+    let value: serde_json::Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(value["error"]["details"]["objects_lost"]["corrupt"], 1, "{}", value);
+    assert!(value["error"]["details"]["notes"].as_array().unwrap().iter()
+        .any(|note| note.as_str().unwrap().starts_with("1 damaged loose object file(s) that no history needs are left in place")), "{}", value);
 }
 
 #[test]

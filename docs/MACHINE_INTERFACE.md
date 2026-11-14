@@ -85,7 +85,17 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 46** (current): two new refusal codes. `object_unreadable` (exit 57): an object the command
+**Schema 47** (current): a corrupt loose object is now refused and reported. A read whose only
+copy of an object is a loose file that does not decompress, or decompresses to other content,
+refuses with `object_unreadable` (exit 57), where it failed with an uncoded message. `heal`'s closing
+check reads every loose file, and one that history still reaches counts as lost: `objects_lost`
+(exit 58) gains a `corrupt` count beside `absent` and `unreadable`, and lists such a hash with the
+reason `corrupt`. The file is left where it is. A corrupt loose file no history reaches, or one
+at an address the warehouse holds by hash alone, redacted or withheld, is not counted lost: the report's `notes` count it as left in
+place. A loose file that cannot be read at all is not judged: the check names it as a reason it may
+be short, in `degraded_sources` when it refuses and in `notes` when it does not.
+
+**Schema 46**: two new refusal codes. `object_unreadable` (exit 57): an object the command
 needs cannot be read from the store: it is missing there, or a pack file holding it is damaged (a
 lost, cut-short or corrupt index, a missing data file, a damaged index entry). Nothing was changed,
 and `next_step` is `forklift heal`, which rebuilds a lost or damaged index from its pack's data

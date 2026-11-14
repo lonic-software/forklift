@@ -2211,7 +2211,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "reason": {
-          "description": "\"absent\", or why the object could not be read.",
+          "description": "\"absent\", \"corrupt\", or why the object could not be read.",
           "type": "string"
         }
       },
@@ -2226,6 +2226,12 @@ A command not listed here either reports only the generic human-message shape `{
       "properties": {
         "absent": {
           "description": "How many reachable objects the store does not hold at all.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "corrupt": {
+          "description": "How many reachable objects have only a loose file whose bytes are not theirs. The files\nare kept where they are.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -2268,6 +2274,7 @@ A command not listed here either reports only the generic human-message shape `{
       "required": [
         "absent",
         "unreadable",
+        "corrupt",
         "hashes",
         "pallets"
       ],
