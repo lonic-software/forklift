@@ -19,7 +19,7 @@ use crate::globals;
 use crate::util::lock_utils::{RefLock, ServeLock};
 use crate::util::sealed_utils::{self, Unrecorded};
 use crate::util::withholding::{self, ChunkDigest, WithheldSet};
-use crate::util::{object_utils, record_utils, tombstone_repair, tombstone_utils};
+use crate::util::{applied_redactions, file_utils, object_utils, record_utils, tombstone_utils, unavailable};
 
 /// The statement a hash takes when the repair keeps it withheld from an entry that lost its own.
 pub const PLACEHOLDER_STATEMENT: &str = "Withheld by this host; the statement was lost to a damaged record.";
@@ -38,8 +38,8 @@ pub struct Repaired {
     /// Each object the history kept here names that is absent and that no record holds: content a
     /// lost entry may have withheld, once its copy was deleted.
     pub absent: Vec<String>,
-    /// Why the history could not be walked for absent objects, when it could not.
-    pub walk_failed: Option<String>,
+    /// The warehouse repaired, quoted for a command line.
+    pub warehouse: String,
 }
 
 impl Repaired {
@@ -65,27 +65,28 @@ impl Repaired {
         for hash in &self.placeholders {
             lines.push(format!(
                 "Kept {} withheld, though its entry did not read whole; restate its statement with \
-                \"forklift-server withhold add {} <statement>\".",
-                hash, hash
+                \"forklift-server withhold add --root {} {} --statement <statement>\".",
+                hash, self.warehouse, hash
             ));
         }
 
-        match (&self.walk_failed, self.absent.len()) {
-            (Some(reason), _) => lines.push(format!("The history could not be walked for content a lost entry withheld: {}", reason)),
-            (None, 0) => lines.push("No object the history here names is absent without a record holding it.".to_string()),
-            (None, n) => lines.push(format!(
+        match self.absent.len() {
+            0 => lines.push("No object the history here names is absent without a record holding it.".to_string()),
+            n => lines.push(format!(
                 "{} object{} the history here names {} absent, and no record holds {}: content a lost entry may \
                 have withheld, once its copy was deleted. Withhold each one that was with \"forklift-server \
-                withhold add <hash> <statement>\":",
-                n, if n == 1 { "" } else { "s" }, if n == 1 { "is" } else { "are" }, if n == 1 { "it" } else { "them" }
+                withhold add --root {} <hash> --statement <statement>\":",
+                n, if n == 1 { "" } else { "s" }, if n == 1 { "is" } else { "are" }, if n == 1 { "it" } else { "them" },
+                self.warehouse
             )),
         }
 
         lines.extend(self.absent.iter().map(|hash| format!("  {}", hash)));
 
         lines.push(
-            "Content a lost entry withheld whose copy is still stored is served again once this warehouse is: \
-            no record shows it. Withhold it again before serving if you know of any.".to_string()
+            "Content a lost entry withheld whose copy is still stored is served again once this warehouse is, \
+            and content it withheld that was never stored here can be lifted and served: no record shows \
+            either. Withhold any you know of again before serving.".to_string()
         );
 
         lines
@@ -100,9 +101,9 @@ impl Repaired {
 /// * `Ok(Repaired)` - What was repaired.
 /// * `Err(String)`  - The record reads, or is absent from a root never served, so there is nothing
 ///                    to repair; it is of a version this build does not know, which a newer
-///                    Forklift repairs; the root is being served; or a file could not be read or
-///                    written. Nothing was changed, unless the record's write failed after the
-///                    damaged one was moved aside: the error then names the copy to put back.
+///                    Forklift repairs; the root is being served; the history could not be walked;
+///                    or a file could not be read or written. The damaged record is left in
+///                    place until the repaired one replaces it, so a rerun finds it as it was.
 pub fn repair_withheld() -> Result<Repaired, String> {
     let _serve_lock = ServeLock::acquire().map_err(|e| format!("Refusing to repair the record of withheld content: {}", e))?;
     let lock = RefLock::acquire()?;
@@ -133,25 +134,40 @@ pub fn repair_withheld() -> Result<Repaired, String> {
 
     let (set, salvaged, placeholders, unreadable_lines) = salvage(bytes.as_deref().unwrap_or_default());
 
-    let set_aside = match bytes {
-        Some(_) => Some(tombstone_repair::set_aside(&path)?),
+    // Everything is worked out before anything is written, so a repair that stops or fails leaves
+    // the damaged record where it was, for a rerun to find whole.
+    let absent = absent_unheld(&set).map_err(|e| format!(
+        "Refusing to repair the record of withheld content: the history could not be walked for content a \
+        lost entry withheld, which the report must list. Nothing was changed. {}",
+        e
+    ))?;
+
+    // A copy aside, then the record replaced: never a moment without one.
+    let set_aside = match &bytes {
+        Some(bytes) => Some(copy_aside(&path, bytes)?),
         None => None,
     };
 
-    set.write(&lock).map_err(|e| match &set_aside {
-        Some(copy) => format!(
-            "{} The damaged record was moved aside to \"{}\"; move it back to \"{}\" before repairing again.",
-            e, copy.to_string_lossy(), path.to_string_lossy()
-        ),
-        None => e,
-    })?;
+    set.write(&lock)?;
 
-    let (absent, walk_failed) = match absent_unheld() {
-        Ok(absent) => (absent, None),
-        Err(e) => (Vec::new(), Some(e)),
-    };
+    // The storage root may be relative to where the command runs.
+    let root = std::path::absolute(globals::forklift_root()).unwrap_or_else(|_| globals::forklift_root());
+    let warehouse = crate::util::franchise_utils::quote(&root.parent().unwrap_or(&root).to_string_lossy());
 
-    Ok(Repaired { set_aside, salvaged, placeholders, unreadable_lines, absent, walk_failed })
+    Ok(Repaired { set_aside, salvaged, placeholders, unreadable_lines, absent, warehouse })
+}
+
+/// Keep `bytes`, the damaged record at `path`, beside it under a name no other repair uses.
+fn copy_aside(path: &std::path::Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let target = path.with_file_name(format!("{}.damaged-{}", path.file_name().unwrap_or_default().to_string_lossy(), stamp));
+
+    file_utils::replace_file_atomically(&target, bytes)?;
+
+    Ok(target)
 }
 
 /// Every entry of a damaged record that still reads whole, and each hash kept with the
@@ -195,9 +211,14 @@ fn salvage(bytes: &[u8]) -> (WithheldSet, usize, Vec<String>, usize) {
 }
 
 /// Every object the history this root keeps names that is absent and that no record holds, the
-/// sealed record included, sorted.
-fn absent_unheld() -> Result<Vec<String>, String> {
-    let tolerated = sealed_utils::read_tolerated()?;
+/// sealed record and `withheld`, the salvaged record, included, sorted.
+fn absent_unheld(withheld: &WithheldSet) -> Result<Vec<String>, String> {
+    let tolerated = sealed_utils::Tolerated {
+        sealed: sealed_utils::read_sealed()?,
+        applied: applied_redactions::read_applied()?,
+        withheld: withheld.clone(),
+        unavailable: unavailable::read_unavailable()?,
+    };
     let walked = sealed_utils::walk(&[], &tolerated, Unrecorded::Boundary)?
         .map_err(|damage| format!("object {} is absent, named by {}", damage.hash, damage.named_by))?;
 
@@ -211,7 +232,7 @@ fn absent_unheld() -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
-    use crate::util::file_utils;
+    use crate::util::pallet_utils;
 
     struct Scratch {
         root: PathBuf,
@@ -224,6 +245,9 @@ mod tests {
             let _ = file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
+            // The walk reads the bay position, as on any warehouse a host serves.
+            pallet_utils::write_position_in(&root.join(globals::FOLDER_NAME_FORKLIFT_ROOT),
+                &pallet_utils::BayPosition::new("main", None)).unwrap();
 
             Scratch { root, _scope: scope }
         }
@@ -278,7 +302,7 @@ mod tests {
         assert_eq!(repaired.set_aside.as_ref(), Some(&moved[0]));
 
         let report = repaired.report().join("\n");
-        assert!(report.contains(&format!("forklift-server withhold add {} <statement>", B)), "{}", report);
+        assert!(report.contains(&format!("forklift-server withhold add --root {} {} --statement <statement>", repaired.warehouse, B)), "{}", report);
         assert!(report.contains("served again"), "{}", report);
 
         assert!(repair_withheld().unwrap_err().contains("nothing to repair"), "a record that reads is left alone");

@@ -2990,7 +2990,8 @@ fn a_served_root_whose_withheld_record_is_lost_or_damaged_refuses_until_its_oper
     let repaired = withhold(&root, &["repair"]);
     assert!(repaired.status.success(), "{}", String::from_utf8_lossy(&repaired.stderr));
     let report = String::from_utf8_lossy(&repaired.stdout).into_owned();
-    assert!(report.contains(&format!("forklift-server withhold add {} <statement>", film)), "{}", report);
+    // The root as the server opened it, which this side cannot spell on every platform.
+    assert!(report.contains("\"forklift-server withhold add --root ") && report.contains(&format!(" {} --statement <statement>\"", film)), "{}", report);
 
     let server = Server::serve(&root);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);

@@ -304,11 +304,17 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<WithheldSet, Unparsed> {
 pub fn read_withheld() -> Result<WithheldSet, String> {
     let bytes = match std::fs::read(withheld_path()) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return match tombstone_utils::served_state()? {
-            ServedState::Never => Ok(WithheldSet::default()),
-            ServedState::Unfinished | ServedState::Served => Err(damaged(
-                "This warehouse has been served, but its record of withheld content is missing."
-            )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match tombstone_utils::served_state()? {
+            ServedState::Never => return Ok(WithheldSet::default()),
+            // A first serve may have landed between the two reads, the record durably before the
+            // mark, so the record is read once more before it is judged lost.
+            ServedState::Unfinished | ServedState::Served => match std::fs::read(withheld_path()) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(damaged(
+                    "This warehouse has been served, but its record of withheld content is missing."
+                )),
+                Err(e) => return Err(damaged(&format!("The record of withheld content could not be read: {}.", e))),
+            },
         },
         Err(e) => return Err(damaged(&format!("The record of withheld content could not be read: {}.", e))),
     };
