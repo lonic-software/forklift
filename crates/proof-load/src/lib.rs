@@ -9,7 +9,8 @@
 //! and a read-only warehouse, a work tree on a case-folding or no-exec volume, network faults
 //! through a proxy every host is served behind (with a killed server restarted), a check that every
 //! server route the version's route table lists was answered through that proxy, a check that
-//! every write a traced server made falls in its route's declared write set, and the report.
+//! every write a traced server made falls in its route's declared write set, server kill points
+//! and server power loss (Linux), and the report.
 
 pub mod bindings;
 pub mod census;
@@ -31,6 +32,7 @@ pub mod runner;
 pub mod scenario;
 pub mod scrub;
 pub mod servekill;
+pub mod servepower;
 pub mod tool;
 pub mod trace;
 pub mod volume;

@@ -96,18 +96,37 @@ fn unit_of(call: &Call, windows: &[Window]) -> (String, u64) {
     window_of(call, windows).map_or_else(|| ("serve background".to_string(), 0), |window| (format!("serve {}", window.route), window.from))
 }
 
+/// The route `table` resolves `exchange` to, by its label.
+pub(crate) fn route_of(exchange: &Exchange, table: Option<&RouteTable>) -> String {
+    table.and_then(|table| table.resolve(Mode::Single, &exchange.method, &exchange.path).ok().flatten()).map(|route| route.label())
+        .unwrap_or_else(|| format!("{} (no listed route)", exchange.method))
+}
+
 /// Each exchange's window and what names it, numbered in order.
 fn windows(exchanges: &[Exchange], table: Option<&RouteTable>) -> Vec<Window> {
     exchanges.iter().enumerate().filter_map(|(at, exchange)| {
         let from = exchange.forwarded?;
-        let route = table.and_then(|table| table.resolve(Mode::Single, &exchange.method, &exchange.path).ok().flatten()).map(|route| route.label())
-            .unwrap_or_else(|| format!("{} (no listed route)", exchange.method));
-        Some(Window { at, from, to: exchange.answered.unwrap_or(u64::MAX), route })
+        Some(Window { at, from, to: exchange.answered.unwrap_or(u64::MAX), route: route_of(exchange, table) })
     }).collect()
 }
 
+/// What a restart took, merged into the grade of the fault it followed: its removals are outside
+/// knowledge the user needed before any other step, and what it could not carry out, or the
+/// server's last refusal, is unextractable.
+pub(crate) fn merge(graded: &mut faulted::Graded, restarted: Restarted) {
+    let Restarted { outside_knowledge, unextractable, refused } = restarted;
+    for (at, step) in outside_knowledge.into_iter().enumerate() {
+        graded.recoverability.outside_knowledge.insert(at, step);
+    }
+    for text in unextractable.into_iter().chain(refused.map(|said| format!("the restarted server refused: {}", said))) {
+        if !graded.unextractable.contains(&text) {
+            graded.unextractable.push(text);
+        }
+    }
+}
+
 /// Writes a server trace back where the run's traces are kept: the host removes each it reads.
-fn keep(settings: &Settings, name: &str, text: &str) {
+pub(crate) fn keep(settings: &Settings, name: &str, text: &str) {
     let _ = std::fs::write(settings.traces.join(format!("{}.trace", name)), text);
 }
 
@@ -337,15 +356,8 @@ fn inject(scenario: &Scenario, programs: &Programs, settings: &Settings, templat
     let calls = trace::parse(&text).map_err(RunError::Io)?;
     let landing = kill::landing_served(&calls, point, &root, pid);
     let mut graded = (landing == Landing::Landed).then_some(graded);
-    if let (Some(graded), Some(Restarted { outside_knowledge, unextractable, refused })) = (graded.as_mut(), restarted) {
-        for (at, step) in outside_knowledge.into_iter().enumerate() {
-            graded.recoverability.outside_knowledge.insert(at, step);
-        }
-        for text in unextractable.into_iter().chain(refused.map(|said| format!("the restarted server refused: {}", said))) {
-            if !graded.unextractable.contains(&text) {
-                graded.unextractable.push(text);
-            }
-        }
+    if let (Some(graded), Some(restarted)) = (graded.as_mut(), restarted) {
+        merge(graded, restarted);
     }
     // An area that graded well holds nothing to look at; one that did not is kept for diagnosis.
     if graded.as_ref().is_none_or(|graded| !graded.grade.is_failure()) {

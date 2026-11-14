@@ -401,7 +401,7 @@ pub struct Replay {
 }
 
 /// Calls that make something durable.
-const SYNCS: &[&str] = &["fsync", "fdatasync", "sync", "syncfs"];
+pub(crate) const SYNCS: &[&str] = &["fsync", "fdatasync", "sync", "syncfs"];
 
 /// Calls that change only what the model does not hold: times, owners, extended attributes, and a
 /// range writeback that promises nothing durable.
@@ -418,14 +418,23 @@ impl Replay {
 
     /// Replays one traced line, run in the folder `start`. `before` sees the model before each
     /// call, by the call's index.
-    pub fn line(&mut self, calls: &[Call], start: &str, mut before: impl FnMut(usize, &Model)) -> Result<(), String> {
+    pub fn line(&mut self, calls: &[Call], start: &str, before: impl FnMut(usize, &Model)) -> Result<(), String> {
+        self.grouped(calls, trace::thread_groups(calls), start, before)
+    }
+
+    /// [`Replay::line`] of a trace attached to the running process `pid`: every thread the trace
+    /// shows that no traced clone made is one of that process's own, sharing its descriptors.
+    pub fn attached(&mut self, calls: &[Call], pid: u32, start: &str, before: impl FnMut(usize, &Model)) -> Result<(), String> {
+        self.grouped(calls, trace::attached_groups(calls, pid), start, before)
+    }
+
+    fn grouped(&mut self, calls: &[Call], groups: BTreeMap<u32, u32>, start: &str, mut before: impl FnMut(usize, &Model)) -> Result<(), String> {
         // Every line is a new set of processes.
         self.descriptions.clear();
         self.tables.clear();
         self.table_of.clear();
         self.umasks.clear();
         self.model.changed.clear();
-        let groups = trace::thread_groups(calls);
         let mut threads: BTreeMap<u32, usize> = BTreeMap::new();
         for (tid, group) in &groups {
             if tid != group {
@@ -1108,7 +1117,7 @@ fn set_mode(_: &Path, _: u32) -> std::io::Result<()> {
 /// Removes a tree the harness wrote itself, its folders made writable first, since a crash state
 /// can hold a read-only folder whose entries could not be removed otherwise. Links are removed,
 /// never followed.
-fn remove_tree(path: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_tree(path: &Path) -> std::io::Result<()> {
     fn open_up(path: &Path) -> std::io::Result<()> {
         if !std::fs::symlink_metadata(path)?.is_dir() {
             return Ok(());
@@ -1138,6 +1147,10 @@ pub enum Moment {
     Ending { line: usize, command: String },
     /// After a line of the faulted command exited.
     After { line: usize, command: String },
+    /// On the host's server while the faulted command ran: in the run cut once the server
+    /// answered `request`, counted from 0 among the faulted command's, or in the run that went to
+    /// its end when none; `when` says where in that run.
+    Served { request: Option<usize>, route: String, when: String },
 }
 
 impl Moment {
@@ -1148,15 +1161,19 @@ impl Moment {
             Moment::During { point } => (point.line, true),
             Moment::Synced { line, .. } | Moment::Ending { line, .. } => (*line, true),
             Moment::After { line, .. } => (line + 1, false),
+            // Every state of one served run is graded with that run's steps.
+            Moment::Served { request, .. } => (request.unwrap_or(usize::MAX), false),
         }
     }
 
-    fn label(&self) -> String {
+    pub fn label(&self) -> String {
         match self {
             Moment::During { point } => format!("line {} {} {}#{} {}", point.line + 1, point.command, point.name, point.when, point.base),
             Moment::Synced { line, command, call, name } => format!("line {} {} before {} at traced call {}", line + 1, command, name, call + 1),
             Moment::Ending { line, command } => format!("line {} {} after its last call, before it exited", line + 1, command),
             Moment::After { line, command } => format!("after line {} {}", line + 1, command),
+            Moment::Served { request: Some(request), route, when } => format!("server, run cut at request {} {}: {}", request + 1, route, when),
+            Moment::Served { request: None, when, .. } => format!("server, run to its end: {}", when),
         }
     }
 }
@@ -1199,15 +1216,7 @@ pub fn crashes(fixture: &Image, root: &Root, start: &str, umask: u32, lines: &[L
             .map(|(index, _)| index).collect()
     };
     let moments: usize = lines.iter().map(|line| line.points.len() + synced(line).len() + 2).sum();
-    let mut rng = Rng::new(seed);
-    // The moments a variant is drawn at, with repeats: each draw is its own variant.
-    let mut draws: BTreeMap<usize, usize> = BTreeMap::new();
-    for _ in 0..variants {
-        if moments > 0 {
-            *draws.entry(rng.below(moments as u64) as usize).or_default() += 1;
-        }
-    }
-    let mut collector = Collector { crashes: Vec::new(), seen: BTreeMap::new(), cached: None, draws, rng, moment: 0, drawn: 0 };
+    let mut collector = Collector::new(moments, variants, seed);
     let last = lines.len().checked_sub(1).ok_or_else(|| "the faulted command has no lines".to_string())?;
     for (index, line) in lines.iter().enumerate() {
         let here: BTreeMap<usize, &Point> = line.points.iter().map(|point| (point.call, *point)).collect();
@@ -1226,15 +1235,11 @@ pub fn crashes(fixture: &Image, root: &Root, start: &str, umask: u32, lines: &[L
         collector.record(Moment::Ending { line: index, command: line.command.clone() }, &replay.model, false);
         collector.record(Moment::After { line: index, command: line.command.clone() }, &replay.model, index == last);
     }
-    // A draw a real moment superseded left a gap: number the variants that remain from 1.
-    let mut crashes = collector.crashes;
-    for (number, variant) in crashes.iter_mut().filter_map(|crash| crash.variant.as_mut()).enumerate() {
-        *variant = number + 1;
-    }
-    Ok((crashes, replay.model.volatile_image()))
+    Ok((collector.finish(), replay.model.volatile_image()))
 }
 
-struct Collector {
+/// Every distinct state the moments recorded leave, with seeded variants drawn at seeded moments.
+pub(crate) struct Collector {
     crashes: Vec<Crash>,
     /// Each state's crash, by its tree's digest, whether it was acknowledged, and its step trail.
     seen: BTreeMap<(String, bool, (usize, bool)), usize>,
@@ -1248,7 +1253,30 @@ struct Collector {
 }
 
 impl Collector {
-    fn record(&mut self, moment: Moment, model: &Model, acknowledged: bool) {
+    /// A collector of `moments` moments, `variants` of them drawn, with repeats, from `seed`.
+    pub(crate) fn new(moments: usize, variants: usize, seed: u64) -> Collector {
+        let mut rng = Rng::new(seed);
+        // The moments a variant is drawn at, with repeats: each draw is its own variant.
+        let mut draws: BTreeMap<usize, usize> = BTreeMap::new();
+        for _ in 0..variants {
+            if moments > 0 {
+                *draws.entry(rng.below(moments as u64) as usize).or_default() += 1;
+            }
+        }
+        Collector { crashes: Vec::new(), seen: BTreeMap::new(), cached: None, draws, rng, moment: 0, drawn: 0 }
+    }
+
+    /// The states found, the variants among them numbered from 1: a draw a real moment superseded
+    /// left a gap.
+    pub(crate) fn finish(self) -> Vec<Crash> {
+        let mut crashes = self.crashes;
+        for (number, variant) in crashes.iter_mut().filter_map(|crash| crash.variant.as_mut()).enumerate() {
+            *variant = number + 1;
+        }
+        crashes
+    }
+
+    pub(crate) fn record(&mut self, moment: Moment, model: &Model, acknowledged: bool) {
         if self.cached.as_ref().is_none_or(|(version, _, _)| *version != model.version) {
             let image = model.durable_image();
             let key = digest(&image);
@@ -1305,6 +1333,8 @@ pub struct ScenarioPower {
     pub refusals: Vec<String>,
     /// States whose grading failed to happen at all, with why.
     pub errors: Vec<String>,
+    /// For a server's power loss, each run that never reached its cut, with why.
+    pub not_reached: Vec<String>,
     pub crashes: Vec<GradedCrash>,
 }
 
@@ -1424,7 +1454,7 @@ fn bound(image: &Image, needles: &[&str]) -> Option<String> {
 
 /// The umask this process runs under, which every traced command inherits; read from /proc, since
 /// the call that reads it sets it too.
-fn harness_umask() -> Result<u32, String> {
+pub(crate) fn harness_umask() -> Result<u32, String> {
     let status = std::fs::read_to_string("/proc/self/status").map_err(|error| format!("reading /proc/self/status for the umask: {}", error))?;
     status.lines().find_map(|line| line.strip_prefix("Umask:")).and_then(|mask| u32::from_str_radix(mask.trim(), 8).ok())
         .ok_or_else(|| "/proc/self/status names no umask".to_string())
@@ -1450,6 +1480,7 @@ fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, sett
             steps.push(cut);
         }
         Moment::After { line, .. } => steps.extend(counted.lines[..=*line].iter().map(|line| line.outcome.clone())),
+        Moment::Served { .. } => return Err(RunError::Io("a server's crash state is graded through its host, not a client's copy".to_string())),
     }
     let graded = faulted::grade_after(&context, &counted.expected, counted.faulted, |_, first| {
         first.append(&mut steps);
@@ -1473,14 +1504,26 @@ pub struct Summary {
 /// The report's share of every scenario's power loss. A scenario reported not run is listed, and
 /// fails nothing.
 pub fn summarize(all: &[ScenarioPower]) -> Summary {
+    summarize_as(all, kill::Side::Client)
+}
+
+/// [`summarize`] for `side`'s power loss: a server's names, beside its states, each run that never
+/// reached its cut.
+pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
+    let (category, binding, prefix) = match side {
+        kill::Side::Client => (Category::PowerLossClient, "forklift", ""),
+        kill::Side::Server => (Category::PowerLossServer, "forklift-server", "server "),
+    };
+    let mut unreached = Vec::new();
     let (mut rows, mut refusals, mut errors, mut not_run, mut missing) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for scenario in all {
         if let Some(reason) = &scenario.not_run {
-            not_run.push(Completeness { check: format!("power loss of {}", scenario.scenario), cell: Cell::not_run(reason), missing: vec![] });
+            not_run.push(Completeness { check: format!("{}power loss of {}", prefix, scenario.scenario), cell: Cell::not_run(reason), missing: vec![] });
             continue;
         }
         refusals.extend(scenario.refusals.iter().map(|refusal| format!("{}: {}", scenario.scenario, refusal)));
         errors.extend(scenario.errors.iter().map(|error| format!("{}: {}", scenario.scenario, error)));
+        unreached.extend(scenario.not_reached.iter().map(|why| format!("{}: {}", scenario.scenario, why)));
         if scenario.refusals.is_empty() && scenario.errors.is_empty() && scenario.crashes.is_empty() {
             missing.push(format!("{}: no crash state was graded", scenario.scenario));
         }
@@ -1495,8 +1538,8 @@ pub fn summarize(all: &[ScenarioPower]) -> Summary {
             let variant = crash.variant.map(|number| format!(" variant {}", number)).unwrap_or_default();
             rows.push(Row {
                 scenario: format!("{} power {}{}", scenario.scenario, crash.moment.label(), variant),
-                category: Category::PowerLossClient,
-                binding: "forklift".to_string(),
+                category,
+                binding: binding.to_string(),
                 grade: graded.grade,
                 recoverability: graded.recoverability.clone(),
                 note: Some(notes.join("; ")),
@@ -1504,15 +1547,18 @@ pub fn summarize(all: &[ScenarioPower]) -> Summary {
         }
     }
     if all.iter().all(|scenario| scenario.not_run.is_some()) {
-        missing.push("no scenario's power loss ran".to_string());
+        missing.push(format!("no scenario's {}power loss ran", prefix));
     }
     let mut completeness = vec![
-        Completeness { check: "power-loss states".to_string(), cell: Cell::Run, missing },
-        Completeness { check: "power-loss soundness".to_string(), cell: Cell::Run, missing: refusals },
-        Completeness { check: "power-loss states ran".to_string(), cell: Cell::Run, missing: errors },
+        Completeness { check: format!("{}power-loss states", prefix), cell: Cell::Run, missing },
+        Completeness { check: format!("{}power-loss soundness", prefix), cell: Cell::Run, missing: refusals },
+        Completeness { check: format!("{}power-loss states ran", prefix), cell: Cell::Run, missing: errors },
     ];
+    if side == kill::Side::Server {
+        completeness.push(Completeness { check: "server power-loss cuts reached".to_string(), cell: Cell::Run, missing: unreached });
+    }
     completeness.extend(not_run);
-    let cell = if rows.is_empty() { Cell::not_run("no power-loss state was graded") } else { Cell::Run };
+    let cell = if rows.is_empty() { Cell::not_run(&format!("no {}power-loss state was graded", prefix)) } else { Cell::Run };
     Summary { cell, rows, completeness }
 }
 
@@ -2071,6 +2117,52 @@ mod tests {
         let calls = trace::parse(&text).unwrap();
         assert!(calls[1].unreadable.as_deref().unwrap().contains("an unreadable dump row"));
         assert!(replayed(&[text]).unwrap_err().contains("an unreadable dump row"));
+    }
+
+    /// An attached trace's threads are the running process's own, whichever of them prints first:
+    /// one writes through a descriptor another opened.
+    ///
+    /// Revert: replay an attached trace as a line, its first thread the only process → the second
+    /// thread's write refuses as never opened.
+    #[test]
+    fn an_attached_server_s_threads_share_its_descriptors() {
+        let text = format!("5 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_APPEND) = 3</s/w/a>\n{}", write(6, 3, "/s/w/a", b"+served"));
+        let calls = trace::parse(&text).unwrap();
+        let mut attached = Replay::new(Model::of(&fixture()).unwrap(), root(), 0o022);
+        attached.attached(&calls, 4, "/", |_, _| {}).unwrap();
+        assert_eq!(data(&attached.model.volatile_image(), "w/a").unwrap(), b"old+served");
+        let mut line = Replay::new(Model::of(&fixture()).unwrap(), root(), 0o022);
+        assert!(line.line(&calls, "/", |_, _| {}).unwrap_err().contains("never seen opened"));
+    }
+
+    /// A server's power loss is reported under its own category and binding, its rows and checks
+    /// named for the server, and each run that never reached its cut is listed missing.
+    ///
+    /// Revert: report a server's states as a client's → the rows land in the client's category;
+    /// drop the unreached runs → the cut check lists nothing.
+    #[test]
+    fn a_server_s_power_loss_is_reported_as_the_server_s() {
+        let graded = Graded {
+            grade: crate::oracle::Grade::Healed, evidence: Default::default(), recoverability: Default::default(),
+            steps: vec![], readbacks: vec![], unextractable: vec![],
+        };
+        let moment = Moment::Served { request: Some(1), route: "POST /v1/pallets/{name}".into(), when: "as the server died".into() };
+        let crash = Crash { moment, acknowledged: false, shared: 1, variant: None, image: Default::default() };
+        let all = vec![ScenarioPower {
+            scenario: "lifted".into(), not_reached: vec!["the run cut at request 3: never request 3".into()],
+            crashes: vec![GradedCrash { crash, graded }], ..Default::default()
+        }];
+        let summary = summarize_as(&all, kill::Side::Server);
+        assert_eq!(summary.cell, Cell::Run);
+        assert_eq!(summary.rows.len(), 1);
+        assert_eq!((summary.rows[0].category, summary.rows[0].binding.as_str()), (Category::PowerLossServer, "forklift-server"));
+        assert_eq!(summary.rows[0].scenario, "lifted power server, run cut at request 2 POST /v1/pallets/{name}: as the server died");
+        let checks: Vec<&str> = summary.completeness.iter().map(|check| check.check.as_str()).collect();
+        assert_eq!(checks, ["server power-loss states", "server power-loss soundness", "server power-loss states ran", "server power-loss cuts reached"]);
+        assert_eq!(summary.completeness[3].missing, ["lifted: the run cut at request 3: never request 3"]);
+        let client = summarize(&all);
+        assert_eq!(client.rows[0].category, Category::PowerLossClient);
+        assert_eq!(client.completeness.len(), 3, "a client's power loss has no cuts");
     }
 
     /// A crash moment's label names its line, so two lines' moments at the same call read apart.

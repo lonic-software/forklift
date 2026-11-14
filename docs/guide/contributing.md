@@ -150,7 +150,14 @@ Notes:
   syncing call the server makes while the faulted command runs (the `kill points (server)` row):
   each point on a fresh build with strace attached to the listening server, the server restarted
   as above, and each point's unit the route whose request held the call, or the server's
-  background work; a scenario whose command only reads from the server owes none. A fault whose condition
+  background work; a scenario whose command only reads from the server owes none. With `--power`
+  (CI: `history`, `lifted`), each hosted scenario it names also has its host's machine lose power
+  (the `power loss (server)` row): one traced run goes to its end and one is cut after each answer
+  the server gives, the server killed with the answer undelivered; each run's server trace is
+  replayed over the warehouse as the idle server held it, its states taken from the answer before
+  its cut to the server's death, and each state graded on the run's own area restored at its own
+  path, the server restarted as above. A run that never reaches its cut is listed in the `server
+  power-loss cuts reached` check. A fault whose condition
   no longer held when the command ended, every line of it landed, is listed as missing from its
   lane's check and fails the run; one that held
   is graded, so a refused write the tool swallowed counts as an acknowledgement. A retry resumes at the line that did not land, as a user

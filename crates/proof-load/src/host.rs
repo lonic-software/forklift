@@ -227,6 +227,13 @@ impl Host {
     pub fn finish(self) -> (Vec<Exchange>, Vec<Result<String, String>>) {
         self.kill();
         let log = self.proxy.log();
+        (log, self.end_traces())
+    }
+
+    /// Kills the server and ends its traces, as [`Host::finish`] does, keeping the host: a restart
+    /// serves the same warehouse behind the same URL, untraced.
+    pub fn end_traces(&self) -> Vec<Result<String, String>> {
+        self.kill();
         let attached = lock(&self.tracing).take().map(|tracing| tracing.attached).unwrap_or_default();
         let mut traces = Vec::new();
         for mut tracer in attached {
@@ -246,7 +253,12 @@ impl Host {
             #[allow(clippy::disallowed_methods, reason = "the harness's own trace, read in full above")]
             let _ = std::fs::remove_file(&tracer.trace);
         }
-        (log, traces)
+        traces
+    }
+
+    /// The host warehouse's folder.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Kills the server, as a crash would: no shutdown, whatever it holds left behind.
