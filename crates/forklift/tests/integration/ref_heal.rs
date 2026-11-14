@@ -580,18 +580,25 @@ fn a_served_warehouses_ref_is_never_set_below_what_its_own_bytes_name() {
 }
 
 #[test]
-fn a_meta_pallet_is_refused_and_a_refusal_names_what_the_run_already_set() {
-    // Mutation: drop the "@" check → main is set to the office head → red.
+fn meta_history_is_refused_however_spelled_and_a_refusal_names_what_the_run_already_set() {
+    // Mutation: drop refuse_meta_history → main is set to the office head → red.
     // Mutation: return the bare refusal from the --ref loop → the earlier rebuild goes unreported → red.
     let area = Area::new("set-partial");
     let (root, side) = side_only_its_bytes_name(&area);
+    area.run_ok(&root, &["office", "enroll"]);
+    let office = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+        forklift_core::util::pallet_utils::get_meta_pallet_head("office").unwrap().expect("an enrolled office has a head")
+    };
     let main = head(&root, "main");
     std::fs::write(ref_path(&root, "main"), &main.as_bytes()[..20]).unwrap();
 
-    let meta = area.run(&root, &["heal", "--ref", "main=@office"]);
-    assert!(!meta.status.success(), "{}", text(&meta.stdout));
-    assert!(text(&meta.stderr).contains("meta pallet"), "{}", text(&meta.stderr));
-    assert_eq!(std::fs::read(ref_path(&root, "main")).unwrap(), main.as_bytes()[..20].to_vec());
+    for spelled in ["@office".to_string(), office.clone(), office[..16].to_string()] {
+        let meta = area.run(&root, &["heal", "--ref", &format!("main={}", spelled)]);
+        assert!(!meta.status.success(), "{}: {}", spelled, text(&meta.stdout));
+        assert!(text(&meta.stderr).contains("meta history"), "{}: {}", spelled, text(&meta.stderr));
+        assert_eq!(std::fs::read(ref_path(&root, "main")).unwrap(), main.as_bytes()[..20].to_vec(), "{}", spelled);
+    }
     area.run_ok(&root, &["heal", "--ref", &format!("main={}", main)]);
 
     std::fs::write(ref_path(&root, "side"), &side.as_bytes()[..20]).unwrap();
