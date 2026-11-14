@@ -178,7 +178,10 @@ const PUT_OBJECT: &[Entry] = &[
     entry(Change::Rename, ".forklift/objects/{hash[..2]}/{hash[2..]}.tmp~*"), entry(Change::Rename, ".forklift/objects/{hash[..2]}/{hash[2..]}"),
 ];
 // withholding::record_digest: the withheld record rewritten whole. No scenario reaches it yet
-// (FORK-474), so this set is from the source alone.
+// (FORK-474), so this set is from the source alone. The redaction deleter records a digest in the
+// same file in the background, and a write a shared set holds credits no route, so this route is
+// credited only once it is seen making a write of its own: the step FORK-474 adds fails this
+// check until then, by design, rather than letting a background write prove it.
 const PUT_WITHHELD_RECIPE: &[Entry] = &[
     entry(Change::Write, ".forklift/withheld.tmp~*"), entry(Change::Rename, ".forklift/withheld.tmp~*"), entry(Change::Rename, ".forklift/withheld"),
 ];
@@ -196,7 +199,7 @@ const PUT_TRUST: &[Entry] = &[entry(Change::Write, ".forklift/trust.tmp~*"), ent
 // The parent folders and the tombstone are from the source alone: no scenario nests a name or
 // lifts a deleted pallet again.
 const UPDATE_PALLET: &[Entry] = &[
-    entry(Change::Mkdir, ".forklift/pallets/**"), entry(Change::Mkdir, ".forklift/meta/**"),
+    entry(Change::Mkdir, ".forklift/pallets/{name:parents}"), entry(Change::Mkdir, ".forklift/meta/{name:parents[1..]}"),
     entry(Change::Write, ".forklift/tombstones.tmp~*"), entry(Change::Rename, ".forklift/tombstones.tmp~*"), entry(Change::Rename, ".forklift/tombstones"),
     entry(Change::Write, ".forklift/pallets/{name}.tmp~*"), entry(Change::Rename, ".forklift/pallets/{name}.tmp~*"), entry(Change::Rename, ".forklift/pallets/{name}"),
     entry(Change::Mkdir, ".forklift/meta"),
@@ -205,9 +208,9 @@ const UPDATE_PALLET: &[Entry] = &[
     entry(Change::Write, ".forklift/graph/*.tmp~*"), entry(Change::Rename, ".forklift/graph/*.tmp~*"), entry(Change::Rename, ".forklift/graph/*"),
 ];
 // A ref deletion: the head removed, each parent folder it leaves empty removed (`unlink_ref`, from
-// the source alone), and its last head kept in the tombstones file.
+// the source alone), and its last head kept in the tombstones file. A meta pallet is refused.
 const DELETE_PALLET: &[Entry] = &[
-    entry(Change::Remove, ".forklift/pallets/{name}"), entry(Change::Remove, ".forklift/pallets/**"), entry(Change::Remove, ".forklift/meta/**"),
+    entry(Change::Remove, ".forklift/pallets/{name}"), entry(Change::Remove, ".forklift/pallets/{name:parents}"),
     entry(Change::Write, ".forklift/tombstones.tmp~*"), entry(Change::Rename, ".forklift/tombstones.tmp~*"), entry(Change::Rename, ".forklift/tombstones"),
 ];
 // create_warehouse: a `.creating-<id>-<pid>-<n>` staging folder prepared in full, an empty folder

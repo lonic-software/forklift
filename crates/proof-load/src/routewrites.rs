@@ -30,7 +30,9 @@ use crate::writeops::is_lock;
 /// One change a unit may make: its kind, and a path template relative to the host warehouse's
 /// root. A segment may hold `*`, any run of characters but `/`, and `{name}`, the request's
 /// capture of that name, percent-decoded; `{name[a..b]}` takes characters `a` to `b` of it, either
-/// bound left out for its end. A final `**` stands for one or more segments.
+/// bound left out for its end. `{name:parents}` stands for each folder the capture's path passes
+/// through (`a` and `a/b` of `a/b/c`), and may be sliced the same way. A final `**` stands for one
+/// or more segments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub kind: Kind,
@@ -137,7 +139,22 @@ fn fits(pieces: &[Piece], path: &[char]) -> bool {
 /// filled from `captures`.
 pub fn holds(set: &[Entry], kind: Kind, relative: &str, captures: &BTreeMap<String, String>) -> bool {
     let path: Vec<char> = relative.chars().collect();
-    set.iter().any(|entry| entry.kind == kind && compile(entry.path, captures).is_some_and(|pieces| fits(&pieces, &path)))
+    set.iter().any(|entry| entry.kind == kind && filled(entry.path, captures).iter().any(|captures| {
+        compile(entry.path, captures).is_some_and(|pieces| fits(&pieces, &path))
+    }))
+}
+
+/// The captures `template` is compiled with: `captures` as they are, or, when it names
+/// `{name:parents}`, once for each folder `name`'s path passes through, under that key.
+fn filled(template: &str, captures: &BTreeMap<String, String>) -> Vec<BTreeMap<String, String>> {
+    let Some(at) = template.find(":parents") else { return vec![captures.clone()] };
+    let name = &template[template[..at].rfind('{').map_or(0, |open| open + 1)..at];
+    let Some(value) = captures.get(name) else { return vec![] };
+    value.match_indices('/').map(|(cut, _)| {
+        let mut with = captures.clone();
+        with.insert(format!("{}:parents", name), value[..cut].to_string());
+        with
+    }).collect()
 }
 
 /// A request's window, its route's binding and captures, and whether it was answered with success.
@@ -274,7 +291,8 @@ mod tests {
     /// A template's captures, stars and rest match as they say, and a capture the request lacks
     /// matches nothing.
     ///
-    /// Revert: let `*` cross a `/` → `a/b/c` matches `a/*`; fill a capture as a glob → `{hash}`
+    /// Revert: let `*` cross a `/` → `a/b/c` matches `a/*`; give `:parents` the name itself → a
+    /// deletion's handler may remove the ref beside its own; fill a capture as a glob → `{hash}`
     /// matches any name.
     #[test]
     fn templates_match_what_they_name() {
@@ -288,6 +306,10 @@ mod tests {
         assert!(fit("a/**", "a/b/c"));
         assert!(!fit("a/**", "a/"));
         assert!(fit("pallets/{name}", "pallets/feature/x"));
+        assert!(fit("pallets/{name:parents}", "pallets/feature"));
+        assert!(!fit("pallets/{name:parents}", "pallets/feature/x"), "the name itself is no parent");
+        assert!(!fit("pallets/{name:parents}", "pallets/main"));
+        assert!(!fit("objects/{hash:parents}", "objects/ab12"), "a one-segment name has no parents");
         assert!(!fit("objects/{missing}", "objects/ab12"));
         assert!(fit("objects/{hash[..2]}/{hash[2..]}", "objects/ab/12"));
         assert!(!fit("objects/{hash[..2]}/{hash[2..]}", "objects/ab/13"));
