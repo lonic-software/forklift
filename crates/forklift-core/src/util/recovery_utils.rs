@@ -2145,7 +2145,7 @@ pub(crate) struct ClosureWalkResult {
     /// [`unavailable_absent_note`].
     pub unavailable_absent: usize,
     /// The corrupt-boundary hashes in `hashes` that the walk's own read of the sealed record holds
-    /// by hash, a blob's, a tree's or a chunk's: their remote holds the content, so a caller that
+    /// by hash, a blob's, a tree's or a chunk's (held by hash alone, redacted or withheld), so a caller that
     /// judges loss does not count them lost. Empty for every other walk.
     pub held_corrupt: BTreeSet<String>,
 }
@@ -2305,8 +2305,9 @@ pub struct LostObjects {
     pub corrupt: BTreeMap<String, String>,
     /// How many corrupt loose files no history reaches. They are not lost, and are left in place.
     pub damaged_unreached: usize,
-    /// How many corrupt loose files history reaches at an address the sealed record holds by
-    /// hash: their remote holds the content, so they are not lost. They are left in place.
+    /// How many corrupt loose files history reaches at an address the sealed record holds (by
+    /// hash alone, redacted or withheld), which the walk never counts lost either. They are left
+    /// in place.
     pub damaged_held: usize,
     /// Why some loose files could not be read to check them, if any could not: whether they are
     /// damaged is not known, so the lists above may be short. Also in `degraded_sources`.
@@ -2348,8 +2349,8 @@ pub fn find_lost_objects() -> Result<LostObjects, String> {
 
     let (reached, absent): (BTreeSet<String>, BTreeSet<String>) =
         walk.hashes.into_iter().partition(|hash| scan.corrupt.contains_key(hash));
-    // A corrupt file at an address the sealed record holds by hash does not lose the object: its
-    // remote holds it. An unreadable record holds nothing, as the walk's own degraded note says.
+    // A corrupt file at an address the sealed record holds is not lost, as an absent one there is
+    // not. An unreadable record holds nothing, as the walk's own degraded note says.
     let mut corrupt = BTreeMap::new();
     let (mut damaged_unreached, mut damaged_held) = (0, 0);
     for (hash, why) in scan.corrupt {

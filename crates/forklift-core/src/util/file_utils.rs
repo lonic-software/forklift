@@ -2813,11 +2813,14 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
 /// * `Err(std::io::Error)` - `reader` itself failed: nothing is known about the file.
 pub(crate) fn verify_loose(hash: &str, reader: impl std::io::Read) -> std::io::Result<Result<(), String>> {
     // An environment failure is told apart from a decode failure by reading through a reader that
-    // records the first error it passes on.
+    // records the errors it passes on. An interruption is retried by the readers above it, so it
+    // is never one.
     struct Tracked<R> { inner: R, error: Option<std::io::ErrorKind> }
     impl<R: std::io::Read> std::io::Read for Tracked<R> {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            self.inner.read(buf).inspect_err(|error| self.error = Some(error.kind()))
+            self.inner.read(buf).inspect_err(|error| if error.kind() != std::io::ErrorKind::Interrupted {
+                self.error = Some(error.kind());
+            })
         }
     }
     let mut tracked = Tracked { inner: reader, error: None };

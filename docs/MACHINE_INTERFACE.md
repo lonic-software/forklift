@@ -91,7 +91,7 @@ refuses with `object_unreadable` (exit 57), where it failed with an uncoded mess
 check reads every loose file, and one that history still reaches counts as lost: `objects_lost`
 (exit 58) gains a `corrupt` count beside `absent` and `unreadable`, and lists such a hash with the
 reason `corrupt`. The file is left where it is. A corrupt loose file no history reaches, or one
-holding content the warehouse has sealed, is not lost: the report's `notes` count it as left in
+at an address the warehouse holds by hash alone, redacted or withheld, is not counted lost: the report's `notes` count it as left in
 place. A loose file that cannot be read at all is not judged: the check names it as a reason it may
 be short, in `degraded_sources` when it refuses and in `notes` when it does not.
 

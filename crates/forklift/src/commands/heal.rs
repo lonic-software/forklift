@@ -228,7 +228,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
         if lost.damaged_held > 0 {
             notes.push(format!(
-                "{} damaged loose object file(s) hold content this warehouse has sealed, so it is not lost; they are left in place, and a read of one fails until the file is removed.",
+                "{} damaged loose object file(s) sit at addresses this warehouse holds by hash alone, redacted or withheld, so they are not counted lost; they are left in place, and a read of one fails until the file is removed.",
                 lost.damaged_held
             ));
         }
