@@ -2671,7 +2671,8 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
 }
 
 /// A loose file's bytes, decompressed and checked against `hash`: the one decode every loose read
-/// goes through, so a scan of the loose store judges a file exactly as a read of it would.
+/// goes through. [`verify_loose`] is its streamed twin for a scan of the loose store; the two
+/// share the decompression and the content-addressing check, so a change to one belongs in both.
 ///
 /// # Returns
 /// * `Ok(Vec<u8>)`  - The object's bytes; they hash to `hash`.
@@ -2801,27 +2802,35 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Whether a loose file's bytes decompress to content that hashes to `hash`: what
-/// [`decode_loose`] decides, streamed into the hasher so a giant object is never held whole.
+/// Whether the loose file `reader` yields decompresses to content that hashes to `hash`: what
+/// [`decode_loose`] decides, streamed from the file through the decoder into the hasher so neither
+/// the compressed nor the decompressed object is ever held whole.
 ///
 /// # Returns
-/// * `Ok(())`       - They do.
-/// * `Err(String)`  - They do not decompress, or decompress to other content; the message names
-///                    `hash`, as [`decode_loose`]'s does.
-pub(crate) fn verify_loose(hash: &str, compressed: &[u8]) -> Result<(), String> {
+/// * `Ok(Ok(()))`          - It does.
+/// * `Ok(Err(String))`     - It does not decompress, or decompresses to other content; the message
+///                           names `hash`, as [`decode_loose`]'s does.
+/// * `Err(std::io::Error)` - `reader` itself failed: nothing is known about the file.
+pub(crate) fn verify_loose(hash: &str, reader: impl std::io::Read) -> std::io::Result<Result<(), String>> {
+    // An environment failure is told apart from a decode failure by reading through a reader that
+    // records the first error it passes on.
+    struct Tracked<R> { inner: R, error: Option<std::io::ErrorKind> }
+    impl<R: std::io::Read> std::io::Read for Tracked<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf).inspect_err(|error| self.error = Some(error.kind()))
+        }
+    }
+    let mut tracked = Tracked { inner: reader, error: None };
+
     // Trusted bytes, read back from this store's own loose files, as in `decode_loose`, whose
     // unbounded decode this mirrors.
     #[allow(clippy::disallowed_methods)]
-    let decoder = zstd::stream::read::Decoder::new(compressed);
-    let mut hasher = blake3::Hasher::new();
-    decoder.and_then(|mut decoder| std::io::copy(&mut decoder, &mut hasher))
-        .map_err(|e| format!("Object {} is corrupt: its stored bytes do not decompress ({}).", hash, e))?;
-    let actual = hasher.finalize().to_hex().to_string();
-    match actual == hash {
-        true => Ok(()),
-        false => Err(format!(
-            "Object {} is corrupt: its stored bytes hash to {} instead (content-addressing violated).", hash, actual
-        )),
+    let hashed = zstd::stream::read::Decoder::new(&mut tracked)
+        .and_then(crate::util::object_utils::hash_object_reader);
+    match (hashed, tracked.error) {
+        (Ok(actual), _) => Ok(crate::util::object_utils::verify_object_hash(hash, &actual)),
+        (Err(error), Some(_)) => Err(error),
+        (Err(e), None) => Ok(Err(format!("Object {} is corrupt: its stored bytes do not decompress ({}).", hash, e))),
     }
 }
 

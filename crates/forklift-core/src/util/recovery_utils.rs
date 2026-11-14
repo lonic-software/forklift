@@ -2290,9 +2290,14 @@ pub struct LostObjects {
     /// Reachable hashes whose only copy is a loose file that does not decode to them, each with
     /// why. The file is left in place.
     pub corrupt: BTreeMap<String, String>,
-    /// How many damaged loose files (corrupt, or unreadable) no history reaches, or sit at an
-    /// address the sealed record holds. They are not lost, and are left in place.
+    /// How many corrupt loose files no history reaches. They are not lost, and are left in place.
     pub damaged_unreached: usize,
+    /// How many corrupt loose files history reaches at an address the sealed record holds by
+    /// hash: their remote holds the content, so they are not lost. They are left in place.
+    pub damaged_held: usize,
+    /// Why some loose files could not be read to check them, if any could not: whether they are
+    /// damaged is not known, so the lists above may be short. Also in `degraded_sources`.
+    pub loose_unchecked: Option<String>,
     /// Sources the walk could not read this run, so the lists above may be short.
     pub degraded_sources: Vec<String>,
     /// Whether the pack folder holds an index of another pack format, so what it holds reads
@@ -2313,95 +2318,117 @@ impl LostObjects {
 /// out-of-scope objects are not lost and are not listed.
 ///
 /// Every loose file is decoded and hash-checked first (FORK-447), since the walk reads a leaf's
-/// presence and never its bytes: a damaged loose file no pack copy stands in for, or one that
-/// cannot be read at all, is a boundary of the walk, and reported lost when history reaches it
-/// (unless the sealed record holds its hash). The others are counted as left in place, never
-/// listed as lost: a later write of the same content would keep the damaged file. This reads the
-/// whole loose store, in parallel above a threshold, holding one compressed file per worker.
+/// presence and never its bytes: a corrupt loose file no pack copy stands in for is a boundary of
+/// the walk, and reported lost when history reaches it, unless the sealed record holds its hash.
+/// The others are counted as left in place, never listed as lost: a later write of the same
+/// content would keep the damaged file. A file that cannot be read at all is not judged: it is
+/// named as a reason the check may be short, as any source the check could not consult is. This
+/// reads the whole loose store, streamed, in parallel above a threshold.
 ///
 /// # Returns
 /// * `Ok(LostObjects)` - What is lost, possibly nothing.
 /// * `Err(String)`     - The walk could not finish: nothing may be concluded about loss.
 pub fn find_lost_objects() -> Result<LostObjects, String> {
-    let damaged = corrupt_loose_objects()?;
-    let walk = enumerate_absent_reachable(&damaged.keys().cloned().collect())?;
+    let scan = corrupt_loose_objects()?;
+    let walk = enumerate_absent_reachable(&scan.corrupt.keys().cloned().collect())?;
     let foreign_index = pack_utils::pack_health_snapshot().is_ok_and(|snapshot| !snapshot.foreign.is_empty());
 
     let (reached, absent): (BTreeSet<String>, BTreeSet<String>) =
-        walk.hashes.into_iter().partition(|hash| damaged.contains_key(hash));
-    // A damaged file at an address the sealed record holds by hash does not lose the object: its
+        walk.hashes.into_iter().partition(|hash| scan.corrupt.contains_key(hash));
+    // A corrupt file at an address the sealed record holds by hash does not lose the object: its
     // remote holds it. An unreadable record holds nothing, as the walk's own degraded note says.
     let sealed = sealed_utils::read_tolerated().unwrap_or_default();
-    let held = |hash: &str| sealed.held(hash, At::File).is_some() || sealed.held(hash, At::Chunk).is_some();
-    let (mut corrupt, mut unreadable) = (BTreeMap::new(), walk.unwalked_hashes);
-    let mut damaged_unreached = 0;
-    for (hash, damage) in damaged {
-        match (reached.contains(&hash) && !held(&hash), damage) {
-            (true, LooseDamage::Corrupt(why)) => { corrupt.insert(hash, why); }
-            (true, LooseDamage::Unreadable(why)) => { unreadable.insert(hash, why); }
+    let held = |hash: &str| [At::File, At::Tree, At::Chunk].into_iter().any(|at| sealed.held(hash, at).is_some());
+    let mut corrupt = BTreeMap::new();
+    let (mut damaged_unreached, mut damaged_held) = (0, 0);
+    for (hash, why) in scan.corrupt {
+        match (reached.contains(&hash), held(&hash)) {
+            (true, false) => { corrupt.insert(hash, why); }
+            (true, true) => damaged_held += 1,
             (false, _) => damaged_unreached += 1,
         }
     }
 
+    let mut degraded_sources = walk.degraded_sources;
+    let loose_unchecked = scan.unchecked.first().map(|(hash, why)| format!(
+        "{} loose object file(s) could not be read to check them, so whether they are damaged is not known (the first, {}: {}).",
+        scan.unchecked.len(), hash, why
+    ));
+    degraded_sources.extend(loose_unchecked.clone());
+
     Ok(LostObjects {
         absent,
-        unreadable,
+        unreadable: walk.unwalked_hashes,
         corrupt,
         damaged_unreached,
-        degraded_sources: walk.degraded_sources,
+        damaged_held,
+        loose_unchecked,
+        degraded_sources,
         foreign_index,
     })
 }
 
-/// What is wrong with a loose file [`corrupt_loose_objects`] lists, with why.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LooseDamage {
-    /// Its bytes do not decompress, or decompress to other content.
-    Corrupt(String),
-    /// It, or the store's other copies of its object, could not be read at all.
-    Unreadable(String),
+/// What [`corrupt_loose_objects`] finds in the loose store.
+#[derive(Debug, Default)]
+pub(crate) struct LooseScan {
+    /// Every loose object whose file does not decompress to it, and that the store cannot read
+    /// another way, each with why.
+    pub(crate) corrupt: BTreeMap<String, String>,
+    /// Loose files that could not be read to judge them, or whose other copies could not be
+    /// consulted, each with why, in hash order: an environment unknown, never a verdict.
+    pub(crate) unchecked: Vec<(String, String)>,
 }
 
-/// Every loose object whose file does not decode to its hash, or cannot be read, and that the
-/// store cannot read another way. A pack copy that verifies wins, so its loose file is not listed;
-/// a file removed while this runs is not either. An I/O failure on one file never fails the scan:
-/// that object is listed unreadable, which the walk treats as a boundary.
+/// Every loose object whose file does not decode to its hash and that the store cannot read
+/// another way. A pack copy that verifies wins, so its loose file is not listed; a file removed
+/// while this runs is not either. An I/O failure never fails the scan, and never reads as damage:
+/// that file is listed unchecked, as is a corrupt one whose pack copies could not be consulted.
 ///
 /// # Returns
-/// * `Ok(BTreeMap)`  - The damaged hashes, possibly none.
+/// * `Ok(LooseScan)` - What was found, possibly nothing.
 /// * `Err(String)`   - The loose store could not be listed.
-pub(crate) fn corrupt_loose_objects() -> Result<BTreeMap<String, LooseDamage>, String> {
+pub(crate) fn corrupt_loose_objects() -> Result<LooseScan, String> {
+    enum Judged { Corrupt(String), Unchecked(String) }
+
     let root = forklift_root();
     let mut paths = Vec::new();
     walk_loose_object_paths(&root, &mut paths)?;
     let hashes: Vec<String> = paths.iter().filter_map(|path| file_utils::hash_from_object_path(path)).collect();
 
-    let judge = |hash: &String| -> Option<(String, LooseDamage)> {
-        let damage = |damage: LooseDamage| Some((hash.clone(), damage));
+    let judge = |hash: &String| -> Option<(String, Judged)> {
+        let judged = |judged: Judged| Some((hash.clone(), judged));
         let path = match file_utils::get_path_for_object(hash) {
             Ok((folder, name)) => Path::new(&folder).join(name),
-            Err(error) => return damage(LooseDamage::Unreadable(error)),
+            Err(error) => return judged(Judged::Unchecked(error)),
         };
-        let why = match std::fs::read(&path) {
-            Ok(compressed) => match file_utils::verify_loose(hash, &compressed) {
-                Ok(()) => return None,
-                Err(why) => LooseDamage::Corrupt(why),
-            },
+        let unreadable = |error: std::io::Error| format!("its loose file could not be read: {}", error);
+        let verdict = std::fs::File::open(&path).and_then(|file| file_utils::verify_loose(hash, file));
+        let why = match verdict {
+            Ok(Ok(())) => return None,
+            Ok(Err(why)) => why,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(error) => LooseDamage::Unreadable(format!("its loose file could not be read: {}", error)),
+            Err(error) => return judged(Judged::Unchecked(unreadable(error))),
         };
         match file_utils::read_object_classified(hash) {
             Ok(file_utils::StoreReadOutcome::Verified(_) | file_utils::StoreReadOutcome::Absent) => None,
-            Ok(file_utils::StoreReadOutcome::Unverifiable(..)) => damage(why),
-            Err(error) => damage(LooseDamage::Unreadable(error)),
+            Ok(file_utils::StoreReadOutcome::Unverifiable(..)) => judged(Judged::Corrupt(why)),
+            Err(error) => judged(Judged::Unchecked(format!("its loose file is corrupt, but its other copies could not be consulted: {}", error))),
         }
     };
 
-    let judged: Vec<Option<(String, LooseDamage)>> = match hashes.len() >= PARALLEL_RESTAGE_THRESHOLD {
+    let judged: Vec<Option<(String, Judged)>> = match hashes.len() >= PARALLEL_RESTAGE_THRESHOLD {
         true => fanout_utils::fanout_map(&hashes, judge),
         false => hashes.iter().map(judge).collect(),
     };
-    Ok(judged.into_iter().flatten().collect())
+    let mut scan = LooseScan::default();
+    for (hash, judged) in judged.into_iter().flatten() {
+        match judged {
+            Judged::Corrupt(why) => { scan.corrupt.insert(hash, why); }
+            Judged::Unchecked(why) => scan.unchecked.push((hash, why)),
+        }
+    }
+    scan.unchecked.sort();
+    Ok(scan)
 }
 
 /// The pallets (user then meta, as wire names) whose history reaches any of `hashes`, for a
@@ -3977,10 +4004,11 @@ mod tests {
         crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
-    /// FORK-447: a loose file that cannot be read never fails heal's closing check. Reached, it is
-    /// listed unreadable; unreached, it is only counted. A corrupt file at an address the sealed
-    /// record holds is not lost either. Mutation: fail the scan on an I/O error, or ignore the
-    /// sealed record → red.
+    /// FORK-447: a loose file that cannot be read never fails heal's closing check and is never
+    /// judged lost: it is named as a reason the check may be short. A corrupt file at an address
+    /// the sealed record holds, a blob's or a tree's, is not lost either, and is counted apart.
+    /// Mutation: fail the scan on an I/O error, judge an unreadable file lost, or ignore the
+    /// sealed record or its trees → red.
     #[test]
     fn find_lost_objects_survives_an_unreadable_loose_file_and_holds_a_sealed_one() {
         use crate::model::tree_item::TreeItem;
@@ -4002,7 +4030,7 @@ mod tests {
         let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         root.add_child(TreeItem::new("a.txt".to_string(), reached.clone(), DirEntryType::Normal));
         root.add_child(TreeItem::new("s.txt".to_string(), sealed.clone(), DirEntryType::Normal));
-        plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
+        let tree = plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
         seal(&[&sealed]);
 
         // A folder where a file should be: reading it fails with an error other than NotFound.
@@ -4013,10 +4041,21 @@ mod tests {
         std::fs::write(loose_path(&sealed), b"not zstd").unwrap();
         file_utils::forget_cached_objects();
 
-        let lost = find_lost_objects().expect("an unreadable loose file is a boundary, not a walk failure");
-        assert_eq!(lost.unreadable.keys().collect::<Vec<_>>(), vec![&reached], "{:?}", lost);
-        assert!(lost.corrupt.is_empty() && lost.absent.is_empty(), "{:?}", lost);
-        assert_eq!(lost.damaged_unreached, 2, "the unreached folder and the sealed file: {:?}", lost);
+        let lost = find_lost_objects().expect("an unreadable loose file never fails the walk");
+        assert!(lost.is_empty(), "an unreadable file is not judged lost: {:?}", lost);
+        assert_eq!((lost.damaged_unreached, lost.damaged_held), (0, 1), "the sealed file is held: {:?}", lost);
+        let unchecked = lost.loose_unchecked.as_deref().expect("the unreadable files are named");
+        assert!(unchecked.starts_with("2 loose object file(s) could not be read"), "{}", unchecked);
+        assert!(lost.degraded_sources.iter().any(|source| source == unchecked), "{:?}", lost);
+
+        // A sealed tree holds as a sealed blob does: its corrupt file is not a loss either. The
+        // walk stops at it, so the sealed blob below it is no longer reached.
+        seal(&[&sealed, &tree]);
+        std::fs::write(loose_path(&tree), b"not zstd").unwrap();
+        file_utils::forget_cached_objects();
+        let lost = find_lost_objects().unwrap();
+        assert!(lost.is_empty(), "a sealed tree's corrupt file is not a loss: {:?}", lost);
+        assert_eq!((lost.damaged_unreached, lost.damaged_held), (1, 1), "{:?}", lost);
 
         crate::util::file_utils::remove_dir_all(&dir).ok();
     }

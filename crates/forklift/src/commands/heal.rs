@@ -226,6 +226,16 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                 lost.damaged_unreached
             ));
         }
+        if lost.damaged_held > 0 {
+            notes.push(format!(
+                "{} damaged loose object file(s) hold content this warehouse has sealed, so it is not lost; they are left in place, and a read of one fails until the file is removed.",
+                lost.damaged_held
+            ));
+        }
+        // A refusal lists it among the reasons its check may be short.
+        if let (Some(unchecked), true) = (&lost.loose_unchecked, lost.is_empty()) {
+            notes.push(format!("The check for lost objects may be short: {}", unchecked));
+        }
     }
     let objects_lost = match &lost {
         Ok(lost) if !lost.is_empty() => Some(ObjectsLost::of(lost)),

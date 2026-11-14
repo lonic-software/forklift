@@ -12423,7 +12423,7 @@ pub(crate) mod tests {
         invalidate_cache();
         assert_eq!(file_utils::retrieve_object_by_hash_uncached(&p_hash).unwrap(), packed);
 
-        let corrupt = crate::util::recovery_utils::corrupt_loose_objects().unwrap();
+        let corrupt = crate::util::recovery_utils::corrupt_loose_objects().unwrap().corrupt;
         assert_eq!(corrupt.keys().collect::<Vec<_>>(), {
             let mut expected = vec![&garbled, &other];
             expected.sort();
