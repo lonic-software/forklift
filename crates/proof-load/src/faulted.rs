@@ -433,6 +433,19 @@ fn own_lines() -> usize {
     bind(Tool::Forklift, &Op::Record { index: 0 }).expect("Tool::Forklift binds every operation").len()
 }
 
+/// Per line of a faulted command that runs its record and then `then`, whether a settle that finds
+/// the record served answers for it: the record's own lines, which the record being there says
+/// ran, and a push's, which the record being on the host says ran. Any other line (a compaction)
+/// says nothing of the record, and a refusal of it is its own answer.
+fn vouched(then: &[Op]) -> Vec<bool> {
+    let lines = |op: &Op| bind(Tool::Forklift, op).expect("Tool::Forklift binds every operation").len();
+    let mut vouched = vec![true; own_lines()];
+    for op in then {
+        vouched.extend(std::iter::repeat_n(matches!(op, Op::Push), lines(op)));
+    }
+    vouched
+}
+
 /// What the faulted command's attempts have established of its record.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Made {
@@ -467,14 +480,16 @@ impl Made {
     /// Where the rest of the lines resume when the attempt that stopped at `stopped` left the
     /// record, from `before`, acknowledged by a settle ([`Made::promote`]) rather than by landing:
     /// it stopped short of the acknowledging lines, at a line whose answer asked nothing further.
-    /// That line is done, so the rest resume after it, and never inside the record's own lines,
-    /// which the settle says are done too. Read back through the host, a line between the
-    /// record's own and the last push (a push told there is nothing to push) is answered so, and
-    /// the lines after it still run. An attempt acknowledged by landing stopped at or past the
-    /// acknowledging lines, at a line refused for good, and is not run again.
-    fn rest(&self, before: Made, stopped: Resume, acknowledging: usize) -> Option<Resume> {
+    /// A line the settle answers for (`vouched`: the record's own, or a push read back through
+    /// the host, told there is nothing to push) is done, so the rest resume after it, and never
+    /// inside the record's own lines. Any other line (a compaction refused for good) is not, and
+    /// runs again, so a refusal for good is refused again and never completes. An attempt
+    /// acknowledged by landing stopped at or past the acknowledging lines, at a line refused for
+    /// good, and is not run again.
+    fn rest(&self, before: Made, stopped: Resume, acknowledging: usize, vouched: &[bool]) -> Option<Resume> {
+        let done = vouched.get(stopped.at).copied().unwrap_or(false);
         (!before.acknowledged && self.acknowledged && !self.completed && stopped.at < acknowledging)
-            .then_some(Resume { at: own_lines().max(stopped.at + 1), may_have_stacked: false })
+            .then_some(Resume { at: if done { own_lines().max(stopped.at + 1) } else { stopped.at }, may_have_stacked: false })
     }
 
     /// Adds what a retry established, which landed every line or stopped where `next` resumes:
@@ -715,6 +730,7 @@ pub(crate) fn grade_after(
     let mut made = Made::of(&trail.steps, acknowledging, lines);
     let mut resume = resume_after(&trail.steps, lines);
     let promoted = Made::through(acknowledging, acknowledging, lines);
+    let vouched = vouched(context.then);
     // A retry from where the last attempt stopped, then the readback. A retry whose answer settles
     // the record as acknowledged ran none of the lines after the record's own, or none that
     // landed, so they are run once more from the first of them: only landing completes them.
@@ -727,7 +743,7 @@ pub(crate) fn grade_after(
         };
         let before = *made;
         let reads = again(trail, resume, made)?;
-        match made.rest(before, *resume, acknowledging) {
+        match made.rest(before, *resume, acknowledging, &vouched) {
             Some(rest) => {
                 *resume = rest;
                 again(trail, resume, made)
@@ -1182,7 +1198,9 @@ mod tests {
     /// its compaction runs it twice; resume the rest at the acknowledging lines → read back
     /// through the host, the lines between an answered push and the last are skipped; resume it at
     /// the answered line → that line is re-run and refused again; resume it inside the record's
-    /// own lines → the stack is re-run.
+    /// own lines → the stack is re-run; skip any answered line → read back through the host, a
+    /// compaction refused for good before the last push grades healed; vouch for a push only,
+    /// not the record's own lines → the stack is re-run.
     #[test]
     fn a_settled_record_is_owed_and_the_lines_after_it_still_run() {
         let made = |acknowledged, completed| Made { acknowledged, completed };
@@ -1191,14 +1209,19 @@ mod tests {
         assert_eq!(promoted(Made::through(2, 2, 2)), made(true, true));
         let at = |at| Resume { at, may_have_stacked: false };
         assert_eq!(own_lines(), 2);
-        assert_eq!(made(true, false).rest(Made::default(), at(1), 2), Some(at(2)));
-        assert_eq!(made(true, false).rest(Made::default(), at(0), 2), Some(at(2)));
-        assert_eq!(made(true, false).rest(Made::default(), at(2), 2), None, "acknowledged by landing: the compaction was refused for good");
+        let local = vouched(&[Op::Pack]);
+        assert_eq!(local, [true, true, false]);
+        assert_eq!(made(true, false).rest(Made::default(), at(1), 2, &local), Some(at(2)));
+        assert_eq!(made(true, false).rest(Made::default(), at(0), 2, &local), Some(at(2)));
+        assert_eq!(made(true, false).rest(Made::default(), at(2), 2, &local), None, "acknowledged by landing: the compaction was refused for good");
         // Read back through the host, then [push, pack, push]: the acknowledging lines run through 5.
-        assert_eq!(made(true, false).rest(Made::default(), at(2), 5), Some(at(3)), "the answered push is done, the pack and last push run");
-        assert_eq!(made(true, false).rest(Made::default(), at(1), 5), Some(at(2)));
-        assert_eq!(made(true, false).rest(made(true, false), at(1), 2), None, "owed before this settle");
-        assert_eq!(made(true, true).rest(Made::default(), at(1), 2), None);
+        let hosted = vouched(&[Op::Push, Op::Pack, Op::Push]);
+        assert_eq!(hosted, [true, true, true, false, true]);
+        assert_eq!(made(true, false).rest(Made::default(), at(2), 5, &hosted), Some(at(3)), "the answered push is done, the pack and last push run");
+        assert_eq!(made(true, false).rest(Made::default(), at(1), 5, &hosted), Some(at(2)));
+        assert_eq!(made(true, false).rest(Made::default(), at(3), 5, &hosted), Some(at(3)), "a compaction refused for good runs again");
+        assert_eq!(made(true, false).rest(made(true, false), at(1), 2, &local), None, "owed before this settle");
+        assert_eq!(made(true, true).rest(Made::default(), at(1), 2, &local), None);
     }
 
 }
