@@ -615,3 +615,130 @@ fn meta_history_is_refused_however_spelled_and_a_refusal_names_what_the_run_alre
     assert!(stderr.contains("Note: Whether") && stderr.contains("\"@tags\""), "{}", stderr);
     assert_eq!(head(&root, "side"), side);
 }
+
+/// The loose file of `hash` in the warehouse at `root`.
+fn loose_object(root: &Path, hash: &str) -> PathBuf {
+    let (folder, file) = forklift_core::util::file_utils::get_path_for_object(hash).unwrap();
+    root.join(folder).join(file)
+}
+
+/// The hash of the blob holding `content`.
+fn blob_hash(content: &str) -> String {
+    use forklift_core::util::object_utils;
+    object_utils::hash_object_bytes(&object_utils::blob_bytes(content.as_bytes()))
+}
+
+#[test]
+fn heal_refuses_as_objects_lost_when_a_reachable_object_is_absent() {
+    // An untainted store with one reachable blob deleted: nothing earlier in the run looks for it,
+    // so only the closing verdict can say it is lost.
+    // Mutation: skip the verdict (`objects_lost` always None) → heal passes → red.
+    let area = Area::new("lost");
+    let root = area.warehouse();
+    healed(&area, &root);
+
+    let hash = blob_hash("one\n");
+    let path = loose_object(&root, &hash);
+    assert!(path.is_file(), "the fixture must find the blob loose");
+    forklift_core::util::file_utils::remove_file(&path).unwrap();
+
+    let output = area.run(&root, &["--json", "heal"]);
+    assert_eq!(output.status.code(), Some(58), "{}{}", text(&output.stdout), text(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "objects_lost", "{}", value);
+    let lost = &value["error"]["details"]["objects_lost"];
+    assert_eq!(lost["absent"], 1, "{}", value);
+    assert_eq!(lost["unreadable"], 0, "{}", value);
+    assert_eq!(lost["hashes"][0]["hash"], hash.as_str(), "{}", value);
+    assert_eq!(lost["hashes"][0]["reason"], "absent", "{}", value);
+    assert_eq!(lost["pallets"], serde_json::json!(["main"]), "{}", value);
+    assert!(
+        value["error"]["next_step"].as_str().unwrap().starts_with("restore the warehouse from a backup"),
+        "{}",
+        value
+    );
+
+    // The verdict records nothing: the next run says the same.
+    let again = area.run(&root, &["--json", "heal"]);
+    assert_eq!(again.status.code(), Some(58), "{}", text(&again.stdout));
+}
+
+#[test]
+fn a_refusing_heal_still_rebuilds_a_lost_ref() {
+    // The verdict runs last, so the repairs before it land even when it refuses.
+    // Mutation: return the verdict before the ref pass → the ref stays lost → red.
+    let area = Area::new("lost-and-ref");
+    let root = area.warehouse();
+    let before = head(&root, "main");
+    area.run_ok(&root, &["pallet", "create", "side"]);
+    area.run_ok(&root, &["shift", "side"]);
+    area.stack(&root, "d.txt", "side only");
+    area.run_ok(&root, &["shift", "main"]);
+
+    // Lost under `side` alone, so `main`'s history stays complete and its ref can be rebuilt.
+    forklift_core::util::file_utils::remove_file(loose_object(&root, &blob_hash("side only\n"))).unwrap();
+    damage(&root, "main", Damage::Delete);
+
+    let output = area.run(&root, &["--json", "heal"]);
+    assert_eq!(output.status.code(), Some(58), "{}{}", text(&output.stdout), text(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error"]["details"]["refs_rebuilt"][0]["pallet"], "main", "{}", value);
+    assert_eq!(value["error"]["details"]["objects_lost"]["pallets"], serde_json::json!(["side"]), "{}", value);
+    assert_eq!(head(&root, "main"), before);
+}
+
+#[test]
+fn a_reachability_walk_that_cannot_finish_claims_nothing_lost() {
+    // A staged shard that does not parse stops the walk: heal says it does not know, and never
+    // answers `objects_lost`.
+    // Mutation: read a walk error as "nothing lost" → heal passes → red.
+    let area = Area::new("walk-error");
+    let root = area.warehouse();
+    std::fs::write(root.join("c.txt"), "three\n").unwrap();
+    area.run_ok(&root, &["load", "."]);
+    garble_staged_shards(&root);
+
+    let output = area.run(&root, &["--json", "heal"]);
+    assert!(!output.status.success(), "{}", text(&output.stdout));
+    let shown = format!("{}{}", text(&output.stdout), text(&output.stderr));
+    assert!(shown.contains("heal could not finish its reachability check"), "{}", shown);
+    assert!(!shown.contains("objects_lost"), "{}", shown);
+}
+
+#[test]
+fn a_refused_ref_keeps_its_code_when_the_walk_cannot_finish() {
+    // The walk's failure is said, but a ref heal refused still answers `ref_damaged` with its own
+    // next step.
+    // Mutation: return the walk's untyped error ahead of a refused ref → exit 1 → red.
+    let area = Area::new("walk-error-ref");
+    let (root, side) = side_only_its_bytes_name(&area);
+    std::fs::write(ref_path(&root, "side"), &side.as_bytes()[..7]).unwrap();
+    std::fs::write(root.join("c.txt"), "three\n").unwrap();
+    area.run_ok(&root, &["load", "."]);
+    garble_staged_shards(&root);
+
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    assert_eq!(refused["error"]["details"]["refs_refused"][0]["pallet"], "side", "{}", refused);
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("heal could not finish its reachability check"), "{}", refused);
+}
+
+/// Overwrites every staged inventory shard with bytes that do not parse.
+fn garble_staged_shards(root: &Path) {
+    let mut shards = Vec::new();
+    let mut folders = vec![root.join(".forklift").join("inventory")];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                folders.push(path);
+            } else if path.file_name().is_some_and(|name| name == "data") {
+                shards.push(path);
+            }
+        }
+    }
+    assert!(!shards.is_empty(), "the fixture must find a staged shard");
+    for shard in &shards {
+        std::fs::write(shard, b"not an inventory").unwrap();
+    }
+}

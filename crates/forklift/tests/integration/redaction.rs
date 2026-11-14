@@ -429,10 +429,10 @@ fn a_read_of_content_whose_redaction_is_applied_is_refused_as_redacted() {
     // The parcel's other content is untouched.
     warehouse.run_ok(&["blame", "-r", &leak, "notes.txt"]);
 
-    // An object absent with no redaction naming it is missing, not redacted.
+    // An object absent with no redaction naming it is missing, not redacted: damage heal names.
     warehouse.remove_object(&hash_of(b"notes\n"));
     let missing = warehouse.json(&["blame", "-r", &leak, "notes.txt"]);
-    assert_eq!(missing["error"]["code"], "error", "{}", missing);
+    assert_eq!(missing["error"]["code"], "object_unreadable", "{}", missing);
     assert!(missing["error"]["message"].as_str().unwrap().contains("entity not found"), "{}", missing);
 
     // An applied record that cannot be read leaves the absence undecided: the read still names

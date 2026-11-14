@@ -476,10 +476,14 @@ fn collect_changed_files(tree: &TreeItem,
 
     let path_of = |name: &str| if prefix.is_empty() { name.to_string() } else { format!("{}/{}", prefix, name) };
     let head_tree = match head_tree_hash {
-        Some(hash) => Some(object_utils::load_tree(hash).map_err(|e| format!(
-            "The head's tree {} for \"{}\" could not be read, so staged changes there cannot be told \
-            apart from what the head already holds: {}. No parcel was made.",
-            hash, if prefix.is_empty() { "." } else { prefix }, e.trim_end_matches('.')
+        // The read's own code survives, so a damaged store still names its remedy.
+        Some(hash) => Some(object_utils::load_tree(hash).map_err(|e| crate::error::append_to_message(
+            crate::error::prefix_message(&format!(
+                "The head's tree {} for \"{}\" could not be read, so staged changes there cannot be told \
+                apart from what the head already holds",
+                hash, if prefix.is_empty() { "." } else { prefix }
+            ), e),
+            "No parcel was made.",
         ))?),
         None => None,
     };
@@ -1158,5 +1162,25 @@ mod subtree_closure_tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A head tree the store cannot give back keeps the read's own code through the stack's
+    /// wrap, so the refusal still names `forklift heal`.
+    /// Mutation: wrap the read's error with `format!` → an uncoded error → red.
+    #[test]
+    fn an_unreadable_head_tree_keeps_its_code_through_the_staged_content_check() {
+        let _scratch = Scratch::new("unreadable-head-tree");
+        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root.add_child(TreeItem::new("f".to_string(), store_blob("staged"), DirEntryType::Normal));
+        let lost_head = "a".repeat(64);
+
+        match require_staged_content_present(&root, Some(&lost_head)) {
+            Err(CoreError::Refusal { code, message, next_step, .. }) => {
+                assert_eq!(code, crate::error::RefusalCode::ObjectUnreadable, "{}", message);
+                assert!(message.contains("The head's tree") && message.contains("No parcel was made."), "{}", message);
+                assert_eq!(next_step, "forklift heal");
+            }
+            other => panic!("expected an object_unreadable refusal, got {:?}", other),
+        }
     }
 }

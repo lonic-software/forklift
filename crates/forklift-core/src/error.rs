@@ -383,6 +383,20 @@ refusal_codes! {
     /// `forklift-server withhold repair` while the warehouse is not served; until then its server
     /// answers every request that reads the record with this code.
     WithheldDamaged => "withheld_damaged",
+
+    /// An object could not be read: no file holds it, or the only pack index that names it is
+    /// damaged or has lost its data file. Nothing was changed. `forklift heal` rebuilds a damaged
+    /// index from its data file, or refuses with [`RefusalCode::ObjectsLost`] when history still
+    /// reaches an object the store cannot give back. A content mismatch on an object that is
+    /// present carries no code.
+    ObjectUnreadable => "object_unreadable",
+
+    /// `forklift heal` found objects the history reaches that no file holds, or that only a pack
+    /// index it could not rebuild names, so they cannot be read. Nothing was claimed repaired for
+    /// them. The details list how many, up to twenty hashes grouped by reason, and the pallets
+    /// whose history reaches them; the next step restores them from a backup or a copy, or re-runs
+    /// heal when its index rebuild could not take the store lock.
+    ObjectsLost => "objects_lost",
 }
 
 impl RefusalCode {
@@ -758,6 +772,19 @@ fn frame(code: &str, message: &str, next_step: &str, details: Option<&serde_json
     framed.push(REFUSAL_FIELD_SEPARATOR);
     framed.push_str(&details.map_or_else(|| "null".to_string(), |details| details.to_string()));
     framed
+}
+
+/// Every refusal frame `message` carries, at its start or wrapped inside it by a caller's own
+/// words, decoded as [`deframe`] decodes one, outermost first.
+pub fn frames_in(message: &str) -> impl Iterator<Item = (&str, Cow<'_, str>, &str)> {
+    std::iter::once(0)
+        .chain(message.match_indices(REFUSAL_PREFIX).map(|(at, _)| at).filter(|at| *at > 0))
+        .filter_map(move |at| deframe(&message[at..]))
+}
+
+/// Whether `message` carries a frame of `code`, at its start or wrapped inside it.
+pub fn frames_code(message: &str, code: RefusalCode) -> bool {
+    frames_in(message).any(|(framed, _, _)| framed == code.as_str())
 }
 
 /// Decode a sentinel frame into `(code, message, next_step)`; `None` for any string that is not a
