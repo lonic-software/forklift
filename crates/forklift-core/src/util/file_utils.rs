@@ -2495,8 +2495,11 @@ pub(crate) enum Unreadable {
     /// with a corrupt bucket. Heal rebuilds such an index from its data file, or names what it
     /// held as lost.
     PackDamage,
-    /// Anything else: bytes at the address that do not rebuild to it (a corrupt loose file or
-    /// pack record), or an index of another format version.
+    /// A loose file at the address whose bytes do not decompress, or decompress to other content.
+    /// Heal names the object as lost; the file is kept where it is.
+    LooseCorrupt,
+    /// Anything else: a pack record whose bytes do not rebuild to the address, or an index of
+    /// another format version.
     Other,
 }
 
@@ -2661,21 +2664,31 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
         Err(error) => return Err(format!("Error while reading object from file \"{}\": {}", file_path, error)),
     };
 
+    Ok(match decode_loose(hash, &compressed) {
+        Ok(bytes) => StoreReadOutcome::Verified(bytes),
+        Err(e) => StoreReadOutcome::Unverifiable(e, Unreadable::LooseCorrupt),
+    })
+}
+
+/// A loose file's bytes, decompressed and checked against `hash`: the one decode every loose read
+/// goes through, so a scan of the loose store judges a file exactly as a read of it would.
+///
+/// # Returns
+/// * `Ok(Vec<u8>)`  - The object's bytes; they hash to `hash`.
+/// * `Err(String)`  - The bytes do not decompress, or decompress to other content; the message
+///                    names `hash`.
+pub(crate) fn decode_loose(hash: &str, compressed: &[u8]) -> Result<Vec<u8>, String> {
     // Trusted bytes: a loose file is self-written from hash-verified plaintext, never foreign
     // compressed bytes, and the grandfathered-giant contract requires this read to stay
     // unbounded so a pre-existing over-ceiling object stays readable.
     #[allow(clippy::disallowed_methods)]
-    let bytes = match zstd::stream::decode_all(compressed.as_slice()) {
-        Ok(bytes) => bytes,
-        Err(e) => return Ok(StoreReadOutcome::Unverifiable(format!("Error while decompressing object: {}", e), Unreadable::Other)),
-    };
+    let bytes = zstd::stream::decode_all(compressed)
+        .map_err(|e| format!("Object {} is corrupt: its stored bytes do not decompress ({}).", hash, e))?;
 
     // Same content-addressing guarantee the pack path enforces: a corrupt loose file fails the
     // read rather than silently returning wrong bytes.
-    Ok(match crate::util::object_utils::verify_object_bytes(hash, &bytes) {
-        Ok(()) => StoreReadOutcome::Verified(bytes),
-        Err(e) => StoreReadOutcome::Unverifiable(e, Unreadable::Other),
-    })
+    crate::util::object_utils::verify_object_bytes(hash, &bytes)?;
+    Ok(bytes)
 }
 
 /// Read the loose copy at `hash`'s own fan-out path, returning it only if it decodes and
@@ -2694,20 +2707,7 @@ fn read_loose_if_verified(hash: &str) -> Result<Option<Vec<u8>>, String> {
         Err(error) => return Err(format!("Error while reading object from file \"{}\": {}", file_path, error)),
     };
 
-    // Trusted bytes: a loose file is self-written from hash-verified plaintext, never foreign
-    // compressed bytes, and the grandfathered-giant contract requires this read to stay
-    // unbounded so a pre-existing over-ceiling object stays readable — same justification as the
-    // sibling decode in the ordinary loose branch below.
-    #[allow(clippy::disallowed_methods)]
-    let bytes = match zstd::stream::decode_all(compressed.as_slice()) {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(None),
-    };
-
-    match crate::util::object_utils::verify_object_bytes(hash, &bytes) {
-        Ok(()) => Ok(Some(bytes)),
-        Err(_) => Ok(None),
-    }
+    Ok(decode_loose(hash, &compressed).ok())
 }
 
 /// Read an object's decompressed bytes straight from the store, without consulting the read
@@ -2722,10 +2722,11 @@ fn read_loose_if_verified(hash: &str) -> Result<Option<Vec<u8>>, String> {
 /// which is what makes disagreement between an ordinary read and a taint recheck built on the
 /// same core structurally impossible (DESIGN.html §3.1.1).
 ///
-/// The one place an ordinary read's failure gets its code: pack damage ([`Unreadable::PackDamage`])
-/// and an absence nothing else accounts for are framed [`RefusalCode::ObjectUnreadable`], whose
-/// next step is `forklift heal`. What heal cannot act on stays untyped: a content mismatch, an
-/// index of another format version, an absence a redaction or a withholding explains. Classified
+/// The one place an ordinary read's failure gets its code: pack damage ([`Unreadable::PackDamage`]),
+/// a corrupt loose file ([`Unreadable::LooseCorrupt`]) and an absence nothing else accounts for are
+/// framed [`RefusalCode::ObjectUnreadable`], whose next step is `forklift heal`. What heal cannot act
+/// on stays untyped: a pack record whose bytes do not rebuild to the address, an index of another
+/// format version, an absence a redaction or a withholding explains. Classified
 /// readers never see the frame, so a reason heal itself reports never embeds one.
 fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
     match read_object_classified(hash)? {
@@ -2801,9 +2802,11 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
 }
 
 /// The ordinary read's error for an [`StoreReadOutcome::Unverifiable`] outcome: framed
-/// [`RefusalCode::ObjectUnreadable`] for pack damage, `error` itself otherwise.
+/// [`RefusalCode::ObjectUnreadable`] for pack damage and a corrupt loose file (whose message
+/// already names the object), `error` itself otherwise.
 fn unverifiable_read_error(hash: &str, error: String, cause: Unreadable) -> String {
     match cause {
+        Unreadable::LooseCorrupt => object_unreadable(error),
         Unreadable::PackDamage => object_unreadable(format!("Object {} cannot be read: {}", hash, error)),
         Unreadable::Other => error,
     }

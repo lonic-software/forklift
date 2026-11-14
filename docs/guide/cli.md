@@ -2721,8 +2721,8 @@ so the loss stays reported until the object is restored:
   read as missing. Then re-run `heal`. A torn record is likewise left standing.
 
 Last, once every repair has run, `heal` walks what pallets, parked changes, bays and trust pins
-still reach and checks the store gives each object back. When one is absent, or sits in a pack
-file the run could not repair, `heal` refuses with `objects_lost` (exit 58), after printing its
+still reach and checks the store gives each object back, reading every loose file to do so. When
+one is absent, held only in a corrupt loose file, or sits in a pack file the run could not repair, `heal` refuses with `objects_lost` (exit 58), after printing its
 report: it counts the objects, lists up to 20 hashes with the reason for each, and names the
 pallets whose history reaches them. Every repair before it still landed. The next step is to
 restore the warehouse from a backup or clone it afresh, to re-create it when the pack folder holds

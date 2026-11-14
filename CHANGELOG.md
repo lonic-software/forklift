@@ -12,6 +12,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **A corrupt loose object is refused with a code, and `heal` names it as lost.** A loose object
+  file whose bytes did not decompress, or decompressed to other content, failed reads with an
+  uncoded message, and `heal` exited 0 over it, since its closing check never read a file's bytes.
+  Now such a read is refused with exit 57 (`object_unreadable`), and `heal` reads every loose file:
+  one that history still reaches is counted as `corrupt` in its `objects_lost` refusal (exit 58),
+  with the pallets that reach it. The file is left in place. The `--json` schema is now 47.
+
 - **A damaged pack file is refused with a code, `heal` rebuilds a lost or damaged index, and `heal`
   says when objects are lost.** A read that met a lost, cut-short or corrupt pack index, a missing
   pack data file or a damaged index entry failed with an uncoded message, or reported the object as
