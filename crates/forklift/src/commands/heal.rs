@@ -234,13 +234,13 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
         if lost.damaged_records_unreached > 0 {
             notes.push(format!(
-                "{} damaged pack record(s) that no history needs are left in place; storing the same content again would keep the damaged record.",
+                "{} object(s) with damaged pack records that no history needs are left in place; storing the same content again would keep the damaged records.",
                 lost.damaged_records_unreached
             ));
         }
         if lost.damaged_records_held > 0 {
             notes.push(format!(
-                "{} damaged pack record(s) sit at addresses this warehouse holds by hash alone, redacted or withheld, so they are not counted lost; they are left in place, and a read of one fails.",
+                "{} object(s) with damaged pack records sit at addresses this warehouse holds by hash alone, redacted or withheld, so they are not counted lost; the records are left in place, and a read of one fails.",
                 lost.damaged_records_held
             ));
         }

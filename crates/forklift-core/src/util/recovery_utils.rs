@@ -2311,10 +2311,11 @@ pub struct LostObjects {
     /// hash alone, redacted or withheld), which the walk never counts lost either. They are left
     /// in place.
     pub damaged_held: usize,
-    /// How many damaged pack records no history reaches, counted as `damaged_unreached` is.
+    /// How many objects whose pack records are all damaged no history reaches, counted as
+    /// `damaged_unreached` is.
     pub damaged_records_unreached: usize,
-    /// How many damaged pack records history reaches at an address the sealed record holds,
-    /// counted as `damaged_held` is.
+    /// How many objects whose pack records are all damaged history reaches at an address the
+    /// sealed record holds, counted as `damaged_held` is.
     pub damaged_records_held: usize,
     /// Why some loose files or pack records could not be checked, one sentence per store, if any
     /// could not: whether they are damaged is not known, so the lists above may be short. Also in
@@ -2483,15 +2484,19 @@ pub(crate) fn corrupt_packed_objects() -> Result<StoreScan, String> {
     }
 
     let mut scan = StoreScan::default();
+    // The scan just loaded the registry, so a failing read reloading it would only reread every
+    // pack once per hash.
+    let _no_reloads = pack_utils::NoForcedReloads::enter();
     for (hash, record) in failing {
-        // The whole store's read judges it: another good copy stands in, and a failure that says
-        // nothing about the record (an `Other` cause) is the read's to explain.
+        // The whole store's read judges it: another good copy stands in. Only damaged copies make
+        // it corrupt; a damaged index heal could not rebuild is the walk's to report unreadable,
+        // and any other failure is the read's to explain.
         match file_utils::read_object_classified(&hash) {
             Ok(file_utils::StoreReadOutcome::Verified(_) | file_utils::StoreReadOutcome::Absent) => {}
-            Ok(file_utils::StoreReadOutcome::Unverifiable(error, file_utils::Unreadable::Other)) => {
-                scan.unchecked.push((hash, error));
+            Ok(file_utils::StoreReadOutcome::Unverifiable(_, file_utils::Unreadable::RecordDamage | file_utils::Unreadable::LooseCorrupt)) => {
+                scan.corrupt.insert(hash, record.why);
             }
-            Ok(file_utils::StoreReadOutcome::Unverifiable(..)) => { scan.corrupt.insert(hash, record.why); }
+            Ok(file_utils::StoreReadOutcome::Unverifiable(error, _)) => scan.unchecked.push((hash, error)),
             Err(error) => scan.unchecked.push((hash, format!(
                 "its pack record does not rebuild, but its other copies could not be consulted: {}", error
             ))),
