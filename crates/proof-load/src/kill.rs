@@ -149,17 +149,41 @@ impl Directories {
 /// write-op coverage it feeds reports a command only when no traced run of it reaches a placed
 /// write.
 pub fn written(calls: &[Call], start: &str) -> Vec<String> {
+    writes(calls, start).0.into_iter().map(|write| write.path).collect()
+}
+
+/// One path a successful mutating call named: what it did there, and when the call was entered.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Write {
+    /// Absolute.
+    pub path: String,
+    pub kind: trace::Kind,
+    /// The call's `-ttt` stamp, in microseconds since the Unix epoch, when it has one.
+    pub when: Option<u64>,
+    /// The call as strace named it, for a refusal to quote.
+    pub call: String,
+}
+
+/// [`written`], each path with its kind and stamp, in trace order, and what the table refused:
+/// each call it cannot classify or place, which names nothing among the writes. A caller that
+/// must see every write refuses on the second; [`written`] needs only some.
+pub fn writes(calls: &[Call], start: &str) -> (Vec<Write>, Vec<String>) {
     let mut directories = Directories::new(trace::thread_groups(calls), start);
-    let mut paths = Vec::new();
+    let mut writes = Vec::new();
+    let mut refused = Vec::new();
     for call in calls {
-        if let Ok(touched) = trace::touch(call) {
-            if touched.class == Class::Mutating && matches!(call.returned, Returned::Value(_)) {
-                paths.extend(touched.operands.iter().map(|operand| directories.resolved(operand, call.tid)));
+        match trace::touch(call) {
+            Ok(touched) if touched.class == Class::Mutating && matches!(call.returned, Returned::Value(_)) => {
+                // touch refuses a mutating call that has no kind.
+                let kind = trace::kind(&call.name).expect("touch gives every mutating call a kind");
+                writes.extend(touched.operands.iter().map(|operand| Write { path: directories.resolved(operand, call.tid), kind, when: call.when, call: call.name.clone() }));
             }
+            Ok(_) => {}
+            Err(unsound) => refused.push(unsound.to_string()),
         }
         directories.follow(call);
     }
-    paths
+    (writes, refused)
 }
 
 /// `call`'s identity: see [`Identity`].
@@ -821,6 +845,19 @@ mod tests {
     ///
     /// Revert: count positions across threads → the worker's temp open is #3, not #1; aim the temp
     /// with -P → its pid-bearing path never fires; target the child → git's write is a point.
+    /// A mutating call the table cannot place is refused aloud, never dropped: the server route
+    /// write check must see every write or say why it cannot.
+    ///
+    /// Revert: skip a call `touch` refuses → the unplaced unlink vanishes and nothing is refused.
+    #[test]
+    fn an_unplaced_write_is_refused_not_dropped() {
+        let calls = trace::parse("7 1731542400.000100 unlinkat(5, \"x\", 0) = 0\n7 1731542400.000200 unlinkat(AT_FDCWD</s>, \"y\", 0) = 0\n").unwrap();
+        let (writes, refused) = writes(&calls, "/s");
+        assert_eq!(writes.iter().map(|write| write.path.as_str()).collect::<Vec<_>>(), vec!["/s/y"]);
+        assert_eq!(refused.len(), 1, "{:?}", refused);
+        assert!(refused[0].contains("unlinkat"), "{:?}", refused);
+    }
+
     #[test]
     fn a_counting_trace_yields_its_kill_points() {
         let text = "\

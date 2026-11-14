@@ -139,7 +139,7 @@ Notes:
   probe measures which, a cell whose property does not hold is not run, and the volume is never
   lifted, since nobody lifts the file system their checkout lives on. Every hosted scenario's
   server is reached only through the harness's TCP proxy, which logs each HTTP/1.1 exchange and,
-  in the network lane only, forwards one request at a time; `--network <scenario>` (CI: `lifted`,
+  in the network lane and wherever the server is traced, forwards one request at a time; `--network <scenario>` (CI: `lifted`,
   every OS) arms one fault of
   each kind (a delay, a dropped request, a truncated, reset or stalled response, a request cut
   toward the server, the server killed once the request is forwarded) at a seeded request of the
@@ -160,6 +160,13 @@ Notes:
   scenarios are built, or be exempt in `ROUTE_EXEMPTIONS` in the same file, and a request that no
   listed route matches fails the check too. A new route needs a scenario step that sends it, or an
   exemption.
+  On Linux strace is attached to each hosted scenario's server once it listens, and every write
+  it makes to the warehouse it serves must fall in the write set `ROUTE_WRITES` binds to a route
+  whose request was in flight when it was made (`forwarded` to `answered` in `exchanges.json`), or
+  in `BACKGROUND_WRITES` or `ADMISSION_WRITES`; a writing route answered with success needs a
+  write of its own, and every listed route needs a binding, read-only ones included. The traced
+  writes are uploaded as `server-writes.json`. A route that writes somewhere new needs that path
+  in its set, or the check fails naming the write.
   They are outside `ci passed` and their run step continues on error, so for now they report without
   failing; read the grades in the job summary or the uploaded report. A census row added without a
   damage binding or an exemption in `crates/proof-load/src/bindings.rs` fails the `bindings` unit

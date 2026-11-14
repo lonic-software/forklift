@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use crate::census::Census;
 use crate::damage::{self, Binding, Exemption, Kind, Warehouse};
 use crate::routes::{Exemption as RouteExemption, Mount};
+use crate::routewrites::{Bound, Entry, RouteWrites};
+use crate::trace::Kind as Change;
 use crate::scenario::Scenario;
 use crate::writeops::Exemption as WriteExemption;
 use crate::writeops::Exemption::{ReadOnly, Unrunnable};
@@ -119,7 +121,6 @@ const GLOBAL: &str = "writes only the operator's own configuration and keys, out
 const PRINTS: &str = "prints what the binary is and touches no warehouse";
 const REPLACES_BINARY: &str = "replaces the binary under test, or the shell's aliases for it, outside every warehouse";
 const NEEDS_OLDER_FORMAT: &str = "upgrades a warehouse of an older format, and the version under test writes only its own";
-const SERVES: &str = "serves until stopped; its writes are the hosted scenarios' requests, which the server kill points grade";
 
 /// The commands the write-op check does not require a traced write of, by schema id (a server
 /// leaf as `forklift-server <words>`). A read-only one must still be run by some scenario, and
@@ -143,7 +144,6 @@ pub const WRITE_EXEMPTIONS: &[(&str, WriteExemption)] = &[
     ("version", Unrunnable(PRINTS)), ("self-update", Unrunnable(REPLACES_BINARY)),
     ("self-alias-install", Unrunnable(REPLACES_BINARY)), ("self-alias-uninstall", Unrunnable(REPLACES_BINARY)),
     ("upgrade", Unrunnable(NEEDS_OLDER_FORMAT)), ("forklift-server upgrade", Unrunnable(NEEDS_OLDER_FORMAT)),
-    ("forklift-server serve", Unrunnable(SERVES)),
 ];
 
 /// The server routes the route check does not require a successful answer of, by the route
@@ -158,6 +158,108 @@ pub const ROUTE_EXEMPTIONS: &[RouteExemption] = &[
     RouteExemption { method: "POST", path: "/objects/missing", mount: Mount::Protocol, reason: "sent by an origin move over withheld recipes and by heal's refetch into a hosted clone, and no scenario reaches either yet" },
     RouteExemption { method: "PUT", path: "/withheld/{hash}/recipe", mount: Mount::Protocol, reason: "sent when a lift's new history reaches content the host withholds, and no scenario builds that yet" },
 ];
+
+const fn entry(kind: Change, path: &'static str) -> Entry {
+    Entry { kind, path }
+}
+
+const fn route(method: &'static str, path: &'static str, mount: Mount, bound: Bound) -> RouteWrites {
+    RouteWrites { method, path, mount, bound }
+}
+
+// Each set is what a CI trace of the version under test showed its route write, checked against
+// the handler's source. A write is made atomically: a `<name>.tmp~<pid>-<n>` written, then renamed
+// onto the name, so both names are a rename's operands.
+
+// store_object_bytes: the object zstd-compressed at objects/<first two>/<rest>, its fan-out folder
+// made first.
+const PUT_OBJECT: &[Entry] = &[
+    entry(Change::Mkdir, ".forklift/objects/{hash[..2]}"), entry(Change::Write, ".forklift/objects/{hash[..2]}/{hash[2..]}.tmp~*"),
+    entry(Change::Rename, ".forklift/objects/{hash[..2]}/{hash[2..]}.tmp~*"), entry(Change::Rename, ".forklift/objects/{hash[..2]}/{hash[2..]}"),
+];
+// withholding::record_digest: the withheld record rewritten whole. No scenario reaches it yet
+// (FORK-474), so this set is from the source alone. The redaction deleter records a digest in the
+// same file in the background, and a write a shared set holds credits no route, so this route is
+// credited only once it is seen making a write of its own: the step FORK-474 adds fails this
+// check until then, by design, rather than letting a background write prove it.
+const PUT_WITHHELD_RECIPE: &[Entry] = &[
+    entry(Change::Write, ".forklift/withheld.tmp~*"), entry(Change::Rename, ".forklift/withheld.tmp~*"), entry(Change::Rename, ".forklift/withheld"),
+];
+// store_raw_parcel_signature: a sidecar beside its parcel, objects/<first two>/<rest>.sig.
+const PUT_SIGNATURE: &[Entry] = &[
+    entry(Change::Write, ".forklift/objects/{hash[..2]}/{hash[2..]}.sig.tmp~*"),
+    entry(Change::Rename, ".forklift/objects/{hash[..2]}/{hash[2..]}.sig.tmp~*"), entry(Change::Rename, ".forklift/objects/{hash[..2]}/{hash[2..]}.sig"),
+];
+// The office's trust file.
+const PUT_TRUST: &[Entry] = &[entry(Change::Write, ".forklift/trust.tmp~*"), entry(Change::Rename, ".forklift/trust.tmp~*"), entry(Change::Rename, ".forklift/trust")];
+// A ref update: the head at pallets/<name>, or meta/<name> for an `@name`, its parent folders made
+// for a nested name, and the commit-graph shards of the parcels it brings, graph/<first two>.
+// `{name[1..]}` drops the `@`; for a user pallet it names a meta head with its first letter cut,
+// which no update writes. Recreating a deleted pallet clears its tombstone (`clear_tombstone`).
+// The parent folders and the tombstone are from the source alone: no scenario nests a name or
+// lifts a deleted pallet again.
+const UPDATE_PALLET: &[Entry] = &[
+    entry(Change::Mkdir, ".forklift/pallets/{name:parents}"), entry(Change::Mkdir, ".forklift/meta/{name:parents[1..]}"),
+    entry(Change::Write, ".forklift/tombstones.tmp~*"), entry(Change::Rename, ".forklift/tombstones.tmp~*"), entry(Change::Rename, ".forklift/tombstones"),
+    entry(Change::Write, ".forklift/pallets/{name}.tmp~*"), entry(Change::Rename, ".forklift/pallets/{name}.tmp~*"), entry(Change::Rename, ".forklift/pallets/{name}"),
+    entry(Change::Mkdir, ".forklift/meta"),
+    entry(Change::Write, ".forklift/meta/{name[1..]}.tmp~*"), entry(Change::Rename, ".forklift/meta/{name[1..]}.tmp~*"), entry(Change::Rename, ".forklift/meta/{name[1..]}"),
+    entry(Change::Mkdir, ".forklift/graph"),
+    entry(Change::Write, ".forklift/graph/*.tmp~*"), entry(Change::Rename, ".forklift/graph/*.tmp~*"), entry(Change::Rename, ".forklift/graph/*"),
+];
+// A ref deletion: the head removed, each parent folder it leaves empty removed (`unlink_ref`, from
+// the source alone), and its last head kept in the tombstones file. A meta pallet is refused.
+const DELETE_PALLET: &[Entry] = &[
+    entry(Change::Remove, ".forklift/pallets/{name}"), entry(Change::Remove, ".forklift/pallets/{name:parents}"),
+    entry(Change::Write, ".forklift/tombstones.tmp~*"), entry(Change::Rename, ".forklift/tombstones.tmp~*"), entry(Change::Rename, ".forklift/tombstones"),
+];
+// create_warehouse: a `.creating-<id>-<pid>-<n>` staging folder prepared in full, an empty folder
+// at the id removed, the staging folder renamed onto it.
+const PUT_WAREHOUSE: &[Entry] = &[
+    entry(Change::Mkdir, ".creating-{warehouse}-*"), entry(Change::Mkdir, ".creating-{warehouse}-*/**"),
+    entry(Change::Write, ".creating-{warehouse}-*/**"), entry(Change::Rename, ".creating-{warehouse}-*/**"),
+    entry(Change::Remove, "{warehouse}"), entry(Change::Rename, ".creating-{warehouse}-*"), entry(Change::Rename, "{warehouse}"),
+];
+
+/// Every server route the route table lists, bound to what it may write in the warehouse it
+/// serves, as a template relative to the host root filled from the request's captures.
+pub const ROUTE_WRITES: &[RouteWrites] = &[
+    route("GET", "/warehouse", Mount::Protocol, Bound::ReadOnly),
+    route("POST", "/objects/missing", Mount::Protocol, Bound::ReadOnly),
+    route("POST", "/objects/upload-targets", Mount::Protocol, Bound::ReadOnly),
+    route("POST", "/objects/batch", Mount::Protocol, Bound::ReadOnly),
+    route("GET", "/parcels/{parcel}/subtree/{*path}", Mount::Protocol, Bound::ReadOnly),
+    route("GET", "/objects/{hash}", Mount::Protocol, Bound::ReadOnly),
+    route("PUT", "/objects/{hash}", Mount::Protocol, Bound::Writes(PUT_OBJECT)),
+    route("PUT", "/withheld/{hash}/recipe", Mount::Protocol, Bound::Writes(PUT_WITHHELD_RECIPE)),
+    route("GET", "/signatures/{hash}", Mount::Protocol, Bound::ReadOnly),
+    route("PUT", "/signatures/{hash}", Mount::Protocol, Bound::Writes(PUT_SIGNATURE)),
+    route("PUT", "/trust", Mount::Protocol, Bound::Writes(PUT_TRUST)),
+    route("POST", "/pallets/{*name}", Mount::Protocol, Bound::Writes(UPDATE_PALLET)),
+    route("DELETE", "/pallets/{*name}", Mount::Protocol, Bound::Writes(DELETE_PALLET)),
+    route("POST", "/holds/{*name}", Mount::Protocol, Bound::ReadOnly),
+    route("POST", "/resolve", Mount::Protocol, Bound::ReadOnly),
+    route("GET", "/bundles/latest", Mount::Protocol, Bound::ReadOnly),
+    route("PUT", "/warehouses/{warehouse}", Mount::Root, Bound::Writes(PUT_WAREHOUSE)),
+    route("GET", "/healthz", Mount::Root, Bound::ReadOnly),
+];
+
+/// What the server writes on its own, after it answered: work a request or a command started
+/// that goes on running in a spawned task. Its redaction round deletes what a redaction or a
+/// withhold took away once the warehouse drains (`delete_drained`, through the redaction deleter):
+/// loose copies removed (seen in a trace), and from the source alone, packs repacked without them,
+/// the chunks-owed journal written or removed, and a withheld recipe's digest recorded.
+pub const BACKGROUND_WRITES: &[Entry] = &[
+    entry(Change::Remove, ".forklift/objects/*/*"),
+    entry(Change::Write, ".forklift/objects/pack/*"), entry(Change::Rename, ".forklift/objects/pack/*"), entry(Change::Remove, ".forklift/objects/pack/*"),
+    entry(Change::Write, ".forklift/redactions-chunks-owed.tmp~*"), entry(Change::Rename, ".forklift/redactions-chunks-owed.tmp~*"),
+    entry(Change::Rename, ".forklift/redactions-chunks-owed"), entry(Change::Remove, ".forklift/redactions-chunks-owed"),
+    entry(Change::Write, ".forklift/withheld.tmp~*"), entry(Change::Rename, ".forklift/withheld.tmp~*"), entry(Change::Rename, ".forklift/withheld"),
+];
+
+/// What the server writes admitting a request: nothing, as admission asks a hook over the network
+/// and writes no file. Kept as its own set so a version that records admissions must declare it.
+pub const ADMISSION_WRITES: &[Entry] = &[];
 
 /// What the damage completeness check finds missing: census names no binding or exemption covers,
 /// bindings and exemptions the census no longer lists, bindings naming a scenario that does not

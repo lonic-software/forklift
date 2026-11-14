@@ -40,6 +40,9 @@ pub struct Call {
     /// How many calls had finished when this one started: its own index, unless it was printed
     /// unfinished and other calls finished while it ran.
     pub entered: usize,
+    /// When it was entered, in microseconds since the Unix epoch, when the trace was taken with
+    /// `-ttt`: the stamp of its first half, if it was printed unfinished.
+    pub when: Option<u64>,
 }
 
 /// One argument read as what it names.
@@ -56,13 +59,22 @@ pub enum Argument {
     Other(String),
 }
 
+/// `<seconds>.<microseconds>`, as `-ttt` stamps a line, in microseconds.
+fn stamp(text: &str) -> Option<u64> {
+    let (seconds, micros) = text.split_once('.')?;
+    if micros.len() != 6 || !seconds.bytes().chain(micros.bytes()).all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    seconds.parse::<u64>().ok()?.checked_mul(1_000_000)?.checked_add(micros.parse().ok()?)
+}
+
 /// Reads `text`, the output of one `strace -f -qq -y -o` run, with any `-e write=` dumps joined to
-/// the call they follow. A line the harness cannot read refuses the trace: a guess at a call is a
-/// kill point aimed at nothing.
+/// the call they follow, and each line's `-ttt` stamp when it has one. A line the harness cannot
+/// read refuses the trace: a guess at a call is a kill point aimed at nothing.
 pub fn parse(text: &str) -> Result<Vec<Call>, String> {
     let mut calls: Vec<Call> = Vec::new();
-    // Per thread, the first half of an unfinished call.
-    let mut pending: BTreeMap<u32, (String, usize)> = BTreeMap::new();
+    // Per thread, the first half of an unfinished call, where it was entered, and its stamp.
+    let mut pending: BTreeMap<u32, (String, usize, Option<u64>)> = BTreeMap::new();
     for (number, line) in text.lines().enumerate() {
         let refuse = |why: &str| format!("trace line {}: {}: {}", number + 1, why, line);
         if line.trim().is_empty() {
@@ -86,30 +98,39 @@ pub fn parse(text: &str) -> Result<Vec<Call>, String> {
         }
         let (tid, rest) = line.trim_start().split_once(char::is_whitespace).ok_or_else(|| refuse("no thread id"))?;
         let tid: u32 = tid.parse().map_err(|_| refuse("no thread id"))?;
-        let rest = rest.trim_start();
+        let mut rest = rest.trim_start();
+        let mut when = None;
+        if let Some((first, after)) = rest.split_once(char::is_whitespace) {
+            if let Some(stamped) = stamp(first) {
+                when = Some(stamped);
+                rest = after.trim_start();
+            }
+        }
         if rest.starts_with("+++") || rest.starts_with("---") {
             continue;
         }
-        let (whole, entered) = if let Some(resumed) = rest.strip_prefix("<... ") {
+        let (whole, entered, when) = if let Some(resumed) = rest.strip_prefix("<... ") {
             let (_, tail) = resumed.split_once(" resumed>").ok_or_else(|| refuse("a resumed call without its name"))?;
-            let (head, entered) = pending.remove(&tid).ok_or_else(|| refuse("a resumed call that never started"))?;
-            (format!("{}{}", head, tail), entered)
+            let (head, entered, started) = pending.remove(&tid).ok_or_else(|| refuse("a resumed call that never started"))?;
+            (format!("{}{}", head, tail), entered, started)
         } else {
-            (rest.to_string(), calls.len())
+            (rest.to_string(), calls.len(), when)
         };
         if let Some(head) = whole.strip_suffix("<unfinished ...>") {
-            pending.insert(tid, (head.trim_end().to_string(), entered));
+            pending.insert(tid, (head.trim_end().to_string(), entered, when));
             continue;
         }
         let mut finished = call(tid, &whole).ok_or_else(|| refuse("not a call"))?;
         finished.entered = entered;
+        finished.when = when;
         calls.push(finished);
     }
     // A call still unfinished at the end never returned: its process died in it.
-    for (tid, (head, entered)) in pending {
+    for (tid, (head, entered, when)) in pending {
         if let Some(mut started) = call(tid, &format!("{}) = ?", head)) {
             started.returned = Returned::Unknown;
             started.entered = entered;
+            started.when = when;
             calls.push(started);
         }
     }
@@ -132,7 +153,7 @@ fn call(tid: u32, text: &str) -> Option<Call> {
     } else {
         Returned::Value(value_token(returned))
     };
-    Some(Call { tid, name: name.to_string(), arguments, returned, data: Vec::new(), unreadable: None, entered: 0 })
+    Some(Call { tid, name: name.to_string(), arguments, returned, data: Vec::new(), unreadable: None, entered: 0, when: None })
 }
 
 /// The bytes of one dump row, after its leading `| `: a hex offset of at least five digits (strace
@@ -419,12 +440,63 @@ const INERT_IOCTLS: &[&str] = &["TCGETS", "TCGETS2", "TIOCGWINSZ", "TIOCGPGRP", 
 /// ioctl requests that write a file: reflink clone and dedupe.
 const MUTATING_IOCTLS: &[&str] = &["FICLONE", "FICLONERANGE", "FIDEDUPERANGE", "BTRFS_IOC_CLONE", "BTRFS_IOC_CLONE_RANGE"];
 
+/// What a mutating call does to the path it names, as a write set declares it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Kind {
+    /// Creates, writes into or cuts a file: a writing open, a descriptor write, a truncation, a
+    /// clone into it, a device node.
+    Write,
+    /// Moves a name: both the old name and the new.
+    Rename,
+    /// Removes a file or a folder.
+    Remove,
+    Mkdir,
+    /// A hard or symbolic link made at the path.
+    Link,
+    /// Changes a mode, an owner, times or an extended attribute.
+    Metadata,
+}
+
+impl Kind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Write => "write",
+            Kind::Rename => "rename",
+            Kind::Remove => "remove",
+            Kind::Mkdir => "mkdir",
+            Kind::Link => "link",
+            Kind::Metadata => "metadata",
+        }
+    }
+}
+
+/// The kind of change a call the table classifies as mutating makes, by its name; None for a name
+/// the table does not list as mutating.
+pub fn kind(name: &str) -> Option<Kind> {
+    Some(match name {
+        "openat" | "open" | "creat" | "openat2" | "write" | "writev" | "pwrite64" | "pwritev" | "pwritev2" | "ftruncate"
+        | "truncate" | "fallocate" | "copy_file_range" | "sendfile" | "splice" | "ioctl" | "mknodat" | "mknod" => Kind::Write,
+        "renameat" | "renameat2" | "rename" => Kind::Rename,
+        "unlinkat" | "unlink" | "rmdir" => Kind::Remove,
+        "mkdirat" | "mkdir" => Kind::Mkdir,
+        "linkat" | "link" | "symlinkat" | "symlink" => Kind::Link,
+        "fchmodat" | "fchmodat2" | "chmod" | "fchmod" | "fchownat" | "chown" | "lchown" | "fchown" | "setxattr" | "lsetxattr"
+        | "fsetxattr" | "removexattr" | "lremovexattr" | "fremovexattr" | "utimes" | "utime" | "futimesat" | "utimensat" => Kind::Metadata,
+        _ => return None,
+    })
+}
+
 /// Reads `call` against the table. A change that did not fail, to a path relative to a folder
 /// descriptor strace did not name, is unsound: where it landed is not known, and the working
 /// folder is not guessed in its place.
 pub fn touch(call: &Call) -> Result<Touch, Unsound> {
     let unplaced = std::cell::Cell::new(None);
     let touched = classify(call, &unplaced)?;
+    // A write set names a change by its kind: a mutating call without one could match none.
+    if touched.class == Class::Mutating && kind(&call.name).is_none() {
+        return Err(Unsound::Unclassified(format!("{} (it mutates, and has no write kind)", call.name)));
+    }
     if let Some(traced) = unplaced.take() {
         if touched.class == Class::Mutating && !matches!(call.returned, Returned::Failed(_)) {
             return Err(Unsound::Unplaced(format!("{} of {:?}", call.name, traced)));
@@ -674,6 +746,7 @@ pub fn base(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     /// A trace's lines become calls: an unfinished call joins its resumed half, a killed call
     /// returns unknown, a failure keeps its errno, an interrupted one is restarted, and exit and
@@ -699,13 +772,48 @@ mod tests {
         assert_eq!(calls[0].arguments.len(), 3);
         assert_eq!(calls[1].name, "unlinkat");
         assert_eq!(calls[1].returned, Returned::Failed("ENOENT".into()));
-        assert_eq!(calls[2], Call { tid: 88, name: "fsync".into(), arguments: vec!["12</s/work/.forklift/pallets>".into()], returned: Returned::Unknown, data: vec![], unreadable: None, entered: 1 });
+        assert_eq!(calls[2], Call { tid: 88, name: "fsync".into(), arguments: vec!["12</s/work/.forklift/pallets>".into()], returned: Returned::Unknown, data: vec![], unreadable: None, entered: 1, when: None });
         assert_eq!(calls[3].returned, Returned::Restarted);
         assert!(parse("87    nonsense\n").is_err());
         assert!(parse("87    <... fsync resumed>) = 0\n").is_err(), "a resumed call that never started");
         // A call cut off by the kill with no resumed line never returned.
         let cut = parse("88    write(5</s/a.tmp~87-0>, \"x\", 1 <unfinished ...>\n").unwrap();
         assert_eq!(cut[0].returned, Returned::Unknown);
+    }
+
+    /// Every call name the table can classify as mutating has a kind, and nothing else has one.
+    ///
+    /// Revert: drop a name from `kind` → its writes would be uncounted by every write set.
+    #[test]
+    fn every_mutating_call_has_a_kind() {
+        let mutating: BTreeSet<&str> = PATH_CALLS.iter().filter(|(_, _, class)| *class == Class::Mutating).map(|(name, _, _)| *name)
+            .chain(DESCRIPTOR_CALLS.iter().filter(|(_, _, class)| *class == Class::Mutating).map(|(name, _, _)| *name))
+            .chain(["openat", "open", "creat", "openat2", "utimensat", "ioctl"]).collect();
+        for name in &mutating {
+            assert!(kind(name).is_some(), "{} mutates and has no kind", name);
+        }
+        for name in INERT.iter().chain(&["sync", "fsync", "mmap"]) {
+            assert_eq!(kind(name), None, "{}", name);
+        }
+    }
+
+    /// A `-ttt` stamp after the thread id is read into the call, an unfinished call keeps the
+    /// stamp of its first half, and a trace without stamps has none.
+    ///
+    /// Revert: take the resumed line's stamp → the fsync reads 7.000300; skip the stamp → every
+    /// stamped line is "not a call".
+    #[test]
+    fn stamps_are_read_from_the_first_half() {
+        let text = "88 1731542400.000100 fsync(12</s/p> <unfinished ...>\n\
+            87 1731542400.000200 unlinkat(AT_FDCWD</s>, \"a\", 0) = 0\n\
+            88 1731542400.000300 <... fsync resumed>) = 0\n\
+            87 1731542400.000400 +++ exited with 0 +++\n";
+        let calls = parse(text).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!((calls[0].name.as_str(), calls[0].when), ("unlinkat", Some(1_731_542_400_000_200)));
+        assert_eq!((calls[1].name.as_str(), calls[1].when), ("fsync", Some(1_731_542_400_000_100)));
+        assert_eq!(parse("87 unlinkat(AT_FDCWD</s>, \"a\", 0) = 0\n").unwrap()[0].when, None);
+        assert_eq!(stamp("1.5"), None, "-ttt prints six digits");
     }
 
     /// Arguments split at top-level commas only, and each reads as what it names.

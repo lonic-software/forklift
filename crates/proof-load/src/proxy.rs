@@ -92,6 +92,17 @@ pub struct Exchange {
     pub status: Option<u16>,
     /// The fault injected into it, if any.
     pub fault: Option<Fault>,
+    /// When its bytes were first sent toward the server, in microseconds since the Unix epoch:
+    /// none when nothing of it was.
+    pub forwarded: Option<u64>,
+    /// When the server's response to it had been read to its end, in the same clock: none when it
+    /// never was.
+    pub answered: Option<u64>,
+}
+
+/// The system's wall clock, in microseconds since the Unix epoch: the clock strace's `-ttt` reads.
+pub fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_micros() as u64)
 }
 
 /// The fault armed for the `at`-th request (from 0) read after arming.
@@ -449,7 +460,7 @@ fn serve_connection(client: TcpStream, state: &State) {
             let index = {
                 let mut log = lock(&state.log);
                 let index = log.len();
-                log.push(Exchange { index, method: request.first.clone(), path: path_of(&request.second), status: None, fault: None });
+                log.push(Exchange { index, method: request.first.clone(), path: path_of(&request.second), status: None, fault: None, forwarded: None, answered: None });
                 index
             };
             let fault = take_fault(state, index);
@@ -480,6 +491,8 @@ fn serve_connection(client: TcpStream, state: &State) {
                     let _ = client.shutdown(Shutdown::Both);
                     return;
                 };
+                // A resend keeps the first stamp: the window opens when any of the request went.
+                lock(&state.log)[index].forwarded.get_or_insert_with(now);
                 if fault == Some(Fault::Cut) {
                     if server.writer.write_all(&request.bytes[..request.bytes.len() / 2]).and_then(|_| server.writer.flush()).is_err() {
                         if reused {
@@ -526,7 +539,10 @@ fn serve_connection(client: TcpStream, state: &State) {
                     continue;
                 }
                 match read_response(&mut server.reader, &request.first) {
-                    Ok(Some(response)) => break (index, fault, response),
+                    Ok(Some(response)) => {
+                        lock(&state.log)[index].answered = Some(now());
+                        break (index, fault, response);
+                    }
                     _ => {
                         let _ = client.shutdown(Shutdown::Both);
                         return;
@@ -673,9 +689,12 @@ mod tests {
             vec![("GET", "/v1/warehouse", Some(200)), ("PUT", "/v1/objects/ab", Some(200)), ("POST", "/v1/pallets/main", Some(200))]);
     }
 
-    /// Serialized, requests on concurrent connections reach the server one at a time.
+    /// Serialized, requests on concurrent connections reach the server one at a time, and each
+    /// exchange's forwarded-to-answered window holds the server's handling of it alone.
     ///
-    /// Revert: forward without taking the order lock → the server handles several at once.
+    /// Revert: forward without taking the order lock → the server handles several at once and the
+    /// windows overlap; stamp `forwarded` once the response is read → every window is shorter than
+    /// the server's delay.
     #[test]
     fn concurrent_requests_reach_the_server_one_at_a_time() {
         let server = echo(Duration::from_millis(100));
@@ -690,6 +709,15 @@ mod tests {
         }
         assert_eq!(server.reached.load(Ordering::SeqCst), 6);
         assert_eq!(server.widest.load(Ordering::SeqCst), 1);
+        // Each window spans the server's handling of its request, and no two overlap.
+        let mut windows: Vec<(u64, u64)> = proxy.log().iter().map(|exchange| (exchange.forwarded.unwrap(), exchange.answered.unwrap())).collect();
+        windows.sort();
+        for (forwarded, answered) in &windows {
+            assert!(answered - forwarded >= 100_000, "a window of {} µs is shorter than the server's 100 ms", answered - forwarded);
+        }
+        for pair in windows.windows(2) {
+            assert!(pair[0].1 <= pair[1].0, "windows {:?} and {:?} overlap", pair[0], pair[1]);
+        }
     }
 
     /// Each fault fires once, on the request it was armed for, and does what it names: a drop

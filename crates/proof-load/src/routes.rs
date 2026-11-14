@@ -301,6 +301,24 @@ fn matches(template: &str, path: &str) -> Option<usize> {
     (given.len() == wanted.len()).then_some(literals)
 }
 
+/// What `path` gives each of `template`'s captures, by name, when it matches: a `{name}` its one
+/// segment, a final `{*name}` the rest of the path joined by `/`.
+pub fn captures(template: &str, path: &str) -> Option<std::collections::BTreeMap<String, String>> {
+    matches(template, path)?;
+    let given: Vec<&str> = path.split('/').skip(1).collect();
+    let mut found = std::collections::BTreeMap::new();
+    for (at, segment) in template.split('/').skip(1).enumerate() {
+        if let Some(name) = segment.strip_prefix("{*").and_then(|rest| rest.strip_suffix('}')) {
+            found.insert(name.to_string(), given[at..].join("/"));
+            break;
+        }
+        if let Some(name) = segment.strip_prefix('{').and_then(|rest| rest.strip_suffix('}')) {
+            found.insert(name.to_string(), given[at].to_string());
+        }
+    }
+    Some(found)
+}
+
 /// What the route check finds missing, over the exchanges logged in `mode`: every listed route no
 /// exchange was answered with success at and no exemption covers; every exemption that names no
 /// listed route, or a route an exchange was answered at after all; and every exchange that matches
@@ -367,7 +385,19 @@ mod tests {
     }
 
     fn exchange(method: &str, path: &str, status: u16) -> Exchange {
-        Exchange { index: 0, method: method.to_string(), path: path.to_string(), status: Some(status), fault: None }
+        Exchange { index: 0, method: method.to_string(), path: path.to_string(), status: Some(status), fault: None, forwarded: None, answered: None }
+    }
+
+    /// A capture takes its one segment and a final rest capture every segment after it; a path
+    /// the template does not match captures nothing.
+    ///
+    /// Revert: take the rest capture's first segment only → `feature/x` captures as `feature`.
+    #[test]
+    fn captures_name_what_the_path_gives() {
+        let got = captures("/warehouses/{warehouse}/v1/pallets/{*name}", "/warehouses/w/v1/pallets/feature/x").unwrap();
+        assert_eq!(got, [("warehouse".to_string(), "w".to_string()), ("name".to_string(), "feature/x".to_string())].into());
+        assert_eq!(captures("/v1/objects/{hash}", "/v1/objects/ab").unwrap(), [("hash".to_string(), "ab".to_string())].into());
+        assert_eq!(captures("/v1/objects/{hash}", "/v1/signatures/ab"), None);
     }
 
     /// The tables parse into routes and both prefixes; a document without route markers has no

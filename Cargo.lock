@@ -2230,6 +2230,7 @@ dependencies = [
  "blake3",
  "clap",
  "libc",
+ "percent-encoding",
  "serde",
  "serde_json",
 ]
