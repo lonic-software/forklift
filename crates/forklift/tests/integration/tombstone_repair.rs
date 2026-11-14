@@ -287,6 +287,25 @@ fn a_repair_names_a_deletion_at_a_head_another_pallet_still_holds() {
     assert!(listed.lines().any(|line| line.contains(&main) && line.contains("gone")), "{}", listed);
 }
 
+/// Revert: leave a head kept with no name once a journal names it → the list holds it twice, and
+/// after the name is restored the nameless entry still pins it → red.
+#[test]
+fn a_repair_that_names_a_head_the_damaged_list_kept_holds_it_once() {
+    use forklift_core::util::record_utils;
+    let area = Area::new("kept-named");
+    let root = area.served();
+    let gone = area.deleted(&root, "gone");
+    let damaged = record_utils::to_bytes("tombstones", 2, [gone.as_str(), "not an entry"]);
+    std::fs::write(list_path(&root), &damaged).unwrap();
+
+    area.server_ok(&root, &["tombstone", "repair"]);
+
+    let listed = area.server_ok(&root, &["tombstone", "list"]);
+    let lines: Vec<&str> = listed.lines().filter(|line| line.contains(&gone)).collect();
+    assert_eq!(lines.len(), 1, "{}", listed);
+    assert!(lines[0].contains("gone"), "{}", listed);
+}
+
 /// Revert: run the whole repair when only the mark was lost → the journal settles "gone", whose
 /// tombstone the operator dropped, so it is named again → red.
 #[test]

@@ -197,11 +197,13 @@ pub fn repair_tombstones() -> Result<Repaired, String> {
 
     if let Some(evidence) = &evidence {
         for head in evidence.deleted_heads() {
-            if !lost.unheld.contains(head) && !pallet_utils::object_hashes_with_prefix(head)?.iter().any(|stored| stored == head) {
+            if !lost.unheld.contains(head) && !file_utils::is_present_for_sweep(head)? {
                 continue;
             }
 
             if let Some(name) = evidence.name_of(head, &live, &tombstones)? {
+                // A head the damaged list kept with no name is now held by the name alone.
+                tombstones.kept.remove(head);
                 tombstones.named.insert(name.clone(), head.clone());
                 repaired.named.push((name, head.clone()));
                 named_heads.insert(head.clone());
@@ -220,7 +222,11 @@ pub fn repair_tombstones() -> Result<Repaired, String> {
     }
 
     if list.is_some() {
-        repaired.set_aside.push(set_aside(&list_path)?);
+        let moved = set_aside(&list_path).map_err(|e| match repaired.set_aside.first() {
+            Some(mark) => format!("{} The damaged served mark was moved aside to \"{}\" first.", e, mark.to_string_lossy()),
+            None => e,
+        })?;
+        repaired.set_aside.push(moved);
     }
 
     let moved = |error: String| match repaired.set_aside.is_empty() {
