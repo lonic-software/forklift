@@ -174,8 +174,9 @@ enum Salvage {
     /// This one parcel.
     Found(String),
 
-    /// More than one parcel: the bytes name one of these, not which.
-    Ambiguous(Vec<String>),
+    /// More than one parcel: the bytes name one of these, not which. The flag says another match
+    /// was tainted or could not be read, so may be the one.
+    Ambiguous(Vec<String>, bool),
 
     /// A match whose kind cannot be read, or that is tainted.
     Unknown(String),
@@ -194,6 +195,9 @@ struct Evidence {
 
     /// The parcels an ambiguous salvage may name.
     salvage_ambiguous: Vec<String>,
+
+    /// Whether an ambiguous salvage also matched an object that is tainted or cannot be read.
+    salvage_dropped: bool,
 
     /// Whether any checkout stands on the pallet.
     stood_on: bool,
@@ -360,9 +364,10 @@ fn gather(damaged: &DamagedRef, tainted: &Tainted, notes: &mut Vec<String>) -> E
             Ok(Salvage::Nothing) => {}
             Ok(Salvage::Found(head)) => evidence.candidates.push((head, Source::Salvage)),
             Ok(Salvage::Unknown(reason)) => evidence.salvage_unknown = Some(reason),
-            Ok(Salvage::Ambiguous(parcels)) => {
+            Ok(Salvage::Ambiguous(parcels, dropped)) => {
                 evidence.salvage_unknown = Some(format!("its bytes match more than one parcel: {}", parcels.join(", ")));
                 evidence.salvage_ambiguous = parcels;
+                evidence.salvage_dropped = dropped;
             }
             Err(error) => evidence.salvage_unknown = Some(format!("the store could not be searched for what its bytes name: {}", error)),
         }
@@ -433,7 +438,7 @@ fn judge(matches: Vec<String>, tainted: &Tainted) -> Salvage {
     }
 
     match (parcels.as_slice(), unknown.as_slice()) {
-        ([_, _, ..], _) => Salvage::Ambiguous(parcels),
+        ([_, _, ..], _) => Salvage::Ambiguous(parcels.clone(), !unknown.is_empty()),
         (_, [hash, ..]) => Salvage::Unknown(format!(
             "what its bytes name may be object {}, which is possibly lost or cannot be read", hash
         )),
@@ -643,7 +648,7 @@ pub fn set_damaged_ref(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> R
     let damaged = damaged_ref(pallet, notes)?;
 
     let head = pallet_utils::resolve_revision(parcel)?;
-    refuse_meta_history(pallet, parcel, &head)?;
+    refuse_meta_history(pallet, parcel, &head, notes)?;
 
     if crate::util::tombstone_utils::is_served()? {
         refuse_below_a_floor(&damaged, &head, notes)?;
@@ -656,18 +661,30 @@ pub fn set_damaged_ref(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> R
 }
 
 /// Refuse `head`, resolved from `parcel`, when it is a meta pallet's head or one of its ancestors.
-fn refuse_meta_history(pallet: &str, parcel: &str, head: &str) -> Result<(), String> {
-    for meta in pallet_utils::list_meta_pallets()? {
-        let Ok(Some(meta_head)) = pallet_utils::get_meta_pallet_head(&meta) else { continue };
+/// A meta pallet whose head or history cannot be read is not checked, with a note: refusing on it
+/// would block every `--ref` over a meta pallet unrelated to the damaged ref.
+fn refuse_meta_history(pallet: &str, parcel: &str, head: &str, notes: &mut Vec<String>) -> Result<(), String> {
+    let mut unchecked = |meta: &str, error: String| push_note(notes, format!(
+        "Whether {} is history of meta pallet \"@{}\" could not be told, so that was not checked: {}", head, meta, error
+    ));
 
-        let refusal = |why: String| format!(
-            "\"{}\" {}, so the ref of pallet \"{}\" is not set to it. Nothing was changed.", parcel, why, pallet
-        );
+    for meta in pallet_utils::list_meta_pallets()? {
+        let meta_head = match pallet_utils::get_meta_pallet_head(&meta) {
+            Ok(Some(meta_head)) => meta_head,
+            Ok(None) => continue,
+            Err(error) => {
+                unchecked(&meta, error);
+                continue;
+            }
+        };
 
         match at_or_below(head, &meta_head) {
             Ok(false) => {}
-            Ok(true) => return Err(refusal(format!("is meta history (of pallet \"@{}\"), not user history", meta))),
-            Err(error) => return Err(refusal(format!("could not be told apart from the history of pallet \"@{}\": {}", meta, error))),
+            Ok(true) => return Err(format!(
+                "\"{}\" is meta history (of pallet \"@{}\"), not user history, so the ref of pallet \"{}\" is not set to it. Nothing was changed.",
+                parcel, meta, pallet
+            )),
+            Err(error) => unchecked(&meta, error),
         }
     }
 
@@ -675,36 +692,50 @@ fn refuse_meta_history(pallet: &str, parcel: &str, head: &str) -> Result<(), Str
 }
 
 /// Refuse `head` for served `damaged` unless it equals or descends from every floor the evidence
-/// still records: each checkout's base, an interrupted operation's parcels, and what the ref's own
-/// bytes name (every parcel, when they match several). This is judged before the write's hold, and
-/// only over what can be read: a checkout whose state cannot be read, or bytes naming an object
-/// that is lost, add a note instead, since refusing on them would leave the ref no way out. With
-/// no floor at all it passes: what clones fetched is then the operator's to know.
+/// still records (each checkout's base, an interrupted operation's parcels, the one parcel the
+/// ref's own bytes name) and, when those bytes match several parcels, from at least one of them.
+/// This is judged before the write's hold, and only over what can be read: a checkout whose state
+/// cannot be read, a salvage match that is lost, or an ancestry walk that fails adds a note
+/// instead, since refusing on them would leave the ref no way out. With no floor at all it passes:
+/// what clones fetched is then the operator's to know.
 fn refuse_below_a_floor(damaged: &DamagedRef, head: &str, notes: &mut Vec<String>) -> Result<(), String> {
     let evidence = gather(damaged, &Tainted::read(notes), notes);
+    let mut partial = evidence.narrowed || evidence.salvage_dropped
+        || (evidence.salvage_unknown.is_some() && evidence.salvage_ambiguous.is_empty());
 
-    if evidence.narrowed || (evidence.salvage_unknown.is_some() && evidence.salvage_ambiguous.is_empty()) {
+    let below = |what: String| format!(
+        "This warehouse is served, and {} does not descend from {}, so the ref of pallet \"{}\" is not set to it: its clones may rely on that head. Nothing was changed.",
+        head, what, damaged.pallet
+    );
+
+    for (floor, source) in evidence.candidates.iter().filter(|(_, source)| source.is_floor()) {
+        match at_or_below(floor, head) {
+            Ok(true) => {}
+            Ok(false) => return Err(below(format!("{} ({})", floor, source.describe()))),
+            Err(_) => partial = true,
+        }
+    }
+
+    if !evidence.salvage_ambiguous.is_empty() {
+        let answers: Vec<Result<bool, String>> = evidence.salvage_ambiguous.iter().map(|parcel| at_or_below(parcel, head)).collect();
+
+        if answers.iter().any(|answer| answer.is_err()) {
+            partial = true;
+        }
+
+        // A lost match may be the one the bytes name, so only a "no" from every match refuses.
+        if !evidence.salvage_dropped && answers.iter().all(|answer| answer == &Ok(false)) {
+            return Err(below(format!(
+                "any of the parcels the ref's own bytes may name ({})", evidence.salvage_ambiguous.join(", ")
+            )));
+        }
+    }
+
+    if partial {
         push_note(notes, format!(
             "This warehouse is served, and not everything that records the head of pallet \"{}\" could be read, so {} was checked only against what could.",
             damaged.pallet, head
         ));
-    }
-
-    let ambiguous = evidence.salvage_ambiguous.iter().map(|parcel| (parcel.clone(), Source::Salvage));
-    let floors: Vec<(String, Source)> = evidence.candidates.iter().filter(|(_, source)| source.is_floor()).cloned().chain(ambiguous).collect();
-
-    for (floor, source) in &floors {
-        match at_or_below(floor, head) {
-            Ok(true) => {}
-            Ok(false) => return Err(format!(
-                "This warehouse is served, and {} does not descend from {} ({}), so the ref of pallet \"{}\" is not set to it: its clones may rely on that head. Nothing was changed.",
-                head, floor, source.describe(), damaged.pallet
-            )),
-            Err(error) => return Err(format!(
-                "This warehouse is served, and whether {} descends from {} ({}) could not be told, so the ref of pallet \"{}\" is not set: {} Nothing was changed.",
-                head, floor, source.describe(), damaged.pallet, error
-            )),
-        }
     }
 
     Ok(())
@@ -789,6 +820,9 @@ mod tests {
         let clean = Tainted { hashes: BTreeSet::new(), torn: false };
 
         assert_eq!(judge(vec![one.clone()], &clean), Salvage::Found(one.clone()));
-        assert_eq!(judge(vec![one.clone(), two.clone()], &clean), Salvage::Ambiguous(vec![one, two]));
+        assert_eq!(judge(vec![one.clone(), two.clone()], &clean), Salvage::Ambiguous(vec![one.clone(), two.clone()], false));
+
+        let tainted = Tainted { hashes: BTreeSet::from(["f".repeat(HASH_LENGTH)]), torn: false };
+        assert_eq!(judge(vec![one.clone(), two.clone(), "f".repeat(HASH_LENGTH)], &tainted), Salvage::Ambiguous(vec![one, two], true));
     }
 }

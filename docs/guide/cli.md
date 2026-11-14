@@ -2790,8 +2790,9 @@ are in `details` under `--json`). Choose one yourself:
 - `forklift heal --ref <pallet>=<parcel>` sets the ref to that parcel (any revision `history`
   accepts, but not a meta pallet's history), once its history checks out as complete and passes
   the trust check. In a served warehouse it must also lead up from every parcel the warehouse still
-  records a checkout or the ref's own bytes standing on (all of them, when the bytes match several).
-  The head the damage hid cannot be checked, and what cannot be read is skipped with a `Note:`, so
+  records a checkout or the ref's own bytes standing on (at least one of them, when the bytes match
+  several). The head the damage hid cannot be checked, and what cannot be read is skipped with a
+  `Note:`, as is a meta pallet whose history cannot be read, so
   choose a parcel at or above what clones fetched. Repeatable.
 - `forklift heal --remove-ref <pallet>` drops a damaged ref that nothing names a head for and no
   checkout stands on, once every checkout's saved state could be read. Its bytes are kept under `.forklift/removed-refs`, and whatever only that
