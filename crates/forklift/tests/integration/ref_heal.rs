@@ -413,3 +413,87 @@ fn a_rolling_back_lowers_take_is_never_landed() {
     let _ = area.run(&root, &["heal"]);
     assert_eq!(head(&root, "main"), start);
 }
+
+/// A warehouse whose working tree is consolidating `side` into `main` with `a.txt` in conflict,
+/// resolved and loaded, so the next `stack` completes the merge.
+fn consolidating(area: &Area) -> PathBuf {
+    let root = area.warehouse();
+    area.run_ok(&root, &["pallet", "create", "side"]);
+    area.stack(&root, "a.txt", "side's a");
+    area.run_ok(&root, &["shift", "main"]);
+    area.stack(&root, "a.txt", "main's a");
+
+    let consolidate = area.run(&root, &["consolidate", "side"]);
+    assert!(!consolidate.status.success() || text(&consolidate.stdout).contains("onflict"),
+        "the fixture must stop at conflicts: {}{}", text(&consolidate.stdout), text(&consolidate.stderr));
+    std::fs::write(root.join("a.txt"), "resolved\n").unwrap();
+    area.run_ok(&root, &["load", "."]);
+    root
+}
+
+#[test]
+fn stacking_a_merge_over_a_lost_ref_is_refused_as_damaged() {
+    // Mutation: let `moved_under_merge` report a missing head as `behind` → red.
+    let area = Area::new("merge-lost");
+    let root = consolidating(&area);
+    std::fs::remove_file(ref_path(&root, "main")).unwrap();
+
+    let refused = ref_damaged(&area.run(&root, &["--json", "stack", "-m", "merge"]));
+    assert_eq!(refused["error"]["next_step"], "forklift heal", "{}", refused);
+}
+
+/// A warehouse whose working tree is on `main`, with `side` diverged from it and mergeable cleanly.
+fn mergeable(area: &Area) -> PathBuf {
+    let root = area.warehouse();
+    area.run_ok(&root, &["pallet", "create", "side"]);
+    area.stack(&root, "s.txt", "side");
+    area.run_ok(&root, &["shift", "main"]);
+    area.stack(&root, "m.txt", "main");
+    root
+}
+
+#[test]
+fn an_interrupted_consolidation_is_rebuilt_at_its_parcel_and_rolled_forward() {
+    // The consolidation stops after its ref write and before its position write; the ref is then
+    // destroyed. The marker's completing parcel is the rebuild, and the operation recovery rolls
+    // the bay forward onto it.
+    // Mutation: drop the marker's completing parcel from the candidates → the rebuild lands at the
+    // base, below the merge → red.
+    use forklift_core::util::file_utils::CRASH_POINT_EXIT_CODE;
+
+    for at in 1..200 {
+        let area = Area::new(&format!("merge-crash-{}", at));
+        let root = mergeable(&area);
+        let before = head(&root, "main");
+
+        let stopped = forklift_command()
+            .args(["consolidate", "side"])
+            .current_dir(&root)
+            .env("FORKLIFT_GLOBAL_CONFIG", area.home.join("global-config.toml"))
+            .env("FORKLIFT_KEYS_DIR", area.home.join("keys"))
+            .env("FORKLIFT_DEBUG_CRASH_AT_RENAME", at.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(stopped.status.code(), Some(CRASH_POINT_EXIT_CODE),
+            "consolidate finished before the ref moved past its position: {}{}", text(&stopped.stdout), text(&stopped.stderr));
+
+        let moved = head(&root, "main");
+        let position = std::fs::read_to_string(root.join(".forklift").join("position")).unwrap();
+        if moved == before || position.contains(&moved) || !root.join(".forklift").join("operation").exists() {
+            continue;
+        }
+
+        // A stopped process leaves its lock behind, as a power loss would; the operator clears it.
+        let _ = std::fs::remove_file(root.join(".forklift").join("lock"));
+        std::fs::remove_file(ref_path(&root, "main")).unwrap();
+
+        let data = healed(&area, &root);
+        assert_eq!(head(&root, "main"), moved, "{}", data);
+        assert!(std::fs::read_to_string(root.join(".forklift").join("position")).unwrap().contains(&moved),
+            "the operation must roll forward onto the merge: {}", data);
+        area.stack(&root, "z.txt", "after");
+        return;
+    }
+
+    panic!("no rename stops the consolidation between its ref write and its position write");
+}

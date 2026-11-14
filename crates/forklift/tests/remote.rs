@@ -10509,6 +10509,115 @@ fn heal_pass_one_restoring_a_missing_ancestor_keeps_the_closure_walk_from_falsel
     assert!(object_present(&area, "dev", &h2), "pass 1 must have restored the current head too");
 }
 
+/// Destroy pallet `pallet`'s ref in `dev`: removed, or cut to its first 20 bytes.
+fn destroy_ref(area: &TestArea, pallet: &str, truncate: bool) {
+    let path = area.path(&format!("dev/.forklift/pallets/{}", pallet));
+    match truncate {
+        true => {
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::write(&path, &bytes[..20]).unwrap();
+        }
+        false => std::fs::remove_file(&path).unwrap(),
+    }
+}
+
+/// Lose object `hash` from `dev`'s store and record it in the taint, as a crash leaves it.
+fn lose_object(area: &TestArea, hash: &str) {
+    forklift_core::util::file_utils::remove_file(object_store_path(area, "dev", hash)).unwrap();
+    plant_taint(area, "dev", &[&loose_object_relative_path(hash)]);
+}
+
+#[test]
+fn a_lost_ref_waits_for_the_refetch_that_completes_a_bay_ahead() {
+    // A bay stands ahead of the working tree on the same pallet, at a head whose blob is lost but
+    // the remote holds. The first pass may not rebuild below the bay; once the taint recovery
+    // refetches the blob, the second pass rebuilds at the bay's head.
+    // Mutation: drop the second pass from heal → heal refuses the ref → red. Mutation: let a
+    // verified candidate qualify without descending from every floor → the first pass rebuilds at
+    // the working tree's base → red.
+    let area = TestArea::new("ref-heal-bay-ahead");
+    let server = Server::start(&area, None);
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/a.txt", "base\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift("dev", &["bay", "add", "feature", area.path("bay").to_str().unwrap()]));
+    assert_success(&area.forklift("bay", &["shift", "main"]));
+    area.write_file("bay/y.txt", "ahead\n");
+    assert_success(&area.forklift("bay", &["load", "."]));
+    assert_success(&area.forklift("bay", &["stack", "-m", "ahead"]));
+    assert_success(&area.forklift("bay", &["lift"]));
+    let ahead = pallet_head(&area, "dev", "main");
+
+    lose_object(&area, &path_object_hash(&area, "dev", &ahead, "y.txt"));
+    destroy_ref(&area, "main", false);
+
+    let healed = area.forklift("dev", &["--json", "heal"]);
+    assert_success(&healed);
+    assert_eq!(pallet_head(&area, "dev", "main"), ahead, "{}", stdout(&healed));
+    assert!(recorded_taint_paths(&area, "dev").is_empty(), "the taint must be cleared: {}", stdout(&healed));
+}
+
+/// `dev` with pallet `side` one lifted parcel ahead of `main`, which the working tree stands on.
+fn side_ahead(area: &TestArea, server: &Server) -> String {
+    prepare_warehouse(area, "dev", &server.url);
+    area.write_file("dev/a.txt", "base\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_success(&area.forklift("dev", &["pallet", "create", "side"]));
+    area.write_file("dev/s.txt", "side\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "side"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_success(&area.forklift("dev", &["shift", "main"]));
+    pallet_head(area, "dev", "side")
+}
+
+#[test]
+fn a_truncated_ref_is_salvaged_once_the_refetch_completes_its_head() {
+    // Nothing stands on `side`; its truncated bytes and the journal name its head, whose blob is
+    // lost but the remote holds. The rebuild lands at that head once it is refetched, never at the
+    // working tree's base.
+    // Mutation: make `salvage` return Nothing and drop journal candidates → heal refuses → red.
+    let area = TestArea::new("ref-heal-salvage-refetch");
+    let server = Server::start(&area, None);
+    let side = side_ahead(&area, &server);
+    let base = pallet_head(&area, "dev", "main");
+
+    lose_object(&area, &path_object_hash(&area, "dev", &side, "s.txt"));
+    destroy_ref(&area, "side", true);
+
+    let healed = area.forklift("dev", &["--json", "heal"]);
+    assert_success(&healed);
+    assert_eq!(pallet_head(&area, "dev", "side"), side, "{}", stdout(&healed));
+    assert_ne!(side, base);
+    assert!(recorded_taint_paths(&area, "dev").is_empty(), "the taint must be cleared: {}", stdout(&healed));
+}
+
+#[test]
+fn a_truncated_ref_whose_own_parcel_was_lost_waits_for_its_refetch() {
+    // As above, with the head parcel itself lost and no journal entry left: only the taint and
+    // the truncated bytes name it. The first pass defers; the taint recovery refetches the parcel
+    // under a walk the unreadable ref degrades, and the rebuild lands at the salvage.
+    // Mutation: drop the taint's hashes from `salvage`'s matches and the second pass → red.
+    let area = TestArea::new("ref-heal-parcel-refetch");
+    let server = Server::start(&area, None);
+    let side = side_ahead(&area, &server);
+
+    std::fs::remove_file(area.path("dev/.forklift/journal.json")).unwrap();
+    lose_object(&area, &side);
+    destroy_ref(&area, "side", true);
+
+    let healed = area.forklift("dev", &["--json", "heal"]);
+    assert_success(&healed);
+    assert_eq!(pallet_head(&area, "dev", "side"), side, "{}", stdout(&healed));
+    assert!(object_present(&area, "dev", &side), "the parcel must be refetched");
+    assert!(recorded_taint_paths(&area, "dev").is_empty(), "a refetched object clears under a degraded walk: {}", stdout(&healed));
+}
+
 #[test]
 fn heal_driven_refetch_treats_a_locally_repacked_object_as_recovered() {
     // §3.2 D2: the post-fetch presence check must accept "present in a pack" as recovered for a

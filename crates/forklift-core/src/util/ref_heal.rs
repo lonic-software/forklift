@@ -361,15 +361,20 @@ fn is_hex(byte: u8) -> bool {
 /// What a damaged ref's `bytes` still name: the full hash when its 64 leading characters are hex
 /// (a damaged newline), the one parcel matching at every position but the one non-hex character
 /// among the first 64 (a flipped byte), else the one parcel a leading hex run of at least 8
-/// characters is a prefix of (a truncation).
+/// characters is a prefix of (a truncation). A hash the taint records as possibly lost matches
+/// as well as a stored one, so an object a crash took is an unknown answer rather than none.
 fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
     let run = bytes.iter().take_while(|byte| is_hex(**byte)).count();
+    let matching = |prefix: &str| -> Result<Vec<String>, String> {
+        let mut matches = pallet_utils::object_hashes_with_prefix(prefix)?;
+        matches.extend(tainted.hashes.iter().filter(|hash| hash.starts_with(prefix)).cloned());
+        matches.sort();
+        matches.dedup();
+        Ok(matches)
+    };
 
     if run >= HASH_LENGTH {
-        let hash = String::from_utf8_lossy(&bytes[..HASH_LENGTH]).into_owned();
-        let present = pallet_utils::object_hashes_with_prefix(&hash)?;
-
-        return Ok(judge(present, tainted));
+        return Ok(judge(matching(&String::from_utf8_lossy(&bytes[..HASH_LENGTH]))?, tainted));
     }
 
     let mut matches = Vec::new();
@@ -379,12 +384,12 @@ fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
             let mut hash = bytes[..HASH_LENGTH].to_vec();
             hash[run] = *digit;
 
-            matches.extend(pallet_utils::object_hashes_with_prefix(&String::from_utf8_lossy(&hash))?);
+            matches.extend(matching(&String::from_utf8_lossy(&hash))?);
         }
     }
 
     if matches.is_empty() && run >= MIN_SALVAGE_PREFIX {
-        matches = pallet_utils::object_hashes_with_prefix(&String::from_utf8_lossy(&bytes[..run]))?;
+        matches = matching(&String::from_utf8_lossy(&bytes[..run]))?;
     }
 
     Ok(judge(matches, tainted))
