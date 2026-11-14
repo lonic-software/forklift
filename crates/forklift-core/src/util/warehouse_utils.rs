@@ -751,15 +751,14 @@ struct MarkerPair {
 fn read_marker_pair(forklift: &Path) -> Result<MarkerPair, String> {
     let names = [FILE_NAME_WAREHOUSE_MARKER, FILE_NAME_WAREHOUSE_MARKER_COPY];
     let [primary, copy] = names.map(|name| read_marker_file(forklift, name));
-    let (primary, copy) = (primary?, copy?);
 
     let (marker, bytes, other, other_name) = match (primary, copy) {
         (MarkerFile::Valid(marker, bytes), copy) => (marker, bytes, copy, FILE_NAME_WAREHOUSE_MARKER_COPY),
         (primary, MarkerFile::Valid(marker, bytes)) => (marker, bytes, primary, FILE_NAME_WAREHOUSE_MARKER),
         (MarkerFile::Absent, MarkerFile::Absent) => return Ok(MarkerPair { chosen: None, stale: Vec::new() }),
-        (MarkerFile::Unusable(refusal), MarkerFile::Unusable(_)) => return Err(format!(
-            "{} Its copy \"{}\" cannot be used either, so nothing records what the warehouse holds.",
-            refusal, forklift.join(FILE_NAME_WAREHOUSE_MARKER_COPY).to_string_lossy()
+        (MarkerFile::Unusable(refusal), MarkerFile::Unusable(copy_refusal)) => return Err(format!(
+            "{} Its copy cannot be used either, so nothing records what the warehouse holds: {}",
+            refusal, copy_refusal
         )),
         (MarkerFile::Unusable(refusal), MarkerFile::Absent) | (MarkerFile::Absent, MarkerFile::Unusable(refusal)) => return Err(refusal),
     };
@@ -770,20 +769,21 @@ fn read_marker_pair(forklift: &Path) -> Result<MarkerPair, String> {
     Ok(MarkerPair { chosen: Some((marker, bytes)), stale })
 }
 
-/// Read one file of the marker pair. Only a failure to read it at all is an error.
-fn read_marker_file(forklift: &Path, name: &str) -> Result<MarkerFile, String> {
+/// Read one file of the marker pair. A file that is there but cannot be read is unusable like a
+/// damaged one, so its twin can stand in for it.
+fn read_marker_file(forklift: &Path, name: &str) -> MarkerFile {
     let path = forklift.join(name);
 
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Ok(MarkerFile::Absent),
-        Err(e) => return Err(format!("Error while reading the warehouse marker \"{}\": {}", path.to_string_lossy(), e)),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return MarkerFile::Absent,
+        Err(e) => return MarkerFile::Unusable(format!("Error while reading the warehouse marker \"{}\": {}.", path.to_string_lossy(), e)),
     };
 
-    Ok(match decode_marker(&bytes, &path, forklift) {
+    match decode_marker(&bytes, &path, forklift) {
         Ok(marker) => MarkerFile::Valid(marker, bytes),
         Err(refusal) => MarkerFile::Unusable(refusal),
-    })
+    }
 }
 
 /// The marker `bytes` (read from `path` in `forklift`) record, through the framing frozen at
@@ -918,7 +918,11 @@ pub(crate) fn encode_marker(marker: &WarehouseMarker) -> Vec<u8> {
     let upgrade = marker.upgrade.map(|upgrade| format!("upgrading {} {}", upgrade.target, upgrade.step));
     let entries = [Some(format.as_str()), Some(marker.mode.as_str()), upgrade.as_deref()];
 
-    let mut bytes = record_utils::to_bytes(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, entries.into_iter().flatten());
+    with_digest(record_utils::to_bytes(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, entries.into_iter().flatten()))
+}
+
+/// `bytes` followed by the digest line [`decode_marker`] checks: the digest of every byte before it.
+fn with_digest(mut bytes: Vec<u8>) -> Vec<u8> {
     let digest = blake3::hash(&bytes).to_hex();
     bytes.extend_from_slice(format!("{}{}\n", MARKER_DIGEST_PREFIX, digest).as_bytes());
     bytes
@@ -928,10 +932,7 @@ pub(crate) fn encode_marker(marker: &WarehouseMarker) -> Vec<u8> {
 /// and digested as [`write_marker`] frames them, whatever the entries say: for a test that lays down
 /// a `.forklift`, or a marker of another format, by hand. Hand-typed bytes could not carry the digest.
 pub fn framed_marker_bytes(entries: &str) -> Vec<u8> {
-    let mut bytes = format!("{}\n{}", record_utils::header(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION), entries).into_bytes();
-    let digest = blake3::hash(&bytes).to_hex();
-    bytes.extend_from_slice(format!("{}{}\n", MARKER_DIGEST_PREFIX, digest).as_bytes());
-    bytes
+    with_digest(format!("{}\n{}", record_utils::header(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION), entries).into_bytes())
 }
 
 /// The origin [`mark_for_test`] records for a partial mode.
@@ -1776,7 +1777,7 @@ mod tests {
                         assert!(read_marker_pair(&forklift).is_err(), "{} on {} beside an absent twin", fault, hit);
                         lay(twin, damage(&good));
                         let both = read_marker_pair(&forklift).unwrap_err();
-                        assert!(both.contains("Its copy") && both.contains("cannot be used either"), "{} on both: {}", fault, both);
+                        assert!(both.contains("Its copy cannot be used either") && both.contains(FILE_NAME_WAREHOUSE_MARKER_COPY), "{} on both: {}", fault, both);
                     }
                 }
             }
@@ -1793,8 +1794,19 @@ mod tests {
             assert_eq!(pair.stale, vec![copy]);
         }
 
+        // A file that cannot be read at all, here a folder in its place, is stood in for like a damaged one.
+        for (hit, twin) in [(primary, copy), (copy, primary)] {
+            write_marker(&forklift, &marker).unwrap();
+            lay(hit, None);
+            std::fs::create_dir(forklift.join(hit)).unwrap();
+            let pair = read_marker_pair(&forklift).unwrap();
+            assert_eq!(pair.chosen, Some((marker.clone(), good.clone())), "a folder as {}", hit);
+            lay(twin, None);
+            assert!(read_marker_pair(&forklift).is_err(), "a folder as {} beside an absent twin", hit);
+            file_utils::remove_dir(forklift.join(hit)).unwrap();
+        }
+
         // A marker from before the digest stands in for no missing twin.
-        lay(primary, None);
         lay(copy, Some(b"/forklift-warehouse 3\nformat 1\nfull\n".to_vec()));
         assert!(read_marker_pair(&forklift).unwrap_err().contains("carried a digest"));
 

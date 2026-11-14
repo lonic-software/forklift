@@ -27,9 +27,9 @@ digest <blake3 of every byte before this line, in lowercase hex>
 second, each atomically and synced, so at every instant at least one of them is whole. A build reads
 the marker if it is whole and the copy otherwise; when the two differ, or one is missing or damaged,
 the next open of the warehouse rewrites the stale one from the one it read. A folder is a warehouse
-when either file is present, and only when both are missing is it refused as not a warehouse; one
-that is present but unreadable, with no whole twin, is refused as damaged and is never answered with
-`prepare`. A version-3 marker, from before the marker carried a digest, is refused with its own
+when either file is whole. Only when both are missing is it refused as not a warehouse; one that is
+present but unreadable or damaged, with no whole twin, is refused as damaged and is never answered
+with `prepare`. A version-3 marker, from before the marker carried a digest, is refused with its own
 message: the warehouse is made again.
 
 This framing is frozen, so any future build can read any marker well enough to refuse it correctly.
