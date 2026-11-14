@@ -1237,7 +1237,7 @@ fn read() -> Result<Vec<JournalEntry>, String> {
 }
 
 /// Read the journal of the bay whose state lives in `dir` (see [`read_from`]).
-fn read_in(dir: &Path) -> Result<Vec<JournalEntry>, String> {
+pub(crate) fn read_in(dir: &Path) -> Result<Vec<JournalEntry>, String> {
     read_from(&path_in(dir))
 }
 

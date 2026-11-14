@@ -1284,6 +1284,34 @@ pub fn repair_pallet_head(name: &str, damage: &RefDamage, new: &str) -> Result<(
     update_pallet_head_checked(PalletNamespace::User, name, None, new, &RefPreconditions::NONE, None, None, None, Some(damage))
 }
 
+/// Remove the unreadable ref of user pallet `name`, which must still hold exactly `bytes` inside
+/// the ref lock, after keeping those bytes in the new file `kept`. Nothing else is written: no
+/// tombstone and no journal entry, since nothing the ref held could be read. What only that ref
+/// reached is no longer rooted.
+pub fn remove_damaged_ref(name: &str, bytes: &[u8], kept: &Path) -> Result<(), RefUpdateError> {
+    let _lock = crate::util::lock_utils::RefLock::acquire()?;
+
+    require_damage(PalletNamespace::User, name, &RefDamage::Unreadable(bytes.to_vec()))?;
+
+    if kept.exists() {
+        return Err(RefUpdateError::Failed(format!(
+            "The file \"{}\" the ref of pallet \"{}\" was to be kept in already exists.",
+            kept.to_string_lossy(), name
+        )));
+    }
+
+    if let Some(parent) = kept.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!(
+            "Error while creating the folder \"{}\": {}", parent.to_string_lossy(), e
+        ))?;
+    }
+
+    file_utils::write_file_atomically(kept, bytes)?;
+
+    unlink_ref(PalletNamespace::User, &get_pallet_ref_path(PalletNamespace::User, name))
+        .map_err(RefUpdateError::Failed)
+}
+
 /// Refuse with [`RefUpdateError::Moved`] unless the ref of `name` is damaged exactly as `damage`
 /// says: still absent, or still holding exactly those bytes.
 fn require_damage(namespace: PalletNamespace, name: &str, damage: &RefDamage) -> Result<(), RefUpdateError> {
@@ -1598,10 +1626,10 @@ fn closure_to_verify(namespace: PalletNamespace, expected: Option<&str>, new: &s
 ///                           on.
 ///
 /// [`audit_utils::verify_ref_head_closure`]: crate::util::audit_utils::verify_ref_head_closure
-fn verify_new_head(name: &str,
-                   expected: Option<&str>,
-                   new: &str,
-                   scope: &PathScope) -> Result<Option<Tolerated>, RefUpdateError> {
+pub(crate) fn verify_new_head(name: &str,
+                              expected: Option<&str>,
+                              new: &str,
+                              scope: &PathScope) -> Result<Option<Tolerated>, RefUpdateError> {
     // Bounded by the readable user refs only: a damaged ref bounds nothing, and a narrower bound
     // only makes the walk check more, so a damaged ref never reads as "history incomplete".
     let heads = readable_user_heads()?;
@@ -4416,6 +4444,22 @@ fn resolve_object_hash_prefix(prefix: &str) -> Result<String, String> {
     // prefix still finds the fan-out folder, and the user's casing would end up in the result.
     let prefix = prefix.to_ascii_lowercase();
     let prefix = prefix.as_str();
+    let matches = object_hashes_with_prefix(prefix)?;
+
+    match matches.as_slice() {
+        [] => Err(format!("No object with hash \"{}\" exists.", prefix)),
+        [hash] => Ok(hash.clone()),
+        _ => Err(format!(
+            "The hash prefix \"{}\" is ambiguous ({} objects match); use more characters.",
+            prefix,
+            matches.len()
+        )),
+    }
+}
+
+/// The hashes of every stored object, loose or packed, that start with `prefix`: lowercase hex of
+/// at least 2 characters. Sorted, each once.
+pub(crate) fn object_hashes_with_prefix(prefix: &str) -> Result<Vec<String>, String> {
     let mut matches: Vec<String> = Vec::new();
 
     // Loose objects: scan the fan-out folder for matching file names.
@@ -4454,13 +4498,5 @@ fn resolve_object_hash_prefix(prefix: &str) -> Result<String, String> {
     matches.sort();
     matches.dedup();
 
-    match matches.as_slice() {
-        [] => Err(format!("No object with hash \"{}\" exists.", prefix)),
-        [hash] => Ok(hash.clone()),
-        _ => Err(format!(
-            "The hash prefix \"{}\" is ambiguous ({} objects match); use more characters.",
-            prefix,
-            matches.len()
-        )),
-    }
+    Ok(matches)
 }

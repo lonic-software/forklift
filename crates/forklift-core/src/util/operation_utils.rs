@@ -433,6 +433,11 @@ pub fn read() -> Result<Option<Operation>, String> {
     read_at(&marker_path())
 }
 
+/// Read the marker of the bay whose bay-local state dir is `dir` (see [`read`]).
+pub(crate) fn read_in(dir: &Path) -> Result<Option<Operation>, String> {
+    read_at(&dir.join(FILE_NAME_OPERATION))
+}
+
 fn read_at(path: &Path) -> Result<Option<Operation>, String> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,

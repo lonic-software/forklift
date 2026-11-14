@@ -1,6 +1,8 @@
 use serde::Serialize;
 use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::operation_utils::{self, RecoveryOutcome};
+use forklift_core::error::{CoreError, RefusalCode};
+use forklift_core::util::ref_heal::{self, Pass};
 use forklift_core::util::{recovery_utils, sealed_utils, unavailable};
 use crate::output::{self, CommandOutput};
 
@@ -11,7 +13,13 @@ use crate::output::{self, CommandOutput};
 /// then clear the sealed-object record of every object the store holds again
 /// (`forklift_core::util::sealed_utils::unseal`).
 ///
-/// No arguments — v1 keeps the surface minimal. See `recovery_utils`'s module doc comment for
+/// Around the taint recovery it rebuilds every lost or damaged user pallet ref it can
+/// ([`ref_heal`]): once before, for what nothing still missing could change, and once after,
+/// before the operation recovery, whose landed test reads the rebuilt ref. `--ref` and
+/// `--remove-ref` settle damaged refs the user chose for, first. A damaged ref left standing makes
+/// the run a `ref_damaged` refusal (exit 53) carrying the whole report.
+///
+/// See `recovery_utils`'s module doc comment for
 /// the full per-verdict behavior (restage, the closure walk, partial clears); this handler's job
 /// is only to turn the core result into a machine-first envelope.
 ///
@@ -28,7 +36,23 @@ use crate::output::{self, CommandOutput};
 /// * `Err(String)` - A `durability_taint` refusal (torn, or an unresolved dangling reference), or
 ///                   the sealed-object record is damaged and could not be rebuilt, which stops
 ///                   the run before anything else.
-pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String> {
+pub async fn handle_command(store_access: &StoreAccessLock, set_ref: &[String], remove_ref: &[String]) -> Result<(), String> {
+    // What the user chose goes first, so the passes below judge only what is left.
+    let mut ref_notes: Vec<String> = Vec::new();
+    let mut refs_rebuilt: Vec<ref_heal::Rebuilt> = Vec::new();
+    let mut refs_removed: Vec<ref_heal::Removed> = Vec::new();
+
+    for spec in set_ref {
+        let (pallet, parcel) = spec.split_once('=').ok_or_else(|| format!(
+            "--ref takes PALLET=PARCEL, not \"{}\". Nothing was changed.", spec
+        ))?;
+        refs_rebuilt.push(ref_heal::set_damaged_ref(pallet, parcel, &mut ref_notes)?);
+    }
+
+    for pallet in remove_ref {
+        refs_removed.push(ref_heal::remove_damaged_ref(pallet, &mut ref_notes)?);
+    }
+
     // First, so the taint's rescan below tells what the record holds by hash from what is lost. The
     // rebuild writes only the record, which no recovery reads through the taint. A damaged record
     // it could not rebuild stops the run, since everything after it would read the damage. One
@@ -39,6 +63,12 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
             error, if error.ends_with('.') { "" } else { "." },
         ))?
         .map(RecordRebuilt::from);
+
+    // Before the taint recovery, whose closure walk reads every ref: a ref rebuilt here roots
+    // what it reaches for that walk.
+    let first = ref_heal::repair(Pass::BeforeTaint)?;
+    refs_rebuilt.extend(first.rebuilt);
+    ref_notes.extend(first.notes);
 
     // A torn taint's rescan (§8.3) can take a while on a large or uncompacted store — it reports
     // per-phase/per-count progress through this callback rather than staying silent. `human!` is
@@ -53,6 +83,16 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
             if let Some(rebuilt) = &record_rebuilt {
                 error = forklift_core::error::append_to_message(error, &rebuilt.sentence());
             }
+            for rebuilt in &refs_rebuilt {
+                error = forklift_core::error::append_to_message(error, &rebuilt_sentence(rebuilt));
+            }
+            for removed in &refs_removed {
+                error = forklift_core::error::append_to_message(error, &removed_sentence(removed));
+            }
+            if ref_heal::detect(&mut Vec::new()).is_ok_and(|damaged| !damaged.is_empty()) {
+                error = forklift_core::error::append_to_message(error,
+                    "A damaged pallet ref also stands; heal rebuilds it once the taint is resolved.");
+            }
             return Err(match operation_utils::read() {
                 Ok(Some(operation)) => forklift_core::error::append_to_message(error, &format!(
                     "An interrupted {} also stands in this bay; heal finishes or undoes it once the \
@@ -63,8 +103,27 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
         }
     };
 
+    // After the taint, which may have refetched what a candidate lacked; before the operation
+    // recovery, whose landed test reads the ref.
+    let second = ref_heal::repair(Pass::AfterTaint)?;
+    refs_rebuilt.extend(second.rebuilt);
+    ref_notes.extend(second.notes);
+    let refs_refused = second.refused;
+
+    // An operation on a pallet whose ref is still damaged waits: its landed test would read the
+    // damage as "not landed".
+    let waits = match operation_utils::read() {
+        Ok(Some(operation)) => refs_refused.iter()
+            .any(|refused| refused.pallet == operation.source.pallet || refused.pallet == operation.target.pallet)
+            .then_some(operation.kind),
+        _ => None,
+    };
+
     // After the taint: an operation's recovery reads and writes the store the taint vouches for.
-    let recovered = operation_utils::recover().map_err(|error| match &record_rebuilt {
+    let recovered = match waits {
+        Some(_) => Ok(None),
+        None => operation_utils::recover(),
+    }.map_err(|error| match &record_rebuilt {
         Some(rebuilt) => forklift_core::error::append_to_message(error, &rebuilt.sentence()),
         None => error,
     })?;
@@ -84,10 +143,21 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
     // A refill whose removal was lost leaves an object present and still recorded. That seals
     // nothing while it is present, but were it lost later it would read as held rather than lost.
     let mut notes = outcome.notes;
+    for note in ref_notes {
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+    if let Some(kind) = waits {
+        notes.push(format!(
+            "The interrupted {} in this bay waits for its pallet's ref; heal finishes or undoes it once that ref is set.",
+            kind.as_str()
+        ));
+    }
     let (unsealed, unseal_failed) = unseal_present(store_access, &mut notes);
     drop_present_unavailable(&mut notes);
 
-    output::emit(&HealReport {
+    let report = HealReport {
         record_rebuilt,
         was_tainted: outcome.was_tainted,
         restaged: outcome.restaged,
@@ -97,9 +167,57 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
         unsealed: unsealed.removed,
         newly_held_by_hash: unsealed.pushed_down,
         unseal_failed,
-    });
+        refs_rebuilt,
+        refs_removed,
+        refs_refused,
+    };
 
-    Ok(())
+    if report.refs_refused.is_empty() {
+        output::emit(&report);
+        return Ok(());
+    }
+
+    if !output::is_json() {
+        report.render_human();
+    }
+
+    Err(ref_refusal(&report).into())
+}
+
+/// The `ref_damaged` refusal of a run that left a damaged ref standing, carrying the whole report.
+fn ref_refusal(report: &HealReport) -> CoreError {
+    let mut lines = Vec::new();
+
+    for refused in &report.refs_refused {
+        lines.push(format!("The ref of pallet \"{}\" was not rebuilt: {}.", refused.pallet, refused.reason));
+
+        if refused.candidates.is_empty() {
+            lines.push("  Nothing names a head for it.".to_string());
+        }
+        for candidate in &refused.candidates {
+            lines.push(format!("  {} ({})", candidate.head, candidate.source));
+        }
+    }
+
+    let first = &report.refs_refused[0].pallet;
+
+    CoreError::refusal_with_details(
+        RefusalCode::RefDamaged,
+        lines.join("\n"),
+        format!("forklift heal --ref {}=<parcel>", first),
+        serde_json::json!(report),
+    )
+}
+
+fn rebuilt_sentence(rebuilt: &ref_heal::Rebuilt) -> String {
+    format!("Rebuilt the ref of pallet \"{}\" at {}, from {}.", rebuilt.pallet, rebuilt.head, rebuilt.source)
+}
+
+fn removed_sentence(removed: &ref_heal::Removed) -> String {
+    format!(
+        "Removed the unreadable ref of pallet \"{}\", keeping its bytes in \"{}\"; what only it reached is no longer held by any pallet.",
+        removed.pallet, removed.kept
+    )
 }
 
 /// Drop the unavailable record's entry of every object the store holds, whose content came back,
@@ -213,6 +331,20 @@ pub(crate) struct HealReport {
     /// Running `heal` again retries.
     #[serde(skip_serializing_if = "Option::is_none")]
     unseal_failed: Option<String>,
+
+    /// Pallet refs that were lost or damaged and this run set: rebuilt at the head the evidence
+    /// agreed on, or set to the parcel `--ref` gave.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    refs_rebuilt: Vec<ref_heal::Rebuilt>,
+
+    /// Unreadable pallet refs `--remove-ref` removed, and where their bytes were kept.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    refs_removed: Vec<ref_heal::Removed>,
+
+    /// Damaged pallet refs this run left alone, with every head the evidence named. Present only
+    /// on a `ref_damaged` refusal's details.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    refs_refused: Vec<ref_heal::Refused>,
 }
 
 /// What `heal` dropped from a damaged sealed-object record.
@@ -290,6 +422,14 @@ impl CommandOutput for HealReport {
             println!("{}", rebuilt.sentence());
         }
 
+        for rebuilt in &self.refs_rebuilt {
+            println!("{}", rebuilt_sentence(rebuilt));
+        }
+
+        for removed in &self.refs_removed {
+            println!("{}", removed_sentence(removed));
+        }
+
         if let Some(operation) = &self.operation {
             operation.render_human();
         }
@@ -308,6 +448,7 @@ impl CommandOutput for HealReport {
             }
         } else if self.operation.is_none() && self.unsealed.is_empty() && self.newly_held_by_hash.is_empty()
             && self.notes.is_empty() && self.unseal_failed.is_none() && self.record_rebuilt.is_none()
+            && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
         {
             println!("Nothing to heal — no durability taint is standing.");
         }
