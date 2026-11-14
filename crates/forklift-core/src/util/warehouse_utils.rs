@@ -769,16 +769,19 @@ fn read_marker_pair(forklift: &Path) -> Result<MarkerPair, String> {
     let (marker, bytes, other, other_name) = match (primary, copy) {
         (MarkerFile::Valid(marker, bytes), copy) => (marker, bytes, copy, FILE_NAME_WAREHOUSE_MARKER_COPY),
         (primary, MarkerFile::Valid(marker, bytes)) => (marker, bytes, primary, FILE_NAME_WAREHOUSE_MARKER),
-        // With no valid twin, a file that could not be read is reported as that failure, never as
-        // damage: it may hold a whole marker that a later read gets.
-        (MarkerFile::Unreadable(refusal), _) | (_, MarkerFile::Unreadable(refusal)) => return Err(refusal),
-        (primary, copy) => return match (primary.refusal(), copy.refusal()) {
-            (None, None) => Ok(MarkerPair { chosen: None, stale: Vec::new() }),
-            (Some(refusal), Some(copy_refusal)) => Err(format!(
+        // With no valid twin, a file that could not be read is reported as its read error, never as
+        // damage: it may hold a whole marker that a later read gets. Both refusals are given, so
+        // every fault is named at once.
+        (primary, copy) => return match (matches!(primary, MarkerFile::Unreadable(_)) || matches!(copy, MarkerFile::Unreadable(_)), primary.refusal(), copy.refusal()) {
+            (_, None, None) => Ok(MarkerPair { chosen: None, stale: Vec::new() }),
+            (true, Some(refusal), Some(copy_refusal)) => Err(format!(
+                "{} Its copy cannot be used either: {}", refusal, copy_refusal
+            )),
+            (false, Some(refusal), Some(copy_refusal)) => Err(format!(
                 "{} Its copy cannot be used either, so nothing records what the warehouse holds: {}",
                 refusal, copy_refusal
             )),
-            (Some(refusal), None) | (None, Some(refusal)) => Err(refusal),
+            (_, Some(refusal), None) | (_, None, Some(refusal)) => Err(refusal),
         },
     };
 
@@ -933,9 +936,8 @@ pub(crate) fn write_marker(forklift: &Path, marker: &WarehouseMarker) -> Result<
     let bytes = encode_marker(marker);
 
     for name in [FILE_NAME_WAREHOUSE_MARKER_COPY, FILE_NAME_WAREHOUSE_MARKER] {
-        let path = forklift.join(name);
-        file_utils::replace_file_atomically(&path, &bytes)
-            .map_err(|e| format!("Error while writing the warehouse marker \"{}\": {}", path.to_string_lossy(), e))?;
+        file_utils::replace_file_atomically(&forklift.join(name), &bytes)
+            .map_err(|e| format!("Error while writing the warehouse marker: {}", e))?;
     }
 
     Ok(())
@@ -1874,7 +1876,8 @@ mod tests {
         std::fs::create_dir(forklift.join(copy)).unwrap();
         let refusal = read_marker_pair(&forklift).unwrap_err();
         assert!(refusal.starts_with("Error while reading the warehouse marker"), "{}", refusal);
-        assert!(!refusal.contains("cannot be used either"), "{}", refusal);
+        assert!(refusal.contains(&format!("Its copy cannot be used either: Error while reading the warehouse marker \"{}", forklift.join(copy).to_string_lossy())), "{}", refusal);
+        assert!(!refusal.contains("nothing records"), "{}", refusal);
         file_utils::remove_dir(forklift.join(primary)).unwrap();
         file_utils::remove_dir(forklift.join(copy)).unwrap();
 
