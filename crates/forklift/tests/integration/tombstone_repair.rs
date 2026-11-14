@@ -210,6 +210,52 @@ fn a_repair_keeps_a_head_held_only_in_a_pack() {
     assert!(holds(&area, &root, &side));
 }
 
+/// A lost tip whose only copy is loose in a fan-out folder the repair cannot list: the repair
+/// refuses, naming the folder, rather than finishing without it; once the folder lists again it
+/// keeps the tip. Skipped as root, which lists any folder.
+///
+/// Three listings guard it: the store status the pack check reads first lists the loose objects
+/// and the signature sidecars, and then the lost-tip enumeration lists the folder again. Revert:
+/// let all three read an unlistable folder as empty → the repair finishes keeping nothing → red.
+/// Any one of them alone keeps it green.
+#[cfg(unix)]
+#[test]
+fn a_repair_refuses_a_fan_out_folder_it_cannot_list() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let area = Area::new("unlistable");
+    let root = area.served();
+    let objects = root.join(".forklift").join("objects");
+
+    // The tip's folder must hold nothing else: a reachable object there would be read by the
+    // walk before the listing, and refuse for a different reason.
+    let (side, folder) = (0..20).find_map(|attempt| {
+        let side = area.deleted(&root, &format!("side{}", attempt));
+        let folder = objects.join(&side[..2]);
+        let alone = std::fs::read_dir(&folder).unwrap()
+            .all(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(&side[2..]));
+        alone.then_some((side, folder))
+    }).expect("a deleted tip alone in its fan-out folder");
+    forget_journals(&root);
+    forklift_core::util::file_utils::remove_file(list_path(&root)).unwrap();
+
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let refused = area.server(&root, &["tombstone", "repair"]);
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(!refused.status.success(), "{}", text(&refused.stdout));
+    let stderr = text(&refused.stderr);
+    assert!(stderr.contains(&format!("objects/{}", &side[..2])), "{}", stderr);
+
+    area.server_ok(&root, &["tombstone", "repair"]);
+    let listed = area.server_ok(&root, &["tombstone", "list"]);
+    assert!(listed.contains(&side) && listed.contains("(kept, no name)"), "{}", listed);
+}
+
 /// Revert: adopt a journal's name without checking every head the journals name for it → H1 is
 /// listed as "side", though the lost list held side at H2 → red. Revert: take every deleted name
 /// as a candidate for every tip → no tip has one candidate, so "gone" is not named → red.

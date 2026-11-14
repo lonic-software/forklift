@@ -213,6 +213,41 @@ fn a_ref_nothing_stands_on_is_salvaged_from_its_own_bytes() {
     }
 }
 
+/// A damaged ref whose head sits loose in a fan-out folder that cannot be listed: its salvage is
+/// unknown, never "names nothing", and the ref is left alone. Skipped as root, which lists any
+/// folder.
+///
+/// Revert: let `object_hashes_with_prefix` read an unlistable folder as empty → the salvage
+/// names nothing and the refusal says no more → red.
+#[cfg(unix)]
+#[test]
+fn a_salvage_through_a_fan_out_folder_that_cannot_be_listed_is_unknown() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let area = Area::new("salvage-unlistable");
+    let (root, side) = side_only_its_bytes_name(&area);
+    let truncated = side.as_bytes()[..20].to_vec();
+    std::fs::write(ref_path(&root, "side"), &truncated).unwrap();
+    let folder = root.join(".forklift").join("objects").join(&side[..2]);
+
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = area.run(&root, &["--json", "heal"]);
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let refused = ref_damaged(&output);
+    let reason = refused["error"]["details"]["refs_refused"][0]["reason"].as_str().unwrap().to_string();
+    assert!(reason.starts_with("its salvage is unknown"), "{}", refused);
+    assert!(reason.contains("could not be listed") && reason.contains(&format!("objects/{}", &side[..2])), "{}", reason);
+    assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), truncated, "the ref must be left alone");
+
+    healed(&area, &root);
+    assert_eq!(head(&root, "side"), side, "once the folder lists, the salvage finds the head");
+}
+
 #[test]
 fn a_prefix_too_short_or_naming_no_parcel_salvages_nothing() {
     // Mutation: lower MIN_SALVAGE_PREFIX to 4 → the 7-character prefix salvages the parcel → red.
