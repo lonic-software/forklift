@@ -784,7 +784,9 @@ fn create_shard_folder(inventory_path: &Path) -> Result<(), String> {
     };
 
     if file_utils::create_folder_if_not_exists(shard_folder)? {
-        file_utils::sync_folders_before_flushed_write(&file_utils::ancestors_to_storage_root(shard_folder).into_iter().collect())?;
+        if let Some(created_in) = shard_folder.parent() {
+            file_utils::sync_folders_before_flushed_write(&BTreeSet::from([created_in.to_path_buf()]))?;
+        }
     }
 
     Ok(())

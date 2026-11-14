@@ -264,9 +264,9 @@ fn taint_record_line(path: &Path) -> String {
 /// The taint's own write routine — deliberately not [`file_utils::write_file_atomically`] (see
 /// [`record_taint`]'s doc comment on no re-entry). Exclusive-creates a fresh file under
 /// `<root>/taint/`, writes every recorded path plus the terminator, fsyncs the file's own bytes,
-/// then fsyncs the directory. On any failure past file creation, best-effort removes the file it
-/// created before returning the error — a *returned* error (as opposed to a crash, which runs no
-/// cleanup at all) therefore never leaves a taint file behind.
+/// then fsyncs the directory, then the folders above it. On any failure past file creation up to
+/// the directory's own sync, best-effort removes the file it created before returning the error.
+/// A failure syncing the folders above keeps the file and returns the error.
 fn write_taint_file(root: &Path, relative_paths: &BTreeSet<PathBuf>) -> Result<(), String> {
     let taint_dir = root.join(FOLDER_NAME_TAINT);
     file_utils::create_folder_if_not_exists(&taint_dir)?;
@@ -293,12 +293,11 @@ fn write_taint_file(root: &Path, relative_paths: &BTreeSet<PathBuf>) -> Result<(
         return Err(e);
     }
 
-    // The folders above, best-effort: the failure being recorded may be one of theirs, and a
-    // record whose folder entry is not yet durable still gates every later command, where a
-    // removed one gates nothing.
-    let _ = file_utils::sync_ancestors_to_storage_root(&taint_dir);
-
-    Ok(())
+    // The folders above: the failure being recorded may be one of theirs, so the record is kept
+    // either way (one whose folder entry is not yet durable still gates every later command,
+    // where a removed one gates nothing), and the failure is returned beside it.
+    file_utils::sync_ancestors_to_storage_root(&taint_dir)
+        .map_err(|e| format!("the record is kept, but its folder may not survive a power loss: {}", e))
 }
 
 /// The process-global, never-reset source of the `<counter>` suffix in every taint filename this
@@ -711,7 +710,8 @@ fn delete_snapshot_and_sync(root: &Path, files: &[PathBuf]) -> Result<(), String
         return Ok(());
     }
 
-    file_utils::sync_dir(&taint_dir)
+    // Only entries inside the taint folder changed; it is the folder alone that needs syncing.
+    file_utils::sync_dir_alone(&taint_dir)
 }
 
 /// Delete exactly the taint files named in `files` — a snapshot a caller captured earlier via

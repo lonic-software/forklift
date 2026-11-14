@@ -715,8 +715,16 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 /// whoever created it: a folder found already present may have been made by a writer that never
 /// finished syncing its parent, or by a process that died first. The bound is the root's path,
 /// never a folder name, because a pallet or bay name may itself contain a `.forklift` component.
+///
+/// The CLI's root is relative to the working directory, while a caller such as a clone's resume
+/// sweep may name its folders absolutely; the root is then made absolute to compare, so the walk
+/// is never silently empty.
 pub(crate) fn ancestors_to_storage_root(dir: &Path) -> Vec<PathBuf> {
     let root = forklift_root();
+    let root = match root.is_relative() && dir.is_absolute() {
+        true => std::path::absolute(&root).unwrap_or(root),
+        false => root,
+    };
 
     dir.ancestors().skip(1)
         .take_while(|folder| folder.starts_with(&root))
@@ -788,9 +796,8 @@ pub(crate) fn sync_ancestors_to_storage_root(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// [`sync_dir`] for `dir` alone, without the folders above it. Only for a write whose own failure
-/// handling must not hang on the storage root's health: the taint record, which must survive the
-/// very ancestor failure it is recording.
+/// [`sync_dir`] for `dir` alone, without the folders above it. Only for the taint folder, whose
+/// record must survive the very ancestor failure it is recording.
 pub(crate) fn sync_dir_alone(dir: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -6974,6 +6981,22 @@ mod tests {
         assert_eq!(sync_dir_attempts(), vec![forklift.clone()], "the warehouse folder above is outside the root");
 
         remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_absolute_folder_under_a_relative_root_walks_to_the_root() {
+        // The CLI's root is the relative `.forklift`; a clone's resume sweep names its folders
+        // absolutely. Nothing is created: the folders do not exist, so each sync fails after
+        // being recorded.
+        assert_eq!(forklift_root(), PathBuf::from(".forklift"), "this test needs no scope and no bay");
+        let root = std::path::absolute(".forklift").unwrap();
+        let folder = root.join("objects").join("44");
+
+        let _guard = SyncDirFaultGuard::recording();
+        let _ = sync_ancestors_to_storage_root(&folder);
+
+        assert_eq!(sync_dir_attempts(), vec![root.join("objects"), root.clone()]);
     }
 
     #[test]
