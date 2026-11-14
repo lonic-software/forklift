@@ -61,7 +61,8 @@ enum Command {
         #[arg(long)]
         strace: Option<PathBuf>,
         /// Kill points of this scenario only; repeatable. Without it or `--power`, every
-        /// scenario's; with only `--power` named, none.
+        /// scenario's; with only `--power` named, none. A hosted scenario's server is killed at
+        /// each of its own calls too, given a forklift-server.
         #[arg(long = "kill")]
         kill: Vec<String>,
         /// Power loss of this scenario only; repeatable. Without it or `--kill`, every scenario's;
@@ -591,6 +592,8 @@ fn main() -> ExitCode {
     // Every scenario's faulted command killed at each call that changes or syncs a file, and its
     // power loss at each of those moments, Linux only.
     let mut kill_completeness = Vec::new();
+    let mut server_kill_completeness = Vec::new();
+    let mut server_not_reached = 0;
     let mut power_completeness = Vec::new();
     let mut not_reached = 0;
     let traced_lanes = match (&forklift, &git, &strace) {
@@ -613,11 +616,22 @@ fn main() -> ExitCode {
             };
             // One template and one counting run per scenario feed both lanes; the write dumps are
             // taken only when the power loss will read them.
-            let (mut all_kills, mut all_power) = (Vec::new(), Vec::new());
+            let (mut all_kills, mut all_power, mut all_server_kills) = (Vec::new(), Vec::new(), Vec::new());
             for scenario in &scenarios {
                 let (killing, powering) = kill::lanes(&kill, &power, &scenario.id);
                 if !killing && !powering {
                     continue;
+                }
+                // The host's server killed while the faulted command runs, on fresh builds of its own.
+                if killing && server.is_some() && scenario.hosts() {
+                    let served = output.scratch(&format!("{}-served", scenario.id)).map_err(|error| error.to_string())
+                        .and_then(|template| proof_load::servekill::count(scenario, &faulted_corpus, &programs, &settings, &template, routes.as_ref()).map(|counting| (template, counting)).map_err(|error| error.to_string()));
+                    let kills = match served {
+                        Ok((template, counting)) => proof_load::servekill::run(scenario, &programs, &settings, &template, &counting),
+                        Err(error) => kill::ScenarioKills { scenario: scenario.id.clone(), errors: vec![error], ..Default::default() },
+                    };
+                    let _ = std::fs::write(output.root().join(format!("server-kills-{}.json", scenario.id)), serde_json::to_string(&kills).unwrap_or_default());
+                    all_server_kills.push(kills);
                 }
                 let counted = output.scratch(&format!("{}-traced", scenario.id)).map_err(|error| error.to_string())
                     .and_then(|template| kill::count(scenario, &faulted_corpus, &programs, &settings, &template, powering).map(|counting| (template, counting)).map_err(|error| error.to_string()));
@@ -664,6 +678,17 @@ fn main() -> ExitCode {
                 not_reached = summary.not_reached;
                 summary.cell
             };
+            let server_kill_cell = if server.is_none() {
+                Cell::not_run("no forklift-server binary given")
+            } else if all_server_kills.is_empty() {
+                Cell::not_run("no hosted scenario this run picked was named for it")
+            } else {
+                let summary = kill::summarize_as(&all_server_kills, kill::Side::Server);
+                rows.extend(summary.rows);
+                server_kill_completeness = summary.completeness;
+                server_not_reached = summary.not_reached;
+                summary.cell
+            };
             let power_cell = if all_power.is_empty() {
                 unasked()
             } else {
@@ -672,15 +697,18 @@ fn main() -> ExitCode {
                 power_completeness = summary.completeness;
                 summary.cell
             };
-            Ok((kill_cell, power_cell))
+            Ok((kill_cell, power_cell, server_kill_cell))
         }
     };
-    let (kill_cell, power_cell) = match traced_lanes {
+    let (kill_cell, power_cell, server_kill_cell) = match traced_lanes {
         Ok(cells) => cells,
-        Err((kill, power)) => (Cell::not_run(kill), Cell::not_run(power)),
+        Err((kill, power)) => (Cell::not_run(kill), Cell::not_run(power), Cell::not_run(kill)),
     };
     if kill_completeness.is_empty() {
         kill_completeness.push(Completeness { check: "kill-point units".to_string(), cell: kill_cell.clone(), missing: vec![] });
+    }
+    if server_kill_completeness.is_empty() {
+        server_kill_completeness.push(Completeness { check: "server kill-point units".to_string(), cell: server_kill_cell.clone(), missing: vec![] });
     }
     if power_completeness.is_empty() {
         power_completeness.push(Completeness { check: "power-loss states".to_string(), cell: power_cell.clone(), missing: vec![] });
@@ -690,6 +718,7 @@ fn main() -> ExitCode {
         // The dead-holder locks are planted by the damage lane, binding by binding.
         Category::DamagedFiles | Category::DeadPidLock => damaged_cell.clone(),
         Category::KillPointsClient => kill_cell.clone(),
+        Category::KillPointsServer => server_kill_cell.clone(),
         Category::PowerLossClient => power_cell.clone(),
         Category::DiskFull => disk_full_cell.clone(),
         Category::ReadOnly => read_only_cell.clone(),
@@ -701,10 +730,14 @@ fn main() -> ExitCode {
     if matches!(kill_cell, Cell::Run | Cell::Sampled) || not_reached > 0 {
         coverage.not_reached.insert(Category::KillPointsClient, not_reached);
     }
+    if matches!(server_kill_cell, Cell::Run | Cell::Sampled) || server_not_reached > 0 {
+        coverage.not_reached.insert(Category::KillPointsServer, server_not_reached);
+    }
     let mut completeness = vec![damage_check, walk_check, route_check, route_write_check, fault_check];
     completeness.extend(condition_checks);
     completeness.extend(write_checks);
     completeness.extend(kill_completeness);
+    completeness.extend(server_kill_completeness);
     completeness.extend(power_completeness);
     completeness.push(Completeness::budget(started.elapsed(), budget.map(std::time::Duration::from_secs)));
     let report = Report {

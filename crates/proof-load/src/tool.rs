@@ -163,6 +163,12 @@ impl Served {
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
+
+    /// How its process ended, if it has: a kill the harness did not make, such as an injected one,
+    /// or a crash.
+    pub fn ended(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
 }
 
 impl Drop for Served {
