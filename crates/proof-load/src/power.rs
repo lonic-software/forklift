@@ -357,11 +357,13 @@ impl Model {
     /// Every file the durable tree names whose contents the calls changed since its last sync,
     /// with each way it can come back torn: one inode, under every durable name it has, whatever
     /// the volatile namespace now calls it.
-    pub fn torn(&self) -> Vec<(Ino, Vec<Torn>)> {
+    /// `files` is [`Model::durable_files`] of this durable version.
+    fn torn(&self, files: &Names) -> Vec<(Ino, Vec<Torn>)> {
         let mut out = Vec::new();
-        for ino in self.durable_files().into_keys() {
+        for &ino in files.keys() {
             if let (Some(Node::File { data: kept, .. }), Some(Node::File { data: made, .. })) = (self.durable.get(&ino), self.volatile.get(&ino)) {
-                if kept != made {
+                // A file cut and written back to its synced bytes still tears at the cut.
+                if kept != made || self.truncated.contains_key(&ino) {
                     let forms = torn_forms(kept, made, self.truncated.get(&ino).copied());
                     if !forms.is_empty() {
                         out.push((ino, forms));
@@ -413,7 +415,7 @@ pub enum Form {
     ZeroTail,
     /// The synced bytes and the first half of what followed them.
     HalfTail,
-    /// Overwritten in place, the first half new and the rest as synced.
+    /// Overwritten in place, the first half of the changed bytes new and the rest as synced.
     HalfOverwritten,
 }
 
@@ -453,10 +455,14 @@ fn torn_forms(kept: &[u8], made: &[u8], truncated: Option<usize>) -> Vec<Torn> {
         }
     }
     if truncated.is_none() && made.len() <= kept.len() {
-        let half = made.len() / 2;
-        let mut overwritten = kept.to_vec();
-        overwritten[..half].copy_from_slice(&made[..half]);
-        forms.push((Form::HalfOverwritten, overwritten));
+        // The first half of the bytes the writes changed, from the first that differs to the last.
+        let differs = |at: &usize| kept[*at] != made[*at];
+        if let (Some(first), Some(last)) = ((0..made.len()).find(differs), (0..made.len()).rev().find(differs)) {
+            let end = first + (last + 1 - first).div_ceil(2);
+            let mut overwritten = kept.to_vec();
+            overwritten[first..end].copy_from_slice(&made[first..end]);
+            forms.push((Form::HalfOverwritten, overwritten));
+        }
     }
     let mut out: Vec<Torn> = Vec::new();
     for (form, data) in forms {
@@ -1344,7 +1350,8 @@ impl Moment {
 /// One state a crash can leave.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Crash {
-    /// The first moment that leaves it.
+    /// The moment it is reported at: the first that leaves it as its kind, or for a torn state
+    /// the last of its span, which tears the most of what the calls wrote.
     pub moment: Moment,
     /// Whether the faulted command had finished every line: the record was acknowledged.
     pub acknowledged: bool,
@@ -1547,6 +1554,11 @@ impl Collector {
         }
         let (_, image, key, files) = self.cached.as_ref().expect("cached above");
         let (image, key, files) = (image.clone(), key.clone(), files.clone());
+        // The span before this moment is reported before anything this moment leaves.
+        let span = (model.version, acknowledged, moment.trail());
+        if self.pending.as_ref().is_some_and(|pending| pending.key != span) {
+            self.flush();
+        }
         self.add(moment.clone(), image.clone(), key, acknowledged, State::Durable);
 
         let ordered = model.ordered_image();
@@ -1554,12 +1566,8 @@ impl Collector {
         self.requested.ordered.0 += 1;
         self.add(moment.clone(), std::sync::Arc::new(ordered), key, acknowledged, State::Ordered);
 
-        let span = (model.version, acknowledged, moment.trail());
-        if self.pending.as_ref().is_some_and(|pending| pending.key != span) {
-            self.flush();
-        }
         let pending = self.pending.get_or_insert_with(|| Span { key: span, image, files, torn: BTreeMap::new() });
-        for (ino, forms) in model.torn() {
+        for (ino, forms) in model.torn(&pending.files) {
             for (form, data) in forms {
                 pending.torn.insert((ino, form), (moment.clone(), data));
             }
@@ -1609,7 +1617,12 @@ impl Collector {
                 }
                 return;
             }
-            self.crashes[at] = None;
+            // The moments that already left this state still do; a seeded draw is not a moment.
+            let before = self.crashes[at].take().expect("a seen state holds its crash");
+            let shared = if matches!(before.state, State::Seeded { .. }) { 1 } else { before.shared + 1 };
+            self.seen.insert(key, self.crashes.len());
+            self.crashes.push(Some(Crash { moment, acknowledged, shared, state, image }));
+            return;
         }
         self.seen.insert(key, self.crashes.len());
         self.crashes.push(Some(Crash { moment, acknowledged, shared: 1, state, image }));
@@ -1844,7 +1857,9 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
         if scenario.refusals.is_empty() && scenario.errors.is_empty() && scenario.crashes.is_empty() {
             missing.push(format!("{}: no crash state was graded", scenario.scenario));
         }
-        between.push(Completeness { check: format!("{}power loss of {}, states between durable and volatile: {}", prefix, scenario.scenario, scenario.requested.label()), cell: Cell::Run, missing: vec![] });
+        if !scenario.crashes.is_empty() {
+            between.push(Completeness { check: format!("{}power loss of {}, states between durable and volatile: {}", prefix, scenario.scenario, scenario.requested.label()), cell: Cell::Run, missing: vec![] });
+        }
         for GradedCrash { crash, graded } in &scenario.crashes {
             let mut notes = vec![CAVEAT.to_string(), REWRITTEN.to_string()];
             if crash.shared > 1 {
@@ -2693,14 +2708,17 @@ mod tests {
     /// sync, every form holds what was synced; a form the same as the synced file is left out.
     ///
     /// Revert: floor every form at 0 → an appended file tears to `ol`; drop the cut from the floor
-    /// → a rewritten file keeps `old` under the new bytes' zeros.
+    /// → a rewritten file keeps `old` under the new bytes' zeros; overwrite the file's first half
+    /// → a change in its second half tears to the synced bytes and is left out.
     #[test]
     fn a_torn_file_never_loses_a_synced_byte() {
         let forms = |kept: &[u8], made: &[u8], cut| torn_forms(kept, made, cut).into_iter().map(|(form, data)| (form, String::from_utf8(data).unwrap())).collect::<Vec<_>>();
         assert_eq!(forms(b"old", b"olders", None), [(Form::ZeroTail, "old\0\0\0".to_string()), (Form::HalfTail, "olde".to_string())]);
         assert_eq!(forms(b"old", b"newer", Some(0)), [(Form::Cut, String::new()), (Form::ZeroTail, "\0\0\0\0\0".to_string()), (Form::HalfTail, "ne".to_string())]);
         assert_eq!(forms(b"old", b"olx", Some(2)), [(Form::Cut, "ol".to_string()), (Form::ZeroTail, "ol\0".to_string())]);
-        assert_eq!(forms(b"old", b"new", None), [(Form::HalfOverwritten, "nld".to_string())]);
+        assert_eq!(forms(b"old", b"new", None), [(Form::HalfOverwritten, "ned".to_string())]);
+        // Only the changed bytes tear, wherever in the file they lie.
+        assert_eq!(forms(b"AAAAAAAA", b"AAAAAABB", None), [(Form::HalfOverwritten, "AAAAAABA".to_string())]);
         assert!(forms(b"old", b"old", None).is_empty());
     }
 
@@ -2792,6 +2810,44 @@ mod tests {
         let scenario = |then| Scenario { id: "s".into(), history: vec![], then, damage: None, files: crate::scenario::Files::Seeded };
         assert_eq!(not_run(&scenario(vec![])), None);
         assert!(not_run(&scenario(vec![crate::scenario::Op::Record { index: 0 }])).unwrap().contains("lines after its record"));
+    }
+
+    /// A file cut and written back to its synced bytes still tears at the cut: the truncate can
+    /// land without the write, and without the unsynced folder made beside it.
+    ///
+    /// Revert: tear only files whose bytes changed → no torn state.
+    #[test]
+    fn a_file_rewritten_to_its_synced_bytes_tears_at_the_cut() {
+        let text = format!("1 mkdir(\"n\", 0755) = 0\n1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_TRUNC) = 3</s/w/a>\n{}1 close(3</s/w/a>) = 0\n", write(1, 3, "/s/w/a", b"old"));
+        let torn: Vec<Vec<u8>> = found(&text).crashes.iter().filter(|crash| matches!(crash.state, State::Torn { form: Form::Cut, .. }))
+            .map(|crash| data(&crash.image, "w/a").unwrap()).collect();
+        assert!(!torn.is_empty());
+        assert!(torn.iter().all(|held| held.is_empty()));
+        assert!(found(&text).crashes.iter().filter(|crash| matches!(crash.state, State::Torn { .. })).all(|crash| !crash.image.contains_key("w/n")));
+    }
+
+    /// A state a more realistic kind takes over keeps the moments that already left it, and the
+    /// torn states of a span are reported before anything the moment after it leaves.
+    ///
+    /// Revert: restart the count at the takeover → a seedless run's shared counts drop; flush
+    /// after the moment's own states → a torn row follows the next span's durable one.
+    #[test]
+    fn a_takeover_keeps_its_moments_and_a_span_is_reported_in_order() {
+        let mut collector = Collector::new(0, 0, 0);
+        let image = std::sync::Arc::new(fixture());
+        let moment = |call| Moment::Synced { line: 0, command: "stack".into(), call, name: "fsync".into() };
+        collector.add(moment(1), image.clone(), "x".into(), false, State::Ordered);
+        collector.add(moment(2), image.clone(), "x".into(), false, State::Ordered);
+        collector.add(moment(3), image.clone(), "x".into(), false, State::Durable);
+        let (crashes, _) = collector.finish();
+        assert_eq!(crashes.len(), 1);
+        assert_eq!((crashes[0].state.clone(), crashes[0].shared), (State::Durable, 3));
+        let chunks: String = (0..2).map(|_| write(1, 3, "/s/w/a", b"ab")).collect();
+        let text = format!("1 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_APPEND) = 3</s/w/a>\n{}1 fsync(3</s/w/a>) = 0\n1 close(3</s/w/a>) = 0\n", chunks);
+        let crashes = found(&text).crashes;
+        let synced = crashes.iter().position(|crash| crash.state == State::Durable && data(&crash.image, "w/a").unwrap() == b"oldabab").unwrap();
+        let torn = crashes.iter().rposition(|crash| matches!(crash.state, State::Torn { .. })).unwrap();
+        assert!(torn < synced, "{:?}", crashes.iter().map(|crash| (crash.moment.label(), crash.state.label())).collect::<Vec<_>>());
     }
 
     /// A state found without a draw is never reported as a variant: drawing variants leaves every
