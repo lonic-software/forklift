@@ -40,17 +40,21 @@ pub fn explain_unfetched(root_tree: &str, path: &str, error: String) -> String {
     }
 
     // A fetch scope that cannot be read is the problem to report, never hidden behind the read's.
-    match unfetched_refusal(root_tree, path) {
+    let fetch = match scope_utils::read_fetch_scope() {
+        Ok(fetch) => fetch,
+        Err(scope_error) => return scope_error,
+    };
+
+    // Anything else that stops the refusal being decided leaves the read's own error standing.
+    match unfetched_refusal(&fetch, root_tree, path) {
         Ok(Some(refusal)) => refusal,
-        Ok(None) => error,
-        Err(scope_error) => scope_error,
+        _ => error,
     }
 }
 
 /// The `out_of_scope` refusal [`explain_unfetched`] gives, or `None` when the path stays inside
 /// the fetch scope, or a tree above the boundary does not load.
-fn unfetched_refusal(root_tree: &str, path: &str) -> Result<Option<String>, String> {
-    let fetch = scope_utils::read_fetch_scope()?;
+fn unfetched_refusal(fetch: &scope_utils::PathScope, root_tree: &str, path: &str) -> Result<Option<String>, String> {
     let key = WarehousePath::from_user_input(path)?.as_key().to_string();
     let components: Vec<&str> = key.split('/').collect();
     let Some(depth) = (1..=components.len())
