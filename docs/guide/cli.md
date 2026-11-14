@@ -2769,11 +2769,15 @@ Commands that need it refuse with `ref_damaged` (exit 53). `heal` rebuilds such 
 the warehouse still records about it: the parcel each checkout's files stand on, the head the
 checkout's journal last recorded for it, the parcels an interrupted operation started from or was
 completing, and the parcel the damaged file's remaining bytes still name (a hash cut short of at
-least 8 characters, or one with a single damaged character, if exactly one parcel matches). It
+least 8 characters, or one with a single damaged character, if exactly one parcel matches; bytes
+matching several parcels name a head without saying which, so the ref is refused). It
 rebuilds at the one parcel that holds a complete history and that every other head it found leads
 up to. In a warehouse with an office, that parcel's history must also pass the trust check, as an
 undone delete's does. A pallet whose latest journal entry deletes it is never brought back, unless a
-checkout stands on it, which proves it was made again since.
+checkout stands on it: it was then made again since, or a shift raced the delete, and the rebuild
+keeps what that checkout stands on (run the delete again if it was meant). Journals are not ordered
+across checkouts, so a head one checkout's journal recorded can win over a later rewind in another;
+rewind again if so.
 
 `heal` looks before resolving a durability taint and again after: a head whose objects the taint
 names as lost waits until the taint's own refetch brings them back. An interrupted operation on a
@@ -2784,12 +2788,15 @@ changes nothing on that ref, lists every head it found, and refuses with `ref_da
 are in `details` under `--json`). Choose one yourself:
 
 - `forklift heal --ref <pallet>=<parcel>` sets the ref to that parcel (any revision `history`
-  accepts), once its history checks out as complete and passes the trust check. Repeatable.
+  accepts, but not a meta pallet), once its history checks out as complete and passes the trust
+  check. In a served warehouse it must also lead up from every parcel a checkout or the ref's own
+  bytes stand on, since clones may rely on that head. Repeatable.
 - `forklift heal --remove-ref <pallet>` drops a damaged ref that nothing names a head for and no
   checkout stands on, once every checkout's saved state could be read. Its bytes are kept under `.forklift/removed-refs`, and whatever only that
   ref reached is no longer kept by any pallet. Repeatable.
 
-Both refuse a ref that is readable. The report lists `refs_rebuilt`, `refs_removed` and
+Both refuse a ref that is readable. A refusal also lists any ref the same run already set or
+removed. The report lists `refs_rebuilt`, `refs_removed` and
 `refs_refused` under `--json`.
 
 #### Interrupted operations
