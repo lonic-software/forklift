@@ -306,7 +306,7 @@ impl PathScope {
                     ignore files this one holds in scope. {}",
                     e.describe(), remedy
                 ),
-                _ => format!("{} Its version cannot be read, so it is damaged. {}", e.describe(), remedy),
+                _ => format!("{} Its header is malformed, so it is damaged. {}", e.describe(), remedy),
             },
             _ => format!("{} {}", e.describe(), remedy),
         })?;
@@ -331,9 +331,13 @@ fn is_newer_header(header: &str) -> bool {
     header_version(header).is_some_and(|version| version > SCOPE_VERSION)
 }
 
-/// The version a scope file's header names, if it can be read as one.
+/// The version a scope file's header names, when it is written as Forklift writes one: the tag, one
+/// space, and a number without a leading zero. Any other header is damaged, whatever number it holds.
 fn header_version(header: &str) -> Option<u32> {
-    header.rsplit(' ').next().and_then(|version| version.trim().parse::<u32>().ok())
+    let digits = header.strip_prefix(&format!("/forklift-{} ", SCOPE_RECORD))?;
+    let plain = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) && (digits == "0" || !digits.starts_with('0'));
+
+    if plain { digits.parse().ok() } else { None }
 }
 
 /// A scope file as `heal` reads it: on its own, never against the warehouse's mode or another
@@ -1005,7 +1009,10 @@ mod tests {
     /// Revert: send an unreadable version down the older arm, or the newer arm → red.
     #[test]
     fn a_header_version_is_read_as_older_newer_or_damaged() {
-        for header in ["/forklift-scope x7".to_string(), format!("/forklift-scope  {}", SCOPE_VERSION), format!("/forklift-scope junk {}", SCOPE_VERSION)] {
+        for header in [
+            "/forklift-scope x7".to_string(), format!("/forklift-scope  {}", SCOPE_VERSION), format!("/forklift-scope junk {}", SCOPE_VERSION),
+            "/forklift-scope junk 2".to_string(), format!("/forklift-scope junk {}", SCOPE_VERSION + 1), format!("/forklift-scope 0{}", SCOPE_VERSION + 1),
+        ] {
             let damaged = PathScope::from_bytes(format!("{}\ndocs\n", header).as_bytes(), "REMEDY").unwrap_err();
             assert!(damaged.contains("damaged") && damaged.contains("REMEDY") && !damaged.contains("older version"), "{:?}: {}", header, damaged);
         }
@@ -1015,6 +1022,16 @@ mod tests {
 
         let newer = PathScope::from_bytes(format!("/forklift-scope {}\ndocs\n", SCOPE_VERSION + 1).as_bytes(), "REMEDY").unwrap_err();
         assert!(newer.contains("Use the Forklift that wrote it") && !newer.contains("REMEDY"), "{}", newer);
+
+        // heal leaves a newer file alone, so a garbled header that ends in a higher number is not one.
+        let dir = std::env::temp_dir().join(format!("forklift-scope-header-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scope");
+        std::fs::write(&path, format!("/forklift-scope junk {}\ndocs\n", SCOPE_VERSION + 1)).unwrap();
+        assert!(matches!(read_scope_raw(&path).unwrap(), RawScope::Damaged(_)), "{:?}", read_scope_raw(&path));
+        std::fs::write(&path, format!("/forklift-scope {}\ndocs\n", SCOPE_VERSION + 1)).unwrap();
+        assert!(matches!(read_scope_raw(&path).unwrap(), RawScope::Newer(_)), "{:?}", read_scope_raw(&path));
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     #[test]
