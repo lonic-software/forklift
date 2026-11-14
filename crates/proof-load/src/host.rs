@@ -94,8 +94,8 @@ fn state_of(stat: &str) -> Option<char> {
 
 /// Attaches `strace` to the running process `pid`, following every thread it has and makes, its
 /// trace written to `trace`; returns once every thread the process has shows a tracer, or, for an
-/// `injecting` trace, once strace has ended cleanly with the process gone. What strace said is the error when it exits
-/// otherwise first, or does not attach within `limit`.
+/// `injecting` trace, once strace has ended cleanly with the process gone. What strace said is the
+/// error when it exits otherwise first, or does not attach within `limit`.
 fn attach(strace: &Path, pid: u32, trace: &Path, filter: &[String], injecting: bool, limit: Duration) -> Result<Attached, String> {
     let mut child = Command::new(strace).args(["-f", "-qq", "-y", "-ttt", "-o"]).arg(trace).args(filter).arg("-p").arg(pid.to_string())
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
@@ -254,8 +254,8 @@ impl Host {
         drop(lock(&self.server).take());
     }
 
-    /// Whether the server has been killed and not restarted: by the harness, or by anything else
-    /// that ended its process, such as an injected kill.
+    /// Whether the harness has killed the server and not restarted it. A server that ended any
+    /// other way, such as an injected kill or a crash, is noticed by [`Host::ended`].
     pub fn killed(&self) -> bool {
         lock(&self.server).is_none()
     }

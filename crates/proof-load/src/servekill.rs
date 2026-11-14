@@ -6,15 +6,16 @@
 //! scratch area with its own host, attaches strace to the listening server, and runs the faulted
 //! command through the proxy, which forwards one request at a time. The counting run attaches a
 //! plain trace before the faulted command; every mutating or syncing call in it is a kill point,
-//! enumerated as a client's are, every thread the server already had counted as its own, and
-//! positioned among the calls made since its unit began. Each point's unit is the request whose
-//! window its call fell in, by the route the table resolves it to, or the server's background work
-//! when it fell in none. An injected run attaches a trace that kills the server at the point, the
-//! moment its unit begins: just before the proxy forwards the point's request, or before the
-//! faulted command for a background point; the run counts only when the server was killed and its
-//! own trace shows the kill on the point's target. The server is then restarted through
-//! [`Host::restart`], whose remedies are the outside knowledge the grade records, and the record is
-//! read back through a fresh clone of the host.
+//! enumerated as a client's are but aimed by path only where the path resolves to itself, every
+//! thread the server already had counted as its own, and positioned among the calls made since its
+//! unit began. Each point's unit is the request whose window its call fell in, by the route the
+//! table resolves it to, or the server's background work when it fell in none. An injected run
+//! attaches a trace that kills the server at the point, the moment its unit begins: just before the
+//! proxy forwards the point's request, or before the faulted command for a background point; the
+//! run counts only when the server was killed and its own trace shows the kill on the point's
+//! target, and a server that ends without the SIGKILL crashed on its own, which is an error. The
+//! server is then restarted through [`Host::restart`], whose remedies are the outside knowledge the
+//! grade records, and the record is read back through a fresh clone of the host.
 //!
 //! A fresh build per run, not a copy: a copy's work tree names the URL of the server it was copied
 //! beside. The server's handlers run on pooled threads, so a point another thread can reach first

@@ -222,7 +222,9 @@ pub fn enumerate(calls: &[Call], line: usize, command: &str, root: &Root, start:
 /// and the moment its position is counted from: the injecting trace is attached then, so only the
 /// calls from that moment on count toward `when`, and only those can steal it. Since that moment
 /// is not the counting trace's start, what existed when strace resolves a -P path is unknown: a
-/// path whose resolved form could differ from it is counted by position instead.
+/// path whose lexical resolution under the root's canonical form is not the path itself, such as
+/// a relative one, is counted by position instead. A symlink below the root would still differ
+/// unseen; the server's warehouse layout makes none.
 pub fn enumerate_served(calls: &[Call], pid: u32, unit: &dyn Fn(&Call) -> (String, u64), root: &Root, start: &str) -> Result<Enumerated, Vec<String>> {
     enumerate_in(calls, trace::attached_groups(calls, pid), pid, 0, unit, root, start, None)
 }
