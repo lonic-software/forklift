@@ -1806,13 +1806,30 @@ fn is_damage(message: &str) -> bool {
     forklift_core::error::deframe(message).is_some_and(|(code, _, _)| DAMAGE_CODES.iter().any(|damage| damage.as_str() == code))
 }
 
-/// Map an error from a read of a host record: a `503` carrying its code and next step when the
-/// record is damaged ([`is_damage`]), with no `Retry-After` ([`error_response`]), since only the
-/// operator's repair mends it; any other error is [`internal`].
+/// The operator's remedy for a damaged host record, as a client is told it: the server's own
+/// directories are not named over the wire, so the warehouse is a placeholder.
+fn operator_remedy(code: forklift_core::error::RefusalCode) -> &'static str {
+    match code {
+        forklift_core::error::RefusalCode::TombstonesDamaged => "forklift-server tombstone repair --root <warehouse>",
+        _ => unreachable!("not a damage code"),
+    }
+}
+
+/// Map an error from a read of a host record: a `503` carrying its code and the operator's remedy
+/// ([`operator_remedy`]) when the record is damaged ([`is_damage`]), with no `Retry-After`
+/// ([`error_response`]), since only the operator's repair mends it; any other error is
+/// [`internal`]. The damage itself is logged, with the local next step.
 fn damage_refusal(message: String) -> HandlerError {
-    match is_damage(&message) {
-        true => (StatusCode::SERVICE_UNAVAILABLE, message),
-        false => internal(message),
+    let damage = forklift_core::error::deframe(&message).and_then(|(code, human, _)| {
+        DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, human.to_string()))
+    });
+
+    match damage {
+        Some((code, human)) => {
+            tracing::error!(%message, "a host record is damaged");
+            (StatusCode::SERVICE_UNAVAILABLE, forklift_core::error::CoreError::refusal(code, human, operator_remedy(code)).into())
+        }
+        None => internal(message),
     }
 }
 
@@ -9721,6 +9738,29 @@ mod tests {
             let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
+        /// Revert: read an absent served mark as never served → the gate serves the root and
+        /// writes a fresh mark over the tombstones → red. Revert: answer damage as `internal` in
+        /// `damage_refusal` → a 500 → red.
+        #[tokio::test]
+        async fn a_root_whose_mark_was_lost_beside_its_tombstones_is_not_served() {
+            let (root, scope, side) = served_with_side("mark-lost");
+            assert_eq!(delete(&root, "side", &side).await.status(), StatusCode::OK);
+            std::fs::remove_file(forklift_core::globals::forklift_root().join("served")).unwrap();
+            drop(scope);
+
+            let refused = WarehouseHandle::serving(root.clone(), false).err().expect("the root is refused");
+            assert!(matches!(&refused, ServingRefusal::Unreadable(reason) if reason.contains("served mark")), "{:?}", refused);
+
+            let (status, message) = damage_refusal(match refused { ServingRefusal::Unreadable(reason) => reason, _ => unreachable!() });
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(forklift_core::error::deframe(&message).is_some_and(|(code, _, _)| code == "tombstones_damaged"), "{}", message);
+
+            let _scope = StorageRootScope::enter(&root);
+            assert!(!forklift_core::globals::forklift_root().join("served").exists(), "no mark is written over the damage");
+            drop(_scope);
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+        }
+
         #[tokio::test]
         async fn a_delete_removes_the_ref_and_the_handshake_lists_its_tombstone() {
             let (root, _scope, side) = served_with_side("delete-lands");
@@ -9735,6 +9775,42 @@ mod tests {
             let info: WarehouseInfo = serde_json::from_str(&body_text(info).await).unwrap();
             assert_eq!(info.tombstones, Some(BTreeMap::from([("side".to_string(), side)])));
             assert!(!info.pallets.contains_key("side"), "a deleted pallet is not listed");
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+        }
+
+        /// Revert: map the handshake's list read through `internal` → a 500 with no code → red.
+        /// Revert: add `Retry-After` to every 503 → the damage answer tells the client to wait →
+        /// red.
+        #[tokio::test]
+        async fn a_handshake_over_a_damaged_list_refuses_with_its_code_and_no_retry() {
+            use forklift_core::util::record_utils;
+            let (root, _scope, side) = served_with_side("handshake-damaged");
+            let list = forklift_core::globals::forklift_root().join("tombstones");
+            let (first, second) = (format!("{} gone", side), format!("{} gone", "b".repeat(64)));
+
+            let damages: [(&str, Option<Vec<u8>>); 4] = [
+                ("not text", Some(b"\xff\xfe not text".to_vec())),
+                ("a bad entry", Some(record_utils::to_bytes("tombstones", 2, ["nothash gone"]))),
+                ("a duplicate", Some(record_utils::to_bytes("tombstones", 2, [first.as_str(), second.as_str()]))),
+                ("an absent list", None),
+            ];
+
+            for (what, bytes) in damages {
+                match bytes {
+                    Some(bytes) => std::fs::write(&list, bytes).unwrap(),
+                    None => std::fs::remove_file(&list).unwrap(),
+                }
+
+                let response = get_warehouse(State(Arc::new(single_mode_state(root.clone()))), Path(PathParams::new()))
+                    .await.into_response();
+
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{}", what);
+                assert!(response.headers().get(axum::http::header::RETRY_AFTER).is_none(), "{}: no wait mends it", what);
+                let body = body_text(response).await;
+                assert!(body.contains(r#""code":"tombstones_damaged""#), "{}: {}", what, body);
+                assert!(body.contains("forklift-server tombstone repair --root <warehouse>"), "{}: {}", what, body);
+            assert!(!body.contains("repair --root /") && !body.contains("repair --root '"), "{}: no server path: {}", what, body);
+            }
             let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 

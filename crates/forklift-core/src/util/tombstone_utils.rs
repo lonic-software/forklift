@@ -95,7 +95,8 @@ pub enum ServedState {
 
 /// The command that repairs the tombstones of the warehouse at the current storage root.
 fn repair_command() -> String {
-    let root = globals::forklift_root();
+    // The storage root may be relative to where the command runs, and the remedy is run elsewhere.
+    let root = std::path::absolute(globals::forklift_root()).unwrap_or_else(|_| globals::forklift_root());
     let warehouse = root.parent().unwrap_or(&root);
 
     format!("forklift-server tombstone repair --root {}", crate::util::franchise_utils::quote(&warehouse.to_string_lossy()))
@@ -112,6 +113,11 @@ pub(crate) fn damaged(detail: &str) -> String {
         ),
         repair_command(),
     ).into()
+}
+
+/// Whether `error` is the refusal of damaged tombstones ([`damaged`]).
+pub fn is_damage(error: &str) -> bool {
+    crate::error::deframe(error).is_some_and(|(code, _, _)| code == RefusalCode::TombstonesDamaged.as_str())
 }
 
 /// Read a record file's entries; `None` when the file is absent.
@@ -539,6 +545,25 @@ pub(crate) mod tests {
         for error in [is_served().unwrap_err(), served_for_removal().unwrap_err(), read_tombstones().unwrap_err()] {
             assert_damaged(&error, "the served mark");
         }
+    }
+
+    /// Revert: the old note, which said a newer forklift may have written the list and named no
+    /// repair → red.
+    #[test]
+    fn a_tolerant_root_walk_over_damaged_tombstones_notes_the_repair() {
+        use crate::util::{bay_utils::BayReadPolicy, office_utils::TrustPinReadPolicy, recovery_utils};
+        let _scratch = Scratch::new("tolerant-walk");
+        served_with(&Tombstones::default());
+        std::fs::write(tombstones_path(), b"\xff\xfe not a list").unwrap();
+
+        let refused = recovery_utils::gc_root_sources(&[], BayReadPolicy::FailClosed, TrustPinReadPolicy::FailClosed).err().unwrap_or_default();
+        assert!(is_damage(&refused), "gc and prune refuse: {}", refused);
+
+        let tolerated = recovery_utils::gc_root_sources(&[], BayReadPolicy::Tolerate, TrustPinReadPolicy::Tolerate).unwrap();
+        assert!(
+            tolerated.degraded.iter().any(|note| note.contains("forklift-server tombstone repair --root") && note.contains("nothing was freed")),
+            "{:?}", tolerated.degraded
+        );
     }
 
     #[test]

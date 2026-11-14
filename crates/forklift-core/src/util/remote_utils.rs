@@ -2567,7 +2567,7 @@ pub const MUTATION_RERUN_CONVERGES: &str =
 /// have wrapped it). Never a local failure, whatever its text quotes.
 pub fn is_transient_failure(message: &str) -> bool {
     // A remote's damaged records are mended by its operator, not by time.
-    if crate::error::deframe(message).is_some_and(|(code, _, _)| code == RefusalCode::TombstonesDamaged.as_str()) {
+    if crate::util::tombstone_utils::is_damage(message) {
         return false;
     }
 

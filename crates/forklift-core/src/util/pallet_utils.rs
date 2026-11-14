@@ -4065,6 +4065,24 @@ pub(crate) mod tests {
             let _ = file_utils::remove_dir_all(&root);
         }
 
+        /// Revert: read an absent served mark as never served → the removal is made with no
+        /// tombstone (an undo entry is passed, so "never served" does not refuse it) → red.
+        #[test]
+        fn a_removal_beside_tombstones_whose_mark_was_lost_is_refused_as_damage() {
+            let (root, _scope) = deleted_in_a_served_root("tombstone-mark-lost");
+            update_pallet_head("other", None, &hash('b'), &RefPreconditions::NONE).unwrap();
+            std::fs::remove_file(tombstone_utils::served_path()).unwrap();
+
+            let refused = remove_pallet_head_in(
+                PalletNamespace::User, "other", &hash('b'), &RefPreconditions::NONE, Some(&deleting("other", &hash('b'))),
+            ).unwrap_err();
+
+            let refused = refused.to_string();
+            assert!(crate::error::deframe(&refused).is_some_and(|(code, _, _)| code == "tombstones_damaged"), "{}", refused);
+            assert_eq!(get_pallet_head("other").unwrap(), Some(hash('b')), "nothing was removed");
+            let _ = file_utils::remove_dir_all(&root);
+        }
+
         /// A served root with pallet "gone" deleted at `hash('a')`.
         fn deleted_in_a_served_root(name: &str) -> (PathBuf, StorageRootScope) {
             let (root, scope) = scratch(name);

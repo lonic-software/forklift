@@ -607,6 +607,9 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
                 .and_then(|preconditions| pallet_utils::repair_pallet_head(&damaged.pallet, &damaged.damage, &head, &preconditions))
             {
                 Ok(()) => report.rebuilt.push(Rebuilt { pallet: damaged.pallet.clone(), head, source }),
+                // Damaged tombstones refuse every ref write alike, and only the operator's repair
+                // mends them, so the refusal is the answer, with its own next step.
+                Err(RefUpdateError::Failed(error)) if crate::util::tombstone_utils::is_damage(&error) => return Err(error),
                 // The first pass leaves a failed write to the second, which reports it.
                 Err(_) if pass == Pass::BeforeTaint => {}
                 Err(error) => report.refused.push(Refused {

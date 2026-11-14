@@ -38,6 +38,8 @@ pub struct Repaired {
     pub kept: Vec<String>,
     /// Why no name was taken from the journals at all, when one could not be read.
     pub journals_unread: Option<String>,
+    /// Each pallet ref that did not read, whose history was left unheld and so kept, as a note.
+    pub refs_unread: Vec<String>,
     /// Whether the served mark was written.
     pub mark_written: bool,
 }
@@ -63,6 +65,10 @@ impl Repaired {
 
         for (pallet, head) in &self.named {
             lines.push(format!("Named {} as deleted pallet \"{}\", from its deletion in an undo journal.", head, pallet));
+        }
+
+        for note in &self.refs_unread {
+            lines.push(format!("Kept the history of a ref that does not read: {}", note));
         }
 
         if let Some(reason) = &self.journals_unread {
@@ -147,7 +153,8 @@ pub fn repair_tombstones() -> Result<Repaired, String> {
         repaired.set_aside.push(set_aside(&tombstone_utils::served_path())?);
     }
 
-    let tips = lost_tips(&tombstones)?;
+    let (tips, refs_unread) = lost_tips(&tombstones)?;
+    repaired.refs_unread = refs_unread;
 
     let evidence = match JournalEvidence::read() {
         Ok(evidence) => Some(evidence),
@@ -270,8 +277,10 @@ fn refuse_unlisted_packs() -> Result<(), String> {
     }
 }
 
-/// Every lost tip (see the module doc), given the tombstones the repair keeps.
-fn lost_tips(tombstones: &Tombstones) -> Result<Vec<String>, String> {
+/// Every lost tip (see the module doc), given the tombstones the repair keeps, and a note for each
+/// pallet ref that did not read: what only it reaches is a lost tip too, and kept, so that heal,
+/// which a damaged list refuses, can rebuild it once the list is repaired.
+fn lost_tips(tombstones: &Tombstones) -> Result<(Vec<String>, Vec<String>), String> {
     let durable = crate::util::recovery_utils::durable_root_sources(tombstones.heads())?;
     let (reached, _gaps) = audit_utils::collect_reachable_noting_gaps(&durable.heads(), file_utils::is_present_for_sweep)?;
 
@@ -295,7 +304,7 @@ fn lost_tips(tombstones: &Tombstones) -> Result<Vec<String>, String> {
         }
     }
 
-    Ok(unheld.into_iter().filter(|hash| !parents.contains(hash)).collect())
+    Ok((unheld.into_iter().filter(|hash| !parents.contains(hash)).collect(), durable.degraded))
 }
 
 /// What the bays' undo journals record of each pallet's heads.

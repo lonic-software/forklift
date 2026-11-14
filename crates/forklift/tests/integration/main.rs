@@ -36,6 +36,7 @@ mod rollup_hash_skip;
 mod shard_store;
 mod tag_subject_gc;
 mod take_writers;
+mod tombstone_repair;
 mod tree_names;
 mod warehouse_format;
 mod warehouse_marker;

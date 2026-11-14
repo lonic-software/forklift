@@ -1554,13 +1554,14 @@ fn pallet_ref_heads(bay_policy: &bay_utils::BayReadPolicy, degraded: &mut Vec<St
 }
 
 /// The roots only durable holders give: every user and meta pallet head, every trust-pin root, and
-/// `tombstone_heads`, the heads the caller's own tombstones keep. Read fail-closed throughout.
-/// Every record that names a head only for a while (journal entries, parked parcels, positions,
+/// `tombstone_heads`, the heads the caller's own tombstones keep. Read fail-closed, but for a ref
+/// that does not read: its head cannot be named, so what only it reaches is left unheld, with a
+/// note in `degraded`. Every record that names a head only for a while (journal entries, parked parcels, positions,
 /// hauls, the git mirror's roots, staged shards) is left out on purpose: what only such a record
 /// reaches is what a tombstone repair must still find unheld, because the record expires.
 pub(crate) fn durable_root_sources(tombstone_heads: Vec<String>) -> Result<GcRootSources, String> {
     let mut degraded: Vec<String> = Vec::new();
-    let (parcels, meta_heads) = pallet_ref_heads(&bay_utils::BayReadPolicy::FailClosed, &mut degraded)?;
+    let (parcels, meta_heads) = pallet_ref_heads(&bay_utils::BayReadPolicy::Tolerate, &mut degraded)?;
     let trust_pins = office_utils::collect_trust_pin_roots(office_utils::TrustPinReadPolicy::FailClosed)?;
 
     Ok(GcRootSources {
