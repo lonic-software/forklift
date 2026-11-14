@@ -590,9 +590,20 @@ fn classify(call: &Call, unplaced: &std::cell::Cell<Option<String>>) -> Result<T
 /// The thread group of every thread in a trace: a clone with CLONE_THREAD joins its parent's, any
 /// other starts its own. The first thread in the trace is the traced command's own process.
 pub fn thread_groups(calls: &[Call]) -> BTreeMap<u32, u32> {
-    let mut groups = BTreeMap::new();
-    let Some(first) = calls.first() else { return groups };
-    groups.insert(first.tid, first.tid);
+    let Some(first) = calls.first() else { return BTreeMap::new() };
+    groups_from(calls, BTreeMap::from([(first.tid, first.tid)]))
+}
+
+/// [`thread_groups`] of a trace attached to the running process `pid`: every thread the trace
+/// shows that no traced clone made was already there, so it is one of the process's own threads.
+pub fn attached_groups(calls: &[Call], pid: u32) -> BTreeMap<u32, u32> {
+    let made: std::collections::BTreeSet<u32> = spawns(calls).into_iter().map(|(_, child, _)| child).collect();
+    let seeds = calls.iter().map(|call| call.tid).filter(|tid| !made.contains(tid)).map(|tid| (tid, pid)).collect();
+    groups_from(calls, seeds)
+}
+
+/// Every successful clone or fork in `calls`: (parent, child, whether it made a thread).
+fn spawns(calls: &[Call]) -> Vec<(u32, u32, bool)> {
     let mut spawned: Vec<(u32, u32, bool)> = Vec::new();
     for call in calls.iter().filter(|call| matches!(call.name.as_str(), "clone" | "clone3" | "fork" | "vfork")) {
         let Returned::Value(child) = &call.returned else { continue };
@@ -602,6 +613,13 @@ pub fn thread_groups(calls: &[Call]) -> BTreeMap<u32, u32> {
         }
         spawned.push((call.tid, child, call.arguments.iter().any(|argument| argument.contains("CLONE_THREAD"))));
     }
+    spawned
+}
+
+/// The groups `seeds` start, extended along every spawn in `calls`; a thread neither reaches is
+/// its own.
+fn groups_from(calls: &[Call], mut groups: BTreeMap<u32, u32>) -> BTreeMap<u32, u32> {
+    let spawned = spawns(calls);
     // A child's clone can print before its parent's: settle until nothing changes. A chain settles
     // within one pass per spawn; a tid reused under two parents never does, so the passes stop
     // there rather than hang.
@@ -926,6 +944,25 @@ mod tests {
             10 clone(child_stack=NULL, flags=SIGCHLD) = 60\n\
             10 clone(child_stack=0x1, flags=CLONE_VM|CLONE_THREAD) = 60\n").unwrap();
         assert!(thread_groups(&reused).contains_key(&60));
+    }
+
+    /// In a trace attached to a running process, every thread no traced clone made is the
+    /// process's own, whichever prints first; a thread it clones joins it and a process it forks
+    /// does not.
+    ///
+    /// Revert: seed only the first thread → the server's other pooled threads count as children
+    /// and none of their calls is a point.
+    #[test]
+    fn an_attached_trace_counts_every_thread_already_there() {
+        let calls = parse("21 write(1<pipe:[5]>, \"x\", 1) = 1\n\
+            20 write(1<pipe:[5]>, \"x\", 1) = 1\n\
+            22 clone3({flags=CLONE_VM|CLONE_THREAD, exit_signal=0}, 88) = 30\n\
+            21 clone(child_stack=NULL, flags=CLONE_CHILD_SETTID|SIGCHLD) = 31\n\
+            30 write(1<pipe:[5]>, \"x\", 1) = 1\n\
+            31 write(1<pipe:[5]>, \"x\", 1) = 1\n").unwrap();
+        let groups = attached_groups(&calls, 20);
+        assert_eq!([groups[&20], groups[&21], groups[&22], groups[&30]], [20; 4]);
+        assert_eq!(groups[&31], 31);
     }
 
     /// A root covers a path only at a component boundary, in either spelling, and rebases keeping

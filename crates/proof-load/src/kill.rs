@@ -213,8 +213,19 @@ fn selected(call: &Call, aims: &BTreeSet<String>) -> bool {
 /// coordinates) existed when the line started, since strace's `-P` adds the resolved form of a path
 /// that exists then. A call the table cannot classify, or a write outside the root, refuses.
 pub fn enumerate(calls: &[Call], line: usize, command: &str, root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
-    let groups = trace::thread_groups(calls);
     let tool = calls.first().map(|call| call.tid).unwrap_or_default();
+    enumerate_in(calls, trace::thread_groups(calls), tool, line, &|_| command.to_string(), root, start, existed)
+}
+
+/// The kill points of a trace attached to the running server `pid`: [`enumerate`], every thread
+/// the server already had counted as its own, and each point's command the unit `unit` names for
+/// its call.
+pub fn enumerate_served(calls: &[Call], pid: u32, unit: &dyn Fn(&Call) -> String, root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
+    enumerate_in(calls, trace::attached_groups(calls, pid), pid, 0, unit, root, start, existed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, tool: u32, line: usize, command: &dyn Fn(&Call) -> String, root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
     let mut directories = Directories::new(groups, start);
     let mut refusals = Vec::new();
     let mut enumerated = Enumerated::default();
@@ -225,7 +236,7 @@ pub fn enumerate(calls: &[Call], line: usize, command: &str, root: &Root, start:
         let touched = match trace::touch(call) {
             Ok(touched) => touched,
             Err(unsound) => {
-                refusals.push(format!("{}: {}", command, unsound));
+                refusals.push(format!("{}: {}", command(call), unsound));
                 continue;
             }
         };
@@ -242,7 +253,7 @@ pub fn enumerate(calls: &[Call], line: usize, command: &str, root: &Root, start:
             continue;
         }
         if let Some(outside) = files.iter().map(|at| &resolved[*at]).find(|path| !root.holds(path)) {
-            refusals.push(format!("{}: {} writes outside its scratch area: {}", command, call.name, outside));
+            refusals.push(format!("{}: {} writes outside its scratch area: {}", command(call), call.name, outside));
             continue;
         }
         let group = directories.group(call.tid);
@@ -281,7 +292,7 @@ pub fn enumerate(calls: &[Call], line: usize, command: &str, root: &Root, start:
         let counts = |other: &Call| other.name == call.name && aims.as_ref().is_none_or(|aims| selected(other, aims));
         let when = calls[..=index].iter().filter(|other| other.tid == call.tid && counts(other)).count();
         let sampled = calls.iter().any(|other| other.tid != call.tid && counts(other));
-        enumerated.points.push(Point { line, call: index, command: command.to_string(), name: call.name.clone(), aim, when, target, base, sampled });
+        enumerated.points.push(Point { line, call: index, command: command(call), name: call.name.clone(), aim, when, target, base, sampled });
     }
     Ok(enumerated)
 }
@@ -317,9 +328,17 @@ pub fn landing(calls: &[Call], point: &Point, root: &Root, exit: Option<i32>) ->
     if exit == Some(0) {
         return Landing::NotReached { why: "the injection never fired: the command finished".to_string() };
     }
-    let groups = trace::thread_groups(calls);
     // Under -P the trace holds only selected calls and no execve; the tool's process is the first.
     let tool = calls.iter().find(|call| call.name == "execve").or(calls.first()).map(|call| call.tid).unwrap_or_default();
+    landing_in(calls, point, root, &trace::thread_groups(calls), tool)
+}
+
+/// [`landing`] in a trace attached to the running server `pid`, which the caller saw killed.
+pub fn landing_served(calls: &[Call], point: &Point, root: &Root, pid: u32) -> Landing {
+    landing_in(calls, point, root, &trace::attached_groups(calls, pid), pid)
+}
+
+fn landing_in(calls: &[Call], point: &Point, root: &Root, groups: &BTreeMap<u32, u32>, tool: u32) -> Landing {
     let mut seen = Vec::new();
     for (index, call) in calls.iter().enumerate() {
         if call.name != point.name || call.returned != Returned::Unknown {
@@ -391,7 +410,7 @@ pub(crate) fn holds_root(bytes: &[u8], needle: &[u8]) -> bool {
 }
 
 /// The paths under `root`, absolute, as they stand.
-fn listing(root: &Path) -> BTreeSet<String> {
+pub(crate) fn listing(root: &Path) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
@@ -454,7 +473,7 @@ pub fn command_id(schema: &crate::writeops::Schema, arguments: &[String]) -> Res
 /// Why a scenario's kill points cannot run in this build of the harness, if they cannot.
 pub fn not_run(scenario: &Scenario) -> Option<String> {
     if scenario.history.iter().any(|op| matches!(op, Op::Host)) {
-        return Some("hosted: every copy would share one server and its warehouse; copies of the host arrive with server kill points".to_string());
+        return Some("hosted: every copy would share one server and its warehouse, and the copy's work tree names that server's URL".to_string());
     }
     None
 }
@@ -765,6 +784,25 @@ pub struct Summary {
 /// a scenario whose faulted command made no call to kill. A scenario reported not run is listed,
 /// and fails nothing.
 pub fn summarize(kills: &[ScenarioKills]) -> Summary {
+    summarize_as(kills, Side::Client)
+}
+
+/// Whose kill points a summary reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    /// The faulted command's own process.
+    Client,
+    /// The host's server, while the faulted command runs: a hosted scenario whose command only
+    /// reads from it makes no call to kill there, which is owed nothing.
+    Server,
+}
+
+/// [`summarize`] for `side`'s kill points.
+pub fn summarize_as(kills: &[ScenarioKills], side: Side) -> Summary {
+    let (category, binding, prefix) = match side {
+        Side::Client => (Category::KillPointsClient, "forklift", "kill"),
+        Side::Server => (Category::KillPointsServer, "forklift-server", "server kill"),
+    };
     let mut rows = Vec::new();
     let mut units: BTreeMap<(String, String, String, String), bool> = BTreeMap::new();
     let (mut refusals, mut errors, mut empty, mut not_run) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -772,12 +810,12 @@ pub fn summarize(kills: &[ScenarioKills]) -> Summary {
     let mut sampled = false;
     for scenario in kills {
         if let Some(reason) = &scenario.not_run {
-            not_run.push(Completeness { check: format!("kill points of {}", scenario.scenario), cell: Cell::not_run(reason), missing: vec![] });
+            not_run.push(Completeness { check: format!("{} points of {}", prefix, scenario.scenario), cell: Cell::not_run(reason), missing: vec![] });
             continue;
         }
         refusals.extend(scenario.refusals.iter().map(|refusal| format!("{}: {}", scenario.scenario, refusal)));
         errors.extend(scenario.errors.iter().map(|error| format!("{}: {}", scenario.scenario, error)));
-        if scenario.refusals.is_empty() && scenario.killed.is_empty() && scenario.errors.is_empty() {
+        if side == Side::Client && scenario.refusals.is_empty() && scenario.killed.is_empty() && scenario.errors.is_empty() {
             empty.push(format!("{}: the faulted command made no call to kill", scenario.scenario));
         }
         for killed in &scenario.killed {
@@ -799,8 +837,8 @@ pub fn summarize(kills: &[ScenarioKills]) -> Summary {
             let point = &killed.point;
             rows.push(Row {
                 scenario: format!("{} {} {}#{} {}", scenario.scenario, point.command, point.name, point.when, point.base),
-                category: Category::KillPointsClient,
-                binding: "forklift".to_string(),
+                category,
+                binding: binding.to_string(),
                 grade: graded.grade,
                 recoverability: graded.recoverability.clone(),
                 note: (!notes.is_empty()).then(|| notes.join("; ")),
@@ -811,12 +849,12 @@ pub fn summarize(kills: &[ScenarioKills]) -> Summary {
         .map(|((scenario, command, name, base), _)| format!("{}: {} {} {}: no kill landed", scenario, command, name, base)).collect();
     missing.extend(empty);
     if kills.iter().all(|scenario| scenario.not_run.is_some()) {
-        missing.push("no scenario's kill points ran".to_string());
+        missing.push(format!("no scenario's {} points ran", prefix));
     }
     let mut completeness = vec![
-        Completeness { check: "kill-point units".to_string(), cell: Cell::Run, missing },
-        Completeness { check: "kill-point soundness".to_string(), cell: Cell::Run, missing: refusals },
-        Completeness { check: "kill points ran".to_string(), cell: Cell::Run, missing: errors },
+        Completeness { check: format!("{}-point units", prefix), cell: Cell::Run, missing },
+        Completeness { check: format!("{}-point soundness", prefix), cell: Cell::Run, missing: refusals },
+        Completeness { check: format!("{} points ran", prefix), cell: Cell::Run, missing: errors },
     ];
     completeness.extend(not_run);
     let cell = if rows.is_empty() {

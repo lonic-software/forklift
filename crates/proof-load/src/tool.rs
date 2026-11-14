@@ -163,6 +163,11 @@ impl Served {
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
+
+    /// Whether its process has ended: a kill the harness did not make, such as an injected one.
+    pub fn exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
 }
 
 impl Drop for Served {

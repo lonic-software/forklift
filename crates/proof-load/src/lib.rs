@@ -30,6 +30,7 @@ pub mod routewrites;
 pub mod runner;
 pub mod scenario;
 pub mod scrub;
+pub mod servekill;
 pub mod tool;
 pub mod trace;
 pub mod volume;
