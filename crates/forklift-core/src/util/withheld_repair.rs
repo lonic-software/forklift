@@ -206,3 +206,121 @@ fn absent_unheld() -> Result<Vec<String>, String> {
 
     Ok(absent)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::globals::StorageRootScope;
+    use crate::util::file_utils;
+
+    struct Scratch {
+        root: PathBuf,
+        _scope: StorageRootScope,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let root = std::env::temp_dir().join(format!("forklift-withheld-repair-test-{}-{}", name, std::process::id()));
+            let _ = file_utils::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let scope = StorageRootScope::enter(&root);
+
+            Scratch { root, _scope: scope }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = file_utils::remove_dir_all(&self.root);
+        }
+    }
+
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn record() -> PathBuf {
+        globals::forklift_root().join("withheld")
+    }
+
+    fn aside() -> Vec<PathBuf> {
+        std::fs::read_dir(globals::forklift_root()).unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with("withheld.damaged-"))
+            .collect()
+    }
+
+    // Revert: drop the placeholder → a hash whose entry lost its statement is served again; or
+    // keep nothing of a broken record → every takedown in it is.
+    #[test]
+    fn a_damaged_record_keeps_every_hash_it_can_still_tell() {
+        let _scratch = Scratch::new("salvage");
+        assert!(tombstone_utils::mark_served(true).unwrap());
+
+        // A whole entry, one cut inside its digest column, a line naming no object, one that
+        // escapes a backslash, and no line ending at the end: cut short.
+        let bytes = format!("/forklift-withheld 2\n{} - court order 7\n{} 12\nnot a hash at all\n{} - path a\\\\b\n{} - DMCA", A, B, C, A);
+        std::fs::write(record(), &bytes).unwrap();
+        assert!(withholding::is_damage(&withholding::read_withheld().unwrap_err()));
+
+        let repaired = repair_withheld().unwrap();
+        let set = withholding::read_withheld().unwrap();
+
+        assert_eq!(set.statement(A), Some("DMCA"), "a whole entry read later is kept as written");
+        assert_eq!(set.statement(B), Some(PLACEHOLDER_STATEMENT));
+        assert_eq!(set.digest(B), Some(&ChunkDigest::Unknown));
+        assert_eq!(set.statement(C), Some("path a\\b"), "read unescaped");
+        assert_eq!((repaired.salvaged, repaired.placeholders.clone(), repaired.unreadable_lines), (2, vec![B.to_string()], 1));
+
+        let moved = aside();
+        assert_eq!(moved.len(), 1);
+        assert_eq!(std::fs::read_to_string(&moved[0]).unwrap(), bytes, "the damaged bytes are kept aside");
+        assert_eq!(repaired.set_aside.as_ref(), Some(&moved[0]));
+
+        let report = repaired.report().join("\n");
+        assert!(report.contains(&format!("forklift-server withhold add {} <statement>", B)), "{}", report);
+        assert!(report.contains("served again"), "{}", report);
+
+        assert!(repair_withheld().unwrap_err().contains("nothing to repair"), "a record that reads is left alone");
+    }
+
+    // Revert: read a missing record as nothing to repair → a served root wedged on the loss.
+    #[test]
+    fn a_lost_record_in_a_served_root_is_written_anew_and_a_root_never_served_is_left_alone() {
+        let _scratch = Scratch::new("lost");
+        assert!(repair_withheld().unwrap_err().contains("never been served"));
+        assert!(!record().exists());
+
+        assert!(tombstone_utils::mark_served(true).unwrap());
+        std::fs::remove_file(record()).unwrap();
+
+        let repaired = repair_withheld().unwrap();
+        assert_eq!(repaired.set_aside, None);
+        assert!(withholding::read_withheld().unwrap().is_empty());
+        assert!(aside().is_empty());
+    }
+
+    // Revert: set aside a record of a version this build does not know → a newer Forklift's
+    // takedowns are moved out of its reach.
+    #[test]
+    fn a_record_of_another_version_is_left_for_the_forklift_that_wrote_it() {
+        let _scratch = Scratch::new("version");
+        let bytes = record_utils::to_bytes("withheld", 3, [format!("{} - statement", A)]);
+        std::fs::write(record(), &bytes).unwrap();
+
+        assert!(repair_withheld().unwrap_err().contains("a newer Forklift wrote it"));
+        assert_eq!(std::fs::read(record()).unwrap(), bytes);
+        assert!(aside().is_empty());
+    }
+
+    // Revert: take no serve lock → the record is rewritten under a server answering from it.
+    #[test]
+    fn the_repair_refuses_while_the_root_is_served() {
+        let _scratch = Scratch::new("served");
+        std::fs::write(record(), b"garbage").unwrap();
+
+        let _serving = ServeLock::acquire().unwrap();
+        assert!(repair_withheld().unwrap_err().starts_with("Refusing to repair the record of withheld content"));
+        assert_eq!(std::fs::read(record()).unwrap(), b"garbage");
+    }
+}

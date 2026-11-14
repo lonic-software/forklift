@@ -721,6 +721,21 @@ mod tests {
         std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [A])).unwrap();
         assert!(read_withheld().unwrap_err().contains("not an object hash, a chunk-list digest and a statement"));
 
+        // Revert: an uncoded error → a server answers it as its own fault, a 500 naming its path.
+        let good = record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} - statement", A)]);
+        let mut flipped = good.clone();
+        flipped[3] ^= 0x80;
+        for bytes in [good[..good.len() - 1].to_vec(), flipped, vec![0; good.len()], b"\xff\xfe".to_vec(),
+                      record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [A])] {
+            std::fs::write(withheld_path(), &bytes).unwrap();
+            let refused = read_withheld().unwrap_err();
+            let (code, human, next_step) = crate::error::deframe(&refused).unwrap_or_else(|| panic!("uncoded: {}", refused));
+            assert_eq!(code, "withheld_damaged", "{}", refused);
+            assert!(is_damage(&refused));
+            assert!(!human.contains(globals::FOLDER_NAME_FORKLIFT_ROOT), "no host path in the message: {}", human);
+            assert!(next_step.starts_with("forklift-server withhold repair --root "), "{}", next_step);
+        }
+
         // A version-1 entry, with no digest column, and a host entry recorded Conflicted.
         std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} statement", A)])).unwrap();
         assert!(read_withheld().is_err());

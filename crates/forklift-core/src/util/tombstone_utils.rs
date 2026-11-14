@@ -534,6 +534,8 @@ pub(crate) mod tests {
     fn a_torn_first_serve_is_completed_by_the_next_mark() {
         let _scratch = Scratch::new("torn");
 
+        // A first serve writes the record of withheld content before the list.
+        withholding::create_if_absent(&RefLock::acquire().unwrap()).unwrap();
         write_list(&[]);
         assert_eq!(served_state().unwrap(), ServedState::Unfinished);
         assert!(!is_served().unwrap(), "nothing was served before the mark");
@@ -542,6 +544,30 @@ pub(crate) mod tests {
         assert!(mark_served(false).unwrap());
         assert_eq!(served_state().unwrap(), ServedState::Served);
         assert!(served_for_removal().unwrap());
+    }
+
+    // Revert: write the record of withheld content after the list, or not at all → the first
+    // serve leaves a served root with none, read as nothing withheld; or skip the read before the
+    // mark → a root is marked served over a lost record.
+    #[test]
+    fn the_first_serve_writes_the_withheld_record_first_and_never_marks_over_a_lost_one() {
+        let _scratch = Scratch::new("withheld-witness");
+
+        assert!(withholding::read_withheld().unwrap().is_empty(), "a root never served reads none as nothing withheld");
+        assert!(mark_served(true).unwrap());
+        assert!(globals::forklift_root().join("withheld").is_file(), "the first serve writes the record");
+        assert!(withholding::read_withheld().unwrap().is_empty());
+
+        std::fs::remove_file(globals::forklift_root().join("withheld")).unwrap();
+        assert!(withholding::is_damage(&withholding::read_withheld().unwrap_err()), "lost from a served root");
+        assert!(mark_served(true).unwrap(), "a marked root is answered without reading the record");
+        assert!(!globals::forklift_root().join("withheld").exists(), "never written anew over a loss");
+
+        // A torn first serve that lost its record is not completed over the loss.
+        std::fs::remove_file(served_path()).unwrap();
+        assert_eq!(served_state().unwrap(), ServedState::Unfinished);
+        assert!(withholding::is_damage(&mark_served(true).unwrap_err()));
+        assert_eq!(served_state().unwrap(), ServedState::Unfinished, "no mark written");
     }
 
     #[test]
