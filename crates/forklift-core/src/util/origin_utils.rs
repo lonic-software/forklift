@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
 use crate::globals;
 use crate::util::lock_utils::RefLock;
-use crate::util::{config_utils, file_utils, origin_move, record_utils, scope_utils};
+use crate::util::{config_utils, file_utils, origin_move, record_utils};
 
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
 pub const FILE_NAME: &str = "origin";
@@ -105,7 +105,9 @@ pub fn checked_remote() -> Result<(String, Option<String>), CoreError> {
             config_utils::KEY_REMOTE_URL
         ))?;
 
-    if scope_utils::content_may_be_absent()? {
+    // The mode alone, from the marker, never the fetch scope: `heal --fetch-scope` dials to
+    // replace a fetch scope that cannot be read.
+    if crate::util::warehouse_utils::warehouse_mode()? != crate::util::warehouse_utils::WarehouseMode::Full {
         let Some(origin) = read_origin()? else {
             return Err(missing_origin_refusal());
         };
@@ -172,6 +174,7 @@ pub fn missing_origin_refusal() -> CoreError {
 mod tests {
     use super::*;
     use crate::enums::config_scope::ConfigScope;
+    use crate::util::scope_utils;
     use crate::util::warehouse_utils::{self, WarehouseMode};
 
     fn scratch(name: &str) -> (PathBuf, globals::StorageRootScope) {
