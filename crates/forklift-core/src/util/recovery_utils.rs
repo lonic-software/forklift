@@ -2485,7 +2485,7 @@ pub(crate) fn corrupt_packed_objects() -> Result<StoreScan, String> {
     let mut scan = StoreScan::default();
     for (hash, record) in failing {
         // The whole store's read judges it: another good copy stands in, and a failure that says
-        // nothing about the record (its cause `Other`) is the read's to explain.
+        // nothing about the record (an `Other` cause) is the read's to explain.
         match file_utils::read_object_classified(&hash) {
             Ok(file_utils::StoreReadOutcome::Verified(_) | file_utils::StoreReadOutcome::Absent) => {}
             Ok(file_utils::StoreReadOutcome::Unverifiable(error, file_utils::Unreadable::Other)) => {

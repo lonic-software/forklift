@@ -3618,10 +3618,6 @@ pub(crate) struct UndecodableRecord {
     pub(crate) hash: String,
     /// Why it does not rebuild.
     pub(crate) why: String,
-    /// [`file_utils::Unreadable::RecordDamage`] when the record or its chain is damaged;
-    /// [`file_utils::Unreadable::Other`] when its base could not be read for a reason that says
-    /// nothing about the record.
-    pub(crate) cause: file_utils::Unreadable,
 }
 
 /// How many records a scan resolves on the calling thread before it fans out.
@@ -3649,11 +3645,11 @@ pub(crate) fn undecodable_records() -> Result<Vec<UndecodableRecord>, String> {
 
     let judge = |(pack, hash_bytes, offset, length): &(&LoadedPack, [u8; HASH_LEN], u64, u64)| {
         let hash = sign_utils::to_hex(hash_bytes);
-        let failure = match pack.slice(*offset, *length) {
-            Ok(record) => resolve_record(record, &hash).err()?,
-            Err(error) => record_damage(error),
+        let why = match pack.slice(*offset, *length) {
+            Ok(record) => resolve_record(record, &hash).err()?.0,
+            Err(error) => error,
         };
-        Some(UndecodableRecord { hash, why: failure.0, cause: failure.1 })
+        Some(UndecodableRecord { hash, why })
     };
     let judged: Vec<Option<UndecodableRecord>> = match records.len() >= PARALLEL_RECORD_SCAN_THRESHOLD {
         true => fanout_utils::fanout_map(&records, judge),
@@ -12584,31 +12580,24 @@ pub(crate) mod tests {
         }
         assert_eq!(file_utils::retrieve_object_by_hash_uncached(&sound_hash).unwrap(), sound);
 
-        let mut listed: Vec<(String, file_utils::Unreadable)> =
-            undecodable_records().unwrap().into_iter().map(|record| (record.hash, record.cause)).collect();
-        listed.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut expected: Vec<(String, file_utils::Unreadable)> = [&garbled, &other, &base_hash, &delta].into_iter()
-            .map(|hash| (hash.clone(), file_utils::Unreadable::RecordDamage)).collect();
-        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut listed: Vec<String> = undecodable_records().unwrap().into_iter().map(|record| record.hash).collect();
+        listed.sort();
+        let mut expected = vec![garbled, other, base_hash, delta];
+        expected.sort();
         assert_eq!(listed, expected);
+        let scan = crate::util::recovery_utils::corrupt_packed_objects().unwrap();
+        assert_eq!(scan.corrupt.into_keys().collect::<Vec<_>>(), expected);
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// A delta whose base the store refuses as unreadable is unreadable with it, named by its own
     /// hash and its base's, while a delta whose base fails some other way, here behind an index of
-    /// another format version, keeps that wording with no code: the scan lists it with cause
-    /// `Other`, which heal reports unchecked rather than damaged. Mutation: type every base failure
-    /// as record damage, or none → red.
+    /// another format version, keeps that wording with no code, which heal reports unchecked
+    /// rather than damaged. Mutation: type every base failure as record damage, or none → red.
     #[test]
     fn a_delta_is_damaged_only_by_a_base_refused_as_unreadable() {
         let (temp, _scope) = salvage_root("fork495-delta-bases");
-        let listed = || {
-            let mut listed: Vec<(String, file_utils::Unreadable)> =
-                undecodable_records().unwrap().into_iter().map(|record| (record.hash, record.cause)).collect();
-            listed.sort_by(|a, b| a.0.cmp(&b.0));
-            listed
-        };
 
         let (absent_base, absent_hash) = blob449("a delta base never stored, padded to be a fit base");
         let (over_absent, over_absent_hash) = blob449("a delta over an absent base, padded to be a fit target");
@@ -12617,7 +12606,6 @@ pub(crate) mod tests {
         assert_eq!(code.as_deref(), Some("object_unreadable"), "{}", error);
         let (_, message, _) = crate::error::deframe(&error).unwrap();
         assert!(message.contains(over_absent_hash.as_str()) && message.contains(absent_hash.as_str()), "{}", message);
-        assert_eq!(listed(), vec![(over_absent_hash.clone(), file_utils::Unreadable::RecordDamage)]);
         let scan = crate::util::recovery_utils::corrupt_packed_objects().unwrap();
         assert_eq!(scan.corrupt.keys().collect::<Vec<_>>(), vec![&over_absent_hash], "{:?}", scan);
 
@@ -12634,12 +12622,6 @@ pub(crate) mod tests {
         assert_ne!(code.as_deref(), Some("object_unreadable"), "{}", error);
         assert!(error.contains("version"), "{}", error);
 
-        let mut expected = vec![
-            (over_absent_hash.clone(), file_utils::Unreadable::Other),
-            (over_foreign_hash.clone(), file_utils::Unreadable::Other),
-        ];
-        expected.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(listed(), expected);
         let scan = crate::util::recovery_utils::corrupt_packed_objects().unwrap();
         assert!(scan.corrupt.is_empty(), "{:?}", scan);
         assert_eq!(scan.unchecked.len(), 2, "{:?}", scan);
