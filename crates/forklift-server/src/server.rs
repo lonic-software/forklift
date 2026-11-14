@@ -137,13 +137,13 @@ struct WarehouseHandle {
     /// still in flight writes. Each is numbered and added under this mutex.
     applies_in_flight: std::sync::Mutex<std::collections::BTreeSet<u64>>,
 
-    /// Wakes the requests waiting for the owed applies ([`await_applies`]), when an apply
-    /// discharges some and when the warehouse is drained.
     /// The damage refusal ([`damage_refusal`]) the last apply stopped on, while it stands: an apply
     /// owed then waits for the operator's repair, not for time, so content is refused with it at
-    /// once rather than after [`APPLY_WAIT`]. Cleared by the next apply that discharges.
+    /// once rather than after [`APPLY_WAIT`]. Each apply's outcome sets or clears it.
     apply_damage: std::sync::Mutex<Option<String>>,
 
+    /// Wakes the requests waiting for the owed applies ([`await_applies`]), when an apply
+    /// discharges some and when the warehouse is drained.
     applies_wake: tokio::sync::Notify,
 
     /// Which chunks are served as absent while a deletion is owed ([`withheld_among`]).
@@ -4634,8 +4634,11 @@ async fn apply_discharging(warehouse: &Arc<WarehouseHandle>) -> (bool, Result<()
     let outcome = match apply_redactions(Arc::clone(warehouse)).await {
         Ok(outcome) => outcome,
         Err((_, error)) => {
-            if is_damage(&error) {
-                *warehouse.apply_damage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.clone());
+            let damage = is_damage(&error).then(|| error.clone());
+            let wake = damage.is_some();
+            *warehouse.apply_damage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = damage;
+
+            if wake {
                 warehouse.applies_wake.notify_waiters();
             }
 
@@ -4643,11 +4646,13 @@ async fn apply_discharging(warehouse: &Arc<WarehouseHandle>) -> (bool, Result<()
         }
     };
 
+    // Whatever stops this apply now, it is not the damage an earlier one stopped on.
+    *warehouse.apply_damage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
     if let Some(why) = outcome.undecided {
         return (outcome.applied, Err(why));
     }
 
-    *warehouse.apply_damage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     warehouse.applies_discharged.fetch_max(owed, Ordering::SeqCst);
     warehouse.applies_wake.notify_waiters();
 

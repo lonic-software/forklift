@@ -244,6 +244,51 @@ fn a_repair_names_a_deletion_only_where_the_journals_settle_it() {
     assert!(!listed.lines().any(|line| line.contains("side")), "nothing is named side: {}", listed);
 }
 
+/// Revert: name only lost tips → "gone" is deleted at a head that "side" was made from and moved
+/// on from, so that head is a parent, not a tip, and "gone" loses its name → red.
+#[test]
+fn a_repair_names_a_deleted_head_that_unheld_history_descends_from() {
+    let area = Area::new("descendant");
+    let root = area.served();
+    area.run_ok(&root, &["pallet", "create", "gone"]);
+    area.stack(&root, "gone.txt", "gone work");
+    let gone = head(&root, "gone");
+    area.run_ok(&root, &["pallet", "create", "side"]);
+    area.stack(&root, "side.txt", "side work");
+    let side = head(&root, "side");
+    area.run_ok(&root, &["shift", "main"]);
+    area.run_ok(&root, &["pallet", "delete", "side", "--force"]);
+    area.run_ok(&root, &["pallet", "delete", "gone", "--force"]);
+    forklift_core::util::file_utils::remove_file(list_path(&root)).unwrap();
+
+    let report = area.server_ok(&root, &["tombstone", "repair"]);
+
+    let listed = area.server_ok(&root, &["tombstone", "list"]);
+    let line_of = |head: &str| listed.lines().find(|line| line.contains(head)).unwrap_or_else(|| panic!("{} is not kept: {}\n{}", head, listed, report)).to_string();
+    assert!(line_of(&gone).contains("gone"), "{}", listed);
+    assert!(line_of(&side).contains("side"), "{}", listed);
+}
+
+/// Revert: run the whole repair when only the mark was lost → the journal settles "gone", whose
+/// tombstone the operator dropped, so it is named again → red.
+#[test]
+fn a_repair_over_a_lost_mark_beside_a_whole_list_writes_only_the_mark() {
+    let area = Area::new("mark-only");
+    let root = area.served();
+    let gone = area.deleted(&root, "gone");
+    area.server_ok(&root, &["tombstone", "drop", "gone"]);
+    let side = area.deleted(&root, "side");
+    let before = std::fs::read(list_path(&root)).unwrap();
+    forklift_core::util::file_utils::remove_file(root.join(".forklift").join("served")).unwrap();
+
+    area.server_ok(&root, &["tombstone", "repair"]);
+
+    assert_eq!(std::fs::read(list_path(&root)).unwrap(), before, "a whole list is left as it was");
+    assert!(root.join(".forklift").join("served").exists());
+    let listed = area.server_ok(&root, &["tombstone", "list"]);
+    assert!(listed.contains(&side) && !listed.contains(&gone), "{}", listed);
+}
+
 /// Revert: write only the kept heads → the entries that still read are lost → red.
 #[test]
 fn a_repair_keeps_what_a_damaged_list_still_says_and_sets_the_original_aside() {

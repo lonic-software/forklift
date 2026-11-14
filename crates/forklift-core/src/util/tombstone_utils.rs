@@ -40,8 +40,8 @@ use crate::util::{file_utils, object_utils, pallet_utils, record_utils};
 
 /// The mark's file name in the shared forklift root, and its [`record_utils`] kind and version.
 const FILE_NAME_SERVED: &str = "served";
-const SERVED_RECORD: &str = "served";
-const SERVED_VERSION: u32 = 1;
+pub(crate) const SERVED_RECORD: &str = "served";
+pub(crate) const SERVED_VERSION: u32 = 1;
 
 /// The tombstone list's file name in the shared forklift root, and its kind and version. Version 2
 /// added kept heads; a list of any other version reads as damage, never as empty.
