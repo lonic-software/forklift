@@ -121,10 +121,9 @@ pub fn read_unavailable() -> Result<UnavailableSet, String> {
 
     let entries = record_utils::from_bytes(&bytes, UNAVAILABLE_RECORD, UNAVAILABLE_VERSION).map_err(|e| format!(
         "The record of content this warehouse cannot get \"{}\" {} {}",
-        path.to_string_lossy(), e.describe(), match &e {
-            record_utils::RecordError::OtherVersion(header) if newer_version(header) =>
-                "This version of Forklift never writes over it.",
-            _ => "\"forklift heal\" rebuilds it from the entries that still read.",
+        path.to_string_lossy(), e.describe(), match written_by_newer(&bytes) {
+            true => "This version of Forklift never writes over it.",
+            false => "\"forklift heal\" rebuilds it from the entries that still read.",
         }
     ))?;
 
@@ -197,10 +196,8 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
     if read_unavailable().is_ok() {
         return Ok(None);
     }
-    if let Err(record_utils::RecordError::OtherVersion(header)) = record_utils::from_bytes(&bytes, UNAVAILABLE_RECORD, UNAVAILABLE_VERSION) {
-        if newer_version(&header) {
-            return Ok(None);
-        }
+    if written_by_newer(&bytes) {
+        return Ok(None);
     }
 
     let (set, dropped) = salvage(&bytes);
@@ -208,6 +205,13 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
     write_locked(&lock, &set)?;
 
     Ok(Some(Rebuilt { set_aside, kept: set.entries.len(), dropped }))
+}
+
+/// Whether the record `bytes` opens with this record's header at a newer version, judged on the
+/// first line's own bytes: damage elsewhere, such as a byte that is not UTF-8, must not hide it.
+fn written_by_newer(bytes: &[u8]) -> bool {
+    let first = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
+    std::str::from_utf8(first).is_ok_and(newer_version)
 }
 
 /// Whether `header` is this record's header at a version newer than this build's, written as
@@ -659,8 +663,8 @@ mod tests {
         assert_eq!(set_aside_copies(), vec![rebuilt.set_aside]);
     }
 
-    // Revert: drop the newer-version check → a newer Forklift's record is rewritten as this one's;
-    // drop the readable check → a whole record is copied aside and rewritten.
+    // Revert: drop the newer-version check, or judge it by the whole record's parse → a newer
+    // Forklift's record, damaged past its header, is rewritten as this one's; drop the readable check → a whole record is copied aside and rewritten.
     #[test]
     fn a_readable_missing_or_newer_record_is_left_as_it_is() {
         let _scratch = Scratch::new("left");
@@ -674,6 +678,13 @@ mod tests {
         std::fs::write(unavailable_path(), &newer).unwrap();
         assert_eq!(rebuild().unwrap(), None);
         assert_eq!(std::fs::read(unavailable_path()).unwrap(), newer);
+
+        // Damage past its header does not make it this version's.
+        let mut damaged = newer.clone();
+        damaged.extend_from_slice(b"\xff\n");
+        std::fs::write(unavailable_path(), &damaged).unwrap();
+        assert_eq!(rebuild().unwrap(), None);
+        assert_eq!(std::fs::read(unavailable_path()).unwrap(), damaged);
         assert!(set_aside_copies().is_empty());
         assert!(read_unavailable().unwrap_err().contains("never writes over it"));
     }
