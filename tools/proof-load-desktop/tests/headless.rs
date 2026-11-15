@@ -77,6 +77,11 @@ fn texts(theme: egui::Theme, app: &mut App) -> Vec<(String, egui::Color32)> {
 
 /// `texts` in a window `width` wide.
 fn texts_at(theme: egui::Theme, app: &mut App, width: f32) -> Vec<(String, egui::Color32)> {
+    shown_texts(theme, app, width).into_iter().map(|(text, colour, _)| (text, colour)).collect()
+}
+
+/// Each text drawn, its colour, and how wide a part of it its clip leaves on screen.
+fn shown_texts(theme: egui::Theme, app: &mut App, width: f32) -> Vec<(String, egui::Color32, f32)> {
     let ctx = egui::Context::default();
     proof_load_desktop::install(&ctx);
     ctx.set_theme(theme);
@@ -88,19 +93,20 @@ fn texts_at(theme: egui::Theme, app: &mut App, width: f32) -> Vec<(String, egui:
     for _ in 0..2 {
         output = ctx.run(input(), |ctx| app.show(ctx));
     }
-    fn walk(shape: &epaint::Shape, found: &mut Vec<(String, egui::Color32)>) {
+    fn walk(shape: &epaint::Shape, clip: egui::Rect, found: &mut Vec<(String, egui::Color32, f32)>) {
         match shape {
-            epaint::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, found)),
+            epaint::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, clip, found)),
             epaint::Shape::Text(text) => {
                 let colour = text.galley.job.sections.first().map_or(text.fallback_color, |section| section.format.color);
-                found.push((text.galley.text().to_string(), colour));
+                let shown = text.visual_bounding_rect().intersect(clip).width().max(0.0);
+                found.push((text.galley.text().to_string(), colour, shown));
             }
             _ => {}
         }
     }
     let mut found = Vec::new();
     for clipped in &output.shapes {
-        walk(&clipped.shape, &mut found);
+        walk(&clipped.shape, clipped.clip_rect, &mut found);
     }
     found
 }
@@ -311,6 +317,7 @@ fn a_click_picks_the_row_under_it() {
 #[test]
 fn a_narrow_window_keeps_the_scenario_names() {
     let mut app = App::showing(fixture());
-    let texts = texts_at(egui::Theme::Light, &mut app, 760.0);
-    assert!(texts.iter().any(|(text, _)| text.starts_with("signed ")), "no scenario name at 760 px: {:?}", texts.iter().map(|(text, _)| text).collect::<Vec<_>>());
+    let names: Vec<(String, f32)> = shown_texts(egui::Theme::Light, &mut app, 760.0).into_iter()
+        .filter(|(text, _, _)| text.starts_with("signed ")).map(|(text, _, shown)| (text, shown)).collect();
+    assert!(!names.is_empty() && names.iter().all(|(_, shown)| *shown >= 100.0), "scenario names squeezed at 760 px: {names:?}");
 }
