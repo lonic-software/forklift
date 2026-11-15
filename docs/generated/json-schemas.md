@@ -2400,7 +2400,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "integer"
         },
         "set_aside": {
-          "description": "Where the damaged record was copied to; absent when it was missing.",
+          "description": "Where the damaged record was copied to; absent when it was missing or read whole.",
           "type": [
             "string",
             "null"

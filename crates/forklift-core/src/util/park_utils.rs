@@ -156,8 +156,10 @@ fn leftovers_in(forklift: &Path) -> Result<Vec<PathBuf>, String> {
 /// The record `bytes` at `path` lists, or why they list nothing this build can trust.
 fn decode(bytes: &[u8], path: &Path) -> Result<Vec<ParkedEntry>, String> {
     let lines = record_utils::from_bytes_digested(bytes, PARKED_RECORD, PARKED_VERSION).map_err(|e| {
-        // Version 1 carried no digest, so its header is told apart before the digest's verdict.
-        let what = match bytes.starts_with(format!("/forklift-{} 1\n", PARKED_RECORD).as_bytes()) {
+        // Version 1 carried no digest line, so a record with one is damage whatever its header.
+        let version_1 = bytes.starts_with(format!("/forklift-{} 1\n", PARKED_RECORD).as_bytes())
+            && record_utils::without_digest_line(bytes).len() == bytes.len();
+        let what = match version_1 {
             true => "was written by an older Forklift, as version 1, which this one reads only to \
                 rebuild it.".to_string(),
             false => e.describe(),
@@ -594,6 +596,12 @@ mod tests {
 
         let error = decode(&v1, Path::new("parked")).unwrap_err();
         assert!(error.contains("older Forklift, as version 1") && error.contains("forklift heal"), "{}", error);
+
+        // A digested record whose version digit flipped to 1 is damage, not an older record.
+        let mut flipped = parked_bytes(&[entry("x", "x")]);
+        flipped[b"/forklift-parked ".len()] = b'1';
+        let error = decode(&flipped, Path::new("parked")).unwrap_err();
+        assert!(error.contains("is damaged"), "{}", error);
     }
 
     /// A digit of the header flipped to a newer version, with the digest left as it was, is damage,

@@ -1147,7 +1147,7 @@ pub(crate) struct ParkedRebuilt {
     /// parked work of its own.
     record: ParkedRecordWas,
 
-    /// Where the damaged record was copied to; absent when it was missing.
+    /// Where the damaged record was copied to; absent when it was missing or read whole.
     #[serde(skip_serializing_if = "Option::is_none")]
     set_aside: Option<String>,
 
