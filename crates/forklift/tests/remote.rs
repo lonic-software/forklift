@@ -13350,3 +13350,485 @@ fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
     }
     out
 }
+
+// Heal of a partial warehouse whose origin record or sealed record is damaged (FORK-451).
+
+/// The step a refusal names to record `server`'s URL as the origin again, split into its arguments.
+fn move_step(server_url: &str) -> (String, Vec<String>) {
+    let url = server_url.trim_end_matches('/').to_string();
+    (format!("forklift remote move {}", url), vec!["remote".to_string(), "move".to_string(), url])
+}
+
+/// Damage `directory`'s origin record: delete it, or put bytes in it that are not a URL.
+fn damage_origin(area: &TestArea, directory: &str, damage: &str) {
+    let origin = area.path(&format!("{}/.forklift/origin", directory));
+    match damage {
+        "missing" => forklift_core::util::file_utils::remove_file(&origin).unwrap(),
+        _ => std::fs::write(&origin, b"\xff\xfe\x00").unwrap(),
+    }
+}
+
+/// Delete `directory`'s sealed record, as a lost file would.
+fn lose_sealed_record(area: &TestArea, directory: &str) {
+    forklift_core::util::file_utils::remove_file(area.path(&format!("{}/.forklift/sealed", directory))).unwrap();
+}
+
+/// Delete `hash`'s loose file from `directory`'s store.
+fn lose_object_in(area: &TestArea, directory: &str, hash: &str) {
+    forklift_core::util::file_utils::remove_file(object_store_path(area, directory, hash)).unwrap();
+}
+
+/// The hashes a `heal --json` run reports re-sealed, from a success or from a refusal's details.
+fn resealed_of(output: &Output) -> Vec<String> {
+    let json = json_of(output);
+    let report = if json["ok"] == true { &json["data"] } else { &json["error"]["details"] };
+    report["resealed"].as_array().map(|hashes| {
+        hashes.iter().map(|hash| hash.as_str().unwrap().to_string()).collect()
+    }).unwrap_or_default()
+}
+
+/// The notes of a `heal --json` run, from a success or from a refusal's details.
+fn heal_notes(output: &Output) -> Vec<String> {
+    let json = json_of(output);
+    let report = if json["ok"] == true { &json["data"] } else { &json["error"]["details"] };
+    report["notes"].as_array().map(|notes| {
+        notes.iter().map(|note| note.as_str().unwrap().to_string()).collect()
+    }).unwrap_or_default()
+}
+
+/// The older parcels' roots of a cache clone of [`three_signed_parcels`], which the clone holds
+/// by hash in its sealed record, sorted.
+fn sealed_older_roots(area: &TestArea, directory: &str, head: &str) -> Vec<String> {
+    let history = history_with_roots(area, "a", head);
+    let tip_root = history[0].1.clone();
+    let mut older: Vec<String> = history[1..].iter().map(|(_, root)| root.clone()).filter(|root| *root != tip_root).collect();
+    older.sort();
+    older.dedup();
+    for root in &older {
+        assert!(!object_held(area, directory, root) && recorded(area, directory, root), "{} is held by hash", root);
+    }
+    older
+}
+
+/// A cache whose origin record is missing, or damaged, refuses a lift as `non_origin_remote`, and the
+/// step it names is a move to the configured remote, runnable as written: once run, the lift goes
+/// through. With no remote configured either, the error names the recorded origin when it reads.
+///
+/// Revert: keep the `<url>` placeholder in the step → the step is not the runnable move; read a
+/// damaged record as a plain error → the code is `error`, with no step.
+#[test]
+fn a_cache_whose_origin_record_is_lost_names_a_move_that_lets_a_lift_through() {
+    let area = TestArea::new("origin-lost-lift");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    let (step, args) = move_step(&server.url);
+
+    for damage in ["missing", "damaged"] {
+        damage_origin(&area, "cached", damage);
+        area.write_file("cached/src/code.txt", &format!("{}\n", damage));
+        assert_success(&area.forklift("cached", &["load", "."]));
+        assert_success(&area.forklift("cached", &["stack", "-m", damage]));
+
+        let refused = refusal_of(&area.forklift("cached", &["--json", "lift"]), 11);
+        assert_eq!(refused["code"], "non_origin_remote", "{}: {}", damage, refused);
+        assert!(refused["next_step"].as_str().unwrap().contains(&format!("\"{}\"", step)), "{}: {}", damage, refused);
+        assert_eq!(refused["message"].as_str().unwrap().contains("damaged"), damage == "damaged", "{}", refused);
+
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert_success(&area.forklift("cached", &args));
+        assert_success(&area.forklift("cached", &["lift"]));
+    }
+
+    assert_success(&area.forklift("cached", &["config", "unset", "remote.url"]));
+    let refused = refusal_of(&area.forklift("cached", &["--json", "lift"]), 1);
+    let message = refused["message"].as_str().unwrap();
+    assert!(message.contains(&format!("\"forklift config set remote.url {}\"", server.url.trim_end_matches('/'))), "{}", refused);
+}
+
+/// Bare `remote` reports a missing or damaged origin record of a cache as the block a dialling
+/// command meets, with its move, and succeeds; `heal` with nothing lost refuses as
+/// `non_origin_remote`, after its own repairs, naming the same move, never exit 0.
+///
+/// Revert: let `remote` read the damaged record as an error → it fails; drop heal's origin check →
+/// heal exits 0 over a cache that cannot fetch.
+#[test]
+fn remote_and_heal_report_a_lost_origin_record_of_a_cache() {
+    let area = TestArea::new("origin-lost-heal");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    let (step, args) = move_step(&server.url);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    for damage in ["missing", "damaged"] {
+        damage_origin(&area, "cached", damage);
+
+        let shown = area.forklift("cached", &["--json", "remote"]);
+        assert_success(&shown);
+        let report = &json_of(&shown)["data"];
+        assert_eq!(report["origin"], serde_json::Value::Null, "{}: {}", damage, report);
+        assert_eq!(report["blocked"]["code"], "non_origin_remote", "{}: {}", damage, report);
+        assert!(report["blocked"]["next_step"].as_str().unwrap().contains(&step), "{}: {}", damage, report);
+
+        let healed = refusal_of(&area.forklift("cached", &["--json", "heal"]), 11);
+        assert_eq!(healed["code"], "non_origin_remote", "{}: {}", damage, healed);
+        assert!(healed["next_step"].as_str().unwrap().contains(&step), "{}: {}", damage, healed);
+        assert!(healed["details"].is_object(), "the run's report is carried: {}", healed);
+
+        assert_success(&area.forklift("cached", &args));
+        assert_success(&area.forklift("cached", &["heal"]));
+    }
+}
+
+/// With the origin record missing and the sealed record lost too, heal refuses as `objects_lost`,
+/// re-sealing nothing, and a note names the move that records the origin again; once it is run,
+/// heal re-seals what the origin holds and exits 0.
+///
+/// Revert: drop the note → it names no move; let the origin refusal win → the code is
+/// `non_origin_remote` over lost objects.
+#[test]
+fn heal_names_the_move_when_the_origin_and_sealed_records_are_both_lost() {
+    let area = TestArea::new("origin-and-sealed-lost");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    let older = sealed_older_roots(&area, "cached", &head);
+    damage_origin(&area, "cached", "missing");
+    lose_sealed_record(&area, "cached");
+    let (step, args) = move_step(&server.url);
+
+    let output = area.forklift("cached", &["--json", "heal"]);
+    let refused = refusal_of(&output, 58);
+    assert_eq!(refused["code"], "objects_lost", "{}", refused);
+    assert!(resealed_of(&output).is_empty(), "{}", refused);
+    assert!(heal_notes(&output).iter().any(|note| note.contains(&format!("\"{}\"", step))), "{}", refused);
+
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    assert_success(&area.forklift("cached", &args));
+    let healed = area.forklift("cached", &["--json", "heal"]);
+    assert_success(&healed);
+    assert_eq!(resealed_of(&healed), older);
+}
+
+/// A cache whose sealed record was lost reads its sealed absences as lost; heal re-seals each one
+/// the origin's held history reaches, exits 0, and a later read refills it from the origin.
+///
+/// Revert: skip the re-seal → heal refuses as `objects_lost`.
+#[test]
+fn heal_reseals_what_the_origin_holds_after_the_sealed_record_is_lost() {
+    let area = TestArea::new("sealed-lost-reseal");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    let older = sealed_older_roots(&area, "cached", &head);
+    let oldest = history_with_roots(&area, "a", &head)[2].0.clone();
+    lose_sealed_record(&area, "cached");
+
+    let healed = area.forklift("cached", &["--json", "heal"]);
+    assert_success(&healed);
+    assert_eq!(resealed_of(&healed), older);
+    for root in &older {
+        assert!(recorded(&area, "cached", root), "{} is recorded again", root);
+    }
+
+    let shown = area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]);
+    assert_success(&shown);
+    assert_eq!(stdout(&shown), "one\n");
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
+/// A cache behind a collaborator's lift holds none of the origin's live heads, but its record of
+/// earlier held heads names its own, which the origin confirms it still reaches: heal walks from
+/// there and re-seals what the lost sealed record held.
+///
+/// Revert: walk only the origin's live heads → nothing is met and heal refuses as `objects_lost`.
+#[test]
+fn heal_reseals_from_a_confirmed_earlier_head_behind_a_collaborators_lift() {
+    let area = TestArea::new("sealed-lost-behind");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    let older = sealed_older_roots(&area, "cached", &head);
+
+    for version in ["four", "five"] {
+        area.write_file("a/src/code.txt", &format!("{}\n", version));
+        assert_success(&area.forklift("a", &["load", "."]));
+        assert_success(&area.forklift("a", &["stack", "-m", version]));
+    }
+    assert_success(&area.forklift("a", &["lift"]));
+    let live = pallet_head(&area, "server-root", "main");
+    assert!(!object_held(&area, "cached", &live), "the cache does not hold the origin's live head");
+    lose_sealed_record(&area, "cached");
+
+    let healed = area.forklift("cached", &["--json", "heal"]);
+    assert_success(&healed);
+    assert_eq!(resealed_of(&healed), older);
+}
+
+/// What the origin's held history does not reach stays lost, even when the server's store holds it
+/// as an interrupted upload would leave it: a blob only unlifted local work names, copied into the
+/// server's store and deleted from the cache's. Heal refuses as `objects_lost` over it, re-seals
+/// nothing, asks the origin only for its handshake and its holds, and its walk descends no absent
+/// tree (the older roots are absent, held by hash).
+///
+/// Revert: seal every lost absent object → the blob is re-sealed; descend an absent tree → the walk
+/// cannot finish and says so.
+#[test]
+fn heal_leaves_lost_what_only_unlifted_work_reaches_and_reads_no_object_for_it() {
+    let area = TestArea::new("sealed-unlifted-lost");
+    let (server, head) = three_signed_parcels(&area);
+    let seen = Seen::franchise(&area, &server);
+    sealed_older_roots(&area, "cached", &head);
+
+    area.write_file("cached/src/local.txt", "local\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "-m", "local"]));
+    let local_root = history_with_roots(&area, "cached", &pallet_head(&area, "cached", "main"))[0].1.clone();
+    let local = file_of(&area, "cached", &subtree_of(&area, "cached", &local_root, "src"), "local.txt");
+
+    let on_server = object_store_path(&area, "server-root", &local);
+    std::fs::create_dir_all(on_server.parent().unwrap()).unwrap();
+    std::fs::copy(object_store_path(&area, "cached", &local), &on_server).unwrap();
+    lose_object_in(&area, "cached", &local);
+    seen.clear();
+
+    let output = area.forklift("cached", &["--json", "heal"]);
+    let refused = refusal_of(&output, 58);
+    assert_eq!(refused["code"], "objects_lost", "{}", refused);
+    assert!(refused["message"].as_str().unwrap().contains(&local), "{}", refused);
+    assert!(resealed_of(&output).is_empty(), "{}", refused);
+    assert!(!recorded(&area, "cached", &local));
+    assert!(!heal_notes(&output).iter().any(|note| note.contains("could not finish")), "{:?}", heal_notes(&output));
+
+    let paths = seen.paths.lock().unwrap().clone();
+    assert!(paths.iter().any(|path| path.ends_with("/v1/warehouse")), "{:?}", paths);
+    assert!(
+        paths.iter().all(|path| path.ends_with("/v1/warehouse") || path.starts_with("/v1/holds")),
+        "only the handshake and the holds are asked: {:?}", paths
+    );
+}
+
+/// Content the origin's host withholds is never re-sealed, though its held history reaches it: a
+/// blob the cache read before it was withheld, then lost.
+///
+/// Revert: drop the withheld filter → the blob is re-sealed.
+#[test]
+fn heal_never_reseals_content_the_origin_withholds() {
+    let area = TestArea::new("sealed-withheld");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    let (oldest, oldest_root) = history_with_roots(&area, "a", &head)[2].clone();
+    assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
+    let one = file_of(&area, "cached", &subtree_of(&area, "cached", &oldest_root, "src"), "code.txt");
+
+    let withheld = server_command()
+        .args(["withhold", "add", "--root", area.path("server-root").to_str().unwrap(), &one, "--statement", "Removed on request"])
+        .output().unwrap();
+    assert_success(&withheld);
+    lose_object_in(&area, "cached", &one);
+
+    let output = area.forklift("cached", &["--json", "heal"]);
+    let refused = refusal_of(&output, 58);
+    assert!(refused["message"].as_str().unwrap().contains(&one), "{}", refused);
+    assert!(!resealed_of(&output).contains(&one), "{}", refused);
+    assert!(!recorded(&area, "cached", &one));
+}
+
+/// A chunk only a withheld recipe names is never re-sealed: the walk does not descend a recipe the
+/// origin's host withholds, though the cache holds it.
+///
+/// Revert: descend withheld recipes → the chunk is re-sealed.
+#[test]
+fn heal_never_reseals_a_chunk_only_a_withheld_recipe_names() {
+    let area = TestArea::new("sealed-withheld-recipe");
+    let (server, _) = three_signed_parcels(&area);
+    area.write_large_file("a/big.bin", 451, CHUNK_THRESHOLD + 4096);
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "big"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let head = pallet_head(&area, "server-root", "main");
+    let root = history_with_roots(&area, "a", &head)[0].1.clone();
+
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    let recipe = file_of(&area, "cached", &root, "big.bin");
+    let chunks = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
+        forklift_core::util::object_utils::recipe_chunk_hashes(&recipe).unwrap()
+    };
+    let chunk = chunks[0].clone();
+    assert!(object_held(&area, "cached", &recipe) && object_held(&area, "cached", &chunk));
+
+    let withheld = server_command()
+        .args(["withhold", "add", "--root", area.path("server-root").to_str().unwrap(), &recipe, "--statement", "Removed on request"])
+        .output().unwrap();
+    assert_success(&withheld);
+    lose_object_in(&area, "cached", &chunk);
+
+    let output = area.forklift("cached", &["--json", "heal"]);
+    let refused = refusal_of(&output, 58);
+    assert!(refused["message"].as_str().unwrap().contains(&chunk), "{}", refused);
+    assert!(!resealed_of(&output).contains(&chunk), "{}", refused);
+    assert!(!recorded(&area, "cached", &chunk));
+}
+
+/// Meta history is fetched and kept whole, never sealed, so a lost `@office` tree is never
+/// re-sealed, though the origin holds the office pallet.
+///
+/// Revert: walk the origin's meta pallet heads too → the tree is re-sealed.
+#[test]
+fn heal_never_reseals_lost_office_content() {
+    let area = TestArea::new("sealed-office");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+
+    let office_root = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
+        let office = forklift_core::util::pallet_utils::all_pallet_refs().unwrap().into_iter()
+            .find(|(pallet, _)| pallet.namespace != forklift_core::util::pallet_utils::PalletNamespace::User)
+            .map(|(_, head)| head).unwrap();
+        forklift_core::util::object_utils::load_parcel(&office).unwrap().tree_hash
+    };
+    lose_object_in(&area, "cached", &office_root);
+
+    let output = area.forklift("cached", &["--json", "heal"]);
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(!resealed_of(&output).contains(&office_root), "{}", stdout(&output));
+    assert!(!recorded(&area, "cached", &office_root));
+}
+
+/// With the origin unreachable, heal re-seals nothing, says the origin did not answer, and names
+/// running heal again; once the origin answers, that step heals.
+///
+/// Revert: treat no response as a refusal → the step is not `forklift heal`.
+#[test]
+fn heal_with_the_origin_unreachable_names_itself_and_seals_nothing() {
+    let area = TestArea::new("sealed-unreachable");
+    let (mut server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    let older = sealed_older_roots(&area, "cached", &head);
+    lose_sealed_record(&area, "cached");
+
+    server.stop();
+    let output = area.forklift("cached", &["--json", "heal"]);
+    let refused = refusal_of(&output, 58);
+    assert_eq!(refused["next_step"].as_str().unwrap(), "forklift heal", "{}", refused);
+    assert!(heal_notes(&output).iter().any(|note| note.contains("did not answer")), "{}", refused);
+    for root in &older {
+        assert!(!recorded(&area, "cached", root), "nothing is sealed: {}", root);
+    }
+
+    server.restart(&area);
+    let healed = area.forklift("cached", &["--json", "heal"]);
+    assert_success(&healed);
+    assert_eq!(resealed_of(&healed), older);
+}
+
+/// An origin that answers with a failure, an error status or a handshake of another protocol
+/// version, is not one that did not answer: heal returns that failure as it is, never naming
+/// itself as the step, and seals nothing.
+///
+/// Revert: treat every handshake failure as no response → heal refuses as `objects_lost` naming
+/// `forklift heal`.
+#[test]
+fn heal_returns_an_answered_handshake_failure_as_it_is() {
+    let area = TestArea::new("sealed-answered");
+    let (server, head) = three_signed_parcels(&area);
+    let mode = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let answering = std::sync::Arc::clone(&mode);
+    let other_protocol = serde_json::json!({
+        "protocol": "1999-01-01", "default_pallet": "main", "pallets": {}, "trust": null,
+    }).to_string();
+    let proxy = InterceptingProxy::start(&server.url, move |path| {
+        if !path.ends_with("/v1/warehouse") {
+            return None;
+        }
+        match answering.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => Some(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()),
+            2 => Some(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                other_protocol.len(), other_protocol
+            ).into_bytes()),
+            _ => None,
+        }
+    });
+    assert_success(&area.forklift(".", &["clone", &proxy.url, "cached", "--cache"]));
+    let older = sealed_older_roots(&area, "cached", &head);
+    lose_sealed_record(&area, "cached");
+
+    for answer in [1, 2] {
+        mode.store(answer, std::sync::atomic::Ordering::SeqCst);
+        let output = area.forklift("cached", &["--json", "heal"]);
+        assert!(!output.status.success(), "{}: {}", answer, stdout(&output));
+        let error = &json_of(&output)["error"];
+        assert_ne!(error["code"], "objects_lost", "{}: {}", answer, error);
+        assert_ne!(error["next_step"], "forklift heal", "{}: {}", answer, error);
+        for root in &older {
+            assert!(!recorded(&area, "cached", root), "{}: nothing is sealed: {}", answer, root);
+        }
+    }
+}
+
+/// A check for lost objects that could not read every source may call held objects absent, so heal
+/// re-seals nothing over it, and says so.
+///
+/// Revert: re-seal over a degraded check → the older roots are re-sealed.
+#[test]
+fn heal_reseals_nothing_over_a_check_that_could_not_read_every_source() {
+    let area = TestArea::new("sealed-degraded");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    let older = sealed_older_roots(&area, "cached", &head);
+    lose_sealed_record(&area, "cached");
+    std::fs::write(area.path("cached/.forklift/consolidation"), "not a record\n").unwrap();
+
+    let output = area.forklift("cached", &["--json", "heal"]);
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(resealed_of(&output).is_empty(), "{}", stdout(&output));
+    assert!(heal_notes(&output).iter().any(|note| note.contains("could not read every source")), "{}", stdout(&output));
+    for root in &older {
+        assert!(!recorded(&area, "cached", root), "nothing is sealed: {}", root);
+    }
+}
+
+/// A lost parcel is never re-sealed, as the walk meets parcels only as heads and ancestors it
+/// holds, while a lost tree the same heal reaches is: heal re-seals the middle parcel's root and
+/// refuses as `objects_lost` over the oldest parcel, not as a bare error.
+///
+/// Revert: re-seal every lost absent object → the parcel is re-sealed and heal exits 0.
+#[test]
+fn heal_reseals_a_lost_tree_but_leaves_a_lost_parcel_lost() {
+    let area = TestArea::new("sealed-parcel-lost");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    let history = history_with_roots(&area, "a", &head);
+    let (oldest, middle_root) = (history[2].0.clone(), history[1].1.clone());
+    sealed_older_roots(&area, "cached", &head);
+    lose_sealed_record(&area, "cached");
+    lose_object_in(&area, "cached", &oldest);
+
+    let output = area.forklift("cached", &["--json", "heal"]);
+    let refused = refusal_of(&output, 58);
+    assert_eq!(refused["code"], "objects_lost", "{}", refused);
+    assert!(refused["message"].as_str().unwrap().contains(&oldest), "{}", refused);
+    assert_eq!(resealed_of(&output), vec![middle_root.clone()], "{}", refused);
+    assert!(recorded(&area, "cached", &middle_root) && !recorded(&area, "cached", &oldest));
+}
+
+/// An origin whose trust changed is refused as any lower would refuse it, and heal re-seals
+/// nothing from it.
+///
+/// Revert: skip the trust check → heal re-seals from the reset origin and exits 0.
+#[test]
+fn heal_refuses_an_origin_whose_trust_changed_and_seals_nothing() {
+    let area = TestArea::new("sealed-trust");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    let older = sealed_older_roots(&area, "cached", &head);
+
+    forklift_core::util::file_utils::remove_dir_all(area.path("shared-keys")).unwrap();
+    assert_success(&area.forklift("a", &["office", "regenesis", "--confirm"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    lose_sealed_record(&area, "cached");
+
+    let output = area.forklift("cached", &["--json", "heal"]);
+    trust_changed_details(&output);
+    for root in &older {
+        assert!(!recorded(&area, "cached", root), "nothing is sealed: {}", root);
+    }
+}

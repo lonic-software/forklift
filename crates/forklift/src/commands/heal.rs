@@ -27,6 +27,14 @@ use crate::output::{self, CommandOutput};
 /// `--remove-ref` settle damaged refs the user chose for, first. A damaged ref left standing makes
 /// the run a `ref_damaged` refusal (exit 53) carrying the whole report.
 ///
+/// Last, in a partial warehouse, it reads the origin record. In a cache whose check for lost
+/// objects read every source, it re-seals each lost absent object the origin's held history meets
+/// ([`reseal_utils::reseal_held`]), then checks again. An origin that sends no response leaves the
+/// lost objects lost and names running heal again. Any other failure, the origin's trust among
+/// them, is returned as it is. A missing or damaged origin record, with nothing else standing,
+/// makes the run a `non_origin_remote` refusal (exit 11) carrying the whole report. With objects
+/// lost, it becomes a note naming the move that records the origin again.
+///
 /// See `recovery_utils`'s module doc comment for
 /// the full per-verdict behavior (restage, the closure walk, partial clears); this handler's job
 /// is only to turn the core result into a machine-first envelope.
