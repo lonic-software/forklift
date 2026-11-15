@@ -214,6 +214,9 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             tools.insert("strace".to_string(), described(strace));
         }
         for scenario in &built_scenarios {
+            if progress.cancelled() {
+                return Err(RunError::Cancelled);
+            }
             let observer = writeops::Observer::new(traced.as_ref().ok().map(PathBuf::as_path), &traces, schema, &leaves, &read_only, &scenario.id);
             let built = output.scratch(&scenario.id).map_err(|error| error.to_string())
                 .and_then(|scratch| {
@@ -863,4 +866,54 @@ fn discarded_area<T>(
 /// past the history, the one the faulted command writes.
 fn faulted_corpus(seed: u64) -> corpus::Corpus {
     corpus::generate(seed, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cancels at its `polls`-th question, and counts the questions.
+    struct CancelAt {
+        polls: usize,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Progress for CancelAt {
+        fn cancelled(&self) -> bool {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= self.polls
+        }
+    }
+
+    fn fresh(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("proof-load-run-{}-{}-{}", name, std::process::id(), nanos))
+    }
+
+    fn bare(out: PathBuf) -> RunOptions {
+        let source = fresh("source");
+        std::fs::create_dir_all(&source).unwrap();
+        RunOptions { source, out, seed: 1, ..RunOptions::default() }
+    }
+
+    /// A run given no tools still completes in-process: it returns its report and writes the
+    /// same report, which reads back.
+    #[test]
+    fn a_run_returns_the_report_it_writes() {
+        let out = fresh("out");
+        let report = run(&bare(out.clone()), &Quiet).expect("a run with no tools completes");
+        let written = Report::from_json(&std::fs::read_to_string(out.join("report.json")).unwrap()).expect("the written report reads");
+        assert_eq!(written.json(), report.json());
+        assert_eq!(report.format, REPORT_FORMAT);
+    }
+
+    /// A run asked to stop stops with `Cancelled` and writes no report.
+    ///
+    /// Revert: drop the poll before the volume faults → the run completes.
+    #[test]
+    fn a_cancelled_run_stops_and_writes_no_report() {
+        let out = fresh("out");
+        let progress = CancelAt { polls: 1, asked: Default::default() };
+        assert!(matches!(run(&bare(out.clone()), &progress), Err(RunError::Cancelled)));
+        assert!(!out.join("report.json").exists());
+    }
 }
