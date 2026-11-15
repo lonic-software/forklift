@@ -70,6 +70,36 @@ fn screens() -> Vec<(&'static str, App)> {
     vec![("run", run), ("results", steps), ("results without details", gone), ("coverage", coverage)]
 }
 
+/// The texts the app's last frame draws, each with its first section's colour.
+fn texts(theme: egui::Theme, app: &mut App) -> Vec<(String, egui::Color32)> {
+    let ctx = egui::Context::default();
+    proof_load_desktop::install(&ctx);
+    ctx.set_theme(theme);
+    let input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1120.0, 2400.0))),
+        ..egui::RawInput::default()
+    };
+    let mut output = ctx.run(input(), |ctx| app.show(ctx));
+    for _ in 0..2 {
+        output = ctx.run(input(), |ctx| app.show(ctx));
+    }
+    fn walk(shape: &epaint::Shape, found: &mut Vec<(String, egui::Color32)>) {
+        match shape {
+            epaint::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, found)),
+            epaint::Shape::Text(text) => {
+                let colour = text.galley.job.sections.first().map_or(text.fallback_color, |section| section.format.color);
+                found.push((text.galley.text().to_string(), colour));
+            }
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    for clipped in &output.shapes {
+        walk(&clipped.shape, &mut found);
+    }
+    found
+}
+
 fn painted(theme: egui::Theme) -> BTreeSet<[u8; 4]> {
     let mut all = BTreeSet::new();
     for (_, mut app) in screens() {
@@ -210,7 +240,7 @@ fn a_blank_step_screen_line_keeps_its_height() {
 /// screen, the selected row's step screen, the refusal of steps whose details are gone, and the
 /// coverage lamps.
 ///
-/// Revert: show the refusal of unreadable details in muted ink → that screen paints no `--g-lost`.
+/// Revert: show the refusal of unreadable details in muted ink → it is not drawn in `--g-lost`.
 #[test]
 fn each_screen_paints_what_it_shows() {
     let palette = theme::palette_of(egui::Theme::Light);
@@ -227,6 +257,10 @@ fn each_screen_paints_what_it_shows() {
         }
         if name == "results without details" {
             assert!(!painted.contains(&palette.crt_bg.to_array()), "a row whose details are gone shows a step screen");
+            let refusal = texts(egui::Theme::Light, &mut app).into_iter().find(|(text, _)| text.starts_with("The steps cannot be shown: "));
+            let (text, colour) = refusal.expect("the refusal is drawn");
+            assert!(text.contains("cannot read"), "{text}");
+            assert_eq!(colour, palette.g_lost, "the refusal is drawn loud");
         }
     }
 }
