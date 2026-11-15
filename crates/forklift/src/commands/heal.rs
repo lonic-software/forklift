@@ -6,9 +6,13 @@ use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::util::ref_heal::{self, Pass};
 use forklift_core::util::reseal_utils::{self, ResealError};
 use forklift_core::util::warehouse_utils::{self, WarehouseMode};
-use forklift_core::util::unavailable_heal::{self, RerecordError};
-use forklift_core::util::{config_utils, origin_utils, recovery_utils, sealed_utils, unavailable};
+use forklift_core::util::applied_redactions::{self, RedactionState};
+use forklift_core::util::unavailable_heal::{self, RemoteError};
+use forklift_core::util::{config_utils, origin_utils, recovery_utils, redaction_utils, sealed_utils, unavailable};
 use crate::output::{self, CommandOutput};
+
+/// The note of a re-apply of redactions that could not run, followed by why.
+const UNREAPPLIED: &str = "No redaction whose content is lost was applied again";
 
 /// The note of a re-record a check that could not read every source stopped.
 const UNRECORDED_SHORT: &str = "No absent object was recorded unavailable again: the check for lost objects could not read every source.";
@@ -31,13 +35,18 @@ const UNRECORDED_SHORT: &str = "No absent object was recorded unavailable again:
 /// `--remove-ref` settle damaged refs the user chose for, first. A damaged ref left standing makes
 /// the run a `ref_damaged` refusal (exit 53) carrying the whole report.
 ///
-/// A damaged record of content this warehouse cannot get is rebuilt first, from the entries that
-/// still read whole, a copy kept ([`unavailable::rebuild`]). Last, each lost absent user file
-/// content the configured remote's host withholds is recorded unavailable again
-/// ([`unavailable_heal::record_withheld_lost`]), then the check runs again; not when the
-/// warehouse's mode does not read, nor in a partial warehouse whose origin record does not read,
-/// nor over a check that could not read every source. A remote that sends no response, or
-/// refuses, is handled as the origin is below.
+/// A damaged record of content this warehouse cannot get, and a damaged record of applied
+/// redactions, are rebuilt first, from the entries that still read whole, a copy kept
+/// ([`unavailable::rebuild`], [`applied_redactions::rebuild`]). Last, over a check that read
+/// every source, each redaction naming lost absent user file content that the applied record does
+/// not hold is applied again where its scan and the configured remote's report allow
+/// ([`applied_redactions::reapply`]); one that is not is named in a note. Then each lost absent
+/// user file content the remote's host withholds is recorded unavailable again
+/// ([`unavailable_heal::record_withheld_lost`]); not when the warehouse's mode does not read, nor
+/// in a partial warehouse whose origin record does not read. The check runs again after each step
+/// that changed something. Both read one handshake ([`unavailable_heal::handshake`]). A remote
+/// that sends no response, or refuses, is handled as the origin is below when the re-record asked
+/// it; when only the re-apply did, it is a note.
 ///
 /// Then, in a partial warehouse, it reads the origin record. In a cache whose check for lost
 /// objects read every source, it re-seals each lost absent object the origin's held history meets
@@ -115,14 +124,32 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
     };
 
-    // After the record, which the check of the history leans on, and before everything else, which
-    // reads the fetch scope.
+    // Before the taint recovery too, whose walks read the record of applied redactions: one that
+    // does not read is a degraded source of every walk, and fails every read of redacted content.
+    // What it drops, heal applies again below when the content is gone. A failure is a note, as
+    // the record's above.
+    let applied_rebuilt = match applied_redactions::rebuild() {
+        Ok(rebuilt) => rebuilt.map(AppliedRebuilt::from),
+        Err(error) => {
+            ref_notes.push(format!(
+                "The damaged record of applied redactions was not rebuilt: {}",
+                error.trim_end_matches('.')
+            ));
+            None
+        }
+    };
+
+    // After the records, which the check of the history leans on, and before everything else,
+    // which reads the fetch scope.
     let scope_rebuilt = match &exclusive {
         Some(exclusive) => Some(scope_heal::set_chosen(fetch_scope, exclusive).await),
         None => scope_heal::repair().transpose(),
     }.transpose().map_err(|error| {
         let mut error = String::from(error);
-        for sentence in record_rebuilt.iter().map(RecordRebuilt::sentence).chain(unavailable_rebuilt.iter().map(UnavailableRebuilt::sentence)) {
+        let sentences = record_rebuilt.iter().map(RecordRebuilt::sentence)
+            .chain(unavailable_rebuilt.iter().map(UnavailableRebuilt::sentence))
+            .chain(applied_rebuilt.iter().map(AppliedRebuilt::sentence));
+        for sentence in sentences {
             error = forklift_core::error::append_to_message(error, &sentence);
         }
         for note in &ref_notes {
@@ -151,6 +178,9 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             error = forklift_core::error::append_to_message(error, &record.sentence());
         }
         if let Some(record) = &unavailable_rebuilt {
+            error = forklift_core::error::append_to_message(error, &record.sentence());
+        }
+        if let Some(record) = &applied_rebuilt {
             error = forklift_core::error::append_to_message(error, &record.sentence());
         }
         if let Some(scope) = &scope_rebuilt {
@@ -292,6 +322,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // a client would ask is not known to be its origin, and the notes name that. Only over a check
     // that read every source, as the re-seal below.
     let mut recorded_unavailable: Vec<String> = Vec::new();
+    let mut redactions_reapplied: Vec<String> = Vec::new();
     let mut origin_unanswered = false;
     let mut remote_refused: Option<CoreError> = None;
     let rerecord_from = match (&lost, mode, &origin) {
@@ -305,29 +336,110 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
         _ => None,
     };
-    if let Some(absent) = rerecord_from {
-        match unavailable_heal::record_withheld_lost(&absent).await {
+
+    // Absent file content that a redaction names whose hash a lost or damaged record of applied
+    // redactions dropped: applied again, a read of it is refused as redacted and an export leaves
+    // it out, as before. Over a check that read every source, as the re-record; with no remote,
+    // and whatever the origin record says, too: the scan and the remote configured decide, as
+    // they do for `redact apply`. Before the re-record, which skips applied content.
+    let redactions = match &lost {
+        Ok(found) if !found.absent_files.is_empty() && found.degraded_sources.is_empty() => {
+            match redaction_utils::read_redactions() {
+                Ok(read) => Some((read, found.absent_files.clone())),
+                Err(why) => {
+                    notes.push(format!("{}: {}", UNREAPPLIED, why.trim_end_matches('.')));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let reapply_of = match &redactions {
+        Some((read, absent)) => applied_redactions::unapplied_among(read, absent).unwrap_or_else(|why| {
+            notes.push(format!("{}: {}", UNREAPPLIED, why.trim_end_matches('.')));
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+
+    // One handshake for both, so the remote's report and what its host withholds are one answer.
+    let mut waits_for_remote: Vec<&str> = Vec::new();
+    if rerecord_from.is_some() {
+        waits_for_remote.push("no absent object its host may withhold was recorded unavailable again");
+    }
+    if !reapply_of.is_empty() {
+        waits_for_remote.push("no redaction whose content is lost was applied again");
+    }
+    let mut remote_failed = false;
+    let answered = match waits_for_remote.is_empty() {
+        true => None,
+        false => match unavailable_heal::handshake().await {
+            Ok(answered) => answered,
+            // A remote only the re-apply asked never stands in for the origin's answer: the
+            // re-seal and the run's refusal are not this step's to settle.
+            Err(RemoteError::NoResponse(why)) => {
+                origin_unanswered |= rerecord_from.is_some();
+                remote_failed = true;
+                notes.push(format!(
+                    "The remote did not answer, so {}: {}", waits_for_remote.join(", and "), why.trim_end_matches('.')
+                ));
+                None
+            }
+            // As the re-seal's below: a coded refusal is the run's own, anything else a note.
+            Err(RemoteError::Refused(why)) => {
+                remote_failed = true;
+                match CoreError::from(why) {
+                    refused @ CoreError::Refusal { .. } if rerecord_from.is_some() => remote_refused = Some(refused),
+                    // A note is prose: a refusal gives its message, never its machine frame.
+                    other => notes.push(format!(
+                        "The handshake with the remote failed, so {}: {}",
+                        waits_for_remote.join(", and "),
+                        match other {
+                            CoreError::Refusal { message, .. } => message,
+                            other => String::from(other),
+                        }.trim_end_matches('.')
+                    )),
+                }
+                None
+            }
+        },
+    };
+
+    if !reapply_of.is_empty() && !remote_failed {
+        let report = answered.as_ref().map(unavailable_heal::Answered::report);
+        match applied_redactions::reapply(&reapply_of, report.as_ref()) {
+            Ok(statuses) => {
+                for status in statuses {
+                    match status.state {
+                        RedactionState::Applied => redactions_reapplied.push(status.hash),
+                        state => {
+                            notes.push(format!(
+                                "The redaction of lost object {} is not applied again: it is {}.",
+                                status.hash, crate::commands::redact::StateView::from(&state).describe()
+                            ));
+                        }
+                    }
+                }
+                if !redactions_reapplied.is_empty() {
+                    lost = recovery_utils::find_lost_objects();
+                }
+            }
+            Err(why) => notes.push(format!("{}: {}", UNREAPPLIED, why.trim_end_matches('.'))),
+        }
+    }
+
+    if let (Some(absent), Some(answered)) = (rerecord_from, &answered) {
+        match unavailable_heal::record_withheld_lost(&absent, answered) {
             Ok(recorded) => {
                 if !recorded.is_empty() {
                     recorded_unavailable = recorded;
                     lost = recovery_utils::find_lost_objects();
                 }
             }
-            Err(RerecordError::NoResponse(why)) => {
-                origin_unanswered = true;
-                notes.push(format!(
-                    "The remote did not answer, so no absent object its host may withhold was recorded unavailable again: {}",
-                    why.trim_end_matches('.')
-                ));
-            }
-            // As the re-seal's below: a coded refusal is the run's own, anything else a note.
-            Err(RerecordError::Refused(why)) => match CoreError::from(why) {
-                refused @ CoreError::Refusal { .. } => remote_refused = Some(refused),
-                other => notes.push(format!(
-                    "No absent object was recorded unavailable again: {}",
-                    String::from(other).trim_end_matches('.')
-                )),
-            },
+            Err(RemoteError::NoResponse(why) | RemoteError::Refused(why)) => notes.push(format!(
+                "No absent object was recorded unavailable again: {}",
+                why.trim_end_matches('.')
+            )),
         }
     }
 
@@ -439,6 +551,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let report = HealReport {
         record_rebuilt,
         unavailable_rebuilt,
+        redactions_applied_rebuilt: applied_rebuilt,
         fetch_scope_rebuilt: scope_rebuilt,
         was_tainted: outcome.was_tainted,
         restaged: outcome.restaged,
@@ -450,6 +563,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         unseal_failed,
         resealed,
         recorded_unavailable,
+        redactions_reapplied,
         refs_rebuilt,
         refs_removed,
         refs_refused,
@@ -797,6 +911,11 @@ pub(crate) struct HealReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     unavailable_rebuilt: Option<UnavailableRebuilt>,
 
+    /// What this run kept of a damaged record of applied redactions, which it rebuilt from the
+    /// hashes that still read whole and that a redaction names, and where it kept a copy of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redactions_applied_rebuilt: Option<AppliedRebuilt>,
+
     /// The fetch scope of a sparse warehouse, which was lost or damaged and this run wrote: rebuilt
     /// from the checkouts' scopes, or set to the paths `--fetch-scope` gave.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -861,6 +980,12 @@ pub(crate) struct HealReport {
     /// this warehouse held a copy and lost it; heal cannot tell which.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     recorded_unavailable: Vec<String>,
+
+    /// Absent user file content history still reaches that a redaction names, whose hash the record
+    /// of applied redactions did not hold, and which this run applied again: a read of it is refused
+    /// as redacted and an export leaves it out. A lost or damaged record dropped its hash.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    redactions_reapplied: Vec<String>,
 
     /// Pallet refs that were lost or damaged and this run set: rebuilt at the head the evidence
     /// agreed on, or set to the parcel `--ref` gave.
@@ -945,6 +1070,41 @@ impl UnavailableRebuilt {
     }
 }
 
+/// What `heal` kept of a damaged record of applied redactions.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct AppliedRebuilt {
+    /// Where the damaged record was copied to.
+    set_aside: String,
+
+    /// How many hashes still read whole and were kept.
+    kept: usize,
+
+    /// How many lines were dropped: they did not read whole, or named a hash no redaction names.
+    dropped: usize,
+}
+
+impl From<applied_redactions::Rebuilt> for AppliedRebuilt {
+    fn from(rebuilt: applied_redactions::Rebuilt) -> Self {
+        AppliedRebuilt {
+            set_aside: rebuilt.set_aside.to_string_lossy().into_owned(),
+            kept: rebuilt.kept,
+            dropped: rebuilt.dropped,
+        }
+    }
+}
+
+impl AppliedRebuilt {
+    fn sentence(&self) -> String {
+        format!(
+            "The record of applied redactions was damaged and is rebuilt from the {} hash(es) that \
+            still read whole and that a redaction names; {} line(s) that did not are dropped, and a \
+            copy of it is kept at \"{}\".",
+            self.kept, self.dropped, self.set_aside
+        )
+    }
+}
+
 /// How `heal` settled an interrupted operation.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
@@ -996,6 +1156,10 @@ impl CommandOutput for HealReport {
             println!("{}", rebuilt.sentence());
         }
 
+        if let Some(rebuilt) = &self.redactions_applied_rebuilt {
+            println!("{}", rebuilt.sentence());
+        }
+
         if let Some(rebuilt) = &self.fetch_scope_rebuilt {
             println!("{}", scope_sentence(rebuilt));
         }
@@ -1027,6 +1191,7 @@ impl CommandOutput for HealReport {
         } else if self.operation.is_none() && self.unsealed.is_empty() && self.newly_held_by_hash.is_empty()
             && self.resealed.is_empty() && self.recorded_unavailable.is_empty() && self.notes.is_empty()
             && self.unseal_failed.is_none() && self.record_rebuilt.is_none() && self.unavailable_rebuilt.is_none()
+            && self.redactions_applied_rebuilt.is_none() && self.redactions_reapplied.is_empty()
             && self.fetch_scope_rebuilt.is_none()
             && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
             && self.objects_lost.is_none()
@@ -1077,6 +1242,17 @@ impl CommandOutput for HealReport {
                 println!("  {}", hash);
             }
             println!("If this warehouse held a copy of one, restoring it from a backup brings the content back.");
+        }
+
+        if !self.redactions_reapplied.is_empty() {
+            println!(
+                "{} absent object(s) a redaction names are applied again, so a read of one is refused \
+                as redacted and an export leaves it out:",
+                self.redactions_reapplied.len()
+            );
+            for hash in &self.redactions_reapplied {
+                println!("  {}", hash);
+            }
         }
 
         if let Some(error) = &self.unseal_failed {

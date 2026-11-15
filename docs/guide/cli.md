@@ -2265,7 +2265,9 @@ serves. `lower` and `clone` read the remote's report as they take what it serves
 redaction it lists applied that nothing here names any more, and delete the copies; `redact apply`
 asks the remote for its report first, and says so when it cannot reach it. A git mirror
 (`.forklift/mirror.git`) may still hold a copy exported before the redaction: nothing here deletes
-it, and the command that applied the redaction names it. Neither
+it, and the command that applied the redaction names it. If the record of which redactions this
+warehouse applied is lost or damaged, `forklift heal` rebuilds it, keeping a copy, and applies again
+each redaction whose content is gone. Neither
 `redact record` nor `redact apply` is an agent tool under `forklift mcp`. For a leaked secret,
 [`leaked-secret.md`](leaked-secret.md) walks through the whole response, rotation first.
 

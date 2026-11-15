@@ -2186,6 +2186,33 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$defs": {
+    "AppliedRebuilt": {
+      "description": "What `heal` kept of a damaged record of applied redactions.",
+      "properties": {
+        "dropped": {
+          "description": "How many lines were dropped: they did not read whole, or named a hash no redaction names.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kept": {
+          "description": "How many hashes still read whole and were kept.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "set_aside": {
+          "description": "Where the damaged record was copied to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "set_aside",
+        "kept",
+        "dropped"
+      ],
+      "type": "object"
+    },
     "Candidate": {
       "description": "A head the evidence names, and where it was found.",
       "properties": {
@@ -2585,6 +2612,24 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "recorded_unavailable": {
       "description": "Absent user file content history still reaches that the record of content this warehouse\ncannot get did not hold, which this run recorded in it again: the remote's host withholds\neach, so a checkout or an export leaves it out, as after the fetch. Its entry was lost, or\nthis warehouse held a copy and lost it; heal cannot tell which.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "redactions_applied_rebuilt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AppliedRebuilt"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What this run kept of a damaged record of applied redactions, which it rebuilt from the\nhashes that still read whole and that a redaction names, and where it kept a copy of it."
+    },
+    "redactions_reapplied": {
+      "description": "Absent user file content history still reaches that a redaction names, whose hash the record\nof applied redactions did not hold, and which this run applied again: a read of it is refused\nas redacted and an export leaves it out. A lost or damaged record dropped its hash.",
       "items": {
         "type": "string"
       },

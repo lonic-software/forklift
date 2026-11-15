@@ -15,7 +15,11 @@
 //! since an applied redaction is never taken back. It is written whole and atomically under the
 //! [`RefLock`], re-read under that lock first, so two writers never drop each other's hashes. A
 //! record this build cannot read, of another version or with an entry that is not an object hash,
-//! fails every read and is never written over: an applied redaction must never read as pending.
+//! fails every read: an applied redaction must never read as pending. No writer writes over it,
+//! except `heal`'s [`rebuild`] of a damaged one, which keeps a copy and every hash that still reads;
+//! one a newer Forklift wrote is never written over. A hash the record lost, deleted or damaged,
+//! `heal` applies again once the store lacks its content ([`reapply`]); one whose content is still
+//! present reads as pending until `redact apply` deletes it.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -85,8 +89,11 @@ pub fn read_applied() -> Result<AppliedSet, String> {
     };
 
     let entries = record_utils::from_bytes(&bytes, APPLIED_RECORD, APPLIED_VERSION).map_err(|e| format!(
-        "The record of applied redactions \"{}\" {} This version of Forklift never writes over it.",
-        path.to_string_lossy(), e.describe()
+        "The record of applied redactions \"{}\" {} {}",
+        path.to_string_lossy(), e.describe(), match written_by_newer(&bytes) {
+            true => "This version of Forklift never writes over it.",
+            false => REBUILT_BY_HEAL,
+        }
     ))?;
 
     let mut set = AppliedSet::default();
@@ -95,8 +102,8 @@ pub fn read_applied() -> Result<AppliedSet, String> {
         if !object_utils::is_object_hash(&entry) {
             return Err(format!(
                 "The record of applied redactions \"{}\" holds an entry that is not an object hash: \
-                \"{}\". This version of Forklift never writes over it.",
-                path.to_string_lossy(), entry.escape_debug()
+                \"{}\". {}",
+                path.to_string_lossy(), entry.escape_debug(), REBUILT_BY_HEAL
             ));
         }
 
@@ -104,6 +111,97 @@ pub fn read_applied() -> Result<AppliedSet, String> {
     }
 
     Ok(set)
+}
+
+/// What a damaged record's read error names: `heal`'s [`rebuild`].
+const REBUILT_BY_HEAL: &str = "\"forklift heal\" rebuilds it from the entries that still read, and applies again each \
+    redaction whose content is gone.";
+
+/// Whether the record `bytes` opens with this record's header at a newer version.
+fn written_by_newer(bytes: &[u8]) -> bool {
+    record_utils::written_by_newer(bytes, APPLIED_RECORD, APPLIED_VERSION)
+}
+
+/// What [`rebuild`] did with a damaged record.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Rebuilt {
+    /// Where the damaged record was copied to.
+    pub set_aside: PathBuf,
+    /// How many entries still read whole and were kept.
+    pub kept: usize,
+    /// How many lines were dropped: they did not read whole, or named a hash no redaction names.
+    pub dropped: usize,
+}
+
+/// Rebuild a damaged record from the hashes that still read whole, under the ref lock this takes,
+/// first copying the damaged record beside it ([`file_utils::copy_aside`]). A line is whole only
+/// when it is valid UTF-8, its escapes read, it ends in its newline, and it is an object hash that
+/// a cell of `@redactions` names, when that reads. A dropped hash reads as pending, so `heal`
+/// applies again each redaction whose content history still reaches and the store lacks
+/// ([`reapply`]); one whose content is still present stays pending until `redact apply`.
+///
+/// A record whose header names a newer version of it is not damage, and is left as it is.
+///
+/// # Returns
+/// * `Ok(Some(Rebuilt))` - The record was damaged, and is rebuilt.
+/// * `Ok(None)`          - There is no record, it reads, or a newer Forklift wrote it.
+/// * `Err(String)`       - The record could not be read or written, or this thread holds the ref
+///                         lock already.
+pub fn rebuild() -> Result<Option<Rebuilt>, String> {
+    if RefLock::held_by_this_thread() {
+        return Err("The record of applied redactions is not rebuilt while this thread holds the ref lock.".to_string());
+    }
+
+    let path = applied_path();
+
+    // The damaged record's bytes, or `None` when there is nothing to rebuild.
+    let damaged = || -> Result<Option<Vec<u8>>, String> {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
+        };
+
+        Ok((read_applied().is_err() && !written_by_newer(&bytes)).then_some(bytes))
+    };
+
+    // Judged first without the lock, so a record that reads costs no read of `@redactions`. That
+    // read goes before the lock: a cache fetches what of it it lacks, which it never does under
+    // the ref lock. A cell, once written, is never removed, so a later read names no fewer.
+    if damaged()?.is_none() {
+        return Ok(None);
+    }
+    let redactions = redaction_utils::read_redactions();
+
+    let _lock = RefLock::acquire()?;
+    let Some(bytes) = damaged()? else {
+        return Ok(None);
+    };
+
+    let (hashes, mut dropped) = record_utils::salvage(&bytes, |line| {
+        object_utils::is_object_hash(line).then(|| line.to_string())
+    });
+
+    // A byte flipped to another hex digit leaves a whole line naming a hash no redaction names,
+    // which would hold that content as redacted. A redaction's cell is never removed, so every
+    // applied hash is a cell's path. With `@redactions` unread, or reading as no cell at all,
+    // which its lost ref reads as too, every whole line is kept.
+    let hashes: Vec<String> = match redactions {
+        Ok(read) if !read.redactions.is_empty() || !read.unreadable.is_empty() => {
+            let named: BTreeSet<&str> = read.redactions.iter().map(|attributed| attributed.redaction.hash.as_str())
+                .chain(read.unreadable.iter().map(|unreadable| unreadable.hash.as_str()))
+                .collect();
+            let (kept, phantom): (Vec<String>, Vec<String>) = hashes.into_iter().partition(|hash| named.contains(hash.as_str()));
+            dropped += phantom.len();
+            kept
+        }
+        _ => hashes,
+    };
+    let set = AppliedSet::of(hashes);
+    let set_aside = file_utils::copy_aside(&path, &bytes)?;
+    file_utils::replace_file_atomically(&path, &record_utils::to_bytes(APPLIED_RECORD, APPLIED_VERSION, set.hashes()))?;
+
+    Ok(Some(Rebuilt { set_aside, kept: set.hashes.len(), dropped }))
 }
 
 /// The `content_redacted` refusal of a read that found `hash` held nowhere in the store, when it
@@ -409,9 +507,39 @@ pub fn statuses(read: &RedactionsRead) -> Result<Vec<RedactionStatus>, String> {
 pub fn apply(read: &RedactionsRead,
              only: Option<&str>,
              report: Option<&RemoteReport>) -> Result<Vec<RedactionStatus>, String> {
+    reapply(&chosen(read, only), report)
+}
+
+/// The readable redactions of `read` that name one of `lost`, content the store lacks that history
+/// still reaches, and that the applied record does not hold: a lost or damaged record dropped them,
+/// or they were never applied. Each would read as pending, and its content as lost.
+///
+/// # Returns
+/// * `Ok(Vec<&Redaction>)` - Those redactions, in the order `read` lists them, possibly none.
+/// * `Err(String)`         - The applied record cannot be read.
+pub fn unapplied_among<'a>(read: &'a RedactionsRead, lost: &BTreeSet<String>) -> Result<Vec<&'a Redaction>, String> {
+    let applied = read_applied()?;
+
+    Ok(chosen(read, None).into_iter()
+        .filter(|redaction| lost.contains(&redaction.hash) && !applied.contains(&redaction.hash))
+        .collect())
+}
+
+/// [`apply`] over the redactions `chosen`, with the same contract: a scan, the remote's report and
+/// the re-judge under the ref lock decide, and the bundle is withdrawn before the record is
+/// written. `heal` passes those [`unapplied_among`] found: their content is gone, so applying one
+/// again deletes no content, but the bundle is still withdrawn, since one built before may hold it.
+///
+/// # Returns
+/// * `Ok(Vec<RedactionStatus>)` - One per redaction, in the order given; each that reads as
+///                                applied is applied on disk.
+/// * `Err(String)`              - The applied record, the configuration or the warehouse's mode
+///                                cannot be read, or the bundle could not be withdrawn or the
+///                                record written.
+pub fn reapply(chosen: &[&Redaction], report: Option<&RemoteReport>) -> Result<Vec<RedactionStatus>, String> {
     let applied = read_applied()?;
     let (remote, partial) = read_judged()?;
-    let mut statuses = judge(&chosen(read, only), &applied, Judge { remote: remote.as_deref(), partial, report });
+    let mut statuses = judge(chosen, &applied, Judge { remote: remote.as_deref(), partial, report });
 
     let newly = |statuses: &[RedactionStatus]| -> Vec<String> {
         statuses.iter()
@@ -498,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_this_build_cannot_read_fails_loudly_and_is_never_written_over() {
+    fn a_record_this_build_cannot_read_fails_loudly_and_no_apply_writes_over_it() {
         let _scratch = Scratch::new("applied-unknown");
 
         for (bytes, expected) in [

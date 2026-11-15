@@ -207,47 +207,16 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
     Ok(Some(Rebuilt { set_aside, kept: set.entries.len(), dropped }))
 }
 
-/// Whether the record `bytes` opens with this record's header at a newer version, judged on the
-/// first line's own bytes: damage elsewhere, such as a byte that is not UTF-8, must not hide it.
+/// Whether the record `bytes` opens with this record's header at a newer version.
 fn written_by_newer(bytes: &[u8]) -> bool {
-    let first = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
-    std::str::from_utf8(first).is_ok_and(newer_version)
-}
-
-/// Whether `header` is this record's header at a version newer than this build's, written as
-/// Forklift writes one: the tag, one space, and a number without a leading zero.
-fn newer_version(header: &str) -> bool {
-    header.strip_prefix(&format!("/forklift-{} ", UNAVAILABLE_RECORD))
-        .and_then(|text| text.parse::<u32>().ok().filter(|version| version.to_string() == text))
-        .is_some_and(|version| version > UNAVAILABLE_VERSION)
+    record_utils::written_by_newer(bytes, UNAVAILABLE_RECORD, UNAVAILABLE_VERSION)
 }
 
 /// Every entry of a damaged record that reads whole (see [`rebuild`]), and how many lines did not.
-/// A first line that opens as a record header is skipped.
 fn salvage(bytes: &[u8]) -> (UnavailableSet, usize) {
-    let mut set = UnavailableSet::default();
-    let mut dropped = 0;
+    let (entries, dropped) = record_utils::salvage(bytes, parse_entry);
 
-    let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
-    for (index, raw) in lines.iter().enumerate() {
-        if raw.is_empty() || (index == 0 && raw.starts_with(b"/forklift-")) {
-            continue;
-        }
-
-        // The piece after the last newline is a line the record was cut inside.
-        let terminated = index + 1 < lines.len();
-        let parsed = std::str::from_utf8(raw).ok()
-            .filter(|_| terminated)
-            .and_then(record_utils::unescape)
-            .and_then(|entry| parse_entry(&entry));
-
-        match parsed {
-            Some((hash, entry)) => { set.entries.insert(hash, entry); }
-            None => dropped += 1,
-        }
-    }
-
-    (set, dropped)
+    (UnavailableSet { entries: entries.into_iter().collect() }, dropped)
 }
 
 /// How many of the record's entries the store lacks: content its history may name that this
