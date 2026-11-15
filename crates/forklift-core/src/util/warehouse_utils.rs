@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{self, forklift_root, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, lock_utils, origin_utils, pallet_utils, record_utils, scope_utils, upgrade_utils};
+use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, lock_utils, origin_utils, pallet_utils, park_utils, record_utils, scope_utils, upgrade_utils};
 use crate::util::record_utils::RecordError;
 use crate::util::scope_utils::PathScope;
 
@@ -603,8 +603,6 @@ pub const FILE_NAME_WAREHOUSE_MARKER_COPY: &str = "warehouse-copy";
 /// are refused.
 const WAREHOUSE_MARKER_RECORD: &str = "warehouse";
 const WAREHOUSE_MARKER_VERSION: u32 = 4;
-/// The entry prefix of a marker's digest, its last entry.
-const MARKER_DIGEST_PREFIX: &str = "digest ";
 
 /// The one warehouse format this build reads (docs/format/WAREHOUSE_FORMAT.md).
 pub const WAREHOUSE_FORMAT: u32 = 1;
@@ -832,26 +830,21 @@ fn decode_marker(bytes: &[u8], path: &Path, forklift: &Path) -> Result<Warehouse
         path.to_string_lossy(), what, forklift.to_string_lossy()
     );
 
-    let entries = match record_utils::from_bytes(bytes, WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION) {
-        Ok(entries) => entries,
+    // The header is judged first, so an older marker's refusal names what it was; the frame next.
+    match record_utils::from_bytes(bytes, WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION) {
+        Ok(_) => (),
         Err(RecordError::OtherVersion(header)) if header == record_utils::header(WAREHOUSE_MARKER_RECORD, 3) =>
             return Err(older("carried a digest")),
         Err(RecordError::OtherVersion(header))
             if (1..3).any(|version| header == record_utils::header(WAREHOUSE_MARKER_RECORD, version)) =>
             return Err(older("recorded the warehouse's format")),
         Err(e) => return Err(unknown(&e.describe())),
-    };
-
-    let damaged = || unknown("is damaged: it does not match its digest.");
-    let (digest, entries) = entries.split_last().ok_or_else(damaged)?;
-    let hex = digest.strip_prefix(MARKER_DIGEST_PREFIX).ok_or_else(damaged)?;
-    let body = bytes.strip_suffix(format!("{}{}\n", MARKER_DIGEST_PREFIX, hex).as_bytes()).ok_or_else(damaged)?;
-
-    if blake3::hash(body).to_hex().as_str() != hex {
-        return Err(damaged());
     }
 
-    parse_marker_entries(entries).map_err(|reason| unknown(&reason))
+    let entries = record_utils::from_bytes_digested(bytes, WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION)
+        .map_err(|e| unknown(&e.describe()))?;
+
+    parse_marker_entries(&entries).map_err(|reason| unknown(&reason))
 }
 
 /// Bring the files of the marker pair in `forklift` that do not hold `bytes`, the pair's chosen
@@ -950,21 +943,14 @@ pub(crate) fn encode_marker(marker: &WarehouseMarker) -> Vec<u8> {
     let upgrade = marker.upgrade.map(|upgrade| format!("upgrading {} {}", upgrade.target, upgrade.step));
     let entries = [Some(format.as_str()), Some(marker.mode.as_str()), upgrade.as_deref()];
 
-    with_digest(record_utils::to_bytes(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, entries.into_iter().flatten()))
-}
-
-/// `bytes` followed by the digest line [`decode_marker`] checks: the digest of every byte before it.
-fn with_digest(mut bytes: Vec<u8>) -> Vec<u8> {
-    let digest = blake3::hash(&bytes).to_hex();
-    bytes.extend_from_slice(format!("{}{}\n", MARKER_DIGEST_PREFIX, digest).as_bytes());
-    bytes
+    record_utils::to_bytes_digested(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, entries.into_iter().flatten())
 }
 
 /// Marker bytes holding `entries` (each line ending in `\n`, as they follow the header), framed
 /// and digested as [`write_marker`] frames them, whatever the entries say: for a test that lays down
 /// a `.forklift`, or a marker of another format, by hand. Hand-typed bytes could not carry the digest.
 pub fn framed_marker_bytes(entries: &str) -> Vec<u8> {
-    with_digest(format!("{}\n{}", record_utils::header(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION), entries).into_bytes())
+    record_utils::with_digest(format!("{}\n{}", record_utils::header(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION), entries).into_bytes())
 }
 
 /// The origin [`mark_for_test`] records for a partial mode.
@@ -981,6 +967,7 @@ pub(crate) fn mark_for_test(mode: WarehouseMode) {
     if mode != WarehouseMode::Full {
         origin_utils::write_origin(&forklift, TEST_ORIGIN).unwrap();
     }
+    park_utils::create_if_not_exists(&forklift).unwrap();
     write_warehouse_marker(&forklift, mode).unwrap();
 }
 
@@ -1182,6 +1169,10 @@ fn fill(forklift: &Path, shown: &Path) -> Result<(Vec<String>, Vec<PathBuf>), St
     if config_utils::create_warehouse_config_if_not_exists()? {
         notes.push("Created warehouse configuration file.".to_string());
     }
+
+    // Not a note: no piece a user asked for. Never written over a bay's leftover, which a
+    // record of `heal`'s rebuilding takes in.
+    park_utils::create_if_not_exists(forklift)?;
 
     Ok((notes, created))
 }

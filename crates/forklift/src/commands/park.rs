@@ -11,6 +11,7 @@ use forklift_core::util::{
     operation_utils, pallet_utils, park_utils, redaction_utils, scope_utils, shift_utils, sign_utils, stack_utils,
     tree_utils,
 };
+use forklift_core::util::lock_utils::ParkedLock;
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::commands::merge_abort;
 use crate::output::{self, CommandOutput};
@@ -144,10 +145,37 @@ pub async fn park_changes() -> Result<(), String> {
         return Err("There is nothing to park: the warehouse matches the pallet head.".to_string());
     }
 
-    // Parked parcels follow the same authorship convention as stacked ones: the author
-    // is recorded explicitly, even though it is always the parking operator.
-    let timestamp = Utc::now();
+    // The barrier: every tree object staged above becomes durable and visible at its final
+    // content-addressed path now, all at once. The parcel object is not among them: it is stored
+    // only in the hold that lists it, so a park refused below stores no parcel at all.
+    batch.finish()?;
 
+    // A parked parcel is no pallet head, but popping it would bring the content back, so the
+    // parked tree is judged whole, as a head's is: the refresh above judged only what it restaged.
+    // Judged once the batch is readable; a refusal leaves the bay as it was.
+    if let Some(guard) = redaction_utils::staging_guard()? {
+        if let Some((path, hash)) = guard.names_tree(&root_tree.hash)? {
+            return Err(park_refusal(&path, &hash));
+        }
+    }
+
+    // The reset back to the pallet head is checked before anything references the parked
+    // parcel: a staged removal leaves a path the head writes back, and untracked content (or,
+    // on a case-insensitive volume, another spelling) may sit there now. A refusal here leaves
+    // the bay as it was.
+    let (ops, removed_dirs) = shift_utils::diff_trees(Some(&root_tree.hash), &head_tree_hash)?;
+
+    alias_utils::refuse_collisions("Parking", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
+    shift_utils::ensure_writes_present(&ops)?;
+
+    // The record is read before anything is signed, so damage refuses the park with nothing
+    // written; the name it picks is checked again in the hold below.
+    let timestamp = Utc::now();
+    let name = park_utils::unique_name(&park_utils::default_name(&pallet, timestamp), &park_utils::read_parked()?);
+
+    // Parked parcels follow the same authorship convention as stacked ones: the author is
+    // recorded explicitly, even though it is always the parking operator. The Park action names
+    // the park, so a store scan can bring the name back with the parcel.
     let parcel = Parcel {
         tree_hash: root_tree.hash.clone(),
         parents: vec![head.clone()],
@@ -160,70 +188,61 @@ pub async fn park_changes() -> Result<(), String> {
             },
             ParcelAction {
                 operator,
-                action: ParcelActionType::Stack,
-                description: None,
+                action: ParcelActionType::Park,
+                description: Some(name.clone()),
                 timestamp,
             },
         ],
         description: Some(format!("Parked changes on pallet \"{}\".", pallet)),
     };
-
-    // The parcel object itself joins the same batch as the tree objects it points to: the parked
-    // list will reference it directly, so it must be just as durable as everything beneath it
-    // before anything downstream can see it.
     let mut object = LooseObjectBuilder::build_parcel(&parcel);
-    object.store_deferred(&batch)?;
 
-    // The barrier: every tree object and the parcel object staged above become durable and
-    // visible at their final content-addressed paths now, all at once. Must complete (return
-    // `Ok`) before anything below is allowed to reference what it just published — the signature
-    // sidecar and the parked-list record are both written only from this point on, deliberately
-    // kept out of this same batch (see `stack_utils::stack_parcel`'s identical ordering note).
-    batch.finish()?;
+    // Signed outside the hold: a signature can wait on a key agent, which the hold never does.
+    let signature = signing_key_id.as_deref()
+        .map(|key_id| sign_utils::sign_parcel_hash(key_id, &object.hash))
+        .transpose()?;
 
-    // A parked parcel is no pallet head, but popping it would bring the content back, so the
-    // parked tree is judged whole, as a head's is: the refresh above judged only what it restaged.
-    // Judged once the batch is readable; a refusal leaves the bay as it was, and the parcel object
-    // unreferenced.
-    if let Some(guard) = redaction_utils::staging_guard()? {
-        if let Some((path, hash)) = guard.names_tree(&root_tree.hash)? {
-            return Err(park_refusal(&path, &hash));
+    {
+        let lock = ParkedLock::acquire()?;
+        let mut parked = park_utils::read_parked()?;
+
+        if parked.iter().any(|entry| entry.name == name) {
+            return Err(format!(
+                "Other work was parked as \"{}\" while this park ran. Nothing was parked; park again.",
+                sanitize(&name)
+            ));
         }
+
+        object.store()?;
+        if let Some(signature) = &signature {
+            sign_utils::store_parcel_signature(&object.hash, signature)?;
+        }
+
+        // Raised before the record names the parcel, and finished once staging is back at the
+        // head. Recovery tells the two sides of the record write apart by `listed`, written in
+        // this same hold, and else by the record itself, read under this lock.
+        let mut operation = Operation::new(
+            OperationKind::Park, position.clone(), Some(head_tree_hash.clone()), position.clone(),
+        );
+        operation.target_tree = Some(head_tree_hash.clone());
+        operation.parked = Some(object.hash.clone());
+        operation.park_name = Some(name.clone());
+        operation_utils::raise(&operation)?;
+
+        #[cfg(test)]
+        tests::BEFORE_PARKED_WRITE.with(|seam| seam.take().map(|seam| seam())).transpose()?;
+
+        parked.push(park_utils::ParkedEntry { parcel: object.hash.clone(), recovered: false, name: name.clone() });
+        park_utils::write_parked(&lock, &parked)?;
+
+        #[cfg(test)]
+        tests::AFTER_PARKED_WRITE.with(|seam| seam.take().map(|seam| seam())).transpose()?;
+
+        operation_utils::record_listed()?;
+
+        #[cfg(test)]
+        tests::AFTER_LISTED.with(|seam| seam.take().map(|seam| seam())).transpose()?;
     }
-
-    // The reset back to the pallet head is checked before anything references the parked
-    // parcel: a staged removal leaves a path the head writes back, and untracked content (or,
-    // on a case-insensitive volume, another spelling) may sit there now. A refusal here leaves
-    // the bay as it was; the parcel object stays unreferenced.
-    let (ops, removed_dirs) = shift_utils::diff_trees(Some(&root_tree.hash), &head_tree_hash)?;
-
-    alias_utils::refuse_collisions("Parking", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
-    shift_utils::ensure_writes_present(&ops)?;
-
-    if let Some(key_id) = &signing_key_id {
-        let signature = sign_utils::sign_parcel_hash(key_id, &object.hash)?;
-        sign_utils::store_parcel_signature(&object.hash, &signature)?;
-    }
-
-    // Raised before the parked list names the parcel, and finished once staging is back at the
-    // head. Recovery tells the two sides of the list write apart by the parcel's hash: before it
-    // the work was never moved, after it the work is safe in the list.
-    let mut operation = Operation::new(
-        OperationKind::Park, position.clone(), Some(head_tree_hash.clone()), position.clone(),
-    );
-    operation.target_tree = Some(head_tree_hash.clone());
-    operation.parked = Some(object.hash.clone());
-    operation_utils::raise(&operation)?;
-
-    #[cfg(test)]
-    tests::BEFORE_PARKED_WRITE.with(|seam| seam.take().map(|seam| seam())).transpose()?;
-
-    let mut parked = park_utils::read_parked()?;
-    parked.push(object.hash.clone());
-    park_utils::write_parked(&parked)?;
-
-    #[cfg(test)]
-    tests::AFTER_PARKED_WRITE.with(|seam| seam.take().map(|seam| seam())).transpose()?;
 
     // Reset the working directory and the inventory to the pallet head.
     shift_utils::apply_ops(&ops, &removed_dirs)?;
@@ -233,7 +252,7 @@ pub async fn park_changes() -> Result<(), String> {
     operation_utils::finish()?;
 
     output::message(format!(
-        "Parked the work in progress as {} and reset to the pallet head.", object.hash
+        "Parked the work in progress as \"{}\" ({}) and reset to the pallet head.", sanitize(&name), object.hash
     ));
 
     Ok(())
@@ -253,9 +272,7 @@ fn park_refusal(path: &str, hash: &str) -> String {
 /// Re-apply the most recently parked parcel (staging its changes) and drop it from the
 /// parked list.
 pub fn pop_parked() -> Result<(), String> {
-    let mut parked = park_utils::read_parked()?;
-
-    let Some(parked_hash) = parked.last().cloned() else {
+    let Some(parked_hash) = park_utils::read_parked()?.last().map(|entry| entry.parcel.clone()) else {
         return Err("There are no parked changes.".to_string());
     };
 
@@ -371,8 +388,23 @@ pub fn pop_parked() -> Result<(), String> {
         }
     }
 
-    parked.pop();
-    park_utils::write_parked(&parked)?;
+    #[cfg(test)]
+    tests::BEFORE_POP_REMOVES.with(|seam| seam.take().map(|seam| seam())).transpose()?;
+
+    // Re-read under the lock: another bay may have parked or popped since. One that popped or
+    // dropped this same parcel meanwhile is said, never passed over as a pop that took it.
+    let lock = ParkedLock::acquire()?;
+    let mut parked = park_utils::read_parked()?;
+    let before = parked.len();
+    parked.retain(|entry| entry.parcel != parked_hash);
+    if parked.len() == before {
+        return Err(format!(
+            "The parked changes from {} were popped or dropped by another command while this pop ran. \
+            They are applied and staged here as well; the parked list was not changed.",
+            parked_hash
+        ));
+    }
+    park_utils::write_parked(&lock, &parked)?;
 
     output::message(format!("Re-applied the parked changes from {} (staged).", parked_hash));
 
@@ -385,12 +417,12 @@ pub fn list_parked() -> Result<(), String> {
 
     let mut entries = Vec::new();
 
-    for hash in parked.iter().rev() {
-        let description = object_utils::load_parcel(hash)?
+    for entry in parked.iter().rev() {
+        let description = object_utils::load_parcel(&entry.parcel)?
             .description
             .unwrap_or_default();
 
-        entries.push(ParkedEntry { parcel: hash.clone(), description });
+        entries.push(ParkedEntry { parcel: entry.parcel.clone(), name: entry.name.clone(), recovered: entry.recovered, description });
     }
 
     output::emit(&ParkedList { parked: entries });
@@ -410,6 +442,11 @@ pub(crate) struct ParkedList {
 #[derive(Serialize)]
 pub(crate) struct ParkedEntry {
     parcel: String,
+    /// The name the work is parked under.
+    name: String,
+    /// Whether `heal` found the parcel in the store rather than in the parked-work record: it may
+    /// be work that was popped or dropped before the record was lost.
+    recovered: bool,
     description: String,
 }
 
@@ -421,7 +458,8 @@ impl CommandOutput for ParkedList {
         }
 
         for entry in &self.parked {
-            println!("{} {}", entry.parcel, sanitize(&entry.description));
+            let recovered = if entry.recovered { " (recovered by heal)" } else { "" };
+            println!("{} {}{}", entry.parcel, sanitize(&entry.name), recovered);
         }
     }
 }
@@ -437,16 +475,25 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 
 #[cfg(test)]
 mod tests {
+    /// A test's stand-in for a crash at one point of a park: an error it returns is the crash.
+    type Seam = std::cell::Cell<Option<Box<dyn FnOnce() -> Result<(), String>>>>;
+
     thread_local! {
         /// Runs once after park raised its marker, before the parked list names the parcel: an
         /// error stands for a crash there.
-        pub(crate) static BEFORE_PARKED_WRITE: std::cell::Cell<Option<Box<dyn FnOnce() -> Result<(), String>>>> =
-            std::cell::Cell::new(None);
+        pub(crate) static BEFORE_PARKED_WRITE: Seam = std::cell::Cell::new(None);
 
         /// Runs once after the parked list names the parcel, before the bay is reset: an error
         /// stands for a crash there.
-        pub(crate) static AFTER_PARKED_WRITE: std::cell::Cell<Option<Box<dyn FnOnce() -> Result<(), String>>>> =
-            std::cell::Cell::new(None);
+        pub(crate) static AFTER_PARKED_WRITE: Seam = std::cell::Cell::new(None);
+
+        /// Runs once after the marker records that the parked list names the parcel, before the
+        /// bay is reset: an error stands for a crash there.
+        pub(crate) static AFTER_LISTED: Seam = std::cell::Cell::new(None);
+
+        /// Runs once after a pop applied and staged the parked changes, before it takes them out
+        /// of the parked list: a test stands in for another bay's command there.
+        pub(crate) static BEFORE_POP_REMOVES: Seam = std::cell::Cell::new(None);
     }
 
     use super::*;
@@ -506,12 +553,282 @@ mod tests {
 
         let parked = park_utils::read_parked().unwrap();
         assert_eq!(parked.len(), 1, "the work is safe in the parked list");
-        let parked_tree = object_utils::load_parcel(&parked[0]).unwrap().tree_hash;
+        let parked_tree = object_utils::load_parcel(&parked[0].parcel).unwrap().tree_hash;
         assert!(object_utils::load_tree(&parked_tree).is_ok(), "the parked parcel's tree is stored");
         assert!(staged_paths(&tree).is_empty(), "staging is back at the head");
 
         // The reset is finished: the file still held the parked content, so it is back at the head.
         assert!(recovery.unheld.is_empty(), "{:?}", recovery.unheld);
         assert!(test_support::file_holds(&warehouse.root, "a.txt", b"one\n"));
+    }
+
+    /// Park "main"'s work twice, the second after a fresh edit. Returns the two entries.
+    fn two_parks(root: &std::path::Path) -> Vec<park_utils::ParkedEntry> {
+        work_in_progress_on_main(root);
+        test_support::block_on(park_changes()).unwrap();
+        std::fs::write(root.join("a.txt"), b"more work\n").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+        test_support::block_on(park_changes()).unwrap();
+
+        let parked = park_utils::read_parked().unwrap();
+        assert_eq!(parked.len(), 2, "sanity: two parks are listed");
+        parked
+    }
+
+    fn remove_record() {
+        forklift_core::util::file_utils::remove_file(park_utils::parked_path()).unwrap();
+    }
+
+    /// A crash after the marker records `listed` rolls forward even when the record is gone by
+    /// recovery: the marker alone says the parcel was listed. Revert the `operation.listed` arm in
+    /// recovery and it reads the missing record, which refuses.
+    #[test]
+    fn a_park_interrupted_after_it_was_listed_rolls_forward_without_reading_the_record() {
+        let warehouse = Warehouse::with_working_tree("park-crash-after-listed");
+        let tree = work_in_progress_on_main(&warehouse.root);
+
+        AFTER_LISTED.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
+        assert_eq!(test_support::block_on(park_changes()).unwrap_err(), "crashed");
+        operation_utils::forget_raised_for_tests();
+        remove_record();
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!((recovery.operation, recovery.outcome), (OperationKind::Park, RecoveryOutcome::RolledForward));
+        assert!(staged_paths(&tree).is_empty(), "staging is back at the head");
+    }
+
+    /// A crash before the record names the parcel, then damage to the record: the rebuild finds
+    /// the stored parcel and lists it as recovered, and recovery then clears the park, taking the
+    /// recovered entry out, so the work is in the file once and not also parked.
+    #[test]
+    fn a_park_interrupted_before_listing_clears_and_takes_out_the_entry_a_rebuild_recovered() {
+        let warehouse = Warehouse::with_working_tree("park-crash-before-list-rebuilt");
+        let tree = work_in_progress_on_main(&warehouse.root);
+
+        BEFORE_PARKED_WRITE.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
+        assert_eq!(test_support::block_on(park_changes()).unwrap_err(), "crashed");
+        operation_utils::forget_raised_for_tests();
+        remove_record();
+
+        let rebuilt = park_utils::rebuild().unwrap().expect("the missing record is rebuilt");
+        assert_eq!(rebuilt.recovered, 1, "{:?}", rebuilt);
+        let parked = park_utils::read_parked().unwrap();
+        assert!(parked.len() == 1 && parked[0].recovered, "{:?}", parked);
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!((recovery.operation, recovery.outcome), (OperationKind::Park, RecoveryOutcome::Cleared));
+        assert!(park_utils::read_parked().unwrap().is_empty(), "the recovered entry is taken out");
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"work\n"), "the work stays in the file");
+        assert_eq!(staged_paths(&tree), vec!["a.txt".to_string()], "and staged, as it was");
+    }
+
+    /// Heal rebuilds the record before it recovers the interrupted park: recovery reads the
+    /// record, so the other order refuses on the missing one.
+    #[test]
+    fn heal_rebuilds_the_parked_record_before_it_recovers_an_interrupted_park() {
+        let warehouse = Warehouse::with_working_tree("park-heal-order");
+        work_in_progress_on_main(&warehouse.root);
+
+        BEFORE_PARKED_WRITE.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
+        assert_eq!(test_support::block_on(park_changes()).unwrap_err(), "crashed");
+        operation_utils::forget_raised_for_tests();
+        remove_record();
+
+        test_support::block_on(crate::commands::heal::handle_command(None, &[], &[], &[])).unwrap();
+
+        assert!(park_utils::read_parked().unwrap().is_empty(), "the recovered entry is taken out");
+        assert!(operation_utils::read().unwrap().is_none(), "the marker is cleared");
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"work\n"));
+    }
+
+    /// A park refused on a missing record stores no parcel: a rebuild then finds nothing parked.
+    #[test]
+    fn a_park_refused_on_a_missing_record_stores_no_parked_parcel() {
+        let warehouse = Warehouse::with_working_tree("park-refused-missing");
+        work_in_progress_on_main(&warehouse.root);
+        remove_record();
+
+        let error = test_support::block_on(park_changes()).unwrap_err();
+        assert!(error.contains("is missing") && error.contains("forklift heal"), "{}", error);
+
+        let rebuilt = park_utils::rebuild().unwrap().expect("the missing record is rebuilt");
+        assert_eq!(rebuilt.recovered, 0, "{:?}", rebuilt);
+        assert!(park_utils::read_parked().unwrap().is_empty());
+    }
+
+    /// The parked parcel carries a Park action naming the park, which is what a store scan reads.
+    #[test]
+    fn a_parked_parcel_is_marked_with_its_name() {
+        let warehouse = Warehouse::with_working_tree("park-marker");
+        work_in_progress_on_main(&warehouse.root);
+        test_support::block_on(park_changes()).unwrap();
+
+        let entry = park_utils::read_parked().unwrap().remove(0);
+        let parcel = object_utils::load_parcel(&entry.parcel).unwrap();
+        let marks: Vec<_> = parcel.actions.iter()
+            .filter(|action| matches!(action.action, ParcelActionType::Park))
+            .map(|action| action.description.clone())
+            .collect();
+        assert_eq!(marks, vec![Some(entry.name.clone())], "one Park action, naming the park");
+        assert!(entry.name.starts_with("main "), "the default name starts with the pallet: {}", entry.name);
+    }
+
+    /// Every damage the record can take is rebuilt to the same parks in the same order: a flipped
+    /// digest and a cut tail keep each entry as written, and a record emptied or deleted brings
+    /// each back from the store, named from its Park action and flagged as recovered.
+    #[test]
+    fn a_damaged_record_is_rebuilt_to_the_same_parks_in_the_same_order() {
+        let warehouse = Warehouse::with_working_tree("park-rebuild-damage");
+        let parked = two_parks(&warehouse.root);
+        let bytes = std::fs::read(park_utils::parked_path()).unwrap();
+
+        let flipped = {
+            let mut bytes = bytes.clone();
+            // A hex digit of the digest, on the record's last line.
+            let at = bytes.len() - 3;
+            bytes[at] = if bytes[at] == b'0' { b'1' } else { b'0' };
+            bytes
+        };
+        let cut = bytes[..bytes.len() - 1].to_vec();
+
+        for (damage, written, kept) in [("flipped", Some(flipped), true), ("cut", Some(cut), true),
+                                        ("emptied", Some(Vec::new()), false), ("deleted", None, false)] {
+            match written {
+                Some(written) => std::fs::write(park_utils::parked_path(), written).unwrap(),
+                None => remove_record(),
+            }
+            assert!(park_utils::read_parked().is_err(), "{}: sanity: the record reads as damaged", damage);
+
+            park_utils::rebuild().unwrap().unwrap_or_else(|| panic!("{}: the record is rebuilt", damage));
+            let rebuilt = park_utils::read_parked().unwrap();
+
+            let expected: Vec<_> = parked.iter()
+                .map(|entry| park_utils::ParkedEntry { recovered: !kept, ..entry.clone() })
+                .collect();
+            assert_eq!(rebuilt, expected, "{}", damage);
+
+            // Back to the record as written, for the next damage.
+            std::fs::write(park_utils::parked_path(), &bytes).unwrap();
+        }
+    }
+
+    /// A version-1 record lists bare hashes, of parcels parked as Stack-marked ones. Its entries
+    /// are kept by the rebuild under a default name: a parcel the store holds is kept whatever
+    /// marks it.
+    #[test]
+    fn a_version_1_record_keeps_its_parcels_under_a_default_name() {
+        let _warehouse = Warehouse::with_working_tree("park-rebuild-v1");
+        test_support::configure_operator();
+        let parcel = test_support::store_parcel(&test_support::store_tree("a.txt", b"old\n"), &[]);
+        std::fs::write(park_utils::parked_path(), format!("/forklift-parked 1\n{}\n", parcel)).unwrap();
+        let error = park_utils::read_parked().unwrap_err();
+        assert!(error.contains("older Forklift, as version 1") && error.contains("forklift heal"), "{}", error);
+
+        let rebuilt = park_utils::rebuild().unwrap().expect("a version-1 record is rebuilt");
+        assert_eq!((rebuilt.kept, rebuilt.recovered), (1, 0), "{:?}", rebuilt);
+        let parked = park_utils::read_parked().unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!((parked[0].parcel.as_str(), parked[0].recovered), (parcel.as_str(), false));
+        assert!(!parked[0].name.is_empty());
+    }
+
+    /// A bay's leftover parked file is merged into the shared record and then removed.
+    #[test]
+    fn a_bays_leftover_parked_file_is_merged_and_removed() {
+        let warehouse = Warehouse::with_working_tree("park-rebuild-leftover");
+        let parked = two_parks(&warehouse.root);
+
+        let bay = forklift_core::util::bay_utils::bay_state_dir("b");
+        std::fs::create_dir_all(&bay).unwrap();
+        let leftover = bay.join(park_utils::FILE_NAME_PARKED);
+        test_support::configure_operator();
+        let old = test_support::store_parcel(&test_support::store_tree("b.txt", b"old\n"), &[]);
+        std::fs::write(&leftover, format!("/forklift-parked 1\n{}\n", old)).unwrap();
+        assert!(park_utils::read_parked().is_err(), "a leftover is damage");
+
+        let rebuilt = park_utils::rebuild().unwrap().expect("the leftover is merged");
+        assert_eq!(rebuilt.merged_bays, 1, "{:?}", rebuilt);
+        assert_eq!((rebuilt.record, rebuilt.set_aside.as_ref()), (park_utils::RecordWas::Whole, None),
+            "a record that read is not called damaged, nor copied aside");
+        let now: Vec<_> = park_utils::read_parked().unwrap().into_iter().map(|entry| entry.parcel).collect();
+        assert_eq!(now, vec![parked[0].parcel.clone(), parked[1].parcel.clone(), old], "kept first, then merged");
+        assert!(!leftover.exists(), "the leftover is removed once merged");
+    }
+
+    /// A parcel the rebuild brings back goes in by the time it was parked, so the newest park
+    /// stays last and `park pop` takes it. Parks A and B, B popped (its parcel stays in the
+    /// store), then C: the rebuilt record is A, B (recovered), C. Revert the insert by time to an
+    /// append and B lands last, so the next pop re-applies work already popped.
+    #[test]
+    fn a_rebuild_puts_a_recovered_parcel_by_its_time_and_keeps_the_newest_last() {
+        // Park times are whole seconds, so the three parks are a second apart.
+        let next_second = || std::thread::sleep(std::time::Duration::from_millis(1100));
+        let warehouse = Warehouse::with_working_tree("park-rebuild-order");
+        work_in_progress_on_main(&warehouse.root);
+        test_support::block_on(park_changes()).unwrap();
+        next_second();
+        std::fs::write(warehouse.root.join("a.txt"), b"b work\n").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+        test_support::block_on(park_changes()).unwrap();
+        let popped = park_utils::read_parked().unwrap()[1].parcel.clone();
+        pop_parked().unwrap();
+        next_second();
+        std::fs::write(warehouse.root.join("a.txt"), b"c work\n").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+        test_support::block_on(park_changes()).unwrap();
+        let listed = park_utils::read_parked().unwrap();
+        assert_eq!(listed.len(), 2, "sanity: A and C are listed");
+
+        // Flip a hex digit of the digest, so every entry still reads and is kept.
+        let mut bytes = std::fs::read(park_utils::parked_path()).unwrap();
+        let at = bytes.len() - 3;
+        bytes[at] = if bytes[at] == b'0' { b'1' } else { b'0' };
+        std::fs::write(park_utils::parked_path(), bytes).unwrap();
+        park_utils::rebuild().unwrap().expect("the damaged record is rebuilt");
+
+        let rebuilt: Vec<_> = park_utils::read_parked().unwrap().into_iter()
+            .map(|entry| (entry.parcel, entry.recovered)).collect();
+        assert_eq!(rebuilt, vec![
+            (listed[0].parcel.clone(), false), (popped, true), (listed[1].parcel.clone(), false),
+        ]);
+    }
+
+    /// A pop whose parcel another command popped or dropped while it ran says so, rather than
+    /// reporting a pop of work that was no longer parked. Revert the check and the pop succeeds.
+    #[test]
+    fn a_pop_whose_parcel_was_taken_meanwhile_says_so() {
+        let warehouse = Warehouse::with_working_tree("park-pop-raced");
+        work_in_progress_on_main(&warehouse.root);
+        test_support::block_on(park_changes()).unwrap();
+
+        BEFORE_POP_REMOVES.with(|seam| seam.set(Some(Box::new(|| {
+            let lock = ParkedLock::acquire()?;
+            park_utils::write_parked(&lock, &[])
+        }))));
+        let error = pop_parked().unwrap_err();
+        assert!(error.contains("popped or dropped by another command"), "{}", error);
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"work\n"), "the changes are applied here");
+    }
+
+    /// A store whose history cannot be walked does not stop the rebuild: a parked parcel is
+    /// listed as recovered even though whether a ref reaches it cannot be told. Revert to
+    /// propagating the walk's error and the rebuild fails, leaving every reader refusing.
+    #[test]
+    fn a_rebuild_lists_parked_parcels_when_the_history_cannot_be_walked() {
+        let warehouse = Warehouse::with_working_tree("park-rebuild-unwalkable");
+        work_in_progress_on_main(&warehouse.root);
+        test_support::block_on(park_changes()).unwrap();
+        let parked = park_utils::read_parked().unwrap().remove(0);
+        remove_record();
+
+        // The head parcel is present but corrupt, so the walk from "main" cannot finish.
+        let head = pallet_utils::get_pallet_head("main").unwrap().unwrap();
+        let head_path = warehouse.root.join(".forklift/objects").join(&head[..2]).join(&head[2..]);
+        std::fs::write(&head_path, b"not a parcel").unwrap();
+
+        let rebuilt = park_utils::rebuild().unwrap().expect("the missing record is rebuilt");
+        assert_eq!(rebuilt.recovered, 1, "{:?}", rebuilt);
+        assert!(rebuilt.unreadable >= 1, "the walk that failed is counted: {:?}", rebuilt);
+        assert_eq!(park_utils::read_parked().unwrap()[0].parcel, parked.parcel);
     }
 }

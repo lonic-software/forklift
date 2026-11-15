@@ -465,7 +465,7 @@ A command not listed here either reports only the generic human-message shape `{
         },
         {
           "const": "parked",
-          "description": "A parcel parked in a checkout.",
+          "description": "Parked work, which every bay shares; the description names it.",
           "type": "string"
         },
         {
@@ -2368,6 +2368,81 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "ParkedRebuilt": {
+      "description": "What `heal` kept of a missing, damaged or incomplete parked-work record.",
+      "properties": {
+        "dropped": {
+          "description": "How many lines were dropped: they did not read whole, or named no parcel the store holds.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kept": {
+          "description": "How many entries still read whole, from the record and the bays' leftovers, and were kept.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "merged_bays": {
+          "description": "How many bays' own parked files were merged in and removed.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "record": {
+          "$ref": "#/$defs/ParkedRecordWas",
+          "description": "What the record was: `missing`, `damaged`, or `whole` when it read but a bay still held\nparked work of its own."
+        },
+        "recovered": {
+          "description": "How many parked parcels the store held that no kept entry named, listed again as\nrecovered: work popped or dropped before the damage comes back this way too.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "set_aside": {
+          "description": "Where the damaged record was copied to; absent when it was missing or read whole.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unreadable": {
+          "description": "How many objects or pack indexes the store scan could not read, and skipped.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "record",
+        "kept",
+        "recovered",
+        "dropped",
+        "unreadable",
+        "merged_bays"
+      ],
+      "type": "object"
+    },
+    "ParkedRecordWas": {
+      "description": "What the parked-work record was before `heal` rebuilt it.",
+      "oneOf": [
+        {
+          "const": "missing",
+          "description": "There was none.",
+          "type": "string"
+        },
+        {
+          "const": "damaged",
+          "description": "It did not read.",
+          "type": "string"
+        },
+        {
+          "const": "whole",
+          "description": "It read whole, but a bay still held parked work of its own.",
+          "type": "string"
+        }
+      ]
+    },
     "Rebuilt": {
       "description": "A ref this run rebuilt.",
       "properties": {
@@ -2598,6 +2673,17 @@ A command not listed here either reports only the generic human-message shape `{
         }
       ],
       "description": "The operation this run settled: one interrupted in this bay before it finished, which every\ncommand that changes the bay or commits staged content refused over until now."
+    },
+    "parked_rebuilt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ParkedRebuilt"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The parked-work record, which was missing, damaged or incomplete and this run rebuilt from\nthe entries that still read, the bays' own leftovers and the parked parcels the store holds."
     },
     "record_rebuilt": {
       "anyOf": [
@@ -3351,7 +3437,7 @@ A command not listed here either reports only the generic human-message shape `{
         },
         {
           "const": "parked",
-          "description": "A parcel parked in a checkout.",
+          "description": "Parked work, which every bay shares; the description names it.",
           "type": "string"
         },
         {
@@ -4672,12 +4758,22 @@ A command not listed here either reports only the generic human-message shape `{
         "description": {
           "type": "string"
         },
+        "name": {
+          "description": "The name the work is parked under.",
+          "type": "string"
+        },
         "parcel": {
           "type": "string"
+        },
+        "recovered": {
+          "description": "Whether `heal` found the parcel in the store rather than in the parked-work record: it may\nbe work that was popped or dropped before the record was lost.",
+          "type": "boolean"
         }
       },
       "required": [
         "parcel",
+        "name",
+        "recovered",
         "description"
       ],
       "type": "object"
@@ -7424,7 +7520,7 @@ A command not listed here either reports only the generic human-message shape `{
         },
         {
           "const": "parked",
-          "description": "A parcel parked in a checkout.",
+          "description": "Parked work, which every bay shares; the description names it.",
           "type": "string"
         },
         {
@@ -7715,7 +7811,7 @@ A command not listed here either reports only the generic human-message shape `{
         },
         {
           "const": "parked",
-          "description": "A parcel parked in a checkout.",
+          "description": "Parked work, which every bay shares; the description names it.",
           "type": "string"
         },
         {

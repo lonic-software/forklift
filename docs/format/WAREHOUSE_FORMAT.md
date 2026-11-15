@@ -264,6 +264,7 @@ name in a row is a constant, and every path in every fixture matches a row.
 | `origin` | rewritable | `origin_utils::FILE_NAME` |
 | `origin-move` | rewritable | `origin_move::FILE_NAME` |
 | `franchise` | rewritable | `franchise_utils::FILE_NAME_FRANCHISE` |
+| `parked` | rewritable | `park_utils::FILE_NAME_PARKED` |
 | `mirror-roots` | rewritable | `mirror_utils::FILE_NAME_MIRROR_ROOTS` |
 | `mirror.git/**` | foreign | `mirror_utils::FOLDER_NAME_MIRROR_REPOSITORY` |
 | `.gitignore` | foreign | `warehouse_utils::FILE_NAME_GIT_SELF_IGNORE` |
@@ -274,14 +275,13 @@ name in a row is a constant, and every path in every fixture matches a row.
 | `taint/`, `taint/<name>` | rewritable | `taint_utils::FOLDER_NAME_TAINT` |
 | `graph/`, `graph/<xx>` | derived | `globals::FOLDER_NAME_GRAPH_ROOT` |
 | `bundles/`, `bundles/latest`, `bundles/partial` | derived | `bundle_utils::FOLDER_NAME_BUNDLES`, `bundle_utils::FILE_NAME_LATEST`, `bundle_utils::FILE_NAME_DOWNLOAD` |
-| `store.lock`, `serve.lock`, `store-access.lock`, `refs.lock`, `mirror.lock`, `origin-move.lock` | lock | `lock_utils::FILE_NAME_STORE_LOCK`, `lock_utils::FILE_NAME_SERVE_LOCK`, `lock_utils::FILE_NAME_STORE_ACCESS_LOCK`, `lock_utils::FILE_NAME_REF_LOCK`, `lock_utils::FILE_NAME_MIRROR_LOCK`, `lock_utils::FILE_NAME_MOVE_LOCK` |
+| `store.lock`, `serve.lock`, `store-access.lock`, `refs.lock`, `mirror.lock`, `origin-move.lock`, `parked.lock` | lock | `lock_utils::FILE_NAME_STORE_LOCK`, `lock_utils::FILE_NAME_SERVE_LOCK`, `lock_utils::FILE_NAME_STORE_ACCESS_LOCK`, `lock_utils::FILE_NAME_REF_LOCK`, `lock_utils::FILE_NAME_MIRROR_LOCK`, `lock_utils::FILE_NAME_MOVE_LOCK`, `lock_utils::FILE_NAME_PARKED_LOCK` |
 | `bays/`, `bays/<name>/`, `bays/<name>/path` | rewritable | `globals::FOLDER_NAME_BAYS_ROOT`, `bay_utils::FILE_NAME_BAY_PATH` |
 | `{bay}inventory/`, `{bay}inventory/metadata` | rewritable | `globals::FOLDER_NAME_INVENTORY_ROOT`, `file_utils::FILE_NAME_INVENTORY_METADATA` |
 | `{bay}inventory/inv_/`, `{bay}inventory/inv_/<xx>/`, `{bay}inventory/inv_/<xx>/<hash>/`, `{bay}inventory/inv_/<xx>/<hash>/data` | rewritable | `file_utils::FOLDER_NAME_INVENTORY_STORE`, `file_utils::FILE_NAME_INVENTORY_DATA` |
 | `{bay}inventory/incomplete-load` | rewritable | `load_guard_utils::FILE_NAME_INCOMPLETE_LOAD_MARKER` |
 | `{bay}position` | rewritable | `pallet_utils::FILE_NAME_POSITION` |
 | `{bay}scope` | rewritable | `scope_utils::FILE_NAME_BAY_SCOPE` |
-| `{bay}parked` | rewritable | `park_utils::FILE_NAME_PARKED` |
 | `{bay}cherry-pick` | rewritable | `cherry_pick_utils::FILE_NAME_CHERRY_PICK` |
 | `{bay}consolidation` | rewritable | `merge_utils::FILE_NAME_CONSOLIDATION` |
 | `{bay}consolidation-skeleton` | rewritable | `merge_utils::FILE_NAME_SKELETON` |

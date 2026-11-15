@@ -227,7 +227,7 @@ Park the idea again for later; `park list` shows what is parked:
 $ forklift park
 Parked the work in progress as … and reset to the pallet head.
 $ forklift park list
-… Parked changes on pallet "main".
+… main …
 ```
 
 Reference: [`park`](cli.md#park--stash-pa) and [`undo`](cli.md#undo--reverse-the-last-operation).

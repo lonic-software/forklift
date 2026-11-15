@@ -35,7 +35,7 @@ use crate::util::lock_utils::{RefLock, ServeLock, StoreAccessExclusive, StoreLoc
 use crate::util::progress_utils::Progress;
 use crate::util::{
     applied_redactions, bay_utils, cache_miss, file_utils, gc_utils, object_utils, office_utils, pack_utils,
-    pallet_utils, prune_utils, record_utils, recovery_utils, redaction_utils, withholding,
+    pallet_utils, park_utils, prune_utils, record_utils, recovery_utils, redaction_utils, withholding,
 };
 use crate::util::applied_redactions::AppliedSet;
 
@@ -160,8 +160,8 @@ pub enum CopyHolder {
     /// A checkout's base.
     Base(Checkout),
 
-    /// A parcel parked in a checkout.
-    Parked(Checkout),
+    /// The parked work of the given name.
+    Parked(String),
 
     /// A consolidation in progress in a checkout.
     Consolidation(Checkout),
@@ -191,7 +191,7 @@ impl CopyHolder {
             CopyHolder::MetaHistory(name) => format!("the history of @{}", name),
             CopyHolder::AdoptedHistory => "the history the trust anchor adopts".to_string(),
             CopyHolder::Base(checkout) => format!("the base of {}", checkout.describe()),
-            CopyHolder::Parked(checkout) => format!("a parcel parked in {}", checkout.describe()),
+            CopyHolder::Parked(name) => format!("the parked work \"{}\"", name),
             CopyHolder::Consolidation(checkout) => format!("the consolidation in progress in {}", checkout.describe()),
             CopyHolder::Pick(checkout) => format!("the cherry-pick in progress in {}", checkout.describe()),
             CopyHolder::Staged(checkout) => format!("the work staged in {}", checkout.describe()),
@@ -257,6 +257,10 @@ pub fn deletion_census(targets: &HashSet<String>,
         }
     }
 
+    for parked in park_utils::read_parked()? {
+        census.parcel_tree(&parked.parcel, CopyHolder::Parked(parked.name))?;
+    }
+
     let checkouts = std::iter::once((Checkout::Main, forklift_root()))
         .chain(bay_utils::list_bays()?.into_iter().map(|name| (Checkout::Bay(name.clone()), bay_utils::bay_state_dir(&name))));
 
@@ -265,9 +269,6 @@ pub fn deletion_census(targets: &HashSet<String>,
 
         if let Some(base) = state.base.filter(|_| removal == Removal::Applied) {
             census.parcel_tree(&base, CopyHolder::Base(checkout.clone()))?;
-        }
-        for parked in state.parked {
-            census.parcel_tree(&parked, CopyHolder::Parked(checkout.clone()))?;
         }
         for parcel in state.consolidation {
             census.parcel_tree(&parcel, CopyHolder::Consolidation(checkout.clone()))?;

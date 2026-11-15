@@ -629,7 +629,7 @@ pub(crate) enum HolderKind {
     /// A checkout's base.
     Base,
 
-    /// A parcel parked in a checkout.
+    /// Parked work, which every bay shares; the description names it.
     Parked,
 
     /// A consolidation in progress in a checkout.
@@ -653,7 +653,7 @@ impl From<&CopyHolder> for HolderView {
             CopyHolder::MetaHistory(name) => (HolderKind::MetaHistory, Some(format!("@{}", name)), None),
             CopyHolder::AdoptedHistory => (HolderKind::AdoptedHistory, None, None),
             CopyHolder::Base(checkout) => (HolderKind::Base, None, bay(checkout)),
-            CopyHolder::Parked(checkout) => (HolderKind::Parked, None, bay(checkout)),
+            CopyHolder::Parked(_) => (HolderKind::Parked, None, None),
             CopyHolder::Consolidation(checkout) => (HolderKind::Consolidation, None, bay(checkout)),
             CopyHolder::Pick(checkout) => (HolderKind::Pick, None, bay(checkout)),
             CopyHolder::Staged(checkout) => (HolderKind::Staged, None, bay(checkout)),

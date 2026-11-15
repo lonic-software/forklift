@@ -18,7 +18,7 @@
 //! pack data/index file, or an inventory shard — the three shapes the taint schema can ever
 //! record) and, for the object-shaped ones, checks whether the object it names is genuinely absent
 //! (present elsewhere — another pack, or loose — is not a loss) and, if so, whether *any* durable
-//! ref source still reaches it: pallet heads (both namespaces), every bay's parked parcels,
+//! ref source still reaches it: pallet heads (both namespaces), the warehouse's parked parcels,
 //! every parcel a bay's in-progress consolidation or cherry-pick records, the trust anchor's adopted
 //! head (a re-genesis pin, §8.7), and every bay's staged inventory shards **enumerated from the
 //! files on disk**, never the registration ledger (`inventory_utils::ShardLedger`), which is blind
@@ -245,7 +245,7 @@ use crate::error::{CoreError, RefusalCode};
 use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::{
     audit_utils, bay_utils, fanout_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, mirror_utils, object_utils,
-    office_utils, pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sealed_utils, sign_utils, tag_utils,
+    office_utils, pack_utils, pallet_utils, park_utils, record_utils, remote_utils, scope_utils, sealed_utils, sign_utils, tag_utils,
     signature_table, taint_utils, tombstone_utils,
 };
 use crate::util::sealed_utils::{At, Held, Tolerated};
@@ -1512,7 +1512,7 @@ fn sync_nearest_ancestor(root: &Path, relative: &Path) -> Result<(), String> {
 /// the registration ledger) — see the module doc comment.
 struct WalkRoots {
     /// Parcel hashes to walk ancestry-and-tree-closure from, as user history: every user pallet
-    /// head, every bay's parked parcels, and every parcel a bay's in-progress consolidation or
+    /// head, the warehouse's parked parcels, and every parcel a bay's in-progress consolidation or
     /// cherry-pick records. A hash
     /// here that is itself absent is treated as an ordinary dangling reference — see
     /// [`walk_closure_for`]. Every one of these is a ref THIS warehouse's own commands set, so its
@@ -1745,7 +1745,7 @@ impl GcRootSources {
 ///
 /// # Returns
 /// * `Ok(GcRootSources)` - Every pallet head, every haul's proposed head not yet merged, the git
-///                         mirror's roots, every readable bay's parked-parcel/consolidation roots, every trust-pin root this call could establish, and every staged
+///                         mirror's roots, the parked parcels, every readable bay's consolidation roots, every trust-pin root this call could establish, and every staged
 ///                         shard leaf of every bay.
 /// * `Err(String)`        - Under either policy's fail-closed branch, if the trust file itself
 ///                         could not be read (always fail-closed regardless of `pin_policy` — see
@@ -1812,6 +1812,20 @@ pub(crate) fn gc_root_sources(
         },
     };
 
+    // The parked-work record is the only holder of a parked parcel, and every bay's work is in
+    // it. Read under `bay_policy`: gc and prune refuse on a damaged one, heal reads past it.
+    match park_utils::parked_parcels() {
+        Ok(parked) => parcels.extend(parked),
+        Err(e) => match bay_policy {
+            bay_utils::BayReadPolicy::FailClosed => return Err(e),
+            bay_utils::BayReadPolicy::Tolerate => degraded.push(format!(
+                "the parked work could not be read this run ({}); it was treated as holding nothing \
+                rather than blocking this command.",
+                e
+            )),
+        },
+    }
+
     let bay_scope = bay_utils::collect_bay_scoped_parcel_roots(bay_dirs, bay_policy)?;
     parcels.extend(bay_scope.roots);
     degraded.extend(bay_scope.degraded);
@@ -1836,7 +1850,7 @@ pub(crate) fn gc_root_sources(
 ///
 /// **Warehouse-scale, not bay-scale.** The taint this walk exists to resolve is over the
 /// *shared* object store (`forklift_root()`, invariant across every bay) — objects and pallet
-/// refs are shared, but a bay's parked parcels, staged inventory shards and in-progress
+/// refs are shared, and so is the parked work, but a bay's staged inventory shards and in-progress
 /// consolidation are bay-*local* (`.forklift/bays/<name>/…`; the main tree keeps them directly
 /// under `.forklift/`). Answering "is this shared object still referenced by *anything*
 /// durable" from only the active bay's local state would under-count references and could clear
@@ -1846,7 +1860,7 @@ pub(crate) fn gc_root_sources(
 ///
 /// **Invariant with [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set):**
 /// this walk's roots must stay a *superset* of gc's live-set roots (every pallet head, every
-/// head a haul not yet merged proposes, every bay's parked parcels, every parcel a bay's in-progress consolidation or cherry-pick records,
+/// head a haul not yet merged proposes, the parked parcels, every parcel a bay's in-progress consolidation or cherry-pick records,
 /// and every trust-pin root — the shared trust-anchor `adopts`, its `boundary` snapshot, and every key's revocation
 /// `distrust_boundary`, FORK-81 — every bay's staged inventory shard leaves, FORK-156, and every
 /// parcel the git mirror's roots record names, FORK-143). If
@@ -5156,12 +5170,10 @@ mod tests {
         crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
-    /// (ii) A parked hash planted in bay "b"'s `parked` file must still be found. Pins
-    /// `collect_walk_roots`'s per-bay `read_parked_in` enumeration. Red without it: the pre-fix
-    /// walk called `park_utils::read_parked()` once, scoped to the active bay only, so bay "b"'s
-    /// parked hash was never a root.
+    /// (ii) A parked hash the shared parked-work record lists must be found, with a bay beside the
+    /// main tree. Pins `gc_root_sources`' read of the record.
     #[test]
-    fn walk_finds_a_parked_hash_in_a_non_active_bay() {
+    fn walk_finds_a_parked_hash() {
         use crate::globals::StorageRootScope;
 
         let dir = std::env::temp_dir()
@@ -5177,13 +5189,12 @@ mod tests {
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&[&target_hash])).unwrap();
+        crate::util::park_utils::park_for_test(&[&target_hash]);
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
         let referenced = closure_references_any(&targets).unwrap().hashes;
 
-        assert!(referenced.contains(&target_hash),
-            "a parked hash in a non-active bay must still be found by the closure walk");
+        assert!(referenced.contains(&target_hash), "a parked hash must be found by the closure walk");
 
         crate::util::file_utils::remove_dir_all(&dir).ok();
     }
@@ -5191,15 +5202,15 @@ mod tests {
     /// (fail-closed/tolerant split — design call) `closure_references_any` is `forklift heal`'s
     /// own walk, and heal never deletes — so, unlike `gc_utils::collect_live_set` (still pinned
     /// fail-closed by `gc_utils::tests::
-    /// gc_fails_closed_and_deletes_nothing_on_an_unreadable_bay_parked_file`), a malformed
-    /// `parked` file in a *non-active* bay must no longer abort this walk: it is skipped
+    /// gc_fails_closed_and_deletes_nothing_on_an_unreadable_parked_record`), a malformed
+    /// `consolidation` file in a *non-active* bay must no longer abort this walk: it is skipped
     /// (contributing no roots) and named in the returned degraded-bay notes instead. This
     /// used to pin the opposite (fail-closed) behavior for this exact fixture, before the
     /// tolerant/fail-closed split — see `bay_utils::BayReadPolicy`'s own doc comment for why the
     /// two callers are allowed to differ. Red if `collect_walk_roots` ever went back to a single,
     /// unconditionally-propagating `?` on `collect_bay_scoped_parcel_roots`'s result.
     #[test]
-    fn walk_tolerates_an_unreadable_bay_parked_file_and_names_it_degraded() {
+    fn walk_tolerates_an_unreadable_bay_file_and_names_it_degraded() {
         use crate::globals::StorageRootScope;
 
         let dir = std::env::temp_dir()
@@ -5210,11 +5221,10 @@ mod tests {
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
-        // Bay "b"'s `parked` file is malformed (not 64 hex chars) — `read_parked_in` errors on it.
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&["not-a-valid-hash"])).unwrap();
+        std::fs::write(bay_b_dir.join("consolidation"), b"not a consolidation record\n").unwrap();
 
         let targets: BTreeSet<String> = ["a".repeat(64)].into_iter().collect();
         let walk = closure_references_any(&targets)
@@ -7851,12 +7861,12 @@ mod tests {
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
-        // Bay "b"'s `parked` file is malformed — the exact same corrupt-file shape both halves of
-        // this fix are about.
+        // Bay "b"'s `consolidation` file is malformed — the exact same corrupt-file shape both
+        // halves of this fix are about.
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&["not-a-valid-hash"])).unwrap();
+        std::fs::write(bay_b_dir.join("consolidation"), b"not a consolidation record\n").unwrap();
 
         // A genuinely vanished object recorded as tainted, unrelated to bay "b"'s own state — so
         // this run actually drives the closure walk (and so `collect_walk_roots`'s tolerance)
@@ -7885,7 +7895,7 @@ mod tests {
         // The other half: gc and compact must still refuse outright on the exact same corrupt
         // file — never weakened by this fix.
         let gc_result = crate::util::gc_utils::collect_garbage(0);
-        assert!(gc_result.is_err(), "gc must still fail closed on an unreadable bay's parked file");
+        assert!(gc_result.is_err(), "gc must still fail closed on an unreadable bay file");
 
         // `compact --all` (`all: true`) is the variant that actually computes the live set
         // (`collect_targets` only calls `collect_live_set` under `all` — an incremental compact
@@ -7893,17 +7903,16 @@ mod tests {
         // path). This is `compact --all`'s own fail-closed check, unweakened by this fix.
         let compact_all_result = pack_utils::compact(true, false, true, &Progress::NONE);
         assert!(compact_all_result.is_err(),
-            "compact --all must still fail closed on an unreadable bay's parked file");
+            "compact --all must still fail closed on an unreadable bay file");
 
         crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// The core Fix-A regression fixture — the sharper version of the one above, and the one that
     /// actually demonstrates permanent data loss rather than an overly broad refusal. Bay "b"'s
-    /// `parked` file has the vanished object's own hash as its first (otherwise valid) line,
-    /// followed by a malformed second line that makes `read_parked_in` reject the *whole* file —
-    /// so the walk never sees that hash as a root at all, exactly as if bay "b" had simply never
-    /// existed. Bay "b" is therefore the object's *only* durable reference.
+    /// `consolidation` file is malformed, so the walk never sees anything it would have named as
+    /// a root, exactly as if bay "b" had simply never existed. Bay "b" is therefore the object's
+    /// *only* durable reference.
     ///
     /// Before this fix, a narrower root set (missing exactly this one reference) made the walk's
     /// "not referenced" answer come back positive, not refused — so heal would call the object
@@ -7935,7 +7944,7 @@ mod tests {
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&[vanished_hash.as_str(), "not-a-valid-hash"])).unwrap();
+        std::fs::write(bay_b_dir.join("consolidation"), b"not a consolidation record\n").unwrap();
 
         let vanished_path = loose_remainder_path(&forklift, &vanished_hash).unwrap();
         plant_complete_taint(&forklift, &[vanished_path.to_str().unwrap()]);
@@ -8036,7 +8045,7 @@ mod tests {
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&["not-a-valid-hash"])).unwrap();
+        std::fs::write(bay_b_dir.join("consolidation"), b"not a consolidation record\n").unwrap();
 
         plant_torn_taint(&forklift, &[]);
 

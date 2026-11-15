@@ -3822,9 +3822,9 @@ fn park_saves_and_reapplies_work_in_progress() {
     let status = stdout(&warehouse.run(&["stocktake"]));
     assert!(status.contains("The inventory matches the pallet head"));
 
-    // The parked parcel is listed.
+    // The parked parcel is listed under its default name: the pallet and the time it was parked.
     let listing = stdout(&warehouse.run(&["park", "list"]));
-    assert!(listing.contains("Parked changes on pallet \"main\""));
+    assert!(listing.contains(" main 20"), "{}", listing);
 
     // Popping re-applies the changes, staged.
     assert_success(&warehouse.run(&["park", "pop"]));
@@ -3878,7 +3878,7 @@ fn park_pop_refuses_conflicting_head_changes() {
         std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(),
         "head moved\n"
     );
-    assert!(stdout(&warehouse.run(&["park", "list"])).contains("Parked changes"));
+    assert!(stdout(&warehouse.run(&["park", "list"])).contains(" main 20"));
 }
 
 #[test]

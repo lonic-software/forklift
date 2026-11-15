@@ -6393,6 +6393,40 @@ fn best_delta(target: &[u8], window: &VecDeque<WindowEntry>) -> Result<Option<De
     Ok(best)
 }
 
+/// Every object hash the active warehouse's store holds, loose or named by a pack index, sorted
+/// and once each, and how many pack indexes could not be read. For a scan of the whole store by
+/// object type (`park_utils::rebuild`), which reads each object it is handed.
+///
+/// # Returns
+/// * `Ok((hashes, unreadable))` - The hashes, and the count of unreadable indexes skipped.
+/// * `Err(String)`              - The objects or pack folder could not be listed.
+pub(crate) fn stored_object_hashes() -> Result<(Vec<String>, usize), String> {
+    let mut hashes: std::collections::BTreeSet<String> = enumerate_loose_objects()?.iter()
+        .map(|target| target.hash.iter().map(|byte| format!("{:02x}", byte)).collect())
+        .collect();
+    let mut unreadable = 0;
+
+    let folder = pack_folder();
+    let entries = match std::fs::read_dir(&folder) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((hashes.into_iter().collect(), 0)),
+        Err(e) => return Err(format!("Error while reading the pack folder \"{}\": {}", folder.to_string_lossy(), e)),
+    };
+
+    for entry in entries {
+        let path = entry.map_err(|e| format!("Error while listing the pack folder: {}", e))?.path();
+
+        if path.extension().and_then(|e| e.to_str()) == Some(FILE_EXTENSION_PACK_INDEX) {
+            match hashes_in_index_file(&path) {
+                Ok(named) => hashes.extend(named),
+                Err(_) => unreadable += 1,
+            }
+        }
+    }
+
+    Ok((hashes.into_iter().collect(), unreadable))
+}
+
 /// Enumerate the loose objects of the active warehouse: the files under the two-hex fan-out
 /// folders, excluding signature sidecars, in-progress temp files, and anything that is not a
 /// valid object hash. Each carries its compressed on-disk size (for the packing order).
@@ -11441,6 +11475,7 @@ pub(crate) mod tests {
         let temp = fresh_root("repack-serve-lock");
         let _scope = StorageRootScope::enter(&temp);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
+        crate::util::park_utils::create_if_not_exists(&crate::globals::forklift_root()).unwrap();
 
         let content = b"content packed beside a live server".to_vec();
         store_loose(&blake3::hash(&content).to_hex().to_string(), &content);
@@ -11468,6 +11503,7 @@ pub(crate) mod tests {
         let temp = fresh_root("repack-store-access");
         let _scope = StorageRootScope::enter(&temp);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
+        crate::util::park_utils::create_if_not_exists(&crate::globals::forklift_root()).unwrap();
 
         let content = b"unreachable, packed, and found present by another bay's dedup".to_vec();
         let hash = blake3::hash(&content).to_hex().to_string();
