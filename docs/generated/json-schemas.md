@@ -2389,6 +2389,10 @@ A command not listed here either reports only the generic human-message shape `{
           "minimum": 0,
           "type": "integer"
         },
+        "record": {
+          "$ref": "#/$defs/ParkedRecordWas",
+          "description": "What the record was: `missing`, `damaged`, or `whole` when it read but a bay still held\nparked work of its own."
+        },
         "recovered": {
           "description": "How many parked parcels the store held that no kept entry named, listed again as\nrecovered: work popped or dropped before the damage comes back this way too.",
           "format": "uint",
@@ -2410,6 +2414,7 @@ A command not listed here either reports only the generic human-message shape `{
         }
       },
       "required": [
+        "record",
         "kept",
         "recovered",
         "dropped",
@@ -2417,6 +2422,26 @@ A command not listed here either reports only the generic human-message shape `{
         "merged_bays"
       ],
       "type": "object"
+    },
+    "ParkedRecordWas": {
+      "description": "What the parked-work record was before `heal` rebuilt it.",
+      "oneOf": [
+        {
+          "const": "missing",
+          "description": "There was none.",
+          "type": "string"
+        },
+        {
+          "const": "damaged",
+          "description": "It did not read.",
+          "type": "string"
+        },
+        {
+          "const": "whole",
+          "description": "It read whole, but a bay still held parked work of its own.",
+          "type": "string"
+        }
+      ]
     },
     "Rebuilt": {
       "description": "A ref this run rebuilt.",
