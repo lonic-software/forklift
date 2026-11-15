@@ -824,7 +824,7 @@ mod tests {
 
         // A group's own arguments, which clap keeps off its subcommands, are its bare form's.
         let park = json("park");
-        assert!(park.contains(r#""run":"park {name}""#), "{park}");
+        assert!(park.contains(r#""run":"park {name} -- {paths}""#), "{park}");
         assert!(json("park-pop").contains(r#""run":"park pop -- {name}""#));
 
         let franchise = json("clone");

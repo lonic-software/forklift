@@ -3930,6 +3930,65 @@ fn a_park_reaching_outside_a_scoped_bay_is_never_popped_there_in_part() {
     assert_eq!(std::fs::read_to_string(warehouse.root.join("src/web/w.txt")).unwrap(), "web work\n");
 }
 
+/// A park given paths parks only those, in a full bay and in a scoped one, where a path outside
+/// the scope refuses. A path spelled like a subcommand is written "./list", and a bare `list` stays
+/// the subcommand.
+#[test]
+fn a_park_given_paths_parks_only_those() {
+    let warehouse = TestWarehouse::new("park-paths");
+    warehouse.write_file("src/api/a.txt", "api\n");
+    warehouse.write_file("src/web/w.txt", "web\n");
+    warehouse.write_file("list/l.txt", "l\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
+    let read = |root: &std::path::Path, path: &str| std::fs::read_to_string(root.join(path)).unwrap();
+
+    warehouse.write_file("src/api/a.txt", "api work\n");
+    warehouse.write_file("src/web/w.txt", "web work\n");
+    warehouse.write_file("list/l.txt", "l work\n");
+    assert_success(&warehouse.run(&["park", "--name", "api", "src/api"]));
+    assert_eq!(read(&warehouse.root, "src/api/a.txt"), "api\n");
+    assert_eq!(read(&warehouse.root, "src/web/w.txt"), "web work\n", "the rest stays");
+
+    assert_success(&warehouse.run(&["park", "--name", "l", "./list"]));
+    assert_eq!(read(&warehouse.root, "list/l.txt"), "l\n");
+    assert_eq!(read(&warehouse.root, "src/web/w.txt"), "web work\n");
+    let listed = warehouse.run(&["park", "list"]);
+    assert_success(&listed);
+    assert!(stdout(&listed).contains(" api\n") && stdout(&listed).contains(" l\n"), "{}", stdout(&listed));
+
+    // In a scoped bay a path outside the scope refuses, and one inside parks there.
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "scoped work\n").unwrap();
+    std::fs::write(scoped_dir.join("src/api/b.txt"), "untracked\n").unwrap();
+    let refused = warehouse.run_at(&scoped_dir, &["park", "src/web"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("scope"), "{}", stderr(&refused));
+    assert_success(&warehouse.run_at(&scoped_dir, &["park", "--name", "scoped", "src/api/a.txt"]));
+    assert_eq!(read(&scoped_dir, "src/api/a.txt"), "api\n");
+    assert_success(&warehouse.run_at(&scoped_dir, &["park", "pop", "scoped"]));
+    assert_eq!(read(&scoped_dir, "src/api/a.txt"), "scoped work\n");
+
+    // A path on the spine above the scope parks the part in scope, and keeps the head's siblings
+    // outside it: none is written into the bay, and none is deleted by the park.
+    assert_success(&warehouse.run_at(&scoped_dir, &["park", "--name", "spine", "src"]));
+    assert!(!scoped_dir.join("src/web").exists(), "nothing outside the scope is written into the bay");
+    let shown = warehouse.run_at(&scoped_dir, &["--json", "park", "show", "spine"]);
+    assert_success(&shown);
+    let shown: serde_json::Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    let files: Vec<_> = shown["data"]["files"].as_array().unwrap().iter()
+        .map(|file| file["path"].as_str().unwrap().to_string()).collect();
+    assert_eq!(files, vec!["src/api/a.txt".to_string()], "the park changes only the file in scope");
+    assert_success(&warehouse.run_at(&scoped_dir, &["park", "pop", "spine"]));
+    assert_eq!(read(&scoped_dir, "src/api/a.txt"), "scoped work\n");
+
+    assert_success(&warehouse.run(&["park", "pop", "api"]));
+    assert_eq!(read(&warehouse.root, "src/api/a.txt"), "api work\n");
+}
+
 #[test]
 fn park_pop_refuses_conflicting_head_changes() {
     let warehouse = TestWarehouse::new("park-conflict");

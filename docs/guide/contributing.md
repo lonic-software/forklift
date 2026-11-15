@@ -541,10 +541,11 @@ changelog), `SERVER.md` (server ops), `MACHINE_INTERFACE.md` (`--json`/MCP),
    surface tests (`cargo test -p forklift --bin forklift surface_check`) fail until it agrees
    with the binary. A new name may make a prefix people
    type ambiguous (`pi` stops meaning `pick` once `pin` exists); that is expected, because
-   prefixes are only for typing. A command with subcommands takes no positional argument, and
-   each of its options takes no value or exactly one, so the prefix expansion in
-   `crates/forklift/src/prefix.rs` can tell its subcommand from its arguments; that module's
-   tests hold it. A flag never switches a command into a different operation: an on/off flag
+   prefixes are only for typing. Each option of a command with subcommands takes no value or
+   exactly one, so the prefix expansion in `crates/forklift/src/prefix.rs` can tell its
+   subcommand from its arguments; that module's tests hold it. Such a command may take positional
+   arguments too (`park <paths>…`), and there the expansion matches only a subcommand's exact
+   name, since a path may start one. A flag never switches a command into a different operation: an on/off flag
    declared to conflict with a positional argument (`--abort` against a URL) is a second
    operation, and the surface tests refuse it, so make it a subcommand of its own.
 9. **Decide whether agents drive it.** `forklift mcp` generates its tools from the command

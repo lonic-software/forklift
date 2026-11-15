@@ -815,6 +815,100 @@ fn splice_spine_level(head: Option<&TreeItem>,
     Ok(Some(tree))
 }
 
+/// The tree `base` with the entry at each of `paths` taken from `source` instead: the file or
+/// subtree `source` holds there, or none where it holds none. Every other entry is `base`'s, by
+/// hash. A partial park's parked tree, `base` its head and `source` the tree staging builds. A
+/// directory left empty is pruned, as the tree build prunes one; the root never is.
+///
+/// Only the trees on the way to `paths` are loaded, a level at a time, so both trees must be
+/// stored; each new tree is staged into `batch`. `paths` are warehouse path keys, none of them the
+/// root.
+///
+/// # Returns
+/// * `Ok(String)`  - The hash of the spliced root tree.
+/// * `Err(String)` - If a tree could not be loaded or staged, or a path's ancestor is a file in one
+///                   tree and a directory in the other.
+pub fn splice_paths(base: &str,
+                    source: &str,
+                    paths: &[String],
+                    batch: &Arc<file_utils::WriteBatch>) -> Result<String, String> {
+    let base = object_utils::load_tree(base)?;
+    let source = object_utils::load_tree(source)?;
+
+    match splice_paths_level(Some(&base), Some(&source), "", paths, batch)? {
+        Some(tree) => Ok(tree.hash),
+        None => {
+            let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+            store_tree(&mut tree, batch)?;
+            Ok(tree.hash)
+        }
+    }
+}
+
+/// One level of [`splice_paths`] at `key`: `None` when it ends up empty.
+fn splice_paths_level(base: Option<&TreeItem>,
+                      source: Option<&TreeItem>,
+                      key: &str,
+                      paths: &[String],
+                      batch: &Arc<file_utils::WriteBatch>) -> Result<Option<TreeItem>, String> {
+    let entries = |tree: Option<&TreeItem>| -> BTreeMap<String, TreeItem> {
+        tree.map(|tree| tree.get_files().chain(tree.get_subtrees())
+            .map(|(name, item)| (name.clone(), shallow_entry(item)))
+            .collect())
+            .unwrap_or_default()
+    };
+    let (base_entries, source_entries) = (entries(base), entries(source));
+    let names: BTreeSet<&String> = base_entries.keys().chain(source_entries.keys()).collect();
+
+    let mut tree = TreeItem::new(last_component(key).to_string(), String::new(), DirEntryType::Tree);
+
+    for name in names {
+        let child_key = join_key(key, name);
+        let (in_base, in_source) = (base_entries.get(name), source_entries.get(name));
+
+        if paths.iter().any(|path| scope_utils::is_at_or_under(&child_key, path)) {
+            if let Some(entry) = in_source {
+                tree.add_child(shallow_entry(entry));
+            }
+            continue;
+        }
+
+        let is_folder = |entry: Option<&TreeItem>| entry.is_some_and(|entry| entry.item_type == DirEntryType::Tree);
+        let on_the_way = paths.iter().any(|path| scope_utils::is_strictly_under(path, &child_key));
+
+        // Off the way to every path, or where neither tree has a folder for a path to be in.
+        if !on_the_way || !(is_folder(in_base) || is_folder(in_source)) {
+            if let Some(entry) = in_base {
+                tree.add_child(shallow_entry(entry));
+            }
+            continue;
+        }
+
+        if in_base.is_some_and(|entry| !is_folder(Some(entry))) || in_source.is_some_and(|entry| !is_folder(Some(entry))) {
+            return Err(format!(
+                "\"{}\" is a file on one side of the change and a folder on the other, so the paths under \
+                it cannot be taken alone.",
+                child_key
+            ));
+        }
+
+        let subtree = |entry: Option<&TreeItem>| entry.map(|entry| object_utils::load_tree(&entry.hash)).transpose();
+        let (base_subtree, source_subtree) = (subtree(in_base)?, subtree(in_source)?);
+
+        if let Some(spliced) = splice_paths_level(base_subtree.as_ref(), source_subtree.as_ref(), &child_key, paths, batch)? {
+            tree.add_child(spliced);
+        }
+    }
+
+    if is_tree_empty(&tree) {
+        return Ok(None);
+    }
+
+    store_tree(&mut tree, batch)?;
+
+    Ok(Some(tree))
+}
+
 /// Emit one out-of-scope sibling into the spliced spine level: the merge skeleton's resolution
 /// wins when present (`Some((hash, type))` sets it to theirs' entry, `None` deletes it — omit),
 /// otherwise the head's entry is copied verbatim by hash. Never loads or descends the object.

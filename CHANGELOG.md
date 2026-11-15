@@ -12,6 +12,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Added
 
+- **`park` can park part of the work in progress.** `park <paths>…` parks and resets only the
+  changes at or under the paths; every other file keeps its working content and its staging. An
+  interrupted partial park is finished over its paths only. A path that names nothing refuses, so
+  a misspelled path is never skipped silently. At `park`, a subcommand must be
+  spelled out (`park a` parks `a`, never `park apply`), and a path spelled like one is `./list`.
 - **Parks can be named, shown, applied, popped and dropped by name.** `park --name <name>` parks
   under a name of your choice; `park show`, `park apply`, `park pop` and `park drop` each take a
   park's name, and without one the newest park. `apply` re-applies a park and keeps it, `pop`

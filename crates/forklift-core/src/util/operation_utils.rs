@@ -31,14 +31,14 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::util::pallet_utils::{self, AnchorPrecondition, BayPosition, OfficePrecondition, RefPreconditions};
 use crate::util::shift_utils::{self, CarriedEntry, CarriedItem, FileOp, TreeProvenance};
-use crate::util::{cherry_pick_utils, file_utils, inventory_utils, merge_utils, object_utils, park_utils, record_utils};
+use crate::util::{cherry_pick_utils, file_utils, inventory_utils, merge_utils, object_utils, park_utils, path_utils, record_utils};
 
 /// The name of the marker file in the bay-local state dir.
 const FILE_NAME_OPERATION: &str = "operation";
 
 /// The [`record_utils`] kind and version of the marker file.
 const OPERATION_RECORD: &str = "operation";
-const OPERATION_VERSION: u32 = 4;
+const OPERATION_VERSION: u32 = 5;
 
 /// The operations that raise the marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +129,11 @@ pub struct Operation {
     /// knows the work is safe in the record without reading it.
     pub listed: bool,
 
+    /// Park: the warehouse paths a partial park parked, none of them covering another; empty
+    /// for a park of the whole work in progress. Its reset, recovery's included, touches nothing
+    /// outside them.
+    pub pathspec: Vec<String>,
+
     /// Merge and cherry-pick: the other side's tree. Every path the merge can have written differs
     /// between it and `source_tree`, which bounds what a rollback puts back.
     pub their_tree: Option<String>,
@@ -158,6 +163,7 @@ impl Operation {
             parked: None,
             park_name: None,
             listed: false,
+            pathspec: Vec::new(),
             their_tree: None,
             office: OfficePrecondition::NotConsumed,
             anchor: AnchorPrecondition::NotConsumed,
@@ -197,7 +203,9 @@ impl Operation {
                 AnchorPrecondition::Absent => "absent".to_string(),
                 AnchorPrecondition::Bytes(bytes) => format!("bytes {}", crate::util::sign_utils::to_hex(bytes)),
             },
-        ].into_iter().chain(self.carried.iter().flat_map(|carried| match &carried.entry {
+            // The pathspec's length, then its paths, so the carried triples after it stay apart.
+            self.pathspec.len().to_string(),
+        ].into_iter().chain(self.pathspec.iter().cloned()).chain(self.carried.iter().flat_map(|carried| match &carried.entry {
             // Three entries each: the path, then the hash and the "<type> <state>" codes, both
             // empty for a path the inventory held no entry for.
             Some(item) => [carried.path.clone(), item.hash.clone(), format!("{} {}", item.item_type.get_code(), item.state.get_code())],
@@ -208,16 +216,32 @@ impl Operation {
     fn from_bytes(bytes: &[u8]) -> Result<Operation, String> {
         let entries = record_utils::from_bytes(bytes, OPERATION_RECORD, OPERATION_VERSION).map_err(|e| e.describe())?;
 
-        if entries.len() < 15 || (entries.len() - 15) % 3 != 0 {
+        if entries.len() < 16 {
             return Err("is malformed.".to_string());
         }
 
         let mut entries = entries.into_iter();
-        let [kind, phase, source_pallet, source_base, source_tree, target_pallet, target_base, target_tree, expected, parked, park_name, listed, their_tree, office, anchor] =
+        let [kind, phase, source_pallet, source_base, source_tree, target_pallet, target_base, target_tree, expected, parked, park_name, listed, their_tree, office, anchor, pathspec_len] =
             std::array::from_fn(|_| entries.next().expect("counted above"));
-        let carried: Vec<String> = entries.collect();
+        let rest: Vec<String> = entries.collect();
+
+        // A count written by `to_bytes` is plain decimal: no sign, no leading zero.
+        let pathspec_len = match pathspec_len.parse::<usize>() {
+            Ok(len) if len.to_string() == pathspec_len && len <= rest.len() => len,
+            _ => return Err("is malformed.".to_string()),
+        };
+        let (pathspec, carried) = rest.split_at(pathspec_len);
+
+        if carried.len() % 3 != 0 || !pathspec_is_well_formed(pathspec) {
+            return Err("is malformed.".to_string());
+        }
 
         let kind = OperationKind::parse(&kind).ok_or(format!("names an operation this version of Forklift does not know (\"{}\").", kind.escape_debug()))?;
+
+        // Only a park records paths: on any other operation they would be read and never obeyed.
+        if kind != OperationKind::Park && !pathspec.is_empty() {
+            return Err("is malformed.".to_string());
+        }
 
         let rolling_back = match phase.as_str() {
             "running" => false,
@@ -252,6 +276,7 @@ impl Operation {
                 "listed" => true,
                 _ => return Err("is malformed.".to_string()),
             },
+            pathspec: pathspec.to_vec(),
             their_tree: hash(their_tree)?,
             office: match office.as_str() {
                 "" => OfficePrecondition::NotConsumed,
@@ -635,8 +660,15 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
                 // The work is safe in the list, so the reset to the head is finished: a file still
                 // holding the parked content goes back to the head.
                 let head_tree = tree_or_empty(operation.source_tree.as_deref())?;
+                // The two trees differ only under a partial park's paths, so the put-back stays
+                // inside them, and so must the staging reset: a whole rebuild would also reset
+                // what was staged outside them, which the park left alone.
                 put_back(&object_utils::load_parcel(parcel)?.tree_hash, &head_tree, &[])?;
-                Ok((RecoveryOutcome::RolledForward, rebuild_staging(Some(&head_tree), &[])?))
+                let unheld = match operation.pathspec.as_slice() {
+                    [] => rebuild_staging(Some(&head_tree), &[])?,
+                    paths => shift_utils::reset_staging_under(&head_tree, paths, TreeProvenance::Verify)?,
+                };
+                Ok((RecoveryOutcome::RolledForward, unheld))
             } else {
                 // The working files were never touched, and staging holds only what they hold.
                 Ok((RecoveryOutcome::Cleared, Vec::new()))
@@ -798,6 +830,17 @@ fn put_back(from: &str, to: &str, carried: &[CarriedEntry]) -> Result<(), String
     shift_utils::apply_ops(&ops, &removed_dirs)
 }
 
+/// Whether `pathspec` is as a partial park records it: warehouse path keys, none the root, none
+/// with an empty, `.` or `..` component, and none at or under another.
+fn pathspec_is_well_formed(pathspec: &[String]) -> bool {
+    let key_is_well_formed = |key: &String| !key.is_empty()
+        && key.split('/').all(|component| !matches!(component, "" | "." | ".."));
+
+    pathspec.iter().all(key_is_well_formed) && pathspec.iter().enumerate().all(|(index, key)| {
+        pathspec.iter().enumerate().all(|(other_index, other)| index == other_index || !path_utils::covers(other, key))
+    })
+}
+
 /// `tree`, or the empty tree for `None`.
 fn tree_or_empty(tree: Option<&str>) -> Result<String, String> {
     match tree {
@@ -885,9 +928,51 @@ mod tests {
             assert_eq!(Operation::from_bytes(&operation.to_bytes()), Ok(operation.clone()));
         }
 
+        // The anchor is the entry before the pathspec's count, the last one here.
         let text = String::from_utf8(operation.to_bytes()).unwrap();
-        let unknown = format!("{}bytes zz\n", text.trim_end_matches('\n').rsplit_once('\n').unwrap().0.to_string() + "\n");
+        let mut lines: Vec<&str> = text.strip_suffix('\n').unwrap().split('\n').collect();
+        assert_eq!(lines.pop(), Some("0"));
+        assert_eq!(lines.pop(), Some(""), "the anchor, not consumed");
+        let unknown = [lines.as_slice(), &["bytes zz", "0"]].concat().join("\n") + "\n";
         assert_eq!(Operation::from_bytes(unknown.as_bytes()), Err("is malformed.".to_string()));
+    }
+
+    // Revert: write the pathspec but drop it on the read → the round trip loses it.
+    #[test]
+    fn a_park_record_reads_back_its_pathspec() {
+        let mut operation = operation();
+        operation.kind = OperationKind::Park;
+        operation.pathspec = vec!["a".to_string(), "b/c.txt".to_string()];
+        operation.carried = vec![CarriedEntry { path: "mv/from.txt".to_string(), entry: None }];
+        assert_eq!(Operation::from_bytes(&operation.to_bytes()), Ok(operation.clone()));
+
+        // The count, the paths, then the carried triple.
+        let text = String::from_utf8(operation.to_bytes()).unwrap();
+        let lines: Vec<&str> = text.strip_suffix('\n').unwrap().split('\n').collect();
+        let head = &lines[..lines.len() - 6];
+        assert_eq!(&lines[lines.len() - 6..], ["2", "a", "b/c.txt", "mv/from.txt", "", ""]);
+        let with = |tail: &[&str]| [head, tail].concat().join("\n") + "\n";
+        assert_eq!(with(&["2", "a", "b/c.txt", "mv/from.txt", "", ""]), text, "the edits below change only the tail");
+
+        for malformed in [
+            // A count past the entries, a count that is not plain decimal, and one that leaves
+            // the carried entries out of step.
+            with(&["7", "a", "b/c.txt", "mv/from.txt", "", ""]),
+            with(&["02", "a", "b/c.txt", "mv/from.txt", "", ""]),
+            with(&["+2", "a", "b/c.txt", "mv/from.txt", "", ""]),
+            with(&["1", "a", "b/c.txt", "mv/from.txt", "", ""]),
+            // Paths no partial park records: the root, a dot component, and one under another.
+            with(&["2", "", "b/c.txt", "mv/from.txt", "", ""]),
+            with(&["2", "a", "b/../c.txt", "mv/from.txt", "", ""]),
+            with(&["2", "a", "a/c.txt", "mv/from.txt", "", ""]),
+            with(&["2", "a", "a", "mv/from.txt", "", ""]),
+        ] {
+            assert_eq!(Operation::from_bytes(malformed.as_bytes()), Err("is malformed.".to_string()), "{}", malformed);
+        }
+
+        // Only a park records paths.
+        operation.kind = OperationKind::Lower;
+        assert_eq!(Operation::from_bytes(&operation.to_bytes()), Err("is malformed.".to_string()));
     }
 
     // Revert: write the carried entries but drop them on the read → the round trip loses them.

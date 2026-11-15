@@ -5,7 +5,8 @@
 //! listing them, never a guess. Hidden aliases (git's words) match only when spelled out: they are
 //! there for typing git's word, and a prefix of one would be a short form nobody can see. Visible
 //! aliases are typed whole too: they are already short, and a prefix is of a command's name. Flags
-//! are never expanded.
+//! are never expanded. Where a command takes words of its own besides its subcommands (`park`
+//! takes paths), a word is its subcommand only when spelled out: there `a` is a path, not `apply`.
 //!
 //! Prefixes are for typing. Adding a command can make a working prefix ambiguous, so every machine
 //! surface spells full names, and the checks that hold hints and MCP argv to the tree parse with
@@ -80,7 +81,12 @@ pub fn expand(command: &Command, args: &mut [OsString]) -> Result<(), clap::Erro
             index += if takes_next_word(level, &word) { 2 } else { 1 };
             continue;
         }
-        match subcommand(level, &word) {
+        let resolved = if level.get_positionals().next().is_some() {
+            level.find_subcommand(&word).map_or(Resolved::Unknown, Resolved::Command)
+        } else {
+            subcommand(level, &word)
+        };
+        match resolved {
             Resolved::Command(sub) => {
                 args[index] = OsString::from(sub.get_name());
                 path.push(sub.get_name());
@@ -172,6 +178,17 @@ mod tests {
         expands_to("q", "query");
         expands_to("bl", "blame");
         expands_to("au", "audit");
+    }
+
+    #[test]
+    fn a_command_taking_words_of_its_own_expands_no_prefix() {
+        // `park` takes paths, and `a` or `sh` may be one: only a subcommand spelled out is one.
+        expands_to("park a", "park a");
+        expands_to("park sh b", "park sh b");
+        expands_to("park pop", "park pop");
+        expands_to("park --name wip lis", "park --name wip lis");
+        // The park level itself is still reached by a prefix.
+        expands_to("par list", "park list");
     }
 
     /// An exact name or alias wins over the longer names it starts, hidden aliases included.
@@ -271,8 +288,8 @@ mod tests {
     }
 
     /// The resolver steps over an option's value by reading whether the option takes one, so an
-    /// option of a command with subcommands must take exactly one word, and such a command must
-    /// take no positional argument a command word could be mistaken for.
+    /// option of a command with subcommands must take exactly one word. Such a command may take
+    /// positional arguments: there the resolver expands no prefix.
     #[test]
     fn every_family_lets_the_walk_find_its_subcommand() {
         let cli = built();
@@ -287,7 +304,11 @@ mod tests {
             }
             for arg in family.get_arguments() {
                 let name = family.get_name();
-                assert!(!arg.is_positional(), "`{name}` has subcommands and the positional {}", arg.get_id());
+                // A family's own positional words stop the walk there: it expands no prefix at
+                // such a level, so a word that is no subcommand's exact name is clap's to parse.
+                if arg.is_positional() {
+                    continue;
+                }
                 if arg.get_action().takes_values() {
                     assert!(!arg.is_require_equals_set(),
                         "`{name} --{}` needs `=`; the walk steps over the next word", arg.get_id());

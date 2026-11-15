@@ -1780,7 +1780,9 @@ mod tests {
         assert_eq!(tool("tag_create").path, ["tag", "create"]);
 
         // A family's own arguments, which clap keeps off its subcommands, are its bare tool's.
-        assert_eq!(tool("park").params.iter().map(|param| param.key.as_str()).collect::<Vec<_>>(), ["name"]);
+        assert_eq!(tool("park").params.iter().map(|param| param.key.as_str()).collect::<Vec<_>>(), ["name", "paths"]);
+        // Its paths come after "--", so one spelled like a subcommand is still a path.
+        assert_eq!(tool("park").argv(json!({ "paths": ["list"] }).as_object().unwrap()).unwrap(), ["park", "--", "list"]);
         assert_eq!(tool("park_pop").params.iter().map(|param| param.key.as_str()).collect::<Vec<_>>(), ["name"]);
 
         // An argument no agent passes is left out of its tool, which is served without it; passing

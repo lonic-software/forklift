@@ -14,6 +14,7 @@ use forklift_core::util::{
 };
 use forklift_core::util::lock_utils::ParkedLock;
 use forklift_core::util::scope_utils::PathScope;
+use forklift_core::util::path_utils::{self, WarehousePath};
 use std::collections::BTreeSet;
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::commands::merge_abort;
@@ -24,11 +25,14 @@ use crate::output::{self, CommandOutput};
 
 /// Save the work in progress (the staged and unstaged changes of *tracked* files) as a
 /// parked parcel listed as `name`, or under a default name, and reset the warehouse to the pallet
-/// head. Untracked files are left alone.
-pub async fn park_changes(name: Option<&str>) -> Result<(), String> {
+/// head. Untracked files are left alone. Given `paths`, only the changes at or under them are
+/// parked and reset; every other file keeps its working content and its staging.
+pub async fn park_changes(name: Option<&str>, paths: &[String]) -> Result<(), String> {
     if let Some(name) = name {
         park_utils::validate_name(name)?;
     }
+
+    let paths = pathspec(paths)?;
 
     // The cheapest possible pre-check runs first, exactly like `stack_utils::stack_parcel`'s
     // identical guard: `park` builds a tree straight from the staged inventory and durably
@@ -75,13 +79,17 @@ pub async fn park_changes(name: Option<&str>) -> Result<(), String> {
 
     let head_tree_hash = object_utils::load_parcel(&head)?.tree_hash;
 
-    // Stage the whole work in progress: modified tracked files are rehashed, deleted
-    // tracked files become staged removals. Untracked files stay untracked. Its own blob
+    // Stage the work in progress, or only the part under the paths: modified tracked files are
+    // rehashed, deleted tracked files become staged removals. Untracked files stay untracked. Its own blob
     // stores are already batched internally (DESIGN.html §5.0 D item 10, finding #3). The
     // rebuild below anchors before it, so a file edited after the refresh is never trusted.
     let anchor = file_utils::take_stat_anchor()?;
 
-    inventory_utils::refresh_tracked_entries(|path, hash| park_refusal(path, hash))?;
+    if paths.is_empty() {
+        inventory_utils::refresh_tracked_entries(park_refusal)?;
+    } else {
+        inventory_utils::refresh_tracked_entries_under(&paths, park_refusal)?;
+    }
 
     // In a scoped (sparse) bay the inventory holds only the in-scope subtree(s); splice it
     // onto the head's spine exactly like `stack` does (§3.2), so the parked parcel commits the
@@ -106,7 +114,7 @@ pub async fn park_changes(name: Option<&str>) -> Result<(), String> {
     // this read and the tree build the same rollup-based skip `stack` has: a subtree whose
     // shard's rollup already matches the head subtree hash is not read here, nor hashed or
     // (re)stored — its parent's tree includes it by hash. `park` as a whole still reads every
-    // shard: the conflict check and `refresh_tracked_entries` above both do.
+    // shard: the conflict check does, and a whole park's refresh above.
     let prepared = std::sync::Arc::new(inventory_utils::prepare_stack_inventory(Some((&head_tree_hash, &scope)))?);
 
     // `prepare_stack_inventory` stops collecting at the first conflict entry it finds (sorted key
@@ -125,8 +133,9 @@ pub async fn park_changes(name: Option<&str>) -> Result<(), String> {
     }
 
     // The per-directory tree hashes the build can return are `stack`-only bookkeeping (for
-    // stamping rollups after a successful stack): `park` overwrites every shard from head a few
-    // lines down (`replace_all_inventories`), so it passes `track_tree_hashes: false`.
+    // stamping rollups after a successful stack): `park` resets staging to the head below, whole
+    // or under its paths, and stamps no rollup from this build, so it passes
+    // `track_tree_hashes: false`.
     let (partial_root, _tree_hashes) = tree_utils::build_tree_from_inventory_deferred(&prepared, &batch, false).await?;
     let partial_root = partial_root.ok_or("There is nothing to park.".to_string())?;
 
@@ -134,8 +143,8 @@ pub async fn park_changes(name: Option<&str>) -> Result<(), String> {
     // the working copy, so a parked parcel naming lost content could never be popped back.
     tree_utils::require_staged_content_present(&partial_root, Some(&head_tree_hash))?;
 
-    let root_tree = if scope.is_full() {
-        partial_root
+    let staged_root_hash = if scope.is_full() {
+        partial_root.hash
     } else {
         // A park is a WIP snapshot, never a merge completion, so it has no out-of-scope skeleton:
         // every out-of-scope sibling is copied verbatim from the head. Runs sequentially (no
@@ -145,11 +154,32 @@ pub async fn park_changes(name: Option<&str>) -> Result<(), String> {
 
         tree_utils::build_scoped_root_tree(
             Some(&head_tree_hash), &partial_root, &scope, &overrides, &batch,
-        )?
+        )?.hash
     };
 
-    if root_tree.hash == head_tree_hash {
-        return Err("There is nothing to park: the warehouse matches the pallet head.".to_string());
+    let root_tree_hash = if paths.is_empty() {
+        staged_root_hash
+    } else {
+        // Only the trees on the way to the paths change: everything else is the head's, by hash,
+        // whatever is staged there. The splice takes them from the whole staged root, spliced
+        // onto the head's spine in a scoped bay, so a path on the spine above the scope carries
+        // the head's out-of-scope siblings with it. The splice reads the staged trees, so they are
+        // made durable first, and its own trees join a barrier of their own.
+        batch.finish()?;
+        let spliced = std::sync::Arc::new(file_utils::WriteBatch::new());
+        let root = tree_utils::splice_paths(&head_tree_hash, &staged_root_hash, &paths, &spliced)?;
+        spliced.finish()?;
+
+        refuse_unmatched(&paths, &head_tree_hash, &root)?;
+        root
+    };
+
+    if root_tree_hash == head_tree_hash {
+        return Err(if paths.is_empty() {
+            "There is nothing to park: the warehouse matches the pallet head.".to_string()
+        } else {
+            "There is nothing to park under those paths: they match the pallet head.".to_string()
+        });
     }
 
     // The barrier: every tree object staged above becomes durable and visible at its final
@@ -161,7 +191,7 @@ pub async fn park_changes(name: Option<&str>) -> Result<(), String> {
     // parked tree is judged whole, as a head's is: the refresh above judged only what it restaged.
     // Judged once the batch is readable; a refusal leaves the bay as it was.
     if let Some(guard) = redaction_utils::staging_guard()? {
-        if let Some((path, hash)) = guard.names_tree(&root_tree.hash)? {
+        if let Some((path, hash)) = guard.names_tree(&root_tree_hash)? {
             return Err(park_refusal(&path, &hash));
         }
     }
@@ -170,7 +200,7 @@ pub async fn park_changes(name: Option<&str>) -> Result<(), String> {
     // parcel: a staged removal leaves a path the head writes back, and untracked content (or,
     // on a case-insensitive volume, another spelling) may sit there now. A refusal here leaves
     // the bay as it was.
-    let (ops, removed_dirs) = shift_utils::diff_trees(Some(&root_tree.hash), &head_tree_hash)?;
+    let (ops, removed_dirs) = shift_utils::diff_trees(Some(&root_tree_hash), &head_tree_hash)?;
 
     alias_utils::refuse_collisions("Parking", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
     shift_utils::ensure_writes_present(&ops)?;
@@ -192,7 +222,7 @@ pub async fn park_changes(name: Option<&str>) -> Result<(), String> {
     // recorded explicitly, even though it is always the parking operator. The Park action names
     // the park, so a store scan can bring the name back with the parcel.
     let parcel = Parcel {
-        tree_hash: root_tree.hash.clone(),
+        tree_hash: root_tree_hash.clone(),
         parents: vec![head.clone()],
         actions: vec![
             ParcelAction {
@@ -242,6 +272,7 @@ pub async fn park_changes(name: Option<&str>) -> Result<(), String> {
         operation.target_tree = Some(head_tree_hash.clone());
         operation.parked = Some(object.hash.clone());
         operation.park_name = Some(name.clone());
+        operation.pathspec = paths.clone();
         operation_utils::raise(&operation)?;
 
         #[cfg(test)]
@@ -259,16 +290,75 @@ pub async fn park_changes(name: Option<&str>) -> Result<(), String> {
         tests::AFTER_LISTED.with(|seam| seam.take().map(|seam| seam())).transpose()?;
     }
 
-    // Reset the working directory and the inventory to the pallet head.
+    // Reset the working directory and the inventory to the pallet head: the ops, diffed from the
+    // parked tree, touch only the paths when there are any, and so does the staging reset.
     shift_utils::apply_ops(&ops, &removed_dirs)?;
 
-    let shards = shift_utils::build_inventories_for_tree(&head_tree_hash, shift_utils::TreeProvenance::Written(anchor))?.shards;
-    inventory_utils::replace_all_inventories(&shards)?;
+    if paths.is_empty() {
+        let shards = shift_utils::build_inventories_for_tree(&head_tree_hash, shift_utils::TreeProvenance::Written(anchor))?.shards;
+        inventory_utils::replace_all_inventories(&shards)?;
+    } else {
+        shift_utils::reset_staging_under(&head_tree_hash, &paths, shift_utils::TreeProvenance::Written(anchor))?;
+    }
     operation_utils::finish()?;
 
-    output::message(format!(
-        "Parked the work in progress as \"{}\" ({}) and reset to the pallet head.", sanitize(&name), object.hash
-    ));
+    output::message(if paths.is_empty() {
+        format!("Parked the work in progress as \"{}\" ({}) and reset to the pallet head.", sanitize(&name), object.hash)
+    } else {
+        format!(
+            "Parked the work in progress under the given paths as \"{}\" ({}) and reset them to the pallet head; \
+            every other change is left as it was.",
+            sanitize(&name), object.hash
+        )
+    });
+
+    Ok(())
+}
+
+/// The warehouse path keys of a partial park's `raw` paths, each in the bay's scope, sorted, and none
+/// at or under another: empty, a whole park, when there are none or one is the warehouse root.
+fn pathspec(raw: &[String]) -> Result<Vec<String>, String> {
+    let mut keys = BTreeSet::new();
+
+    for raw in raw {
+        let path = WarehousePath::from_user_input(raw)?;
+        if path.is_root() {
+            return Ok(Vec::new());
+        }
+        crate::commands::scope::ensure_path_in_scope(path.as_key())?;
+        keys.insert(path.as_key().to_string());
+    }
+
+    // Sorted, an ancestor comes before everything under it.
+    let mut paths: Vec<String> = Vec::new();
+    for key in keys {
+        if !paths.iter().any(|path| path_utils::covers(path, &key)) {
+            paths.push(key);
+        }
+    }
+
+    Ok(paths)
+}
+
+/// Refuse a partial park naming a path no tracked file or folder is at: in neither the head nor
+/// the parked tree, which holds what is staged there. A misspelled path would otherwise be parked
+/// as nothing, silently. The working directory is not asked: an untracked file is never parked,
+/// and on a case-insensitive volume a path spelled in another case is found there but matches no
+/// key, so its changes would be left out.
+fn refuse_unmatched(paths: &[String], head_tree: &str, parked_tree: &str) -> Result<(), String> {
+    let holds = |tree: &str, key: &str| -> Result<bool, String> {
+        Ok(tree_utils::resolve_subtree_hash(tree, key)?.is_some() || object_utils::resolve_tree_file(tree, key)?.is_some())
+    };
+
+    for path in paths {
+        if !holds(head_tree, path)? && !holds(parked_tree, path)? {
+            return Err(format!(
+                "\"{}\" names nothing tracked: no file or folder is there in the pallet head or in the \
+                work in progress. Nothing was parked.",
+                sanitize(path)
+            ));
+        }
+    }
 
     Ok(())
 }
@@ -753,7 +843,7 @@ mod tests {
         let tree = work_in_progress_on_main(&warehouse.root);
 
         BEFORE_PARKED_WRITE.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
-        assert_eq!(test_support::block_on(park_changes(None)).unwrap_err(), "crashed");
+        assert_eq!(test_support::block_on(park_changes(None, &[])).unwrap_err(), "crashed");
         operation_utils::forget_raised_for_tests();
 
         let recovery = operation_utils::recover().unwrap().expect("a marker stands");
@@ -770,7 +860,7 @@ mod tests {
         let tree = work_in_progress_on_main(&warehouse.root);
 
         AFTER_PARKED_WRITE.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
-        assert_eq!(test_support::block_on(park_changes(None)).unwrap_err(), "crashed");
+        assert_eq!(test_support::block_on(park_changes(None, &[])).unwrap_err(), "crashed");
         operation_utils::forget_raised_for_tests();
 
         let recovery = operation_utils::recover().unwrap().expect("a marker stands");
@@ -790,10 +880,10 @@ mod tests {
     /// Park "main"'s work twice, the second after a fresh edit. Returns the two entries.
     fn two_parks(root: &std::path::Path) -> Vec<park_utils::ParkedEntry> {
         work_in_progress_on_main(root);
-        test_support::block_on(park_changes(None)).unwrap();
+        test_support::block_on(park_changes(None, &[])).unwrap();
         std::fs::write(root.join("a.txt"), b"more work\n").unwrap();
         test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
-        test_support::block_on(park_changes(None)).unwrap();
+        test_support::block_on(park_changes(None, &[])).unwrap();
 
         let parked = park_utils::read_parked().unwrap();
         assert_eq!(parked.len(), 2, "sanity: two parks are listed");
@@ -813,7 +903,7 @@ mod tests {
         let tree = work_in_progress_on_main(&warehouse.root);
 
         AFTER_LISTED.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
-        assert_eq!(test_support::block_on(park_changes(None)).unwrap_err(), "crashed");
+        assert_eq!(test_support::block_on(park_changes(None, &[])).unwrap_err(), "crashed");
         operation_utils::forget_raised_for_tests();
         remove_record();
 
@@ -831,7 +921,7 @@ mod tests {
         let tree = work_in_progress_on_main(&warehouse.root);
 
         BEFORE_PARKED_WRITE.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
-        assert_eq!(test_support::block_on(park_changes(None)).unwrap_err(), "crashed");
+        assert_eq!(test_support::block_on(park_changes(None, &[])).unwrap_err(), "crashed");
         operation_utils::forget_raised_for_tests();
         remove_record();
 
@@ -855,7 +945,7 @@ mod tests {
         work_in_progress_on_main(&warehouse.root);
 
         BEFORE_PARKED_WRITE.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
-        assert_eq!(test_support::block_on(park_changes(None)).unwrap_err(), "crashed");
+        assert_eq!(test_support::block_on(park_changes(None, &[])).unwrap_err(), "crashed");
         operation_utils::forget_raised_for_tests();
         remove_record();
 
@@ -873,7 +963,7 @@ mod tests {
         work_in_progress_on_main(&warehouse.root);
         remove_record();
 
-        let error = test_support::block_on(park_changes(None)).unwrap_err();
+        let error = test_support::block_on(park_changes(None, &[])).unwrap_err();
         assert!(error.contains("is missing") && error.contains("forklift heal"), "{}", error);
 
         let rebuilt = park_utils::rebuild().unwrap().expect("the missing record is rebuilt");
@@ -886,7 +976,7 @@ mod tests {
     fn a_parked_parcel_is_marked_with_its_name() {
         let warehouse = Warehouse::with_working_tree("park-marker");
         work_in_progress_on_main(&warehouse.root);
-        test_support::block_on(park_changes(None)).unwrap();
+        test_support::block_on(park_changes(None, &[])).unwrap();
 
         let entry = park_utils::read_parked().unwrap().remove(0);
         let parcel = object_utils::load_parcel(&entry.parcel).unwrap();
@@ -990,17 +1080,17 @@ mod tests {
         let next_second = || std::thread::sleep(std::time::Duration::from_millis(1100));
         let warehouse = Warehouse::with_working_tree("park-rebuild-order");
         work_in_progress_on_main(&warehouse.root);
-        test_support::block_on(park_changes(None)).unwrap();
+        test_support::block_on(park_changes(None, &[])).unwrap();
         next_second();
         std::fs::write(warehouse.root.join("a.txt"), b"b work\n").unwrap();
         test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
-        test_support::block_on(park_changes(None)).unwrap();
+        test_support::block_on(park_changes(None, &[])).unwrap();
         let popped = park_utils::read_parked().unwrap()[1].parcel.clone();
         pop_parked(None).unwrap();
         next_second();
         std::fs::write(warehouse.root.join("a.txt"), b"c work\n").unwrap();
         test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
-        test_support::block_on(park_changes(None)).unwrap();
+        test_support::block_on(park_changes(None, &[])).unwrap();
         let listed = park_utils::read_parked().unwrap();
         assert_eq!(listed.len(), 2, "sanity: A and C are listed");
 
@@ -1024,7 +1114,7 @@ mod tests {
     fn a_pop_whose_park_was_taken_before_it_held_the_lock_applies_nothing() {
         let warehouse = Warehouse::with_working_tree("park-pop-raced");
         work_in_progress_on_main(&warehouse.root);
-        test_support::block_on(park_changes(None)).unwrap();
+        test_support::block_on(park_changes(None, &[])).unwrap();
 
         BEFORE_POP_HOLDS.with(|seam| seam.set(Some(Box::new(|| {
             let lock = ParkedLock::acquire()?;
@@ -1043,7 +1133,7 @@ mod tests {
     fn a_pop_holds_the_parked_lock_while_it_applies() {
         let warehouse = Warehouse::with_working_tree("park-pop-holds");
         work_in_progress_on_main(&warehouse.root);
-        test_support::block_on(park_changes(None)).unwrap();
+        test_support::block_on(park_changes(None, &[])).unwrap();
 
         let root = warehouse.root.clone();
         BEFORE_POP_REMOVES.with(|seam| seam.set(Some(Box::new(move || {
@@ -1066,7 +1156,7 @@ mod tests {
     fn a_pop_takes_only_its_own_park_when_another_was_added_meanwhile() {
         let warehouse = Warehouse::with_working_tree("park-pop-added");
         work_in_progress_on_main(&warehouse.root);
-        test_support::block_on(park_changes(Some("mine"))).unwrap();
+        test_support::block_on(park_changes(Some("mine"), &[])).unwrap();
 
         BEFORE_POP_HOLDS.with(|seam| seam.set(Some(Box::new(|| {
             let lock = ParkedLock::acquire()?;
@@ -1089,10 +1179,10 @@ mod tests {
     fn apply_keeps_a_park_pop_takes_the_one_named_and_drop_leaves_the_files() {
         let warehouse = Warehouse::with_working_tree("park-named");
         work_in_progress_on_main(&warehouse.root);
-        test_support::block_on(park_changes(Some("first"))).unwrap();
+        test_support::block_on(park_changes(Some("first"), &[])).unwrap();
         std::fs::write(warehouse.root.join("a.txt"), b"second\n").unwrap();
         test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
-        test_support::block_on(park_changes(Some("second"))).unwrap();
+        test_support::block_on(park_changes(Some("second"), &[])).unwrap();
 
         let names = || park_utils::read_parked().unwrap().into_iter().map(|entry| entry.name).collect::<Vec<_>>();
         assert_eq!(names(), vec!["first", "second"]);
@@ -1114,11 +1204,11 @@ mod tests {
     fn a_park_under_a_name_already_parked_is_refused_with_the_work_in_place() {
         let warehouse = Warehouse::with_working_tree("park-name-taken");
         work_in_progress_on_main(&warehouse.root);
-        test_support::block_on(park_changes(Some("wip"))).unwrap();
+        test_support::block_on(park_changes(Some("wip"), &[])).unwrap();
         std::fs::write(warehouse.root.join("a.txt"), b"more\n").unwrap();
         test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
 
-        let error = test_support::block_on(park_changes(Some("wip"))).unwrap_err();
+        let error = test_support::block_on(park_changes(Some("wip"), &[])).unwrap_err();
         assert!(error.contains("Work is already parked as \"wip\""), "{}", error);
         assert!(test_support::file_holds(&warehouse.root, "a.txt", b"more\n"), "the work stays");
         assert_eq!(park_utils::read_parked().unwrap().len(), 1);
@@ -1131,7 +1221,7 @@ mod tests {
         work_in_progress_on_main(&warehouse.root);
         std::fs::write(warehouse.root.join("b.txt"), b"new\n").unwrap();
         test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
-        test_support::block_on(park_changes(Some("wip"))).unwrap();
+        test_support::block_on(park_changes(Some("wip"), &[])).unwrap();
 
         let shown = park_show(Some("wip")).unwrap();
         assert_eq!(shown.base, pallet_utils::get_pallet_head("main").unwrap());
@@ -1147,7 +1237,7 @@ mod tests {
     fn a_rebuild_lists_parked_parcels_when_the_history_cannot_be_walked() {
         let warehouse = Warehouse::with_working_tree("park-rebuild-unwalkable");
         work_in_progress_on_main(&warehouse.root);
-        test_support::block_on(park_changes(None)).unwrap();
+        test_support::block_on(park_changes(None, &[])).unwrap();
         let parked = park_utils::read_parked().unwrap().remove(0);
         remove_record();
 
@@ -1160,5 +1250,160 @@ mod tests {
         assert_eq!(rebuilt.recovered, 1, "{:?}", rebuilt);
         assert!(rebuilt.unreadable >= 1, "the walk that failed is counted: {:?}", rebuilt);
         assert_eq!(park_utils::read_parked().unwrap()[0].parcel, parked.parcel);
+    }
+
+    /// A flat folder's files, each a name and its content.
+    type Files<'a> = &'a [(&'a str, &'a [u8])];
+
+    /// Store a tree of `folders` (each a name and its flat files) beside the flat `files`; returns
+    /// the tree's hash.
+    fn store_folders(folders: &[(&str, Files)], files: Files) -> String {
+        use forklift_core::enums::dir_entry_type::DirEntryType;
+        use forklift_core::model::tree_item::TreeItem;
+
+        let flat = object_utils::load_tree(&test_support::store_files(files)).unwrap();
+        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        for (_, file) in flat.get_files() {
+            root.add_child(TreeItem::new(file.name.clone(), file.hash.clone(), file.item_type));
+        }
+        for (name, children) in folders {
+            root.add_child(TreeItem::new(name.to_string(), test_support::store_files(children), DirEntryType::Tree));
+        }
+        let mut tree = LooseObjectBuilder::build_tree(&root);
+        tree.store().unwrap();
+        tree.hash
+    }
+
+    /// "main" at a tree of a/x, b/y, b/z and top.txt, checked out, with a/x edited and loaded, and
+    /// b/y edited, loaded, and edited again. Returns the head's tree.
+    fn work_in_two_folders(root: &std::path::Path) -> String {
+        test_support::configure_operator();
+
+        let tree = store_folders(
+            &[("a", &[("x", b"one\n")]), ("b", &[("y", b"one\n"), ("z", b"one\n")])],
+            &[("top.txt", b"one\n")],
+        );
+        let head = test_support::store_parcel(&tree, &[]);
+        pallet_utils::update_pallet_head("main", None, &head, &pallet_utils::RefPreconditions::NONE).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(head))).unwrap();
+        test_support::check_out(&tree);
+
+        std::fs::write(root.join("a/x"), b"work\n").unwrap();
+        std::fs::write(root.join("b/y"), b"staged\n").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+        std::fs::write(root.join("b/y"), b"unstaged\n").unwrap();
+
+        tree
+    }
+
+    fn unstaged_paths() -> Vec<String> {
+        test_support::block_on(stocktake_utils::collect_unstaged_changes()).unwrap()
+            .into_iter().map(|change| change.path).collect()
+    }
+
+    fn subtree_hash(tree: &str, name: &str) -> String {
+        object_utils::load_tree(tree).unwrap().get_subtree(name).unwrap().hash.clone()
+    }
+
+    /// A park of "a" parks and resets only a: b keeps its staged change and its working one, and
+    /// the parked tree holds the head's b, not the staged one. Revert the splice to park the
+    /// staged tree whole and the parked b is the staged one; revert the reset to the whole tree
+    /// and b's staged change is gone.
+    #[test]
+    fn a_partial_park_parks_and_resets_only_its_paths() {
+        let warehouse = Warehouse::with_working_tree("park-partial");
+        let tree = work_in_two_folders(&warehouse.root);
+
+        test_support::block_on(park_changes(Some("wip"), &["a".to_string()])).unwrap();
+
+        assert!(test_support::file_holds(&warehouse.root, "a/x", b"one\n"), "a is back at the head");
+        assert!(test_support::file_holds(&warehouse.root, "b/y", b"unstaged\n"), "b keeps its working content");
+        assert_eq!(staged_paths(&tree), vec!["b/y".to_string()], "and its staging");
+        assert_eq!(unstaged_paths(), vec!["b/y".to_string()]);
+
+        let parked = park_utils::read_parked().unwrap().remove(0);
+        let parked_tree = object_utils::load_parcel(&parked.parcel).unwrap().tree_hash;
+        assert_eq!(subtree_hash(&parked_tree, "b"), subtree_hash(&tree, "b"), "the parked b is the head's");
+        assert_ne!(subtree_hash(&parked_tree, "a"), subtree_hash(&tree, "a"), "the parked a holds the work");
+
+        // Popped, the work in a comes back staged beside b's.
+        pop_parked(Some("wip")).unwrap();
+        assert!(test_support::file_holds(&warehouse.root, "a/x", b"work\n"));
+        assert_eq!(staged_paths(&tree), vec!["a/x".to_string(), "b/y".to_string()]);
+    }
+
+    /// A partial park interrupted once it was listed rolls forward over its paths only: the
+    /// recovery resets a, and b keeps its staged and working changes. Revert recovery to rebuild
+    /// staging whole and b's staged change is gone.
+    #[test]
+    fn a_partial_park_interrupted_after_it_was_listed_rolls_forward_over_its_paths_only() {
+        let warehouse = Warehouse::with_working_tree("park-partial-crash-after-listed");
+        let tree = work_in_two_folders(&warehouse.root);
+
+        AFTER_LISTED.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
+        assert_eq!(test_support::block_on(park_changes(None, &["a".to_string()])).unwrap_err(), "crashed");
+        operation_utils::forget_raised_for_tests();
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!((recovery.operation, recovery.outcome), (OperationKind::Park, RecoveryOutcome::RolledForward));
+
+        assert!(test_support::file_holds(&warehouse.root, "a/x", b"one\n"), "a is back at the head");
+        assert!(test_support::file_holds(&warehouse.root, "b/y", b"unstaged\n"), "b keeps its working content");
+        assert_eq!(staged_paths(&tree), vec!["b/y".to_string()], "and its staging");
+    }
+
+    /// A file can be parked alone: its neighbour's staged change stays.
+    #[test]
+    fn a_partial_park_of_one_file_leaves_its_neighbour_staged() {
+        let warehouse = Warehouse::with_working_tree("park-partial-file");
+        let tree = work_in_progress_on_main(&warehouse.root);
+        std::fs::write(warehouse.root.join("b.txt"), b"new\n").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+
+        test_support::block_on(park_changes(None, &["a.txt".to_string()])).unwrap();
+
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"one\n"));
+        assert!(test_support::file_holds(&warehouse.root, "b.txt", b"new\n"));
+        assert_eq!(staged_paths(&tree), vec!["b.txt".to_string()]);
+        let shown = park_show(None).unwrap();
+        let files: Vec<_> = shown.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(files, vec!["a.txt"]);
+    }
+
+    /// Paths with nothing to park refuse and park nothing: unchanged ones, and one that names
+    /// nothing, which would otherwise be parked as nothing beside the others.
+    #[test]
+    fn a_partial_park_refuses_paths_with_nothing_to_park() {
+        let warehouse = Warehouse::with_working_tree("park-partial-nothing");
+        let tree = work_in_two_folders(&warehouse.root);
+
+        let error = test_support::block_on(park_changes(None, &["top.txt".to_string()])).unwrap_err();
+        assert_eq!(error, "There is nothing to park under those paths: they match the pallet head.");
+
+        let error = test_support::block_on(park_changes(None, &["a".to_string(), "nope".to_string()])).unwrap_err();
+        assert!(error.starts_with("\"nope\" names nothing tracked"), "{}", error);
+
+        // An untracked file is never parked, and a path in another case matches no key, even
+        // where the volume finds it.
+        std::fs::write(warehouse.root.join("loose.txt"), b"untracked\n").unwrap();
+        for path in ["loose.txt", "A/X"] {
+            let error = test_support::block_on(park_changes(None, &["a".to_string(), path.to_string()])).unwrap_err();
+            assert!(error.contains("names nothing tracked"), "{}: {}", path, error);
+        }
+
+        assert!(park_utils::read_parked().unwrap().is_empty());
+        assert_eq!(staged_paths(&tree), vec!["a/x".to_string(), "b/y".to_string()]);
+        assert!(test_support::file_holds(&warehouse.root, "a/x", b"work\n"));
+    }
+
+    /// The paths are taken as keys: one under another goes, and the root parks everything.
+    #[test]
+    fn a_pathspec_drops_covered_paths_and_the_root_is_a_whole_park() {
+        let _warehouse = Warehouse::with_working_tree("park-pathspec");
+
+        let raw = |paths: &[&str]| paths.iter().map(|path| path.to_string()).collect::<Vec<_>>();
+        assert_eq!(pathspec(&raw(&["b", "a/x", "./a", "b"])).unwrap(), raw(&["a", "b"]));
+        assert_eq!(pathspec(&raw(&["a/x", "."])).unwrap(), Vec::<String>::new());
+        assert_eq!(pathspec(&[]).unwrap(), Vec::<String>::new());
     }
 }

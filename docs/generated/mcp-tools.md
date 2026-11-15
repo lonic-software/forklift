@@ -51,7 +51,7 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `pallet_create` | `forklift pallet create` | Create a new pallet and shift to it | `name` (a string, required)<br>`revision` (a string) |
 | `pallet_delete` | `forklift pallet delete` | Delete a pallet: remove its ref, keeping its parcels | `name` (a string, required)<br>`force` (a boolean) |
 | `pallet_restore` | `forklift pallet restore` | Bring back a deleted pallet at the head its tombstone holds | `name` (a string, required)<br>`remote` (a boolean) |
-| `park` | `forklift park` | Park the work in progress and reset to the pallet head | `name` (a string) |
+| `park` | `forklift park` | Park the work in progress and reset to the pallet head | `name` (a string)<br>`paths` (an array of strings) |
 | `park_pop` | `forklift park pop` | Re-apply a park's changes (staged) and take it off the parked list | `name` (a string) |
 | `park_apply` | `forklift park apply` | Re-apply a park's changes (staged) and keep it parked | `name` (a string) |
 | `park_drop` | `forklift park drop` | Discard a park without applying it | `name` (a string) |
