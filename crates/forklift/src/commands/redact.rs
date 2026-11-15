@@ -893,7 +893,7 @@ impl From<&RedactionState> for StateView {
 impl StateView {
     /// The status as a phrase that follows "It is ". Pallet names and paths are another
     /// operator's text, so they are sanitized.
-    fn describe(&self) -> String {
+    pub(crate) fn describe(&self) -> String {
         match self.state {
             StateName::Applied => "applied".to_string(),
             StateName::AwaitingRemote => "pending until the remote reports it applied".to_string(),

@@ -148,9 +148,78 @@ pub fn from_bytes(bytes: &[u8], kind: &str, version: u32) -> Result<Vec<String>,
         .collect()
 }
 
+/// Whether `bytes` open with the header of `kind` at a version newer than `version`, written as
+/// [`to_bytes`] writes one: the tag, one space, and a number without a leading zero. Judged on the
+/// first line's own bytes, so damage elsewhere, such as a byte that is not UTF-8, does not hide
+/// it. A record that does not read and passes this is a newer build's, not damage.
+pub fn written_by_newer(bytes: &[u8], kind: &str, version: u32) -> bool {
+    let first = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
+
+    std::str::from_utf8(first).ok()
+        .and_then(|header| header.strip_prefix(&format!("/forklift-{} ", kind)))
+        .and_then(|text| text.parse::<u32>().ok().filter(|found| found.to_string() == text))
+        .is_some_and(|found| found > version)
+}
+
+/// Every line of a damaged record that still reads whole, unescaped, in file order, and how many
+/// did not. A line is whole only when it is valid UTF-8, its escapes read, it ends in its newline
+/// and `parse` accepts it: a record cut inside its last entry would otherwise keep an altered one.
+/// Empty lines are skipped, and so is a first line that opens as a record header, of any kind or
+/// version.
+pub fn salvage<T>(bytes: &[u8], parse: impl Fn(&str) -> Option<T>) -> (Vec<T>, usize) {
+    let mut whole = Vec::new();
+    let mut dropped = 0;
+
+    let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    for (index, raw) in lines.iter().enumerate() {
+        if raw.is_empty() || (index == 0 && raw.starts_with(b"/forklift-")) {
+            continue;
+        }
+
+        // The piece after the last newline is a line the record was cut inside.
+        let terminated = index + 1 < lines.len();
+        let parsed = std::str::from_utf8(raw).ok()
+            .filter(|_| terminated)
+            .and_then(unescape)
+            .and_then(|entry| parse(&entry));
+
+        match parsed {
+            Some(entry) => whole.push(entry),
+            None => dropped += 1,
+        }
+    }
+
+    (whole, dropped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A newer header is told apart from this version's, an older one, another kind's, a padded
+    /// number and a first line that is not UTF-8, whatever follows it.
+    ///
+    /// Revert: compare with `>=` → this version's own header reads as newer.
+    #[test]
+    fn only_a_newer_header_of_the_same_kind_reads_as_written_by_newer() {
+        assert!(written_by_newer(b"/forklift-k 3\n\xff\n", "k", 2));
+        assert!(written_by_newer(b"/forklift-k 10", "k", 2));
+        for bytes in [&b"/forklift-k 2\n"[..], b"/forklift-k 1\n", b"/forklift-j 3\n", b"/forklift-k 03\n",
+                      b"/forklift-k  3\n", b"/forklift-k 3x\n", b"\xff/forklift-k 3\n", b"", b"/forklift-k \n"] {
+            assert!(!written_by_newer(bytes, "k", 2), "{:?}", String::from_utf8_lossy(bytes));
+        }
+    }
+
+    /// Only a terminated, valid, parsed line is kept; the header and empty lines count nothing.
+    ///
+    /// Revert: keep the unterminated last piece → the cut "cc" is kept.
+    #[test]
+    fn salvage_keeps_only_whole_lines_the_parser_accepts() {
+        let parse = |line: &str| (line.len() == 2).then(|| line.to_string());
+        let bytes = b"/forklift-k 9\naa\n\n\xffb\nb\\q\nccc\nd\\\\\ncc";
+
+        assert_eq!(salvage(bytes, parse), (vec!["aa".to_string(), "d\\".to_string()], 4));
+    }
 
     /// Every character an entry could hold that the escape has to handle, alone and together.
     const ENTRIES: [&str; 11] = [

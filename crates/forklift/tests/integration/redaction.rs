@@ -2008,9 +2008,12 @@ fn a_server_owing_a_deletion_serves_the_chunks_only_its_recipe_names_as_absent()
 /// says so, and names the git mirror's copy, which nothing here deletes. While the remote still
 /// holds the redaction pending, a lower applies nothing, though nothing here names the content.
 ///
+/// Once applied, a lost record is applied again by heal on the remote's report, and not while the
+/// remote does not answer.
+///
 /// Revert: apply on any report, not only the hashes it lists → the first lower applies the pending
 /// redaction. Revert: drop the apply after the pallet lands → the second lower applies nothing and
-/// the copy stays.
+/// the copy stays. Revert: re-apply with no report → heal leaves the redaction awaiting the remote.
 #[test]
 fn a_lower_applies_what_the_remote_reports_applied_and_deletes_the_copy_here() {
     let server = Server::start(&std::env::temp_dir()
@@ -2071,6 +2074,24 @@ fn a_lower_applies_what_the_remote_reports_applied_and_deletes_the_copy_here() {
     assert_eq!(again["data"].get("redactions"), None, "{}", again);
     let human = String::from_utf8_lossy(&holder.run_ok(&["lower"]).stdout).into_owned();
     assert!(!human.contains("mirror"), "nothing was applied this time: {}", human);
+
+    // A lost applied record: heal applies the redaction again on the remote's report. With the
+    // remote unreachable it applies nothing, and names running heal again.
+    let record = holder.root.join(".forklift/redactions-applied");
+    forklift_core::util::file_utils::remove_file(&record).unwrap();
+    holder.run_ok(&["config", "set", "remote.url", "http://127.0.0.1:9"]);
+    let unanswered = holder.json(&["heal"]);
+    assert_eq!(unanswered["error"]["code"], "objects_lost", "{}", unanswered);
+    assert_eq!(unanswered["error"]["next_step"], "forklift heal", "{}", unanswered);
+    let notes = unanswered["error"]["details"]["notes"].to_string();
+    assert!(notes.contains("no redaction whose content is lost was applied again"), "{}", unanswered);
+    assert!(!record.exists());
+
+    holder.run_ok(&["config", "set", "remote.url", &server.url]);
+    let healed = holder.json(&["heal"]);
+    assert_eq!(healed["ok"], true, "{}", healed);
+    assert_eq!(healed["data"]["redactions_reapplied"], serde_json::json!([hash]), "{}", healed);
+    assert_eq!(applied_record(&holder), format!("/forklift-redactions-applied 1\n{}\n", hash));
 }
 
 /// `redact apply` in a warehouse with a remote reads the remote's handshake, and applies on its
@@ -2518,6 +2539,87 @@ fn git_export_leaves_out_a_file_whose_redaction_is_applied_and_names_it() {
         .into_owned();
     assert!(human.contains("Left out \"other/secret.env\""), "{}", human);
     assert!(human.contains("of 2 commit(s)"), "{}", human);
+}
+
+/// A record of applied redactions lost or damaged, whichever way, leaves the redacted content gone
+/// and the redaction recorded: export refuses on a damaged record and names heal, and heal applies
+/// the redaction again, keeping a copy of a damaged record, after which export leaves the file out
+/// and `redact list` says applied. A record a newer Forklift wrote is left as it is.
+///
+/// A damaged record whose hash line reads whole but names another hash, one hex digit flipped to
+/// another, drops that line too: no redaction names it.
+///
+/// Revert: skip the re-apply → heal refuses `objects_lost` over the redacted content. Revert: skip
+/// the rebuild → a damaged record still fails heal's check and the export. Revert: keep a hash no
+/// redaction names → the phantom case keeps it.
+#[test]
+fn heal_applies_again_a_redaction_a_lost_or_damaged_applied_record_held() {
+    let warehouse = Warehouse::new("applied-damaged");
+    warehouse.stack("keep.txt", b"keep\n", "keep");
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+    let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
+    let hash = recorded["data"]["hash"].as_str().unwrap().to_string();
+    assert_eq!(recorded["data"]["status"]["state"], "applied", "{}", recorded);
+    let record = warehouse.root.join(".forklift/redactions-applied");
+    let whole = std::fs::read(&record).unwrap();
+
+    for damage in ["deleted", "truncated", "flipped", "zeroed", "phantom"] {
+        match damage {
+            "deleted" => forklift_core::util::file_utils::remove_file(&record).unwrap(),
+            "truncated" => std::fs::write(&record, &whole[..whole.len() / 2]).unwrap(),
+            "flipped" => std::fs::write(&record, whole.iter().enumerate().map(|(at, byte)| match at == whole.len() - 10 {
+                true => !byte,
+                false => *byte,
+            }).collect::<Vec<_>>()).unwrap(),
+            "zeroed" => std::fs::write(&record, vec![0u8; whole.len()]).unwrap(),
+            _ => {
+                let mut phantom = whole.clone();
+                let at = whole.len() - 10;
+                phantom[at] = if phantom[at] == b'0' { b'1' } else { b'0' };
+                phantom.extend_from_slice(b"\xff\n");
+                std::fs::write(&record, phantom).unwrap();
+            }
+        }
+        let out = warehouse.root.with_file_name(format!("applied-damaged-{}.git", damage));
+
+        if damage != "deleted" {
+            let refused = warehouse.run(&["git", "export", out.to_str().unwrap()]);
+            assert!(!refused.status.success(), "{}", damage);
+            assert!(String::from_utf8_lossy(&refused.stderr).contains("\"forklift heal\" rebuilds it"), "{}: {:?}", damage, refused);
+        }
+
+        let healed = warehouse.json(&["heal"]);
+        assert_eq!(healed["ok"], true, "{}: {}", damage, healed);
+        assert_eq!(healed["data"]["redactions_reapplied"], serde_json::json!([hash]), "{}: {}", damage, healed);
+        let rebuilt = &healed["data"]["redactions_applied_rebuilt"];
+        match damage {
+            "deleted" => assert!(rebuilt.is_null(), "{}", healed),
+            _ => {
+                let dropped = if damage == "phantom" { 2 } else { 1 };
+                assert_eq!((&rebuilt["kept"], &rebuilt["dropped"]), (&0.into(), &dropped.into()), "{}: {}", damage, healed);
+                let copy = warehouse.root.join(rebuilt["set_aside"].as_str().unwrap());
+                assert_ne!(std::fs::read(&copy).unwrap(), whole, "the damaged record is kept");
+                forklift_core::util::file_utils::remove_file(&copy).unwrap();
+            }
+        }
+        assert_eq!(std::fs::read(&record).unwrap(), whole, "{}: the record holds the hash again", damage);
+        assert_eq!(warehouse.redactions()[0]["status"]["state"], "applied", "{}", damage);
+
+        let exported = warehouse.json(&["git", "export", out.to_str().unwrap()]);
+        assert_eq!(exported["ok"], true, "{}: {}", damage, exported);
+        assert_eq!(exported["data"]["redacted"][0]["hash"], hash.as_str(), "{}: {}", damage, exported);
+    }
+
+    // A newer Forklift's record is not damage: heal leaves it, and export names no rebuild.
+    let newer = b"/forklift-redactions-applied 2\nanything\n";
+    std::fs::write(&record, newer).unwrap();
+    let healed = warehouse.json(&["heal"]);
+    assert_eq!(healed["ok"], false, "the redacted content cannot be told from a lost one: {}", healed);
+    assert!(healed["error"]["details"].is_object() && healed["error"]["details"]["redactions_applied_rebuilt"].is_null(), "{}", healed);
+    assert!(healed["error"]["message"].as_str().unwrap().contains("never writes over it"), "{}", healed);
+    assert_eq!(std::fs::read(&record).unwrap(), newer);
+    let refused = warehouse.run(&["git", "export", warehouse.root.with_file_name("applied-newer.git").to_str().unwrap()]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("never writes over it"), "{:?}", refused);
 }
 
 /// A lift may name content the server's host withholds and the server never held: nothing asks
