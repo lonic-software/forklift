@@ -3918,6 +3918,14 @@ fn a_park_reaching_outside_a_scoped_bay_is_never_popped_there_in_part() {
 
     let listed = warehouse.run(&["--json", "park", "list"]);
     assert!(stdout(&listed).contains("\"wide\""), "the park stays listed: {}", stdout(&listed));
+
+    // A park wholly outside the scope applies nothing there, and says so rather than "Re-applied".
+    warehouse.write_file("src/web/w.txt", "web only\n");
+    assert_success(&warehouse.run(&["park", "--name", "web"]));
+    let refused = warehouse.run_at(&scoped_dir, &["park", "apply", "web"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("applies nothing"), "{}", stderr(&refused));
+    assert_success(&warehouse.run(&["park", "drop", "web"]));
     assert_success(&warehouse.run(&["park", "pop"]));
     assert_eq!(std::fs::read_to_string(warehouse.root.join("src/web/w.txt")).unwrap(), "web work\n");
 }

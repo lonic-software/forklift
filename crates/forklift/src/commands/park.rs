@@ -346,6 +346,14 @@ fn unpark(name: Option<&str>, how: Unpark) -> Result<(), String> {
     )?;
     let outside = outside_scope(Some(&parked_base_tree), &parked_parcel.tree_hash, &scope)?;
 
+    if how == Unpark::Apply && ops.is_empty() && !outside.is_empty() {
+        return Err(format!(
+            "Every file the parked work \"{}\" ({}) changes is outside this bay's scope, so applying it \
+            here applies nothing; it stays parked. Apply or pop it in a bay whose scope holds them.",
+            sanitize(&entry.name), parked_hash
+        ));
+    }
+
     if how == Unpark::Pop && !outside.is_empty() {
         return Err(format!(
             "The parked work \"{}\" ({}) also changes files outside this bay's scope:\n  {}\n\
