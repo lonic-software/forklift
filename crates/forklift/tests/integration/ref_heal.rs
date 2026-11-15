@@ -763,6 +763,7 @@ fn heal_names_unload_when_only_a_staged_load_reaches_a_lost_blob() {
         assert_eq!(lost["staged_only"], true, "{}", error);
         assert_eq!(lost["staged"], serde_json::json!(["a.txt"]), "{}", error);
         assert_eq!(lost["pallets"], serde_json::json!([]), "{}", error);
+        assert!(error["details"].get("restored_from_working_tree").is_none(), "nothing else is stored: {}", error);
         assert_eq!(
             error["next_step"],
             "from the working tree's root, run \"forklift unload a.txt\", then load the file again if you mean to stage it",
