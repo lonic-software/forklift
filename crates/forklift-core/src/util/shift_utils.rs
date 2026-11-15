@@ -8,7 +8,7 @@ use crate::model::tree_item::TreeItem;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, PathScope, ScopeClass};
 use crate::util::stocktake_utils;
-use crate::util::{alias_utils, audit_utils, cache_miss, config_utils, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils, unavailable, warehouse_utils};
+use crate::util::{alias_utils, audit_utils, cache_miss, config_utils, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, path_utils, tree_utils, unavailable, warehouse_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
 pub enum FileOp {
@@ -1516,6 +1516,73 @@ pub fn build_inventories_for_tree(root_tree_hash: &str,
 pub fn build_inventories_carrying(root_tree_hash: &str,
                                   provenance: TreeProvenance,
                                   carried: &[CarriedEntry]) -> Result<TreeInventories, String> {
+    build_inventories(root_tree_hash, provenance, carried, None)
+}
+
+/// [`build_inventories_for_tree`] for the files at or under `paths` only: no other file is
+/// stat'ed or read, and recorded in no shard. So only a shard at or under one of `paths` is the
+/// tree's whole directory; any other holds just the entries for files among `paths`.
+pub fn build_inventories_under(root_tree_hash: &str,
+                               provenance: TreeProvenance,
+                               paths: &[String]) -> Result<TreeInventories, String> {
+    build_inventories(root_tree_hash, provenance, &[], Some(paths))
+}
+
+/// Reset staging at and under each of `paths` to `tree`'s content, recorded under `provenance`,
+/// and leave every other entry as it is: a partial park's reset, and its recovery's. A directory
+/// among `paths` has its shards replaced whole, so one the tree lacks goes; a file among them
+/// takes the tree's entry in its parent's shard, or loses its entry where the tree has none.
+/// `paths` are warehouse path keys, none of them the root and none at or under another.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The files under `paths` the working directory does not hold at `tree`'s
+///                       content (see [`TreeInventories::unheld`]).
+/// * `Err(String)`     - If the tree could not be loaded, a file not stat'ed or read, or a shard
+///                       not read or written.
+pub fn reset_staging_under(tree: &str,
+                           paths: &[String],
+                           provenance: TreeProvenance) -> Result<Vec<String>, String> {
+    let TreeInventories { shards: mut built, unheld } = build_inventories_under(tree, provenance, paths)?;
+    let mut ledger = inventory_utils::ShardLedger::read()?;
+
+    for path in paths {
+        let keys: Vec<String> = built.keys().filter(|key| path_utils::covers(path, key)).cloned().collect();
+        let shards: BTreeMap<String, Inventory> = keys.into_iter()
+            .filter_map(|key| built.remove(&key).map(|shard| (key, shard)))
+            .collect();
+
+        if !shards.is_empty() || ledger.keys().any(|key| path_utils::covers(path, key)) {
+            ledger.replace_subtree(path, &shards)?;
+        }
+    }
+
+    // A file's entry sits in its parent's shard, which the replacements above leave alone unless
+    // the parent is itself at or under another path, which `paths` rules out.
+    let mut batch = inventory_utils::ShardMutationBatch::over(&ledger);
+
+    for path in paths {
+        let (parent, name) = inventory_utils::split_path_key(path);
+        let entry = built.get(parent).and_then(|shard| shard.get_item_by_name(name));
+        let staged = ledger.inventory(parent)?.is_some_and(|shard| shard.get_item_by_name(name).is_some());
+
+        match entry {
+            Some(entry) => batch.update(parent, |shard| shard.add_item((*entry).clone()))?,
+            None if staged => batch.update(parent, |shard| { shard.remove_item_by_name(name); })?,
+            None => {}
+        }
+    }
+
+    batch.publish()?;
+
+    Ok(unheld)
+}
+
+/// The tree's shards, built over the files at or under `under` only when it is given (see
+/// [`build_inventories_under`]), with `carried` in place of the tree's entries at their paths.
+fn build_inventories(root_tree_hash: &str,
+                     provenance: TreeProvenance,
+                     carried: &[CarriedEntry],
+                     under: Option<&[String]>) -> Result<TreeInventories, String> {
     let root_tree = object_utils::load_tree(root_tree_hash)?;
 
     // In a scoped checkout only the in-scope subtree(s) are inventoried; the spine is descended
@@ -1527,6 +1594,10 @@ pub fn build_inventories_carrying(root_tree_hash: &str,
     let mut files: Vec<TreeFile> = Vec::new();
 
     collect_tree_directories(root_tree, root_tree_hash, &scope, &mut shards, &mut files)?;
+
+    if let Some(paths) = under {
+        files.retain(|file| paths.iter().any(|path| path_utils::covers(path, &file.key)));
+    }
 
     if !carried.is_empty() {
         let carried_paths: HashSet<&str> = carried.iter().map(|entry| entry.path.as_str()).collect();

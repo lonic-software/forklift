@@ -600,13 +600,13 @@ async fn dispatch(cli: Cli, store_access: &mut Option<lock_utils::StoreAccessLoc
             Some(PalletAction::Restore { name, remote: true }) => commands::pallet::restore_remote_pallet(&name).await,
             Some(PalletAction::Restore { name, remote: false }) => commands::pallet::restore_pallet(&name),
         },
-        Command::Park { name, action } => match action {
+        Command::Park { name, paths, action } => match action {
             Some(ParkAction::Pop { name }) => commands::park::pop_parked(name.as_deref()),
             Some(ParkAction::Apply { name }) => commands::park::apply_parked(name.as_deref()),
             Some(ParkAction::Drop { name }) => commands::park::drop_parked(name.as_deref()),
             Some(ParkAction::Show { name }) => commands::park::show_parked(name.as_deref()),
             Some(ParkAction::List) => commands::park::list_parked(),
-            None => commands::park::park_changes(name.as_deref()).await,
+            None => commands::park::park_changes(name.as_deref(), &paths).await,
         },
         Command::Prepare => commands::prepare::handle_command(cli.verbose),
         Command::Upgrade => commands::upgrade::handle_command(),

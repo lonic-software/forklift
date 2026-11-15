@@ -589,7 +589,8 @@ pub enum Command {
                       as a parked parcel and reset the warehouse to the pallet head. Untracked \
                       files are left alone. Every bay of the warehouse shares one list of parks, each \
                       under a unique name: \"--name\" picks it, and by default it is the pallet and \
-                      the time. \"forklift park pop\" re-applies a park and takes it off the list, \
+                      the time. Given paths, only the changes at or under them are parked and \
+                      reset; every other change stays as it is. \"forklift park pop\" re-applies a park and takes it off the list, \
                       \"forklift park apply\" re-applies it and keeps it, \"forklift park drop\" \
                       discards it, \"forklift park show\" shows its changes and \"forklift park \
                       list\" lists every park. Each takes a park's name, and without one uses the \
@@ -599,6 +600,10 @@ pub enum Command {
         /// The name to park the work under (default: the pallet and the time)
         #[arg(long)]
         name: Option<String>,
+
+        /// Park only the changes at or under these paths (default: every change)
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
 
         #[command(subcommand)]
         action: Option<ParkAction>,

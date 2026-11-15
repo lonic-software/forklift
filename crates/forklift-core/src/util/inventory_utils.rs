@@ -1432,6 +1432,18 @@ fn directory_has_no_untracked_content(key: &str,
 ///                   to the publish step when the blob batch finishes; a blob-batch failure
 ///                   publishes nothing from this pass — see the doc comment above.
 pub fn refresh_tracked_entries(refuse_redacted: impl Fn(&str, &str) -> String) -> Result<(), String> {
+    refresh_tracked(None, refuse_redacted)
+}
+
+/// [`refresh_tracked_entries`] for the entries at or under `paths` (warehouse path keys) only: a
+/// partial park's. No other entry is rehashed, marked deleted or given fresh stat data, so what is
+/// staged outside `paths`, and what is not, stays as it was.
+pub fn refresh_tracked_entries_under(paths: &[String], refuse_redacted: impl Fn(&str, &str) -> String) -> Result<(), String> {
+    refresh_tracked(Some(paths), refuse_redacted)
+}
+
+/// [`refresh_tracked_entries`], over the entries at or under `under` when it is given.
+fn refresh_tracked(under: Option<&[String]>, refuse_redacted: impl Fn(&str, &str) -> String) -> Result<(), String> {
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
 
     let Some(metadata) = metadata_opt else {
@@ -1455,8 +1467,12 @@ pub fn refresh_tracked_entries(refuse_redacted: impl Fn(&str, &str) -> String) -
 
     // Every shard is decided across every core; each decision is independent of the others (its
     // own anchor, its own shard, its own files), and they are taken up below in metadata order.
-    let keys: Vec<&str> = metadata.iter().map(|entry| metadata_entry_to_key(entry)).collect();
-    let decisions = fanout_utils::fanout_map(&keys, |key| decide_tracked_refresh(key, &blob_batch));
+    // Restricted, only a shard that can list a path at or under `under` is read: one at or under
+    // a path, or an ancestor of one.
+    let keys: Vec<&str> = metadata.iter().map(|entry| metadata_entry_to_key(entry))
+        .filter(|key| under.is_none_or(|paths| paths.iter().any(|path| path_utils::covers(path, key) || path_utils::covers(key, path))))
+        .collect();
+    let decisions = fanout_utils::fanout_map(&keys, |key| decide_tracked_refresh(key, under, &blob_batch));
 
     for (key, decision) in keys.iter().zip(decisions) {
         match decision {
@@ -1514,7 +1530,9 @@ pub fn refresh_tracked_entries(refuse_redacted: impl Fn(&str, &str) -> String) -
 /// * `Ok(Some(Inventory))` - The shard's new content, when any entry changed (stat data included).
 /// * `Ok(None)`            - When nothing about the shard changed, or it has no shard file.
 /// * `Err(String)`         - If the shard could not be read or parsed, or a file not processed.
-fn decide_tracked_refresh(key: &str, blob_batch: &file_utils::WriteBatch) -> Result<Option<Inventory>, String> {
+fn decide_tracked_refresh(key: &str,
+                          under: Option<&[String]>,
+                          blob_batch: &file_utils::WriteBatch) -> Result<Option<Inventory>, String> {
     // Before this decision stats anything below — see `refresh_tracked_entries`'s doc comment.
     let anchor = file_utils::take_stat_anchor()?;
 
@@ -1537,11 +1555,13 @@ fn decide_tracked_refresh(key: &str, blob_batch: &file_utils::WriteBatch) -> Res
             continue;
         }
 
-        let file_path = if key.is_empty() {
-            std::path::PathBuf::from(&name)
-        } else {
-            std::path::PathBuf::from(format!("{}/{}", key, name))
-        };
+        let entry_key = if key.is_empty() { name.clone() } else { format!("{}/{}", key, name) };
+
+        if under.is_some_and(|paths| !paths.iter().any(|path| path_utils::covers(path, &entry_key))) {
+            continue;
+        }
+
+        let file_path = std::path::PathBuf::from(&entry_key);
 
         let Ok(metadata) = file_utils::get_symlink_metadata_for_path(&file_path) else {
             // An entry not checked out stays so: no load turns it into a removal.
