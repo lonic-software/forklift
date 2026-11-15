@@ -360,24 +360,24 @@ impl Walk<'_> {
         let mut positionals = Vec::new();
 
         for arg in command.get_arguments() {
-            let secret = self.secret(&path, arg)?;
+            let secret = self.secret(path, arg)?;
             if arg.is_positional() {
-                positionals.push(positional(&path, arg, secret)?);
+                positionals.push(positional(path, arg, secret)?);
                 continue;
             }
 
             let long = arg.get_long()
-                .ok_or_else(|| refusal(&path, arg, "it has no long name for Pult to pass"))?;
+                .ok_or_else(|| refusal(path, arg, "it has no long name for Pult to pass"))?;
             let kind = match arg.get_action() {
                 ArgAction::SetTrue => {
-                    switch_refusals(&path, arg)?;
+                    switch_refusals(path, arg)?;
                     if arg.get_num_args().is_some() {
-                        return Err(refusal(&path, arg, "it is a switch with a value count"));
+                        return Err(refusal(path, arg, "it is a switch with a value count"));
                     }
                     Kind::Flag(Flag { arg: format!("--{long}") })
                 }
                 ArgAction::Set | ArgAction::Append => {
-                    single_valued(&path, arg)?;
+                    single_valued(path, arg)?;
                     let required = arg.is_required_set();
                     let append = matches!(arg.get_action(), ArgAction::Append);
                     Kind::Repeat(Repeat {
@@ -387,9 +387,9 @@ impl Walk<'_> {
                         secret,
                     })
                 }
-                other => return Err(refusal(&path, arg, &format!("its action {other:?} has no Pult param"))),
+                other => return Err(refusal(path, arg, &format!("its action {other:?} has no Pult param"))),
             };
-            named.0.push((long.to_string(), Param { kind, description: help(&path, arg)? }));
+            named.0.push((long.to_string(), Param { kind, description: help(path, arg)? }));
         }
 
         let mut params = named;
@@ -398,7 +398,7 @@ impl Walk<'_> {
             run.push_str(&format!(" {{{key}}}"));
         }
 
-        let positional_params = layout(&path, positionals)?;
+        let positional_params = layout(path, positionals)?;
         if !positional_params.is_empty() {
             // Without `--`, a positional value that spells one of the command's own flags
             // would be read as that flag, silently. After it, every word is a positional.
