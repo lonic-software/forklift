@@ -3370,7 +3370,7 @@ fn reconstruct_record(record: &[u8], hash: &str, bases: Bases) -> Result<Vec<u8>
 }
 
 /// Why a delta cannot be rebuilt when its verified base read failed with `error`, judged by the
-/// base read's own `cause` (`None` for an absence), never by reading the base again, which down a
+/// base read's own `cause` (`None` for an absence nothing else accounts for), never by reading the base again, which down a
 /// failing chain would repeat at every level. A base that is absent, or whose every copy is
 /// damaged, leaves the delta damaged with it, and a base behind a damaged index heal can rebuild
 /// leaves it with that cause: each is reworded to name the base. Any other failure says nothing
@@ -12691,6 +12691,30 @@ pub(crate) mod tests {
         let scan = crate::util::recovery_utils::corrupt_packed_objects().unwrap();
         assert!(scan.corrupt.is_empty(), "{:?}", scan);
         assert_eq!(scan.unchecked.len(), 2, "{:?}", scan);
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    /// A delta whose base is absent while a pack file with no index might hold it is not damaged:
+    /// the absence is undecided, so the scan reports the delta unchecked, never corrupt.
+    /// Mutation: judge every framed absence of a base as record damage → red.
+    #[test]
+    fn a_delta_over_a_base_an_unindexed_pack_may_hold_is_not_damaged() {
+        let (temp, _scope) = salvage_root("fork495-unindexed-base");
+
+        let (base, base_hash) = blob449("a delta base only an unindexed pack holds, padded to be a fit base");
+        let (target, target_hash) = blob449("a delta over an unindexed base, padded to be a fit target");
+        let (_, index) = write_named_pack(&[(base_hash.clone(), full_record(&base))]);
+        file_utils::remove_file(&index).unwrap();
+        write_named_pack(&[(target_hash.clone(), delta_record(&base_hash, &base, &target))]);
+        file_utils::forget_cached_objects();
+
+        let (code, error) = read_code(&target_hash);
+        assert_eq!(code.as_deref(), Some("object_unreadable"), "{}", error);
+        assert!(error.contains("pack file this read cannot use"), "{}", error);
+        let scan = crate::util::recovery_utils::corrupt_packed_objects().unwrap();
+        assert!(scan.corrupt.is_empty(), "{:?}", scan);
+        assert_eq!(scan.unchecked.iter().map(|(hash, _)| hash).collect::<Vec<_>>(), vec![&target_hash], "{:?}", scan);
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }

@@ -2444,25 +2444,19 @@ pub fn retrieve_object_by_hash(hash: &str) -> Result<Vec<u8>, String> {
 /// (and verified against) its hash, so its bytes are the same bytes in every warehouse that
 /// holds it — the cache key isolates *presence* per warehouse, never the content.
 pub fn retrieve_object_by_hash_shared(hash: &str) -> Result<std::sync::Arc<Vec<u8>>, String> {
+    retrieve_object_by_hash_shared_classified(hash).map_err(|(error, _)| error)
+}
+
+/// [`retrieve_object_by_hash_shared`], whose error also carries what [`read_object_as_classified`]
+/// says of the failure, so a caller judging it need not read the object again.
+pub(crate) fn retrieve_object_by_hash_shared_classified(hash: &str)
+    -> Result<std::sync::Arc<Vec<u8>>, (String, Option<Unreadable>)> {
     if let Some(bytes) = read_cache_get(hash) {
         return Ok(bytes);
     }
 
     // Wrap the freshly read bytes in the `Arc` once and share that same allocation with the
     // cache — the caller and the cached entry point at one buffer, never two.
-    let bytes = std::sync::Arc::new(read_object_uncached(hash)?);
-    read_cache_put(hash, std::sync::Arc::clone(&bytes));
-    Ok(bytes)
-}
-
-/// [`retrieve_object_by_hash_shared`], whose error also carries the cause of an
-/// [`StoreReadOutcome::Unverifiable`] read (`None` for an absence or an environment error), so a
-/// caller judging the failure need not read the object again.
-pub(crate) fn retrieve_object_by_hash_shared_classified(hash: &str)
-    -> Result<std::sync::Arc<Vec<u8>>, (String, Option<Unreadable>)> {
-    if let Some(bytes) = read_cache_get(hash) {
-        return Ok(bytes);
-    }
     let bytes = std::sync::Arc::new(read_object_as_classified(hash, Absence::History)?);
     read_cache_put(hash, std::sync::Arc::clone(&bytes));
     Ok(bytes)
@@ -2784,27 +2778,31 @@ fn read_object_as(hash: &str, absence: Absence) -> Result<Vec<u8>, String> {
     read_object_as_classified(hash, absence).map_err(|(error, _)| error)
 }
 
-/// [`read_object_as`], whose error also carries the cause of an [`StoreReadOutcome::Unverifiable`]
-/// read: `None` for an absence or an environment error.
+/// [`read_object_as`], whose error also says what is known of the failure: the cause of an
+/// [`StoreReadOutcome::Unverifiable`] read, [`Unreadable::Other`] for an environment error or an
+/// absence left undecided, and `None` only for an absence nothing else accounts for.
 fn read_object_as_classified(hash: &str, absence: Absence) -> Result<Vec<u8>, (String, Option<Unreadable>)> {
-    match read_object_classified(hash).map_err(|error| (error, None))? {
+    match read_object_classified(hash).map_err(|error| (error, Some(Unreadable::Other)))? {
         StoreReadOutcome::Verified(bytes) => Ok(bytes),
         StoreReadOutcome::Unverifiable(e, cause) => Err((unverifiable_read_error(hash, e, cause), Some(cause))),
-        StoreReadOutcome::Absent => read_absent(hash, absence).map_err(|error| (error, None)),
+        StoreReadOutcome::Absent => read_absent(hash, absence),
     }
 }
 
 /// The ordinary read's answer for an object [`read_object_classified`] found absent: a cache
-/// warehouse's refill, a redaction's or withholding's refusal, or the missing-object refusal.
-fn read_absent(hash: &str, absence: Absence) -> Result<Vec<u8>, String> {
+/// warehouse's refill, a redaction's or withholding's refusal, or the missing-object refusal. The
+/// error's cause is as [`read_object_as_classified`] says.
+fn read_absent(hash: &str, absence: Absence) -> Result<Vec<u8>, (String, Option<Unreadable>)> {
+    let other = |error: String| (error, Some(Unreadable::Other));
+
     // A cache warehouse fetches an object it holds by hash, then reads it as stored.
-    if super::cache_miss::refill_recorded(hash)? {
-        return match read_object_classified(hash)? {
+    if super::cache_miss::refill_recorded(hash).map_err(other)? {
+        return match read_object_classified(hash).map_err(other)? {
             StoreReadOutcome::Verified(bytes) => Ok(bytes),
-            StoreReadOutcome::Unverifiable(e, cause) => Err(unverifiable_read_error(hash, e, cause)),
-            StoreReadOutcome::Absent => Err(format!(
+            StoreReadOutcome::Unverifiable(e, cause) => Err((unverifiable_read_error(hash, e, cause), Some(cause))),
+            StoreReadOutcome::Absent => Err(other(format!(
                 "Object {} was fetched from the origin and stored, yet the store does not hold it.", hash
-            )),
+            ))),
         };
     }
 
@@ -2814,7 +2812,7 @@ fn read_absent(hash: &str, absence: Absence) -> Result<Vec<u8>, String> {
     // stands, with the record's own error added rather than in its place.
     let applied = super::applied_redactions::absent_read_refusal(hash);
     if let Ok(Some(refusal)) = applied {
-        return Err(refusal);
+        return Err(other(refusal));
     }
 
     // Absent because this warehouse's remote withholds it and a fetch left it out: refused
@@ -2822,7 +2820,7 @@ fn read_absent(hash: &str, absence: Absence) -> Result<Vec<u8>, String> {
     // unavailable record leaves the absence undecided in the same way.
     let unavailable = super::unavailable::absent_read_refusal(hash);
     if let Ok(Some(refusal)) = unavailable {
-        return Err(refusal);
+        return Err(other(refusal));
     }
 
     // The same NotFound-shaped message the read path has always produced for this case —
@@ -2830,7 +2828,7 @@ fn read_absent(hash: &str, absence: Absence) -> Result<Vec<u8>, String> {
     // design) since nothing about the message depends on which of the two `Absent`
     // sources in `read_object_classified` produced it.
     let records_decided = applied.is_ok() && unavailable.is_ok();
-    let (path, file_name) = get_path_for_object(hash)?;
+    let (path, file_name) = get_path_for_object(hash).map_err(other)?;
     let file_path = path.add(PATH_SEPARATOR).add(&file_name);
     let missing = format!(
         "Error while reading object from file \"{}\": {}",
@@ -2856,8 +2854,9 @@ fn read_absent(hash: &str, absence: Absence) -> Result<Vec<u8>, String> {
 
     // Nothing left undecided and nothing says the store ever held it: a hash the caller
     // was handed is simply not here.
-    if absence == Absence::Named && records_decided && holders.is_empty() {
-        return Err(format!("Object {} is not in this store.", hash));
+    let decided = records_decided && holders.is_empty();
+    if absence == Absence::Named && decided {
+        return Err((format!("Object {} is not in this store.", hash), None));
     }
 
     let missing = match holders.is_empty() {
@@ -2868,7 +2867,7 @@ fn read_absent(hash: &str, absence: Absence) -> Result<Vec<u8>, String> {
             holders.iter().map(|path| format!("\"{}\"", path.to_string_lossy())).collect::<Vec<_>>().join(", ")
         ),
     };
-    Err(object_unreadable(missing))
+    Err((object_unreadable(missing), if decided { None } else { Some(Unreadable::Other) }))
 }
 
 /// Whether the loose file `reader` yields decompresses to content that hashes to `hash`: what
