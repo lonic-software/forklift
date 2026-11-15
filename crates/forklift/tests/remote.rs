@@ -13668,28 +13668,38 @@ fn heal_never_reseals_a_chunk_only_a_withheld_recipe_names() {
 }
 
 /// Meta history is fetched and kept whole, never sealed, so a lost `@office` tree is never
-/// re-sealed, though the origin holds the office pallet.
+/// re-sealed, though the origin holds the office pallet: here the root of the office's earlier
+/// parcel, which the office record does not read, so the check for lost objects stays whole.
 ///
-/// Revert: walk the origin's meta pallet heads too → the tree is re-sealed.
+/// Revert: walk the origin's meta pallet heads too, and drop the local meta exclusion → the tree
+/// is re-sealed (either one alone keeps it out).
 #[test]
 fn heal_never_reseals_lost_office_content() {
     let area = TestArea::new("sealed-office");
     let (server, _) = three_signed_parcels(&area);
+    let worker = keygen_admit_args(&area, "worker@forklift");
+    assert_success(&area.forklift("a", &["office", "admit", &worker[0], &worker[1], &worker[2]]));
+    assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
 
-    let office_root = {
+    let earlier_root = {
         let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
         let office = forklift_core::util::pallet_utils::all_pallet_refs().unwrap().into_iter()
             .find(|(pallet, _)| pallet.namespace != forklift_core::util::pallet_utils::PalletNamespace::User)
             .map(|(_, head)| head).unwrap();
-        forklift_core::util::object_utils::load_parcel(&office).unwrap().tree_hash
+        let head = forklift_core::util::object_utils::load_parcel(&office).unwrap();
+        let earlier = forklift_core::util::object_utils::load_parcel(&head.parents[0]).unwrap();
+        assert_ne!(earlier.tree_hash, head.tree_hash);
+        earlier.tree_hash
     };
-    lose_object_in(&area, "cached", &office_root);
+    lose_object_in(&area, "cached", &earlier_root);
 
     let output = area.forklift("cached", &["--json", "heal"]);
-    assert!(!output.status.success(), "{}", stdout(&output));
-    assert!(!resealed_of(&output).contains(&office_root), "{}", stdout(&output));
-    assert!(!recorded(&area, "cached", &office_root));
+    let refused = refusal_of(&output, 58);
+    assert!(refused["message"].as_str().unwrap().contains(&earlier_root), "{}", refused);
+    assert_eq!(refused["details"]["objects_lost"]["degraded_sources"], serde_json::Value::Null, "{}", refused);
+    assert!(!resealed_of(&output).contains(&earlier_root), "{}", refused);
+    assert!(!recorded(&area, "cached", &earlier_root));
 }
 
 /// With the origin unreachable, heal re-seals nothing, says the origin did not answer, and names
