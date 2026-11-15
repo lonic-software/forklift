@@ -1730,7 +1730,8 @@ alone). `park apply` and `park pop` re-apply a park's changes as a clean re-appl
 — it must be applied onto the head it was parked on, or it reports a conflict. If
 staging the re-applied changes fails, the parcel stays parked, and the error says that the
 working directory already holds the changes. Without a name, `show`, `apply`, `pop` and `drop`
-take the newest park. `drop` leaves the working files alone; the parked parcel is left to gc.
+take the newest park. `drop` leaves the working files alone; until gc frees the parked parcel,
+`forklift pick <parcel>` stacks its changes onto the current pallet.
 
 Parked work belongs to the warehouse, not to a bay: every bay lists and pops the same parks. Each
 park has a name, the pallet it was parked on and the time (`main 2026-11-15T15:50:16Z`), with

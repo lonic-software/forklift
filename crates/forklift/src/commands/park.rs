@@ -475,7 +475,8 @@ fn unpark(name: Option<&str>, how: Unpark) -> Result<(), String> {
 }
 
 /// Take the park named `name`, or the newest, off the parked list without applying it. Its
-/// parcel is left to garbage collection.
+/// parcel is left to garbage collection, and until then `pick` brings its changes back, so a drop
+/// is not on the surface's destructive list.
 pub fn drop_parked(name: Option<&str>) -> Result<(), String> {
     let lock = ParkedLock::acquire()?;
     let mut parked = park_utils::read_parked()?;
@@ -483,7 +484,9 @@ pub fn drop_parked(name: Option<&str>) -> Result<(), String> {
     park_utils::write_parked(&lock, &parked)?;
 
     output::message(format!(
-        "Dropped the parked work \"{}\" ({}); its changes were not applied.", sanitize(&entry.name), entry.parcel
+        "Dropped the parked work \"{}\" ({}); its changes were not applied. Until gc frees the parcel, \
+        \"forklift pick {}\" stacks its changes onto the current pallet.",
+        sanitize(&entry.name), entry.parcel, entry.parcel
     ));
 
     Ok(())

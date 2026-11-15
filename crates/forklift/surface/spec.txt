@@ -30,7 +30,7 @@ manifest: note approve provenance show set get unset keys log
 mcp
 office: enroll admit link authorize role rotate retire regenesis accept-regenesis list
 pallet: list create delete restore
-park: pop list
+park: pop apply drop show list
 pick
 prepare
 profile: list create use keygen
