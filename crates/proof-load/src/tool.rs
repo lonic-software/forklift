@@ -54,15 +54,17 @@ pub struct Invocation {
 }
 
 /// A forklift failure document's `error`.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Failure {
     pub code: String,
     pub message: String,
     pub next_step: Option<String>,
 }
 
-/// What a run produced.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+/// What a run produced. A row's details file holds these as its `steps`; `Row::steps` reads them.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Outcome {
     pub arguments: Vec<String>,
     /// The exit code; None when the process ended on a signal.

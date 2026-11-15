@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::oracle::{Grade, Recoverability};
+use crate::tool::Outcome;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -198,7 +199,8 @@ pub struct Determinism {
 pub struct Row {
     pub scenario: String,
     pub category: Category,
-    /// The tool and binding the row graded: `forklift`, `git`, `git-tuned`.
+    /// The program the row faulted: `forklift`, or `forklift-server` for a hosted scenario's
+    /// server. A row's steps are the forklift commands its scenario ran either way.
     pub binding: String,
     pub grade: Grade,
     pub recoverability: Recoverability,
@@ -207,6 +209,27 @@ pub struct Row {
     /// JSON pointer to the object in it that holds the row's `steps`, each step's arguments, exit
     /// and output. `None` where the run wrote no details for the row.
     pub detail: Option<String>,
+}
+
+impl Row {
+    /// The commands the row's details hold, in order: the file `detail` names, under `out`, the
+    /// directory the run wrote the report to, and the `steps` of the object its JSON pointer picks.
+    /// Refuses a row with no details, a `detail` without its `#`, a file name that leaves `out`,
+    /// and a file, pointer or steps that cannot be read, saying which.
+    pub fn steps(&self, out: &std::path::Path) -> Result<Vec<Outcome>, String> {
+        let detail = self.detail.as_deref().ok_or("the run wrote no details for this row")?;
+        let (file, pointer) = detail.split_once('#').ok_or_else(|| format!("the row's details `{}` name no JSON pointer", detail))?;
+        let relative = std::path::Path::new(file);
+        if file.is_empty() || !relative.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+            return Err(format!("the row's details file `{}` is not a file name inside the run's folder", file));
+        }
+        let path = out.join(relative);
+        let text = std::fs::read_to_string(&path).map_err(|error| format!("cannot read {}: {}", path.display(), error))?;
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| format!("{} is not JSON: {}", path.display(), error))?;
+        let object = value.pointer(pointer).ok_or_else(|| format!("{} holds nothing at `{}`", path.display(), pointer))?;
+        let steps = object.get("steps").ok_or_else(|| format!("{} holds no steps at `{}`", path.display(), pointer))?;
+        serde_json::from_value(steps.clone()).map_err(|error| format!("the steps in {} at `{}` cannot be read: {}", path.display(), pointer, error))
+    }
 }
 
 /// A completeness check's outcome.
@@ -448,4 +471,65 @@ mod tests {
         let reasoned = read_changed(|value| value["completeness"][0]["cell"] = serde_json::json!({"state": "run", "reason": "x"})).map(|_| ()).unwrap_err();
         assert!(reasoned.contains("names no reason"), "{}", reasoned);
     }
+    /// A scratch folder of its own for one test.
+    fn folder(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |time| time.as_nanos());
+        let folder = std::env::temp_dir().join(format!("proof-load-steps-{}-{}-{}", label, std::process::id(), nanos));
+        std::fs::create_dir_all(&folder).expect("a scratch folder");
+        folder
+    }
+
+    fn step(arguments: &[&str], exit: i32) -> Outcome {
+        Outcome { arguments: arguments.iter().map(|argument| argument.to_string()).collect(), exit: Some(exit), stdout: b"out".to_vec(), stderr: vec![], failure: None }
+    }
+
+    fn row_at(detail: Option<&str>) -> Row {
+        Row { detail: detail.map(str::to_string), ..sample().rows.remove(0) }
+    }
+
+    /// A row's steps are the ones at its pointer, in its file under the run's folder: a details
+    /// file holding other steps at its root and in another file is read where the row points.
+    ///
+    /// Revert: read `steps` at the file's root whatever the pointer → the root's steps come back.
+    #[test]
+    fn a_rows_steps_are_read_at_its_pointer() {
+        let out = folder("pointer");
+        let graded = vec![step(&["heal"], 0), step(&["load", "."], 2)];
+        let document = serde_json::json!({"steps": [step(&["root"], 9)], "killed": [{"graded": {"steps": graded}}]});
+        std::fs::write(out.join("kills.json"), document.to_string()).expect("written");
+        std::fs::write(out.join("other.json"), serde_json::json!({"steps": [step(&["other"], 7)]}).to_string()).expect("written");
+        assert_eq!(row_at(Some("kills.json#/killed/0/graded")).steps(&out), Ok(graded));
+        assert_eq!(row_at(Some("kills.json#")).steps(&out), Ok(vec![step(&["root"], 9)]));
+        assert_eq!(row_at(Some("other.json#")).steps(&out), Ok(vec![step(&["other"], 7)]));
+    }
+
+    /// Every way a row's details can fail to lead to its steps is refused and says which.
+    ///
+    /// Revert: allow any relative path → `../kills.json` reads the file above the run's folder.
+    #[test]
+    fn a_row_whose_details_cannot_be_read_is_refused() {
+        let parent = folder("refused");
+        let out = parent.join("run");
+        std::fs::create_dir_all(&out).expect("the run's folder");
+        let document = serde_json::json!({"steps": [step(&["heal"], 0)]}).to_string();
+        std::fs::write(parent.join("kills.json"), &document).expect("written");
+        std::fs::write(out.join("kills.json"), &document).expect("written");
+        std::fs::write(out.join("odd.json"), serde_json::json!({"steps": [{"arguments": [], "exit": 0, "stdout": [], "stderr": [], "failure": null, "weight": 1}]}).to_string()).expect("written");
+        std::fs::write(out.join("bare.json"), "{\"graded\": {}}").expect("written");
+        assert!(row_at(Some("kills.json#")).steps(&out).is_ok(), "the well-formed row reads");
+        let refusal = |detail: Option<&str>| row_at(detail).steps(&out).unwrap_err();
+        assert_eq!(refusal(None), "the run wrote no details for this row");
+        assert_eq!(refusal(Some("kills.json")), "the row's details `kills.json` name no JSON pointer");
+        for outside in ["../kills.json#", "#", "./kills.json#"] {
+            let file = outside.trim_end_matches('#');
+            assert_eq!(refusal(Some(outside)), format!("the row's details file `{}` is not a file name inside the run's folder", file), "{}", outside);
+        }
+        let absolute = format!("{}#", parent.join("kills.json").display());
+        assert!(refusal(Some(&absolute)).contains("is not a file name inside the run's folder"), "{}", absolute);
+        assert!(refusal(Some("gone.json#")).starts_with("cannot read "), "a missing file");
+        assert!(refusal(Some("bare.json#/killed")).ends_with("holds nothing at `/killed`"), "a pointer to nothing");
+        assert!(refusal(Some("bare.json#/graded")).ends_with("holds no steps at `/graded`"), "an object without steps");
+        assert!(refusal(Some("odd.json#")).contains("unknown field `weight`"), "a step with a field this build does not know");
+    }
 }
+

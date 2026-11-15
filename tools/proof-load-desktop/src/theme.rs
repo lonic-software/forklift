@@ -84,6 +84,8 @@ pub const PLATE_PADDING: f32 = 14.0;
 pub const SCREEN_GAP: f32 = 20.0;
 /// `.plate`'s gap between its parts, and `.grid`'s between plates that share a row.
 pub const PLATE_GAP: f32 = 14.0;
+/// The Results side column's width, `.screen`'s first track.
+pub const SIDE_WIDTH: f32 = 230.0;
 /// The gaps inside a plate's layouts: the results side column (`.side`) and the detail readouts
 /// (`.detail`), 10 px; a stack of fields or lines (`.stack`), 8 px.
 pub const SIDE_GAP: f32 = 10.0;
@@ -183,6 +185,8 @@ pub enum Type {
     /// Readout mono 22/600, and its unit, mono 12/400.
     Readout,
     ReadoutUnit,
+    /// A readout whose value is words, not a number: 13/400.
+    ReadoutText,
 }
 
 impl Type {
@@ -205,6 +209,7 @@ impl Type {
             Type::Screen => (12.0, Face::Mono),
             Type::Readout => (22.0, Face::MonoSemiBold),
             Type::ReadoutUnit => (12.0, Face::Mono),
+            Type::ReadoutText => (13.0, Face::Sans),
         };
         FontId::new(size, face.family())
     }

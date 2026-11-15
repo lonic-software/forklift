@@ -389,6 +389,101 @@ pub fn readout(ui: &mut Ui, label: &str, value: &str, unit: &str) -> Response {
     .response
 }
 
+/// A readout whose value is words: an engraved label over 13 px text, in a well.
+pub fn readout_text(ui: &mut Ui, label: &str, value: &str) -> Response {
+    let p = theme::palette(ui.ctx());
+    in_well(ui, egui::Margin::symmetric(12, 10), |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = U;
+        engraved(ui, label);
+        text(ui, value, Type::ReadoutText, p.ink);
+    })
+    .response
+}
+
+/// A table's column: its heading and its width; a width of 0 takes what the others leave.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Column {
+    pub heading: &'static str,
+    pub width: f32,
+}
+
+/// Cell padding, `td { padding: 7px 10px }`; a heading's is 8 px over and under.
+const CELL_PADDING: f32 = 10.0;
+const HEAD_PADDING: f32 = 8.0;
+/// The narrowest the flexible column gets before the table scrolls sideways instead.
+const FLEX_MIN_WIDTH: f32 = 200.0;
+
+/// A table as the page draws one: engraved headings over a line, then `rows` rows of
+/// `ROW_HEIGHT` with a line between them, `cell` drawing each cell's contents left to right. With
+/// `pick`, a row lights on hover, the `selected` row sits in a well with the accent on its left
+/// edge, and the row clicked is returned.
+pub fn table(
+    ui: &mut Ui,
+    columns: &[Column],
+    rows: usize,
+    pick: bool,
+    selected: Option<usize>,
+    mut cell: impl FnMut(&mut Ui, usize, usize),
+) -> Option<usize> {
+    let p = theme::palette(ui.ctx());
+    let fixed: f32 = columns.iter().map(|column| column.width).sum();
+    let rest = (ui.available_width() - fixed).max(FLEX_MIN_WIDTH);
+    let width = fixed + rest;
+    let widths: Vec<f32> = columns.iter().map(|column| if column.width == 0.0 { rest } else { column.width }).collect();
+    let mut clicked = None;
+    // `.scroll`: a table wider than its column scrolls sideways, as the page's does.
+    let salt = ui.next_auto_id();
+    egui::ScrollArea::horizontal().id_salt(salt).show(ui, |ui| ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let head = 2.0 * HEAD_PADDING + Type::Label.font().size;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, head), Sense::hover());
+        let mut x = rect.left();
+        for (column, column_width) in columns.iter().zip(&widths) {
+            let cell_rect = Rect::from_min_size(egui::pos2(x + CELL_PADDING, rect.top()), egui::vec2((column_width - 2.0 * CELL_PADDING).max(0.0), head));
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+            engraved(&mut child, column.heading);
+            x += column_width;
+        }
+        ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, hairline(p.line));
+        for row in 0..rows {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, theme::ROW_HEIGHT), Sense::hover());
+            // Only the rows on screen are drawn, so a report of thousands of rows stays quick.
+            if !ui.is_rect_visible(rect) {
+                continue;
+            }
+            let background = ui.painter().add(Shape::Noop);
+            let mut x = rect.left();
+            for (column, column_width) in widths.iter().enumerate() {
+                let cell_rect = Rect::from_min_size(egui::pos2(x + CELL_PADDING, rect.top()), egui::vec2((column_width - 2.0 * CELL_PADDING).max(0.0), rect.height()));
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                child.set_clip_rect(cell_rect.intersect(ui.clip_rect()));
+                cell(&mut child, row, column);
+                x += column_width;
+            }
+            if pick {
+                // Made after the cells, so the row, not a cell, takes the pointer.
+                let response = ui.interact(rect, ui.id().with(("row", row)), Sense::click());
+                let mut shapes = Vec::new();
+                if selected == Some(row) {
+                    shapes.push(Shape::rect_filled(rect, CornerRadius::ZERO, p.well));
+                    shapes.push(Shape::rect_filled(Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())), CornerRadius::ZERO, p.accent));
+                } else if response.hovered() {
+                    shapes.push(Shape::rect_filled(rect, CornerRadius::ZERO, p.pad));
+                }
+                ui.painter().set(background, Shape::Vec(shapes));
+                if response.clicked() {
+                    clicked = Some(row);
+                }
+            }
+            if row + 1 < rows {
+                ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, hairline(p.line));
+            }
+        }
+    }));
+    clicked
+}
+
 /// The step screen's inks: the page's `.crt` text and its `.d`, `.r` and `.a` spans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ink {
