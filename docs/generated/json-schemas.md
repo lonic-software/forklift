@@ -4856,13 +4856,18 @@ A command not listed here either reports only the generic human-message shape `{
             "null"
           ]
         },
+        "outside_scope": {
+          "description": "Whether the change reaches outside this bay's scope, so un-parking here does not apply it.",
+          "type": "boolean"
+        },
         "path": {
           "type": "string"
         }
       },
       "required": [
         "path",
-        "change"
+        "change",
+        "outside_scope"
       ],
       "type": "object"
     }
@@ -4878,7 +4883,7 @@ A command not listed here either reports only the generic human-message shape `{
       ]
     },
     "files": {
-      "description": "Every file the park changes, against its base.",
+      "description": "Every file the park changes, against its base, in this bay's scope or not.",
       "items": {
         "$ref": "#/$defs/ParkedFile"
       },

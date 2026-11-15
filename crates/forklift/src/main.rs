@@ -213,25 +213,13 @@ fn knows_option(level: &clap::Command, word: &str) -> bool {
     true
 }
 
-/// The refusal for git's `branch NAME`. `branch` is a hidden alias of the `pallet` family, kept for
-/// git users, but git's `branch NAME` creates a branch without switching to it, and `pallet create`
-/// also shifts, so a name after `branch` is not taken as a create: it is refused with the command
-/// that creates the pallet. A flag the pallet level lacks (git's `-d`, `-m`) leaves the name to
-/// clap, which refuses the flag, and so does a help flag, so the help asked for is printed. Only a pallet subcommand's exact name or alias is a subcommand there;
-/// `args` are read before [`prefix::expand`], so `branch cr` is the pallet "cr", not a prefix of
-/// `create`. Options are stepped over as the prefix walk steps over them, and the words after `--`
-/// are left to clap. `command` must be built.
-///
-/// # Returns
-/// * `Some(clap::Error)` - A usage error on `pallet`, naming `forklift pallet create NAME`.
-/// * `None`              - The command is not `branch`, or `branch` is given no name.
 /// The usage error for a family argument [`cli::BARE_ONLY_ARGS`] keeps to the family's bare form,
 /// given on the command line together with one of the family's subcommands. The table is the
 /// rule, so the MCP tools and `self schema`, which read it, cannot drift from what is refused.
 /// `command` must be built.
 ///
 /// # Returns
-/// * `Some(clap::Error)` - A usage error on the family, naming where the subcommand takes its name.
+/// * `Some(clap::Error)` - A usage error on the family, naming the family and the subcommand.
 /// * `None`              - No bare-only argument came with a subcommand.
 fn bare_only_error(command: &clap::Command, matches: &clap::ArgMatches) -> Option<clap::Error> {
     cli::BARE_ONLY_ARGS.iter().find_map(|&(family, arg)| {
@@ -254,6 +242,18 @@ fn bare_only_error(command: &clap::Command, matches: &clap::ArgMatches) -> Optio
     })
 }
 
+/// The refusal for git's `branch NAME`. `branch` is a hidden alias of the `pallet` family, kept for
+/// git users, but git's `branch NAME` creates a branch without switching to it, and `pallet create`
+/// also shifts, so a name after `branch` is not taken as a create: it is refused with the command
+/// that creates the pallet. A flag the pallet level lacks (git's `-d`, `-m`) leaves the name to
+/// clap, which refuses the flag, and so does a help flag, so the help asked for is printed. Only a pallet subcommand's exact name or alias is a subcommand there;
+/// `args` are read before [`prefix::expand`], so `branch cr` is the pallet "cr", not a prefix of
+/// `create`. Options are stepped over as the prefix walk steps over them, and the words after `--`
+/// are left to clap. `command` must be built.
+///
+/// # Returns
+/// * `Some(clap::Error)` - A usage error on `pallet`, naming `forklift pallet create NAME`.
+/// * `None`              - The command is not `branch`, or `branch` is given no name.
 fn branch_name_error(command: &clap::Command, args: &[OsString]) -> Option<clap::Error> {
     let mut level = command;
     let mut at_root = true;
