@@ -13586,6 +13586,8 @@ fn heal_leaves_lost_what_only_unlifted_work_reaches_and_reads_no_object_for_it()
     std::fs::create_dir_all(on_server.parent().unwrap()).unwrap();
     std::fs::copy(object_store_path(&area, "cached", &local), &on_server).unwrap();
     lose_object_in(&area, "cached", &local);
+    // The working file no longer holds it, so heal cannot store it again from there.
+    area.write_file("cached/src/local.txt", "changed\n");
     seen.clear();
 
     let output = area.forklift("cached", &["--json", "heal"]);
@@ -13662,6 +13664,8 @@ fn heal_never_reseals_a_chunk_only_a_withheld_recipe_names() {
         .output().unwrap();
     assert_success(&withheld);
     lose_object_in(&area, "cached", &chunk);
+    // The working file no longer holds it, so heal cannot store it again from there.
+    area.write_file("cached/big.bin", "changed\n");
 
     let output = area.forklift("cached", &["--json", "heal"]);
     let refused = refusal_of(&output, 58);

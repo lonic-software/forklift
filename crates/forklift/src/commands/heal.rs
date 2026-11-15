@@ -783,6 +783,12 @@ impl ObjectsLost {
                 }
             ));
         }
+        if self.staged_only && self.corrupt > 0 {
+            lines.push(
+                "Some of that content is held by a damaged file, which loading the same content again keeps, so that load reads as lost again."
+                    .to_string(),
+            );
+        }
         if !self.staged_elsewhere.is_empty() {
             lines.push(format!(
                 "Staged, with nothing else reaching that content, in another checkout: {}.",

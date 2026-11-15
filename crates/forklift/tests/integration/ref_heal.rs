@@ -780,6 +780,26 @@ fn heal_names_unload_when_only_a_staged_load_reaches_a_lost_blob() {
 }
 
 #[test]
+fn heal_warns_that_a_damaged_staged_object_stays_lost_when_loaded_again() {
+    // FORK-493: a staged-only object held by a corrupt loose file gets the unload step too, and
+    // the refusal says that loading the same content again keeps the damaged file, as it does.
+    // Mutation: drop the damaged-file line → red.
+    let area = Area::new("staged-corrupt");
+    let root = area.warehouse();
+    std::fs::write(root.join("a.txt"), "staged\n").unwrap();
+    area.run_ok(&root, &["load", "a.txt"]);
+    std::fs::write(loose_object(&root, &blob_hash("staged\n")), "garbage").unwrap();
+
+    let error = lost_refusal(&area, &root);
+    assert_eq!(error["details"]["objects_lost"]["corrupt"], 1, "{}", error);
+    assert!(error["next_step"].as_str().unwrap().contains("\"forklift unload a.txt\""), "{}", error);
+    assert!(error["message"].as_str().unwrap().contains("loading the same content again keeps"), "{}", error);
+
+    area.run_ok(&root, &["load", "a.txt"]);
+    lost_refusal(&area, &root);
+}
+
+#[test]
 fn heal_keeps_the_backup_step_while_history_reaches_a_lost_object() {
     // FORK-493: a staged-only loss beside one history reaches is listed, but the backup step
     // stands, since unloading does not bring the history's object back.
