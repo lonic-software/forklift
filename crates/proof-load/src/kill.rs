@@ -810,6 +810,15 @@ pub enum Side {
     Server,
 }
 
+/// The file in the output directory that holds one scenario's kill points of `side`, as `run`
+/// writes it and as each row's detail names it.
+pub fn details_file(side: Side, scenario: &str) -> String {
+    match side {
+        Side::Client => format!("kills-{}.json", scenario),
+        Side::Server => format!("server-kills-{}.json", scenario),
+    }
+}
+
 /// [`summarize`] for `side`'s kill points.
 pub fn summarize_as(kills: &[ScenarioKills], side: Side) -> Summary {
     let (category, binding, prefix) = match side {
@@ -831,7 +840,7 @@ pub fn summarize_as(kills: &[ScenarioKills], side: Side) -> Summary {
         if side == Side::Client && scenario.refusals.is_empty() && scenario.killed.is_empty() && scenario.errors.is_empty() {
             empty.push(format!("{}: the faulted command made no call to kill", scenario.scenario));
         }
-        for killed in &scenario.killed {
+        for (index, killed) in scenario.killed.iter().enumerate() {
             let (command, name, base) = killed.point.unit();
             let covered = units.entry((scenario.scenario.clone(), command, name, base)).or_default();
             let Some(graded) = &killed.graded else {
@@ -855,6 +864,7 @@ pub fn summarize_as(kills: &[ScenarioKills], side: Side) -> Summary {
                 grade: graded.grade,
                 recoverability: graded.recoverability.clone(),
                 note: (!notes.is_empty()).then(|| notes.join("; ")),
+                detail: Some(format!("{}#/killed/{}/graded", details_file(side, &scenario.scenario), index)),
             });
         }
     }

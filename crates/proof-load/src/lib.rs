@@ -28,6 +28,7 @@ pub mod remedy;
 pub mod report;
 pub mod routes;
 pub mod routewrites;
+pub mod run;
 pub mod runner;
 pub mod scenario;
 pub mod scrub;
