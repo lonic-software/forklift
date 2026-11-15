@@ -184,7 +184,7 @@ than `@tags`: the signed office (`@office`), approvals and provenance (`@manifes
 reviews (`@haul`) and custom metadata (`@kv`), nor for the signatures on parcels and tags. The
 export's last line names each one the warehouse (or its remote) holds; `--json` lists them as
 `not_exported`. Parked work (`park`) is on no pallet, so it is not exported either; a warning counts
-it, in every bay (`parked`). A file whose redaction this warehouse applied (`redact`) is left out
+it (`parked`). A file whose redaction this warehouse applied (`redact`) is left out
 of each commit that carried it, with nothing in its place; the export names it with those parcels
 (`redacted` in `--json`), and so does `git mirror`, under the first pallet whose export wrote
 those commits. A commit a mirror wrote before the redaction applied keeps the file. A file whose
@@ -1716,7 +1716,7 @@ prefix.
 
 ```sh
 forklift park            # park tracked changes and reset to the pallet head
-forklift park list       # list parked parcels, newest first
+forklift park list       # list parked work by name, newest first
 forklift park pop         # re-apply the most recent parked changes (staged) and drop it
 ```
 
@@ -1726,6 +1726,13 @@ alone). `park pop` re-applies the most recent parked changes as a clean re-apply
 — it must be popped onto the head it was parked on, or it reports a conflict. If
 staging the re-applied changes fails, the parcel stays parked, and the error says that the
 working directory already holds the changes.
+
+Parked work belongs to the warehouse, not to a bay: every bay lists and pops the same parks. Each
+park has a name, the pallet it was parked on and the time (`main 2026-11-15T15:50:16Z`), with
+` (2)` added when two would share one. The record of what is parked carries a digest, so damage
+to it is never read as "nothing is parked": a missing or damaged record refuses every command that
+reads it, naming `forklift heal`, which rebuilds it from the entries that still read and the parked
+parcels the object store holds. A park the store scan brought back is listed as recovered by heal.
 
 `park`'s push durably commits the staged inventory into a parked parcel, exactly
 like `stack` commits into a stacked one — so it refuses under the same

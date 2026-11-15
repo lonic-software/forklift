@@ -12,6 +12,17 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **Parked work is shared by every bay, named, and rebuilt by `heal` when its record is damaged.**
+  Each bay kept its parked work in its own `parked` file, read as empty when it was lost, so the
+  parked work was gone without a word, and gc could free its content. Parked work now lives in one
+  record, `.forklift/parked`, which every bay shares and which carries a digest. A missing or
+  damaged record refuses `park`, `park list`, `park pop`, gc and every other reader, naming
+  `forklift heal`. `heal` rebuilds it from the entries that still read, any bay's leftover
+  `parked` file, and the parked parcels the store holds, keeping a copy of the damaged one
+  (`parked_rebuilt` in `--json`). Each park has a name, by default the pallet and the time
+  (`park list` prints it, and `--json` carries `name` and `recovered`, set on a park the store
+  scan brought back). Warehouses made before this have no record and refuse until `heal` runs.
+
 - **`heal` repairs a lost or damaged record of applied redactions.** A damaged record of which
   redactions this warehouse applied (`.forklift/redactions-applied`) failed every read of redacted
   content, so `git export` failed, with no remedy named; a lost one listed each redaction as pending
