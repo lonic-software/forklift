@@ -195,12 +195,18 @@ pub fn with_digest(mut bytes: Vec<u8>) -> Vec<u8> {
 /// The bytes of a digested record before its digest line, when its last line is a digest line
 /// that matches them; `None` otherwise. Judged before anything else, at any version.
 fn verified_body(bytes: &[u8]) -> Option<&[u8]> {
-    let text = bytes.strip_suffix(b"\n")?;
-    let start = text.iter().rposition(|byte| *byte == b'\n').map_or(0, |index| index + 1);
-    let hex = text[start..].strip_prefix(DIGEST_PREFIX.as_bytes())?;
-    let body = &bytes[..start];
+    let (body, last) = last_line(bytes);
+    let hex = last.strip_suffix(b"\n")?.strip_prefix(DIGEST_PREFIX.as_bytes())?;
 
     (blake3::hash(body).to_hex().as_bytes() == hex).then_some(body)
+}
+
+/// `bytes` split before its last line, which keeps its newline when it has one.
+fn last_line(bytes: &[u8]) -> (&[u8], &[u8]) {
+    let text = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let start = text.iter().rposition(|byte| *byte == b'\n').map_or(0, |index| index + 1);
+
+    bytes.split_at(start)
 }
 
 /// Parse a record written by [`to_bytes_digested`] for `kind` at `version`. The digest is checked
@@ -221,11 +227,10 @@ pub fn written_by_newer_digested(bytes: &[u8], kind: &str, version: u32) -> bool
 /// `bytes` without a digested record's last line, when that line opens as a digest line, matching
 /// or not, cut short or not: what [`salvage`] reads of a damaged digested record.
 pub fn without_digest_line(bytes: &[u8]) -> &[u8] {
-    let text = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-    let start = text.iter().rposition(|byte| *byte == b'\n').map_or(0, |index| index + 1);
+    let (body, last) = last_line(bytes);
 
-    match text[start..].starts_with(DIGEST_PREFIX.as_bytes()) {
-        true => &bytes[..start],
+    match last.starts_with(DIGEST_PREFIX.as_bytes()) {
+        true => body,
         false => bytes,
     }
 }

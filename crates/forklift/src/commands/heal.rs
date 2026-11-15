@@ -1126,10 +1126,27 @@ impl AppliedRebuilt {
     }
 }
 
+/// What the parked-work record was before `heal` rebuilt it.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ParkedRecordWas {
+    /// There was none.
+    Missing,
+    /// It did not read.
+    Damaged,
+    /// It read whole, but a bay still held parked work of its own.
+    Whole,
+}
+
 /// What `heal` kept of a missing, damaged or incomplete parked-work record.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct ParkedRebuilt {
+    /// What the record was: `missing`, `damaged`, or `whole` when it read but a bay still held
+    /// parked work of its own.
+    record: ParkedRecordWas,
+
     /// Where the damaged record was copied to; absent when it was missing.
     #[serde(skip_serializing_if = "Option::is_none")]
     set_aside: Option<String>,
@@ -1154,6 +1171,11 @@ pub(crate) struct ParkedRebuilt {
 impl From<park_utils::Rebuilt> for ParkedRebuilt {
     fn from(rebuilt: park_utils::Rebuilt) -> Self {
         ParkedRebuilt {
+            record: match rebuilt.record {
+                park_utils::RecordWas::Missing => ParkedRecordWas::Missing,
+                park_utils::RecordWas::Damaged => ParkedRecordWas::Damaged,
+                park_utils::RecordWas::Whole => ParkedRecordWas::Whole,
+            },
             set_aside: rebuilt.set_aside.map(|path| path.to_string_lossy().into_owned()),
             kept: rebuilt.kept,
             recovered: rebuilt.recovered,
@@ -1167,9 +1189,13 @@ impl From<park_utils::Rebuilt> for ParkedRebuilt {
 impl ParkedRebuilt {
     fn sentence(&self) -> String {
         let mut sentence = format!(
-            "The parked-work record was {} and is rebuilt: {} entr(ies) kept, {} parked parcel(s) found \
+            "The parked-work record {} and is rebuilt: {} entr(ies) kept, {} parked parcel(s) found \
             in the store listed again as recovered, {} line(s) dropped",
-            if self.set_aside.is_some() { "damaged" } else { "missing" },
+            match self.record {
+                ParkedRecordWas::Missing => "was missing",
+                ParkedRecordWas::Damaged => "was damaged",
+                ParkedRecordWas::Whole => "read, but a bay still held parked work of its own,",
+            },
             self.kept, self.recovered, self.dropped
         );
         if self.merged_bays > 0 {

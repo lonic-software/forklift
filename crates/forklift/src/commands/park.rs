@@ -388,10 +388,22 @@ pub fn pop_parked() -> Result<(), String> {
         }
     }
 
-    // Re-read under the lock: another bay may have parked or popped since.
+    #[cfg(test)]
+    tests::BEFORE_POP_REMOVES.with(|seam| seam.take().map(|seam| seam())).transpose()?;
+
+    // Re-read under the lock: another bay may have parked or popped since. One that popped or
+    // dropped this same parcel meanwhile is said, never passed over as a pop that took it.
     let lock = ParkedLock::acquire()?;
     let mut parked = park_utils::read_parked()?;
+    let before = parked.len();
     parked.retain(|entry| entry.parcel != parked_hash);
+    if parked.len() == before {
+        return Err(format!(
+            "The parked changes from {} were popped or dropped by another command while this pop ran. \
+            They are applied and staged here as well; the parked list was not changed.",
+            parked_hash
+        ));
+    }
     park_utils::write_parked(&lock, &parked)?;
 
     output::message(format!("Re-applied the parked changes from {} (staged).", parked_hash));
@@ -478,6 +490,10 @@ mod tests {
         /// Runs once after the marker records that the parked list names the parcel, before the
         /// bay is reset: an error stands for a crash there.
         pub(crate) static AFTER_LISTED: Seam = std::cell::Cell::new(None);
+
+        /// Runs once after a pop applied and staged the parked changes, before it takes them out
+        /// of the parked list: a test stands in for another bay's command there.
+        pub(crate) static BEFORE_POP_REMOVES: Seam = std::cell::Cell::new(None);
     }
 
     use super::*;
@@ -705,6 +721,8 @@ mod tests {
         test_support::configure_operator();
         let parcel = test_support::store_parcel(&test_support::store_tree("a.txt", b"old\n"), &[]);
         std::fs::write(park_utils::parked_path(), format!("/forklift-parked 1\n{}\n", parcel)).unwrap();
+        let error = park_utils::read_parked().unwrap_err();
+        assert!(error.contains("older Forklift, as version 1") && error.contains("forklift heal"), "{}", error);
 
         let rebuilt = park_utils::rebuild().unwrap().expect("a version-1 record is rebuilt");
         assert_eq!((rebuilt.kept, rebuilt.recovered), (1, 0), "{:?}", rebuilt);
@@ -730,8 +748,87 @@ mod tests {
 
         let rebuilt = park_utils::rebuild().unwrap().expect("the leftover is merged");
         assert_eq!(rebuilt.merged_bays, 1, "{:?}", rebuilt);
+        assert_eq!((rebuilt.record, rebuilt.set_aside.as_ref()), (park_utils::RecordWas::Whole, None),
+            "a record that read is not called damaged, nor copied aside");
         let now: Vec<_> = park_utils::read_parked().unwrap().into_iter().map(|entry| entry.parcel).collect();
         assert_eq!(now, vec![parked[0].parcel.clone(), parked[1].parcel.clone(), old], "kept first, then merged");
         assert!(!leftover.exists(), "the leftover is removed once merged");
+    }
+
+    /// A parcel the rebuild brings back goes in by the time it was parked, so the newest park
+    /// stays last and `park pop` takes it. Parks A and B, B popped (its parcel stays in the
+    /// store), then C: the rebuilt record is A, B (recovered), C. Revert the insert by time to an
+    /// append and B lands last, so the next pop re-applies work already popped.
+    #[test]
+    fn a_rebuild_puts_a_recovered_parcel_by_its_time_and_keeps_the_newest_last() {
+        // Park times are whole seconds, so the three parks are a second apart.
+        let next_second = || std::thread::sleep(std::time::Duration::from_millis(1100));
+        let warehouse = Warehouse::with_working_tree("park-rebuild-order");
+        work_in_progress_on_main(&warehouse.root);
+        test_support::block_on(park_changes()).unwrap();
+        next_second();
+        std::fs::write(warehouse.root.join("a.txt"), b"b work\n").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+        test_support::block_on(park_changes()).unwrap();
+        let popped = park_utils::read_parked().unwrap()[1].parcel.clone();
+        pop_parked().unwrap();
+        next_second();
+        std::fs::write(warehouse.root.join("a.txt"), b"c work\n").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+        test_support::block_on(park_changes()).unwrap();
+        let listed = park_utils::read_parked().unwrap();
+        assert_eq!(listed.len(), 2, "sanity: A and C are listed");
+
+        // Flip a hex digit of the digest, so every entry still reads and is kept.
+        let mut bytes = std::fs::read(park_utils::parked_path()).unwrap();
+        let at = bytes.len() - 3;
+        bytes[at] = if bytes[at] == b'0' { b'1' } else { b'0' };
+        std::fs::write(park_utils::parked_path(), bytes).unwrap();
+        park_utils::rebuild().unwrap().expect("the damaged record is rebuilt");
+
+        let rebuilt: Vec<_> = park_utils::read_parked().unwrap().into_iter()
+            .map(|entry| (entry.parcel, entry.recovered)).collect();
+        assert_eq!(rebuilt, vec![
+            (listed[0].parcel.clone(), false), (popped, true), (listed[1].parcel.clone(), false),
+        ]);
+    }
+
+    /// A pop whose parcel another command popped or dropped while it ran says so, rather than
+    /// reporting a pop of work that was no longer parked. Revert the check and the pop succeeds.
+    #[test]
+    fn a_pop_whose_parcel_was_taken_meanwhile_says_so() {
+        let warehouse = Warehouse::with_working_tree("park-pop-raced");
+        work_in_progress_on_main(&warehouse.root);
+        test_support::block_on(park_changes()).unwrap();
+
+        BEFORE_POP_REMOVES.with(|seam| seam.set(Some(Box::new(|| {
+            let lock = ParkedLock::acquire()?;
+            park_utils::write_parked(&lock, &[])
+        }))));
+        let error = pop_parked().unwrap_err();
+        assert!(error.contains("popped or dropped by another command"), "{}", error);
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"work\n"), "the changes are applied here");
+    }
+
+    /// A store whose history cannot be walked does not stop the rebuild: a parked parcel is
+    /// listed as recovered even though whether a ref reaches it cannot be told. Revert to
+    /// propagating the walk's error and the rebuild fails, leaving every reader refusing.
+    #[test]
+    fn a_rebuild_lists_parked_parcels_when_the_history_cannot_be_walked() {
+        let warehouse = Warehouse::with_working_tree("park-rebuild-unwalkable");
+        work_in_progress_on_main(&warehouse.root);
+        test_support::block_on(park_changes()).unwrap();
+        let parked = park_utils::read_parked().unwrap().remove(0);
+        remove_record();
+
+        // The head parcel is present but corrupt, so the walk from "main" cannot finish.
+        let head = pallet_utils::get_pallet_head("main").unwrap().unwrap();
+        let head_path = warehouse.root.join(".forklift/objects").join(&head[..2]).join(&head[2..]);
+        std::fs::write(&head_path, b"not a parcel").unwrap();
+
+        let rebuilt = park_utils::rebuild().unwrap().expect("the missing record is rebuilt");
+        assert_eq!(rebuilt.recovered, 1, "{:?}", rebuilt);
+        assert!(rebuilt.unreadable >= 1, "the walk that failed is counted: {:?}", rebuilt);
+        assert_eq!(park_utils::read_parked().unwrap()[0].parcel, parked.parcel);
     }
 }

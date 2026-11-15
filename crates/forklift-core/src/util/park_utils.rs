@@ -155,13 +155,17 @@ fn leftovers_in(forklift: &Path) -> Result<Vec<PathBuf>, String> {
 
 /// The record `bytes` at `path` lists, or why they list nothing this build can trust.
 fn decode(bytes: &[u8], path: &Path) -> Result<Vec<ParkedEntry>, String> {
-    let lines = record_utils::from_bytes_digested(bytes, PARKED_RECORD, PARKED_VERSION).map_err(|e| format!(
-        "The parked-work record \"{}\" {} {}",
-        path.to_string_lossy(), e.describe(), match written_by_newer(bytes) {
+    let lines = record_utils::from_bytes_digested(bytes, PARKED_RECORD, PARKED_VERSION).map_err(|e| {
+        let what = match bytes.starts_with(VERSION_1_HEADER.as_bytes()) {
+            true => "was written by an older Forklift, as version 1, which this one reads only to \
+                rebuild it.".to_string(),
+            false => e.describe(),
+        };
+        format!("The parked-work record \"{}\" {} {}", path.to_string_lossy(), what, match written_by_newer(bytes) {
             true => "This version of Forklift never writes over it.",
             false => REBUILT_BY_HEAL,
-        }
-    ))?;
+        })
+    })?;
 
     let mut entries: Vec<ParkedEntry> = Vec::with_capacity(lines.len());
     let mut names: HashSet<String> = HashSet::new();
@@ -178,6 +182,9 @@ fn decode(bytes: &[u8], path: &Path) -> Result<Vec<ParkedEntry>, String> {
 
     Ok(entries)
 }
+
+/// The header line of a version-1 record, which carried no digest.
+const VERSION_1_HEADER: &str = "/forklift-parked 1\n";
 
 fn written_by_newer(bytes: &[u8]) -> bool {
     record_utils::written_by_newer_digested(bytes, PARKED_RECORD, PARKED_VERSION)
@@ -272,9 +279,22 @@ pub fn settle_unlisted(parcel: &str) -> Result<bool, String> {
     }
 }
 
+/// What a rebuilt record was before the rebuild.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordWas {
+    /// There was none.
+    Missing,
+    /// It did not read.
+    Damaged,
+    /// It read whole, but a bay still held a leftover of its own.
+    Whole,
+}
+
 /// What [`rebuild`] did with a damaged, missing or incomplete record.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Rebuilt {
+    /// What the record was before the rebuild.
+    pub record: RecordWas,
     /// Where the damaged record was copied to, when there was one.
     pub set_aside: Option<PathBuf>,
     /// How many entries still read whole, from the record and the bays' leftovers, and were kept.
@@ -401,12 +421,16 @@ fn scan_store(kept: &[ParkedEntry]) -> Result<(Vec<Found>, usize), String> {
         return Ok((found, unreadable));
     }
 
-    // A parcel a ref reaches is history, not parked work.
-    let mut heads: Vec<String> = Vec::new();
-    for pallet in crate::util::pallet_utils::list_pallets()? {
-        heads.extend(crate::util::pallet_utils::get_pallet_head(&pallet)?);
-    }
-    let reachable = crate::util::gc_utils::collect_reachable_for_sweep(&heads)?;
+    // A parcel a ref reaches is history, not parked work. On a store too damaged to walk, that
+    // cannot be told, and the parcel is listed anyway: a recovered entry is the user's to drop,
+    // while a rebuild that stopped here would leave every reader refusing.
+    let reachable = match reachable_from_heads() {
+        Ok(reachable) => reachable,
+        Err(_) => {
+            unreadable += 1;
+            HashSet::new()
+        }
+    };
     let guard = redaction_utils::staging_guard()?;
 
     let mut kept_found = Vec::new();
@@ -414,17 +438,46 @@ fn scan_store(kept: &[ParkedEntry]) -> Result<(Vec<Found>, usize), String> {
         if reachable.contains(&hash) {
             continue;
         }
+        // Content an applied redaction refuses is never brought back, and neither is a parcel
+        // whose tree cannot be judged.
         if let Some(guard) = &guard {
-            let tree = object_utils::load_parcel(&hash)?.tree_hash;
-            if guard.names_tree(&tree)?.is_some() {
-                continue;
+            let refused = object_utils::load_parcel(&hash)
+                .and_then(|parcel| guard.names_tree(&parcel.tree_hash).map_err(|e| e.to_string()));
+            match refused {
+                Ok(None) => (),
+                Ok(Some(_)) => continue,
+                Err(_) => {
+                    unreadable += 1;
+                    continue;
+                }
             }
         }
         kept_found.push((at, hash, name));
     }
-    kept_found.sort();
+    // Park times are whole seconds: two parks of one second keep the order of their names, the
+    // later one carrying the suffix.
+    kept_found.sort_by(|a, b| (a.0, &a.2, &a.1).cmp(&(b.0, &b.2, &b.1)));
 
     Ok((kept_found, unreadable))
+}
+
+/// Every parcel a pallet head reaches.
+fn reachable_from_heads() -> Result<HashSet<String>, String> {
+    let mut heads: Vec<String> = Vec::new();
+    for pallet in crate::util::pallet_utils::list_pallets()? {
+        heads.extend(crate::util::pallet_utils::get_pallet_head(&pallet)?);
+    }
+
+    Ok(crate::util::gc_utils::collect_reachable_for_sweep(&heads)?.into_iter().collect())
+}
+
+/// When the parcel `hash` was parked: its Park action's time, else its first action's.
+fn parked_at(hash: &str) -> Option<DateTime<Utc>> {
+    let parcel = object_utils::load_parcel(hash).ok()?;
+    parcel.actions.iter()
+        .find(|action| matches!(action.action, ParcelActionType::Park))
+        .or(parcel.actions.first())
+        .map(|action| action.timestamp)
 }
 
 /// Rebuild a missing, damaged or incomplete record under the [`ParkedLock`], first copying a
@@ -462,15 +515,31 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
     }
     let kept = entries.len();
 
+    // Each parcel found goes in by the time it was parked, before the first kept entry parked
+    // later, so the newest entry stays the newest park and `park pop` takes it, not a parcel the
+    // scan brought back.
     let (found, unreadable) = scan_store(&entries)?;
     let recovered = found.len();
-    for (_, parcel, name) in found {
+    let mut times: Vec<Option<DateTime<Utc>>> = entries.iter().map(|entry| parked_at(&entry.parcel)).collect();
+    for (at, parcel, name) in found {
         let name = unique_name(&name, &entries);
-        entries.push(ParkedEntry { parcel, recovered: true, name });
+        let index = times.iter().position(|time| time.is_some_and(|time| time > at)).unwrap_or(entries.len());
+        entries.insert(index, ParkedEntry { parcel, recovered: true, name });
+        times.insert(index, Some(at));
     }
 
+    // Only a record that was itself damaged is copied aside: one that read whole beside a bay's
+    // leftover is kept in the rebuilt one.
     let path = forklift.join(FILE_NAME_PARKED);
-    let set_aside = bytes.map(|bytes| file_utils::copy_aside(&path, &bytes)).transpose()?;
+    let record = match &bytes {
+        None => RecordWas::Missing,
+        Some(bytes) if decode(bytes, &path).is_err() => RecordWas::Damaged,
+        Some(_) => RecordWas::Whole,
+    };
+    let set_aside = match (&record, bytes) {
+        (RecordWas::Damaged, Some(bytes)) => Some(file_utils::copy_aside(&path, &bytes)?),
+        _ => None,
+    };
     write_parked(&lock, &entries)?;
 
     for leftover in &leftovers {
@@ -478,7 +547,7 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
             .map_err(|e| format!("Error while removing \"{}\": {}", leftover.to_string_lossy(), e))?;
     }
 
-    Ok(Some(Rebuilt { set_aside, kept, recovered, dropped, unreadable, merged_bays: leftovers.len() }))
+    Ok(Some(Rebuilt { record, set_aside, kept, recovered, dropped, unreadable, merged_bays: leftovers.len() }))
 }
 
 /// The parcels the record lists, for a census of every object something holds.
