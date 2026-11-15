@@ -2250,7 +2250,7 @@ fn a_sparse_clone_and_lower_take_in_scope_history_naming_applied_content_without
     assert_eq!(healed["error"]["code"], "objects_lost", "{}", healed);
     assert_ne!(healed["error"]["next_step"], "forklift heal", "{}", healed);
     let notes = healed["error"]["details"]["notes"].to_string();
-    assert!(notes.contains("was not asked, so no redaction whose content is lost was applied again"), "{}", healed);
+    assert!(notes.contains("The handshake with the remote failed, so no redaction whose content is lost was applied again"), "{}", healed);
     let framed = healed["error"]["details"]["notes"].as_array().unwrap().iter()
         .any(|note| note.as_str().unwrap().contains('\u{1f}'));
     assert!(!framed, "no refusal frame in a note: {}", healed);
