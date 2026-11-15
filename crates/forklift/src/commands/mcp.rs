@@ -959,13 +959,19 @@ fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
             return Ok(());
         }
         if command.has_subcommands() {
-            if let Some(arg) = command.get_arguments().find(|arg| !arg.is_global_set()) {
+            // A family's own arguments belong to its bare form only, so they are allowed just
+            // where clap keeps them off the subcommands.
+            let own = command.get_arguments().find(|arg| !arg.is_global_set());
+            if let Some(arg) = own.filter(|_| !command.is_args_conflicts_with_subcommands_set()) {
                 return Err(format!("`forklift {shown}` has subcommands and its own argument `{}`", arg.get_id()));
             }
             if !command.is_subcommand_required_set() {
                 match BARE_SAME_AS.iter().position(|(family, _)| *family == shown) {
+                    Some(_) if own.is_some() => {
+                        return Err(format!("`forklift {shown}` takes its own arguments, so BARE_SAME_AS cannot name it"));
+                    }
                     Some(index) => used.bare_same_as[index] = true,
-                    None => tools.push(tool_for(command, &path, Vec::new())?),
+                    None => tools.push(leaf_tool(command, &path, used)?),
                 }
             }
             for sub in command.get_subcommands().filter(|sub| !sub.is_hide_set()) {
@@ -976,6 +982,13 @@ fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
             return Ok(());
         }
 
+        tools.push(leaf_tool(command, &path, used)?);
+        Ok(())
+    }
+
+    /// The tool for `command` run with its own arguments, those in [`HUMAN_ONLY_ARGS`] withheld.
+    fn leaf_tool(command: &clap::Command, path: &[String], used: &mut Used) -> Result<Tool, String> {
+        let shown = path.join(" ");
         let mut params = Vec::new();
         let mut withheld = Vec::new();
         for arg in command.get_arguments().filter(|arg| !arg.is_global_set() && !arg.is_hide_set()) {
@@ -993,10 +1006,9 @@ fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
         if let Some(param) = params.iter().find(|param| !keys.insert(param.key.as_str())) {
             return Err(format!("two arguments of `forklift {shown}` make the property `{}`", param.key));
         }
-        let mut tool = tool_for(command, &path, params)?;
+        let mut tool = tool_for(command, path, params)?;
         tool.withheld = withheld;
-        tools.push(tool);
-        Ok(())
+        Ok(tool)
     }
 
     let mut tools = Vec::new();
@@ -1756,8 +1768,8 @@ mod tests {
     #[test]
     fn every_visible_command_path_is_a_tool_unless_it_is_human_only_or_the_same_as_a_subcommand() {
         let names: Vec<&str> = super::tools().unwrap().iter().map(|tool| tool.name.as_str()).collect();
-        for name in ["stocktake", "bay", "bay_add", "park", "park_pop", "manifest", "manifest_provenance",
-                     "office_list", "tag_list", "haul_list", "scope_status", "manifest_set", "pick"] {
+        for name in ["stocktake", "bay", "bay_add", "park", "park_pop", "park_apply", "park_drop", "park_show",
+                     "manifest", "manifest_provenance", "office_list", "tag_list", "haul_list", "scope_status", "manifest_set", "pick"] {
             assert!(names.contains(&name), "{name} must be a tool");
         }
         for name in ["office", "tag", "haul", "scope", "pallet", "office_enroll", "office_regenesis", "prepare", "upgrade",
@@ -1765,6 +1777,10 @@ mod tests {
             assert!(!names.contains(&name), "{name} must not be a tool");
         }
         assert_eq!(tool("tag_create").path, ["tag", "create"]);
+
+        // A family's own arguments, which clap keeps off its subcommands, are its bare tool's.
+        assert_eq!(tool("park").params.iter().map(|param| param.key.as_str()).collect::<Vec<_>>(), ["name"]);
+        assert!(tool("park_pop").params.iter().all(|param| param.key == "name"));
 
         // An argument no agent passes is left out of its tool, which is served without it; passing
         // it is refused with why, the description names it, and the same argument of another
@@ -1824,6 +1840,9 @@ mod tests {
         assert!(refused(cli().mut_subcommand("haul", |haul| haul.subcommand_required(true))).contains("BARE_SAME_AS names"));
         assert!(refused(cli().mut_subcommand("tag", |tag| tag.arg(clap::Arg::new("x").long("x"))))
             .contains("`forklift tag` has subcommands and its own argument"));
+        assert!(refused(cli().mut_subcommand("tag", |tag| tag.args_conflicts_with_subcommands(true)
+            .arg(clap::Arg::new("x").long("x"))))
+            .contains("`forklift tag` takes its own arguments, so BARE_SAME_AS cannot name it"));
         assert!(refused(cli().subcommand(clap::Command::new("tag_list").about("Twin")))
             .contains("two commands make the tool name `tag_list`"));
         assert!(refused(cli().subcommand(clap::Command::new("twin").about("Twin")

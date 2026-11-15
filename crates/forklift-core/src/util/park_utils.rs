@@ -128,6 +128,20 @@ pub fn unique_name(base: &str, entries: &[ParkedEntry]) -> String {
     unreachable!("an unbounded search ends")
 }
 
+/// The index in `entries` of the park named `name`, or of the newest park when no name is given.
+///
+/// # Returns
+/// * `Ok(usize)`   - Its index.
+/// * `Err(String)` - Nothing is parked, or nothing under that name.
+pub fn pick(entries: &[ParkedEntry], name: Option<&str>) -> Result<usize, String> {
+    match name {
+        None if entries.is_empty() => Err("There are no parked changes.".to_string()),
+        None => Ok(entries.len() - 1),
+        Some(name) => entries.iter().position(|entry| entry.name == name)
+            .ok_or_else(|| format!("No work is parked as \"{}\".", crate::error::sanitize(name))),
+    }
+}
+
 /// The leftover `parked` files of the named bays of the warehouse at forklift root `forklift`.
 fn leftovers_in(forklift: &Path) -> Result<Vec<PathBuf>, String> {
     let folder = forklift.join(crate::globals::FOLDER_NAME_BAYS_ROOT);
