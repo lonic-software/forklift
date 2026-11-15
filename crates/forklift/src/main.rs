@@ -165,9 +165,12 @@ fn parse_or_exit() -> Cli {
                 Ok(mut matches) => {
                     output::set_command(matches.subcommand_name());
 
-                    match Cli::from_arg_matches_mut(&mut matches) {
-                        Ok(cli) => return cli,
-                        Err(error) => error,
+                    match bare_only_error(&command, &matches) {
+                        Some(error) => error,
+                        None => match Cli::from_arg_matches_mut(&mut matches) {
+                            Ok(cli) => return cli,
+                            Err(error) => error,
+                        },
                     }
                 }
                 Err(error) => error,
@@ -222,6 +225,35 @@ fn knows_option(level: &clap::Command, word: &str) -> bool {
 /// # Returns
 /// * `Some(clap::Error)` - A usage error on `pallet`, naming `forklift pallet create NAME`.
 /// * `None`              - The command is not `branch`, or `branch` is given no name.
+/// The usage error for a family argument [`cli::BARE_ONLY_ARGS`] keeps to the family's bare form,
+/// given on the command line together with one of the family's subcommands. The table is the
+/// rule, so the MCP tools and `self schema`, which read it, cannot drift from what is refused.
+/// `command` must be built.
+///
+/// # Returns
+/// * `Some(clap::Error)` - A usage error on the family, naming where the subcommand takes its name.
+/// * `None`              - No bare-only argument came with a subcommand.
+fn bare_only_error(command: &clap::Command, matches: &clap::ArgMatches) -> Option<clap::Error> {
+    cli::BARE_ONLY_ARGS.iter().find_map(|&(family, arg)| {
+        let mut level = command;
+        let mut found = matches;
+        for word in family.split(' ') {
+            let (name, sub) = found.subcommand()?;
+            if name != word {
+                return None;
+            }
+            level = level.find_subcommand(word)?;
+            found = sub;
+        }
+        let given = found.value_source(arg) == Some(clap::parser::ValueSource::CommandLine);
+        let (subcommand, _) = found.subcommand()?;
+        given.then(|| level.clone().error(ErrorKind::ArgumentConflict, format!(
+            "\"--{arg}\" belongs to a bare \"forklift {family}\", not to \"forklift {family} {subcommand}\", \
+            which takes its own arguments after it. Nothing was done."
+        )))
+    })
+}
+
 fn branch_name_error(command: &clap::Command, args: &[OsString]) -> Option<clap::Error> {
     let mut level = command;
     let mut at_root = true;
@@ -568,10 +600,6 @@ async fn dispatch(cli: Cli, store_access: &mut Option<lock_utils::StoreAccessLoc
             Some(PalletAction::Restore { name, remote: true }) => commands::pallet::restore_remote_pallet(&name).await,
             Some(PalletAction::Restore { name, remote: false }) => commands::pallet::restore_pallet(&name),
         },
-        Command::Park { name: Some(_), action: Some(_) } => Err(
-            "\"--name\" names the work a bare \"forklift park\" parks; a subcommand takes the park's name \
-            after it, as in \"forklift park pop <name>\". Nothing was done.".to_string()
-        ),
         Command::Park { name, action } => match action {
             Some(ParkAction::Pop { name }) => commands::park::pop_parked(name.as_deref()),
             Some(ParkAction::Apply { name }) => commands::park::apply_parked(name.as_deref()),

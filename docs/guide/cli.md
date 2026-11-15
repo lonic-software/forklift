@@ -1741,7 +1741,10 @@ reads it, naming `forklift heal`, which rebuilds it from the entries that still 
 parcels the object store holds. A park the store scan brought back is listed as recovered by heal;
 it may be work that was popped or dropped before the record was lost, so applying or popping it says
 so, and `park drop` discards it. Two bays never both pop one park: a pop applies the changes while
-holding the lock over the record, and a pop whose park another bay took first applies nothing.
+holding the lock over the record, and a pop whose park another bay took first applies nothing. A
+scoped bay applies only the part of a park inside its scope, so there `pop` refuses a park that also
+changes files outside it, `apply` applies the part inside and keeps it parked, and `show` lists
+every file, marking those outside the scope.
 
 `park`'s push durably commits the staged inventory into a parked parcel, exactly
 like `stack` commits into a stacked one — so it refuses under the same

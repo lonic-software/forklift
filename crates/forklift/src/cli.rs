@@ -2133,7 +2133,7 @@ pub enum ProfileAction {
 }
 
 /// A family's own arguments, by family path and argument id: they belong to its bare form only, and
-/// dispatch refuses them given with a subcommand. clap's `args_conflicts_with_subcommands` would
+/// the parse refuses them given with a subcommand, as a usage error. clap's `args_conflicts_with_subcommands` would
 /// say so too, but it also refuses every global flag written between the family and its
 /// subcommand (`park --json pop`). The MCP tools and `self schema` give these to the bare form.
 pub const BARE_ONLY_ARGS: &[(&str, &str)] = &[("park", "name")];

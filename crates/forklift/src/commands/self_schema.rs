@@ -332,7 +332,7 @@ impl Walk<'_> {
         command_settings(&path, command)?;
         if command.has_subcommands() {
             // A group's own arguments would have no place in its children's commands, so they
-            // are allowed only where the CLI's BARE_ONLY_ARGS says dispatch refuses them with a
+            // are allowed only where the CLI's BARE_ONLY_ARGS says the parse refuses them with a
             // subcommand: then they are the bare form's.
             let shown = path.join(" ");
             let bare_only = |arg: &&Arg| crate::cli::BARE_ONLY_ARGS.contains(&(shown.as_str(), arg.get_id().as_str()));

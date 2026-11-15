@@ -13,6 +13,8 @@ use forklift_core::util::{
     tree_utils,
 };
 use forklift_core::util::lock_utils::ParkedLock;
+use forklift_core::util::scope_utils::PathScope;
+use std::collections::BTreeSet;
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::commands::merge_abort;
 use crate::output::{self, CommandOutput};
@@ -333,11 +335,27 @@ fn unpark(name: Option<&str>, how: Unpark) -> Result<(), String> {
     let head_tree_hash = object_utils::load_parcel(&head)?.tree_hash;
 
     // The parked changes are the diff between the parked parcel and the head it was
-    // parked on.
-    let (ops, removed_dirs) = shift_utils::diff_trees(
+    // parked on, within this bay's scope. Parks are shared by every bay, so one made in a wider
+    // bay can change files this one does not hold: a pop would apply only part of it and take
+    // all of it off the list, so it refuses; an apply keeps the park and says what it left out.
+    let scope = scope_utils::current_scope()?;
+    let (ops, removed_dirs) = shift_utils::diff_trees_in(
         Some(&parked_base_tree),
-        &parked_parcel.tree_hash
+        &parked_parcel.tree_hash,
+        &scope
     )?;
+    let outside = outside_scope(Some(&parked_base_tree), &parked_parcel.tree_hash, &scope)?;
+
+    if how == Unpark::Pop && !outside.is_empty() {
+        return Err(format!(
+            "The parked work \"{}\" ({}) also changes files outside this bay's scope:\n  {}\n\
+            Popping it here would apply only part of it, so nothing was applied. \"forklift park apply\" \
+            applies the part inside this scope and keeps it parked; a pop in a bay whose scope holds \
+            these files applies all of it.",
+            sanitize(&entry.name), parked_hash,
+            outside.iter().map(|path| sanitize(path)).collect::<Vec<_>>().join("\n  ")
+        ));
+    }
 
     // Safety: every file the parked changes touch must be unchanged between the parked
     // base and the current head — this keeps un-parking a clean re-apply instead of a
@@ -454,7 +472,14 @@ fn unpark(name: Option<&str>, how: Unpark) -> Result<(), String> {
     #[cfg(test)]
     tests::BEFORE_POP_REMOVES.with(|seam| seam.take().map(|seam| seam())).transpose()?;
 
-    let note = if entry.recovered { format!(" {}", RECOVERED_NOTE) } else { String::new() };
+    let mut note = if entry.recovered { format!(" {}", RECOVERED_NOTE) } else { String::new() };
+    if !outside.is_empty() {
+        note.push_str(&format!(
+            " It also changes {} outside this bay's scope, not applied here; \"forklift park show\" \
+            lists them.",
+            if outside.len() == 1 { "1 file".to_string() } else { format!("{} files", outside.len()) }
+        ));
+    }
 
     match lock {
         Some((lock, mut parked, index)) => {
@@ -518,10 +543,32 @@ fn park_show(name: Option<&str>) -> Result<ParkedShow, String> {
     let base_tree = base.as_deref().map(|base| object_utils::load_parcel(base).map(|base| base.tree_hash)).transpose()?;
     // A plain tree-to-tree comparison, as `diff` makes: not the apply plan, which depends on this
     // file system's case folding.
-    let files = crate::commands::diff::tree_file_changes(base_tree.as_deref(), &parcel.tree_hash)?
-        .into_iter().map(|(change, path, moved_from)| ParkedFile { path, change, moved_from }).collect();
+    // Parks are shared by every bay, so every file is listed, those this bay's scope leaves out
+    // marked.
+    let scope = scope_utils::current_scope()?;
+    let outside = outside_scope(base_tree.as_deref(), &parcel.tree_hash, &scope)?;
+    let files = crate::commands::diff::tree_file_changes(base_tree.as_deref(), &parcel.tree_hash, &PathScope::full())?
+        .into_iter().map(|(change, path, moved_from)| {
+            let outside_scope = outside.contains(&path) || moved_from.as_ref().is_some_and(|from| outside.contains(from));
+            ParkedFile { path, change, moved_from, outside_scope }
+        }).collect();
 
     Ok(ParkedShow { name: entry.name, parcel: entry.parcel, base, recovered: entry.recovered, parked_at, files })
+}
+
+/// The paths a change from tree `from` to tree `to` touches (a move touches both its ends) that a
+/// comparison within `scope` leaves out: none in a full scope.
+fn outside_scope(from: Option<&str>, to: &str, scope: &PathScope) -> Result<BTreeSet<String>, String> {
+    if scope.is_full() {
+        return Ok(BTreeSet::new());
+    }
+    let touched = |scope: &PathScope| -> Result<BTreeSet<String>, String> {
+        Ok(crate::commands::diff::tree_file_changes(from, to, scope)?.into_iter()
+            .flat_map(|(_, path, moved_from)| std::iter::once(path).chain(moved_from))
+            .collect())
+    };
+    let inside = touched(scope)?;
+    Ok(touched(&PathScope::full())?.into_iter().filter(|path| !inside.contains(path)).collect())
 }
 
 /// One park, with how it changes each file.
@@ -539,7 +586,7 @@ pub(crate) struct ParkedShow {
     recovered: bool,
     /// When the work was parked (UTC, RFC 3339).
     parked_at: Option<String>,
-    /// Every file the park changes, against its base.
+    /// Every file the park changes, against its base, in this bay's scope or not.
     files: Vec<ParkedFile>,
 }
 
@@ -553,17 +600,8 @@ pub(crate) struct ParkedFile {
     /// Where a moved file moved from.
     #[serde(skip_serializing_if = "Option::is_none")]
     moved_from: Option<String>,
-}
-
-/// The word for how a park changes a file.
-fn change_label(change: ChangeKind) -> &'static str {
-    match change {
-        ChangeKind::Added => "added",
-        ChangeKind::Modified => "modified",
-        ChangeKind::Moved => "moved",
-        ChangeKind::Removed => "removed",
-        _ => "changed",
-    }
+    /// Whether the change reaches outside this bay's scope, so un-parking here does not apply it.
+    outside_scope: bool,
 }
 
 impl CommandOutput for ParkedShow {
@@ -576,9 +614,10 @@ impl CommandOutput for ParkedShow {
             println!("  parked    {}", parked_at);
         }
         for file in &self.files {
+            let outside = if file.outside_scope { "  (outside this bay's scope)" } else { "" };
             match &file.moved_from {
-                Some(from) => println!("  {:<9} {} -> {}", change_label(file.change), sanitize(from), sanitize(&file.path)),
-                None => println!("  {:<9} {}", change_label(file.change), sanitize(&file.path)),
+                Some(from) => println!("  {:<9} {} -> {}{}", file.change, sanitize(from), sanitize(&file.path), outside),
+                None => println!("  {:<9} {}{}", file.change, sanitize(&file.path), outside),
             }
         }
     }
@@ -1089,8 +1128,8 @@ mod tests {
         let shown = park_show(Some("wip")).unwrap();
         assert_eq!(shown.base, pallet_utils::get_pallet_head("main").unwrap());
         assert!(shown.parked_at.is_some());
-        let files: Vec<_> = shown.files.iter().map(|file| (file.path.as_str(), change_label(file.change))).collect();
-        assert_eq!(files, vec![("a.txt", "modified"), ("b.txt", "added")]);
+        let files: Vec<_> = shown.files.iter().map(|file| (file.path.as_str(), file.change.to_string(), file.outside_scope)).collect();
+        assert_eq!(files, vec![("a.txt", "modified".to_string(), false), ("b.txt", "added".to_string(), false)]);
     }
 
     /// A store whose history cannot be walked does not stop the rebuild: a parked parcel is

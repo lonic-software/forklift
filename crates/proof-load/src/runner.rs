@@ -389,13 +389,19 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
 
     let parked = if tool == Tool::Forklift && scenario.history.iter().any(|op| matches!(op, Op::Park { .. })) {
         let listed = run_in(program, vec!["--json".into(), "park".into(), "list".into()], scratch.work())?;
-        // A listing that exited 0 but cannot be read fails the build: an empty list here would
-        // let every readback pass whatever happened to the parks.
-        let parked = parked_parcels(&listed.stdout).ok_or_else(|| RunError::Io(format!(
-            "scenario {}: `forklift park list --json` printed no parked list: {}", scenario.id, String::from_utf8_lossy(&listed.stdout)
-        )))?;
+        // The history runs on an undamaged warehouse, so a listing that refuses, or exits 0 but
+        // cannot be read, fails the build: an empty list here would let every readback pass
+        // whatever happened to the parks.
+        let parked = match listed.succeeded() {
+            true => parked_parcels(&listed.stdout).ok_or_else(|| format!(
+                "printed no parked list: {}", String::from_utf8_lossy(&listed.stdout)
+            )),
+            false => Err(format!(
+                "exited {:?}: {}{}", listed.exit, String::from_utf8_lossy(&listed.stdout), String::from_utf8_lossy(&listed.stderr)
+            )),
+        };
         outcomes.push(listed);
-        parked
+        parked.map_err(|why| RunError::Io(format!("scenario {}: `forklift park list --json` {}", scenario.id, why)))?
     } else {
         Vec::new()
     };

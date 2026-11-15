@@ -960,7 +960,7 @@ fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
         }
         if command.has_subcommands() {
             // A family's own arguments belong to its bare form only, so they are allowed just
-            // where the CLI's BARE_ONLY_ARGS says dispatch refuses them with a subcommand.
+            // where the CLI's BARE_ONLY_ARGS says the parse refuses them with a subcommand.
             let own: Vec<&clap::Arg> = command.get_arguments().filter(|arg| !arg.is_global_set()).collect();
             let bare_only = |arg: &clap::Arg| crate::cli::BARE_ONLY_ARGS.contains(&(shown.as_str(), arg.get_id().as_str()));
             if let Some(arg) = own.iter().find(|arg| !bare_only(arg)) {
