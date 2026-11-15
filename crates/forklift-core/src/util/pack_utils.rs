@@ -3358,8 +3358,8 @@ fn reconstruct_record(record: &[u8], hash: &str, bases: Bases) -> Result<Vec<u8>
             // Borrow-only: the delta base is only read to reconstruct against, so share the
             // cached `Arc` instead of copying the base out (hot on packed-delta reads and compact).
             let base = match bases {
-                Bases::Verified => file_utils::retrieve_object_by_hash_shared(&base_hash)
-                    .map_err(|error| delta_base_failure(&base_hash, error))?,
+                Bases::Verified => file_utils::retrieve_object_by_hash_shared_classified(&base_hash)
+                    .map_err(|(error, cause)| delta_base_failure(&base_hash, error, cause))?,
                 Bases::Unverified => unverified_delta_base(&base_hash, &base_bytes).map_err(record_damage)?,
             };
 
@@ -3370,24 +3370,24 @@ fn reconstruct_record(record: &[u8], hash: &str, bases: Bases) -> Result<Vec<u8>
 }
 
 /// Why a delta cannot be rebuilt when its verified base read failed with `error`, judged by the
-/// base's own cause (read again, on this failure path only). A base that is absent, or whose every
-/// copy is damaged, leaves the delta damaged with it, and a base behind a damaged index heal can
-/// rebuild leaves it with that cause: each is reworded to name the base. Any other failure says
-/// nothing about this record and keeps the base's own wording.
-fn delta_base_failure(base_hash: &str, error: String) -> (String, file_utils::Unreadable) {
-    let reason = |error: &str| match crate::error::deframe(error) {
-        Some((_, message, _)) => message.to_string(),
-        None => error.to_string(),
-    };
-    match file_utils::read_object_classified(base_hash) {
-        Ok(file_utils::StoreReadOutcome::Absent) => {
-            record_damage(format!("its delta base {} is not in this store: {}", base_hash, reason(&error)))
+/// base read's own `cause` (`None` for an absence), never by reading the base again, which down a
+/// failing chain would repeat at every level. A base that is absent, or whose every copy is
+/// damaged, leaves the delta damaged with it, and a base behind a damaged index heal can rebuild
+/// leaves it with that cause: each is reworded to name the base. Any other failure says nothing
+/// about this record and keeps the base's own wording.
+fn delta_base_failure(base_hash: &str, error: String, cause: Option<file_utils::Unreadable>) -> (String, file_utils::Unreadable) {
+    let unreadable = crate::error::deframe(&error)
+        .filter(|(code, _, _)| *code == crate::error::RefusalCode::ObjectUnreadable.as_str())
+        .map(|(_, message, _)| message.to_string());
+    match (cause, unreadable) {
+        (Some(file_utils::Unreadable::RecordDamage | file_utils::Unreadable::LooseCorrupt), Some(message)) => {
+            record_damage(format!("its delta base {} cannot be read: {}", base_hash, message))
         }
-        Ok(file_utils::StoreReadOutcome::Unverifiable(_, file_utils::Unreadable::RecordDamage | file_utils::Unreadable::LooseCorrupt)) => {
-            record_damage(format!("its delta base {} cannot be read: {}", base_hash, reason(&error)))
+        (None, Some(message)) => {
+            record_damage(format!("its delta base {} is not in this store: {}", base_hash, message))
         }
-        Ok(file_utils::StoreReadOutcome::Unverifiable(_, file_utils::Unreadable::PackDamage)) => (
-            format!("its delta base {} cannot be read: {}", base_hash, reason(&error)),
+        (Some(file_utils::Unreadable::PackDamage), Some(message)) => (
+            format!("its delta base {} cannot be read: {}", base_hash, message),
             file_utils::Unreadable::PackDamage,
         ),
         _ => (error, file_utils::Unreadable::Other),
