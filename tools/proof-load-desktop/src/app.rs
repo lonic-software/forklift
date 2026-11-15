@@ -109,6 +109,8 @@ impl App {
         });
         widgets::plate(ui, "Results parts", "tally, filter and readouts", |ui| {
             ui.horizontal_top(|ui| {
+                // `.screen`: the side column and the detail are 14 px apart.
+                ui.spacing_mut().item_spacing.x = theme::PLATE_GAP;
                 ui.allocate_ui(egui::vec2(230.0, 200.0), |ui| {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = theme::SIDE_GAP;
@@ -119,7 +121,7 @@ impl App {
                     });
                 });
                 ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = theme::SIDE_GAP;
+                    ui.spacing_mut().item_spacing.y = theme::STACK_GAP;
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = theme::SIDE_GAP;
                         ui.allocate_ui(egui::vec2(220.0, 80.0), |ui| widgets::readout(ui, "Commands to expected", "3", "commands"));

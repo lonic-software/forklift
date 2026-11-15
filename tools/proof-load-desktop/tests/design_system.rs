@@ -111,10 +111,10 @@ fn the_shape_and_type_tokens_match_the_page() {
 /// `family` and the rest), whitespace ignored. A `galley.size()` is a measurement, not a size
 /// written, and a `face.family()` a getter: a `size` or `family` called with nothing is allowed.
 fn literals(source: &str) -> Vec<String> {
-    const WRITES: [&str; 22] = [
+    const WRITES: [&str; 25] = [
         "Color32::", "Color32 as", "Rgba", "Hsva", "Hsla", "from_rgb", "from_gray", "from_hex", "from_srgb",
         "gamma_multiply", "linear_multiply", "lerp_to_gamma", "FontId", "TextStyle::", ".strong()",
-        ".heading()", ".small()", ".monospace()", ".weak()", ".text_style(", ".code()",
+        ".heading()", ".small()", ".monospace()", ".weak()", ".text_style(", ".code()", "font_id", "FontSelection", "TextFormat::simple",
         ".italics()",
     ];
     source.lines().enumerate()
@@ -152,7 +152,8 @@ fn no_file_but_the_theme_writes_a_colour_or_a_font_size() {
 fn the_literal_scan_finds_what_it_bans() {
     assert_eq!(literals("let a = 1;\nlet red = Color32::RED;"), ["2: let red = Color32::RED;"]);
     for write in ["FontId::new(9.0, family)", "FontId { size: 9.0, family }", "RichText::new(x).size(20.0)", "RichText::new(x).strong()",
-        "ink.gamma_multiply(0.45)", "RichText::new(x).size (20.0)", "RichText::new(x).code()", "RichText::new(x).family(f)", "use egui::Color32 as C;", "Rgba::from_rgb(1.0, 0.0, 0.0)", "ecolor::Hsva::new(0.0, 1.0, 1.0, 1.0)"] {
+        "ink.gamma_multiply(0.45)", "RichText::new(x).size (20.0)", "RichText::new(x).code()", "RichText::new(x).family(f)", "format.font_id.size = 20.0;", "egui::FontSelection::Default",
+        "TextFormat::simple(font, color)", "use egui::Color32 as C;", "Rgba::from_rgb(1.0, 0.0, 0.0)", "ecolor::Hsva::new(0.0, 1.0, 1.0, 1.0)"] {
         assert_eq!(literals(write).len(), 1, "the scan misses {write}");
     }
     assert!(literals("let width = galley.size().x;").is_empty(), "a measured size is not a size written");

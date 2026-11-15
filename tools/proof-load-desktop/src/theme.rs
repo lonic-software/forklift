@@ -209,6 +209,11 @@ impl Type {
         FontId::new(size, face.family())
     }
 
+    /// This style in `color`, as a span of text.
+    pub fn format(self, color: Color32) -> egui::TextFormat {
+        egui::TextFormat { font_id: self.font(), color, extra_letter_spacing: self.letter_spacing(), ..egui::TextFormat::default() }
+    }
+
     /// The extra space between letters, in points: `.engraved`'s .12em, h1's -.01em, and none
     /// elsewhere.
     pub fn letter_spacing(self) -> f32 {

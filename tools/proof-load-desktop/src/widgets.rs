@@ -4,7 +4,7 @@
 //! what egui keeps for focus and hover. Raised and sunk pads are a 1 px highlight and a 1 px shade
 //! stroke, as the page's note says, not real inset shadows.
 
-use eframe::egui::{self, text::LayoutJob, Color32, CornerRadius, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, TextFormat, Ui, Vec2};
+use eframe::egui::{self, text::LayoutJob, Color32, CornerRadius, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2};
 use proof_load::oracle::Grade;
 use proof_load::report::Cell;
 
@@ -14,12 +14,7 @@ use crate::theme::{self, hairline, Palette, Type, U};
 /// Text in one of the page's type styles. A `Label` is drawn upper case, as `.engraved` is.
 pub fn job(text: &str, style: Type, color: Color32) -> LayoutJob {
     let text = if style == Type::Label { text.to_uppercase() } else { text.to_string() };
-    LayoutJob::single_section(text, format(style, color))
-}
-
-/// One of the page's type styles in `color`, for a span of a longer job.
-pub fn format(style: Type, color: Color32) -> TextFormat {
-    TextFormat { font_id: style.font(), color, extra_letter_spacing: style.letter_spacing(), ..TextFormat::default() }
+    LayoutJob::single_section(text, style.format(color))
 }
 
 /// A line of text that does not respond to the pointer.
@@ -447,11 +442,11 @@ pub fn screen(ui: &mut Ui, lines: &[ScreenLine]) -> Response {
                         Ink::Red => p.crt_red,
                         Ink::Amber => p.crt_amber,
                     };
-                    row.append(text, 0.0, format(Type::Screen, color));
+                    row.append(text, 0.0, Type::Screen.format(color));
                 }
                 if row.is_empty() {
                     // A blank line keeps its height, as the page's `white-space: pre` does.
-                    row.append("", 0.0, format(Type::Screen, p.crt_ink));
+                    row.append("", 0.0, Type::Screen.format(p.crt_ink));
                 }
                 ui.add(egui::Label::new(row).extend());
             }
