@@ -36,6 +36,13 @@ const MESSAGES: usize = 6;
 /// How many seconds a field's check stands before the file system is asked again.
 const RECHECK: f64 = 1.0;
 
+/// Whether a field check still stands: the form is as checked, and either `age` seconds is under
+/// `RECHECK` or a run is going. A run fills its own report folder, so the check made as it
+/// started stands until it ends, when the fields are checked again.
+fn still_good(same_form: bool, age: f64, running: bool) -> bool {
+    same_form && (running || age < RECHECK)
+}
+
 /// The Show switch's options: failing rows only, or every row.
 const SHOW: [&str; 2] = ["Failures", "All"];
 
@@ -173,8 +180,9 @@ impl App {
     /// The fields' errors, checked again when the form has changed since the last check, or
     /// `RECHECK` seconds after it, as files may come and go under the paths typed.
     fn errors(&mut self, now: f64) -> [Option<&'static str>; 6] {
+        let running = self.running();
         match &self.checked {
-            Some((form, at, errors)) if *form == self.form && now - at < RECHECK => *errors,
+            Some((form, at, errors)) if still_good(form == &self.form, now - at, running) => *errors,
             _ => {
                 let errors = self.form.errors();
                 self.checked = Some((self.form.clone(), now, errors));
@@ -267,7 +275,10 @@ impl App {
             Some(Ok(report)) => (format!("Finished: {} rows graded.", report.rows.len() + report.forklift_only.len()), p.muted),
             Some(Err(Ended::Run(RunError::Cancelled))) => ("Stopped. The run wrote no report.".to_string(), p.muted),
             Some(Err(Ended::Run(error))) => (format!("Refused: {error}"), p.g_lost),
-            Some(Err(Ended::Internal(error))) => (format!("Proof Load failed: {error}. This is a fault of the harness, not a grade."), p.g_lost),
+            Some(Err(Ended::Internal(error))) => {
+                let error = error.trim_end().trim_end_matches('.');
+                (format!("Proof Load failed: {error}. This is a fault of the harness, not a grade."), p.g_lost)
+            }
         }
     }
 
@@ -480,5 +491,22 @@ fn theme_preference(index: usize) -> egui::ThemePreference {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.show(ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A check stands while the form is unchanged and young, or while a run is going whatever its
+    /// age, and is made again otherwise.
+    ///
+    /// Revert: re-check by age while running → a run's own files turn its folder field red.
+    #[test]
+    fn a_check_stands_through_a_run() {
+        assert!(still_good(true, 0.5, false));
+        assert!(!still_good(true, RECHECK, false));
+        assert!(still_good(true, 60.0, true), "a run's own report folder is not checked under it");
+        assert!(!still_good(false, 0.0, true));
     }
 }

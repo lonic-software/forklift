@@ -373,9 +373,9 @@ fn a_field_is_checked_again_as_the_disk_changes() {
 #[test]
 fn a_harness_failure_is_not_shown_as_a_refusal() {
     let mut app = App::default();
-    app.meter.apply(Event::Done(Err(Ended::Internal("index out of bounds".into()))));
+    app.meter.apply(Event::Done(Err(Ended::Internal("index out of bounds.".into()))));
     let texts = texts(egui::Theme::Light, &mut app);
     let status = texts.iter().find(|(text, _)| text.contains("index out of bounds")).expect("the status is drawn");
-    assert!(status.0.starts_with("Proof Load failed: ") && !status.0.contains("Refused"), "{}", status.0);
+    assert!(status.0.starts_with("Proof Load failed: index out of bounds. This") && !status.0.contains("Refused"), "{}", status.0);
     assert_eq!(status.1, theme::palette_of(egui::Theme::Light).g_lost);
 }

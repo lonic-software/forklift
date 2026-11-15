@@ -153,7 +153,7 @@ impl Worker {
         let stop = Arc::new(AtomicBool::new(false));
         let channel = Channel { events: sender, stop: stop.clone(), repaint: Box::new(repaint) };
         std::thread::spawn(move || {
-            // A run that panics still ends: the window is told it was refused, and why, rather
+            // A run that panics still ends: the window is told the harness failed, and why, rather
             // than left waiting for a Done that never comes.
             let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&channel))) {
                 Ok(result) => result.map_err(Ended::Run),
@@ -283,7 +283,7 @@ mod tests {
     ///
     /// Revert: send Done only when the body returns → the worker goes with no Done.
     #[test]
-    fn a_panicking_run_ends_refused() {
+    fn a_panicking_run_ends_on_an_internal_error() {
         let worker = Worker::start_with(|_| panic!("index out of bounds"), || {});
         assert_eq!(worker.next(), Some(Event::Done(Err(Ended::Internal("index out of bounds".into())))));
         assert_eq!(worker.next(), None);
