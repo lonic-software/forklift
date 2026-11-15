@@ -749,6 +749,43 @@ fn a_corrupt_loose_object_refuses_reads_and_heal_names_it_lost() {
 }
 
 #[test]
+fn a_damaged_pack_record_refuses_reads_and_heal_names_it_lost() {
+    // FORK-495: once the store is compacted, a flipped byte in the last record of the pack data
+    // file, past every header, fails a read with a code naming heal, and heal names the object
+    // lost as corrupt instead of passing or aborting its walk. The pack is kept.
+    // Mutation: leave a damaged record's read unframed (exit 1), or skip heal's pack scan (heal
+    // passes, or its walk fails on a damaged tree) → red.
+    let area = Area::new("damaged-record");
+    let root = area.warehouse();
+    healed(&area, &root);
+    area.run_ok(&root, &["store", "compact"]);
+
+    let pack = std::fs::read_dir(root.join(".forklift").join("objects").join("pack")).unwrap().flatten()
+        .map(|entry| entry.path()).find(|path| path.extension().is_some_and(|ext| ext == "pack"))
+        .expect("compact writes a pack");
+    let mut bytes = std::fs::read(&pack).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&pack, &bytes).unwrap();
+
+    let out = area.base.join("exported");
+    let read = area.run(&root, &["--json", "git", "export", out.to_str().unwrap()]);
+    assert_eq!(read.status.code(), Some(57), "{}{}", text(&read.stdout), text(&read.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "object_unreadable", "{}", value);
+    assert_eq!(value["error"]["next_step"], "forklift heal", "{}", value);
+
+    let output = area.run(&root, &["--json", "heal"]);
+    assert_eq!(output.status.code(), Some(58), "{}{}", text(&output.stdout), text(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let lost = &value["error"]["details"]["objects_lost"];
+    assert_eq!((&lost["absent"], &lost["unreadable"]), (&serde_json::json!(0), &serde_json::json!(0)), "{}", value);
+    assert!(lost["corrupt"].as_u64().unwrap() >= 1, "{}", value);
+    assert!(lost["hashes"].as_array().unwrap().iter().all(|entry| entry["reason"] == "corrupt"), "{}", value);
+    assert_eq!(std::fs::read(&pack).unwrap(), bytes, "heal keeps the damaged pack");
+}
+
+#[test]
 fn a_refusing_heal_still_rebuilds_a_lost_ref() {
     // The verdict runs last, so the repairs before it land even when it refuses.
     // Mutation: return the verdict before the ref pass → the ref stays lost → red.

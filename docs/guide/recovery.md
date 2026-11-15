@@ -218,8 +218,9 @@ read as an option.
 
 An object the command needs cannot be read from the store. Either a pack file holding it is
 damaged (an index is lost, cut short or corrupt, a pack's data file is missing, or one index entry is
-damaged), its loose file is corrupt (its bytes do not decompress, or decompress to something else),
-or the object is missing altogether. Nothing was changed. Run:
+damaged), its loose file or its record in a pack is corrupt (its bytes do not decompress, or
+decompress to something else, or the delta it is stored as stands on such an object), or the object
+is missing altogether. Nothing was changed. Run:
 
 ```sh
 forklift heal
@@ -227,17 +228,18 @@ forklift heal
 
 `heal` rebuilds a lost or damaged index from the pack's data file, keeping a replaced index beside it
 as `<name>.idx.damaged-<time>`, and the command then works. If the data file itself is damaged or
-gone, the loose file is corrupt, or the object is missing altogether, nothing in this store can
-bring it back; when history still reaches it, `heal` refuses with `objects_lost`. A corrupt loose
-file is left where it is, and `heal` notes one that no history needs. A loose file `heal` cannot
-read at all is not counted lost; it says its check may be short instead.
+gone, the loose file or pack record is corrupt, or the object is missing altogether, nothing in
+this store can bring it back; when history still reaches it, `heal` refuses with `objects_lost`. A
+corrupt loose file or pack record is left where it is, and `heal` notes one that no history needs.
+A loose file `heal` cannot read at all, or a pack record whose delta base it cannot judge, is not
+counted lost; it says its check may be short instead.
 `forklift store status` lists each damaged pack file under `pack problems:`.
 
 ### `objects_lost` (exit 58)
 
 `heal` ran every repair it could, and objects that history still reaches cannot be read from this
-store. The message counts them (absent, unreadable, and corrupt: held only in a loose file whose bytes
-are not the object's), lists up to 20 hashes with the reason for each, and names the pallets
+store. The message counts them (absent, unreadable, and corrupt: held only in loose files or pack
+records whose bytes are not the object's), lists up to 20 hashes with the reason for each, and names the pallets
 whose history reaches them. `--json` carries the same in `details.objects_lost`. Do what the next
 step names:
 

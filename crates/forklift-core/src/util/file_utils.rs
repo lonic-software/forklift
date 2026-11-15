@@ -2444,13 +2444,20 @@ pub fn retrieve_object_by_hash(hash: &str) -> Result<Vec<u8>, String> {
 /// (and verified against) its hash, so its bytes are the same bytes in every warehouse that
 /// holds it — the cache key isolates *presence* per warehouse, never the content.
 pub fn retrieve_object_by_hash_shared(hash: &str) -> Result<std::sync::Arc<Vec<u8>>, String> {
+    retrieve_object_by_hash_shared_classified(hash).map_err(|(error, _)| error)
+}
+
+/// [`retrieve_object_by_hash_shared`], whose error also carries what [`read_object_as_classified`]
+/// says of the failure, so a caller judging it need not read the object again.
+pub(crate) fn retrieve_object_by_hash_shared_classified(hash: &str)
+    -> Result<std::sync::Arc<Vec<u8>>, (String, Option<Unreadable>)> {
     if let Some(bytes) = read_cache_get(hash) {
         return Ok(bytes);
     }
 
     // Wrap the freshly read bytes in the `Arc` once and share that same allocation with the
     // cache — the caller and the cached entry point at one buffer, never two.
-    let bytes = std::sync::Arc::new(read_object_uncached(hash)?);
+    let bytes = std::sync::Arc::new(read_object_as_classified(hash, Absence::History)?);
     read_cache_put(hash, std::sync::Arc::clone(&bytes));
     Ok(bytes)
 }
@@ -2525,8 +2532,11 @@ pub(crate) enum Unreadable {
     /// A loose file at the address whose bytes do not decompress, or decompress to other content.
     /// Heal names the object as lost; the file is kept where it is.
     LooseCorrupt,
-    /// Anything else: a pack record whose bytes do not rebuild to the address, or an index of
-    /// another format version.
+    /// A pack record whose bytes do not rebuild to the address, or a delta whose base the store
+    /// refuses as unreadable. Heal names the object as lost; the pack is kept as it is.
+    RecordDamage,
+    /// Anything else: an index of another format version, or a delta whose base read failed
+    /// some other way.
     Other,
 }
 
@@ -2751,10 +2761,11 @@ fn read_loose_if_verified(hash: &str) -> Result<Option<Vec<u8>>, String> {
 /// same core structurally impossible (DESIGN.html §3.1.1).
 ///
 /// The one place an ordinary read's failure gets its code: pack damage ([`Unreadable::PackDamage`]),
-/// a corrupt loose file ([`Unreadable::LooseCorrupt`]) and an absence nothing else accounts for are
-/// framed [`RefusalCode::ObjectUnreadable`], whose next step is `forklift heal`. What heal cannot act
-/// on stays untyped: a pack record whose bytes do not rebuild to the address, an index of another
-/// format version, an absence a redaction or a withholding explains. A hash the caller was
+/// a corrupt loose file ([`Unreadable::LooseCorrupt`]), a pack record that does not rebuild to the
+/// address ([`Unreadable::RecordDamage`]) and an absence nothing else accounts for are framed
+/// [`RefusalCode::ObjectUnreadable`], whose next step is `forklift heal`. What heal cannot act on
+/// stays untyped: an index of another format version, a delta whose base read failed uncoded, an
+/// absence a redaction or a withholding explains. A hash the caller was
 /// handed rather than reached through history is read by [`retrieve_named_object_by_hash`], whose
 /// plain absence is untyped too. Classified readers never see the frame, so a reason heal itself
 /// reports never embeds one.
@@ -2764,84 +2775,99 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
 
 /// [`read_object_uncached`], with the final absence told as `absence` says.
 fn read_object_as(hash: &str, absence: Absence) -> Result<Vec<u8>, String> {
-    match read_object_classified(hash)? {
+    read_object_as_classified(hash, absence).map_err(|(error, _)| error)
+}
+
+/// [`read_object_as`], whose error also says what is known of the failure: the cause of an
+/// [`StoreReadOutcome::Unverifiable`] read, [`Unreadable::Other`] for an environment error or an
+/// absence left undecided, and `None` only for an absence nothing else accounts for.
+fn read_object_as_classified(hash: &str, absence: Absence) -> Result<Vec<u8>, (String, Option<Unreadable>)> {
+    match read_object_classified(hash).map_err(|error| (error, Some(Unreadable::Other)))? {
         StoreReadOutcome::Verified(bytes) => Ok(bytes),
-        StoreReadOutcome::Unverifiable(e, cause) => Err(unverifiable_read_error(hash, e, cause)),
-        StoreReadOutcome::Absent => {
-            // A cache warehouse fetches an object it holds by hash, then reads it as stored.
-            if super::cache_miss::refill_recorded(hash)? {
-                return match read_object_classified(hash)? {
-                    StoreReadOutcome::Verified(bytes) => Ok(bytes),
-                    StoreReadOutcome::Unverifiable(e, cause) => Err(unverifiable_read_error(hash, e, cause)),
-                    StoreReadOutcome::Absent => Err(format!(
-                        "Object {} was fetched from the origin and stored, yet the store does not hold it.", hash
-                    )),
-                };
-            }
-
-            // Absent because a redaction applied here removed it: refused as redacted, never as
-            // a missing object. The cache refill above never fetches such a hash. An unreadable
-            // applied record leaves the absence undecided, so the missing-object error below
-            // stands, with the record's own error added rather than in its place.
-            let applied = super::applied_redactions::absent_read_refusal(hash);
-            if let Ok(Some(refusal)) = applied {
-                return Err(refusal);
-            }
-
-            // Absent because this warehouse's remote withholds it and a fetch left it out: refused
-            // as withheld, with the host's statement, never as a missing object. An unreadable
-            // unavailable record leaves the absence undecided in the same way.
-            let unavailable = super::unavailable::absent_read_refusal(hash);
-            if let Ok(Some(refusal)) = unavailable {
-                return Err(refusal);
-            }
-
-            // The same NotFound-shaped message the read path has always produced for this case —
-            // reconstructed here (rather than carried on the `Absent` variant, which is bare by
-            // design) since nothing about the message depends on which of the two `Absent`
-            // sources in `read_object_classified` produced it.
-            let records_decided = applied.is_ok() && unavailable.is_ok();
-            let (path, file_name) = get_path_for_object(hash)?;
-            let file_path = path.add(PATH_SEPARATOR).add(&file_name);
-            let missing = format!(
-                "Error while reading object from file \"{}\": {}",
-                file_path, std::io::Error::from(std::io::ErrorKind::NotFound)
-            );
-            let missing = match applied {
-                Err(record) => format!(
-                    "{}. Whether a redaction removed it could not be told: {}", missing, record
-                ),
-                Ok(_) => missing,
-            };
-            let missing = match unavailable {
-                Err(record) => format!(
-                    "{}. Whether its remote withholds it could not be told: {}", missing, record
-                ),
-                Ok(_) => missing,
-            };
-
-            // Pack files whose hash set is unknown may hold it; they never change the verdict
-            // (I4), only what the reader is told; a folder that cannot be listed adds nothing, so
-            // the read still names the missing object.
-            let holders = crate::util::pack_utils::unindexed_holders().unwrap_or_default();
-
-            // Nothing left undecided and nothing says the store ever held it: a hash the caller
-            // was handed is simply not here.
-            if absence == Absence::Named && records_decided && holders.is_empty() {
-                return Err(format!("Object {} is not in this store.", hash));
-            }
-
-            let missing = match holders.is_empty() {
-                true => missing,
-                false => format!(
-                    "{}. It may be in a pack file this read cannot use: {}",
-                    missing.trim_end_matches('.'),
-                    holders.iter().map(|path| format!("\"{}\"", path.to_string_lossy())).collect::<Vec<_>>().join(", ")
-                ),
-            };
-            Err(object_unreadable(missing))
-        }
+        StoreReadOutcome::Unverifiable(e, cause) => Err((unverifiable_read_error(hash, e, cause), Some(cause))),
+        StoreReadOutcome::Absent => read_absent(hash, absence),
     }
+}
+
+/// The ordinary read's answer for an object [`read_object_classified`] found absent: a cache
+/// warehouse's refill, a redaction's or withholding's refusal, or the missing-object refusal. The
+/// error's cause is as [`read_object_as_classified`] says.
+fn read_absent(hash: &str, absence: Absence) -> Result<Vec<u8>, (String, Option<Unreadable>)> {
+    let other = |error: String| (error, Some(Unreadable::Other));
+
+    // A cache warehouse fetches an object it holds by hash, then reads it as stored.
+    if super::cache_miss::refill_recorded(hash).map_err(other)? {
+        return match read_object_classified(hash).map_err(other)? {
+            StoreReadOutcome::Verified(bytes) => Ok(bytes),
+            StoreReadOutcome::Unverifiable(e, cause) => Err((unverifiable_read_error(hash, e, cause), Some(cause))),
+            StoreReadOutcome::Absent => Err(other(format!(
+                "Object {} was fetched from the origin and stored, yet the store does not hold it.", hash
+            ))),
+        };
+    }
+
+    // Absent because a redaction applied here removed it: refused as redacted, never as
+    // a missing object. The cache refill above never fetches such a hash. An unreadable
+    // applied record leaves the absence undecided, so the missing-object error below
+    // stands, with the record's own error added rather than in its place.
+    let applied = super::applied_redactions::absent_read_refusal(hash);
+    if let Ok(Some(refusal)) = applied {
+        return Err(other(refusal));
+    }
+
+    // Absent because this warehouse's remote withholds it and a fetch left it out: refused
+    // as withheld, with the host's statement, never as a missing object. An unreadable
+    // unavailable record leaves the absence undecided in the same way.
+    let unavailable = super::unavailable::absent_read_refusal(hash);
+    if let Ok(Some(refusal)) = unavailable {
+        return Err(other(refusal));
+    }
+
+    // The same NotFound-shaped message the read path has always produced for this case —
+    // reconstructed here (rather than carried on the `Absent` variant, which is bare by
+    // design) since nothing about the message depends on which of the two `Absent`
+    // sources in `read_object_classified` produced it.
+    let records_decided = applied.is_ok() && unavailable.is_ok();
+    let (path, file_name) = get_path_for_object(hash).map_err(other)?;
+    let file_path = path.add(PATH_SEPARATOR).add(&file_name);
+    let missing = format!(
+        "Error while reading object from file \"{}\": {}",
+        file_path, std::io::Error::from(std::io::ErrorKind::NotFound)
+    );
+    let missing = match applied {
+        Err(record) => format!(
+            "{}. Whether a redaction removed it could not be told: {}", missing, record
+        ),
+        Ok(_) => missing,
+    };
+    let missing = match unavailable {
+        Err(record) => format!(
+            "{}. Whether its remote withholds it could not be told: {}", missing, record
+        ),
+        Ok(_) => missing,
+    };
+
+    // Pack files whose hash set is unknown may hold it; they never change the verdict
+    // (I4), only what the reader is told; a folder that cannot be listed adds nothing, so
+    // the read still names the missing object.
+    let holders = crate::util::pack_utils::unindexed_holders().unwrap_or_default();
+
+    // Nothing left undecided and nothing says the store ever held it: a hash the caller
+    // was handed is simply not here.
+    let decided = records_decided && holders.is_empty();
+    if absence == Absence::Named && decided {
+        return Err((format!("Object {} is not in this store.", hash), None));
+    }
+
+    let missing = match holders.is_empty() {
+        true => missing,
+        false => format!(
+            "{}. It may be in a pack file this read cannot use: {}",
+            missing.trim_end_matches('.'),
+            holders.iter().map(|path| format!("\"{}\"", path.to_string_lossy())).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    Err((object_unreadable(missing), if decided { None } else { Some(Unreadable::Other) }))
 }
 
 /// Whether the loose file `reader` yields decompresses to content that hashes to `hash`: what
@@ -2880,18 +2906,20 @@ pub(crate) fn verify_loose(hash: &str, reader: impl std::io::Read) -> std::io::R
 }
 
 /// The ordinary read's error for an [`StoreReadOutcome::Unverifiable`] outcome: framed
-/// [`RefusalCode::ObjectUnreadable`] for pack damage and a corrupt loose file (whose message
-/// already names the object), `error` itself otherwise.
+/// [`RefusalCode::ObjectUnreadable`] for pack damage, a damaged pack record and a corrupt loose
+/// file (whose message already names the object), `error` itself otherwise.
 fn unverifiable_read_error(hash: &str, error: String, cause: Unreadable) -> String {
     match cause {
         Unreadable::LooseCorrupt => object_unreadable(error),
-        Unreadable::PackDamage => object_unreadable(format!("Object {} cannot be read: {}", hash, error)),
+        Unreadable::PackDamage | Unreadable::RecordDamage => {
+            object_unreadable(format!("Object {} cannot be read: {}", hash, error))
+        }
         Unreadable::Other => error,
     }
 }
 
-/// `message` framed as [`RefusalCode::ObjectUnreadable`]. A message already framed is a delta's
-/// base failing, which keeps its own code.
+/// `message` framed as [`RefusalCode::ObjectUnreadable`]. A message already framed keeps its own
+/// code.
 fn object_unreadable(message: String) -> String {
     if crate::error::deframe(&message).is_some() {
         return message;
