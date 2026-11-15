@@ -259,6 +259,22 @@ async fn diff_staged(filter: Option<&WarehousePath>, verbose: bool) -> Result<()
     print_blocks(blocks)
 }
 
+/// Every file that differs from tree `from` (none: the empty tree) to tree `to` within `scope`,
+/// sorted by path, moves detected: its kind, path and, for a move, where it moved from.
+pub(crate) fn tree_file_changes(from: Option<&str>,
+                                to: &str,
+                                scope: &PathScope) -> Result<Vec<(ChangeKind, String, Option<String>)>, String> {
+    let from_tree = from.map(object_utils::load_tree_shared).transpose()?;
+    let to_tree = object_utils::load_tree_shared(to)?;
+
+    let mut changes: Vec<TreeChange> = Vec::new();
+    collect_tree_changes(from_tree.as_deref(), Some(to_tree.as_ref()), "", &mut changes, scope)?;
+    detect_tree_moves(&mut changes);
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(changes.into_iter().map(|change| (change.kind, change.path, change.moved_from)).collect())
+}
+
 /// Diff the trees of two revisions: `from` is the old side, `to` the new side (the
 /// report reads "what changed going from `from` to `to`"). Identical subtree hashes are
 /// skipped entirely. Either side may be [`EMPTY_TREE_TOKEN`] instead of a real revision,

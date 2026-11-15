@@ -165,9 +165,12 @@ fn parse_or_exit() -> Cli {
                 Ok(mut matches) => {
                     output::set_command(matches.subcommand_name());
 
-                    match Cli::from_arg_matches_mut(&mut matches) {
-                        Ok(cli) => return cli,
-                        Err(error) => error,
+                    match bare_only_error(&command, &matches) {
+                        Some(error) => error,
+                        None => match Cli::from_arg_matches_mut(&mut matches) {
+                            Ok(cli) => return cli,
+                            Err(error) => error,
+                        },
                     }
                 }
                 Err(error) => error,
@@ -208,6 +211,35 @@ fn knows_option(level: &clap::Command, word: &str) -> bool {
         }
     }
     true
+}
+
+/// The usage error for a family argument [`cli::BARE_ONLY_ARGS`] keeps to the family's bare form,
+/// given on the command line together with one of the family's subcommands. The table is the
+/// rule, so the MCP tools and `self schema`, which read it, cannot drift from what is refused.
+/// `command` must be built.
+///
+/// # Returns
+/// * `Some(clap::Error)` - A usage error on the family, naming the family and the subcommand.
+/// * `None`              - No bare-only argument came with a subcommand.
+fn bare_only_error(command: &clap::Command, matches: &clap::ArgMatches) -> Option<clap::Error> {
+    cli::BARE_ONLY_ARGS.iter().find_map(|&(family, arg)| {
+        let mut level = command;
+        let mut found = matches;
+        for word in family.split(' ') {
+            let (name, sub) = found.subcommand()?;
+            if name != word {
+                return None;
+            }
+            level = level.find_subcommand(word)?;
+            found = sub;
+        }
+        let given = found.value_source(arg) == Some(clap::parser::ValueSource::CommandLine);
+        let (subcommand, _) = found.subcommand()?;
+        given.then(|| level.clone().error(ErrorKind::ArgumentConflict, format!(
+            "\"--{arg}\" belongs to a bare \"forklift {family}\", not to \"forklift {family} {subcommand}\", \
+            which takes its own arguments after it. Nothing was done."
+        )))
+    })
 }
 
 /// The refusal for git's `branch NAME`. `branch` is a hidden alias of the `pallet` family, kept for
@@ -568,10 +600,13 @@ async fn dispatch(cli: Cli, store_access: &mut Option<lock_utils::StoreAccessLoc
             Some(PalletAction::Restore { name, remote: true }) => commands::pallet::restore_remote_pallet(&name).await,
             Some(PalletAction::Restore { name, remote: false }) => commands::pallet::restore_pallet(&name),
         },
-        Command::Park { action } => match action {
-            Some(ParkAction::Pop) => commands::park::pop_parked(),
+        Command::Park { name, action } => match action {
+            Some(ParkAction::Pop { name }) => commands::park::pop_parked(name.as_deref()),
+            Some(ParkAction::Apply { name }) => commands::park::apply_parked(name.as_deref()),
+            Some(ParkAction::Drop { name }) => commands::park::drop_parked(name.as_deref()),
+            Some(ParkAction::Show { name }) => commands::park::show_parked(name.as_deref()),
             Some(ParkAction::List) => commands::park::list_parked(),
-            None => commands::park::park_changes().await,
+            None => commands::park::park_changes(name.as_deref()).await,
         },
         Command::Prepare => commands::prepare::handle_command(cli.verbose),
         Command::Upgrade => commands::upgrade::handle_command(),

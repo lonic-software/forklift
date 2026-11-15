@@ -32,6 +32,9 @@ pub struct Built {
     pub taken: Vec<Taken>,
     /// Marks acknowledged: each record or variant whose binding exited 0 throughout.
     pub acknowledged: Vec<Mark>,
+    /// The parcels `park list` names after a Forklift history that parks, which every readback
+    /// must find listed again.
+    pub parked: Vec<String>,
     /// The server a `Host` operation started, serving until this is dropped.
     #[serde(skip)]
     pub host: Option<Host>,
@@ -384,6 +387,25 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
         }
     }
 
+    let parked = if tool == Tool::Forklift && scenario.history.iter().any(|op| matches!(op, Op::Park { .. })) {
+        let listed = run_in(program, vec!["--json".into(), "park".into(), "list".into()], scratch.work())?;
+        // The history runs on an undamaged warehouse, so a listing that refuses, or exits 0 but
+        // cannot be read, fails the build: an empty list here would let every readback pass
+        // whatever happened to the parks.
+        let parked = match listed.succeeded() {
+            true => parked_parcels(&listed.stdout).ok_or_else(|| format!(
+                "printed no parked list: {}", String::from_utf8_lossy(&listed.stdout)
+            )),
+            false => Err(format!(
+                "exited {:?}: {}{}", listed.exit, String::from_utf8_lossy(&listed.stdout), String::from_utf8_lossy(&listed.stderr)
+            )),
+        };
+        outcomes.push(listed);
+        parked.map_err(|why| RunError::Io(format!("scenario {}: `forklift park list --json` {}", scenario.id, why)))?
+    } else {
+        Vec::new()
+    };
+
     let walked = census::walk(&scratch.work().join(state_folder(tool))).map_err(|error| RunError::Io(error.to_string()))?;
     let host_walked = match host {
         Some(_) => census::walk(&host_root(scratch).join(".forklift")).map_err(|error| RunError::Io(error.to_string()))?,
@@ -395,7 +417,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
             stopped.extend(finish(last, observer, scratch)?);
         }
     }
-    Ok(Built { outcomes, walked, host_walked, taken, acknowledged, host: host.take(), stopped: std::mem::take(stopped) })
+    Ok(Built { outcomes, walked, host_walked, taken, acknowledged, parked, host: host.take(), stopped: std::mem::take(stopped) })
 }
 
 /// Stops `host`: through `observer` when there is one, so its traces are read, and otherwise by
@@ -422,6 +444,13 @@ pub fn described_parcels(stdout: &[u8]) -> Vec<(String, String)> {
     document(stdout)["data"]["entries"].as_array().map(|entries| entries.iter().filter_map(|entry| {
         Some((entry["description"].as_str()?.to_string(), entry["parcel"].as_str()?.to_string()))
     }).collect()).unwrap_or_default()
+}
+
+/// The parcels `park list --json` names, newest first; nothing when it printed no parked list, or
+/// an entry without a parcel.
+pub fn parked_parcels(stdout: &[u8]) -> Option<Vec<String>> {
+    document(stdout)["data"]["parked"].as_array()?.iter()
+        .map(|entry| Some(entry["parcel"].as_str()?.to_string())).collect()
 }
 
 /// The state `redact list --json` reports for redaction `hash`, if it lists it.

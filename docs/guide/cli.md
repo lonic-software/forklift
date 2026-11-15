@@ -1715,24 +1715,36 @@ prefix.
 ### `park` — stash (`pa`)
 
 ```sh
-forklift park            # park tracked changes and reset to the pallet head
-forklift park list       # list parked work by name, newest first
-forklift park pop         # re-apply the most recent parked changes (staged) and drop it
+forklift park                 # park tracked changes and reset to the pallet head
+forklift park --name wip      # the same, under the name "wip"
+forklift park list            # list parked work by name, newest first
+forklift park show [<name>]   # the park's parcel, base, time and the files it changes
+forklift park apply [<name>]  # re-apply the park (staged) and keep it parked
+forklift park pop [<name>]    # re-apply the park (staged) and take it off the list
+forklift park drop [<name>]   # discard the park without applying it
 ```
 
 `park` saves your staged and unstaged changes to **tracked** files as a parked
 parcel and resets the warehouse to the pallet head (untracked files are left
-alone). `park pop` re-applies the most recent parked changes as a clean re-apply
-— it must be popped onto the head it was parked on, or it reports a conflict. If
+alone). `park apply` and `park pop` re-apply a park's changes as a clean re-apply
+— it must be applied onto the head it was parked on, or it reports a conflict. If
 staging the re-applied changes fails, the parcel stays parked, and the error says that the
-working directory already holds the changes.
+working directory already holds the changes. Without a name, `show`, `apply`, `pop` and `drop`
+take the newest park. `drop` leaves the working files alone; until gc frees the parked parcel,
+`forklift pick <parcel>` stacks its changes onto the current pallet.
 
 Parked work belongs to the warehouse, not to a bay: every bay lists and pops the same parks. Each
 park has a name, the pallet it was parked on and the time (`main 2026-11-15T15:50:16Z`), with
 ` (2)` added when two would share one. The record of what is parked carries a digest, so damage
 to it is never read as "nothing is parked": a missing or damaged record refuses every command that
 reads it, naming `forklift heal`, which rebuilds it from the entries that still read and the parked
-parcels the object store holds. A park the store scan brought back is listed as recovered by heal.
+parcels the object store holds. A park the store scan brought back is listed as recovered by heal;
+it may be work that was popped or dropped before the record was lost, so applying or popping it says
+so, and `park drop` discards it. Two bays never both pop one park: a pop applies the changes while
+holding the lock over the record, and a pop whose park another bay took first applies nothing. A
+scoped bay applies only the part of a park inside its scope, so there `pop` refuses a park that also
+changes files outside it, `apply` applies the part inside and keeps it parked, and `show` lists
+every file, marking those outside the scope.
 
 `park`'s push durably commits the staged inventory into a parked parcel, exactly
 like `stack` commits into a stacked one — so it refuses under the same

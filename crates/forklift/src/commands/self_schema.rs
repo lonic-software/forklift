@@ -331,12 +331,17 @@ impl Walk<'_> {
         }
         command_settings(&path, command)?;
         if command.has_subcommands() {
-            // A group's own arguments would have no place in its children's commands.
-            if let Some(arg) = command.get_arguments().next() {
+            // A group's own arguments would have no place in its children's commands, so they
+            // are allowed only where the CLI's BARE_ONLY_ARGS says the parse refuses them with a
+            // subcommand: then they are the bare form's.
+            let shown = path.join(" ");
+            let bare_only = |arg: &&Arg| crate::cli::BARE_ONLY_ARGS.contains(&(shown.as_str(), arg.get_id().as_str()));
+            if let Some(arg) = command.get_arguments().find(|arg| !bare_only(arg)) {
                 return Err(refusal(&path, arg, "it belongs to a group that has subcommands"));
             }
             if !command.is_subcommand_required_set() {
-                self.push(command, &path, Params::default(), path.join(" "))?;
+                let (params, run) = self.params(command, &path)?;
+                self.push(command, &path, params, run)?;
             }
             for sub in command.get_subcommands().filter(|sub| !sub.is_hide_set()) {
                 let mut sub_path = path.clone();
@@ -346,28 +351,34 @@ impl Walk<'_> {
             return Ok(());
         }
 
+        let (params, run) = self.params(command, &path)?;
+        self.push(command, &path, params, run)
+    }
+
+    /// The params of `command` run with its own arguments, and the line Pult runs it with.
+    fn params(&mut self, command: &Command, path: &[&str]) -> Result<(Params, String), String> {
         let mut named = Params::default();
         let mut positionals = Vec::new();
 
         for arg in command.get_arguments() {
-            let secret = self.secret(&path, arg)?;
+            let secret = self.secret(path, arg)?;
             if arg.is_positional() {
-                positionals.push(positional(&path, arg, secret)?);
+                positionals.push(positional(path, arg, secret)?);
                 continue;
             }
 
             let long = arg.get_long()
-                .ok_or_else(|| refusal(&path, arg, "it has no long name for Pult to pass"))?;
+                .ok_or_else(|| refusal(path, arg, "it has no long name for Pult to pass"))?;
             let kind = match arg.get_action() {
                 ArgAction::SetTrue => {
-                    switch_refusals(&path, arg)?;
+                    switch_refusals(path, arg)?;
                     if arg.get_num_args().is_some() {
-                        return Err(refusal(&path, arg, "it is a switch with a value count"));
+                        return Err(refusal(path, arg, "it is a switch with a value count"));
                     }
                     Kind::Flag(Flag { arg: format!("--{long}") })
                 }
                 ArgAction::Set | ArgAction::Append => {
-                    single_valued(&path, arg)?;
+                    single_valued(path, arg)?;
                     let required = arg.is_required_set();
                     let append = matches!(arg.get_action(), ArgAction::Append);
                     Kind::Repeat(Repeat {
@@ -377,9 +388,9 @@ impl Walk<'_> {
                         secret,
                     })
                 }
-                other => return Err(refusal(&path, arg, &format!("its action {other:?} has no Pult param"))),
+                other => return Err(refusal(path, arg, &format!("its action {other:?} has no Pult param"))),
             };
-            named.0.push((long.to_string(), Param { kind, description: help(&path, arg)? }));
+            named.0.push((long.to_string(), Param { kind, description: help(path, arg)? }));
         }
 
         let mut params = named;
@@ -388,7 +399,7 @@ impl Walk<'_> {
             run.push_str(&format!(" {{{key}}}"));
         }
 
-        let positional_params = layout(&path, positionals)?;
+        let positional_params = layout(path, positionals)?;
         if !positional_params.is_empty() {
             // Without `--`, a positional value that spells one of the command's own flags
             // would be read as that flag, silently. After it, every word is a positional.
@@ -399,7 +410,7 @@ impl Walk<'_> {
         }
         params.0.extend(positional_params);
 
-        self.push(command, &path, params, run)
+        Ok((params, run))
     }
 
     /// Validate and record one command.
@@ -810,6 +821,11 @@ mod tests {
         assert!(config.contains(r#""value":{"input":{"secret":true},"description":"The value to set the key to"}"#), "{config}");
         assert!(config.contains(r#""key":{"input":{},"#), "{config}");
         assert!(config.contains(r#""run":"config set {global} -- {key} {value}""#), "{config}");
+
+        // A group's own arguments, which clap keeps off its subcommands, are its bare form's.
+        let park = json("park");
+        assert!(park.contains(r#""run":"park {name}""#), "{park}");
+        assert!(json("park-pop").contains(r#""run":"park pop -- {name}""#));
 
         let franchise = json("clone");
         assert!(franchise.contains(concat!(

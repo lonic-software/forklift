@@ -587,10 +587,19 @@ pub enum Command {
         alias = "stash",
         long_about = "Park the work in progress (the staged and unstaged changes of tracked files) \
                       as a parked parcel and reset the warehouse to the pallet head. Untracked \
-                      files are left alone. \"forklift park pop\" re-applies the latest parked changes; \
-                      \"forklift park list\" lists them."
+                      files are left alone. Every bay of the warehouse shares one list of parks, each \
+                      under a unique name: \"--name\" picks it, and by default it is the pallet and \
+                      the time. \"forklift park pop\" re-applies a park and takes it off the list, \
+                      \"forklift park apply\" re-applies it and keeps it, \"forklift park drop\" \
+                      discards it, \"forklift park show\" shows its changes and \"forklift park \
+                      list\" lists every park. Each takes a park's name, and without one uses the \
+                      newest park."
     )]
     Park {
+        /// The name to park the work under (default: the pallet and the time)
+        #[arg(long)]
+        name: Option<String>,
+
         #[command(subcommand)]
         action: Option<ParkAction>,
     },
@@ -2123,12 +2132,39 @@ pub enum ProfileAction {
     },
 }
 
+/// A family's own arguments, by family path and argument id: they belong to its bare form only, and
+/// the parse refuses them given with a subcommand, as a usage error. clap's `args_conflicts_with_subcommands` would
+/// say so too, but it also refuses every global flag written between the family and its
+/// subcommand (`park --json pop`). The MCP tools and `self schema` give these to the bare form.
+pub const BARE_ONLY_ARGS: &[(&str, &str)] = &[("park", "name")];
+
 #[derive(Subcommand)]
 pub enum ParkAction {
-    /// Re-apply the most recently parked changes (staged) and drop them from the list
-    Pop,
+    /// Re-apply a park's changes (staged) and take it off the parked list
+    Pop {
+        /// The park's name (default: the newest park)
+        name: Option<String>,
+    },
 
-    /// List the parked parcels, newest first
+    /// Re-apply a park's changes (staged) and keep it parked
+    Apply {
+        /// The park's name (default: the newest park)
+        name: Option<String>,
+    },
+
+    /// Discard a park without applying it
+    Drop {
+        /// The park's name (default: the newest park)
+        name: Option<String>,
+    },
+
+    /// Show a park and the files it changes
+    Show {
+        /// The park's name (default: the newest park)
+        name: Option<String>,
+    },
+
+    /// List the parks, newest first
     List,
 }
 

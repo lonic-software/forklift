@@ -3849,6 +3849,87 @@ fn park_saves_and_reapplies_work_in_progress() {
     assert!(final_status.contains("The inventory matches the pallet head"));
 }
 
+/// A global flag may sit between `park` and its subcommand, while `--name`, which names what a bare
+/// `park` parks, is refused with a subcommand and nothing is done. Restore clap's
+/// `args_conflicts_with_subcommands` on `park` and the first call is a usage error.
+#[test]
+fn park_takes_global_flags_before_its_subcommand_and_refuses_name_with_one() {
+    let warehouse = TestWarehouse::new("park-flags");
+    warehouse.write_file("a.txt", "original\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
+    warehouse.write_file("a.txt", "work\n");
+    assert_success(&warehouse.run(&["park", "--name", "wip"]));
+
+    let listed = warehouse.run(&["park", "--json", "list"]);
+    assert_success(&listed);
+    assert!(stdout(&listed).contains("\"wip\""), "{}", stdout(&listed));
+
+    let refused = warehouse.run(&["park", "--name", "wip", "pop"]);
+    assert_eq!(refused.status.code(), Some(2), "a usage error: {}", stderr(&refused));
+    assert!(stderr(&refused).contains("not to \"forklift park pop\""), "{}", stderr(&refused));
+    let refused = warehouse.run(&["--json", "park", "--name", "wip", "pop"]);
+    assert_eq!(refused.status.code(), Some(2), "a usage error: {}", stdout(&refused));
+    assert!(stdout(&refused).contains("\"usage\""), "{}", stdout(&refused));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(), "original\n", "nothing was popped");
+
+    assert_success(&warehouse.run(&["park", "-v", "pop", "wip"]));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(), "work\n");
+}
+
+/// Parks are shared by every bay, so one made in a full bay can reach outside a scoped bay. There
+/// a pop refuses with nothing applied and the park kept, an apply applies the part in scope and
+/// keeps it, and show lists every file, marking the ones out of scope. Revert the pop's refusal
+/// and the pop takes the park off the list having applied only the in-scope file.
+#[test]
+fn a_park_reaching_outside_a_scoped_bay_is_never_popped_there_in_part() {
+    let warehouse = TestWarehouse::new("park-scoped-bay");
+    warehouse.write_file("src/api/a.txt", "api\n");
+    warehouse.write_file("src/web/w.txt", "web\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    warehouse.write_file("src/api/a.txt", "api work\n");
+    warehouse.write_file("src/web/w.txt", "web work\n");
+    assert_success(&warehouse.run(&["park", "--name", "wide"]));
+
+    let refused = warehouse.run_at(&scoped_dir, &["park", "pop"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("outside this bay's scope:\n  src/web/w.txt\n"), "{}", stderr(&refused));
+    assert_eq!(std::fs::read_to_string(scoped_dir.join("src/api/a.txt")).unwrap(), "api\n", "nothing was applied");
+
+    let shown = warehouse.run_at(&scoped_dir, &["--json", "park", "show"]);
+    assert_success(&shown);
+    let shown: serde_json::Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    let files: Vec<_> = shown["data"]["files"].as_array().unwrap().iter()
+        .map(|file| (file["path"].as_str().unwrap().to_string(), file["outside_scope"].as_bool().unwrap())).collect();
+    assert_eq!(files, vec![("src/api/a.txt".to_string(), false), ("src/web/w.txt".to_string(), true)]);
+
+    let applied = warehouse.run_at(&scoped_dir, &["park", "apply"]);
+    assert_success(&applied);
+    assert!(stdout(&applied).contains("It also changes 1 file outside this bay's scope, not applied here"), "{}", stdout(&applied));
+    assert_eq!(std::fs::read_to_string(scoped_dir.join("src/api/a.txt")).unwrap(), "api work\n");
+
+    let listed = warehouse.run(&["--json", "park", "list"]);
+    assert!(stdout(&listed).contains("\"wide\""), "the park stays listed: {}", stdout(&listed));
+
+    // A park wholly outside the scope applies nothing there, and says so rather than "Re-applied".
+    warehouse.write_file("src/web/w.txt", "web only\n");
+    assert_success(&warehouse.run(&["park", "--name", "web"]));
+    let refused = warehouse.run_at(&scoped_dir, &["park", "apply", "web"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("applies nothing"), "{}", stderr(&refused));
+    assert_success(&warehouse.run(&["park", "drop", "web"]));
+    assert_success(&warehouse.run(&["park", "pop"]));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("src/web/w.txt")).unwrap(), "web work\n");
+}
+
 #[test]
 fn park_pop_refuses_conflicting_head_changes() {
     let warehouse = TestWarehouse::new("park-conflict");

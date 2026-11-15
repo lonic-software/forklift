@@ -5,6 +5,7 @@ use forklift_core::enums::parcel_action_type::ParcelActionType;
 use forklift_core::model::parcel::Parcel;
 use forklift_core::model::parcel_action::ParcelAction;
 use forklift_core::util::shift_utils::{Applied, FileOp};
+use forklift_core::util::stocktake_utils::ChangeKind;
 use serde::Serialize;
 use forklift_core::util::{
     alias_utils, cherry_pick_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
@@ -12,6 +13,8 @@ use forklift_core::util::{
     tree_utils,
 };
 use forklift_core::util::lock_utils::ParkedLock;
+use forklift_core::util::scope_utils::PathScope;
+use std::collections::BTreeSet;
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::commands::merge_abort;
 use crate::output::{self, CommandOutput};
@@ -20,9 +23,13 @@ use crate::output::{self, CommandOutput};
 // function per subcommand; the CLI surface itself is defined in `cli.rs`.
 
 /// Save the work in progress (the staged and unstaged changes of *tracked* files) as a
-/// parked parcel and reset the warehouse to the pallet head. Untracked files are left
-/// alone.
-pub async fn park_changes() -> Result<(), String> {
+/// parked parcel listed as `name`, or under a default name, and reset the warehouse to the pallet
+/// head. Untracked files are left alone.
+pub async fn park_changes(name: Option<&str>) -> Result<(), String> {
+    if let Some(name) = name {
+        park_utils::validate_name(name)?;
+    }
+
     // The cheapest possible pre-check runs first, exactly like `stack_utils::stack_parcel`'s
     // identical guard: `park` builds a tree straight from the staged inventory and durably
     // commits it as a parked parcel below (a real commit-to-history event, not just a working-
@@ -171,7 +178,15 @@ pub async fn park_changes() -> Result<(), String> {
     // The record is read before anything is signed, so damage refuses the park with nothing
     // written; the name it picks is checked again in the hold below.
     let timestamp = Utc::now();
-    let name = park_utils::unique_name(&park_utils::default_name(&pallet, timestamp), &park_utils::read_parked()?);
+    let parked = park_utils::read_parked()?;
+    let name = match name {
+        Some(name) if parked.iter().any(|entry| entry.name == name) => return Err(format!(
+            "Work is already parked as \"{}\". Nothing was parked; choose another name, or drop that park first.",
+            sanitize(name)
+        )),
+        Some(name) => name.to_string(),
+        None => park_utils::unique_name(&park_utils::default_name(&pallet, timestamp), &parked),
+    };
 
     // Parked parcels follow the same authorship convention as stacked ones: the author is
     // recorded explicitly, even though it is always the parking operator. The Park action names
@@ -269,12 +284,34 @@ fn park_refusal(path: &str, hash: &str) -> String {
     )
 }
 
-/// Re-apply the most recently parked parcel (staging its changes) and drop it from the
+/// Re-apply the park named `name`, or the newest (staging its changes), and take it off the
 /// parked list.
-pub fn pop_parked() -> Result<(), String> {
-    let Some(parked_hash) = park_utils::read_parked()?.last().map(|entry| entry.parcel.clone()) else {
-        return Err("There are no parked changes.".to_string());
+pub fn pop_parked(name: Option<&str>) -> Result<(), String> {
+    unpark(name, Unpark::Pop)
+}
+
+/// Re-apply the park named `name`, or the newest (staging its changes), and keep it parked.
+pub fn apply_parked(name: Option<&str>) -> Result<(), String> {
+    unpark(name, Unpark::Apply)
+}
+
+/// Whether an un-park keeps the park or takes it off the list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unpark {
+    Apply,
+    Pop,
+}
+
+/// The sentence an un-park of an entry `heal` recovered adds.
+const RECOVERED_NOTE: &str = "Heal recovered this park from the object store, so it may be work that was \
+    already popped or dropped.";
+
+fn unpark(name: Option<&str>, how: Unpark) -> Result<(), String> {
+    let entry = {
+        let parked = park_utils::read_parked()?;
+        parked[park_utils::pick(&parked, name)?].clone()
     };
+    let parked_hash = entry.parcel.clone();
 
     let parked_parcel = object_utils::load_parcel(&parked_hash)?;
 
@@ -298,11 +335,35 @@ pub fn pop_parked() -> Result<(), String> {
     let head_tree_hash = object_utils::load_parcel(&head)?.tree_hash;
 
     // The parked changes are the diff between the parked parcel and the head it was
-    // parked on.
-    let (ops, removed_dirs) = shift_utils::diff_trees(
+    // parked on, within this bay's scope. Parks are shared by every bay, so one made in a wider
+    // bay can change files this one does not hold: a pop would apply only part of it and take
+    // all of it off the list, so it refuses; an apply keeps the park and says what it left out.
+    let scope = scope_utils::current_scope()?;
+    let (ops, removed_dirs) = shift_utils::diff_trees_in(
         Some(&parked_base_tree),
-        &parked_parcel.tree_hash
+        &parked_parcel.tree_hash,
+        &scope
     )?;
+    let outside = outside_scope(Some(&parked_base_tree), &parked_parcel.tree_hash, &scope)?;
+
+    if how == Unpark::Apply && ops.is_empty() && !outside.is_empty() {
+        return Err(format!(
+            "Every file the parked work \"{}\" ({}) changes is outside this bay's scope, so applying it \
+            here applies nothing; it stays parked. Apply or pop it in a bay whose scope holds them.",
+            sanitize(&entry.name), parked_hash
+        ));
+    }
+
+    if how == Unpark::Pop && !outside.is_empty() {
+        return Err(format!(
+            "The parked work \"{}\" ({}) also changes files outside this bay's scope:\n  {}\n\
+            Popping it here would apply only part of it, so nothing was applied. \"forklift park apply\" \
+            applies the part inside this scope and keeps it parked; a pop in a bay whose scope holds \
+            these files applies all of it.",
+            sanitize(&entry.name), parked_hash,
+            outside.iter().map(|path| sanitize(path)).collect::<Vec<_>>().join("\n  ")
+        ));
+    }
 
     // Safety: every file the parked changes touch must be unchanged between the parked
     // base and the current head — this keeps un-parking a clean re-apply instead of a
@@ -340,13 +401,40 @@ pub fn pop_parked() -> Result<(), String> {
     if !conflicts.is_empty() {
         return Err(format!(
             "The parked changes conflict with the current state of these files:\n  {}\n\
-            Un-park on the head the changes were parked on (parcel {}), or resolve by hand.",
+            Un-park on the head the changes were parked on (parcel {}), or resolve by hand; \
+            \"forklift park drop\" discards a park that is no longer wanted.{}",
             conflicts.join("\n  "),
-            parked_base
+            parked_base,
+            if entry.recovered { format!(" {}", RECOVERED_NOTE) } else { String::new() }
         ));
     }
 
+    // Whatever the apply needs from an origin is fetched only once the checks above pass, and
+    // before a pop takes the lock that every bay's park, pop and drop wait on.
     shift_utils::ensure_writes_present(&ops)?;
+
+    // A pop holds the parked-work lock from here until the entry is off the list, so two bays
+    // popping one park never both apply it. The entry is found again under the lock by its name
+    // and parcel: one another command took meanwhile is refused with nothing applied, while a
+    // park added since is no reason to.
+    #[cfg(test)]
+    tests::BEFORE_POP_HOLDS.with(|seam| seam.take().map(|seam| seam())).transpose()?;
+
+    let lock = match how {
+        Unpark::Pop => {
+            let lock = ParkedLock::acquire()?;
+            let parked = park_utils::read_parked()?;
+            let Some(index) = parked.iter().position(|now| now.name == entry.name && now.parcel == parked_hash) else {
+                return Err(format!(
+                    "The parked work \"{}\" ({}) was popped or dropped by another command while this \
+                    pop ran. Nothing was applied.",
+                    sanitize(&entry.name), parked_hash
+                ));
+            };
+            Some((lock, parked, index))
+        }
+        Unpark::Apply => None,
+    };
 
     // Every removal (and the directories it empties) before every write: across a case-only
     // rename the write would otherwise land on the old name through the alias, and the removal
@@ -367,13 +455,14 @@ pub fn pop_parked() -> Result<(), String> {
     });
 
     // The batch publishes whatever was applied before a failure; the parcel stays parked on any
-    // failure, and the error says how far the pop got.
+    // failure, and the error says how far the un-park got.
     match (applied, batch.publish()) {
         (Ok(()), Ok(())) => {}
         (Err(e), Ok(())) => {
             return Err(format!(
                 "{}\nThe parked changes applied before this error are in the working directory and \
-                staged. The parcel is still parked.",
+                staged. The parcel is still parked, so once the cause is fixed, un-parking it again \
+                applies the rest.",
                 e
             ));
         }
@@ -391,24 +480,155 @@ pub fn pop_parked() -> Result<(), String> {
     #[cfg(test)]
     tests::BEFORE_POP_REMOVES.with(|seam| seam.take().map(|seam| seam())).transpose()?;
 
-    // Re-read under the lock: another bay may have parked or popped since. One that popped or
-    // dropped this same parcel meanwhile is said, never passed over as a pop that took it.
-    let lock = ParkedLock::acquire()?;
-    let mut parked = park_utils::read_parked()?;
-    let before = parked.len();
-    parked.retain(|entry| entry.parcel != parked_hash);
-    if parked.len() == before {
-        return Err(format!(
-            "The parked changes from {} were popped or dropped by another command while this pop ran. \
-            They are applied and staged here as well; the parked list was not changed.",
-            parked_hash
+    let mut note = if entry.recovered { format!(" {}", RECOVERED_NOTE) } else { String::new() };
+    if !outside.is_empty() {
+        note.push_str(&format!(
+            " It also changes {} outside this bay's scope, not applied here; \"forklift park show\" \
+            lists them.",
+            if outside.len() == 1 { "1 file".to_string() } else { format!("{} files", outside.len()) }
         ));
     }
-    park_utils::write_parked(&lock, &parked)?;
 
-    output::message(format!("Re-applied the parked changes from {} (staged).", parked_hash));
+    match lock {
+        Some((lock, mut parked, index)) => {
+            parked.remove(index);
+            park_utils::write_parked(&lock, &parked)?;
+
+            output::message(format!(
+                "Re-applied the parked work \"{}\" ({}) (staged) and took it off the parked list.{}",
+                sanitize(&entry.name), parked_hash, note
+            ));
+        }
+        None => output::message(format!(
+            "Re-applied the parked work \"{}\" ({}) (staged); it stays parked.{}",
+            sanitize(&entry.name), parked_hash, note
+        )),
+    }
 
     Ok(())
+}
+
+/// Take the park named `name`, or the newest, off the parked list without applying it. Its
+/// parcel is left to garbage collection, and until then `pick` brings its changes back, so a drop
+/// is not on the surface's destructive list.
+pub fn drop_parked(name: Option<&str>) -> Result<(), String> {
+    let lock = ParkedLock::acquire()?;
+    let mut parked = park_utils::read_parked()?;
+    let entry = parked.remove(park_utils::pick(&parked, name)?);
+    park_utils::write_parked(&lock, &parked)?;
+
+    output::message(format!(
+        "Dropped the parked work \"{}\" ({}); its changes were not applied. Until gc frees the parcel, \
+        \"forklift pick {}\" stacks its changes onto the current pallet.",
+        sanitize(&entry.name), entry.parcel, entry.parcel
+    ));
+
+    Ok(())
+}
+
+/// Show the park named `name`, or the newest: its parcel, the head it was parked on, when, and
+/// how it changes each file.
+pub fn show_parked(name: Option<&str>) -> Result<(), String> {
+    output::emit(&park_show(name)?);
+
+    Ok(())
+}
+
+fn park_show(name: Option<&str>) -> Result<ParkedShow, String> {
+    let entry = {
+        let parked = park_utils::read_parked()?;
+        parked[park_utils::pick(&parked, name)?].clone()
+    };
+    let parcel = object_utils::load_parcel(&entry.parcel)?;
+    let base = parcel.parents.first().cloned();
+
+    // When it was parked: its Park action, or for a parcel parked before that marker, its Author
+    // action.
+    let parked_at = parcel.actions.iter().find(|action| matches!(action.action, ParcelActionType::Park))
+        .or_else(|| parcel.actions.iter().find(|action| matches!(action.action, ParcelActionType::Author)))
+        .map(|action| action.timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+
+    let base_tree = base.as_deref().map(|base| object_utils::load_parcel(base).map(|base| base.tree_hash)).transpose()?;
+    // A plain tree-to-tree comparison, as `diff` makes: not the apply plan, which depends on this
+    // file system's case folding.
+    // Parks are shared by every bay, so every file is listed, those this bay's scope leaves out
+    // marked.
+    let scope = scope_utils::current_scope()?;
+    let outside = outside_scope(base_tree.as_deref(), &parcel.tree_hash, &scope)?;
+    let files = crate::commands::diff::tree_file_changes(base_tree.as_deref(), &parcel.tree_hash, &PathScope::full())?
+        .into_iter().map(|(change, path, moved_from)| {
+            let outside_scope = outside.contains(&path) || moved_from.as_ref().is_some_and(|from| outside.contains(from));
+            ParkedFile { path, change, moved_from, outside_scope }
+        }).collect();
+
+    Ok(ParkedShow { name: entry.name, parcel: entry.parcel, base, recovered: entry.recovered, parked_at, files })
+}
+
+/// The paths a change from tree `from` to tree `to` touches (a move touches both its ends) that a
+/// comparison within `scope` leaves out: none in a full scope.
+fn outside_scope(from: Option<&str>, to: &str, scope: &PathScope) -> Result<BTreeSet<String>, String> {
+    if scope.is_full() {
+        return Ok(BTreeSet::new());
+    }
+    let touched = |scope: &PathScope| -> Result<BTreeSet<String>, String> {
+        Ok(crate::commands::diff::tree_file_changes(from, to, scope)?.into_iter()
+            .flat_map(|(_, path, moved_from)| std::iter::once(path).chain(moved_from))
+            .collect())
+    };
+    let inside = touched(scope)?;
+    Ok(touched(&PathScope::full())?.into_iter().filter(|path| !inside.contains(path)).collect())
+}
+
+/// One park, with how it changes each file.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct ParkedShow {
+    /// The name the work is parked under.
+    name: String,
+    /// The parked parcel.
+    parcel: String,
+    /// The head the work was parked on, which un-parking applies the changes against.
+    base: Option<String>,
+    /// Whether `heal` found the parcel in the store rather than in the parked-work record: it may
+    /// be work that was popped or dropped before the record was lost.
+    recovered: bool,
+    /// When the work was parked (UTC, RFC 3339).
+    parked_at: Option<String>,
+    /// Every file the park changes, against its base, in this bay's scope or not.
+    files: Vec<ParkedFile>,
+}
+
+/// One file a park changes.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct ParkedFile {
+    path: String,
+    /// How the park changes the file, in the words `stocktake` and `diff` use.
+    change: ChangeKind,
+    /// Where a moved file moved from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved_from: Option<String>,
+    /// Whether the change reaches outside this bay's scope, so un-parking here does not apply it.
+    outside_scope: bool,
+}
+
+impl CommandOutput for ParkedShow {
+    fn render_human(&self) {
+        let recovered = if self.recovered { " (recovered by heal)" } else { "" };
+        println!("Park \"{}\"{}", sanitize(&self.name), recovered);
+        println!("  parcel    {}", self.parcel);
+        println!("  base      {}", self.base.as_deref().unwrap_or("(none)"));
+        if let Some(parked_at) = &self.parked_at {
+            println!("  parked    {}", parked_at);
+        }
+        for file in &self.files {
+            let outside = if file.outside_scope { "  (outside this bay's scope)" } else { "" };
+            match &file.moved_from {
+                Some(from) => println!("  {:<9} {} -> {}{}", file.change, sanitize(from), sanitize(&file.path), outside),
+                None => println!("  {:<9} {}{}", file.change, sanitize(&file.path), outside),
+            }
+        }
+    }
 }
 
 /// List the parked parcels, newest first.
@@ -470,6 +690,7 @@ impl CommandOutput for ParkedList {
 pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
         crate::docgen::OutputSchema::of::<ParkedList>(),
+        crate::docgen::OutputSchema::of::<ParkedShow>(),
     ]
 }
 
@@ -491,8 +712,12 @@ mod tests {
         /// bay is reset: an error stands for a crash there.
         pub(crate) static AFTER_LISTED: Seam = std::cell::Cell::new(None);
 
+        /// Runs once after a pop picked its park and fetched what it needs, before it takes the
+        /// parked-work lock: a test stands in for another bay's command there.
+        pub(crate) static BEFORE_POP_HOLDS: Seam = std::cell::Cell::new(None);
+
         /// Runs once after a pop applied and staged the parked changes, before it takes them out
-        /// of the parked list: a test stands in for another bay's command there.
+        /// of the parked list: a test checks the lock is held there.
         pub(crate) static BEFORE_POP_REMOVES: Seam = std::cell::Cell::new(None);
     }
 
@@ -528,7 +753,7 @@ mod tests {
         let tree = work_in_progress_on_main(&warehouse.root);
 
         BEFORE_PARKED_WRITE.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
-        assert_eq!(test_support::block_on(park_changes()).unwrap_err(), "crashed");
+        assert_eq!(test_support::block_on(park_changes(None)).unwrap_err(), "crashed");
         operation_utils::forget_raised_for_tests();
 
         let recovery = operation_utils::recover().unwrap().expect("a marker stands");
@@ -545,7 +770,7 @@ mod tests {
         let tree = work_in_progress_on_main(&warehouse.root);
 
         AFTER_PARKED_WRITE.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
-        assert_eq!(test_support::block_on(park_changes()).unwrap_err(), "crashed");
+        assert_eq!(test_support::block_on(park_changes(None)).unwrap_err(), "crashed");
         operation_utils::forget_raised_for_tests();
 
         let recovery = operation_utils::recover().unwrap().expect("a marker stands");
@@ -565,10 +790,10 @@ mod tests {
     /// Park "main"'s work twice, the second after a fresh edit. Returns the two entries.
     fn two_parks(root: &std::path::Path) -> Vec<park_utils::ParkedEntry> {
         work_in_progress_on_main(root);
-        test_support::block_on(park_changes()).unwrap();
+        test_support::block_on(park_changes(None)).unwrap();
         std::fs::write(root.join("a.txt"), b"more work\n").unwrap();
         test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
-        test_support::block_on(park_changes()).unwrap();
+        test_support::block_on(park_changes(None)).unwrap();
 
         let parked = park_utils::read_parked().unwrap();
         assert_eq!(parked.len(), 2, "sanity: two parks are listed");
@@ -588,7 +813,7 @@ mod tests {
         let tree = work_in_progress_on_main(&warehouse.root);
 
         AFTER_LISTED.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
-        assert_eq!(test_support::block_on(park_changes()).unwrap_err(), "crashed");
+        assert_eq!(test_support::block_on(park_changes(None)).unwrap_err(), "crashed");
         operation_utils::forget_raised_for_tests();
         remove_record();
 
@@ -606,7 +831,7 @@ mod tests {
         let tree = work_in_progress_on_main(&warehouse.root);
 
         BEFORE_PARKED_WRITE.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
-        assert_eq!(test_support::block_on(park_changes()).unwrap_err(), "crashed");
+        assert_eq!(test_support::block_on(park_changes(None)).unwrap_err(), "crashed");
         operation_utils::forget_raised_for_tests();
         remove_record();
 
@@ -630,7 +855,7 @@ mod tests {
         work_in_progress_on_main(&warehouse.root);
 
         BEFORE_PARKED_WRITE.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
-        assert_eq!(test_support::block_on(park_changes()).unwrap_err(), "crashed");
+        assert_eq!(test_support::block_on(park_changes(None)).unwrap_err(), "crashed");
         operation_utils::forget_raised_for_tests();
         remove_record();
 
@@ -648,7 +873,7 @@ mod tests {
         work_in_progress_on_main(&warehouse.root);
         remove_record();
 
-        let error = test_support::block_on(park_changes()).unwrap_err();
+        let error = test_support::block_on(park_changes(None)).unwrap_err();
         assert!(error.contains("is missing") && error.contains("forklift heal"), "{}", error);
 
         let rebuilt = park_utils::rebuild().unwrap().expect("the missing record is rebuilt");
@@ -661,7 +886,7 @@ mod tests {
     fn a_parked_parcel_is_marked_with_its_name() {
         let warehouse = Warehouse::with_working_tree("park-marker");
         work_in_progress_on_main(&warehouse.root);
-        test_support::block_on(park_changes()).unwrap();
+        test_support::block_on(park_changes(None)).unwrap();
 
         let entry = park_utils::read_parked().unwrap().remove(0);
         let parcel = object_utils::load_parcel(&entry.parcel).unwrap();
@@ -765,17 +990,17 @@ mod tests {
         let next_second = || std::thread::sleep(std::time::Duration::from_millis(1100));
         let warehouse = Warehouse::with_working_tree("park-rebuild-order");
         work_in_progress_on_main(&warehouse.root);
-        test_support::block_on(park_changes()).unwrap();
+        test_support::block_on(park_changes(None)).unwrap();
         next_second();
         std::fs::write(warehouse.root.join("a.txt"), b"b work\n").unwrap();
         test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
-        test_support::block_on(park_changes()).unwrap();
+        test_support::block_on(park_changes(None)).unwrap();
         let popped = park_utils::read_parked().unwrap()[1].parcel.clone();
-        pop_parked().unwrap();
+        pop_parked(None).unwrap();
         next_second();
         std::fs::write(warehouse.root.join("a.txt"), b"c work\n").unwrap();
         test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
-        test_support::block_on(park_changes()).unwrap();
+        test_support::block_on(park_changes(None)).unwrap();
         let listed = park_utils::read_parked().unwrap();
         assert_eq!(listed.len(), 2, "sanity: A and C are listed");
 
@@ -793,21 +1018,126 @@ mod tests {
         ]);
     }
 
-    /// A pop whose parcel another command popped or dropped while it ran says so, rather than
-    /// reporting a pop of work that was no longer parked. Revert the check and the pop succeeds.
+    /// A pop whose park another command popped, dropped or parked over between its pick and its
+    /// hold applies nothing. Revert the re-pick under the lock and the pop applies the work.
     #[test]
-    fn a_pop_whose_parcel_was_taken_meanwhile_says_so() {
+    fn a_pop_whose_park_was_taken_before_it_held_the_lock_applies_nothing() {
         let warehouse = Warehouse::with_working_tree("park-pop-raced");
         work_in_progress_on_main(&warehouse.root);
-        test_support::block_on(park_changes()).unwrap();
+        test_support::block_on(park_changes(None)).unwrap();
 
-        BEFORE_POP_REMOVES.with(|seam| seam.set(Some(Box::new(|| {
+        BEFORE_POP_HOLDS.with(|seam| seam.set(Some(Box::new(|| {
             let lock = ParkedLock::acquire()?;
             park_utils::write_parked(&lock, &[])
         }))));
-        let error = pop_parked().unwrap_err();
+        let error = pop_parked(None).unwrap_err();
         assert!(error.contains("popped or dropped by another command"), "{}", error);
-        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"work\n"), "the changes are applied here");
+        assert!(error.contains("Nothing was applied"), "{}", error);
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"one\n"), "the head stays in the file");
+    }
+
+    /// A pop holds the parked-work lock from its re-pick through applying the changes, so a
+    /// second bay's pop waits rather than applying the same park. Revert the hold and another
+    /// thread takes the lock while the pop is applying.
+    #[test]
+    fn a_pop_holds_the_parked_lock_while_it_applies() {
+        let warehouse = Warehouse::with_working_tree("park-pop-holds");
+        work_in_progress_on_main(&warehouse.root);
+        test_support::block_on(park_changes(None)).unwrap();
+
+        let root = warehouse.root.clone();
+        BEFORE_POP_REMOVES.with(|seam| seam.set(Some(Box::new(move || {
+            assert!(test_support::file_holds(&root, "a.txt", b"work\n"), "the changes are applied");
+            let other = std::thread::scope(|scope| scope.spawn(|| {
+                let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+                ParkedLock::try_acquire().map(|lock| lock.is_some())
+            }).join().unwrap())?;
+            assert!(!other, "another bay cannot take the lock while the pop applies");
+            Ok(())
+        }))));
+        pop_parked(None).unwrap();
+        assert!(park_utils::read_parked().unwrap().is_empty(), "the pop took the park off the list");
+    }
+
+    /// A pop takes exactly the park it picked: a park added meanwhile, even one naming the same
+    /// parcel, stays listed. Revert to re-picking "the newest" under the lock and the pop refuses;
+    /// revert to removing by parcel and the other name goes too.
+    #[test]
+    fn a_pop_takes_only_its_own_park_when_another_was_added_meanwhile() {
+        let warehouse = Warehouse::with_working_tree("park-pop-added");
+        work_in_progress_on_main(&warehouse.root);
+        test_support::block_on(park_changes(Some("mine"))).unwrap();
+
+        BEFORE_POP_HOLDS.with(|seam| seam.set(Some(Box::new(|| {
+            let lock = ParkedLock::acquire()?;
+            let mut parked = park_utils::read_parked()?;
+            let mine = parked[0].clone();
+            parked.push(park_utils::ParkedEntry { name: "twin".to_string(), ..mine.clone() });
+            parked.push(park_utils::ParkedEntry { name: "newer".to_string(), parcel: "0".repeat(64), ..mine });
+            park_utils::write_parked(&lock, &parked)
+        }))));
+        pop_parked(None).unwrap();
+
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"work\n"), "the pop applied its park");
+        let names: Vec<_> = park_utils::read_parked().unwrap().into_iter().map(|entry| entry.name).collect();
+        assert_eq!(names, vec!["twin", "newer"]);
+    }
+
+    /// Apply keeps the park listed; pop by name takes that park, not the newest; drop leaves the
+    /// working files alone. Revert apply's keep and the list empties.
+    #[test]
+    fn apply_keeps_a_park_pop_takes_the_one_named_and_drop_leaves_the_files() {
+        let warehouse = Warehouse::with_working_tree("park-named");
+        work_in_progress_on_main(&warehouse.root);
+        test_support::block_on(park_changes(Some("first"))).unwrap();
+        std::fs::write(warehouse.root.join("a.txt"), b"second\n").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+        test_support::block_on(park_changes(Some("second"))).unwrap();
+
+        let names = || park_utils::read_parked().unwrap().into_iter().map(|entry| entry.name).collect::<Vec<_>>();
+        assert_eq!(names(), vec!["first", "second"]);
+
+        apply_parked(Some("first")).unwrap();
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"work\n"), "the named park is applied");
+        assert_eq!(names(), vec!["first", "second"], "apply keeps it parked");
+
+        drop_parked(None).unwrap();
+        assert_eq!(names(), vec!["first"], "drop takes the newest");
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"work\n"), "and leaves the files alone");
+
+        assert!(drop_parked(Some("second")).unwrap_err().contains("No work is parked as \"second\""));
+    }
+
+    /// A name already parked is refused before anything is parked. Revert the check and the
+    /// park reaches the hold's collision refusal after signing a parcel.
+    #[test]
+    fn a_park_under_a_name_already_parked_is_refused_with_the_work_in_place() {
+        let warehouse = Warehouse::with_working_tree("park-name-taken");
+        work_in_progress_on_main(&warehouse.root);
+        test_support::block_on(park_changes(Some("wip"))).unwrap();
+        std::fs::write(warehouse.root.join("a.txt"), b"more\n").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+
+        let error = test_support::block_on(park_changes(Some("wip"))).unwrap_err();
+        assert!(error.contains("Work is already parked as \"wip\""), "{}", error);
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"more\n"), "the work stays");
+        assert_eq!(park_utils::read_parked().unwrap().len(), 1);
+    }
+
+    /// Show names the park's base and each file it changes, by kind.
+    #[test]
+    fn show_lists_each_file_a_park_changes() {
+        let warehouse = Warehouse::with_working_tree("park-show");
+        work_in_progress_on_main(&warehouse.root);
+        std::fs::write(warehouse.root.join("b.txt"), b"new\n").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+        test_support::block_on(park_changes(Some("wip"))).unwrap();
+
+        let shown = park_show(Some("wip")).unwrap();
+        assert_eq!(shown.base, pallet_utils::get_pallet_head("main").unwrap());
+        assert!(shown.parked_at.is_some());
+        let files: Vec<_> = shown.files.iter().map(|file| (file.path.as_str(), file.change.to_string(), file.outside_scope)).collect();
+        assert_eq!(files, vec![("a.txt", "modified".to_string(), false), ("b.txt", "added".to_string(), false)]);
     }
 
     /// A store whose history cannot be walked does not stop the rebuild: a parked parcel is
@@ -817,7 +1147,7 @@ mod tests {
     fn a_rebuild_lists_parked_parcels_when_the_history_cannot_be_walked() {
         let warehouse = Warehouse::with_working_tree("park-rebuild-unwalkable");
         work_in_progress_on_main(&warehouse.root);
-        test_support::block_on(park_changes()).unwrap();
+        test_support::block_on(park_changes(None)).unwrap();
         let parked = park_utils::read_parked().unwrap().remove(0);
         remove_record();
 

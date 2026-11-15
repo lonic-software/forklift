@@ -734,9 +734,11 @@ impl RefLock {
 /// The lock over the warehouse's parked-work record (`park_utils`), shared by every bay: a kernel
 /// lock on the never-deleted sidecar `forklift_root()/parked.lock`, like [`RefLock`], so a
 /// hard-killed holder leaves nothing stale and a writer waits. It is the innermost lock: a holder
-/// takes no other lock inside it, and holds it only across one read of the record, the writes that
-/// decision makes, and the record's write. Readers that only read the record take no lock: it is
-/// replaced whole and atomically.
+/// takes no other lock inside it and reaches no network, so whatever it needs from an origin is
+/// fetched before it takes the lock. A holder keeps it across one read of the record, the writes
+/// that decision makes, and the record's write; for a pop those writes include applying the parked
+/// changes to the working tree and staging them, so two bays never both apply one park. Readers
+/// that only read the record take no lock: it is replaced whole and atomically.
 ///
 /// It is not reentrant, so a thread that holds it is refused a second hold rather than left
 /// waiting on itself.

@@ -4797,6 +4797,131 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+### `ParkedShow`
+
+```json
+{
+  "$defs": {
+    "ChangeKind": {
+      "description": "The kind of a change reported by a stocktake.",
+      "oneOf": [
+        {
+          "const": "added",
+          "description": "The item exists in the newer state but not in the older one.",
+          "type": "string"
+        },
+        {
+          "const": "modified",
+          "description": "The item exists in both states with different content.",
+          "type": "string"
+        },
+        {
+          "const": "moved",
+          "description": "The item was moved: it disappeared from one path and reappeared at another with\nthe same content (detected by a move-detection post-pass; the formats stay move-agnostic).",
+          "type": "string"
+        },
+        {
+          "const": "removed",
+          "description": "The item exists in the older state but not in the newer one.",
+          "type": "string"
+        },
+        {
+          "const": "untracked",
+          "description": "The item exists in the working directory but is not tracked by the inventory.",
+          "type": "string"
+        },
+        {
+          "const": "conflict",
+          "description": "The item is in a conflict state (an unresolved consolidation).",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "The item is not checked out: the head names it, but the remote's host withholds its\ncontent and this warehouse lacks it (inventory state `Unavailable`). It is no local change:\nthe next parcel still names the file, and only `forklift remove` stages its removal.",
+          "type": "string"
+        }
+      ]
+    },
+    "ParkedFile": {
+      "description": "One file a park changes.",
+      "properties": {
+        "change": {
+          "$ref": "#/$defs/ChangeKind",
+          "description": "How the park changes the file, in the words `stocktake` and `diff` use."
+        },
+        "moved_from": {
+          "description": "Where a moved file moved from.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outside_scope": {
+          "description": "Whether the change reaches outside this bay's scope, so un-parking here does not apply it.",
+          "type": "boolean"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "change",
+        "outside_scope"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One park, with how it changes each file.",
+  "properties": {
+    "base": {
+      "description": "The head the work was parked on, which un-parking applies the changes against.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "files": {
+      "description": "Every file the park changes, against its base, in this bay's scope or not.",
+      "items": {
+        "$ref": "#/$defs/ParkedFile"
+      },
+      "type": "array"
+    },
+    "name": {
+      "description": "The name the work is parked under.",
+      "type": "string"
+    },
+    "parcel": {
+      "description": "The parked parcel.",
+      "type": "string"
+    },
+    "parked_at": {
+      "description": "When the work was parked (UTC, RFC 3339).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "recovered": {
+      "description": "Whether `heal` found the parcel in the store rather than in the parked-work record: it may\nbe work that was popped or dropped before the record was lost.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "name",
+    "parcel",
+    "base",
+    "recovered",
+    "parked_at",
+    "files"
+  ],
+  "title": "ParkedShow",
+  "type": "object"
+}
+```
+
 ## `pick`
 
 ### `Picked`
