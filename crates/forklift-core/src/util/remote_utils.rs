@@ -6656,16 +6656,73 @@ pub async fn read_objects_verified(client: &RemoteClient,
             let _permit = semaphore.acquire().await
                 .map_err(|_| "The transfer pool was closed unexpectedly.".to_string())?;
 
-            let bytes = client.fetch_object(&hash).await
-                .map_err(|e| format!("Object {} could not be read from the remote: {}", hash, e))?;
-            object_utils::verify_object_bytes(&hash, &bytes)
-                .map_err(|_| format!("The remote answered object {} with other bytes.", hash))?;
+            let bytes = read_object_verified(&client, &hash).await?;
 
             Ok((hash, bytes))
         });
     }
 
     join_all(tasks).await
+}
+
+/// Read one object from the remote into memory, verified against its hash and not stored.
+///
+/// # Returns
+/// * `Ok(Vec<u8>)`  - The object's bytes.
+/// * `Err(String)`  - If the transfer failed or the remote answered with other bytes.
+pub async fn read_object_verified(client: &RemoteClient, hash: &str) -> Result<Vec<u8>, String> {
+    let bytes = client.fetch_object(hash).await
+        .map_err(|e| format!("Object {} could not be read from the remote: {}", hash, e))?;
+    object_utils::verify_object_bytes(hash, &bytes)
+        .map_err(|_| format!("The remote answered object {} with other bytes.", hash))?;
+
+    Ok(bytes)
+}
+
+/// The first of `keys` that does not name a directory in the root tree `root_tree`, if any. Only
+/// the trees holding each key's entry are read, never the key's own. A tree at a path `sealed`
+/// answers true for (`""` is the root) is read from the remote into memory, verified against its
+/// hash and not stored; any other is read from the store, so a tree the store should hold and lacks
+/// fails here as it does on any other read. Nothing here writes to the store.
+///
+/// # Returns
+/// * `Ok(Option<String>)` - The first key that names no directory, or `None` when every one does.
+/// * `Err(String)`        - If a tree could not be read, from the store or from the remote.
+pub async fn first_non_directory(client: &RemoteClient,
+                                 root_tree: &str,
+                                 keys: &[String],
+                                 sealed: impl Fn(&str) -> bool) -> Result<Option<String>, String> {
+    let mut trees: HashMap<String, crate::model::tree_item::TreeItem> = HashMap::new();
+
+    for key in keys {
+        let mut hash = root_tree.to_string();
+        let mut path = String::new();
+
+        for component in key.split('/') {
+            if !trees.contains_key(&hash) {
+                let tree = if sealed(&path) {
+                    object_utils::parse_tree_bytes(&hash, &read_object_verified(client, &hash).await?)?
+                } else {
+                    object_utils::load_tree(&hash)?
+                };
+
+                trees.insert(hash.clone(), tree);
+            }
+
+            let subtree = trees[&hash].get_subtrees()
+                .find(|(name, _)| name.as_str() == component)
+                .map(|(_, item)| item.hash.clone());
+
+            match subtree {
+                Some(subtree) => hash = subtree,
+                None => return Ok(Some(key.clone())),
+            }
+
+            path = scope_join(&path, component);
+        }
+    }
+
+    Ok(None)
 }
 
 /// D4's dedicated corrupt-candidate fetch (DESIGN.html §3.1.1): one loose `GET` per flagged hash,

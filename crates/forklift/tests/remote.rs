@@ -6189,10 +6189,11 @@ fn expand_checks_its_paths_before_walking_other_histories() {
     assert!(stderr(&refused).contains("\"src/wbe\" is not a directory"), "{}", stderr(&refused));
 }
 
-/// Every file under a warehouse's object store, loose and packed, by path.
-fn object_store_files(area: &TestArea, dir: &str) -> std::collections::BTreeSet<PathBuf> {
-    let mut found = std::collections::BTreeSet::new();
-    let mut pending = vec![area.path(dir).join(".forklift").join("objects")];
+/// Every file under a warehouse's `.forklift` folder but its lock files, by path, with its bytes:
+/// what a command that records nothing leaves exactly as it was.
+fn forklift_files(area: &TestArea, dir: &str) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut pending = vec![area.path(dir).join(".forklift")];
 
     while let Some(folder) = pending.pop() {
         for entry in std::fs::read_dir(&folder).unwrap().flatten() {
@@ -6200,8 +6201,8 @@ fn object_store_files(area: &TestArea, dir: &str) -> std::collections::BTreeSet<
 
             if path.is_dir() {
                 pending.push(path);
-            } else {
-                found.insert(path);
+            } else if path.extension().is_none_or(|extension| extension != "lock") {
+                found.insert(path.clone(), std::fs::read(&path).unwrap());
             }
         }
     }
@@ -6209,14 +6210,10 @@ fn object_store_files(area: &TestArea, dir: &str) -> std::collections::BTreeSet<
     found
 }
 
-// Revert: walk the base at the widened scope before checking the added paths → the refused fetch
-// stores the file's blobs (and the tree above it), and the out-of-scope file then reads.
-#[test]
-fn a_refused_scope_fetch_of_a_file_stores_nothing() {
-    let area = TestArea::new("sparse-expand-file");
-    let server = Server::start(&area, None);
-
-    prepare_warehouse(&area, "dev", &server.url);
+/// A remote whose head holds `src/api/a.txt` and, in two revisions, `docs/guide.md`; returns the
+/// head and the guide's blob there.
+fn remote_with_a_guide(area: &TestArea, server: &Server) -> (String, String) {
+    prepare_warehouse(area, "dev", &server.url);
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/docs/guide.md", "guide v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
@@ -6226,17 +6223,28 @@ fn a_refused_scope_fetch_of_a_file_stores_nothing() {
     assert_success(&area.forklift("dev", &["stack", "-m", "guide v2"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    let head = pallet_head(&area, "dev", "main");
-    let guide_blob = path_object_hash(&area, "dev", &head, "docs/guide.md");
+    let head = pallet_head(area, "dev", "main");
+    let guide_blob = path_object_hash(area, "dev", &head, "docs/guide.md");
+
+    (head, guide_blob)
+}
+
+// Revert: walk the base at the widened scope before checking the added paths, or store the sealed
+// trees the check reads → the refused fetch changes the store, and the out-of-scope file then reads.
+#[test]
+fn a_refused_scope_fetch_of_a_file_stores_nothing() {
+    let area = TestArea::new("sparse-expand-file");
+    let server = Server::start(&area, None);
+    let (_, guide_blob) = remote_with_a_guide(&area, &server);
 
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
-    let before = object_store_files(&area, "sparse");
+    let before = forklift_files(&area, "sparse");
 
     for file in ["docs/guide.md", "docs/guide.md/below"] {
         let refused = area.forklift("sparse", &["scope", "fetch", file]);
         assert!(!refused.status.success(), "{}", stdout(&refused));
         assert!(stderr(&refused).contains(&format!("\"{}\" is not a directory", file)), "{}", stderr(&refused));
-        assert_eq!(object_store_files(&area, "sparse"), before, "scope fetch {} stored objects", file);
+        assert!(forklift_files(&area, "sparse") == before, "scope fetch {} changed the warehouse", file);
     }
 
     let shown = area.forklift("sparse", &["--json", "show", "main:docs/guide.md"]);
@@ -6245,6 +6253,48 @@ fn a_refused_scope_fetch_of_a_file_stores_nothing() {
     // The directory itself fetches, and with it the file.
     assert_success(&area.forklift("sparse", &["scope", "fetch", "docs"]));
     assert!(object_present(&area, "sparse", &guide_blob), "scope fetch docs fetches the guide");
+}
+
+// Revert: read every tree the check needs from the remote → a spine tree the warehouse lost is
+// fetched over quietly, and the scope fetch succeeds over the damage.
+#[test]
+fn a_scope_fetch_over_a_lost_spine_tree_fails_naming_it() {
+    let area = TestArea::new("sparse-expand-lost-spine");
+    let server = Server::start(&area, None);
+    remote_with_two_subtrees(&area, &server);
+
+    let head = pallet_head(&area, "dev", "main");
+    let src_tree = path_object_hash(&area, "dev", &head, "src");
+
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "sparse", &src_tree)).unwrap();
+
+    let failed = area.forklift("sparse", &["scope", "fetch", "src/web"]);
+    assert!(!failed.status.success(), "{}", stdout(&failed));
+    assert!(stderr(&failed).contains(&src_tree[2..14]), "{}", stderr(&failed));
+    assert!(!object_present(&area, "sparse", &src_tree), "the lost tree was fetched over");
+}
+
+// Revert: check the --only paths after the scoped fetch → the refused clone keeps the file's blobs,
+// and its corrected resume reads the file outside the fetch scope.
+#[test]
+fn a_refused_clone_of_a_file_keeps_none_of_it() {
+    let area = TestArea::new("sparse-clone-file");
+    let server = Server::start(&area, None);
+    let (_, guide_blob) = remote_with_a_guide(&area, &server);
+
+    let refused = area.forklift(".", &["--json", "clone", &server.url, "sparse", "--only", "docs/guide.md"]);
+    assert_eq!(json_of(&refused)["error"]["details"]["cause_code"], "only_prefix_not_found", "{}", stdout(&refused));
+    assert!(!object_present(&area, "sparse", &guide_blob), "the refused clone fetched the guide");
+
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
+    assert!(!object_present(&area, "sparse", &guide_blob), "the resume kept the guide");
+    let shown = area.forklift("sparse", &["--json", "show", "main:docs/guide.md"]);
+    assert_eq!(json_of(&shown)["error"]["code"], "out_of_scope", "{}", stdout(&shown));
+
+    // The directory clones, and with it the file.
+    assert_success(&area.forklift(".", &["clone", &server.url, "docs", "--only", "docs"]));
+    assert!(object_present(&area, "docs", &guide_blob), "clone --only docs fetches the guide");
 }
 
 // Revert: clone fetches through the scope on disk, which does not exist yet → the whole
@@ -11092,8 +11142,8 @@ fn remote_with_two_subtrees(area: &TestArea, server: &Server) {
 
 #[test]
 fn a_failed_franchise_keeps_its_directory_and_a_corrected_resume_finishes() {
-    // "src/ap" (missing the final "i") names nothing in the head: refused only after the
-    // handshake and the scoped history fetch, by which point objects are in the store.
+    // "src/ap" (missing the final "i") names nothing in the head: refused after the handshake,
+    // with the franchise recorded.
     let area = TestArea::new("clone-resume-corrected");
     let server = Server::start(&area, None);
     remote_with_two_subtrees(&area, &server);
@@ -11124,7 +11174,8 @@ fn a_failed_franchise_keeps_its_directory_and_a_corrected_resume_finishes() {
 #[test]
 fn a_resume_keeps_the_objects_an_earlier_attempt_fetched() {
     // A full clone of the same remote fetches every object loose (the test server has no
-    // bundle). A resume after a sparse attempt fetched the spine fetches only what it lacks.
+    // bundle). An attempt that failed partway, on an object the remote could not serve, keeps
+    // what it stored, and its resume fetches only what it lacks.
     let area = TestArea::new("clone-resume-keeps-objects");
     let server = Server::start(&area, None);
     remote_with_two_subtrees(&area, &server);
@@ -11133,9 +11184,15 @@ fn a_resume_keeps_the_objects_an_earlier_attempt_fetched() {
     assert_success(&fresh);
     let fresh_fetched = json_of(&fresh)["data"]["fetched_objects"].as_u64().unwrap();
 
-    let failed = area.forklift(".", &["clone", &server.url, "kept", "--only", "src/ap"]);
+    let head = pallet_head(&area, "dev", "main");
+    let web_blob = path_object_hash(&area, "dev", &head, "src/web/b.txt");
+    let served = object_store_path(&area, "server-root", &web_blob);
+    let aside = area.path("web-blob-aside");
+    std::fs::rename(&served, &aside).unwrap();
+
+    let failed = area.forklift(".", &["clone", &server.url, "kept"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
-    assert_eq!(origin_of(&area, "kept").as_deref(), Some(server.url.as_str()), "the origin is recorded before the fetch");
+    std::fs::rename(&aside, &served).unwrap();
 
     let resumed = area.forklift(".", &["--json", "clone", &server.url, "kept"]);
     assert_success(&resumed);
@@ -11145,7 +11202,6 @@ fn a_resume_keeps_the_objects_an_earlier_attempt_fetched() {
         "the resume must not refetch what the first attempt stored: {} vs {}", resumed_fetched, fresh_fetched);
     assert_eq!(area.read_file("kept/src/api/a.txt"), "api v1\n");
     assert_eq!(area.read_file("kept/src/web/b.txt"), "web v1\n");
-    assert_eq!(origin_of(&area, "kept"), None, "a full resume of a sparse attempt leaves no origin behind");
     assert_success(&area.forklift("kept", &["status"]));
 }
 

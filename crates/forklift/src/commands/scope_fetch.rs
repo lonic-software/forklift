@@ -2,7 +2,7 @@ use serde::Serialize;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::remote_utils::{BatchLaneClosure, ExpandCommit, RemoteClient};
 use forklift_core::util::scope_utils::ScopeClass;
-use forklift_core::util::{file_utils, object_utils, pallet_utils, remote_utils, scope_utils};
+use forklift_core::util::{object_utils, pallet_utils, remote_utils, scope_utils};
 use crate::output::{self, CommandOutput};
 
 /// Handle `scope fetch` (§7.6): widen a sparse warehouse's fetch scope and download the
@@ -89,21 +89,28 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     // names it widens without it rather than being refused.
     client.fetch_info().await?;
 
-    // Each added path must name a real directory at the head, checked before anything is fetched:
-    // the trees on the way are read from the store, or from the remote into memory when the
-    // sparse store sealed them, verified and never stored. A path refused here leaves the store and
-    // the fetch scope as they were. A retry only ever narrows the added paths, so this check covers
+    // Each added path must name a directory at the base, checked before anything is fetched. A
+    // tree the fetch scope seals is read from the remote into memory, verified and not stored; the
+    // spine above the scope is read from the store. A path refused here leaves the store and the
+    // fetch scope as they were. A retry only ever narrows the added paths, so this check covers
     // every attempt.
     let tree = object_utils::load_parcel(&head)?.tree_hash;
+    let sealed = |path: &str| current.classify(path) == ScopeClass::OutOfScope;
+    let checked = remote_utils::first_non_directory(&client, &tree, &added, sealed).await
+        .map_err(|e| forklift_core::error::append_to_message(
+            forklift_core::error::prefix_message(
+                &format!("Could not check the requested path(s) against pallet \"{}\" at this checkout's base", pallet),
+                e,
+            ),
+            "Nothing was recorded.",
+        ))?;
 
-    for prefix in &added {
-        if !names_directory_reading_sealed(&client, &tree, prefix).await? {
-            return Err(format!(
-                "\"{}\" is not a directory in pallet \"{}\" at its head, so it cannot be a fetch \
-                scope. Nothing was recorded.",
-                prefix, pallet
-            ));
-        }
+    if let Some(prefix) = checked {
+        return Err(format!(
+            "\"{}\" is not a directory in pallet \"{}\" at this checkout's base, so it cannot be a \
+            fetch scope. Nothing was recorded.",
+            prefix, pallet
+        ));
     }
 
     // Fetch the newly in-scope content FIRST, at the widened scope, and only then record it: the
@@ -145,33 +152,6 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
         "The warehouse kept changing while \"forklift scope fetch\" ran, so the fetch scope was not widened; run it \
         again.".to_string()
     )
-}
-
-/// Whether the warehouse path `key` names a directory in the root tree `root_tree`. Only the trees
-/// holding its entry are read, never its own. A tree the store lacks, sealed because the fetch scope
-/// leaves it out, is read from the remote into memory and verified against its hash, and is not
-/// stored.
-async fn names_directory_reading_sealed(client: &RemoteClient, root_tree: &str, key: &str) -> Result<bool, String> {
-    let mut hash = root_tree.to_string();
-
-    for component in key.split('/') {
-        let tree = if file_utils::does_object_exist(&hash)? {
-            object_utils::load_tree(&hash)?
-        } else {
-            let read = remote_utils::read_objects_verified(client, std::slice::from_ref(&hash)).await?;
-            let (_, bytes) = read.into_iter().next()
-                .ok_or_else(|| format!("The remote returned nothing for tree {}.", hash))?;
-
-            object_utils::parse_tree_bytes(&hash, &bytes)?
-        };
-
-        match crate::commands::scope::subtree_hash(&tree, component) {
-            Some(subtree) => hash = subtree,
-            None => return Ok(false),
-        }
-    }
-
-    Ok(true)
 }
 
 /// The result of a `scope fetch`: what was added to the fetch scope and how much was fetched.

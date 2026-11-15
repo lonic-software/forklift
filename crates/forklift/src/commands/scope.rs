@@ -105,7 +105,7 @@ fn unfetched_refusal(fetch: &scope_utils::PathScope, root_tree: &str, path: &str
 }
 
 /// The hash of the subtree `name` in `tree`, if it has one.
-pub(crate) fn subtree_hash(tree: &forklift_core::model::tree_item::TreeItem, name: &str) -> Option<String> {
+fn subtree_hash(tree: &forklift_core::model::tree_item::TreeItem, name: &str) -> Option<String> {
     tree.get_subtrees().find(|(entry, _)| entry.as_str() == name).map(|(_, item)| item.hash.clone())
 }
 
