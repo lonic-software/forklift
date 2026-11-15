@@ -3640,6 +3640,50 @@ fn heal_finishes_an_interrupted_lower_to_a_head_naming_withheld_content() {
     left_out_film(&warehouse, &takedown);
 }
 
+/// A warehouse whose unavailable record was lost, or damaged past reading, is healed: heal
+/// records again the absent film history reaches and the remote's host still withholds, setting a
+/// damaged record aside first, and a git export then leaves the film out rather than failing on it.
+///
+/// Revert: drop heal's re-recording → the lost film fails heal as `objects_lost`. Revert: drop
+/// heal's rebuild → the damaged record leaves heal nothing to judge and the export fails.
+#[test]
+fn heal_records_again_what_a_lost_or_damaged_unavailable_record_held() {
+    let mut takedown = takedown("heal-record");
+    let warehouse = Warehouse::cloned("takedown-heal-record", &takedown.server.url);
+    takedown.withhold_new_film(false);
+    warehouse.run_ok(&["lower"]);
+    recorded_film(&warehouse, &takedown);
+    let record = warehouse.root.join(".forklift/unavailable");
+
+    for damage in ["lost", "zeroed"] {
+        let length = std::fs::read(&record).unwrap().len();
+        match damage {
+            "lost" => forklift_core::util::file_utils::remove_file(&record).unwrap(),
+            _ => std::fs::write(&record, vec![0u8; length]).unwrap(),
+        }
+
+        let healed = warehouse.json(&["heal"]);
+        assert_eq!(healed["ok"], true, "{}: {}", damage, healed);
+        assert_eq!(healed["data"]["recorded_unavailable"], serde_json::json!([takedown.film]), "{}: {}", damage, healed);
+        let rebuilt = &healed["data"]["unavailable_rebuilt"];
+        match damage {
+            "lost" => assert!(rebuilt.is_null(), "{}", healed),
+            _ => {
+                assert_eq!((&rebuilt["kept"], &rebuilt["dropped"]), (&0.into(), &1.into()), "{}", healed);
+                let copy = warehouse.root.join(rebuilt["set_aside"].as_str().unwrap());
+                assert_eq!(std::fs::read(&copy).unwrap(), vec![0u8; length], "the damaged record is kept");
+                forklift_core::util::file_utils::remove_file(&copy).unwrap();
+            }
+        }
+        recorded_film(&warehouse, &takedown);
+
+        let out = warehouse.root.with_file_name(format!("takedown-heal-record-{}.git", damage));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&out);
+        let exported = warehouse.run(&["git", "export", out.to_str().unwrap()]);
+        assert!(exported.status.success(), "{}: {}", damage, String::from_utf8_lossy(&exported.stderr));
+    }
+}
+
 /// A lower whose bay has diverged from a remote head changing a file to content the remote's host
 /// withholds merges that head in without it, in a full warehouse and in a cache: the merge parcel
 /// has both heads as parents, the local change stays, the old version is removed and the new one
