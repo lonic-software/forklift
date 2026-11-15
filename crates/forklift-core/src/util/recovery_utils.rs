@@ -3075,18 +3075,24 @@ impl WalkClass {
 }
 
 /// The parcels a closure walk has been through, per [`WalkClass`]: a crafted user history naming a
-/// real meta parcel as a parent must not spend that parcel's full walk on a scoped one. A meta visit
-/// covers a user one, since a walk in full checks everything a scoped walk would.
+/// real meta parcel as a parent must not spend that parcel's full walk on a scoped one, and a walk
+/// in one class never covers the other, because the sink is told whether a leaf is user file
+/// content: a parcel user and meta history share is walked once in each.
 #[derive(Default)]
 struct ParcelVisits {
     user: HashSet<String>,
     meta: HashSet<String>,
+    /// Parcels with nothing to walk in any class.
+    settled: HashSet<String>,
 }
 
 impl ParcelVisits {
     /// Whether a visit in `class` has nothing left to do at `hash`.
     fn covers(&self, hash: &str, class: WalkClass) -> bool {
-        self.meta.contains(hash) || (class == WalkClass::User && self.user.contains(hash))
+        self.settled.contains(hash) || match class {
+            WalkClass::User => self.user.contains(hash),
+            WalkClass::Meta => self.meta.contains(hash),
+        }
     }
 
     /// Record a walk of a present parcel in `class`.
@@ -3100,12 +3106,12 @@ impl ParcelVisits {
     /// Record a parcel with nothing to walk (absent, corrupt or unreadable), which no class would
     /// walk differently and which is reported once.
     fn settle(&mut self, hash: &str) {
-        self.meta.insert(hash.to_string());
+        self.settled.insert(hash.to_string());
     }
 
     /// Whether any visit resolved `hash`.
     fn reached(&self, hash: &str) -> bool {
-        self.user.contains(hash) || self.meta.contains(hash)
+        self.user.contains(hash) || self.meta.contains(hash) || self.settled.contains(hash)
     }
 }
 
@@ -4117,9 +4123,10 @@ mod tests {
     /// heal records unavailable again only what the closing check met as user file content: an
     /// absent leaf is in `absent_files`; an absent tree beside it, and an absent leaf only meta
     /// history reaches, are absent but not user file content; an absent leaf in a tree both reach
-    /// is. Mutation: report every sink hash as file content → the tree is listed; ignore the walk's
-    /// class → the meta leaf is listed; visit a tree once whatever the class → the shared leaf,
-    /// walked as meta first, is not listed.
+    /// is, and so is one under a parcel both reach. Mutation: report every sink hash as file
+    /// content → the tree is listed; ignore the walk's class → the meta leaf is listed; visit a
+    /// tree or a parcel once whatever the class → the shared leaf, walked as meta first, is not
+    /// listed.
     #[test]
     fn find_lost_objects_tells_absent_file_content_from_an_absent_tree() {
         use crate::model::tree_item::TreeItem;
@@ -4145,13 +4152,19 @@ mod tests {
         plant_head_over_tree(pallet_utils::PalletNamespace::Meta, "notes", &meta);
         root.add_child(TreeItem::new("shared".to_string(), shared_object.hash.clone(), DirEntryType::Tree));
         plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
+        // One parcel both a meta head and a user head name: same tree, same description.
+        let parcel_leaf = object_utils::hash_object_bytes(&object_utils::blob_bytes(b"an absent leaf of a shared parcel"));
+        let mut one = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        one.add_child(TreeItem::new("d.txt".to_string(), parcel_leaf.clone(), DirEntryType::Normal));
+        plant_head_over_tree(pallet_utils::PalletNamespace::Meta, "both", &one);
+        plant_head_over_tree(pallet_utils::PalletNamespace::User, "both", &one);
         file_utils::forget_cached_objects();
 
         let lost = find_lost_objects().unwrap();
-        let mut absent = vec![leaf.clone(), sub_object.hash.clone(), cell, both.clone()];
+        let mut absent = vec![leaf.clone(), sub_object.hash.clone(), cell, both.clone(), parcel_leaf.clone()];
         absent.sort();
         assert_eq!(lost.absent.iter().cloned().collect::<Vec<_>>(), absent, "{:?}", lost);
-        let mut files = vec![leaf, both];
+        let mut files = vec![leaf, both, parcel_leaf];
         files.sort();
         assert_eq!(lost.absent_files.iter().cloned().collect::<Vec<_>>(), files, "{:?}", lost);
 
