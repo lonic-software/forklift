@@ -672,6 +672,8 @@ fn heal_refuses_as_objects_lost_when_a_reachable_object_is_absent() {
     let root = area.warehouse();
     healed(&area, &root);
 
+    // The working file no longer holds it, so heal cannot store it again from there.
+    std::fs::write(root.join("a.txt"), "changed\n").unwrap();
     let hash = blob_hash("one\n");
     let path = loose_object(&root, &hash);
     assert!(path.is_file(), "the fixture must find the blob loose");
@@ -697,6 +699,229 @@ fn heal_refuses_as_objects_lost_when_a_reachable_object_is_absent() {
     // The verdict records nothing: the next run says the same.
     let again = area.run(&root, &["--json", "heal"]);
     assert_eq!(again.status.code(), Some(58), "{}", text(&again.stdout));
+}
+
+/// The `objects_lost` refusal of a `--json heal` run in `dir`, as its `error` object.
+fn lost_refusal(area: &Area, dir: &Path) -> serde_json::Value {
+    let output = area.run(dir, &["--json", "heal"]);
+    assert_eq!(output.status.code(), Some(58), "{}{}", text(&output.stdout), text(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "objects_lost", "{}", value);
+    value["error"].clone()
+}
+
+/// Delete the loose file of `hash` under `root`.
+fn lose(root: &Path, hash: &str) {
+    let path = loose_object(root, hash);
+    assert!(path.is_file(), "the fixture must find {} loose", hash);
+    forklift_core::util::file_utils::remove_file(&path).unwrap();
+}
+
+#[test]
+fn heal_stores_a_lost_blob_again_from_the_working_file_that_holds_it() {
+    // FORK-493: a lost blob the working tree still holds, at a path the inventory lists with that
+    // hash, is stored again from the file, whether history or only a staged load reaches it, and
+    // the run passes. Nothing else is written.
+    // Mutation: skip the restore (heal refuses objects_lost) → red.
+    let area = Area::new("restore-working");
+    let root = area.warehouse();
+    healed(&area, &root);
+    std::fs::write(root.join("c.txt"), "staged\n").unwrap();
+    area.run_ok(&root, &["load", "c.txt"]);
+
+    lose(&root, &blob_hash("one\n"));
+    lose(&root, &blob_hash("staged\n"));
+
+    let data = healed(&area, &root);
+    assert_eq!(data["restored_from_working_tree"], serde_json::json!(["a.txt", "c.txt"]), "{}", data);
+    assert!(loose_object(&root, &blob_hash("one\n")).is_file());
+    assert!(loose_object(&root, &blob_hash("staged\n")).is_file());
+
+    let human = area.run_ok(&root, &["heal"]);
+    assert!(text(&human.stdout).contains("Nothing to heal"), "{}", text(&human.stdout));
+}
+
+#[test]
+fn heal_names_unload_when_only_a_staged_load_reaches_a_lost_blob() {
+    // FORK-493: a lost blob only a load never stacked reaches, whose file has changed or gone, is
+    // the user's to unstage: the refusal says so, names the path and gives `forklift unload`,
+    // never a backup, and the unload mends it.
+    // Mutation: drop the staged-only arm of the next step (backup again) → red.
+    // A parent folder replaced by a file reads as the path gone, never as a file that may hold it.
+    for (case, path) in [("changed", "a.txt"), ("gone", "a.txt"), ("parent-a-file", "d/a.txt")] {
+        let area = Area::new(&format!("staged-{}", case));
+        let root = area.warehouse();
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join(path), "staged\n").unwrap();
+        area.run_ok(&root, &["load", path]);
+        lose(&root, &blob_hash("staged\n"));
+        match case {
+            "gone" => forklift_core::util::file_utils::remove_file(root.join(path)).unwrap(),
+            "changed" => std::fs::write(root.join(path), "changed\n").unwrap(),
+            _ => {
+                forklift_core::util::file_utils::remove_dir_all(root.join("d")).unwrap();
+                std::fs::write(root.join("d"), "a file now\n").unwrap();
+            }
+        }
+
+        let error = lost_refusal(&area, &root);
+        let lost = &error["details"]["objects_lost"];
+        assert_eq!(lost["staged_only"], true, "{}", error);
+        assert_eq!(lost["staged"], serde_json::json!([path]), "{}", error);
+        assert_eq!(lost["pallets"], serde_json::json!([]), "{}", error);
+        assert!(error["details"].get("restored_from_working_tree").is_none(), "nothing else is stored: {}", error);
+        assert!(!error["details"]["notes"].to_string().contains("may hold"), "{}", error);
+        assert_eq!(
+            error["next_step"],
+            format!(
+                "from the working tree's root, run \"forklift unload {}\", then load the file again if you mean to stage it",
+                path
+            ),
+            "{}",
+            error
+        );
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("only staged content still reaches"), "{}", message);
+        assert!(!message.contains("other refs"), "{}", message);
+
+        area.run_ok(&root, &["unload", path]);
+        healed(&area, &root);
+    }
+}
+
+#[test]
+fn heal_warns_that_a_damaged_staged_object_stays_lost_when_loaded_again() {
+    // FORK-493: a staged-only object held by a corrupt loose file gets the unload step too, and
+    // the refusal says that loading the same content again keeps the damaged file, as it does.
+    // Mutation: drop the damaged-file line → red.
+    let area = Area::new("staged-corrupt");
+    let root = area.warehouse();
+    std::fs::write(root.join("a.txt"), "staged\n").unwrap();
+    area.run_ok(&root, &["load", "a.txt"]);
+    std::fs::write(loose_object(&root, &blob_hash("staged\n")), "garbage").unwrap();
+
+    let error = lost_refusal(&area, &root);
+    assert_eq!(error["details"]["objects_lost"]["corrupt"], 1, "{}", error);
+    assert!(error["next_step"].as_str().unwrap().contains("\"forklift unload a.txt\""), "{}", error);
+    assert!(error["message"].as_str().unwrap().contains("loading the same content again keeps"), "{}", error);
+
+    area.run_ok(&root, &["load", "a.txt"]);
+    lost_refusal(&area, &root);
+}
+
+#[test]
+fn heal_keeps_the_backup_step_while_history_reaches_a_lost_object() {
+    // FORK-493: a staged-only loss beside one history reaches gets the backup step, since
+    // unloading does not bring the history's object back, and no staged path is claimed: the walk
+    // stops at what it lacks, so history may reach that content too.
+    // Mutation: name unload whenever anything is staged only (ignore `staged_only`), or report the
+    // staged paths short of all → red.
+    let area = Area::new("staged-and-history");
+    let root = area.warehouse();
+    std::fs::write(root.join("a.txt"), "staged\n").unwrap();
+    area.run_ok(&root, &["load", "a.txt"]);
+    std::fs::write(root.join("a.txt"), "changed\n").unwrap();
+    std::fs::write(root.join("b.txt"), "changed too\n").unwrap();
+    lose(&root, &blob_hash("staged\n"));
+    lose(&root, &blob_hash("two\n"));
+
+    let error = lost_refusal(&area, &root);
+    let lost = &error["details"]["objects_lost"];
+    assert_eq!(lost["absent"], 2, "{}", error);
+    assert_eq!(lost["staged_only"], false, "{}", error);
+    assert!(lost.get("staged").is_none(), "{}", error);
+    assert_eq!(lost["pallets"], serde_json::json!(["main"]), "{}", error);
+    assert!(error["next_step"].as_str().unwrap().starts_with("restore the warehouse from a backup"), "{}", error);
+}
+
+#[test]
+fn heal_names_the_bay_whose_staged_load_reaches_a_lost_blob() {
+    // FORK-493: content only another checkout's staged load reaches is that checkout's to mend:
+    // heal here names the bay and has it run heal there, which stores the content again from its
+    // own working tree.
+    // Mutation: skip the other checkouts' inventories (no staged_elsewhere, backup step) → red.
+    let area = Area::new("staged-bay");
+    let root = area.warehouse();
+    let bay = area.base.join("bay");
+    area.run_ok(&root, &["bay", "add", "side", bay.to_str().unwrap()]);
+    std::fs::write(bay.join("c.txt"), "in the bay\n").unwrap();
+    area.run_ok(&bay, &["load", "c.txt"]);
+    lose(&root, &blob_hash("in the bay\n"));
+
+    let error = lost_refusal(&area, &root);
+    let lost = &error["details"]["objects_lost"];
+    assert_eq!(lost["staged_only"], true, "{}", error);
+    assert!(lost.get("staged").is_none(), "{}", error);
+    assert_eq!(lost["staged_elsewhere"].as_array().map(Vec::len), Some(1), "{}", error);
+    assert!(lost["staged_elsewhere"][0].as_str().unwrap().starts_with("bay \"side\""), "{}", error);
+    assert_eq!(error["next_step"], "from each checkout named above, run \"forklift heal\"", "{}", error);
+
+    // Lost here too: the step unloads this checkout's path, then has the bay run heal.
+    // Mutation: leave the other checkouts out of the unload step → red.
+    std::fs::write(root.join("d.txt"), "here\n").unwrap();
+    area.run_ok(&root, &["load", "d.txt"]);
+    lose(&root, &blob_hash("here\n"));
+    std::fs::write(root.join("d.txt"), "changed\n").unwrap();
+    let error = lost_refusal(&area, &root);
+    assert_eq!(error["details"]["objects_lost"]["staged"], serde_json::json!(["d.txt"]), "{}", error);
+    assert_eq!(
+        error["next_step"],
+        "from the working tree's root, run \"forklift unload d.txt\", then load the file again if you mean to stage it; \
+        then, from each other checkout named above, run \"forklift heal\"",
+        "{}",
+        error
+    );
+    area.run_ok(&root, &["unload", "d.txt"]);
+
+    let data = healed(&area, &bay);
+    assert_eq!(data["restored_from_working_tree"], serde_json::json!(["c.txt"]), "{}", data);
+    healed(&area, &root);
+}
+
+#[test]
+fn heal_stores_a_lost_chunk_again_from_the_working_file() {
+    // FORK-493: a chunked file's lost chunk is content its recipe reaches, so heal stores it again
+    // from the working file that still holds it.
+    // Mutation: match entries by their own hash only, never a recipe's chunks → red.
+    let area = Area::new("restore-chunk");
+    let root = area.warehouse();
+    let objects = root.join(".forklift").join("objects");
+    let before = loose_files(&objects);
+
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let content: Vec<u8> = (0..9 * 1024 * 1024)
+        .map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 56) as u8
+        })
+        .collect();
+    std::fs::write(root.join("big.bin"), &content).unwrap();
+    area.run_ok(&root, &["load", "big.bin"]);
+
+    let (chunk, size) = loose_files(&objects)
+        .into_iter()
+        .filter(|(path, _)| !before.iter().any(|(old, _)| old == path))
+        .max_by_key(|(_, size)| *size)
+        .expect("the load wrote objects");
+    assert!(size > 64 * 1024, "the largest new object must be a chunk, not the recipe");
+    forklift_core::util::file_utils::remove_file(&chunk).unwrap();
+
+    let data = healed(&area, &root);
+    assert_eq!(data["restored_from_working_tree"], serde_json::json!(["big.bin"]), "{}", data);
+    assert!(chunk.is_file());
+}
+
+/// Every loose object file under `objects`, with its size.
+fn loose_files(objects: &Path) -> Vec<(PathBuf, u64)> {
+    let mut files = Vec::new();
+    for fan in std::fs::read_dir(objects).unwrap().flatten() {
+        if fan.path().is_dir() {
+            for file in std::fs::read_dir(fan.path()).unwrap().flatten() {
+                files.push((file.path(), file.metadata().unwrap().len()));
+            }
+        }
+    }
+    files
 }
 
 #[test]

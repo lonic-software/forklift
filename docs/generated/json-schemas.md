@@ -2291,6 +2291,24 @@ A command not listed here either reports only the generic human-message shape `{
             "null"
           ]
         },
+        "staged": {
+          "description": "When `staged_only`, this checkout's staged paths whose content is among them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "staged_elsewhere": {
+          "description": "When `staged_only`, the other checkouts (the main working tree, or a bay) staging content\namong them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "staged_only": {
+          "description": "Whether only staged content reaches every one of them: loads never stacked, each in a\ncheckout `staged` or `staged_elsewhere` names, which no backup is needed to mend.",
+          "type": "boolean"
+        },
         "unreadable": {
           "description": "How many reachable objects the store could not read.",
           "format": "uint",
@@ -2303,7 +2321,8 @@ A command not listed here either reports only the generic human-message shape `{
         "unreadable",
         "corrupt",
         "hashes",
-        "pallets"
+        "pallets",
+        "staged_only"
       ],
       "type": "object"
     },
@@ -2758,6 +2777,13 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "restaged": {
       "description": "Recorded paths that were present, verified, and freshly rewritten.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "restored_from_working_tree": {
+      "description": "Paths this checkout's inventory lists whose content the store had lost, which this run stored\nagain from the working tree, where the file still holds that content.",
       "items": {
         "type": "string"
       },
