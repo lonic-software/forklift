@@ -12,6 +12,16 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **`heal` repairs a cache whose sealed record was lost, and a lost origin record names a move that
+  works.** A cache that lost entries of its record of content held by hash read that content as
+  lost, and `heal` refused with exit 58 (`objects_lost`), though the origin still held it. Now `heal`
+  asks the origin which history it holds and records again each lost absent object that history
+  reaches, listed in `--json` as `resealed`; a read then fetches it as before. An origin that does
+  not answer leaves them lost and names `forklift heal`. A missing or damaged origin record of a
+  partial warehouse is refused with exit 11 (`non_origin_remote`) everywhere, `heal` included, where
+  a damaged one failed with no code, and its next step names `forklift remote move` with the
+  configured remote instead of a `<url>` placeholder. Bare `remote` reports it as a block.
+
 - **A read the warehouse cannot serve names a remedy that works.** `store peek <hash>` of a hash
   the store does not hold now says only that, with no next step, where it was refused with exit 57
   (`object_unreadable`) naming `heal`, which then found nothing to heal. An absence that still leaves

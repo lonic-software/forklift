@@ -410,8 +410,8 @@ error_codes! {
     OutOfScopeConflict,
 
     /// A partial (sparse or cache) warehouse was asked to talk to a remote other than its origin,
-    /// or its origin record is missing: what it lacks was only ever proved present on the origin,
-    /// so every remote command refuses up front.
+    /// or its origin record is missing or damaged: what it lacks was only ever proved present on
+    /// the origin, so every remote command refuses up front.
     NonOriginRemote,
 
     /// `scope narrow` was asked to drop a subtree that still holds uncommitted work (staged,
@@ -754,7 +754,7 @@ impl ErrorCode {
             ErrorCode::OutOfScopeConflict =>
                 "A scoped bay merge hit an out-of-scope entry changed on both sides",
             ErrorCode::NonOriginRemote =>
-                "A partial (--only or --cache) warehouse was asked to talk to a remote other than its origin, or its origin record is missing",
+                "A partial (--only or --cache) warehouse was asked to talk to a remote other than its origin, or its origin record is missing or damaged",
             ErrorCode::NarrowUnclean =>
                 "\"forklift scope narrow\" would delete a subtree that still holds uncommitted work",
             ErrorCode::ScopePruneBlocked =>

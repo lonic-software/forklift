@@ -128,9 +128,9 @@ refusal_codes! {
     SparseWorkspace => "sparse_workspace",
 
     /// A partial warehouse (cloned with `--only` or `--cache`) was asked to talk to a remote
-    /// other than its origin, or its origin record is missing: the content it does not hold was
-    /// only ever proved present on the origin, so every fetch, lift and read of remote heads from
-    /// it refuses up front.
+    /// other than its origin, or its origin record is missing or damaged: the content it does not
+    /// hold was only ever proved present on the origin, so every fetch, lift and read of remote
+    /// heads from it refuses up front.
     NonOriginRemote => "non_origin_remote",
 
     /// `scope narrow` was asked to drop a subtree that still holds uncommitted work (staged, unstaged or

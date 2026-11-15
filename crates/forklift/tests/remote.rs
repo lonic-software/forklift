@@ -6482,7 +6482,7 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     let json: serde_json::Value = serde_json::from_str(&stdout(&forced)).unwrap();
     assert_eq!(json["error"]["code"], "non_origin_remote", "{}", stdout(&forced));
     assert!(json["error"]["message"].as_str().unwrap().contains("origin record")
-            && json["error"]["next_step"].as_str().unwrap().contains("remote move <url>"),
+            && json["error"]["next_step"].as_str().unwrap().contains(&format!("remote move {}", server1.url.trim_end_matches('/'))),
         "the refusal names the missing record and the way out: {}", json);
 }
 
@@ -8208,7 +8208,7 @@ fn a_stopped_move_is_abandoned_only_while_checking_and_finished_by_the_next() {
 
     forklift_core::util::file_utils::remove_file(area.path("cached/.forklift/origin")).unwrap();
     let missing = area.forklift("cached", &["--json", "lower"]);
-    assert!(json_of(&missing)["error"]["next_step"].as_str().unwrap().contains("remote move <url>"), "{}", stdout(&missing));
+    assert!(json_of(&missing)["error"]["next_step"].as_str().unwrap().contains(&format!("remote move {}", copy.url.trim_end_matches('/'))), "{}", stdout(&missing));
     assert_success(&area.forklift("cached", &["remote", "move", &copy.url]));
     assert_eq!(origin_of(&area, "cached").as_deref(), Some(copy.url.as_str()));
     assert_success(&area.forklift("cached", &["lower"]));
