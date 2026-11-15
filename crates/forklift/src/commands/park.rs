@@ -79,8 +79,8 @@ pub async fn park_changes(name: Option<&str>, paths: &[String]) -> Result<(), St
 
     let head_tree_hash = object_utils::load_parcel(&head)?.tree_hash;
 
-    // Stage the whole work in progress: modified tracked files are rehashed, deleted
-    // tracked files become staged removals. Untracked files stay untracked. Its own blob
+    // Stage the work in progress, or only the part under the paths: modified tracked files are
+    // rehashed, deleted tracked files become staged removals. Untracked files stay untracked. Its own blob
     // stores are already batched internally (DESIGN.html §5.0 D item 10, finding #3). The
     // rebuild below anchors before it, so a file edited after the refresh is never trusted.
     let anchor = file_utils::take_stat_anchor()?;
@@ -114,7 +114,7 @@ pub async fn park_changes(name: Option<&str>, paths: &[String]) -> Result<(), St
     // this read and the tree build the same rollup-based skip `stack` has: a subtree whose
     // shard's rollup already matches the head subtree hash is not read here, nor hashed or
     // (re)stored — its parent's tree includes it by hash. `park` as a whole still reads every
-    // shard: the conflict check and `refresh_tracked_entries` above both do.
+    // shard: the conflict check does, and a whole park's refresh above.
     let prepared = std::sync::Arc::new(inventory_utils::prepare_stack_inventory(Some((&head_tree_hash, &scope)))?);
 
     // `prepare_stack_inventory` stops collecting at the first conflict entry it finds (sorted key
@@ -133,8 +133,9 @@ pub async fn park_changes(name: Option<&str>, paths: &[String]) -> Result<(), St
     }
 
     // The per-directory tree hashes the build can return are `stack`-only bookkeeping (for
-    // stamping rollups after a successful stack): `park` overwrites every shard from head a few
-    // lines down (`replace_all_inventories`), so it passes `track_tree_hashes: false`.
+    // stamping rollups after a successful stack): `park` resets staging to the head below, whole
+    // or under its paths, and stamps no rollup from this build, so it passes
+    // `track_tree_hashes: false`.
     let (partial_root, _tree_hashes) = tree_utils::build_tree_from_inventory_deferred(&prepared, &batch, false).await?;
     let partial_root = partial_root.ok_or("There is nothing to park.".to_string())?;
 
@@ -142,19 +143,7 @@ pub async fn park_changes(name: Option<&str>, paths: &[String]) -> Result<(), St
     // the working copy, so a parked parcel naming lost content could never be popped back.
     tree_utils::require_staged_content_present(&partial_root, Some(&head_tree_hash))?;
 
-    let root_tree_hash = if !paths.is_empty() {
-        // Only the trees on the way to the paths change: everything else is the head's, by hash,
-        // whatever is staged there. The splice reads the staged trees, so they are made durable
-        // first, and its own trees join a barrier of their own. The paths lie in the bay's scope,
-        // so no out-of-scope sibling is on the way to one.
-        batch.finish()?;
-        let spliced = std::sync::Arc::new(file_utils::WriteBatch::new());
-        let root = tree_utils::splice_paths(&head_tree_hash, &partial_root.hash, &paths, &spliced)?;
-        spliced.finish()?;
-
-        refuse_unmatched(&paths, &head_tree_hash, &root)?;
-        root
-    } else if scope.is_full() {
+    let staged_root_hash = if scope.is_full() {
         partial_root.hash
     } else {
         // A park is a WIP snapshot, never a merge completion, so it has no out-of-scope skeleton:
@@ -166,6 +155,23 @@ pub async fn park_changes(name: Option<&str>, paths: &[String]) -> Result<(), St
         tree_utils::build_scoped_root_tree(
             Some(&head_tree_hash), &partial_root, &scope, &overrides, &batch,
         )?.hash
+    };
+
+    let root_tree_hash = if paths.is_empty() {
+        staged_root_hash
+    } else {
+        // Only the trees on the way to the paths change: everything else is the head's, by hash,
+        // whatever is staged there. The splice takes them from the whole staged root, spliced
+        // onto the head's spine in a scoped bay, so a path on the spine above the scope carries
+        // the head's out-of-scope siblings with it. The splice reads the staged trees, so they are
+        // made durable first, and its own trees join a barrier of their own.
+        batch.finish()?;
+        let spliced = std::sync::Arc::new(file_utils::WriteBatch::new());
+        let root = tree_utils::splice_paths(&head_tree_hash, &staged_root_hash, &paths, &spliced)?;
+        spliced.finish()?;
+
+        refuse_unmatched(&paths, &head_tree_hash, &root)?;
+        root
     };
 
     if root_tree_hash == head_tree_hash {
@@ -334,39 +340,27 @@ fn pathspec(raw: &[String]) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
-/// Refuse a partial park naming a path that nothing holds: not the head, not the parked tree, and
-/// not the working directory. A misspelled path would otherwise be parked as nothing, silently.
+/// Refuse a partial park naming a path no tracked file or folder is at: in neither the head nor
+/// the parked tree, which holds what is staged there. A misspelled path would otherwise be parked
+/// as nothing, silently. The working directory is not asked: an untracked file is never parked,
+/// and on a case-insensitive volume a path spelled in another case is found there but matches no
+/// key, so its changes would be left out.
 fn refuse_unmatched(paths: &[String], head_tree: &str, parked_tree: &str) -> Result<(), String> {
+    let holds = |tree: &str, key: &str| -> Result<bool, String> {
+        Ok(tree_utils::resolve_subtree_hash(tree, key)?.is_some() || object_utils::resolve_tree_file(tree, key)?.is_some())
+    };
+
     for path in paths {
-        let on_disk = std::path::Path::new(path).symlink_metadata().is_ok();
-        if !on_disk && !tree_holds(head_tree, path)? && !tree_holds(parked_tree, path)? {
+        if !holds(head_tree, path)? && !holds(parked_tree, path)? {
             return Err(format!(
-                "\"{}\" names nothing in the warehouse: no file or folder is there, in the pallet head or in \
-                the work in progress. Nothing was parked.",
+                "\"{}\" names nothing tracked: no file or folder is there in the pallet head or in the \
+                work in progress. Nothing was parked.",
                 sanitize(path)
             ));
         }
     }
 
     Ok(())
-}
-
-/// Whether the tree `tree` holds a file or folder at the warehouse path key `key`.
-fn tree_holds(tree: &str, key: &str) -> Result<bool, String> {
-    let mut level = object_utils::load_tree(tree)?;
-    let mut components = key.split('/').peekable();
-
-    while let Some(component) = components.next() {
-        if components.peek().is_none() {
-            return Ok(level.get_file(component).is_some() || level.get_subtree(component).is_some());
-        }
-        let Some(subtree) = level.get_subtree(component) else {
-            return Ok(false);
-        };
-        level = object_utils::load_tree(&subtree.hash)?;
-    }
-
-    Ok(false)
 }
 
 /// The refusal of a park that would park the file at `path`, whose content `hash` is redacted.
@@ -1387,7 +1381,15 @@ mod tests {
         assert_eq!(error, "There is nothing to park under those paths: they match the pallet head.");
 
         let error = test_support::block_on(park_changes(None, &["a".to_string(), "nope".to_string()])).unwrap_err();
-        assert!(error.starts_with("\"nope\" names nothing in the warehouse"), "{}", error);
+        assert!(error.starts_with("\"nope\" names nothing tracked"), "{}", error);
+
+        // An untracked file is never parked, and a path in another case matches no key, even
+        // where the volume finds it.
+        std::fs::write(warehouse.root.join("loose.txt"), b"untracked\n").unwrap();
+        for path in ["loose.txt", "A/X"] {
+            let error = test_support::block_on(park_changes(None, &["a".to_string(), path.to_string()])).unwrap_err();
+            assert!(error.contains("names nothing tracked"), "{}: {}", path, error);
+        }
 
         assert!(park_utils::read_parked().unwrap().is_empty());
         assert_eq!(staged_paths(&tree), vec!["a/x".to_string(), "b/y".to_string()]);

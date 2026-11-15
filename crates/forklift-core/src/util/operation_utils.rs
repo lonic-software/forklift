@@ -238,6 +238,11 @@ impl Operation {
 
         let kind = OperationKind::parse(&kind).ok_or(format!("names an operation this version of Forklift does not know (\"{}\").", kind.escape_debug()))?;
 
+        // Only a park records paths: on any other operation they would be read and never obeyed.
+        if kind != OperationKind::Park && !pathspec.is_empty() {
+            return Err("is malformed.".to_string());
+        }
+
         let rolling_back = match phase.as_str() {
             "running" => false,
             "rolling-back" => true,
@@ -964,6 +969,10 @@ mod tests {
         ] {
             assert_eq!(Operation::from_bytes(malformed.as_bytes()), Err("is malformed.".to_string()), "{}", malformed);
         }
+
+        // Only a park records paths.
+        operation.kind = OperationKind::Lower;
+        assert_eq!(Operation::from_bytes(&operation.to_bytes()), Err("is malformed.".to_string()));
     }
 
     // Revert: write the carried entries but drop them on the read → the round trip loses them.

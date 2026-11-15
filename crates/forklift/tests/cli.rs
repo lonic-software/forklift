@@ -3972,6 +3972,19 @@ fn a_park_given_paths_parks_only_those() {
     assert_success(&warehouse.run_at(&scoped_dir, &["park", "pop", "scoped"]));
     assert_eq!(read(&scoped_dir, "src/api/a.txt"), "scoped work\n");
 
+    // A path on the spine above the scope parks the part in scope, and keeps the head's siblings
+    // outside it: none is written into the bay, and none is deleted by the park.
+    assert_success(&warehouse.run_at(&scoped_dir, &["park", "--name", "spine", "src"]));
+    assert!(!scoped_dir.join("src/web").exists(), "nothing outside the scope is written into the bay");
+    let shown = warehouse.run_at(&scoped_dir, &["--json", "park", "show", "spine"]);
+    assert_success(&shown);
+    let shown: serde_json::Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    let files: Vec<_> = shown["data"]["files"].as_array().unwrap().iter()
+        .map(|file| file["path"].as_str().unwrap().to_string()).collect();
+    assert_eq!(files, vec!["src/api/a.txt".to_string()], "the park changes only the file in scope");
+    assert_success(&warehouse.run_at(&scoped_dir, &["park", "pop", "spine"]));
+    assert_eq!(read(&scoped_dir, "src/api/a.txt"), "scoped work\n");
+
     assert_success(&warehouse.run(&["park", "pop", "api"]));
     assert_eq!(read(&warehouse.root, "src/api/a.txt"), "api work\n");
 }

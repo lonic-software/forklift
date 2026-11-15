@@ -180,7 +180,6 @@ mod tests {
         expands_to("au", "audit");
     }
 
-    /// An exact name or alias wins over the longer names it starts, hidden aliases included.
     #[test]
     fn a_command_taking_words_of_its_own_expands_no_prefix() {
         // `park` takes paths, and `a` or `sh` may be one: only a subcommand spelled out is one.
@@ -192,6 +191,7 @@ mod tests {
         expands_to("par list", "park list");
     }
 
+    /// An exact name or alias wins over the longer names it starts, hidden aliases included.
     #[test]
     fn an_exact_name_or_alias_wins() {
         // `s` starts stack, stocktake, store, show, shift, scope and more; it is stack's alias.
