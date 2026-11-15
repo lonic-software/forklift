@@ -836,9 +836,10 @@ pub(crate) struct HealReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     resealed: Vec<String>,
 
-    /// Absent objects history still reaches whose entries in the record of content this
-    /// warehouse cannot get were lost, which this run recorded again: the remote's host still
-    /// withholds each, so a checkout or an export leaves it out, as after the fetch.
+    /// Absent objects history still reaches that the record of content this warehouse cannot get
+    /// did not hold, which this run recorded in it again: the remote's host withholds each, so a
+    /// checkout or an export leaves it out, as after the fetch. Its entry was lost, or this
+    /// warehouse held a copy and lost it; heal cannot tell which.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     recorded_unavailable: Vec<String>,
 
@@ -1056,6 +1057,7 @@ impl CommandOutput for HealReport {
             for hash in &self.recorded_unavailable {
                 println!("  {}", hash);
             }
+            println!("If this warehouse held a copy of one, restoring it from a backup brings the content back.");
         }
 
         if let Some(error) = &self.unseal_failed {
