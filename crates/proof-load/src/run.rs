@@ -112,21 +112,21 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     let mut output = match Output::claim(&out) {
         Ok(output) => output,
         Err(error) => {
-            return Err(RunError::Refused(format!("{}", error)));
+            return Err(RunError::Refused(error.to_string()));
         }
     };
 
     let census = match Census::load(&source) {
         Ok(census) => census,
         Err(error) => {
-            return Err(RunError::Refused(format!("{}", error)));
+            return Err(RunError::Refused(error.to_string()));
         }
     };
 
     let routes = match crate::routes::RouteTable::load(&source) {
         Ok(routes) => routes,
         Err(error) => {
-            return Err(RunError::Refused(format!("{}", error)));
+            return Err(RunError::Refused(error.to_string()));
         }
     };
 
@@ -169,7 +169,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         Some(program) => match asked("schema").and_then(|(scratch, environment)| writeops::read_schema(program, &scratch, &environment, limit)) {
             Ok(schema) => Some(schema),
             Err(error) => {
-                return Err(RunError::Refused(format!("{}", error)));
+                return Err(RunError::Refused(error.to_string()));
             }
         },
     };
@@ -178,7 +178,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         Some(server) => match asked("server-help").and_then(|(scratch, environment)| writeops::read_server_leaves(server, &scratch, &environment, limit)) {
             Ok(leaves) => leaves,
             Err(error) => {
-                return Err(RunError::Refused(format!("{}", error)));
+                return Err(RunError::Refused(error.to_string()));
             }
         },
     };
