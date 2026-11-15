@@ -19,8 +19,16 @@ pub enum Event {
     Started(Category, String),
     Finished(Category, String, bool),
     Message(String),
-    /// The run returned; nothing follows.
-    Done(Result<Report, RunError>),
+    /// The run returned, or the harness failed under it; nothing follows.
+    Done(Result<Report, Ended>),
+}
+
+/// How a run ended without a report: as the run itself said, or on a fault of the harness that
+/// is no verdict on the tool under test.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ended {
+    Run(RunError),
+    Internal(String),
 }
 
 /// One lane of the meter: its category, its block count where the run knew it before starting,
@@ -47,7 +55,7 @@ impl Lane {
 pub struct Meter {
     pub lanes: Vec<Lane>,
     pub messages: Vec<String>,
-    pub ended: Option<Result<Report, RunError>>,
+    pub ended: Option<Result<Report, Ended>>,
 }
 
 impl Meter {
@@ -147,8 +155,10 @@ impl Worker {
         std::thread::spawn(move || {
             // A run that panics still ends: the window is told it was refused, and why, rather
             // than left waiting for a Done that never comes.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&channel)))
-                .unwrap_or_else(|panic| Err(RunError::Refused(format!("the run stopped on an internal error: {}", panicked(&*panic)))));
+            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&channel))) {
+                Ok(result) => result.map_err(Ended::Run),
+                Err(panic) => Err(Ended::Internal(panicked(&*panic))),
+            };
             channel.send(Event::Done(result));
         });
         Worker { events, stop }
@@ -164,7 +174,7 @@ impl Worker {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     if !events.iter().any(|event| matches!(event, Event::Done(_))) {
-                        events.push(Event::Done(Err(RunError::Refused("the run ended without a result".to_string()))));
+                        events.push(Event::Done(Err(Ended::Internal("the run ended without a result".to_string()))));
                     }
                     break;
                 }
@@ -264,20 +274,20 @@ mod tests {
         assert!(!worker.stopping());
         worker.stop();
         go.send(()).expect("the run is waiting");
-        assert_eq!(worker.next(), Some(Event::Done(Err(RunError::Cancelled))));
+        assert_eq!(worker.next(), Some(Event::Done(Err(Ended::Run(RunError::Cancelled)))));
         assert!(worker.stopping());
     }
 
-    /// A run that panics ends refused, with the panic's message, instead of leaving the window
-    /// running.
+    /// A run that panics ends on an internal error, with the panic's message, not as a refusal,
+    /// and not left running.
     ///
     /// Revert: send Done only when the body returns → the worker goes with no Done.
     #[test]
     fn a_panicking_run_ends_refused() {
         let worker = Worker::start_with(|_| panic!("index out of bounds"), || {});
-        assert_eq!(worker.next(), Some(Event::Done(Err(RunError::Refused("the run stopped on an internal error: index out of bounds".into())))));
+        assert_eq!(worker.next(), Some(Event::Done(Err(Ended::Internal("index out of bounds".into())))));
         assert_eq!(worker.next(), None);
         let events = worker.drain();
-        assert_eq!(events, [Event::Done(Err(RunError::Refused("the run ended without a result".into())))], "a gone worker reads as ended");
+        assert_eq!(events, [Event::Done(Err(Ended::Internal("the run ended without a result".into())))], "a gone worker reads as ended");
     }
 }

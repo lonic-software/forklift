@@ -125,6 +125,15 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     } = options.clone();
     let started = std::time::Instant::now();
 
+    // Ids are checked first, so a mistyped one is refused before anything is written or read.
+    for (flag, ids) in [("--kill", &kill), ("--power", &power), ("--disk-full", &disk_full), ("--read-only", &read_only_lane), ("--network", &network_lane)] {
+        if let Some(unknown) = ids.iter().find(|id| !scenario::catalog().iter().any(|scenario| &scenario.id == *id)) {
+            return Err(RunError::Refused(format!("{} {}: no such scenario", flag, unknown)));
+        }
+    }
+    if let Some(unknown) = only.as_ref().filter(|only| !scenario::known(only)) {
+        return Err(RunError::Refused(format!("--only {}: no such scenario", unknown)));
+    }
     let mut output = match Output::claim(&out) {
         Ok(output) => output,
         Err(error) => {
@@ -146,14 +155,6 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         }
     };
 
-    for (flag, ids) in [("--kill", &kill), ("--power", &power), ("--disk-full", &disk_full), ("--read-only", &read_only_lane), ("--network", &network_lane)] {
-        if let Some(unknown) = ids.iter().find(|id| !scenario::catalog().iter().any(|scenario| &scenario.id == *id)) {
-            return Err(RunError::Refused(format!("{} {}: no such scenario", flag, unknown)));
-        }
-    }
-    if let Some(unknown) = only.as_ref().filter(|only| !scenario::known(only)) {
-        return Err(RunError::Refused(format!("--only {}: no such scenario", unknown)));
-    }
     let scenarios: Vec<_> = scenario::catalog().into_iter().filter(|scenario| only.as_ref().is_none_or(|only| *only == scenario.id)).collect();
     let corpus = corpus::generate(seed, corpus::Shape::SMALL);
     let mut tools = BTreeMap::new();
@@ -936,8 +937,10 @@ mod tests {
     /// Revert: drop the check → the unknown id runs nothing and reports success.
     #[test]
     fn an_unknown_only_is_refused() {
-        let options = RunOptions { only: Some("signd".to_string()), ..bare(fresh("out")) };
+        let out = fresh("out");
+        let options = RunOptions { only: Some("signd".to_string()), ..bare(out.clone()) };
         assert_eq!(run(&options, &Quiet).unwrap_err(), RunError::Refused("--only signd: no such scenario".to_string()));
+        assert!(!out.exists(), "a mistyped id is refused before the report folder is made");
         let coverage = scenario::coverage().into_iter().next().expect("there are coverage scenarios").id;
         assert!(scenario::known(&coverage) && scenario::known("signed"));
     }

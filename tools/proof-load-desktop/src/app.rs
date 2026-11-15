@@ -11,7 +11,7 @@ use proof_load::run::RunError;
 
 use crate::form::{Field, Form};
 use crate::results::{self, Results};
-use crate::run_state::{Event, Meter, Worker};
+use crate::run_state::{Ended, Event, Meter, Worker};
 use crate::steps;
 use crate::theme::{self, Palette, Type};
 use crate::widgets::{self, Button, Column, ScreenLine};
@@ -33,6 +33,9 @@ const SCREEN_NAMES: [&str; 3] = ["Run", "Results", "Coverage"];
 /// The most run messages the Run screen keeps on show, newest last.
 const MESSAGES: usize = 6;
 
+/// How many seconds a field's check stands before the file system is asked again.
+const RECHECK: f64 = 1.0;
+
 /// The Show switch's options: failing rows only, or every row.
 const SHOW: [&str; 2] = ["Failures", "All"];
 
@@ -52,9 +55,9 @@ pub struct App {
     /// The selected row, an index into `Results::rows`, and its step screen once read.
     selected: Option<usize>,
     step_lines: Option<(usize, Result<Vec<ScreenLine>, String>)>,
-    /// The fields' errors and the form they were checked for, so the file system is asked again
-    /// only when a field changes, not every frame.
-    checked: Option<(Form, [Option<&'static str>; 6])>,
+    /// The fields' errors, the form they were checked for and when, so the file system is asked
+    /// again when a field changes, a run ends, or a second has passed, not every frame.
+    checked: Option<(Form, f64, [Option<&'static str>; 6])>,
 }
 
 impl Default for App {
@@ -159,19 +162,22 @@ impl App {
         }
         if let Some(result) = done {
             self.worker = None;
+            // The run has written into its report folder, so the fields are checked again.
+            self.checked = None;
             if let Ok(report) = result {
                 self.open(Results::new(report, Path::new(self.form.out.trim()).to_path_buf()));
             }
         }
     }
 
-    /// The fields' errors, checked again only when the form has changed since the last check.
-    fn errors(&mut self) -> [Option<&'static str>; 6] {
+    /// The fields' errors, checked again when the form has changed since the last check, or
+    /// `RECHECK` seconds after it, as files may come and go under the paths typed.
+    fn errors(&mut self, now: f64) -> [Option<&'static str>; 6] {
         match &self.checked {
-            Some((form, errors)) if *form == self.form => *errors,
+            Some((form, at, errors)) if *form == self.form && now - at < RECHECK => *errors,
             _ => {
                 let errors = self.form.errors();
-                self.checked = Some((self.form.clone(), errors));
+                self.checked = Some((self.form.clone(), now, errors));
                 errors
             }
         }
@@ -184,7 +190,8 @@ impl App {
     fn run_screen(&mut self, ui: &mut Ui) {
         let p = theme::palette(ui.ctx());
         let running = self.running();
-        let errors = self.errors();
+        let errors = self.errors(ui.input(|input| input.time));
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(RECHECK));
         widgets::plate(ui, "Run", "proof_load::run", |ui| {
             ui.add_enabled_ui(!running, |ui| {
                 for (pair, pair_errors) in Field::ALL.chunks(2).zip(errors.chunks(2)) {
@@ -199,11 +206,15 @@ impl App {
                 let ready = errors.iter().all(Option::is_none);
                 if widgets::button(ui, "Run scenarios", Button::Primary, !running && ready).clicked() {
                     // Checked once more as it starts: the file system may have changed.
-                    if let Some(options) = self.form.options() {
-                        let ctx = ui.ctx().clone();
-                        self.meter = Meter::default();
-                        self.opened = None;
-                        self.worker = Some(Worker::start(options, move || ctx.request_repaint()));
+                    match self.form.options() {
+                        Some(options) => {
+                            let ctx = ui.ctx().clone();
+                            self.meter = Meter::default();
+                            self.opened = None;
+                            self.worker = Some(Worker::start(options, move || ctx.request_repaint()));
+                        }
+                        // A field went wrong since its last check; the next frame shows which.
+                        None => self.checked = None,
                     }
                 }
                 let stoppable = self.worker.as_ref().is_some_and(|worker| !worker.stopping());
@@ -254,8 +265,9 @@ impl App {
         match &self.meter.ended {
             None => (String::new(), p.muted),
             Some(Ok(report)) => (format!("Finished: {} rows graded.", report.rows.len() + report.forklift_only.len()), p.muted),
-            Some(Err(RunError::Cancelled)) => ("Stopped. The run wrote no report.".to_string(), p.muted),
-            Some(Err(error)) => (format!("Refused: {error}"), p.g_lost),
+            Some(Err(Ended::Run(RunError::Cancelled))) => ("Stopped. The run wrote no report.".to_string(), p.muted),
+            Some(Err(Ended::Run(error))) => (format!("Refused: {error}"), p.g_lost),
+            Some(Err(Ended::Internal(error))) => (format!("Proof Load failed: {error}. This is a fault of the harness, not a grade."), p.g_lost),
         }
     }
 

@@ -10,7 +10,7 @@ use proof_load::report::{Category, Cell};
 use proof_load::run::RunError;
 use proof_load_desktop::app::{App, Screen};
 use proof_load_desktop::results::Results;
-use proof_load_desktop::run_state::Event;
+use proof_load_desktop::run_state::{Ended, Event};
 use proof_load_desktop::{theme, widgets};
 
 /// Every colour the window's last frame puts on screen: the frame is tessellated as eframe would,
@@ -58,7 +58,7 @@ fn screens() -> Vec<(&'static str, App)> {
         Event::Finished(Category::DamagedFiles, "b".into(), true),
         Event::Started(Category::DamagedFiles, "c".into()),
         Event::Message("built the warehouse".into()),
-        Event::Done(Err(RunError::Refused("the source tree has no Cargo.toml".into()))),
+        Event::Done(Err(Ended::Run(RunError::Refused("the source tree has no Cargo.toml".into())))),
     ] {
         run.meter.apply(event);
     }
@@ -320,4 +320,62 @@ fn a_narrow_window_keeps_the_scenario_names() {
     let names: Vec<(String, f32)> = shown_texts(egui::Theme::Light, &mut app, 760.0).into_iter()
         .filter(|(text, _, _)| text.starts_with("signed ")).map(|(text, _, shown)| (text, shown)).collect();
     assert!(!names.is_empty() && names.iter().all(|(_, shown)| *shown >= 100.0), "scenario names squeezed at 760 px: {names:?}");
+}
+
+/// The texts of the Run screen at each of `times`, the app kept between them, with `between`
+/// run after the first frame.
+fn run_texts_over(app: &mut App, times: [f64; 2], mut between: impl FnMut()) -> Vec<String> {
+    let ctx = egui::Context::default();
+    proof_load_desktop::install(&ctx);
+    let mut output = None;
+    for (index, time) in times.into_iter().enumerate() {
+        if index == 1 {
+            between();
+        }
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1120.0, 2400.0))),
+            time: Some(time),
+            ..egui::RawInput::default()
+        };
+        output = Some(ctx.run(input, |ctx| app.show(ctx)));
+    }
+    fn walk(shape: &epaint::Shape, found: &mut Vec<String>) {
+        match shape {
+            epaint::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, found)),
+            epaint::Shape::Text(text) => found.push(text.galley.text().to_string()),
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    for clipped in &output.expect("a frame ran").shapes {
+        walk(&clipped.shape, &mut found);
+    }
+    found
+}
+
+/// A field's check is asked again as time passes, so a report folder a run has written into, or
+/// one filled from outside, shows its error rather than a Run that silently starts nothing.
+///
+/// Revert: check the fields only when the form changes → the filled folder still reads as fine.
+#[test]
+fn a_field_is_checked_again_as_the_disk_changes() {
+    let folder = std::env::temp_dir().join(format!("proof-load-desktop-recheck-{}", std::process::id()));
+    std::fs::create_dir_all(&folder).expect("a scratch folder");
+    let mut app = App::default();
+    app.form.out = folder.display().to_string();
+    let texts = run_texts_over(&mut app, [0.0, 2.0], || std::fs::write(folder.join("report.json"), "{}").expect("written"));
+    assert!(texts.iter().any(|text| text == "This folder is not empty. A run needs an empty or new one."), "{texts:?}");
+}
+
+/// A run the harness itself failed under says so, and is not shown as the tool's refusal.
+///
+/// Revert: show every ending without a report as "Refused: …" → the crash reads as a refusal.
+#[test]
+fn a_harness_failure_is_not_shown_as_a_refusal() {
+    let mut app = App::default();
+    app.meter.apply(Event::Done(Err(Ended::Internal("index out of bounds".into()))));
+    let texts = texts(egui::Theme::Light, &mut app);
+    let status = texts.iter().find(|(text, _)| text.contains("index out of bounds")).expect("the status is drawn");
+    assert!(status.0.starts_with("Proof Load failed: ") && !status.0.contains("Refused"), "{}", status.0);
+    assert_eq!(status.1, theme::palette_of(egui::Theme::Light).g_lost);
 }
