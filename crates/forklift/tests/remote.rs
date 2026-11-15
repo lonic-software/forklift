@@ -6275,6 +6275,33 @@ fn a_scope_fetch_over_a_lost_spine_tree_fails_naming_it() {
     assert!(!object_present(&area, "sparse", &src_tree), "the lost tree was fetched over");
 }
 
+// Revert: cache the check's trees by hash alone → the copy of the tree read from the remote at the
+// sealed "docs" answers for the lost one at "src", and the scope fetch succeeds over the damage.
+#[test]
+fn a_lost_spine_tree_is_found_though_a_sealed_directory_holds_the_same_tree() {
+    let area = TestArea::new("sparse-expand-lost-twin");
+    let server = Server::start(&area, None);
+    prepare_warehouse(&area, "dev", &server.url);
+    for root in ["src", "docs"] {
+        area.write_file(&format!("dev/{}/api/a.txt", root), "api v1\n");
+        area.write_file(&format!("dev/{}/web/b.txt", root), "web v1\n");
+    }
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "twins"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let src_tree = path_object_hash(&area, "dev", &head, "src");
+    assert_eq!(path_object_hash(&area, "dev", &head, "docs"), src_tree, "the two directories share a tree");
+
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
+    forklift_core::util::file_utils::remove_file(object_store_path(&area, "sparse", &src_tree)).unwrap();
+
+    let failed = area.forklift("sparse", &["scope", "fetch", "docs/web", "src/web"]);
+    assert!(!failed.status.success(), "{}", stdout(&failed));
+    assert!(stderr(&failed).contains(&src_tree[2..14]), "{}", stderr(&failed));
+}
+
 // Revert: check the --only paths after the scoped fetch → the refused clone keeps the file's blobs,
 // and its corrected resume reads the file outside the fetch scope.
 #[test]
@@ -6285,7 +6312,8 @@ fn a_refused_clone_of_a_file_keeps_none_of_it() {
 
     let refused = area.forklift(".", &["--json", "clone", &server.url, "sparse", "--only", "docs/guide.md"]);
     assert_eq!(json_of(&refused)["error"]["details"]["cause_code"], "only_prefix_not_found", "{}", stdout(&refused));
-    assert!(!object_present(&area, "sparse", &guide_blob), "the refused clone fetched the guide");
+    let objects = area.path("sparse/.forklift/objects");
+    assert!(!objects.exists() || walk(&objects).is_empty(), "the refused clone stored objects");
 
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
     assert!(!object_present(&area, "sparse", &guide_blob), "the resume kept the guide");
@@ -11174,8 +11202,8 @@ fn a_failed_franchise_keeps_its_directory_and_a_corrected_resume_finishes() {
 #[test]
 fn a_resume_keeps_the_objects_an_earlier_attempt_fetched() {
     // A full clone of the same remote fetches every object loose (the test server has no
-    // bundle). An attempt that failed partway, on an object the remote could not serve, keeps
-    // what it stored, and its resume fetches only what it lacks.
+    // bundle). A sparse attempt that failed partway, on an object the remote could not serve,
+    // keeps what it stored, and a full resume of it fetches only what it lacks.
     let area = TestArea::new("clone-resume-keeps-objects");
     let server = Server::start(&area, None);
     remote_with_two_subtrees(&area, &server);
@@ -11190,8 +11218,9 @@ fn a_resume_keeps_the_objects_an_earlier_attempt_fetched() {
     let aside = area.path("web-blob-aside");
     forklift_core::util::file_utils::rename(&served, &aside).unwrap();
 
-    let failed = area.forklift(".", &["clone", &server.url, "kept"]);
+    let failed = area.forklift(".", &["clone", &server.url, "kept", "--only", "src"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
+    assert_eq!(origin_of(&area, "kept").as_deref(), Some(server.url.as_str()), "the origin is recorded before the fetch");
     forklift_core::util::file_utils::rename(&aside, &served).unwrap();
 
     let resumed = area.forklift(".", &["--json", "clone", &server.url, "kept"]);
@@ -11202,6 +11231,7 @@ fn a_resume_keeps_the_objects_an_earlier_attempt_fetched() {
         "the resume must not refetch what the first attempt stored: {} vs {}", resumed_fetched, fresh_fetched);
     assert_eq!(area.read_file("kept/src/api/a.txt"), "api v1\n");
     assert_eq!(area.read_file("kept/src/web/b.txt"), "web v1\n");
+    assert_eq!(origin_of(&area, "kept"), None, "a full resume of a sparse attempt leaves no origin behind");
     assert_success(&area.forklift("kept", &["status"]));
 }
 
