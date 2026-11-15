@@ -5,7 +5,11 @@
 
 pub mod app;
 pub mod fonts;
+pub mod form;
 pub mod grades;
+pub mod results;
+pub mod run_state;
+pub mod steps;
 pub mod theme;
 pub mod widgets;
 

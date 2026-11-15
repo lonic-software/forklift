@@ -289,9 +289,9 @@ tr:last-child td { border-bottom: 0 }
     </div>
     <div class="row" style="gap:18px; align-items:start">
       <div class="specimen"><div class="seg" role="group" aria-label="Binding">
-        <button id="b-fl" aria-pressed="true">forklift</button><button id="b-git" aria-pressed="false">git</button><button id="b-gt" aria-pressed="false">git-tuned</button>
+        <button id="b-all" aria-pressed="true">All</button><button id="b-fl" aria-pressed="false">forklift</button><button id="b-srv" aria-pressed="false">forklift-server</button>
       </div><span class="state-label">segmented · binding filter</span></div>
-      <div class="field" style="width:260px"><label class="engraved" for="f-only">Only</label><input id="f-only" value="redacted"><small>Scenarios whose name contains this text</small></div>
+      <div class="field" style="width:260px"><label class="engraved" for="f-only">Only</label><input id="f-only" value="signed"><small>Run only the scenario with this id. Empty runs every scenario.</small></div>
       <div class="field err" style="width:260px"><label class="engraved" for="f-bin">forklift binary</label><input id="f-bin" value="target/debug/forklfit"><small>No file at this path.</small></div>
     </div>
   </section>
@@ -331,6 +331,10 @@ rebuilt the applied-redactions record (2 kept)
         <div class="tally" id="tally"></div>
         <div class="seg" role="group" aria-label="Show">
           <button id="s-fail" aria-pressed="true">Failures</button><button id="s-all" aria-pressed="false">All</button>
+        </div>
+        <span class="engraved">Binding</span>
+        <div class="seg" role="group" aria-label="Binding">
+          <button id="r-all" aria-pressed="true">All</button><button id="r-fl" aria-pressed="false">forklift</button><button id="r-srv" aria-pressed="false">forklift-server</button>
         </div>
       </aside>
       <div class="stack" style="min-width:0">
@@ -413,25 +417,28 @@ document.getElementById("cov").innerHTML = `<thead><tr><th>Category</th><th>Linu
     const label = s === "notrun" ? "not run" : s;
     return `<td><span class="cell ${s}" title="${why}"><i class="lamp ${s}"></i>${label}</span></td>`; }).join("")}</tr>`).join("") + `</tbody>`;
 
-const ROWS = [
-  { s: "redactions-applied__flip__byte-17", cat: "damaged files", fl: "remedy", git: "lost", cmds: 3, right: true, out: [] },
-  { s: "withheld-served__truncate__half", cat: "damaged files", fl: "lost", git: "lost", cmds: null, right: false, out: [] },
-  { s: "pack-index__zero__header", cat: "damaged files", fl: "healed", git: "silent", cmds: 1, right: true, out: [] },
-  { s: "stack__kill__renameat-4", cat: "kill points (client)", fl: "healed", git: "noremedy", cmds: 1, right: true, out: [] },
-  { s: "consolidate__disk-full__at-60%", cat: "disk full", fl: "remedy", git: "remedy", cmds: 2, right: true, out: ["free disk space"] },
-  { s: "lock__dead-pid__stale", cat: "dead-PID lock", fl: "noremedy", git: "remedy", cmds: null, right: false, out: ["remove .git/index.lock"] },
-];
+// One table row per report row: a scenario graded under one binding. Worst grade first, then by
+// scenario; the side's Binding switch shows one binding's rows.
 const ORDER = ["silent","lost","noremedy","remedy","healed"];
-let onlyFail = true, sel = 0;
+const ROWS = [
+  { s: "redactions-applied flip byte-17", cat: "damaged files", b: "forklift", g: "remedy", cmds: 3, right: true, out: [] },
+  { s: "withheld-served truncate half", cat: "damaged files", b: "forklift", g: "lost", cmds: null, right: false, out: [] },
+  { s: "pack-index zero header", cat: "damaged files", b: "forklift", g: "healed", cmds: 1, right: true, out: [] },
+  { s: "stack kill renameat-4", cat: "kill points (client)", b: "forklift", g: "healed", cmds: 1, right: true, out: [] },
+  { s: "serve kill fsync-2", cat: "kill points (server)", b: "forklift-server", g: "silent", cmds: null, right: false, out: [] },
+  { s: "consolidate disk-full at-60%", cat: "disk full", b: "forklift", g: "remedy", cmds: 2, right: true, out: ["free disk space"] },
+  { s: "lock dead-pid stale", cat: "dead-PID lock", b: "forklift", g: "noremedy", cmds: null, right: false, out: [] },
+].sort((a, b) => ORDER.indexOf(a.g) - ORDER.indexOf(b.g) || a.s.localeCompare(b.s));
+let onlyFail = true, binding = null, sel = 0;
 function renderResults() {
-  const rows = ROWS.map((r, i) => ({ ...r, i })).filter(r => !onlyFail || ["silent","lost","noremedy"].includes(r.fl) || ["silent","lost","noremedy"].includes(r.git));
+  const rows = ROWS.map((r, i) => ({ ...r, i })).filter(r => (!onlyFail || ["silent","lost","noremedy"].includes(r.g)) && (binding == null || r.b === binding));
   if (!rows.some(r => r.i === sel) && rows.length) sel = rows[0].i;
-  document.getElementById("results").innerHTML = `<thead><tr><th>Scenario</th><th>Category</th><th>forklift</th><th>git</th><th>To expected</th></tr></thead><tbody>` +
-    rows.map(r => `<tr class="${r.i === sel ? "sel" : ""}" data-i="${r.i}" tabindex="0"><td class="mono">${r.s}</td><td class="muted">${r.cat}</td><td>${chip(r.fl)}</td><td>${chip(r.git)}</td>
+  document.getElementById("results").innerHTML = `<thead><tr><th>Scenario</th><th>Category</th><th>Binding</th><th>Grade</th><th>To expected</th></tr></thead><tbody>` +
+    rows.map(r => `<tr class="${r.i === sel ? "sel" : ""}" data-i="${r.i}" tabindex="0"><td class="mono">${r.s}</td><td class="muted">${r.cat}</td><td class="mono">${r.b}</td><td>${chip(r.g)}</td>
       <td class="num">${r.cmds == null ? "never" : r.cmds + " cmd"}</td></tr>`).join("") + `</tbody>`;
   const r = ROWS[sel];
   document.getElementById("detail").innerHTML = `
-    <div class="readout"><span class="engraved">Commands to expected</span><span class="v">${r.cmds == null ? "never" : r.cmds} <small>${r.cmds == null ? "" : "commands"}</small></span></div>
+    <div class="readout"><span class="engraved">Commands to expected</span><span class="v">${r.cmds == null ? "never" : r.cmds} <small>${r.cmds == null ? "" : r.cmds === 1 ? "command" : "commands"}</small></span></div>
     <div class="readout"><span class="engraved">Named the remedy that worked</span><span class="v">${r.right ? "yes" : "no"}</span></div>
     <div class="readout"><span class="engraved">Outside knowledge</span><span style="font-size:13px">${r.out.length ? r.out.join(", ") : "none: the tool's own commands were enough"}</span></div>`;
   document.querySelectorAll("#results tbody tr").forEach(tr => {
@@ -448,7 +455,8 @@ function seg(ids, on) {
     ids.forEach(o => document.getElementById(o).setAttribute("aria-pressed", String(o === id))); on && on(b); }); });
 }
 seg(["s-fail","s-all"], b => { onlyFail = b.id === "s-fail"; renderResults(); });
-seg(["b-fl","b-git","b-gt"]);
+seg(["b-all","b-fl","b-srv"]);
+seg(["r-all","r-fl","r-srv"], b => { binding = { "r-fl": "forklift", "r-srv": "forklift-server" }[b.id] ?? null; renderResults(); });
 seg(["t-sys","t-light","t-dark"], b => {
   const t = b.dataset.t; if (t) document.documentElement.setAttribute("data-theme", t); else document.documentElement.removeAttribute("data-theme");
   try { localStorage.setItem("pl-theme", t); } catch (e) {}

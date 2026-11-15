@@ -6,8 +6,11 @@
 use std::collections::BTreeSet;
 
 use eframe::egui::{self, epaint, Color32};
-use proof_load_desktop::app::App;
-use proof_load::report::Cell;
+use proof_load::report::{Category, Cell};
+use proof_load::run::RunError;
+use proof_load_desktop::app::{App, Screen};
+use proof_load_desktop::results::Results;
+use proof_load_desktop::run_state::Event;
 use proof_load_desktop::{theme, widgets};
 
 /// Every colour the window's last frame puts on screen: the frame is tessellated as eframe would,
@@ -37,9 +40,42 @@ fn painted_by(theme: egui::Theme, mut show: impl FnMut(&egui::Context)) -> BTree
     found
 }
 
+/// The report a real run of the signed scenario wrote, with two rows' details beside it.
+fn fixture() -> Results {
+    Results::open(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/signed")).expect("the fixture reads")
+}
+
+/// Each screen as a run leaves it: the Run screen with its fields in error and a meter part way
+/// through, the Results screen on a row whose steps it shows and on one whose details are gone,
+/// and the Coverage screen.
+fn screens() -> Vec<(&'static str, App)> {
+    let mut run = App::default();
+    for event in [
+        Event::Lane(Category::DamagedFiles, Some(5)),
+        Event::Started(Category::DamagedFiles, "a".into()),
+        Event::Finished(Category::DamagedFiles, "a".into(), false),
+        Event::Started(Category::DamagedFiles, "b".into()),
+        Event::Finished(Category::DamagedFiles, "b".into(), true),
+        Event::Started(Category::DamagedFiles, "c".into()),
+        Event::Message("built the warehouse".into()),
+        Event::Done(Err(RunError::Refused("the source tree has no Cargo.toml".into()))),
+    ] {
+        run.meter.apply(event);
+    }
+    let mut steps = App::showing(fixture());
+    assert!(steps.select("signed trust FlipByte"));
+    let gone = App::showing(fixture());
+    let mut coverage = App::showing(fixture());
+    coverage.screen = Screen::Coverage;
+    vec![("run", run), ("results", steps), ("results without details", gone), ("coverage", coverage)]
+}
+
 fn painted(theme: egui::Theme) -> BTreeSet<[u8; 4]> {
-    let mut app = App::default();
-    painted_by(theme, |ctx| app.show(ctx))
+    let mut all = BTreeSet::new();
+    for (_, mut app) in screens() {
+        all.extend(painted_by(theme, |ctx| app.show(ctx)));
+    }
+    all
 }
 
 /// What one widget paints, alone in a panel.
@@ -63,7 +99,7 @@ fn check(which: egui::Theme) {
     let strays: Vec<String> = painted.iter().filter(|colour| !allowed.contains(*colour)).map(|colour| format!("{colour:?}")).collect();
     assert!(strays.is_empty(), "{which:?} paints colours that are not tokens: {}", strays.join(", "));
     // The window uses the theme's own surfaces and a grade colour, not only some of its tokens.
-    for token in [palette.bg, palette.panel, palette.ink, palette.accent, palette.g_silent, palette.crt_bg] {
+    for token in [palette.bg, palette.panel, palette.ink, palette.accent, palette.g_lost, palette.g_healed, palette.crt_bg] {
         assert!(painted.contains(&token.to_array()), "{which:?} never paints {:?}", named(&token.to_array()));
     }
 }
@@ -168,4 +204,63 @@ fn a_blank_step_screen_line_keeps_its_height() {
     let two = height(vec![line(), line()]);
     let with_blank = height(vec![line(), widgets::ScreenLine(Vec::new()), line()]);
     assert!(with_blank > two + 10.0, "a blank line between two adds {} px", with_blank - two);
+}
+
+/// Each screen, alone, paints what it exists to show: the meter's lit LEDs and a refusal on the Run
+/// screen, the selected row's step screen, the refusal of steps whose details are gone, and the
+/// coverage lamps.
+///
+/// Revert: show the refusal of unreadable details in muted ink → that screen paints no `--g-lost`.
+#[test]
+fn each_screen_paints_what_it_shows() {
+    let palette = theme::palette_of(egui::Theme::Light);
+    for (name, mut app) in screens() {
+        let painted = painted_by(egui::Theme::Light, |ctx| app.show(ctx));
+        let wanted: &[egui::Color32] = match name {
+            "run" => &[palette.g_healed, palette.g_lost, palette.accent, palette.lamp_off],
+            "results" => &[palette.crt_bg, palette.crt_red, palette.accent, palette.well],
+            "results without details" => &[palette.g_lost],
+            _ => &[palette.g_healed, palette.notrun],
+        };
+        for token in wanted {
+            assert!(painted.contains(&token.to_array()), "the {name} screen never paints {token:?}");
+        }
+        if name == "results without details" {
+            assert!(!painted.contains(&palette.crt_bg.to_array()), "a row whose details are gone shows a step screen");
+        }
+    }
+}
+
+/// A click on a row picks that row, though its cells hold widgets of their own.
+///
+/// Revert: make the row's interaction before its cells → a cell's chip takes the click.
+#[test]
+fn a_click_picks_the_row_under_it() {
+    let ctx = egui::Context::default();
+    proof_load_desktop::install(&ctx);
+    let columns = [widgets::Column { heading: "Grade", width: 0.0 }];
+    let head = 2.0 * 8.0 + theme::Type::Label.font().size;
+    let y = head + 1.5 * theme::ROW_HEIGHT;
+    let mut picked = None;
+    for event in [
+        vec![egui::Event::PointerMoved(egui::pos2(30.0, y))],
+        vec![egui::Event::PointerButton { pos: egui::pos2(30.0, y), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }],
+        vec![egui::Event::PointerButton { pos: egui::pos2(30.0, y), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }],
+    ] {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0))),
+            events: event,
+            ..egui::RawInput::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                if let Some(row) = widgets::table(ui, &columns, 3, true, None, |ui, _, _| {
+                    widgets::grade_chip(ui, proof_load::oracle::Grade::Healed);
+                }) {
+                    picked = Some(row);
+                }
+            });
+        });
+    }
+    assert_eq!(picked, Some(1));
 }

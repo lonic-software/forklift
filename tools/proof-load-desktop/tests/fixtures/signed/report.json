@@ -1,0 +1,515 @@
+{
+  "format": 1,
+  "coverage": {
+    "cells": {
+      "damaged-files": {
+        "linux": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        },
+        "macos": {
+          "state": "run"
+        },
+        "windows": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        }
+      },
+      "kill-points-client": {
+        "linux": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        },
+        "macos": {
+          "state": "not-run",
+          "reason": "no unprivileged syscall injection for an unmodified binary (dtrace needs SIP disabled)"
+        },
+        "windows": {
+          "state": "not-run",
+          "reason": "no syscall injection on Windows in this harness"
+        }
+      },
+      "kill-points-server": {
+        "linux": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        },
+        "macos": {
+          "state": "not-run",
+          "reason": "no unprivileged syscall injection for an unmodified binary (dtrace needs SIP disabled)"
+        },
+        "windows": {
+          "state": "not-run",
+          "reason": "no syscall injection on Windows in this harness"
+        }
+      },
+      "power-loss-client": {
+        "linux": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        },
+        "macos": {
+          "state": "not-run",
+          "reason": "no unprivileged syscall trace of an unmodified binary (dtrace needs SIP disabled)"
+        },
+        "windows": {
+          "state": "not-run",
+          "reason": "no syscall trace on Windows in this harness"
+        }
+      },
+      "power-loss-server": {
+        "linux": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        },
+        "macos": {
+          "state": "not-run",
+          "reason": "no unprivileged syscall trace of an unmodified binary (dtrace needs SIP disabled)"
+        },
+        "windows": {
+          "state": "not-run",
+          "reason": "no syscall trace on Windows in this harness"
+        }
+      },
+      "disk-full": {
+        "linux": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        },
+        "macos": {
+          "state": "not-run",
+          "reason": "no capped volume given"
+        },
+        "windows": {
+          "state": "not-run",
+          "reason": "no volume of this kind is built on Windows in this harness"
+        }
+      },
+      "read-only": {
+        "linux": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        },
+        "macos": {
+          "state": "not-run",
+          "reason": "no scenario this run picked was named for it"
+        },
+        "windows": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        }
+      },
+      "case-folding": {
+        "linux": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        },
+        "macos": {
+          "state": "not-run",
+          "reason": "no folding volume given"
+        },
+        "windows": {
+          "state": "not-run",
+          "reason": "no volume of this kind is built on Windows in this harness"
+        }
+      },
+      "no-exec": {
+        "linux": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        },
+        "macos": {
+          "state": "not-run",
+          "reason": "no folding volume given"
+        },
+        "windows": {
+          "state": "not-run",
+          "reason": "no volume of this kind is built on Windows in this harness"
+        }
+      },
+      "dead-pid-lock": {
+        "linux": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        },
+        "macos": {
+          "state": "run"
+        },
+        "windows": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        }
+      },
+      "network": {
+        "linux": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        },
+        "macos": {
+          "state": "not-run",
+          "reason": "no scenario this run picked was named for it"
+        },
+        "windows": {
+          "state": "not-run",
+          "reason": "this run was on another platform"
+        }
+      },
+      "clock-skew": {
+        "linux": {
+          "state": "not-run",
+          "reason": "no clock-skew mechanism yet"
+        },
+        "macos": {
+          "state": "not-run",
+          "reason": "no clock-skew mechanism yet"
+        },
+        "windows": {
+          "state": "not-run",
+          "reason": "no clock-skew mechanism yet"
+        }
+      },
+      "aws-head": {
+        "linux": {
+          "state": "not-run",
+          "reason": "the AWS head is not driven yet"
+        },
+        "macos": {
+          "state": "not-run",
+          "reason": "the AWS head is not driven yet"
+        },
+        "windows": {
+          "state": "not-run",
+          "reason": "the AWS head is not driven yet"
+        }
+      }
+    },
+    "not_reached": {}
+  },
+  "determinism": {
+    "seed": 1,
+    "tools": {
+      "forklift": "/src/forklift/target/debug/forklift (forklift 0.3.1)",
+      "forklift-server": "/src/forklift/target/debug/forklift-server (forklift-server 0.3.1)",
+      "git": "/usr/bin/git (git version 2.55.0)"
+    },
+    "scenarios": [
+      "signed"
+    ],
+    "platform": "macos",
+    "environment": {
+      "GIT_CONFIG_GLOBAL": "/run/proof-load/scratch/0002-signed/gitconfig-global",
+      "GIT_CONFIG_SYSTEM": "/run/proof-load/scratch/0002-signed/gitconfig-system",
+      "HOME": "/run/proof-load/scratch/0002-signed/home",
+      "PATH": "/usr/bin:/bin",
+      "TMPDIR": "/run/proof-load/scratch/0002-signed/tmp",
+      "XDG_CONFIG_HOME": "/run/proof-load/scratch/0002-signed/home/.config"
+    }
+  },
+  "completeness": [
+    {
+      "check": "damage bindings",
+      "cell": {
+        "state": "run"
+      },
+      "missing": []
+    },
+    {
+      "check": "census walk",
+      "cell": {
+        "state": "run"
+      },
+      "missing": []
+    },
+    {
+      "check": "server routes answered",
+      "cell": {
+        "state": "not-run",
+        "reason": "--only builds one scenario"
+      },
+      "missing": []
+    },
+    {
+      "check": "server route writes",
+      "cell": {
+        "state": "not-run",
+        "reason": "write-op traces run on Linux only"
+      },
+      "missing": []
+    },
+    {
+      "check": "damaged-file faults ran",
+      "cell": {
+        "state": "run"
+      },
+      "missing": []
+    },
+    {
+      "check": "disk-full faults ran",
+      "cell": {
+        "state": "not-run",
+        "reason": "no capped volume given"
+      },
+      "missing": []
+    },
+    {
+      "check": "read-only faults ran",
+      "cell": {
+        "state": "not-run",
+        "reason": "no scenario this run picked was named for it"
+      },
+      "missing": []
+    },
+    {
+      "check": "case-folding faults ran",
+      "cell": {
+        "state": "not-run",
+        "reason": "no folding volume given"
+      },
+      "missing": []
+    },
+    {
+      "check": "no-exec faults ran",
+      "cell": {
+        "state": "not-run",
+        "reason": "no folding volume given"
+      },
+      "missing": []
+    },
+    {
+      "check": "network faults ran",
+      "cell": {
+        "state": "not-run",
+        "reason": "no scenario this run picked was named for it"
+      },
+      "missing": []
+    },
+    {
+      "check": "write-op coverage",
+      "cell": {
+        "state": "not-run",
+        "reason": "--only builds one scenario"
+      },
+      "missing": []
+    },
+    {
+      "check": "read-only exemptions",
+      "cell": {
+        "state": "not-run",
+        "reason": "--only builds one scenario"
+      },
+      "missing": []
+    },
+    {
+      "check": "kill-point units",
+      "cell": {
+        "state": "not-run",
+        "reason": "kill points run on Linux only"
+      },
+      "missing": []
+    },
+    {
+      "check": "server kill-point units",
+      "cell": {
+        "state": "not-run",
+        "reason": "kill points run on Linux only"
+      },
+      "missing": []
+    },
+    {
+      "check": "power-loss states",
+      "cell": {
+        "state": "not-run",
+        "reason": "power loss runs on Linux only"
+      },
+      "missing": []
+    },
+    {
+      "check": "server power-loss states",
+      "cell": {
+        "state": "not-run",
+        "reason": "power loss runs on Linux only"
+      },
+      "missing": []
+    },
+    {
+      "check": "wall-clock budget",
+      "cell": {
+        "state": "not-run",
+        "reason": "no budget given"
+      },
+      "missing": []
+    }
+  ],
+  "rows": [
+    {
+      "scenario": "signed trust FlipByte",
+      "category": "damaged-files",
+      "binding": "forklift",
+      "grade": "refused-no-remedy",
+      "recoverability": {
+        "commands_to_expected": null,
+        "named_right_remedy": false,
+        "outside_knowledge": []
+      },
+      "note": null,
+      "detail": "signed-trust-FlipByte.json#"
+    },
+    {
+      "scenario": "signed trust Truncate",
+      "category": "damaged-files",
+      "binding": "forklift",
+      "grade": "refused-no-remedy",
+      "recoverability": {
+        "commands_to_expected": null,
+        "named_right_remedy": false,
+        "outside_knowledge": []
+      },
+      "note": null,
+      "detail": "signed-trust-Truncate.json#"
+    },
+    {
+      "scenario": "signed trust Zero",
+      "category": "damaged-files",
+      "binding": "forklift",
+      "grade": "refused-no-remedy",
+      "recoverability": {
+        "commands_to_expected": null,
+        "named_right_remedy": false,
+        "outside_knowledge": []
+      },
+      "note": null,
+      "detail": "signed-trust-Zero.json#"
+    },
+    {
+      "scenario": "signed trust Delete",
+      "category": "damaged-files",
+      "binding": "forklift",
+      "grade": "healed",
+      "recoverability": {
+        "commands_to_expected": 2,
+        "named_right_remedy": false,
+        "outside_knowledge": []
+      },
+      "note": null,
+      "detail": "signed-trust-Delete.json#"
+    },
+    {
+      "scenario": "signed meta Delete",
+      "category": "damaged-files",
+      "binding": "forklift",
+      "grade": "refused-no-remedy",
+      "recoverability": {
+        "commands_to_expected": null,
+        "named_right_remedy": false,
+        "outside_knowledge": []
+      },
+      "note": null,
+      "detail": "signed-meta_-Delete.json#"
+    },
+    {
+      "scenario": "signed meta/office FlipByte",
+      "category": "damaged-files",
+      "binding": "forklift",
+      "grade": "refused-no-remedy",
+      "recoverability": {
+        "commands_to_expected": null,
+        "named_right_remedy": false,
+        "outside_knowledge": []
+      },
+      "note": null,
+      "detail": "signed-meta__name_-FlipByte.json#"
+    },
+    {
+      "scenario": "signed meta/office Truncate",
+      "category": "damaged-files",
+      "binding": "forklift",
+      "grade": "refused-no-remedy",
+      "recoverability": {
+        "commands_to_expected": null,
+        "named_right_remedy": false,
+        "outside_knowledge": []
+      },
+      "note": null,
+      "detail": "signed-meta__name_-Truncate.json#"
+    },
+    {
+      "scenario": "signed meta/office Zero",
+      "category": "damaged-files",
+      "binding": "forklift",
+      "grade": "refused-no-remedy",
+      "recoverability": {
+        "commands_to_expected": null,
+        "named_right_remedy": false,
+        "outside_knowledge": []
+      },
+      "note": null,
+      "detail": "signed-meta__name_-Zero.json#"
+    },
+    {
+      "scenario": "signed meta/office Delete",
+      "category": "damaged-files",
+      "binding": "forklift",
+      "grade": "refused-no-remedy",
+      "recoverability": {
+        "commands_to_expected": null,
+        "named_right_remedy": false,
+        "outside_knowledge": []
+      },
+      "note": null,
+      "detail": "signed-meta__name_-Delete.json#"
+    },
+    {
+      "scenario": "signed objects/1b/e1cc88d307dbd79534ef678121b12588c3e5d3019c72c87cbe7b2701680b7f.sig FlipByte",
+      "category": "damaged-files",
+      "binding": "forklift",
+      "grade": "refused-no-remedy",
+      "recoverability": {
+        "commands_to_expected": null,
+        "named_right_remedy": false,
+        "outside_knowledge": []
+      },
+      "note": null,
+      "detail": "signed-objects__xx___hash_.sig-FlipByte.json#"
+    },
+    {
+      "scenario": "signed objects/47/59002aec5b37bb1d3e10e72e6d68696d4fb53198c289660637a5752b960468.sig Truncate",
+      "category": "damaged-files",
+      "binding": "forklift",
+      "grade": "refused-no-remedy",
+      "recoverability": {
+        "commands_to_expected": null,
+        "named_right_remedy": false,
+        "outside_knowledge": []
+      },
+      "note": null,
+      "detail": "signed-objects__xx___hash_.sig-Truncate.json#"
+    },
+    {
+      "scenario": "signed objects/b0/2d25865843b57e0f51278480fff188e190634c8708c5e16447611b82afd4ea.sig Zero",
+      "category": "damaged-files",
+      "binding": "forklift",
+      "grade": "healed",
+      "recoverability": {
+        "commands_to_expected": 2,
+        "named_right_remedy": false,
+        "outside_knowledge": []
+      },
+      "note": null,
+      "detail": "signed-objects__xx___hash_.sig-Zero.json#"
+    },
+    {
+      "scenario": "signed objects/63/d0d339b90966ee09586240b126ee11093f89c2d439128fed03d6a5d9dcdeb0.sig Delete",
+      "category": "damaged-files",
+      "binding": "forklift",
+      "grade": "refused-no-remedy",
+      "recoverability": {
+        "commands_to_expected": null,
+        "named_right_remedy": false,
+        "outside_knowledge": []
+      },
+      "note": null,
+      "detail": "signed-objects__xx___hash_.sig-Delete.json#"
+    }
+  ],
+  "forklift_only": []
+}

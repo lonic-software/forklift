@@ -144,7 +144,7 @@ fn no_file_but_the_theme_writes_a_colour_or_a_font_size() {
         checked.push(name);
     }
     checked.sort();
-    assert_eq!(checked, ["app.rs", "fonts.rs", "grades.rs", "lib.rs", "main.rs", "widgets.rs"]);
+    assert_eq!(checked, ["app.rs", "fonts.rs", "form.rs", "grades.rs", "lib.rs", "main.rs", "results.rs", "run_state.rs", "steps.rs", "widgets.rs"]);
     assert!(found.is_empty(), "colours or font sizes outside theme.rs:\n{}", found.join("\n"));
 }
 
