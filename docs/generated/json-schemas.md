@@ -4802,20 +4802,59 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$defs": {
-    "FileChange": {
-      "description": "How a park changes a file.",
-      "enum": [
-        "added",
-        "modified",
-        "deleted"
-      ],
-      "type": "string"
+    "ChangeKind": {
+      "description": "The kind of a change reported by a stocktake.",
+      "oneOf": [
+        {
+          "const": "added",
+          "description": "The item exists in the newer state but not in the older one.",
+          "type": "string"
+        },
+        {
+          "const": "modified",
+          "description": "The item exists in both states with different content.",
+          "type": "string"
+        },
+        {
+          "const": "moved",
+          "description": "The item was moved: it disappeared from one path and reappeared at another with\nthe same content (detected by a move-detection post-pass; the formats stay move-agnostic).",
+          "type": "string"
+        },
+        {
+          "const": "removed",
+          "description": "The item exists in the older state but not in the newer one.",
+          "type": "string"
+        },
+        {
+          "const": "untracked",
+          "description": "The item exists in the working directory but is not tracked by the inventory.",
+          "type": "string"
+        },
+        {
+          "const": "conflict",
+          "description": "The item is in a conflict state (an unresolved consolidation).",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "The item is not checked out: the head names it, but the remote's host withholds its\ncontent and this warehouse lacks it (inventory state `Unavailable`). It is no local change:\nthe next parcel still names the file, and only `forklift remove` stages its removal.",
+          "type": "string"
+        }
+      ]
     },
     "ParkedFile": {
       "description": "One file a park changes.",
       "properties": {
         "change": {
-          "$ref": "#/$defs/FileChange"
+          "$ref": "#/$defs/ChangeKind",
+          "description": "How the park changes the file, in the words `stocktake` and `diff` use."
+        },
+        "moved_from": {
+          "description": "Where a moved file moved from.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "path": {
           "type": "string"
