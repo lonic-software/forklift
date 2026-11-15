@@ -2559,13 +2559,17 @@ pub fn pallets_reaching(hashes: &BTreeSet<String>) -> Result<Vec<String>, String
     Ok(reaching)
 }
 
+/// What the enumerating walk feeds each absence it finds: the hash, and whether it was met as a
+/// file's content (see the module doc).
+type AbsenceSink<'a> = dyn FnMut(&str, bool) + 'a;
+
 /// Re-borrow an `Option<&mut dyn FnMut(&str, bool)>` for one call, without moving the original out of
 /// its owning local variable — needed because `Option<&mut dyn FnMut(&str, bool)>` is used repeatedly
 /// across loop iterations and nested calls in [`walk_closure_for`]/`walk_tree`/`check_leaf`, and
 /// the generic `Option::as_deref_mut` does not shrink a `&mut &mut dyn Trait`'s lifetime down to
 /// just the one call the way this concrete, non-generic match does (a known reborrowing gap for
 /// generic `DerefMut` blanket impls over nested mutable references).
-fn reborrow_sink<'a>(sink: &'a mut Option<&mut dyn FnMut(&str, bool)>) -> Option<&'a mut dyn FnMut(&str, bool)> {
+fn reborrow_sink<'a>(sink: &'a mut Option<&mut AbsenceSink<'_>>) -> Option<&'a mut AbsenceSink<'a>> {
     match sink {
         Some(s) => Some(&mut **s),
         None => None,
@@ -2661,7 +2665,7 @@ fn walk_closure_for(
     corrupt: &BTreeSet<String>,
     scope: &PathScope,
     sealed: Option<&Tolerated>,
-    mut sink: Option<&mut dyn FnMut(&str, bool)>,
+    mut sink: Option<&mut AbsenceSink<'_>>,
 ) -> Result<WalkClosureOutcome, String> {
     let mut referenced: BTreeSet<String> = BTreeSet::new();
     let mut unwalked: BTreeMap<String, String> = BTreeMap::new();
@@ -2864,7 +2868,7 @@ fn drain_parcel_queue(
     visited_trees: &mut TreeVisits,
     scope: &PathScope,
     sealed: Option<&Tolerated>,
-    mut sink: Option<&mut dyn FnMut(&str, bool)>,
+    mut sink: Option<&mut AbsenceSink<'_>>,
 ) -> Result<(), String> {
     while let Some((hash, policy, class)) = queue.pop_front() {
         // Targets-check FIRST: a vanished hash that is itself a root ref (a pallet head, a parked
@@ -2958,7 +2962,7 @@ fn walk_tree(
     visited_trees: &mut TreeVisits,
     scope: &PathScope,
     sealed: Option<&Tolerated>,
-    mut sink: Option<&mut dyn FnMut(&str, bool)>,
+    mut sink: Option<&mut AbsenceSink<'_>>,
 ) -> Result<(), String> {
     // Each entry carries its warehouse path while it is on the spine of `scope`, and `None` once
     // the walk is in full: inside an in-scope subtree, under a full scope from the start, or in
@@ -3148,7 +3152,7 @@ fn check_leaf(
     sealed: Option<&Tolerated>,
     referenced: &mut BTreeSet<String>,
     unwalked: &mut BTreeMap<String, String>,
-    mut sink: Option<&mut dyn FnMut(&str, bool)>,
+    mut sink: Option<&mut AbsenceSink<'_>>,
 ) -> Result<(), String> {
     if targets.contains(hash) {
         referenced.insert(hash.to_string());
