@@ -2292,14 +2292,14 @@ A command not listed here either reports only the generic human-message shape `{
           ]
         },
         "staged": {
-          "description": "This checkout's staged paths whose content is among them and that nothing else reaches.",
+          "description": "When `staged_only`, this checkout's staged paths whose content is among them.",
           "items": {
             "type": "string"
           },
           "type": "array"
         },
         "staged_elsewhere": {
-          "description": "The other checkouts (the main working tree, or a bay) staging content among them that\nnothing else reaches.",
+          "description": "When `staged_only`, the other checkouts (the main working tree, or a bay) staging content\namong them.",
           "items": {
             "type": "string"
           },
