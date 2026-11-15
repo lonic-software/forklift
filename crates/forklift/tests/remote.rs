@@ -11188,11 +11188,11 @@ fn a_resume_keeps_the_objects_an_earlier_attempt_fetched() {
     let web_blob = path_object_hash(&area, "dev", &head, "src/web/b.txt");
     let served = object_store_path(&area, "server-root", &web_blob);
     let aside = area.path("web-blob-aside");
-    std::fs::rename(&served, &aside).unwrap();
+    forklift_core::util::file_utils::rename(&served, &aside).unwrap();
 
     let failed = area.forklift(".", &["clone", &server.url, "kept"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
-    std::fs::rename(&aside, &served).unwrap();
+    forklift_core::util::file_utils::rename(&aside, &served).unwrap();
 
     let resumed = area.forklift(".", &["--json", "clone", &server.url, "kept"]);
     assert_success(&resumed);
@@ -12883,6 +12883,7 @@ impl StrippedRemote {
 
         prepare_warehouse(area, "a", &server.url);
         stack_file(area, "a", "code.txt", "v1\n");
+        stack_file(area, "a", "lib/util.txt", "util\n");
         assert_success(&area.forklift("a", &["office", "enroll"]));
         stack_file(area, "a", "code.txt", "v2\n");
         assert_success(&area.forklift("a", &["lift"]));
@@ -13005,7 +13006,7 @@ fn first_contact_refuses_history_that_does_not_verify_against_the_served_anchor(
     assert!(!walk(&area.path("d/.forklift")).iter().any(|entry| entry.starts_with(area.path("d/.forklift/meta"))),
             "no office or other meta pallet adopted");
 
-    let sparse = area.forklift(".", &["--json", "clone", &remote.server.url, "s", "--only", "code.txt"]);
+    let sparse = area.forklift(".", &["--json", "clone", &remote.server.url, "s", "--only", "lib"]);
     franchise_history_unverified_message(&sparse);
     assert!(!area.path("s/.forklift/trust").exists(), "no anchor installed");
 

@@ -463,7 +463,8 @@ fn a_clone_stopped_by_a_wrong_only_path_finishes_with_the_right_one() {
         let error = area.refused(".", &["clone", &server.url, "partial", "--token", "secret", "--only", "nosuch"],
             "clone_incomplete", 30);
         assert_eq!(error["details"]["cause_code"], "only_prefix_not_found", "{}", error);
-        assert!(!object_files(&area.path("partial/.forklift/objects")).is_empty(), "what it fetched is kept");
+        let objects = area.path("partial/.forklift/objects");
+        assert!(!objects.exists() || object_files(&objects).is_empty(), "the refused clone stored nothing");
     }
 
     area.ok(".", &["clone", &server.url, "partial", "--token", "secret", "--only", "src"]);
