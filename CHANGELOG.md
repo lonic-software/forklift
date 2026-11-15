@@ -12,6 +12,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **`heal` repairs a lost or damaged record of content the remote withholds.** When the record of
+  what a fetch left out because the remote's host withholds it (`.forklift/unavailable`) was lost,
+  `heal` refused with exit 58 (`objects_lost`) and `git export` failed on the missing content; a
+  damaged one also stopped every read of it, with no remedy named. Now `heal` rebuilds a damaged
+  record from the entries that still read, keeping a copy of it (`unavailable_rebuilt` in `--json`),
+  and records again each absent file the remote's host still withholds (`recorded_unavailable`),
+  so checkouts and exports leave it out as after the fetch. A damaged record's error now names
+  `forklift heal`.
+
 - **`heal` repairs a cache whose sealed record was lost, and a lost origin record names a move that
   works.** A cache that lost entries of its record of content held by hash read that content as
   lost, and `heal` refused with exit 58 (`objects_lost`), though the origin still held it. Now `heal`

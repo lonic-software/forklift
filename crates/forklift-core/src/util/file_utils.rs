@@ -4856,6 +4856,38 @@ fn get_regex_for_pattern(pattern: &str) -> Result<Regex, String> {
         .map_err(|e| format!("Error while parsing regex pattern: {}", e))
 }
 
+/// Keep `bytes`, the damaged record at `path`, beside it as `<name>.damaged-<stamp>`, under a name
+/// no earlier repair took: an earlier copy may hold what a later one lost. The caller holds the
+/// lock its record's repairs take, so no other repair picks a name meanwhile.
+///
+/// # Returns
+/// * `Ok(PathBuf)`  - Where the copy is.
+/// * `Err(String)`  - A name could not be checked, or the copy could not be written.
+pub(crate) fn copy_aside(path: &std::path::Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+
+    for attempt in 0u32.. {
+        let target = path.with_file_name(match attempt {
+            0 => format!("{}.damaged-{}", name, stamp),
+            n => format!("{}.damaged-{}-{}", name, stamp, n),
+        });
+        match std::fs::symlink_metadata(&target) {
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                replace_file_atomically(&target, bytes)?;
+                return Ok(target);
+            }
+            Err(e) => return Err(format!("Error while reading \"{}\": {}", target.to_string_lossy(), e)),
+        }
+    }
+
+    unreachable!("a free name is found before the counter runs out")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

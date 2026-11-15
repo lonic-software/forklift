@@ -13605,9 +13605,11 @@ fn heal_leaves_lost_what_only_unlifted_work_reaches_and_reads_no_object_for_it()
 }
 
 /// Content the origin's host withholds is never re-sealed, though its held history reaches it: a
-/// blob the cache read before it was withheld, then lost.
+/// blob the cache read before it was withheld, then lost. Heal records it unavailable instead, as a
+/// fetch would have: it cannot tell a copy this cache lost from a lost entry of that record.
 ///
-/// Revert: drop the withheld filter → the blob is re-sealed.
+/// Revert: drop heal's re-record → the blob stays lost (exit 58). The re-seal's own withheld filter
+/// is not falsifiable here, since the re-record runs first and leaves the blob no longer lost.
 #[test]
 fn heal_never_reseals_content_the_origin_withholds() {
     let area = TestArea::new("sealed-withheld");
@@ -13624,9 +13626,10 @@ fn heal_never_reseals_content_the_origin_withholds() {
     lose_object_in(&area, "cached", &one);
 
     let output = area.forklift("cached", &["--json", "heal"]);
-    let refused = refusal_of(&output, 58);
-    assert!(refused["message"].as_str().unwrap().contains(&one), "{}", refused);
-    assert!(!resealed_of(&output).contains(&one), "{}", refused);
+    assert_success(&output);
+    let healed = json_of(&output);
+    assert_eq!(healed["data"]["recorded_unavailable"], serde_json::json!([one]), "{}", healed);
+    assert!(!resealed_of(&output).contains(&one), "{}", healed);
     assert!(!recorded(&area, "cached", &one));
 }
 

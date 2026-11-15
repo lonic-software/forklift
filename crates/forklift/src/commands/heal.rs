@@ -6,8 +6,12 @@ use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::util::ref_heal::{self, Pass};
 use forklift_core::util::reseal_utils::{self, ResealError};
 use forklift_core::util::warehouse_utils::{self, WarehouseMode};
+use forklift_core::util::unavailable_heal::{self, RerecordError};
 use forklift_core::util::{config_utils, origin_utils, recovery_utils, sealed_utils, unavailable};
 use crate::output::{self, CommandOutput};
+
+/// The note of a re-record a check that could not read every source stopped.
+const UNRECORDED_SHORT: &str = "No absent object was recorded unavailable again: the check for lost objects could not read every source.";
 
 /// Handle the `heal` command: rebuild a damaged sealed-object record from the part before the
 /// damage (`forklift_core::util::sealed_utils::rebuild`), run the durability-taint recovery verb
@@ -27,7 +31,15 @@ use crate::output::{self, CommandOutput};
 /// `--remove-ref` settle damaged refs the user chose for, first. A damaged ref left standing makes
 /// the run a `ref_damaged` refusal (exit 53) carrying the whole report.
 ///
-/// Last, in a partial warehouse, it reads the origin record. In a cache whose check for lost
+/// A damaged record of content this warehouse cannot get is rebuilt first, from the entries that
+/// still read whole, a copy kept ([`unavailable::rebuild`]). Last, each lost absent user file
+/// content the configured remote's host withholds is recorded unavailable again
+/// ([`unavailable_heal::record_withheld_lost`]), then the check runs again; not when the
+/// warehouse's mode does not read, nor in a partial warehouse whose origin record does not read,
+/// nor over a check that could not read every source. A remote that sends no response, or
+/// refuses, is handled as the origin is below.
+///
+/// Then, in a partial warehouse, it reads the origin record. In a cache whose check for lost
 /// objects read every source, it re-seals each lost absent object the origin's held history meets
 /// ([`reseal_utils::reseal_held`]), then checks again. An origin that sends no response leaves the
 /// lost objects lost and names running heal again. A coded refusal, the origin's trust among them,
@@ -88,14 +100,35 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         ))?
         .map(RecordRebuilt::from);
 
+    // Before the taint recovery too, whose walks read the record of content this warehouse cannot
+    // get: one that does not read makes them hold nothing absent. What it drops, heal records again
+    // below when the remote's host still withholds it. A rebuild that fails is a note, which every
+    // refusal below carries too: the readers degrade around the damage and say so.
+    let unavailable_rebuilt = match unavailable::rebuild() {
+        Ok(rebuilt) => rebuilt.map(UnavailableRebuilt::from),
+        Err(error) => {
+            ref_notes.push(format!(
+                "The damaged record of content this warehouse cannot get was not rebuilt: {}",
+                error.trim_end_matches('.')
+            ));
+            None
+        }
+    };
+
     // After the record, which the check of the history leans on, and before everything else, which
     // reads the fetch scope.
     let scope_rebuilt = match &exclusive {
         Some(exclusive) => Some(scope_heal::set_chosen(fetch_scope, exclusive).await),
         None => scope_heal::repair().transpose(),
-    }.transpose().map_err(|error| match &record_rebuilt {
-        Some(record) => forklift_core::error::append_to_message(String::from(error), &record.sentence()),
-        None => String::from(error),
+    }.transpose().map_err(|error| {
+        let mut error = String::from(error);
+        for sentence in record_rebuilt.iter().map(RecordRebuilt::sentence).chain(unavailable_rebuilt.iter().map(UnavailableRebuilt::sentence)) {
+            error = forklift_core::error::append_to_message(error, &sentence);
+        }
+        for note in &ref_notes {
+            error = forklift_core::error::append_to_message(error, &format!("Note: {}", note));
+        }
+        error
     })?;
     drop(exclusive);
 
@@ -115,6 +148,9 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let changed = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String]| {
         let mut error = error;
         if let Some(record) = &record_rebuilt {
+            error = forklift_core::error::append_to_message(error, &record.sentence());
+        }
+        if let Some(record) = &unavailable_rebuilt {
             error = forklift_core::error::append_to_message(error, &record.sentence());
         }
         if let Some(scope) = &scope_rebuilt {
@@ -237,7 +273,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         Ok(mode) => Some(mode),
         Err(why) => {
             notes.push(format!(
-                "Whether this is a partial warehouse could not be read, so its origin record was not checked and nothing was re-sealed from the origin: {}",
+                "Whether this is a partial warehouse could not be read, so its origin record was not checked, and nothing was re-sealed from the origin or recorded unavailable again: {}",
                 why.trim_end_matches('.')
             ));
             None
@@ -249,20 +285,68 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         Some(_) => Some(origin_utils::recorded_origin(configured.as_deref())),
     };
 
+    // Absent file content whose unavailable entry was lost, or dropped from a damaged record, is
+    // content the remote's host may still withhold: recorded again, a checkout or an export leaves
+    // it out, as after the fetch. Only file content, as a fetch records. Not when the warehouse's
+    // mode does not read, nor in a partial warehouse whose origin record does not read: the remote
+    // a client would ask is not known to be its origin, and the notes name that. Only over a check
+    // that read every source, as the re-seal below.
+    let mut recorded_unavailable: Vec<String> = Vec::new();
+    let mut origin_unanswered = false;
+    let mut remote_refused: Option<CoreError> = None;
+    let rerecord_from = match (&lost, mode, &origin) {
+        (Ok(found), Some(_), None | Some(Ok(_))) if !found.absent_files.is_empty() => {
+            if found.degraded_sources.is_empty() {
+                Some(found.absent_files.clone())
+            } else {
+                notes.push(UNRECORDED_SHORT.to_string());
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(absent) = rerecord_from {
+        match unavailable_heal::record_withheld_lost(&absent).await {
+            Ok(recorded) => {
+                if !recorded.is_empty() {
+                    recorded_unavailable = recorded;
+                    lost = recovery_utils::find_lost_objects();
+                }
+            }
+            Err(RerecordError::NoResponse(why)) => {
+                origin_unanswered = true;
+                notes.push(format!(
+                    "The remote did not answer, so no absent object its host may withhold was recorded unavailable again: {}",
+                    why.trim_end_matches('.')
+                ));
+            }
+            // As the re-seal's below: a coded refusal is the run's own, anything else a note.
+            Err(RerecordError::Refused(why)) => match CoreError::from(why) {
+                refused @ CoreError::Refusal { .. } => remote_refused = Some(refused),
+                other => notes.push(format!(
+                    "No absent object was recorded unavailable again: {}",
+                    String::from(other).trim_end_matches('.')
+                )),
+            },
+        }
+    }
+
     // In a cache, an absent object the sealed record lost may be one the origin still holds:
     // recorded again, a read refills it on demand. Only once the origin's record reads, and only
-    // over a check that read every source, since a short one may call held objects absent.
+    // over a check that read every source, since a short one may call held objects absent. Not
+    // once the same remote went unanswered or refused above.
     let mut resealed: Vec<String> = Vec::new();
-    let mut origin_unanswered = false;
-    let mut reseal_refused: Option<CoreError> = None;
     let reseal_from = match (&lost, mode, &origin) {
+        _ if origin_unanswered || remote_refused.is_some() => None,
         (Ok(found), Some(WarehouseMode::Cache), Some(Ok(_))) if !found.absent.is_empty() => {
             if found.degraded_sources.is_empty() {
                 Some(found.absent.clone())
             } else {
-                notes.push(
-                    "No absent object was re-sealed from the origin: the check for lost objects could not read every source.".to_string()
-                );
+                // One note for both steps the short check stopped.
+                match notes.iter().position(|note| note == UNRECORDED_SHORT) {
+                    Some(at) => notes[at] = "No absent object was recorded unavailable again or re-sealed from the origin: the check for lost objects could not read every source.".to_string(),
+                    None => notes.push("No absent object was re-sealed from the origin: the check for lost objects could not read every source.".to_string()),
+                }
                 None
             }
         }
@@ -287,7 +371,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             // A coded refusal is the run's own, with its next step, once the report is built; its
             // step clears it, and heal can run again after. Anything else is a note.
             Err(ResealError::Refused(why)) => match CoreError::from(why) {
-                refused @ CoreError::Refusal { .. } => reseal_refused = Some(refused),
+                refused @ CoreError::Refusal { .. } => remote_refused = Some(refused),
                 other => notes.push(format!(
                     "No absent object was re-sealed from the origin: {}",
                     String::from(other).trim_end_matches('.')
@@ -354,6 +438,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
 
     let report = HealReport {
         record_rebuilt,
+        unavailable_rebuilt,
         fetch_scope_rebuilt: scope_rebuilt,
         was_tainted: outcome.was_tainted,
         restaged: outcome.restaged,
@@ -364,6 +449,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         newly_held_by_hash: unsealed.pushed_down,
         unseal_failed,
         resealed,
+        recorded_unavailable,
         refs_rebuilt,
         refs_removed,
         refs_refused,
@@ -395,7 +481,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     }
 
     if let Some(lost) = &report.objects_lost {
-        if let Some(refused) = reseal_refused {
+        if let Some(refused) = remote_refused {
             return Err(with_report(&report, refused, objects_lost_lines(&report, lost)).into());
         }
         return Err(objects_lost_refusal(&report, lost, outcome.index_rebuild_skipped || origin_unanswered).into());
@@ -706,6 +792,11 @@ pub(crate) struct HealReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     record_rebuilt: Option<RecordRebuilt>,
 
+    /// What this run kept of a damaged record of content this warehouse cannot get, which it
+    /// rebuilt from the entries that still read whole, and where it kept a copy of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable_rebuilt: Option<UnavailableRebuilt>,
+
     /// The fetch scope of a sparse warehouse, which was lost or damaged and this run wrote: rebuilt
     /// from the checkouts' scopes, or set to the paths `--fetch-scope` gave.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -764,6 +855,13 @@ pub(crate) struct HealReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     resealed: Vec<String>,
 
+    /// Absent user file content history still reaches that the record of content this warehouse
+    /// cannot get did not hold, which this run recorded in it again: the remote's host withholds
+    /// each, so a checkout or an export leaves it out, as after the fetch. Its entry was lost, or
+    /// this warehouse held a copy and lost it; heal cannot tell which.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    recorded_unavailable: Vec<String>,
+
     /// Pallet refs that were lost or damaged and this run set: rebuilt at the head the evidence
     /// agreed on, or set to the parcel `--ref` gave.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -808,6 +906,41 @@ impl RecordRebuilt {
             the {} byte(s) from there on are dropped. An absent object whose record was among them now \
             reads as missing.",
             self.at, self.dropped_bytes
+        )
+    }
+}
+
+/// What `heal` kept of a damaged record of content this warehouse cannot get.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct UnavailableRebuilt {
+    /// Where the damaged record was copied to.
+    set_aside: String,
+
+    /// How many entries still read whole and were kept.
+    kept: usize,
+
+    /// How many lines did not read whole and were dropped.
+    dropped: usize,
+}
+
+impl From<unavailable::Rebuilt> for UnavailableRebuilt {
+    fn from(rebuilt: unavailable::Rebuilt) -> Self {
+        UnavailableRebuilt {
+            set_aside: rebuilt.set_aside.to_string_lossy().into_owned(),
+            kept: rebuilt.kept,
+            dropped: rebuilt.dropped,
+        }
+    }
+}
+
+impl UnavailableRebuilt {
+    fn sentence(&self) -> String {
+        format!(
+            "The record of content this warehouse cannot get was damaged and is rebuilt from the {} \
+            entr{} that still read whole; {} line(s) that did not are dropped, and a copy of it is kept \
+            at \"{}\".",
+            self.kept, if self.kept == 1 { "y" } else { "ies" }, self.dropped, self.set_aside
         )
     }
 }
@@ -859,6 +992,10 @@ impl CommandOutput for HealReport {
             println!("{}", rebuilt.sentence());
         }
 
+        if let Some(rebuilt) = &self.unavailable_rebuilt {
+            println!("{}", rebuilt.sentence());
+        }
+
         if let Some(rebuilt) = &self.fetch_scope_rebuilt {
             println!("{}", scope_sentence(rebuilt));
         }
@@ -888,7 +1025,8 @@ impl CommandOutput for HealReport {
                 }
             }
         } else if self.operation.is_none() && self.unsealed.is_empty() && self.newly_held_by_hash.is_empty()
-            && self.resealed.is_empty() && self.notes.is_empty() && self.unseal_failed.is_none() && self.record_rebuilt.is_none()
+            && self.resealed.is_empty() && self.recorded_unavailable.is_empty() && self.notes.is_empty()
+            && self.unseal_failed.is_none() && self.record_rebuilt.is_none() && self.unavailable_rebuilt.is_none()
             && self.fetch_scope_rebuilt.is_none()
             && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
             && self.objects_lost.is_none()
@@ -927,6 +1065,18 @@ impl CommandOutput for HealReport {
             for hash in &self.resealed {
                 println!("  {}", hash);
             }
+        }
+
+        if !self.recorded_unavailable.is_empty() {
+            println!(
+                "{} absent object(s) the remote's host withholds are recorded unavailable again, so a \
+                checkout or an export leaves them out:",
+                self.recorded_unavailable.len()
+            );
+            for hash in &self.recorded_unavailable {
+                println!("  {}", hash);
+            }
+            println!("If this warehouse held a copy of one, restoring it from a backup brings the content back.");
         }
 
         if let Some(error) = &self.unseal_failed {

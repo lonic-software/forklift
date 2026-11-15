@@ -94,7 +94,9 @@
 //! the sink actually being present (`Option::is_some`) and skipped — not merely no-opped, the
 //! syscall itself is skipped — when there is nothing to feed.
 //!
-//! The sink is `Option<&mut dyn FnMut(&str)>`: `None` for the common, targeted walk
+//! The sink is `Option<&mut dyn FnMut(&str, bool)>`, the `bool` saying whether the hash was met as
+//! user file content (a blob or a recipe, staged or in a tree user history reaches; never one only
+//! meta history reaches): `None` for the common, targeted walk
 //! ([`closure_references_any`]) — descent-guard absences are simply skipped, and the (gated)
 //! terminal-leaf presence check never runs at all, so the targeted walk pays no per-leaf/per-chunk
 //! stat it has no use for. `Some(collector)` for the targetless enumerator
@@ -2108,6 +2110,10 @@ pub(crate) struct ClosureWalkResult {
     /// [`enumerate_absent_reachable`]: every raw-absent (or corrupt-boundary) hash the walk
     /// reached.
     pub hashes: BTreeSet<String>,
+    /// [`enumerate_absent_reachable`]: those of `hashes` the walk met as user file content, a blob
+    /// or a recipe that is staged or in a tree user history reaches. Empty for
+    /// [`closure_references_any`].
+    pub file_hashes: BTreeSet<String>,
     /// Plain-language notes, one per degraded source — see [`collect_walk_roots`]'s doc comment.
     pub degraded_sources: Vec<String>,
     /// Plain-language notes, one per node the walk could not descend because only an unreadable
@@ -2166,6 +2172,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
             redacted_absent: 0,
             unavailable_absent: 0,
             held_corrupt: BTreeSet::new(),
+            file_hashes: BTreeSet::new(),
         });
     }
 
@@ -2190,6 +2197,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
         redacted_absent: 0,
         unavailable_absent: 0,
         held_corrupt: BTreeSet::new(),
+        file_hashes: BTreeSet::new(),
     })
 }
 
@@ -2256,8 +2264,14 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
     });
     let empty_targets: BTreeSet<String> = BTreeSet::new();
     let mut absent: BTreeSet<String> = BTreeSet::new();
+    let mut files: BTreeSet<String> = BTreeSet::new();
     let outcome = {
-        let mut collecting_sink = |hash: &str| { absent.insert(hash.to_string()); };
+        let mut collecting_sink = |hash: &str, file: bool| {
+            absent.insert(hash.to_string());
+            if file {
+                files.insert(hash.to_string());
+            }
+        };
         walk_closure_for(&empty_targets, &roots, corrupt, &scope, Some(&sealed), Some(&mut collecting_sink))?
     };
     // Only a note reads these counts, so a presence check that fails counts nothing rather than
@@ -2282,6 +2296,7 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
     Ok(ClosureWalkResult {
         held_corrupt,
         hashes: absent,
+        file_hashes: files,
         degraded_sources: roots.degraded_sources,
         unwalked: unwalked_notes(&outcome.unwalked),
         unwalked_hashes: outcome.unwalked,
@@ -2299,6 +2314,10 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
 pub struct LostObjects {
     /// Reachable hashes the store does not hold at all.
     pub absent: BTreeSet<String>,
+    /// Those of `absent` met as user file content, a blob or a recipe that is staged or in a tree
+    /// user history reaches: what a fetch records unavailable when the remote's host withholds it.
+    /// Meta history's content is not, since a fetch never leaves any of it out.
+    pub absent_files: BTreeSet<String>,
     /// Reachable hashes the walk could not read, each with why: a pack index that does not parse,
     /// a data file with no index, a damaged index.
     pub unreadable: BTreeMap<String, String>,
@@ -2391,8 +2410,11 @@ pub fn find_lost_objects() -> Result<LostObjects, String> {
     ].into_iter().flatten().collect();
     degraded_sources.extend(unchecked.iter().cloned());
 
+    let absent_files = walk.file_hashes.intersection(&absent).cloned().collect();
+
     Ok(LostObjects {
         absent,
+        absent_files,
         unreadable: walk.unwalked_hashes,
         corrupt,
         damaged_unreached,
@@ -2540,13 +2562,17 @@ pub fn pallets_reaching(hashes: &BTreeSet<String>) -> Result<Vec<String>, String
     Ok(reaching)
 }
 
-/// Re-borrow an `Option<&mut dyn FnMut(&str)>` for one call, without moving the original out of
-/// its owning local variable — needed because `Option<&mut dyn FnMut(&str)>` is used repeatedly
+/// What the enumerating walk feeds each absence it finds: the hash, and whether it was met as a
+/// file's content (see the module doc).
+type AbsenceSink<'a> = dyn FnMut(&str, bool) + 'a;
+
+/// Re-borrow an `Option<&mut dyn FnMut(&str, bool)>` for one call, without moving the original out of
+/// its owning local variable — needed because `Option<&mut dyn FnMut(&str, bool)>` is used repeatedly
 /// across loop iterations and nested calls in [`walk_closure_for`]/`walk_tree`/`check_leaf`, and
 /// the generic `Option::as_deref_mut` does not shrink a `&mut &mut dyn Trait`'s lifetime down to
 /// just the one call the way this concrete, non-generic match does (a known reborrowing gap for
 /// generic `DerefMut` blanket impls over nested mutable references).
-fn reborrow_sink<'a>(sink: &'a mut Option<&mut dyn FnMut(&str)>) -> Option<&'a mut dyn FnMut(&str)> {
+fn reborrow_sink<'a>(sink: &'a mut Option<&mut AbsenceSink<'_>>) -> Option<&'a mut AbsenceSink<'a>> {
     match sink {
         Some(s) => Some(&mut **s),
         None => None,
@@ -2642,7 +2668,7 @@ fn walk_closure_for(
     corrupt: &BTreeSet<String>,
     scope: &PathScope,
     sealed: Option<&Tolerated>,
-    mut sink: Option<&mut dyn FnMut(&str)>,
+    mut sink: Option<&mut AbsenceSink<'_>>,
 ) -> Result<WalkClosureOutcome, String> {
     let mut referenced: BTreeSet<String> = BTreeSet::new();
     let mut unwalked: BTreeMap<String, String> = BTreeMap::new();
@@ -2657,7 +2683,7 @@ fn walk_closure_for(
             continue;
         }
 
-        check_leaf(hash, *item_type, targets, corrupt, None, &mut referenced, &mut unwalked, reborrow_sink(&mut sink))?;
+        check_leaf(hash, *item_type, true, targets, corrupt, None, &mut referenced, &mut unwalked, reborrow_sink(&mut sink))?;
     }
 
     // One combined queue, ordinary and pin roots alike — see this function's own doc comment for
@@ -2845,7 +2871,7 @@ fn drain_parcel_queue(
     visited_trees: &mut TreeVisits,
     scope: &PathScope,
     sealed: Option<&Tolerated>,
-    mut sink: Option<&mut dyn FnMut(&str)>,
+    mut sink: Option<&mut AbsenceSink<'_>>,
 ) -> Result<(), String> {
     while let Some((hash, policy, class)) = queue.pop_front() {
         // Targets-check FIRST: a vanished hash that is itself a root ref (a pallet head, a parked
@@ -2870,7 +2896,7 @@ fn drain_parcel_queue(
         // never tolerated as a gap.
         if corrupt.contains(&hash) {
             visited_parcels.settle(&hash);
-            if let Some(s) = reborrow_sink(&mut sink) { s(&hash); }
+            if let Some(s) = reborrow_sink(&mut sink) { s(&hash, false); }
             continue;
         }
         match descent_presence(&hash)? {
@@ -2879,7 +2905,7 @@ fn drain_parcel_queue(
                 match policy {
                     AbsencePolicy::Report => {
                         visited_parcels.settle(&hash);
-                        if let Some(s) = reborrow_sink(&mut sink) { s(&hash); }
+                        if let Some(s) = reborrow_sink(&mut sink) { s(&hash, false); }
                     }
                     // Deliberately does NOT mark `hash` visited — see `AbsencePolicy::Gap`'s own
                     // doc comment for why leaving it open is exactly what lets a genuine ancestry
@@ -2939,7 +2965,7 @@ fn walk_tree(
     visited_trees: &mut TreeVisits,
     scope: &PathScope,
     sealed: Option<&Tolerated>,
-    mut sink: Option<&mut dyn FnMut(&str)>,
+    mut sink: Option<&mut AbsenceSink<'_>>,
 ) -> Result<(), String> {
     // Each entry carries its warehouse path while it is on the spine of `scope`, and `None` once
     // the walk is in full: inside an in-scope subtree, under a full scope from the start, or in
@@ -2956,7 +2982,7 @@ fn walk_tree(
             referenced.insert(tree_hash);
             continue;
         }
-        if !visited_trees.first_visit(&tree_hash, spine_path.as_deref()) {
+        if !visited_trees.first_visit(&tree_hash, spine_path.as_deref(), class) {
             continue;
         }
         // Presence-tolerant (I3), plus the §8.3 corrupt-boundary carve-out: a subtree boundary
@@ -2976,7 +3002,7 @@ fn walk_tree(
             Descent::Present => {}
             Descent::Absent => {
                 if !held_by_hash(sealed, corrupt, &tree_hash, At::Tree) {
-                    if let Some(s) = reborrow_sink(&mut sink) { s(&tree_hash); }
+                    if let Some(s) = reborrow_sink(&mut sink) { s(&tree_hash, false); }
                 }
                 continue;
             }
@@ -3007,7 +3033,10 @@ fn walk_tree(
 
         for (_, file) in tree.get_files() {
             if in_scope(&file.name).is_some() {
-                check_leaf(&file.hash, file.item_type, targets, corrupt, sealed, referenced, unwalked, reborrow_sink(&mut sink))?;
+                check_leaf(
+                    &file.hash, file.item_type, class == WalkClass::User, targets, corrupt, sealed, referenced, unwalked,
+                    reborrow_sink(&mut sink),
+                )?;
             }
         }
 
@@ -3029,7 +3058,7 @@ fn walk_tree(
 /// come from a remote, so a label on one would be the remote's to choose. The one rule heal's
 /// enumerating walk and scope prune's retained walks share, so heal never reports lost what a prune
 /// kept, nor a prune frees what heal counts as held.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum WalkClass {
     User,
     Meta,
@@ -3046,18 +3075,24 @@ impl WalkClass {
 }
 
 /// The parcels a closure walk has been through, per [`WalkClass`]: a crafted user history naming a
-/// real meta parcel as a parent must not spend that parcel's full walk on a scoped one. A meta visit
-/// covers a user one, since a walk in full checks everything a scoped walk would.
+/// real meta parcel as a parent must not spend that parcel's full walk on a scoped one, and a walk
+/// in one class never covers the other, because the sink is told whether a leaf is user file
+/// content: a parcel user and meta history share is walked once in each.
 #[derive(Default)]
 struct ParcelVisits {
     user: HashSet<String>,
     meta: HashSet<String>,
+    /// Parcels with nothing to walk in any class.
+    settled: HashSet<String>,
 }
 
 impl ParcelVisits {
     /// Whether a visit in `class` has nothing left to do at `hash`.
     fn covers(&self, hash: &str, class: WalkClass) -> bool {
-        self.meta.contains(hash) || (class == WalkClass::User && self.user.contains(hash))
+        self.settled.contains(hash) || match class {
+            WalkClass::User => self.user.contains(hash),
+            WalkClass::Meta => self.meta.contains(hash),
+        }
     }
 
     /// Record a walk of a present parcel in `class`.
@@ -3071,20 +3106,22 @@ impl ParcelVisits {
     /// Record a parcel with nothing to walk (absent, corrupt or unreadable), which no class would
     /// walk differently and which is reported once.
     fn settle(&mut self, hash: &str) {
-        self.meta.insert(hash.to_string());
+        self.settled.insert(hash.to_string());
     }
 
     /// Whether any visit resolved `hash`.
     fn reached(&self, hash: &str) -> bool {
-        self.user.contains(hash) || self.meta.contains(hash)
+        self.user.contains(hash) || self.meta.contains(hash) || self.settled.contains(hash)
     }
 }
 
 /// The trees a closure walk has been through, so it walks each at most once per way it is reached.
+/// Per [`WalkClass`] too: the sink is told whether a leaf is user file content, so a tree user and
+/// meta history share is walked once in each.
 #[derive(Default)]
 struct TreeVisits {
-    /// Trees walked in full: everything beneath one was checked, whatever path reached it.
-    full: HashSet<String>,
+    /// Trees walked in full, by class: everything beneath one was checked, whatever path reached it.
+    full: HashSet<(String, WalkClass)>,
     /// Spine trees of a sparse warehouse, by the path each was walked at. The same tree at another
     /// path is walked again, because the scope selects different entries there: deduplicating on
     /// the hash alone would leave an in-scope loss under the second path unchecked.
@@ -3092,13 +3129,14 @@ struct TreeVisits {
 }
 
 impl TreeVisits {
-    /// Whether `tree_hash` still needs walking, marking it walked: in full when `spine_path` is
-    /// `None`, otherwise on the spine at that path. A tree already walked in full needs no spine
-    /// walk anywhere.
-    fn first_visit(&mut self, tree_hash: &str, spine_path: Option<&str>) -> bool {
+    /// Whether `tree_hash` still needs walking in `class`, marking it walked: in full when
+    /// `spine_path` is `None`, otherwise on the spine at that path. A tree already walked in full in
+    /// `class` needs no spine walk anywhere.
+    fn first_visit(&mut self, tree_hash: &str, spine_path: Option<&str>, class: WalkClass) -> bool {
+        let full = (tree_hash.to_string(), class);
         match spine_path {
-            None => self.full.insert(tree_hash.to_string()),
-            Some(path) => !self.full.contains(tree_hash) && self.spine.insert((tree_hash.to_string(), path.to_string())),
+            None => self.full.insert(full),
+            Some(path) => !self.full.contains(&full) && self.spine.insert((tree_hash.to_string(), path.to_string())),
         }
     }
 }
@@ -3121,15 +3159,19 @@ impl TreeVisits {
 /// `raw_object_present` syscall itself is skipped) for the targeted walk
 /// ([`closure_references_any`], `sink: None`), and only actually runs for the enumerator
 /// ([`enumerate_absent_reachable`], `sink: Some(_)`) — see the module doc comment.
+///
+/// `user` says whether the leaf is user file content (staged, or in a tree user history reaches),
+/// which the sink is told beside each absence.
 fn check_leaf(
     hash: &str,
     item_type: DirEntryType,
+    user: bool,
     targets: &BTreeSet<String>,
     corrupt: &BTreeSet<String>,
     sealed: Option<&Tolerated>,
     referenced: &mut BTreeSet<String>,
     unwalked: &mut BTreeMap<String, String>,
-    mut sink: Option<&mut dyn FnMut(&str)>,
+    mut sink: Option<&mut AbsenceSink<'_>>,
 ) -> Result<(), String> {
     if targets.contains(hash) {
         referenced.insert(hash.to_string());
@@ -3146,7 +3188,7 @@ fn check_leaf(
             Descent::Present => {}
             Descent::Absent => {
                 if !held_by_hash(sealed, corrupt, hash, At::File) {
-                    if let Some(s) = reborrow_sink(&mut sink) { s(hash); }
+                    if let Some(s) = reborrow_sink(&mut sink) { s(hash, user); }
                 }
                 return Ok(());
             }
@@ -3167,7 +3209,7 @@ fn check_leaf(
                 if !held_by_hash(sealed, corrupt, &chunk, At::Chunk)
                     && (corrupt.contains(&chunk) || !file_utils::raw_object_present(&chunk)?)
                 {
-                    s(&chunk);
+                    s(&chunk, false);
                 }
             }
         }
@@ -3178,7 +3220,7 @@ fn check_leaf(
         if !held_by_hash(sealed, corrupt, hash, At::File)
             && (corrupt.contains(hash) || !file_utils::raw_object_present(hash)?)
         {
-            s(hash);
+            s(hash, user);
         }
     }
 
@@ -4078,6 +4120,57 @@ mod tests {
         crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
+    /// heal records unavailable again only what the closing check met as user file content: an
+    /// absent leaf is in `absent_files`; an absent tree beside it, and an absent leaf only meta
+    /// history reaches, are absent but not user file content; an absent leaf in a tree both reach
+    /// is, and so is one under a parcel both reach. Mutation: report every sink hash as file
+    /// content → the tree is listed; ignore the walk's class → the meta leaf is listed; visit a
+    /// tree or a parcel once whatever the class → the shared leaf, walked as meta first, is not
+    /// listed.
+    #[test]
+    fn find_lost_objects_tells_absent_file_content_from_an_absent_tree() {
+        use crate::model::tree_item::TreeItem;
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+
+        let (dir, _scope) = enter_temp_root("absent-files");
+        let leaf = object_utils::hash_object_bytes(&object_utils::blob_bytes(b"an absent leaf"));
+        let mut sub = TreeItem::new("sub".to_string(), String::new(), DirEntryType::Tree);
+        sub.add_child(TreeItem::new("b.txt".to_string(), leaf.clone(), DirEntryType::Normal));
+        let sub_object = LooseObjectBuilder::build_tree(&sub);
+        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root.add_child(TreeItem::new("a.txt".to_string(), leaf.clone(), DirEntryType::Normal));
+        root.add_child(TreeItem::new("sub".to_string(), sub_object.hash.clone(), DirEntryType::Tree));
+        let cell = object_utils::hash_object_bytes(&object_utils::blob_bytes(b"an absent meta cell"));
+        let both = object_utils::hash_object_bytes(&object_utils::blob_bytes(b"an absent shared leaf"));
+        let mut shared = TreeItem::new("shared".to_string(), String::new(), DirEntryType::Tree);
+        shared.add_child(TreeItem::new("c.txt".to_string(), both.clone(), DirEntryType::Normal));
+        let mut shared_object = LooseObjectBuilder::build_tree(&shared);
+        shared_object.store().unwrap();
+        let mut meta = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        meta.add_child(TreeItem::new("cell".to_string(), cell.clone(), DirEntryType::Normal));
+        meta.add_child(TreeItem::new("shared".to_string(), shared_object.hash.clone(), DirEntryType::Tree));
+        plant_head_over_tree(pallet_utils::PalletNamespace::Meta, "notes", &meta);
+        root.add_child(TreeItem::new("shared".to_string(), shared_object.hash.clone(), DirEntryType::Tree));
+        plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
+        // One parcel both a meta head and a user head name: same tree, same description.
+        let parcel_leaf = object_utils::hash_object_bytes(&object_utils::blob_bytes(b"an absent leaf of a shared parcel"));
+        let mut one = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        one.add_child(TreeItem::new("d.txt".to_string(), parcel_leaf.clone(), DirEntryType::Normal));
+        plant_head_over_tree(pallet_utils::PalletNamespace::Meta, "both", &one);
+        plant_head_over_tree(pallet_utils::PalletNamespace::User, "both", &one);
+        file_utils::forget_cached_objects();
+
+        let lost = find_lost_objects().unwrap();
+        let mut absent = vec![leaf.clone(), sub_object.hash.clone(), cell, both.clone(), parcel_leaf.clone()];
+        absent.sort();
+        assert_eq!(lost.absent.iter().cloned().collect::<Vec<_>>(), absent, "{:?}", lost);
+        let mut files = vec![leaf, both, parcel_leaf];
+        files.sort();
+        assert_eq!(lost.absent_files.iter().cloned().collect::<Vec<_>>(), files, "{:?}", lost);
+
+        crate::util::file_utils::remove_dir_all(&dir).ok();
+    }
+
     /// FORK-495: heal's closing check names a reachable packed leaf whose record does not
     /// decompress, a reachable packed tree whose record holds other bytes (a boundary, not a walk
     /// failure), and a reachable delta over the damaged leaf as corrupt. A damaged record that a
@@ -4367,7 +4460,7 @@ mod tests {
         };
         let mut reported: BTreeSet<String> = BTreeSet::new();
         {
-            let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
+            let mut sink = |hash: &str, _: bool| { reported.insert(hash.to_string()); };
             walk_closure_for(
                 &BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::from_prefixes(["src"]), None, Some(&mut sink),
             ).unwrap();
@@ -4411,7 +4504,7 @@ mod tests {
         };
         let mut reported: BTreeSet<String> = BTreeSet::new();
         {
-            let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
+            let mut sink = |hash: &str, _: bool| { reported.insert(hash.to_string()); };
             walk_closure_for(
                 &BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::from_prefixes(["src"]), None, Some(&mut sink),
             ).unwrap();
@@ -4456,7 +4549,7 @@ mod tests {
     fn walk_reports(roots: &WalkRoots) -> BTreeSet<String> {
         let mut reported: BTreeSet<String> = BTreeSet::new();
         {
-            let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
+            let mut sink = |hash: &str, _: bool| { reported.insert(hash.to_string()); };
             walk_closure_for(
                 &BTreeSet::new(), roots, &BTreeSet::new(), &PathScope::from_prefixes(["src"]), None, Some(&mut sink),
             ).unwrap();
@@ -4706,7 +4799,7 @@ mod tests {
         };
         let mut reported: BTreeSet<String> = BTreeSet::new();
         {
-            let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
+            let mut sink = |hash: &str, _: bool| { reported.insert(hash.to_string()); };
             walk_closure_for(
                 &BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::full(), Some(&record), Some(&mut sink),
             ).unwrap();
@@ -4745,7 +4838,7 @@ mod tests {
         };
         let mut reported: BTreeSet<String> = BTreeSet::new();
         {
-            let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
+            let mut sink = |hash: &str, _: bool| { reported.insert(hash.to_string()); };
             walk_closure_for(
                 &BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::full(), Some(&record), Some(&mut sink),
             ).unwrap();
@@ -6117,7 +6210,7 @@ mod tests {
         };
         let mut reported: Vec<String> = Vec::new();
         {
-            let mut sink = |hash: &str| reported.push(hash.to_string());
+            let mut sink = |hash: &str, _: bool| reported.push(hash.to_string());
             walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::full(), None, Some(&mut sink)).unwrap();
         }
         assert_eq!(reported, vec![lost_parent.clone()]);
@@ -6157,7 +6250,7 @@ mod tests {
         };
         let mut reported: Vec<String> = Vec::new();
         {
-            let mut sink = |hash: &str| reported.push(hash.to_string());
+            let mut sink = |hash: &str, _: bool| reported.push(hash.to_string());
             walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::full(), None, Some(&mut sink)).unwrap();
         }
         assert_eq!(reported, vec![lost]);
@@ -6222,7 +6315,7 @@ mod tests {
         };
         let mut reported: Vec<String> = Vec::new();
         let outcome = {
-            let mut sink = |hash: &str| reported.push(hash.to_string());
+            let mut sink = |hash: &str, _: bool| reported.push(hash.to_string());
             walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::full(), None, Some(&mut sink))
                 .expect("tag subjects must never abort the walk")
         };

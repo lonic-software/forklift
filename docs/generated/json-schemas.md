@@ -2476,6 +2476,33 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "UnavailableRebuilt": {
+      "description": "What `heal` kept of a damaged record of content this warehouse cannot get.",
+      "properties": {
+        "dropped": {
+          "description": "How many lines did not read whole and were dropped.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kept": {
+          "description": "How many entries still read whole and were kept.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "set_aside": {
+          "description": "Where the damaged record was copied to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "set_aside",
+        "kept",
+        "dropped"
+      ],
+      "type": "object"
+    },
     "Unread": {
       "description": "A checkout whose scope could not be used.",
       "properties": {
@@ -2556,6 +2583,13 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "description": "What this run dropped from a damaged sealed-object record, which it rebuilt as the part\nbefore the damage. An object whose record was dropped reads as missing if it is absent."
     },
+    "recorded_unavailable": {
+      "description": "Absent user file content history still reaches that the record of content this warehouse\ncannot get did not hold, which this run recorded in it again: the remote's host withholds\neach, so a checkout or an export leaves it out, as after the fetch. Its entry was lost, or\nthis warehouse held a copy and lost it; heal cannot tell which.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "refs_rebuilt": {
       "description": "Pallet refs that were lost or damaged and this run set: rebuilt at the head the evidence\nagreed on, or set to the parcel `--ref` gave.",
       "items": {
@@ -2597,6 +2631,17 @@ A command not listed here either reports only the generic human-message shape `{
         "type": "string"
       },
       "type": "array"
+    },
+    "unavailable_rebuilt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UnavailableRebuilt"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What this run kept of a damaged record of content this warehouse cannot get, which it\nrebuilt from the entries that still read whole, and where it kept a copy of it."
     },
     "unseal_failed": {
       "description": "Why removing those records failed, if it did. A failed write may have landed in part, so\n`unsealed` and `newly_held_by_hash` are then empty whatever the record holds.\nRunning `heal` again retries.",

@@ -3577,6 +3577,13 @@ impl RemoteClient {
         self.withheld.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(hash).map(|(statement, _)| statement.clone())
     }
 
+    /// The host's statement beside `hash` and the chunk-list digest its handshake reported, when a
+    /// content walk through this client leaves it out as content the remote's host withholds
+    /// ([`Self::leave_out_withheld`]): what a fetch records unavailable for it.
+    pub fn withheld_entry(&self, hash: &str) -> Option<(String, Option<String>)> {
+        self.withheld.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(hash).cloned()
+    }
+
     /// Make every later walk through this client, or any clone of it, record none of what it
     /// leaves out as withheld unavailable ([`Self::record_withheld_skips`]). For a command that
     /// writes no head over what a walk left out, and must not tolerate the absence of content this
