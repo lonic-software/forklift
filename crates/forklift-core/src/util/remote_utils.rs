@@ -3469,9 +3469,10 @@ impl RemoteClient {
             posture, reqwest::Method::GET, "/v1/warehouse", SendBody::Empty, "the handshake"
         ).await?;
         let unanswered = match &outcome {
-            // A request that could not be built never left; every other transport failure is one
-            // no response came back from, however far the request got.
-            SendOutcome::Transport(e) => !e.is_builder(),
+            // A request that could not be built never left, and a redirect the policy refused was
+            // an answer; every other transport failure is one no response came back from, however
+            // far the request got.
+            SendOutcome::Transport(e) => !e.is_builder() && !e.is_redirect(),
             SendOutcome::HeadWaitExpired { .. } => true,
             SendOutcome::Sent(_) => false,
         };

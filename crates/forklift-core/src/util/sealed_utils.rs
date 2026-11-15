@@ -731,8 +731,8 @@ pub fn record_absences_under(roots: &[String]) -> Result<(), String> {
 /// [`append_locked`] is.
 ///
 /// # Returns
-/// * `Ok(Vec<String>)` - The entries this asked to add; one an applied redaction or the unavailable
-///                       record names is dropped by the append, never written.
+/// * `Ok(Vec<String>)` - The entries this wrote: one already recorded, or one an applied redaction or
+///                       the unavailable record names, is left out, as the append never writes it.
 /// * `Err(String)`     - As [`append_locked`].
 pub fn record_held_absences(absent: &[String]) -> Result<Vec<String>, String> {
     if absent.is_empty() {
@@ -742,7 +742,7 @@ pub fn record_held_absences(absent: &[String]) -> Result<Vec<String>, String> {
     let lock = RefLock::acquire()?;
     let mut asked = Vec::new();
 
-    append_decided_locked(&lock, Entries::Claimed, |set| {
+    let set = append_decided_locked(&lock, Entries::Claimed, |set| {
         let mut written: HashSet<&str> = HashSet::new();
         let ops: Vec<(SealOp, String)> = absent.iter()
             .filter(|hash| !set.contains(hash) && written.insert(hash.as_str()))
@@ -752,8 +752,8 @@ pub fn record_held_absences(absent: &[String]) -> Result<Vec<String>, String> {
         Ok(ops)
     })?;
 
-    // The append drops what another record already accounts for, so only what landed is reported.
-    let set = read_sealed()?;
+    // The append drops what another record already accounts for, so only what landed is reported,
+    // judged on the set it wrote under the lock rather than on a second read.
     Ok(asked.into_iter().filter(|hash| set.contains(hash)).collect())
 }
 

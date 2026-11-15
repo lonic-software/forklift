@@ -396,14 +396,14 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
 
     if let Some(lost) = &report.objects_lost {
         if let Some(refused) = reseal_refused {
-            return Err(with_report(&report, refused).into());
+            return Err(with_report(&report, refused, objects_lost_lines(&report, lost)).into());
         }
         return Err(objects_lost_refusal(&report, lost, outcome.index_rebuild_skipped || origin_unanswered).into());
     }
 
     if report.refs_refused.is_empty() {
         if let Some(refused) = origin_refused {
-            return Err(with_report(&report, refused).into());
+            return Err(with_report(&report, refused, Vec::new()).into());
         }
     }
 
@@ -518,12 +518,7 @@ impl ObjectsLost {
 /// The `objects_lost` refusal of a run that found reachable objects the store cannot give back,
 /// carrying the whole report. A damaged ref left standing is listed too.
 fn objects_lost_refusal(report: &HealReport, lost: &ObjectsLost, rebuild_skipped: bool) -> CoreError {
-    let mut lines = lost.lines();
-    if !report.refs_refused.is_empty() {
-        if let CoreError::Refusal { message, .. } = ref_refusal(report, None) {
-            lines.push(message);
-        }
-    }
+    let lines = objects_lost_lines(report, lost);
 
     let next_step = if lost.foreign_index {
         "re-create the warehouse with this build of Forklift: the pack folder holds an index another build wrote"
@@ -541,25 +536,47 @@ fn objects_lost_refusal(report: &HealReport, lost: &ObjectsLost, rebuild_skipped
     )
 }
 
-/// A refusal the origin's record or the origin itself made, as the run's own, carrying the whole
-/// report, unless it carries details of its own, which its remedy may read: this run's repairs
-/// stand, so its "nothing was changed" is dropped.
-fn with_report(report: &HealReport, refused: CoreError) -> CoreError {
-    match refused {
-        CoreError::Refusal { details: Some(details), code, message, next_step } => CoreError::refusal_with_details(
-            code, message, next_step, details,
-        ),
-        CoreError::Refusal { code, message, next_step, .. } => CoreError::refusal_with_details(
-            code,
-            match message.strip_suffix("; nothing was changed.") {
-                Some(described) => format!("{}.", described),
-                None => message,
-            },
-            next_step,
-            serde_json::json!(report),
-        ),
-        other => other,
+/// The lines of an `objects_lost` refusal: what was lost, then a damaged ref left standing.
+fn objects_lost_lines(report: &HealReport, lost: &ObjectsLost) -> Vec<String> {
+    let mut lines = lost.lines();
+    if !report.refs_refused.is_empty() {
+        if let CoreError::Refusal { message, .. } = ref_refusal(report, None) {
+            lines.push(message);
+        }
     }
+    lines
+}
+
+/// A refusal the origin's record or the origin itself made, as the run's own, followed by `also`,
+/// what else the run leaves standing, and carrying the whole report. Details of its own, which its
+/// remedy may read, are kept, with each report field they do not name added beside them. This
+/// run's repairs stand, so its "nothing was changed" is dropped.
+fn with_report(report: &HealReport, refused: CoreError, also: Vec<String>) -> CoreError {
+    let CoreError::Refusal { code, message, next_step, details } = refused else {
+        return refused;
+    };
+
+    let mut lines = vec![match message.strip_suffix("; nothing was changed.") {
+        Some(described) => format!("{}.", described),
+        None => message,
+    }];
+    lines.extend(also);
+
+    let report = serde_json::json!(report);
+    let details = match details {
+        Some(serde_json::Value::Object(mut own)) => {
+            if let serde_json::Value::Object(fields) = report {
+                for (field, value) in fields {
+                    own.entry(field).or_insert(value);
+                }
+            }
+            serde_json::Value::Object(own)
+        }
+        Some(other) => other,
+        None => report,
+    };
+
+    CoreError::refusal_with_details(code, lines.join("\n"), next_step, details)
 }
 
 /// The `ref_damaged` refusal of a run that left a damaged ref standing, carrying the whole report.

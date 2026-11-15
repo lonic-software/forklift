@@ -13846,7 +13846,10 @@ fn heal_refuses_an_origin_whose_trust_changed_and_seals_nothing() {
     lose_sealed_record(&area, "cached");
 
     let output = area.forklift("cached", &["--json", "heal"]);
-    trust_changed_details(&output);
+    let details = trust_changed_details(&output);
+    assert!(details["objects_lost"]["absent"].as_u64().unwrap() >= 1, "the report stands beside the refusal's own details: {}", details);
+    let refused: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert!(refused["error"]["message"].as_str().unwrap().contains("absent"), "the refusal still names what is lost: {}", refused);
     for root in &older {
         assert!(!recorded(&area, "cached", root), "nothing is sealed: {}", root);
     }
@@ -13870,6 +13873,7 @@ fn heal_keeps_its_report_when_the_reseal_may_not_dial() {
     let refused = refusal_of(&area.forklift("cached", &["--json", "heal"]), 11);
     assert_eq!(refused["code"], "non_origin_remote", "{}", refused);
     assert!(refused["details"]["objects_lost"]["absent"].as_u64().unwrap() >= 1, "{}", refused);
+    assert!(refused["message"].as_str().unwrap().contains("cannot be read from this store"), "{}", refused);
 
     assert_success(&area.forklift("cached", &["config", "unset", "remote.url"]));
     let output = area.forklift("cached", &["--json", "heal"]);
