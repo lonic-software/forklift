@@ -1,0 +1,454 @@
+<title>Proof Load Faceplate</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: a faceplate bench — one instrument per section, every component shown in both themes
+   via the toggle. Tokens are pult-desktop's "1b Faceplate" set plus a grade family of its own. */
+:root {
+  --bg: #dcdee2; --panel: #f4f5f7; --pad: #eceef1; --pad-hi: #ffffff; --pad-lo: #c9cdd3;
+  --well: #e3e6ea; --ink: #1a1d23; --muted: #5c6470; --line: #d3d7dd; --engrave: #b9bec6;
+  --accent: #e0982a; --accent-ink: #1a1d23; --focus: #e0982a;
+  --lamp-off: #c3c8cf;
+  /* grades: color says good/bad, shape says which */
+  --g-healed: #2fae6e; --g-remedy: #2fae6e; --g-noremedy: #d9503f; --g-lost: #c8343a; --g-silent: #a3203a;
+  --g-silent-ink: #ffffff; --sampled: #8a93a0; --notrun: #c3c8cf;
+  --crt-bg: #0d1512; --crt-ink: #8fe3b4; --crt-dim: #4f8a6c; --crt-red: #ff7a7a; --crt-amber: #f0b45a;
+  --r-s: 6px; --r-l: 10px; --u: 4px;
+  --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --shadow-raise: 0 1px 0 var(--pad-hi) inset, 0 -1px 0 var(--pad-lo) inset, 0 1px 2px rgba(20,24,30,.18);
+  --shadow-sink: 0 1px 2px rgba(20,24,30,.22) inset, 0 -1px 0 var(--pad-hi) inset;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0e0f12; --panel: #1c2026; --pad: #252a31; --pad-hi: #343a43; --pad-lo: #0a0b0d;
+  --well: #15181d; --ink: #e9ebee; --muted: #9aa3ae; --line: #2c323a; --engrave: #3a414b;
+  --accent: #e5a93d; --accent-ink: #14110a; --focus: #e5a93d; --lamp-off: #3a414b;
+  --g-healed: #3fbf77; --g-remedy: #3fbf77; --g-noremedy: #e86a55; --g-lost: #e05c5c; --g-silent: #ff5d7a;
+  --g-silent-ink: #14080b; --sampled: #7d8794; --notrun: #3a414b;
+  --shadow-raise: 0 1px 0 var(--pad-hi) inset, 0 1px 2px rgba(0,0,0,.5);
+  --shadow-sink: 0 1px 3px rgba(0,0,0,.6) inset;
+  color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0e0f12; --panel: #1c2026; --pad: #252a31; --pad-hi: #343a43; --pad-lo: #0a0b0d;
+  --well: #15181d; --ink: #e9ebee; --muted: #9aa3ae; --line: #2c323a; --engrave: #3a414b;
+  --accent: #e5a93d; --accent-ink: #14110a; --focus: #e5a93d; --lamp-off: #3a414b;
+  --g-healed: #3fbf77; --g-remedy: #3fbf77; --g-noremedy: #e86a55; --g-lost: #e05c5c; --g-silent: #ff5d7a;
+  --g-silent-ink: #14080b; --sampled: #7d8794; --notrun: #3a414b;
+  --shadow-raise: 0 1px 0 var(--pad-hi) inset, 0 1px 2px rgba(0,0,0,.5);
+  --shadow-sink: 0 1px 3px rgba(0,0,0,.6) inset;
+  color-scheme: dark }
+
+* { box-sizing: border-box }
+body { background: var(--bg); color: var(--ink); font: 400 14px/1.5 var(--sans); }
+.wrap { max-width: 1120px; margin: 0 auto; padding-block: 28px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 20px }
+h1, h2, h3 { margin: 0; text-wrap: balance; font-weight: 600 }
+h1 { font-size: 26px; letter-spacing: -.01em }
+h2 { font-size: 17px }
+h3 { font-size: 13px }
+p { margin: 0; max-width: 68ch }
+code, .mono { font-family: var(--mono); font-size: 12.5px }
+.engraved { font: 600 10.5px/1 var(--sans); letter-spacing: .12em; text-transform: uppercase; color: var(--muted) }
+.muted { color: var(--muted) }
+
+.top { display: flex; flex-wrap: wrap; gap: 16px; align-items: end; justify-content: space-between }
+.top .lede { display: grid; gap: 6px }
+
+.plate { background: var(--panel); border-radius: var(--r-l); box-shadow: var(--shadow-raise);
+  padding: 18px; display: grid; gap: 14px; min-width: 0 }
+.plate > header { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; justify-content: space-between;
+  border-bottom: 1px solid var(--line); padding-bottom: 10px }
+.screws { display: none }
+
+.grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)) }
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center }
+.stack { display: grid; gap: 8px }
+
+/* decision */
+.decide { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)) }
+.option { background: var(--well); border-radius: var(--r-s); box-shadow: var(--shadow-sink); padding: 14px; display: grid; gap: 8px; align-content: start }
+.option.rec { outline: 2px solid var(--accent); outline-offset: -2px }
+.option ul { margin: 0; padding-left: 18px; display: grid; gap: 4px }
+.tag { font: 600 10.5px/1 var(--sans); letter-spacing: .1em; text-transform: uppercase; padding: 4px 7px; border-radius: 4px;
+  background: var(--accent); color: var(--accent-ink); justify-self: start }
+
+/* swatches */
+.swatches { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)) }
+.sw { display: grid; grid-template-columns: 34px 1fr; gap: 8px; align-items: center; min-width: 0 }
+.sw i { width: 34px; height: 34px; border-radius: var(--r-s); box-shadow: 0 0 0 1px var(--line) inset, var(--shadow-sink) }
+.sw b { display: block; font: 500 12.5px/1.2 var(--mono) }
+.sw span { font-size: 12px; color: var(--muted) }
+
+/* lamps and grades */
+.lamp { width: 12px; height: 12px; border-radius: 50%; display: inline-block; flex: none; background: var(--lamp-off);
+  box-shadow: 0 0 0 1px rgba(0,0,0,.15) inset }
+.glyph { width: 16px; height: 16px; flex: none; display: inline-block }
+.grade { display: inline-flex; align-items: center; gap: 7px; font: 500 12.5px/1 var(--sans); padding: 5px 9px 5px 7px;
+  border-radius: 5px; background: var(--pad); box-shadow: var(--shadow-sink); white-space: nowrap }
+.grade.latched { background: var(--g-silent); color: var(--g-silent-ink); box-shadow: none; font-weight: 600 }
+.grades { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)) }
+.gcard { background: var(--well); border-radius: var(--r-s); padding: 12px; display: grid; gap: 8px; align-content: start; box-shadow: var(--shadow-sink) }
+.gcard p { font-size: 12.5px; color: var(--muted) }
+
+/* type */
+.type-row { display: grid; grid-template-columns: 120px 1fr; gap: 12px; align-items: baseline; border-bottom: 1px dashed var(--line); padding-bottom: 8px }
+.type-row:last-child { border-bottom: 0 }
+@media (max-width: 520px) { .type-row { grid-template-columns: 1fr; gap: 2px } }
+
+/* spacing */
+.ruler { display: flex; flex-wrap: wrap; gap: 14px; align-items: end }
+.ruler div { display: grid; gap: 4px; justify-items: center }
+.ruler i { display: block; background: var(--accent); height: 10px; border-radius: 2px }
+
+/* controls */
+.btn { font: 500 13px/1 var(--sans); color: var(--ink); background: var(--pad); border: 0; border-radius: var(--r-s);
+  padding: 9px 14px; box-shadow: var(--shadow-raise); cursor: pointer; display: inline-flex; gap: 8px; align-items: center }
+.btn:hover { background: var(--pad-hi) }
+.btn:active, .btn.is-active { box-shadow: var(--shadow-sink); background: var(--well); transform: translateY(1px) }
+.btn:focus-visible, .btn.is-focus, .seg button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px }
+.btn.primary { background: var(--accent); color: var(--accent-ink); font-weight: 600 }
+.btn.primary:hover { filter: brightness(1.06) }
+.btn[disabled] { opacity: .45; cursor: not-allowed; box-shadow: none }
+.state-label { font-size: 11px; color: var(--muted); text-align: center }
+.specimen { display: grid; gap: 6px; justify-items: center }
+
+.seg { display: inline-flex; background: var(--well); border-radius: var(--r-s); box-shadow: var(--shadow-sink); padding: 3px; gap: 3px }
+.seg button { font: 500 12.5px/1 var(--sans); color: var(--muted); background: transparent; border: 0; border-radius: 4px; padding: 7px 11px; cursor: pointer }
+.seg button[aria-pressed="true"] { background: var(--pad); color: var(--ink); box-shadow: var(--shadow-raise) }
+
+.field { display: grid; gap: 5px; min-width: 0 }
+.field input { font: 400 13px var(--mono); color: var(--ink); background: var(--well); border: 0; border-radius: var(--r-s);
+  box-shadow: var(--shadow-sink); padding: 9px 10px; width: 100%; min-width: 0 }
+.field input:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px }
+.field.err input { box-shadow: var(--shadow-sink), 0 0 0 1.5px var(--g-lost) inset }
+.field small { font-size: 11.5px; color: var(--muted) }
+.field.err small { color: var(--g-lost) }
+
+/* meter */
+.meter { display: grid; gap: 6px }
+.leds { display: grid; grid-template-columns: repeat(40, 1fr); gap: 2px; background: var(--well); padding: 5px; border-radius: 5px; box-shadow: var(--shadow-sink) }
+.leds i { height: 12px; border-radius: 2px; background: var(--lamp-off) }
+.leds i.ok { background: var(--g-healed) }
+.leds i.bad { background: var(--g-lost) }
+.leds i.run { background: var(--accent) }
+
+/* CRT */
+.crt { background: var(--crt-bg); color: var(--crt-ink); border-radius: var(--r-s); padding: 12px 14px;
+  font: 400 12px/1.6 var(--mono); box-shadow: 0 0 0 3px var(--pad-lo), var(--shadow-sink); overflow-x: auto; white-space: pre; min-width: 0 }
+.crt .d { color: var(--crt-dim) } .crt .r { color: var(--crt-red) } .crt .a { color: var(--crt-amber) }
+
+/* coverage matrix */
+.scroll { overflow-x: auto; min-width: 0 }
+table { border-collapse: separate; border-spacing: 0; width: 100%; font-variant-numeric: tabular-nums }
+th { text-align: left; font: 600 10.5px/1 var(--sans); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap }
+td { padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; white-space: nowrap }
+tr:last-child td { border-bottom: 0 }
+.cov td:first-child { color: var(--ink) }
+.cell { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px }
+.cell .lamp.run { background: var(--g-healed) }
+.cell .lamp.sampled { background: transparent; box-shadow: 0 0 0 2px var(--sampled) inset }
+.cell .lamp.notrun { background: var(--notrun) }
+.cell.notrun { color: var(--muted) }
+
+.results tbody tr { cursor: pointer }
+.results tbody tr:hover td { background: var(--pad) }
+.results tbody tr.sel td { background: var(--well) }
+.results tbody tr.sel td:first-child { box-shadow: 3px 0 0 var(--accent) inset }
+.vs { display: inline-flex; gap: 6px }
+.num { font-family: var(--mono); font-size: 12.5px }
+
+.detail { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)) }
+.readout { background: var(--well); border-radius: var(--r-s); box-shadow: var(--shadow-sink); padding: 10px 12px; display: grid; gap: 4px; min-width: 0 }
+.readout .v { font: 600 22px/1.1 var(--mono) }
+.readout .v small { font-size: 12px; font-weight: 400; color: var(--muted) }
+
+/* composed screen */
+.screen { display: grid; grid-template-columns: 230px 1fr; gap: 14px; min-width: 0 }
+@media (max-width: 760px) { .screen { grid-template-columns: 1fr } }
+.side { display: grid; gap: 10px; align-content: start }
+.tally { display: grid; gap: 6px }
+.tally div { display: grid; grid-template-columns: 18px 1fr auto; gap: 8px; align-items: center; font-size: 13px }
+.tally b { font: 600 13px var(--mono) }
+
+.themebar { display: inline-flex; gap: 8px; align-items: center }
+.note { border-left: 3px solid var(--engrave); padding-left: 10px; color: var(--muted); font-size: 12.5px }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important } }
+</style>
+
+<div class="wrap">
+  <div class="top">
+    <div class="lede">
+      <span class="engraved">Proof Load · desktop head · design system · accepted 2026-11-15</span>
+      <h1>Proof Load Faceplate</h1>
+      <p class="muted">This is the proposed look for the egui desktop app that runs fault scenarios and grades how Forklift and git
+        come back from them. Every screen is built only from these tokens and components; anything the page lacks is added here first. Use the switch to flip themes, and every component on the page follows.</p>
+    </div>
+    <div class="themebar">
+      <span class="engraved">Theme</span>
+      <div class="seg" role="group" aria-label="Theme">
+        <button id="t-sys" aria-pressed="true" data-t="">System</button>
+        <button id="t-light" aria-pressed="false" data-t="light">Light</button>
+        <button id="t-dark" aria-pressed="false" data-t="dark">Dark</button>
+      </div>
+    </div>
+  </div>
+
+  <section class="plate">
+    <header><h2>The decision: share pult-desktop's system or stand alone</h2><span class="engraved">decided: shared</span></header>
+    <div class="decide">
+      <div class="option rec">
+        <span class="tag">Recommended</span>
+        <h3>Share the Faceplate, add a grade family</h3>
+        <ul>
+          <li>Same tokens as pult-desktop: surfaces, ink, amber as the only interactive accent, Plex Sans and Mono, 6/10 px radius, 4 px grid.</li>
+          <li>The same rules apply: color says <em>what</em> happened and only failures latch.</li>
+          <li>Proof Load adds the five grade tokens below, each with its own glyph, because a grading matrix needs more than green and red.</li>
+          <li>The cost is that the tokens live in two places, CSS in pult-desktop and a Rust <code>Theme</code> struct here. A short
+            parity test keeps the two copies in step.</li>
+        </ul>
+      </div>
+      <div class="option">
+        <span class="engraved">Alternative</span>
+        <h3>A standalone lab look</h3>
+        <ul>
+          <li>A flat, dense, table-first look with no raised pads and a neutral blue accent.</li>
+          <li>It is easier to make look native in egui (no inset shadows to fake), and it reads more as a test lab than as a hardware instrument.</li>
+          <li>The cost is that the lonic tools would no longer look like one family, and a second set of rules would have to be kept.</li>
+        </ul>
+      </div>
+    </div>
+    <p class="note">egui can draw everything on this page: rounded frames, strokes, flat fills and one shadow per frame. The raised and sunk
+      pads use a 1 px highlight stroke and a 1 px shade stroke instead of real inset shadows. IBM Plex ships inside the binary, so every OS shows the same type.</p>
+  </section>
+
+  <section class="plate">
+    <header><h2>Grades</h2><span class="engraved">oracle::Grade · worst first in sorting</span></header>
+    <p>Green is the only good color and red is the only bad one. The glyph tells grades of the same color apart, so the matrix still reads in
+      grayscale or for color-blind users. <em>Silent</em> is the one latched state, an inverted plate that stays lit until it has been looked at,
+      because it is the one outcome where the tool served wrong bytes and reported success.</p>
+    <div class="grades" id="grades"></div>
+  </section>
+
+  <section class="plate">
+    <header><h2>Color tokens</h2><span class="engraved">values follow the theme switch</span></header>
+    <div class="stack">
+      <span class="engraved">Surfaces and ink (shared with pult-desktop)</span>
+      <div class="swatches" id="sw-base"></div>
+    </div>
+    <div class="stack">
+      <span class="engraved">Grades and coverage (Proof Load only)</span>
+      <div class="swatches" id="sw-grade"></div>
+    </div>
+    <div class="stack">
+      <span class="engraved">Screen (fixed in both themes)</span>
+      <div class="swatches" id="sw-crt"></div>
+    </div>
+  </section>
+
+  <div class="grid">
+    <section class="plate">
+      <header><h2>Type</h2><span class="engraved">IBM Plex</span></header>
+      <div class="stack">
+        <div class="type-row"><span class="engraved">Title 26/600</span><span style="font:600 26px/1.2 var(--sans)">Run 2026-11-15 · 412 scenarios</span></div>
+        <div class="type-row"><span class="engraved">Heading 17/600</span><span style="font:600 17px/1.3 var(--sans)">Damaged files</span></div>
+        <div class="type-row"><span class="engraved">Body 14/400</span><span>The tool refused and named <code>forklift heal</code>, which brought the record back.</span></div>
+        <div class="type-row"><span class="engraved">Label 10.5/600</span><span class="engraved">Recoverability</span></div>
+        <div class="type-row"><span class="engraved">Data mono 12.5</span><span class="mono">redactions-applied__flip__byte-17</span></div>
+        <div class="type-row"><span class="engraved">Readout mono 22</span><span style="font:600 22px/1 var(--mono)">3 <small class="muted" style="font-size:12px">commands</small></span></div>
+      </div>
+    </section>
+    <section class="plate">
+      <header><h2>Space and shape</h2><span class="engraved">4 px grid</span></header>
+      <div class="ruler" id="ruler"></div>
+      <div class="row">
+        <div class="specimen"><div style="width:72px;height:44px;border-radius:var(--r-s);background:var(--pad);box-shadow:var(--shadow-raise)"></div><span class="state-label">pad · raised · r 6</span></div>
+        <div class="specimen"><div style="width:72px;height:44px;border-radius:var(--r-s);background:var(--well);box-shadow:var(--shadow-sink)"></div><span class="state-label">well · sunk · r 6</span></div>
+        <div class="specimen"><div style="width:72px;height:44px;border-radius:var(--r-l);background:var(--panel);box-shadow:var(--shadow-raise)"></div><span class="state-label">plate · r 10</span></div>
+      </div>
+      <p class="muted" style="font-size:12.5px">The density is compact: a 28 px table row, 32 px controls and 14 px plate padding at the desktop default.</p>
+    </section>
+  </div>
+
+  <section class="plate">
+    <header><h2>Controls</h2><span class="engraved">every state</span></header>
+    <div class="row" style="gap:18px">
+      <div class="specimen"><button class="btn primary">Run scenarios</button><span class="state-label">primary</span></div>
+      <div class="specimen"><button class="btn primary is-focus">Run scenarios</button><span class="state-label">primary · focus</span></div>
+      <div class="specimen"><button class="btn primary" disabled>Run scenarios</button><span class="state-label">primary · disabled</span></div>
+      <div class="specimen"><button class="btn">Open report</button><span class="state-label">default</span></div>
+      <div class="specimen"><button class="btn is-active">Open report</button><span class="state-label">pressed</span></div>
+      <div class="specimen"><button class="btn" disabled>Open report</button><span class="state-label">disabled</span></div>
+    </div>
+    <div class="row" style="gap:18px; align-items:start">
+      <div class="specimen"><div class="seg" role="group" aria-label="Binding">
+        <button id="b-fl" aria-pressed="true">forklift</button><button id="b-git" aria-pressed="false">git</button><button id="b-gt" aria-pressed="false">git-tuned</button>
+      </div><span class="state-label">segmented · binding filter</span></div>
+      <div class="field" style="width:260px"><label class="engraved" for="f-only">Only</label><input id="f-only" value="redacted"><small>Scenarios whose name contains this text</small></div>
+      <div class="field err" style="width:260px"><label class="engraved" for="f-bin">forklift binary</label><input id="f-bin" value="target/debug/forklfit"><small>No file at this path.</small></div>
+    </div>
+  </section>
+
+  <div class="grid">
+    <section class="plate">
+      <header><h2>Run meter</h2><span class="engraved">one LED per scenario block</span></header>
+      <div class="meter">
+        <div class="row" style="justify-content:space-between"><span class="engraved">Damaged files</span><span class="num">287 / 412</span></div>
+        <div class="leds" id="leds"></div>
+        <span class="muted" style="font-size:12px">Green means passed, red means failed and stays lit, amber means running and gray means queued.</span>
+      </div>
+    </section>
+    <section class="plate">
+      <header><h2>Step screen</h2><span class="engraved">what the tool printed</span></header>
+<div class="crt"><span class="d">$ forklift git export --out ./x</span>
+<span class="r">error: the applied-redactions record is damaged.</span>
+<span class="d">  next step:</span> forklift heal
+<span class="d">$ forklift heal</span>
+rebuilt the applied-redactions record (2 kept)
+<span class="a">applied again: 1 redaction</span>
+<span class="d">$ forklift git export --out ./x</span>   exit 0</div>
+    </section>
+  </div>
+
+  <section class="plate">
+    <header><h2>Coverage table</h2><span class="engraved">report::CoverageTable</span></header>
+    <div class="scroll"><table class="cov" id="cov"></table></div>
+    <p class="muted" style="font-size:12.5px">A <em>run</em> cell has a filled lamp and a <em>sampled</em> cell a hollow one. A <em>not run</em> cell has a gray lamp, and its reason shows as the cell's tooltip.</p>
+  </section>
+
+  <section class="plate">
+    <header><h2>Results, composed</h2><span class="engraved">the main window · click a row</span></header>
+    <div class="screen">
+      <aside class="side">
+        <span class="engraved">This run</span>
+        <div class="tally" id="tally"></div>
+        <div class="seg" role="group" aria-label="Show">
+          <button id="s-fail" aria-pressed="true">Failures</button><button id="s-all" aria-pressed="false">All</button>
+        </div>
+      </aside>
+      <div class="stack" style="min-width:0">
+        <div class="scroll"><table class="results" id="results"></table></div>
+        <div class="detail" id="detail"></div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+const GRADES = [
+  { k: "silent", name: "Silent", tok: "--g-silent", glyph: "silent", latched: true,
+    what: "Exit 0 with bytes matching no expected tree. It wins over every other grade and is a failure." },
+  { k: "lost", name: "Data lost", tok: "--g-lost", glyph: "lost",
+    what: "Even after every remedy it named, heal included, a record cannot be read back. The tool refuses rather than serve wrong bytes." },
+  { k: "noremedy", name: "Refused, no remedy", tok: "--g-noremedy", glyph: "noremedy",
+    what: "A refusal that names no remedy, or one that does not work, while earlier records still read back. A failure." },
+  { k: "remedy", name: "Refused, remedy works", tok: "--g-remedy", glyph: "remedy",
+    what: "A refusal naming a remedy that, once run, leads to the expected bytes." },
+  { k: "healed", name: "Healed", tok: "--g-healed", glyph: "healed",
+    what: "Exit 0 with the expected bytes, from the faulted command or a plain retry of it." },
+];
+function glyph(kind, color) {
+  const c = color || `var(${GRADES.find(g => g.k === kind).tok})`;
+  const s = {
+    healed:   `<circle cx="8" cy="8" r="6" fill="${c}"/>`,
+    remedy:   `<circle cx="8" cy="8" r="5" fill="none" stroke="${c}" stroke-width="2"/><circle cx="8" cy="8" r="2" fill="${c}"/>`,
+    noremedy: `<path d="M8 2.2 14 13.4H2Z" fill="none" stroke="${c}" stroke-width="2" stroke-linejoin="round"/>`,
+    lost:     `<rect x="2" y="2" width="12" height="12" rx="2" fill="${c}"/><path d="M5 5l6 6M11 5l-6 6" stroke="var(--panel)" stroke-width="1.8" stroke-linecap="round"/>`,
+    silent:   `<rect x="2" y="2" width="12" height="12" rx="2" fill="currentColor"/><path d="M8 4.5v4.5" stroke="var(--g-silent)" stroke-width="2" stroke-linecap="round"/><circle cx="8" cy="11.6" r="1.2" fill="var(--g-silent)"/>`,
+  }[kind];
+  return `<svg class="glyph" viewBox="0 0 16 16" aria-hidden="true">${s}</svg>`;
+}
+function chip(k) {
+  const g = GRADES.find(x => x.k === k);
+  return `<span class="grade${g.latched ? " latched" : ""}">${glyph(k)}${g.name}</span>`;
+}
+document.getElementById("grades").innerHTML = GRADES.map(g => `
+  <div class="gcard">${chip(g.k)}<p>${g.what}</p><code class="muted">${g.tok}</code></div>`).join("");
+
+const swatch = (tok, label) => `<div class="sw"><i style="background:var(${tok})"></i><div><b>${tok}</b><span data-tok="${tok}">${label}</span></div></div>`;
+document.getElementById("sw-base").innerHTML = [
+  ["--bg","window"],["--panel","plate"],["--pad","raised pad"],["--well","sunk well"],["--ink","text"],["--muted","secondary text"],
+  ["--line","rules"],["--accent","only interactive accent"],["--lamp-off","unlit lamp"]].map(([t,l]) => swatch(t,l)).join("");
+document.getElementById("sw-grade").innerHTML = [
+  ["--g-healed","healed"],["--g-remedy","remedy works"],["--g-noremedy","no remedy"],["--g-lost","data lost"],["--g-silent","silent (latched)"],
+  ["--sampled","sampled cell"],["--notrun","not-run cell"]].map(([t,l]) => swatch(t,l)).join("");
+document.getElementById("sw-crt").innerHTML = [
+  ["--crt-bg","screen"],["--crt-ink","output"],["--crt-dim","commands"],["--crt-red","refusal"],["--crt-amber","tool's action"]].map(([t,l]) => swatch(t,l)).join("");
+function refreshHex() {
+  const cs = getComputedStyle(document.documentElement);
+  document.querySelectorAll("[data-tok]").forEach(el => {
+    const base = el.dataset.label || el.textContent; el.dataset.label = base;
+    el.textContent = `${base} · ${cs.getPropertyValue(el.dataset.tok).trim()}`;
+  });
+}
+
+document.getElementById("ruler").innerHTML = [4,8,12,16,24,32].map(n => `<div><i style="width:${n}px"></i><span class="state-label">${n}</span></div>`).join("");
+
+const leds = []; for (let i = 0; i < 40; i++) leds.push(i < 26 ? (i === 9 || i === 17 ? "bad" : "ok") : i === 26 ? "run" : "");
+document.getElementById("leds").innerHTML = leds.map(c => `<i class="${c}"></i>`).join("");
+
+const CATS = ["damaged files","kill points (client)","kill points (server)","power loss (client)","power loss (server)","disk full","read-only",
+  "case-folding volume","no-exec volume","dead-PID lock","network proxy","clock skew","AWS head"];
+const GAP = {
+  "clock skew": ["no clock-skew mechanism yet","no clock-skew mechanism yet","no clock-skew mechanism yet"],
+  "AWS head": ["the AWS head is not driven yet","the AWS head is not driven yet","the AWS head is not driven yet"],
+};
+function covCell(cat, p) {
+  if (GAP[cat]) return ["notrun", GAP[cat][p]];
+  const mac = p === 1, win = p === 2;
+  if (/kill|power/.test(cat) && (mac || win)) return ["notrun", mac ? "no unprivileged syscall injection for an unmodified binary (dtrace needs SIP disabled)" : "no syscall injection on Windows in this harness"];
+  if (/disk full|case-folding|no-exec/.test(cat) && win) return ["notrun","no volume of this kind is built on Windows in this harness"];
+  if (p !== 0) return ["notrun","not run on this machine"];
+  return [/power/.test(cat) ? "sampled" : "run", ""];
+}
+document.getElementById("cov").innerHTML = `<thead><tr><th>Category</th><th>Linux</th><th>macOS</th><th>Windows</th></tr></thead><tbody>` +
+  CATS.map(c => `<tr><td>${c}</td>${[0,1,2].map(p => { const [s, why] = covCell(c, p);
+    const label = s === "notrun" ? "not run" : s;
+    return `<td><span class="cell ${s}" title="${why}"><i class="lamp ${s}"></i>${label}</span></td>`; }).join("")}</tr>`).join("") + `</tbody>`;
+
+const ROWS = [
+  { s: "redactions-applied__flip__byte-17", cat: "damaged files", fl: "remedy", git: "lost", cmds: 3, right: true, out: [] },
+  { s: "withheld-served__truncate__half", cat: "damaged files", fl: "lost", git: "lost", cmds: null, right: false, out: [] },
+  { s: "pack-index__zero__header", cat: "damaged files", fl: "healed", git: "silent", cmds: 1, right: true, out: [] },
+  { s: "stack__kill__renameat-4", cat: "kill points (client)", fl: "healed", git: "noremedy", cmds: 1, right: true, out: [] },
+  { s: "consolidate__disk-full__at-60%", cat: "disk full", fl: "remedy", git: "remedy", cmds: 2, right: true, out: ["free disk space"] },
+  { s: "lock__dead-pid__stale", cat: "dead-PID lock", fl: "noremedy", git: "remedy", cmds: null, right: false, out: ["remove .git/index.lock"] },
+];
+const ORDER = ["silent","lost","noremedy","remedy","healed"];
+let onlyFail = true, sel = 0;
+function renderResults() {
+  const rows = ROWS.map((r, i) => ({ ...r, i })).filter(r => !onlyFail || ["silent","lost","noremedy"].includes(r.fl) || ["silent","lost","noremedy"].includes(r.git));
+  if (!rows.some(r => r.i === sel) && rows.length) sel = rows[0].i;
+  document.getElementById("results").innerHTML = `<thead><tr><th>Scenario</th><th>Category</th><th>forklift</th><th>git</th><th>To expected</th></tr></thead><tbody>` +
+    rows.map(r => `<tr class="${r.i === sel ? "sel" : ""}" data-i="${r.i}" tabindex="0"><td class="mono">${r.s}</td><td class="muted">${r.cat}</td><td>${chip(r.fl)}</td><td>${chip(r.git)}</td>
+      <td class="num">${r.cmds == null ? "never" : r.cmds + " cmd"}</td></tr>`).join("") + `</tbody>`;
+  const r = ROWS[sel];
+  document.getElementById("detail").innerHTML = `
+    <div class="readout"><span class="engraved">Commands to expected</span><span class="v">${r.cmds == null ? "never" : r.cmds} <small>${r.cmds == null ? "" : "commands"}</small></span></div>
+    <div class="readout"><span class="engraved">Named the remedy that worked</span><span class="v">${r.right ? "yes" : "no"}</span></div>
+    <div class="readout"><span class="engraved">Outside knowledge</span><span style="font-size:13px">${r.out.length ? r.out.join(", ") : "none: the tool's own commands were enough"}</span></div>`;
+  document.querySelectorAll("#results tbody tr").forEach(tr => {
+    const pick = () => { sel = +tr.dataset.i; renderResults(); };
+    tr.addEventListener("click", pick);
+    tr.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } });
+  });
+}
+const counts = { silent: 1, lost: 4, noremedy: 3, remedy: 61, healed: 343 };
+document.getElementById("tally").innerHTML = ORDER.map(k => `<div>${glyph(k)}<span>${GRADES.find(g => g.k === k).name}</span><b>${counts[k]}</b></div>`).join("");
+
+function seg(ids, on) {
+  ids.forEach(id => { const b = document.getElementById(id); b.addEventListener("click", () => {
+    ids.forEach(o => document.getElementById(o).setAttribute("aria-pressed", String(o === id))); on && on(b); }); });
+}
+seg(["s-fail","s-all"], b => { onlyFail = b.id === "s-fail"; renderResults(); });
+seg(["b-fl","b-git","b-gt"]);
+seg(["t-sys","t-light","t-dark"], b => {
+  const t = b.dataset.t; if (t) document.documentElement.setAttribute("data-theme", t); else document.documentElement.removeAttribute("data-theme");
+  try { localStorage.setItem("pl-theme", t); } catch (e) {}
+  refreshHex();
+});
+try { const t = localStorage.getItem("pl-theme"); if (t) document.getElementById(t === "dark" ? "t-dark" : "t-light").click(); } catch (e) {}
+matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", refreshHex);
+renderResults(); refreshHex();
+</script>
