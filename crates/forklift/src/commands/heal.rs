@@ -856,9 +856,9 @@ pub(crate) struct HealReport {
     resealed: Vec<String>,
 
     /// Absent user file content history still reaches that the record of content this warehouse
-    /// cannot get did not hold, which this run recorded in it again: the remote's host withholds each, so a
-    /// checkout or an export leaves it out, as after the fetch. Its entry was lost, or this
-    /// warehouse held a copy and lost it; heal cannot tell which.
+    /// cannot get did not hold, which this run recorded in it again: the remote's host withholds
+    /// each, so a checkout or an export leaves it out, as after the fetch. Its entry was lost, or
+    /// this warehouse held a copy and lost it; heal cannot tell which.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     recorded_unavailable: Vec<String>,
 

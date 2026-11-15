@@ -2982,7 +2982,7 @@ fn walk_tree(
             referenced.insert(tree_hash);
             continue;
         }
-        if !visited_trees.first_visit(&tree_hash, spine_path.as_deref()) {
+        if !visited_trees.first_visit(&tree_hash, spine_path.as_deref(), class) {
             continue;
         }
         // Presence-tolerant (I3), plus the §8.3 corrupt-boundary carve-out: a subtree boundary
@@ -3058,7 +3058,7 @@ fn walk_tree(
 /// come from a remote, so a label on one would be the remote's to choose. The one rule heal's
 /// enumerating walk and scope prune's retained walks share, so heal never reports lost what a prune
 /// kept, nor a prune frees what heal counts as held.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum WalkClass {
     User,
     Meta,
@@ -3110,10 +3110,12 @@ impl ParcelVisits {
 }
 
 /// The trees a closure walk has been through, so it walks each at most once per way it is reached.
+/// Per [`WalkClass`] too: the sink is told whether a leaf is user file content, so a tree user and
+/// meta history share is walked once in each.
 #[derive(Default)]
 struct TreeVisits {
-    /// Trees walked in full: everything beneath one was checked, whatever path reached it.
-    full: HashSet<String>,
+    /// Trees walked in full, by class: everything beneath one was checked, whatever path reached it.
+    full: HashSet<(String, WalkClass)>,
     /// Spine trees of a sparse warehouse, by the path each was walked at. The same tree at another
     /// path is walked again, because the scope selects different entries there: deduplicating on
     /// the hash alone would leave an in-scope loss under the second path unchecked.
@@ -3121,13 +3123,14 @@ struct TreeVisits {
 }
 
 impl TreeVisits {
-    /// Whether `tree_hash` still needs walking, marking it walked: in full when `spine_path` is
-    /// `None`, otherwise on the spine at that path. A tree already walked in full needs no spine
-    /// walk anywhere.
-    fn first_visit(&mut self, tree_hash: &str, spine_path: Option<&str>) -> bool {
+    /// Whether `tree_hash` still needs walking in `class`, marking it walked: in full when
+    /// `spine_path` is `None`, otherwise on the spine at that path. A tree already walked in full in
+    /// `class` needs no spine walk anywhere.
+    fn first_visit(&mut self, tree_hash: &str, spine_path: Option<&str>, class: WalkClass) -> bool {
+        let full = (tree_hash.to_string(), class);
         match spine_path {
-            None => self.full.insert(tree_hash.to_string()),
-            Some(path) => !self.full.contains(tree_hash) && self.spine.insert((tree_hash.to_string(), path.to_string())),
+            None => self.full.insert(full),
+            Some(path) => !self.full.contains(&full) && self.spine.insert((tree_hash.to_string(), path.to_string())),
         }
     }
 }
@@ -4113,8 +4116,10 @@ mod tests {
 
     /// heal records unavailable again only what the closing check met as user file content: an
     /// absent leaf is in `absent_files`; an absent tree beside it, and an absent leaf only meta
-    /// history reaches, are absent but not user file content. Mutation: report every sink hash as
-    /// file content → the tree is listed; ignore the walk's class → the meta leaf is listed.
+    /// history reaches, are absent but not user file content; an absent leaf in a tree both reach
+    /// is. Mutation: report every sink hash as file content → the tree is listed; ignore the walk's
+    /// class → the meta leaf is listed; visit a tree once whatever the class → the shared leaf,
+    /// walked as meta first, is not listed.
     #[test]
     fn find_lost_objects_tells_absent_file_content_from_an_absent_tree() {
         use crate::model::tree_item::TreeItem;
@@ -4128,18 +4133,27 @@ mod tests {
         let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         root.add_child(TreeItem::new("a.txt".to_string(), leaf.clone(), DirEntryType::Normal));
         root.add_child(TreeItem::new("sub".to_string(), sub_object.hash.clone(), DirEntryType::Tree));
-        plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
         let cell = object_utils::hash_object_bytes(&object_utils::blob_bytes(b"an absent meta cell"));
+        let both = object_utils::hash_object_bytes(&object_utils::blob_bytes(b"an absent shared leaf"));
+        let mut shared = TreeItem::new("shared".to_string(), String::new(), DirEntryType::Tree);
+        shared.add_child(TreeItem::new("c.txt".to_string(), both.clone(), DirEntryType::Normal));
+        let mut shared_object = LooseObjectBuilder::build_tree(&shared);
+        shared_object.store().unwrap();
         let mut meta = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         meta.add_child(TreeItem::new("cell".to_string(), cell.clone(), DirEntryType::Normal));
+        meta.add_child(TreeItem::new("shared".to_string(), shared_object.hash.clone(), DirEntryType::Tree));
         plant_head_over_tree(pallet_utils::PalletNamespace::Meta, "notes", &meta);
+        root.add_child(TreeItem::new("shared".to_string(), shared_object.hash.clone(), DirEntryType::Tree));
+        plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
         file_utils::forget_cached_objects();
 
         let lost = find_lost_objects().unwrap();
-        let mut absent = vec![leaf.clone(), sub_object.hash.clone(), cell];
+        let mut absent = vec![leaf.clone(), sub_object.hash.clone(), cell, both.clone()];
         absent.sort();
         assert_eq!(lost.absent.iter().cloned().collect::<Vec<_>>(), absent, "{:?}", lost);
-        assert_eq!(lost.absent_files.iter().cloned().collect::<Vec<_>>(), vec![leaf], "{:?}", lost);
+        let mut files = vec![leaf, both];
+        files.sort();
+        assert_eq!(lost.absent_files.iter().cloned().collect::<Vec<_>>(), files, "{:?}", lost);
 
         crate::util::file_utils::remove_dir_all(&dir).ok();
     }
