@@ -16,13 +16,18 @@ pub struct Results {
     pub out: PathBuf,
     /// The report's rows and its forklift-only rows, worst grade first, then by scenario.
     pub rows: Vec<Row>,
+    /// The bindings the rows graded, sorted, each once.
+    pub bindings: Vec<String>,
 }
 
 impl Results {
     pub fn new(report: Report, out: PathBuf) -> Results {
         let mut rows: Vec<Row> = report.rows.iter().chain(&report.forklift_only).cloned().collect();
         rows.sort_by(|a, b| grades::rank(a.grade).cmp(&grades::rank(b.grade)).then_with(|| a.scenario.cmp(&b.scenario)));
-        Results { report, out, rows }
+        let mut bindings: Vec<String> = rows.iter().map(|row| row.binding.clone()).collect();
+        bindings.sort();
+        bindings.dedup();
+        Results { report, out, rows, bindings }
     }
 
     /// Reads `report.json` from the folder a run wrote it to. Refuses one that cannot be read, or
@@ -37,14 +42,6 @@ impl Results {
     /// How many rows of the whole run have each grade, worst first, every grade listed.
     pub fn tally(&self) -> Vec<(Grade, usize)> {
         grades::WORST_FIRST.into_iter().map(|grade| (grade, self.rows.iter().filter(|row| row.grade == grade).count())).collect()
-    }
-
-    /// The bindings the rows graded, sorted, each once.
-    pub fn bindings(&self) -> Vec<String> {
-        let mut bindings: Vec<String> = self.rows.iter().map(|row| row.binding.clone()).collect();
-        bindings.sort();
-        bindings.dedup();
-        bindings
     }
 
     /// The indices into `rows` the table shows: only failing grades when `failures`, and only
@@ -119,13 +116,15 @@ mod tests {
         server.binding = "forklift-server".to_string();
         server.grade = Grade::Healed;
         results.rows.push(server);
+        results = Results::new(Report { rows: results.rows.clone(), forklift_only: vec![], ..results.report.clone() }, results.out.clone());
         let all = results.shown(false, None);
         assert_eq!(all.len(), results.rows.len());
         let failures = results.shown(true, None);
         assert!(!failures.is_empty() && failures.len() < all.len());
         assert!(failures.iter().all(|index| results.rows[*index].grade.is_failure()));
-        assert_eq!(results.bindings(), ["forklift", "forklift-server"]);
-        assert_eq!(results.shown(false, Some("forklift-server")), [results.rows.len() - 1]);
+        assert_eq!(results.bindings, ["forklift", "forklift-server"]);
+        let server = results.rows.iter().position(|row| row.binding == "forklift-server").expect("the server row");
+        assert_eq!(results.shown(false, Some("forklift-server")), [server]);
         assert_eq!(results.shown(false, Some("forklift")).len(), all.len() - 1);
     }
 

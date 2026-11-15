@@ -52,13 +52,16 @@ pub struct App {
     /// The selected row, an index into `Results::rows`, and its step screen once read.
     selected: Option<usize>,
     step_lines: Option<(usize, Result<Vec<ScreenLine>, String>)>,
+    /// The fields' errors and the form they were checked for, so the file system is asked again
+    /// only when a field changes, not every frame.
+    checked: Option<(Form, [Option<&'static str>; 6])>,
 }
 
 impl Default for App {
     fn default() -> App {
         App {
             theme: 0, screen: Screen::Run, form: Form::default(), worker: None, meter: Meter::default(),
-            opened: None, results: None, show: 0, binding: 0, selected: None, step_lines: None,
+            opened: None, results: None, show: 0, binding: 0, selected: None, step_lines: None, checked: None,
         }
     }
 }
@@ -97,7 +100,7 @@ impl App {
     /// The rows the table shows under the current filters.
     fn shown(&self) -> Vec<usize> {
         let Some(results) = &self.results else { return Vec::new() };
-        let bindings = results.bindings();
+        let bindings = &results.bindings;
         let binding = self.binding.checked_sub(1).and_then(|index| bindings.get(index)).map(String::as_str);
         results.shown(self.show == 0, binding)
     }
@@ -162,6 +165,18 @@ impl App {
         }
     }
 
+    /// The fields' errors, checked again only when the form has changed since the last check.
+    fn errors(&mut self) -> [Option<&'static str>; 6] {
+        match &self.checked {
+            Some((form, errors)) if *form == self.form => *errors,
+            _ => {
+                let errors = self.form.errors();
+                self.checked = Some((self.form.clone(), errors));
+                errors
+            }
+        }
+    }
+
     fn running(&self) -> bool {
         self.worker.is_some()
     }
@@ -169,21 +184,22 @@ impl App {
     fn run_screen(&mut self, ui: &mut Ui) {
         let p = theme::palette(ui.ctx());
         let running = self.running();
+        let errors = self.errors();
         widgets::plate(ui, "Run", "proof_load::run", |ui| {
             ui.add_enabled_ui(!running, |ui| {
-                for pair in Field::ALL.chunks(2) {
+                for (pair, pair_errors) in Field::ALL.chunks(2).zip(errors.chunks(2)) {
                     ui.columns(pair.len(), |columns| {
-                        for (column, field) in columns.iter_mut().zip(pair) {
-                            let error = self.form.error(*field);
-                            widgets::field(column, field.label(), self.form.value(*field), field.hint(), error);
+                        for ((column, field), error) in columns.iter_mut().zip(pair).zip(pair_errors) {
+                            widgets::field(column, field.label(), self.form.value(*field), field.hint(), *error);
                         }
                     });
                 }
             });
             ui.horizontal(|ui| {
-                let options = self.form.options();
-                if widgets::button(ui, "Run scenarios", Button::Primary, !running && options.is_some()).clicked() {
-                    if let Some(options) = options {
+                let ready = errors.iter().all(Option::is_none);
+                if widgets::button(ui, "Run scenarios", Button::Primary, !running && ready).clicked() {
+                    // Checked once more as it starts: the file system may have changed.
+                    if let Some(options) = self.form.options() {
                         let ctx = ui.ctx().clone();
                         self.meter = Meter::default();
                         self.opened = None;
@@ -252,7 +268,7 @@ impl App {
             return;
         };
         let tally = results.tally();
-        let bindings = results.bindings();
+        let bindings = results.bindings.clone();
         let out = results.out.display().to_string();
         let mut show = self.show;
         let mut binding = self.binding;
@@ -262,16 +278,17 @@ impl App {
             ui.horizontal_top(|ui| {
                 // `.screen`: the side column and the main one are 14 px apart.
                 ui.spacing_mut().item_spacing.x = theme::PLATE_GAP;
-                ui.allocate_ui(egui::vec2(230.0, 0.0), |ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width(230.0);
-                        ui.spacing_mut().item_spacing.y = theme::SIDE_GAP;
-                        widgets::engraved(ui, "This run");
-                        widgets::tally(ui, &tally);
-                        widgets::segmented(ui, &mut show, &SHOW);
-                        widgets::engraved(ui, "Binding");
-                        let mut options = vec!["All"];
-                        options.extend(bindings.iter().map(String::as_str));
+                ui.allocate_ui_with_layout(egui::vec2(theme::SIDE_WIDTH, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(theme::SIDE_WIDTH);
+                    ui.spacing_mut().item_spacing.y = theme::SIDE_GAP;
+                    widgets::engraved(ui, "This run");
+                    widgets::tally(ui, &tally);
+                    widgets::segmented(ui, &mut show, &SHOW);
+                    widgets::engraved(ui, "Binding");
+                    let mut options = vec!["All"];
+                    options.extend(bindings.iter().map(String::as_str));
+                    // More bindings than the column holds scroll sideways rather than widen it.
+                    egui::ScrollArea::horizontal().id_salt("bindings").show(ui, |ui| {
                         widgets::segmented(ui, &mut binding, &options);
                     });
                 });
@@ -369,7 +386,7 @@ impl App {
         let Some(results) = &self.results else { return };
         let row = &results.rows[selected];
         if self.step_lines.as_ref().is_none_or(|(index, _)| *index != selected) {
-            let lines = row.steps(&results.out).map(|outcomes| steps::lines(steps::program(&row.binding), &outcomes));
+            let lines = row.steps(&results.out).map(|outcomes| steps::lines(&outcomes));
             self.step_lines = Some((selected, lines));
         }
         let tag = row.scenario.clone();

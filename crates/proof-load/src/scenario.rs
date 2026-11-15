@@ -509,6 +509,12 @@ pub fn catalog() -> Vec<Scenario> {
     ]
 }
 
+/// Whether `id` names a scenario a run can build: one of the catalog's or the coverage
+/// scenarios'. `--only` takes these.
+pub fn known(id: &str) -> bool {
+    catalog().iter().chain(&coverage()).any(|scenario| scenario.id == id)
+}
+
 /// The coverage scenarios: histories built only for the write-op check, each reaching commands no
 /// faulted scenario runs, with the precondition each needs built first. They are built and walked
 /// like every scenario, and never faulted.

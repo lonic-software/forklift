@@ -9,21 +9,17 @@ use crate::widgets::{Ink, ScreenLine};
 /// The most lines one stream of one step shows; the rest are counted, not printed.
 pub const STREAM_LINES: usize = 40;
 
-/// The program a row's binding ran, as its commands are printed.
-pub fn program(binding: &str) -> &'static str {
-    if binding.starts_with("git") { "git" } else { "forklift" }
-}
-
-/// The step screen's lines for `steps` run by `program`. A refusal prints its message red and its
+/// The step screen's lines for `steps`, each a forklift command, whichever binding the row
+/// faulted (`Row::binding`). A refusal prints its message red and its
 /// next step after a dim label, in place of the JSON document it came in; anything else on stdout
 /// prints plain, stderr amber, and every step ends with a dim line saying how it exited.
-pub fn lines(program: &str, steps: &[Outcome]) -> Vec<ScreenLine> {
+pub fn lines(steps: &[Outcome]) -> Vec<ScreenLine> {
     let mut lines = Vec::new();
     if steps.is_empty() {
         lines.push(ScreenLine::new(Ink::Dim, "the row ran no commands"));
     }
     for step in steps {
-        let mut command = program.to_string();
+        let mut command = "forklift".to_string();
         for argument in &step.arguments {
             command.push(' ');
             command.push_str(&quoted(argument));
@@ -89,7 +85,7 @@ mod tests {
     #[test]
     fn a_refusal_prints_its_message_and_next_step() {
         let failure = Failure { code: "damaged".into(), message: "The trust file is damaged.".into(), next_step: Some("forklift heal".into()) };
-        let lines = lines("forklift", &[
+        let lines = lines(&[
             step(&["--json", "stack", "-m", "a message"], Some(1), "{\"error\": {}}", "", Some(failure)),
             step(&["heal"], Some(0), "rebuilt the trust file\n", "warning: one kept\n", None),
         ]);
@@ -115,13 +111,13 @@ mod tests {
     #[test]
     fn a_long_stream_is_cut_and_counted() {
         let out: String = (0..45).map(|index| format!("line {index}\n")).collect();
-        let lines = lines("git", &[step(&["fsck"], None, &out, "", None)]);
+        let lines = lines(&[step(&["fsck"], None, &out, "", None)]);
         let texts = texts(&lines);
         assert_eq!(texts.len(), 1 + STREAM_LINES + 2);
         assert_eq!(texts[STREAM_LINES], format!("line {}", STREAM_LINES - 1));
         assert_eq!(texts[STREAM_LINES + 1], "… 5 more lines");
         assert_eq!(texts.last().unwrap(), "  ended on a signal");
-        assert_eq!(texts[0], "$ git fsck");
+        assert_eq!(texts[0], "$ forklift fsck");
     }
 
     #[test]
@@ -129,8 +125,6 @@ mod tests {
         assert_eq!(quoted("--out=./x"), "--out=./x");
         assert_eq!(quoted(""), "''");
         assert_eq!(quoted("it's"), "'it'\\''s'");
-        assert_eq!(program("git-tuned"), "git");
-        assert_eq!(program("forklift-server"), "forklift");
-        assert_eq!(texts(&lines("forklift", &[])), ["the row ran no commands"]);
+        assert_eq!(texts(&lines(&[])), ["the row ran no commands"]);
     }
 }

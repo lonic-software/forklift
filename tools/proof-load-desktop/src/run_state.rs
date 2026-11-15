@@ -4,8 +4,8 @@
 //! Nothing here draws, so the reducer is tested without egui.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::Arc;
 
 use proof_load::report::{Category, Report};
 use proof_load::run::{self, Progress, RunError, RunOptions};
@@ -88,7 +88,7 @@ impl Meter {
 /// The `Progress` the worker runs with: every call becomes an event on the channel, followed by
 /// `repaint`, and `cancelled` reads the Stop flag.
 pub struct Channel {
-    events: Mutex<Sender<Event>>,
+    events: Sender<Event>,
     stop: Arc<AtomicBool>,
     repaint: Box<dyn Fn() + Send + Sync>,
 }
@@ -96,9 +96,7 @@ pub struct Channel {
 impl Channel {
     fn send(&self, event: Event) {
         // A window that has gone away has nothing left to show; the run goes on to its end.
-        if let Ok(events) = self.events.lock() {
-            let _ = events.send(event);
-        }
+        let _ = self.events.send(event);
         (self.repaint)();
     }
 }
@@ -145,12 +143,34 @@ impl Worker {
     ) -> Worker {
         let (sender, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let channel = Channel { events: Mutex::new(sender), stop: stop.clone(), repaint: Box::new(repaint) };
+        let channel = Channel { events: sender, stop: stop.clone(), repaint: Box::new(repaint) };
         std::thread::spawn(move || {
-            let result = body(&channel);
+            // A run that panics still ends: the window is told it was refused, and why, rather
+            // than left waiting for a Done that never comes.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&channel)))
+                .unwrap_or_else(|panic| Err(RunError::Refused(format!("the run stopped on an internal error: {}", panicked(&*panic)))));
             channel.send(Event::Done(result));
         });
         Worker { events, stop }
+    }
+
+    /// Every event sent since the last call, in order, without waiting; a worker that has gone
+    /// without sending `Done` ends as refused, so the window never waits on it.
+    pub fn drain(&self) -> Vec<Event> {
+        let mut events = Vec::new();
+        loop {
+            match self.events.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !events.iter().any(|event| matches!(event, Event::Done(_))) {
+                        events.push(Event::Done(Err(RunError::Refused("the run ended without a result".to_string()))));
+                    }
+                    break;
+                }
+            }
+        }
+        events
     }
 
     /// Asks the run to stop before its next block.
@@ -162,14 +182,18 @@ impl Worker {
         self.stop.load(Ordering::SeqCst)
     }
 
-    /// Every event sent since the last call, in order, without waiting.
-    pub fn drain(&self) -> Vec<Event> {
-        self.events.try_iter().collect()
-    }
-
     /// The next event, waiting for it; `None` once the worker has gone.
     pub fn next(&self) -> Option<Event> {
         self.events.recv().ok()
+    }
+}
+
+/// What a panic said, where it said it in words.
+fn panicked(panic: &(dyn std::any::Any + Send)) -> String {
+    match (panic.downcast_ref::<&str>(), panic.downcast_ref::<String>()) {
+        (Some(text), _) => text.to_string(),
+        (_, Some(text)) => text.clone(),
+        _ => "no message".to_string(),
     }
 }
 
@@ -242,5 +266,18 @@ mod tests {
         go.send(()).expect("the run is waiting");
         assert_eq!(worker.next(), Some(Event::Done(Err(RunError::Cancelled))));
         assert!(worker.stopping());
+    }
+
+    /// A run that panics ends refused, with the panic's message, instead of leaving the window
+    /// running.
+    ///
+    /// Revert: send Done only when the body returns → the worker goes with no Done.
+    #[test]
+    fn a_panicking_run_ends_refused() {
+        let worker = Worker::start_with(|_| panic!("index out of bounds"), || {});
+        assert_eq!(worker.next(), Some(Event::Done(Err(RunError::Refused("the run stopped on an internal error: index out of bounds".into())))));
+        assert_eq!(worker.next(), None);
+        let events = worker.drain();
+        assert_eq!(events, [Event::Done(Err(RunError::Refused("the run ended without a result".into())))], "a gone worker reads as ended");
     }
 }

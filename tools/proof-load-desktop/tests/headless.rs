@@ -72,11 +72,16 @@ fn screens() -> Vec<(&'static str, App)> {
 
 /// The texts the app's last frame draws, each with its first section's colour.
 fn texts(theme: egui::Theme, app: &mut App) -> Vec<(String, egui::Color32)> {
+    texts_at(theme, app, 1120.0)
+}
+
+/// `texts` in a window `width` wide.
+fn texts_at(theme: egui::Theme, app: &mut App, width: f32) -> Vec<(String, egui::Color32)> {
     let ctx = egui::Context::default();
     proof_load_desktop::install(&ctx);
     ctx.set_theme(theme);
     let input = || egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1120.0, 2400.0))),
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 2400.0))),
         ..egui::RawInput::default()
     };
     let mut output = ctx.run(input(), |ctx| app.show(ctx));
@@ -297,4 +302,15 @@ fn a_click_picks_the_row_under_it() {
         });
     }
     assert_eq!(picked, Some(1));
+}
+
+/// At the window's narrowest the results table keeps its Scenario column and scrolls sideways,
+/// rather than squeezing scenario names to nothing.
+///
+/// Revert: let the flexible column shrink to 0 → no scenario name is drawn at 760 px.
+#[test]
+fn a_narrow_window_keeps_the_scenario_names() {
+    let mut app = App::showing(fixture());
+    let texts = texts_at(egui::Theme::Light, &mut app, 760.0);
+    assert!(texts.iter().any(|(text, _)| text.starts_with("signed ")), "no scenario name at 760 px: {:?}", texts.iter().map(|(text, _)| text).collect::<Vec<_>>());
 }

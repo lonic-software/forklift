@@ -411,6 +411,8 @@ pub struct Column {
 /// Cell padding, `td { padding: 7px 10px }`; a heading's is 8 px over and under.
 const CELL_PADDING: f32 = 10.0;
 const HEAD_PADDING: f32 = 8.0;
+/// The narrowest the flexible column gets before the table scrolls sideways instead.
+const FLEX_MIN_WIDTH: f32 = 200.0;
 
 /// A table as the page draws one: engraved headings over a line, then `rows` rows of
 /// `ROW_HEIGHT` with a line between them, `cell` drawing each cell's contents left to right. With
@@ -425,12 +427,14 @@ pub fn table(
     mut cell: impl FnMut(&mut Ui, usize, usize),
 ) -> Option<usize> {
     let p = theme::palette(ui.ctx());
-    let width = ui.available_width();
     let fixed: f32 = columns.iter().map(|column| column.width).sum();
-    let rest = (width - fixed).max(0.0);
+    let rest = (ui.available_width() - fixed).max(FLEX_MIN_WIDTH);
+    let width = fixed + rest;
     let widths: Vec<f32> = columns.iter().map(|column| if column.width == 0.0 { rest } else { column.width }).collect();
     let mut clicked = None;
-    ui.vertical(|ui| {
+    // `.scroll`: a table wider than its column scrolls sideways, as the page's does.
+    let salt = ui.next_auto_id();
+    egui::ScrollArea::horizontal().id_salt(salt).show(ui, |ui| ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         let head = 2.0 * HEAD_PADDING + Type::Label.font().size;
         let (rect, _) = ui.allocate_exact_size(egui::vec2(width, head), Sense::hover());
@@ -444,6 +448,10 @@ pub fn table(
         ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, hairline(p.line));
         for row in 0..rows {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(width, theme::ROW_HEIGHT), Sense::hover());
+            // Only the rows on screen are drawn, so a report of thousands of rows stays quick.
+            if !ui.is_rect_visible(rect) {
+                continue;
+            }
             let background = ui.painter().add(Shape::Noop);
             let mut x = rect.left();
             for (column, column_width) in widths.iter().enumerate() {
@@ -472,7 +480,7 @@ pub fn table(
                 ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, hairline(p.line));
             }
         }
-    });
+    }));
     clicked
 }
 

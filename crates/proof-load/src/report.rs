@@ -199,7 +199,8 @@ pub struct Determinism {
 pub struct Row {
     pub scenario: String,
     pub category: Category,
-    /// The tool and binding the row graded: `forklift`, `git`, `git-tuned`.
+    /// The program the row faulted: `forklift`, or `forklift-server` for a hosted scenario's
+    /// server. A row's steps are the forklift commands its scenario ran either way.
     pub binding: String,
     pub grade: Grade,
     pub recoverability: Recoverability,

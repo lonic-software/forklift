@@ -75,8 +75,13 @@ impl Form {
             Field::Git => binary(&self.git),
             Field::Source => source(&self.source),
             Field::Out => out(&self.out),
-            Field::Only => None,
+            Field::Only => only(&self.only),
         }
+    }
+
+    /// Every field's error, in `Field::ALL`'s order.
+    pub fn errors(&self) -> [Option<&'static str>; 6] {
+        Field::ALL.map(|field| self.error(field))
     }
 
     /// The run these fields ask for, or `None` while any field has an error.
@@ -128,25 +133,34 @@ fn source(text: &str) -> Option<&'static str> {
     }
 }
 
-/// The report folder is needed, and is new or an empty folder.
+/// The report folder is needed, and is new or an empty folder. A link is judged as itself, not
+/// followed, as the run claims the folder.
 fn out(text: &str) -> Option<&'static str> {
     let text = text.trim();
     let path = Path::new(text);
     if text.is_empty() {
-        Some("A run needs a folder for its report.")
-    } else if !path.is_absolute() {
-        Some("Give the folder's full path.")
-    } else if path.is_dir() {
-        match std::fs::read_dir(path).map(|mut entries| entries.next().is_none()) {
+        return Some("A run needs a folder for its report.");
+    }
+    if !path.is_absolute() {
+        return Some("Give the folder's full path.");
+    }
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some("This folder cannot be read."),
+        Ok(metadata) if metadata.is_symlink() => Some("This is a link. Give the folder itself."),
+        Ok(metadata) if !metadata.is_dir() => Some("This is a file, not a folder."),
+        Ok(_) => match std::fs::read_dir(path).map(|mut entries| entries.next().is_none()) {
             Ok(true) => None,
             Ok(false) => Some("This folder is not empty. A run needs an empty or new one."),
             Err(_) => Some("This folder cannot be read."),
-        }
-    } else if path.exists() {
-        Some("This is a file, not a folder.")
-    } else {
-        None
+        },
     }
+}
+
+/// Only may be left empty; given, it names a scenario the run can build.
+fn only(text: &str) -> Option<&'static str> {
+    let text = text.trim();
+    (!text.is_empty() && !proof_load::scenario::known(text)).then_some("No scenario has this id.")
 }
 
 #[cfg(test)]
@@ -181,7 +195,7 @@ mod tests {
 
     /// Each field refuses what the run would refuse, and any error keeps Run from starting.
     ///
-    /// Revert: accept a non-empty report folder → the run would refuse it after Run.
+    /// Revert: follow links → a link to an empty folder passes, and the run refuses it after Run.
     #[test]
     fn each_field_refuses_what_the_run_cannot_use() {
         let folder = scratch("errors");
@@ -198,6 +212,19 @@ mod tests {
         assert_eq!(out("relative"), Some("Give the folder's full path."));
         let empty = scratch("empty");
         assert_eq!(out(&empty.display().to_string()), None);
+        // A link to an empty folder, or to nothing, is refused as the run refuses it.
+        #[cfg(unix)]
+        {
+            let link = folder.join("link");
+            std::os::unix::fs::symlink(&empty, &link).expect("a link");
+            assert_eq!(out(&link.display().to_string()), Some("This is a link. Give the folder itself."));
+            let dangling = folder.join("dangling");
+            std::os::unix::fs::symlink(folder.join("nothing"), &dangling).expect("a link");
+            assert_eq!(out(&dangling.display().to_string()), Some("This is a link. Give the folder itself."));
+        }
+        assert_eq!(only("signd"), Some("No scenario has this id."));
+        assert_eq!(only("signed"), None);
+        assert_eq!(only(" "), None);
         let form = Form { source: folder.display().to_string(), out: folder.display().to_string(), ..Form::default() };
         assert!(form.options().is_none());
     }
