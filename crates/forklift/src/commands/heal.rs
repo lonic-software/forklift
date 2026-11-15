@@ -313,14 +313,32 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let mut lost = recovery_utils::find_lost_objects();
 
     // Absent content a file of this checkout's inventory still holds in the working tree is stored
-    // again from there: the file hashes to it, so what is written is the lost object itself.
+    // again from there: the file hashes to it, so what is written is the lost object itself. Never
+    // content a redaction names, which a lost record of applied redactions leaves reading as
+    // absent, so nothing is stored while the redactions cannot all be read.
     let mut restored_from_working_tree: Vec<String> = Vec::new();
-    if let Ok(found) = &lost {
-        match recovery_utils::restore_from_working_tree(&found.absent) {
+    let redacted = match &lost {
+        Ok(found) if !found.absent.is_empty() => match redaction_utils::read_redactions() {
+            Ok(read) if read.unreadable.is_empty() => {
+                Ok(read.redactions.into_iter().map(|attributed| attributed.redaction.hash).collect())
+            }
+            Ok(read) => Err(format!("{} redaction(s) cannot be read", read.unreadable.len())),
+            Err(why) => Err(why),
+        },
+        _ => Ok(std::collections::BTreeSet::new()),
+    };
+    if let (Ok(_), Err(why)) = (&lost, &redacted) {
+        notes.push(format!(
+            "Lost content was not looked for in the working tree, since what the redactions name is not known, so none was stored again from there: {}",
+            why.trim_end_matches('.')
+        ));
+    }
+    if let (Ok(found), Ok(redacted)) = (&lost, &redacted) {
+        match recovery_utils::restore_from_working_tree(&found.absent, redacted) {
             Ok(restore) => {
                 for (path, why) in &restore.failed {
                     notes.push(format!(
-                        "\"{}\" in the working tree holds content the store lost, and it was not stored again: {}",
+                        "\"{}\" in the working tree may hold content the store lost, and was not stored again from there: {}",
                         path, why.trim_end_matches('.')
                     ));
                 }
@@ -682,12 +700,12 @@ pub(crate) struct ObjectsLost {
     /// checkout `staged` or `staged_elsewhere` names, which no backup is needed to mend.
     staged_only: bool,
 
-    /// This checkout's staged paths whose content is among them and that nothing else reaches.
+    /// When `staged_only`, this checkout's staged paths whose content is among them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     staged: Vec<String>,
 
-    /// The other checkouts (the main working tree, or a bay) staging content among them that
-    /// nothing else reaches.
+    /// When `staged_only`, the other checkouts (the main working tree, or a bay) staging content
+    /// among them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     staged_elsewhere: Vec<String>,
 
@@ -812,7 +830,11 @@ fn objects_lost_refusal(report: &HealReport, lost: &ObjectsLost, rebuild_skipped
     } else if rebuild_skipped {
         "forklift heal".to_string()
     } else if lost.staged_only && !lost.staged.is_empty() {
-        unload_step_when(&lost.staged, cfg!(windows))
+        let unload = unload_step_when(&lost.staged, cfg!(windows));
+        match lost.staged_elsewhere.is_empty() {
+            true => unload,
+            false => format!("{}; then, from each other checkout named above, run \"forklift heal\"", unload),
+        }
     } else if lost.staged_only {
         "from each checkout named above, run \"forklift heal\"".to_string()
     } else {
@@ -831,8 +853,18 @@ fn objects_lost_refusal(report: &HealReport, lost: &ObjectsLost, rebuild_skipped
 /// `windows` quotes them: unload each, which unstages it and leaves its file as it is, and load
 /// again what is meant to be staged. The paths are warehouse-root-relative, so the commands run
 /// from the working tree's root, each path one argument ([`tree_utils::remedy_path_when`]), or
-/// every one listed behind a placeholder step when any cannot be quoted there.
+/// every one listed behind a placeholder step when any cannot be quoted there. More paths than the
+/// refusal's lines list get the placeholder step alone, pointing at the report that lists them.
 fn unload_step_when(paths: &[String], windows: bool) -> String {
+    // Past the lines' cap the paths are not spelled out again: the report names them all.
+    if paths.len() > LOST_HASHES_LISTED {
+        return format!(
+            "from the working tree's root, run \"forklift unload -- <path>\" for each of the {} staged paths, \
+            with the path quoted for your shell, then load again what you mean to stage; \"forklift --json heal\" \
+            lists them all in `staged`",
+            paths.len()
+        );
+    }
     let arguments: Option<Vec<String>> = paths.iter().map(|path| tree_utils::remedy_path_when(path, windows)).collect();
     match (arguments, paths) {
         (Some(arguments), [_]) => format!(
@@ -1558,6 +1590,19 @@ mod tests {
             unload_step_when(&paths, true),
             "from the working tree's root, run \"forklift unload -- <path>\" for each of these paths, with the path \
             quoted for your shell, then load again what you mean to stage: \"a.txt\", \"b c.txt\""
+        );
+
+        // Past the refusal's cap, the step points at the report instead of spelling every path.
+        // Mutation: drop the cap → red.
+        let many: Vec<String> = (0..=super::LOST_HASHES_LISTED).map(|n| format!("f{}.txt", n)).collect();
+        assert_eq!(
+            unload_step_when(&many, false),
+            format!(
+                "from the working tree's root, run \"forklift unload -- <path>\" for each of the {} staged paths, with \
+                the path quoted for your shell, then load again what you mean to stage; \"forklift --json heal\" lists \
+                them all in `staged`",
+                many.len()
+            )
         );
     }
 }

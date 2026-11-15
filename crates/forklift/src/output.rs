@@ -873,7 +873,7 @@ impl ErrorCode {
             ErrorCode::ObjectUnreadable =>
                 "An object could not be read: no file holds it, its loose file is corrupt, or the only pack index that names it is damaged or has lost its data file. Nothing was changed; heal rebuilds a damaged index from its data file, or names what is lost when history still reaches it",
             ErrorCode::ObjectsLost =>
-                "Heal found objects the history or staged content reaches that no file holds, that only a corrupt loose file holds, or that only a pack index it could not rebuild names, and that the working tree did not hold either. Nothing was claimed repaired for them; unload the paths it names when only staged content reaches them, or else restore them from a backup or a copy that holds them",
+                "Heal found objects the history or staged content reaches that no file holds, that only a corrupt loose file holds, or that only a pack index it could not rebuild names, and that heal could not store again from the working tree. Nothing was claimed repaired for them; unload the paths it names when only staged content reaches them, or else restore them from a backup or a copy that holds them",
         }
     }
 

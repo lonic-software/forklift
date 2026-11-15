@@ -2589,20 +2589,34 @@ pub struct WorkingTreeRestore {
 /// Store again, from this checkout's working tree, each object of `absent` that an entry of its
 /// inventory (staged, or as stacked) holds: the entry's blob or recipe, or a chunk of a recipe the
 /// store holds. Only where the working file at the entry's path still hashes to the entry's hash,
-/// so what is stored is the lost object itself, and nothing else is written. A file that changed,
-/// went away or is not of the entry's kind (a symlink, or a regular file) is left alone: a staged
-/// one is its owner's to unload, and a stacked one is history's, which a backup restores.
+/// so what is stored is the lost object itself. A chunked file is read a second time to store its
+/// chunks and recipe as it streams; one that changes between the two reads is reported failed, and
+/// the objects of its new content that pass wrote are left for gc, since nothing reaches them. A
+/// file that changed, went away or is not of the entry's kind (a symlink, or a regular file) is
+/// left alone: a staged one is its owner's to unload, and a stacked one is history's, which a
+/// backup restores.
+///
+/// No entry whose content a redaction names, as its own hash or one of `absent` it reaches, is
+/// stored: with the record of applied redactions lost, redacted content reads as absent, and
+/// storing it from a working file that still holds it would undo the redaction.
+///
+/// # Arguments
+/// * `absent`   - The hashes the store lacks.
+/// * `redacted` - Every hash a redaction names.
 ///
 /// # Returns
 /// * `Ok(WorkingTreeRestore)` - What was stored again, and what matched but could not be.
 /// * `Err(String)`            - The checkout's staged entries could not be read.
-pub fn restore_from_working_tree(absent: &BTreeSet<String>) -> Result<WorkingTreeRestore, String> {
+pub fn restore_from_working_tree(absent: &BTreeSet<String>, redacted: &BTreeSet<String>) -> Result<WorkingTreeRestore, String> {
     let mut outcome = WorkingTreeRestore::default();
     if absent.is_empty() {
         return Ok(outcome);
     }
 
     for (path, hash, item_type) in staged_entries_reaching(absent)? {
+        if redacted.contains(&hash) || reached_by(&hash, item_type, absent).iter().any(|lost| redacted.contains(lost)) {
+            continue;
+        }
         match restore_entry(&path, &hash, item_type) {
             Ok(true) => outcome.restored.push(path),
             Ok(false) => {}
@@ -2624,7 +2638,8 @@ fn restore_entry(path: &str, hash: &str, item_type: DirEntryType) -> Result<bool
     let file = Path::new(path);
     let metadata = match std::fs::symlink_metadata(file) {
         Ok(metadata) => metadata,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        // A parent replaced by a file reads as the path gone, as it is.
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Ok(false),
         Err(e) => return Err(format!("Error while reading the metadata of \"{}\": {}", path, e)),
     };
     let symlink = item_type == DirEntryType::SymbolicLink;
@@ -2696,13 +2711,19 @@ pub struct StagedLosses {
     pub all: bool,
 }
 
-/// Which of `lost` only staged content reaches, and where it is staged: a walk of every durable
-/// ref but the checkouts' inventories finds what else reaches them, and each checkout's inventory
-/// is read for the rest. Such an object is the content of a load that was never stacked, so the
-/// checkout holding it unstages the path, or loads it again, and needs no backup.
+/// Whether only staged content reaches every one of `lost`, and where it is staged: a walk of every
+/// durable ref but the checkouts' inventories finds what else reaches them, and each checkout's
+/// inventory is read for the rest. Such an object is the content of a load that was never stacked,
+/// so the checkout holding it unstages the path, or loads it again, and needs no backup. Anything
+/// short of all of them reports nothing.
+///
+/// The walk descends every tree the store holds. One it lacks and does not count lost, out of the
+/// fetch scope or held by hash alone, is history this store never owed, so content only beneath
+/// such a tree is still the staged load's to mend here; a tree it lacks that is lost is itself
+/// among `lost`, history reaches it, and nothing is reported.
 ///
 /// # Returns
-/// * `Ok(StagedLosses)` - Where they are staged; empty when none is staged content only.
+/// * `Ok(StagedLosses)` - Where they are staged; empty unless all of them are staged content only.
 /// * `Err(String)`      - A source the walk needs could not be read, or the walk or an inventory
 ///                        could not be: which losses are staged only is not known.
 pub fn staged_only_losses(lost: &BTreeSet<String>, corrupt: &BTreeSet<String>) -> Result<StagedLosses, String> {
@@ -2755,7 +2776,12 @@ pub fn staged_only_losses(lost: &BTreeSet<String>, corrupt: &BTreeSet<String>) -
         }
     }
 
-    Ok(StagedLosses { all: staged_only.len() == lost.len() && attributed == staged_only, here, elsewhere })
+    // Only when every lost object is staged content only: the walk stops at a tree it lacks, so with
+    // one of history's lost too, content beneath it may be history's as well as staged.
+    match staged_only.len() == lost.len() && attributed == staged_only {
+        true => Ok(StagedLosses { all: true, here, elsewhere }),
+        false => Ok(StagedLosses::default()),
+    }
 }
 
 /// Which of `hashes` a file entry of `hash` and `item_type` reaches, as [`entry_reaches`] tells.

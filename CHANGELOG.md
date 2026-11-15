@@ -611,7 +611,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   content again from the working tree wherever a file there still holds it, staged or stacked, and
   lists the paths. When only staged content reaches what is still lost, the refusal says so, names
   the paths, and its next step is `forklift unload` on each; content another bay stages is named
-  with the bay, whose own `heal` mends it. `--json` carries `restored_from_working_tree`, and
+  with the bay, whose own `heal` stores it again or names what to unload there. `--json` carries `restored_from_working_tree`, and
   `objects_lost` gains `staged_only`, `staged` and `staged_elsewhere`.
 
 - **A refused `scope fetch` or `clone --only` of a file no longer stores it.** `scope fetch

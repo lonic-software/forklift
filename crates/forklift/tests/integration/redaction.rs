@@ -2560,6 +2560,37 @@ fn git_export_leaves_out_a_file_whose_redaction_is_applied_and_names_it() {
     assert!(human.contains("of 2 commit(s)"), "{}", human);
 }
 
+/// Redacted content a working file still holds, at a path the inventory lists with its hash, is
+/// never stored again by heal's restore from the working tree: with the record of applied
+/// redactions lost it reads as absent, and storing it would undo the redaction.
+///
+/// Revert: let the restore ignore the redactions → heal stores the secret again.
+#[test]
+fn heal_never_stores_redacted_content_again_from_the_working_tree() {
+    let warehouse = Warehouse::new("restore-redacted");
+    warehouse.stack("keep.txt", b"keep\n", "keep");
+    std::fs::write(warehouse.root.join("secret.env"), b"TOKEN=hunter2\n").unwrap();
+    warehouse.run_ok(&["load", "secret.env"]);
+    let hash = hash_of(b"TOKEN=hunter2\n");
+    let recorded = recorded_hash(&warehouse, &hash, "leaked token");
+    assert_eq!(recorded["data"]["status"]["state"], "applied", "{}", recorded);
+    // The copy gone, as after a redaction's deletion, while the staged entry and its file stay.
+    if warehouse.holds_loose(&hash) {
+        let (folder, file) = forklift_core::util::file_utils::get_path_for_object(&hash).unwrap();
+        forklift_core::util::file_utils::remove_file(warehouse.root.join(folder).join(file)).unwrap();
+    }
+    assert!(warehouse.root.join("secret.env").is_file(), "the working file still holds the secret");
+
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/redactions-applied")).unwrap();
+    let healed = warehouse.json(&["heal"]);
+    let data = match healed["ok"] == true {
+        true => &healed["data"],
+        false => &healed["error"]["details"],
+    };
+    assert!(data.get("restored_from_working_tree").is_none(), "{}", healed);
+    assert!(!warehouse.holds_loose(&hash), "heal must not store the redacted content: {}", healed);
+}
+
 /// A record of applied redactions lost or damaged, whichever way, leaves the redacted content gone
 /// and the redaction recorded: export refuses on a damaged record and names heal, and heal applies
 /// the redaction again, keeping a copy of a damaged record, after which export leaves the file out
