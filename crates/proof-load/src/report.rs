@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 
 use crate::oracle::{Grade, Recoverability};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Category {
     DamagedFiles,
@@ -53,7 +53,7 @@ impl Category {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Platform {
     Linux,
@@ -73,12 +73,36 @@ impl Platform {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-#[serde(tag = "state", rename_all = "kebab-case")]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case", try_from = "WrittenCell")]
 pub enum Cell {
     Run,
     Sampled,
     NotRun { reason: String },
+}
+
+/// A cell as written, read field by field: serde's `deny_unknown_fields` lets an unknown field
+/// through on an internally tagged unit variant, so `Cell` is read through this instead.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WrittenCell {
+    state: String,
+    reason: Option<String>,
+}
+
+impl TryFrom<WrittenCell> for Cell {
+    type Error = String;
+
+    fn try_from(written: WrittenCell) -> Result<Cell, String> {
+        match (written.state.as_str(), written.reason) {
+            ("run", None) => Ok(Cell::Run),
+            ("sampled", None) => Ok(Cell::Sampled),
+            ("not-run", Some(reason)) => Ok(Cell::NotRun { reason }),
+            ("run" | "sampled", Some(_)) => Err(format!("a {} cell names no reason", written.state)),
+            ("not-run", None) => Err("a not-run cell names its reason".to_string()),
+            (state, _) => Err(format!("unknown cell state `{}`", state)),
+        }
+    }
 }
 
 impl Cell {
@@ -113,7 +137,8 @@ pub fn platform_gap(category: Category, platform: Platform) -> Option<&'static s
 }
 
 /// The coverage table. Built only by `CoverageTable::new`, which fills every cell.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoverageTable {
     pub cells: BTreeMap<Category, BTreeMap<Platform, Cell>>,
     /// Per kill-point cell, how many targets were not reached.
@@ -155,7 +180,8 @@ impl CoverageTable {
 }
 
 /// What determines a run: replaying with the same five reproduces it.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Determinism {
     pub seed: u64,
     /// Each tool's path, then the first line of its `--version` output in parentheses.
@@ -167,7 +193,8 @@ pub struct Determinism {
 }
 
 /// One graded row.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Row {
     pub scenario: String,
     pub category: Category,
@@ -176,10 +203,15 @@ pub struct Row {
     pub grade: Grade,
     pub recoverability: Recoverability,
     pub note: Option<String>,
+    /// Where the row's details are, relative to the output directory: a file name, then `#` and a
+    /// JSON pointer to the object in it that holds the row's `steps`, each step's arguments, exit
+    /// and output. `None` where the run wrote no details for the row.
+    pub detail: Option<String>,
 }
 
 /// A completeness check's outcome.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Completeness {
     pub check: String,
     pub cell: Cell,
@@ -206,8 +238,15 @@ impl Completeness {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+/// The report's format. A reader refuses any other, so a report written by another build of the
+/// harness is never read as if it meant the same thing.
+pub const REPORT_FORMAT: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Report {
+    /// Always `REPORT_FORMAT` when written.
+    pub format: u32,
     pub coverage: CoverageTable,
     pub determinism: Determinism,
     pub completeness: Vec<Completeness>,
@@ -222,6 +261,18 @@ impl Report {
     pub fn failed(&self) -> bool {
         self.rows.iter().chain(&self.forklift_only).any(|row| row.grade.is_failure())
             || self.completeness.iter().any(|check| !check.missing.is_empty())
+    }
+
+    /// Reads a `report.json`. Refuses a format other than `REPORT_FORMAT` by number before
+    /// anything else is read, and any field this build does not know.
+    pub fn from_json(text: &str) -> Result<Report, String> {
+        let value: serde_json::Value = serde_json::from_str(text).map_err(|error| format!("not a report: {}", error))?;
+        match value.get("format") {
+            Some(format) if format.as_u64() == Some(u64::from(REPORT_FORMAT)) => {}
+            Some(format) => return Err(format!("report format {} is not one this build reads (it reads {})", format, REPORT_FORMAT)),
+            None => return Err("not a report: it names no format".to_string()),
+        }
+        serde_json::from_value(value).map_err(|error| format!("not a report of format {}: {}", REPORT_FORMAT, error))
     }
 
     pub fn json(&self) -> String {
@@ -291,6 +342,7 @@ mod tests {
     #[test]
     fn the_markdown_opens_with_the_coverage_table() {
         let report = Report {
+            format: REPORT_FORMAT,
             coverage: CoverageTable::new(Platform::Linux, |_| Cell::not_run("not built yet")),
             determinism: Determinism { seed: 7, tools: BTreeMap::new(), scenarios: vec![], platform: Platform::Linux, environment: BTreeMap::new() },
             completeness: vec![],
@@ -307,6 +359,7 @@ mod tests {
     #[test]
     fn a_completeness_gap_fails_the_run() {
         let report = Report {
+            format: REPORT_FORMAT,
             coverage: CoverageTable::new(Platform::Linux, |_| Cell::Run),
             determinism: Determinism { seed: 1, tools: BTreeMap::new(), scenarios: vec![], platform: Platform::Linux, environment: BTreeMap::new() },
             completeness: vec![Completeness { check: "damage".to_string(), cell: Cell::Run, missing: vec!["trust".to_string()] }],
@@ -329,5 +382,70 @@ mod tests {
         assert_eq!(Completeness::budget(Duration::from_secs(59), Some(Duration::from_secs(60))).missing, Vec::<String>::new());
         let unset = Completeness::budget(Duration::from_secs(10_000), None);
         assert!(unset.missing.is_empty() && matches!(unset.cell, Cell::NotRun { .. }));
+    }
+
+    fn sample() -> Report {
+        Report {
+            format: REPORT_FORMAT,
+            coverage: CoverageTable::new(Platform::Linux, |category| match category {
+                Category::DamagedFiles => Cell::Run,
+                _ => Cell::not_run("not asked for"),
+            }),
+            determinism: Determinism { seed: 3, tools: BTreeMap::new(), scenarios: vec!["trust".to_string()], platform: Platform::Linux, environment: BTreeMap::new() },
+            completeness: vec![Completeness { check: "damage".to_string(), cell: Cell::Run, missing: vec![] }],
+            rows: vec![Row {
+                scenario: "trust".to_string(), category: Category::DamagedFiles, binding: "forklift".to_string(), grade: Grade::RefusedWorkingRemedy,
+                recoverability: Recoverability { commands_to_expected: Some(2), named_right_remedy: true, outside_knowledge: vec![] },
+                note: None, detail: Some("trust-head.json#".to_string()),
+            }],
+            forklift_only: vec![],
+        }
+    }
+
+    /// Changes the sample's JSON with `change`, then reads it back.
+    fn read_changed(change: impl FnOnce(&mut serde_json::Value)) -> Result<Report, String> {
+        let mut value: serde_json::Value = serde_json::from_str(&sample().json()).expect("the sample is JSON");
+        change(&mut value);
+        Report::from_json(&value.to_string())
+    }
+
+    /// What a run writes, a reader reads back whole.
+    #[test]
+    fn a_report_reads_back_what_was_written() {
+        let report = sample();
+        let read = Report::from_json(&report.json()).expect("the report reads back");
+        assert_eq!(read.json(), report.json());
+        assert_eq!(read.rows, report.rows);
+    }
+
+    /// A report of another format, or of none, is refused by number before anything else is read.
+    ///
+    /// Revert: read any format → the report of format 2 reads.
+    #[test]
+    fn a_report_of_another_format_is_refused() {
+        let other = read_changed(|value| value["format"] = serde_json::json!(REPORT_FORMAT + 1)).map(|_| ()).unwrap_err();
+        assert_eq!(other, format!("report format {} is not one this build reads (it reads {})", REPORT_FORMAT + 1, REPORT_FORMAT));
+        let none = read_changed(|value| { value.as_object_mut().expect("an object").remove("format"); }).map(|_| ()).unwrap_err();
+        assert_eq!(none, "not a report: it names no format");
+        let quoted = read_changed(|value| value["format"] = serde_json::json!("1")).map(|_| ()).unwrap_err();
+        assert_eq!(quoted, format!("report format \"1\" is not one this build reads (it reads {})", REPORT_FORMAT));
+        assert!(read_changed(|_| ()).is_ok(), "the unchanged sample reads");
+    }
+
+    /// A field this build does not know is refused, never dropped, in a row and in a coverage cell.
+    ///
+    /// Revert: drop `deny_unknown_fields` from `Row` or from `Cell` → that report reads.
+    #[test]
+    fn a_report_with_an_unknown_field_is_refused() {
+        let in_row = read_changed(|value| value["rows"][0]["weight"] = serde_json::json!(1)).map(|_| ()).unwrap_err();
+        assert!(in_row.contains("unknown field `weight`"), "{}", in_row);
+        for category in ["kill-points-client", "damaged-files"] {
+            let in_cell = read_changed(|value| value["coverage"]["cells"][category]["linux"]["weight"] = serde_json::json!(1)).map(|_| ()).unwrap_err();
+            assert!(in_cell.contains("unknown field `weight`"), "{}: {}", category, in_cell);
+        }
+        let sampled = read_changed(|value| value["completeness"][0]["cell"] = serde_json::json!({"state": "sampled", "weight": 1})).map(|_| ()).unwrap_err();
+        assert!(sampled.contains("unknown field `weight`"), "{}", sampled);
+        let reasoned = read_changed(|value| value["completeness"][0]["cell"] = serde_json::json!({"state": "run", "reason": "x"})).map(|_| ()).unwrap_err();
+        assert!(reasoned.contains("names no reason"), "{}", reasoned);
     }
 }

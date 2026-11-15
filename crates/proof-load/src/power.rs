@@ -1842,6 +1842,15 @@ pub fn summarize(all: &[ScenarioPower]) -> Summary {
     summarize_as(all, kill::Side::Client)
 }
 
+/// The file in the output directory that holds one scenario's power loss of `side`, as `run`
+/// writes it and as each row's detail names it.
+pub fn details_file(side: kill::Side, scenario: &str) -> String {
+    match side {
+        kill::Side::Client => format!("power-{}.json", scenario),
+        kill::Side::Server => format!("server-power-{}.json", scenario),
+    }
+}
+
 /// [`summarize`] for `side`'s power loss: a server's names, beside its states, each run that never
 /// reached its cut.
 pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
@@ -1865,7 +1874,7 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
         if !scenario.crashes.is_empty() {
             between.push(Completeness { check: format!("{}power loss of {}, states between durable and volatile: {}", prefix, scenario.scenario, scenario.requested.label()), cell: Cell::Run, missing: vec![] });
         }
-        for GradedCrash { crash, graded } in &scenario.crashes {
+        for (index, GradedCrash { crash, graded }) in scenario.crashes.iter().enumerate() {
             let mut notes = vec![CAVEAT.to_string(), REWRITTEN.to_string()];
             if crash.shared > 1 {
                 notes.push(format!("{} crash moments leave this state", crash.shared));
@@ -1880,6 +1889,7 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
                 grade: graded.grade,
                 recoverability: graded.recoverability.clone(),
                 note: Some(notes.join("; ")),
+                detail: Some(format!("{}#/crashes/{}/graded", details_file(side, &scenario.scenario), index)),
             });
         }
     }

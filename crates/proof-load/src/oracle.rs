@@ -165,7 +165,7 @@ pub fn judge(readback: &Readback, expectation: &Expectation) -> Verdict {
 }
 
 /// The five grades.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Grade {
     /// Exit 0 with expected bytes, in the faulted command or a plain retry of it.
@@ -217,7 +217,8 @@ pub fn grade(evidence: &Evidence) -> Grade {
 }
 
 /// Each grade's recoverability record.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Recoverability {
     /// Commands from the fault to expected bytes, or none if expected bytes were never reached.
     pub commands_to_expected: Option<u32>,
