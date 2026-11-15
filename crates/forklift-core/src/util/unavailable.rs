@@ -664,7 +664,8 @@ mod tests {
     }
 
     // Revert: drop the newer-version check, or judge it by the whole record's parse → a newer
-    // Forklift's record, damaged past its header, is rewritten as this one's; drop the readable check → a whole record is copied aside and rewritten.
+    // Forklift's record, damaged past its header, is rewritten as this one's; drop the readable
+    // check → a whole record is copied aside and rewritten.
     #[test]
     fn a_readable_missing_or_newer_record_is_left_as_it_is() {
         let _scratch = Scratch::new("left");

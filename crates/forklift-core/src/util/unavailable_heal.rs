@@ -7,8 +7,8 @@
 //! fetch records one on: the remote's handshake lists the hash withheld, with a statement and
 //! chunk-list digest the record may hold, the handshake does not report it redacted and applied,
 //! no redaction this warehouse applied names it, and the store lacks it. What history reaches is
-//! not part of that premise; the caller passes only lost hashes, so nothing is recorded that no
-//! history names.
+//! not part of that premise; the caller passes only lost user file content, so nothing is recorded
+//! that no history names, and no tree, chunk, parcel or meta content.
 
 use std::collections::BTreeSet;
 use crate::util::remote_utils::{self, HandshakeError, RemoteClient};
@@ -24,8 +24,10 @@ pub enum RerecordError {
     Refused(String),
 }
 
-/// Record unavailable again each of `lost`, absent objects history still reaches, that the
-/// configured remote's host withholds (see the module doc). No remote configured records nothing.
+/// Record unavailable again each of `lost` that the configured remote's host withholds (see the
+/// module doc). `lost` must be absent user file content history still reaches
+/// ([`crate::util::recovery_utils::LostObjects::absent_files`]), never every absent object: a fetch
+/// records nothing else. No remote configured records nothing.
 ///
 /// # Returns
 /// * `Ok(Vec<String>)`     - The hashes recorded, sorted, possibly none.

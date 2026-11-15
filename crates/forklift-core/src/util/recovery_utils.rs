@@ -95,7 +95,8 @@
 //! syscall itself is skipped — when there is nothing to feed.
 //!
 //! The sink is `Option<&mut dyn FnMut(&str, bool)>`, the `bool` saying whether the hash was met as
-//! a file's content (a blob or a recipe, staged or in a tree): `None` for the common, targeted walk
+//! user file content (a blob or a recipe, staged or in a tree user history reaches; never one only
+//! meta history reaches): `None` for the common, targeted walk
 //! ([`closure_references_any`]) — descent-guard absences are simply skipped, and the (gated)
 //! terminal-leaf presence check never runs at all, so the targeted walk pays no per-leaf/per-chunk
 //! stat it has no use for. `Some(collector)` for the targetless enumerator
@@ -2109,8 +2110,9 @@ pub(crate) struct ClosureWalkResult {
     /// [`enumerate_absent_reachable`]: every raw-absent (or corrupt-boundary) hash the walk
     /// reached.
     pub hashes: BTreeSet<String>,
-    /// [`enumerate_absent_reachable`]: those of `hashes` the walk met as a file's content, a blob
-    /// or a recipe. Empty for [`closure_references_any`].
+    /// [`enumerate_absent_reachable`]: those of `hashes` the walk met as user file content, a blob
+    /// or a recipe that is staged or in a tree user history reaches. Empty for
+    /// [`closure_references_any`].
     pub file_hashes: BTreeSet<String>,
     /// Plain-language notes, one per degraded source — see [`collect_walk_roots`]'s doc comment.
     pub degraded_sources: Vec<String>,
@@ -2312,8 +2314,9 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
 pub struct LostObjects {
     /// Reachable hashes the store does not hold at all.
     pub absent: BTreeSet<String>,
-    /// Those of `absent` history names as a file's content, a blob or a recipe: what a fetch
-    /// records unavailable when the remote's host withholds it.
+    /// Those of `absent` met as user file content, a blob or a recipe that is staged or in a tree
+    /// user history reaches: what a fetch records unavailable when the remote's host withholds it.
+    /// Meta history's content is not, since a fetch never leaves any of it out.
     pub absent_files: BTreeSet<String>,
     /// Reachable hashes the walk could not read, each with why: a pack index that does not parse,
     /// a data file with no index, a damaged index.
@@ -2680,7 +2683,7 @@ fn walk_closure_for(
             continue;
         }
 
-        check_leaf(hash, *item_type, targets, corrupt, None, &mut referenced, &mut unwalked, reborrow_sink(&mut sink))?;
+        check_leaf(hash, *item_type, true, targets, corrupt, None, &mut referenced, &mut unwalked, reborrow_sink(&mut sink))?;
     }
 
     // One combined queue, ordinary and pin roots alike — see this function's own doc comment for
@@ -3030,7 +3033,10 @@ fn walk_tree(
 
         for (_, file) in tree.get_files() {
             if in_scope(&file.name).is_some() {
-                check_leaf(&file.hash, file.item_type, targets, corrupt, sealed, referenced, unwalked, reborrow_sink(&mut sink))?;
+                check_leaf(
+                    &file.hash, file.item_type, class == WalkClass::User, targets, corrupt, sealed, referenced, unwalked,
+                    reborrow_sink(&mut sink),
+                )?;
             }
         }
 
@@ -3144,9 +3150,13 @@ impl TreeVisits {
 /// `raw_object_present` syscall itself is skipped) for the targeted walk
 /// ([`closure_references_any`], `sink: None`), and only actually runs for the enumerator
 /// ([`enumerate_absent_reachable`], `sink: Some(_)`) — see the module doc comment.
+///
+/// `user` says whether the leaf is user file content (staged, or in a tree user history reaches),
+/// which the sink is told beside each absence.
 fn check_leaf(
     hash: &str,
     item_type: DirEntryType,
+    user: bool,
     targets: &BTreeSet<String>,
     corrupt: &BTreeSet<String>,
     sealed: Option<&Tolerated>,
@@ -3169,7 +3179,7 @@ fn check_leaf(
             Descent::Present => {}
             Descent::Absent => {
                 if !held_by_hash(sealed, corrupt, hash, At::File) {
-                    if let Some(s) = reborrow_sink(&mut sink) { s(hash, true); }
+                    if let Some(s) = reborrow_sink(&mut sink) { s(hash, user); }
                 }
                 return Ok(());
             }
@@ -3201,7 +3211,7 @@ fn check_leaf(
         if !held_by_hash(sealed, corrupt, hash, At::File)
             && (corrupt.contains(hash) || !file_utils::raw_object_present(hash)?)
         {
-            s(hash, true);
+            s(hash, user);
         }
     }
 
@@ -4101,9 +4111,10 @@ mod tests {
         crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
-    /// heal records unavailable again only what the closing check met as a file's content: an
-    /// absent leaf is in `absent_files`, an absent tree beside it is absent but not file content.
-    /// Mutation: report every sink hash as file content → the tree is listed.
+    /// heal records unavailable again only what the closing check met as user file content: an
+    /// absent leaf is in `absent_files`; an absent tree beside it, and an absent leaf only meta
+    /// history reaches, are absent but not user file content. Mutation: report every sink hash as
+    /// file content → the tree is listed; ignore the walk's class → the meta leaf is listed.
     #[test]
     fn find_lost_objects_tells_absent_file_content_from_an_absent_tree() {
         use crate::model::tree_item::TreeItem;
@@ -4118,10 +4129,14 @@ mod tests {
         root.add_child(TreeItem::new("a.txt".to_string(), leaf.clone(), DirEntryType::Normal));
         root.add_child(TreeItem::new("sub".to_string(), sub_object.hash.clone(), DirEntryType::Tree));
         plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
+        let cell = object_utils::hash_object_bytes(&object_utils::blob_bytes(b"an absent meta cell"));
+        let mut meta = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        meta.add_child(TreeItem::new("cell".to_string(), cell.clone(), DirEntryType::Normal));
+        plant_head_over_tree(pallet_utils::PalletNamespace::Meta, "notes", &meta);
         file_utils::forget_cached_objects();
 
         let lost = find_lost_objects().unwrap();
-        let mut absent = vec![leaf.clone(), sub_object.hash.clone()];
+        let mut absent = vec![leaf.clone(), sub_object.hash.clone(), cell];
         absent.sort();
         assert_eq!(lost.absent.iter().cloned().collect::<Vec<_>>(), absent, "{:?}", lost);
         assert_eq!(lost.absent_files.iter().cloned().collect::<Vec<_>>(), vec![leaf], "{:?}", lost);

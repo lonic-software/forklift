@@ -10,6 +10,9 @@ use forklift_core::util::unavailable_heal::{self, RerecordError};
 use forklift_core::util::{config_utils, origin_utils, recovery_utils, sealed_utils, unavailable};
 use crate::output::{self, CommandOutput};
 
+/// The note of a re-record a check that could not read every source stopped.
+const UNRECORDED_SHORT: &str = "No absent object was recorded unavailable again: the check for lost objects could not read every source.";
+
 /// Handle the `heal` command: rebuild a damaged sealed-object record from the part before the
 /// damage (`forklift_core::util::sealed_utils::rebuild`), run the durability-taint recovery verb
 /// (`forklift_core::util::recovery_utils::run`), then settle an operation interrupted in this
@@ -29,11 +32,12 @@ use crate::output::{self, CommandOutput};
 /// the run a `ref_damaged` refusal (exit 53) carrying the whole report.
 ///
 /// A damaged record of content this warehouse cannot get is rebuilt first, from the entries that
-/// still read whole, a copy kept ([`unavailable::rebuild`]). Last, each lost absent object the
-/// configured remote's host withholds is recorded unavailable again
-/// ([`unavailable_heal::record_withheld_lost`]), then the check runs again; not in a partial
-/// warehouse whose origin record does not read. A remote that sends no response, or refuses, is
-/// handled as the origin is below.
+/// still read whole, a copy kept ([`unavailable::rebuild`]). Last, each lost absent user file
+/// content the configured remote's host withholds is recorded unavailable again
+/// ([`unavailable_heal::record_withheld_lost`]), then the check runs again; not when the
+/// warehouse's mode does not read, nor in a partial warehouse whose origin record does not read,
+/// nor over a check that could not read every source. A remote that sends no response, or
+/// refuses, is handled as the origin is below.
 ///
 /// Then, in a partial warehouse, it reads the origin record. In a cache whose check for lost
 /// objects read every source, it re-seals each lost absent object the origin's held history meets
@@ -295,9 +299,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             if found.degraded_sources.is_empty() {
                 Some(found.absent_files.clone())
             } else {
-                notes.push(
-                    "No absent object was recorded unavailable again: the check for lost objects could not read every source.".to_string()
-                );
+                notes.push(UNRECORDED_SHORT.to_string());
                 None
             }
         }
@@ -340,9 +342,11 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             if found.degraded_sources.is_empty() {
                 Some(found.absent.clone())
             } else {
-                notes.push(
-                    "No absent object was re-sealed from the origin: the check for lost objects could not read every source.".to_string()
-                );
+                // One note for both steps the short check stopped.
+                match notes.iter().position(|note| note == UNRECORDED_SHORT) {
+                    Some(at) => notes[at] = "No absent object was recorded unavailable again or re-sealed from the origin: the check for lost objects could not read every source.".to_string(),
+                    None => notes.push("No absent object was re-sealed from the origin: the check for lost objects could not read every source.".to_string()),
+                }
                 None
             }
         }
@@ -851,8 +855,8 @@ pub(crate) struct HealReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     resealed: Vec<String>,
 
-    /// Absent objects history still reaches that the record of content this warehouse cannot get
-    /// did not hold, which this run recorded in it again: the remote's host withholds each, so a
+    /// Absent user file content history still reaches that the record of content this warehouse
+    /// cannot get did not hold, which this run recorded in it again: the remote's host withholds each, so a
     /// checkout or an export leaves it out, as after the fetch. Its entry was lost, or this
     /// warehouse held a copy and lost it; heal cannot tell which.
     #[serde(skip_serializing_if = "Vec::is_empty")]

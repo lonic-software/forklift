@@ -17,7 +17,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   `heal` refused with exit 58 (`objects_lost`) and `git export` failed on the missing content; a
   damaged one also stopped every read of it, with no remedy named. Now `heal` rebuilds a damaged
   record from the entries that still read, keeping a copy of it (`unavailable_rebuilt` in `--json`),
-  and records again each absent object the remote's host still withholds (`recorded_unavailable`),
+  and records again each absent file the remote's host still withholds (`recorded_unavailable`),
   so checkouts and exports leave it out as after the fetch. A damaged record's error now names
   `forklift heal`.
 

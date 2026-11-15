@@ -2784,10 +2784,12 @@ A damaged record of content this warehouse cannot get (`.forklift/unavailable`, 
 out because the remote's host withholds it) is rebuilt next, from the entries that still read
 whole, and a copy of the damaged record is kept beside it (`unavailable_rebuilt` under `--json`,
 naming the copy and how many entries were kept and lines dropped). A record a newer Forklift wrote
-is left as it is. Last, each absent object history still reaches that no record holds and the
-configured remote's host still withholds is recorded unavailable again, exactly as a fetch records
-it, so a checkout or a `git export` leaves it out rather than failing on it
-(`recorded_unavailable`). Outside a taint, `heal` cannot tell an entry the record lost from a copy
+is left as it is. Last, each absent file content that user history still reaches, that no record
+holds and that the configured remote's host still withholds, is recorded unavailable again, as a
+fetch records it, so a checkout or a `git export` leaves it out rather than failing on it
+(`recorded_unavailable`). Nothing is recorded, and a `Note:` line says why, when the check for
+lost objects could not read every source, or whether this is a partial warehouse, or its origin
+record, could not be read. Outside a taint, `heal` cannot tell an entry the record lost from a copy
 this warehouse held and lost; either way the remote will not send it, and once the content is
 restored the entry is dropped. When the remote does not answer, nothing is recorded and a `Note:`
 line says so; run `heal` again once it does.
