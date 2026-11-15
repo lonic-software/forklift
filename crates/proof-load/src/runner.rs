@@ -392,7 +392,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
         // A listing that exited 0 but cannot be read fails the build: an empty list here would
         // let every readback pass whatever happened to the parks.
         let parked = parked_parcels(&listed.stdout).ok_or_else(|| RunError::Io(format!(
-            "scenario {}: `park list --json` printed no parked list: {}", scenario.id, String::from_utf8_lossy(&listed.stdout)
+            "scenario {}: `forklift park list --json` printed no parked list: {}", scenario.id, String::from_utf8_lossy(&listed.stdout)
         )))?;
         outcomes.push(listed);
         parked
