@@ -724,6 +724,37 @@ pub fn record_absences_under(roots: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Record each of `absent`, objects a caller found absent and judged held by the origin, that the
+/// record does not already hold: those alone, never anything beneath them, which [`record_absences_under`]
+/// would walk. What is already recorded is judged on the record as it is re-read under the ref lock
+/// this takes, so a concurrent writer's entry is not written twice. Synced when this returns, as
+/// [`append_locked`] is.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The entries this asked to add; one an applied redaction or the unavailable
+///                       record names is dropped by the append, never written.
+/// * `Err(String)`     - As [`append_locked`].
+pub fn record_held_absences(absent: &[String]) -> Result<Vec<String>, String> {
+    if absent.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let lock = RefLock::acquire()?;
+    let mut asked = Vec::new();
+
+    append_decided_locked(&lock, Entries::Claimed, |set| {
+        let mut written: HashSet<&str> = HashSet::new();
+        let ops: Vec<(SealOp, String)> = absent.iter()
+            .filter(|hash| !set.contains(hash) && written.insert(hash.as_str()))
+            .map(|hash| (SealOp::Record, hash.clone()))
+            .collect();
+        asked = ops.iter().map(|(_, hash)| hash.clone()).collect();
+        Ok(ops)
+    })?;
+
+    Ok(asked)
+}
+
 /// Remove the records of those of `filled` the record holds, under a ref lock it takes and
 /// releases. Unlike [`unseal`] this pushes nothing down, so the caller must have just made the
 /// whole closure of each present: every tree and file of it, not a part. Judged

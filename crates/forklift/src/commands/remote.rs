@@ -145,25 +145,30 @@ async fn check_and_rewrite(target: &str,
 
 /// Handle bare `remote`: report the configured remote, whether this is a partial warehouse and,
 /// for one, its origin, and what would stop a client talking to the remote from here (a move of
-/// the origin standing, a remote that is not the origin, or a partial warehouse's missing origin
-/// record). Reads only; takes no lock.
+/// the origin standing, a remote that is not the origin, or a partial warehouse's missing or
+/// damaged origin record). Reads only; takes no lock.
 ///
 /// # Returns
 /// * `Ok(())`      - The report was emitted.
-/// * `Err(String)` - The configuration, the fetch state, the origin record or a move's intent
-///   could not be read.
+/// * `Err(String)` - The configuration, the fetch state or a move's intent could not be read.
 pub fn show() -> Result<(), String> {
     let remote = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?.map(|(value, _)| value);
     let partial = scope_utils::content_may_be_absent()?;
-    let origin = if partial { origin_utils::read_origin()? } else { None };
+    // A damaged record is reported as the block it is, not as the show's own failure.
+    let recorded = if partial { Some(origin_utils::recorded_origin(None)) } else { None };
+    let origin = recorded.as_ref().and_then(|recorded| recorded.as_ref().ok().cloned());
 
     // A move of the origin standing stops every client first, remote or none. Past it, what
     // `checked_remote` refuses is what every client dialing the remote would; with no remote
-    // there is nothing to dial, and only a partial warehouse's missing origin is still damage.
+    // there is nothing to dial, and only a partial warehouse's missing or damaged origin is still
+    // damage.
     let blocked = if let Err(pending) = origin_move::ensure_none_pending() {
         Some(block_of(pending)?)
     } else if remote.is_none() {
-        if partial && origin.is_none() { Some(block_of(origin_utils::missing_origin_refusal())?) } else { None }
+        match recorded {
+            Some(Err(refused)) => Some(block_of(refused)?),
+            _ => None,
+        }
     } else {
         match origin_utils::checked_remote() {
             Ok(_) => None,
@@ -245,12 +250,13 @@ pub(crate) struct RemoteReport {
     partial: bool,
 
     /// A partial warehouse's origin, the one server proved to hold what it lacks; none for a full
-    /// warehouse, which may talk to any remote, and for a partial one whose record is missing.
+    /// warehouse, which may talk to any remote, and for a partial one whose record is missing or
+    /// damaged.
     origin: Option<String>,
 
     /// The refusal a command that dials the remote would meet from here; none when nothing stops
     /// it. With no remote configured, only a move of the origin standing or a partial warehouse's
-    /// missing origin record is reported.
+    /// missing or damaged origin record is reported.
     blocked: Option<RemoteBlock>,
 }
 
