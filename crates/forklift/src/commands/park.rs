@@ -86,9 +86,9 @@ pub async fn park_changes(name: Option<&str>, paths: &[String]) -> Result<(), St
     let anchor = file_utils::take_stat_anchor()?;
 
     if paths.is_empty() {
-        inventory_utils::refresh_tracked_entries(|path, hash| park_refusal(path, hash))?;
+        inventory_utils::refresh_tracked_entries(park_refusal)?;
     } else {
-        inventory_utils::refresh_tracked_entries_under(&paths, |path, hash| park_refusal(path, hash))?;
+        inventory_utils::refresh_tracked_entries_under(&paths, park_refusal)?;
     }
 
     // In a scoped (sparse) bay the inventory holds only the in-scope subtree(s); splice it
@@ -1258,9 +1258,12 @@ mod tests {
         assert_eq!(park_utils::read_parked().unwrap()[0].parcel, parked.parcel);
     }
 
+    /// A flat folder's files, each a name and its content.
+    type Files<'a> = &'a [(&'a str, &'a [u8])];
+
     /// Store a tree of `folders` (each a name and its flat files) beside the flat `files`; returns
     /// the tree's hash.
-    fn store_folders(folders: &[(&str, &[(&str, &[u8])])], files: &[(&str, &[u8])]) -> String {
+    fn store_folders(folders: &[(&str, Files)], files: Files) -> String {
         use forklift_core::enums::dir_entry_type::DirEntryType;
         use forklift_core::model::tree_item::TreeItem;
 
