@@ -1729,8 +1729,8 @@ forklift park drop [<name>]   # discard the park without applying it
 parcel and resets the warehouse to the pallet head (untracked files are left
 alone). Given paths, `park` parks and resets only the changes at or under them: every other
 file keeps its working content and its staging, and the parked parcel holds the pallet head
-everywhere else. A path that names nothing in the head, the work in progress or the working
-directory refuses, and so does one outside a scoped bay's scope. A path spelled like a
+everywhere else. A path where no tracked file or folder is, in the head or in the work in progress,
+refuses (an untracked file is never parked), and so does one outside a scoped bay's scope. A path spelled like a
 subcommand is written `./list`. `park apply` and `park pop` re-apply a park's changes as a clean re-apply
 — it must be applied onto the head it was parked on, or it reports a conflict. If
 staging the re-applied changes fails, the parcel stays parked, and the error says that the
