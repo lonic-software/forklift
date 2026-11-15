@@ -163,7 +163,7 @@ pub fn repair_withheld(header_damaged: bool) -> Result<Repaired, String> {
 
     // A copy aside, then the record replaced: never a moment without one.
     let set_aside = match &bytes {
-        Some(bytes) => Some(copy_aside(&path, bytes)?),
+        Some(bytes) => Some(file_utils::copy_aside(&path, bytes)?),
         None => None,
     };
 
@@ -173,34 +173,6 @@ pub fn repair_withheld(header_damaged: bool) -> Result<Repaired, String> {
     let (absent, absent_other) = absent;
 
     Ok(Repaired { set_aside, salvaged, placeholders, unreadable_lines, absent, absent_other, warehouse })
-}
-
-/// Keep `bytes`, the damaged record at `path`, beside it under a name no earlier repair took: an
-/// earlier copy may hold the only words of a lost statement. Only under the serve and ref locks,
-/// so no other repair picks a name meanwhile.
-fn copy_aside(path: &std::path::Path, bytes: &[u8]) -> Result<PathBuf, String> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or_default();
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-
-    for attempt in 0u32.. {
-        let target = path.with_file_name(match attempt {
-            0 => format!("{}.damaged-{}", name, stamp),
-            n => format!("{}.damaged-{}-{}", name, stamp, n),
-        });
-        match std::fs::symlink_metadata(&target) {
-            Ok(_) => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                file_utils::replace_file_atomically(&target, bytes)?;
-                return Ok(target);
-            }
-            Err(e) => return Err(format!("Error while reading \"{}\": {}", target.to_string_lossy(), e)),
-        }
-    }
-
-    unreachable!("a free name is found before the counter runs out")
 }
 
 /// Every entry of a damaged record that still reads whole, and each hash kept with the

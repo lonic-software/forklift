@@ -36,6 +36,7 @@ pub mod applied_redactions;
 pub mod withholding;
 pub mod withheld_repair;
 pub mod unavailable;
+pub mod unavailable_heal;
 pub mod redaction_deleter;
 pub mod cherry_pick_utils;
 pub mod pallet_utils;

@@ -24,8 +24,9 @@
 //! makes the entry Conflicted, and nothing takes it out of Conflicted. The record is written whole and atomically under the [`RefLock`],
 //! re-read under that lock first, so two writers never drop each other's entries. A record this
 //! build cannot read, of another version or with an entry that is not a hash and a statement,
-//! fails every read and is never written over: a hash it lists must never read as damage, nor a
-//! root lacking it as whole.
+//! fails every read: a hash it lists must never read as damage, nor a root lacking it as whole.
+//! No writer writes over it, except `heal`'s [`rebuild`] of a damaged one, which keeps a copy and
+//! every entry that still reads; one a newer Forklift wrote is never written over.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -119,31 +120,130 @@ pub fn read_unavailable() -> Result<UnavailableSet, String> {
     };
 
     let entries = record_utils::from_bytes(&bytes, UNAVAILABLE_RECORD, UNAVAILABLE_VERSION).map_err(|e| format!(
-        "The record of content this warehouse cannot get \"{}\" {} This version of Forklift never writes over it.",
-        path.to_string_lossy(), e.describe()
+        "The record of content this warehouse cannot get \"{}\" {} {}",
+        path.to_string_lossy(), e.describe(), match &e {
+            record_utils::RecordError::OtherVersion(header) if newer_version(header) =>
+                "This version of Forklift never writes over it.",
+            _ => "\"forklift heal\" rebuilds it from the entries that still read.",
+        }
     ))?;
 
     let mut set = UnavailableSet::default();
 
     for entry in entries {
-        let parsed = entry.split_once(' ')
-            .and_then(|(hash, rest)| rest.split_once(' ').map(|(column, statement)| (hash, column, statement)))
-            .and_then(|(hash, column, statement)| Some((hash, ChunkDigest::parse_column(column)?, statement)));
-
-        match parsed {
-            Some((hash, digest, statement)) if object_utils::is_object_hash(hash) && withholding::valid_statement(statement) => {
-                set.entries.insert(hash.to_string(), UnavailableEntry { statement: statement.to_string(), digest });
-            }
-            _ => return Err(format!(
+        match parse_entry(&entry) {
+            Some((hash, parsed)) => { set.entries.insert(hash, parsed); }
+            None => return Err(format!(
                 "The record of content this warehouse cannot get \"{}\" holds an entry that is not an \
-                object hash, a chunk-list digest and a statement: \"{}\". This version of Forklift never \
-                writes over it.",
+                object hash, a chunk-list digest and a statement: \"{}\". \"forklift heal\" rebuilds it \
+                from the entries that still read.",
                 path.to_string_lossy(), entry.escape_debug()
             )),
         }
     }
 
     Ok(set)
+}
+
+/// One unescaped entry of the record, `<hash> <digest> <statement>`, when it is one.
+fn parse_entry(entry: &str) -> Option<(String, UnavailableEntry)> {
+    let (hash, rest) = entry.split_once(' ')?;
+    let (column, statement) = rest.split_once(' ')?;
+    let digest = ChunkDigest::parse_column(column)?;
+
+    (object_utils::is_object_hash(hash) && withholding::valid_statement(statement))
+        .then(|| (hash.to_string(), UnavailableEntry { statement: statement.to_string(), digest }))
+}
+
+/// What [`rebuild`] did with a damaged record.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Rebuilt {
+    /// Where the damaged record was copied to.
+    pub set_aside: PathBuf,
+    /// How many entries still read whole and were kept.
+    pub kept: usize,
+    /// How many lines did not read whole and were dropped.
+    pub dropped: usize,
+}
+
+/// Rebuild a damaged record from the entries that still read whole, under the ref lock this takes,
+/// first copying the damaged record beside it ([`file_utils::copy_aside`]). An entry records only
+/// what a fetch saw a remote's host withhold, and `heal` records again each absent object history
+/// still reaches that its remote withholds ([`crate::util::unavailable_heal`]), so a dropped entry
+/// costs only content no remote vouches for any more. A line is whole only when it is valid
+/// UTF-8, its escapes read, it ends in its newline, and it parses as an entry: a record cut inside
+/// its last entry would otherwise keep an altered statement.
+///
+/// A record whose header names a newer version of it is not damage, and is left as it is.
+///
+/// # Returns
+/// * `Ok(Some(Rebuilt))` - The record was damaged, and is rebuilt.
+/// * `Ok(None)`          - There is no record, it reads, or a newer Forklift wrote it.
+/// * `Err(String)`       - The record could not be read or written, or this thread holds the ref
+///                         lock already.
+pub fn rebuild() -> Result<Option<Rebuilt>, String> {
+    if RefLock::held_by_this_thread() {
+        return Err("The record of content this warehouse cannot get is not rebuilt while this thread holds the ref lock.".to_string());
+    }
+
+    let lock = RefLock::acquire()?;
+    let path = unavailable_path();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
+    };
+
+    if read_unavailable().is_ok() {
+        return Ok(None);
+    }
+    if let Err(record_utils::RecordError::OtherVersion(header)) = record_utils::from_bytes(&bytes, UNAVAILABLE_RECORD, UNAVAILABLE_VERSION) {
+        if newer_version(&header) {
+            return Ok(None);
+        }
+    }
+
+    let (set, dropped) = salvage(&bytes);
+    let set_aside = file_utils::copy_aside(&path, &bytes)?;
+    write_locked(&lock, &set)?;
+
+    Ok(Some(Rebuilt { set_aside, kept: set.entries.len(), dropped }))
+}
+
+/// Whether `header` is this record's header at a version newer than this build's, written as
+/// Forklift writes one: the tag, one space, and a number without a leading zero.
+fn newer_version(header: &str) -> bool {
+    header.strip_prefix(&format!("/forklift-{} ", UNAVAILABLE_RECORD))
+        .and_then(|text| text.parse::<u32>().ok().filter(|version| version.to_string() == text))
+        .is_some_and(|version| version > UNAVAILABLE_VERSION)
+}
+
+/// Every entry of a damaged record that reads whole (see [`rebuild`]), and how many lines did not.
+/// A first line that opens as a record header is skipped.
+fn salvage(bytes: &[u8]) -> (UnavailableSet, usize) {
+    let mut set = UnavailableSet::default();
+    let mut dropped = 0;
+
+    let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    for (index, raw) in lines.iter().enumerate() {
+        if raw.is_empty() || (index == 0 && raw.starts_with(b"/forklift-")) {
+            continue;
+        }
+
+        // The piece after the last newline is a line the record was cut inside.
+        let terminated = index + 1 < lines.len();
+        let parsed = std::str::from_utf8(raw).ok()
+            .filter(|_| terminated)
+            .and_then(record_utils::unescape)
+            .and_then(|entry| parse_entry(&entry));
+
+        match parsed {
+            Some((hash, entry)) => { set.entries.insert(hash, entry); }
+            None => dropped += 1,
+        }
+    }
+
+    (set, dropped)
 }
 
 /// How many of the record's entries the store lacks: content its history may name that this
