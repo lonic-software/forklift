@@ -598,4 +598,92 @@ mod tests {
 
         assert!(drop_present().is_err());
     }
+
+    /// The record's bytes as `record` writes them for A and B.
+    fn recorded_bytes() -> Vec<u8> {
+        record([(A.to_string(), "DMCA notice 1".to_string()), (B.to_string(), "court order 7".to_string())]).unwrap();
+        std::fs::read(unavailable_path()).unwrap()
+    }
+
+    /// Every file beside the record that `rebuild` set aside.
+    fn set_aside_copies() -> Vec<PathBuf> {
+        std::fs::read_dir(unavailable_path().parent().unwrap()).unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with("unavailable.damaged-"))
+            .collect()
+    }
+
+    // Revert: drop a line check → the line that is not an entry or not UTF-8 is kept, or the rebuild
+    // fails on it; drop the copy aside → no copy of the damaged bytes is kept.
+    #[test]
+    fn a_damaged_record_is_rebuilt_from_its_whole_entries_and_kept_aside() {
+        let _scratch = Scratch::new("rebuild");
+        let mut bytes = recorded_bytes();
+        bytes.extend_from_slice(b"not an entry\n\xff\xfe broken\n");
+        std::fs::write(unavailable_path(), &bytes).unwrap();
+        assert!(read_unavailable().is_err());
+
+        let rebuilt = rebuild().unwrap().unwrap();
+        assert_eq!((rebuilt.kept, rebuilt.dropped), (2, 2));
+        assert_eq!(std::fs::read(&rebuilt.set_aside).unwrap(), bytes);
+        let set = read_unavailable().unwrap();
+        assert_eq!(set.statement(A), Some("DMCA notice 1"));
+        assert_eq!(set.statement(B), Some("court order 7"));
+        assert_eq!(rebuild().unwrap(), None, "a rebuilt record reads");
+    }
+
+    // Revert: keep an unterminated last line → B is kept with a statement cut short.
+    #[test]
+    fn a_record_cut_inside_its_last_entry_drops_that_entry() {
+        let _scratch = Scratch::new("cut");
+        let bytes = recorded_bytes();
+        std::fs::write(unavailable_path(), &bytes[..bytes.len() - 3]).unwrap();
+
+        let rebuilt = rebuild().unwrap().unwrap();
+        assert_eq!((rebuilt.kept, rebuilt.dropped), (1, 1));
+        let set = read_unavailable().unwrap();
+        assert!(set.contains(A) && !set.contains(B));
+    }
+
+    // Revert: rebuild a record no line of which reads into an empty one → it is written, not
+    // removed.
+    #[test]
+    fn a_record_with_no_whole_entry_is_removed_and_kept_aside() {
+        let _scratch = Scratch::new("zeroed");
+        let length = recorded_bytes().len();
+        std::fs::write(unavailable_path(), vec![0u8; length]).unwrap();
+
+        let rebuilt = rebuild().unwrap().unwrap();
+        assert_eq!((rebuilt.kept, rebuilt.dropped), (0, 1));
+        assert!(!unavailable_path().exists());
+        assert_eq!(set_aside_copies(), vec![rebuilt.set_aside]);
+    }
+
+    // Revert: drop the newer-version check → a newer Forklift's record is rewritten as this one's;
+    // drop the readable check → a whole record is copied aside and rewritten.
+    #[test]
+    fn a_readable_missing_or_newer_record_is_left_as_it_is() {
+        let _scratch = Scratch::new("left");
+        assert_eq!(rebuild().unwrap(), None);
+
+        let bytes = recorded_bytes();
+        assert_eq!(rebuild().unwrap(), None);
+        assert_eq!(std::fs::read(unavailable_path()).unwrap(), bytes);
+
+        let newer = record_utils::to_bytes(UNAVAILABLE_RECORD, UNAVAILABLE_VERSION + 1, [format!("{} - statement", A)]);
+        std::fs::write(unavailable_path(), &newer).unwrap();
+        assert_eq!(rebuild().unwrap(), None);
+        assert_eq!(std::fs::read(unavailable_path()).unwrap(), newer);
+        assert!(set_aside_copies().is_empty());
+        assert!(read_unavailable().unwrap_err().contains("never writes over it"));
+    }
+
+    // Revert: drop the own-hold check → the rebuild waits on this thread's own ref lock forever.
+    #[test]
+    fn a_rebuild_refuses_under_this_threads_ref_lock() {
+        let _scratch = Scratch::new("rebuild-own-lock");
+        let _lock = RefLock::acquire().unwrap();
+
+        assert!(rebuild().is_err());
+    }
 }
