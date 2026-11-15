@@ -248,7 +248,12 @@ step names:
 - **Re-create the warehouse with this build** when the pack folder holds an index another build of
   Forklift wrote. **Do not** move that index aside, which makes its objects read as missing.
 - **Run `forklift heal` again** when the message says another process held the store, so the
-  indexes were not rebuilt this run.
+  indexes were not rebuilt this run, or, in a cache, when its origin did not answer.
+
+In a cache, `heal` first records again as held by hash each lost absent object its origin's held
+history reaches (`details.resealed`), so a read fetches it again; what that history does not reach,
+or the origin's host withholds, stays lost. With the origin record also missing or damaged, a note
+names the move that records it again, after which `heal` re-seals.
 
 Every other repair in the run still landed: a lost ref rebuilt before the refusal stays rebuilt.
 
@@ -519,8 +524,10 @@ A partial clone was pointed at a remote other than the one it was cloned from. O
 known to hold what it lacks. Set `remote.url` back to the origin the message names, or use
 [`remote move`](cli.md#remote-move-and-remote-abort--move-a-partial-warehouse-to-another-origin) to move the origin properly. `config` cannot change the origin.
 
-If the message says the origin record is missing, the `.forklift` folder is damaged: name a server
-holding this warehouse's content with `forklift remote move <url>`, or clone afresh.
+If the message says the origin record is missing or damaged, the `.forklift` folder is damaged:
+run the move the next step names, which records the configured remote as the origin once it checks
+that server holds this warehouse's content, or clone afresh. `heal` refuses with this code too when
+nothing else is wrong.
 
 ### `origin_move_pending` (exit 37)
 

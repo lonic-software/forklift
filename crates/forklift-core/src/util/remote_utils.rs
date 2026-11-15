@@ -2453,6 +2453,30 @@ use clients::{Clients, Posture, RequestDestination, SendBody, SendOutcome, Unbou
 /// reported beside it.
 type HandshakeWithheld = BTreeMap<String, (String, Option<String>)>;
 
+/// Why [`RemoteClient::fetch_info_answered`] got no handshake.
+#[derive(Debug)]
+pub enum HandshakeError {
+    /// No response came back at all: the connection was refused, reset or timed out, the name did
+    /// not resolve, or the headers never arrived.
+    NoResponse(String),
+    /// Anything else: a refusing status, a protocol version or a trust anchor this build cannot
+    /// use, a protocol violation, or an answer that could not be read.
+    Answered(String),
+}
+
+impl From<String> for HandshakeError {
+    fn from(why: String) -> Self {
+        HandshakeError::Answered(why)
+    }
+}
+
+impl From<HandshakeError> for String {
+    fn from(error: HandshakeError) -> Self {
+        match error {
+            HandshakeError::NoResponse(why) | HandshakeError::Answered(why) => why,
+        }
+    }
+}
 /// The remote endpoint: base URL, optional bearer token, and the HTTP clients — see the
 /// [`clients`] module's own doc for why there is more than one of them and why they are not fields here
 /// any more.
@@ -2792,7 +2816,8 @@ impl RemoteClient {
     /// # Returns
     /// * `Ok(RemoteClient)` - The client.
     /// * `Err(CoreError)`   - No remote is configured, a partial warehouse's remote is not its
-    ///   origin or it has none (`non_origin_remote`), or the client could not be built.
+    ///   origin or its origin record is missing or damaged (`non_origin_remote`), or the client
+    ///   could not be built.
     pub fn for_warehouse() -> Result<RemoteClient, CoreError> {
         let (url, token) = origin_utils::checked_remote()?;
 
@@ -3433,16 +3458,30 @@ impl RemoteClient {
     /// walk through this client, or any clone of it, leaves out the content the handshake lists
     /// withheld by the remote's host ([`Self::leave_out_withheld`]).
     pub async fn fetch_info(&self) -> Result<WarehouseInfo, String> {
+        self.fetch_info_answered().await.map_err(String::from)
+    }
+
+    /// [`Self::fetch_info`], telling a remote that sent no response at all from every other
+    /// failure ([`HandshakeError`]), for a caller whose remedy differs between the two.
+    pub async fn fetch_info_answered(&self) -> Result<WarehouseInfo, HandshakeError> {
         let posture = Posture::BoundedReads;
         let outcome = self.send_waiting_out(
             posture, reqwest::Method::GET, "/v1/warehouse", SendBody::Empty, "the handshake"
         ).await?;
+        let unanswered = match &outcome {
+            // A request that could not be built never left, and a redirect the policy refused was
+            // an answer; every other transport failure is one no response came back from, however
+            // far the request got.
+            SendOutcome::Transport(e) => !e.is_builder() && !e.is_redirect(),
+            SendOutcome::HeadWaitExpired { .. } => true,
+            SendOutcome::Sent(_) => false,
+        };
         let response = self.response_from_send(
             &format!("reaching the remote {}", self.base), posture, outcome
-        )?;
+        ).map_err(|why| if unanswered { HandshakeError::NoResponse(why) } else { HandshakeError::Answered(why) })?;
 
         if !response.status().is_success() {
-            return Err(self.error_of(response, "the handshake").await);
+            return Err(self.error_of(response, "the handshake").await.into());
         }
 
         let info: WarehouseInfo = self.read_json(
@@ -3455,7 +3494,7 @@ impl RemoteClient {
                 "The remote speaks protocol version \"{}\", this build speaks \"{}\". \
                 Update the older side.",
                 info.protocol, PROTOCOL_VERSION
-            ));
+            ).into());
         }
 
         if let Some(trust) = &info.trust {
@@ -3469,7 +3508,7 @@ impl RemoteClient {
         // as held and sent back as a ref's head, so it is held to the same spelling.
         let tombstone_heads = info.tombstones.iter().flat_map(|tombstones| tombstones.values());
         if info.pallets.values().chain(tombstone_heads).any(|head| !object_utils::is_object_hash(head)) {
-            return Err(CoreError::refusal(
+            return Err(HandshakeError::Answered(CoreError::refusal(
                 RefusalCode::RemoteProtocolViolation,
                 format!(
                     "The remote {} reports a pallet head that is not an object hash (64 lowercase \
@@ -3477,7 +3516,7 @@ impl RemoteClient {
                     self.base
                 ),
                 "Report it to whoever runs the remote; retrying gets the same answer.",
-            ).into());
+            ).into()));
         }
 
         self.leave_out_withheld(&info);

@@ -108,24 +108,26 @@ pub fn checked_remote_by_mode() -> Result<(String, Option<String>), CoreError> {
     checked_remote_for(|| Ok(crate::util::warehouse_utils::warehouse_mode()? != crate::util::warehouse_utils::WarehouseMode::Full))
 }
 
-/// [`checked_remote`], with `partial` saying whether the warehouse may lack content, read only
-/// once a remote is known to be configured.
+/// [`checked_remote`], with `partial` saying whether the warehouse may lack content. With no remote
+/// configured, it is read only to name the recorded origin, and a failure to read it names none.
 fn checked_remote_for(partial: impl FnOnce() -> Result<bool, String>) -> Result<(String, Option<String>), CoreError> {
     // A move of the origin is checking the new server against what this warehouse holds, or has
     // started rewriting which remote that is: no client talks to either until it finishes.
     origin_move::ensure_none_pending()?;
 
-    let url = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?
-        .map(|(value, _)| value)
-        .ok_or_else(|| format!(
-            "No remote is configured for this warehouse. Set one with \"forklift config set {} <url>\".",
-            config_utils::KEY_REMOTE_URL
-        ))?;
+    let configured = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?.map(|(value, _)| value);
+
+    let Some(url) = configured else {
+        // A partial warehouse whose origin reads can name the one remote it may be pointed at.
+        let recorded = if partial().unwrap_or(false) { read_origin().ok().flatten() } else { None };
+        return Err(format!(
+            "No remote is configured for this warehouse. Set one with \"forklift config set {} {}\".",
+            config_utils::KEY_REMOTE_URL, recorded.as_deref().unwrap_or("<url>")
+        ).into());
+    };
 
     if partial()? {
-        let Some(origin) = read_origin()? else {
-            return Err(missing_origin_refusal());
-        };
+        let origin = recorded_origin(Some(&url))?;
 
         if !same_remote(&url, &origin) {
             return Err(non_origin_remote_refusal(&origin, &url));
@@ -167,12 +169,25 @@ pub fn non_origin_remote_refusal(origin: &str, other: &str) -> CoreError {
     )
 }
 
+/// The origin a partial warehouse records, or the `non_origin_remote` refusal a missing or damaged
+/// record earns ([`missing_origin_refusal`], [`damaged_origin_refusal`]).
+///
+/// # Arguments
+/// * `configured` - The configured `remote.url`, which the refusal's next step names when set.
+pub fn recorded_origin(configured: Option<&str>) -> Result<String, CoreError> {
+    match read_origin() {
+        Ok(Some(origin)) => Ok(origin),
+        Ok(None) => Err(missing_origin_refusal(configured)),
+        Err(why) => Err(damaged_origin_refusal(&why, configured)),
+    }
+}
+
 /// The `non_origin_remote` refusal for a partial warehouse with no origin recorded, which only a
 /// damaged `.forklift` can be: preparing a partial warehouse writes the origin before its marker.
-pub fn missing_origin_refusal() -> CoreError {
-    let next_step = "Record the origin with \"forklift remote move <url>\", naming a server that holds \
-        this warehouse's content, or clone the remote again into a new directory.";
-
+///
+/// # Arguments
+/// * `configured` - The configured `remote.url`, which the next step names when set.
+pub fn missing_origin_refusal(configured: Option<&str>) -> CoreError {
     CoreError::refusal(
         RefusalCode::NonOriginRemote,
         format!(
@@ -181,7 +196,34 @@ pub fn missing_origin_refusal() -> CoreError {
             warehouse does not; nothing was changed.",
             FILE_NAME
         ),
-        next_step,
+        record_again_step(configured),
+    )
+}
+
+/// The `non_origin_remote` refusal for a partial warehouse whose origin record cannot be read.
+///
+/// # Arguments
+/// * `why`        - Why the record cannot be read, as [`read_origin`] says.
+/// * `configured` - The configured `remote.url`, which the next step names when set.
+pub fn damaged_origin_refusal(why: &str, configured: Option<&str>) -> CoreError {
+    CoreError::refusal(
+        RefusalCode::NonOriginRemote,
+        format!(
+            "This is a partial warehouse, but its origin record cannot be read ({}), so Forklift \
+            cannot tell which remote holds the content this warehouse does not; nothing was changed.",
+            why.trim_end_matches('.')
+        ),
+        record_again_step(configured),
+    )
+}
+
+/// The next step that records the origin again: a move to the configured remote, which checks
+/// that server holds this warehouse's content before it records it.
+fn record_again_step(configured: Option<&str>) -> String {
+    format!(
+        "Record the origin again with \"forklift remote move {}\", naming a server that holds this \
+        warehouse's content, or clone the remote again into a new directory.",
+        configured.map(|url| url.trim_end_matches('/')).unwrap_or("<url>")
     )
 }
 

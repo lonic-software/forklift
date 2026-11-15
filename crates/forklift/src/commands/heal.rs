@@ -4,7 +4,9 @@ use forklift_core::util::scope_heal::{self, ScopeRebuilt};
 use forklift_core::util::operation_utils::{self, RecoveryOutcome};
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::util::ref_heal::{self, Pass};
-use forklift_core::util::{recovery_utils, sealed_utils, unavailable};
+use forklift_core::util::reseal_utils::{self, ResealError};
+use forklift_core::util::warehouse_utils::{self, WarehouseMode};
+use forklift_core::util::{config_utils, origin_utils, recovery_utils, sealed_utils, unavailable};
 use crate::output::{self, CommandOutput};
 
 /// Handle the `heal` command: rebuild a damaged sealed-object record from the part before the
@@ -24,6 +26,15 @@ use crate::output::{self, CommandOutput};
 /// before the operation recovery, whose landed test reads the rebuilt ref. `--ref` and
 /// `--remove-ref` settle damaged refs the user chose for, first. A damaged ref left standing makes
 /// the run a `ref_damaged` refusal (exit 53) carrying the whole report.
+///
+/// Last, in a partial warehouse, it reads the origin record. In a cache whose check for lost
+/// objects read every source, it re-seals each lost absent object the origin's held history meets
+/// ([`reseal_utils::reseal_held`]), then checks again. An origin that sends no response leaves the
+/// lost objects lost and names running heal again. A coded refusal, the origin's trust among them,
+/// is the run's own, carrying the report unless it has details of its own; any other failure is a
+/// note on the `objects_lost` refusal. A missing or damaged origin record, with nothing else standing,
+/// makes the run a `non_origin_remote` refusal (exit 11) carrying the whole report. With objects
+/// lost, it becomes a note naming the move that records the origin again.
 ///
 /// See `recovery_utils`'s module doc comment for
 /// the full per-verdict behavior (restage, the closure walk, partial clears); this handler's job
@@ -218,7 +229,72 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
 
     // Last, once every repair before it has run: what a durable ref still reaches and this store
     // cannot give back. A walk that cannot finish claims nothing lost.
-    let lost = recovery_utils::find_lost_objects();
+    let mut lost = recovery_utils::find_lost_objects();
+
+    // A partial warehouse leans on its origin for what it lacks, so a missing or damaged record of
+    // it is damage heal names, even with nothing lost.
+    let mode = match warehouse_utils::warehouse_mode() {
+        Ok(mode) => Some(mode),
+        Err(why) => {
+            notes.push(format!(
+                "Whether this is a partial warehouse could not be read, so its origin record was not checked and nothing was re-sealed from the origin: {}",
+                why.trim_end_matches('.')
+            ));
+            None
+        }
+    };
+    let configured = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL).ok().flatten().map(|(url, _)| url);
+    let origin = match mode {
+        Some(WarehouseMode::Full) | None => None,
+        Some(_) => Some(origin_utils::recorded_origin(configured.as_deref())),
+    };
+
+    // In a cache, an absent object the sealed record lost may be one the origin still holds:
+    // recorded again, a read refills it on demand. Only once the origin's record reads, and only
+    // over a check that read every source, since a short one may call held objects absent.
+    let mut resealed: Vec<String> = Vec::new();
+    let mut origin_unanswered = false;
+    let mut reseal_refused: Option<CoreError> = None;
+    let reseal_from = match (&lost, mode, &origin) {
+        (Ok(found), Some(WarehouseMode::Cache), Some(Ok(_))) if !found.absent.is_empty() => {
+            if found.degraded_sources.is_empty() {
+                Some(found.absent.clone())
+            } else {
+                notes.push(
+                    "No absent object was re-sealed from the origin: the check for lost objects could not read every source.".to_string()
+                );
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(absent) = reseal_from {
+        match reseal_utils::reseal_held(&absent, store_access).await {
+            Ok(done) => {
+                notes.extend(done.notes);
+                if !done.recorded.is_empty() {
+                    resealed = done.recorded;
+                    lost = recovery_utils::find_lost_objects();
+                }
+            }
+            Err(ResealError::NoResponse(why)) => {
+                origin_unanswered = true;
+                notes.push(format!(
+                    "The origin did not answer, so no absent object it may still hold was re-sealed: {}",
+                    why.trim_end_matches('.')
+                ));
+            }
+            // A coded refusal is the run's own, with its next step, once the report is built; its
+            // step clears it, and heal can run again after. Anything else is a note.
+            Err(ResealError::Refused(why)) => match CoreError::from(why) {
+                refused @ CoreError::Refusal { .. } => reseal_refused = Some(refused),
+                other => notes.push(format!(
+                    "No absent object was re-sealed from the origin: {}",
+                    String::from(other).trim_end_matches('.')
+                )),
+            },
+        }
+    }
     if let Ok(lost) = &lost {
         if lost.damaged_unreached > 0 {
             notes.push(format!(
@@ -256,6 +332,26 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         _ => None,
     };
 
+    // The origin's refusal is the run's own only when nothing else stands; otherwise it is a note,
+    // since a move to restore the record checks that server holds everything listed lost.
+    let origin_refused = match origin {
+        Some(Err(refused)) => Some(refused),
+        _ => None,
+    };
+    if origin_refused.is_some() && (objects_lost.is_some() || lost.is_err() || !refs_refused.is_empty()) {
+        let url = configured.as_deref().map(|url| url.trim_end_matches('/')).unwrap_or("<url>");
+        notes.push(match (mode, &objects_lost) {
+            (Some(WarehouseMode::Cache), Some(_)) => format!(
+                "The origin record is missing or damaged. \"forklift remote move {}\" records it again only if that server holds every object listed lost, after which heal re-seals them.",
+                url
+            ),
+            _ => format!(
+                "The origin record is missing or damaged. \"forklift remote move {}\" records it again once it checks that server holds this warehouse's content.",
+                url
+            ),
+        });
+    }
+
     let report = HealReport {
         record_rebuilt,
         fetch_scope_rebuilt: scope_rebuilt,
@@ -267,6 +363,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         unsealed: unsealed.removed,
         newly_held_by_hash: unsealed.pushed_down,
         unseal_failed,
+        resealed,
         refs_rebuilt,
         refs_removed,
         refs_refused,
@@ -288,7 +385,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         return Err(unfinished);
     }
 
-    if report.refs_refused.is_empty() && report.objects_lost.is_none() {
+    if report.refs_refused.is_empty() && report.objects_lost.is_none() && origin_refused.is_none() {
         output::emit(&report);
         return Ok(());
     }
@@ -298,7 +395,16 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     }
 
     if let Some(lost) = &report.objects_lost {
-        return Err(objects_lost_refusal(&report, lost, outcome.index_rebuild_skipped).into());
+        if let Some(refused) = reseal_refused {
+            return Err(with_report(&report, refused, objects_lost_lines(&report, lost)).into());
+        }
+        return Err(objects_lost_refusal(&report, lost, outcome.index_rebuild_skipped || origin_unanswered).into());
+    }
+
+    if report.refs_refused.is_empty() {
+        if let Some(refused) = origin_refused {
+            return Err(with_report(&report, refused, Vec::new()).into());
+        }
     }
 
     Err(ref_refusal(&report, None).into())
@@ -412,12 +518,7 @@ impl ObjectsLost {
 /// The `objects_lost` refusal of a run that found reachable objects the store cannot give back,
 /// carrying the whole report. A damaged ref left standing is listed too.
 fn objects_lost_refusal(report: &HealReport, lost: &ObjectsLost, rebuild_skipped: bool) -> CoreError {
-    let mut lines = lost.lines();
-    if !report.refs_refused.is_empty() {
-        if let CoreError::Refusal { message, .. } = ref_refusal(report, None) {
-            lines.push(message);
-        }
-    }
+    let lines = objects_lost_lines(report, lost);
 
     let next_step = if lost.foreign_index {
         "re-create the warehouse with this build of Forklift: the pack folder holds an index another build wrote"
@@ -433,6 +534,49 @@ fn objects_lost_refusal(report: &HealReport, lost: &ObjectsLost, rebuild_skipped
         next_step,
         serde_json::json!(report),
     )
+}
+
+/// The lines of an `objects_lost` refusal: what was lost, then a damaged ref left standing.
+fn objects_lost_lines(report: &HealReport, lost: &ObjectsLost) -> Vec<String> {
+    let mut lines = lost.lines();
+    if !report.refs_refused.is_empty() {
+        if let CoreError::Refusal { message, .. } = ref_refusal(report, None) {
+            lines.push(message);
+        }
+    }
+    lines
+}
+
+/// A refusal the origin's record or the origin itself made, as the run's own, followed by `also`,
+/// what else the run leaves standing, and carrying the whole report. Details of its own, which its
+/// remedy may read, are kept, with each report field they do not name added beside them. This
+/// run's repairs stand, so its "nothing was changed" is dropped.
+fn with_report(report: &HealReport, refused: CoreError, also: Vec<String>) -> CoreError {
+    let CoreError::Refusal { code, message, next_step, details } = refused else {
+        return refused;
+    };
+
+    let mut lines = vec![match message.strip_suffix("; nothing was changed.") {
+        Some(described) => format!("{}.", described),
+        None => message,
+    }];
+    lines.extend(also);
+
+    let report = serde_json::json!(report);
+    let details = match details {
+        Some(serde_json::Value::Object(mut own)) => {
+            if let serde_json::Value::Object(fields) = report {
+                for (field, value) in fields {
+                    own.entry(field).or_insert(value);
+                }
+            }
+            serde_json::Value::Object(own)
+        }
+        Some(other) => other,
+        None => report,
+    };
+
+    CoreError::refusal_with_details(code, lines.join("\n"), next_step, details)
 }
 
 /// The `ref_damaged` refusal of a run that left a damaged ref standing, carrying the whole report.
@@ -614,6 +758,12 @@ pub(crate) struct HealReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     unseal_failed: Option<String>,
 
+    /// Absent objects of a cache warehouse whose sealed-object records were lost, which this run
+    /// recorded again as held by the origin: a local walk of the history the origin holds names
+    /// each, so a read fetches it from there again.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    resealed: Vec<String>,
+
     /// Pallet refs that were lost or damaged and this run set: rebuilt at the head the evidence
     /// agreed on, or set to the parcel `--ref` gave.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -738,7 +888,7 @@ impl CommandOutput for HealReport {
                 }
             }
         } else if self.operation.is_none() && self.unsealed.is_empty() && self.newly_held_by_hash.is_empty()
-            && self.notes.is_empty() && self.unseal_failed.is_none() && self.record_rebuilt.is_none()
+            && self.resealed.is_empty() && self.notes.is_empty() && self.unseal_failed.is_none() && self.record_rebuilt.is_none()
             && self.fetch_scope_rebuilt.is_none()
             && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
             && self.objects_lost.is_none()
@@ -764,6 +914,17 @@ impl CommandOutput for HealReport {
                 self.newly_held_by_hash.len()
             );
             for hash in &self.newly_held_by_hash {
+                println!("  {}", hash);
+            }
+        }
+
+        if !self.resealed.is_empty() {
+            println!(
+                "{} absent object(s) whose sealed-object records were lost are recorded again as held \
+                by the origin, which a read fetches them from:",
+                self.resealed.len()
+            );
+            for hash in &self.resealed {
                 println!("  {}", hash);
             }
         }

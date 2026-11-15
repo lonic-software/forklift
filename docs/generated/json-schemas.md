@@ -2577,6 +2577,13 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "type": "array"
     },
+    "resealed": {
+      "description": "Absent objects of a cache warehouse whose sealed-object records were lost, which this run\nrecorded again as held by the origin: a local walk of the history the origin holds names\neach, so a read fetches it from there again.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "resolved": {
       "description": "Recorded paths (or hashes) resolved without a rewrite: proven absent and unreferenced by\nthe closure walk, or a vanished inventory shard (a staging concern, never an object-trust\none — see `notes`).",
       "items": {
@@ -6092,10 +6099,10 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "null"
         }
       ],
-      "description": "The refusal a command that dials the remote would meet from here; none when nothing stops\nit. With no remote configured, only a move of the origin standing or a partial warehouse's\nmissing origin record is reported."
+      "description": "The refusal a command that dials the remote would meet from here; none when nothing stops\nit. With no remote configured, only a move of the origin standing or a partial warehouse's\nmissing or damaged origin record is reported."
     },
     "origin": {
-      "description": "A partial warehouse's origin, the one server proved to hold what it lacks; none for a full\nwarehouse, which may talk to any remote, and for a partial one whose record is missing.",
+      "description": "A partial warehouse's origin, the one server proved to hold what it lacks; none for a full\nwarehouse, which may talk to any remote, and for a partial one whose record is missing or\ndamaged.",
       "type": [
         "string",
         "null"

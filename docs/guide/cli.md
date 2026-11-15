@@ -1913,12 +1913,16 @@ partial warehouse — `lift`, `lower`, `scope fetch`, `scope prune`, `store evic
 `accept-regenesis`, and a cache's fetch of content it lacks — refuses with the
 `non_origin_remote` code (exit 11) when `remote.url` is not the origin, naming both and changing
 nothing. `heal` asks no such remote either: it does its local repair and, for what only a remote
-could restore, carries that refusal's message in its own report. Point `remote.url` back at the
+could restore, carries that refusal's message in its own report. In a cache, `heal` asks its
+origin which history it still holds, and records again as held by hash each lost absent object
+that history reaches, so a read fetches it again. Point `remote.url` back at the
 origin, clone the other remote into a new directory, or move the origin to it with
 `forklift remote move <url>` (below), which first checks that it holds what this warehouse lacks.
 The origin record is not configuration: no `config` key reaches it. A partial
-warehouse whose record is missing (only a damaged `.forklift` can be) is refused with the same
-code; record the origin with `remote move`, or clone the remote again. A full warehouse records
+warehouse whose record is missing or damaged (only a damaged `.forklift` can be) is refused with
+the same code, and so is `heal` there when nothing else is wrong; the next step names
+`forklift remote move` with the configured remote, which records it again once its check passes,
+or clone the remote again. A full warehouse records
 no origin, holds the whole closure and can talk to any remote.
 
 **While a move of the origin stands.** Moving a partial warehouse to another origin first records
