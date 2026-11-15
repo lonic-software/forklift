@@ -331,12 +331,16 @@ impl Walk<'_> {
         }
         command_settings(&path, command)?;
         if command.has_subcommands() {
-            // A group's own arguments would have no place in its children's commands.
-            if let Some(arg) = command.get_arguments().next() {
+            // A group's own arguments would have no place in its children's commands, so they
+            // are allowed only where clap keeps them off the subcommands: then they are the bare
+            // form's.
+            let own = command.get_arguments().next();
+            if let Some(arg) = own.filter(|_| !command.is_args_conflicts_with_subcommands_set()) {
                 return Err(refusal(&path, arg, "it belongs to a group that has subcommands"));
             }
             if !command.is_subcommand_required_set() {
-                self.push(command, &path, Params::default(), path.join(" "))?;
+                let (params, run) = self.params(command, &path)?;
+                self.push(command, &path, params, run)?;
             }
             for sub in command.get_subcommands().filter(|sub| !sub.is_hide_set()) {
                 let mut sub_path = path.clone();
@@ -346,6 +350,12 @@ impl Walk<'_> {
             return Ok(());
         }
 
+        let (params, run) = self.params(command, &path)?;
+        self.push(command, &path, params, run)
+    }
+
+    /// The params of `command` run with its own arguments, and the line Pult runs it with.
+    fn params(&mut self, command: &Command, path: &[&str]) -> Result<(Params, String), String> {
         let mut named = Params::default();
         let mut positionals = Vec::new();
 
@@ -399,7 +409,7 @@ impl Walk<'_> {
         }
         params.0.extend(positional_params);
 
-        self.push(command, &path, params, run)
+        Ok((params, run))
     }
 
     /// Validate and record one command.
@@ -810,6 +820,11 @@ mod tests {
         assert!(config.contains(r#""value":{"input":{"secret":true},"description":"The value to set the key to"}"#), "{config}");
         assert!(config.contains(r#""key":{"input":{},"#), "{config}");
         assert!(config.contains(r#""run":"config set {global} -- {key} {value}""#), "{config}");
+
+        // A group's own arguments, which clap keeps off its subcommands, are its bare form's.
+        let park = json("park");
+        assert!(park.contains(r#""run":"park {name}""#), "{park}");
+        assert!(json("park-pop").contains(r#""run":"park pop -- {name}""#));
 
         let franchise = json("clone");
         assert!(franchise.contains(concat!(
