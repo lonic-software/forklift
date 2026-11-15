@@ -13432,7 +13432,7 @@ fn a_cache_whose_origin_record_is_lost_names_a_move_that_lets_a_lift_through() {
         let refused = refusal_of(&area.forklift("cached", &["--json", "lift"]), 11);
         assert_eq!(refused["code"], "non_origin_remote", "{}: {}", damage, refused);
         assert!(refused["next_step"].as_str().unwrap().contains(&format!("\"{}\"", step)), "{}: {}", damage, refused);
-        assert_eq!(refused["message"].as_str().unwrap().contains("damaged"), damage == "damaged", "{}", refused);
+        assert_eq!(refused["message"].as_str().unwrap().contains("cannot be read"), damage == "damaged", "{}", refused);
 
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         assert_success(&area.forklift("cached", &args));
@@ -13730,11 +13730,14 @@ fn heal_with_the_origin_unreachable_names_itself_and_seals_nothing() {
 }
 
 /// An origin that answers with a failure, an error status or a handshake of another protocol
-/// version, is not one that did not answer: heal returns that failure as it is, never naming
-/// itself as the step, and seals nothing.
+/// version, is not one that did not answer: heal reports that failure as it is, on its
+/// `objects_lost` refusal, never naming itself as the step, and seals nothing.
+///
+/// A connection the origin closes with no response at all is no answer, though it connected.
 ///
 /// Revert: treat every handshake failure as no response → heal refuses as `objects_lost` naming
-/// `forklift heal`.
+/// `forklift heal`; count only refused and timed-out connections as no response → the closed one
+/// is returned as a failure.
 #[test]
 fn heal_returns_an_answered_handshake_failure_as_it_is() {
     let area = TestArea::new("sealed-answered");
@@ -13750,6 +13753,7 @@ fn heal_returns_an_answered_handshake_failure_as_it_is() {
         }
         match answering.load(std::sync::atomic::Ordering::SeqCst) {
             1 => Some(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()),
+            3 => Some(Vec::new()),
             2 => Some(format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 other_protocol.len(), other_protocol
@@ -13761,13 +13765,18 @@ fn heal_returns_an_answered_handshake_failure_as_it_is() {
     let older = sealed_older_roots(&area, "cached", &head);
     lose_sealed_record(&area, "cached");
 
+    // A connection closed with no response at all is no answer: heal names itself.
+    mode.store(3, std::sync::atomic::Ordering::SeqCst);
+    let unanswered = refusal_of(&area.forklift("cached", &["--json", "heal"]), 58);
+    assert_eq!(unanswered["next_step"], "forklift heal", "{}", unanswered);
+
     for answer in [1, 2] {
         mode.store(answer, std::sync::atomic::Ordering::SeqCst);
         let output = area.forklift("cached", &["--json", "heal"]);
-        assert!(!output.status.success(), "{}: {}", answer, stdout(&output));
-        let error = &json_of(&output)["error"];
-        assert_ne!(error["code"], "objects_lost", "{}: {}", answer, error);
+        let error = refusal_of(&output, 58);
         assert_ne!(error["next_step"], "forklift heal", "{}: {}", answer, error);
+        assert!(heal_notes(&output).iter().any(|note| note.starts_with("No absent object was re-sealed from the origin: The remote")),
+            "{}: the failure is reported as it is: {}", answer, error);
         for root in &older {
             assert!(!recorded(&area, "cached", root), "{}: nothing is sealed: {}", answer, root);
         }
@@ -13841,4 +13850,30 @@ fn heal_refuses_an_origin_whose_trust_changed_and_seals_nothing() {
     for root in &older {
         assert!(!recorded(&area, "cached", root), "nothing is sealed: {}", root);
     }
+}
+
+/// A remote the cache may not dial for the re-seal stops it, and heal says so without losing its
+/// report: a remote other than the origin is the run's own `non_origin_remote` refusal carrying
+/// the lost objects, and no remote at all is a note on the `objects_lost` refusal.
+///
+/// Revert: return the re-seal's refusal bare → no report rides on it; return every re-seal
+/// failure as the run's error → no remote replaces `objects_lost` with an uncoded error.
+#[test]
+fn heal_keeps_its_report_when_the_reseal_may_not_dial() {
+    let area = TestArea::new("sealed-not-dialled");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    lose_sealed_record(&area, "cached");
+
+    let other = Server::start_at(&area, "server-root-2", None);
+    assert_success(&area.forklift("cached", &["config", "set", "remote.url", &other.url]));
+    let refused = refusal_of(&area.forklift("cached", &["--json", "heal"]), 11);
+    assert_eq!(refused["code"], "non_origin_remote", "{}", refused);
+    assert!(refused["details"]["objects_lost"]["absent"].as_u64().unwrap() >= 1, "{}", refused);
+
+    assert_success(&area.forklift("cached", &["config", "unset", "remote.url"]));
+    let output = area.forklift("cached", &["--json", "heal"]);
+    let refused = refusal_of(&output, 58);
+    assert_eq!(refused["code"], "objects_lost", "{}", refused);
+    assert!(heal_notes(&output).iter().any(|note| note.contains("No remote is configured")), "{}", refused);
 }

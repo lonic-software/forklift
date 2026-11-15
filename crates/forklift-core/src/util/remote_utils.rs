@@ -2456,8 +2456,8 @@ type HandshakeWithheld = BTreeMap<String, (String, Option<String>)>;
 /// Why [`RemoteClient::fetch_info_answered`] got no handshake.
 #[derive(Debug)]
 pub enum HandshakeError {
-    /// No response came back at all: the connection was refused or timed out, the name did not
-    /// resolve, or the headers never arrived.
+    /// No response came back at all: the connection was refused, reset or timed out, the name did
+    /// not resolve, or the headers never arrived.
     NoResponse(String),
     /// Anything else: a refusing status, a protocol version or a trust anchor this build cannot
     /// use, a protocol violation, or an answer that could not be read.
@@ -3469,7 +3469,9 @@ impl RemoteClient {
             posture, reqwest::Method::GET, "/v1/warehouse", SendBody::Empty, "the handshake"
         ).await?;
         let unanswered = match &outcome {
-            SendOutcome::Transport(e) => e.is_connect() || e.is_timeout(),
+            // A request that could not be built never left; every other transport failure is one
+            // no response came back from, however far the request got.
+            SendOutcome::Transport(e) => !e.is_builder(),
             SendOutcome::HeadWaitExpired { .. } => true,
             SendOutcome::Sent(_) => false,
         };

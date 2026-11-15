@@ -30,8 +30,9 @@ use crate::output::{self, CommandOutput};
 /// Last, in a partial warehouse, it reads the origin record. In a cache whose check for lost
 /// objects read every source, it re-seals each lost absent object the origin's held history meets
 /// ([`reseal_utils::reseal_held`]), then checks again. An origin that sends no response leaves the
-/// lost objects lost and names running heal again. Any other failure, the origin's trust among
-/// them, is returned as it is. A missing or damaged origin record, with nothing else standing,
+/// lost objects lost and names running heal again. A coded refusal, the origin's trust among them,
+/// is the run's own, carrying the report unless it has details of its own; any other failure is a
+/// note on the `objects_lost` refusal. A missing or damaged origin record, with nothing else standing,
 /// makes the run a `non_origin_remote` refusal (exit 11) carrying the whole report. With objects
 /// lost, it becomes a note naming the move that records the origin again.
 ///
@@ -232,7 +233,16 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
 
     // A partial warehouse leans on its origin for what it lacks, so a missing or damaged record of
     // it is damage heal names, even with nothing lost.
-    let mode = warehouse_utils::warehouse_mode().ok();
+    let mode = match warehouse_utils::warehouse_mode() {
+        Ok(mode) => Some(mode),
+        Err(why) => {
+            notes.push(format!(
+                "Whether this is a partial warehouse could not be read, so its origin record was not checked and nothing was re-sealed from the origin: {}",
+                why.trim_end_matches('.')
+            ));
+            None
+        }
+    };
     let configured = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL).ok().flatten().map(|(url, _)| url);
     let origin = match mode {
         Some(WarehouseMode::Full) | None => None,
@@ -244,6 +254,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // over a check that read every source, since a short one may call held objects absent.
     let mut resealed: Vec<String> = Vec::new();
     let mut origin_unanswered = false;
+    let mut reseal_refused: Option<CoreError> = None;
     let reseal_from = match (&lost, mode, &origin) {
         (Ok(found), Some(WarehouseMode::Cache), Some(Ok(_))) if !found.absent.is_empty() => {
             if found.degraded_sources.is_empty() {
@@ -273,8 +284,15 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                     why.trim_end_matches('.')
                 ));
             }
-            // Its own next step clears it, and heal can run again after.
-            Err(ResealError::Refused(why)) => return Err(changed(why, &refs_rebuilt, &refs_removed, &notes)),
+            // A coded refusal is the run's own, with its next step, once the report is built; its
+            // step clears it, and heal can run again after. Anything else is a note.
+            Err(ResealError::Refused(why)) => match CoreError::from(why) {
+                refused @ CoreError::Refusal { .. } => reseal_refused = Some(refused),
+                other => notes.push(format!(
+                    "No absent object was re-sealed from the origin: {}",
+                    String::from(other).trim_end_matches('.')
+                )),
+            },
         }
     }
     if let Ok(lost) = &lost {
@@ -321,10 +339,17 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         _ => None,
     };
     if origin_refused.is_some() && (objects_lost.is_some() || lost.is_err() || !refs_refused.is_empty()) {
-        notes.push(format!(
-            "The origin record is missing or damaged. \"forklift remote move {}\" records it again only if that server holds every object listed lost, after which heal re-seals them.",
-            configured.as_deref().map(|url| url.trim_end_matches('/')).unwrap_or("<url>")
-        ));
+        let url = configured.as_deref().map(|url| url.trim_end_matches('/')).unwrap_or("<url>");
+        notes.push(match (mode, &objects_lost) {
+            (Some(WarehouseMode::Cache), Some(_)) => format!(
+                "The origin record is missing or damaged. \"forklift remote move {}\" records it again only if that server holds every object listed lost, after which heal re-seals them.",
+                url
+            ),
+            _ => format!(
+                "The origin record is missing or damaged. \"forklift remote move {}\" records it again once it checks that server holds this warehouse's content.",
+                url
+            ),
+        });
     }
 
     let report = HealReport {
@@ -370,12 +395,15 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     }
 
     if let Some(lost) = &report.objects_lost {
+        if let Some(refused) = reseal_refused {
+            return Err(with_report(&report, refused).into());
+        }
         return Err(objects_lost_refusal(&report, lost, outcome.index_rebuild_skipped || origin_unanswered).into());
     }
 
     if report.refs_refused.is_empty() {
         if let Some(refused) = origin_refused {
-            return Err(origin_refusal(&report, refused).into());
+            return Err(with_report(&report, refused).into());
         }
     }
 
@@ -513,10 +541,14 @@ fn objects_lost_refusal(report: &HealReport, lost: &ObjectsLost, rebuild_skipped
     )
 }
 
-/// The `non_origin_remote` refusal of a partial warehouse whose origin record is missing or
-/// damaged, with nothing else standing, carrying the whole report: this run's repairs stand.
-fn origin_refusal(report: &HealReport, refused: CoreError) -> CoreError {
+/// A refusal the origin's record or the origin itself made, as the run's own, carrying the whole
+/// report, unless it carries details of its own, which its remedy may read: this run's repairs
+/// stand, so its "nothing was changed" is dropped.
+fn with_report(report: &HealReport, refused: CoreError) -> CoreError {
     match refused {
+        CoreError::Refusal { details: Some(details), code, message, next_step } => CoreError::refusal_with_details(
+            code, message, next_step, details,
+        ),
         CoreError::Refusal { code, message, next_step, .. } => CoreError::refusal_with_details(
             code,
             match message.strip_suffix("; nothing was changed.") {

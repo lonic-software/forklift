@@ -108,8 +108,8 @@ pub fn checked_remote_by_mode() -> Result<(String, Option<String>), CoreError> {
     checked_remote_for(|| Ok(crate::util::warehouse_utils::warehouse_mode()? != crate::util::warehouse_utils::WarehouseMode::Full))
 }
 
-/// [`checked_remote`], with `partial` saying whether the warehouse may lack content, read only
-/// once a remote is known to be configured.
+/// [`checked_remote`], with `partial` saying whether the warehouse may lack content. With no remote
+/// configured, it is read only to name the recorded origin, and a failure to read it names none.
 fn checked_remote_for(partial: impl FnOnce() -> Result<bool, String>) -> Result<(String, Option<String>), CoreError> {
     // A move of the origin is checking the new server against what this warehouse holds, or has
     // started rewriting which remote that is: no client talks to either until it finishes.
@@ -119,7 +119,7 @@ fn checked_remote_for(partial: impl FnOnce() -> Result<bool, String>) -> Result<
 
     let Some(url) = configured else {
         // A partial warehouse whose origin reads can name the one remote it may be pointed at.
-        let recorded = if partial()? { read_origin().ok().flatten() } else { None };
+        let recorded = if partial().unwrap_or(false) { read_origin().ok().flatten() } else { None };
         return Err(format!(
             "No remote is configured for this warehouse. Set one with \"forklift config set {} {}\".",
             config_utils::KEY_REMOTE_URL, recorded.as_deref().unwrap_or("<url>")
@@ -209,8 +209,8 @@ pub fn damaged_origin_refusal(why: &str, configured: Option<&str>) -> CoreError 
     CoreError::refusal(
         RefusalCode::NonOriginRemote,
         format!(
-            "This is a partial warehouse, but its origin record is damaged ({}), so Forklift cannot \
-            tell which remote holds the content this warehouse does not; nothing was changed.",
+            "This is a partial warehouse, but its origin record cannot be read ({}), so Forklift \
+            cannot tell which remote holds the content this warehouse does not; nothing was changed.",
             why.trim_end_matches('.')
         ),
         record_again_step(configured),

@@ -752,7 +752,9 @@ pub fn record_held_absences(absent: &[String]) -> Result<Vec<String>, String> {
         Ok(ops)
     })?;
 
-    Ok(asked)
+    // The append drops what another record already accounts for, so only what landed is reported.
+    let set = read_sealed()?;
+    Ok(asked.into_iter().filter(|hash| set.contains(hash)).collect())
 }
 
 /// Remove the records of those of `filled` the record holds, under a ref lock it takes and
