@@ -568,6 +568,10 @@ async fn dispatch(cli: Cli, store_access: &mut Option<lock_utils::StoreAccessLoc
             Some(PalletAction::Restore { name, remote: true }) => commands::pallet::restore_remote_pallet(&name).await,
             Some(PalletAction::Restore { name, remote: false }) => commands::pallet::restore_pallet(&name),
         },
+        Command::Park { name: Some(_), action: Some(_) } => Err(
+            "\"--name\" names the work a bare \"forklift park\" parks; a subcommand takes the park's name \
+            after it, as in \"forklift park pop <name>\". Nothing was done.".to_string()
+        ),
         Command::Park { name, action } => match action {
             Some(ParkAction::Pop { name }) => commands::park::pop_parked(name.as_deref()),
             Some(ParkAction::Apply { name }) => commands::park::apply_parked(name.as_deref()),

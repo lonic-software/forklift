@@ -287,7 +287,8 @@ impl Context<'_> {
             return Ok(None);
         }
         let listing = self.run(&self.programs.forklift, vec!["--json".into(), "park".into(), "list".into()], self.scratch.work())?;
-        let listed = if listing.succeeded() { runner::parked_parcels(&listing.stdout) } else { Vec::new() };
+        // A listing that exits 0 but cannot be read names nothing, so every park is missing.
+        let listed = if listing.succeeded() { runner::parked_parcels(&listing.stdout).unwrap_or_default() } else { Vec::new() };
         let missing = parked.iter().filter(|parcel| !listed.contains(parcel)).cloned().collect();
         Ok(Some(ParkedReadback { listing, missing }))
     }
@@ -1011,6 +1012,11 @@ mod tests {
         let refused = parked(1, &["p"]);
         assert!(!refused.reads(&[Mark::Record(0)]));
         assert!(!refused.silent() && refused.refused());
+
+        // A listing that names no parked list, or an entry without a parcel, is not read as none.
+        assert_eq!(runner::parked_parcels(br#"{"data":{"parked":[{"parcel":"p"}]}}"#), Some(vec!["p".to_string()]));
+        assert_eq!(runner::parked_parcels(br#"{"data":{}}"#), None);
+        assert_eq!(runner::parked_parcels(br#"{"data":{"parked":[{"name":"n"}]}}"#), None);
     }
 
     /// An export's left-out files are documented per record by their parcels: withheld content as

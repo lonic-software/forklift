@@ -276,6 +276,21 @@ async fn diff_staged(filter: Option<&WarehousePath>, verbose: bool) -> Result<()
 /// * `Ok(())`      - If the diff completed.
 /// * `Err(String)` - If a revision does not resolve (unknown pallet, unborn head, or
 ///                   unresolvable hash), or an object could not be read.
+/// Every file that differs from tree `from` (none: the empty tree) to tree `to`, within the bay's
+/// scope, sorted by path, moves detected: its kind, path and, for a move, where it moved from.
+pub(crate) fn tree_file_changes(from: Option<&str>, to: &str) -> Result<Vec<(ChangeKind, String, Option<String>)>, String> {
+    let from_tree = from.map(object_utils::load_tree_shared).transpose()?;
+    let to_tree = object_utils::load_tree_shared(to)?;
+    let scope = scope_utils::current_scope()?;
+
+    let mut changes: Vec<TreeChange> = Vec::new();
+    collect_tree_changes(from_tree.as_deref(), Some(to_tree.as_ref()), "", &mut changes, &scope)?;
+    detect_tree_moves(&mut changes);
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(changes.into_iter().map(|change| (change.kind, change.path, change.moved_from)).collect())
+}
+
 fn diff_pallets(from_revision: &str,
                 to_revision: &str,
                 filter: Option<&WarehousePath>,

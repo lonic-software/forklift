@@ -5,6 +5,7 @@ use forklift_core::enums::parcel_action_type::ParcelActionType;
 use forklift_core::model::parcel::Parcel;
 use forklift_core::model::parcel_action::ParcelAction;
 use forklift_core::util::shift_utils::{Applied, FileOp};
+use forklift_core::util::stocktake_utils::ChangeKind;
 use serde::Serialize;
 use forklift_core::util::{
     alias_utils, cherry_pick_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
@@ -338,33 +339,6 @@ fn unpark(name: Option<&str>, how: Unpark) -> Result<(), String> {
         &parked_parcel.tree_hash
     )?;
 
-    // Whatever the apply needs from an origin is fetched now, before a pop takes the lock that
-    // every bay's park, pop and drop wait on.
-    shift_utils::ensure_writes_present(&ops)?;
-
-    // A pop holds the parked-work lock from here until the entry is off the list, so two bays
-    // popping one park never both apply it. The entry is picked again under the lock: one another
-    // command took or replaced meanwhile is refused with nothing applied.
-    #[cfg(test)]
-    tests::BEFORE_POP_HOLDS.with(|seam| seam.take().map(|seam| seam())).transpose()?;
-
-    let lock = match how {
-        Unpark::Pop => {
-            let lock = ParkedLock::acquire()?;
-            let parked = park_utils::read_parked()?;
-            let now = park_utils::pick(&parked, name).ok().map(|index| &parked[index]);
-            if now.map(|now| &now.parcel) != Some(&parked_hash) {
-                return Err(format!(
-                    "The parked work \"{}\" ({}) was popped, dropped or parked over by another command \
-                    while this pop ran. Nothing was applied.",
-                    sanitize(&entry.name), parked_hash
-                ));
-            }
-            Some((lock, parked))
-        }
-        Unpark::Apply => None,
-    };
-
     // Safety: every file the parked changes touch must be unchanged between the parked
     // base and the current head — this keeps un-parking a clean re-apply instead of a
     // merge. Anything else must go through "consolidate".
@@ -408,6 +382,33 @@ fn unpark(name: Option<&str>, how: Unpark) -> Result<(), String> {
             if entry.recovered { format!(" {}", RECOVERED_NOTE) } else { String::new() }
         ));
     }
+
+    // Whatever the apply needs from an origin is fetched only once the checks above pass, and
+    // before a pop takes the lock that every bay's park, pop and drop wait on.
+    shift_utils::ensure_writes_present(&ops)?;
+
+    // A pop holds the parked-work lock from here until the entry is off the list, so two bays
+    // popping one park never both apply it. The entry is found again under the lock by its name
+    // and parcel: one another command took meanwhile is refused with nothing applied, while a
+    // park added since is no reason to.
+    #[cfg(test)]
+    tests::BEFORE_POP_HOLDS.with(|seam| seam.take().map(|seam| seam())).transpose()?;
+
+    let lock = match how {
+        Unpark::Pop => {
+            let lock = ParkedLock::acquire()?;
+            let parked = park_utils::read_parked()?;
+            let Some(index) = parked.iter().position(|now| now.name == entry.name && now.parcel == parked_hash) else {
+                return Err(format!(
+                    "The parked work \"{}\" ({}) was popped or dropped by another command while this \
+                    pop ran. Nothing was applied.",
+                    sanitize(&entry.name), parked_hash
+                ));
+            };
+            Some((lock, parked, index))
+        }
+        Unpark::Apply => None,
+    };
 
     // Every removal (and the directories it empties) before every write: across a case-only
     // rename the write would otherwise land on the old name through the alias, and the removal
@@ -456,8 +457,8 @@ fn unpark(name: Option<&str>, how: Unpark) -> Result<(), String> {
     let note = if entry.recovered { format!(" {}", RECOVERED_NOTE) } else { String::new() };
 
     match lock {
-        Some((lock, mut parked)) => {
-            parked.retain(|listed| listed.parcel != parked_hash);
+        Some((lock, mut parked, index)) => {
+            parked.remove(index);
             park_utils::write_parked(&lock, &parked)?;
 
             output::message(format!(
@@ -515,12 +516,10 @@ fn park_show(name: Option<&str>) -> Result<ParkedShow, String> {
         .map(|action| action.timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
 
     let base_tree = base.as_deref().map(|base| object_utils::load_parcel(base).map(|base| base.tree_hash)).transpose()?;
-    let (ops, _) = shift_utils::diff_trees(base_tree.as_deref(), &parcel.tree_hash)?;
-    let files = ops.into_iter().map(|op| match op {
-        FileOp::Write { path, is_new: true, .. } => ParkedFile { path, change: FileChange::Added },
-        FileOp::Write { path, .. } => ParkedFile { path, change: FileChange::Modified },
-        FileOp::Remove { path } => ParkedFile { path, change: FileChange::Deleted },
-    }).collect();
+    // A plain tree-to-tree comparison, as `diff` makes: not the apply plan, which depends on this
+    // file system's case folding.
+    let files = crate::commands::diff::tree_file_changes(base_tree.as_deref(), &parcel.tree_hash)?
+        .into_iter().map(|(change, path, moved_from)| ParkedFile { path, change, moved_from }).collect();
 
     Ok(ParkedShow { name: entry.name, parcel: entry.parcel, base, recovered: entry.recovered, parked_at, files })
 }
@@ -549,17 +548,22 @@ pub(crate) struct ParkedShow {
 #[derive(Serialize)]
 pub(crate) struct ParkedFile {
     path: String,
-    change: FileChange,
+    /// How the park changes the file, in the words `stocktake` and `diff` use.
+    change: ChangeKind,
+    /// Where a moved file moved from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved_from: Option<String>,
 }
 
-/// How a park changes a file.
-#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
-#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FileChange {
-    Added,
-    Modified,
-    Deleted,
+/// The word for how a park changes a file.
+fn change_label(change: ChangeKind) -> &'static str {
+    match change {
+        ChangeKind::Added => "added",
+        ChangeKind::Modified => "modified",
+        ChangeKind::Moved => "moved",
+        ChangeKind::Removed => "removed",
+        _ => "changed",
+    }
 }
 
 impl CommandOutput for ParkedShow {
@@ -572,12 +576,10 @@ impl CommandOutput for ParkedShow {
             println!("  parked    {}", parked_at);
         }
         for file in &self.files {
-            let change = match file.change {
-                FileChange::Added => "added",
-                FileChange::Modified => "modified",
-                FileChange::Deleted => "deleted",
-            };
-            println!("  {:<9} {}", change, sanitize(&file.path));
+            match &file.moved_from {
+                Some(from) => println!("  {:<9} {} -> {}", change_label(file.change), sanitize(from), sanitize(&file.path)),
+                None => println!("  {:<9} {}", change_label(file.change), sanitize(&file.path)),
+            }
         }
     }
 }
@@ -976,17 +978,15 @@ mod tests {
         let warehouse = Warehouse::with_working_tree("park-pop-raced");
         work_in_progress_on_main(&warehouse.root);
         test_support::block_on(park_changes(None)).unwrap();
-        let parked = park_utils::read_parked().unwrap();
 
         BEFORE_POP_HOLDS.with(|seam| seam.set(Some(Box::new(|| {
             let lock = ParkedLock::acquire()?;
             park_utils::write_parked(&lock, &[])
         }))));
         let error = pop_parked(None).unwrap_err();
-        assert!(error.contains("popped, dropped or parked over by another command"), "{}", error);
+        assert!(error.contains("popped or dropped by another command"), "{}", error);
         assert!(error.contains("Nothing was applied"), "{}", error);
         assert!(test_support::file_holds(&warehouse.root, "a.txt", b"one\n"), "the head stays in the file");
-        drop(parked);
     }
 
     /// A pop holds the parked-work lock from its re-pick through applying the changes, so a
@@ -1010,6 +1010,30 @@ mod tests {
         }))));
         pop_parked(None).unwrap();
         assert!(park_utils::read_parked().unwrap().is_empty(), "the pop took the park off the list");
+    }
+
+    /// A pop takes exactly the park it picked: a park added meanwhile, even one naming the same
+    /// parcel, stays listed. Revert to re-picking "the newest" under the lock and the pop refuses;
+    /// revert to removing by parcel and the other name goes too.
+    #[test]
+    fn a_pop_takes_only_its_own_park_when_another_was_added_meanwhile() {
+        let warehouse = Warehouse::with_working_tree("park-pop-added");
+        work_in_progress_on_main(&warehouse.root);
+        test_support::block_on(park_changes(Some("mine"))).unwrap();
+
+        BEFORE_POP_HOLDS.with(|seam| seam.set(Some(Box::new(|| {
+            let lock = ParkedLock::acquire()?;
+            let mut parked = park_utils::read_parked()?;
+            let mine = parked[0].clone();
+            parked.push(park_utils::ParkedEntry { name: "twin".to_string(), ..mine.clone() });
+            parked.push(park_utils::ParkedEntry { name: "newer".to_string(), parcel: "0".repeat(64), ..mine });
+            park_utils::write_parked(&lock, &parked)
+        }))));
+        pop_parked(None).unwrap();
+
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"work\n"), "the pop applied its park");
+        let names: Vec<_> = park_utils::read_parked().unwrap().into_iter().map(|entry| entry.name).collect();
+        assert_eq!(names, vec!["twin", "newer"]);
     }
 
     /// Apply keeps the park listed; pop by name takes that park, not the newest; drop leaves the
@@ -1065,8 +1089,8 @@ mod tests {
         let shown = park_show(Some("wip")).unwrap();
         assert_eq!(shown.base, pallet_utils::get_pallet_head("main").unwrap());
         assert!(shown.parked_at.is_some());
-        let files: Vec<_> = shown.files.iter().map(|file| (file.path.as_str(), file.change)).collect();
-        assert_eq!(files, vec![("a.txt", FileChange::Modified), ("b.txt", FileChange::Added)]);
+        let files: Vec<_> = shown.files.iter().map(|file| (file.path.as_str(), change_label(file.change))).collect();
+        assert_eq!(files, vec![("a.txt", "modified"), ("b.txt", "added")]);
     }
 
     /// A store whose history cannot be walked does not stop the rebuild: a parked parcel is

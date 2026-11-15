@@ -3849,6 +3849,33 @@ fn park_saves_and_reapplies_work_in_progress() {
     assert!(final_status.contains("The inventory matches the pallet head"));
 }
 
+/// A global flag may sit between `park` and its subcommand, while `--name`, which names what a bare
+/// `park` parks, is refused with a subcommand and nothing is done. Restore clap's
+/// `args_conflicts_with_subcommands` on `park` and the first call is a usage error.
+#[test]
+fn park_takes_global_flags_before_its_subcommand_and_refuses_name_with_one() {
+    let warehouse = TestWarehouse::new("park-flags");
+    warehouse.write_file("a.txt", "original\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
+    warehouse.write_file("a.txt", "work\n");
+    assert_success(&warehouse.run(&["park", "--name", "wip"]));
+
+    let listed = warehouse.run(&["park", "--json", "list"]);
+    assert_success(&listed);
+    assert!(stdout(&listed).contains("\"wip\""), "{}", stdout(&listed));
+
+    let refused = warehouse.run(&["park", "--name", "wip", "pop"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("a subcommand takes the park's name"), "{}", stderr(&refused));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(), "original\n", "nothing was popped");
+
+    assert_success(&warehouse.run(&["park", "-v", "pop", "wip"]));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(), "work\n");
+}
+
 #[test]
 fn park_pop_refuses_conflicting_head_changes() {
     let warehouse = TestWarehouse::new("park-conflict");

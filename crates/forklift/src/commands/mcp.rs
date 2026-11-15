@@ -960,14 +960,15 @@ fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
         }
         if command.has_subcommands() {
             // A family's own arguments belong to its bare form only, so they are allowed just
-            // where clap keeps them off the subcommands.
-            let own = command.get_arguments().find(|arg| !arg.is_global_set());
-            if let Some(arg) = own.filter(|_| !command.is_args_conflicts_with_subcommands_set()) {
+            // where the CLI's BARE_ONLY_ARGS says dispatch refuses them with a subcommand.
+            let own: Vec<&clap::Arg> = command.get_arguments().filter(|arg| !arg.is_global_set()).collect();
+            let bare_only = |arg: &clap::Arg| crate::cli::BARE_ONLY_ARGS.contains(&(shown.as_str(), arg.get_id().as_str()));
+            if let Some(arg) = own.iter().find(|arg| !bare_only(arg)) {
                 return Err(format!("`forklift {shown}` has subcommands and its own argument `{}`", arg.get_id()));
             }
             if !command.is_subcommand_required_set() {
                 match BARE_SAME_AS.iter().position(|(family, _)| *family == shown) {
-                    Some(_) if own.is_some() => {
+                    Some(_) if !own.is_empty() => {
                         return Err(format!("`forklift {shown}` takes its own arguments, so BARE_SAME_AS cannot name it"));
                     }
                     Some(index) => used.bare_same_as[index] = true,
@@ -1780,7 +1781,7 @@ mod tests {
 
         // A family's own arguments, which clap keeps off its subcommands, are its bare tool's.
         assert_eq!(tool("park").params.iter().map(|param| param.key.as_str()).collect::<Vec<_>>(), ["name"]);
-        assert!(tool("park_pop").params.iter().all(|param| param.key == "name"));
+        assert_eq!(tool("park_pop").params.iter().map(|param| param.key.as_str()).collect::<Vec<_>>(), ["name"]);
 
         // An argument no agent passes is left out of its tool, which is served without it; passing
         // it is refused with why, the description names it, and the same argument of another
@@ -1840,9 +1841,8 @@ mod tests {
         assert!(refused(cli().mut_subcommand("haul", |haul| haul.subcommand_required(true))).contains("BARE_SAME_AS names"));
         assert!(refused(cli().mut_subcommand("tag", |tag| tag.arg(clap::Arg::new("x").long("x"))))
             .contains("`forklift tag` has subcommands and its own argument"));
-        assert!(refused(cli().mut_subcommand("tag", |tag| tag.args_conflicts_with_subcommands(true)
-            .arg(clap::Arg::new("x").long("x"))))
-            .contains("`forklift tag` takes its own arguments, so BARE_SAME_AS cannot name it"));
+        assert!(refused(cli().mut_subcommand("park", |park| park.arg(clap::Arg::new("x").long("x"))))
+            .contains("`forklift park` has subcommands and its own argument `x`"));
         assert!(refused(cli().subcommand(clap::Command::new("tag_list").about("Twin")))
             .contains("two commands make the tool name `tag_list`"));
         assert!(refused(cli().subcommand(clap::Command::new("twin").about("Twin")

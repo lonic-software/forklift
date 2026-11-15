@@ -332,10 +332,11 @@ impl Walk<'_> {
         command_settings(&path, command)?;
         if command.has_subcommands() {
             // A group's own arguments would have no place in its children's commands, so they
-            // are allowed only where clap keeps them off the subcommands: then they are the bare
-            // form's.
-            let own = command.get_arguments().next();
-            if let Some(arg) = own.filter(|_| !command.is_args_conflicts_with_subcommands_set()) {
+            // are allowed only where the CLI's BARE_ONLY_ARGS says dispatch refuses them with a
+            // subcommand: then they are the bare form's.
+            let shown = path.join(" ");
+            let bare_only = |arg: &&Arg| crate::cli::BARE_ONLY_ARGS.contains(&(shown.as_str(), arg.get_id().as_str()));
+            if let Some(arg) = command.get_arguments().find(|arg| !bare_only(arg)) {
                 return Err(refusal(&path, arg, "it belongs to a group that has subcommands"));
             }
             if !command.is_subcommand_required_set() {

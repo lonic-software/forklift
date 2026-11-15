@@ -595,7 +595,6 @@ pub enum Command {
                       list\" lists every park. Each takes a park's name, and without one uses the \
                       newest park."
     )]
-    #[command(args_conflicts_with_subcommands = true)]
     Park {
         /// The name to park the work under (default: the pallet and the time)
         #[arg(long)]
@@ -2132,6 +2131,12 @@ pub enum ProfileAction {
         passphrase: bool,
     },
 }
+
+/// A family's own arguments, by family path and argument id: they belong to its bare form only, and
+/// dispatch refuses them given with a subcommand. clap's `args_conflicts_with_subcommands` would
+/// say so too, but it also refuses every global flag written between the family and its
+/// subcommand (`park --json pop`). The MCP tools and `self schema` give these to the bare form.
+pub const BARE_ONLY_ARGS: &[(&str, &str)] = &[("park", "name")];
 
 #[derive(Subcommand)]
 pub enum ParkAction {

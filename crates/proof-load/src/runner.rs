@@ -389,7 +389,11 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
 
     let parked = if tool == Tool::Forklift && scenario.history.iter().any(|op| matches!(op, Op::Park { .. })) {
         let listed = run_in(program, vec!["--json".into(), "park".into(), "list".into()], scratch.work())?;
-        let parked = parked_parcels(&listed.stdout);
+        // A listing that exited 0 but cannot be read fails the build: an empty list here would
+        // let every readback pass whatever happened to the parks.
+        let parked = parked_parcels(&listed.stdout).ok_or_else(|| RunError::Io(format!(
+            "scenario {}: `park list --json` printed no parked list: {}", scenario.id, String::from_utf8_lossy(&listed.stdout)
+        )))?;
         outcomes.push(listed);
         parked
     } else {
@@ -436,10 +440,11 @@ pub fn described_parcels(stdout: &[u8]) -> Vec<(String, String)> {
     }).collect()).unwrap_or_default()
 }
 
-/// The parcels `park list --json` names, newest first.
-pub fn parked_parcels(stdout: &[u8]) -> Vec<String> {
-    document(stdout)["data"]["parked"].as_array().map(|entries| entries.iter()
-        .filter_map(|entry| Some(entry["parcel"].as_str()?.to_string())).collect()).unwrap_or_default()
+/// The parcels `park list --json` names, newest first; nothing when it printed no parked list, or
+/// an entry without a parcel.
+pub fn parked_parcels(stdout: &[u8]) -> Option<Vec<String>> {
+    document(stdout)["data"]["parked"].as_array()?.iter()
+        .map(|entry| Some(entry["parcel"].as_str()?.to_string())).collect()
 }
 
 /// The state `redact list --json` reports for redaction `hash`, if it lists it.
