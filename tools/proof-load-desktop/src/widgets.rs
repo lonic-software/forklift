@@ -14,8 +14,12 @@ use crate::theme::{self, hairline, Palette, Type, U};
 /// Text in one of the page's type styles. A `Label` is drawn upper case, as `.engraved` is.
 pub fn job(text: &str, style: Type, color: Color32) -> LayoutJob {
     let text = if style == Type::Label { text.to_uppercase() } else { text.to_string() };
-    let format = TextFormat { font_id: style.font(), color, extra_letter_spacing: style.letter_spacing(), ..TextFormat::default() };
-    LayoutJob::single_section(text, format)
+    LayoutJob::single_section(text, format(style, color))
+}
+
+/// One of the page's type styles in `color`, for a span of a longer job.
+pub fn format(style: Type, color: Color32) -> TextFormat {
+    TextFormat { font_id: style.font(), color, extra_letter_spacing: style.letter_spacing(), ..TextFormat::default() }
 }
 
 /// A line of text that does not respond to the pointer.
@@ -92,6 +96,7 @@ pub fn plate<R>(ui: &mut Ui, heading: &str, tag: &str, add_contents: impl FnOnce
         let rule = ui.available_rect_before_wrap();
         ui.painter().hline(rule.x_range(), rule.top(), hairline(p.line));
         ui.add_space(theme::PLATE_GAP);
+        // The plate's parts are PLATE_GAP apart; a layout inside a part sets its own page gap.
         ui.spacing_mut().item_spacing.y = theme::PLATE_GAP;
         add_contents(ui)
     });
@@ -403,7 +408,7 @@ pub enum Ink {
 }
 
 /// A line of the step screen: spans of text, each in its ink.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScreenLine(pub Vec<(Ink, String)>);
 
 impl ScreenLine {
@@ -442,7 +447,11 @@ pub fn screen(ui: &mut Ui, lines: &[ScreenLine]) -> Response {
                         Ink::Red => p.crt_red,
                         Ink::Amber => p.crt_amber,
                     };
-                    row.append(text, 0.0, job(text, Type::Screen, color).sections[0].format.clone());
+                    row.append(text, 0.0, format(Type::Screen, color));
+                }
+                if row.is_empty() {
+                    // A blank line keeps its height, as the page's `white-space: pre` does.
+                    row.append("", 0.0, format(Type::Screen, p.crt_ink));
                 }
                 ui.add(egui::Label::new(row).extend());
             }

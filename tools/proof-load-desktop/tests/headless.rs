@@ -1,7 +1,7 @@
 //! The window drawn into a bare egui context, with no window opened: it lays out in both themes,
-//! and every colour it paints is a token of that theme's palette (or the lamp's ring, the page's
-//! one colour that is not a token), so neither egui's own defaults nor a widget's arithmetic puts
-//! a colour on screen that the design system does not have.
+//! and every colour it paints is a token of that theme's palette, a disabled or hovered form of
+//! one the page defines, or the lamp's ring, so neither egui's own defaults nor a widget's
+//! arithmetic puts a colour on screen that the design system does not have.
 
 use std::collections::BTreeSet;
 
@@ -53,7 +53,7 @@ fn check(which: egui::Theme) {
     let palette = theme::palette_of(which);
     let allowed: BTreeSet<[u8; 4]> = palette.tokens().into_iter()
         .flat_map(|(_, colour)| [colour, theme::disabled(colour)])
-        .chain([theme::LAMP_RING])
+        .chain([theme::LAMP_RING, theme::hovered_primary(palette.accent)])
         .map(|colour| colour.to_array()).collect();
     let painted = painted(which);
     assert!(painted.len() >= 10, "the {which:?} window painted almost nothing: {painted:?}");
@@ -122,4 +122,50 @@ fn a_lit_lamp_has_its_ring_and_a_sampled_one_does_not() {
     });
     assert!(lamp(Cell::Run).contains(&ring));
     assert!(!lamp(Cell::Sampled).contains(&ring));
+}
+
+#[test]
+fn a_hovered_primary_button_brightens_its_accent() {
+    let palette = theme::palette_of(egui::Theme::Light);
+    let ctx = egui::Context::default();
+    proof_load_desktop::install(&ctx);
+    ctx.set_theme(egui::Theme::Light);
+    let mut fill = None;
+    for _ in 0..3 {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0))),
+            events: vec![egui::Event::PointerMoved(egui::pos2(20.0, 16.0))],
+            ..egui::RawInput::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                widgets::button(ui, "Run scenarios", widgets::Button::Primary, true);
+            });
+        });
+        fill = ctx.tessellate(output.shapes, output.pixels_per_point).into_iter().find_map(|clipped| match clipped.primitive {
+            epaint::Primitive::Mesh(mesh) => mesh.vertices.first().map(|vertex| vertex.color),
+            epaint::Primitive::Callback(_) => None,
+        });
+    }
+    assert_ne!(theme::hovered_primary(palette.accent), palette.accent);
+    assert_eq!(fill, Some(theme::hovered_primary(palette.accent)));
+}
+
+#[test]
+fn a_blank_step_screen_line_keeps_its_height() {
+    let height = |lines: Vec<widgets::ScreenLine>| {
+        let ctx = egui::Context::default();
+        proof_load_desktop::install(&ctx);
+        let mut height = 0.0;
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| height = widgets::screen(ui, &lines).rect.height());
+            });
+        }
+        height
+    };
+    let line = || widgets::ScreenLine::command("forklift heal");
+    let two = height(vec![line(), line()]);
+    let with_blank = height(vec![line(), widgets::ScreenLine(Vec::new()), line()]);
+    assert!(with_blank > two + 10.0, "a blank line between two adds {} px", with_blank - two);
 }

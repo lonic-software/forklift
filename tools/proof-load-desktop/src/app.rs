@@ -46,7 +46,7 @@ impl App {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(16, 8)))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = theme::PLATE_GAP;
+                    ui.spacing_mut().item_spacing.y = theme::SCREEN_GAP;
                     self.bench(ui);
                 });
             });
@@ -111,6 +111,7 @@ impl App {
             ui.horizontal_top(|ui| {
                 ui.allocate_ui(egui::vec2(230.0, 200.0), |ui| {
                     ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = theme::SIDE_GAP;
                         widgets::engraved(ui, "This run");
                         let counts: Vec<_> = grades::WORST_FIRST.into_iter().zip([1, 4, 3, 61, 343]).collect();
                         widgets::tally(ui, &counts);
@@ -118,8 +119,12 @@ impl App {
                     });
                 });
                 ui.vertical(|ui| {
-                    widgets::readout(ui, "Commands to expected", "3", "commands");
-                    widgets::readout(ui, "Named the remedy that worked", "yes", "");
+                    ui.spacing_mut().item_spacing.y = theme::SIDE_GAP;
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = theme::SIDE_GAP;
+                        ui.allocate_ui(egui::vec2(220.0, 80.0), |ui| widgets::readout(ui, "Commands to expected", "3", "commands"));
+                        ui.allocate_ui(egui::vec2(220.0, 80.0), |ui| widgets::readout(ui, "Named the remedy that worked", "yes", ""));
+                    });
                     widgets::text(ui, "redactions-applied__flip__byte-17", Type::Data, p.ink);
                     widgets::grade_chip(ui, Grade::RefusedWorkingRemedy);
                 });

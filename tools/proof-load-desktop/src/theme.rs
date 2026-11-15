@@ -80,8 +80,14 @@ pub const U: f32 = 4.0;
 pub const ROW_HEIGHT: f32 = 28.0;
 pub const CONTROL_HEIGHT: f32 = 32.0;
 pub const PLATE_PADDING: f32 = 14.0;
-/// `.plate`'s gap between its parts, and between plates on a screen (`.grid`).
+/// The gap between plates on a screen (`.wrap`).
+pub const SCREEN_GAP: f32 = 20.0;
+/// `.plate`'s gap between its parts, and `.grid`'s between plates that share a row.
 pub const PLATE_GAP: f32 = 14.0;
+/// The gaps inside a plate's layouts: the results side column (`.side`) and the detail readouts
+/// (`.detail`), 10 px; a stack of fields or lines (`.stack`), 8 px.
+pub const SIDE_GAP: f32 = 10.0;
+pub const STACK_GAP: f32 = 8.0;
 /// The space between a plate's heading and the rule under it (`.plate > header`).
 pub const HEADER_GAP: f32 = 10.0;
 /// The space between tally lines (`.tally`).
@@ -102,7 +108,7 @@ pub fn hovered_primary(color: Color32) -> Color32 {
 }
 
 /// `.lamp`'s inset ring, `rgba(0,0,0,.15)` in both themes: the page's one colour that is not a
-/// token.
+/// token and not derived from one (the others are `disabled` and `hovered_primary`).
 pub const LAMP_RING: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 38);
 
 /// The first family of the page's `--sans` and `--mono`, which the binary embeds.
