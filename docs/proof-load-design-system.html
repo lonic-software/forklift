@@ -5,6 +5,12 @@
 <style>
 /* Layout: a faceplate bench — one instrument per section, every component shown in both themes
    via the toggle. Tokens are pult-desktop's "1b Faceplate" set plus a grade family of its own. */
+/* Last compared with pult-desktop at f68d073d2926548c62cf1a2733a1155adac2696d
+   (src/lib/styles/tokens.css, 2026-10-15). This page's values are the ones in force; they already
+   differ from that commit in light --accent-ink, --engrave and --line, and in dark --accent-ink,
+   --engrave, --line, --muted and --pad. tools/proof-load-desktop/tests/design_system.rs holds the
+   desktop to this page; nothing holds this page to pult-desktop, so a change there goes unnoticed
+   until someone compares the two again and updates this note. */
 :root {
   --bg: #dcdee2; --panel: #f4f5f7; --pad: #eceef1; --pad-hi: #ffffff; --pad-lo: #c9cdd3;
   --well: #e3e6ea; --ink: #1a1d23; --muted: #5c6470; --line: #d3d7dd; --engrave: #b9bec6;

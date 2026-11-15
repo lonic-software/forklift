@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Fails if aws-lc (aws-lc-rs, aws-lc-sys) is in a lockfile. It is kept out of both workspaces'
+# locks, the root one and tools/proof-load-desktop's own, and an AWS SDK or TLS dependency change
+# can pull it back in without anything else noticing. The proof-load-desktop workflow runs this
+# whenever either lockfile changes.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+status=0
+for lock in Cargo.lock tools/proof-load-desktop/Cargo.lock; do
+    [ -f "$lock" ] || { echo "check-no-aws-lc: $lock is missing." >&2; status=1; continue; }
+    if grep -n -E '^name = "aws-lc' "$lock" >&2; then
+        echo "check-no-aws-lc: $lock holds aws-lc (above); cargo tree -i names its source." >&2
+        status=1
+    fi
+done
+exit "$status"

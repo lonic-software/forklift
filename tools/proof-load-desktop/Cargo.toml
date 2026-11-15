@@ -1,0 +1,28 @@
+# The Proof Load desktop head: an egui window over the proof-load library's run API and report.
+#
+# A workspace of its own, with its own Cargo.lock, so that egui and its windowing stack never enter
+# the root Cargo.lock or the per-PR CI build. `.github/workflows/proof-load-desktop.yml` builds and
+# tests it on every OS; run it with `cargo run --manifest-path tools/proof-load-desktop/Cargo.toml`.
+[workspace]
+resolver = "2"
+
+[package]
+name = "proof-load-desktop"
+description = "Proof Load's desktop head: runs fault scenarios and shows their grades."
+# Not released, so bin/release does not bump it; packaging the desktop is a ticket of its own.
+version = "0.0.0"
+edition = "2021"
+repository = "https://github.com/lonic-software/forklift"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "proof-load-desktop"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "=0.31.1"
+proof-load = { path = "../../crates/proof-load" }
