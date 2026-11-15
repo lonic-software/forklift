@@ -192,6 +192,16 @@ Notes:
   and proof-load, then `target/debug/proof-load run --source . --out <new dir> --forklift
   target/debug/forklift --forklift-server target/debug/forklift-server --git "$(command -v git)"
   --only <scenario>`.
+- The `proof load desktop` checks (`.github/workflows/proof-load-desktop.yml`, one per OS) build,
+  test and Clippy `tools/proof-load-desktop`, Proof Load's egui window. It is a Cargo workspace of
+  its own with its own `Cargo.lock`, so egui is in neither the root lock nor any other job's build;
+  run it with `--manifest-path tools/proof-load-desktop/Cargo.toml`. The checks run when the
+  desktop, `crates/proof-load`, the root `Cargo.toml` or `Cargo.lock`, or
+  `docs/proof-load-design-system.html` changes, and weekly; they are outside `ci passed`, and
+  Clippy fails them on any warning. Its tests hold every colour and shape token of the design
+  system page to `src/theme.rs`, ban colour and font-size literals elsewhere in `src/`, and lay
+  the window out in both themes without opening one, failing on any colour painted that is not a
+  token. The Linux job also runs `bin/check-no-aws-lc`, which fails if aws-lc is in either lock.
 - CI links on Windows with `rust-lld` (lld-link) instead of MSVC's `link.exe`, set by
   `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` in `ci.yml` (Linux already links with `rust-lld`
   by default and macOS with Apple's linker). Every push rebuilds all the workspace's test binaries,

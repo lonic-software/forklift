@@ -1,0 +1,73 @@
+# Proof Load's desktop head, tools/proof-load-desktop: a Cargo workspace of its own, so egui stays
+# out of the root Cargo.lock and out of every other job's build. It runs when the desktop, the
+# library it views, the root workspace's manifest or lock, or the design system page it is tested
+# against changes, and weekly, so a toolchain or runner change shows without a PR. It is not part of
+# the `ci passed` gate. No test opens a window.
+name: proof load desktop
+
+on:
+  pull_request:
+    paths:
+      - "tools/proof-load-desktop/**"
+      - "crates/proof-load/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "docs/proof-load-design-system.html"
+      - "bin/check-no-aws-lc"
+      - ".github/workflows/proof-load-desktop.yml"
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: proof-load-desktop-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # As in ci.yml: an empty RUSTFLAGS replaces the macOS split-debuginfo entry of .cargo/config.toml.
+  RUSTFLAGS: ""
+
+jobs:
+  desktop:
+    name: proof load desktop (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check both lockfiles for aws-lc
+        if: runner.os == 'Linux'
+        run: bin/check-no-aws-lc
+
+      # The libraries eframe's windowing and OpenGL backends build against on Linux.
+      - name: Install the egui system libraries
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev
+          libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/proof-load-desktop
+
+      - name: Build
+        run: cargo build --locked --all-targets --manifest-path tools/proof-load-desktop/Cargo.toml
+
+      - name: Test
+        run: cargo test --locked --no-fail-fast --manifest-path tools/proof-load-desktop/Cargo.toml
+
+      # --all-targets so clippy.toml's bans reach the tests; the workspace is clean, so any warning
+      # fails the job.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --manifest-path tools/proof-load-desktop/Cargo.toml -- -D warnings
