@@ -2576,6 +2576,214 @@ pub fn pallets_reaching(hashes: &BTreeSet<String>) -> Result<Vec<String>, String
     Ok(reaching)
 }
 
+/// What [`restore_from_working_tree`] stored again.
+#[derive(Debug, Default)]
+pub struct WorkingTreeRestore {
+    /// The paths of this checkout's inventory whose content was stored again from the working tree.
+    pub restored: Vec<String>,
+    /// The paths whose working file matched, or could not be read to tell, and was not stored, each
+    /// with why.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Store again, from this checkout's working tree, each object of `absent` that an entry of its
+/// inventory (staged, or as stacked) holds: the entry's blob or recipe, or a chunk of a recipe the
+/// store holds. Only where the working file at the entry's path still hashes to the entry's hash,
+/// so what is stored is the lost object itself, and nothing else is written. A file that changed,
+/// went away or is not of the entry's kind (a symlink, or a regular file) is left alone: a staged
+/// one is its owner's to unload, and a stacked one is history's, which a backup restores.
+///
+/// # Returns
+/// * `Ok(WorkingTreeRestore)` - What was stored again, and what matched but could not be.
+/// * `Err(String)`            - The checkout's staged entries could not be read.
+pub fn restore_from_working_tree(absent: &BTreeSet<String>) -> Result<WorkingTreeRestore, String> {
+    let mut outcome = WorkingTreeRestore::default();
+    if absent.is_empty() {
+        return Ok(outcome);
+    }
+
+    for (path, hash, item_type) in staged_entries_reaching(absent)? {
+        match restore_entry(&path, &hash, item_type) {
+            Ok(true) => outcome.restored.push(path),
+            Ok(false) => {}
+            Err(why) => outcome.failed.push((path, why)),
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// Store the content of the staged entry at `path` (its `hash` and `item_type`) from the working
+/// file there, if that file still hashes to `hash`.
+///
+/// # Returns
+/// * `Ok(true)`    - The content was stored again.
+/// * `Ok(false)`   - The working file is gone, of another kind, or holds other content.
+/// * `Err(String)` - The file matched, or could not be read to tell, and was not stored.
+fn restore_entry(path: &str, hash: &str, item_type: DirEntryType) -> Result<bool, String> {
+    let file = Path::new(path);
+    let metadata = match std::fs::symlink_metadata(file) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("Error while reading the metadata of \"{}\": {}", path, e)),
+    };
+    let symlink = item_type == DirEntryType::SymbolicLink;
+    if metadata.file_type().is_symlink() != symlink || metadata.is_dir() {
+        return Ok(false);
+    }
+
+    let kind = item_type.on_disk_kind();
+    let computed = object_utils::ingest_file(path, file, kind, object_utils::IngestMode::ComputeOnly)?;
+    if computed.hash != hash {
+        return Ok(false);
+    }
+    match computed.deferred {
+        Some(mut object) => { object.store()?; }
+        // A chunked file is read again, storing its chunks and recipe this time; content that
+        // changed between the reads is not the entry's, so it is not counted stored.
+        None => {
+            let stored = object_utils::ingest_file(path, file, kind, object_utils::IngestMode::Store)?;
+            if stored.hash != hash {
+                return Err("the file changed while it was read".to_string());
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+/// Every staged entry of this checkout whose content reaches any of `hashes`, as its path, hash
+/// and type: the entry's own hash, or a chunk of its recipe when the store holds the recipe.
+fn staged_entries_reaching(hashes: &BTreeSet<String>) -> Result<Vec<(String, String, DirEntryType)>, String> {
+    let ledger = inventory_utils::ShardLedger::read()?;
+    let mut found = Vec::new();
+
+    for key in ledger.keys() {
+        let Some(inventory) = ledger.inventory(key)? else {
+            continue;
+        };
+        for (_, item) in inventory.get_items() {
+            if item.item_type.is_file() && entry_reaches(&item.hash, item.item_type, hashes) {
+                let path = match key.is_empty() {
+                    true => item.name.clone(),
+                    false => format!("{}{}{}", key, file_utils::PATH_SEPARATOR_CHAR, item.name),
+                };
+                found.push((path, item.hash.clone(), item.item_type));
+            }
+        }
+    }
+
+    Ok(found)
+}
+
+/// Whether a file entry of `hash` and `item_type` reaches any of `hashes`: its own hash, or a chunk
+/// of its recipe when the store holds the recipe.
+fn entry_reaches(hash: &str, item_type: DirEntryType, hashes: &BTreeSet<String>) -> bool {
+    hashes.contains(hash)
+        || (item_type.is_chunked()
+            && object_utils::recipe_chunk_hashes(hash).is_ok_and(|chunks| chunks.iter().any(|chunk| hashes.contains(chunk))))
+}
+
+/// Where the lost objects that only staged content reaches are staged ([`staged_only_losses`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StagedLosses {
+    /// This checkout's staged paths whose content is lost and that nothing else reaches.
+    pub here: Vec<String>,
+    /// The other checkouts whose staged content is lost and that nothing else reaches: `bay
+    /// "<name>"`, or `the main working tree`, each with its working directory when it reads.
+    pub elsewhere: Vec<String>,
+    /// Whether every one of the lost objects is staged content only, each found in a checkout.
+    pub all: bool,
+}
+
+/// Which of `lost` only staged content reaches, and where it is staged: a walk of every durable
+/// ref but the checkouts' inventories finds what else reaches them, and each checkout's inventory
+/// is read for the rest. Such an object is the content of a load that was never stacked, so the
+/// checkout holding it unstages the path, or loads it again, and needs no backup.
+///
+/// # Returns
+/// * `Ok(StagedLosses)` - Where they are staged; empty when none is staged content only.
+/// * `Err(String)`      - A source the walk needs could not be read, or the walk or an inventory
+///                        could not be: which losses are staged only is not known.
+pub fn staged_only_losses(lost: &BTreeSet<String>, corrupt: &BTreeSet<String>) -> Result<StagedLosses, String> {
+    let mut roots = collect_walk_roots()?;
+    if let Some(source) = roots.degraded_sources.first() {
+        return Err(source.clone());
+    }
+    roots.shard_referenced.clear();
+    let sealed = sealed_utils::read_tolerated()?;
+    let outcome = walk_closure_for(lost, &roots, corrupt, &PathScope::full(), Some(&sealed), None)?;
+    if let Some((node, why)) = outcome.unwalked.iter().next() {
+        return Err(format!("what lies beneath {} could not be walked: {}", node, why.trim_end_matches('.')));
+    }
+    let staged_only: BTreeSet<String> = lost.difference(&outcome.referenced).cloned().collect();
+    if staged_only.is_empty() {
+        return Ok(StagedLosses::default());
+    }
+
+    let mut attributed: BTreeSet<String> = BTreeSet::new();
+    let here: Vec<String> = staged_entries_reaching(&staged_only)?
+        .into_iter()
+        .map(|(path, hash, item_type)| {
+            attributed.extend(reached_by(&hash, item_type, &staged_only));
+            path
+        })
+        .collect();
+
+    let active = crate::globals::active_bay();
+    let mut checkouts: Vec<(Option<String>, PathBuf)> = Vec::new();
+    if active.is_some() {
+        checkouts.push((None, forklift_root()));
+    }
+    for name in bay_utils::list_bays()? {
+        if active.as_deref() != Some(name.as_str()) {
+            checkouts.push((Some(name.clone()), bay_utils::bay_state_dir(&name)));
+        }
+    }
+    let mut elsewhere = Vec::new();
+    for (name, dir) in checkouts {
+        let mut leaves = Vec::new();
+        walk_shard_files(&dir.join(FOLDER_NAME_INVENTORY_ROOT), &mut leaves)?;
+        let mut reached = false;
+        for (hash, item_type) in leaves {
+            let found = reached_by(&hash, item_type, &staged_only);
+            reached |= !found.is_empty();
+            attributed.extend(found);
+        }
+        if reached {
+            elsewhere.push(describe_checkout(name.as_deref()));
+        }
+    }
+
+    Ok(StagedLosses { all: staged_only.len() == lost.len() && attributed == staged_only, here, elsewhere })
+}
+
+/// Which of `hashes` a file entry of `hash` and `item_type` reaches, as [`entry_reaches`] tells.
+fn reached_by(hash: &str, item_type: DirEntryType, hashes: &BTreeSet<String>) -> Vec<String> {
+    let mut found: Vec<String> = hashes.get(hash).cloned().into_iter().collect();
+    if item_type.is_chunked() {
+        if let Ok(chunks) = object_utils::recipe_chunk_hashes(hash) {
+            found.extend(chunks.into_iter().filter(|chunk| hashes.contains(chunk)));
+        }
+    }
+    found
+}
+
+/// A checkout other than this one, for a report: the main working tree (`None`) or a bay, with
+/// its working directory when that reads.
+fn describe_checkout(bay: Option<&str>) -> String {
+    match bay {
+        None => match forklift_root().parent() {
+            Some(root) => format!("the main working tree at \"{}\"", root.to_string_lossy()),
+            None => "the main working tree".to_string(),
+        },
+        Some(name) => match bay_utils::read_bay_path(name) {
+            Ok(Some(path)) => format!("bay \"{}\" at \"{}\"", name, path.to_string_lossy()),
+            _ => format!("bay \"{}\"", name),
+        },
+    }
+}
+
 /// What the enumerating walk feeds each absence it finds: the hash, and whether it was met as a
 /// file's content (see the module doc).
 type AbsenceSink<'a> = dyn FnMut(&str, bool) + 'a;

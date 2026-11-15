@@ -8,7 +8,7 @@ use forklift_core::util::reseal_utils::{self, ResealError};
 use forklift_core::util::warehouse_utils::{self, WarehouseMode};
 use forklift_core::util::applied_redactions::{self, RedactionState};
 use forklift_core::util::unavailable_heal::{self, RemoteError};
-use forklift_core::util::{config_utils, origin_utils, park_utils, recovery_utils, redaction_utils, sealed_utils, unavailable};
+use forklift_core::util::{config_utils, origin_utils, park_utils, recovery_utils, redaction_utils, sealed_utils, tree_utils, unavailable};
 use crate::output::{self, CommandOutput};
 
 /// The note of a re-apply of redactions that could not run, followed by why.
@@ -312,6 +312,30 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // cannot give back. A walk that cannot finish claims nothing lost.
     let mut lost = recovery_utils::find_lost_objects();
 
+    // Absent content a file of this checkout's inventory still holds in the working tree is stored
+    // again from there: the file hashes to it, so what is written is the lost object itself.
+    let mut restored_from_working_tree: Vec<String> = Vec::new();
+    if let Ok(found) = &lost {
+        match recovery_utils::restore_from_working_tree(&found.absent) {
+            Ok(restore) => {
+                for (path, why) in &restore.failed {
+                    notes.push(format!(
+                        "\"{}\" in the working tree holds content the store lost, and it was not stored again: {}",
+                        path, why.trim_end_matches('.')
+                    ));
+                }
+                if !restore.restored.is_empty() {
+                    restored_from_working_tree = restore.restored;
+                    lost = recovery_utils::find_lost_objects();
+                }
+            }
+            Err(why) => notes.push(format!(
+                "Lost content was not looked for in the working tree, so none was stored again from there: {}",
+                why.trim_end_matches('.')
+            )),
+        }
+    }
+
     // A partial warehouse leans on its origin for what it lacks, so a missing or damaged record of
     // it is damage heal names, even with nothing lost.
     let mode = match warehouse_utils::warehouse_mode() {
@@ -580,6 +604,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         resealed,
         recorded_unavailable,
         redactions_reapplied,
+        restored_from_working_tree,
         refs_rebuilt,
         refs_removed,
         refs_refused,
@@ -653,6 +678,19 @@ pub(crate) struct ObjectsLost {
     #[serde(skip_serializing_if = "Option::is_none")]
     pallets_unknown: Option<String>,
 
+    /// Whether only staged content reaches every one of them: loads never stacked, each in a
+    /// checkout `staged` or `staged_elsewhere` names, which no backup is needed to mend.
+    staged_only: bool,
+
+    /// This checkout's staged paths whose content is among them and that nothing else reaches.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    staged: Vec<String>,
+
+    /// The other checkouts (the main working tree, or a bay) staging content among them that
+    /// nothing else reaches.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    staged_elsewhere: Vec<String>,
+
     /// Sources the check could not read this run, so the counts may be short.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     degraded_sources: Vec<String>,
@@ -688,6 +726,9 @@ impl ObjectsLost {
             Ok(pallets) => (pallets, None),
             Err(error) => (Vec::new(), Some(error)),
         };
+        // Where staged content is all that reaches them cannot be told, they read as history's.
+        let corrupt: std::collections::BTreeSet<String> = lost.corrupt.keys().cloned().collect();
+        let staged = recovery_utils::staged_only_losses(&all, &corrupt).unwrap_or_default();
 
         ObjectsLost {
             absent: lost.absent.len(),
@@ -696,6 +737,9 @@ impl ObjectsLost {
             hashes,
             pallets,
             pallets_unknown,
+            staged_only: staged.all,
+            staged: staged.here,
+            staged_elsewhere: staged.elsewhere,
             degraded_sources: lost.degraded_sources.clone(),
             foreign_index: lost.foreign_index,
         }
@@ -705,8 +749,8 @@ impl ObjectsLost {
     fn lines(&self) -> Vec<String> {
         let total = self.absent + self.unreadable + self.corrupt;
         let mut lines = vec![format!(
-            "{} object(s) that history still reaches cannot be read from this store: {} absent, {} unreadable, {} corrupt.",
-            total, self.absent, self.unreadable, self.corrupt
+            "{} object(s) that {} still reaches cannot be read from this store: {} absent, {} unreadable, {} corrupt.",
+            total, if self.staged_only { "only staged content" } else { "history" }, self.absent, self.unreadable, self.corrupt
         )];
         let mut reason: Option<&str> = None;
         for object in &self.hashes {
@@ -722,7 +766,28 @@ impl ObjectsLost {
         match (&self.pallets_unknown, self.pallets.is_empty()) {
             (Some(error), _) => lines.push(format!("Which pallets reach them could not be told: {}", error)),
             (None, false) => lines.push(format!("History that reaches them: {}.", self.pallets.join(", "))),
-            (None, true) => lines.push("No pallet's history reaches them; other refs (parked work, a bay's operation, a tombstone) do.".to_string()),
+            (None, true) if self.staged_only => {}
+            (None, true) => lines.push(
+                "No pallet's history reaches them; other refs (staged content, parked work, a bay's operation, a tombstone) do."
+                    .to_string(),
+            ),
+        }
+        if !self.staged.is_empty() {
+            let listed: Vec<&str> = self.staged.iter().take(LOST_HASHES_LISTED).map(String::as_str).collect();
+            lines.push(format!(
+                "Staged in this checkout, with nothing else reaching that content: {}{}.",
+                listed.join(", "),
+                match self.staged.len() - listed.len() {
+                    0 => String::new(),
+                    more => format!(", and {} more", more),
+                }
+            ));
+        }
+        if !self.staged_elsewhere.is_empty() {
+            lines.push(format!(
+                "Staged, with nothing else reaching that content, in another checkout: {}.",
+                self.staged_elsewhere.join(", ")
+            ));
         }
         for source in &self.degraded_sources {
             lines.push(format!("This check may be short: {}", source));
@@ -737,11 +802,15 @@ fn objects_lost_refusal(report: &HealReport, lost: &ObjectsLost, rebuild_skipped
     let lines = objects_lost_lines(report, lost);
 
     let next_step = if lost.foreign_index {
-        "re-create the warehouse with this build of Forklift: the pack folder holds an index another build wrote"
+        "re-create the warehouse with this build of Forklift: the pack folder holds an index another build wrote".to_string()
     } else if rebuild_skipped {
-        "forklift heal"
+        "forklift heal".to_string()
+    } else if lost.staged_only && !lost.staged.is_empty() {
+        unload_step_when(&lost.staged, cfg!(windows))
+    } else if lost.staged_only {
+        "from each checkout named above, run \"forklift heal\"".to_string()
     } else {
-        "restore the warehouse from a backup, or clone it afresh from a remote that holds these objects"
+        "restore the warehouse from a backup, or clone it afresh from a remote that holds these objects".to_string()
     };
 
     CoreError::refusal_with_details(
@@ -750,6 +819,31 @@ fn objects_lost_refusal(report: &HealReport, lost: &ObjectsLost, rebuild_skipped
         next_step,
         serde_json::json!(report),
     )
+}
+
+/// The next step for lost content only staged paths of this checkout reach, as the platform
+/// `windows` quotes them: unload each, which unstages it and leaves its file as it is, and load
+/// again what is meant to be staged. The paths are warehouse-root-relative, so the commands run
+/// from the working tree's root, each path one argument ([`tree_utils::remedy_path_when`]), or
+/// every one listed behind a placeholder step when any cannot be quoted there.
+fn unload_step_when(paths: &[String], windows: bool) -> String {
+    let arguments: Option<Vec<String>> = paths.iter().map(|path| tree_utils::remedy_path_when(path, windows)).collect();
+    match (arguments, paths) {
+        (Some(arguments), [_]) => format!(
+            "from the working tree's root, run \"forklift unload {}\", then load the file again if you \
+            mean to stage it",
+            arguments[0]
+        ),
+        (Some(arguments), _) => format!(
+            "from the working tree's root, run each of these, then load again what you mean to stage: {}",
+            arguments.iter().map(|argument| format!("\"forklift unload {}\"", argument)).collect::<Vec<_>>().join(", ")
+        ),
+        (None, _) => format!(
+            "from the working tree's root, run \"forklift unload -- <path>\" for each of these paths, with \
+            the path quoted for your shell, then load again what you mean to stage: {}",
+            paths.iter().map(|path| format!("\"{}\"", path)).collect::<Vec<_>>().join(", ")
+        ),
+    }
 }
 
 /// The lines of an `objects_lost` refusal: what was lost, then a damaged ref left standing.
@@ -1007,6 +1101,11 @@ pub(crate) struct HealReport {
     /// as redacted and an export leaves it out. A lost or damaged record dropped its hash.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     redactions_reapplied: Vec<String>,
+
+    /// Paths this checkout's inventory lists whose content the store had lost, which this run stored
+    /// again from the working tree, where the file still holds that content.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    restored_from_working_tree: Vec<String>,
 
     /// Pallet refs that were lost or damaged and this run set: rebuilt at the head the evidence
     /// agreed on, or set to the parcel `--ref` gave.
@@ -1303,6 +1402,7 @@ impl CommandOutput for HealReport {
             && self.resealed.is_empty() && self.recorded_unavailable.is_empty() && self.notes.is_empty()
             && self.unseal_failed.is_none() && self.record_rebuilt.is_none() && self.unavailable_rebuilt.is_none()
             && self.redactions_applied_rebuilt.is_none() && self.redactions_reapplied.is_empty()
+            && self.restored_from_working_tree.is_empty()
             && self.fetch_scope_rebuilt.is_none() && self.parked_rebuilt.is_none()
             && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
             && self.objects_lost.is_none()
@@ -1353,6 +1453,16 @@ impl CommandOutput for HealReport {
                 println!("  {}", hash);
             }
             println!("If this warehouse held a copy of one, restoring it from a backup brings the content back.");
+        }
+
+        if !self.restored_from_working_tree.is_empty() {
+            println!(
+                "{} path(s) whose content the store had lost are stored again from the working tree:",
+                self.restored_from_working_tree.len()
+            );
+            for path in &self.restored_from_working_tree {
+                println!("  {}", path);
+            }
         }
 
         if !self.redactions_reapplied.is_empty() {
