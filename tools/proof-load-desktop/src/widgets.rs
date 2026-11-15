@@ -29,10 +29,19 @@ pub fn engraved(ui: &mut Ui, label: &str) -> Response {
     text(ui, label, Type::Label, muted)
 }
 
-/// A raised pad: its fill, a highlight along the top and a shade along the bottom.
+/// A raised pad: its fill, a highlight along the top and, in light, a shade along the bottom.
 pub fn raised(ctx: &egui::Context, rect: Rect, fill: Color32, radius: u8) -> Vec<Shape> {
+    let mut shapes = vec![Shape::rect_filled(rect, CornerRadius::same(radius), fill)];
+    shapes.extend(raised_edges(ctx, rect, radius));
+    shapes
+}
+
+/// A raised pad's edges without its fill, for a frame that paints its own.
+fn raised_edges(ctx: &egui::Context, rect: Rect, radius: u8) -> Vec<Shape> {
     let p = theme::palette(ctx);
-    vec![Shape::rect_filled(rect, CornerRadius::same(radius), fill), edge(rect, radius, true, p.pad_hi), edge(rect, radius, false, p.pad_lo)]
+    let mut shapes = vec![edge(rect, radius, true, p.pad_hi)];
+    shapes.extend(theme::raise_shade(ctx.theme()).map(|shade| edge(rect, radius, false, shade)));
+    shapes
 }
 
 /// A sunk well: its fill, a shade along the top, and in light a highlight along the bottom.
@@ -73,17 +82,20 @@ pub fn plate<R>(ui: &mut Ui, heading: &str, tag: &str, add_contents: impl FnOnce
         .inner_margin(egui::Margin::same(theme::PLATE_PADDING as i8));
     let inner = frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
+        // The plate sets its own gaps, so none of the screen's spacing reaches its contents.
+        ui.spacing_mut().item_spacing.y = 0.0;
         ui.horizontal(|ui| {
             text(ui, heading, Type::Heading, p.ink);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| engraved(ui, tag));
         });
+        ui.add_space(theme::HEADER_GAP);
         let rule = ui.available_rect_before_wrap();
         ui.painter().hline(rule.x_range(), rule.top(), hairline(p.line));
-        ui.add_space(2.0 * U);
+        ui.add_space(theme::PLATE_GAP);
+        ui.spacing_mut().item_spacing.y = theme::PLATE_GAP;
         add_contents(ui)
     });
-    let rect = inner.response.rect;
-    ui.painter().extend([edge(rect, theme::R_L, true, p.pad_hi), edge(rect, theme::R_L, false, p.pad_lo)]);
+    ui.painter().extend(raised_edges(ui.ctx(), inner.response.rect, theme::R_L));
     inner.inner
 }
 
@@ -100,12 +112,11 @@ pub enum Button {
 pub fn button(ui: &mut Ui, label: &str, kind: Button, enabled: bool) -> Response {
     let p = theme::palette(ui.ctx());
     let (fill, ink, style) = match kind {
-        Button::Primary => (p.accent, p.accent_ink, Type::Control),
+        Button::Primary => (p.accent, p.accent_ink, Type::PrimaryControl),
         Button::Default => (p.pad, p.ink, Type::Control),
     };
-    let opacity = if enabled { 1.0 } else { 0.45 };
     // The text's colour is the job's own, which the painter's fallback colour does not replace.
-    let ink = ink.gamma_multiply(opacity);
+    let ink = if enabled { ink } else { theme::disabled(ink) };
     let galley = ui.painter().layout_job(job(label, style, ink));
     let padding = egui::vec2(3.5 * U, 0.0);
     let size = egui::vec2(galley.size().x + 2.0 * padding.x, theme::CONTROL_HEIGHT);
@@ -116,11 +127,12 @@ pub fn button(ui: &mut Ui, label: &str, kind: Button, enabled: bool) -> Response
         let fill = match (kind, pressed, enabled && response.hovered()) {
             (Button::Default, true, _) => p.well,
             (Button::Default, false, true) => p.pad_hi,
+            (Button::Primary, false, true) => theme::hovered_primary(fill),
             _ => fill,
         };
         let shift = if pressed { egui::vec2(0.0, 1.0) } else { Vec2::ZERO };
         if !enabled {
-            ui.painter().rect_filled(rect, CornerRadius::same(theme::R_S), fill.gamma_multiply(opacity));
+            ui.painter().rect_filled(rect, CornerRadius::same(theme::R_S), theme::disabled(fill));
         } else if pressed {
             ui.painter().extend(sunk(ui.ctx(), rect.translate(shift), fill, theme::R_S));
         } else {
@@ -214,17 +226,22 @@ pub enum Lamp {
     NotRun,
 }
 
-/// A 12 px lamp, centred in `rect`.
+/// A 12 px lamp at `center`, with the page's faint inset ring; a sampled lamp is its ring alone.
 pub fn paint_lamp(ui: &Ui, center: Pos2, lamp: Lamp) {
     let p = theme::palette(ui.ctx());
     let painter = ui.painter();
     let radius = 6.0;
-    match lamp {
-        Lamp::Off => painter.circle_filled(center, radius, p.lamp_off),
-        Lamp::Run => painter.circle_filled(center, radius, p.g_healed),
-        Lamp::NotRun => painter.circle_filled(center, radius, p.notrun),
-        Lamp::Sampled => painter.circle_stroke(center, radius - 1.0, Stroke::new(2.0_f32, p.sampled)),
+    let fill = match lamp {
+        Lamp::Off => p.lamp_off,
+        Lamp::Run => p.g_healed,
+        Lamp::NotRun => p.notrun,
+        Lamp::Sampled => {
+            painter.circle_stroke(center, radius - 1.0, Stroke::new(2.0_f32, p.sampled));
+            return;
+        }
     };
+    painter.circle_filled(center, radius, fill);
+    painter.circle_stroke(center, radius - 0.5, hairline(theme::LAMP_RING));
 }
 
 /// A coverage table cell: its lamp and its state, with a not-run cell's reason as the tooltip.
@@ -239,7 +256,7 @@ pub fn coverage_cell(ui: &mut Ui, cell: &Cell) -> Response {
         ui.spacing_mut().item_spacing.x = 6.0;
         let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), Sense::hover());
         paint_lamp(ui, rect.center(), lamp);
-        text(ui, label, Type::Chip, color);
+        text(ui, label, Type::Cell, color);
     })
     .response;
     match cell {
@@ -291,7 +308,8 @@ pub fn grade_chip(ui: &mut Ui, grade: Grade) -> Response {
     let p = theme::palette(ui.ctx());
     let latched = grades::latched(grade);
     let (fill, ink) = if latched { (p.g_silent, p.g_silent_ink) } else { (p.pad, p.ink) };
-    let galley = ui.painter().layout_job(job(grades::name(grade), Type::Chip, ink));
+    let style = if latched { Type::LatchedChip } else { Type::Chip };
+    let galley = ui.painter().layout_job(job(grades::name(grade), style, ink));
     let size = egui::vec2(7.0 + 16.0 + 7.0 + galley.size().x + 9.0, 16.0 + 2.0 * 5.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     if ui.is_rect_visible(rect) {
@@ -364,27 +382,49 @@ pub fn readout(ui: &mut Ui, label: &str, value: &str, unit: &str) -> Response {
         ui.horizontal(|ui| {
             text(ui, value, Type::Readout, p.ink);
             if !unit.is_empty() {
-                text(ui, unit, Type::Small, p.muted);
+                text(ui, unit, Type::ReadoutUnit, p.muted);
             }
         });
     })
     .response
 }
 
-/// A line of the step screen.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ScreenLine {
-    /// A command the scenario ran, `$ forklift …`, dim.
-    Command(String),
+/// The step screen's inks: the page's `.crt` text and its `.d`, `.r` and `.a` spans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ink {
     /// What the tool printed.
-    Output(String),
-    /// A refusal, red.
-    Refusal(String),
-    /// What the tool did about it, amber.
-    Action(String),
+    Plain,
+    /// A command the scenario ran, and a refusal's hint.
+    Dim,
+    /// A refusal.
+    Red,
+    /// What the tool did about it.
+    Amber,
 }
 
-/// The step screen: a fixed dark CRT in both themes, one line per entry.
+/// A line of the step screen: spans of text, each in its ink.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScreenLine(pub Vec<(Ink, String)>);
+
+impl ScreenLine {
+    /// A line in one ink.
+    pub fn new(ink: Ink, text: impl Into<String>) -> ScreenLine {
+        ScreenLine(vec![(ink, text.into())])
+    }
+
+    /// A command the scenario ran, `$ <command>`, dim.
+    pub fn command(command: &str) -> ScreenLine {
+        ScreenLine::new(Ink::Dim, format!("$ {command}"))
+    }
+
+    /// This line with `text` added after it, in `ink`.
+    pub fn then(mut self, ink: Ink, text: impl Into<String>) -> ScreenLine {
+        self.0.push((ink, text.into()));
+        self
+    }
+}
+
+/// The step screen: a fixed dark CRT in both themes, one row per line.
 pub fn screen(ui: &mut Ui, lines: &[ScreenLine]) -> Response {
     let p = theme::palette(ui.ctx());
     let frame = egui::Frame::new().fill(p.crt_bg).corner_radius(CornerRadius::same(theme::R_S))
@@ -394,29 +434,43 @@ pub fn screen(ui: &mut Ui, lines: &[ScreenLine]) -> Response {
         ui.spacing_mut().item_spacing.y = 12.0 * 0.6;
         egui::ScrollArea::horizontal().show(ui, |ui| {
             for line in lines {
-                let (content, color) = match line {
-                    ScreenLine::Command(command) => (format!("$ {}", command), p.crt_dim),
-                    ScreenLine::Output(output) => (output.clone(), p.crt_ink),
-                    ScreenLine::Refusal(refusal) => (refusal.clone(), p.crt_red),
-                    ScreenLine::Action(action) => (action.clone(), p.crt_amber),
-                };
-                ui.add(egui::Label::new(job(&content, Type::Screen, color)).extend());
+                let mut row = LayoutJob::default();
+                for (ink, text) in &line.0 {
+                    let color = match ink {
+                        Ink::Plain => p.crt_ink,
+                        Ink::Dim => p.crt_dim,
+                        Ink::Red => p.crt_red,
+                        Ink::Amber => p.crt_amber,
+                    };
+                    row.append(text, 0.0, job(text, Type::Screen, color).sections[0].format.clone());
+                }
+                ui.add(egui::Label::new(row).extend());
             }
         });
     })
     .response
 }
 
-/// Where a grade glyph sits beside a tally line's name and count.
-pub fn tally_line(ui: &mut Ui, grade: Grade, count: usize) -> Response {
+/// The run's tally: one line per grade, its glyph, name and count.
+pub fn tally(ui: &mut Ui, lines: &[(Grade, usize)]) -> Response {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = theme::TALLY_GAP;
+        for (grade, count) in lines {
+            tally_line(ui, *grade, *count);
+        }
+    })
+    .response
+}
+
+/// One tally line: the grade's glyph, its name, and its count at the right.
+fn tally_line(ui: &mut Ui, grade: Grade, count: usize) -> Response {
     let p: &Palette = theme::palette(ui.ctx());
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 16.0), Sense::hover());
         paint_glyph(ui, Rect::from_center_size(rect.center(), egui::vec2(16.0, 16.0)), grade, p.ink);
-        text(ui, grades::name(grade), Type::Body, p.ink);
+        text(ui, grades::name(grade), Type::Tally, p.ink);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let galley = job(&count.to_string(), Type::Data, p.ink);
-            ui.add(egui::Label::new(galley).selectable(false));
+            text(ui, &count.to_string(), Type::TallyCount, p.ink);
         });
     })
     .response

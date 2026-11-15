@@ -1,15 +1,14 @@
 //! The window drawn into a bare egui context, with no window opened: it lays out in both themes,
-//! and every colour it paints is a token of that theme's palette, so neither egui's own defaults
-//! nor a widget's arithmetic puts a colour on screen that the design system does not have.
+//! and every colour it paints is a token of that theme's palette (or the lamp's ring, the page's
+//! one colour that is not a token), so neither egui's own defaults nor a widget's arithmetic puts
+//! a colour on screen that the design system does not have.
 
 use std::collections::BTreeSet;
 
 use eframe::egui::{self, epaint, Color32};
 use proof_load_desktop::app::App;
+use proof_load::report::Cell;
 use proof_load_desktop::{theme, widgets};
-
-/// A disabled control draws its fill and text at this share of their opacity (`.btn[disabled]`).
-const DISABLED: f32 = 0.45;
 
 /// Every colour the window's last frame puts on screen: the frame is tessellated as eframe would,
 /// so a text's fallback and opacity, a mesh and egui's own decoration are all read as painted.
@@ -53,7 +52,8 @@ fn painted_by_widget(theme: egui::Theme, mut add: impl FnMut(&mut egui::Ui)) -> 
 fn check(which: egui::Theme) {
     let palette = theme::palette_of(which);
     let allowed: BTreeSet<[u8; 4]> = palette.tokens().into_iter()
-        .flat_map(|(_, colour)| [colour, colour.gamma_multiply(DISABLED)])
+        .flat_map(|(_, colour)| [colour, theme::disabled(colour)])
+        .chain([theme::LAMP_RING])
         .map(|colour| colour.to_array()).collect();
     let painted = painted(which);
     assert!(painted.len() >= 10, "the {which:?} window painted almost nothing: {painted:?}");
@@ -85,7 +85,7 @@ fn a_disabled_button_draws_its_text_at_45_percent() {
         let painted = painted_by_widget(which, |ui| {
             widgets::button(ui, "Open report", widgets::Button::Default, false);
         });
-        assert!(painted.contains(&palette.ink.gamma_multiply(DISABLED).to_array()), "{which:?}: {painted:?}");
+        assert!(painted.contains(&theme::disabled(palette.ink).to_array()), "{which:?}: {painted:?}");
         assert!(!painted.contains(&palette.ink.to_array()), "{which:?} draws a disabled label at full ink");
     }
 }
@@ -100,4 +100,26 @@ fn an_unpressed_segment_is_muted_and_the_pressed_one_is_ink() {
         assert!(painted.contains(&palette.ink.to_array()), "{which:?} has no pressed segment in ink");
         assert!(painted.contains(&palette.muted.to_array()), "{which:?} has no unpressed segment muted");
     }
+}
+
+#[test]
+fn a_raised_pad_has_a_bottom_shade_in_light_only() {
+    for (which, shaded) in [(egui::Theme::Light, true), (egui::Theme::Dark, false)] {
+        let palette = theme::palette_of(which);
+        let painted = painted_by_widget(which, |ui| {
+            widgets::button(ui, "Open report", widgets::Button::Default, true);
+        });
+        assert!(painted.contains(&palette.pad_hi.to_array()), "{which:?} has no top highlight");
+        assert_eq!(painted.contains(&palette.pad_lo.to_array()), shaded, "{which:?}'s bottom shade");
+    }
+}
+
+#[test]
+fn a_lit_lamp_has_its_ring_and_a_sampled_one_does_not() {
+    let ring = theme::LAMP_RING.to_array();
+    let lamp = |cell: Cell| painted_by_widget(egui::Theme::Light, move |ui| {
+        widgets::coverage_cell(ui, &cell);
+    });
+    assert!(lamp(Cell::Run).contains(&ring));
+    assert!(!lamp(Cell::Sampled).contains(&ring));
 }

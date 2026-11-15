@@ -105,10 +105,18 @@ fn the_shape_and_type_tokens_match_the_page() {
     }
 }
 
-/// The lines of `source` that write a colour or a font size, which only theme.rs may.
+/// The lines of `source` that write a colour or a font size, which only theme.rs may: a colour
+/// constructor, constant, conversion or derivation, a `FontId` or `TextStyle` written out, or
+/// egui's own sizing and weighting of text (`RichText::size`, `strong`, `heading` and the rest).
+/// A `galley.size()` is a measurement, not a size written, and is allowed.
 fn literals(source: &str) -> Vec<String> {
-    const WRITES: [&str; 7] = ["Color32::", "from_rgb", "from_gray", "from_hex", "FontId::new", "FontId::proportional", "FontId::monospace"];
-    source.lines().enumerate().filter(|(_, line)| WRITES.iter().any(|write| line.contains(write)))
+    const WRITES: [&str; 20] = [
+        "Color32::", "Color32 as", "Rgba", "Hsva", "Hsla", "from_rgb", "from_gray", "from_hex", "from_srgb",
+        "gamma_multiply", "linear_multiply", "lerp_to_gamma", "FontId", "TextStyle::", ".strong()",
+        ".heading()", ".small()", ".monospace()", ".weak()", ".text_style(",
+    ];
+    source.lines().enumerate()
+        .filter(|(_, line)| WRITES.iter().any(|write| line.contains(write)) || line.replace(".size()", "").contains(".size("))
         .map(|(index, line)| format!("{}: {}", index + 1, line.trim())).collect()
 }
 
@@ -136,7 +144,11 @@ fn no_file_but_the_theme_writes_a_colour_or_a_font_size() {
 #[test]
 fn the_literal_scan_finds_what_it_bans() {
     assert_eq!(literals("let a = 1;\nlet red = Color32::RED;"), ["2: let red = Color32::RED;"]);
-    assert_eq!(literals("FontId::new(9.0, family)").len(), 1);
+    for write in ["FontId::new(9.0, family)", "FontId { size: 9.0, family }", "RichText::new(x).size(20.0)", "RichText::new(x).strong()",
+        "ink.gamma_multiply(0.45)", "use egui::Color32 as C;", "Rgba::from_rgb(1.0, 0.0, 0.0)", "ecolor::Hsva::new(0.0, 1.0, 1.0, 1.0)"] {
+        assert_eq!(literals(write).len(), 1, "the scan misses {write}");
+    }
+    assert!(literals("let width = galley.size().x;").is_empty(), "a measured size is not a size written");
     let theme = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/theme.rs")).unwrap();
     assert!(!literals(&theme).is_empty(), "theme.rs writes its colours in a form the scan sees");
 }

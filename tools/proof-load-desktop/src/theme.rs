@@ -1,7 +1,9 @@
 //! Every token the desktop draws with, copied from the accepted design system,
-//! docs/proof-load-design-system.html. This is the only file that names a colour or a type size:
-//! tests/design_system.rs fails on a token here that differs from the page, a token of the page
-//! missing here, or a colour or font size written anywhere else in src/.
+//! docs/proof-load-design-system.html. This is the only file that names a colour or a type size.
+//! tests/design_system.rs fails on a colour token here that differs from the page or is missing
+//! from it, on `--r-s`, `--r-l`, `--u` or a font family that differs, and on a colour or font size
+//! written anywhere else in src/ in a form its scan knows. The type scale, the spacing and the
+//! component radii below are copied from the page's rules by hand, and no test reads them back.
 
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Stroke, Visuals};
 
@@ -78,6 +80,30 @@ pub const U: f32 = 4.0;
 pub const ROW_HEIGHT: f32 = 28.0;
 pub const CONTROL_HEIGHT: f32 = 32.0;
 pub const PLATE_PADDING: f32 = 14.0;
+/// `.plate`'s gap between its parts, and between plates on a screen (`.grid`).
+pub const PLATE_GAP: f32 = 14.0;
+/// The space between a plate's heading and the rule under it (`.plate > header`).
+pub const HEADER_GAP: f32 = 10.0;
+/// The space between tally lines (`.tally`).
+pub const TALLY_GAP: f32 = 6.0;
+
+/// `.btn[disabled]`: a disabled control's fill and text at this share of their opacity.
+pub const DISABLED_OPACITY: f32 = 0.45;
+
+/// A disabled control's version of `color`.
+pub fn disabled(color: Color32) -> Color32 {
+    color.gamma_multiply(DISABLED_OPACITY)
+}
+
+/// `.btn.primary:hover`: the fill at `brightness(1.06)`.
+pub fn hovered_primary(color: Color32) -> Color32 {
+    let brighten = |channel: u8| (f32::from(channel) * 1.06).round().min(255.0) as u8;
+    Color32::from_rgb(brighten(color.r()), brighten(color.g()), brighten(color.b()))
+}
+
+/// `.lamp`'s inset ring, `rgba(0,0,0,.15)` in both themes: the page's one colour that is not a
+/// token.
+pub const LAMP_RING: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 38);
 
 /// The first family of the page's `--sans` and `--mono`, which the binary embeds.
 pub const SANS_FAMILY: &str = "IBM Plex Sans";
@@ -121,15 +147,23 @@ impl Face {
 /// The page's type scale. `Label` is also drawn upper case and letter-spaced (`.engraved`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Type {
-    /// Title 26/600.
+    /// Title 26/600, letter-spaced -.01em.
     Title,
     /// Heading 17/600.
     Heading,
     /// Body 14/400.
     Body,
-    /// A control's text: buttons 13/500, the segmented control and chips 12.5/500.
+    /// A control's text: buttons 13/500, the primary button 13/600, the segmented control and
+    /// chips 12.5/500, the latched chip 12.5/600.
     Control,
+    PrimaryControl,
     Chip,
+    LatchedChip,
+    /// A coverage cell's state, 12.5/400.
+    Cell,
+    /// A tally line's grade name, 13/400, and its count, mono 13/600.
+    Tally,
+    TallyCount,
     /// Label 10.5/600, engraved.
     Label,
     /// Small print under a field and beside a meter: 11.5/400.
@@ -140,8 +174,9 @@ pub enum Type {
     Input,
     /// The step screen, mono 12/400.
     Screen,
-    /// Readout mono 22/600.
+    /// Readout mono 22/600, and its unit, mono 12/400.
     Readout,
+    ReadoutUnit,
 }
 
 impl Type {
@@ -151,21 +186,29 @@ impl Type {
             Type::Heading => (17.0, Face::SansSemiBold),
             Type::Body => (14.0, Face::Sans),
             Type::Control => (13.0, Face::SansMedium),
+            Type::PrimaryControl => (13.0, Face::SansSemiBold),
             Type::Chip => (12.5, Face::SansMedium),
+            Type::LatchedChip => (12.5, Face::SansSemiBold),
+            Type::Cell => (12.5, Face::Sans),
+            Type::Tally => (13.0, Face::Sans),
+            Type::TallyCount => (13.0, Face::MonoSemiBold),
             Type::Label => (10.5, Face::SansSemiBold),
             Type::Small => (11.5, Face::Sans),
             Type::Data => (12.5, Face::Mono),
             Type::Input => (13.0, Face::Mono),
             Type::Screen => (12.0, Face::Mono),
             Type::Readout => (22.0, Face::MonoSemiBold),
+            Type::ReadoutUnit => (12.0, Face::Mono),
         };
         FontId::new(size, face.family())
     }
 
-    /// The extra space between letters, in points: `.engraved`'s .12em, and none elsewhere.
+    /// The extra space between letters, in points: `.engraved`'s .12em, h1's -.01em, and none
+    /// elsewhere.
     pub fn letter_spacing(self) -> f32 {
         match self {
             Type::Label => 10.5 * 0.12,
+            Type::Title => 26.0 * -0.01,
             _ => 0.0,
         }
     }
@@ -180,6 +223,15 @@ pub fn palette_of(theme: egui::Theme) -> &'static Palette {
     match theme {
         egui::Theme::Light => &LIGHT,
         egui::Theme::Dark => &DARK,
+    }
+}
+
+/// The page's raised pads have a shade along their lower edge in light only; in dark the highlight
+/// at the top and the drop shadow are the whole effect (`--shadow-raise`).
+pub fn raise_shade(theme: egui::Theme) -> Option<Color32> {
+    match theme {
+        egui::Theme::Light => Some(LIGHT.pad_lo),
+        egui::Theme::Dark => None,
     }
 }
 

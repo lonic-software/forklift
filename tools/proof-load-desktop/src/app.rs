@@ -8,7 +8,7 @@ use proof_load::report::Cell;
 
 use crate::grades;
 use crate::theme::{self, Type};
-use crate::widgets::{self, Button, Led, ScreenLine};
+use crate::widgets::{self, Button, Ink, Led, ScreenLine};
 
 /// The theme switch's options, in order.
 const THEMES: [&str; 3] = ["System", "Light", "Dark"];
@@ -46,7 +46,7 @@ impl App {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(16, 8)))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 5.0 * theme::U;
+                    ui.spacing_mut().item_spacing.y = theme::PLATE_GAP;
                     self.bench(ui);
                 });
             });
@@ -91,12 +91,13 @@ impl App {
         });
         widgets::plate(ui, "Step screen", "what the tool printed", |ui| {
             widgets::screen(ui, &[
-                ScreenLine::Command("forklift git export --out ./x".to_string()),
-                ScreenLine::Refusal("error: the applied-redactions record is damaged.".to_string()),
-                ScreenLine::Output("  next step: forklift heal".to_string()),
-                ScreenLine::Command("forklift heal".to_string()),
-                ScreenLine::Output("rebuilt the applied-redactions record (2 kept)".to_string()),
-                ScreenLine::Action("applied again: 1 redaction".to_string()),
+                ScreenLine::command("forklift git export --out ./x"),
+                ScreenLine::new(Ink::Red, "error: the applied-redactions record is damaged."),
+                ScreenLine::new(Ink::Dim, "  next step:").then(Ink::Plain, " forklift heal"),
+                ScreenLine::command("forklift heal"),
+                ScreenLine::new(Ink::Plain, "rebuilt the applied-redactions record (2 kept)"),
+                ScreenLine::new(Ink::Amber, "applied again: 1 redaction"),
+                ScreenLine::command("forklift git export --out ./x").then(Ink::Plain, "   exit 0"),
             ]);
         });
         widgets::plate(ui, "Coverage cells", "report::CoverageTable", |ui| {
@@ -111,9 +112,8 @@ impl App {
                 ui.allocate_ui(egui::vec2(230.0, 200.0), |ui| {
                     ui.vertical(|ui| {
                         widgets::engraved(ui, "This run");
-                        for (grade, count) in grades::WORST_FIRST.into_iter().zip([1, 4, 3, 61, 343]) {
-                            widgets::tally_line(ui, grade, count);
-                        }
+                        let counts: Vec<_> = grades::WORST_FIRST.into_iter().zip([1, 4, 3, 61, 343]).collect();
+                        widgets::tally(ui, &counts);
                         widgets::segmented(ui, &mut self.show, &["Failures", "All"]);
                     });
                 });
