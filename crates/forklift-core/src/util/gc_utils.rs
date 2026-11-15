@@ -952,23 +952,16 @@ pub(crate) mod tests {
         assert!(loose_path(&garbage).exists(), "gc must delete nothing when the live set cannot be computed");
     }
 
-    /// (v) The gc half of the bay-scoping bug: `collect_live_set` used to read only the active
-    /// bay's `parked`/`consolidation` state (`bay_root()`, which with no active bay resolves to
-    /// `forklift_root()` itself — never a *named* bay's state dir) — a parcel parked in a
-    /// different bay was invisible to gc, and `collect_garbage`/`compact --all` run from the
-    /// main tree deleted its otherwise-unreferenced objects. Present-tense data loss (worse than
-    /// the recovery walk's under-count: nothing has to crash first), not merely a stale taint
-    /// record. Pins the per-bay loop over `bay_utils::all_bay_state_dirs` in `collect_live_set`.
-    /// Red without it: the blob below is reachable from **no** pallet head — only bay "b"'s
-    /// parked file (planted directly, by path, mirroring how `collect_live_set` itself only ever
-    /// reads paths) — so a pre-fix `collect_garbage(0)` run from the main scope deletes it.
+    /// (v) gc keeps what parked work holds. The blob below is reachable from **no** pallet head —
+    /// only the parked-work record, which every bay shares — so a `collect_garbage(0)` whose live
+    /// set left the record out deletes it: present-tense data loss, with no crash first.
     #[test]
-    fn gc_keeps_an_object_referenced_only_by_another_bays_parked_parcel() {
+    fn gc_keeps_an_object_referenced_only_by_a_parked_parcel() {
         let _scratch = Scratch::new("gc-bay-scoped-parked");
 
         // A real parcel over a real tree/blob, stored but reachable from no pallet head at all —
-        // its only reference is bay "b"'s parked file.
-        let blob = store_blob("only bay b's parked parcel reaches me\n");
+        // its only reference is the parked-work record.
+        let blob = store_blob("only a parked parcel reaches me\n");
         let tree = store_tree(&[("f.txt", &blob, DirEntryType::Normal)]);
         let parcel = {
             let parcel = Parcel { tree_hash: tree.clone(), parents: Vec::new(), actions: Vec::new(), description: None };
@@ -977,50 +970,46 @@ pub(crate) mod tests {
             object.hash
         };
 
-        let bay_b_dir = bay_utils::bay_state_dir("b");
-        std::fs::create_dir_all(&bay_b_dir).unwrap();
-        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&[&parcel])).unwrap();
+        crate::util::park_utils::park_for_test(&[&parcel]);
 
-        // Run from the MAIN scope (no active bay) — gc must still see bay "b"'s parked parcel.
-        let stats = collect_garbage(0).expect("gc must tolerate another bay's parked parcel");
+        let stats = collect_garbage(0).expect("gc reads the parked-work record");
 
-        assert_eq!(stats.deleted, 0, "nothing reachable only through bay b's parked parcel may be deleted");
-        assert!(loose_path(&blob).exists(), "a blob referenced only by another bay's parked parcel must survive gc");
-        assert!(loose_path(&tree).exists(), "a tree referenced only by another bay's parked parcel must survive gc");
-        assert!(loose_path(&parcel).exists(), "a parcel parked only in another bay must survive gc");
+        assert_eq!(stats.deleted, 0, "nothing reachable only through a parked parcel may be deleted");
+        assert!(loose_path(&blob).exists(), "a blob referenced only by a parked parcel must survive gc");
+        assert!(loose_path(&tree).exists(), "a tree referenced only by a parked parcel must survive gc");
+        assert!(loose_path(&parcel).exists(), "a parked parcel must survive gc");
     }
 
-    /// Regression lock for the fail-closed contract on `bay_utils::collect_bay_scoped_parcel_roots`
-    /// (see its doc comment): a malformed `parked` file in a *non-active* bay must make
-    /// `collect_garbage`/`collect_live_set` fail outright and delete nothing — never silently
-    /// skip the unreadable bay and reclaim garbage anyway, which would re-open the exact
-    /// under-counting bug the bay-scope fix closed (a bay's still-live object swept because its
-    /// ref source could not be proven to exclude it). Red if `read_parked_in`'s `?` in
-    /// `collect_bay_scoped_parcel_roots` (crates/forklift-core/src/util/bay_utils.rs) were ever
-    /// changed to skip-and-continue on an `Err` instead of propagating it.
+    /// A damaged parked-work record, or a bay's own leftover parked file, must make
+    /// `collect_garbage`/`collect_live_set` fail outright and delete nothing — never read as no
+    /// parked work and reclaim garbage anyway: a parked parcel's only reference is that record.
+    ///
+    /// Revert: tolerate the record's error in `gc_root_sources` under `FailClosed` → gc deletes.
     #[test]
-    fn gc_fails_closed_and_deletes_nothing_on_an_unreadable_bay_parked_file() {
+    fn gc_fails_closed_and_deletes_nothing_on_an_unreadable_parked_record() {
         let _scratch = Scratch::new("gc-bay-unreadable-parked");
 
         // A real piece of garbage that a skip-and-continue bug would wrongly let gc collect.
         let garbage = store_blob("would be wrongly collected if the bad bay were skipped\n");
         assert!(loose_path(&garbage).exists());
 
-        // Bay "b"'s `parked` file is malformed (not 64 hex chars) — `read_parked_in` errors on it.
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&["not-a-valid-hash"])).unwrap();
 
-        let live_set_result = collect_live_set();
-        assert!(live_set_result.is_err(),
-            "an unreadable/malformed bay ref source must fail the live-set computation, not be skipped");
+        let mut damaged = std::fs::read(crate::util::park_utils::parked_path()).unwrap();
+        damaged[0] ^= 1;
+        let leftover = bay_b_dir.join(crate::util::park_utils::FILE_NAME_PARKED);
+        for (record, bay_file) in [(&damaged[..], None), (&crate::util::park_utils::parked_bytes(&[])[..], Some(&leftover))] {
+            std::fs::write(crate::util::park_utils::parked_path(), record).unwrap();
+            if let Some(bay_file) = bay_file {
+                std::fs::write(bay_file, b"/forklift-parked 1\n").unwrap();
+            }
 
-        let gc_result = collect_garbage(0);
-        assert!(gc_result.is_err(), "gc must refuse rather than reclaim when a bay's ref source is unreadable");
-        assert!(loose_path(&garbage).exists(),
-            "gc must delete nothing when the live set could not be computed, even unrelated garbage");
+            assert!(collect_live_set().is_err(), "an unreadable parked record must fail the live set, not be skipped");
+            assert!(collect_garbage(0).is_err(), "gc must refuse rather than reclaim");
+            assert!(loose_path(&garbage).exists(), "gc must delete nothing, even unrelated garbage");
+        }
     }
 
     /// Plant a staged inventory shard holding `items` (`(name, hash, type)`) in bay `bay`'s state

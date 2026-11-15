@@ -19,6 +19,9 @@ const FILE_NAME_STORE_ACCESS_LOCK: &str = "store-access.lock";
 /// The name of the ref lock sidecar (inside the shared forklift root folder). Never deleted.
 const FILE_NAME_REF_LOCK: &str = "refs.lock";
 
+/// The name of the parked-work lock sidecar, in the shared forklift root folder. Never deleted.
+pub const FILE_NAME_PARKED_LOCK: &str = "parked.lock";
+
 /// The name of the mirror lock sidecar (inside the shared forklift root folder). Never deleted.
 pub const FILE_NAME_MIRROR_LOCK: &str = "mirror.lock";
 
@@ -728,6 +731,75 @@ impl RefLock {
     }
 }
 
+/// The lock over the warehouse's parked-work record (`park_utils`), shared by every bay: a kernel
+/// lock on the never-deleted sidecar `forklift_root()/parked.lock`, like [`RefLock`], so a
+/// hard-killed holder leaves nothing stale and a writer waits. It is the innermost lock: a holder
+/// takes no other lock inside it, and holds it only across one read of the record, the writes that
+/// decision makes, and the record's write. Readers that only read the record take no lock: it is
+/// replaced whole and atomically.
+///
+/// It is not reentrant, so a thread that holds it is refused a second hold rather than left
+/// waiting on itself.
+pub struct ParkedLock {
+    // Held only to keep the lock: closing the handle releases it.
+    _file: std::fs::File,
+    // Not `Send`: the hold is counted against the thread that took it.
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+thread_local! {
+    /// Whether this thread holds a [`ParkedLock`].
+    static PARKED_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl ParkedLock {
+    /// Take the parked-work lock of the active warehouse, waiting while another thread or process
+    /// holds it. The forklift root folder must exist.
+    ///
+    /// # Returns
+    /// * `Ok(ParkedLock)` - The acquired lock (released when dropped).
+    /// * `Err(String)`    - This thread holds it already, or the sidecar could not be opened or
+    ///                      locked.
+    pub fn acquire() -> Result<ParkedLock, String> {
+        if PARKED_LOCK_HELD.with(|held| held.get()) {
+            return Err("The parked-work lock is not taken again by the thread that holds it.".to_string());
+        }
+
+        let path = absolute(forklift_root().join(FILE_NAME_PARKED_LOCK));
+        let file = open_lock_sidecar(&path)?;
+        file.lock().map_err(|e| lock_error(&path, &e))?;
+        PARKED_LOCK_HELD.with(|held| held.set(true));
+
+        Ok(ParkedLock { _file: file, _thread_bound: std::marker::PhantomData })
+    }
+
+    /// Take the parked-work lock without waiting, for a test that checks it is held.
+    ///
+    /// # Returns
+    /// * `Ok(Some(ParkedLock))` - The lock was free, and is now held.
+    /// * `Ok(None)`             - Another thread or process holds it.
+    /// * `Err(String)`          - The sidecar could not be opened or locked.
+    pub fn try_acquire() -> Result<Option<ParkedLock>, String> {
+        let path = absolute(forklift_root().join(FILE_NAME_PARKED_LOCK));
+        let file = open_lock_sidecar(&path)?;
+
+        match file.try_lock() {
+            Ok(()) => {
+                PARKED_LOCK_HELD.with(|held| held.set(true));
+                Ok(Some(ParkedLock { _file: file, _thread_bound: std::marker::PhantomData }))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(lock_error(&path, &e)),
+        }
+    }
+}
+
+impl Drop for ParkedLock {
+    fn drop(&mut self) {
+        PARKED_LOCK_HELD.with(|held| held.set(false));
+    }
+}
+
 /// Open (creating if needed) the store-access sidecar at the current storage root, at an absolute
 /// path. The forklift root folder must exist.
 fn open_store_access_sidecar() -> Result<(std::fs::File, PathBuf), String> {
@@ -889,6 +961,30 @@ fn absolute(path: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
+
+    /// The parked-work lock is one per warehouse: a second open file, standing in for another
+    /// bay's process, is refused while it is held and granted once it is dropped, and the thread
+    /// that holds it cannot take it again. Revert the reentry check and the second `acquire`
+    /// waits on itself forever instead of refusing.
+    #[test]
+    fn the_parked_lock_is_one_per_warehouse_and_never_taken_twice_by_its_holder() {
+        let temp = std::env::temp_dir().join(format!("forklift-parkedlock-{}", std::process::id()));
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let held = ParkedLock::acquire().expect("the first hold");
+        assert!(ParkedLock::try_acquire().unwrap().is_none(), "another open file is refused while held");
+        let error = ParkedLock::acquire().err().expect("the holder cannot take it again");
+        assert!(error.contains("not taken again"), "{}", error);
+        drop(held);
+
+        let again = ParkedLock::try_acquire().unwrap().expect("free once the first hold is dropped");
+        drop(again);
+        ParkedLock::acquire().expect("and the thread may take it again once it let go");
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
 
     #[test]
     fn the_store_lock_is_exclusive_and_releases_on_drop() {

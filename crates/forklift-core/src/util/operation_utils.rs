@@ -38,7 +38,7 @@ const FILE_NAME_OPERATION: &str = "operation";
 
 /// The [`record_utils`] kind and version of the marker file.
 const OPERATION_RECORD: &str = "operation";
-const OPERATION_VERSION: u32 = 3;
+const OPERATION_VERSION: u32 = 4;
 
 /// The operations that raise the marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +122,13 @@ pub struct Operation {
     /// Park: the parcel the work in progress was parked as.
     pub parked: Option<String>,
 
+    /// Park: the name the parked work is listed under.
+    pub park_name: Option<String>,
+
+    /// Park: set in the same hold of the parked-work lock that lists the parcel, so recovery
+    /// knows the work is safe in the record without reading it.
+    pub listed: bool,
+
     /// Merge and cherry-pick: the other side's tree. Every path the merge can have written differs
     /// between it and `source_tree`, which bounds what a rollback puts back.
     pub their_tree: Option<String>,
@@ -149,6 +156,8 @@ impl Operation {
             target_tree: None,
             expected: None,
             parked: None,
+            park_name: None,
+            listed: false,
             their_tree: None,
             office: OfficePrecondition::NotConsumed,
             anchor: AnchorPrecondition::NotConsumed,
@@ -175,6 +184,8 @@ impl Operation {
             or_empty(&self.target_tree),
             or_empty(&self.expected),
             or_empty(&self.parked),
+            or_empty(&self.park_name),
+            if self.listed { "listed" } else { "" }.to_string(),
             or_empty(&self.their_tree),
             match &self.office {
                 OfficePrecondition::NotConsumed => String::new(),
@@ -197,12 +208,12 @@ impl Operation {
     fn from_bytes(bytes: &[u8]) -> Result<Operation, String> {
         let entries = record_utils::from_bytes(bytes, OPERATION_RECORD, OPERATION_VERSION).map_err(|e| e.describe())?;
 
-        if entries.len() < 13 || (entries.len() - 13) % 3 != 0 {
+        if entries.len() < 15 || (entries.len() - 15) % 3 != 0 {
             return Err("is malformed.".to_string());
         }
 
         let mut entries = entries.into_iter();
-        let [kind, phase, source_pallet, source_base, source_tree, target_pallet, target_base, target_tree, expected, parked, their_tree, office, anchor] =
+        let [kind, phase, source_pallet, source_base, source_tree, target_pallet, target_base, target_tree, expected, parked, park_name, listed, their_tree, office, anchor] =
             std::array::from_fn(|_| entries.next().expect("counted above"));
         let carried: Vec<String> = entries.collect();
 
@@ -235,6 +246,12 @@ impl Operation {
             target_tree: hash(target_tree)?,
             expected: hash(expected)?,
             parked: hash(parked)?,
+            park_name: (!park_name.is_empty()).then_some(park_name),
+            listed: match listed.as_str() {
+                "" => false,
+                "listed" => true,
+                _ => return Err("is malformed.".to_string()),
+            },
             their_tree: hash(their_tree)?,
             office: match office.as_str() {
                 "" => OfficePrecondition::NotConsumed,
@@ -361,6 +378,22 @@ pub fn record_completing_parcel(parcel: &str) -> Result<(), String> {
     }
 
     operation.target.base = Some(parcel.to_string());
+    write_marker(&marker_path(), &operation)
+}
+
+/// Record that the park whose marker this thread raised listed its parcel, durably, in the hold
+/// of the parked-work lock that wrote the entry: recovery then rolls the park forward without
+/// reading the record. Does nothing when no park marker stands.
+pub fn record_listed() -> Result<(), String> {
+    let Some(mut operation) = raised_operation()? else {
+        return Ok(());
+    };
+
+    if operation.kind != OperationKind::Park {
+        return Ok(());
+    }
+
+    operation.listed = true;
     write_marker(&marker_path(), &operation)
 }
 
@@ -590,10 +623,11 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
         },
 
         OperationKind::Park => {
-            // The position does not change across a park, so the parked list is its signal: the
-            // work is safe there only if the list names the parked parcel.
+            // The position does not change across a park, so the record is its signal: the work
+            // is safe only once the record lists the parked parcel. `listed` is set in the same
+            // hold of the parked-work lock as that write; unset, the record itself is read.
             let parked = match operation.parked.as_deref() {
-                Some(hash) if park_utils::read_parked()?.iter().any(|entry| entry == hash) => Some(hash),
+                Some(hash) if operation.listed || park_utils::settle_unlisted(hash)? => Some(hash),
                 _ => None,
             };
 

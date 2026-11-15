@@ -295,9 +295,9 @@ fn the_census_matcher_reads_its_patterns() {
     assert!(!census_matches("objects/<xx>/<hash>", "objects/ab/cd/ef"));
     assert!(census_matches("objects/", "objects/"));
     assert!(!census_matches("objects/", "objects"));
-    assert!(census_matches("{bay}parked", "parked"));
-    assert!(census_matches("{bay}parked", "bays/review/parked"));
-    assert!(!census_matches("{bay}parked", "bays/parked"));
+    assert!(census_matches("{bay}consolidation", "consolidation"));
+    assert!(census_matches("{bay}consolidation", "bays/review/consolidation"));
+    assert!(!census_matches("{bay}consolidation", "bays/consolidation"));
     assert!(census_matches("**/<name>.tmp~<pid>-<n>", "pallets/main.tmp~12-0"));
     assert!(census_matches("**/<name>.tmp~<pid>-<n>/**", "a/b/c.tmp~1-2/lock"));
     assert!(census_matches("mirror.git/**", "mirror.git/"));

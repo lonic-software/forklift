@@ -462,15 +462,18 @@ fn a_full_audit_counts_an_applied_redaction_as_redacted_and_passes() {
     assert_eq!(recorded["data"]["status"], serde_json::json!({ "state": "applied" }), "{}", recorded);
     let hash = recorded["data"]["hash"].as_str().unwrap();
     assert_eq!(recorded["data"]["deletion"]["deleted"], serde_json::json!([]), "{}", recorded);
+    // The holder is named by the park's name, which defaults to the pallet and the time.
+    let name = warehouse.json(&["park", "list"])["data"]["parked"][0]["name"].as_str().unwrap().to_string();
+    let holder = format!("the parked work \"{}\"", name);
     assert_eq!(recorded["data"]["deletion"]["kept"], serde_json::json!([{
         "hash": hash,
-        "holders": [{ "kind": "parked", "description": "a parcel parked in the warehouse's own working tree" }],
+        "holders": [{ "kind": "parked", "description": holder }],
     }]), "{}", recorded);
     assert!(warehouse.holds_loose(hash));
     let human = String::from_utf8_lossy(&warehouse.run_ok(&["redact", "apply"]).stdout).into_owned();
     assert!(human.contains(&format!(
-        "Kept {}: named by a parcel parked in the warehouse's own working tree. Take the file out of it, \
-        then run \"forklift redact apply\" to delete it.", hash
+        "Kept {}: named by {}. Take the file out of it, then run \"forklift redact apply\" to delete \
+        it.", hash, holder
     )), "{}", human);
     let audited = warehouse.json(&["audit", "--full"]);
     assert_eq!(audited["ok"], true, "{}", audited);

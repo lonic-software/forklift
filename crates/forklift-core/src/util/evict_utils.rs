@@ -173,7 +173,6 @@ pub fn plan_evict(held_heads: &[String],
     let mut local_roots: Vec<String> = Vec::new();
     for dir in &bay_dirs {
         checkout_roots.extend(pallet_utils::read_position_in(dir)?.base);
-        local_roots.extend(park_utils::read_parked_in(dir)?);
 
         if let Some(consolidation) = merge_utils::read_consolidation_state_in(dir)? {
             local_roots.push(consolidation.their_head);
@@ -185,6 +184,7 @@ pub fn plan_evict(held_heads: &[String],
             local_roots.push(pick.our_head);
         }
     }
+    local_roots.extend(park_utils::parked_parcels()?);
     local_roots.extend(meta_parcels(&sources)?);
     local_roots.extend(sources.pin_parcels.into_iter().map(|(hash, _)| hash));
 

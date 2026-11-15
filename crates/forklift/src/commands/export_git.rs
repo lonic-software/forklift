@@ -9,7 +9,7 @@ use forklift_core::model::parcel::Parcel;
 use forklift_core::error::sanitize;
 use forklift_core::util::tag_utils::{self, AttributedTag};
 use forklift_core::util::{file_utils, haul_utils, kv_utils, manifest_utils, object_utils, office_utils};
-use forklift_core::util::{applied_redactions, bay_utils, pallet_utils, park_utils};
+use forklift_core::util::{applied_redactions, pallet_utils, park_utils};
 use forklift_core::util::applied_redactions::AppliedSet;
 use forklift_core::util::unavailable::{self, UnavailableSet};
 use forklift_core::util::withholding::{self, WithheldSet};
@@ -108,11 +108,8 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
         .collect();
     not_exported.sort();
     not_exported.dedup();
-    // Parked work is bay-local, and every bay's is left behind.
-    let mut parked = 0;
-    for dir in bay_utils::all_bay_state_dirs()? {
-        parked += park_utils::read_parked_in(&dir)?.len();
-    }
+    // Parked work is left behind.
+    let parked = park_utils::read_parked()?.len();
     let RemoteCheck { left_behind, unchecked, .. } = remote.unwrap_or_default();
     let applied = applied_redactions::read_applied()?;
     let withheld_here = withholding::read_withheld()?;
@@ -1570,8 +1567,8 @@ impl CommandOutput for ExportReport {
 
         if self.parked > 0 {
             println!(
-                "  warning: {} parked parcel(s) were not exported. \"forklift park pop\", in a bay \
-                that parked one, brings back its latest, to stack before exporting again.",
+                "  warning: {} parked parcel(s) were not exported. \"forklift park pop\" brings back \
+                the latest, to stack before exporting again.",
                 self.parked
             );
         }

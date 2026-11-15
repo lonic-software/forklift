@@ -299,9 +299,9 @@ mod tests {
         assert!(!matches("objects/<xx>/<hash>.sig", "objects/ab/.sig"));
         assert!(matches("objects/", "objects/"));
         assert!(!matches("objects/", "objects"));
-        assert!(matches("{bay}parked", "parked"));
-        assert!(matches("{bay}parked", "bays/review/parked"));
-        assert!(!matches("{bay}parked", "bays/parked"));
+        assert!(matches("{bay}consolidation", "consolidation"));
+        assert!(matches("{bay}consolidation", "bays/review/consolidation"));
+        assert!(!matches("{bay}consolidation", "bays/consolidation"));
         assert!(matches("**/<name>.tmp~<pid>-<n>", "pallets/main.tmp~12-3"));
         assert!(matches("**/<name>.tmp~<pid>-<n>/**", "inventory/x.tmp~1-2/a/b"));
     }

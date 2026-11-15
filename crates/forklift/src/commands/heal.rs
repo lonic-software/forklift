@@ -8,7 +8,7 @@ use forklift_core::util::reseal_utils::{self, ResealError};
 use forklift_core::util::warehouse_utils::{self, WarehouseMode};
 use forklift_core::util::applied_redactions::{self, RedactionState};
 use forklift_core::util::unavailable_heal::{self, RemoteError};
-use forklift_core::util::{config_utils, origin_utils, recovery_utils, redaction_utils, sealed_utils, unavailable};
+use forklift_core::util::{config_utils, origin_utils, park_utils, recovery_utils, redaction_utils, sealed_utils, unavailable};
 use crate::output::{self, CommandOutput};
 
 /// The note of a re-apply of redactions that could not run, followed by why.
@@ -168,6 +168,18 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
     };
 
+    // Under store access, since it scans the store for parked parcels, and before the operation's
+    // recovery, which reads the parked-work record for a park, and the taint recovery, whose walks
+    // root every parked parcel. A failure is a note, as the records' above: the walks degrade
+    // around the damage and say so.
+    let parked_rebuilt = match park_utils::rebuild() {
+        Ok(rebuilt) => rebuilt.map(ParkedRebuilt::from),
+        Err(error) => {
+            ref_notes.push(format!("The parked-work record was not rebuilt: {}", error.trim_end_matches('.')));
+            None
+        }
+    };
+
     // What the user chose goes after the record, which it reads, and before the passes, so they
     // judge only what is left. A refusal says what this run already changed: its own "Nothing was
     // changed" speaks only for the write it refused. Its notes go along: a check they say was
@@ -185,6 +197,9 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
         if let Some(scope) = &scope_rebuilt {
             error = forklift_core::error::append_to_message(error, &scope_sentence(scope));
+        }
+        if let Some(record) = &parked_rebuilt {
+            error = forklift_core::error::append_to_message(error, &record.sentence());
         }
         for rebuilt in rebuilt {
             error = forklift_core::error::append_to_message(error, &rebuilt_sentence(rebuilt));
@@ -553,6 +568,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         unavailable_rebuilt,
         redactions_applied_rebuilt: applied_rebuilt,
         fetch_scope_rebuilt: scope_rebuilt,
+        parked_rebuilt,
         was_tainted: outcome.was_tainted,
         restaged: outcome.restaged,
         resolved: outcome.resolved,
@@ -921,6 +937,11 @@ pub(crate) struct HealReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     fetch_scope_rebuilt: Option<ScopeRebuilt>,
 
+    /// The parked-work record, which was missing, damaged or incomplete and this run rebuilt from
+    /// the entries that still read, the bays' own leftovers and the parked parcels the store holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parked_rebuilt: Option<ParkedRebuilt>,
+
     /// Whether a durability taint was actually standing (an already-healthy warehouse reports
     /// `false`, with `restaged` and `resolved` empty).
     was_tainted: bool,
@@ -1105,6 +1126,66 @@ impl AppliedRebuilt {
     }
 }
 
+/// What `heal` kept of a missing, damaged or incomplete parked-work record.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct ParkedRebuilt {
+    /// Where the damaged record was copied to; absent when it was missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    set_aside: Option<String>,
+
+    /// How many entries still read whole, from the record and the bays' leftovers, and were kept.
+    kept: usize,
+
+    /// How many parked parcels the store held that no kept entry named, listed again as
+    /// recovered: work popped or dropped before the damage comes back this way too.
+    recovered: usize,
+
+    /// How many lines were dropped: they did not read whole, or named no parcel the store holds.
+    dropped: usize,
+
+    /// How many objects or pack indexes the store scan could not read, and skipped.
+    unreadable: usize,
+
+    /// How many bays' own parked files were merged in and removed.
+    merged_bays: usize,
+}
+
+impl From<park_utils::Rebuilt> for ParkedRebuilt {
+    fn from(rebuilt: park_utils::Rebuilt) -> Self {
+        ParkedRebuilt {
+            set_aside: rebuilt.set_aside.map(|path| path.to_string_lossy().into_owned()),
+            kept: rebuilt.kept,
+            recovered: rebuilt.recovered,
+            dropped: rebuilt.dropped,
+            unreadable: rebuilt.unreadable,
+            merged_bays: rebuilt.merged_bays,
+        }
+    }
+}
+
+impl ParkedRebuilt {
+    fn sentence(&self) -> String {
+        let mut sentence = format!(
+            "The parked-work record was {} and is rebuilt: {} entr(ies) kept, {} parked parcel(s) found \
+            in the store listed again as recovered, {} line(s) dropped",
+            if self.set_aside.is_some() { "damaged" } else { "missing" },
+            self.kept, self.recovered, self.dropped
+        );
+        if self.merged_bays > 0 {
+            sentence.push_str(&format!(", {} bay(s)' own parked work merged in", self.merged_bays));
+        }
+        if self.unreadable > 0 {
+            sentence.push_str(&format!(", {} object(s) or pack index(es) that did not read skipped", self.unreadable));
+        }
+        match &self.set_aside {
+            Some(path) => sentence.push_str(&format!("; a copy of it is kept at \"{}\".", path)),
+            None => sentence.push('.'),
+        }
+        sentence
+    }
+}
+
 /// How `heal` settled an interrupted operation.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
@@ -1164,6 +1245,10 @@ impl CommandOutput for HealReport {
             println!("{}", scope_sentence(rebuilt));
         }
 
+        if let Some(rebuilt) = &self.parked_rebuilt {
+            println!("{}", rebuilt.sentence());
+        }
+
         for rebuilt in &self.refs_rebuilt {
             println!("{}", rebuilt_sentence(rebuilt));
         }
@@ -1192,7 +1277,7 @@ impl CommandOutput for HealReport {
             && self.resealed.is_empty() && self.recorded_unavailable.is_empty() && self.notes.is_empty()
             && self.unseal_failed.is_none() && self.record_rebuilt.is_none() && self.unavailable_rebuilt.is_none()
             && self.redactions_applied_rebuilt.is_none() && self.redactions_reapplied.is_empty()
-            && self.fetch_scope_rebuilt.is_none()
+            && self.fetch_scope_rebuilt.is_none() && self.parked_rebuilt.is_none()
             && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
             && self.objects_lost.is_none()
         {

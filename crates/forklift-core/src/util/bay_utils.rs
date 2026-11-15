@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_BAYS_ROOT, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{cherry_pick_utils, file_utils, journal_utils, merge_utils, pallet_utils, park_utils, record_utils, tree_utils, warehouse_utils};
+use crate::util::{cherry_pick_utils, file_utils, journal_utils, merge_utils, pallet_utils, record_utils, tree_utils, warehouse_utils};
 use crate::error::{CoreError, RefusalCode};
 use crate::util::record_utils::RecordError;
 
@@ -572,7 +572,7 @@ pub fn list_bays() -> Result<Vec<String>, String> {
 /// (`bay_state_dir`), sorted by name.
 ///
 /// This is the union a warehouse-scale walk must enumerate whenever it needs every bay's
-/// bay-local state (parked parcels, staged inventory, an in-progress consolidation) rather than
+/// bay-local state (its base, staged inventory, an in-progress consolidation) rather than
 /// just the active bay's — reading only the active bay under-counts references to a shared
 /// object and can silently drop (or delete) something a *different* bay still needs.
 /// `recovery_utils::collect_walk_roots` and `gc_utils::collect_live_set` both loop over this.
@@ -617,12 +617,12 @@ pub fn bays_on(pallet: &str) -> Result<Vec<(String, pallet_utils::BayPosition)>,
     Ok(on)
 }
 
-/// How [`collect_bay_scoped_parcel_roots`] treats a bay whose `parked`/`consolidation` state
+/// How [`collect_bay_scoped_parcel_roots`] treats a bay whose `position`/`consolidation` state
 /// cannot be read.
 ///
 /// **The real property, stated plainly (a previous version of this comment got it backwards):**
 /// skipping an unreadable bay can only *narrow* the root set this call returns — an object
-/// referenced only through that one bay's parked parcels or in-progress consolidation now looks
+/// referenced only through that one bay's base or in-progress consolidation now looks
 /// unreferenced, because the reference that would have named it is simply missing. A narrower
 /// root set makes any caller's "not referenced" verdict *less* trustworthy, never more — it is
 /// the opposite of conservative.
@@ -659,7 +659,7 @@ pub enum BayReadPolicy {
 
 /// [`collect_bay_scoped_parcel_roots`]'s result.
 pub struct BayScopeOutcome {
-    /// Every listed dir's base, parked-parcel hashes, the parcels an in-progress consolidation
+    /// Every listed dir's base, the parcels an in-progress consolidation
     /// or cherry-pick records and the heads its journal's deletes removed, from every bay this
     /// call could actually read.
     pub roots: Vec<String>,
@@ -672,7 +672,7 @@ pub struct BayScopeOutcome {
 /// The bay-scoped parcel roots shared by **both**
 /// [`recovery_utils::collect_walk_roots`](crate::util::recovery_utils::collect_walk_roots) and
 /// [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set): across every entry of
-/// `dirs`, that bay's base, its parked parcels ([`park_utils::read_parked_in`]), the parcels an
+/// `dirs`, that bay's base, the parcels an
 /// in-progress consolidation or cherry-pick records and the heads its undo journal's deletes
 /// removed — see [`read_one_bay_scoped_roots`].
 ///
@@ -681,7 +681,7 @@ pub struct BayScopeOutcome {
 /// per-bay pass of their own over the same dirs (recovery additionally walks staged inventory
 /// shards; a future gc source could too), and a second internal enumeration here would mean
 /// `list_bays` runs twice per call for no reason. Passing the dirs in keeps this to exactly one
-/// enumeration per caller while still sharing the parked+consolidation logic itself.
+/// enumeration per caller while still sharing the per-bay logic itself.
 ///
 /// This loop used to be hand-duplicated in both callers. Extracted here so the two can never
 /// drift apart: recovery's walk roots must stay a *superset* of gc's live-set roots (see
@@ -714,11 +714,11 @@ pub struct BayScopeOutcome {
 /// * `policy` - What to do with a bay whose state cannot be read — see [`BayReadPolicy`].
 ///
 /// # Returns
-/// * `Ok(BayScopeOutcome)` - Every readable dir's base, parked-parcel hashes, the parcels an
+/// * `Ok(BayScopeOutcome)` - Every readable dir's base, the parcels an
 ///                           in-progress consolidation or cherry-pick records and the heads its
 ///                           journal's deletes removed, in `dirs` order, plus (under `Tolerate`)
 ///                           a note for every bay that had to be skipped.
-/// * `Err(String)`         - Under `FailClosed`, some bay's `position`, `parked`, `consolidation`
+/// * `Err(String)`         - Under `FailClosed`, some bay's `position`, `consolidation`
 ///                           or journal file could not be read or was malformed — see above.
 pub fn collect_bay_scoped_parcel_roots(
     dirs: &[PathBuf],
@@ -741,7 +741,7 @@ pub fn collect_bay_scoped_parcel_roots(
 }
 
 /// One bay's own contribution to [`collect_bay_scoped_parcel_roots`] — the single read (the
-/// bay's base, parked parcels, then an in-progress consolidation's `their_head` and `our_head`,
+/// bay's base, then an in-progress consolidation's `their_head` and `our_head`,
 /// then an in-progress cherry-pick's `source` and `our_head`, then its journal's removed heads) both [`BayReadPolicy`] variants
 /// perform identically; only what happens to its `Err` differs, in the caller above. A recorded
 /// `our_head` is the completing parcel's parent, and the pallet may have moved off it since, so
@@ -753,7 +753,6 @@ fn read_one_bay_scoped_roots(dir: &Path) -> Result<Vec<String>, String> {
     let state = read_bay_state_roots_in(dir)?;
     let mut roots: Vec<String> = state.base.into_iter().collect();
 
-    roots.extend(state.parked);
     roots.extend(state.consolidation);
     roots.extend(state.pick);
     roots.append(&mut journal_utils::removed_heads_in(dir)?);
@@ -761,15 +760,12 @@ fn read_one_bay_scoped_roots(dir: &Path) -> Result<Vec<String>, String> {
     Ok(roots)
 }
 
-/// The parcels a bay's own state names: what its checkout, its parked work and an operation in
-/// progress in it stand on. A journal's removed heads are not among them: they are history an
-/// undo can restore, not state the bay holds.
+/// The parcels a bay's own state names: what its checkout and an operation in progress in it
+/// stand on. Parked work is the warehouse's, not a bay's (`park_utils`). A journal's removed
+/// heads are not among them: they are history an undo can restore, not state the bay holds.
 pub struct BayStateRoots {
     /// The checkout's base.
     pub base: Option<String>,
-
-    /// The parked parcels.
-    pub parked: Vec<String>,
 
     /// An in-progress consolidation's `their_head` and `our_head`.
     pub consolidation: Vec<String>,
@@ -782,11 +778,10 @@ pub struct BayStateRoots {
 ///
 /// # Returns
 /// * `Ok(BayStateRoots)` - What the bay's state names.
-/// * `Err(String)`       - If the bay's `position`, `parked`, `consolidation` or cherry-pick
+/// * `Err(String)`       - If the bay's `position`, `consolidation` or cherry-pick
 ///                         state could not be read or was malformed.
 pub fn read_bay_state_roots_in(dir: &Path) -> Result<BayStateRoots, String> {
     let base = pallet_utils::read_position_in(dir)?.base;
-    let parked = park_utils::read_parked_in(dir)?;
     let consolidation = merge_utils::read_consolidation_state_in(dir)?
         .map(|state| vec![state.their_head, state.our_head])
         .unwrap_or_default();
@@ -794,7 +789,7 @@ pub fn read_bay_state_roots_in(dir: &Path) -> Result<BayStateRoots, String> {
         .map(|state| vec![state.source, state.our_head])
         .unwrap_or_default();
 
-    Ok(BayStateRoots { base, parked, consolidation, pick })
+    Ok(BayStateRoots { base, consolidation, pick })
 }
 
 /// Plain-language note for a bay [`collect_bay_scoped_parcel_roots`] skipped under
@@ -804,15 +799,15 @@ fn degraded_bay_note(dir: &Path, error: &str) -> String {
     if dir == forklift_root() {
         format!(
             "the current tree's own saved state could not be read this run ({}); it was treated \
-            as having no parked parcels rather than blocking this command. Fix the file and run \
-            this command again.",
+            as holding nothing rather than blocking this command. Fix the file and run this \
+            command again.",
             error
         )
     } else {
         let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
         format!(
-            "bay \"{}\" could not be read this run ({}); it was treated as having no parked \
-            parcels rather than blocking this command. If the bay is stale, remove it with \
+            "bay \"{}\" could not be read this run ({}); it was treated as holding nothing \
+            rather than blocking this command. If the bay is stale, remove it with \
             \"forklift bay remove {}\"; otherwise fix the file and run this command again.",
             name, error, name
         )
@@ -897,7 +892,7 @@ mod tests {
 
     /// Pins that `collect_bay_scoped_parcel_roots` — the helper both
     /// `recovery_utils::collect_walk_roots` and `gc_utils::collect_live_set` call for their
-    /// shared portion — actually surfaces a **non-active** bay's parked parcel and the parcels
+    /// shared portion — actually surfaces a **non-active** bay's parcels
     /// its in-progress consolidation and cherry-pick record, in one pass. Neither caller has its own test
     /// exercising both sources through this exact function, so this is the one place that would
     /// go red if a future edit accidentally dropped either source from the shared helper (which
@@ -911,14 +906,12 @@ mod tests {
         let _scope = StorageRootScope::enter(&dir);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
-        let parked_hash = "2".repeat(64);
         let consolidation_hash = "3".repeat(64);
         let (merge_base, pick_base) = ("4".repeat(64), "5".repeat(64));
 
         let bay_b_dir = bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&[&parked_hash])).unwrap();
         let state = crate::util::merge_utils::ConsolidationState {
             their_head: consolidation_hash.clone(), their_pallet: "their-pallet".to_string(), our_head: merge_base.clone(), our_pallet: "main".to_string(),
         };
@@ -936,8 +929,6 @@ mod tests {
         let dirs = all_bay_state_dirs().unwrap();
         let roots = collect_bay_scoped_parcel_roots(&dirs, BayReadPolicy::FailClosed).unwrap().roots;
 
-        assert!(roots.contains(&parked_hash),
-            "a non-active bay's parked parcel must be in the shared roots");
         assert!(roots.contains(&consolidation_hash),
             "a non-active bay's consolidation their_head must be in the shared roots");
         assert!(roots.contains(&merge_base),
@@ -969,7 +960,7 @@ mod tests {
         let bay_b_dir = bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&["not-a-valid-hash"])).unwrap();
+        std::fs::write(bay_b_dir.join("consolidation"), b"not a consolidation record\n").unwrap();
 
         let dirs = all_bay_state_dirs().unwrap();
 

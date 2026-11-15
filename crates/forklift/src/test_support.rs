@@ -43,6 +43,7 @@ impl Warehouse {
         std::fs::create_dir_all(&forklift).unwrap();
         std::fs::write(forklift.join(forklift_core::util::warehouse_utils::FILE_NAME_WAREHOUSE_MARKER),
             forklift_core::util::warehouse_utils::framed_marker_bytes("format 1\nfull\n")).unwrap();
+        forklift_core::util::park_utils::create_if_not_exists(&forklift).unwrap();
 
         if cwd.is_some() {
             std::env::set_current_dir(&root).unwrap();

@@ -1696,13 +1696,14 @@ mod tests {
         assert_eq!(plan.retained_shared, 1);
     }
 
-    /// Park `tree_hash` as bay `bay`'s only parked parcel, by path. Returns the parcel's hash.
+    /// Park `tree_hash` as the only parked parcel, with bay `bay` standing beside it. Returns the
+    /// parcel's hash.
     fn plant_parked(bay: &str, tree_hash: &str) -> String {
         let parcel = store_parcel(tree_hash, Vec::new());
         let dir = crate::util::bay_utils::bay_state_dir(bay);
         std::fs::create_dir_all(&dir).unwrap();
         crate::util::pallet_utils::write_position_in(&dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(dir.join("parked"), crate::util::park_utils::parked_bytes(&[&parcel])).unwrap();
+        crate::util::park_utils::park_for_test(&[&parcel]);
         parcel
     }
 

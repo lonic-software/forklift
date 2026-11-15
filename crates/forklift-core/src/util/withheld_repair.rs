@@ -266,6 +266,7 @@ mod tests {
             // The walk reads the bay position, as on any warehouse a host serves.
             pallet_utils::write_position_in(&root.join(globals::FOLDER_NAME_FORKLIFT_ROOT),
                 &pallet_utils::BayPosition::new("main", None)).unwrap();
+            crate::util::park_utils::create_if_not_exists(&root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
 
             Scratch { root, _scope: scope }
         }

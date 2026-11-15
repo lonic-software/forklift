@@ -278,7 +278,7 @@ pub fn load_parcel(hash: &str) -> Result<Parcel, String> {
 
 /// Decode a parcel's object bytes. A refusal names the parcel it came from, so a walk that meets a
 /// malformed one says which.
-fn decode_parcel(hash: &str, bytes: &[u8]) -> Result<Parcel, String> {
+pub(crate) fn decode_parcel(hash: &str, bytes: &[u8]) -> Result<Parcel, String> {
     match parser::object::loose_object_parser::parse(bytes)
         .map_err(|e| format!("Parcel {} could not be read: {}", hash, e))?
     {

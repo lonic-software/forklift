@@ -2,6 +2,7 @@ use serde::Serialize;
 
 const CODE_AUTHOR: u64 = 1;
 const CODE_STACK: u64 = 2;
+const CODE_PARK: u64 = 3;
 
 /// A type of interaction between an operator and a parcel.
 #[derive(Serialize)]
@@ -11,6 +12,8 @@ pub enum ParcelActionType {
     Author,
     // Stacked the parcel to the pallet.
     Stack,
+    // Parked the changes, away from every pallet; the description is the park's name.
+    Park,
 }
 
 impl ParcelActionType {
@@ -22,6 +25,7 @@ impl ParcelActionType {
         match self {
             ParcelActionType::Author => CODE_AUTHOR,
             ParcelActionType::Stack => CODE_STACK,
+            ParcelActionType::Park => CODE_PARK,
         }
     }
 
@@ -37,6 +41,7 @@ impl ParcelActionType {
         match code {
             CODE_AUTHOR => Ok(ParcelActionType::Author),
             CODE_STACK => Ok(ParcelActionType::Stack),
+            CODE_PARK => Ok(ParcelActionType::Park),
             _ => Err(format!("Unknown parcel action type: {}", code)),
         }
     }
@@ -50,6 +55,7 @@ impl ParcelActionType {
         match self {
             ParcelActionType::Author => "author",
             ParcelActionType::Stack =>  "stack ",
+            ParcelActionType::Park =>   "park  ",
         }.to_string()
     }
 }
