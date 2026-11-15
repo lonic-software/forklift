@@ -2673,8 +2673,8 @@ here, before giving up on anything — you never need to run `lower` by hand for
 would not help: `lower` is subject to the very same taint check, so it would just hit the same
 refusal before ever reaching its own fetch). It does not ask for content the remote's host
 withholds, which the remote refuses: a lost object whose content is withheld is named with the
-host's statement, and no re-run brings it back. Heal never records such content as unavailable,
-so the loss stays reported until the object is restored:
+host's statement, and no re-run brings it back. Heal never records an object a taint names as
+unavailable, so the loss stays reported until the object is restored:
 
 - **Nothing was actually lost, or what vanished is not needed by anything anymore** — `heal`
   clears the taint and reports what it restaged or dropped. Exit 0; go on with what you were
@@ -2779,6 +2779,18 @@ known to be damaged, so `heal` carries on and notes it.
 An absent object that a redaction applied in this warehouse names was removed on purpose, so a
 rescan after an interrupted write counts none of them as lost, and `heal` notes how many there
 are.
+
+A damaged record of content this warehouse cannot get (`.forklift/unavailable`, what a fetch left
+out because the remote's host withholds it) is rebuilt next, from the entries that still read
+whole, and a copy of the damaged record is kept beside it (`unavailable_rebuilt` under `--json`,
+naming the copy and how many entries were kept and lines dropped). A record a newer Forklift wrote
+is left as it is. Last, each absent object history still reaches that no record holds and the
+configured remote's host still withholds is recorded unavailable again, exactly as a fetch records
+it, so a checkout or a `git export` leaves it out rather than failing on it
+(`recorded_unavailable`). Outside a taint, `heal` cannot tell an entry the record lost from a copy
+this warehouse held and lost; either way the remote will not send it, and once the content is
+restored the entry is dropped. When the remote does not answer, nothing is recorded and a `Note:`
+line says so; run `heal` again once it does.
 
 Once nothing is left to resolve, `heal` also removes from the sealed-object record every object
 that is on disk again, such as one fetched back by a refill whose own removal was interrupted. An
