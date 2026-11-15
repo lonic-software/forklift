@@ -205,7 +205,7 @@ The inventory matches the pallet head; nothing is staged.
 
 The working directory matches the inventory.
 $ forklift park pop
-Re-applied the parked changes from … (staged).
+Re-applied the parked work … (staged) and took it off the parked list.
 ```
 
 Suppose you stack the half-finished idea by mistake. `undo` reverses the last operation; after

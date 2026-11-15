@@ -76,8 +76,11 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `pallet delete` |  |  | Delete a pallet: remove its ref, keeping its parcels |
 | `pallet restore` |  |  | Bring back a deleted pallet at the head its tombstone holds |
 | `park` | `pa` | `stash` | Park the work in progress and reset to the pallet head |
-| `park pop` |  |  | Re-apply the most recently parked changes (staged) and drop them from the list |
-| `park list` |  |  | List the parked parcels, newest first |
+| `park pop` |  |  | Re-apply a park's changes (staged) and take it off the parked list |
+| `park apply` |  |  | Re-apply a park's changes (staged) and keep it parked |
+| `park drop` |  |  | Discard a park without applying it |
+| `park show` |  |  | Show a park and the files it changes |
+| `park list` |  |  | List the parks, newest first |
 | `pick` |  | `cherry-pick` | Apply a parcel's changes onto the current pallet as a new, author-preserving parcel |
 | `prepare` |  | `init` | Prepare a new warehouse in the current directory |
 | `profile` |  |  | Manage identity profiles (named operator ids) and select one per warehouse |

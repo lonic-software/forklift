@@ -10,6 +10,16 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ## [Unreleased]
 
+### Added
+
+- **Parks can be named, shown, applied, popped and dropped by name.** `park --name <name>` parks
+  under a name of your choice; `park show`, `park apply`, `park pop` and `park drop` each take a
+  park's name, and without one the newest park. `apply` re-applies a park and keeps it, `pop`
+  re-applies it and takes it off the list, `drop` discards it without touching the working files,
+  and `show` lists the files a park changes (`--json` carries the parcel, base, time and each
+  file's change). Two bays popping one park no longer both apply it: the second applies nothing
+  and says the park was taken.
+
 ### Changed
 
 - **Parked work is shared by every bay, named, and rebuilt by `heal` when its record is damaged.**

@@ -51,9 +51,12 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `pallet_create` | `forklift pallet create` | Create a new pallet and shift to it | `name` (a string, required)<br>`revision` (a string) |
 | `pallet_delete` | `forklift pallet delete` | Delete a pallet: remove its ref, keeping its parcels | `name` (a string, required)<br>`force` (a boolean) |
 | `pallet_restore` | `forklift pallet restore` | Bring back a deleted pallet at the head its tombstone holds | `name` (a string, required)<br>`remote` (a boolean) |
-| `park` | `forklift park` | Park the work in progress and reset to the pallet head |  |
-| `park_pop` | `forklift park pop` | Re-apply the most recently parked changes (staged) and drop them from the list |  |
-| `park_list` | `forklift park list` | List the parked parcels, newest first |  |
+| `park` | `forklift park` | Park the work in progress and reset to the pallet head | `name` (a string) |
+| `park_pop` | `forklift park pop` | Re-apply a park's changes (staged) and take it off the parked list | `name` (a string) |
+| `park_apply` | `forklift park apply` | Re-apply a park's changes (staged) and keep it parked | `name` (a string) |
+| `park_drop` | `forklift park drop` | Discard a park without applying it | `name` (a string) |
+| `park_show` | `forklift park show` | Show a park and the files it changes | `name` (a string) |
+| `park_list` | `forklift park list` | List the parks, newest first |  |
 | `pick` | `forklift pick` | Apply a parcel's changes onto the current pallet as a new, author-preserving parcel | `revision` (a string, required)<br>`message` (a string) |
 | `query` | `forklift query` | Query parcel history by signed identity, signer and parcel facts | `revisions` (an array of strings)<br>`from` (a string)<br>`class` (a string)<br>`unsupervised` (a boolean)<br>`supervisor` (a string)<br>`signer` (a string)<br>`author_after` (a string)<br>`author_before` (a string)<br>`merges` (a boolean)<br>`no_merges` (a boolean)<br>`grep` (a string)<br>`model` (a string)<br>`tool` (a string)<br>`tag` (a string)<br>`touches` (a string)<br>`verify` (a boolean)<br>`recorded` (a boolean)<br>`where` (an object)<br>`limit` (an integer of at least 1)<br>`after` (a string)<br>`oneline` (a boolean) |
 | `remove` | `forklift remove` | Stage a file or directory for removal | `path` (a string, required) |

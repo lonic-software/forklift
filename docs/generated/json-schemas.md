@@ -4797,6 +4797,87 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+### `ParkedShow`
+
+```json
+{
+  "$defs": {
+    "FileChange": {
+      "description": "How a park changes a file.",
+      "enum": [
+        "added",
+        "modified",
+        "deleted"
+      ],
+      "type": "string"
+    },
+    "ParkedFile": {
+      "description": "One file a park changes.",
+      "properties": {
+        "change": {
+          "$ref": "#/$defs/FileChange"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "change"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One park, with how it changes each file.",
+  "properties": {
+    "base": {
+      "description": "The head the work was parked on, which un-parking applies the changes against.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "files": {
+      "description": "Every file the park changes, against its base.",
+      "items": {
+        "$ref": "#/$defs/ParkedFile"
+      },
+      "type": "array"
+    },
+    "name": {
+      "description": "The name the work is parked under.",
+      "type": "string"
+    },
+    "parcel": {
+      "description": "The parked parcel.",
+      "type": "string"
+    },
+    "parked_at": {
+      "description": "When the work was parked (UTC, RFC 3339).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "recovered": {
+      "description": "Whether `heal` found the parcel in the store rather than in the parked-work record: it may\nbe work that was popped or dropped before the record was lost.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "name",
+    "parcel",
+    "base",
+    "recovered",
+    "parked_at",
+    "files"
+  ],
+  "title": "ParkedShow",
+  "type": "object"
+}
+```
+
 ## `pick`
 
 ### `Picked`

@@ -55,21 +55,34 @@ pub struct HistoryReadback {
     /// reads through. A refusal here refuses every record.
     pub export: Outcome,
     pub records: Vec<RecordReadback>,
+    /// The parked work read back, when the history left work parked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parked: Option<ParkedReadback>,
+}
+
+/// What `park list` said of the work the history left parked.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ParkedReadback {
+    pub listing: Outcome,
+    /// The parked parcels the listing did not name; all of them when it refused.
+    pub missing: Vec<String>,
 }
 
 impl HistoryReadback {
     fn refused(&self) -> bool {
-        !self.export.succeeded()
+        !self.export.succeeded() || self.parked.as_ref().is_some_and(|parked| !parked.listing.succeeded())
     }
 
-    /// Any record served wrong with exit 0.
+    /// Any record served wrong with exit 0, or parked work a listing that exited 0 left out.
     fn silent(&self) -> bool {
         self.records.iter().any(|record| record.verdicts.contains(&Verdict::Silent))
+            || self.parked.as_ref().is_some_and(|parked| parked.listing.succeeded() && !parked.missing.is_empty())
     }
 
-    /// Every record in `wanted` served, and served as expected.
+    /// Every record in `wanted` served, and served as expected, and the work parked still listed.
     fn reads(&self, wanted: &[Mark]) -> bool {
-        !self.refused() && wanted.iter().all(|mark| self.records.iter().any(|record| record.mark == *mark
+        !self.refused() && self.parked.as_ref().is_none_or(|parked| parked.missing.is_empty())
+            && wanted.iter().all(|mark| self.records.iter().any(|record| record.mark == *mark
             && !record.verdicts.is_empty() && record.verdicts.iter().all(|verdict| *verdict == Verdict::Expected)))
     }
 }
@@ -199,7 +212,7 @@ impl Context<'_> {
             let clone = self.fresh("clone");
             let cloned = self.run(&self.programs.forklift, vec!["--json".into(), "clone".into(), url.to_string(), clone.display().to_string()], self.scratch.root().to_path_buf())?;
             if !cloned.succeeded() {
-                return Ok(HistoryReadback { export: cloned, records: Vec::new() });
+                return Ok(HistoryReadback { export: cloned, records: Vec::new(), parked: None });
             }
             clone
         } else {
@@ -208,7 +221,7 @@ impl Context<'_> {
         let exported = self.fresh("readback");
         let export = self.run(&self.programs.forklift, vec!["--json".into(), "git".into(), "export".into(), exported.display().to_string()], bay.clone())?;
         if !export.succeeded() {
-            return Ok(HistoryReadback { export, records: Vec::new() });
+            return Ok(HistoryReadback { export, records: Vec::new(), parked: None });
         }
         // The listing names the records the export left files out of, so it is read only when the
         // export left something out. When it refuses, the records go unnamed, and each file the
@@ -264,7 +277,19 @@ impl Context<'_> {
             }
             records.push(RecordReadback { mark, verdicts });
         }
-        Ok(HistoryReadback { export, records })
+        Ok(HistoryReadback { export, records, parked: None })
+    }
+
+    /// What `park list` says of the `parked` parcels, read in the work tree; nothing when none
+    /// were parked.
+    fn read_back_parked(&self, parked: &[String]) -> Result<Option<ParkedReadback>, RunError> {
+        if parked.is_empty() {
+            return Ok(None);
+        }
+        let listing = self.run(&self.programs.forklift, vec!["--json".into(), "park".into(), "list".into()], self.scratch.work())?;
+        let listed = if listing.succeeded() { runner::parked_parcels(&listing.stdout) } else { Vec::new() };
+        let missing = parked.iter().filter(|parcel| !listed.contains(parcel)).cloned().collect();
+        Ok(Some(ParkedReadback { listing, missing }))
     }
 
     /// The readback of a scoped bay, where `git export` refuses and `show` serves no binary file's
@@ -276,7 +301,7 @@ impl Context<'_> {
         let work = self.scratch.work();
         let listing = self.run(&self.programs.forklift, vec!["--json".into(), "history".into()], work.clone())?;
         if !listing.succeeded() {
-            return Ok(HistoryReadback { export: listing, records: Vec::new() });
+            return Ok(HistoryReadback { export: listing, records: Vec::new(), parked: None });
         }
         let parcels = runner::described_parcels(&listing.stdout);
 
@@ -286,7 +311,7 @@ impl Context<'_> {
             "--json".into(), "bay".into(), "add".into(), name.clone(), side.display().to_string(), "--scope".into(), scope.to_string(),
         ], work)?;
         if !opened.succeeded() {
-            return Ok(HistoryReadback { export: opened, records: Vec::new() });
+            return Ok(HistoryReadback { export: opened, records: Vec::new(), parked: None });
         }
 
         let mut records = Vec::new();
@@ -313,7 +338,7 @@ impl Context<'_> {
             }
             records.push(RecordReadback { mark, verdicts });
         }
-        Ok(HistoryReadback { export: opened, records })
+        Ok(HistoryReadback { export: opened, records, parked: None })
     }
 }
 
@@ -509,6 +534,8 @@ pub(crate) struct Expected {
     after: oracle::Tree,
     /// Content the history took away, by digest, with what a read of it may now produce.
     taken: Vec<(String, Vec<Admissible>)>,
+    /// The parcels the history left parked, which must be listed again.
+    parked: Vec<String>,
 }
 
 impl Expected {
@@ -587,7 +614,9 @@ impl Trail {
     }
 
     fn read_back(&self, context: &Context, expected: &Expected, acknowledged: bool) -> Result<HistoryReadback, RunError> {
-        context.read_back(&expected.marks(), &expected.required(acknowledged), |mark| expected.of(context.corpus, mark, acknowledged))
+        let mut readback = context.read_back(&expected.marks(), &expected.required(acknowledged), |mark| expected.of(context.corpus, mark, acknowledged))?;
+        readback.parked = context.read_back_parked(&expected.parked)?;
+        Ok(readback)
     }
 }
 
@@ -617,7 +646,8 @@ pub(crate) fn expected(scenario: &Scenario, corpus: &Corpus, built: &runner::Bui
         .ok_or_else(|| RunError::Io(format!("the faulted record {} is past the corpus's {} records", faulted, corpus.records.len())))?;
     let before = before_of(&built.acknowledged, corpus);
     let taken = built.taken.iter().map(|taken| (taken.digest.clone(), admissible(taken, scenario.withhold_reader(warehouse)))).collect();
-    Ok((Expected { before, after: corpus::expected(snapshot, &corpus.modes), acknowledged: built.acknowledged.clone(), faulted: Mark::Record(faulted), taken }, faulted))
+    Ok((Expected { before, after: corpus::expected(snapshot, &corpus.modes), acknowledged: built.acknowledged.clone(), faulted: Mark::Record(faulted), taken,
+        parked: built.parked.clone() }, faulted))
 }
 
 /// What the steps after a fault established, and the grade they earn.
@@ -943,7 +973,7 @@ mod tests {
         for (index, verdict) in subjects {
             records.entry(Mark::Record(*index)).or_default().push(*verdict);
         }
-        HistoryReadback { export, records: records.into_iter().map(|(mark, verdicts)| RecordReadback { mark, verdicts }).collect() }
+        HistoryReadback { export, records: records.into_iter().map(|(mark, verdicts)| RecordReadback { mark, verdicts }).collect(), parked: None }
     }
 
     /// A history reads only when every wanted record was served and every copy of it expected: a
@@ -962,6 +992,25 @@ mod tests {
         assert!(doubled.silent());
         let refused = HistoryReadback { export: Outcome { exit: Some(1), ..full.export.clone() }, ..full };
         assert!(!refused.reads(&[Mark::Record(0), Mark::Record(1)]));
+    }
+
+    /// Work the history left parked reads only while the listing still names it: one a listing
+    /// that exited 0 left out is silent, and a listing that refused is a refusal.
+    ///
+    /// Revert: ignore the parked readback in `reads` → a heal that drops the park passes.
+    #[test]
+    fn parked_work_reads_only_while_it_is_listed() {
+        let full = served(&[(0, Verdict::Expected)]);
+        let parked = |exit: i32, missing: &[&str]| HistoryReadback { parked: Some(ParkedReadback {
+            listing: Outcome { exit: Some(exit), ..full.export.clone() }, missing: missing.iter().map(|parcel| parcel.to_string()).collect(),
+        }), ..full.clone() };
+        assert!(parked(0, &[]).reads(&[Mark::Record(0)]));
+        let dropped = parked(0, &["p"]);
+        assert!(!dropped.reads(&[Mark::Record(0)]));
+        assert!(dropped.silent());
+        let refused = parked(1, &["p"]);
+        assert!(!refused.reads(&[Mark::Record(0)]));
+        assert!(!refused.silent() && refused.refused());
     }
 
     /// An export's left-out files are documented per record by their parcels: withheld content as
@@ -1027,7 +1076,7 @@ mod tests {
         let expected = Expected {
             acknowledged: vec![Mark::Record(0), Mark::Record(1)], faulted: Mark::Record(2),
             before: corpus::expected(&corpus.records[1], &corpus.modes), after: corpus::expected(&corpus.records[2], &corpus.modes),
-            taken: vec![(oracle::digest(b"x"), documented.clone())],
+            taken: vec![(oracle::digest(b"x"), documented.clone())], parked: Vec::new(),
         };
         let first = expected.of(&corpus, Mark::Record(0), false);
         assert_eq!(first.transformed, BTreeMap::from([("a".to_string(), documented.clone())]));
