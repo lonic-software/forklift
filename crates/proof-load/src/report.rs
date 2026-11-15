@@ -74,11 +74,35 @@ impl Platform {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(tag = "state", rename_all = "kebab-case", try_from = "WrittenCell")]
 pub enum Cell {
     Run,
     Sampled,
     NotRun { reason: String },
+}
+
+/// A cell as written, read field by field: serde's `deny_unknown_fields` lets an unknown field
+/// through on an internally tagged unit variant, so `Cell` is read through this instead.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WrittenCell {
+    state: String,
+    reason: Option<String>,
+}
+
+impl TryFrom<WrittenCell> for Cell {
+    type Error = String;
+
+    fn try_from(written: WrittenCell) -> Result<Cell, String> {
+        match (written.state.as_str(), written.reason) {
+            ("run", None) => Ok(Cell::Run),
+            ("sampled", None) => Ok(Cell::Sampled),
+            ("not-run", Some(reason)) => Ok(Cell::NotRun { reason }),
+            ("run" | "sampled", Some(_)) => Err(format!("a {} cell names no reason", written.state)),
+            ("not-run", None) => Err("a not-run cell names its reason".to_string()),
+            (state, _) => Err(format!("unknown cell state `{}`", state)),
+        }
+    }
 }
 
 impl Cell {
@@ -243,8 +267,8 @@ impl Report {
     /// anything else is read, and any field this build does not know.
     pub fn from_json(text: &str) -> Result<Report, String> {
         let value: serde_json::Value = serde_json::from_str(text).map_err(|error| format!("not a report: {}", error))?;
-        match value.get("format").and_then(serde_json::Value::as_u64) {
-            Some(format) if format == u64::from(REPORT_FORMAT) => {}
+        match value.get("format") {
+            Some(format) if format.as_u64() == Some(u64::from(REPORT_FORMAT)) => {}
             Some(format) => return Err(format!("report format {} is not one this build reads (it reads {})", format, REPORT_FORMAT)),
             None => return Err("not a report: it names no format".to_string()),
         }
@@ -403,6 +427,8 @@ mod tests {
         assert_eq!(other, format!("report format {} is not one this build reads (it reads {})", REPORT_FORMAT + 1, REPORT_FORMAT));
         let none = read_changed(|value| { value.as_object_mut().expect("an object").remove("format"); }).map(|_| ()).unwrap_err();
         assert_eq!(none, "not a report: it names no format");
+        let quoted = read_changed(|value| value["format"] = serde_json::json!("1")).map(|_| ()).unwrap_err();
+        assert_eq!(quoted, format!("report format \"1\" is not one this build reads (it reads {})", REPORT_FORMAT));
         assert!(read_changed(|_| ()).is_ok(), "the unchanged sample reads");
     }
 
@@ -413,7 +439,13 @@ mod tests {
     fn a_report_with_an_unknown_field_is_refused() {
         let in_row = read_changed(|value| value["rows"][0]["weight"] = serde_json::json!(1)).map(|_| ()).unwrap_err();
         assert!(in_row.contains("unknown field `weight`"), "{}", in_row);
-        let in_cell = read_changed(|value| value["coverage"]["cells"]["kill-points-client"]["linux"]["weight"] = serde_json::json!(1)).map(|_| ()).unwrap_err();
-        assert!(in_cell.contains("unknown field `weight`"), "{}", in_cell);
+        for category in ["kill-points-client", "damaged-files"] {
+            let in_cell = read_changed(|value| value["coverage"]["cells"][category]["linux"]["weight"] = serde_json::json!(1)).map(|_| ()).unwrap_err();
+            assert!(in_cell.contains("unknown field `weight`"), "{}: {}", category, in_cell);
+        }
+        let sampled = read_changed(|value| value["completeness"][0]["cell"] = serde_json::json!({"state": "sampled", "weight": 1})).map(|_| ()).unwrap_err();
+        assert!(sampled.contains("unknown field `weight`"), "{}", sampled);
+        let reasoned = read_changed(|value| value["completeness"][0]["cell"] = serde_json::json!({"state": "run", "reason": "x"})).map(|_| ()).unwrap_err();
+        assert!(reasoned.contains("names no reason"), "{}", reasoned);
     }
 }

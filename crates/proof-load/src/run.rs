@@ -54,8 +54,9 @@ pub trait Progress: Sync {
     fn block_finished(&self, _category: Category, _block: &str, _failed: bool) {}
     /// A line for the person running it, such as which names a scenario's build created.
     fn message(&self, _text: &str) {}
-    /// Polled before each block: once it answers true the run stops there, writes no report and
-    /// returns `RunError::Cancelled`. A block already started runs to its end.
+    /// Polled before each block and each build a lane counts on: once it answers true the run
+    /// stops there, writes no report and returns `RunError::Cancelled`. A block already started
+    /// runs to its end.
     fn cancelled(&self) -> bool {
         false
     }
@@ -83,13 +84,24 @@ impl std::fmt::Display for RunError {
     }
 }
 
+/// Stops the run once the caller has cancelled.
+fn stop_if_cancelled(progress: &dyn Progress) -> Result<(), RunError> {
+    if progress.cancelled() { Err(RunError::Cancelled) } else { Ok(()) }
+}
+
 /// Stops the run before a block once the caller has cancelled, and says the block is starting.
 fn start_block(progress: &dyn Progress, category: Category, block: &str) -> Result<(), RunError> {
-    if progress.cancelled() {
-        return Err(RunError::Cancelled);
-    }
+    stop_if_cancelled(progress)?;
     progress.block_started(category, block);
     Ok(())
+}
+
+/// Writes a row's details file, `name` under the output directory. A details file a row points at
+/// that cannot be written refuses the run, as the report itself would.
+fn write_detail(root: &std::path::Path, name: &str, value: &impl serde::Serialize) -> Result<(), RunError> {
+    let refused = |error: String| RunError::Refused(format!("cannot write {}: {}", name, error));
+    let text = serde_json::to_string(value).map_err(|error| refused(error.to_string()))?;
+    std::fs::write(root.join(name), text).map_err(|error| refused(error.to_string()))
 }
 
 /// A tool as the determinism record names it: its path and the first line of its `--version`.
@@ -102,6 +114,10 @@ fn described(program: &std::path::Path) -> String {
     format!("{} ({})", program.display(), version)
 }
 
+/// Runs every lane `options` asks for into `options.out`, which must be empty or new, and returns
+/// the report it wrote there as `report.json` and `report.md`. A run that is refused or cancelled
+/// leaves whatever it wrote before it stopped, but no `report.json`; a run again needs another
+/// empty directory.
 pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunError> {
     let RunOptions {
         source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, power, power_variants, jobs,
@@ -338,8 +354,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     progress.block_finished(Category::DamagedFiles, &label, result.as_ref().map_or(true, |run| run.grade.is_failure()));
                     match result {
                         Ok(run) => {
-                            let detail = serde_json::to_string(&run).unwrap_or_default();
-                            let _ = std::fs::write(output.root().join(format!("{}.json", label)), detail);
+                            write_detail(output.root(), &format!("{}.json", label), &run)?;
                             rows.push(Row {
                                 scenario: format!("{} {}{} {:?}", run.scenario, if run.warehouse == Warehouse::Host { "host:" } else { "" }, run.target, run.kind),
                                 category: if run.kind.plants() { Category::DeadPidLock } else { Category::DamagedFiles },
@@ -390,6 +405,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             progress.lane(Category::DiskFull, None);
             let errors = condition_errors.entry(Category::DiskFull).or_default();
             for scenario in picked(&disk_full) {
+                stop_if_cancelled(progress)?;
                 let consumed = discarded_area(&mut capped, &format!("{}-counted", scenario.id), &search_path, |scratch, environment|
                     crate::conditions::consumed(scenario, &faulted_corpus(seed), programs, scratch, environment, limit, &ballast));
                 let consumed = match consumed {
@@ -460,6 +476,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             progress.lane(Category::Network, None);
             let errors = condition_errors.entry(Category::Network).or_default();
             for scenario in picked(&network_lane) {
+                stop_if_cancelled(progress)?;
                 let counted = in_area(&mut output, &format!("{}-network-counted", scenario.id), &search_path, |scratch, environment|
                     crate::network::count(scenario, &faulted_corpus(seed), programs, scratch, environment, limit).map_err(|error| error.to_string()));
                 let requests = match counted {
@@ -487,7 +504,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     };
     for run in networked {
         let label = format!("{}-network-{:?}-{}", run.scenario, run.point.fault, run.point.at);
-        let _ = std::fs::write(output.root().join(format!("{}.json", label)), serde_json::to_string(&run).unwrap_or_default());
+        write_detail(output.root(), &format!("{}.json", label), &run)?;
         let mut note = "through the harness's proxy, one request at a time".to_string();
         match &run.restart {
             Some(crate::network::Restart { refused: None }) => note.push_str("; the killed server restarted before the readback"),
@@ -509,7 +526,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
 
     for (category, note, run) in lifted {
         let label = format!("{}-{}", run.scenario, run.condition).replace(' ', "-");
-        let _ = std::fs::write(output.root().join(format!("{}.json", label)), serde_json::to_string(&run).unwrap_or_default());
+        write_detail(output.root(), &format!("{}.json", label), &run)?;
         let mut note = note;
         if !run.graded.unextractable.is_empty() {
             note.push_str(&format!("; unextractable remedies: {}", run.graded.unextractable.join("; ")));
@@ -542,24 +559,22 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         }
         _ => None,
     };
-    if progress.cancelled() {
-        return Err(RunError::Cancelled);
-    }
-    let [case_folding_cell, no_exec_cell] = volume_faults.map(|(category, fold)| {
+    stop_if_cancelled(progress)?;
+    let mut volume_lane = |(category, fold): (Category, scenario::Fold)| -> Result<Cell, RunError> {
         let scenario = scenarios.iter().find(|scenario| scenario.files == scenario::Files::Folded(fold));
         let (programs, (folding, probed), scenario) = match (&resolved, &folding, scenario) {
-            (Err(reason), _, _) => return Cell::not_run(reason),
-            _ if Platform::current() == Platform::Windows => return Cell::not_run("no folding volume is built on Windows in this harness"),
-            (_, None, _) => return Cell::not_run("no folding volume given"),
-            (_, _, None) => return Cell::not_run("no scenario this run picked holds this volume fault's files"),
+            (Err(reason), _, _) => return Ok(Cell::not_run(reason)),
+            _ if Platform::current() == Platform::Windows => return Ok(Cell::not_run("no folding volume is built on Windows in this harness")),
+            (_, None, _) => return Ok(Cell::not_run("no folding volume given")),
+            (_, _, None) => return Ok(Cell::not_run("no scenario this run picked holds this volume fault's files")),
             (Ok(programs), Some(folding), Some(scenario)) => (programs, folding, scenario),
         };
         if let Some(reason) = crate::volume::not_run_because(probed, category) {
-            return Cell::not_run(reason);
+            return Ok(Cell::not_run(reason));
         }
         let block = format!("{}-folding", scenario.id);
         progress.lane(category, Some(1));
-        progress.block_started(category, &block);
+        start_block(progress, category, &block)?;
         let result = output.scratch(&block).map_err(|error| error.to_string()).and_then(|scratch| {
             let scratch = scratch.with_folding_volume(folding.root());
             let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
@@ -568,7 +583,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         progress.block_finished(category, &block, result.as_ref().map_or(true, |graded| graded.grade.is_failure()));
         match result {
             Ok(graded) => {
-                let _ = std::fs::write(output.root().join(format!("{}-folding-volume.json", scenario.id)), serde_json::to_string(&graded).unwrap_or_default());
+                write_detail(output.root(), &format!("{}-folding-volume.json", scenario.id), &graded)?;
                 let mut note = format!("work tree cloned onto the folding volume ({}, {}), standing through the retry, remedies and heal",
                     if probed.folds_case { "folds case" } else { "keeps case" },
                     if probed.keeps_executable_bit { "keeps the executable bit" } else { "no executable bit" });
@@ -580,14 +595,17 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     grade: graded.grade, recoverability: graded.recoverability, note: Some(note),
                     detail: Some(format!("{}-folding-volume.json#", scenario.id)),
                 });
-                Cell::Run
+                Ok(Cell::Run)
             }
             Err(error) => {
                 condition_errors.entry(category).or_default().push(format!("{} on the folding volume: {}", scenario.id, error));
-                Cell::not_run("no volume fault graded")
+                Ok(Cell::not_run("no volume fault graded"))
             }
         }
-    });
+    };
+    // One after the other, so a cancel between them stops the second.
+    let case_folding_cell = volume_lane(volume_faults[0])?;
+    let no_exec_cell = volume_lane(volume_faults[1])?;
 
     let condition_checks: Vec<Completeness> = [
         (Category::DiskFull, "disk-full faults ran", &disk_full_cell), (Category::ReadOnly, "read-only faults ran", &read_only_cell),
@@ -652,7 +670,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                         Ok((template, counting)) => crate::servekill::run(scenario, &programs, &settings, &template, &counting),
                         Err(error) => kill::ScenarioKills { scenario: scenario.id.clone(), errors: vec![error], ..Default::default() },
                     };
-                    let _ = std::fs::write(output.root().join(kill::details_file(kill::Side::Server, &scenario.id)), serde_json::to_string(&kills).unwrap_or_default());
+                    write_detail(output.root(), &kill::details_file(kill::Side::Server, &scenario.id), &kills)?;
                     progress.block_finished(Category::KillPointsServer, &scenario.id, kills_failed(&kills));
                     all_server_kills.push(kills);
                 }
@@ -663,15 +681,17 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                         Ok(template) => crate::servepower::run(scenario, &faulted_corpus, &programs, &settings, &template, routes.as_ref(), power_variants, seed),
                         Err(error) => crate::power::ScenarioPower { scenario: scenario.id.clone(), errors: vec![error.to_string()], ..Default::default() },
                     };
-                    let _ = std::fs::write(output.root().join(crate::power::details_file(kill::Side::Server, &scenario.id)), serde_json::to_string(&lost).unwrap_or_default());
+                    write_detail(output.root(), &crate::power::details_file(kill::Side::Server, &scenario.id), &lost)?;
                     progress.block_finished(Category::PowerLossServer, &scenario.id, power_failed(&lost));
                     all_server_power.push(lost);
                 }
+                // One poll for both client blocks, so a cancel never leaves one started alone.
+                stop_if_cancelled(progress)?;
                 if killing {
-                    start_block(progress, Category::KillPointsClient, &scenario.id)?;
+                    progress.block_started(Category::KillPointsClient, &scenario.id);
                 }
                 if powering {
-                    start_block(progress, Category::PowerLossClient, &scenario.id)?;
+                    progress.block_started(Category::PowerLossClient, &scenario.id);
                 }
                 let counted = output.scratch(&format!("{}-traced", scenario.id)).map_err(|error| error.to_string())
                     .and_then(|template| kill::count(scenario, &faulted_corpus, &programs, &settings, &template, powering).map(|counting| (template, counting)).map_err(|error| error.to_string()));
@@ -692,7 +712,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                 if killing {
                     let kills = match kill::run(scenario, &programs, &settings, &template, &counting) {
                         Ok(kills) => {
-                            let _ = std::fs::write(output.root().join(kill::details_file(kill::Side::Client, &scenario.id)), serde_json::to_string(&kills).unwrap_or_default());
+                            write_detail(output.root(), &kill::details_file(kill::Side::Client, &scenario.id), &kills)?;
                             kills
                         }
                         Err(error) => kill::ScenarioKills { scenario: scenario.id.clone(), errors: vec![error.to_string()], ..Default::default() },
@@ -703,7 +723,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                 if powering {
                     let lost = match crate::power::run(scenario, &programs, &settings, &template, &counting, power_variants, seed) {
                         Ok(power) => {
-                            let _ = std::fs::write(output.root().join(crate::power::details_file(kill::Side::Client, &scenario.id)), serde_json::to_string(&power).unwrap_or_default());
+                            write_detail(output.root(), &crate::power::details_file(kill::Side::Client, &scenario.id), &power)?;
                             power
                         }
                         Err(error) => crate::power::ScenarioPower { scenario: scenario.id.clone(), errors: vec![error.to_string()], ..Default::default() },
@@ -825,7 +845,8 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             progress.message(&format!("{} creates{} {}", scenario, if *warehouse == Warehouse::Host { " on its host" } else { "" }, names.join(" ")));
         }
     }
-    for (name, text) in [("report.json", report.json()), ("report.md", report.markdown())] {
+    // report.json last: it is what says the run finished, so none is left by a run refused here.
+    for (name, text) in [("report.md", report.markdown()), ("report.json", report.json())] {
         if let Err(error) = std::fs::write(output.root().join(name), text) {
             return Err(RunError::Refused(format!("cannot write {}: {}", name, error)));
         }

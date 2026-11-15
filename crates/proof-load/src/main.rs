@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use proof_load::run::{self, Progress, RunError, RunOptions};
+use proof_load::run::{self, Progress, RunOptions};
 
 #[derive(Parser)]
 #[command(name = "proof-load", about = "Fault-injection harness for Forklift")]
@@ -110,7 +110,7 @@ fn main() -> ExitCode {
     match run::run(&options, &Stderr) {
         Ok(report) if report.failed() => ExitCode::from(1),
         Ok(_) => ExitCode::SUCCESS,
-        Err(error @ (RunError::Refused(_) | RunError::Cancelled)) => {
+        Err(error) => {
             eprintln!("proof-load: {}", error);
             ExitCode::from(2)
         }
