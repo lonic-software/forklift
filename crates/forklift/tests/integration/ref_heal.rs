@@ -754,7 +754,7 @@ fn heal_names_unload_when_only_a_staged_load_reaches_a_lost_blob() {
         area.run_ok(&root, &["load", "a.txt"]);
         lose(&root, &blob_hash("staged\n"));
         match gone {
-            true => forklift_core::util::file_utils::remove_file(&root.join("a.txt")).unwrap(),
+            true => forklift_core::util::file_utils::remove_file(root.join("a.txt")).unwrap(),
             false => std::fs::write(root.join("a.txt"), "changed\n").unwrap(),
         }
 
