@@ -129,7 +129,7 @@ pub struct Rebuilt {
     pub set_aside: PathBuf,
     /// How many entries still read whole and were kept.
     pub kept: usize,
-    /// How many lines did not read whole and were dropped.
+    /// How many lines were dropped: they did not read whole, or named a hash no redaction names.
     pub dropped: usize,
 }
 
@@ -152,6 +152,10 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
         return Err("The record of applied redactions is not rebuilt while this thread holds the ref lock.".to_string());
     }
 
+    // Read before the lock: a cache fetches what of `@redactions` it lacks, which it never does
+    // under the ref lock. A cell, once written, is never removed, so a later read names no fewer.
+    let redactions = redaction_utils::read_redactions();
+
     let _lock = RefLock::acquire()?;
     let path = applied_path();
     let bytes = match std::fs::read(&path) {
@@ -172,7 +176,7 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
     // which would hold that content as redacted. A redaction's cell is never removed, so every
     // applied hash is a cell's path. With `@redactions` unread, or reading as no cell at all,
     // which its lost ref reads as too, every whole line is kept.
-    let hashes: Vec<String> = match redaction_utils::read_redactions() {
+    let hashes: Vec<String> = match redactions {
         Ok(read) if !read.redactions.is_empty() || !read.unreadable.is_empty() => {
             let named: BTreeSet<&str> = read.redactions.iter().map(|attributed| attributed.redaction.hash.as_str())
                 .chain(read.unreadable.iter().map(|unreadable| unreadable.hash.as_str()))
@@ -493,7 +497,7 @@ pub fn statuses(read: &RedactionsRead) -> Result<Vec<RedactionStatus>, String> {
 pub fn apply(read: &RedactionsRead,
              only: Option<&str>,
              report: Option<&RemoteReport>) -> Result<Vec<RedactionStatus>, String> {
-    apply_these(&chosen(read, only), report)
+    reapply(&chosen(read, only), report)
 }
 
 /// The readable redactions of `read` that name one of `lost`, content the store lacks that history
@@ -511,20 +515,15 @@ pub fn unapplied_among<'a>(read: &'a RedactionsRead, lost: &BTreeSet<String>) ->
         .collect())
 }
 
-/// Apply each of `redactions` that a scan now finds unheld, as [`apply`] does, for `heal`, which
-/// passes those [`unapplied_among`] found: their content is gone, so applying one again deletes
-/// nothing, and only records what the store already shows.
+/// [`apply`] over the redactions `chosen`, for `heal` too, which passes those [`unapplied_among`]
+/// found: their content is gone, so applying one again deletes no content. It still withdraws the
+/// bundle, as every apply does, since a bundle built before may hold that content.
 ///
 /// # Returns
 /// * `Ok(Vec<RedactionStatus>)` - One per redaction, in the order given; each that reads as
 ///                                applied is applied on disk.
 /// * `Err(String)`              - As [`apply`]'s.
-pub fn reapply(redactions: &[&Redaction], report: Option<&RemoteReport>) -> Result<Vec<RedactionStatus>, String> {
-    apply_these(redactions, report)
-}
-
-/// [`apply`] over the redactions chosen.
-fn apply_these(chosen: &[&Redaction], report: Option<&RemoteReport>) -> Result<Vec<RedactionStatus>, String> {
+pub fn reapply(chosen: &[&Redaction], report: Option<&RemoteReport>) -> Result<Vec<RedactionStatus>, String> {
     let applied = read_applied()?;
     let (remote, partial) = read_judged()?;
     let mut statuses = judge(chosen, &applied, Judge { remote: remote.as_deref(), partial, report });

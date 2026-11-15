@@ -11,6 +11,9 @@ use forklift_core::util::unavailable_heal::{self, RemoteError};
 use forklift_core::util::{config_utils, origin_utils, recovery_utils, redaction_utils, sealed_utils, unavailable};
 use crate::output::{self, CommandOutput};
 
+/// The note of a re-apply of redactions that could not run, followed by why.
+const UNREAPPLIED: &str = "No redaction whose content is lost was applied again";
+
 /// The note of a re-record a check that could not read every source stopped.
 const UNRECORDED_SHORT: &str = "No absent object was recorded unavailable again: the check for lost objects could not read every source.";
 
@@ -34,15 +37,16 @@ const UNRECORDED_SHORT: &str = "No absent object was recorded unavailable again:
 ///
 /// A damaged record of content this warehouse cannot get, and a damaged record of applied
 /// redactions, are rebuilt first, from the entries that still read whole, a copy kept
-/// ([`unavailable::rebuild`], [`applied_redactions::rebuild`]). Last, over a check that read every
-/// source, each redaction naming lost absent user file content that the applied record does not
-/// hold is applied again where its scan, and the configured remote's report, allow
-/// ([`applied_redactions::reapply`]); one that is not is named in a note. Then each lost absent user file content the
-/// remote's host withholds is recorded unavailable again
+/// ([`unavailable::rebuild`], [`applied_redactions::rebuild`]). Last, over a check that read
+/// every source, each redaction naming lost absent user file content that the applied record does
+/// not hold is applied again where its scan and the configured remote's report allow
+/// ([`applied_redactions::reapply`]); one that is not is named in a note. Then each lost absent
+/// user file content the remote's host withholds is recorded unavailable again
 /// ([`unavailable_heal::record_withheld_lost`]); not when the warehouse's mode does not read, nor
 /// in a partial warehouse whose origin record does not read. The check runs again after each step
-/// that changed something. Both read one handshake ([`unavailable_heal::handshake`]); a remote that
-/// sends no response, or refuses, is handled as the origin is below.
+/// that changed something. Both read one handshake ([`unavailable_heal::handshake`]). A remote
+/// that sends no response, or refuses, is handled as the origin is below when the re-record asked
+/// it; when only the re-apply did, it is a note.
 ///
 /// Then, in a partial warehouse, it reads the origin record. In a cache whose check for lost
 /// objects read every source, it re-seals each lost absent object the origin's held history meets
@@ -343,7 +347,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             match redaction_utils::read_redactions() {
                 Ok(read) => Some((read, found.absent_files.clone())),
                 Err(why) => {
-                    notes.push(format!("No redaction whose content is lost was applied again: {}", why.trim_end_matches('.')));
+                    notes.push(format!("{}: {}", UNREAPPLIED, why.trim_end_matches('.')));
                     None
                 }
             }
@@ -352,7 +356,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     };
     let reapply_of = match &redactions {
         Some((read, absent)) => applied_redactions::unapplied_among(read, absent).unwrap_or_else(|why| {
-            notes.push(format!("No redaction whose content is lost was applied again: {}", why.trim_end_matches('.')));
+            notes.push(format!("{}: {}", UNREAPPLIED, why.trim_end_matches('.')));
             Vec::new()
         }),
         None => Vec::new(),
@@ -371,8 +375,10 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         true => None,
         false => match unavailable_heal::handshake().await {
             Ok(answered) => answered,
+            // A remote only the re-apply asked never stands in for the origin's answer: the
+            // re-seal and the run's refusal are not this step's to settle.
             Err(RemoteError::NoResponse(why)) => {
-                origin_unanswered = true;
+                origin_unanswered |= rerecord_from.is_some();
                 remote_failed = true;
                 notes.push(format!(
                     "The remote did not answer, so {}: {}", waits_for_remote.join(", and "), why.trim_end_matches('.')
@@ -383,7 +389,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             Err(RemoteError::Refused(why)) => {
                 remote_failed = true;
                 match CoreError::from(why) {
-                    refused @ CoreError::Refusal { .. } => remote_refused = Some(refused),
+                    refused @ CoreError::Refusal { .. } if rerecord_from.is_some() => remote_refused = Some(refused),
                     other => notes.push(format!(
                         "The remote's handshake failed, so {}: {}",
                         waits_for_remote.join(", and "), String::from(other).trim_end_matches('.')
@@ -413,9 +419,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                     lost = recovery_utils::find_lost_objects();
                 }
             }
-            Err(why) => notes.push(format!(
-                "No redaction whose content is lost was applied again: {}", why.trim_end_matches('.')
-            )),
+            Err(why) => notes.push(format!("{}: {}", UNREAPPLIED, why.trim_end_matches('.'))),
         }
     }
 
@@ -1071,7 +1075,7 @@ pub(crate) struct AppliedRebuilt {
     /// How many hashes still read whole and were kept.
     kept: usize,
 
-    /// How many lines did not read whole, or named a hash no redaction names, and were dropped.
+    /// How many lines were dropped: they did not read whole, or named a hash no redaction names.
     dropped: usize,
 }
 
@@ -1089,7 +1093,8 @@ impl AppliedRebuilt {
     fn sentence(&self) -> String {
         format!(
             "The record of applied redactions was damaged and is rebuilt from the {} hash(es) that \
-            still read whole; {} line(s) that did not are dropped, and a copy of it is kept at \"{}\".",
+            still read whole and that a redaction names; {} line(s) that did not are dropped, and a \
+            copy of it is kept at \"{}\".",
             self.kept, self.dropped, self.set_aside
         )
     }

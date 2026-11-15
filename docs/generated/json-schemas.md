@@ -2190,7 +2190,7 @@ A command not listed here either reports only the generic human-message shape `{
       "description": "What `heal` kept of a damaged record of applied redactions.",
       "properties": {
         "dropped": {
-          "description": "How many lines did not read whole, or named a hash no redaction names, and were dropped.",
+          "description": "How many lines were dropped: they did not read whole, or named a hash no redaction names.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"

@@ -12,6 +12,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **`heal` repairs a lost or damaged record of applied redactions.** A damaged record of which
+  redactions this warehouse applied (`.forklift/redactions-applied`) failed every read of redacted
+  content, so `git export` failed, with no remedy named; a lost one listed each redaction as pending
+  over content already deleted, and `heal` refused with exit 58 (`objects_lost`). Now `heal`
+  rebuilds a damaged record from the hashes that still read and that a redaction names, keeping a
+  copy of it (`redactions_applied_rebuilt` in `--json`), and applies again each redaction whose
+  content is gone, as `redact apply` would (`redactions_reapplied`), so exports leave the file out
+  again. A damaged record's error now names `forklift heal`.
+
 - **`heal` repairs a lost or damaged record of content the remote withholds.** When the record of
   what a fetch left out because the remote's host withholds it (`.forklift/unavailable`) was lost,
   `heal` refused with exit 58 (`objects_lost`) and `git export` failed on the missing content; a
