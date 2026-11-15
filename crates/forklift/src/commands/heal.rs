@@ -1520,3 +1520,38 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
         crate::docgen::OutputSchema::of::<HealReport>(),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::unload_step_when;
+
+    #[test]
+    fn the_unload_step_quotes_each_path_or_lists_them_behind_a_placeholder() {
+        // One path is one quoted argument; several get a command each; a path no Windows shell
+        // reads as one literal argument puts every path behind the placeholder step.
+        // Mutation: quote with the other platform's rule, or keep only the first path → red.
+        let one = |path: &str, windows: bool| unload_step_when(&[path.to_string()], windows);
+        assert_eq!(
+            one("my docs/a.txt", false),
+            "from the working tree's root, run \"forklift unload 'my docs/a.txt'\", then load the file again if you \
+            mean to stage it"
+        );
+        assert_eq!(
+            one("-a.txt", false),
+            "from the working tree's root, run \"forklift unload ./-a.txt\", then load the file again if you mean \
+            to stage it"
+        );
+
+        let paths = ["a.txt".to_string(), "b c.txt".to_string()];
+        assert_eq!(
+            unload_step_when(&paths, false),
+            "from the working tree's root, run each of these, then load again what you mean to stage: \"forklift \
+            unload a.txt\", \"forklift unload 'b c.txt'\""
+        );
+        assert_eq!(
+            unload_step_when(&paths, true),
+            "from the working tree's root, run \"forklift unload -- <path>\" for each of these paths, with the path \
+            quoted for your shell, then load again what you mean to stage: \"a.txt\", \"b c.txt\""
+        );
+    }
+}
