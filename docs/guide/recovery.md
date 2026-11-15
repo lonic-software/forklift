@@ -538,7 +538,8 @@ origin: the move goes ahead once that origin withholds it too or no longer answe
 
 The `--only` path is not a directory in that pallet on the remote. A clone reports this as
 `clone_incomplete`, with this code as its `cause_code`. Running it unchanged fails the same way: check
-the spelling, and run the clone again with the right path. What it fetched is kept.
+the spelling, and run the clone again with the right path. The path is checked before the clone
+stores any of it.
 
 ### `out_of_scope` (exit 7)
 

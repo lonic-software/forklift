@@ -551,6 +551,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **A refused `scope fetch` or `clone --only` of a file no longer stores it.** `scope fetch
+  docs/guide.md`, naming a file rather than a directory, was refused as not a directory but had
+  already downloaded the file across its history, so `show` then read it outside the fetch scope.
+  `clone --only docs/guide.md` did the same, and a resume of that clone at a corrected scope kept
+  the file. Both now check the path before storing anything, and the refusal stores nothing of it.
+
 - **An object folder that cannot be listed is reported, not read as empty.** Matching a short hash
   or salvaging a damaged pallet ref skipped a folder of the object store it could not list, so a
   typed prefix was answered "No object with hash … exists", and `heal` could judge that a damaged

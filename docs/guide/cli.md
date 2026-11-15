@@ -2067,7 +2067,8 @@ Adds subtree path(s) to what the warehouse has fetched, and downloads their cont
 whole history from the remote. Incremental and precise — only the newly in-scope objects are
 fetched; what is already present is skipped, and the content is hash-verified against the seals
 the history commits. Like every remote command in a partial warehouse, it talks only to the
-origin (`non_origin_remote`).
+origin (`non_origin_remote`). A path that is not a directory at the checkout's base is refused,
+and the warehouse stores nothing of it.
 Every checkout's scope stays as it is: after fetching, a bay can be scoped to the new path
 (`bay add --scope`). A full warehouse already holds everything, so there is nothing to fetch.
 

@@ -603,6 +603,35 @@ async fn franchise_into_prepared_target(
     // The meta pallets' own walks, below, take everything, as before.
     client.skip_files(lower::reported_applied(&info));
 
+    // Each --only path must name a directory at the remote head, checked before anything is
+    // fetched, so a refused clone holds none of the path's content for a resume to keep. The head
+    // and the trees on the way are read from the remote into memory, verified against their hashes
+    // and not stored; the history walk below verifies the head against the anchor before anything
+    // of it is kept.
+    if let (true, Some(remote_head)) = (sparse, &remote_head) {
+        let checked = async {
+            let parcel = object_utils::parse_parcel_bytes(
+                remote_head, &remote_utils::read_object_verified(client, remote_head).await?,
+            )?;
+
+            remote_utils::first_non_directory(client, &parcel.tree_hash, fetch_scope.prefixes(), |_| true).await
+        }.await.map_err(|e| error::prefix_message(
+            &format!("Could not check the --only path(s) against pallet \"{}\" on the remote", pallet_name), e,
+        ))?;
+
+        if let Some(prefix) = checked {
+            return Err(CoreError::refusal(
+                RefusalCode::OnlyPrefixNotFound,
+                format!(
+                    "\"{}\" is not a directory in pallet \"{}\" on the remote, so it cannot be a \
+                    sparse clone scope.",
+                    prefix, pallet_name
+                ),
+                "Name a directory of the pallet with --only.",
+            ).into());
+        }
+    }
+
     let fetched = async {
         match &remote_head {
             Some(remote_head) => {
@@ -666,27 +695,6 @@ async fn franchise_into_prepared_target(
     };
 
     let tree_hash = object_utils::load_parcel(&remote_head)?.tree_hash;
-
-    // Validate the --only paths against the fetched head before the pallet head is written. The
-    // scopes are already recorded, but a resume clears them with the marker
-    // and prepares again, and the fetched objects are kept, so a resume with the path corrected
-    // fetches only what the new scope adds. The spine is fetched, so the walk to each in-scope
-    // subtree resolves without touching anything absent.
-    if sparse {
-        for prefix in fetch_scope.prefixes() {
-            if !is_directory_in_tree(&tree_hash, prefix)? {
-                return Err(CoreError::refusal(
-                    RefusalCode::OnlyPrefixNotFound,
-                    format!(
-                        "\"{}\" is not a directory in pallet \"{}\" on the remote, so it cannot be a \
-                        sparse clone scope.",
-                        prefix, pallet_name
-                    ),
-                    "Name a directory of the pallet with --only.",
-                ).into());
-            }
-        }
-    }
 
     shift_utils::ensure_tree_present(&tree_hash, &scope_utils::current_scope()?)?;
 
@@ -883,25 +891,6 @@ fn resolve_fetch_scope(only: &[String]) -> Result<PathScope, String> {
     }
 
     Ok(PathScope::from_prefixes(keys))
-}
-
-/// Whether a warehouse path resolves to a subtree (directory) in the given root tree. Used after
-/// a sparse fetch to reject an --only path that names nothing (or a file) in the head.
-fn is_directory_in_tree(root_tree_hash: &str, key: &str) -> Result<bool, String> {
-    let mut current = object_utils::load_tree(root_tree_hash)?;
-
-    for component in key.split('/') {
-        let subtree = current.get_subtrees()
-            .find(|(name, _)| name.as_str() == component)
-            .map(|(_, item)| item.hash.clone());
-
-        match subtree {
-            Some(hash) => current = object_utils::load_tree(&hash)?,
-            None => return Ok(false),
-        }
-    }
-
-    Ok(true)
 }
 
 /// Emit a successful clone's report, announcing a first-contact adoption first. Only on

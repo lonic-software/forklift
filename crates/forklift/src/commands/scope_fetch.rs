@@ -89,29 +89,35 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     // names it widens without it rather than being refused.
     client.fetch_info().await?;
 
+    // Each added path must name a directory at the base, checked before anything is fetched. A
+    // tree the fetch scope seals is read from the remote into memory, verified and not stored; the
+    // spine above the scope is read from the store. A path refused here leaves the store and the
+    // fetch scope as they were. A retry only ever narrows the added paths, so this check covers
+    // every attempt.
+    let tree = object_utils::load_parcel(&head)?.tree_hash;
+    let sealed = |path: &str| current.classify(path) == ScopeClass::OutOfScope;
+    let checked = remote_utils::first_non_directory(&client, &tree, &added, sealed).await
+        .map_err(|e| forklift_core::error::append_to_message(
+            forklift_core::error::prefix_message(
+                &format!("Could not check the requested path(s) against pallet \"{}\" at this checkout's base", pallet),
+                e,
+            ),
+            "Nothing was recorded.",
+        ))?;
+
+    if let Some(prefix) = checked {
+        return Err(format!(
+            "\"{}\" is not a directory in pallet \"{}\" at this checkout's base, so it cannot be a \
+            fetch scope. Nothing was recorded.",
+            prefix, pallet
+        ));
+    }
+
     // Fetch the newly in-scope content FIRST, at the widened scope, and only then record it: the
     // fetch scope never claims a path is in scope until it is fully fetched. A transfer error, or
     // a hard crash mid-fetch, leaves the on-disk scope as it was, so a plain re-run retries the
     // fetch and self-heals; the fetch primitives skip what already landed.
     let mut expansion = remote_utils::Expansion::new(&pallet, &head, current, added);
-
-    expansion.walk_base(&client).await?;
-
-    // Each added path must name a real directory at the head — the spine (and the subtree itself)
-    // is fetched now, so the walk resolves without touching anything absent. A typo that named
-    // nothing is rejected before any other history is fetched or the scope written, so it leaves
-    // no trace. A retry only ever narrows the added paths, so this check covers every attempt.
-    let tree = object_utils::load_parcel(&head)?.tree_hash;
-
-    for prefix in expansion.added() {
-        if !crate::commands::scope::names_directory(&tree, prefix)? {
-            return Err(format!(
-                "\"{}\" is not a directory in pallet \"{}\" at its head, so it cannot be a fetch \
-                scope. Nothing was recorded.",
-                prefix, pallet
-            ));
-        }
-    }
 
     for _ in 0..remote_utils::EXPAND_ATTEMPTS {
         expansion.walk(&client).await?;
