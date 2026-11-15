@@ -6189,6 +6189,64 @@ fn expand_checks_its_paths_before_walking_other_histories() {
     assert!(stderr(&refused).contains("\"src/wbe\" is not a directory"), "{}", stderr(&refused));
 }
 
+/// Every file under a warehouse's object store, loose and packed, by path.
+fn object_store_files(area: &TestArea, dir: &str) -> std::collections::BTreeSet<PathBuf> {
+    let mut found = std::collections::BTreeSet::new();
+    let mut pending = vec![area.path(dir).join(".forklift").join("objects")];
+
+    while let Some(folder) = pending.pop() {
+        for entry in std::fs::read_dir(&folder).unwrap().flatten() {
+            let path = entry.path();
+
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.insert(path);
+            }
+        }
+    }
+
+    found
+}
+
+// Revert: walk the base at the widened scope before checking the added paths → the refused fetch
+// stores the file's blobs (and the tree above it), and the out-of-scope file then reads.
+#[test]
+fn a_refused_scope_fetch_of_a_file_stores_nothing() {
+    let area = TestArea::new("sparse-expand-file");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
+    area.write_file("dev/docs/guide.md", "guide v2\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "guide v2"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let guide_blob = path_object_hash(&area, "dev", &head, "docs/guide.md");
+
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
+    let before = object_store_files(&area, "sparse");
+
+    for file in ["docs/guide.md", "docs/guide.md/below"] {
+        let refused = area.forklift("sparse", &["scope", "fetch", file]);
+        assert!(!refused.status.success(), "{}", stdout(&refused));
+        assert!(stderr(&refused).contains(&format!("\"{}\" is not a directory", file)), "{}", stderr(&refused));
+        assert_eq!(object_store_files(&area, "sparse"), before, "scope fetch {} stored objects", file);
+    }
+
+    let shown = area.forklift("sparse", &["--json", "show", "main:docs/guide.md"]);
+    assert_eq!(json_of(&shown)["error"]["code"], "out_of_scope", "{}", stdout(&shown));
+
+    // The directory itself fetches, and with it the file.
+    assert_success(&area.forklift("sparse", &["scope", "fetch", "docs"]));
+    assert!(object_present(&area, "sparse", &guide_blob), "scope fetch docs fetches the guide");
+}
+
 // Revert: clone fetches through the scope on disk, which does not exist yet → the whole
 // tree is fetched and nothing is recorded.
 #[test]

@@ -5968,13 +5968,12 @@ impl Expansion {
         self.fetched_objects
     }
 
-    /// Fetch the base at the widened scope, once, so that the added prefixes can be checked
-    /// against its tree before anything else is fetched.
+    /// Fetch the base at the widened scope, once, before any other head.
     ///
     /// # Returns
     /// * `Ok(())`      - The base was walked.
     /// * `Err(String)` - It could not be; the error names the bay's pallet.
-    pub async fn walk_base(&mut self, client: &RemoteClient) -> Result<(), String> {
+    async fn walk_base(&mut self, client: &RemoteClient) -> Result<(), String> {
         if !self.base_walked {
             let base = self.base.clone();
             let added = self.walk_head(client, &base).await
