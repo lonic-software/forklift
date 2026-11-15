@@ -1717,6 +1717,7 @@ prefix.
 ```sh
 forklift park                 # park tracked changes and reset to the pallet head
 forklift park --name wip      # the same, under the name "wip"
+forklift park src/api a.txt   # park only the changes at or under these paths
 forklift park list            # list parked work by name, newest first
 forklift park show [<name>]   # the park's parcel, base, time and the files it changes
 forklift park apply [<name>]  # re-apply the park (staged) and keep it parked
@@ -1726,7 +1727,11 @@ forklift park drop [<name>]   # discard the park without applying it
 
 `park` saves your staged and unstaged changes to **tracked** files as a parked
 parcel and resets the warehouse to the pallet head (untracked files are left
-alone). `park apply` and `park pop` re-apply a park's changes as a clean re-apply
+alone). Given paths, `park` parks and resets only the changes at or under them: every other
+file keeps its working content and its staging, and the parked parcel holds the pallet head
+everywhere else. A path that names nothing in the head, the work in progress or the working
+directory refuses, and so does one outside a scoped bay's scope. A path spelled like a
+subcommand is written `./list`. `park apply` and `park pop` re-apply a park's changes as a clean re-apply
 — it must be applied onto the head it was parked on, or it reports a conflict. If
 staging the re-applied changes fails, the parcel stays parked, and the error says that the
 working directory already holds the changes. Without a name, `show`, `apply`, `pop` and `drop`
@@ -3093,6 +3098,8 @@ that level starts the same way: `forklift ha` is `forklift haul`, `forklift haul
 - Only command names are matched. Aliases are typed whole (`con`, not `co`), flags are always
   typed in full, and so are the hidden git words below: `forklift commit` works, `forklift comm`
   does not.
+- Where a command takes paths besides its subcommands (`park`), its subcommands are typed in full:
+  `forklift park a` parks `a`, and `forklift park apply` applies.
 
 **Prefixes are for typing, not for scripts.** A prefix that works today stops working the day a
 command starting with the same letters is added. Scripts, aliases in your shell configuration,

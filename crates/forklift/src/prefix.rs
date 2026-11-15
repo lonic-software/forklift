@@ -288,8 +288,8 @@ mod tests {
     }
 
     /// The resolver steps over an option's value by reading whether the option takes one, so an
-    /// option of a command with subcommands must take exactly one word, and such a command must
-    /// take no positional argument a command word could be mistaken for.
+    /// option of a command with subcommands must take exactly one word. Such a command may take
+    /// positional arguments: there the resolver expands no prefix.
     #[test]
     fn every_family_lets_the_walk_find_its_subcommand() {
         let cli = built();

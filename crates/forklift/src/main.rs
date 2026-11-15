@@ -235,8 +235,15 @@ fn bare_only_error(command: &clap::Command, matches: &clap::ArgMatches) -> Optio
         }
         let given = found.value_source(arg) == Some(clap::parser::ValueSource::CommandLine);
         let (subcommand, _) = found.subcommand()?;
+        // A positional is named as the help names it, by its value name.
+        let spelled = match level.get_arguments().find(|candidate| candidate.get_id() == arg) {
+            Some(positional) if positional.is_positional() => positional.get_value_names()
+                .and_then(|names| names.first())
+                .map_or_else(|| format!("<{}>", arg.to_uppercase()), |name| format!("<{name}>")),
+            _ => format!("--{arg}"),
+        };
         given.then(|| level.clone().error(ErrorKind::ArgumentConflict, format!(
-            "\"--{arg}\" belongs to a bare \"forklift {family}\", not to \"forklift {family} {subcommand}\", \
+            "\"{spelled}\" belongs to a bare \"forklift {family}\", not to \"forklift {family} {subcommand}\", \
             which takes its own arguments after it. Nothing was done."
         )))
     })

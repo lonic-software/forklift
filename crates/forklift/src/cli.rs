@@ -590,7 +590,8 @@ pub enum Command {
                       files are left alone. Every bay of the warehouse shares one list of parks, each \
                       under a unique name: \"--name\" picks it, and by default it is the pallet and \
                       the time. Given paths, only the changes at or under them are parked and \
-                      reset; every other change stays as it is. \"forklift park pop\" re-applies a park and takes it off the list, \
+                      reset; every other change stays as it is, and a path spelled like a subcommand \
+                      is written as \"./list\". \"forklift park pop\" re-applies a park and takes it off the list, \
                       \"forklift park apply\" re-applies it and keeps it, \"forklift park drop\" \
                       discards it, \"forklift park show\" shows its changes and \"forklift park \
                       list\" lists every park. Each takes a park's name, and without one uses the \
@@ -2141,7 +2142,7 @@ pub enum ProfileAction {
 /// the parse refuses them given with a subcommand, as a usage error. clap's `args_conflicts_with_subcommands` would
 /// say so too, but it also refuses every global flag written between the family and its
 /// subcommand (`park --json pop`). The MCP tools and `self schema` give these to the bare form.
-pub const BARE_ONLY_ARGS: &[(&str, &str)] = &[("park", "name")];
+pub const BARE_ONLY_ARGS: &[(&str, &str)] = &[("park", "name"), ("park", "paths")];
 
 #[derive(Subcommand)]
 pub enum ParkAction {
