@@ -392,11 +392,13 @@ refusal_codes! {
     /// back. A pack record whose bytes do not rebuild to its object carries no code.
     ObjectUnreadable => "object_unreadable",
 
-    /// `forklift heal` found objects the history reaches that no file holds, that only a corrupt
-    /// loose file holds, or that only a pack index it could not rebuild names, so they cannot be
-    /// read. Nothing was claimed repaired for
-    /// them. The details list how many, up to twenty hashes grouped by reason, and the pallets
-    /// whose history reaches them; the next step restores them from a backup or a copy, or re-runs
+    /// `forklift heal` found objects the history or staged content reaches that no file holds,
+    /// that only a corrupt loose file holds, or that only a pack index it could not rebuild names,
+    /// so they cannot be read, and that the working tree did not hold either. Nothing was claimed
+    /// repaired for them. The details list how many, up to twenty hashes grouped by reason, the
+    /// pallets whose history reaches them, and the staged paths when only staged content does; the
+    /// next step unloads those paths, or re-runs heal in the other checkout staging them, when only
+    /// staged content reaches them, and otherwise restores them from a backup or a copy, or re-runs
     /// heal when its index rebuild could not take the store lock.
     ObjectsLost => "objects_lost",
 }
