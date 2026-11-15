@@ -2757,20 +2757,20 @@ unavailable, so the loss stays reported until the object is restored:
   read as missing. Then re-run `heal`. A torn record is likewise left standing.
 
 Last, once every repair has run, `heal` walks what pallets, parked changes, bays and trust pins
-still reach and checks the store gives each object back, reading every loose file and decoding
-every pack record to do so. An absent object that a file in this checkout's working tree still
-holds, at a path its inventory lists with that content, is stored again from the file, and the
-report lists the path; content a redaction names never is. When one is absent, held only in a corrupt loose file or pack record, or
-sits in a pack file the run could not repair, `heal` refuses with `objects_lost` (exit 58), after
-printing its report: it counts the objects, lists up to 20 hashes with the reason for each, and
-names the pallets whose history reaches them. Every repair before it still landed. When only
-staged content reaches them, a load never stacked, the report names the staged paths, and the next
-step is `forklift unload` on each: it unstages the path and leaves its file as it is, to be loaded
-again if you mean to stage it. Content another bay or the main working tree stages is named
-there, and `heal` run in that checkout stores it again or names what to unload there. Otherwise the next step is to restore the
-warehouse from a backup or clone it afresh, to re-create it when the pack folder holds another
-build's index, or to run `heal` again when the store lock was busy. A walk that cannot
-finish (an unreadable staged shard, say) exits non-zero saying it could not finish its
+still reach and checks the store gives each object back, reading every loose file and decoding every
+pack record to do so. An absent object that a file in this checkout's working tree still holds, at a
+path its inventory lists with that content, is stored again from the file, and the report lists the
+path; content a redaction names never is. When one is absent, held only in a corrupt loose file or
+pack record, or sits in a pack file the run could not repair, `heal` refuses with `objects_lost`
+(exit 58), after printing its report: it counts the objects, lists up to 20 hashes with the reason
+for each, and names the pallets whose history reaches them. Every repair before it still landed.
+When only staged content reaches them, a load never stacked, the report names the staged paths, and
+the next step is `forklift unload` on each: it unstages the path and leaves its file as it is, to be
+loaded again if you mean to stage it. Content another bay or the main working tree stages is named
+there, and `heal` run in that checkout stores it again or names what to unload there. Otherwise the
+next step is to restore the warehouse from a backup or clone it afresh, to re-create it when the
+pack folder holds another build's index, or to run `heal` again when the store lock was busy. A walk
+that cannot finish (an unreadable staged shard, say) exits non-zero saying it could not finish its
 reachability check, and claims nothing lost.
 
 `heal` and the read-only `audit` are the only two commands that run while a taint is standing —
