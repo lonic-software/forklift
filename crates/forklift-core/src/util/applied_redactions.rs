@@ -152,21 +152,31 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
         return Err("The record of applied redactions is not rebuilt while this thread holds the ref lock.".to_string());
     }
 
-    // Read before the lock: a cache fetches what of `@redactions` it lacks, which it never does
-    // under the ref lock. A cell, once written, is never removed, so a later read names no fewer.
+    let path = applied_path();
+
+    // The damaged record's bytes, or `None` when there is nothing to rebuild.
+    let damaged = || -> Result<Option<Vec<u8>>, String> {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
+        };
+
+        Ok((read_applied().is_err() && !written_by_newer(&bytes)).then_some(bytes))
+    };
+
+    // Judged first without the lock, so a record that reads costs no read of `@redactions`. That
+    // read goes before the lock: a cache fetches what of it it lacks, which it never does under
+    // the ref lock. A cell, once written, is never removed, so a later read names no fewer.
+    if damaged()?.is_none() {
+        return Ok(None);
+    }
     let redactions = redaction_utils::read_redactions();
 
     let _lock = RefLock::acquire()?;
-    let path = applied_path();
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
-    };
-
-    if read_applied().is_ok() || written_by_newer(&bytes) {
+    let Some(bytes) = damaged()? else {
         return Ok(None);
-    }
+    };
 
     let (hashes, mut dropped) = record_utils::salvage(&bytes, |line| {
         object_utils::is_object_hash(line).then(|| line.to_string())
@@ -515,14 +525,17 @@ pub fn unapplied_among<'a>(read: &'a RedactionsRead, lost: &BTreeSet<String>) ->
         .collect())
 }
 
-/// [`apply`] over the redactions `chosen`, for `heal` too, which passes those [`unapplied_among`]
-/// found: their content is gone, so applying one again deletes no content. It still withdraws the
-/// bundle, as every apply does, since a bundle built before may hold that content.
+/// [`apply`] over the redactions `chosen`, with the same contract: a scan, the remote's report and
+/// the re-judge under the ref lock decide, and the bundle is withdrawn before the record is
+/// written. `heal` passes those [`unapplied_among`] found: their content is gone, so applying one
+/// again deletes no content, but the bundle is still withdrawn, since one built before may hold it.
 ///
 /// # Returns
 /// * `Ok(Vec<RedactionStatus>)` - One per redaction, in the order given; each that reads as
 ///                                applied is applied on disk.
-/// * `Err(String)`              - As [`apply`]'s.
+/// * `Err(String)`              - The applied record, the configuration or the warehouse's mode
+///                                cannot be read, or the bundle could not be withdrawn or the
+///                                record written.
 pub fn reapply(chosen: &[&Redaction], report: Option<&RemoteReport>) -> Result<Vec<RedactionStatus>, String> {
     let applied = read_applied()?;
     let (remote, partial) = read_judged()?;

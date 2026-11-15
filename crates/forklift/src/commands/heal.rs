@@ -390,9 +390,14 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                 remote_failed = true;
                 match CoreError::from(why) {
                     refused @ CoreError::Refusal { .. } if rerecord_from.is_some() => remote_refused = Some(refused),
+                    // A note is prose: a refusal gives its message, never its machine frame.
                     other => notes.push(format!(
-                        "The remote's handshake failed, so {}: {}",
-                        waits_for_remote.join(", and "), String::from(other).trim_end_matches('.')
+                        "The remote was not asked, so {}: {}",
+                        waits_for_remote.join(", and "),
+                        match other {
+                            CoreError::Refusal { message, .. } => message,
+                            other => String::from(other),
+                        }.trim_end_matches('.')
                     )),
                 }
                 None

@@ -2210,6 +2210,8 @@ fn a_lower_and_a_clone_take_history_naming_applied_content_without_it() {
 /// A sparse clone and lower walk the in-scope files of every parcel: one named by history in scope,
 /// whose content the remote reports applied, is left out as a full fetch leaves it out. Revert:
 /// the sparse walk asks for every in-scope file regardless, and both are refused as redacted.
+/// Revert: let a refusal of a remote only heal's re-apply asked be the run's own → heal refuses
+/// `non_origin_remote`; note the refusal whole → its frame is in the note.
 #[test]
 fn a_sparse_clone_and_lower_take_in_scope_history_naming_applied_content_without_it() {
     let server = Server::start(&std::env::temp_dir()
@@ -2238,6 +2240,18 @@ fn a_sparse_clone_and_lower_take_in_scope_history_naming_applied_content_without
     assert_eq!(fresh.head("main"), server.main());
     assert!(!fresh.holds_loose(&hash));
     assert_eq!(applied_record(&fresh), format!("/forklift-redactions-applied 1\n{}\n", hash));
+
+    // With the applied record and the origin record both lost, only heal's re-apply would ask the
+    // remote, which the lost origin record refuses: a note, in prose, not the run's own refusal.
+    forklift_core::util::file_utils::remove_file(fresh.root.join(".forklift/redactions-applied")).unwrap();
+    forklift_core::util::file_utils::remove_file(fresh.root.join(".forklift/origin")).unwrap();
+    fresh.run_ok(&["config", "set", "remote.url", "http://127.0.0.1:9"]);
+    let healed = fresh.json(&["heal"]);
+    assert_eq!(healed["error"]["code"], "objects_lost", "{}", healed);
+    assert_ne!(healed["error"]["next_step"], "forklift heal", "{}", healed);
+    let notes = healed["error"]["details"]["notes"].to_string();
+    assert!(notes.contains("was not asked, so no redaction whose content is lost was applied again"), "{}", healed);
+    assert!(!notes.contains('\u{1f}'), "no refusal frame in a note: {}", healed);
 }
 
 /// A lower applies what the remote reports applied before it writes anything, so one refused
