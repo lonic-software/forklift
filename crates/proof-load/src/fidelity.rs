@@ -655,11 +655,14 @@ struct Side {
     records: BTreeMap<String, Record>,
     /// Each tag by name: its subject, and every other field it lists (message, tagger, time and
     /// any signer) by name.
-    tags: BTreeMap<String, (Option<String>, BTreeMap<String, String>)>,
+    tags: BTreeMap<String, Listed>,
     /// Each keyed value by parcel and key: its value, and every other field it lists (operator and
     /// any signer) by name.
-    keyed: BTreeMap<(String, String), (Option<String>, BTreeMap<String, String>)>,
+    keyed: BTreeMap<(String, String), Listed>,
 }
+
+/// A listed value, and every other field its listing gives, by name.
+type Listed = (Option<String>, BTreeMap<String, String>);
 
 /// The value at `key` of a JSON object as text: a string as it is, nothing as none, anything else
 /// as its JSON.
@@ -758,7 +761,7 @@ fn parcel_trees(log: &[u8]) -> Result<BTreeMap<String, String>, String> {
         let text = String::from_utf8_lossy(chunk);
         let mut lines = text.lines();
         let Some(tree) = lines.next().unwrap_or_default().split_whitespace().nth(1).map(str::to_string) else { continue };
-        let Some(trailer) = lines.filter(|line| !line.trim().is_empty()).last().and_then(|line| line.strip_prefix("Forklift-Parcel: ")) else { continue };
+        let Some(trailer) = lines.rev().find(|line| !line.trim().is_empty()).and_then(|line| line.strip_prefix("Forklift-Parcel: ")) else { continue };
         let mut words = trailer.split_whitespace();
         let (Some(parcel), Some(version)) = (words.next(), words.next()) else { continue };
         if !version.starts_with("export/") {
@@ -945,7 +948,7 @@ impl Records<'_, '_> {
         for name in names {
             let at = format!("tag {}", name);
             let (Some(was), Some(now)) = (self.before.tags.get(&name).cloned(), self.after.tags.get(&name).cloned()) else {
-                let held = |tags: &BTreeMap<String, (Option<String>, BTreeMap<String, String>)>| tags.get(&name).map(|_| "a tag".to_string());
+                let held = |tags: &BTreeMap<String, Listed>| tags.get(&name).map(|_| "a tag".to_string());
                 let (was, now) = (held(&self.before.tags), held(&self.after.tags));
                 self.find("tag", at, was, now);
                 continue;
