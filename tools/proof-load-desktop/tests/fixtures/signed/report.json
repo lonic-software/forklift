@@ -1,5 +1,5 @@
 {
-  "format": 4,
+  "format": 5,
   "coverage": {
     "cells": {
       "damaged-files": {
@@ -638,5 +638,6 @@
       }
     }
   ],
-  "forklift_only": []
+  "forklift_only": [],
+  "fidelity": []
 }
