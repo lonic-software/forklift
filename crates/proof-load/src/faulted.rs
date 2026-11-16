@@ -929,9 +929,10 @@ impl Trail {
     /// Reads the history back and records what it says; true when the faulted command completed
     /// and every record reads as expected, the faulted one held to its own tree once acknowledged.
     /// A served record counts as acknowledged from here on once the tool's latest answer asks
-    /// nothing further (see [`answered`]): a command killed after its record was durable, retried,
-    /// is told there is nothing left to stack. That is `promoted`, what the acknowledging lines
-    /// landing establishes; it says nothing of any line after them, which completes only by landing.
+    /// nothing further (see [`answered`]) and settles it ([`settled_by`]): a command killed after
+    /// its record was durable, retried, is told there is nothing left to stack. That is
+    /// `promoted`, what the acknowledging lines landing establishes; it says nothing of any line
+    /// after them, which completes only by landing.
     /// `retry` says the latest step re-ran the faulted command: only a retry's answer settles a
     /// served record, since the faulted command's own refusal of a write it committed is graded as
     /// a refusal, and heal is no re-run.

@@ -1603,10 +1603,10 @@ mod tests {
     /// planned row of every subject is named in its completeness as not run, as with the run's
     /// deadline already passed, each naming which ran out; with budget enough,
     /// every planned row ran to a row or an unreached entry, paired under the history's scenario,
-    /// with no harness error.
+    /// with no harness error, and no forklift row refused every stack for good grades silent.
     ///
     /// Revert: drop the budget check → rows run with no budget; pass no deadline on → rows run
-    /// past the run's.
+    /// past the run's; settle a record on any answer → the zeroed config's row grades silent.
     #[test]
     #[ignore = "needs PROOF_LOAD_FORKLIFT"]
     fn the_history_lane_names_what_its_budget_did_not_reach() {
