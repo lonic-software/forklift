@@ -1262,8 +1262,9 @@ mod tests {
 
     /// A kill lands only on the call that is, in its thread, the counted position and the target,
     /// with the root rebased and the temp's pid normalised; a kill on another thread's call, on a
-    /// child, or none at all is not reached; a sibling temp of the same base stands for a temp target,
-    /// and never for a fixed path.
+    /// child that runs another program, or none at all is not reached, while a fork of a git subject
+    /// is its own; a sibling temp of the same base stands for a temp target, and never for a fixed
+    /// path.
     ///
     /// Revert: accept any killed call of the name → the worker's object open, killed in place of
     /// the head's temp, counts as landed; compare temps exactly → the sibling object is not reached;
@@ -1292,10 +1293,20 @@ mod tests {
         let child = trace::parse("\
 70 execve(\"/b/forklift\", [], 0x1) = 0
 70 clone(child_stack=NULL, flags=SIGCHLD) = 80
+80 execve(\"/usr/bin/git\", [], 0x1) = 0
 80 openat(AT_FDCWD</o/s/0001-h-kill-4/work>, \"x\", O_RDONLY) = 3</o/s/0001-h-kill-4/work/x>
-80 openat(AT_FDCWD</o/s/0001-h-kill-4/work>, \".forklift/pallets/main.tmp~70-0\", O_WRONLY|O_CREAT) = ?
+80 openat(AT_FDCWD</o/s/0001-h-kill-4/work>, \".forklift/pallets/main.tmp~80-0\", O_WRONLY|O_CREAT) = ?
 ").unwrap();
         assert!(matches!(landing(&child, &target, &injected, None, &subject()), Landing::NotReached { .. }), "a child's call is never the target");
+        // The same call by a git subject's process is its target.
+        let git = Subject { binary: "/usr/bin/git".into(), exec_path: None };
+        let forked = trace::parse("\
+70 execve(\"/usr/bin/git\", [], 0x1) = 0
+70 clone(child_stack=NULL, flags=SIGCHLD) = 80
+80 openat(AT_FDCWD</o/s/0001-h-kill-4/work>, \"x\", O_RDONLY) = 3</o/s/0001-h-kill-4/work/x>
+80 openat(AT_FDCWD</o/s/0001-h-kill-4/work>, \".forklift/pallets/main.tmp~80-0\", O_WRONLY|O_CREAT) = ?
+").unwrap();
+        assert_eq!(landing(&forked, &target, &injected, None, &git), Landing::Landed, "a fork of git is git");
         // A killed call whose place strace could not name is reported, not passed over.
         let unplaced = trace::parse("70 openat(9, \".forklift/pallets/main.tmp~70-0\", O_WRONLY|O_CREAT) = ?\n").unwrap();
         assert!(matches!(landing(&unplaced, &target, &injected, None, &subject()), Landing::NotReached { why } if why.contains("openat#1 openat of \".forklift/pallets/main.tmp~70-0\" is relative to a folder strace could not name")));
