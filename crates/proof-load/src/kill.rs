@@ -1391,7 +1391,7 @@ mod tests {
     /// Each subject's kills summarize apart: a git subject's rows are its own and pair by
     /// scenario, lane and operation; its uncovered units and unrun scenarios are its own checks,
     /// named for it; what refused or failed its traces is the run's own; and the lane's cell is
-    /// forklift's. A scenario only one subject runs does not pair.
+    /// forklift's, though git's alone was sampled. A scenario only one subject runs does not pair.
     ///
     /// Revert: credit git's refusals to git → their check's subject is git; pair unpaired
     /// scenarios → forklift's lone row is on the plate; take the cell from the last subject →
@@ -1402,7 +1402,7 @@ mod tests {
         let kills = vec![
             ScenarioKills { scenario: "history".into(), paired: true, killed: vec![landed("record")], ..Default::default() },
             ScenarioKills { scenario: "solo".into(), killed: vec![landed("record")], ..Default::default() },
-            ScenarioKills { scenario: "history".into(), subject: Tool::Git, paired: true, killed: vec![landed("park"), killed("write", "<root>/c", false, false)],
+            ScenarioKills { scenario: "history".into(), subject: Tool::Git, paired: true, killed: vec![Killed { point: Point { sampled: true, ..landed("park").point }, ..landed("park") }, killed("write", "<root>/c", false, false)],
                 refusals: vec!["unclassified syscall frobnicate".into()], ..Default::default() },
             ScenarioKills { scenario: "compacted".into(), subject: Tool::Git, not_run: Some("no git binding for the faulted command".into()), ..Default::default() },
         ];

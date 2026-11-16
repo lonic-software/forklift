@@ -117,8 +117,12 @@ Notes:
   target: damaged files over every census name, graded by reading every record back; the same
   faults over git's own layout for git at its defaults and tuned, whose rows are reported beside
   forklift's but fail nothing (a git layout path no row classifies fails the check, by name); and
-  on Linux process kills at each of forklift's traced write calls of the `history` scenario
-  (`--strace`, `--kill`; the traces are uploaded with the report), and power loss at each of
+  on Linux process kills at each of forklift's traced write calls of the `history` scenario, and
+  at each of git's and tuned git's running the same steps (a program from git's `--exec-path` is
+  git's, a hook or other program it starts is listed and never killed, and a step that leaves
+  background maintenance running is not run for that subject), each subject's rows paired on the
+  data plate by the operation they stopped and git's failing nothing (`--strace`, `--kill`; the
+  traces are uploaded with the report), and power loss at each of
   those moments, before every other sync (children's included), at each line's end before it
   exits, and after each line (`--power`): the traced calls are replayed over a model that keeps
   only what was fsynced, POSIX-minimal semantics, so a loss there may survive on a real ext4, and
