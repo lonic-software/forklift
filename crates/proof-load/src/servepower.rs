@@ -197,7 +197,7 @@ fn grade(run: Traced, crashes: Vec<Crash>, corpus: &Corpus, scenario: &Scenario,
         let result = grade_one(&run, &saved, &crash, index, corpus, scenario, programs, settings);
         crash.image = std::sync::Arc::default();
         match result {
-            Ok(one) => graded.push(GradedCrash { crash, graded: one }),
+            Ok(one) => graded.push(GradedCrash { crash, op: None, graded: one, unwatched: None }),
             Err(error) => errors.push(format!("{}: {}", crash.moment.label(), error)),
         }
     }

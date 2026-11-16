@@ -186,20 +186,48 @@ pub struct FsmonitorDaemon {
     environment: Environment,
 }
 
+/// Asks any fsmonitor daemon watching `work` to stop, giving it at most [`DAEMON_PROBE_LIMIT`]:
+/// one git started on its own as well as the harness's.
+pub(crate) fn stop_daemon(program: &Path, work: &Path, environment: &Environment) {
+    let mut command = std::process::Command::new(program);
+    command.args(["fsmonitor--daemon", "stop"]).current_dir(work)
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    environment.apply(&mut command);
+    if let Ok(mut stop) = command.spawn() {
+        let started = std::time::Instant::now();
+        while stop.try_wait().is_ok_and(|status| status.is_none()) && started.elapsed() < DAEMON_PROBE_LIMIT {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = stop.kill();
+        let _ = stop.wait();
+    }
+}
+
+/// Why a daemon never watched.
+#[derive(Debug)]
+pub(crate) enum Unwatched {
+    /// It exited first, as git does over a work tree it cannot take for a repository.
+    Exited(String),
+    /// What failed was the harness's: a spawn, a probe, the wait.
+    Harness(RunError),
+}
+
+/// Stops, when dropped, any fsmonitor daemon watching its work tree: one git started on its own.
+pub(crate) struct StopsDaemon {
+    pub(crate) program: PathBuf,
+    pub(crate) work: PathBuf,
+    pub(crate) environment: Environment,
+}
+
+impl Drop for StopsDaemon {
+    fn drop(&mut self) {
+        stop_daemon(&self.program, &self.work, &self.environment);
+    }
+}
+
 impl Drop for FsmonitorDaemon {
     fn drop(&mut self) {
-        let mut command = std::process::Command::new(&self.program);
-        command.args(["fsmonitor--daemon", "stop"]).current_dir(&self.work)
-            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-        self.environment.apply(&mut command);
-        if let Ok(mut stop) = command.spawn() {
-            let started = std::time::Instant::now();
-            while stop.try_wait().is_ok_and(|status| status.is_none()) && started.elapsed() < DAEMON_PROBE_LIMIT {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let _ = stop.kill();
-            let _ = stop.wait();
-        }
+        stop_daemon(&self.program, &self.work, &self.environment);
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -219,29 +247,50 @@ impl FsmonitorDaemon {
             return Err(RunError::Io(format!("turning on the fsmonitor exited {:?}: {}", configured.exit, String::from_utf8_lossy(&configured.stderr))));
         }
         outcomes.push(configured);
+        let (daemon, status) = FsmonitorDaemon::watch(program, work, scratch, environment, limit)?;
+        outcomes.push(status);
+        Ok((daemon, outcomes))
+    }
+
+    /// Starts the daemon over the work tree at `work`, its fsmonitor already on, and waits until
+    /// `status` says it watches: what that `status` said. Nothing in the work tree is configured,
+    /// so a copy whose state is under test keeps its config as it was.
+    pub(crate) fn watch(program: &Path, work: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<(FsmonitorDaemon, Outcome), RunError> {
+        FsmonitorDaemon::watch_or_exit(program, work, scratch, environment, limit).map_err(|unwatched| match unwatched {
+            Unwatched::Exited(why) => RunError::Io(why),
+            Unwatched::Harness(error) => error,
+        })
+    }
+
+    /// [`FsmonitorDaemon::watch`], telling a daemon that exited before it watched, which is git's
+    /// answer to the work tree it was given, from what failed the harness.
+    pub(crate) fn watch_or_exit(program: &Path, work: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<(FsmonitorDaemon, Outcome), Unwatched> {
+        let harness = Unwatched::Harness;
         let mut command = std::process::Command::new(program);
         command.args(["fsmonitor--daemon", "run"]).current_dir(work)
             .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         environment.apply(&mut command);
-        let child = command.spawn().map_err(|error| RunError::Io(format!("starting the fsmonitor daemon: {}", error)))?;
+        let child = command.spawn().map_err(|error| harness(RunError::Io(format!("starting the fsmonitor daemon: {}", error))))?;
         let mut daemon = FsmonitorDaemon { child, program: program.to_path_buf(), work: work.to_path_buf(), environment: environment.clone() };
         let started = std::time::Instant::now();
         loop {
-            if let Some(status) = daemon.child.try_wait().map_err(|error| RunError::Io(error.to_string()))? {
-                return Err(RunError::Io(format!("the fsmonitor daemon exited {} before it watched {}", status, work.display())));
+            // Only an exit that failed with a code is git's answer to the work tree, its refusal; a
+            // clean exit before watching, or a death by a signal, is the harness's.
+            if let Some(status) = daemon.child.try_wait().map_err(|error| harness(RunError::Io(error.to_string())))? {
+                return Err(match status.code() {
+                    Some(code) if code != 0 => Unwatched::Exited(format!("the fsmonitor daemon exited with code {} before it watched", code)),
+                    _ => harness(RunError::Io(format!("the fsmonitor daemon ended {} before it watched {}", status, work.display()))),
+                });
             }
             // A probe that runs past its own bound has not seen the daemon watch yet; only `limit`
             // as a whole gives up.
             match tool::run(&Invocation { program: program.to_path_buf(), arguments: vec!["fsmonitor--daemon".into(), "status".into()], directory: work.to_path_buf(), limit: DAEMON_PROBE_LIMIT.min(limit) }, scratch, environment) {
-                Ok(status) if status.succeeded() => {
-                    outcomes.push(status);
-                    return Ok((daemon, outcomes));
-                }
+                Ok(status) if status.succeeded() => return Ok((daemon, status)),
                 Ok(_) | Err(tool::ToolError::TimedOut { .. }) => {}
-                Err(error) => return Err(RunError::Tool(error)),
+                Err(error) => return Err(harness(RunError::Tool(error))),
             }
             if started.elapsed() > limit {
-                return Err(RunError::Io(format!("the fsmonitor daemon did not watch {} within {:?}", work.display(), limit)));
+                return Err(harness(RunError::Io(format!("the fsmonitor daemon did not watch {} within {:?}", work.display(), limit))));
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -893,6 +942,100 @@ mod tests {
         }
         drop(daemon);
         assert!(!git_in(&["fsmonitor--daemon", "status"]).succeeded(), "git's own daemon outlived the drop");
+    }
+
+    /// Watching configures nothing, so a copy whose state is under test keeps its config; starting
+    /// turns the fsmonitor on.
+    ///
+    /// Revert: configure in `watch` → the config gains `fsmonitor` and is no longer byte-identical.
+    #[test]
+    fn watching_leaves_the_config_as_it_was() {
+        let name = if cfg!(windows) { "git.exe" } else { "git" };
+        let git = std::env::split_paths(&std::env::var_os("PATH").expect("a PATH")).map(|folder| folder.join(name))
+            .find(|path| path.is_file()).expect("a git on PATH");
+        if !has_fsmonitor_daemon(&git) {
+            return;
+        }
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("proof-load-git-watch-{}-{}", std::process::id(), nanos));
+        let scratch = Scratch::create(&root).unwrap();
+        let search = crate::scrub::search_path(Some(&git), std::env::var_os("PATH"));
+        let environment = Environment::scrubbed(&scratch, search, &BTreeMap::new()).unwrap();
+        let git_in = |arguments: &[&str]| tool::run(&Invocation {
+            program: git.clone(), arguments: arguments.iter().map(|argument| argument.to_string()).collect(), directory: scratch.work(), limit: Duration::from_secs(30),
+        }, &scratch, &environment).unwrap();
+        assert!(git_in(&["init", "-q", "-b", "main"]).succeeded());
+        let config = scratch.work().join(".git").join("config");
+        let before = std::fs::read(&config).unwrap();
+        let (daemon, status) = FsmonitorDaemon::watch(&git, &scratch.work(), &scratch, &environment, Duration::from_secs(60)).unwrap();
+        assert!(status.succeeded());
+        assert_eq!(std::fs::read(&config).unwrap(), before, "watching rewrote the config");
+        drop(daemon);
+        let (daemon, _) = FsmonitorDaemon::start(&git, &scratch.work(), &scratch, &environment, Duration::from_secs(60)).unwrap();
+        drop(daemon);
+        assert!(String::from_utf8_lossy(&std::fs::read(&config).unwrap()).contains("fsmonitor = true"), "starting turned no fsmonitor on");
+    }
+
+    /// A daemon over a work tree git cannot take for a repository exits, which is told apart from
+    /// a harness that could not start one; dropping a stop guard stops a daemon git started on its
+    /// own.
+    ///
+    /// Revert: report the exit as the harness's → the torn HEAD reads as a harness failure; leave
+    /// the guard's drop empty → git's own daemon still watches.
+    #[test]
+    fn an_exited_daemon_is_told_from_the_harness_and_a_guard_stops_git_s_own() {
+        let name = if cfg!(windows) { "git.exe" } else { "git" };
+        let git = std::env::split_paths(&std::env::var_os("PATH").expect("a PATH")).map(|folder| folder.join(name))
+            .find(|path| path.is_file()).expect("a git on PATH");
+        if !has_fsmonitor_daemon(&git) {
+            return;
+        }
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("proof-load-git-unwatched-{}-{}", std::process::id(), nanos));
+        let scratch = Scratch::create(&root).unwrap();
+        let search = crate::scrub::search_path(Some(&git), std::env::var_os("PATH"));
+        let environment = Environment::scrubbed(&scratch, search, &BTreeMap::new()).unwrap();
+        let git_in = |arguments: &[&str]| tool::run(&Invocation {
+            program: git.clone(), arguments: arguments.iter().map(|argument| argument.to_string()).collect(), directory: scratch.work(), limit: Duration::from_secs(30),
+        }, &scratch, &environment).unwrap();
+        assert!(git_in(&["init", "-q", "-b", "main"]).succeeded());
+        assert!(git_in(&["config", "core.fsmonitor", "true"]).succeeded());
+        let missing = scratch.root().join("no-such-git");
+        assert!(matches!(FsmonitorDaemon::watch_or_exit(&missing, &scratch.work(), &scratch, &environment, Duration::from_secs(10)), Err(Unwatched::Harness(_))));
+        // Git's own daemon, which a command over a tuned tree starts as the harness's does not.
+        assert!(git_in(&["fsmonitor--daemon", "start"]).succeeded());
+        assert!(git_in(&["fsmonitor--daemon", "status"]).succeeded());
+        drop(StopsDaemon { program: git.clone(), work: scratch.work(), environment: environment.clone() });
+        assert!(!git_in(&["fsmonitor--daemon", "status"]).succeeded(), "the guard left git's own daemon watching");
+        let head = scratch.work().join(".git").join("HEAD");
+        std::fs::write(&head, b"").unwrap();
+        assert!(matches!(FsmonitorDaemon::watch_or_exit(&git, &scratch.work(), &scratch, &environment, Duration::from_secs(30)), Err(Unwatched::Exited(_))));
+        let _ = crate::power::remove_tree(scratch.root());
+    }
+
+    /// A daemon that failed with a code before it watched is git's refusal; one that ended clean
+    /// before it watched is the harness's.
+    ///
+    /// Revert: take every coded exit for a refusal → the clean exit reads as git's answer.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_failed_exit_is_git_s_refusal() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("proof-load-daemon-exit-{}-{}", std::process::id(), nanos));
+        let scratch = Scratch::create(&root).unwrap();
+        let environment = Environment::scrubbed(&scratch, std::env::var_os("PATH"), &BTreeMap::new()).unwrap();
+        let unwatched = |code: i32| {
+            // `sh` reads the stand-in from the work tree, `run` ending with `code` and `status`
+            // never saying it watches. Never executed itself, the file a test just wrote cannot
+            // be busy to a child another test forks meanwhile.
+            let work = scratch.root().join(format!("work-{}", code));
+            std::fs::create_dir_all(&work).unwrap();
+            std::fs::write(work.join("fsmonitor--daemon"), format!("[ \"$1\" = run ] && exit {}\nexit 1\n", code)).unwrap();
+            FsmonitorDaemon::watch_or_exit(Path::new("/bin/sh"), &work, &scratch, &environment, Duration::from_secs(10)).err().expect("the daemon never watched")
+        };
+        assert!(matches!(unwatched(128), Unwatched::Exited(why) if why.contains("code 128")));
+        assert!(matches!(unwatched(0), Unwatched::Harness(RunError::Io(why)) if why.contains("ended exit status: 0")));
+        let _ = crate::power::remove_tree(scratch.root());
     }
 
     /// Only the feature line itself says a git has the fsmonitor daemon.
