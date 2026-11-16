@@ -313,8 +313,8 @@ fn history_damage(
         let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| harness(error.to_string()))?;
         let (git_root, forklift_root) = (scratch.root().join("git"), scratch.root().join("forklift"));
         let refused = |tool: Tool| move |error: crate::runner::RunError| (build_charged_to(tool, &error), format!("{}: {}", tool.label(), error));
-        crate::history::build_git(&programs.git, mirror, &git_root, &scratch, &environment, HISTORY_LIMIT, &mut steps).map_err(refused(Tool::Git))?;
-        crate::history::build_forklift(&programs.forklift, mirror, &forklift_root, &scratch, &environment, HISTORY_LIMIT, &mut steps)
+        let branch = crate::history::build_git(&programs.git, mirror, &git_root, &scratch, &environment, HISTORY_LIMIT, &mut steps).map_err(refused(Tool::Git))?;
+        crate::history::build_forklift(&programs.forklift, mirror, &branch, &forklift_root, &scratch, &environment, HISTORY_LIMIT, &mut steps)
             .map_err(refused(Tool::Forklift))?;
         let lengths = crate::history::git_lengths(&programs.git, &git_root, &scratch, &environment, HISTORY_LIMIT).map_err(refused(Tool::Git))?;
         let present = crate::history::pallets(&programs.forklift, &forklift_root, &scratch, &environment, HISTORY_LIMIT).map_err(refused(Tool::Forklift))?;
