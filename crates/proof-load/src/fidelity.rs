@@ -90,15 +90,14 @@ impl Steps<'_> {
             None => Ok(stdout),
         }
     }
-}
 
-impl Steps<'_> {
     /// Runs a query whose exit 1 means "no": its stdout on exit 0, none on exit 1, and any other
-    /// end refused with what it said.
+    /// end, or a command that never ran, refused with what it said.
     fn ask(&mut self, program: &Path, arguments: &[&str], directory: &Path, environment: &Environment) -> Result<Option<Vec<u8>>, String> {
+        let ran = self.outcomes.len();
         match self.run(program, arguments, directory, environment) {
             Ok(stdout) => Ok(Some(stdout)),
-            Err(_) if self.outcomes.last().is_some_and(|outcome| outcome.exit == Some(1) && outcome.failure.is_none()) => Ok(None),
+            Err(_) if self.outcomes.len() > ran && self.outcomes.last().is_some_and(|outcome| outcome.exit == Some(1) && outcome.failure.is_none()) => Ok(None),
             Err(reason) => Err(reason),
         }
     }
@@ -318,8 +317,8 @@ impl<'a, 'b> Comparison<'a, 'b> {
 
     /// Compares the headers either object has by name, apart from `skipped`: every value of a
     /// name, in order, so one header split into two differs from it. A header one side lacks is a
-    /// finding with nothing on that side; the names both have, first appearing in a different
-    /// order, are a `header order` finding (`tag order` for a tag).
+    /// finding with nothing on that side. The headers of names both sides hold equally often, in a
+    /// different sequence, are a `header order` finding (`tag order` for a tag).
     fn headers(&mut self, prefix: &str, at: &str, before: &[(String, Vec<u8>)], after: &[(String, Vec<u8>)], skipped: &[&str]) {
         let names: BTreeSet<&String> = before.iter().chain(after).map(|(name, _)| name).filter(|name| !skipped.contains(&name.as_str())).collect();
         for name in &names {
@@ -328,21 +327,23 @@ impl<'a, 'b> Comparison<'a, 'b> {
             };
             let (was, now) = (values(before), values(after));
             if was != now {
-                let show = |values: Vec<Vec<u8>>| (!values.is_empty()).then(|| values.iter().map(|value| shown(value)).collect::<Vec<_>>().join(" ; "));
+                // One value as it is; several each bracketed, so no single value reads as two.
+                let show = |values: Vec<Vec<u8>>| match values.as_slice() {
+                    [] => None,
+                    [value] => Some(shown(value)),
+                    values => Some(values.iter().map(|value| format!("[{}]", shown(value))).collect::<Vec<_>>().join(" ")),
+                };
                 self.find(format!("{}{}", prefix, name), at, show(was), show(now));
             }
         }
-        // The names both have, each where it first appears.
-        let order = |headers: &[(String, Vec<u8>)], other: &[(String, Vec<u8>)]| -> Vec<String> {
-            let mut names: Vec<String> = Vec::new();
-            for (name, _) in headers {
-                if !names.contains(name) && other.iter().any(|(header, _)| header == name) {
-                    names.push(name.clone());
-                }
-            }
-            names
+        // Every header in sequence, of the names both sides hold equally many of: a name whose
+        // count differs is a finding above already.
+        let count = |headers: &[(String, Vec<u8>)], name: &str| headers.iter().filter(|(header, _)| header == name).count();
+        let order = |headers: &[(String, Vec<u8>)]| -> Vec<String> {
+            headers.iter().map(|(name, _)| name.clone())
+                .filter(|name| !skipped.contains(&name.as_str()) && count(before, name) == count(after, name)).collect()
         };
-        let (was, now) = (order(before, after), order(after, before));
+        let (was, now) = (order(before), order(after));
         if was != now {
             self.find(format!("{}order", prefix), at, Some(was.join(" ")), Some(now.join(" ")));
         }
@@ -525,7 +526,10 @@ impl<'a, 'b> Comparison<'a, 'b> {
     /// reached is a finding at that commit's id, which is all that names it.
     fn notes(&mut self, name: &str) -> Result<(), String> {
         let (before_dir, after_dir) = (self.before.clone(), self.after.clone());
-        let (was_notes, mut now_notes) = (self.note_list(&before_dir, name)?, self.note_list(&after_dir, name)?);
+        let (was_notes, now_notes) = (self.note_list(&before_dir, name)?, self.note_list(&after_dir, name)?);
+        // Each note that came back is matched by every commit that went in paired with its
+        // commit, so commits collapsed into one each compare with its note.
+        let mut annotated = BTreeSet::new();
         for (object, was_note) in was_notes {
             let Some((counterpart, at)) = self.paired.get(&object).cloned() else {
                 self.find("note", format!("{} on {}", name, object), Some("a note on a commit never compared".to_string()), None);
@@ -533,8 +537,9 @@ impl<'a, 'b> Comparison<'a, 'b> {
             };
             let at = format!("{} on {}", name, at);
             let was = self.cat(&before_dir, "blob", &was_note)?;
-            match now_notes.remove(&counterpart) {
+            match now_notes.get(&counterpart).cloned() {
                 Some(now_note) => {
+                    annotated.insert(counterpart);
                     let now = self.cat(&after_dir, "blob", &now_note)?;
                     if was != now {
                         self.find("note", at, Some(shown(&was)), Some(shown(&now)));
@@ -543,7 +548,7 @@ impl<'a, 'b> Comparison<'a, 'b> {
                 None => self.find("note", at, Some(shown(&was)), None),
             }
         }
-        for (object, now_note) in now_notes {
+        for (object, now_note) in now_notes.into_iter().filter(|(object, _)| !annotated.contains(object)) {
             let now = self.cat(&after_dir, "blob", &now_note)?;
             let at = match self.returned.get(&object).map(|was| self.paired[was].1.clone()) {
                 Some(at) => format!("{} on {}", name, at),
@@ -576,6 +581,7 @@ pub fn git_round_trip(forklift: &Path, git: &Path, scratch: &Scratch, environmen
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scrub::path_git;
 
     #[test]
     fn a_position_writes_first_parent_runs_as_a_count() {
@@ -619,40 +625,56 @@ mod tests {
         assert_eq!(shown(&[b'x'; 300]).chars().count(), 201);
     }
 
-    fn git() -> PathBuf {
-        crate::scrub::path_git()
-    }
-
     fn area(label: &str) -> (Scratch, Environment) {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("proof-load-fidelity-{}-{}-{}", label, std::process::id(), nanos));
         let scratch = Scratch::create(&root).unwrap();
-        let environment = Environment::scrubbed(&scratch, crate::scrub::search_path(Some(&git()), std::env::var_os("PATH")), &BTreeMap::new()).unwrap();
+        let environment = Environment::scrubbed(&scratch, crate::scrub::search_path(Some(&path_git()), std::env::var_os("PATH")), &BTreeMap::new()).unwrap();
         (scratch, environment)
     }
 
     fn compare(steps: &mut Steps, environment: &Environment, before: &Path, after: &Path) -> Vec<Finding> {
-        let git = git();
+        let git = path_git();
         Comparison::new(steps, &git, environment, before, after, Direction::GitForkliftGit).walk().unwrap()
+    }
+
+    /// A query's exit 1 is "no", but a command that never ran is an error, whatever the command
+    /// before it ended with.
+    ///
+    /// Revert: judge by the last outcome alone → the missing program after an exit 1 reads as "no".
+    #[test]
+    fn a_query_that_never_ran_is_an_error_not_a_no() {
+        let (scratch, environment) = area("ask");
+        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
+        let git = path_git();
+        steps.run(&git, &["init", "-q", "repository"], scratch.root(), &environment).unwrap();
+        let repository = scratch.root().join("repository");
+        assert_eq!(steps.ask(&git, &["rev-parse", "--verify", "-q", "HEAD^{commit}"], &repository, &environment), Ok(None));
+        let missing = scratch.root().join("no-such-program");
+        assert!(steps.ask(&missing, &["rev-parse"], &repository, &environment).is_err());
     }
 
     /// Every value of a header is compared in order, so one header split into two is a finding,
     /// and the names both objects have, in another order, are one too.
     ///
     /// Revert: join a name's values into one before comparing → the split gpgsig compares equal.
+    /// Revert: order by each name's first appearance → the interleaved mergetags compare equal.
     #[test]
     fn a_split_header_and_a_reordered_one_are_findings() {
         let (scratch, environment) = area("headers");
         let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
-        let git = git();
+        let git = path_git();
         let mut comparison = Comparison::new(&mut steps, &git, &environment, scratch.root(), scratch.root(), Direction::GitForkliftGit);
         let header = |name: &str, value: &[u8]| (name.to_string(), value.to_vec());
         comparison.headers("header ", "main", &[header("encoding", b"x"), header("gpgsig", b"A\nB")], &[header("encoding", b"x"), header("gpgsig", b"A"), header("gpgsig", b"B")], &[]);
         comparison.headers("header ", "main~1", &[header("encoding", b"x"), header("mergetag", b"m")], &[header("mergetag", b"m"), header("encoding", b"x")], &[]);
+        comparison.headers("header ", "main~2", &[header("mergetag", b"a"), header("encoding", b"x"), header("mergetag", b"b")],
+            &[header("mergetag", b"a"), header("mergetag", b"b"), header("encoding", b"x")], &[]);
         let found: Vec<(String, String, Option<String>, Option<String>)> = comparison.findings.into_iter().map(|finding| (finding.field, finding.at, finding.before, finding.after)).collect();
         assert_eq!(found, [
-            ("header gpgsig".to_string(), "main".to_string(), Some("A\\nB".to_string()), Some("A ; B".to_string())),
+            ("header gpgsig".to_string(), "main".to_string(), Some("A\\nB".to_string()), Some("[A] [B]".to_string())),
             ("header order".to_string(), "main~1".to_string(), Some("encoding mergetag".to_string()), Some("mergetag encoding".to_string())),
+            ("header order".to_string(), "main~2".to_string(), Some("mergetag encoding mergetag".to_string()), Some("mergetag mergetag encoding".to_string())),
         ]);
     }
 
@@ -665,7 +687,7 @@ mod tests {
     fn the_fixture_is_the_same_on_every_build_and_holds_every_shape() {
         let (scratch, environment) = area("fixture");
         let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
-        let git = git();
+        let git = path_git();
         let (one, two) = (scratch.root().join("one"), scratch.root().join("two"));
         build_fixture(&mut steps, &git, &one, &environment).unwrap();
         // A second apart, so an unpinned date would differ between the two builds.
@@ -703,7 +725,7 @@ mod tests {
     fn the_walk_reports_each_field_a_changed_copy_differs_in() {
         let (scratch, environment) = area("walk");
         let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
-        let git = git();
+        let git = path_git();
         let (before, after) = (scratch.root().join("before"), scratch.root().join("after"));
         let mut fixed = environment.clone();
         fixed.variables.extend(FIXTURE_IDENTITY.iter().map(|(name, value)| (name.to_string(), value.to_string())));
@@ -773,7 +795,7 @@ mod tests {
     fn the_round_trip_finishes_against_forklift() {
         let forklift = PathBuf::from(std::env::var_os("PROOF_LOAD_FORKLIFT").expect("PROOF_LOAD_FORKLIFT names the forklift binary under test"));
         let (scratch, environment) = area("trip");
-        let trip = git_round_trip(&forklift, &git(), &scratch, &environment, Duration::from_secs(120));
+        let trip = git_round_trip(&forklift, &path_git(), &scratch, &environment, Duration::from_secs(120));
         let findings = trip.findings.unwrap();
         for finding in &findings {
             println!("{:?}", finding);
