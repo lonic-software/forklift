@@ -1106,6 +1106,16 @@ mod tests {
         assert_eq!(base(".forklift/inventory/inv_0123456789abcdef0123/data"), ".forklift/inventory/inv_<hex>/data");
     }
 
+    /// A child runs what its parent ran when it spawned it, though the parent executes another
+    /// program before the child's first call prints.
+    ///
+    /// Revert: take the parent's program at the child's first call → the child's write is not git's.
+    #[test]
+    fn a_child_runs_what_its_parent_ran_at_the_spawn() {
+        let calls = parse("50 execve(\"/g\", [], 0x1) = 0\n50 clone(child_stack=NULL, flags=SIGCHLD) = 60\n50 execve(\"/sh\", [], 0x1) = 0\n60 write(3</s/a>, \"a\", 1) = 1\n").unwrap();
+        assert_eq!(owned_calls(&calls, &thread_groups(&calls), &|path| path == "/g"), [true, true, false, true]);
+    }
+
     /// Work a command leaves running shows as a call by another process after the command's own
     /// called exit_group; a child that finished first, or a thread of the command, is none.
     ///
