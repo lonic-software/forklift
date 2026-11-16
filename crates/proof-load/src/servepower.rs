@@ -109,7 +109,7 @@ fn traced(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: &
     }
     let context = Context {
         tool: Tool::Forklift, corpus, programs, scratch: &scratch, environment: &environment, limit: settings.limit, then: &scenario.then,
-        url: Some(host.url.as_str()), scope: scenario.scope(), via_host: true,
+        url: Some(host.url.as_str()), scope: scenario.scope(), via_host: true, history: None,
     };
     let mut steps = Vec::new();
     let made = context.record(faulted, &mut steps)?;
@@ -214,7 +214,7 @@ fn grade_one(run: &Traced, saved: &Scratch, crash: &Crash, index: usize, corpus:
     power::materialize(&crash.image, run.host.root()).map_err(io)?;
     let context = Context {
         tool: Tool::Forklift, corpus, programs, scratch: &restored, environment: &run.environment, limit: settings.limit, then: &scenario.then,
-        url: Some(run.host.url.as_str()), scope: scenario.scope(), via_host: true,
+        url: Some(run.host.url.as_str()), scope: scenario.scope(), via_host: true, history: None,
     };
     let mut restarted = None;
     let graded = faulted::grade_after(&context, &run.expected, run.faulted, |_, first| {

@@ -91,7 +91,7 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scratch:
     let (_, index) = faulted::expected(scenario, corpus, &built, Warehouse::Host)?;
     let context = Context {
         tool: Tool::Forklift, corpus, programs, scratch, environment, limit, then: &scenario.then, url: Some(host.url.as_str()),
-        scope: scenario.scope(), via_host: true,
+        scope: scenario.scope(), via_host: true, history: None,
     };
     let before = host.proxy.requests();
     let mut steps = Vec::new();
@@ -116,7 +116,7 @@ pub fn network(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scratc
     let (expected, index) = faulted::expected(scenario, corpus, &built, Warehouse::Host)?;
     let context = Context {
         tool: Tool::Forklift, corpus, programs, scratch, environment, limit, then: &scenario.then, url: Some(host.url.as_str()),
-        scope: scenario.scope(), via_host: true,
+        scope: scenario.scope(), via_host: true, history: None,
     };
     let mut fired = None;
     let mut restarted = None;

@@ -156,7 +156,7 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
     let since = proxy::now();
     let context = Context {
         tool: Tool::Forklift, corpus: &corpus, programs, scratch: template, environment: &environment, limit: settings.limit, then: &scenario.then,
-        url: Some(host.url.as_str()), scope: scenario.scope(), via_host: true,
+        url: Some(host.url.as_str()), scope: scenario.scope(), via_host: true, history: None,
     };
     let mut steps = Vec::new();
     if !context.record(faulted, &mut steps)? {
@@ -310,7 +310,7 @@ fn inject(scenario: &Scenario, programs: &Programs, settings: &Settings, templat
     }
     let context = Context {
         tool: Tool::Forklift, corpus: &counted.corpus, programs, scratch: &scratch, environment: &environment, limit: settings.limit, then: &scenario.then,
-        url: Some(host.url.as_str()), scope: scenario.scope(), via_host: true,
+        url: Some(host.url.as_str()), scope: scenario.scope(), via_host: true, history: None,
     };
     let settle = (after + SETTLE).min(SETTLE_CAP);
     let mut restarted = None;

@@ -189,7 +189,7 @@ impl Scratch {
 
 /// Copies the tree at `from` to `to`: folders with their permissions, files with their bytes and
 /// permissions, symlinks as links.
-fn copy_tree(from: &Path, to: &Path) -> Result<(), CopyOnlyError> {
+pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<(), CopyOnlyError> {
     let metadata = std::fs::symlink_metadata(from).map_err(io(from))?;
     if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(from).map_err(io(from))?;
