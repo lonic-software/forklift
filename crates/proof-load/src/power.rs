@@ -1890,6 +1890,7 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
                 recoverability: graded.recoverability.clone(),
                 note: Some(notes.join("; ")),
                 detail: Some(format!("{}#/crashes/{}/graded", details_file(side, &scenario.scenario), index)),
+                pairing: None,
             });
         }
     }

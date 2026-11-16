@@ -10,15 +10,9 @@ use crate::theme::Palette;
 /// Worst first, as the results table sorts: silent, data lost, no remedy, remedy works, healed.
 pub const WORST_FIRST: [Grade; 5] = [Grade::Silent, Grade::DataLost, Grade::RefusedNoRemedy, Grade::RefusedWorkingRemedy, Grade::Healed];
 
-/// A grade's place in `WORST_FIRST`, 0 for the worst.
+/// A grade's place in `WORST_FIRST`, 0 for the worst: the library's severity, reversed.
 pub fn rank(grade: Grade) -> usize {
-    match grade {
-        Grade::Silent => 0,
-        Grade::DataLost => 1,
-        Grade::RefusedNoRemedy => 2,
-        Grade::RefusedWorkingRemedy => 3,
-        Grade::Healed => 4,
-    }
+    usize::from(Grade::Silent.severity() - grade.severity())
 }
 
 /// The name a chip and the tally show.

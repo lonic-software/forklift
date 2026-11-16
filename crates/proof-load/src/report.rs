@@ -7,6 +7,8 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use crate::damage::{Kind, Warehouse};
+use crate::git_layout::Role;
 use crate::oracle::{Grade, Recoverability, Rescue};
 use crate::scenario::Tool;
 use crate::tool::Outcome;
@@ -181,7 +183,8 @@ impl CoverageTable {
     }
 }
 
-/// What determines a run: replaying with the same five reproduces it.
+/// What determines a run, the data plate's header: replaying with the same seed, tools,
+/// configurations, scenarios and platform reproduces it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Determinism {
@@ -190,6 +193,14 @@ pub struct Determinism {
     pub tools: BTreeMap<String, String>,
     pub scenarios: Vec<String>,
     pub platform: Platform,
+    /// The operating system's name and release.
+    pub os: String,
+    /// The type of the filesystem the run's folder is on, where every scratch area lives except
+    /// the volumes a lane is given.
+    pub filesystem: String,
+    /// Each git subject's configuration by its label: what every repository the harness creates
+    /// for it holds, and for git tuned the options it runs with besides. Empty with no git given.
+    pub configurations: BTreeMap<String, String>,
     /// The environment the tools saw, scratch paths included.
     pub environment: BTreeMap<String, String>,
 }
@@ -213,6 +224,63 @@ pub struct Row {
     /// JSON pointer to the object in it that holds the row's `steps`, each step's arguments, exit
     /// and output. `None` where the run wrote no details for the row.
     pub detail: Option<String>,
+    /// What sets the row beside other subjects' rows on the data plate: a damage row's. None for
+    /// a row of any other lane, where no subject but forklift runs yet.
+    pub pairing: Option<Pairing>,
+}
+
+/// A damage row's place on the data plate: rows of every subject with the same scenario, side,
+/// role and kind of damage are one line of it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pairing {
+    pub scenario: String,
+    /// Whose files were damaged: the client's, or the host's the scenario pushed to.
+    pub side: Warehouse,
+    /// The role of the damaged path, from the role map: what the path is for in either subject.
+    pub role: Role,
+    pub kind: Kind,
+}
+
+/// One subject's standing on a line of the data plate: its worst row there, by grade and then by
+/// rescue kind, since a role is as robust as its weakest path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Standing {
+    pub grade: Grade,
+    pub rescued_by: Option<Rescue>,
+    /// The worst row's details, as the row names them.
+    pub detail: Option<String>,
+    /// How many of the subject's rows the line holds.
+    pub rows: usize,
+}
+
+impl Standing {
+    /// The plate's order, lower is better: the grade's severity, then the rescue kind, none
+    /// before a local repair before a re-clone. Step counts never enter it.
+    pub fn rank(&self) -> (u8, Option<Rescue>) {
+        (self.grade.severity(), self.rescued_by)
+    }
+}
+
+/// One line of the data plate: a pairing and the standing of each subject with rows under it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlateLine {
+    pub pairing: Pairing,
+    pub standings: BTreeMap<Tool, Standing>,
+}
+
+impl PlateLine {
+    /// The git subjects that do better than forklift on this line: a better grade, or the same
+    /// grade and a better rescue kind. A line with no counterpart is never a win, nor is one
+    /// forklift has no row on.
+    pub fn git_does_better(&self) -> Vec<Tool> {
+        if self.pairing.role == Role::NoCounterpart {
+            return vec![];
+        }
+        let Some(forklift) = self.standings.get(&Tool::Forklift) else { return vec![] };
+        self.standings.iter().filter(|(subject, standing)| **subject != Tool::Forklift && standing.rank() < forklift.rank())
+            .map(|(subject, _)| *subject).collect()
+    }
 }
 
 impl Row {
@@ -269,7 +337,7 @@ impl Completeness {
 
 /// The report's format. A reader refuses any other, so a report written by another build of the
 /// harness is never read as if it meant the same thing.
-pub const REPORT_FORMAT: u32 = 3;
+pub const REPORT_FORMAT: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -286,11 +354,46 @@ pub struct Report {
 }
 
 impl Report {
-    /// Whether the run failed: a failing grade of forklift's, or a completeness check that ran and
-    /// found a gap. Another subject's grade is a comparison, never a failure of the run.
+    /// Whether the run failed: a failing grade of forklift's, or a completeness check of forklift's
+    /// or of the run itself that found a gap. Another subject's grade or gap is a comparison, never
+    /// a failure of the run: a git gap shows as git not fully measured.
     pub fn failed(&self) -> bool {
         self.rows.iter().chain(&self.forklift_only).any(|row| row.subject == Tool::Forklift && row.grade.is_failure())
-            || self.completeness.iter().any(|check| !check.missing.is_empty())
+            || self.completeness.iter().any(|check| check.subject.is_none_or(|subject| subject == Tool::Forklift) && !check.missing.is_empty())
+    }
+
+    /// The git subjects' completeness checks that found a gap or did not run: where any is, git
+    /// was not fully measured. None in a run given no git, which asked for no comparison: the run
+    /// names git among its tools, by its label, exactly when it was given one.
+    pub fn git_gaps(&self) -> Vec<&Completeness> {
+        if !self.determinism.tools.contains_key(Tool::Git.label()) {
+            return vec![];
+        }
+        self.completeness.iter()
+            .filter(|check| check.subject.is_some_and(|subject| subject != Tool::Forklift))
+            .filter(|check| !check.missing.is_empty() || matches!(check.cell, Cell::NotRun { .. }))
+            .collect()
+    }
+
+    /// The data plate: every paired row, one line per pairing, in the pairings' order.
+    pub fn plate(&self) -> Vec<PlateLine> {
+        let mut lines: BTreeMap<Pairing, BTreeMap<Tool, Standing>> = BTreeMap::new();
+        for row in &self.rows {
+            let Some(pairing) = &row.pairing else { continue };
+            let standing = Standing { grade: row.grade, rescued_by: row.recoverability.rescued_by, detail: row.detail.clone(), rows: 1 };
+            let standings = lines.entry(pairing.clone()).or_default();
+            match standings.get_mut(&row.subject) {
+                None => { standings.insert(row.subject, standing); }
+                Some(held) => {
+                    let rows = held.rows + 1;
+                    if standing.rank() > held.rank() {
+                        *held = standing;
+                    }
+                    held.rows = rows;
+                }
+            }
+        }
+        lines.into_iter().map(|(pairing, standings)| PlateLine { pairing, standings }).collect()
     }
 
     /// Reads a `report.json`. Refuses a format other than `REPORT_FORMAT` by number before
@@ -310,7 +413,19 @@ impl Report {
     }
 
     pub fn markdown(&self) -> String {
-        let mut out = String::from("# Proof Load report\n\n## Coverage\n\n");
+        let mut out = String::from("# Proof Load report\n\n## Header\n\n");
+        let determinism = &self.determinism;
+        let _ = writeln!(out, "- seed: {}\n- platform: {} ({})\n- filesystem: {}", determinism.seed, determinism.platform.label(), determinism.os, determinism.filesystem);
+        for (tool, version) in &determinism.tools {
+            let _ = writeln!(out, "- {}: {}", tool, version);
+        }
+        for (subject, configuration) in &determinism.configurations {
+            let _ = writeln!(out, "- {} configuration: {}", subject, configuration);
+        }
+        let _ = writeln!(out, "- scenarios: {}", determinism.scenarios.join(", "));
+        let _ = writeln!(out, "- environment: {}", determinism.environment.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(" "));
+
+        out.push_str("\n## Coverage\n\n");
         self.coverage.markdown(&mut out);
 
         out.push_str("\n## Completeness\n\n");
@@ -321,6 +436,42 @@ impl Report {
                 let _ = writeln!(out, "  - missing: {}", missing);
             }
         }
+        let gaps = self.git_gaps();
+        if !gaps.is_empty() {
+            let named: Vec<String> = gaps.iter().map(|check| format!("{} ({})", check.check, check.subject.map_or("", Tool::label))).collect();
+            let _ = writeln!(out, "\ngit: not fully measured, by {}. Git's gaps never fail the run.", named.join(", "));
+        }
+
+        let plate = self.plate();
+        let subjects = [Tool::Forklift, Tool::Git, Tool::GitTuned];
+        out.push_str("\n## Data plate\n\n");
+        if plate.is_empty() {
+            out.push_str("None.\n");
+        } else {
+            let _ = writeln!(out, "| Scenario | Side | Role | Damage | {} |", subjects.map(Tool::label).join(" | "));
+            let _ = writeln!(out, "|---|---|---|---|{}", "---|".repeat(subjects.len()));
+            for line in &plate {
+                let cells: Vec<String> = subjects.iter().map(|subject| match line.standings.get(subject) {
+                    None if line.pairing.role == Role::NoCounterpart => "no counterpart".to_string(),
+                    None => "not measured".to_string(),
+                    Some(standing) => standing_text(standing),
+                }).collect();
+                let _ = writeln!(out, "| {} | {} | {} | {} | {} |", line.pairing.scenario, kebab(line.pairing.side), kebab(line.pairing.role), kebab(line.pairing.kind), cells.join(" | "));
+            }
+            out.push_str("\nA subject's cell is its worst row on the line, by grade and then by rescue kind. A subject with no row on a line is not measured there, unless the role has no counterpart in it: such a line is never compared.\n");
+        }
+
+        out.push_str("\n## Git does better\n\n");
+        let wins: Vec<(&PlateLine, Tool)> = plate.iter().flat_map(|line| line.git_does_better().into_iter().map(move |subject| (line, subject))).collect();
+        if wins.is_empty() {
+            out.push_str("None.\n");
+        } else {
+            for (line, subject) in wins {
+                let _ = writeln!(out, "- {} {} {} {}: {} {}, forklift {}", line.pairing.scenario, kebab(line.pairing.side), kebab(line.pairing.role), kebab(line.pairing.kind),
+                    subject.label(), standing_text(&line.standings[&subject]), standing_text(&line.standings[&Tool::Forklift]));
+            }
+            out.push_str("\nEach entry is a better grade, or the same grade and a better rescue kind. Each gets a ticket.\n");
+        }
 
         for (title, rows) in [("Grades", &self.rows), ("Forklift-only grades", &self.forklift_only)] {
             let _ = writeln!(out, "\n## {}\n", title);
@@ -330,26 +481,39 @@ impl Report {
             }
             out.push_str("| Subject | Scenario | Fault | Binding | Grade | Commands to expected | Right remedy | Rescued by | Outside knowledge |\n|---|---|---|---|---|---|---|---|---|\n");
             for row in rows {
-                let grade = serde_json::to_value(row.grade).ok().and_then(|value| value.as_str().map(str::to_string)).unwrap_or_default();
                 let commands = row.recoverability.commands_to_expected.map_or("never".to_string(), |n| n.to_string());
                 let outside = if row.recoverability.outside_knowledge.is_empty() { "none".to_string() } else { row.recoverability.outside_knowledge.join("; ") };
                 let rescued = row.recoverability.rescued_by.map_or("none", Rescue::label);
-                let _ = writeln!(out, "| {} | {} | {} | {} | {} | {} | {} | {} | {} |", row.subject.label(), row.scenario, row.category.label(), row.binding, grade, commands,
+                let _ = writeln!(out, "| {} | {} | {} | {} | {} | {} | {} | {} | {} |", row.subject.label(), row.scenario, row.category.label(), row.binding, kebab(row.grade), commands,
                     if row.recoverability.named_right_remedy { "yes" } else { "no" }, rescued, outside);
             }
             if rows.iter().any(|row| row.grade == Grade::DataLost) {
                 out.push_str("\nData lost is decided by readback: lost as far as the tool can tell the user. The bytes may still sit undecoded in the store.\n");
             }
         }
-
-        let _ = writeln!(out, "\n## Determinism\n\n- seed: {}\n- platform: {}", self.determinism.seed, self.determinism.platform.label());
-        for (tool, version) in &self.determinism.tools {
-            let _ = writeln!(out, "- {}: {}", tool, version);
-        }
-        let _ = writeln!(out, "- scenarios: {}", self.determinism.scenarios.join(", "));
-        let _ = writeln!(out, "- environment: {}", self.determinism.environment.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(" "));
         out
     }
+}
+
+/// A value as the JSON names it: a grade, a role, a side or a kind.
+fn kebab(value: impl serde::Serialize) -> String {
+    serde_json::to_value(value).ok().and_then(|value| value.as_str().map(str::to_string)).unwrap_or_default()
+}
+
+/// A subject's standing as a plate cell: its grade, what rescued it, a link to its details and,
+/// where the line holds more than one of its rows, how many.
+fn standing_text(standing: &Standing) -> String {
+    let mut text = kebab(standing.grade);
+    if let Some(rescue) = standing.rescued_by {
+        let _ = write!(text, ", {}", rescue.label());
+    }
+    if let Some(detail) = &standing.detail {
+        text = format!("[{}]({})", text, detail);
+    }
+    if standing.rows > 1 {
+        let _ = write!(text, " (worst of {})", standing.rows);
+    }
+    text
 }
 
 #[cfg(test)]
@@ -372,17 +536,19 @@ mod tests {
     }
 
     #[test]
-    fn the_markdown_opens_with_the_coverage_table() {
+    fn the_markdown_opens_with_the_header_then_the_coverage_table() {
         let report = Report {
             format: REPORT_FORMAT,
             coverage: CoverageTable::new(Platform::Linux, |_| Cell::not_run("not built yet")),
-            determinism: Determinism { seed: 7, tools: BTreeMap::new(), scenarios: vec![], platform: Platform::Linux, environment: BTreeMap::new() },
+            determinism: determinism(7, vec![]),
             completeness: vec![],
             rows: vec![],
             forklift_only: vec![],
         };
         let markdown = report.markdown();
-        assert!(markdown.starts_with("# Proof Load report\n\n## Coverage\n\n| Fault | Linux | macOS | Windows |"));
+        assert!(markdown.starts_with("# Proof Load report\n\n## Header\n\n- seed: 7\n- platform: Linux (Linux 6.1)\n- filesystem: ext2/ext3/ext4\n"), "{}", markdown);
+        assert!(markdown.contains("- git-tuned configuration: core.commitGraph=true\n"), "{}", markdown);
+        assert!(markdown.contains("\n\n## Coverage\n\n| Fault | Linux | macOS | Windows |"));
         assert!(!markdown.contains("|  |"), "no blank cell");
         assert!(!report.failed());
     }
@@ -393,7 +559,7 @@ mod tests {
         let report = Report {
             format: REPORT_FORMAT,
             coverage: CoverageTable::new(Platform::Linux, |_| Cell::Run),
-            determinism: Determinism { seed: 1, tools: BTreeMap::new(), scenarios: vec![], platform: Platform::Linux, environment: BTreeMap::new() },
+            determinism: determinism(1, vec![]),
             completeness: vec![Completeness { subject: Some(Tool::Forklift), check: "damage".to_string(), cell: Cell::Run, missing: vec!["trust".to_string()] }],
             rows: vec![],
             forklift_only: vec![],
@@ -429,6 +595,12 @@ mod tests {
         assert!(unset.missing.is_empty() && matches!(unset.cell, Cell::NotRun { .. }));
     }
 
+    fn determinism(seed: u64, scenarios: Vec<String>) -> Determinism {
+        let configurations = BTreeMap::from([("git-tuned".to_string(), "core.commitGraph=true".to_string())]);
+        Determinism { seed, tools: BTreeMap::new(), scenarios, platform: Platform::Linux, os: "Linux 6.1".to_string(), filesystem: "ext2/ext3/ext4".to_string(),
+            configurations, environment: BTreeMap::new() }
+    }
+
     fn sample() -> Report {
         Report {
             format: REPORT_FORMAT,
@@ -436,15 +608,125 @@ mod tests {
                 Category::DamagedFiles => Cell::Run,
                 _ => Cell::not_run("not asked for"),
             }),
-            determinism: Determinism { seed: 3, tools: BTreeMap::new(), scenarios: vec!["trust".to_string()], platform: Platform::Linux, environment: BTreeMap::new() },
+            determinism: determinism(3, vec!["trust".to_string()]),
             completeness: vec![Completeness { subject: Some(Tool::Forklift), check: "damage".to_string(), cell: Cell::Run, missing: vec![] }],
             rows: vec![Row { subject: Tool::Forklift,
                 scenario: "trust".to_string(), category: Category::DamagedFiles, binding: "forklift".to_string(), grade: Grade::RefusedWorkingRemedy,
                 recoverability: Recoverability { commands_to_expected: Some(2), named_right_remedy: true, outside_knowledge: vec![], rescued_by: None },
-                note: None, detail: Some("trust-head.json#".to_string()),
+                note: None, detail: Some("trust-head.json#".to_string()), pairing: None,
             }],
             forklift_only: vec![],
         }
+    }
+
+    fn damage_row(subject: Tool, side: Warehouse, role: Role, kind: Kind, grade: Grade, rescued_by: Option<Rescue>, commands: Option<u32>) -> Row {
+        Row { subject, grade, binding: subject.label().to_string(),
+            recoverability: Recoverability { commands_to_expected: commands, named_right_remedy: false, outside_knowledge: vec![], rescued_by },
+            detail: Some(format!("{}-{:?}-{:?}.json#", subject.label(), role, grade)),
+            pairing: Some(Pairing { scenario: "history".to_string(), side, role, kind }),
+            ..sample().rows.remove(0) }
+    }
+
+    fn with_rows(rows: Vec<Row>) -> Report {
+        Report { rows, ..sample() }
+    }
+
+    /// Rows pair only on all four of scenario, side, role and kind; a subject with several rows on
+    /// a line stands at its worst; an unpaired row is not on the plate. A subject absent from a
+    /// line reads as not measured, or as no counterpart on a line whose role has none.
+    ///
+    /// Revert: keep a subject's first row on a line instead of its worst → forklift stands healed.
+    #[test]
+    fn the_plate_pairs_damage_rows_on_all_four_and_keeps_the_worst() {
+        use Warehouse::*;
+        let report = with_rows(vec![
+            damage_row(Tool::Forklift, Client, Role::Object, Kind::Delete, Grade::Healed, None, Some(1)),
+            damage_row(Tool::Forklift, Client, Role::Object, Kind::Delete, Grade::DataLost, None, None),
+            damage_row(Tool::Git, Client, Role::Object, Kind::Delete, Grade::Healed, None, Some(1)),
+            damage_row(Tool::Git, Host, Role::Object, Kind::Delete, Grade::Healed, None, Some(1)),
+            damage_row(Tool::Git, Client, Role::Object, Kind::Truncate, Grade::Healed, None, Some(1)),
+            damage_row(Tool::Git, Client, Role::Log, Kind::Delete, Grade::Healed, None, Some(1)),
+            Row { pairing: None, ..damage_row(Tool::Git, Client, Role::Config, Kind::Delete, Grade::Silent, None, None) },
+            damage_row(Tool::Forklift, Host, Role::NoCounterpart, Kind::Delete, Grade::Healed, None, Some(1)),
+        ]);
+        let plate = report.plate();
+        let keys: Vec<(Warehouse, Role, Kind, Vec<Tool>)> = plate.iter()
+            .map(|line| (line.pairing.side, line.pairing.role, line.pairing.kind, line.standings.keys().copied().collect())).collect();
+        assert_eq!(keys, [
+            (Client, Role::Object, Kind::Truncate, vec![Tool::Git]),
+            (Client, Role::Object, Kind::Delete, vec![Tool::Forklift, Tool::Git]),
+            (Client, Role::Log, Kind::Delete, vec![Tool::Git]),
+            (Host, Role::Object, Kind::Delete, vec![Tool::Git]),
+            (Host, Role::NoCounterpart, Kind::Delete, vec![Tool::Forklift]),
+        ]);
+        let forklift = &plate[1].standings[&Tool::Forklift];
+        assert_eq!((forklift.grade, forklift.rows, forklift.detail.as_deref()), (Grade::DataLost, 2, Some("forklift-Object-DataLost.json#")));
+        let markdown = report.markdown();
+        assert!(markdown.contains("| history | client | object | delete | [data-lost](forklift-Object-DataLost.json#) (worst of 2) | [healed](git-Object-Healed.json#) | not measured |"), "{}", markdown);
+        assert!(markdown.contains("| history | host | no-counterpart | delete | [healed](forklift-NoCounterpart-Healed.json#) | no counterpart | no counterpart |"), "{}", markdown);
+    }
+
+    /// Git does better by the plate's grade order, then by rescue kind, and never by step count;
+    /// a role with no counterpart, or a line forklift has no row on, is never a win.
+    ///
+    /// Revert: rank grades in their declaration order → silent beats data lost and the
+    /// data-lost-over-silent win is missed.
+    #[test]
+    fn git_does_better_by_grade_then_rescue_kind() {
+        use Warehouse::Client;
+        let wins = |forklift: Option<(Grade, Option<Rescue>, Option<u32>)>, git: (Grade, Option<Rescue>, Option<u32>), role: Role| -> Vec<Tool> {
+            let mut rows = vec![damage_row(Tool::GitTuned, Client, role, Kind::Zero, git.0, git.1, git.2)];
+            rows.extend(forklift.map(|(grade, rescue, commands)| damage_row(Tool::Forklift, Client, role, Kind::Zero, grade, rescue, commands)));
+            with_rows(rows).plate().remove(0).git_does_better()
+        };
+        let object = Role::Object;
+        assert_eq!(wins(Some((Grade::DataLost, None, None)), (Grade::Healed, None, Some(1)), object), [Tool::GitTuned]);
+        assert_eq!(wins(Some((Grade::Silent, None, None)), (Grade::DataLost, None, None), object), [Tool::GitTuned]);
+        assert_eq!(wins(Some((Grade::DataLost, None, None)), (Grade::Silent, None, None), object), []);
+        assert_eq!(wins(Some((Grade::RefusedNoRemedy, None, None)), (Grade::RefusedWorkingRemedy, None, Some(3)), object), [Tool::GitTuned]);
+        assert_eq!(wins(Some((Grade::Healed, Some(Rescue::Reclone), Some(4))), (Grade::Healed, Some(Rescue::LocalRepair), Some(9)), object), [Tool::GitTuned]);
+        assert_eq!(wins(Some((Grade::Healed, Some(Rescue::LocalRepair), Some(4))), (Grade::Healed, None, Some(9)), object), [Tool::GitTuned]);
+        assert_eq!(wins(Some((Grade::Healed, None, Some(9))), (Grade::Healed, None, Some(1)), object), [], "fewer steps is not a win");
+        assert_eq!(wins(Some((Grade::Healed, None, Some(1))), (Grade::Healed, Some(Rescue::LocalRepair), Some(1)), object), []);
+        assert_eq!(wins(Some((Grade::DataLost, None, None)), (Grade::Healed, None, Some(1)), Role::NoCounterpart), [], "no counterpart");
+        assert_eq!(wins(None, (Grade::Healed, None, Some(1)), object), [], "a line with no row of forklift's");
+
+        let report = with_rows(vec![
+            damage_row(Tool::Forklift, Client, object, Kind::Zero, Grade::DataLost, None, None),
+            damage_row(Tool::Git, Client, object, Kind::Zero, Grade::Healed, Some(Rescue::Reclone), Some(3)),
+        ]);
+        let markdown = report.markdown();
+        assert!(markdown.contains("## Git does better\n\n- history client object zero: git [healed, re-clone](git-Object-Healed.json#), forklift [data-lost](forklift-Object-DataLost.json#)\n"), "{}", markdown);
+        assert!(with_rows(vec![]).markdown().contains("## Git does better\n\nNone.\n"));
+    }
+
+    /// A git subject's gap, or a git check that did not run, shows as git not fully measured and
+    /// never fails the run; forklift's gap and a gap of the run itself do. A run given no git
+    /// asked for no comparison, so its git checks that did not run are no gap.
+    ///
+    /// Revert: count every subject's completeness gap in `failed` → git's gap fails the run.
+    #[test]
+    fn a_git_gap_is_shown_and_never_fails_the_run() {
+        let check = |subject: Option<Tool>, cell: Cell, missing: &[&str]| Completeness { subject, check: "git layout walk".to_string(), cell, missing: missing.iter().map(|m| m.to_string()).collect() };
+        let report = |checks: Vec<Completeness>| {
+            let mut report = Report { completeness: checks, ..sample() };
+            report.determinism.tools.insert("git".to_string(), "/usr/bin/git (git version 2.56.1)".to_string());
+            report
+        };
+        let git = report(vec![check(Some(Tool::GitTuned), Cell::Run, &["history: info/sparse"])]);
+        assert!(!git.failed());
+        assert_eq!(git.git_gaps().len(), 1);
+        assert!(git.markdown().contains("\ngit: not fully measured, by git layout walk (git-tuned). Git's gaps never fail the run.\n"), "{}", git.markdown());
+        let unrun = report(vec![check(Some(Tool::Git), Cell::not_run("--only builds one scenario"), &[])]);
+        assert!(!unrun.failed());
+        assert_eq!(unrun.git_gaps().len(), 1);
+        let no_git = Report { completeness: vec![check(Some(Tool::Git), Cell::not_run("no git binary given"), &[])], ..sample() };
+        assert!(no_git.git_gaps().is_empty() && !no_git.markdown().contains("not fully measured"));
+        let measured = report(vec![check(Some(Tool::Git), Cell::Run, &[]), check(Some(Tool::Forklift), Cell::not_run("no census"), &[])]);
+        assert!(measured.git_gaps().is_empty());
+        assert!(!measured.markdown().contains("not fully measured"));
+        assert!(report(vec![check(Some(Tool::Forklift), Cell::Run, &["trust"])]).failed());
+        assert!(report(vec![check(None, Cell::Run, &["over budget"])]).failed());
     }
 
     /// Changes the sample's JSON with `change`, then reads it back.

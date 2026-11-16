@@ -9,9 +9,10 @@
 //! unpaired silently. The table was taken from git 2.55.0, the version the plate names.
 
 use crate::census::{self, Census, Class};
+use crate::scenario::Tool;
 
 /// What a stored path is for, in terms both subjects share.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Role {
     /// Which line of history the work tree is on.
@@ -234,6 +235,17 @@ pub const CENSUS_ROLES: &[(&str, Role)] = &[
     ("owners.toml", Role::NoCounterpart),
 ];
 
+/// The role of the path a subject's damage binding names: for Forklift a census path's, from
+/// the role map, and for git the layout row's own: the row the name is the pattern of, or else
+/// the row whose pattern it matches, as a lock binding names one lock. None for a name the
+/// subject's table lacks.
+pub fn role_of(subject: Tool, name: &str) -> Option<Role> {
+    match subject {
+        Tool::Forklift => CENSUS_ROLES.iter().find(|(path, _)| *path == name).map(|(_, role)| *role),
+        Tool::Git | Tool::GitTuned => named(name).or_else(|| row_of(name)).map(|row| row.role),
+    }
+}
+
 /// The role map's gaps against `census`: each census path it names no role for, and each entry
 /// naming a path the census no longer lists.
 pub fn role_gaps(census: &Census, roles: &[(&str, Role)]) -> Vec<String> {
@@ -306,5 +318,22 @@ mod tests {
         assert_eq!(role_gaps(&census, &without), ["parked: no role"]);
         let extra: Vec<(&str, Role)> = CENSUS_ROLES.iter().copied().chain([("gone", Role::Metadata)]).collect();
         assert_eq!(role_gaps(&census, &extra), ["stale role: gone"]);
+    }
+
+    /// Every damage binding of every subject names a path its subject's table gives a role, so
+    /// every damage row can be paired; each subject reads its own table.
+    ///
+    /// Revert: look a git name up in the census role map → `refs/stash` has no role.
+    #[test]
+    fn every_damage_binding_has_a_role() {
+        let mut bound: Vec<(Tool, &str)> = crate::bindings::BINDINGS.iter().map(|binding| (Tool::Forklift, binding.name)).collect();
+        for tool in [Tool::Git, Tool::GitTuned] {
+            bound.extend(crate::bindings::git_subject(tool, true).0.iter().map(|binding| (tool, binding.name)));
+        }
+        let unroled: Vec<String> = bound.iter().filter(|(tool, name)| role_of(*tool, name).is_none()).map(|(tool, name)| format!("{} {}", tool.label(), name)).collect();
+        assert_eq!(unroled, Vec::<String>::new());
+        assert_eq!(role_of(Tool::Forklift, "parked"), Some(Role::ParkedWork));
+        assert_eq!(role_of(Tool::GitTuned, "refs/stash"), Some(Role::ParkedWork));
+        assert_eq!(role_of(Tool::Git, "parked"), None);
     }
 }

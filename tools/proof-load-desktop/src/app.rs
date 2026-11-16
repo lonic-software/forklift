@@ -7,6 +7,7 @@ use std::path::Path;
 
 use eframe::egui::{self, Ui};
 use proof_load::report::{Cell, Platform};
+use proof_load::scenario::Tool;
 use proof_load::run::RunError;
 
 use crate::form::{Field, Form};
@@ -172,7 +173,7 @@ impl App {
             // The run has written into its report folder, so the fields are checked again.
             self.checked = None;
             if let Ok(report) = result {
-                self.open(Results::new(report, Path::new(self.form.out.trim()).to_path_buf()));
+                self.open(Results::new(*report, Path::new(self.form.out.trim()).to_path_buf()));
             }
         }
     }
@@ -470,15 +471,22 @@ impl App {
                         let nothing = if matches!(check.cell, Cell::Run) { "nothing" } else { "" };
                         widgets::text(ui, nothing, Type::Body, p.muted);
                     }
+                    // A git subject's gap is a comparison not fully measured, never a failure.
+                    _ if check.subject.is_some_and(|subject| subject != Tool::Forklift) => {
+                        widgets::text(ui, &format!("not fully measured: {}", check.missing.join("; ")), Type::Body, p.muted);
+                    }
                     _ => { widgets::text(ui, &check.missing.join("; "), Type::Body, p.g_lost); }
                 }
             });
         });
         let determinism = &results.report.determinism;
         widgets::plate(ui, "Replay", "what determines this run", |ui| {
-            widgets::text(ui, &format!("seed {} on {}", determinism.seed, determinism.platform.label()), Type::Data, p.ink);
+            widgets::text(ui, &format!("seed {} on {} ({}), filesystem {}", determinism.seed, determinism.platform.label(), determinism.os, determinism.filesystem), Type::Data, p.ink);
             for (tool, version) in &determinism.tools {
                 widgets::text(ui, &format!("{tool}: {version}"), Type::Data, p.muted);
+            }
+            for (subject, configuration) in &determinism.configurations {
+                widgets::text(ui, &format!("{subject} configuration: {configuration}"), Type::Data, p.muted);
             }
         });
     }

@@ -11,7 +11,7 @@ use crate::corpus;
 use crate::damage::Warehouse;
 use crate::faulted::{self, Programs};
 use crate::kill;
-use crate::report::{Category, Cell, Completeness, CoverageTable, Determinism, Platform, Report, Row, REPORT_FORMAT};
+use crate::report::{Category, Cell, Completeness, CoverageTable, Determinism, Pairing, Platform, Report, Row, REPORT_FORMAT};
 use crate::runner;
 use crate::scenario::{self, Tool};
 use crate::scrub::{Environment, Output};
@@ -112,6 +112,78 @@ fn described(program: &std::path::Path) -> String {
         .and_then(|output| String::from_utf8_lossy(&output.stdout).lines().next().map(|line| line.trim().to_string()))
         .filter(|line| !line.is_empty()).unwrap_or_else(|| "no --version output".to_string());
     format!("{} ({})", program.display(), version)
+}
+
+/// The operating system the run was on, as the plate's header names it: its name and release.
+#[cfg(unix)]
+fn operating_system() -> String {
+    // SAFETY: uname fills the zeroed struct it is given and returns -1 on failure, writing nothing.
+    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut name) } != 0 {
+        return format!("{} (uname failed)", Platform::current().label());
+    }
+    let field = |chars: &[libc::c_char]| -> String {
+        let bytes: Vec<u8> = chars.iter().take_while(|c| **c != 0).map(|c| c.to_ne_bytes()[0]).collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    format!("{} {}", field(&name.sysname), field(&name.release))
+}
+
+#[cfg(not(unix))]
+fn operating_system() -> String {
+    format!("{} (release not read in this harness)", Platform::current().label())
+}
+
+/// The type of the filesystem `path` is on, as the plate's header names it.
+#[cfg(target_os = "macos")]
+fn filesystem_of(path: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return "unknown: the path holds a NUL".to_string() };
+    // SAFETY: statfs fills the zeroed struct from a NUL-terminated path and returns -1 on failure.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(path.as_ptr(), &mut stat) } != 0 {
+        return format!("unknown: {}", std::io::Error::last_os_error());
+    }
+    let bytes: Vec<u8> = stat.f_fstypename.iter().take_while(|c| **c != 0).map(|c| c.to_ne_bytes()[0]).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The type of the filesystem `path` is on, by its magic number, as the plate's header names it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn filesystem_of(path: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return "unknown: the path holds a NUL".to_string() };
+    // SAFETY: statfs fills the zeroed struct from a NUL-terminated path and returns -1 on failure.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(path.as_ptr(), &mut stat) } != 0 {
+        return format!("unknown: {}", std::io::Error::last_os_error());
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let magic = stat.f_type as u64 & 0xffff_ffff;
+    let name = match magic {
+        0xEF53 => "ext2/ext3/ext4",
+        0x0102_1994 => "tmpfs",
+        0x9123_683E => "btrfs",
+        0x5846_5342 => "xfs",
+        0x794C_7630 => "overlayfs",
+        0x2FC1_2FC1 => "zfs",
+        0x6969 => "nfs",
+        0xF2F5_2010 => "f2fs",
+        0x6573_5546 => "fuse",
+        _ => return format!("unknown (magic {:#x})", magic),
+    };
+    name.to_string()
+}
+
+#[cfg(not(unix))]
+fn filesystem_of(_path: &std::path::Path) -> String {
+    "not read on Windows in this harness".to_string()
+}
+
+/// What every repository the harness creates for git holds in its own config, as the plate's
+/// header names it.
+fn created_configuration() -> String {
+    runner::GIT_CREATED_CONFIG.iter().map(|[key, value]| format!("{}={}", key, value)).collect::<Vec<_>>().join(" ")
 }
 
 /// What git tuned runs with beyond git at its defaults, as the report names it: its options, and
@@ -344,6 +416,12 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     let git_runnable: Vec<String> = scenario::catalog().into_iter().filter(|scenario| scenario.tools().contains(&Tool::Git)).map(|scenario| scenario.id).collect();
     let git_program = git.as_deref().map(tool::absolute).transpose().map_err(|error| RunError::Refused(format!("the git path: {}", error)))?;
     let daemon = git_program.as_deref().is_some_and(runner::has_fsmonitor_daemon);
+    let mut configurations = BTreeMap::new();
+    if let Some(git_program) = &git_program {
+        tools.insert(Tool::Git.label().to_string(), described(git_program));
+        configurations.insert(Tool::Git.label().to_string(), created_configuration());
+        configurations.insert(Tool::GitTuned.label().to_string(), format!("{}; {}", created_configuration(), tuned_configuration(daemon)));
+    }
     let mut git_checks = Vec::new();
     for subject in [Tool::Git, Tool::GitTuned] {
         let mut walks: BTreeMap<(String, Warehouse), Vec<String>> = BTreeMap::new();
@@ -398,10 +476,8 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             let (Ok(forklift), Ok(git)) = (tool::absolute(forklift), tool::absolute(git)) else {
                 return Err(RunError::Refused("cannot resolve the tool paths".to_string()));
             };
-            tools.insert("git".to_string(), described(&git));
             let programs = Programs { forklift, git, server: server.clone() };
             let faulted_corpus = faulted_corpus(seed);
-            tools.insert(Tool::GitTuned.label().to_string(), tuned_configuration(daemon));
             let subjects = [
                 (Tool::Forklift, crate::bindings::BINDINGS.to_vec()),
                 (Tool::Git, crate::bindings::git_subject(Tool::Git, daemon).0),
@@ -409,9 +485,15 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             ];
             let picked_bindings = || subjects.iter().flat_map(|(subject, bindings)| bindings.iter().map(move |binding| (*subject, binding)))
                 .filter_map(|(subject, binding)| scenarios.iter().find(|scenario| scenario.id == binding.scenario).map(|scenario| (subject, binding, scenario)));
-            progress.lane(Category::DamagedFiles, Some(picked_bindings().map(|(_, binding, _)| binding.kinds.len()).sum()));
-            for (subject, binding, scenario) in picked_bindings() {
-                fault_errors.entry(subject).or_default();
+            for (subject, binding, _) in picked_bindings() {
+                let errors = fault_errors.entry(subject).or_default();
+                errors.extend(role_or_refusal(subject, binding.name).err());
+            }
+            let roled = || picked_bindings().filter_map(|(subject, binding, scenario)| {
+                role_or_refusal(subject, binding.name).ok().map(|role| (subject, binding, scenario, role))
+            });
+            progress.lane(Category::DamagedFiles, Some(roled().map(|(_, binding, _, _)| binding.kinds.len()).sum()));
+            for (subject, binding, scenario, role) in roled() {
                 for kind in binding.kinds {
                     let label = damage_label(subject, binding, *kind);
                     start_block(progress, Category::DamagedFiles, &label)?;
@@ -434,6 +516,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                                 recoverability: run.recoverability,
                                 note: (!run.unextractable.is_empty()).then(|| format!("unextractable remedies: {}", run.unextractable.join("; "))),
                                 detail: Some(format!("{}.json#", label)),
+                                pairing: Some(Pairing { scenario: run.scenario.clone(), side: run.warehouse, role, kind: run.kind }),
                             });
                         }
                         Err(error) => fault_errors.entry(subject).or_default().push(format!("{} {:?}: {}", binding.name, kind, error)),
@@ -443,10 +526,15 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             Cell::Run
         }
     };
-    // One check per subject that ran; forklift's even when it did not.
+    // One check per subject that ran; forklift's even when it did not. A fault that could not run
+    // under a git subject is a fault of the harness, not a gap in git's measure, so its check is
+    // the run's own and fails the run.
     fault_errors.entry(Tool::Forklift).or_default();
-    let fault_checks: Vec<Completeness> = fault_errors.into_iter().map(|(subject, missing)| Completeness {
-        subject: Some(subject), check: "damaged-file faults ran".to_string(), cell: damaged_cell.clone(), missing,
+    let fault_checks: Vec<Completeness> = fault_errors.into_iter().map(|(subject, missing)| match subject {
+        Tool::Forklift => Completeness { subject: Some(subject), check: "damaged-file faults ran".to_string(), cell: damaged_cell.clone(), missing },
+        Tool::Git | Tool::GitTuned => Completeness {
+            subject: None, check: format!("damaged-file faults ran under {}", subject.label()), cell: damaged_cell.clone(), missing,
+        },
     }).collect();
 
     // Disk full on the capped volume and a read-only work folder, each under the faulted command of
@@ -596,6 +684,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             scenario: run.label(), category: Category::Network, binding: "forklift".to_string(),
             grade: run.graded.grade, recoverability: run.graded.recoverability, note: Some(note),
             detail: Some(format!("{}.json#/graded", label)),
+            pairing: None,
         });
     }
 
@@ -610,6 +699,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             scenario: format!("{} {}", run.scenario, run.condition), category, binding: "forklift".to_string(),
             grade: run.graded.grade, recoverability: run.graded.recoverability, note: Some(note),
             detail: Some(format!("{}.json#/graded", label)),
+            pairing: None,
         });
     }
 
@@ -669,6 +759,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     scenario: format!("{} on a {}", scenario.id, category.label()), category, binding: "forklift".to_string(),
                     grade: graded.grade, recoverability: graded.recoverability, note: Some(note),
                     detail: Some(format!("{}-folding-volume.json#", scenario.id)),
+                    pairing: None,
                 });
                 Ok(Cell::Run)
             }
@@ -920,6 +1011,9 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             tools,
             scenarios: scenarios.iter().map(|scenario| scenario.id.clone()).collect(),
             platform: Platform::current(),
+            os: operating_system(),
+            filesystem: filesystem_of(output.root()),
+            configurations,
             environment: environment_seen,
         },
         completeness,
@@ -970,6 +1064,13 @@ fn discarded_area<T>(
     result
 }
 
+/// A damage binding's role, or its refusal where the role map does not know it. Such a binding is
+/// the harness's gap, never a row with no counterpart: that would drop it from every comparison
+/// unsaid. The tables are static, so it is refused once, before any of its faults runs.
+fn role_or_refusal(subject: Tool, name: &str) -> Result<crate::git_layout::Role, String> {
+    crate::git_layout::role_of(subject, name).ok_or_else(|| format!("{}: the role map names no role for it", name))
+}
+
 /// A damage block's label, which names its scratch area and detail file: the subject, the
 /// scenario, the side, the binding's name and the kind. A host's path is named apart from the
 /// client's of the same name.
@@ -999,6 +1100,19 @@ mod tests {
         fn cancelled(&self) -> bool {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= self.polls
         }
+    }
+
+    /// A binding the role map names no role for is refused, under either subject; one it knows
+    /// takes its role.
+    ///
+    /// Revert: return any role for an unknown name → the unknown binding passes unsaid.
+    #[test]
+    fn a_binding_with_no_role_is_refused() {
+        use crate::git_layout::Role;
+        assert_eq!(role_or_refusal(Tool::Forklift, "no-such-path"), Err("no-such-path: the role map names no role for it".to_string()));
+        assert!(role_or_refusal(Tool::GitTuned, "no-such-path").is_err());
+        assert_eq!(role_or_refusal(Tool::Forklift, "trust"), Ok(Role::Signature));
+        assert_eq!(role_or_refusal(Tool::Git, "index.lock"), Ok(Role::Lock));
     }
 
     /// Revert: drop the side → a client and a host binding of one name share a label, so one
