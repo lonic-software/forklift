@@ -1663,6 +1663,9 @@ pub struct GradedCrash {
     pub crash: Crash,
     /// The operation whose bound lines hold the line a client's crash is in; a server's has none.
     pub op: Option<String>,
+    /// Why a tuned git's copy was graded without its fsmonitor daemon: the state let none watch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unwatched: Option<String>,
     pub graded: Graded,
 }
 
@@ -1766,7 +1769,7 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
                 crash.image = std::sync::Arc::default();
                 let op = crash.moment.line().and_then(|line| counted.lines.get(line)).map(|line| line.op.clone());
                 let result = match result {
-                    Ok(graded) => Ok(GradedCrash { crash, op, graded }),
+                    Ok((graded, unwatched)) => Ok(GradedCrash { crash, op, graded, unwatched }),
                     Err(error) => Err(format!("{}: {}", crash.moment.label(), error)),
                 };
                 results.lock().expect("no worker panics holding the lock").push((at, result));
@@ -1816,17 +1819,9 @@ pub(crate) fn harness_umask() -> Result<u32, String> {
 }
 
 /// One crash state written into a fresh copy and graded: the lines before the crash stand as the
-/// counting run ran them, a line the crash cut short as killed.
-/// The daemon a graded copy of a crash state watches under, from what starting it gave: for a
-/// tuned git, none when the state let no daemon watch, since that failure is the state's.
-fn daemon_over_state<D>(started: Result<Option<D>, RunError>, tool: Tool) -> Result<Option<D>, RunError> {
-    match started {
-        Err(_) if tool == Tool::GitTuned => Ok(None),
-        other => other,
-    }
-}
-
-fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, settings: &Settings, template: &Scratch, crash: &Crash, at: usize) -> Result<Graded, RunError> {
+/// counting run ran them, a line the crash cut short as killed. Beside the grade, why a tuned git's
+/// copy was graded without its daemon, when the state let none watch.
+fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, settings: &Settings, template: &Scratch, crash: &Crash, at: usize) -> Result<(Graded, Option<String>), RunError> {
     let io = |error: std::io::Error| RunError::Io(error.to_string());
     // The state is the whole area, so the copy starts empty rather than as the template.
     let copy = Scratch::create(Path::new(&format!("{}-power-{}", template.root().display(), at))).map_err(|error| RunError::Io(error.to_string()))?;
@@ -1834,9 +1829,17 @@ fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, sett
     let environment = kill::environment_of(settings, &copy)?;
     let context = kill::context_of(scenario, &counted.corpus, programs, settings, &copy, &environment, counted.tool);
     // A tuned copy's daemon watches from before its first step until it is graded, as the run's.
-    // A state git cannot start its daemon over, a torn HEAD among them, is graded as it stands:
-    // that refusal is git's, and its commands meet the same damage.
-    let daemon = daemon_over_state(kill::daemon_of(&context), counted.tool)?;
+    // A state no daemon would watch, a torn HEAD among them, is graded as it stands, without one:
+    // the daemon's exit is git's, and its commands meet the same damage. Any daemon a command then
+    // starts on its own is stopped as the grade ends, however it ends. What failed the harness
+    // stays its error.
+    let (daemon, unwatched) = match kill::daemon_over(&context)? {
+        Ok(daemon) => (daemon, None),
+        Err(why) => (None, Some(why)),
+    };
+    let stops = unwatched.is_some().then(|| crate::runner::StopsDaemon {
+        program: context.program().to_path_buf(), work: copy.work(), environment: environment.clone(),
+    });
     let mut steps: Vec<Outcome> = Vec::new();
     match &crash.moment {
         Moment::During { point: Point { line, .. } } | Moment::Synced { line, .. } | Moment::Ending { line, .. } => {
@@ -1860,17 +1863,12 @@ fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, sett
         first.append(&mut steps);
         Ok(())
     })?;
-    match daemon {
-        Some(daemon) => drop(daemon),
-        // Without the harness's daemon, a command may have started git's own over the copy.
-        None if counted.tool == Tool::GitTuned => crate::runner::stop_daemon(context.program(), &copy.work(), &environment),
-        None => {}
-    }
+    drop((daemon, stops));
     // A copy that graded well holds nothing to look at; one that did not is kept for diagnosis.
     if !graded.grade.is_failure() {
         let _ = remove_tree(copy.root());
     }
-    Ok(graded)
+    Ok((graded, unwatched))
 }
 
 /// What the power loss of a run adds to its report.
@@ -1958,8 +1956,11 @@ fn summarize_subject(all: &[&ScenarioPower], side: kill::Side, subject: Tool) ->
         if !scenario.crashes.is_empty() {
             between.push(Completeness { subject: Some(subject), check: named(format!("{}power loss of {}, states between durable and volatile: {}", prefix, scenario.scenario, scenario.requested.label())), cell: Cell::Run, missing: vec![] });
         }
-        for (index, GradedCrash { crash, op, graded }) in scenario.crashes.iter().enumerate() {
+        for (index, GradedCrash { crash, op, graded, unwatched }) in scenario.crashes.iter().enumerate() {
             let mut notes = vec![CAVEAT.to_string(), REWRITTEN.to_string()];
+            if let Some(why) = unwatched {
+                notes.push(format!("graded without the fsmonitor daemon: {}", why));
+            }
             if crash.shared > 1 {
                 notes.push(format!("{} crash moments leave this state", crash.shared));
             }
@@ -2617,7 +2618,7 @@ mod tests {
         let crash = Crash { moment, acknowledged: false, shared: 1, state: State::Durable, image: Default::default() };
         let all = vec![ScenarioPower {
             scenario: "lifted".into(), not_reached: vec!["the run cut at request 3: never request 3".into()],
-            crashes: vec![GradedCrash { crash, op: None, graded }], ..Default::default()
+            crashes: vec![GradedCrash { crash, op: None, graded, unwatched: None }], ..Default::default()
         }];
         let summary = summarize_as(&all, kill::Side::Server);
         assert_eq!(summary.cell, Cell::Run);
@@ -2644,18 +2645,6 @@ mod tests {
         let moment = |line| Moment::Synced { line, command: "stack".into(), call: 3, name: "fsync".into() };
         assert_eq!(moment(1).label(), "line 2 stack before fsync at traced call 4");
         assert_ne!(moment(0).label(), moment(1).label());
-    }
-
-    /// A crash state a tuned git cannot start its daemon over is graded without one, as git meets
-    /// it; any other subject's failure to start one stays the harness's.
-    ///
-    /// Revert: pass every failure on → a torn HEAD fails the run as a harness error.
-    #[test]
-    fn a_state_no_daemon_can_watch_is_graded_as_it_stands() {
-        let failed = || Err::<Option<()>, _>(RunError::Io("the fsmonitor daemon exited 128".into()));
-        assert!(matches!(daemon_over_state(failed(), Tool::GitTuned), Ok(None)));
-        assert!(daemon_over_state(failed(), Tool::Git).is_err());
-        assert!(matches!(daemon_over_state(Ok(Some(())), Tool::GitTuned), Ok(Some(()))));
     }
 
     /// A client's moment names the line it is in or after, which its row pairs by; a server's
@@ -2692,7 +2681,7 @@ mod tests {
         let all = vec![
             ScenarioPower { scenario: "history".into(), subject: Tool::Forklift, paired: true, not_run: Some("path-bound".into()), ..Default::default() },
             ScenarioPower { scenario: "history".into(), subject: Tool::Git, paired: true,
-                crashes: vec![GradedCrash { crash: crash.clone(), op: Some("record".into()), graded: graded.clone() }], ..Default::default() },
+                crashes: vec![GradedCrash { crash: crash.clone(), op: Some("record".into()), graded: graded.clone(), unwatched: Some("the fsmonitor daemon exited 128".into()) }], ..Default::default() },
             ScenarioPower { scenario: "branched".into(), subject: Tool::Git, paired: true, refusals: vec!["the replay does not reproduce the run".into()], ..Default::default() },
             ScenarioPower { scenario: "parked".into(), subject: Tool::GitTuned, not_run: Some("background maintenance".into()), ..Default::default() },
         ];
@@ -2703,6 +2692,7 @@ mod tests {
         assert_eq!((row.subject, row.binding.as_str()), (Tool::Git, "git"));
         assert_eq!(row.pairing, Some(Pairing { scenario: "history".into(), target: Target::Fault { lane: FaultLane::Power, op: "record".into() }, directions: vec![] }));
         assert_eq!(row.detail.as_deref(), Some("git-power-history.json#/crashes/0/graded"));
+        assert!(row.note.as_deref().unwrap().contains("graded without the fsmonitor daemon: the fsmonitor daemon exited 128"));
         let check = |name: &str| summary.completeness.iter().find(|check| check.check == name).unwrap_or_else(|| panic!("no check {}", name));
         assert_eq!(check("power-loss soundness, git").subject, None, "what refused git's replay is the run's");
         assert_eq!(check("power-loss soundness, git").missing, ["branched: the replay does not reproduce the run"]);
@@ -2717,7 +2707,7 @@ mod tests {
         assert_eq!(summarize(&all[..2]).cell, Cell::not_run("no power-loss state was graded"));
         // A server's state pairs with nothing, nor does an unpaired scenario's row.
         assert_eq!(summarize_as(&all[1..2], kill::Side::Server).rows[0].pairing, None);
-        let unpaired = vec![ScenarioPower { scenario: "compacted".into(), subject: Tool::Git, crashes: vec![GradedCrash { crash, op: Some("record".into()), graded }], ..Default::default() }];
+        let unpaired = vec![ScenarioPower { scenario: "compacted".into(), subject: Tool::Git, crashes: vec![GradedCrash { crash, op: Some("record".into()), graded, unwatched: None }], ..Default::default() }];
         assert_eq!(summarize(&unpaired).rows[0].pairing, None);
         assert_eq!(summarize_as(&unpaired, kill::Side::Server).rows[0].pairing, None);
     }

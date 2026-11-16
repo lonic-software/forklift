@@ -757,11 +757,20 @@ fn subject_of(context: &Context) -> Result<Subject, RunError> {
 /// outside every trace, since a command that finds none starts a detached one inside its own. The
 /// build turned the fsmonitor on, so a copy's config is left as the copy holds it.
 pub(crate) fn daemon_of(context: &Context) -> Result<Option<runner::FsmonitorDaemon>, RunError> {
+    daemon_over(context)?.map_err(RunError::Io)
+}
+
+/// [`daemon_of`], with a daemon that exited before it watched told apart from what failed the
+/// harness: why it exited, for a copy whose state git may refuse.
+pub(crate) fn daemon_over(context: &Context) -> Result<Result<Option<runner::FsmonitorDaemon>, String>, RunError> {
     if context.tool != Tool::GitTuned || !runner::has_fsmonitor_daemon(context.program()) {
-        return Ok(None);
+        return Ok(Ok(None));
     }
-    let (daemon, _) = runner::FsmonitorDaemon::watch(context.program(), &context.scratch.work(), context.scratch, context.environment, context.limit)?;
-    Ok(Some(daemon))
+    match runner::FsmonitorDaemon::watch_or_exit(context.program(), &context.scratch.work(), context.scratch, context.environment, context.limit) {
+        Ok((daemon, _)) => Ok(Ok(Some(daemon))),
+        Err(runner::Unwatched::Exited(why)) => Ok(Err(why)),
+        Err(runner::Unwatched::Harness(error)) => Err(error),
+    }
 }
 
 /// What a running fsmonitor daemon keeps in the work tree of `scratch`, as paths relative to its
