@@ -276,12 +276,32 @@ pub(crate) mod tests {
             Position { reference: "main".into(), depth: 3 }, Position { reference: "side".into(), depth: 0 },
         ];
         let (row, environment) = scratch("git-baseline-row");
-        let got = baseline(Tool::Git, &pristine, &positions, &programs(PathBuf::from("forklift-not-used")), &row, &environment, LIMIT).unwrap();
+        let got = baseline(Tool::Git, &pristine, &positions, &programs(PathBuf::from("forklift-not-used")), &row, &environment, LIMIT).unwrap().unwrap();
         let tip = tree(&[("a", "a"), ("b", "b"), ("c", "c"), ("s", "s")]);
         let mut after = tip.clone();
         after.insert(PROBE_FILE.to_string(), crate::oracle::digest(PROBE_BYTES));
         let positions = vec![tip.clone(), tree(&[("a", "a"), ("b", "b"), ("c", "c")]), tree(&[("a", "a")]), tree(&[("a", "a"), ("s", "s")])];
         assert_eq!(got, Baseline { positions, before: tip, after });
+    }
+
+    /// A subject that does not read back unfaulted refuses its baseline, which is the subject's
+    /// (a position past its ref's first commit serves nothing); a pristine subject that is not
+    /// there is the harness's own failure.
+    ///
+    /// Revert: return the readback's refusal as the harness's → the first assertion fails.
+    #[test]
+    fn a_refused_baseline_is_the_subjects_not_the_harnesss() {
+        let (shared, environment) = scratch("git-baseline-refused");
+        let mirror = mirrored(&shared, &environment);
+        let pristine = shared.root().join("pristine");
+        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT).unwrap();
+        let past = vec![Position { reference: "main".into(), depth: 9 }];
+        let (row, environment) = scratch("git-baseline-refused-row");
+        let programs = programs(PathBuf::from("forklift-not-used"));
+        let refused = baseline(Tool::Git, &pristine, &past, &programs, &row, &environment, LIMIT).unwrap();
+        assert!(refused.as_ref().is_err_and(|refusal| refusal.contains("the unfaulted readback")), "{:?}", refused);
+        let (row, environment) = scratch("git-baseline-absent-row");
+        assert!(baseline(Tool::Git, &shared.root().join("absent"), &past, &programs, &row, &environment, LIMIT).is_err());
     }
 
     /// Git's whole-store check names damage the sample did not reach: a commit only an unsampled
@@ -304,7 +324,7 @@ pub(crate) mod tests {
         let positions = vec![Position { reference: "main".into(), depth: 1 }, Position { reference: "side".into(), depth: 0 }];
         let programs = programs(PathBuf::from("forklift-not-used"));
         let (row, environment) = scratch("git-unreached-base");
-        let base = baseline(Tool::Git, &pristine, &positions, &programs, &row, &environment, LIMIT).unwrap();
+        let base = baseline(Tool::Git, &pristine, &positions, &programs, &row, &environment, LIMIT).unwrap().unwrap();
         let subject = HistorySubject { tool: Tool::Git, pristine: &pristine, positions: &positions, baseline: &base };
         for (kind, name, target, unreached) in [(Kind::Zero, "objects/<xx>/<hash>", object.as_str(), true), (Kind::Delete, "refs/heads/**", "refs/heads/lone", false)] {
             let (row, environment) = scratch("git-unreached-row");
@@ -331,7 +351,7 @@ pub(crate) mod tests {
         let positions = vec![Position { reference: "main".into(), depth: 1 }, Position { reference: "side".into(), depth: 0 }];
         let programs = programs(PathBuf::from("forklift-not-used"));
         let (row, environment) = scratch("git-reached-base");
-        let base = baseline(Tool::Git, &pristine, &positions, &programs, &row, &environment, LIMIT).unwrap();
+        let base = baseline(Tool::Git, &pristine, &positions, &programs, &row, &environment, LIMIT).unwrap().unwrap();
         let subject = HistorySubject { tool: Tool::Git, pristine: &pristine, positions: &positions, baseline: &base };
         let (row, environment) = scratch("git-reached-row");
         let faulted = run_history(&subject, "packed-refs", Kind::Delete, &programs, &row, &environment, LIMIT, 0).unwrap();
@@ -361,9 +381,9 @@ pub(crate) mod tests {
         assert_eq!(positions.len(), 6);
         let programs = programs(forklift);
         let (row, environment) = scratch("forklift-baseline-git");
-        let git_base = baseline(Tool::Git, &git_pristine, &positions, &programs, &row, &environment, LIMIT).unwrap();
+        let git_base = baseline(Tool::Git, &git_pristine, &positions, &programs, &row, &environment, LIMIT).unwrap().unwrap();
         let (row, environment) = scratch("forklift-baseline-forklift");
-        let forklift_base = baseline(Tool::Forklift, &forklift_pristine, &positions, &programs, &row, &environment, LIMIT).unwrap();
+        let forklift_base = baseline(Tool::Forklift, &forklift_pristine, &positions, &programs, &row, &environment, LIMIT).unwrap().unwrap();
         assert_eq!(forklift_base, git_base);
 
         // A deleted pallet is reached by the sample: its positions no longer read, so the row is

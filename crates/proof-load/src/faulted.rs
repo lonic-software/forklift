@@ -1440,39 +1440,40 @@ fn history_context<'a>(tool: Tool, corpus: &'a Corpus, programs: &'a Programs, s
 /// the probe ref read, then the probe recorded with the subject's own record binding and the
 /// probe ref read again, then the subject's whole-store check run as every row's is. A record
 /// that does not read back unfaulted (an empty tree is read back; a walk ending short of it is
-/// not), a probe that does not land, or a check that finds damage or repairs anything, fails it,
-/// naming what refused: that subject's rows are then not run, since a check reporting the pristine
-/// subject would report it on every row.
+/// not), a probe that does not land, or a check that finds damage or repairs anything, is the
+/// subject's refusal, the inner `Err` naming what refused: that subject's rows are then not run,
+/// since a check reporting the pristine subject would report it on every row. The outer `Err` is
+/// the harness's own failure to take the readback.
 #[allow(clippy::too_many_arguments)]
-pub fn baseline(tool: Tool, pristine: &Path, positions: &[Position], programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Baseline, RunError> {
+pub fn baseline(tool: Tool, pristine: &Path, positions: &[Position], programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Result<Baseline, String>, RunError> {
     lay_out_subject(pristine, scratch)?;
     let corpus = probe_corpus();
     let context = history_context(tool, &corpus, programs, scratch, environment, limit, positions);
     let marks: Vec<Mark> = (0..positions.len()).map(Mark::Position).chain([Mark::Record(0)]).collect();
-    let trees = |marks: &[Mark]| -> Result<Vec<oracle::Tree>, RunError> {
+    let trees = |marks: &[Mark]| -> Result<Result<Vec<oracle::Tree>, String>, RunError> {
         let (export, served, _) = context.serve_history(&scratch.work(), positions, marks)?;
         if !export.succeeded() {
-            return Err(RunError::Io(format!("the unfaulted readback refused: {:?} exited {:?}: {}", export.arguments, export.exit, String::from_utf8_lossy(&export.stderr).trim())));
+            return Ok(Err(format!("the unfaulted readback refused: {:?} exited {:?}: {}", export.arguments, export.exit, String::from_utf8_lossy(&export.stderr).trim())));
         }
-        served.into_iter().map(|(mark, readback, reached)| match readback {
+        Ok(served.into_iter().map(|(mark, readback, reached)| match readback {
             Readback::Served { tree, .. } if reached => Ok(tree),
-            _ => Err(RunError::Io(format!("the unfaulted readback did not serve {:?}", mark))),
-        }).collect()
+            _ => Err(format!("the unfaulted readback did not serve {:?}", mark)),
+        }).collect())
     };
-    let mut read = trees(&marks)?;
+    let mut read = match trees(&marks)? { Ok(read) => read, Err(refused) => return Ok(Err(refused)) };
     let before = read.pop().unwrap_or_default();
     let mut steps = Vec::new();
     if !context.record(0, &mut steps)? {
         let refused = steps.last().map(|step| format!("{:?} exited {:?}", step.arguments, step.exit)).unwrap_or_default();
-        return Err(RunError::Io(format!("the unfaulted probe record did not land: {}", refused)));
+        return Ok(Err(format!("the unfaulted probe record did not land: {}", refused)));
     }
-    let after = trees(&[Mark::Record(0)])?.pop().unwrap_or_default();
+    let after = match trees(&[Mark::Record(0)])? { Ok(mut after) => after.pop().unwrap_or_default(), Err(refused) => return Ok(Err(refused)) };
     let checked = store_check(&context)?;
     if !checked.succeeded() || (tool == Tool::Forklift && heal_repaired(&checked.stdout)) {
-        return Err(RunError::Io(format!("the unfaulted store check reports the pristine subject: {:?} exited {:?}: {}{}", checked.arguments, checked.exit,
+        return Ok(Err(format!("the unfaulted store check reports the pristine subject: {:?} exited {:?}: {}{}", checked.arguments, checked.exit,
             String::from_utf8_lossy(&checked.stdout).trim(), String::from_utf8_lossy(&checked.stderr).trim())));
     }
-    Ok(Baseline { positions: read, before, after })
+    Ok(Ok(Baseline { positions: read, before, after }))
 }
 
 /// Runs one damage row over a history subject: its pristine subject copied into `scratch`, damage

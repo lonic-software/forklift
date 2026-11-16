@@ -213,7 +213,7 @@ fn history_row(tool: Tool, label: &str, run: &faulted::Faulted, scenario: &str, 
     }
     let mut notes: Vec<String> = Vec::new();
     if tool == Tool::Forklift {
-        notes.push("each position's bay opens at the current head first, so damage only that head holds refuses every position".to_string());
+        notes.push("each position is read through a bay opened at the current head first, so damage the head holds is met at every position".to_string());
     }
     if !run.unextractable.is_empty() {
         notes.push(format!("unextractable remedies: {}", run.unextractable.join("; ")));
@@ -246,111 +246,122 @@ fn history_damage(
 ) -> Result<(Vec<Row>, Vec<Completeness>), RunError> {
     let mut rows = Vec::new();
     let mut history_checks = Vec::new();
-        // What each subject's rows found missing, the run's own errors running them, and the
-        // damage the sample did not reach.
-        let mut gaps: BTreeMap<Tool, Vec<String>> = BTreeMap::new();
-        let mut errors: BTreeMap<Tool, Vec<String>> = BTreeMap::new();
-        let mut unreached: BTreeMap<Tool, Vec<String>> = BTreeMap::new();
-        stop_if_cancelled(progress)?;
-        const BLOCK: &str = "damage-history";
-        let built = output.scratch(BLOCK).map_err(|error| error.to_string()).and_then(|scratch| {
-            let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
-            let (git_root, forklift_root) = (scratch.root().join("git"), scratch.root().join("forklift"));
-            let mut steps = crate::history::build_git(&programs.git, mirror, &git_root, &scratch, &environment, HISTORY_LIMIT)
-                .map_err(|error| format!("git: {}", error))?;
-            steps.extend(crate::history::build_forklift(&programs.forklift, mirror, &forklift_root, &scratch, &environment, HISTORY_LIMIT)
-                .map_err(|error| format!("forklift: {}", error))?);
-            let lengths = crate::history::git_lengths(&programs.git, &git_root, &scratch, &environment, HISTORY_LIMIT).map_err(|error| format!("git: {}", error))?;
-            let present = crate::history::pallets(&programs.forklift, &forklift_root, &scratch, &environment, HISTORY_LIMIT).map_err(|error| format!("forklift: {}", error))?;
-            let positions = crate::history::sample(&lengths, &present, crate::history::SAMPLED, seed);
-            write_detail(output.root(), &format!("{}.json", BLOCK), &serde_json::json!({ "steps": steps, "lengths": lengths, "present": present, "positions": positions }))
-                .map_err(|error| error.to_string())?;
-            Ok((git_root, forklift_root, positions))
+    // What each subject's rows found missing, the run's own errors running them, and the
+    // damage the sample did not reach.
+    let mut gaps: BTreeMap<Tool, Vec<String>> = BTreeMap::new();
+    let mut errors: BTreeMap<Tool, Vec<String>> = BTreeMap::new();
+    let mut unreached: BTreeMap<Tool, Vec<String>> = BTreeMap::new();
+    stop_if_cancelled(progress)?;
+    const BLOCK: &str = "damage-history";
+    let built = output.scratch(BLOCK).map_err(|error| error.to_string()).and_then(|scratch| {
+        let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
+        let (git_root, forklift_root) = (scratch.root().join("git"), scratch.root().join("forklift"));
+        let mut steps = crate::history::build_git(&programs.git, mirror, &git_root, &scratch, &environment, HISTORY_LIMIT)
+            .map_err(|error| format!("git: {}", error))?;
+        steps.extend(crate::history::build_forklift(&programs.forklift, mirror, &forklift_root, &scratch, &environment, HISTORY_LIMIT)
+            .map_err(|error| format!("forklift: {}", error))?);
+        let lengths = crate::history::git_lengths(&programs.git, &git_root, &scratch, &environment, HISTORY_LIMIT).map_err(|error| format!("git: {}", error))?;
+        let present = crate::history::pallets(&programs.forklift, &forklift_root, &scratch, &environment, HISTORY_LIMIT).map_err(|error| format!("forklift: {}", error))?;
+        let positions = crate::history::sample(&lengths, &present, crate::history::SAMPLED, seed);
+        write_detail(output.root(), &format!("{}.json", BLOCK), &serde_json::json!({ "steps": steps, "lengths": lengths, "present": present, "positions": positions }))
+            .map_err(|error| error.to_string())?;
+        Ok((git_root, forklift_root, positions))
+    });
+    let (git_root, forklift_root, positions) = match built {
+        Ok(built) => built,
+        Err(error) => {
+            // An import forklift refuses is forklift's; anything else is the harness's.
+            let subject = if error.starts_with("forklift: ") { Some(Tool::Forklift) } else { None };
+            history_checks.push(Completeness { subject, check: "history subjects built".to_string(), cell: Cell::Run, missing: vec![error] });
+            (Default::default(), Default::default(), Vec::new())
+        }
+    };
+    let mut subjects = Vec::new();
+    if positions.is_empty() && !history_checks.iter().any(|entry: &Completeness| entry.check == "history subjects built") {
+        history_checks.push(Completeness {
+            subject: None, check: "history subjects built".to_string(), cell: Cell::Run,
+            missing: vec!["the sample holds no position: no ref both subjects hold has a commit".to_string()],
         });
-        let (git_root, forklift_root, positions) = match built {
-            Ok(built) => built,
-            Err(error) => {
-                // An import forklift refuses is forklift's; anything else is the harness's.
-                let subject = if error.starts_with("forklift: ") { Some(Tool::Forklift) } else { None };
-                history_checks.push(Completeness { subject, check: "history subjects built".to_string(), cell: Cell::Run, missing: vec![error] });
-                (Default::default(), Default::default(), Vec::new())
-            }
-        };
-        let mut subjects = Vec::new();
-        if !positions.is_empty() {
-            for tool in [Tool::Forklift, Tool::Git, Tool::GitTuned] {
-                let pristine = if tool == Tool::Forklift { &forklift_root } else { &git_root };
-                let state = pristine.join(runner::state_folder(tool));
-                match crate::census::walk(&state) {
-                    Ok(walked) => history_checks.push(Completeness {
-                        subject: Some(tool), check: "history damage bindings".to_string(), cell: Cell::Run,
-                        missing: crate::bindings::check_history_subject(tool, census, &walked),
-                    }),
-                    Err(error) => errors.entry(tool).or_default().push(format!("{}: {}", state.display(), error)),
-                }
-                stop_if_cancelled(progress)?;
-                let label = format!("{}-baseline-{}", BLOCK, tool.label());
-                let base = output.scratch(&label).map_err(|error| error.to_string()).and_then(|scratch| {
-                    let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
-                    faulted::baseline(tool, pristine, &positions, programs, &scratch, &environment, HISTORY_LIMIT).map_err(|error| error.to_string())
-                });
-                match base {
-                    Ok(base) => {
-                        write_detail(output.root(), &format!("{}.json", label), &base)?;
-                        subjects.push((tool, pristine.clone(), base));
-                    }
-                    Err(error) => gaps.entry(tool).or_default().push(format!("its rows: not run: the unfaulted readback failed: {}", error)),
-                }
-            }
-        }
-        // Every subject's rows, mixed by the seed, so a spent budget cuts each subject alike.
-        let mut planned: Vec<(Tool, crate::damage::Binding, crate::damage::Kind, crate::git_layout::Role)> = subjects.iter()
-            .flat_map(|(tool, _, _)| crate::bindings::history_rows(*tool, seed).into_iter().map(move |(binding, kind, role)| (*tool, binding, kind, role)))
-            .collect();
-        let mut state = seed;
-        for index in (1..planned.len()).rev() {
-            planned.swap(index, (crate::history::splitmix(&mut state) % (index as u64 + 1)) as usize);
-        }
-        progress.lane(Category::DamagedFiles, Some(damage_blocks + planned.len()));
-        let scenario = format!("{}, over a sample of {} positions", faulted::HISTORY_SCENARIO, positions.len());
-        let lane_started = std::time::Instant::now();
-        for (tool, binding, kind, role) in planned {
-            let label = damage_label(tool, &binding, kind);
-            if lane_started.elapsed() > budget {
-                gaps.entry(tool).or_default().push(format!("{}: not run: the lane's time budget was spent", label));
-                continue;
-            }
-            let Some((_, pristine, base)) = subjects.iter().find(|(subject, _, _)| *subject == tool) else { continue };
-            let subject = faulted::HistorySubject { tool, pristine, positions: &positions, baseline: base };
-            start_block(progress, Category::DamagedFiles, &label)?;
-            let result = output.scratch(&label).map_err(|error| error.to_string()).and_then(|scratch| {
-                let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
-                faulted::run_history(&subject, binding.name, kind, programs, &scratch, &environment, HISTORY_LIMIT, seed).map_err(|error| error.to_string())
-            });
-            progress.block_finished(Category::DamagedFiles, &label, result.as_ref().map_or(true, |run| tool == Tool::Forklift && (run.grade.is_failure() || run.unreached.is_some())));
-            match result {
-                Ok(run) => {
-                    write_detail(output.root(), &format!("{}.json", label), &run)?;
-                    match history_row(tool, &label, &run, &scenario, role) {
-                        Ok(row) => rows.push(row),
-                        Err(entry) => unreached.entry(tool).or_default().push(entry),
-                    }
-                }
-                Err(error) => errors.entry(tool).or_default().push(format!("{} {:?}: {}", binding.name, kind, error)),
-            }
-        }
+    }
+    if !positions.is_empty() {
         for tool in [Tool::Forklift, Tool::Git, Tool::GitTuned] {
-            history_checks.push(Completeness {
-                subject: Some(tool), check: "history damage rows ran".to_string(), cell: Cell::Run, missing: gaps.remove(&tool).unwrap_or_default(),
+            let pristine = if tool == Tool::Forklift { &forklift_root } else { &git_root };
+            let state = pristine.join(runner::state_folder(tool));
+            match crate::census::walk(&state) {
+                Ok(walked) => history_checks.push(Completeness {
+                    subject: Some(tool), check: "history damage bindings".to_string(), cell: Cell::Run,
+                    missing: crate::bindings::check_history_subject(tool, census, &walked),
+                }),
+                Err(error) => errors.entry(tool).or_default().push(format!("{}: {}", state.display(), error)),
+            }
+            stop_if_cancelled(progress)?;
+            let label = format!("{}-baseline-{}", BLOCK, tool.label());
+            let base = output.scratch(&label).map_err(|error| error.to_string()).and_then(|scratch| {
+                let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
+                faulted::baseline(tool, pristine, &positions, programs, &scratch, &environment, HISTORY_LIMIT).map_err(|error| error.to_string())
             });
-            history_checks.push(Completeness {
-                subject: Some(tool), check: "damage not reached by the sample".to_string(), cell: Cell::Run, missing: unreached.remove(&tool).unwrap_or_default(),
-            });
-            // A row the harness could not run is the harness's fault, not a gap in the measure.
-            let check = match tool { Tool::Forklift => "history damage faults ran".to_string(), other => format!("history damage faults ran under {}", other.label()) };
-            let subject = (tool == Tool::Forklift).then_some(tool);
-            history_checks.push(Completeness { subject, check, cell: Cell::Run, missing: errors.remove(&tool).unwrap_or_default() });
+            // A subject that refuses its own unfaulted readback leaves a gap in its measure; a
+            // readback the harness could not take is the harness's fault, as a row's is.
+            match base {
+                Ok(Ok(base)) => {
+                    write_detail(output.root(), &format!("{}.json", label), &base)?;
+                    subjects.push((tool, pristine.clone(), base));
+                }
+                Ok(Err(refused)) => gaps.entry(tool).or_default().push(format!("its rows: not run: the unfaulted readback failed: {}", refused)),
+                Err(error) => errors.entry(tool).or_default().push(format!("its unfaulted readback: {}", error)),
+            }
         }
+    }
+    // Every subject's rows, mixed by the seed, so a spent budget cuts each subject alike.
+    let mut planned: Vec<(Tool, crate::damage::Binding, crate::damage::Kind, crate::git_layout::Role)> = subjects.iter()
+        .flat_map(|(tool, _, _)| crate::bindings::history_rows(*tool, seed).into_iter().map(move |(binding, kind, role)| (*tool, binding, kind, role)))
+        .collect();
+    let mut state = seed;
+    for index in (1..planned.len()).rev() {
+        planned.swap(index, (crate::history::splitmix(&mut state) % (index as u64 + 1)) as usize);
+    }
+    progress.lane(Category::DamagedFiles, Some(damage_blocks + planned.len()));
+    let scenario = format!("{}, over a sample of {} positions", faulted::HISTORY_SCENARIO, positions.len());
+    let lane_started = std::time::Instant::now();
+    for (tool, binding, kind, role) in planned {
+        let label = damage_label(tool, &binding, kind);
+        if lane_started.elapsed() > budget {
+            // Finished unstarted, so the lane's announced count is still reached.
+            progress.block_finished(Category::DamagedFiles, &label, tool == Tool::Forklift);
+            gaps.entry(tool).or_default().push(format!("{}: not run: the lane's time budget was spent", label));
+            continue;
+        }
+        let Some((_, pristine, base)) = subjects.iter().find(|(subject, _, _)| *subject == tool) else { continue };
+        let subject = faulted::HistorySubject { tool, pristine, positions: &positions, baseline: base };
+        start_block(progress, Category::DamagedFiles, &label)?;
+        let result = output.scratch(&label).map_err(|error| error.to_string()).and_then(|scratch| {
+            let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
+            faulted::run_history(&subject, binding.name, kind, programs, &scratch, &environment, HISTORY_LIMIT, seed).map_err(|error| error.to_string())
+        });
+        progress.block_finished(Category::DamagedFiles, &label, result.as_ref().map_or(true, |run| tool == Tool::Forklift && (run.grade.is_failure() || run.unreached.is_some())));
+        match result {
+            Ok(run) => {
+                write_detail(output.root(), &format!("{}.json", label), &run)?;
+                match history_row(tool, &label, &run, &scenario, role) {
+                    Ok(row) => rows.push(row),
+                    Err(entry) => unreached.entry(tool).or_default().push(entry),
+                }
+            }
+            Err(error) => errors.entry(tool).or_default().push(format!("{} {:?}: {}", binding.name, kind, error)),
+        }
+    }
+    for tool in [Tool::Forklift, Tool::Git, Tool::GitTuned] {
+        history_checks.push(Completeness {
+            subject: Some(tool), check: "history damage rows ran".to_string(), cell: Cell::Run, missing: gaps.remove(&tool).unwrap_or_default(),
+        });
+        history_checks.push(Completeness {
+            subject: Some(tool), check: "damage not reached by the sample".to_string(), cell: Cell::Run, missing: unreached.remove(&tool).unwrap_or_default(),
+        });
+        // A row the harness could not run is the harness's fault, not a gap in the measure.
+        let check = match tool { Tool::Forklift => "history damage faults ran".to_string(), other => format!("history damage faults ran under {}", other.label()) };
+        let subject = (tool == Tool::Forklift).then_some(tool);
+        history_checks.push(Completeness { subject, check, cell: Cell::Run, missing: errors.remove(&tool).unwrap_or_default() });
+    }
     Ok((rows, history_checks))
 }
 

@@ -549,7 +549,11 @@ pub fn check_history_subject(tool: Tool, census: &Census, walked: &[String]) -> 
         Tool::Git | Tool::GitTuned => {
             let scenario = crate::faulted::HISTORY_SCENARIO.to_string();
             let walks = [((scenario.clone(), Warehouse::Client), walked.to_vec())].into_iter().collect();
-            check_git(bindings, exemptions, &[scenario], &walks)
+            let mut missing = check_git(bindings, exemptions, &[scenario], &walks);
+            // check_git asks no role of a binding; a history row without one would never run.
+            missing.extend(bindings.iter().filter(|binding| crate::git_layout::role_of(tool, binding.name).is_none())
+                .map(|binding| format!("{}: the role map gives it no role", binding.name)));
+            missing
         }
     }
 }
@@ -734,10 +738,6 @@ mod tests {
         }
     }
 
-    /// The bindings file covers this tree's whole census and lists nothing the census does not: a
-    /// new census row fails here until it is bound or exempted.
-    ///
-    /// Revert: drop a binding → its name joins the uncovered list.
     /// A history runs one row per (role, kind) its bindings reach, per subject: each row's binding
     /// has that role and kind, and which binding stands for a (role, kind) is the seed's pick.
     ///
@@ -758,6 +758,10 @@ mod tests {
         }
     }
 
+    /// The bindings file covers this tree's whole census and lists nothing the census does not: a
+    /// new census row fails here until it is bound or exempted.
+    ///
+    /// Revert: drop a binding → its name joins the uncovered list.
     #[test]
     fn this_trees_census_is_covered() {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

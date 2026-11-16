@@ -30,9 +30,11 @@ jobs:
     name: proof load history
     runs-on: ubuntu-latest
     # The hang guard, well past a normal run (the scenario lanes, then the history's imports and
-    # exports, each of which may take up to 30 minutes, then the history's damage rows, which
-    # start for at most two hours): a job cut by it writes no report. The budget the run is
-    # graded on is --budget below, the one hour the rest takes plus the damage rows' two.
+    # exports, each of which may take up to 30 minutes, then the history's damage lane: its own
+    # build and baselines, then rows that start for at most two hours, the last of which may run
+    # on past them): a job cut by it writes no report. The budget the run is graded on is
+    # --budget below: the hour the rest takes, the damage lane's two hours of rows, and an hour
+    # for its build, its baselines and its last row.
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
@@ -62,7 +64,7 @@ jobs:
         continue-on-error: true
         run: |
           bin=target/release
-          "$bin/proof-load" run --source . --out "$RUNNER_TEMP/proof-load" --budget 10800 \
+          "$bin/proof-load" run --source . --out "$RUNNER_TEMP/proof-load" --budget 14400 \
             --forklift "$bin/forklift" --forklift-server "$bin/forklift-server" --git "$(command -v git)" \
             --history-from .
 
