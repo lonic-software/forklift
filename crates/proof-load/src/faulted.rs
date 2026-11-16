@@ -983,8 +983,8 @@ pub(crate) fn grade_after(
 /// `audit` (a check: it reports and repairs nothing), then a fresh clone of the remote; for git
 /// `fsck --full` (a check), then each ref that no longer resolves restored with `update-ref` to
 /// its reflog's newest entry ([`reflog_tips`]) when that entry's objects are all present, then a
-/// fresh clone. A loose ref that stands is never moved, so a damaged reflog cannot rewind one; a
-/// ref whose loose file is gone while packed-refs holds an ancestor of that entry is restored.
+/// fresh clone. A ref is only ever moved forward, to a descendant of what it names, so a damaged
+/// reflog cannot rewind one; a loose ref lost over an older packed one is restored.
 /// A clone needs a remote, and is not made where the readback already reads through one, where
 /// the work tree sits on a volume the clone would leave, or over parked work, which no clone holds.
 /// What decides a restore (`rev-parse`, `rev-list`) is the harness's reading, like a readback,
@@ -1008,10 +1008,11 @@ fn own_remedies(context: &Context, expected: &Expected, trail: &mut Trail, made:
                 let value = resolved.succeeded().then(|| String::from_utf8_lossy(&resolved.stdout).trim().to_string());
                 trail.probes.push(resolved);
                 if let Some(value) = value {
-                    // A ref that resolves is moved only when its loose file is gone and what it
-                    // falls back to (packed-refs) is behind its reflog's newest entry: a lost
-                    // update. A loose ref that stands is never moved, whatever its reflog says.
-                    if value == hash || state.join(&reference).exists() {
+                    // A ref that resolves is moved only forward: when it names a strict ancestor of
+                    // its reflog's newest entry (a loose ref lost over an older packed one), an
+                    // update was lost. Every move git makes is logged, so a ref git moved back
+                    // agrees with its newest entry, and an older entry never rewinds a ref.
+                    if value == hash {
                         continue;
                     }
                     let behind = run(&["merge-base", "--is-ancestor", &value, &hash], work.clone())?;
