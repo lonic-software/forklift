@@ -86,6 +86,11 @@ enum Command {
         /// request through the proxy every host is served behind; repeatable. Without it, none.
         #[arg(long = "network")]
         network: Vec<String>,
+        /// A git repository whose history the fidelity round trips also take, both ways, besides
+        /// their fixtures. It is read only: the harness mirrors it into its scratch area first. A
+        /// shallow repository is refused.
+        #[arg(long)]
+        history_from: Option<PathBuf>,
     },
 }
 
@@ -101,11 +106,11 @@ impl Progress for Stderr {
 fn main() -> ExitCode {
     let Command::Run {
         source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, power, power_variants, jobs,
-        capped_volume, disk_full, read_only, folding_volume, network,
+        capped_volume, disk_full, read_only, folding_volume, network, history_from,
     } = Cli::parse().command;
     let options = RunOptions {
         source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, power, power_variants, jobs,
-        capped_volume, disk_full, read_only, folding_volume, network,
+        capped_volume, disk_full, read_only, folding_volume, network, history_from,
     };
     match run::run(&options, &Stderr) {
         Ok(report) if report.failed() => ExitCode::from(1),

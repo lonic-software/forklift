@@ -40,6 +40,7 @@ pub struct RunOptions {
     pub read_only: Vec<String>,
     pub folding_volume: Option<PathBuf>,
     pub network: Vec<String>,
+    pub history_from: Option<PathBuf>,
 }
 
 /// What a run tells its caller while it works. A block is one graded unit a lane runs on a fresh
@@ -201,7 +202,7 @@ fn tuned_configuration(daemon: bool) -> String {
 pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunError> {
     let RunOptions {
         source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, power, power_variants, jobs,
-        capped_volume, disk_full, read_only: read_only_lane, folding_volume, network: network_lane,
+        capped_volume, disk_full, read_only: read_only_lane, folding_volume, network: network_lane, history_from,
     } = options.clone();
     let started = std::time::Instant::now();
 
@@ -214,6 +215,13 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     if let Some(unknown) = only.as_ref().filter(|only| !scenario::known(only)) {
         return Err(RunError::Refused(format!("--only {}: no such scenario", unknown)));
     }
+    // The history is read from wherever the trips run, so it is named absolutely; a path that is
+    // no folder is refused before anything is written.
+    let history_from = match history_from.as_deref().map(std::path::absolute).transpose() {
+        Ok(Some(path)) if !path.is_dir() => return Err(RunError::Refused(format!("--history-from {}: not a folder", path.display()))),
+        Ok(path) => path,
+        Err(error) => return Err(RunError::Refused(format!("--history-from: {}", error))),
+    };
     let mut output = match Output::claim(&out) {
         Ok(output) => output,
         Err(error) => {
@@ -248,6 +256,9 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     };
     if let Some(server) = &server {
         tools.insert("forklift-server".to_string(), described(server));
+    }
+    if let Some(history) = &history_from {
+        tools.insert("history-from".to_string(), history.display().to_string());
     }
 
     // The version under test's write-op universe: its schema's command ids and the server's
@@ -773,27 +784,32 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     let case_folding_cell = volume_lane(volume_faults[0])?;
     let no_exec_cell = volume_lane(volume_faults[1])?;
 
-    // Each fixture history round-tripped, git to Forklift to git and Forklift to git to Forklift:
-    // what a trip changed or dropped is findings, never grades. A round trip that cannot finish is
-    // a gap in the run.
+    // Each fixture history round-tripped, git to Forklift to git and Forklift to git to Forklift,
+    // and the history `--history-from` names both ways too: what a trip changed or dropped is
+    // findings, never grades. A round trip that cannot finish is a gap in the run.
     let mut fidelity = Vec::new();
     let mut fidelity_missing = Vec::new();
     let fidelity_cell = match (&program, &git_program) {
         (None, _) => Cell::not_run("no forklift binary given"),
         (_, None) => Cell::not_run("no git binary given"),
-        _ if only.is_some() => Cell::not_run("--only picks one scenario, and the fidelity fixture is none"),
+        _ if only.is_some() => Cell::not_run("--only picks one scenario, and the fidelity round trips are none"),
         (Some(program), Some(git_program)) => {
-            type RoundTrip = fn(&std::path::Path, &std::path::Path, &crate::scrub::Scratch, &Environment, std::time::Duration) -> crate::fidelity::Trip;
-            let trips: [(&str, crate::fidelity::Direction, RoundTrip); 2] = [
-                ("fidelity-git-forklift-git", crate::fidelity::Direction::GitForkliftGit, crate::fidelity::git_round_trip),
-                ("fidelity-forklift-git-forklift", crate::fidelity::Direction::ForkliftGitForklift, crate::fidelity::forklift_round_trip),
+            use crate::fidelity::{forklift_round_trip, git_round_trip, Direction, Trip};
+            type RoundTrip = fn(&std::path::Path, &std::path::Path, Option<&std::path::Path>, &crate::scrub::Scratch, &Environment, std::time::Duration) -> Trip;
+            let mut trips: Vec<(&str, Direction, RoundTrip, Option<&std::path::Path>)> = vec![
+                ("fidelity-git-forklift-git", Direction::GitForkliftGit, git_round_trip, None),
+                ("fidelity-forklift-git-forklift", Direction::ForkliftGitForklift, forklift_round_trip, None),
             ];
+            if let Some(history) = history_from.as_deref() {
+                trips.push(("fidelity-history-git-forklift-git", Direction::GitForkliftGit, git_round_trip, Some(history)));
+                trips.push(("fidelity-history-forklift-git-forklift", Direction::ForkliftGitForklift, forklift_round_trip, Some(history)));
+            }
             progress.lane(Category::Fidelity, Some(trips.len()));
-            for (block, direction, round_trip) in trips {
+            for (block, direction, round_trip, history) in trips.iter().copied() {
                 start_block(progress, Category::Fidelity, block)?;
                 let trip = output.scratch(block).map_err(|error| error.to_string()).and_then(|scratch| {
                     let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
-                    Ok(round_trip(program, git_program, &scratch, &environment, limit))
+                    Ok(round_trip(program, git_program, history, &scratch, &environment, limit))
                 });
                 let trip = match trip {
                     Ok(trip) => {
@@ -803,13 +819,14 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     Err(error) => Err(error),
                 };
                 progress.block_finished(Category::Fidelity, block, trip.is_err());
+                let input = if history.is_some() { crate::fidelity::Input::History } else { crate::fidelity::Input::Fixture };
                 match trip {
                     Ok(findings) => fidelity.extend(findings),
-                    Err(error) => fidelity_missing.push(format!("{}: {}", direction.label(), error)),
+                    Err(error) => fidelity_missing.push(format!("{} from {}: {}", direction.label(), input.label(), error)),
                 }
             }
-            // A trip that did not finish leaves the other's findings standing: the lane is partial,
-            // and `fidelity_missing` names the trip it lacks.
+            // A trip that did not finish leaves the others' findings standing: the lane is
+            // partial, and `fidelity_missing` names each trip it lacks.
             match fidelity_missing.len() {
                 0 => Cell::Run,
                 missed if missed < trips.len() => Cell::Sampled,
