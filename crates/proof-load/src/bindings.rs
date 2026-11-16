@@ -379,6 +379,34 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// The git bindings over git's layout: the shipped set passes over walks that create what it
+    /// binds, a damage row with no binding or exemption is named, an exemption over a path a scenario
+    /// creates is stale, and a binding over a path its scenario never creates is named.
+    ///
+    /// Revert: skip the walk check for bindings → the uncreated binding passes; skip the stale
+    /// exemption check → the created exempt path passes.
+    #[test]
+    fn git_bindings_are_checked_against_the_layout_and_the_walks() {
+        let runnable: Vec<String> = ["history", "branched", "parked"].map(String::from).to_vec();
+        let all: Vec<String> = ["HEAD", "ORIG_HEAD", "config", "index", "logs/", "logs/refs/heads/main", "refs/", "refs/heads/",
+            "refs/heads/main", "refs/tags/", "refs/stash", "objects/", "objects/info/", "objects/pack/", "objects/ab/", "objects/ab/cdef"]
+            .map(String::from).to_vec();
+        let walks: BTreeMap<String, Vec<String>> = runnable.iter().map(|scenario| (scenario.clone(), all.clone())).collect();
+        assert_eq!(check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &walks), Vec::<String>::new());
+
+        let without_index: Vec<Binding> = GIT_BINDINGS.iter().filter(|binding| binding.name != "index").cloned().collect();
+        assert_eq!(check_git(&without_index, GIT_EXEMPTIONS, &runnable, &walks), vec!["index".to_string()]);
+
+        let mut packed = walks.clone();
+        packed.get_mut("history").unwrap().push("packed-refs".to_string());
+        assert_eq!(check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &packed), vec!["stale exemption: packed-refs: history creates it".to_string()]);
+
+        let mut no_config = walks.clone();
+        no_config.get_mut("history").unwrap().retain(|path| path != "config");
+        let missing = check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &no_config);
+        assert!(missing.iter().any(|line| line.starts_with("config: its scenario history does not create it")), "{:?}", missing);
+    }
+
     const SAMPLE: &str = "<!-- census:start -->\n| Path | Class | Names |\n|---|---|---|\n\
         | `warehouse` | rewritable | `a::B` |\n\
         | `objects/<xx>/<hash>` | history-borne | `a::E` |\n\

@@ -399,6 +399,19 @@ mod tests {
         assert!(report.failed());
     }
 
+    /// A git subject's failing row is reported, not failed on: only forklift's grades fail the run.
+    ///
+    /// Revert: drop the subject test in `failed` → git's data loss fails the run.
+    #[test]
+    fn only_forklift_grades_fail_the_run() {
+        let mut report = sample();
+        report.rows[0].subject = Tool::Git;
+        report.rows[0].grade = Grade::DataLost;
+        assert!(!report.failed());
+        report.rows[0].subject = Tool::Forklift;
+        assert!(report.failed());
+    }
+
     /// A run over its budget fails, one within it does not, and without a budget the check says
     /// it did not run.
     ///
