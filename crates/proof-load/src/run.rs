@@ -353,13 +353,13 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     }
     let git_cell = match &git_program { None => Cell::not_run("no git binary given"), Some(_) => Cell::Run };
     let git_walk_check = Completeness { subject: Some(Tool::Git), check: "git layout walk".to_string(), cell: git_cell.clone(), missing: git_walk_missing };
-    let git_damage_check = Completeness {
-        subject: Some(Tool::Git), check: "git damage bindings".to_string(), cell: git_cell,
-        missing: match &git_program {
-            None => vec![],
-            Some(_) => crate::bindings::check_git(crate::bindings::GIT_BINDINGS, crate::bindings::GIT_EXEMPTIONS, &git_runnable, &git_walks),
-        },
+    // Run in full only: a filtered run walks too few scenarios to answer every binding.
+    let (git_damage_cell, git_damage_missing) = match &git_program {
+        None => (git_cell, vec![]),
+        Some(_) if only.is_some() => (Cell::not_run("--only builds one scenario"), vec![]),
+        Some(_) => (git_cell, crate::bindings::check_git(crate::bindings::GIT_BINDINGS, crate::bindings::GIT_EXEMPTIONS, &git_runnable, &git_walks)),
     };
+    let git_damage_check = Completeness { subject: Some(Tool::Git), check: "git damage bindings".to_string(), cell: git_damage_cell, missing: git_damage_missing };
     let role_check = match &census {
         None => Completeness { subject: None, check: "role map".to_string(), cell: Cell::not_run("no census for this version"), missing: vec![] },
         Some(census) => Completeness { subject: None, check: "role map".to_string(), cell: Cell::Run, missing: crate::git_layout::role_gaps(census, crate::git_layout::CENSUS_ROLES) },
@@ -395,7 +395,8 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                         faulted::run(scenario, binding.name, binding.warehouse, *kind, subject, &faulted_corpus, &programs, &scratch, &environment, std::time::Duration::from_secs(120), seed)
                             .map_err(|error| error.to_string())
                     });
-                    progress.block_finished(Category::DamagedFiles, &label, result.as_ref().map_or(true, |run| run.grade.is_failure()));
+                    // A git subject's grade is a comparison, never a failure of the run.
+                    progress.block_finished(Category::DamagedFiles, &label, result.as_ref().map_or(true, |run| subject == Tool::Forklift && run.grade.is_failure()));
                     match result {
                         Ok(run) => {
                             write_detail(output.root(), &format!("{}.json", label), &run)?;

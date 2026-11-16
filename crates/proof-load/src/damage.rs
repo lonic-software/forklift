@@ -119,15 +119,16 @@ pub fn apply(path: &Path, kind: Kind, seed: u64) -> Result<(), DamageError> {
             std::fs::remove_dir_all(path).map_err(io)
         }
         Kind::Delete => {
+            // Windows refuses to delete a read-only file, and git stores its objects read-only.
             #[allow(clippy::disallowed_methods)] // a harness fault, on a scratch copy; no retry is wanted
-            std::fs::remove_file(path).map_err(io)
+            through_mode(path, false, || std::fs::remove_file(path)).map_err(io)
         }
         Kind::Truncate => {
             let length = std::fs::metadata(path).map_err(io)?.len();
             if length == 0 {
                 return Err(DamageError::Io(format!("{}: empty, so there is nothing to cut", path.display())));
             }
-            through_mode(path, || std::fs::OpenOptions::new().write(true).open(path).and_then(|file| file.set_len(length / 2))).map_err(io)
+            through_mode(path, true, || std::fs::OpenOptions::new().write(true).open(path).and_then(|file| file.set_len(length / 2))).map_err(io)
         }
         Kind::FlipByte | Kind::Zero => {
             let mut bytes = std::fs::read(path).map_err(io)?;
@@ -140,15 +141,16 @@ pub fn apply(path: &Path, kind: Kind, seed: u64) -> Result<(), DamageError> {
                 let at = (seed % bytes.len() as u64) as usize;
                 bytes[at] = !bytes[at];
             }
-            through_mode(path, || std::fs::write(path, bytes)).map_err(io)
+            through_mode(path, true, || std::fs::write(path, bytes)).map_err(io)
         }
     }
 }
 
 /// Runs `damage` on the file at `path` as a disk fault would, whatever its mode: a file stored
 /// read-only (as git stores its objects) is made writable by its owner for the damage and given
-/// its mode back after it, damaged or not.
-fn through_mode(path: &Path, damage: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+/// its mode back after it when `restore` (a deleted file has none to restore), damaged or not. A
+/// failed damage is reported over a failed restore.
+fn through_mode(path: &Path, restore: bool, damage: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
     let before = std::fs::metadata(path)?.permissions();
     if !before.readonly() {
         return damage();
@@ -164,8 +166,11 @@ fn through_mode(path: &Path, damage: impl FnOnce() -> std::io::Result<()>) -> st
     writable.set_readonly(false);
     std::fs::set_permissions(path, writable)?;
     let damaged = damage();
-    std::fs::set_permissions(path, before)?;
-    damaged
+    if !restore {
+        return damaged;
+    }
+    let restored = std::fs::set_permissions(path, before);
+    damaged.and(restored)
 }
 
 #[cfg(test)]
@@ -191,6 +196,11 @@ mod tests {
         apply(&file, Kind::Truncate, 0).unwrap();
         assert_eq!(std::fs::read(&file).unwrap().len(), 2);
         assert!(std::fs::metadata(&file).unwrap().permissions().readonly());
+        let doomed = folder.join("doomed");
+        std::fs::write(&doomed, b"x").unwrap();
+        std::fs::set_permissions(&doomed, std::fs::metadata(&file).unwrap().permissions()).unwrap();
+        apply(&doomed, Kind::Delete, 0).unwrap();
+        assert!(std::fs::symlink_metadata(&doomed).is_err());
 
         let mut writable = std::fs::metadata(&file).unwrap().permissions();
         #[allow(clippy::permissions_set_readonly_false)] // a test's own temporary file

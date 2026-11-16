@@ -202,8 +202,9 @@ pub struct Row {
     pub subject: Tool,
     pub scenario: String,
     pub category: Category,
-    /// The program the row faulted: `forklift`, `forklift-server` for a hosted scenario's server,
-    /// or `git`. A row's steps are the commands of its subject that its scenario ran.
+    /// What the row faulted: `forklift`, `forklift-server` for a hosted scenario's server, or for a
+    /// git subject its label (`git`, `git-tuned`: one program, two configurations). A row's steps
+    /// are the commands of its subject that its scenario ran.
     pub binding: String,
     pub grade: Grade,
     pub recoverability: Recoverability,
