@@ -55,7 +55,7 @@ pub fn build_git(git: &Path, mirror: &Path, to: &Path, scratch: &Scratch, enviro
     let head = match run(&["symbolic-ref", "-q", "HEAD"]) {
         Ok(outcome) => String::from_utf8_lossy(&outcome.stdout).trim().to_string(),
         Err(RunError::BuildFailed { exit: Some(1), .. }) => return Err(RunError::Io(
-            "the history's HEAD is detached, at no branch; put it on one (`git switch -c <name>`)".to_string())),
+            "the history's HEAD is detached, at no branch; put it on a branch first".to_string())),
         Err(error) => return Err(error),
     };
     let branch = head.strip_prefix("refs/heads/")
