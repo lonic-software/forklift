@@ -113,7 +113,9 @@ const FIXTURE_IDENTITY: &[(&str, &str)] = &[
 ];
 
 /// How much of each command's stdout a trip keeps in its steps.
-pub const KEPT_STDOUT: usize = 64 * 1024;
+/// A real history's trip runs thousands of commands, its listings megabytes each, and a step's
+/// stdout is written as a JSON array of numbers: 64 KiB a step made a 165 MB trail.
+pub const KEPT_STDOUT: usize = 4 * 1024;
 
 /// Runs commands in one scratch area and keeps every outcome, its stdout cut to `KEPT_STDOUT`.
 struct Steps<'a> {
