@@ -88,6 +88,10 @@ pub const ROWS: &[LayoutRow] = &[
     row("refs/heads/**", Class::Rewritable, Role::BranchRef),
     row("refs/tags/**/", Class::Rewritable, Role::BranchRef),
     row("refs/tags/**", Class::Rewritable, Role::BranchRef),
+    // What a push or a fetch last saw of the remote's branches, rewritten by the next fetch: the
+    // part Forklift's record of fetched heads plays.
+    row("refs/remotes/**/", Class::Derived, Role::Metadata),
+    row("refs/remotes/**", Class::Derived, Role::Metadata),
     row("packed-refs", Class::Rewritable, Role::PackedRefs),
     row("objects/", Class::HistoryBorne, Role::Object),
     row("objects/info/", Class::Derived, Role::DerivedCache),

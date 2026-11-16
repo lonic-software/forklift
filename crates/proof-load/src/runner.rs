@@ -26,7 +26,8 @@ pub struct Built {
     pub outcomes: Vec<Outcome>,
     /// The paths under the state folder after the build, as `census::walk` lists them.
     pub walked: Vec<String>,
-    /// The same of the host's state folder, when the history hosts a warehouse.
+    /// The same of the host's state folder, when the history hosts a warehouse: for git, the bare
+    /// repository itself, which is all state folder.
     pub host_walked: Vec<String>,
     /// Content the history took away from records it had acknowledged.
     pub taken: Vec<Taken>,
@@ -47,9 +48,18 @@ pub struct Built {
     /// What the proxies of hosts the history stopped logged before they went.
     #[serde(skip)]
     pub stopped: Vec<Exchange>,
+    /// The bare repository a git history's `Host` made, by the path that is its URL.
+    #[serde(skip)]
+    pub bare: Option<String>,
 }
 
 impl Built {
+    /// The URL the history's remote answers at: its forklift-server's, or its bare repository's
+    /// path. None when it hosts nothing, or its server has stopped.
+    pub fn url(&self) -> Option<&str> {
+        self.host.as_ref().map(|host| host.url.as_str()).or(self.bare.as_deref())
+    }
+
     /// Every exchange the history's hosts logged: those it stopped, then the one still serving.
     pub fn exchanges(&self) -> Vec<Exchange> {
         let mut exchanges = self.stopped.clone();
@@ -230,6 +240,8 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
     let mut scope: Option<&str> = None;
     // Values coverage lines kept from earlier documents, by name.
     let mut kept: BTreeMap<String, String> = BTreeMap::new();
+    // A git history's host, by its path, once it has one.
+    let mut bare: Option<String> = None;
     for op in &scenario.history {
         // Read at each step: a clone onto a folding volume moves the work tree.
         let mut work = scratch.work();
@@ -240,6 +252,18 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
         }
         let mut directory = work.clone();
         match op {
+            Op::Host if tool != Tool::Forklift => {
+                // Git serves itself: the host is a bare repository, which a push and a pull reach
+                // by its path. Made on the default branch the work tree's prepare names, with the
+                // same configuration, so nothing it runs detaches.
+                let root = host_root(scratch);
+                let path = root.display().to_string();
+                outcomes.push(run_in(program, vec!["init".into(), "--bare".into(), "-q".into(), "-b".into(), "main".into(), path.clone()], scratch.root().to_path_buf())?);
+                for [key, value] in GIT_CREATED_CONFIG {
+                    outcomes.push(run_in(program, vec!["config".into(), key.to_string(), value.to_string()], root.clone())?);
+                }
+                bare = Some(path);
+            }
             Op::Host => {
                 let server = server.ok_or_else(|| RunError::Io(format!("scenario {} hosts a warehouse, and no forklift-server binary was given", scenario.id)))?;
                 let root = host_root(scratch);
@@ -335,7 +359,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
             Op::Run { line, at, keep } => {
                 let directory = scratch.root().join(at);
                 std::fs::create_dir_all(&directory).map_err(|error| RunError::Io(error.to_string()))?;
-                let arguments = filled(line, &kept, host.as_ref().map(|host| host.url.as_str()), scratch.root(), &work)
+                let arguments = filled(line, &kept, host.as_ref().map(|host| host.url.as_str()).or(bare.as_deref()), scratch.root(), &work)
                     .map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?;
                 let outcome = run_in(program, std::iter::once("--json".to_string()).chain(arguments).collect(), directory)?;
                 for keep in keep {
@@ -388,7 +412,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
                 let Some((observer, strace)) = observer.and_then(|observer| Some((observer, observer.strace?))) else { continue };
                 let directory = scratch.root().join(at);
                 let arguments: Vec<String> = std::iter::once("--json".to_string())
-                    .chain(filled(line, &kept, host.as_ref().map(|host| host.url.as_str()), scratch.root(), &work).map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?)
+                    .chain(filled(line, &kept, host.as_ref().map(|host| host.url.as_str()).or(bare.as_deref()), scratch.root(), &work).map_err(|reason| RunError::Io(format!("scenario {}: {}", scenario.id, reason)))?)
                     .collect();
                 let mut stood = false;
                 for when in 1..=INJECT_ATTEMPTS {
@@ -431,12 +455,18 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
         }
         let lines = bind(tool, op).ok_or_else(|| RunError::Io(format!("{:?} has no binding for {:?}", tool, op)))?;
         for arguments in lines {
-            let arguments = fill(arguments, host.as_ref().map(|host| host.url.as_str()), &work)
+            let arguments = fill(arguments, host.as_ref().map(|host| host.url.as_str()).or(bare.as_deref()), &work)
                 .map_err(|placeholder| RunError::Io(format!("scenario {}: {:?} needs {} before a Host", scenario.id, op, placeholder)))?;
             outcomes.push(run_in(program, arguments, directory.clone())?);
         }
         if let Op::Clone { kind } = op {
             scope = match kind { crate::scenario::CloneKind::Only(scope) => Some(scope.as_str()), _ => None };
+            // A clone's repository is new, and git's configuration is per repository.
+            if tool != Tool::Forklift {
+                for [key, value] in GIT_CREATED_CONFIG {
+                    outcomes.push(run_in(program, vec!["config".into(), key.to_string(), value.to_string()], work.clone())?);
+                }
+            }
         }
         if let Some(mark) = op.mark() {
             acknowledged.push(mark);
@@ -472,9 +502,10 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
     };
 
     let walked = census::walk(&scratch.work().join(state_folder(tool))).map_err(|error| RunError::Io(error.to_string()))?;
-    let host_walked = match host {
-        Some(_) => census::walk(&host_root(scratch).join(".forklift")).map_err(|error| RunError::Io(error.to_string()))?,
-        None => Vec::new(),
+    let host_walked = match (host.as_ref(), &bare) {
+        (Some(_), _) => census::walk(&host_root(scratch).join(".forklift")).map_err(|error| RunError::Io(error.to_string()))?,
+        (None, Some(_)) => census::walk(&host_root(scratch)).map_err(|error| RunError::Io(error.to_string()))?,
+        (None, None) => Vec::new(),
     };
     // Observed, the build's host goes with its build, so its traces are read with the rest.
     if observer.is_some() {
@@ -482,7 +513,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
             stopped.extend(finish(last, observer, scratch)?);
         }
     }
-    Ok(Built { outcomes, walked, host_walked, taken, acknowledged, pushed: pushed.marks, parked, host: host.take(), stopped: std::mem::take(stopped) })
+    Ok(Built { outcomes, walked, host_walked, taken, acknowledged, pushed: pushed.marks, parked, host: host.take(), stopped: std::mem::take(stopped), bare })
 }
 
 /// Stops `host`: through `observer` when there is one, so its traces are read, and otherwise by

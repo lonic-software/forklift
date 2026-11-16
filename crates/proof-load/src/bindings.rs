@@ -283,8 +283,7 @@ pub fn check(census: &Census, bindings: &[Binding], exemptions: &[Exemption], sc
         } else if binding.kinds.iter().all(|kind| kind.plants()) {
             continue;
         } else if created.get(&(binding.scenario.to_string(), binding.warehouse)).is_some_and(|names| !names.iter().any(|name| name == binding.name)) {
-            let warehouse = match binding.warehouse { Warehouse::Client => "", Warehouse::Host => " on its host" };
-            missing.push(format!("{}: its scenario {} does not create it{}", binding.name, binding.scenario, warehouse));
+            missing.push(format!("{}: its scenario {} does not create it{}", binding.name, binding.scenario, on_its(binding.warehouse)));
         }
     }
     missing
@@ -292,7 +291,8 @@ pub fn check(census: &Census, bindings: &[Binding], exemptions: &[Exemption], sc
 
 /// Git's damage bindings, over the git layout's rows ([`crate::git_layout::ROWS`]): the same kinds
 /// per role as Forklift's (every kind on a file, removal on a folder, a dead holder planted for a
-/// lock), on the scenarios git can run. A lock is planted at a name its row matches.
+/// lock), on the scenarios git can run. A lock is planted at a name its row matches. The host is
+/// a bare repository, laid out as a repository's `.git` is, so its paths are the same rows.
 pub const GIT_BINDINGS: &[Binding] = &[
     bound("HEAD", FILE),
     bound_in("ORIG_HEAD", "branched", FILE),
@@ -304,6 +304,8 @@ pub const GIT_BINDINGS: &[Binding] = &[
     bound("refs/heads/**/", FOLDER),
     bound("refs/heads/**", FILE),
     bound("refs/tags/**/", FOLDER),
+    bound_in("refs/remotes/**/", "lifted", FOLDER),
+    bound_in("refs/remotes/**", "lifted", FILE),
     bound_in("refs/stash", "parked", FILE),
     bound("objects/", FOLDER),
     bound("objects/info/", FOLDER),
@@ -313,6 +315,11 @@ pub const GIT_BINDINGS: &[Binding] = &[
     bound("index.lock", DEAD_HOLDER),
     bound("HEAD.lock", DEAD_HOLDER),
     bound("refs/heads/main.lock", DEAD_HOLDER),
+    hosted("HEAD", "lifted", FILE),
+    hosted("config", "lifted", FILE),
+    hosted("refs/heads/**", "lifted", FILE),
+    hosted("objects/<xx>/", "lifted", FOLDER),
+    hosted("objects/<xx>/<hash>", "lifted", FILE),
 ];
 
 const GIT_NOT_WRITTEN: &str = "not written: only a gc, a repack or maintenance writes it, and no scenario git runs does either";
@@ -336,10 +343,11 @@ pub const GIT_EXEMPTIONS: &[Exemption] = &[
 
 /// What git's damage bindings miss: every layout row that needs damage and has neither a binding
 /// nor an exemption; an exemption that names no row, or a row a git build created; and a binding
-/// whose scenario git does not build, or whose built walk holds no path of its row. `walks` holds
-/// the walk of each scenario git built, by id; `runnable` every scenario git can run, so one that
-/// failed to build is the walk check's to report, never this one's.
-pub fn check_git(bindings: &[Binding], exemptions: &[Exemption], runnable: &[String], walks: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+/// whose scenario git does not build, or whose built walk of its warehouse holds no path of its
+/// row. `walks` holds each walk of each scenario git built, by id and warehouse (a scenario that
+/// hosts nothing has no host walk); `runnable` every scenario git can run, so one that failed to
+/// build is the walk check's to report, never this one's.
+pub fn check_git(bindings: &[Binding], exemptions: &[Exemption], runnable: &[String], walks: &BTreeMap<(String, Warehouse), Vec<String>>) -> Vec<String> {
     use crate::git_layout::{self, ROWS};
     let mut missing = Vec::new();
     let plants = |binding: &Binding| binding.kinds.iter().all(|kind| kind.plants());
@@ -354,7 +362,7 @@ pub fn check_git(bindings: &[Binding], exemptions: &[Exemption], runnable: &[Str
         match git_layout::named(exemption.name) {
             None => missing.push(format!("stale exemption: {} is no git layout row", exemption.name)),
             Some(_) => missing.extend(walks.iter().filter(|(_, walked)| !git_layout::reached(exemption.name, walked).is_empty())
-                .map(|(scenario, _)| format!("stale exemption: {}: {} creates it", exemption.name, scenario))),
+                .map(|((scenario, warehouse), _)| format!("stale exemption: {}: {} creates it{}", exemption.name, scenario, on_its(*warehouse)))),
         }
     }
     for binding in bindings {
@@ -367,11 +375,22 @@ pub fn check_git(bindings: &[Binding], exemptions: &[Exemption], runnable: &[Str
         }
         if !runnable.iter().any(|scenario| scenario == binding.scenario) {
             missing.push(format!("{}: its scenario {} is not one git runs", binding.name, binding.scenario));
-        } else if !plants(binding) && walks.get(binding.scenario).is_some_and(|walked| git_layout::reached(binding.name, walked).is_empty()) {
-            missing.push(format!("{}: its scenario {} does not create it", binding.name, binding.scenario));
+        } else if !plants(binding) {
+            let built = walks.contains_key(&(binding.scenario.to_string(), Warehouse::Client));
+            let walked = walks.get(&(binding.scenario.to_string(), binding.warehouse));
+            // Built, with no walk of the binding's warehouse: a host binding on a scenario that
+            // hosts nothing.
+            if (built && walked.is_none()) || walked.is_some_and(|walked| git_layout::reached(binding.name, walked).is_empty()) {
+                missing.push(format!("{}: its scenario {} does not create it{}", binding.name, binding.scenario, on_its(binding.warehouse)));
+            }
         }
     }
     missing
+}
+
+/// How a message names the warehouse a path is in: nothing for the client's.
+fn on_its(warehouse: Warehouse) -> &'static str {
+    match warehouse { Warehouse::Client => "", Warehouse::Host => " on its host" }
 }
 
 #[cfg(test)]
@@ -387,22 +406,40 @@ mod tests {
     /// exemption check → the created exempt path passes.
     #[test]
     fn git_bindings_are_checked_against_the_layout_and_the_walks() {
-        let runnable: Vec<String> = ["history", "branched", "parked"].map(String::from).to_vec();
+        let runnable: Vec<String> = ["history", "branched", "parked", "lifted"].map(String::from).to_vec();
         let all: Vec<String> = ["HEAD", "ORIG_HEAD", "config", "index", "logs/", "logs/refs/heads/main", "refs/", "refs/heads/",
-            "refs/heads/main", "refs/tags/", "refs/stash", "objects/", "objects/info/", "objects/pack/", "objects/ab/", "objects/ab/cdef"]
+            "refs/heads/main", "refs/tags/", "refs/stash", "refs/remotes/", "refs/remotes/origin/", "refs/remotes/origin/main",
+            "objects/", "objects/info/", "objects/pack/", "objects/ab/", "objects/ab/cdef"]
             .map(String::from).to_vec();
-        let walks: BTreeMap<String, Vec<String>> = runnable.iter().map(|scenario| (scenario.clone(), all.clone())).collect();
+        let bare: Vec<String> = ["HEAD", "config", "refs/", "refs/heads/", "refs/heads/main", "objects/", "objects/ab/", "objects/ab/cdef"]
+            .map(String::from).to_vec();
+        let mut walks: BTreeMap<(String, Warehouse), Vec<String>> = runnable.iter().map(|scenario| ((scenario.clone(), Warehouse::Client), all.clone())).collect();
+        walks.insert(("lifted".to_string(), Warehouse::Host), bare.clone());
         assert_eq!(check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &walks), Vec::<String>::new());
+
+        // A host binding is checked against the host's walk, and a scenario that hosts nothing
+        // creates nothing on a host.
+        let mut no_host_object = walks.clone();
+        no_host_object.get_mut(&("lifted".to_string(), Warehouse::Host)).unwrap().retain(|path| path != "objects/ab/cdef");
+        assert_eq!(check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &no_host_object),
+            vec!["objects/<xx>/<hash>: its scenario lifted does not create it on its host".to_string()]);
+        let mut unhosted = walks.clone();
+        unhosted.remove(&("lifted".to_string(), Warehouse::Host));
+        assert_eq!(check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &unhosted).len(), 5);
+        let mut host_packed = walks.clone();
+        host_packed.get_mut(&("lifted".to_string(), Warehouse::Host)).unwrap().push("packed-refs".to_string());
+        assert_eq!(check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &host_packed),
+            vec!["stale exemption: packed-refs: lifted creates it on its host".to_string()]);
 
         let without_index: Vec<Binding> = GIT_BINDINGS.iter().filter(|binding| binding.name != "index").cloned().collect();
         assert_eq!(check_git(&without_index, GIT_EXEMPTIONS, &runnable, &walks), vec!["index".to_string()]);
 
         let mut packed = walks.clone();
-        packed.get_mut("history").unwrap().push("packed-refs".to_string());
+        packed.get_mut(&("history".to_string(), Warehouse::Client)).unwrap().push("packed-refs".to_string());
         assert_eq!(check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &packed), vec!["stale exemption: packed-refs: history creates it".to_string()]);
 
         let mut no_config = walks.clone();
-        no_config.get_mut("history").unwrap().retain(|path| path != "config");
+        no_config.get_mut(&("history".to_string(), Warehouse::Client)).unwrap().retain(|path| path != "config");
         let missing = check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &no_config);
         assert!(missing.iter().any(|line| line.starts_with("config: its scenario history does not create it")), "{:?}", missing);
     }
