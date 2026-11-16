@@ -808,7 +808,13 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     Err(error) => fidelity_missing.push(format!("{}: {}", direction.label(), error)),
                 }
             }
-            if fidelity_missing.is_empty() { Cell::Run } else { Cell::not_run("a round trip did not finish") }
+            // A trip that did not finish leaves the other's findings standing: the lane is partial,
+            // and `fidelity_missing` names the trip it lacks.
+            match fidelity_missing.len() {
+                0 => Cell::Run,
+                missed if missed < trips.len() => Cell::Sampled,
+                _ => Cell::not_run("no round trip finished"),
+            }
         }
     };
 
