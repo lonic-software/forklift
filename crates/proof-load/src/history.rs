@@ -65,14 +65,14 @@ pub fn build_git(git: &Path, mirror: &Path, to: &Path, scratch: &Scratch, enviro
     Ok(branch)
 }
 
-/// Exports forklift's pristine history subject at `warehouse` to git at `to`, which must not
-/// exist yet: the export runs in a copy of the warehouse at `copy`, which must not exist yet
-/// either, so the subject forklift's rows run over is the one both directions compare. The
-/// export must make a branch of each of `branches`, the pallet git's subject made its probe at
-/// and every one the sample reads, must make [`PROBE_REF`] current, the pallet forklift's subject
-/// is on, and must leave no file out, redacted or withheld, so git's subject over it holds the
-/// history forklift's does: an export that does not fails as the export's step. Each step it ran
-/// is kept in `steps`, the failing one too.
+/// Exports forklift's pristine history subject at `warehouse` to git at `to`, which must not exist
+/// yet: the export runs in a copy of the warehouse at `copy`, which must not exist yet either, so
+/// the subject forklift's rows run over is the one both directions compare. The export must make a
+/// branch of each of `branches`, the pallet git's subject made its probe at and every one the
+/// sample reads, must make [`PROBE_REF`] current, the pallet forklift's subject is on, and must
+/// leave no file out, redacted or withheld, and no tag out, so git's subject over it holds the
+/// history forklift's does: an export that does not fails as the export's step. Each step it ran is
+/// kept in `steps`, the failing one too.
 #[allow(clippy::too_many_arguments)]
 pub fn export_forklift(forklift: &Path, warehouse: &Path, branches: &BTreeSet<&str>, copy: &Path, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration, steps: &mut Vec<Outcome>) -> Result<(), RunError> {
     crate::scrub::copy_tree(warehouse, copy).map_err(|error| RunError::Io(format!("{:?}", error)))?;
@@ -81,8 +81,8 @@ pub fn export_forklift(forklift: &Path, warehouse: &Path, branches: &BTreeSet<&s
     let current = data["current"].as_str();
     let made: BTreeSet<&str> = data["branches"].as_array().map(|made| made.iter().filter_map(|branch| branch.as_str()).collect()).unwrap_or_default();
     let unmade: Vec<&&str> = branches.iter().filter(|branch| !made.contains(**branch)).collect();
-    let left_out: Vec<&str> = ["redacted", "withheld", "withheld_here"].into_iter()
-        .filter(|field| data[*field].as_array().is_some_and(|files| !files.is_empty())).collect();
+    let left_out: Vec<&str> = ["redacted", "withheld", "withheld_here", "skipped_tags", "unreadable_tags"].into_iter()
+        .filter(|field| match &data[*field] { serde_json::Value::Array(left) => !left.is_empty(), other => !other.is_null() }).collect();
     if current != Some(PROBE_REF) || !unmade.is_empty() || !left_out.is_empty() {
         return Err(RunError::BuildFailed {
             arguments: exported.arguments.clone(), exit: exported.exit, stdout: String::new(),
@@ -233,10 +233,12 @@ pub(crate) mod tests {
     }
 
     /// An export is accepted only where it made the probe pallet current, made a branch of every
-    /// pallet asked for and left no file out; any one missing fails as the export's own step.
+    /// pallet asked for and left no file or tag out; any one missing fails as the export's own
+    /// step.
     ///
     /// Revert: check `current` alone → the export missing `side` is accepted; ignore the files
-    /// left out → the withholding export is accepted.
+    /// or tags left out → the withholding export, or the one that could not read its tags, is
+    /// accepted.
     #[test]
     #[cfg(unix)]
     fn an_export_off_the_probe_or_missing_the_branch_is_refused() {
@@ -249,6 +251,7 @@ pub(crate) mod tests {
             (r#"{"data":{"current":"proof-load-probe","branches":["side","proof-load-probe"]}}"#, false),
             (r#"{"data":{"current":"proof-load-probe","branches":["main","proof-load-probe"]}}"#, false),
             (r#"{"data":{"current":"proof-load-probe","branches":["main","side","proof-load-probe"],"withheld":[{}]}}"#, false),
+            (r#"{"data":{"current":"proof-load-probe","branches":["main","side","proof-load-probe"],"unreadable_tags":"no"}}"#, false),
             (r#"{"data":{"current":"proof-load-probe","branches":["main","side","proof-load-probe"],"redacted":[]}}"#, true),
         ];
         let branches: BTreeSet<&str> = ["main", "side"].into_iter().collect();

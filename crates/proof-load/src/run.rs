@@ -216,6 +216,13 @@ fn row_cut(now: std::time::Instant, rows_started: std::time::Instant, budget: st
     }
 }
 
+/// Whose a git step building git's subject over forklift's export failed is: forklift's where git
+/// refused it, since what git refuses there is forklift's output; the run's own where it ran past
+/// its limit or could not be run at all.
+fn export_charged_to(error: &crate::runner::RunError) -> Option<Tool> {
+    matches!(error, crate::runner::RunError::BuildFailed { .. }).then_some(Tool::Forklift)
+}
+
 /// When a run `started` and given `budget` seconds must start its last history row: never, for
 /// a run given none or a budget past what the clock can count.
 fn run_deadline(started: std::time::Instant, budget: Option<u64>) -> Option<std::time::Instant> {
@@ -371,10 +378,13 @@ fn history_damage(
         // Git's subject over forklift's export, from a copy of forklift's subject. Its failing
         // fails only its direction: the subjects above are built and the sample drawn.
         let root = scratch.root();
-        // Git refusing the export is forklift's, as the export's own refusal is: it is forklift's
-        // output git refuses, and git is no oracle over it.
+        // Git refusing to take the export as a repository is forklift's, as the export's own
+        // refusal is: what git refuses is forklift's output, laid out by steps it takes over the
+        // given history too. A git step running past its limit, or one the harness could not
+        // run, is the run's own. Once built, git refusing to read a sampled position back is a
+        // gap in git's measure, as over the given history git tuned refusing its is.
         let sampled: std::collections::BTreeSet<&str> = std::iter::once(branch.as_str()).chain(positions.iter().map(|position| position.reference.as_str())).collect();
-        let over_export = |error: crate::runner::RunError| (build_charged_to(Tool::Forklift, &error), format!("git, over forklift's export: {}", error));
+        let over_export = |error: crate::runner::RunError| (export_charged_to(&error), format!("git, over forklift's export: {}", error));
         let exported = crate::history::export_forklift(&programs.forklift, &forklift_root, &sampled, &root.join("export-warehouse"), &root.join("export"), &scratch, &environment, HISTORY_LIMIT, &mut steps)
             .map_err(refused(Tool::Forklift))
             .and_then(|()| crate::history::build_git_export(&programs.git, &root.join("export"), &branch, &root.join("export-mirror"), &root.join("git-export"), &scratch, &environment, HISTORY_LIMIT, &mut steps)
@@ -514,7 +524,10 @@ fn history_damage(
             other => history_check(&format!("history damage faults ran under {}", other.label()), subject),
         };
         let owner = (tool == Tool::Forklift).then_some(tool);
-        history_checks.push(Completeness { subject: owner, check, cell, missing: errors.remove(&subject).unwrap_or_default() });
+        // A check with a failure to name ran and found it, whether or not the rows did.
+        let missing = errors.remove(&subject).unwrap_or_default();
+        let cell = if missing.is_empty() { cell } else { Cell::Run };
+        history_checks.push(Completeness { subject: owner, check, cell, missing });
     }
     Ok((rows, history_checks))
 }
@@ -1642,9 +1655,11 @@ mod tests {
     }
 
     /// Forklift running past its limit is forklift's, as its refusal is; git's, and a step the
-    /// harness could not run, are the run's own.
+    /// harness could not run, are the run's own. Git refusing forklift's export is forklift's, its
+    /// running long over it is not.
     ///
-    /// Revert: drop the timeout from forklift's → a hung import is the harness's.
+    /// Revert: drop the timeout from forklift's → a hung import is the harness's; charge every
+    /// error over the export to forklift → git's slow clone is forklift's.
     #[test]
     fn a_history_build_past_its_limit_is_forklifts() {
         use crate::runner::RunError;
@@ -1652,6 +1667,9 @@ mod tests {
         let timed_out = || RunError::Tool(ToolError::TimedOut { program: PathBuf::from("/forklift"), limit: HISTORY_LIMIT });
         let refused = || RunError::BuildFailed { arguments: vec![], exit: Some(1), stderr: String::new(), stdout: String::new() };
         assert_eq!(build_charged_to(Tool::Forklift, &timed_out()), Some(Tool::Forklift));
+        // Git's steps over forklift's export: its refusal is forklift's, its running long is not.
+        assert_eq!(export_charged_to(&refused()), Some(Tool::Forklift));
+        assert_eq!(export_charged_to(&timed_out()), None);
         assert_eq!(build_charged_to(Tool::Forklift, &refused()), Some(Tool::Forklift));
         assert_eq!(build_charged_to(Tool::Forklift, &RunError::Io("scratch".into())), None);
         assert_eq!(build_charged_to(Tool::Git, &timed_out()), None);
