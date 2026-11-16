@@ -395,3 +395,23 @@ fn the_replay_plate_names_the_os_filesystem_and_git_configurations() {
     assert!(all.contains("git-tuned configuration: gc.autoDetach=false maintenance.autoDetach=false; core.fsync=all"), "{all}");
     assert!(all.contains("git configuration: gc.autoDetach=false maintenance.autoDetach=false"), "{all}");
 }
+
+/// A git subject's completeness gap is drawn muted as not fully measured, and forklift's gap in
+/// the data-lost colour: only forklift's gap fails the run.
+///
+/// Revert: drop the git arm of the gap column → git's gap is drawn as a failure.
+#[test]
+fn a_git_gap_is_drawn_as_not_fully_measured() {
+    use proof_load::report::Completeness;
+    use proof_load::scenario::Tool;
+    let mut results = fixture();
+    let gap = |subject: Tool, missing: &str| Completeness { subject: Some(subject), check: "git layout walk".into(), cell: Cell::Run, missing: vec![missing.into()] };
+    results.report.completeness = vec![gap(Tool::GitTuned, "history: info/sparse"), gap(Tool::Forklift, "trust")];
+    let mut coverage = App::showing(results);
+    coverage.screen = Screen::Coverage;
+    let palette = theme::palette_of(egui::Theme::Light);
+    let texts = texts(egui::Theme::Light, &mut coverage);
+    let colour = |wanted: &str| texts.iter().find(|(text, _)| text == wanted).map(|(_, colour)| *colour);
+    assert_eq!(colour("not fully measured: history: info/sparse"), Some(palette.muted), "{texts:?}");
+    assert_eq!(colour("trust"), Some(palette.g_lost), "{texts:?}");
+}

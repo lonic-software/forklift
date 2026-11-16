@@ -123,7 +123,7 @@ fn operating_system() -> String {
         return format!("{} (uname failed)", Platform::current().label());
     }
     let field = |chars: &[libc::c_char]| -> String {
-        let bytes: Vec<u8> = chars.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+        let bytes: Vec<u8> = chars.iter().take_while(|c| **c != 0).map(|c| c.to_ne_bytes()[0]).collect();
         String::from_utf8_lossy(&bytes).into_owned()
     };
     format!("{} {}", field(&name.sysname), field(&name.release))
@@ -144,7 +144,7 @@ fn filesystem_of(path: &std::path::Path) -> String {
     if unsafe { libc::statfs(path.as_ptr(), &mut stat) } != 0 {
         return format!("unknown: {}", std::io::Error::last_os_error());
     }
-    let bytes: Vec<u8> = stat.f_fstypename.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+    let bytes: Vec<u8> = stat.f_fstypename.iter().take_while(|c| **c != 0).map(|c| c.to_ne_bytes()[0]).collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
@@ -498,6 +498,12 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     });
                     // A git subject's grade is a comparison, never a failure of the run.
                     progress.block_finished(Category::DamagedFiles, &label, result.as_ref().map_or(true, |run| subject == Tool::Forklift && run.grade.is_failure()));
+                    // A binding the role map does not know is the harness's gap, never a row with no
+                    // counterpart: that would drop it from every comparison unsaid.
+                    let role = crate::git_layout::role_of(subject, binding.name);
+                    if role.is_none() {
+                        fault_errors.entry(subject).or_default().push(format!("{} {:?}: the role map names no role for it", binding.name, kind));
+                    }
                     match result {
                         Ok(run) => {
                             write_detail(output.root(), &format!("{}.json", label), &run)?;
@@ -510,12 +516,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                                 recoverability: run.recoverability,
                                 note: (!run.unextractable.is_empty()).then(|| format!("unextractable remedies: {}", run.unextractable.join("; "))),
                                 detail: Some(format!("{}.json#", label)),
-                                pairing: Some(Pairing {
-                                    scenario: run.scenario.clone(),
-                                    side: run.warehouse,
-                                    role: crate::git_layout::role_of(subject, binding.name).unwrap_or(crate::git_layout::Role::NoCounterpart),
-                                    kind: run.kind,
-                                }),
+                                pairing: role.map(|role| Pairing { scenario: run.scenario.clone(), side: run.warehouse, role, kind: run.kind }),
                             });
                         }
                         Err(error) => fault_errors.entry(subject).or_default().push(format!("{} {:?}: {}", binding.name, kind, error)),
@@ -525,10 +526,15 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             Cell::Run
         }
     };
-    // One check per subject that ran; forklift's even when it did not.
+    // One check per subject that ran; forklift's even when it did not. A fault that could not run
+    // under a git subject is a fault of the harness, not a gap in git's measure, so its check is
+    // the run's own and fails the run.
     fault_errors.entry(Tool::Forklift).or_default();
-    let fault_checks: Vec<Completeness> = fault_errors.into_iter().map(|(subject, missing)| Completeness {
-        subject: Some(subject), check: "damaged-file faults ran".to_string(), cell: damaged_cell.clone(), missing,
+    let fault_checks: Vec<Completeness> = fault_errors.into_iter().map(|(subject, missing)| match subject {
+        Tool::Forklift => Completeness { subject: Some(subject), check: "damaged-file faults ran".to_string(), cell: damaged_cell.clone(), missing },
+        Tool::Git | Tool::GitTuned => Completeness {
+            subject: None, check: format!("damaged-file faults ran under {}", subject.label()), cell: damaged_cell.clone(), missing,
+        },
     }).collect();
 
     // Disk full on the capped volume and a read-only work folder, each under the faulted command of

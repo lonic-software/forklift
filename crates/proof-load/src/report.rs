@@ -363,8 +363,11 @@ impl Report {
     }
 
     /// The git subjects' completeness checks that found a gap or did not run: where any is, git
-    /// was not fully measured.
+    /// was not fully measured. None in a run given no git, which asked for no comparison.
     pub fn git_gaps(&self) -> Vec<&Completeness> {
+        if !self.determinism.tools.contains_key("git") {
+            return vec![];
+        }
         self.completeness.iter()
             .filter(|check| check.subject.is_some_and(|subject| subject != Tool::Forklift))
             .filter(|check| !check.missing.is_empty() || matches!(check.cell, Cell::NotRun { .. }))
@@ -448,12 +451,12 @@ impl Report {
             let _ = writeln!(out, "|---|---|---|---|{}", "---|".repeat(subjects.len()));
             for line in &plate {
                 let cells: Vec<String> = subjects.iter().map(|subject| match line.standings.get(subject) {
-                    None => "no counterpart".to_string(),
+                    None => "not measured".to_string(),
                     Some(standing) => standing_text(standing),
                 }).collect();
                 let _ = writeln!(out, "| {} | {} | {} | {} | {} |", line.pairing.scenario, kebab(line.pairing.side), kebab(line.pairing.role), kebab(line.pairing.kind), cells.join(" | "));
             }
-            out.push_str("\nA subject's cell is its worst row on the line, by grade and then by rescue kind. A role with no counterpart is never compared.\n");
+            out.push_str("\nA subject's cell is its worst row on the line, by grade and then by rescue kind. A subject with no row on a line is not measured there. A role with no counterpart is never compared.\n");
         }
 
         out.push_str("\n## Git does better\n\n");
@@ -654,7 +657,7 @@ mod tests {
         let forklift = &plate[1].standings[&Tool::Forklift];
         assert_eq!((forklift.grade, forklift.rows, forklift.detail.as_deref()), (Grade::DataLost, 2, Some("forklift-Object-DataLost.json#")));
         let markdown = report.markdown();
-        assert!(markdown.contains("| history | client | object | delete | [data-lost](forklift-Object-DataLost.json#) (worst of 2) | [healed](git-Object-Healed.json#) | no counterpart |"), "{}", markdown);
+        assert!(markdown.contains("| history | client | object | delete | [data-lost](forklift-Object-DataLost.json#) (worst of 2) | [healed](git-Object-Healed.json#) | not measured |"), "{}", markdown);
     }
 
     /// Git does better by the plate's grade order, then by rescue kind, and never by step count;
@@ -692,13 +695,18 @@ mod tests {
     }
 
     /// A git subject's gap, or a git check that did not run, shows as git not fully measured and
-    /// never fails the run; forklift's gap and a gap of the run itself do.
+    /// never fails the run; forklift's gap and a gap of the run itself do. A run given no git
+    /// asked for no comparison, so its git checks that did not run are no gap.
     ///
     /// Revert: count every subject's completeness gap in `failed` → git's gap fails the run.
     #[test]
     fn a_git_gap_is_shown_and_never_fails_the_run() {
         let check = |subject: Option<Tool>, cell: Cell, missing: &[&str]| Completeness { subject, check: "git layout walk".to_string(), cell, missing: missing.iter().map(|m| m.to_string()).collect() };
-        let report = |checks: Vec<Completeness>| Report { completeness: checks, ..sample() };
+        let report = |checks: Vec<Completeness>| {
+            let mut report = Report { completeness: checks, ..sample() };
+            report.determinism.tools.insert("git".to_string(), "/usr/bin/git (git version 2.56.1)".to_string());
+            report
+        };
         let git = report(vec![check(Some(Tool::GitTuned), Cell::Run, &["history: info/sparse"])]);
         assert!(!git.failed());
         assert_eq!(git.git_gaps().len(), 1);
@@ -706,6 +714,8 @@ mod tests {
         let unrun = report(vec![check(Some(Tool::Git), Cell::not_run("--only builds one scenario"), &[])]);
         assert!(!unrun.failed());
         assert_eq!(unrun.git_gaps().len(), 1);
+        let no_git = Report { completeness: vec![check(Some(Tool::Git), Cell::not_run("no git binary given"), &[])], ..sample() };
+        assert!(no_git.git_gaps().is_empty() && !no_git.markdown().contains("not fully measured"));
         let measured = report(vec![check(Some(Tool::Git), Cell::Run, &[]), check(Some(Tool::Forklift), Cell::not_run("no census"), &[])]);
         assert!(measured.git_gaps().is_empty());
         assert!(!measured.markdown().contains("not fully measured"));

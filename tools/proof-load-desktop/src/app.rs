@@ -7,6 +7,7 @@ use std::path::Path;
 
 use eframe::egui::{self, Ui};
 use proof_load::report::{Cell, Platform};
+use proof_load::scenario::Tool;
 use proof_load::run::RunError;
 
 use crate::form::{Field, Form};
@@ -469,6 +470,10 @@ impl App {
                     _ if check.missing.is_empty() => {
                         let nothing = if matches!(check.cell, Cell::Run) { "nothing" } else { "" };
                         widgets::text(ui, nothing, Type::Body, p.muted);
+                    }
+                    // A git subject's gap is a comparison not fully measured, never a failure.
+                    _ if check.subject.is_some_and(|subject| subject != Tool::Forklift) => {
+                        widgets::text(ui, &format!("not fully measured: {}", check.missing.join("; ")), Type::Body, p.muted);
                     }
                     _ => { widgets::text(ui, &check.missing.join("; "), Type::Body, p.g_lost); }
                 }
