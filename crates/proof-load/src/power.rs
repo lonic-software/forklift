@@ -1817,6 +1817,15 @@ pub(crate) fn harness_umask() -> Result<u32, String> {
 
 /// One crash state written into a fresh copy and graded: the lines before the crash stand as the
 /// counting run ran them, a line the crash cut short as killed.
+/// The daemon a graded copy of a crash state watches under, from what starting it gave: for a
+/// tuned git, none when the state let no daemon watch, since that failure is the state's.
+fn daemon_over_state<D>(started: Result<Option<D>, RunError>, tool: Tool) -> Result<Option<D>, RunError> {
+    match started {
+        Err(_) if tool == Tool::GitTuned => Ok(None),
+        other => other,
+    }
+}
+
 fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, settings: &Settings, template: &Scratch, crash: &Crash, at: usize) -> Result<Graded, RunError> {
     let io = |error: std::io::Error| RunError::Io(error.to_string());
     // The state is the whole area, so the copy starts empty rather than as the template.
@@ -1825,7 +1834,9 @@ fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, sett
     let environment = kill::environment_of(settings, &copy)?;
     let context = kill::context_of(scenario, &counted.corpus, programs, settings, &copy, &environment, counted.tool);
     // A tuned copy's daemon watches from before its first step until it is graded, as the run's.
-    let daemon = kill::daemon_of(&context)?;
+    // A state git cannot start its daemon over, a torn HEAD among them, is graded as it stands:
+    // that refusal is git's, and its commands meet the same damage.
+    let daemon = daemon_over_state(kill::daemon_of(&context), counted.tool)?;
     let mut steps: Vec<Outcome> = Vec::new();
     match &crash.moment {
         Moment::During { point: Point { line, .. } } | Moment::Synced { line, .. } | Moment::Ending { line, .. } => {
@@ -1849,7 +1860,12 @@ fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, sett
         first.append(&mut steps);
         Ok(())
     })?;
-    drop(daemon);
+    match daemon {
+        Some(daemon) => drop(daemon),
+        // Without the harness's daemon, a command may have started git's own over the copy.
+        None if counted.tool == Tool::GitTuned => crate::runner::stop_daemon(context.program(), &copy.work(), &environment),
+        None => {}
+    }
     // A copy that graded well holds nothing to look at; one that did not is kept for diagnosis.
     if !graded.grade.is_failure() {
         let _ = remove_tree(copy.root());
@@ -2628,6 +2644,18 @@ mod tests {
         let moment = |line| Moment::Synced { line, command: "stack".into(), call: 3, name: "fsync".into() };
         assert_eq!(moment(1).label(), "line 2 stack before fsync at traced call 4");
         assert_ne!(moment(0).label(), moment(1).label());
+    }
+
+    /// A crash state a tuned git cannot start its daemon over is graded without one, as git meets
+    /// it; any other subject's failure to start one stays the harness's.
+    ///
+    /// Revert: pass every failure on → a torn HEAD fails the run as a harness error.
+    #[test]
+    fn a_state_no_daemon_can_watch_is_graded_as_it_stands() {
+        let failed = || Err::<Option<()>, _>(RunError::Io("the fsmonitor daemon exited 128".into()));
+        assert!(matches!(daemon_over_state(failed(), Tool::GitTuned), Ok(None)));
+        assert!(daemon_over_state(failed(), Tool::Git).is_err());
+        assert!(matches!(daemon_over_state(Ok(Some(())), Tool::GitTuned), Ok(Some(()))));
     }
 
     /// A client's moment names the line it is in or after, which its row pairs by; a server's

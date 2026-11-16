@@ -186,20 +186,26 @@ pub struct FsmonitorDaemon {
     environment: Environment,
 }
 
+/// Asks any fsmonitor daemon watching `work` to stop, giving it at most [`DAEMON_PROBE_LIMIT`]:
+/// one git started on its own as well as the harness's.
+pub(crate) fn stop_daemon(program: &Path, work: &Path, environment: &Environment) {
+    let mut command = std::process::Command::new(program);
+    command.args(["fsmonitor--daemon", "stop"]).current_dir(work)
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    environment.apply(&mut command);
+    if let Ok(mut stop) = command.spawn() {
+        let started = std::time::Instant::now();
+        while stop.try_wait().is_ok_and(|status| status.is_none()) && started.elapsed() < DAEMON_PROBE_LIMIT {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = stop.kill();
+        let _ = stop.wait();
+    }
+}
+
 impl Drop for FsmonitorDaemon {
     fn drop(&mut self) {
-        let mut command = std::process::Command::new(&self.program);
-        command.args(["fsmonitor--daemon", "stop"]).current_dir(&self.work)
-            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-        self.environment.apply(&mut command);
-        if let Ok(mut stop) = command.spawn() {
-            let started = std::time::Instant::now();
-            while stop.try_wait().is_ok_and(|status| status.is_none()) && started.elapsed() < DAEMON_PROBE_LIMIT {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let _ = stop.kill();
-            let _ = stop.wait();
-        }
+        stop_daemon(&self.program, &self.work, &self.environment);
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

@@ -1351,16 +1351,22 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     };
                     // A git grade never fails the run; only what failed the harness's own look at
                     // git does.
+                    // Each started block is finished before a details file that failed refuses the
+                    // run, so none is left running.
+                    let mut written = Ok(());
                     if let Some(kills) = kills {
-                        write_detail(output.root(), &kill::details_file_of(kill::Side::Client, subject, &scenario.id), &kills)?;
-                        progress.block_finished(Category::KillPointsClient, &block, !kills.errors.is_empty() || !kills.refusals.is_empty());
+                        let detail = write_detail(output.root(), &kill::details_file_of(kill::Side::Client, subject, &scenario.id), &kills);
+                        progress.block_finished(Category::KillPointsClient, &block, detail.is_err() || !kills.errors.is_empty() || !kills.refusals.is_empty());
+                        written = written.and(detail);
                         all_kills.push(kills);
                     }
                     if let Some(lost) = lost {
-                        write_detail(output.root(), &crate::power::details_file_of(kill::Side::Client, subject, &scenario.id), &lost)?;
-                        progress.block_finished(Category::PowerLossClient, &block, !lost.errors.is_empty() || !lost.refusals.is_empty());
+                        let detail = write_detail(output.root(), &crate::power::details_file_of(kill::Side::Client, subject, &scenario.id), &lost);
+                        progress.block_finished(Category::PowerLossClient, &block, detail.is_err() || !lost.errors.is_empty() || !lost.refusals.is_empty());
+                        written = written.and(detail);
                         all_power.push(lost);
                     }
+                    written?;
                 }
                 // One poll for both client blocks, so a cancel never leaves one started alone.
                 stop_if_cancelled(progress)?;
@@ -1386,28 +1392,34 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                         continue;
                     }
                 };
+                // Each started block is finished before a details file that failed refuses the run,
+                // so none is left running.
+                let mut written = Ok(());
                 if killing {
-                    let kills = match kill::run(scenario, &programs, &settings, &template, &counting, Tool::Forklift) {
+                    let (kills, detail) = match kill::run(scenario, &programs, &settings, &template, &counting, Tool::Forklift) {
                         Ok(kills) => {
-                            write_detail(output.root(), &kill::details_file(kill::Side::Client, &scenario.id), &kills)?;
-                            kills
+                            let detail = write_detail(output.root(), &kill::details_file(kill::Side::Client, &scenario.id), &kills);
+                            (kills, detail)
                         }
-                        Err(error) => kill::ScenarioKills { scenario: scenario.id.clone(), errors: vec![error.to_string()], ..Default::default() },
+                        Err(error) => (kill::ScenarioKills { scenario: scenario.id.clone(), errors: vec![error.to_string()], ..Default::default() }, Ok(())),
                     };
-                    progress.block_finished(Category::KillPointsClient, &scenario.id, kills_failed(&kills));
+                    progress.block_finished(Category::KillPointsClient, &scenario.id, detail.is_err() || kills_failed(&kills));
+                    written = written.and(detail);
                     all_kills.push(kills);
                 }
                 if powering {
-                    let lost = match crate::power::run(scenario, &programs, &settings, &template, &counting, power_variants, seed, Tool::Forklift) {
+                    let (lost, detail) = match crate::power::run(scenario, &programs, &settings, &template, &counting, power_variants, seed, Tool::Forklift) {
                         Ok(power) => {
-                            write_detail(output.root(), &crate::power::details_file(kill::Side::Client, &scenario.id), &power)?;
-                            power
+                            let detail = write_detail(output.root(), &crate::power::details_file(kill::Side::Client, &scenario.id), &power);
+                            (power, detail)
                         }
-                        Err(error) => crate::power::ScenarioPower { scenario: scenario.id.clone(), errors: vec![error.to_string()], ..Default::default() },
+                        Err(error) => (crate::power::ScenarioPower { scenario: scenario.id.clone(), errors: vec![error.to_string()], ..Default::default() }, Ok(())),
                     };
-                    progress.block_finished(Category::PowerLossClient, &scenario.id, power_failed(&lost));
+                    progress.block_finished(Category::PowerLossClient, &scenario.id, detail.is_err() || power_failed(&lost));
+                    written = written.and(detail);
                     all_power.push(lost);
                 }
+                written?;
             }
             // A lane no scenario was picked for is not run, which fails nothing: it was not asked
             // for, or what it named is not among the scenarios this run picked.
