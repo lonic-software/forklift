@@ -947,8 +947,6 @@ fn discarded_area<T>(
     result
 }
 
-/// The corpus a faulted command runs over, shared by every lane: the small shape with one record
-/// past the history, the one the faulted command writes.
 /// A damage block's label, which names its scratch area and detail file: the subject, the
 /// scenario, the side, the binding's name and the kind. A host's path is named apart from the
 /// client's of the same name.
@@ -958,6 +956,8 @@ fn damage_label(subject: Tool, binding: &crate::damage::Binding, kind: crate::da
     format!("{}{}-{}{}-{:?}", prefix, binding.scenario, side, binding.name, kind).replace(['/', '<', '>', '{', '}', '*'], "_")
 }
 
+/// The corpus a faulted command runs over, shared by every lane: the small shape with one record
+/// past the history, the one the faulted command writes.
 fn faulted_corpus(seed: u64) -> corpus::Corpus {
     corpus::generate(seed, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL })
 }

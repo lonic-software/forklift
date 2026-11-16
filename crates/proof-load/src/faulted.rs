@@ -1236,7 +1236,8 @@ mod tests {
     ///
     /// Revert: read a host-side git readback from the work tree → the host's lost object is not
     /// what is judged; leave git rows without a URL → no re-clone is tried; clone the host
-    /// locally, for the readback or the re-clone → the clone's objects are the host's files;
+    /// locally, for the readback or the re-clone → the clone's objects are the host's files (held
+    /// on unix only, where a file's link count is read);
     /// check the readback clone out → it holds a work tree.
     #[test]
     fn git_hosts_a_bare_repository_and_clones_it_again() {
