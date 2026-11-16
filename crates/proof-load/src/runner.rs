@@ -1005,7 +1005,7 @@ mod tests {
         let head = scratch.work().join(".git").join("HEAD");
         std::fs::write(&head, b"").unwrap();
         assert!(matches!(FsmonitorDaemon::watch_or_exit(&git, &scratch.work(), &scratch, &environment, Duration::from_secs(30)), Err(Unwatched::Exited(_))));
-        let _ = std::fs::remove_dir_all(scratch.root());
+        let _ = crate::power::remove_tree(scratch.root());
     }
 
     /// Only the feature line itself says a git has the fsmonitor daemon.
