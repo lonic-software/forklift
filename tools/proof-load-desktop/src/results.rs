@@ -64,6 +64,12 @@ pub fn to_expected(row: &Row) -> (String, &'static str) {
     }
 }
 
+/// The Rescued by readout: the kind of step in the subject's own remedy set after which every
+/// acknowledged record first read back, or "none".
+pub fn rescued_by(row: &Row) -> &'static str {
+    row.recoverability.rescued_by.map_or("none", |rescue| rescue.label())
+}
+
 /// The Outside knowledge readout: what the row needed beyond the tool's own commands.
 pub fn outside_knowledge(row: &Row) -> String {
     match row.recoverability.outside_knowledge.as_slice() {
@@ -161,5 +167,9 @@ mod tests {
         row.recoverability.outside_knowledge = vec!["free disk space".into(), "remove .git/index.lock".into()];
         assert_eq!(to_expected(&row), ("1".to_string(), "command"));
         assert_eq!(outside_knowledge(&row), "free disk space, remove .git/index.lock");
+        row.recoverability.rescued_by = None;
+        assert_eq!(rescued_by(&row), "none");
+        row.recoverability.rescued_by = Some(proof_load::oracle::Rescue::Reclone);
+        assert_eq!(rescued_by(&row), "re-clone");
     }
 }

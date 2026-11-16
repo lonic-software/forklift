@@ -1,5 +1,5 @@
 {
-  "format": 2,
+  "format": 3,
   "coverage": {
     "cells": {
       "damaged-files": {
@@ -367,7 +367,8 @@
       "recoverability": {
         "commands_to_expected": null,
         "named_right_remedy": false,
-        "outside_knowledge": []
+        "outside_knowledge": [],
+        "rescued_by": null
       },
       "note": null,
       "detail": "signed-trust-FlipByte.json#"
@@ -381,7 +382,8 @@
       "recoverability": {
         "commands_to_expected": null,
         "named_right_remedy": false,
-        "outside_knowledge": []
+        "outside_knowledge": [],
+        "rescued_by": null
       },
       "note": null,
       "detail": "signed-trust-Truncate.json#"
@@ -395,7 +397,8 @@
       "recoverability": {
         "commands_to_expected": null,
         "named_right_remedy": false,
-        "outside_knowledge": []
+        "outside_knowledge": [],
+        "rescued_by": null
       },
       "note": null,
       "detail": "signed-trust-Zero.json#"
@@ -409,7 +412,8 @@
       "recoverability": {
         "commands_to_expected": 2,
         "named_right_remedy": false,
-        "outside_knowledge": []
+        "outside_knowledge": [],
+        "rescued_by": null
       },
       "note": null,
       "detail": "signed-trust-Delete.json#"
@@ -423,7 +427,8 @@
       "recoverability": {
         "commands_to_expected": null,
         "named_right_remedy": false,
-        "outside_knowledge": []
+        "outside_knowledge": [],
+        "rescued_by": null
       },
       "note": null,
       "detail": "signed-meta_-Delete.json#"
@@ -437,7 +442,8 @@
       "recoverability": {
         "commands_to_expected": null,
         "named_right_remedy": false,
-        "outside_knowledge": []
+        "outside_knowledge": [],
+        "rescued_by": null
       },
       "note": null,
       "detail": "signed-meta__name_-FlipByte.json#"
@@ -451,7 +457,8 @@
       "recoverability": {
         "commands_to_expected": null,
         "named_right_remedy": false,
-        "outside_knowledge": []
+        "outside_knowledge": [],
+        "rescued_by": null
       },
       "note": null,
       "detail": "signed-meta__name_-Truncate.json#"
@@ -465,7 +472,8 @@
       "recoverability": {
         "commands_to_expected": null,
         "named_right_remedy": false,
-        "outside_knowledge": []
+        "outside_knowledge": [],
+        "rescued_by": null
       },
       "note": null,
       "detail": "signed-meta__name_-Zero.json#"
@@ -479,7 +487,8 @@
       "recoverability": {
         "commands_to_expected": null,
         "named_right_remedy": false,
-        "outside_knowledge": []
+        "outside_knowledge": [],
+        "rescued_by": null
       },
       "note": null,
       "detail": "signed-meta__name_-Delete.json#"
@@ -493,7 +502,8 @@
       "recoverability": {
         "commands_to_expected": null,
         "named_right_remedy": false,
-        "outside_knowledge": []
+        "outside_knowledge": [],
+        "rescued_by": null
       },
       "note": null,
       "detail": "signed-objects__xx___hash_.sig-FlipByte.json#"
@@ -507,7 +517,8 @@
       "recoverability": {
         "commands_to_expected": null,
         "named_right_remedy": false,
-        "outside_knowledge": []
+        "outside_knowledge": [],
+        "rescued_by": null
       },
       "note": null,
       "detail": "signed-objects__xx___hash_.sig-Truncate.json#"
@@ -521,7 +532,8 @@
       "recoverability": {
         "commands_to_expected": 2,
         "named_right_remedy": false,
-        "outside_knowledge": []
+        "outside_knowledge": [],
+        "rescued_by": null
       },
       "note": null,
       "detail": "signed-objects__xx___hash_.sig-Zero.json#"
@@ -535,7 +547,8 @@
       "recoverability": {
         "commands_to_expected": null,
         "named_right_remedy": false,
-        "outside_knowledge": []
+        "outside_knowledge": [],
+        "rescued_by": null
       },
       "note": null,
       "detail": "signed-objects__xx___hash_.sig-Delete.json#"

@@ -440,6 +440,7 @@ function renderResults() {
   document.getElementById("detail").innerHTML = `
     <div class="readout"><span class="engraved">Commands to expected</span><span class="v">${r.cmds == null ? "never" : r.cmds} <small>${r.cmds == null ? "" : r.cmds === 1 ? "command" : "commands"}</small></span></div>
     <div class="readout"><span class="engraved">Named the remedy that worked</span><span class="v">${r.right ? "yes" : "no"}</span></div>
+    <div class="readout"><span class="engraved">Rescued by</span><span class="v">${r.res ?? "none"}</span></div>
     <div class="readout"><span class="engraved">Outside knowledge</span><span style="font-size:13px">${r.out.length ? r.out.join(", ") : "none: the tool's own commands were enough"}</span></div>`;
   document.querySelectorAll("#results tbody tr").forEach(tr => {
     const pick = () => { sel = +tr.dataset.i; renderResults(); };

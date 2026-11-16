@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::oracle::{Grade, Recoverability};
+use crate::oracle::{Grade, Recoverability, Rescue};
 use crate::scenario::Tool;
 use crate::tool::Outcome;
 
@@ -269,7 +269,7 @@ impl Completeness {
 
 /// The report's format. A reader refuses any other, so a report written by another build of the
 /// harness is never read as if it meant the same thing.
-pub const REPORT_FORMAT: u32 = 2;
+pub const REPORT_FORMAT: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -328,13 +328,14 @@ impl Report {
                 out.push_str("None.\n");
                 continue;
             }
-            out.push_str("| Subject | Scenario | Fault | Binding | Grade | Commands to expected | Right remedy | Outside knowledge |\n|---|---|---|---|---|---|---|---|\n");
+            out.push_str("| Subject | Scenario | Fault | Binding | Grade | Commands to expected | Right remedy | Rescued by | Outside knowledge |\n|---|---|---|---|---|---|---|---|---|\n");
             for row in rows {
                 let grade = serde_json::to_value(row.grade).ok().and_then(|value| value.as_str().map(str::to_string)).unwrap_or_default();
                 let commands = row.recoverability.commands_to_expected.map_or("never".to_string(), |n| n.to_string());
                 let outside = if row.recoverability.outside_knowledge.is_empty() { "none".to_string() } else { row.recoverability.outside_knowledge.join("; ") };
-                let _ = writeln!(out, "| {} | {} | {} | {} | {} | {} | {} | {} |", row.subject.label(), row.scenario, row.category.label(), row.binding, grade, commands,
-                    if row.recoverability.named_right_remedy { "yes" } else { "no" }, outside);
+                let rescued = row.recoverability.rescued_by.map_or("none", Rescue::label);
+                let _ = writeln!(out, "| {} | {} | {} | {} | {} | {} | {} | {} | {} |", row.subject.label(), row.scenario, row.category.label(), row.binding, grade, commands,
+                    if row.recoverability.named_right_remedy { "yes" } else { "no" }, rescued, outside);
             }
             if rows.iter().any(|row| row.grade == Grade::DataLost) {
                 out.push_str("\nData lost is decided by readback: lost as far as the tool can tell the user. The bytes may still sit undecoded in the store.\n");
@@ -439,7 +440,7 @@ mod tests {
             completeness: vec![Completeness { subject: Some(Tool::Forklift), check: "damage".to_string(), cell: Cell::Run, missing: vec![] }],
             rows: vec![Row { subject: Tool::Forklift,
                 scenario: "trust".to_string(), category: Category::DamagedFiles, binding: "forklift".to_string(), grade: Grade::RefusedWorkingRemedy,
-                recoverability: Recoverability { commands_to_expected: Some(2), named_right_remedy: true, outside_knowledge: vec![] },
+                recoverability: Recoverability { commands_to_expected: Some(2), named_right_remedy: true, outside_knowledge: vec![], rescued_by: None },
                 note: None, detail: Some("trust-head.json#".to_string()),
             }],
             forklift_only: vec![],
