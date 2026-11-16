@@ -65,6 +65,44 @@ pub fn build_git(git: &Path, mirror: &Path, to: &Path, scratch: &Scratch, enviro
     Ok(branch)
 }
 
+/// Exports forklift's pristine history subject at `warehouse` to git at `to`, which must not
+/// exist yet: the export runs in a copy of the warehouse at `copy`, which must not exist yet
+/// either, so the subject forklift's rows run over is the one both directions compare. The
+/// export must make a branch of `branch`, the pallet git's subject made its probe at, and must
+/// make [`PROBE_REF`] current, the pallet forklift's subject is on: an export that does not fails
+/// as the export's step. Each step it ran is kept in `steps`, the failing one too.
+#[allow(clippy::too_many_arguments)]
+pub fn export_forklift(forklift: &Path, warehouse: &Path, branch: &str, copy: &Path, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration, steps: &mut Vec<Outcome>) -> Result<(), RunError> {
+    crate::scrub::copy_tree(warehouse, copy).map_err(|error| RunError::Io(format!("{:?}", error)))?;
+    let exported = step(steps, forklift, &["--json", "git", "export", "--", &to.display().to_string()], copy, scratch, environment, limit)?;
+    let data = &crate::runner::document(&exported.stdout)["data"];
+    let current = data["current"].as_str();
+    let made = data["branches"].as_array().is_some_and(|branches| branches.iter().any(|made| made.as_str() == Some(branch)));
+    if current != Some(PROBE_REF) || !made {
+        return Err(RunError::BuildFailed {
+            arguments: exported.arguments.clone(), exit: exported.exit, stdout: String::new(),
+            stderr: format!("forklift's export made {:?} current, not {:?}, and {} a branch {:?}", current, PROBE_REF, if made { "made" } else { "made no" }, branch),
+        });
+    }
+    Ok(())
+}
+
+/// Builds git's pristine history subject over forklift's export at `export` ([`export_forklift`])
+/// at `to`, which must not exist yet, as [`build_git`] builds one over the given history: the
+/// export mirrored into `mirror`, which must not exist yet, as the given history was, so both git
+/// subjects hold their refs in `packed-refs` and their objects in a pack; then, in the mirror,
+/// `HEAD` put on `branch` and the probe pallet's branch the export carries deleted, so
+/// [`build_git`] makes the probe ref at `branch` as it does over the given history. Each step it
+/// ran is kept in `steps`, the failing one too.
+#[allow(clippy::too_many_arguments)]
+pub fn build_git_export(git: &Path, export: &Path, branch: &str, mirror: &Path, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration, steps: &mut Vec<Outcome>) -> Result<(), RunError> {
+    let (export, mirror_text) = (export.display().to_string(), mirror.display().to_string());
+    step(steps, git, &["clone", "-q", "--mirror", "--no-local", "--", &export, &mirror_text], scratch.root(), scratch, environment, limit)?;
+    step(steps, git, &["symbolic-ref", "HEAD", &format!("refs/heads/{}", branch)], mirror, scratch, environment, limit)?;
+    step(steps, git, &["update-ref", "-d", &format!("refs/heads/{}", PROBE_REF)], mirror, scratch, environment, limit)?;
+    build_git(git, mirror, to, scratch, environment, limit, steps).map(|_| ())
+}
+
 /// Builds forklift's pristine history subject at `to`, which must not exist yet: a fresh
 /// warehouse that imports the mirror at `mirror`, its work tree restored (an import leaves it
 /// empty), and [`PROBE_REF`] made as a pallet at the current head and shifted to. The import must

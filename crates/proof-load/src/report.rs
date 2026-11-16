@@ -246,6 +246,29 @@ pub struct Pairing {
     /// The role of the damaged path, from the role map: what the path is for in either subject.
     pub role: Role,
     pub kind: Kind,
+    /// The directions of a real history whose lines the row stands on, each a line of its own:
+    /// both for forklift's row, whose subject is the one import either direction compares; for a
+    /// git row, the one its subject was built in. Empty for a row off a real history.
+    pub directions: Vec<HistoryDirection>,
+}
+
+/// The history a git subject over a real history was built from, as the data plate pairs it:
+/// the given history itself, or forklift's git export of its import of it. Forklift's subject is
+/// that import in both, so its row stands on the lines of both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HistoryDirection {
+    FromGit,
+    FromForklift,
+}
+
+impl HistoryDirection {
+    pub fn label(self) -> &'static str {
+        match self {
+            HistoryDirection::FromGit => "from git",
+            HistoryDirection::FromForklift => "from Forklift",
+        }
+    }
 }
 
 /// One subject's standing on a line of the data plate: its worst row there, by grade and then by
@@ -271,11 +294,22 @@ impl Standing {
 /// One line of the data plate: a pairing and the standing of each subject with rows under it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlateLine {
+    /// The rows' pairing, its `directions` left empty: the line's own is `direction`.
     pub pairing: Pairing,
+    /// The direction of a real history the line is, or none for a line off one.
+    pub direction: Option<HistoryDirection>,
     pub standings: BTreeMap<Tool, Standing>,
 }
 
 impl PlateLine {
+    /// The line's scenario as the plate names it: with its direction, on a real history.
+    pub fn scenario(&self) -> String {
+        match self.direction {
+            Some(direction) => format!("{}, {}", self.pairing.scenario, direction.label()),
+            None => self.pairing.scenario.clone(),
+        }
+    }
+
     /// The git subjects that do better than forklift on this line: a better grade, or the same
     /// grade and a better rescue kind. A line with no counterpart is never a win, nor is one
     /// forklift has no row on.
@@ -343,7 +377,7 @@ impl Completeness {
 
 /// The report's format. A reader refuses any other, so a report written by another build of the
 /// harness is never read as if it meant the same thing.
-pub const REPORT_FORMAT: u32 = 6;
+pub const REPORT_FORMAT: u32 = 7;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -383,25 +417,32 @@ impl Report {
             .collect()
     }
 
-    /// The data plate: every paired row, one line per pairing, in the pairings' order.
+    /// The data plate: every paired row, one line per pairing and direction it stands on, in the
+    /// pairings' order and each pairing's directions beside each other.
     pub fn plate(&self) -> Vec<PlateLine> {
-        let mut lines: BTreeMap<Pairing, BTreeMap<Tool, Standing>> = BTreeMap::new();
+        let mut lines: BTreeMap<(Pairing, Option<HistoryDirection>), BTreeMap<Tool, Standing>> = BTreeMap::new();
         for row in &self.rows {
             let Some(pairing) = &row.pairing else { continue };
-            let standing = Standing { grade: row.grade, rescued_by: row.recoverability.rescued_by, detail: row.detail.clone(), rows: 1 };
-            let standings = lines.entry(pairing.clone()).or_default();
-            match standings.get_mut(&row.subject) {
-                None => { standings.insert(row.subject, standing); }
-                Some(held) => {
-                    let rows = held.rows + 1;
-                    if standing.rank() > held.rank() {
-                        *held = standing;
+            let directions: Vec<Option<HistoryDirection>> = match pairing.directions.as_slice() {
+                [] => vec![None],
+                directions => directions.iter().copied().map(Some).collect(),
+            };
+            for direction in directions {
+                let standing = Standing { grade: row.grade, rescued_by: row.recoverability.rescued_by, detail: row.detail.clone(), rows: 1 };
+                let standings = lines.entry((Pairing { directions: vec![], ..pairing.clone() }, direction)).or_default();
+                match standings.get_mut(&row.subject) {
+                    None => { standings.insert(row.subject, standing); }
+                    Some(held) => {
+                        let rows = held.rows + 1;
+                        if standing.rank() > held.rank() {
+                            *held = standing;
+                        }
+                        held.rows = rows;
                     }
-                    held.rows = rows;
                 }
             }
         }
-        lines.into_iter().map(|(pairing, standings)| PlateLine { pairing, standings }).collect()
+        lines.into_iter().map(|((pairing, direction), standings)| PlateLine { pairing, direction, standings }).collect()
     }
 
     /// Reads a `report.json`. Refuses a format other than `REPORT_FORMAT` by number before
@@ -467,7 +508,7 @@ impl Report {
                     None => "not measured".to_string(),
                     Some(standing) => standing_text(standing),
                 }).collect();
-                let _ = writeln!(out, "| {} | {} | {} | {} | {} |", line.pairing.scenario, kebab(line.pairing.side), kebab(line.pairing.role), kebab(line.pairing.kind), cells.join(" | "));
+                let _ = writeln!(out, "| {} | {} | {} | {} | {} |", line.scenario(), kebab(line.pairing.side), kebab(line.pairing.role), kebab(line.pairing.kind), cells.join(" | "));
             }
             out.push_str("\nA subject's cell is its worst row on the line, by grade and then by rescue kind. A subject with no row on a line is not measured there, unless the role has no counterpart in it: such a line is never compared.\n");
         }
@@ -478,7 +519,7 @@ impl Report {
             out.push_str("None.\n");
         } else {
             for (line, subject) in wins {
-                let _ = writeln!(out, "- {} {} {} {}: {} {}, forklift {}", line.pairing.scenario, kebab(line.pairing.side), kebab(line.pairing.role), kebab(line.pairing.kind),
+                let _ = writeln!(out, "- {} {} {} {}: {} {}, forklift {}", line.scenario(), kebab(line.pairing.side), kebab(line.pairing.role), kebab(line.pairing.kind),
                     subject.label(), standing_text(&line.standings[&subject]), standing_text(&line.standings[&Tool::Forklift]));
             }
             out.push_str("\nEach entry is a better grade, or the same grade and a better rescue kind. Each gets a ticket.\n");
@@ -667,7 +708,7 @@ mod tests {
         Row { subject, grade, binding: subject.label().to_string(),
             recoverability: Recoverability { commands_to_expected: commands, named_right_remedy: false, outside_knowledge: vec![], rescued_by },
             detail: Some(format!("{}-{:?}-{:?}.json#", subject.label(), role, grade)),
-            pairing: Some(Pairing { scenario: "history".to_string(), side, role, kind }),
+            pairing: Some(Pairing { scenario: "history".to_string(), side, role, kind, directions: vec![] }),
             ..sample().rows.remove(0) }
     }
 
@@ -708,6 +749,39 @@ mod tests {
         let markdown = report.markdown();
         assert!(markdown.contains("| history | client | object | delete | [data-lost](forklift-Object-DataLost.json#) (worst of 2) | [healed](git-Object-Healed.json#) | not measured |"), "{}", markdown);
         assert!(markdown.contains("| history | host | no-counterpart | delete | [healed](forklift-NoCounterpart-Healed.json#) | no counterpart | no counterpart |"), "{}", markdown);
+    }
+
+    /// Over a real history, forklift's one row stands on the line of each direction it names,
+    /// while git's rows of the two directions stand on their own lines, never folded into one
+    /// standing; each line names its direction, and "git does better" is told per line.
+    ///
+    /// Revert: key lines by the pairing alone → the two git rows fold into one line at the worse.
+    #[test]
+    fn forklifts_history_row_stands_on_both_direction_lines() {
+        use HistoryDirection::*;
+        let on = |row: Row, directions: Vec<HistoryDirection>| {
+            let pairing = row.pairing.clone().map(|pairing| Pairing { directions, ..pairing });
+            Row { pairing, ..row }
+        };
+        let (client, role, kind) = (Warehouse::Client, Role::Object, Kind::Delete);
+        let report = with_rows(vec![
+            on(damage_row(Tool::Forklift, client, role, kind, Grade::DataLost, None, None), vec![FromGit, FromForklift]),
+            on(damage_row(Tool::Git, client, role, kind, Grade::Healed, None, Some(1)), vec![FromGit]),
+            on(Row { detail: Some("export.json#".to_string()), ..damage_row(Tool::Git, client, role, kind, Grade::Silent, None, None) }, vec![FromForklift]),
+        ]);
+        let plate = report.plate();
+        let lines: Vec<(Option<HistoryDirection>, Vec<(Tool, Grade)>)> = plate.iter()
+            .map(|line| (line.direction, line.standings.iter().map(|(tool, standing)| (*tool, standing.grade)).collect())).collect();
+        assert_eq!(lines, [
+            (Some(FromGit), vec![(Tool::Forklift, Grade::DataLost), (Tool::Git, Grade::Healed)]),
+            (Some(FromForklift), vec![(Tool::Forklift, Grade::DataLost), (Tool::Git, Grade::Silent)]),
+        ]);
+        assert!(plate.iter().all(|line| line.pairing.directions.is_empty() && line.standings.values().all(|standing| standing.rows == 1)));
+        let markdown = report.markdown();
+        assert!(markdown.contains("| history, from git | client | object | delete | [data-lost](forklift-Object-DataLost.json#) | [healed](git-Object-Healed.json#) |"), "{}", markdown);
+        assert!(markdown.contains("| history, from Forklift | client | object | delete | [data-lost](forklift-Object-DataLost.json#) | [silent](export.json#) |"), "{}", markdown);
+        assert!(markdown.contains("- history, from git client object delete:"), "{}", markdown);
+        assert!(!markdown.contains("- history, from Forklift client object delete:"), "{}", markdown);
     }
 
     /// Git does better by the plate's grade order, then by rescue kind, and never by step count;
