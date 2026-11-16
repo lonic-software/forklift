@@ -117,6 +117,8 @@ pub struct Faulted {
     /// subject's own remedy set.
     pub steps: Vec<Outcome>,
     pub readbacks: Vec<HistoryReadback>,
+    /// The harness's reads that decided the own remedy set ([`Graded::probes`]).
+    pub probes: Vec<Outcome>,
     /// Remedies named in a form the harness does not run.
     pub unextractable: Vec<String>,
 }
@@ -688,6 +690,8 @@ struct Trail {
     readbacks: Vec<HistoryReadback>,
     evidence: Evidence,
     recoverability: Recoverability,
+    /// The harness's own reads that decided the own remedy set ([`Graded::probes`]).
+    probes: Vec<Outcome>,
     /// The fresh clone the own remedy set read from in place of the work tree, once it made one.
     /// It owes only what the history pushed: a record kept local that it lacks is lost, not
     /// silent, while a pushed one it leaves out with exit 0 is still silent.
@@ -790,6 +794,9 @@ pub struct Graded {
     /// subject's own remedy set.
     pub steps: Vec<Outcome>,
     pub readbacks: Vec<HistoryReadback>,
+    /// The harness's own reads that decided the subject's own remedy set, in order: for git, each
+    /// ref's `rev-parse` and each candidate's `rev-list`. No step: the subject was not run for them.
+    pub probes: Vec<Outcome>,
     /// Remedies named in a form the harness does not run.
     pub unextractable: Vec<String>,
 }
@@ -968,7 +975,7 @@ pub(crate) fn grade_after(
 
     Ok(Graded {
         grade: oracle::grade(&trail.evidence), evidence: trail.evidence, recoverability: trail.recoverability,
-        steps: trail.steps, readbacks: trail.readbacks, unextractable,
+        steps: trail.steps, readbacks: trail.readbacks, probes: trail.probes, unextractable,
     })
 }
 
@@ -995,13 +1002,19 @@ fn own_remedies(context: &Context, expected: &Expected, trail: &mut Trail, made:
             trail.rescue(context, expected, made, promoted, Some(run(&["fsck", "--full", "--no-progress"], work.clone())?), None)?;
             let mut restored = false;
             for (reference, hash) in reflog_tips(&work.join(runner::state_folder(context.tool))) {
-                if run(&["rev-parse", "--verify", "-q", &reference], work.clone())?.succeeded() {
+                let resolved = run(&["rev-parse", "--verify", "-q", &reference], work.clone())?;
+                let resolves = resolved.succeeded();
+                trail.probes.push(resolved);
+                if resolves {
                     continue;
                 }
                 // A candidate whose history is not all present would restore a ref the readback
                 // then refuses: only one whose every object is there is restored. `fsck` cannot ask
                 // this of one commit while a broken ref stands, since it checks every ref first.
-                if !run(&["rev-list", "--objects", "--quiet", &hash], work.clone())?.succeeded() {
+                let listed = run(&["rev-list", "--objects", "--quiet", &hash], work.clone())?;
+                let present = listed.succeeded();
+                trail.probes.push(listed);
+                if !present {
                     continue;
                 }
                 trail.recoverability.outside_knowledge.push(format!("read the newest entry of .git/logs/{}", reference));
@@ -1084,7 +1097,7 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, to
     Ok(Faulted {
         scenario: scenario.id.clone(), name: name.to_string(), warehouse, kind, target,
         grade: graded.grade, evidence: graded.evidence, recoverability: graded.recoverability,
-        steps: graded.steps, readbacks: graded.readbacks, unextractable: graded.unextractable,
+        steps: graded.steps, readbacks: graded.readbacks, probes: graded.probes, unextractable: graded.unextractable,
     })
 }
 
@@ -1198,9 +1211,16 @@ mod tests {
     /// no steps the subject was run for.
     ///
     /// Revert: restore every ref whose value differs from its reflog's tip → `main` is rewound to
-    /// its first commit; push the probes as steps → `rev-parse` and `rev-list` are counted.
+    /// its first commit; push the probes as steps → `rev-parse` and `rev-list` are counted; run git
+    /// tuned's own remedies bare → its steps lack its configuration.
     #[test]
     fn a_resolving_ref_is_never_moved_and_probes_are_no_steps() {
+        for tool in [Tool::Git, Tool::GitTuned] {
+            resolving_ref_as(tool);
+        }
+    }
+
+    fn resolving_ref_as(tool: Tool) {
         let git = path_git();
         let scenario = crate::scenario::catalog().into_iter().find(|scenario| scenario.id == "parked").unwrap();
         let corpus = corpus::generate(7, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL });
@@ -1209,9 +1229,9 @@ mod tests {
         let scratch = Scratch::create(&std::env::temp_dir().join(format!("proof-load-git-rewind-{}-{}", std::process::id(), nanos))).unwrap();
         let search = crate::scrub::search_path(Some(&git), std::env::var_os("PATH"));
         let environment = Environment::scrubbed(&scratch, search, &BTreeMap::new()).unwrap();
-        let built = runner::build(&scenario, &corpus, Tool::Git, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
+        let built = runner::build(&scenario, &corpus, tool, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
         let context = Context {
-            tool: Tool::Git, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
+            tool, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
             limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false,
         };
         let head = |reference: &str| String::from_utf8_lossy(&context.run(&git, vec!["rev-parse".into(), reference.into()], scratch.work()).unwrap().stdout).trim().to_string();
@@ -1227,9 +1247,17 @@ mod tests {
         let mut made = Made::default();
         own_remedies(&context, &expected, &mut trail, &mut made, Made::default()).unwrap();
         assert_eq!(head("refs/heads/main"), main, "the intact branch stays where it was");
-        let ran: Vec<&str> = trail.steps.iter().map(|step| step.arguments[0].as_str()).collect();
-        assert_eq!(ran, ["fsck", "update-ref"]);
-        assert_eq!(trail.steps[1].arguments[1], "refs/stash");
+        // Git tuned runs each of its own remedies with its configuration first.
+        let prefix = if tool == Tool::GitTuned { crate::scenario::GIT_TUNED.len() } else { 0 };
+        for step in &trail.steps {
+            assert_eq!(&step.arguments[..prefix], crate::scenario::GIT_TUNED[..prefix].iter().map(|a| a.to_string()).collect::<Vec<_>>(), "{:?}", tool);
+        }
+        let ran: Vec<&str> = trail.steps.iter().map(|step| step.arguments[prefix].as_str()).collect();
+        assert_eq!(ran, ["fsck", "update-ref"], "{:?}", tool);
+        assert_eq!(trail.steps[1].arguments[prefix + 1], "refs/stash");
+        // The probes are kept, apart from the steps: each ref's rev-parse, the stash's rev-list.
+        let probed: Vec<&str> = trail.probes.iter().map(|probe| probe.arguments[prefix].as_str()).collect();
+        assert!(probed.contains(&"rev-parse") && probed.contains(&"rev-list"), "{:?}: {:?}", tool, probed);
         assert_eq!(trail.recoverability.rescued_by, Some(Rescue::LocalRepair));
     }
 

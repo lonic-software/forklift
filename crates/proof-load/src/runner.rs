@@ -32,7 +32,11 @@ pub struct Built {
     pub taken: Vec<Taken>,
     /// Marks acknowledged: each record or variant whose binding exited 0 throughout.
     pub acknowledged: Vec<Mark>,
-    /// The marks acknowledged when the history last pushed, which its remote therefore owes.
+    /// Marks the history's remote surely holds: every mark acknowledged at its last push, claimed
+    /// only while every op so far kept one pallet current and left the remote's content alone. Any
+    /// other op (a branch, a switch, a merge, a deleted remote pallet, a moved origin, a withheld
+    /// or redacted record…) drops the claim for the rest of the history, so this is never more
+    /// than was pushed, though it may be less.
     pub pushed: Vec<Mark>,
     /// The parcels `park list` names after a Forklift history that parks, which every readback
     /// must find listed again.
@@ -102,6 +106,31 @@ impl std::fmt::Display for RunError {
 impl std::error::Error for RunError {}
 
 /// The state folder a tool keeps beside its work tree.
+/// What a history's remote surely holds, op by op ([`Built::pushed`]).
+#[derive(Debug, Default)]
+struct Pushed {
+    marks: Vec<Mark>,
+    /// Some op so far switched pallets or changed the remote's content: nothing is claimed again.
+    diverged: bool,
+}
+
+impl Pushed {
+    /// Takes in `op`, run with `acknowledged` the marks acknowledged through it.
+    fn after(&mut self, op: &Op, acknowledged: &[Mark]) {
+        match op {
+            Op::Push if !self.diverged => self.marks = acknowledged.to_vec(),
+            Op::Record { .. } | Op::Variant { .. } | Op::Push | Op::Fetch | Op::Clone { .. } | Op::Park { .. }
+                | Op::Enroll | Op::Pack | Op::Verify | Op::Repair => {}
+            // The first host, before anything was pushed to one, is the remote itself.
+            Op::Host if self.marks.is_empty() && !self.diverged => {}
+            _ => {
+                self.diverged = true;
+                self.marks.clear();
+            }
+        }
+    }
+}
+
 pub(crate) fn state_folder(tool: Tool) -> &'static str {
     match tool {
         Tool::Forklift => ".forklift",
@@ -190,7 +219,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
         }
     }
     let mut acknowledged = Vec::new();
-    let mut pushed = Vec::new();
+    let mut pushed = Pushed::default();
     let mut taken = Vec::new();
     let mut ledger = RedactionLedger::default();
     // The folder a sparse clone scoped the work tree to, which bounds what a later write may hold.
@@ -408,9 +437,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
         if let Some(mark) = op.mark() {
             acknowledged.push(mark);
         }
-        if matches!(op, Op::Push) {
-            pushed = acknowledged.clone();
-        }
+        pushed.after(op, &acknowledged);
     }
 
     let parks = scenario.history.iter().any(|op| matches!(op, Op::Park { .. }));
@@ -451,7 +478,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
             stopped.extend(finish(last, observer, scratch)?);
         }
     }
-    Ok(Built { outcomes, walked, host_walked, taken, acknowledged, pushed, parked, host: host.take(), stopped: std::mem::take(stopped) })
+    Ok(Built { outcomes, walked, host_walked, taken, acknowledged, pushed: pushed.marks, parked, host: host.take(), stopped: std::mem::take(stopped) })
 }
 
 /// Stops `host`: through `observer` when there is one, so its traces are read, and otherwise by
@@ -604,6 +631,31 @@ pub fn created_names(census: &Census, walked: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A remote is claimed to hold what a push sent only while the history kept one pallet
+    /// current and left the remote's content alone; any other op drops the claim for good.
+    ///
+    /// Revert: set the marks at every push → a push from a side pallet claims main's records;
+    /// keep them past a deleted remote pallet → its records are still owed.
+    #[test]
+    fn a_remote_is_owed_only_what_a_linear_history_pushed() {
+        let replay = |history: &[Op]| {
+            let (mut pushed, mut acknowledged) = (Pushed::default(), Vec::new());
+            for op in history {
+                acknowledged.extend(op.mark());
+                pushed.after(op, &acknowledged);
+            }
+            pushed.marks
+        };
+        let record = |index| Op::Record { index };
+        assert_eq!(replay(&[Op::Host, record(0), record(1), Op::Push, record(2)]), [Mark::Record(0), Mark::Record(1)]);
+        assert_eq!(replay(&[Op::Host, record(0), Op::Push, Op::Clone { kind: crate::scenario::CloneKind::Full }, record(1), Op::Push]),
+            [Mark::Record(0), Mark::Record(1)]);
+        assert!(replay(&[record(0)]).is_empty());
+        assert!(replay(&[Op::Host, record(0), Op::Push, Op::Branch { name: "side".into() }, Op::Switch { name: "side".into() }, record(1), Op::Push]).is_empty());
+        assert!(replay(&[Op::Host, record(0), Op::Push, Op::DeleteRemote { name: "main".into() }]).is_empty());
+        assert!(replay(&[Op::Host, record(0), Op::Push, Op::Host, record(1), Op::Push]).is_empty());
+    }
     use std::collections::BTreeMap;
 
     fn strings(arguments: &[&str]) -> Vec<String> {
