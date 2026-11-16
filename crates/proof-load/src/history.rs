@@ -227,6 +227,36 @@ pub(crate) mod tests {
         entries.iter().map(|(path, contents)| (path.to_string(), crate::oracle::digest(contents.as_bytes()))).collect()
     }
 
+    /// An export is accepted only where it made the probe pallet current and made a branch of
+    /// the one git's subject was built from; either missing fails as the export's own step.
+    ///
+    /// Revert: check `current` alone → the export missing `main` is accepted.
+    #[test]
+    #[cfg(unix)]
+    fn an_export_off_the_probe_or_missing_the_branch_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (scratch, environment) = scratch("export-checked");
+        let warehouse = scratch.root().join("warehouse");
+        std::fs::create_dir(&warehouse).unwrap();
+        let cases = [
+            (r#"{"data":{"current":"main","branches":["main","proof-load-probe"]}}"#, false),
+            (r#"{"data":{"current":"proof-load-probe","branches":["proof-load-probe"]}}"#, false),
+            (r#"{"data":{"current":"proof-load-probe","branches":["main","proof-load-probe"]}}"#, true),
+        ];
+        for (index, (printed, accepted)) in cases.into_iter().enumerate() {
+            let forklift = scratch.root().join(format!("forklift-{}", index));
+            std::fs::write(&forklift, format!("#!/bin/sh\necho '{}'\n", printed)).unwrap();
+            std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let (copy, to) = (scratch.root().join(format!("copy-{}", index)), scratch.root().join(format!("to-{}", index)));
+            let result = export_forklift(&forklift, &warehouse, "main", &copy, &to, &scratch, &environment, LIMIT, &mut Vec::new());
+            match result {
+                Ok(()) => assert!(accepted, "{}", printed),
+                Err(RunError::BuildFailed { stderr, .. }) => assert!(!accepted && stderr.starts_with("forklift's export made"), "{}: {}", printed, stderr),
+                Err(other) => panic!("{}: {:?}", printed, other),
+            }
+        }
+    }
+
     /// A small repository mirrored in `scratch`: `main` of three commits, each adding a file,
     /// then a merge of `side`, one commit off `main`'s first, so a first-parent walk of `main`
     /// differs from a walk of every parent; the merge tagged, as a real history's releases are.
