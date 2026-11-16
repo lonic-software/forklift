@@ -320,7 +320,8 @@ pub(crate) mod tests {
         let (row, environment) = scratch("git-baseline-refused-row");
         let programs = programs(PathBuf::from("forklift-not-used"));
         let refused = baseline(Tool::Git, &pristine, &tip, &programs, &row, &environment, LIMIT).unwrap();
-        assert!(refused.as_ref().is_err_and(|refusal| refusal.contains("the unfaulted readback")), "{:?}", refused);
+        // The refusal names the read that refused, so a run's report says which command did.
+        assert!(refused.as_ref().is_err_and(|refusal| refusal.contains("the unfaulted readback") && refusal.contains(" exited Some(")), "{:?}", refused);
         let (row, environment) = scratch("git-baseline-absent-row");
         assert!(baseline(Tool::Git, &shared.root().join("absent"), &tip, &programs, &row, &environment, LIMIT).is_err());
     }

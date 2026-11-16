@@ -154,12 +154,10 @@ pub struct Position {
     pub depth: usize,
 }
 
-/// A history readback before judging: the readback's own command, what each mark read back as
-/// and whether the subject reached it (a forklift walk that exits 0 short of the depth reads as
-/// served empty, which is not reaching it), and the commands that read them.
-/// What a readback over a real history served: its own command; per mark, what it read back
-/// as, whether its walk reached it, and the indexes into the reads of those that read it; and
-/// the reads.
+/// A history readback before judging: the readback's own command; per mark, what it read back
+/// as, whether the subject reached it (a forklift walk that exits 0 short of the depth reads as
+/// served empty, which is not reaching it), and the indexes of the reads that read that mark;
+/// and the commands that read them.
 type Served = (Outcome, Vec<(Mark, Readback, bool, Vec<usize>)>, Vec<Outcome>);
 
 /// The parts of a faulted run that stay fixed across its steps.
