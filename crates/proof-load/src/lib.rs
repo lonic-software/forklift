@@ -20,6 +20,7 @@ pub mod damage;
 pub mod faulted;
 pub mod fidelity;
 pub mod git_layout;
+pub mod history;
 pub mod host;
 pub mod kill;
 pub mod network;

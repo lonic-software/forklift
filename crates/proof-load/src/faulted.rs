@@ -7,6 +7,7 @@
 //! own history whole; git only lays out the bytes forklift handed it, so a wrong byte in the
 //! readback is one the tool served.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -68,6 +69,12 @@ pub struct HistoryReadback {
     /// The parked work read back, when the history left work parked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parked: Option<ParkedReadback>,
+    /// Over a real history, the commands that resolved and laid out each sampled record, in order;
+    /// a refusal here refuses the record it ran for. Forklift's bay for a record opens at the
+    /// current head before moving to the record, so damage only that head holds refuses every
+    /// forklift record, where git still serves the records that do not hold it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<Outcome>,
 }
 
 /// What `park list` said of the work the history left parked.
@@ -121,7 +128,32 @@ pub struct Faulted {
     pub probes: Vec<Outcome>,
     /// Remedies named in a form the harness does not run.
     pub unextractable: Vec<String>,
+    /// Over a real history, the whole-store check that found damage the sample did not reach,
+    /// once every sampled record read back as expected: "damage not reached by the sample".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unreached: Option<Outcome>,
 }
+
+/// The ref each history subject records the probe on: a git branch, a forklift pallet, made at the
+/// history's current tip and current before the pristine subject is copied.
+pub const PROBE_REF: &str = "proof-load-probe";
+/// The file the probe record writes at the work tree's root.
+pub const PROBE_FILE: &str = "proof-load-probe";
+/// What the probe file holds.
+pub const PROBE_BYTES: &[u8] = b"proof-load probe\n";
+
+/// A record of a real history named by position: a ref, as a git branch name that is also the
+/// forklift pallet's, and a first-parent depth from its tip (0 is the tip).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub struct Position {
+    pub reference: String,
+    pub depth: usize,
+}
+
+/// A history readback before judging: the readback's own command, what each mark read back as
+/// and whether the subject reached it (a forklift walk that exits 0 short of the depth reads as
+/// served empty, which is not reaching it), and the commands that read them.
+type Served = (Outcome, Vec<(Mark, Readback, bool)>, Vec<Outcome>);
 
 /// The parts of a faulted run that stay fixed across its steps.
 pub(crate) struct Context<'a> {
@@ -141,6 +173,10 @@ pub(crate) struct Context<'a> {
     /// Read the history back through a fresh clone of the host rather than from the work tree:
     /// the damage is the host's.
     pub(crate) via_host: bool,
+    /// Over a real history: the sampled positions every readback reads, by [`Mark::Position`]
+    /// index. The faulted command then writes the probe file alone and records it on [`PROBE_REF`],
+    /// which reads back as the faulted record, [`Mark::Record`] 0.
+    pub(crate) history: Option<&'a [Position]>,
 }
 
 impl Context<'_> {
@@ -207,6 +243,11 @@ impl Context<'_> {
 
     /// Writes corpus record `index` into the work tree, as the faulted command does first.
     pub(crate) fn write_snapshot(&self, index: usize) -> Result<(), RunError> {
+        // Over a real history the probe file is written beside the history's own files, which stay.
+        if self.history.is_some() {
+            let probe = self.scratch.work().join(PROBE_FILE);
+            return std::fs::write(&probe, PROBE_BYTES).map_err(|error| RunError::Io(format!("{}: {}", probe.display(), error)));
+        }
         let snapshot = &self.corpus.records[index];
         let snapshot = match self.scope { Some(scope) => corpus::within(snapshot, scope), None => snapshot.clone() };
         corpus::write(&snapshot, &self.corpus.modes, &self.scratch.work(), self.scratch.work_moved()).map_err(|error| RunError::Io(error.to_string()))
@@ -236,6 +277,9 @@ impl Context<'_> {
     /// clone the own remedy set made in its place. `expectation` gives what each may hold; a record
     /// in `required` that an export exiting 0 leaves out was served as missing, which is silent.
     fn read_back(&self, bay: &Path, marks: &[Mark], required: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
+        if let Some(positions) = self.history {
+            return self.read_back_history(bay, positions, marks, expectation);
+        }
         if self.tool != Tool::Forklift {
             return self.read_back_git(bay, marks, required, expectation);
         }
@@ -249,7 +293,7 @@ impl Context<'_> {
             let clone = self.fresh("clone");
             let cloned = self.run(&self.programs.forklift, vec!["--json".into(), "clone".into(), url.to_string(), clone.display().to_string()], self.scratch.root().to_path_buf())?;
             if !cloned.succeeded() {
-                return Ok(HistoryReadback { export: cloned, records: Vec::new(), parked: None });
+                return Ok(HistoryReadback { export: cloned, records: Vec::new(), parked: None, reads: Vec::new() });
             }
             clone
         } else {
@@ -258,7 +302,7 @@ impl Context<'_> {
         let exported = self.fresh("readback");
         let export = self.run(&self.programs.forklift, vec!["--json".into(), "git".into(), "export".into(), exported.display().to_string()], bay.clone())?;
         if !export.succeeded() {
-            return Ok(HistoryReadback { export, records: Vec::new(), parked: None });
+            return Ok(HistoryReadback { export, records: Vec::new(), parked: None, reads: Vec::new() });
         }
         // The listing names the records the export left files out of, so it is read only when the
         // export left something out. When it refuses, the records go unnamed, and each file the
@@ -314,7 +358,7 @@ impl Context<'_> {
             }
             records.push(RecordReadback { mark, verdicts });
         }
-        Ok(HistoryReadback { export, records, parked: None })
+        Ok(HistoryReadback { export, records, parked: None, reads: Vec::new() })
     }
 
     /// Git's readback, the git half of forklift's: the log of the work tree's repository, then each
@@ -340,24 +384,15 @@ impl Context<'_> {
             let arguments = self.subject(vec!["clone".into(), "-q".into(), "--no-local".into(), "--no-checkout".into(), url.to_string(), clone.display().to_string()]);
             let cloned = self.run(self.program(), arguments, self.scratch.root().to_path_buf())?;
             if !cloned.succeeded() {
-                return Ok(HistoryReadback { export: cloned, records: Vec::new(), parked: None });
+                return Ok(HistoryReadback { export: cloned, records: Vec::new(), parked: None, reads: Vec::new() });
             }
             clone.as_path()
         } else {
             bay
         };
-        let git_with = |index: &Path, arguments: &[&str]| {
-            let mut environment = self.environment.clone();
-            environment.variables.insert("GIT_INDEX_FILE".to_string(), index.display().to_string());
-            let invocation = Invocation {
-                program: self.programs.git.clone(), arguments: arguments.iter().map(|argument| argument.to_string()).collect(),
-                directory: bay.to_path_buf(), limit: self.limit,
-            };
-            tool::run(&invocation, self.scratch, &environment).map_err(RunError::Tool)
-        };
-        let log = git_with(&self.fresh("index"), &["log", "--all", "--format=%H%x09%s"])?;
+        let log = self.git_with(bay, &self.fresh("index"), &["log", "--all", "--format=%H%x09%s"])?;
         if !log.succeeded() {
-            return Ok(HistoryReadback { export: log, records: Vec::new(), parked: None });
+            return Ok(HistoryReadback { export: log, records: Vec::new(), parked: None, reads: Vec::new() });
         }
         let subjects: Vec<(String, String)> = String::from_utf8_lossy(&log.stdout).lines()
             .filter_map(|line| line.split_once('\t')).map(|(hash, subject)| (hash.to_string(), subject.to_string()))
@@ -370,19 +405,7 @@ impl Context<'_> {
             let mut hashes: Vec<&String> = subjects.iter().filter(|(_, subject)| *subject == message).map(|(hash, _)| hash).collect();
             hashes.dedup();
             for hash in hashes {
-                let laid_out = self.fresh("record");
-                std::fs::create_dir(&laid_out).map_err(|error| RunError::Io(format!("{}: {}", laid_out.display(), error)))?;
-                // Each record reads its tree into an index of its own and lays out all of it, so an
-                // empty tree is served empty and no record's entries carry into the next.
-                let index = self.fresh("index");
-                let work_tree = format!("--work-tree={}", laid_out.display());
-                let read = git_with(&index, &["read-tree", hash])?;
-                let checkout = if read.succeeded() { git_with(&index, &[&work_tree, "checkout-index", "-a", "-f"])? } else { read };
-                let readback = if checkout.succeeded() {
-                    Readback::Served { tree: oracle::read_tree_when(&laid_out, self.corpus.modes.judged()).map_err(|error| RunError::Io(error.to_string()))?, documented: Default::default() }
-                } else {
-                    Readback::Refused { code: None }
-                };
+                let (readback, _) = self.lay_out_git(bay, hash)?;
                 verdicts.push(oracle::judge(&readback, &expectation(mark)));
             }
             if verdicts.is_empty() && required.contains(&mark) {
@@ -390,7 +413,156 @@ impl Context<'_> {
             }
             records.push(RecordReadback { mark, verdicts });
         }
-        Ok(HistoryReadback { export: log, records, parked: None })
+        Ok(HistoryReadback { export: log, records, parked: None, reads: Vec::new() })
+    }
+
+    /// Git run by the harness in the repository at `bay`, with `index` as its index file
+    /// (`GIT_INDEX_FILE`), so the repository's own index is neither read nor written.
+    fn git_with(&self, bay: &Path, index: &Path, arguments: &[&str]) -> Result<Outcome, RunError> {
+        let mut environment = self.environment.clone();
+        environment.variables.insert("GIT_INDEX_FILE".to_string(), index.display().to_string());
+        let invocation = Invocation {
+            program: self.programs.git.clone(), arguments: arguments.iter().map(|argument| argument.to_string()).collect(),
+            directory: bay.to_path_buf(), limit: self.limit,
+        };
+        tool::run(&invocation, self.scratch, &environment).map_err(RunError::Tool)
+    }
+
+    /// The tree of commit `hash` in the repository at `bay`, read into an index of its own and laid
+    /// out whole into a fresh folder, so an empty tree is served empty and no record's entries
+    /// carry into the next; a read or layout git refuses is a refusal. With the commands it ran.
+    fn lay_out_git(&self, bay: &Path, hash: &str) -> Result<(Readback, Vec<Outcome>), RunError> {
+        let laid_out = self.fresh("record");
+        std::fs::create_dir(&laid_out).map_err(|error| RunError::Io(format!("{}: {}", laid_out.display(), error)))?;
+        let index = self.fresh("index");
+        let work_tree = format!("--work-tree={}", laid_out.display());
+        let read = self.git_with(bay, &index, &["read-tree", hash])?;
+        if !read.succeeded() {
+            return Ok((Readback::Refused { code: None }, vec![read]));
+        }
+        let checkout = self.git_with(bay, &index, &[&work_tree, "checkout-index", "-a", "-f"])?;
+        let readback = if checkout.succeeded() {
+            Readback::Served { tree: oracle::read_tree_when(&laid_out, self.corpus.modes.judged()).map_err(|error| RunError::Io(error.to_string()))?, documented: Default::default() }
+        } else {
+            Readback::Refused { code: None }
+        };
+        Ok((readback, vec![read, checkout]))
+    }
+
+    /// The readback over a real history: the probe record on [`PROBE_REF`]'s tip and each
+    /// [`Mark::Position`] that many first parents along its ref, each resolved inside `bay` itself,
+    /// so damage to refs and parent links shows, then laid out into a fresh folder and judged.
+    /// The readback's own command lists the refs (git's `for-each-ref`, forklift's `pallet list`);
+    /// a refusal there refuses every record. Git then resolves each record with `rev-parse` and
+    /// lays it out through a scratch index ([`Context::lay_out_git`]). Forklift reads natively, in
+    /// a copy of `bay` taken for this readback, so nothing is written into the warehouse being
+    /// graded: the pallet's `history` walked by first parents from its listed head, then a fresh
+    /// bay per record with a pallet made at that parcel, read minus `.forklift`. One shared bay is
+    /// not used: an old position's ignore file wedges it for every later one. The bay opens at the
+    /// current head first: see [`HistoryReadback::reads`]. What forklift prints names the copy, so
+    /// the copy's path is written back as `bay`'s, and a remedy named by path acts on the
+    /// warehouse being graded. A resolve or layout the subject refuses refuses that record; a walk
+    /// that exits 0 and ends before the depth served the record as missing, which is silent.
+    fn read_back_history(&self, bay: &Path, positions: &[Position], marks: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
+        let (export, served, reads) = self.serve_history(bay, positions, marks)?;
+        let records = served.into_iter().map(|(mark, readback, reached)| RecordReadback { mark, verdicts: vec![judged_history(&readback, reached, &expectation(mark))] }).collect();
+        Ok(HistoryReadback { export, records, parked: None, reads })
+    }
+
+    /// What [`Context::read_back_history`] judges: the readback's own command, what each mark
+    /// read back as (nothing when that command refused), and the commands that read them.
+    fn serve_history(&self, bay: &Path, positions: &[Position], marks: &[Mark]) -> Result<Served, RunError> {
+        let forklift = |arguments: &[&str], directory: PathBuf| {
+            self.run(&self.programs.forklift, std::iter::once("--json").chain(arguments.iter().copied()).map(str::to_string).collect(), directory)
+        };
+        let graded = bay;
+        let copy;
+        let (export, bay) = match self.tool {
+            Tool::Forklift => {
+                copy = self.fresh("readback");
+                crate::scrub::copy_tree(bay, &copy).map_err(|error| RunError::Io(format!("{:?}", error)))?;
+                (forklift(&["pallet", "list"], copy.clone())?, copy.as_path())
+            }
+            Tool::Git | Tool::GitTuned => (self.git_with(bay, &self.fresh("index"), &["for-each-ref", "--format=%(refname) %(objectname)"])?, bay),
+        };
+        let rebase = |outcome: Outcome| if self.tool == Tool::Forklift { rebased(outcome, bay, graded) } else { outcome };
+        let export = rebase(export);
+        if !export.succeeded() {
+            return Ok((export, Vec::new(), Vec::new()));
+        }
+        let mut deepest: BTreeMap<&str, usize> = BTreeMap::new();
+        for &mark in marks {
+            if let Some(position) = match mark { Mark::Position(index) => positions.get(index), _ => None } {
+                let depth = deepest.entry(position.reference.as_str()).or_default();
+                *depth = (*depth).max(position.depth);
+            }
+        }
+        let heads = if self.tool == Tool::Forklift { pallet_heads(&export.stdout) } else { BTreeMap::new() };
+        let mut chains: BTreeMap<&str, Option<Vec<String>>> = BTreeMap::new();
+        let mut reads = Vec::new();
+        let mut records = Vec::new();
+        for &mark in marks {
+            let (reference, depth) = match mark {
+                Mark::Position(index) => positions.get(index).map(|position| (position.reference.as_str(), position.depth))
+                    .ok_or_else(|| RunError::Io(format!("position {} is past the sample's {}", index, positions.len())))?,
+                Mark::Record(0) => (PROBE_REF, 0),
+                other => return Err(RunError::Io(format!("{:?} is no record of a real history", other))),
+            };
+            let mut reached = true;
+            let readback = match self.tool {
+                Tool::Git | Tool::GitTuned => {
+                    let revision = format!("refs/heads/{}~{}^{{commit}}", reference, depth);
+                    let resolved = self.git_with(bay, &self.fresh("index"), &["rev-parse", "--verify", "-q", &revision])?;
+                    let hash = resolved.succeeded().then(|| String::from_utf8_lossy(&resolved.stdout).trim().to_string());
+                    reads.push(resolved);
+                    match hash {
+                        Some(hash) => {
+                            let (readback, said) = self.lay_out_git(bay, &hash)?;
+                            reads.extend(said);
+                            readback
+                        }
+                        None => Readback::Refused { code: None },
+                    }
+                }
+                Tool::Forklift => {
+                    if !chains.contains_key(reference) {
+                        let listing = forklift(&["history", reference], bay.to_path_buf())?;
+                        let wanted = deepest.get(reference).copied().unwrap_or_default() + 1;
+                        let chain = listing.succeeded().then(|| first_parents(heads.get(reference).map(String::as_str), &listing.stdout, wanted));
+                        reads.push(listing);
+                        chains.insert(reference, chain);
+                    }
+                    match chains.get(reference).cloned().flatten() {
+                        None => Readback::Refused { code: None },
+                        // A walk that exits 0 without reaching the depth leaves the record out.
+                        Some(chain) if chain.len() <= depth => {
+                            reached = false;
+                            Readback::Served { tree: Default::default(), documented: Default::default() }
+                        }
+                        Some(chain) => {
+                            let side = self.fresh("position");
+                            let name = side.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                            let added = forklift(&["bay", "add", &name, &side.display().to_string()], bay.to_path_buf())?;
+                            let opened = added.succeeded();
+                            reads.push(added);
+                            // The bay checks out a pallet of its own name at the current head, so the
+                            // position's pallet is named apart from it.
+                            let at = format!("{}-at", name);
+                            let created = if opened { Some(forklift(&["pallet", "create", &at, &chain[depth]], side.clone())?) } else { None };
+                            let laid_out = created.as_ref().is_some_and(Outcome::succeeded);
+                            reads.extend(created);
+                            if laid_out {
+                                Readback::Served { tree: oracle::read_tree_when(&side, self.corpus.modes.judged()).map_err(|error| RunError::Io(error.to_string()))?, documented: Default::default() }
+                            } else {
+                                Readback::Refused { code: None }
+                            }
+                        }
+                    }
+                }
+            };
+            records.push((mark, readback, reached));
+        }
+        Ok((export, records, reads.into_iter().map(rebase).collect()))
     }
 
     /// What the subject's listing of parked work says of the `parked` entries, read in `bay`:
@@ -421,7 +593,7 @@ impl Context<'_> {
         let work = bay.to_path_buf();
         let listing = self.run(&self.programs.forklift, vec!["--json".into(), "history".into()], work.clone())?;
         if !listing.succeeded() {
-            return Ok(HistoryReadback { export: listing, records: Vec::new(), parked: None });
+            return Ok(HistoryReadback { export: listing, records: Vec::new(), parked: None, reads: Vec::new() });
         }
         let parcels = runner::described_parcels(&listing.stdout);
 
@@ -431,7 +603,7 @@ impl Context<'_> {
             "--json".into(), "bay".into(), "add".into(), name.clone(), side.display().to_string(), "--scope".into(), scope.to_string(),
         ], work)?;
         if !opened.succeeded() {
-            return Ok(HistoryReadback { export: opened, records: Vec::new(), parked: None });
+            return Ok(HistoryReadback { export: opened, records: Vec::new(), parked: None, reads: Vec::new() });
         }
 
         let mut records = Vec::new();
@@ -458,7 +630,7 @@ impl Context<'_> {
             }
             records.push(RecordReadback { mark, verdicts });
         }
-        Ok(HistoryReadback { export: opened, records, parked: None })
+        Ok(HistoryReadback { export: opened, records, parked: None, reads: Vec::new() })
     }
 }
 
@@ -548,7 +720,7 @@ fn admissible(taken: &Taken, reader: oracle::WithholdReader) -> Vec<Admissible> 
 /// The corpus record the faulted command writes: the next one after every record the history
 /// made. A variant does not count, since it is off the corpus's line.
 fn next_record(acknowledged: &[Mark]) -> usize {
-    acknowledged.iter().filter_map(|mark| match mark { Mark::Record(index) => Some(index + 1), Mark::Variant(_) => None }).max().unwrap_or(0)
+    acknowledged.iter().filter_map(|mark| match mark { Mark::Record(index) => Some(index + 1), Mark::Variant(_) | Mark::Position(_) => None }).max().unwrap_or(0)
 }
 
 /// How many leading lines of a faulted command that runs its record and then `then` acknowledge
@@ -663,6 +835,8 @@ pub(crate) struct Expected {
     parked: Vec<String>,
     /// The records the history pushed, which a fresh clone of its remote must serve.
     pushed: Vec<Mark>,
+    /// Over a real history, what each sampled position holds, by [`Mark::Position`] index.
+    positions: Vec<oracle::Tree>,
 }
 
 impl Expected {
@@ -688,6 +862,7 @@ impl Expected {
 
     fn untransformed(&self, corpus: &Corpus, mark: Mark, acknowledged: bool) -> Expectation {
         match mark {
+            Mark::Position(index) => Expectation::acknowledged(self.positions.get(index).cloned().unwrap_or_default()),
             mark if mark != self.faulted => Expectation::acknowledged(mark.snapshot(corpus).map(|snapshot| corpus::expected(&snapshot, &corpus.modes)).unwrap_or_default()),
             _ if acknowledged => Expectation::acknowledged(self.after.clone()),
             _ => Expectation::faulted(self.before.clone(), self.after.clone()),
@@ -790,6 +965,71 @@ fn answered(last: Option<&Outcome>) -> bool {
     }))
 }
 
+/// Each pallet's head in a `--json pallet list`, by name.
+fn pallet_heads(stdout: &[u8]) -> BTreeMap<String, String> {
+    let document = runner::document(stdout);
+    document["data"]["pallets"].as_array().into_iter().flatten()
+        .filter_map(|pallet| Some((pallet["name"].as_str()?.to_string(), pallet["head"].as_str()?.to_string())))
+        .collect()
+}
+
+/// The verdict on one record of a real history: a record the subject did not reach (a walk that
+/// exited 0 short of it) is silently lost whatever it was expected to hold, even an empty tree;
+/// any other is judged as read.
+fn judged_history(readback: &Readback, reached: bool, expectation: &Expectation) -> Verdict {
+    if reached { oracle::judge(readback, expectation) } else { Verdict::Silent }
+}
+
+/// What `outcome` printed with every mention of `from` written as `to`, both as given and as the
+/// platform resolves it (a temporary folder may be reached through a link): its stdout and
+/// stderr, and the failure parsed from them, which is what remedies are read from. The failure's
+/// text is already decoded, so a path it names matches however the JSON escaped it.
+fn rebased(mut outcome: Outcome, from: &Path, to: &Path) -> Outcome {
+    let mut pairs = vec![(from.display().to_string(), to.display().to_string())];
+    if let (Ok(from), Ok(to)) = (std::fs::canonicalize(from), std::fs::canonicalize(to)) {
+        pairs.push((from.display().to_string(), to.display().to_string()));
+    }
+    for text in [&mut outcome.stdout, &mut outcome.stderr] {
+        let mut written = String::from_utf8_lossy(text).into_owned();
+        for (from, to) in &pairs {
+            written = written.replace(from.as_str(), to);
+        }
+        *text = written.into_bytes();
+    }
+    if let Some(failure) = outcome.failure.as_mut() {
+        for text in std::iter::once(&mut failure.message).chain(failure.next_step.as_mut()) {
+            for (from, to) in &pairs {
+                *text = text.replace(from.as_str(), to);
+            }
+        }
+    }
+    outcome
+}
+
+/// The first `wanted` parcels of the first-parent chain from `head` through the parcels a
+/// `--json history` lists, `head` first: fewer when it ends at a parcel with no parents, at one the
+/// listing leaves out, or at one already walked. Without a head, from the listing's first entry.
+fn first_parents(head: Option<&str>, stdout: &[u8], wanted: usize) -> Vec<String> {
+    let document = runner::document(stdout);
+    let entries = document["data"]["entries"].as_array().cloned().unwrap_or_default();
+    let parents: BTreeMap<String, Option<String>> = entries.iter()
+        .filter_map(|entry| Some((entry["parcel"].as_str()?.to_string(), entry["parents"][0].as_str().map(str::to_string))))
+        .collect();
+    let mut chain = Vec::new();
+    let mut walked = std::collections::BTreeSet::new();
+    let mut at = head.map(str::to_string).or_else(|| entries.first().and_then(|entry| entry["parcel"].as_str()).map(str::to_string));
+    while let Some(parcel) = at {
+        let Some(parent) = parents.get(&parcel) else { break };
+        // A cycle in what a damaged store lists ends the walk rather than looping.
+        if chain.len() == wanted || !walked.insert(parcel.clone()) {
+            break;
+        }
+        at = parent.clone();
+        chain.push(parcel);
+    }
+    chain
+}
+
 /// What the faulted command of a built scenario must leave readable: the record it writes, and
 /// what every record may then hold. Fails when the corpus has no record after the history's.
 pub(crate) fn expected(scenario: &Scenario, corpus: &Corpus, built: &runner::Built, warehouse: Warehouse) -> Result<(Expected, usize), RunError> {
@@ -799,7 +1039,7 @@ pub(crate) fn expected(scenario: &Scenario, corpus: &Corpus, built: &runner::Bui
     let before = before_of(&built.acknowledged, corpus);
     let taken = built.taken.iter().map(|taken| (taken.digest.clone(), admissible(taken, scenario.withhold_reader(warehouse)))).collect();
     Ok((Expected { before, after: corpus::expected(snapshot, &corpus.modes), acknowledged: built.acknowledged.clone(), faulted: Mark::Record(faulted), taken,
-        parked: built.parked.clone(), pushed: built.pushed.clone() }, faulted))
+        parked: built.parked.clone(), pushed: built.pushed.clone(), positions: Vec::new() }, faulted))
 }
 
 /// What the steps after a fault established, and the grade they earn.
@@ -952,7 +1192,7 @@ pub(crate) fn grade_after(
     // remedy twice.
     if !reads {
         let named = |(trail, unextractable): &mut (Trail, Vec<String>)| {
-            let texts: Vec<String> = trail.steps.iter().chain(trail.readbacks.iter().map(|readback| &readback.export))
+            let texts: Vec<String> = trail.steps.iter().chain(trail.readbacks.iter().flat_map(|readback| std::iter::once(&readback.export).chain(&readback.reads)))
                 .flat_map(|outcome| remedy::texts(context.tool, outcome)).collect();
             let extracted = remedy::extract(context.tool, &texts.iter().map(String::as_str).collect::<Vec<_>>());
             for text in extracted.unextractable {
@@ -1133,20 +1373,220 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, to
     let (expected, faulted) = expected(scenario, corpus, &built, warehouse)?;
     let context = Context {
         tool, corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.url(),
-        scope: scenario.scope(), via_host: warehouse == Warehouse::Host,
+        scope: scenario.scope(), via_host: warehouse == Warehouse::Host, history: None,
     };
     let graded = grade_after(&context, &expected, faulted, |context, steps| context.record(faulted, steps).map(drop))?;
     Ok(Faulted {
         scenario: scenario.id.clone(), name: name.to_string(), warehouse, kind, target,
         grade: graded.grade, evidence: graded.evidence, recoverability: graded.recoverability,
-        steps: graded.steps, readbacks: graded.readbacks, probes: graded.probes, unextractable: graded.unextractable,
+        steps: graded.steps, readbacks: graded.readbacks, probes: graded.probes, unextractable: graded.unextractable, unreached: None,
     })
+}
+
+/// What a subject's own readback of an unfaulted run gave, the expectation of every damage row
+/// over it: each sampled position's tree, and the probe ref's tree before and after the probe
+/// record. Taken once per subject on a copy of its pristine subject, so what an import or export
+/// lost is in it, identically, and never counts as damage.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Baseline {
+    pub positions: Vec<oracle::Tree>,
+    pub before: oracle::Tree,
+    pub after: oracle::Tree,
+}
+
+/// One history subject a damage row works on: its tool, the pristine subject (a work tree with its
+/// state folder, the probe ref current), the sample, and its unfaulted readback.
+pub struct HistorySubject<'a> {
+    pub tool: Tool,
+    pub pristine: &'a Path,
+    pub positions: &'a [Position],
+    pub baseline: &'a Baseline,
+}
+
+/// The corpus a history's faulted command records: the probe file alone, its modes judged where
+/// the platform keeps them, so a mode a fault changes reads back changed.
+fn probe_corpus() -> Corpus {
+    let record: corpus::Snapshot = [(PROBE_FILE.to_string(), PROBE_BYTES.to_vec())].into_iter().collect();
+    Corpus {
+        seed: 0, shape: corpus::Shape { records: 1, initial_files: 1, max_bytes: PROBE_BYTES.len() },
+        records: vec![record], modes: corpus::Modes::Judged(Default::default()),
+    }
+}
+
+/// Copies the pristine subject into `scratch`'s work tree, every entry with its state folder, so a
+/// row never touches the pristine copy.
+fn lay_out_subject(pristine: &Path, scratch: &Scratch) -> Result<(), RunError> {
+    let work = scratch.work();
+    let io = |path: &Path| { let path = path.to_path_buf(); move |error: std::io::Error| RunError::Io(format!("{}: {}", path.display(), error)) };
+    std::fs::create_dir_all(&work).map_err(io(&work))?;
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(pristine).map_err(io(pristine))?.collect::<Result<_, _>>().map_err(io(pristine))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        crate::scrub::copy_tree(&entry.path(), &work.join(entry.file_name())).map_err(|error| RunError::Io(format!("{:?}", error)))?;
+    }
+    Ok(())
+}
+
+/// The context of a faulted run over a history subject in `scratch`.
+fn history_context<'a>(tool: Tool, corpus: &'a Corpus, programs: &'a Programs, scratch: &'a Scratch, environment: &'a Environment, limit: Duration, positions: &'a [Position]) -> Context<'a> {
+    Context { tool, corpus, programs, scratch, environment, limit, then: &[], url: None, scope: None, via_host: false, history: Some(positions) }
+}
+
+/// The unfaulted readback of `tool`'s pristine subject, copied into `scratch`: every position and
+/// the probe ref read, then the probe recorded with the subject's own record binding and the
+/// probe ref read again, then the subject's whole-store check run as every row's is. A record
+/// that does not read back unfaulted (an empty tree is read back; a walk ending short of it is
+/// not), a probe that does not land, or a check that finds damage or repairs anything, fails it,
+/// naming what refused: that subject's rows are then not run, since a check reporting the pristine
+/// subject would report it on every row.
+#[allow(clippy::too_many_arguments)]
+pub fn baseline(tool: Tool, pristine: &Path, positions: &[Position], programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Baseline, RunError> {
+    lay_out_subject(pristine, scratch)?;
+    let corpus = probe_corpus();
+    let context = history_context(tool, &corpus, programs, scratch, environment, limit, positions);
+    let marks: Vec<Mark> = (0..positions.len()).map(Mark::Position).chain([Mark::Record(0)]).collect();
+    let trees = |marks: &[Mark]| -> Result<Vec<oracle::Tree>, RunError> {
+        let (export, served, _) = context.serve_history(&scratch.work(), positions, marks)?;
+        if !export.succeeded() {
+            return Err(RunError::Io(format!("the unfaulted readback refused: {:?} exited {:?}: {}", export.arguments, export.exit, String::from_utf8_lossy(&export.stderr).trim())));
+        }
+        served.into_iter().map(|(mark, readback, reached)| match readback {
+            Readback::Served { tree, .. } if reached => Ok(tree),
+            _ => Err(RunError::Io(format!("the unfaulted readback did not serve {:?}", mark))),
+        }).collect()
+    };
+    let mut read = trees(&marks)?;
+    let before = read.pop().unwrap_or_default();
+    let mut steps = Vec::new();
+    if !context.record(0, &mut steps)? {
+        let refused = steps.last().map(|step| format!("{:?} exited {:?}", step.arguments, step.exit)).unwrap_or_default();
+        return Err(RunError::Io(format!("the unfaulted probe record did not land: {}", refused)));
+    }
+    let after = trees(&[Mark::Record(0)])?.pop().unwrap_or_default();
+    let checked = store_check(&context)?;
+    if !checked.succeeded() || (tool == Tool::Forklift && heal_repaired(&checked.stdout)) {
+        return Err(RunError::Io(format!("the unfaulted store check reports the pristine subject: {:?} exited {:?}: {}{}", checked.arguments, checked.exit,
+            String::from_utf8_lossy(&checked.stdout).trim(), String::from_utf8_lossy(&checked.stderr).trim())));
+    }
+    Ok(Baseline { positions: read, before, after })
+}
+
+/// Runs one damage row over a history subject: its pristine subject copied into `scratch`, damage
+/// `kind` applied to the path `name` resolves to there, then the probe record as the faulted
+/// command, graded by [`grade_after`] against the subject's [`Baseline`] over the sampled
+/// positions. A row graded healed then runs the subject's own whole-store check
+/// ([`whole_store_check`]); damage only that check sees is [`Faulted::unreached`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_history(subject: &HistorySubject, name: &str, kind: Kind, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, seed: u64) -> Result<Faulted, RunError> {
+    lay_out_subject(subject.pristine, scratch)?;
+    let state = scratch.work().join(runner::state_folder(subject.tool));
+    let walked = crate::census::walk(&state).map_err(|error| RunError::Io(format!("{}: {}", state.display(), error)))?;
+    let resolved = match subject.tool {
+        Tool::Forklift => resolve(name, &walked, seed),
+        Tool::Git | Tool::GitTuned => crate::git_layout::resolve(name, &walked, seed),
+    };
+    let target = if kind.plants() {
+        damage::planted(name)
+    } else {
+        resolved.ok_or_else(|| RunError::Io(format!("{} resolves to nothing in the history subject", name)))?
+    };
+    damage::apply(&state.join(&target), kind, seed).map_err(|error| RunError::Io(format!("{:?}", error)))?;
+
+    let corpus = probe_corpus();
+    let positions = subject.positions;
+    let expected = Expected {
+        acknowledged: (0..positions.len()).map(Mark::Position).collect(), faulted: Mark::Record(0),
+        before: subject.baseline.before.clone(), after: subject.baseline.after.clone(),
+        taken: Vec::new(), parked: Vec::new(), pushed: Vec::new(), positions: subject.baseline.positions.clone(),
+    };
+    let context = history_context(subject.tool, &corpus, programs, scratch, environment, limit, positions);
+    let mut graded = grade_after(&context, &expected, 0, |context, steps| context.record(0, steps).map(drop))?;
+    let unreached = if graded.grade == Grade::Healed { whole_store_check(&context, &mut graded)? } else { None };
+    Ok(Faulted {
+        scenario: "history".to_string(), name: name.to_string(), warehouse: Warehouse::Client, kind, target,
+        grade: graded.grade, evidence: graded.evidence, recoverability: graded.recoverability,
+        steps: graded.steps, readbacks: graded.readbacks, probes: graded.probes, unextractable: graded.unextractable, unreached,
+    })
+}
+
+/// The subject's own whole-store inspection, run in the work tree once every sampled record read
+/// back as expected, and added to the steps: `git fsck --full`, or forklift's `heal` (`audit`
+/// refuses an unsigned import, and heal is the step that names corrupt objects). Its outcome when
+/// it reports damage, or, for a heal that exits 0, repaired some: the damage the sample did not
+/// reach. Nothing when it found none. The row was already healed, so a repair here rescues nothing.
+fn whole_store_check(context: &Context, graded: &mut Graded) -> Result<Option<Outcome>, RunError> {
+    let checked = store_check(context)?;
+    graded.steps.push(checked.clone());
+    let found = !checked.succeeded() || (context.tool == Tool::Forklift && heal_repaired(&checked.stdout));
+    Ok(found.then_some(checked))
+}
+
+/// The subject's whole-store check, run in the work tree: `git fsck --full`, or forklift's `heal`.
+fn store_check(context: &Context) -> Result<Outcome, RunError> {
+    let arguments: &[&str] = match context.tool {
+        Tool::Forklift => &["--json", "heal"],
+        Tool::Git | Tool::GitTuned => &["fsck", "--full", "--no-progress"],
+    };
+    context.run(context.program(), context.subject(arguments.iter().map(|argument| argument.to_string()).collect()), context.scratch.work())
+}
+
+/// Whether a `--json heal` that exited 0 repaired anything: it restaged a path, or found the
+/// warehouse tainted.
+fn heal_repaired(stdout: &[u8]) -> bool {
+    let document = runner::document(stdout);
+    document["data"]["restaged"].as_array().is_some_and(|restaged| !restaged.is_empty()) || document["data"]["was_tainted"].as_bool() == Some(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// The forklift walk follows first parents from the listed head, stops at the depth it was
+    /// asked for, at a parcel the listing leaves out, and at a cycle; the pallet listing gives
+    /// each pallet's head by name.
+    ///
+    /// Revert: follow a merge's last parent → the walk takes the side parcel; drop the bound →
+    /// the bounded walk runs to the root; drop the cycle stop → the cyclic walk never ends.
+    #[test]
+    fn the_forklift_walk_follows_first_parents() {
+        let listing = |entries: &[(&str, &[&str])]| serde_json::json!({ "data": { "entries": entries.iter()
+            .map(|(parcel, parents)| serde_json::json!({ "parcel": parcel, "parents": parents })).collect::<Vec<_>>() } }).to_string().into_bytes();
+        let merged = listing(&[("m", &["b", "s"]), ("s", &["a"]), ("b", &["a"]), ("a", &[])]);
+        assert_eq!(first_parents(Some("m"), &merged, 10), ["m", "b", "a"]);
+        assert_eq!(first_parents(None, &merged, 10), ["m", "b", "a"]);
+        assert_eq!(first_parents(Some("m"), &merged, 2), ["m", "b"]);
+        assert_eq!(first_parents(Some("s"), &merged, 10), ["s", "a"]);
+        assert_eq!(first_parents(Some("m"), &listing(&[("m", &["gone"])]), 10), ["m"]);
+        assert_eq!(first_parents(Some("x"), &listing(&[("x", &["y"]), ("y", &["x"])]), 10), ["x", "y"]);
+        let pallets = serde_json::json!({ "data": { "pallets": [{ "name": "main", "head": "h1" }, { "name": "side", "head": "h2" }] } }).to_string().into_bytes();
+        assert_eq!(pallet_heads(&pallets), [("main".to_string(), "h1".to_string()), ("side".to_string(), "h2".to_string())].into_iter().collect());
+    }
+
+    /// What forklift printed in a readback copy names the graded warehouse instead, so a remedy
+    /// named by path acts on it: the remedy texts, read from the parsed failure, name it too.
+    ///
+    /// Revert: leave the parsed failure as it was → the remedy texts still name the copy.
+    #[test]
+    fn a_copy_path_is_written_back_as_the_graded_one() {
+        let failure = crate::tool::Failure { code: "locked".into(), message: "held at /s/readback-0/.forklift/lock".into(), next_step: Some("remove /s/readback-0/.forklift/lock".into()) };
+        let outcome = Outcome { arguments: vec![], exit: Some(1), stdout: b"remove /s/readback-0/.forklift/lock".to_vec(), stderr: b"at /s/readback-0".to_vec(), failure: Some(failure) };
+        let rebased = rebased(outcome, Path::new("/s/readback-0"), Path::new("/s/work"));
+        assert_eq!((rebased.stdout.as_slice(), rebased.stderr.as_slice()), (&b"remove /s/work/.forklift/lock"[..], &b"at /s/work"[..]));
+        assert_eq!(rebased.remedy_texts(), ["held at /s/work/.forklift/lock", "remove /s/work/.forklift/lock"]);
+    }
+
+    /// A record a forklift walk ended short of is silently lost even where the baseline expects an
+    /// empty tree, which an unreached record reads back as; a reached one is judged as read.
+    ///
+    /// Revert: judge every record as read → the unreached empty record is expected.
+    #[test]
+    fn an_unreached_record_is_silent_even_when_empty_is_expected() {
+        let empty = Readback::Served { tree: Default::default(), documented: Default::default() };
+        let expected = Expectation::acknowledged(Default::default());
+        assert_eq!(judged_history(&empty, false, &expected), Verdict::Silent);
+        assert_eq!(judged_history(&empty, true, &expected), Verdict::Expected);
+    }
 
     use crate::scrub::path_git;
 
@@ -1213,7 +1653,7 @@ mod tests {
             let (expected, _) = expected(&scenario, &corpus, &built, Warehouse::Client).unwrap();
             let context = Context {
                 tool: Tool::Git, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
-                limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false,
+                limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false, history: None,
             };
             let readback = context.read_back(&scratch.work(), &expected.acknowledged, &expected.acknowledged, |mark| expected.of(&corpus, mark, false)).unwrap();
             assert!(readback.export.succeeded(), "damaged {}: the log ran", damaged);
@@ -1346,7 +1786,7 @@ mod tests {
         for (tool, prefix) in [(Tool::GitTuned, crate::scenario::GIT_TUNED), (Tool::Git, &[][..]), (Tool::Forklift, &[][..])] {
             let context = Context {
                 tool, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
-                limit: Duration::from_secs(1), then: &[], url: None, scope: None, via_host: false,
+                limit: Duration::from_secs(1), then: &[], url: None, scope: None, via_host: false, history: None,
             };
             let expected: Vec<String> = prefix.iter().map(|argument| argument.to_string()).chain(["fsck".to_string()]).collect();
             assert_eq!(context.subject(vec!["fsck".to_string()]), expected, "{:?}", tool);
@@ -1379,7 +1819,7 @@ mod tests {
         let built = runner::build(&scenario, &corpus, tool, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
         let context = Context {
             tool, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
-            limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false,
+            limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false, history: None,
         };
         let head = |reference: &str| String::from_utf8_lossy(&context.run(&git, vec!["rev-parse".into(), reference.into()], scratch.work()).unwrap().stdout).trim().to_string();
         let (main, first) = (head("refs/heads/main"), head("refs/heads/main~1"));
@@ -1425,7 +1865,7 @@ mod tests {
         let built = runner::build(&scenario, &corpus, Tool::Git, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
         let context = Context {
             tool: Tool::Git, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
-            limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false,
+            limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false, history: None,
         };
         let git_run = |arguments: &[&str]| context.run(&git, arguments.iter().map(|argument| argument.to_string()).collect(), scratch.work()).unwrap();
         let head = |reference: &str| String::from_utf8_lossy(&git_run(&["rev-parse", reference]).stdout).trim().to_string();
@@ -1560,7 +2000,7 @@ mod tests {
         for (index, verdict) in subjects {
             records.entry(Mark::Record(*index)).or_default().push(*verdict);
         }
-        HistoryReadback { export, records: records.into_iter().map(|(mark, verdicts)| RecordReadback { mark, verdicts }).collect(), parked: None }
+        HistoryReadback { export, records: records.into_iter().map(|(mark, verdicts)| RecordReadback { mark, verdicts }).collect(), parked: None, reads: Vec::new() }
     }
 
     /// A history reads only when every wanted record was served and every copy of it expected: a
@@ -1673,7 +2113,7 @@ mod tests {
         let expected = Expected {
             acknowledged: vec![Mark::Record(0), Mark::Record(1)], faulted: Mark::Record(2),
             before: corpus::expected(&corpus.records[1], &corpus.modes), after: corpus::expected(&corpus.records[2], &corpus.modes),
-            taken: vec![(oracle::digest(b"x"), documented.clone())], parked: Vec::new(), pushed: Vec::new(),
+            taken: vec![(oracle::digest(b"x"), documented.clone())], parked: Vec::new(), pushed: Vec::new(), positions: Vec::new(),
         };
         let first = expected.of(&corpus, Mark::Record(0), false);
         assert_eq!(first.transformed, BTreeMap::from([("a".to_string(), documented.clone())]));

@@ -143,12 +143,14 @@ pub enum CloneKind {
     Cache,
 }
 
-/// A recorded snapshot a readback grades: a corpus record, or the variant of one.
+/// A recorded snapshot a readback grades: a corpus record, or the variant of one; over a real
+/// history, a sampled position, by its index in the sample.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(tag = "mark", content = "index", rename_all = "kebab-case")]
 pub enum Mark {
     Record(usize),
     Variant(usize),
+    Position(usize),
 }
 
 impl Mark {
@@ -157,6 +159,7 @@ impl Mark {
         match self {
             Mark::Record(index) => format!("proof-load record {}", index),
             Mark::Variant(index) => format!("proof-load variant {}", index),
+            Mark::Position(index) => format!("proof-load position {}", index),
         }
     }
 
@@ -165,6 +168,7 @@ impl Mark {
         match self {
             Mark::Record(index) => corpus.records.get(index).cloned(),
             Mark::Variant(index) => corpus.records.get(index).map(crate::corpus::variant),
+            Mark::Position(_) => None,
         }
     }
 }

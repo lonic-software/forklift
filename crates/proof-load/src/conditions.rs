@@ -132,7 +132,7 @@ fn under(
     let (expected, index) = faulted::expected(scenario, corpus, &built, Warehouse::Client)?;
     let context = Context {
         tool: Tool::Forklift, corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.url(),
-        scope: scenario.scope(), via_host: false,
+        scope: scenario.scope(), via_host: false, history: None,
     };
     let mut graded = faulted::grade_after(&context, &expected, index, |context, steps: &mut Vec<Outcome>| {
         context.write_snapshot(index)?;
@@ -161,7 +161,7 @@ pub fn consumed(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scrat
     let (_, index) = faulted::expected(scenario, corpus, &built, Warehouse::Client).map_err(|error| error.to_string())?;
     let context = Context {
         tool: Tool::Forklift, corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.url(),
-        scope: scenario.scope(), via_host: false,
+        scope: scenario.scope(), via_host: false, history: None,
     };
     context.write_snapshot(index).map_err(|error| error.to_string())?;
     let free = || free_space(ballast);

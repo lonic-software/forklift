@@ -130,7 +130,7 @@ pub fn folded(scenario: &Scenario, corpus: &Corpus, programs: &Programs, scratch
     let (expected, index) = faulted::expected(scenario, corpus, &built, Warehouse::Client)?;
     let context = Context {
         tool: Tool::Forklift, corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.url(),
-        scope: scenario.scope(), via_host: false,
+        scope: scenario.scope(), via_host: false, history: None,
     };
     faulted::grade_after(&context, &expected, index, |context, steps| context.record(index, steps).map(drop))
 }

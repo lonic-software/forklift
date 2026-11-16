@@ -706,7 +706,7 @@ pub(crate) fn environment_of(settings: &Settings, scratch: &Scratch) -> Result<E
 }
 
 pub(crate) fn context_of<'a>(scenario: &'a Scenario, corpus: &'a Corpus, programs: &'a Programs, settings: &Settings, scratch: &'a Scratch, environment: &'a Environment) -> Context<'a> {
-    Context { tool: Tool::Forklift, corpus, programs, scratch, environment, limit: settings.limit, then: &scenario.then, url: None, scope: scenario.scope(), via_host: false }
+    Context { tool: Tool::Forklift, corpus, programs, scratch, environment, limit: settings.limit, then: &scenario.then, url: None, scope: scenario.scope(), via_host: false, history: None }
 }
 
 /// One injected run: a fresh copy, the lines before the point's run plainly, the point's line run
