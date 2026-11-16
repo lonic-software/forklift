@@ -235,21 +235,63 @@ pub struct Row {
     pub pairing: Option<Pairing>,
 }
 
-/// A damage row's place on the data plate: rows of every subject with the same scenario, side,
-/// role and kind of damage are one line of it.
+/// A row's place on the data plate: rows of every subject with the same scenario and target are
+/// one line of it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pairing {
     pub scenario: String,
-    /// Whose files were damaged: the client's, or the host's the scenario pushed to.
-    pub side: Warehouse,
-    /// The role of the damaged path, from the role map: what the path is for in either subject.
-    pub role: Role,
-    pub kind: Kind,
+    pub target: Target,
     /// The directions of a real history whose lines the row stands on, each a line of its own:
     /// both for forklift's row, whose subject is the one import either direction compares; for a
     /// git row, the one its subject was built in. Empty for a row off a real history.
     pub directions: Vec<HistoryDirection>,
+}
+
+/// What a paired row faulted, as every subject's rows of it share it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "by", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum Target {
+    /// A file damaged at rest.
+    File {
+        /// Whose files were damaged: the client's, or the host's the scenario pushed to.
+        side: Warehouse,
+        /// The role of the damaged path, from the role map: what the path is for in either
+        /// subject.
+        role: Role,
+        kind: Kind,
+    },
+    /// The faulted command stopped by a lane while it ran one operation of the scenario: a
+    /// subject's rows of every point in that operation's lines are one line.
+    Fault {
+        lane: FaultLane,
+        /// The operation's tag, as the scenario names it.
+        op: String,
+    },
+}
+
+impl Target {
+    /// Whether the target has no counterpart in some subject, so its line is never compared.
+    pub fn no_counterpart(&self) -> bool {
+        matches!(self, Target::File { role: Role::NoCounterpart, .. })
+    }
+
+    /// The plate's target and fault columns: a file's side and role, and its damage; an
+    /// operation, and the lane that stopped it.
+    pub fn columns(&self) -> (String, String) {
+        match self {
+            Target::File { side, role, kind } => (format!("{} {}", kebab(*side), kebab(*role)), kebab(*kind)),
+            Target::Fault { lane, op } => (op.clone(), kebab(*lane)),
+        }
+    }
+}
+
+/// The lane that stopped a faulted command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FaultLane {
+    Kill,
+    Power,
 }
 
 /// The history a git subject over a real history was built from, as the data plate pairs it:
@@ -319,7 +361,7 @@ impl PlateLine {
     /// grade and a better rescue kind. A line with no counterpart is never a win, nor is one
     /// forklift has no row on.
     pub fn git_does_better(&self) -> Vec<Tool> {
-        if self.pairing.role == Role::NoCounterpart {
+        if self.pairing.target.no_counterpart() {
             return vec![];
         }
         let Some(forklift) = self.standings.get(&Tool::Forklift) else { return vec![] };
@@ -383,7 +425,7 @@ impl Completeness {
 
 /// The report's format. A reader refuses any other, so a report written by another build of the
 /// harness is never read as if it meant the same thing.
-pub const REPORT_FORMAT: u32 = 7;
+pub const REPORT_FORMAT: u32 = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -506,15 +548,16 @@ impl Report {
         if plate.is_empty() {
             out.push_str("None.\n");
         } else {
-            let _ = writeln!(out, "| Scenario | Side | Role | Damage | {} |", subjects.map(Tool::label).join(" | "));
-            let _ = writeln!(out, "|---|---|---|---|{}", "---|".repeat(subjects.len()));
+            let _ = writeln!(out, "| Scenario | Target | Fault | {} |", subjects.map(Tool::label).join(" | "));
+            let _ = writeln!(out, "|---|---|---|{}", "---|".repeat(subjects.len()));
             for line in &plate {
                 let cells: Vec<String> = subjects.iter().map(|subject| match line.standings.get(subject) {
-                    None if line.pairing.role == Role::NoCounterpart => "no counterpart".to_string(),
+                    None if line.pairing.target.no_counterpart() => "no counterpart".to_string(),
                     None => "not measured".to_string(),
                     Some(standing) => standing_text(standing),
                 }).collect();
-                let _ = writeln!(out, "| {} | {} | {} | {} | {} |", line.scenario(), kebab(line.pairing.side), kebab(line.pairing.role), kebab(line.pairing.kind), cells.join(" | "));
+                let (target, fault) = line.pairing.target.columns();
+                let _ = writeln!(out, "| {} | {} | {} | {} |", line.scenario(), target, fault, cells.join(" | "));
             }
             out.push_str("\nA subject's cell is its worst row on the line, by grade and then by rescue kind. A subject with no row on a line is not measured there, unless the role has no counterpart in it: such a line is never compared.\n");
         }
@@ -525,7 +568,8 @@ impl Report {
             out.push_str("None.\n");
         } else {
             for (line, subject) in wins {
-                let _ = writeln!(out, "- {} {} {} {}: {} {}, forklift {}", line.scenario(), kebab(line.pairing.side), kebab(line.pairing.role), kebab(line.pairing.kind),
+                let (target, fault) = line.pairing.target.columns();
+                let _ = writeln!(out, "- {} {} {}: {} {}, forklift {}", line.scenario(), target, fault,
                     subject.label(), standing_text(&line.standings[&subject]), standing_text(&line.standings[&Tool::Forklift]));
             }
             out.push_str("\nEach entry is a better grade, or the same grade and a better rescue kind. Each gets a ticket.\n");
@@ -714,7 +758,7 @@ mod tests {
         Row { subject, grade, binding: subject.label().to_string(),
             recoverability: Recoverability { commands_to_expected: commands, named_right_remedy: false, outside_knowledge: vec![], rescued_by },
             detail: Some(format!("{}-{:?}-{:?}.json#", subject.label(), role, grade)),
-            pairing: Some(Pairing { scenario: "history".to_string(), side, role, kind, directions: vec![] }),
+            pairing: Some(Pairing { scenario: "history".to_string(), target: Target::File { side, role, kind }, directions: vec![] }),
             ..sample().rows.remove(0) }
     }
 
@@ -742,7 +786,10 @@ mod tests {
         ]);
         let plate = report.plate();
         let keys: Vec<(Warehouse, Role, Kind, Vec<Tool>)> = plate.iter()
-            .map(|line| (line.pairing.side, line.pairing.role, line.pairing.kind, line.standings.keys().copied().collect())).collect();
+            .map(|line| match &line.pairing.target {
+                Target::File { side, role, kind } => (*side, *role, *kind, line.standings.keys().copied().collect()),
+                other => panic!("a damage row paired as {:?}", other),
+            }).collect();
         assert_eq!(keys, [
             (Client, Role::Object, Kind::Truncate, vec![Tool::Git]),
             (Client, Role::Object, Kind::Delete, vec![Tool::Forklift, Tool::Git]),
@@ -753,8 +800,8 @@ mod tests {
         let forklift = &plate[1].standings[&Tool::Forklift];
         assert_eq!((forklift.grade, forklift.rows, forklift.detail.as_deref()), (Grade::DataLost, 2, Some("forklift-Object-DataLost.json#")));
         let markdown = report.markdown();
-        assert!(markdown.contains("| history | client | object | delete | [data-lost](forklift-Object-DataLost.json#) (worst of 2) | [healed](git-Object-Healed.json#) | not measured |"), "{}", markdown);
-        assert!(markdown.contains("| history | host | no-counterpart | delete | [healed](forklift-NoCounterpart-Healed.json#) | no counterpart | no counterpart |"), "{}", markdown);
+        assert!(markdown.contains("| history | client object | delete | [data-lost](forklift-Object-DataLost.json#) (worst of 2) | [healed](git-Object-Healed.json#) | not measured |"), "{}", markdown);
+        assert!(markdown.contains("| history | host no-counterpart | delete | [healed](forklift-NoCounterpart-Healed.json#) | no counterpart | no counterpart |"), "{}", markdown);
     }
 
     /// Over a real history, forklift's one row stands on the line of each direction it names,
@@ -784,10 +831,31 @@ mod tests {
         ]);
         assert!(plate.iter().all(|line| line.pairing.directions.is_empty() && line.standings.values().all(|standing| standing.rows == 1)));
         let markdown = report.markdown();
-        assert!(markdown.contains("| history, from git | client | object | delete | [data-lost](forklift-Object-DataLost.json#) | [healed](git-Object-Healed.json#) |"), "{}", markdown);
-        assert!(markdown.contains("| history, from Forklift | client | object | delete | [data-lost](forklift-Object-DataLost.json#) | [silent](export.json#) |"), "{}", markdown);
+        assert!(markdown.contains("| history, from git | client object | delete | [data-lost](forklift-Object-DataLost.json#) | [healed](git-Object-Healed.json#) |"), "{}", markdown);
+        assert!(markdown.contains("| history, from Forklift | client object | delete | [data-lost](forklift-Object-DataLost.json#) | [silent](export.json#) |"), "{}", markdown);
         assert!(markdown.contains("- history, from git client object delete:"), "{}", markdown);
         assert!(!markdown.contains("- history, from Forklift client object delete:"), "{}", markdown);
+    }
+
+    /// Kill rows pair on scenario, lane and operation, each subject at its worst over every point
+    /// of the operation, and print the operation and the lane in the plate's target and fault
+    /// columns; git doing better on one is listed as on a file.
+    ///
+    /// Revert: pair kill rows on their own scenario text → each point is a line of its own.
+    #[test]
+    fn kill_rows_pair_on_their_operation() {
+        let kill = |subject: Tool, grade: Grade, op: &str| Row {
+            category: Category::KillPointsClient, scenario: format!("history {} fsync#1 x", op),
+            pairing: Some(Pairing { scenario: "history".into(), target: Target::Fault { lane: FaultLane::Kill, op: op.into() }, directions: vec![] }),
+            ..damage_row(subject, Warehouse::Client, Role::Object, Kind::Delete, grade, None, Some(1))
+        };
+        let report = with_rows(vec![kill(Tool::Forklift, Grade::Healed, "record"), kill(Tool::Forklift, Grade::DataLost, "record"), kill(Tool::Git, Grade::Healed, "record")]);
+        let plate = report.plate();
+        assert_eq!(plate.len(), 1);
+        assert_eq!(plate[0].standings[&Tool::Forklift].grade, Grade::DataLost);
+        let markdown = report.markdown();
+        assert!(markdown.contains("| history | record | kill | [data-lost](forklift-Object-DataLost.json#) (worst of 2) | [healed](git-Object-Healed.json#) | not measured |"), "{}", markdown);
+        assert!(markdown.contains("- history record kill: git [healed"), "{}", markdown);
     }
 
     /// Git does better by the plate's grade order, then by rescue kind, and never by step count;

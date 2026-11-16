@@ -211,7 +211,7 @@ const DAEMON_PROBE_LIMIT: Duration = Duration::from_secs(10);
 impl FsmonitorDaemon {
     /// Turns on the fsmonitor in the work tree at `work` and starts its daemon, then waits until
     /// `status` says it watches.
-    fn start(program: &Path, work: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<(FsmonitorDaemon, Vec<Outcome>), RunError> {
+    pub(crate) fn start(program: &Path, work: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<(FsmonitorDaemon, Vec<Outcome>), RunError> {
         let mut outcomes = Vec::new();
         let configured = tool::run(&Invocation { program: program.to_path_buf(), arguments: vec!["config".into(), "core.fsmonitor".into(), "true".into()], directory: work.to_path_buf(), limit }, scratch, environment)
             .map_err(RunError::Tool)?;

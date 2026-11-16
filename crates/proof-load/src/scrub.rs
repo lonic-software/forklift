@@ -207,6 +207,12 @@ pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<(), CopyOnlyError> {
         }
         return std::fs::set_permissions(to, metadata.permissions()).map_err(io(to));
     }
+    // A socket is a live process's endpoint, not data: a copy has nothing to hold, and its owner
+    // (git's fsmonitor daemon) makes a fresh one in the copy it serves.
+    #[cfg(unix)]
+    if std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type()) {
+        return Ok(());
+    }
     std::fs::copy(from, to).map(|_| ()).map_err(io(from))
 }
 
@@ -348,8 +354,10 @@ mod tests {
     /// A copy holds every folder, file and link of the area, is independent of it, and is never
     /// made over something that exists.
     ///
+    /// A live socket, as git's fsmonitor daemon leaves one, is left behind rather than failing it.
+    ///
     /// Revert: follow symlinks → the link's target is copied as a file; skip the existence check →
-    /// a copy lands inside an existing area.
+    /// a copy lands inside an existing area; copy a socket as a file → the copy fails.
     #[cfg(unix)]
     #[test]
     fn a_scratch_copy_is_whole_and_independent() {
@@ -358,7 +366,15 @@ mod tests {
         std::fs::write(scratch.work().join(".forklift/objects/ab/cd"), b"object").unwrap();
         std::fs::write(scratch.home().join("config"), b"home").unwrap();
         std::os::unix::fs::symlink("objects/ab/cd", scratch.work().join(".forklift/link")).unwrap();
+        // A socket's path must be short; it is bound in the system temp folder and moved in.
+        let short = PathBuf::from(format!("/tmp/pl-ipc-{}", std::process::id()));
+        #[allow(clippy::disallowed_methods)] // the test's own socket, on unix only
+        let _ = std::fs::remove_file(&short);
+        let _listener = std::os::unix::net::UnixListener::bind(&short).unwrap();
+        #[allow(clippy::disallowed_methods)] // the test's own socket, on unix only
+        std::fs::rename(&short, scratch.work().join("ipc")).unwrap();
         let copy = scratch.copy_to(&fresh("copy-target")).unwrap();
+        assert!(!copy.work().join("ipc").exists());
         assert_eq!(std::fs::read(copy.work().join(".forklift/objects/ab/cd")).unwrap(), b"object");
         assert_eq!(std::fs::read(copy.home().join("config")).unwrap(), b"home");
         assert_eq!(std::fs::read(copy.git_global_config()).unwrap(), GIT_CONFIG.as_bytes());
