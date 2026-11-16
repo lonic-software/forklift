@@ -223,8 +223,10 @@ fn run_deadline(started: std::time::Instant, budget: Option<u64>) -> Option<std:
 }
 
 /// Whose a history build step `tool` failed is: forklift's where forklift ran it and refused it
-/// or misbuilt it, or ran past its limit. Git refusing one is the run's own, git being the oracle
-/// the sample is drawn from, as is a step the harness could not run at all.
+/// or misbuilt it, or ran past its limit. Git refusing one over the given history is the run's
+/// own, git being the oracle the sample is drawn from, as is a step the harness could not run at
+/// all. Git's steps over forklift's export are charged as forklift's own, since it is forklift's
+/// output they refuse.
 fn build_charged_to(tool: Tool, error: &crate::runner::RunError) -> Option<Tool> {
     use crate::runner::RunError::{BuildFailed, Tool as Ran};
     let own = tool == Tool::Forklift && matches!(error, BuildFailed { .. } | Ran(crate::tool::ToolError::TimedOut { .. }));
@@ -271,7 +273,7 @@ fn stands_on((_, direction): Built) -> Vec<HistoryDirection> {
 /// A history completeness check's name for `subject`: with its direction, for a git subject.
 fn history_check(check: &str, (_, direction): Built) -> String {
     match direction {
-        Some(direction) => format!("{}, {}", check, direction.label()),
+        Some(direction) => direction.name(check),
         None => check.to_string(),
     }
 }
@@ -301,7 +303,7 @@ fn history_row(subject: Built, label: &str, run: &faulted::Faulted, scenario: &s
     if !run.unextractable.is_empty() {
         notes.push(format!("unextractable remedies: {}", run.unextractable.join("; ")));
     }
-    let named = direction.map_or(scenario.to_string(), |direction| format!("{}, {}", scenario, direction.label()));
+    let named = direction.map_or(scenario.to_string(), |direction| direction.name(scenario));
     Ok(Row {
         subject: tool,
         scenario: format!("{} {} {:?}", named, run.target, run.kind),
@@ -369,10 +371,14 @@ fn history_damage(
         // Git's subject over forklift's export, from a copy of forklift's subject. Its failing
         // fails only its direction: the subjects above are built and the sample drawn.
         let root = scratch.root();
-        let exported = crate::history::export_forklift(&programs.forklift, &forklift_root, &branch, &root.join("export-warehouse"), &root.join("export"), &scratch, &environment, HISTORY_LIMIT, &mut steps)
+        // Git refusing the export is forklift's, as the export's own refusal is: it is forklift's
+        // output git refuses, and git is no oracle over it.
+        let sampled: std::collections::BTreeSet<&str> = std::iter::once(branch.as_str()).chain(positions.iter().map(|position| position.reference.as_str())).collect();
+        let over_export = |error: crate::runner::RunError| (build_charged_to(Tool::Forklift, &error), format!("git, over forklift's export: {}", error));
+        let exported = crate::history::export_forklift(&programs.forklift, &forklift_root, &sampled, &root.join("export-warehouse"), &root.join("export"), &scratch, &environment, HISTORY_LIMIT, &mut steps)
             .map_err(refused(Tool::Forklift))
             .and_then(|()| crate::history::build_git_export(&programs.git, &root.join("export"), &branch, &root.join("export-mirror"), &root.join("git-export"), &scratch, &environment, HISTORY_LIMIT, &mut steps)
-                .map_err(refused(Tool::Git)))
+                .map_err(over_export))
             .map(|()| root.join("git-export"));
         Ok((git_root, forklift_root, positions, exported))
     })();
@@ -493,9 +499,11 @@ fn history_damage(
         } else {
             Cell::Run
         };
-        history_checks.push(Completeness { subject: Some(tool), check: history_check("history damage rows ran", subject), cell, missing: gaps.remove(&subject).unwrap_or_default() });
+        history_checks.push(Completeness { subject: Some(tool), check: history_check("history damage rows ran", subject), cell: cell.clone(), missing: gaps.remove(&subject).unwrap_or_default() });
+        // A subject whose rows did not run reached no damage and ran no fault, so its two other
+        // checks say so too, rather than reading as run and clean.
         history_checks.push(Completeness {
-            subject: Some(tool), check: history_check("damage not reached by the sample", subject), cell: Cell::Run,
+            subject: Some(tool), check: history_check("damage not reached by the sample", subject), cell: cell.clone(),
             missing: unreached.remove(&subject).unwrap_or_default(),
         });
         // What kept a row from running, the harness's failures with it. Forklift's check stands
@@ -506,7 +514,7 @@ fn history_damage(
             other => history_check(&format!("history damage faults ran under {}", other.label()), subject),
         };
         let owner = (tool == Tool::Forklift).then_some(tool);
-        history_checks.push(Completeness { subject: owner, check, cell: Cell::Run, missing: errors.remove(&subject).unwrap_or_default() });
+        history_checks.push(Completeness { subject: owner, check, cell, missing: errors.remove(&subject).unwrap_or_default() });
     }
     Ok((rows, history_checks))
 }
@@ -1587,12 +1595,14 @@ mod tests {
         }
     }
 
-    /// Forklift refusing its git export, the subjects given the history built, is forklift's and
-    /// leaves only the from-Forklift direction unrun: forklift's rows and git's over the given
-    /// history still run, while git's over the export name why they did not.
+    /// Forklift refusing its git export, or git refusing what it exported, the subjects given the
+    /// history built, is forklift's and leaves only the from-Forklift direction unrun: forklift's
+    /// rows and git's over the given history still run, while every check of git's over the
+    /// export names why it did not run, none reading as run and clean.
     ///
-    /// Revert: fail the whole build on the export → no subject's rows run; charge the export to
-    /// git → the entry stands under no subject.
+    /// Revert: fail the whole build on the export → no subject's rows run; charge the export, or
+    /// git's clone of it, to git → the entry stands under no subject; give the sibling checks
+    /// `Cell::Run` → they read as run.
     #[test]
     #[cfg(unix)]
     #[ignore = "needs PROOF_LOAD_FORKLIFT"]
@@ -1603,20 +1613,31 @@ mod tests {
         let mirror = crate::history::tests::mirrored(&shared, &environment);
         let census = Census::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap().unwrap();
         let search_path = crate::scrub::search_path(Some(&crate::scrub::path_git()), std::env::var_os("PATH"));
-        let forklift = shared.root().join("refuses-export");
-        std::fs::write(&forklift, format!("#!/bin/sh\n[ \"$2$3\" = gitexport ] && exit 3\nexec '{}' \"$@\"\n", real)).unwrap();
-        std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let programs = Programs { forklift, git: crate::scrub::path_git(), server: None };
-        let mut output = Output::claim(&shared.root().join("out")).unwrap();
-        let (_, checks) = history_damage(&mirror, &programs, &census, 3, std::time::Duration::ZERO, None, 0, &mut output, &search_path, &Quiet).unwrap();
-        let built: Vec<&Completeness> = checks.iter().filter(|entry| entry.check.starts_with("history subjects built")).collect();
-        assert!(built.len() == 1 && built[0].check == "history subjects built, from Forklift" && built[0].subject == Some(Tool::Forklift)
-            && built[0].missing[0].starts_with("forklift: "), "{:?}", built);
-        for subject in HISTORY_SUBJECTS {
-            let check = history_check("history damage rows ran", subject);
-            let ran = checks.iter().find(|entry| entry.subject == Some(subject.0) && entry.check == check).unwrap();
-            let expected = if subject.1 == Some(HistoryDirection::FromForklift) { Cell::not_run("git's subject over forklift's export was not built") } else { Cell::Run };
-            assert_eq!(ran.cell, expected, "{:?}", subject);
+        // The export's arguments are `--json git export -- <dir>`: one wrapper refuses it, the
+        // other runs it, then takes the repository's objects away, so git's clone refuses it.
+        let cases = [
+            ("refused", "[ \"$2$3\" = gitexport ] && exit 3\nexec '{}' \"$@\"", "forklift: "),
+            ("unreadable", "'{}' \"$@\" || exit\n[ \"$2$3\" = gitexport ] && rm -rf \"$5/.git/objects\"\nexit 0", "git, over forklift's export: "),
+        ];
+        for (name, script, blamed) in cases {
+            let forklift = shared.root().join(name);
+            std::fs::write(&forklift, format!("#!/bin/sh\n{}\n", script.replace("{}", &real))).unwrap();
+            std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let programs = Programs { forklift, git: crate::scrub::path_git(), server: None };
+            let mut output = Output::claim(&shared.root().join(format!("out-{}", name))).unwrap();
+            let (_, checks) = history_damage(&mirror, &programs, &census, 3, std::time::Duration::ZERO, None, 0, &mut output, &search_path, &Quiet).unwrap();
+            let built: Vec<&Completeness> = checks.iter().filter(|entry| entry.check.starts_with("history subjects built")).collect();
+            assert!(built.len() == 1 && built[0].check == "history subjects built, from Forklift" && built[0].subject == Some(Tool::Forklift)
+                && built[0].missing[0].starts_with(blamed), "{}: {:?}", name, built);
+            let unbuilt = Cell::not_run("git's subject over forklift's export was not built");
+            for subject in HISTORY_SUBJECTS {
+                let check = history_check("history damage rows ran", subject);
+                let ran = checks.iter().find(|entry| entry.subject == Some(subject.0) && entry.check == check).unwrap();
+                let expected = if subject.1 == Some(HistoryDirection::FromForklift) { unbuilt.clone() } else { Cell::Run };
+                assert_eq!(ran.cell, expected, "{}: {:?}", name, subject);
+            }
+            let over_export: Vec<&Completeness> = checks.iter().filter(|entry| entry.check.ends_with(", from Forklift") && !entry.check.starts_with("history subjects built")).collect();
+            assert!(over_export.len() == 6 && over_export.iter().all(|entry| entry.cell == unbuilt), "{}: {:?}", name, over_export);
         }
     }
 

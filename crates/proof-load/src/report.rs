@@ -269,6 +269,11 @@ impl HistoryDirection {
             HistoryDirection::FromForklift => "from Forklift",
         }
     }
+
+    /// `name`, of a scenario or a check, as it is named in this direction.
+    pub fn name(self, name: &str) -> String {
+        format!("{}, {}", name, self.label())
+    }
 }
 
 /// One subject's standing on a line of the data plate: its worst row there, by grade and then by
@@ -305,7 +310,7 @@ impl PlateLine {
     /// The line's scenario as the plate names it: with its direction, on a real history.
     pub fn scenario(&self) -> String {
         match self.direction {
-            Some(direction) => format!("{}, {}", self.pairing.scenario, direction.label()),
+            Some(direction) => direction.name(&self.pairing.scenario),
             None => self.pairing.scenario.clone(),
         }
     }

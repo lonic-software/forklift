@@ -68,20 +68,25 @@ pub fn build_git(git: &Path, mirror: &Path, to: &Path, scratch: &Scratch, enviro
 /// Exports forklift's pristine history subject at `warehouse` to git at `to`, which must not
 /// exist yet: the export runs in a copy of the warehouse at `copy`, which must not exist yet
 /// either, so the subject forklift's rows run over is the one both directions compare. The
-/// export must make a branch of `branch`, the pallet git's subject made its probe at, and must
-/// make [`PROBE_REF`] current, the pallet forklift's subject is on: an export that does not fails
-/// as the export's step. Each step it ran is kept in `steps`, the failing one too.
+/// export must make a branch of each of `branches`, the pallet git's subject made its probe at
+/// and every one the sample reads, must make [`PROBE_REF`] current, the pallet forklift's subject
+/// is on, and must leave no file out, redacted or withheld, so git's subject over it holds the
+/// history forklift's does: an export that does not fails as the export's step. Each step it ran
+/// is kept in `steps`, the failing one too.
 #[allow(clippy::too_many_arguments)]
-pub fn export_forklift(forklift: &Path, warehouse: &Path, branch: &str, copy: &Path, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration, steps: &mut Vec<Outcome>) -> Result<(), RunError> {
+pub fn export_forklift(forklift: &Path, warehouse: &Path, branches: &BTreeSet<&str>, copy: &Path, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration, steps: &mut Vec<Outcome>) -> Result<(), RunError> {
     crate::scrub::copy_tree(warehouse, copy).map_err(|error| RunError::Io(format!("{:?}", error)))?;
     let exported = step(steps, forklift, &["--json", "git", "export", "--", &to.display().to_string()], copy, scratch, environment, limit)?;
     let data = &crate::runner::document(&exported.stdout)["data"];
     let current = data["current"].as_str();
-    let made = data["branches"].as_array().is_some_and(|branches| branches.iter().any(|made| made.as_str() == Some(branch)));
-    if current != Some(PROBE_REF) || !made {
+    let made: BTreeSet<&str> = data["branches"].as_array().map(|made| made.iter().filter_map(|branch| branch.as_str()).collect()).unwrap_or_default();
+    let unmade: Vec<&&str> = branches.iter().filter(|branch| !made.contains(**branch)).collect();
+    let left_out: Vec<&str> = ["redacted", "withheld", "withheld_here"].into_iter()
+        .filter(|field| data[*field].as_array().is_some_and(|files| !files.is_empty())).collect();
+    if current != Some(PROBE_REF) || !unmade.is_empty() || !left_out.is_empty() {
         return Err(RunError::BuildFailed {
             arguments: exported.arguments.clone(), exit: exported.exit, stdout: String::new(),
-            stderr: format!("forklift's export made {:?} current, not {:?}, and {} a branch {:?}", current, PROBE_REF, if made { "made" } else { "made no" }, branch),
+            stderr: format!("forklift's export made {:?} current, not {:?}; made no branch of {:?}; left files out as {:?}", current, PROBE_REF, unmade, left_out),
         });
     }
     Ok(())
@@ -227,10 +232,11 @@ pub(crate) mod tests {
         entries.iter().map(|(path, contents)| (path.to_string(), crate::oracle::digest(contents.as_bytes()))).collect()
     }
 
-    /// An export is accepted only where it made the probe pallet current and made a branch of
-    /// the one git's subject was built from; either missing fails as the export's own step.
+    /// An export is accepted only where it made the probe pallet current, made a branch of every
+    /// pallet asked for and left no file out; any one missing fails as the export's own step.
     ///
-    /// Revert: check `current` alone → the export missing `main` is accepted.
+    /// Revert: check `current` alone → the export missing `side` is accepted; ignore the files
+    /// left out → the withholding export is accepted.
     #[test]
     #[cfg(unix)]
     fn an_export_off_the_probe_or_missing_the_branch_is_refused() {
@@ -239,16 +245,19 @@ pub(crate) mod tests {
         let warehouse = scratch.root().join("warehouse");
         std::fs::create_dir(&warehouse).unwrap();
         let cases = [
-            (r#"{"data":{"current":"main","branches":["main","proof-load-probe"]}}"#, false),
-            (r#"{"data":{"current":"proof-load-probe","branches":["proof-load-probe"]}}"#, false),
-            (r#"{"data":{"current":"proof-load-probe","branches":["main","proof-load-probe"]}}"#, true),
+            (r#"{"data":{"current":"main","branches":["main","side","proof-load-probe"]}}"#, false),
+            (r#"{"data":{"current":"proof-load-probe","branches":["side","proof-load-probe"]}}"#, false),
+            (r#"{"data":{"current":"proof-load-probe","branches":["main","proof-load-probe"]}}"#, false),
+            (r#"{"data":{"current":"proof-load-probe","branches":["main","side","proof-load-probe"],"withheld":[{}]}}"#, false),
+            (r#"{"data":{"current":"proof-load-probe","branches":["main","side","proof-load-probe"],"redacted":[]}}"#, true),
         ];
+        let branches: BTreeSet<&str> = ["main", "side"].into_iter().collect();
         for (index, (printed, accepted)) in cases.into_iter().enumerate() {
             let forklift = scratch.root().join(format!("forklift-{}", index));
             std::fs::write(&forklift, format!("#!/bin/sh\necho '{}'\n", printed)).unwrap();
             std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o755)).unwrap();
             let (copy, to) = (scratch.root().join(format!("copy-{}", index)), scratch.root().join(format!("to-{}", index)));
-            let result = export_forklift(&forklift, &warehouse, "main", &copy, &to, &scratch, &environment, LIMIT, &mut Vec::new());
+            let result = export_forklift(&forklift, &warehouse, &branches, &copy, &to, &scratch, &environment, LIMIT, &mut Vec::new());
             match result {
                 Ok(()) => assert!(accepted, "{}", printed),
                 Err(RunError::BuildFailed { stderr, .. }) => assert!(!accepted && stderr.starts_with("forklift's export made"), "{}: {}", printed, stderr),
