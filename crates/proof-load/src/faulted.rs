@@ -134,6 +134,10 @@ pub struct Faulted {
     pub unreached: Option<Outcome>,
 }
 
+/// The scenario every damage row over a real history names, apart from the fixture scenarios', so
+/// a row over the history never pairs with a fixture row.
+pub const HISTORY_SCENARIO: &str = "real-history";
+
 /// The ref each history subject records the probe on: a git branch, a forklift pallet, made at the
 /// history's current tip and current before the pristine subject is copied.
 pub const PROBE_REF: &str = "proof-load-probe";
@@ -1503,7 +1507,7 @@ pub fn run_history(subject: &HistorySubject, name: &str, kind: Kind, programs: &
     let mut graded = grade_after(&context, &expected, 0, |context, steps| context.record(0, steps).map(drop))?;
     let unreached = if graded.grade == Grade::Healed { whole_store_check(&context, &mut graded)? } else { None };
     Ok(Faulted {
-        scenario: "history".to_string(), name: name.to_string(), warehouse: Warehouse::Client, kind, target,
+        scenario: HISTORY_SCENARIO.to_string(), name: name.to_string(), warehouse: Warehouse::Client, kind, target,
         grade: graded.grade, evidence: graded.evidence, recoverability: graded.recoverability,
         steps: graded.steps, readbacks: graded.readbacks, probes: graded.probes, unextractable: graded.unextractable, unreached,
     })

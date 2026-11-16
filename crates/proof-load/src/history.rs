@@ -123,7 +123,7 @@ pub fn sample(lengths: &BTreeMap<String, usize>, present: &BTreeSet<String>, cou
 }
 
 /// One step of splitmix64 over `state`.
-fn splitmix(state: &mut u64) -> u64 {
+pub(crate) fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -132,7 +132,7 @@ fn splitmix(state: &mut u64) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::damage::Kind;
     use crate::faulted::{baseline, run_history, Baseline, HistorySubject, Programs, PROBE_BYTES, PROBE_FILE};
@@ -143,7 +143,7 @@ mod tests {
 
     const LIMIT: Duration = Duration::from_secs(60);
 
-    fn scratch(label: &str) -> (Scratch, Environment) {
+    pub(crate) fn scratch(label: &str) -> (Scratch, Environment) {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("proof-load-history-{}-{}-{}", label, std::process::id(), nanos));
         let scratch = Scratch::create(&root).unwrap();
@@ -164,8 +164,8 @@ mod tests {
 
     /// A small repository mirrored in `scratch`: `main` of three commits, each adding a file,
     /// then a merge of `side`, one commit off `main`'s first, so a first-parent walk of `main`
-    /// differs from a walk of every parent.
-    fn mirrored(scratch: &Scratch, environment: &Environment) -> PathBuf {
+    /// differs from a walk of every parent; the merge tagged, as a real history's releases are.
+    pub(crate) fn mirrored(scratch: &Scratch, environment: &Environment) -> PathBuf {
         let source = scratch.root().join("source");
         std::fs::create_dir(&source).unwrap();
         git(&["init", "-q", "-b", "main"], &source, scratch, environment);
@@ -183,6 +183,7 @@ mod tests {
         git(&["-c", "user.name=p", "-c", "user.email=p@example.invalid", "commit", "-q", "-m", "side"], &source, scratch, environment);
         git(&["switch", "-q", "main"], &source, scratch, environment);
         git(&["-c", "user.name=p", "-c", "user.email=p@example.invalid", "merge", "-q", "--no-ff", "--no-edit", "side"], &source, scratch, environment);
+        git(&["tag", "v1"], &source, scratch, environment);
         let mirror = scratch.root().join("mirror");
         git(&["clone", "-q", "--mirror", "--no-local", "--", &source.display().to_string(), &mirror.display().to_string()], scratch.root(), scratch, environment);
         mirror
@@ -190,6 +191,50 @@ mod tests {
 
     fn programs(forklift: PathBuf) -> Programs {
         Programs { forklift, git: path_git(), server: None }
+    }
+
+    fn census() -> crate::census::Census {
+        crate::census::Census::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap().unwrap()
+    }
+
+    /// Git's history binding set covers its history subject as built from a mirror: every layout
+    /// row needing damage the subject holds is bound or exempt, every binding it holds, and no
+    /// exemption names what it holds. Without the history set's own bindings, the fixture set
+    /// fails over the same walk, on the rows only a mirror writes.
+    ///
+    /// Revert: drop the `packed-refs` binding → the row is named unbound; exempt the loose objects
+    /// no more → their rows are named unbound.
+    #[test]
+    fn git_history_bindings_cover_the_history_subject() {
+        let (shared, environment) = scratch("git-set");
+        let mirror = mirrored(&shared, &environment);
+        let pristine = shared.root().join("pristine");
+        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT).unwrap();
+        let walked = crate::census::walk(&pristine.join(".git")).unwrap();
+        let census = census();
+        for tool in [Tool::Git, Tool::GitTuned] {
+            assert_eq!(crate::bindings::check_history_subject(tool, &census, &walked), Vec::<String>::new(), "{:?}: {:?}", tool, walked);
+        }
+        let scenario = crate::faulted::HISTORY_SCENARIO.to_string();
+        let walks = [((scenario.clone(), crate::damage::Warehouse::Client), walked)].into_iter().collect();
+        let fixture = crate::bindings::check_git(&[], crate::bindings::GIT_EXEMPTIONS, &[scenario], &walks);
+        assert!(fixture.iter().any(|missing| missing.starts_with("stale exemption: packed-refs")), "{:?}", fixture);
+    }
+
+    /// Forklift's history binding set covers its history subject as an import builds it: every
+    /// census name needing damage the subject holds is bound, and every binding is held.
+    ///
+    /// Revert: drop the `meta/<name>` binding → the imported tag's name is named unbound.
+    #[test]
+    #[ignore = "needs PROOF_LOAD_FORKLIFT"]
+    fn forklift_history_bindings_cover_the_history_subject() {
+        let forklift = PathBuf::from(std::env::var("PROOF_LOAD_FORKLIFT").expect("PROOF_LOAD_FORKLIFT"));
+        let (shared, environment) = scratch("forklift-set");
+        let mirror = mirrored(&shared, &environment);
+        let pristine = shared.root().join("pristine");
+        build_forklift(&forklift, &mirror, &pristine, &shared, &environment, LIMIT).unwrap();
+        let walked = crate::census::walk(&pristine.join(".forklift")).unwrap();
+        assert_eq!(crate::bindings::check_history_subject(Tool::Forklift, &census(), &walked), Vec::<String>::new(), "{:?}", walked);
     }
 
     /// The sample names only depths each ref has, only refs both subjects hold, never repeats a
