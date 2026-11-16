@@ -157,7 +157,10 @@ pub struct Position {
 /// A history readback before judging: the readback's own command, what each mark read back as
 /// and whether the subject reached it (a forklift walk that exits 0 short of the depth reads as
 /// served empty, which is not reaching it), and the commands that read them.
-type Served = (Outcome, Vec<(Mark, Readback, bool)>, Vec<Outcome>);
+/// What a readback over a real history served: its own command; per mark, what it read back
+/// as, whether its walk reached it, and the indexes into the reads of those that read it; and
+/// the reads.
+type Served = (Outcome, Vec<(Mark, Readback, bool, Vec<usize>)>, Vec<Outcome>);
 
 /// The parts of a faulted run that stay fixed across its steps.
 pub(crate) struct Context<'a> {
@@ -469,7 +472,7 @@ impl Context<'_> {
     /// that exits 0 and ends before the depth served the record as missing, which is silent.
     fn read_back_history(&self, bay: &Path, positions: &[Position], marks: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
         let (export, served, reads) = self.serve_history(bay, positions, marks)?;
-        let records = served.into_iter().map(|(mark, readback, reached)| RecordReadback { mark, verdicts: vec![judged_history(&readback, reached, &expectation(mark))] }).collect();
+        let records = served.into_iter().map(|(mark, readback, reached, _)| RecordReadback { mark, verdicts: vec![judged_history(&readback, reached, &expectation(mark))] }).collect();
         Ok(HistoryReadback { export, records, parked: None, reads })
     }
 
@@ -503,6 +506,7 @@ impl Context<'_> {
         }
         let heads = if self.tool == Tool::Forklift { pallet_heads(&export.stdout) } else { BTreeMap::new() };
         let mut chains: BTreeMap<&str, Option<Vec<String>>> = BTreeMap::new();
+        let mut listed: BTreeMap<&str, usize> = BTreeMap::new();
         let mut reads = Vec::new();
         let mut records = Vec::new();
         for &mark in marks {
@@ -512,6 +516,7 @@ impl Context<'_> {
                 Mark::Record(0) => (PROBE_REF, 0),
                 other => return Err(RunError::Io(format!("{:?} is no record of a real history", other))),
             };
+            let first = reads.len();
             let mut reached = true;
             let readback = match self.tool {
                 Tool::Git | Tool::GitTuned => {
@@ -533,6 +538,7 @@ impl Context<'_> {
                         let listing = forklift(&["history", reference], bay.to_path_buf())?;
                         let wanted = deepest.get(reference).copied().unwrap_or_default() + 1;
                         let chain = listing.succeeded().then(|| first_parents(heads.get(reference).map(String::as_str), &listing.stdout, wanted));
+                        listed.insert(reference, reads.len());
                         reads.push(listing);
                         chains.insert(reference, chain);
                     }
@@ -564,7 +570,9 @@ impl Context<'_> {
                     }
                 }
             };
-            records.push((mark, readback, reached));
+            // A walk listed for an earlier mark on the same ref is this mark's evidence too.
+            let evidence = listed.get(reference).copied().filter(|&index| index < first).into_iter().chain(first..reads.len()).collect();
+            records.push((mark, readback, reached, evidence));
         }
         Ok((export, records, reads.into_iter().map(rebase).collect()))
     }
@@ -969,16 +977,23 @@ fn answered(last: Option<&Outcome>) -> bool {
     }))
 }
 
-/// Why the unfaulted readback did not serve `mark`, naming the evidence: the first command of
-/// `reads` that refused, as it exited and what it said, or a walk that ended short of the mark.
-fn unserved(mark: Mark, reached: bool, reads: &[Outcome]) -> String {
-    let said = |outcome: &Outcome| {
-        let text = outcome.failure.as_ref().map(|failure| failure.message.clone()).unwrap_or_else(|| String::from_utf8_lossy(&outcome.stderr).trim().to_string());
-        text.chars().take(400).collect::<String>()
-    };
+/// What a refused `outcome` said: its failure's message, else its stderr, cut at 400 characters
+/// with the cut marked.
+fn said(outcome: &Outcome) -> String {
+    let text = outcome.failure.as_ref().map(|failure| failure.message.clone()).unwrap_or_else(|| String::from_utf8_lossy(&outcome.stderr).trim().to_string());
+    match text.char_indices().nth(400) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text,
+    }
+}
+
+/// Why the unfaulted readback did not serve `mark`, from `reads`, the reads of that mark alone: a
+/// walk that ended short of it, else the first of them that refused, as it exited and what it
+/// said.
+fn unserved(mark: Mark, reached: bool, reads: &[&Outcome]) -> String {
     match reads.iter().find(|outcome| !outcome.succeeded()) {
+        _ if !reached => format!("the unfaulted readback did not serve {:?}: its walk ended short of it", mark),
         Some(refused) => format!("the unfaulted readback did not serve {:?}: {:?} exited {:?}: {}", mark, refused.arguments, refused.exit, said(refused)),
-        None if !reached => format!("the unfaulted readback did not serve {:?}: its walk ended short of it", mark),
         None => format!("the unfaulted readback did not serve {:?}", mark),
     }
 }
@@ -1467,12 +1482,18 @@ pub fn baseline(tool: Tool, pristine: &Path, positions: &[Position], programs: &
     let trees = |marks: &[Mark]| -> Result<Result<Vec<oracle::Tree>, String>, RunError> {
         let (export, served, reads) = context.serve_history(&scratch.work(), positions, marks)?;
         if !export.succeeded() {
-            return Ok(Err(format!("the unfaulted readback refused: {:?} exited {:?}: {}", export.arguments, export.exit, String::from_utf8_lossy(&export.stderr).trim())));
+            return Ok(Err(format!("the unfaulted readback refused: {:?} exited {:?}: {}", export.arguments, export.exit, said(&export))));
         }
-        Ok(served.into_iter().map(|(mark, readback, reached)| match readback {
-            Readback::Served { tree, .. } if reached => Ok(tree),
-            _ => Err(unserved(mark, reached, &reads)),
-        }).collect())
+        let total = served.len();
+        let mut trees = Vec::new();
+        let mut refused = Vec::new();
+        for (mark, readback, reached, evidence) in served {
+            match readback {
+                Readback::Served { tree, .. } if reached => trees.push(tree),
+                _ => refused.push(unserved(mark, reached, &evidence.iter().filter_map(|&index| reads.get(index)).collect::<Vec<_>>())),
+            }
+        }
+        Ok(if refused.is_empty() { Ok(trees) } else { Err(format!("{} of {} records: {}", refused.len(), total, refused.join("; "))) })
     };
     let mut read = match trees(&marks)? { Ok(read) => read, Err(refused) => return Ok(Err(refused)) };
     let before = read.pop().unwrap_or_default();
@@ -1928,10 +1949,12 @@ mod tests {
             .iter().map(|path| path.to_string()).collect()
     }
 
-    /// An unserved record names its evidence: the first read that refused, with its failure's
-    /// message, or else its stderr; or a walk that ended short of the record.
+    /// An unserved record names its own evidence: a walk that ended short of it, whatever else
+    /// refused, or else the first of its reads that refused, with its failure's message or its
+    /// stderr, a long one cut and marked.
     ///
-    /// Revert: drop the refused read → the CI history run's refusal names no command.
+    /// Revert: drop the refused read → the CI history run's refusal names no command; check the
+    /// walk last → a short walk is blamed on a read that refused.
     #[test]
     fn an_unserved_record_names_the_read_that_refused() {
         let ran = |arguments: &[&str], exit: Option<i32>, stderr: &str, message: Option<&str>| Outcome {
@@ -1939,9 +1962,14 @@ mod tests {
             failure: message.map(|message| crate::tool::Failure { code: "x".into(), message: message.into(), next_step: None }),
         };
         let reads = [ran(&["walk"], Some(0), "", None), ran(&["lay", "out"], Some(2), "noise", Some("no parcel abc")), ran(&["open"], Some(1), "later", None)];
+        let reads: Vec<&Outcome> = reads.iter().collect();
         assert_eq!(unserved(Mark::Position(0), true, &reads), r#"the unfaulted readback did not serve Position(0): ["lay", "out"] exited Some(2): no parcel abc"#);
         assert_eq!(unserved(Mark::Position(1), true, &reads[2..]), r#"the unfaulted readback did not serve Position(1): ["open"] exited Some(1): later"#);
         assert_eq!(unserved(Mark::Position(2), false, &reads[..1]), "the unfaulted readback did not serve Position(2): its walk ended short of it");
+        assert_eq!(unserved(Mark::Position(3), false, &reads), "the unfaulted readback did not serve Position(3): its walk ended short of it");
+        let long = ran(&["open"], Some(1), &"é".repeat(500), None);
+        assert_eq!(said(&long), format!("{}…", "é".repeat(400)));
+        assert_eq!(said(&reads[1]), "no parcel abc");
     }
 
     /// A pattern resolves to one of the paths it matches, chosen by the seed, a folder without its

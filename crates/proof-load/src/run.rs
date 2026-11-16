@@ -334,6 +334,7 @@ fn history_damage(
         }
     };
     let mut subjects = Vec::new();
+    let mut refused_baselines = Vec::new();
     if !positions.is_empty() {
         for tool in [Tool::Forklift, Tool::Git, Tool::GitTuned] {
             let pristine = if tool == Tool::Forklift { &forklift_root } else { &git_root };
@@ -360,8 +361,11 @@ fn history_damage(
                     write_detail(output.root(), &format!("{}.json", label), &base)?;
                     subjects.push((tool, pristine.clone(), base));
                 }
-                Ok(Err(refused)) if refused_readback_is_a_gap(tool) => gaps.entry(tool).or_default().push(format!("its rows: not run: the unfaulted readback failed: {}", refused)),
-                Ok(Err(refused)) => errors.entry(tool).or_default().push(format!("its rows: not run: the unfaulted readback failed: {}", refused)),
+                Ok(Err(refused)) => {
+                    refused_baselines.push(tool);
+                    let blamed = if refused_readback_is_a_gap(tool) { &mut gaps } else { &mut errors };
+                    blamed.entry(tool).or_default().push(format!("its rows: not run: the unfaulted readback failed: {}", refused));
+                }
                 Err(error) => errors.entry(tool).or_default().push(format!("its unfaulted readback: {}", error)),
             }
         }
@@ -411,6 +415,8 @@ fn history_damage(
             Cell::not_run("the history subjects were not built")
         } else if positions.is_empty() {
             Cell::not_run("no position was sampled")
+        } else if refused_baselines.contains(&tool) {
+            Cell::not_run("its unfaulted readback refused")
         } else if !subjects.iter().any(|(subject, _, _)| *subject == tool) {
             Cell::not_run("its unfaulted readback was not taken")
         } else {
