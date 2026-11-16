@@ -1285,10 +1285,10 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             let hosted = |scenario: &&scenario::Scenario| server.is_some() && scenario.hosts();
             let killed = |scenario: &&scenario::Scenario| kill::lanes(&kill, &power, &scenario.id).0;
             let powered = |scenario: &&scenario::Scenario| kill::lanes(&kill, &power, &scenario.id).1;
-            // Each git subject a scenario binds is a kill block of its own beside forklift's.
+            // Each git subject a scenario binds is a block of its own in each lane, beside forklift's.
             let git_subjects = |scenario: &scenario::Scenario| scenario.tools().into_iter().filter(|tool| *tool != Tool::Forklift).collect::<Vec<_>>();
             progress.lane(Category::KillPointsClient, Some(scenarios.iter().filter(killed).map(|scenario| 1 + git_subjects(scenario).len()).sum()));
-            progress.lane(Category::PowerLossClient, Some(scenarios.iter().filter(powered).count()));
+            progress.lane(Category::PowerLossClient, Some(scenarios.iter().filter(powered).map(|scenario| 1 + git_subjects(scenario).len()).sum()));
             progress.lane(Category::KillPointsServer, Some(scenarios.iter().filter(killed).filter(hosted).count()));
             progress.lane(Category::PowerLossServer, Some(scenarios.iter().filter(powered).filter(hosted).count()));
             let kills_failed = |kills: &kill::ScenarioKills| !kills.errors.is_empty() || !kills.refusals.is_empty()
@@ -1324,24 +1324,42 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     progress.block_finished(Category::PowerLossServer, &scenario.id, power_failed(&lost));
                     all_server_power.push(lost);
                 }
-                // The same faulted command run as each git subject, killed at its own points. A
-                // count that fails is the run's own failure, as forklift's is.
-                for subject in git_subjects(scenario).into_iter().filter(|_| killing) {
+                // The same faulted command run as each git subject, killed at its own points and
+                // losing power in its own run. A count that fails is the run's own failure, as
+                // forklift's is.
+                for subject in git_subjects(scenario) {
                     let block = format!("{}-{}", subject.label(), scenario.id);
-                    start_block(progress, Category::KillPointsClient, &block)?;
-                    let failed = |error: String| kill::ScenarioKills { scenario: scenario.id.clone(), subject, errors: vec![error], ..Default::default() };
-                    let kills = match output.scratch(&format!("{}-traced", block)).map_err(|error| error.to_string()) {
-                        Err(error) => failed(error),
-                        Ok(template) => match kill::count(scenario, &faulted_corpus, &programs, &settings, &template, false, subject) {
-                            Err(error) => failed(error.to_string()),
-                            Ok(counting) => kill::run(scenario, &programs, &settings, &template, &counting, subject).unwrap_or_else(|error| failed(error.to_string())),
-                        },
+                    // One poll for both blocks, so a cancel never leaves one started alone.
+                    stop_if_cancelled(progress)?;
+                    if killing {
+                        progress.block_started(Category::KillPointsClient, &block);
+                    }
+                    if powering {
+                        progress.block_started(Category::PowerLossClient, &block);
+                    }
+                    let counted = output.scratch(&format!("{}-traced", block)).map_err(|error| error.to_string())
+                        .and_then(|template| kill::count(scenario, &faulted_corpus, &programs, &settings, &template, powering, subject).map(|counting| (template, counting)).map_err(|error| error.to_string()));
+                    let kill_error = |error: String| kill::ScenarioKills { scenario: scenario.id.clone(), subject, errors: vec![error], ..Default::default() };
+                    let power_error = |error: String| crate::power::ScenarioPower { scenario: scenario.id.clone(), subject, errors: vec![error], ..Default::default() };
+                    let (kills, lost) = match &counted {
+                        Err(error) => (killing.then(|| kill_error(error.clone())), powering.then(|| power_error(error.clone()))),
+                        Ok((template, counting)) => (
+                            killing.then(|| kill::run(scenario, &programs, &settings, template, counting, subject).unwrap_or_else(|error| kill_error(error.to_string()))),
+                            powering.then(|| crate::power::run(scenario, &programs, &settings, template, counting, power_variants, seed, subject).unwrap_or_else(|error| power_error(error.to_string()))),
+                        ),
                     };
-                    write_detail(output.root(), &kill::details_file_of(kill::Side::Client, subject, &scenario.id), &kills)?;
                     // A git grade never fails the run; only what failed the harness's own look at
                     // git does.
-                    progress.block_finished(Category::KillPointsClient, &block, !kills.errors.is_empty() || !kills.refusals.is_empty());
-                    all_kills.push(kills);
+                    if let Some(kills) = kills {
+                        write_detail(output.root(), &kill::details_file_of(kill::Side::Client, subject, &scenario.id), &kills)?;
+                        progress.block_finished(Category::KillPointsClient, &block, !kills.errors.is_empty() || !kills.refusals.is_empty());
+                        all_kills.push(kills);
+                    }
+                    if let Some(lost) = lost {
+                        write_detail(output.root(), &crate::power::details_file_of(kill::Side::Client, subject, &scenario.id), &lost)?;
+                        progress.block_finished(Category::PowerLossClient, &block, !lost.errors.is_empty() || !lost.refusals.is_empty());
+                        all_power.push(lost);
+                    }
                 }
                 // One poll for both client blocks, so a cancel never leaves one started alone.
                 stop_if_cancelled(progress)?;
@@ -1379,7 +1397,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     all_kills.push(kills);
                 }
                 if powering {
-                    let lost = match crate::power::run(scenario, &programs, &settings, &template, &counting, power_variants, seed) {
+                    let lost = match crate::power::run(scenario, &programs, &settings, &template, &counting, power_variants, seed, Tool::Forklift) {
                         Ok(power) => {
                             write_detail(output.root(), &crate::power::details_file(kill::Side::Client, &scenario.id), &power)?;
                             power

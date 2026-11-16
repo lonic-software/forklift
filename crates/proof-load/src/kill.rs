@@ -470,11 +470,12 @@ pub fn recorded_root(root: &Path, needles: &[&str]) -> std::io::Result<Option<St
 /// Whether the file at root-relative `path` records in its `bytes` one of `needles` that a copy
 /// would be tied to. A git index's untracked cache names its work tree in its ident, `Location
 /// <work tree>, system <name>`, which git checks on every read and rebuilds the cache over when
-/// it differs: a copy is not tied to it. Only git's own index files are read so.
+/// it differs: a copy is not tied to it. Only git's own index files are read so, the lock it
+/// writes a new index into among them, since a crash can leave that lock behind.
 pub(crate) fn records_root(path: &str, bytes: &[u8], needles: &[&str]) -> bool {
     let mut bytes = std::borrow::Cow::Borrowed(bytes);
     let name = path.rsplit('/').next().unwrap_or(path);
-    let index = path.split('/').rev().nth(1) == Some(".git") && (name == "index" || name.starts_with("sharedindex."));
+    let index = path.split('/').rev().nth(1) == Some(".git") && (matches!(name, "index" | "index.lock") || name.starts_with("sharedindex."));
     if let Some(ident) = untracked_ident(&bytes).filter(|_| index) {
         bytes.to_mut()[ident].fill(0);
     }
@@ -639,6 +640,9 @@ pub struct Counted {
     /// The file the faulted command recorded the scratch area's root in, when it did: the copies
     /// cannot stand for the run then. Reported only once the trace's own refusals are clear.
     pub(crate) path_bound: Option<String>,
+    /// What the power loss's scans of the counting copy leave out: [`daemon_owned`] where a daemon
+    /// ran.
+    pub(crate) unscanned: Vec<String>,
 }
 
 /// What counting found: the counted run, or why the scenario's faults cannot run.
@@ -680,14 +684,15 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
     let counting_root = Root::of(counting.root()).map_err(io)?;
     let subject = subject_of(&counting_context)?;
     let daemon = daemon_of(&counting_context)?;
+    let unscanned = if daemon.is_some() { daemon_owned(&counting) } else { Vec::new() };
     counting_context.write_snapshot(faulted)?;
     // Only the power loss reads the fixture, so a tree it cannot hold fails that lane alone.
-    let fixture = dumps.then(|| crate::power::scan(counting.root()).map_err(|error| error.to_string()));
+    let fixture = dumps.then(|| crate::power::scan_except(counting.root(), &unscanned).map_err(|error| error.to_string()));
     let mut lines = Vec::new();
     let ops = counting_context.line_ops(faulted)?;
     for (index, (arguments, op)) in counting_context.lines(faulted)?.into_iter().zip(ops).enumerate() {
         let before = listing(counting.root());
-        let start = (dumps && index > 0).then(|| crate::power::scan(counting.root()).map_err(|error| error.to_string()));
+        let start = (dumps && index > 0).then(|| crate::power::scan_except(counting.root(), &unscanned).map_err(|error| error.to_string()));
         let trace_path = settings.traces.join(format!("{}-count-{}.trace", label, index));
         let extra = if dumps { vec!["-e".to_string(), "write=all".to_string()] } else { Vec::new() };
         let line = strace_line(&trace_path, &extra, counting_context.program(), &arguments);
@@ -714,7 +719,7 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
     drop(daemon);
     let path_bound = recorded_root(counting.root(), &[&original.given, &original.canonical, &counting_root.given, &counting_root.canonical]).map_err(io)?
         .map(|file| format!("path-bound: the faulted command recorded the scratch area's root in {}", file));
-    Ok(Counting::Counted(Box::new(Counted { tool, subject, corpus, expected, faulted, label, counting, counting_root, original_root: original, fixture, lines, path_bound })))
+    Ok(Counting::Counted(Box::new(Counted { tool, subject, corpus, expected, faulted, label, counting, counting_root, original_root: original, fixture, lines, path_bound, unscanned })))
 }
 
 /// Why a counted line's faults cannot be graded because it left work running behind it, if it
@@ -729,7 +734,7 @@ fn background(calls: &[Call], counting: &Scratch, tool: Tool, arguments: &[Strin
 
 /// Whether a scenario's kill rows pair on the data plate: git runs both its history and its
 /// faulted command, so a git subject's rows stand beside forklift's.
-fn paired(scenario: &Scenario) -> bool {
+pub(crate) fn paired(scenario: &Scenario) -> bool {
     scenario.tools().len() > 1 && scenario.then.iter().all(|op| crate::scenario::bind(Tool::Git, op).is_some())
 }
 
@@ -749,13 +754,26 @@ fn subject_of(context: &Context) -> Result<Subject, RunError> {
 }
 
 /// The fsmonitor daemon a tuned git copy runs, where this git has one: started by the harness
-/// outside every trace, since a command that finds none starts a detached one inside its own.
-fn daemon_of(context: &Context) -> Result<Option<runner::FsmonitorDaemon>, RunError> {
+/// outside every trace, since a command that finds none starts a detached one inside its own. The
+/// build turned the fsmonitor on, so a copy's config is left as the copy holds it.
+pub(crate) fn daemon_of(context: &Context) -> Result<Option<runner::FsmonitorDaemon>, RunError> {
     if context.tool != Tool::GitTuned || !runner::has_fsmonitor_daemon(context.program()) {
         return Ok(None);
     }
-    let (daemon, _) = runner::FsmonitorDaemon::start(context.program(), &context.scratch.work(), context.scratch, context.environment, context.limit)?;
+    let (daemon, _) = runner::FsmonitorDaemon::watch(context.program(), &context.scratch.work(), context.scratch, context.environment, context.limit)?;
     Ok(Some(daemon))
+}
+
+/// What a running fsmonitor daemon keeps in the work tree of `scratch`, as paths relative to its
+/// root: the socket a command connects to and the folder its cookies go in. The daemon writes
+/// them outside every trace, and a traced command only connects to the socket, so the power loss
+/// neither scans nor models them, and each graded copy's own daemon makes its own.
+pub(crate) fn daemon_owned(scratch: &Scratch) -> Vec<String> {
+    let work = scratch.work();
+    let Ok(relative) = work.strip_prefix(scratch.root()) else { return Vec::new() };
+    let parts: Vec<String> = relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
+    let git = parts.iter().map(String::as_str).chain([".git"]).collect::<Vec<_>>().join("/");
+    vec![format!("{}/fsmonitor--daemon", git), format!("{}/fsmonitor--daemon.ipc", git)]
 }
 
 /// The command id of a line `tool` runs: forklift's as the schema names it, git's its subcommand,
@@ -1437,7 +1455,10 @@ mod tests {
         let at = ".git/index";
         assert!(!records_root(at, &index, &["/s/0001-h"]));
         assert!(!records_root("work/.git/sharedindex.ab12", &index, &["/s/0001-h"]));
+        // A crash can leave the lock git writes the next index into.
+        assert!(!records_root("work/.git/index.lock", &index, &["/s/0001-h"]));
         assert!(records_root("work/.forklift/index", &index, &["/s/0001-h"]), "only git's own index is git's to check");
+        assert!(records_root("work/.git/other.lock", &index, &["/s/0001-h"]), "only git's own index is git's to check");
         let mut elsewhere = index.clone();
         elsewhere.extend_from_slice(b"/s/0001-h/x");
         assert!(records_root(at, &elsewhere, &["/s/0001-h"]));

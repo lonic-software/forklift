@@ -49,7 +49,7 @@ use std::sync::Mutex;
 use crate::corpus::Rng;
 use crate::faulted::{self, Graded, Programs};
 use crate::kill::{self, Counting, Directories, Point, Settings};
-use crate::report::{Category, Cell, Completeness, Row};
+use crate::report::{Category, Cell, Completeness, FaultLane, Pairing, Row, Target};
 use crate::runner::RunError;
 use crate::scenario::{Scenario, Tool};
 use crate::scrub::Scratch;
@@ -1174,9 +1174,17 @@ fn fd_of(text: &str) -> Option<i64> {
 /// Reads the tree under `root` as it stands, links as links. A name or link target that is not
 /// UTF-8 is an error, never read lossily into another name.
 pub fn scan(root: &Path) -> std::io::Result<Image> {
+    scan_except(root, &[])
+}
+
+/// [`scan`] without the root-relative paths in `unscanned`, nor anything under them.
+pub(crate) fn scan_except(root: &Path, unscanned: &[String]) -> std::io::Result<Image> {
     let mut out = Image::new();
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((at, path)) = stack.pop() {
+        if unscanned.contains(&path) {
+            continue;
+        }
         let metadata = std::fs::symlink_metadata(&at)?;
         let kind = metadata.file_type();
         if kind.is_symlink() {
@@ -1336,6 +1344,15 @@ impl Moment {
             Moment::After { line, .. } => (line + 1, false),
             // Every state of one served run is graded with that run's steps.
             Moment::Served { request, .. } => (request.unwrap_or(usize::MAX), false),
+        }
+    }
+
+    /// The faulted command's line the crash is in or after, for a client's.
+    pub fn line(&self) -> Option<usize> {
+        match self {
+            Moment::During { point } => Some(point.line),
+            Moment::Synced { line, .. } | Moment::Ending { line, .. } | Moment::After { line, .. } => Some(*line),
+            Moment::Served { .. } => None,
         }
     }
 
@@ -1644,6 +1661,8 @@ impl Collector {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct GradedCrash {
     pub crash: Crash,
+    /// The operation whose bound lines hold the line a client's crash is in; a server's has none.
+    pub op: Option<String>,
     pub graded: Graded,
 }
 
@@ -1651,6 +1670,10 @@ pub struct GradedCrash {
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct ScenarioPower {
     pub scenario: String,
+    /// The subject the faulted command ran as.
+    pub subject: Tool,
+    /// Whether more than one subject runs the scenario, so its rows pair on the data plate.
+    pub paired: bool,
     /// Why the scenario's power loss was not run, when it was not.
     pub not_run: Option<String>,
     /// What refused the replay: unmodelled calls, a replay that does not reproduce the run.
@@ -1667,8 +1690,10 @@ pub struct ScenarioPower {
 /// Grades every state a power loss during `scenario`'s faulted command can leave, `variants`
 /// seeded ones among them, from the run [`kill::count`] counted in `template` with its writes
 /// dumped. Each state is written into its own area beside the template, `<template>-power-<n>`.
-pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, template: &Scratch, counting: &Counting, variants: usize, seed: u64) -> Result<ScenarioPower, RunError> {
-    let mut power = ScenarioPower { scenario: scenario.id.clone(), ..Default::default() };
+/// `tool` is the subject `counting` ran as.
+#[allow(clippy::too_many_arguments)]
+pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, template: &Scratch, counting: &Counting, variants: usize, seed: u64, tool: Tool) -> Result<ScenarioPower, RunError> {
+    let mut power = ScenarioPower { scenario: scenario.id.clone(), subject: tool, paired: kill::paired(scenario), ..Default::default() };
     let counted = match counting {
         Counting::Counted(counted) => counted,
         Counting::NotRun(reason) => {
@@ -1691,7 +1716,7 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
     };
     let mut lines = Vec::new();
     for (index, line) in counted.lines.iter().enumerate() {
-        let command = kill::command_id(settings.schema, &line.arguments).map_err(RunError::Io)?;
+        let command = kill::command_of(counted.tool, settings.schema, &line.arguments).map_err(RunError::Io)?;
         // The first line starts from the fixture, scanned once.
         let before = match (&line.start, index) {
             (_, 0) => fixture,
@@ -1709,7 +1734,7 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
     // Each scenario draws its own variants, not the same corners of every scenario.
     let drawn = seed ^ u64::from_le_bytes(blake3::hash(scenario.id.as_bytes()).as_bytes()[..8].try_into().expect("eight bytes"));
     // A client's copy is read back from its own work tree, as [`kill::context_of`] reads it.
-    let acknowledging = faulted::acknowledging(Tool::Forklift, &scenario.then, false).map_err(RunError::Io)?;
+    let acknowledging = faulted::acknowledging(counted.tool, &scenario.then, false).map_err(RunError::Io)?;
     let Found { crashes, requested, replayed } = match crashes(fixture, &counted.counting_root, &start, umask, &lines, acknowledging, variants, drawn) {
         Ok(found) => found,
         Err(refusal) => {
@@ -1717,7 +1742,7 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
             return Ok(power);
         }
     };
-    let ran = scan(counted.counting.root()).map_err(|error| RunError::Io(error.to_string()))?;
+    let ran = scan_except(counted.counting.root(), &counted.unscanned).map_err(|error| RunError::Io(error.to_string()))?;
     // The same roots the counting run's final tree was checked for.
     let needles = [&counted.original_root, &counted.counting_root].map(|root| [root.given.as_str(), root.canonical.as_str()]).concat();
     if let Some((refusals, not_run)) = stopped(&replayed, &ran, &crashes, &needles) {
@@ -1739,8 +1764,9 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
                 let mut crash = slot.lock().expect("no worker panics holding the lock").take().expect("each state is taken once");
                 let result = grade(scenario, counted, programs, settings, template, &crash, at);
                 crash.image = std::sync::Arc::default();
+                let op = crash.moment.line().and_then(|line| counted.lines.get(line)).map(|line| line.op.clone());
                 let result = match result {
-                    Ok(graded) => Ok(GradedCrash { crash, graded }),
+                    Ok(graded) => Ok(GradedCrash { crash, op, graded }),
                     Err(error) => Err(format!("{}: {}", crash.moment.label(), error)),
                 };
                 results.lock().expect("no worker panics holding the lock").push((at, result));
@@ -1798,6 +1824,8 @@ fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, sett
     materialize(&crash.image, copy.root()).map_err(io)?;
     let environment = kill::environment_of(settings, &copy)?;
     let context = kill::context_of(scenario, &counted.corpus, programs, settings, &copy, &environment, counted.tool);
+    // A tuned copy's daemon watches from before its first step until it is graded, as the run's.
+    let daemon = kill::daemon_of(&context)?;
     let mut steps: Vec<Outcome> = Vec::new();
     match &crash.moment {
         Moment::During { point: Point { line, .. } } | Moment::Synced { line, .. } | Moment::Ending { line, .. } => {
@@ -1821,6 +1849,7 @@ fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, sett
         first.append(&mut steps);
         Ok(())
     })?;
+    drop(daemon);
     // A copy that graded well holds nothing to look at; one that did not is kept for diagnosis.
     if !graded.grade.is_failure() {
         let _ = remove_tree(copy.root());
@@ -1845,24 +1874,63 @@ pub fn summarize(all: &[ScenarioPower]) -> Summary {
 /// The file in the output directory that holds one scenario's power loss of `side`, as `run`
 /// writes it and as each row's detail names it.
 pub fn details_file(side: kill::Side, scenario: &str) -> String {
-    match side {
+    details_file_of(side, Tool::Forklift, scenario)
+}
+
+/// [`details_file`] for `subject`'s power loss: forklift's keep the plain names.
+pub fn details_file_of(side: kill::Side, subject: Tool, scenario: &str) -> String {
+    let file = match side {
         kill::Side::Client => format!("power-{}.json", scenario),
         kill::Side::Server => format!("server-power-{}.json", scenario),
+    };
+    match subject {
+        Tool::Forklift => file,
+        other => format!("{}-{}", other.label(), file),
     }
 }
 
-/// [`summarize`] for `side`'s power loss: a server's names, beside its states, each run that never
-/// reached its cut.
+/// [`summarize`] for `side`'s power loss, each subject's apart, as [`kill::summarize_as`] keeps
+/// them: a git subject's rows, missing states and unrun scenarios are its own, while what refused
+/// its replay or failed its states is the run's. The lane's cell is forklift's. A server's names,
+/// beside its states, each run that never reached its cut.
 pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
+    // Forklift's checks stand even over no scenario, so an empty lane reads as unmeasured.
+    let mut subjects: Vec<Tool> = std::iter::once(Tool::Forklift).chain(all.iter().map(|scenario| scenario.subject)).collect();
+    subjects.sort();
+    subjects.dedup();
+    let mut summary = Summary { cell: Cell::not_run("no power-loss state was graded"), rows: Vec::new(), completeness: Vec::new() };
+    for subject in subjects {
+        let of: Vec<&ScenarioPower> = all.iter().filter(|scenario| scenario.subject == subject).collect();
+        let one = summarize_subject(&of, side, subject);
+        if subject == Tool::Forklift {
+            summary.cell = one.cell;
+        }
+        summary.rows.extend(one.rows);
+        summary.completeness.extend(one.completeness);
+    }
+    summary
+}
+
+fn summarize_subject(all: &[&ScenarioPower], side: kill::Side, subject: Tool) -> Summary {
     let (category, binding, prefix) = match side {
-        kill::Side::Client => (Category::PowerLossClient, "forklift", ""),
+        kill::Side::Client => (Category::PowerLossClient, subject.label(), ""),
         kill::Side::Server => (Category::PowerLossServer, "forklift-server", "server "),
+    };
+    // Forklift's checks keep their names; another subject's name it.
+    let named = |check: String| match subject {
+        Tool::Forklift => check,
+        other => format!("{}, {}", check, other.label()),
+    };
+    // What failed the harness's own look at a git subject is the run's, not git's.
+    let harness = match subject {
+        Tool::Forklift => Some(Tool::Forklift),
+        _ => None,
     };
     let (mut unreached, mut between) = (Vec::new(), Vec::new());
     let (mut rows, mut refusals, mut errors, mut not_run, mut missing) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for scenario in all {
         if let Some(reason) = &scenario.not_run {
-            not_run.push(Completeness { subject: Some(Tool::Forklift), check: format!("{}power loss of {}", prefix, scenario.scenario), cell: Cell::not_run(reason), missing: vec![] });
+            not_run.push(Completeness { subject: Some(subject), check: named(format!("{}power loss of {}", prefix, scenario.scenario)), cell: Cell::not_run(reason), missing: vec![] });
             continue;
         }
         refusals.extend(scenario.refusals.iter().map(|refusal| format!("{}: {}", scenario.scenario, refusal)));
@@ -1872,9 +1940,9 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
             missing.push(format!("{}: no crash state was graded", scenario.scenario));
         }
         if !scenario.crashes.is_empty() {
-            between.push(Completeness { subject: Some(Tool::Forklift), check: format!("{}power loss of {}, states between durable and volatile: {}", prefix, scenario.scenario, scenario.requested.label()), cell: Cell::Run, missing: vec![] });
+            between.push(Completeness { subject: Some(subject), check: named(format!("{}power loss of {}, states between durable and volatile: {}", prefix, scenario.scenario, scenario.requested.label())), cell: Cell::Run, missing: vec![] });
         }
-        for (index, GradedCrash { crash, graded }) in scenario.crashes.iter().enumerate() {
+        for (index, GradedCrash { crash, op, graded }) in scenario.crashes.iter().enumerate() {
             let mut notes = vec![CAVEAT.to_string(), REWRITTEN.to_string()];
             if crash.shared > 1 {
                 notes.push(format!("{} crash moments leave this state", crash.shared));
@@ -1882,15 +1950,18 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
             if !graded.unextractable.is_empty() {
                 notes.push(format!("unextractable remedies: {}", graded.unextractable.join("; ")));
             }
-            rows.push(Row { subject: Tool::Forklift,
+            let pairing = op.as_ref().filter(|_| scenario.paired && side == kill::Side::Client).map(|op| Pairing {
+                scenario: scenario.scenario.clone(), target: Target::Fault { lane: FaultLane::Power, op: op.clone() }, directions: Vec::new(),
+            });
+            rows.push(Row { subject,
                 scenario: format!("{} power {}{}", scenario.scenario, crash.moment.label(), crash.state.label()),
                 category,
                 binding: binding.to_string(),
                 grade: graded.grade,
                 recoverability: graded.recoverability.clone(),
                 note: Some(notes.join("; ")),
-                detail: Some(format!("{}#/crashes/{}/graded", details_file(side, &scenario.scenario), index)),
-                pairing: None,
+                detail: Some(format!("{}#/crashes/{}/graded", details_file_of(side, subject, &scenario.scenario), index)),
+                pairing,
             });
         }
     }
@@ -1898,12 +1969,12 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
         missing.push(format!("no scenario's {}power loss ran", prefix));
     }
     let mut completeness = vec![
-        Completeness { subject: Some(Tool::Forklift), check: format!("{}power-loss states", prefix), cell: Cell::Run, missing },
-        Completeness { subject: Some(Tool::Forklift), check: format!("{}power-loss soundness", prefix), cell: Cell::Run, missing: refusals },
-        Completeness { subject: Some(Tool::Forklift), check: format!("{}power-loss states ran", prefix), cell: Cell::Run, missing: errors },
+        Completeness { subject: Some(subject), check: named(format!("{}power-loss states", prefix)), cell: Cell::Run, missing },
+        Completeness { subject: harness, check: named(format!("{}power-loss soundness", prefix)), cell: Cell::Run, missing: refusals },
+        Completeness { subject: harness, check: named(format!("{}power-loss states ran", prefix)), cell: Cell::Run, missing: errors },
     ];
     if side == kill::Side::Server {
-        completeness.push(Completeness { subject: Some(Tool::Forklift), check: "server power-loss cuts reached".to_string(), cell: Cell::Run, missing: unreached });
+        completeness.push(Completeness { subject: Some(subject), check: "server power-loss cuts reached".to_string(), cell: Cell::Run, missing: unreached });
     }
     completeness.extend(between);
     completeness.extend(not_run);
@@ -2530,7 +2601,7 @@ mod tests {
         let crash = Crash { moment, acknowledged: false, shared: 1, state: State::Durable, image: Default::default() };
         let all = vec![ScenarioPower {
             scenario: "lifted".into(), not_reached: vec!["the run cut at request 3: never request 3".into()],
-            crashes: vec![GradedCrash { crash, graded }], ..Default::default()
+            crashes: vec![GradedCrash { crash, op: None, graded }], ..Default::default()
         }];
         let summary = summarize_as(&all, kill::Side::Server);
         assert_eq!(summary.cell, Cell::Run);
@@ -2557,6 +2628,93 @@ mod tests {
         let moment = |line| Moment::Synced { line, command: "stack".into(), call: 3, name: "fsync".into() };
         assert_eq!(moment(1).label(), "line 2 stack before fsync at traced call 4");
         assert_ne!(moment(0).label(), moment(1).label());
+    }
+
+    /// A client's moment names the line it is in or after, which its row pairs by; a server's
+    /// names none.
+    ///
+    /// Revert: name the next line after one → `after line 2` pairs with line 3's operation.
+    #[test]
+    fn a_moment_names_its_line() {
+        assert_eq!(Moment::After { line: 1, command: "stack".into() }.line(), Some(1));
+        assert_eq!(Moment::Ending { line: 2, command: "stack".into() }.line(), Some(2));
+        assert_eq!(Moment::Synced { line: 3, command: "stack".into(), call: 0, name: "fsync".into() }.line(), Some(3));
+        assert_eq!(Moment::Served { request: None, route: String::new(), when: String::new() }.line(), None);
+    }
+
+    /// A git subject's power loss is its own: its rows bear its name and binding and pair by the
+    /// operation of the crash's line, its missing states and unrun scenarios are git's, and what
+    /// refused its replay or failed its states is the run's. The lane's cell is forklift's.
+    ///
+    /// Revert: pair on the kill lane → the row pairs with a kill row; leave git's refusals
+    /// forklift's → a git replay refusal reads as forklift's; take the last subject's cell → the
+    /// lane reads run while forklift graded nothing.
+    #[test]
+    fn a_git_subject_s_power_loss_is_its_own() {
+        let graded = Graded {
+            grade: crate::oracle::Grade::DataLost, evidence: Default::default(), recoverability: Default::default(),
+            steps: vec![], readbacks: vec![], probes: vec![], unextractable: vec![],
+        };
+        let crash = Crash { moment: Moment::After { line: 0, command: "commit".into() }, acknowledged: true, shared: 1, state: State::Durable, image: Default::default() };
+        let all = vec![
+            ScenarioPower { scenario: "history".into(), subject: Tool::Forklift, paired: true, not_run: Some("path-bound".into()), ..Default::default() },
+            ScenarioPower { scenario: "history".into(), subject: Tool::Git, paired: true,
+                crashes: vec![GradedCrash { crash: crash.clone(), op: Some("record".into()), graded: graded.clone() }], ..Default::default() },
+            ScenarioPower { scenario: "branched".into(), subject: Tool::Git, paired: true, refusals: vec!["the replay does not reproduce the run".into()], ..Default::default() },
+            ScenarioPower { scenario: "parked".into(), subject: Tool::GitTuned, not_run: Some("background maintenance".into()), ..Default::default() },
+        ];
+        let summary = summarize(&all);
+        assert_eq!(summary.cell, Cell::not_run("no power-loss state was graded"), "the lane's cell is forklift's");
+        assert_eq!(summary.rows.len(), 1);
+        let row = &summary.rows[0];
+        assert_eq!((row.subject, row.binding.as_str()), (Tool::Git, "git"));
+        assert_eq!(row.pairing, Some(Pairing { scenario: "history".into(), target: Target::Fault { lane: FaultLane::Power, op: "record".into() }, directions: vec![] }));
+        assert_eq!(row.detail.as_deref(), Some("git-power-history.json#/crashes/0/graded"));
+        let check = |name: &str| summary.completeness.iter().find(|check| check.check == name).unwrap_or_else(|| panic!("no check {}", name));
+        assert_eq!(check("power-loss soundness, git").subject, None, "what refused git's replay is the run's");
+        assert_eq!(check("power-loss soundness, git").missing, ["branched: the replay does not reproduce the run"]);
+        assert_eq!(check("power-loss states ran, git").subject, None);
+        assert_eq!(check("power-loss states, git").subject, Some(Tool::Git));
+        assert_eq!(check("power loss of parked, git-tuned").subject, Some(Tool::GitTuned));
+        assert_eq!(check("power loss of parked, git-tuned").cell, Cell::not_run("background maintenance"));
+        assert_eq!(check("power-loss states, git-tuned").missing, ["no scenario's power loss ran"]);
+        assert_eq!(check("power loss of history").subject, Some(Tool::Forklift));
+        assert!(check("power-loss soundness").missing.is_empty());
+        // An unpaired scenario's row, and a server's state, pair with nothing.
+        let unpaired = vec![ScenarioPower { scenario: "compacted".into(), subject: Tool::Git, crashes: vec![GradedCrash { crash, op: Some("record".into()), graded }], ..Default::default() }];
+        assert_eq!(summarize(&unpaired).rows[0].pairing, None);
+        assert_eq!(summarize_as(&unpaired, kill::Side::Server).rows[0].pairing, None);
+    }
+
+    /// A tuned git's fsmonitor daemon keeps a socket in the work tree, which no scan can hold, and
+    /// cookies the trace never sees; the power loss's scans leave both out.
+    ///
+    /// Revert: scan the copy whole → the socket stops the scan; leave out only the socket → the
+    /// cookie folder stands in the scan.
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_s_own_files_are_left_out_of_the_scan() {
+        let name = "git";
+        let git = std::env::split_paths(&std::env::var_os("PATH").expect("a PATH")).map(|folder| folder.join(name))
+            .find(|path| path.is_file()).expect("a git on PATH");
+        if !crate::runner::has_fsmonitor_daemon(&git) {
+            return;
+        }
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch::create(&std::env::temp_dir().join(format!("proof-load-daemon-scan-{}-{}", std::process::id(), nanos))).unwrap();
+        let search = crate::scrub::search_path(Some(&git), std::env::var_os("PATH"));
+        let environment = crate::scrub::Environment::scrubbed(&scratch, search, &BTreeMap::new()).unwrap();
+        let init = crate::tool::run(&crate::tool::Invocation { program: git.clone(), arguments: vec!["init".into(), "-q".into()], directory: scratch.work(), limit: std::time::Duration::from_secs(30) }, &scratch, &environment).unwrap();
+        assert!(init.succeeded());
+        let (daemon, _) = crate::runner::FsmonitorDaemon::start(&git, &scratch.work(), &scratch, &environment, std::time::Duration::from_secs(60)).unwrap();
+        assert!(scan(scratch.root()).unwrap_err().to_string().contains("neither file, folder nor link"), "the daemon keeps no socket in the work tree");
+        let unscanned = kill::daemon_owned(&scratch);
+        assert_eq!(unscanned, ["work/.git/fsmonitor--daemon", "work/.git/fsmonitor--daemon.ipc"]);
+        let scanned = scan_except(scratch.root(), &unscanned).unwrap();
+        assert!(scanned.contains_key("work/.git/config"));
+        assert!(scanned.keys().all(|path| !path.contains("fsmonitor--daemon")), "{:?}", scanned.keys().filter(|path| path.contains("fsmonitor")).collect::<Vec<_>>());
+        drop(daemon);
+        let _ = remove_tree(scratch.root());
     }
 
     /// A close_range that unshares first closes in the caller's own copy: the process it shared

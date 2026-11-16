@@ -219,6 +219,15 @@ impl FsmonitorDaemon {
             return Err(RunError::Io(format!("turning on the fsmonitor exited {:?}: {}", configured.exit, String::from_utf8_lossy(&configured.stderr))));
         }
         outcomes.push(configured);
+        let (daemon, status) = FsmonitorDaemon::watch(program, work, scratch, environment, limit)?;
+        outcomes.push(status);
+        Ok((daemon, outcomes))
+    }
+
+    /// Starts the daemon over the work tree at `work`, its fsmonitor already on, and waits until
+    /// `status` says it watches: what that `status` said. Nothing in the work tree is configured,
+    /// so a copy whose state is under test keeps its config as it was.
+    pub(crate) fn watch(program: &Path, work: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<(FsmonitorDaemon, Outcome), RunError> {
         let mut command = std::process::Command::new(program);
         command.args(["fsmonitor--daemon", "run"]).current_dir(work)
             .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
@@ -233,10 +242,7 @@ impl FsmonitorDaemon {
             // A probe that runs past its own bound has not seen the daemon watch yet; only `limit`
             // as a whole gives up.
             match tool::run(&Invocation { program: program.to_path_buf(), arguments: vec!["fsmonitor--daemon".into(), "status".into()], directory: work.to_path_buf(), limit: DAEMON_PROBE_LIMIT.min(limit) }, scratch, environment) {
-                Ok(status) if status.succeeded() => {
-                    outcomes.push(status);
-                    return Ok((daemon, outcomes));
-                }
+                Ok(status) if status.succeeded() => return Ok((daemon, status)),
                 Ok(_) | Err(tool::ToolError::TimedOut { .. }) => {}
                 Err(error) => return Err(RunError::Tool(error)),
             }
@@ -893,6 +899,38 @@ mod tests {
         }
         drop(daemon);
         assert!(!git_in(&["fsmonitor--daemon", "status"]).succeeded(), "git's own daemon outlived the drop");
+    }
+
+    /// Watching configures nothing, so a copy whose state is under test keeps its config; starting
+    /// turns the fsmonitor on.
+    ///
+    /// Revert: configure in `watch` → the config gains `fsmonitor` and is no longer byte-identical.
+    #[test]
+    fn watching_leaves_the_config_as_it_was() {
+        let name = if cfg!(windows) { "git.exe" } else { "git" };
+        let git = std::env::split_paths(&std::env::var_os("PATH").expect("a PATH")).map(|folder| folder.join(name))
+            .find(|path| path.is_file()).expect("a git on PATH");
+        if !has_fsmonitor_daemon(&git) {
+            return;
+        }
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("proof-load-git-watch-{}-{}", std::process::id(), nanos));
+        let scratch = Scratch::create(&root).unwrap();
+        let search = crate::scrub::search_path(Some(&git), std::env::var_os("PATH"));
+        let environment = Environment::scrubbed(&scratch, search, &BTreeMap::new()).unwrap();
+        let git_in = |arguments: &[&str]| tool::run(&Invocation {
+            program: git.clone(), arguments: arguments.iter().map(|argument| argument.to_string()).collect(), directory: scratch.work(), limit: Duration::from_secs(30),
+        }, &scratch, &environment).unwrap();
+        assert!(git_in(&["init", "-q", "-b", "main"]).succeeded());
+        let config = scratch.work().join(".git").join("config");
+        let before = std::fs::read(&config).unwrap();
+        let (daemon, status) = FsmonitorDaemon::watch(&git, &scratch.work(), &scratch, &environment, Duration::from_secs(60)).unwrap();
+        assert!(status.succeeded());
+        assert_eq!(std::fs::read(&config).unwrap(), before, "watching rewrote the config");
+        drop(daemon);
+        let (daemon, _) = FsmonitorDaemon::start(&git, &scratch.work(), &scratch, &environment, Duration::from_secs(60)).unwrap();
+        drop(daemon);
+        assert!(String::from_utf8_lossy(&std::fs::read(&config).unwrap()).contains("fsmonitor = true"), "starting turned no fsmonitor on");
     }
 
     /// Only the feature line itself says a git has the fsmonitor daemon.
