@@ -773,8 +773,9 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     let case_folding_cell = volume_lane(volume_faults[0])?;
     let no_exec_cell = volume_lane(volume_faults[1])?;
 
-    // The fixture history round-tripped, git to forklift to git: what it changed or dropped is
-    // findings, never grades. A round trip that cannot finish is a gap in the run.
+    // Each fixture history round-tripped, git to Forklift to git and Forklift to git to Forklift:
+    // what a trip changed or dropped is findings, never grades. A round trip that cannot finish is
+    // a gap in the run.
     let mut fidelity = Vec::new();
     let mut fidelity_missing = Vec::new();
     let fidelity_cell = match (&program, &git_program) {
@@ -782,30 +783,37 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         (_, None) => Cell::not_run("no git binary given"),
         _ if only.is_some() => Cell::not_run("--only picks one scenario, and the fidelity fixture is none"),
         (Some(program), Some(git_program)) => {
-            let block = "fidelity-git-forklift-git";
-            progress.lane(Category::Fidelity, Some(1));
-            start_block(progress, Category::Fidelity, block)?;
-            let trip = output.scratch(block).map_err(|error| error.to_string()).and_then(|scratch| {
-                let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
-                Ok(crate::fidelity::git_round_trip(program, git_program, &scratch, &environment, limit))
-            });
-            let trip = match trip {
-                Ok(trip) => {
-                    write_detail(output.root(), &format!("{}.json", block), &trip)?;
-                    trip.findings
+            type RoundTrip = fn(&std::path::Path, &std::path::Path, &crate::scrub::Scratch, &Environment, std::time::Duration) -> crate::fidelity::Trip;
+            let trips: [(&str, crate::fidelity::Direction, RoundTrip); 2] = [
+                ("fidelity-git-forklift-git", crate::fidelity::Direction::GitForkliftGit, crate::fidelity::git_round_trip),
+                ("fidelity-forklift-git-forklift", crate::fidelity::Direction::ForkliftGitForklift, crate::fidelity::forklift_round_trip),
+            ];
+            progress.lane(Category::Fidelity, Some(trips.len()));
+            for (block, direction, round_trip) in trips {
+                start_block(progress, Category::Fidelity, block)?;
+                let trip = output.scratch(block).map_err(|error| error.to_string()).and_then(|scratch| {
+                    let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
+                    Ok(round_trip(program, git_program, &scratch, &environment, limit))
+                });
+                let trip = match trip {
+                    Ok(trip) => {
+                        write_detail(output.root(), &format!("{}.json", block), &trip)?;
+                        trip.findings
+                    }
+                    Err(error) => Err(error),
+                };
+                progress.block_finished(Category::Fidelity, block, trip.is_err());
+                match trip {
+                    Ok(findings) => fidelity.extend(findings),
+                    Err(error) => fidelity_missing.push(format!("{}: {}", direction.label(), error)),
                 }
-                Err(error) => Err(error),
-            };
-            progress.block_finished(Category::Fidelity, block, trip.is_err());
-            match trip {
-                Ok(findings) => {
-                    fidelity.extend(findings);
-                    Cell::Run
-                }
-                Err(error) => {
-                    fidelity_missing.push(format!("git to Forklift to git: {}", error));
-                    Cell::not_run("no round trip finished")
-                }
+            }
+            // A trip that did not finish leaves the other's findings standing: the lane is partial,
+            // and `fidelity_missing` names the trip it lacks.
+            match fidelity_missing.len() {
+                0 => Cell::Run,
+                missed if missed < trips.len() => Cell::Sampled,
+                _ => Cell::not_run("no round trip finished"),
             }
         }
     };
