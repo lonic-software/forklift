@@ -1669,7 +1669,7 @@ mod tests {
                 refused_for_good.push(name);
             }
         }
-        assert!(!refused_for_good.is_empty(), "no forklift row in {} was refused every stack", root.display());
+        assert!(!refused_for_good.is_empty(), "of the rows in {}, none of forklift's was refused every stack", root.display());
     }
 
     /// A binding the role map names no role for is refused, under either subject; one it knows
