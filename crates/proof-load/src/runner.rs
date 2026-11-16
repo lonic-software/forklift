@@ -105,7 +105,6 @@ impl std::fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
-/// The state folder a tool keeps beside its work tree.
 /// What a history's remote surely holds, op by op ([`Built::pushed`]).
 #[derive(Debug, Default)]
 struct Pushed {
@@ -119,7 +118,11 @@ impl Pushed {
     fn after(&mut self, op: &Op, acknowledged: &[Mark]) {
         match op {
             Op::Push if !self.diverged => self.marks = acknowledged.to_vec(),
-            Op::Record { .. } | Op::Variant { .. } | Op::Push | Op::Fetch | Op::Clone { .. } | Op::Park { .. }
+            // A clone replaces the work tree with the remote's, so it keeps the claim only while
+            // nothing was acknowledged since the last push: a later push would otherwise claim
+            // records the clone threw away.
+            Op::Clone { .. } if acknowledged.len() == self.marks.len() && !self.diverged => {}
+            Op::Record { .. } | Op::Variant { .. } | Op::Push | Op::Fetch | Op::Park { .. }
                 | Op::Enroll | Op::Pack | Op::Verify | Op::Repair => {}
             // The first host, before anything was pushed to one, is the remote itself.
             Op::Host if self.marks.is_empty() && !self.diverged => {}
@@ -131,6 +134,7 @@ impl Pushed {
     }
 }
 
+/// The state folder a tool keeps beside its work tree.
 pub(crate) fn state_folder(tool: Tool) -> &'static str {
     match tool {
         Tool::Forklift => ".forklift",
@@ -636,7 +640,8 @@ mod tests {
     /// current and left the remote's content alone; any other op drops the claim for good.
     ///
     /// Revert: set the marks at every push → a push from a side pallet claims main's records;
-    /// keep them past a deleted remote pallet → its records are still owed.
+    /// keep them past a deleted remote pallet → its records are still owed; let any clone keep the
+    /// claim → records the clone threw away are owed.
     #[test]
     fn a_remote_is_owed_only_what_a_linear_history_pushed() {
         let replay = |history: &[Op]| {
@@ -654,6 +659,8 @@ mod tests {
         assert!(replay(&[record(0)]).is_empty());
         assert!(replay(&[Op::Host, record(0), Op::Push, Op::Branch { name: "side".into() }, Op::Switch { name: "side".into() }, record(1), Op::Push]).is_empty());
         assert!(replay(&[Op::Host, record(0), Op::Push, Op::DeleteRemote { name: "main".into() }]).is_empty());
+        assert!(replay(&[Op::Host, record(0), Op::Push, record(1), Op::Clone { kind: crate::scenario::CloneKind::Full }, Op::Push]).is_empty(),
+            "a clone over unpushed work claims nothing more");
         assert!(replay(&[Op::Host, record(0), Op::Push, Op::Host, record(1), Op::Push]).is_empty());
     }
     use std::collections::BTreeMap;
