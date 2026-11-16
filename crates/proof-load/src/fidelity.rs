@@ -684,7 +684,7 @@ mod tests {
             &[header("mergetag", b"a"), header("mergetag", b"b"), header("encoding", b"x")], &[]);
         comparison.headers("header ", "main~3", &[header("committer", b"c"), header("gpgsig", b"g")], &[header("gpgsig", b"g"), header("committer", b"c")], &["committer"]);
         let author = header("author", b"A <a@example.com> 1 +0000");
-        comparison.identities("", "main~4", &[author.clone()], &[author.clone(), header("author", b"B <b@example.com> 1 +0000")], &["author"]);
+        comparison.identities("", "main~4", std::slice::from_ref(&author), &[author.clone(), header("author", b"B <b@example.com> 1 +0000")], &["author"]);
         let found: Vec<(String, String, Option<String>, Option<String>)> = comparison.findings.into_iter().map(|finding| (finding.field, finding.at, finding.before, finding.after)).collect();
         assert_eq!(found, [
             ("header gpgsig".to_string(), "main".to_string(), Some("[A\\nB]".to_string()), Some("[A] [B]".to_string())),
