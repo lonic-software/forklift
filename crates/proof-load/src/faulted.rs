@@ -75,10 +75,11 @@ pub struct HistoryReadback {
     pub reads: Vec<Outcome>,
 }
 
-/// Written with each successful read's stdout left out, its length kept, unless the readback is
-/// silent: over a real history those bytes ran to some 100 MB a readback (CI, 2026-11-16), so a
-/// run's details came to 3.1 GB. A refused read is kept whole, and so is every read of a silent
-/// readback, whose served bytes are what shows the wrong tree.
+/// Written with each successful read's stdout left out, its length kept: over a real history
+/// those bytes ran to some 100 MB a readback (CI, 2026-11-16), so a run's details came to 3.1 GB.
+/// They are no tree's evidence: each record's tree is read from the folder it was laid out in,
+/// and a successful read's stdout is a walk's listing, a hash, or a command's document. A refused
+/// read is kept whole.
 impl serde::Serialize for HistoryReadback {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(serde::Serialize)]
@@ -104,10 +105,9 @@ impl serde::Serialize for HistoryReadback {
         // Destructured whole, so a field added to either is a compile error here, not one the
         // details silently leave out.
         let HistoryReadback { export, records, parked, reads } = self;
-        let silent = self.silent();
         let reads = reads.iter().map(|read| {
             let Outcome { arguments, exit, stdout, stderr, failure } = read;
-            let kept = silent || !read.succeeded();
+            let kept = !read.succeeded();
             Read {
                 arguments, exit: *exit, stdout: kept.then_some(stdout.as_slice()),
                 stdout_bytes: (!kept).then_some(stdout.len()), stderr, failure,
@@ -2125,11 +2125,11 @@ mod tests {
     }
 
     /// A readback's details keep a refused read whole, and a successful one without its stdout,
-    /// whose length they keep; a silent readback keeps every read whole.
+    /// whose length they keep, a silent readback's too.
     ///
     /// Revert: serialize the reads as they are → the served bytes are written; drop every
-    /// stdout → the refused read's own words are lost; drop the stdout of a silent readback's
-    /// successful read → the bytes that show the wrong tree are lost.
+    /// stdout → the refused read's own words are lost; keep a silent readback's whole → its
+    /// served bytes are written.
     #[test]
     fn a_readback_writes_what_its_reads_refused_not_what_they_served() {
         let read = |exit, stdout: &[u8]| Outcome { arguments: vec!["show".into()], exit: Some(exit), stdout: stdout.to_vec(), stderr: b"said".to_vec(), failure: None };
@@ -2144,8 +2144,8 @@ mod tests {
         assert_eq!(reads[1]["exit"], 1);
         let silent = HistoryReadback { reads: vec![read(0, b"wrong-tree")], ..served(&[(0, Verdict::Silent)]) };
         let written = serde_json::to_value(&silent).unwrap();
-        assert_eq!(written["reads"][0]["stdout"], serde_json::json!(b"wrong-tree".to_vec()), "{}", written);
-        assert_eq!(written["reads"][0].get("stdout_bytes"), None);
+        assert_eq!(written["reads"][0].get("stdout"), None, "{}", written);
+        assert_eq!(written["reads"][0]["stdout_bytes"], 10);
         assert_eq!(written["records"][0]["verdicts"], serde_json::json!(["silent"]));
     }
 
