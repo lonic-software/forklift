@@ -487,10 +487,10 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                 .filter_map(|(subject, binding)| scenarios.iter().find(|scenario| scenario.id == binding.scenario).map(|scenario| (subject, binding, scenario)));
             for (subject, binding, _) in picked_bindings() {
                 let errors = fault_errors.entry(subject).or_default();
-                errors.extend(role_refusal(subject, binding.name));
+                errors.extend(role_or_refusal(subject, binding.name).err());
             }
             let roled = || picked_bindings().filter_map(|(subject, binding, scenario)| {
-                crate::git_layout::role_of(subject, binding.name).map(|role| (subject, binding, scenario, role))
+                role_or_refusal(subject, binding.name).ok().map(|role| (subject, binding, scenario, role))
             });
             progress.lane(Category::DamagedFiles, Some(roled().map(|(_, binding, _, _)| binding.kinds.len()).sum()));
             for (subject, binding, scenario, role) in roled() {
@@ -1064,16 +1064,16 @@ fn discarded_area<T>(
     result
 }
 
+/// A damage binding's role, or its refusal where the role map does not know it. Such a binding is
+/// the harness's gap, never a row with no counterpart: that would drop it from every comparison
+/// unsaid. The tables are static, so it is refused once, before any of its faults runs.
+fn role_or_refusal(subject: Tool, name: &str) -> Result<crate::git_layout::Role, String> {
+    crate::git_layout::role_of(subject, name).ok_or_else(|| format!("{}: the role map names no role for it", name))
+}
+
 /// A damage block's label, which names its scratch area and detail file: the subject, the
 /// scenario, the side, the binding's name and the kind. A host's path is named apart from the
 /// client's of the same name.
-/// The refusal of a damage binding the role map does not know. Such a binding is the harness's
-/// gap, never a row with no counterpart: that would drop it from every comparison unsaid. The
-/// tables are static, so it is refused once, before any of its faults runs.
-fn role_refusal(subject: Tool, name: &str) -> Option<String> {
-    crate::git_layout::role_of(subject, name).is_none().then(|| format!("{}: the role map names no role for it", name))
-}
-
 fn damage_label(subject: Tool, binding: &crate::damage::Binding, kind: crate::damage::Kind) -> String {
     let prefix = match subject { Tool::Forklift => String::new(), other => format!("{}-", other.label()) };
     let side = match binding.warehouse { Warehouse::Client => "", Warehouse::Host => "host-" };
@@ -1102,20 +1102,21 @@ mod tests {
         }
     }
 
-    /// Revert: drop the side → a client and a host binding of one name share a label, so one
-    /// row's scratch and detail file is the other's.
-    /// A binding the role map names no role for is refused, under either subject; one it knows is
-    /// not.
+    /// A binding the role map names no role for is refused, under either subject; one it knows
+    /// takes its role.
     ///
-    /// Revert: return None from `role_refusal` → the unknown binding passes unsaid.
+    /// Revert: return any role for an unknown name → the unknown binding passes unsaid.
     #[test]
     fn a_binding_with_no_role_is_refused() {
-        assert_eq!(role_refusal(Tool::Forklift, "no-such-path").as_deref(), Some("no-such-path: the role map names no role for it"));
-        assert!(role_refusal(Tool::GitTuned, "no-such-path").is_some());
-        assert_eq!(role_refusal(Tool::Forklift, "trust"), None);
-        assert_eq!(role_refusal(Tool::Git, "index.lock"), None);
+        use crate::git_layout::Role;
+        assert_eq!(role_or_refusal(Tool::Forklift, "no-such-path"), Err("no-such-path: the role map names no role for it".to_string()));
+        assert!(role_or_refusal(Tool::GitTuned, "no-such-path").is_err());
+        assert_eq!(role_or_refusal(Tool::Forklift, "trust"), Ok(Role::Signature));
+        assert_eq!(role_or_refusal(Tool::Git, "index.lock"), Ok(Role::Lock));
     }
 
+    /// Revert: drop the side → a client and a host binding of one name share a label, so one
+    /// row's scratch and detail file is the other's.
     #[test]
     fn a_host_damage_block_is_labelled_apart_from_the_client() {
         use crate::damage::{Binding, Kind};
