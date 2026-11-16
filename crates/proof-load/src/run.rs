@@ -392,10 +392,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             for (subject, binding, scenario) in picked_bindings() {
                 fault_errors.entry(subject).or_default();
                 for kind in binding.kinds {
-                    let prefix = match subject { Tool::Forklift => String::new(), other => format!("{}-", other.label()) };
-                    // A host's path is named apart from the client's of the same name.
-                    let side = match binding.warehouse { Warehouse::Client => "", Warehouse::Host => "host-" };
-                    let label = format!("{}{}-{}{}-{:?}", prefix, binding.scenario, side, binding.name, kind).replace(['/', '<', '>', '{', '}', '*'], "_");
+                    let label = damage_label(subject, binding, *kind);
                     start_block(progress, Category::DamagedFiles, &label)?;
                     let result = output.scratch(&label).map_err(|error| error.to_string()).and_then(|scratch| {
                         let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
@@ -952,6 +949,15 @@ fn discarded_area<T>(
 
 /// The corpus a faulted command runs over, shared by every lane: the small shape with one record
 /// past the history, the one the faulted command writes.
+/// A damage block's label, which names its scratch area and detail file: the subject, the
+/// scenario, the side, the binding's name and the kind. A host's path is named apart from the
+/// client's of the same name.
+fn damage_label(subject: Tool, binding: &crate::damage::Binding, kind: crate::damage::Kind) -> String {
+    let prefix = match subject { Tool::Forklift => String::new(), other => format!("{}-", other.label()) };
+    let side = match binding.warehouse { Warehouse::Client => "", Warehouse::Host => "host-" };
+    format!("{}{}-{}{}-{:?}", prefix, binding.scenario, side, binding.name, kind).replace(['/', '<', '>', '{', '}', '*'], "_")
+}
+
 fn faulted_corpus(seed: u64) -> corpus::Corpus {
     corpus::generate(seed, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL })
 }
@@ -970,6 +976,18 @@ mod tests {
         fn cancelled(&self) -> bool {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= self.polls
         }
+    }
+
+    /// Revert: drop the side → a client and a host binding of one name share a label, so one
+    /// row's scratch and detail file is the other's.
+    #[test]
+    fn a_host_damage_block_is_labelled_apart_from_the_client() {
+        use crate::damage::{Binding, Kind};
+        let client = Binding { name: "HEAD", scenario: "lifted", warehouse: Warehouse::Client, kinds: &[] };
+        let host = Binding { warehouse: Warehouse::Host, ..client.clone() };
+        assert_eq!(damage_label(Tool::Git, &client, Kind::Delete), "git-lifted-HEAD-Delete");
+        assert_eq!(damage_label(Tool::Git, &host, Kind::Delete), "git-lifted-host-HEAD-Delete");
+        assert_eq!(damage_label(Tool::Forklift, &host, Kind::Zero), "lifted-host-HEAD-Zero");
     }
 
     fn fresh(name: &str) -> PathBuf {

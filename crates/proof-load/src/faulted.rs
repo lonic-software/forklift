@@ -1235,7 +1235,9 @@ mod tests {
     /// git cannot rewrite, is rescued by cloning the host again.
     ///
     /// Revert: read a host-side git readback from the work tree → the host's lost object is not
-    /// what is judged; leave git rows without a URL → no re-clone is tried.
+    /// what is judged; leave git rows without a URL → no re-clone is tried; clone the host
+    /// locally, for the readback or the re-clone → the clone's objects are the host's files;
+    /// check the readback clone out → it holds a work tree.
     #[test]
     fn git_hosts_a_bare_repository_and_clones_it_again() {
         let git = path_git();
@@ -1270,6 +1272,38 @@ mod tests {
         let faulted = run(&scenario, "refs/heads/**", Warehouse::Client, Kind::Zero, Tool::Git, &corpus, &programs, &scratch, &environment, Duration::from_secs(60), 0).unwrap();
         assert_eq!(faulted.recoverability.rescued_by, Some(Rescue::Reclone), "{:?}", faulted.recoverability);
         assert!(faulted.steps.iter().any(|step| step.arguments.first().map(String::as_str) == Some("clone") && step.succeeded()), "{:?}", faulted.steps);
+        assert_owns_its_objects(&scratch.root().join("reclone-0"));
+
+        // A host the readback can clone: the clone came through git's transport, so it shares
+        // no object file with the host, and holds no work tree.
+        let (scratch, environment) = area("readback");
+        run(&scenario, "config", Warehouse::Host, Kind::Delete, Tool::Git, &corpus, &programs, &scratch, &environment, Duration::from_secs(60), 0).unwrap();
+        let clone = scratch.root().join("clone-0");
+        assert_owns_its_objects(&clone);
+        let entries: Vec<_> = std::fs::read_dir(&clone).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from(".git")]);
+    }
+
+    /// Every object file of the clone at `repository` is its own: a local clone hardlinks the
+    /// host's.
+    fn assert_owns_its_objects(repository: &Path) {
+        let objects = repository.join(".git").join("objects");
+        let mut files = 0;
+        let mut pending = vec![objects.clone()];
+        while let Some(folder) = pending.pop() {
+            for entry in std::fs::read_dir(&folder).unwrap() {
+                let entry = entry.unwrap();
+                let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+                if metadata.is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    files += 1;
+                    #[cfg(unix)]
+                    assert_eq!(std::os::unix::fs::MetadataExt::nlink(&metadata), 1, "{}", entry.path().display());
+                }
+            }
+        }
+        assert!(files > 0, "{} holds no object", objects.display());
     }
 
     /// Git tuned runs every command of its own with its configuration first, as its bindings do;

@@ -3,7 +3,7 @@
 //! A scenario is tool-independent: a history to build, written in an abstract operation
 //! vocabulary, and a fault. A binding maps each operation to concrete command lines for one tool.
 //! Forklift binds every operation; git binds the ones it has, twice, at its defaults and tuned. An
-//! operation git has no binding for makes the scenario Forklift-only, and so does a volume fault's
+//! operation git has no binding for makes the scenario Forklift-only, and so do a volume fault's
 //! files, which only Forklift is run on; the report shows those rows in their own table instead of
 //! counting them as git losses.
 
