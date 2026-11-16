@@ -680,10 +680,11 @@ fn text_at(value: &serde_json::Value, key: &str) -> Option<String> {
 }
 
 /// Reads one warehouse of a round trip, and the git export of it at `export`: its pallets, the
-/// records their listings name, each record's manifest entries and exported tree, its tags and
+/// records their listings name, each record's manifest entries and exported trees, its tags and
 /// its keyed values. A listing missing a field the comparison reads is an error, never an empty
-/// value. An export commit is matched to its parcel by the `Forklift-Parcel` trailer on its last
-/// line; a record no commit names has no tree, and two commits naming one parcel are an error.
+/// value. An export commit is matched to its parcel by the parcel line its message ends in (see
+/// `parcel_trees`); a record no commit names has no tree, and commits naming one parcel with
+/// different trees give it each of them.
 fn read_side(steps: &mut Steps, forklift: &Path, git: &Path, environment: &Environment, warehouse: &Path, export: &Path) -> Result<Side, String> {
     let mut data = |arguments: &[&str]| -> Result<serde_json::Value, String> {
         let mut full = vec!["--json"];
@@ -815,7 +816,8 @@ impl Records<'_, '_> {
 
     /// Compares one paired record: description, parent count, actions in order and each action's
     /// operator, time and trust at its first occurrence, the exported tree entry by entry, and
-    /// the manifest entries. A record either export wrote no commit for is a `tree` finding.
+    /// the manifest entries. A record with no one exported tree on either side (no export commit
+    /// names it, or commits with different trees do) is a `tree` finding.
     fn record(&mut self, at: &str, before: &str, after: &str) -> Result<(Vec<String>, Vec<String>), String> {
         let missing = |parcel: &str| format!("the history lists {} as a parent but not as a record", parcel);
         let was = self.before.records.get(before).cloned().ok_or_else(|| missing(before))?;
