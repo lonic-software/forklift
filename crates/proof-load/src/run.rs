@@ -236,9 +236,11 @@ fn history_row(tool: Tool, label: &str, run: &faulted::Faulted, scenario: &str, 
 /// subject's history bindings checked against its walk and its unfaulted readback taken on a
 /// copy, then one row per (role, kind) per subject, each on its own copy, in seed order while
 /// the lane has run less than `budget`. With the rows, every check the lane answers: a row the
-/// budget did not reach, a subject whose readback failed, and damage the sample did not reach are
-/// each named in the subject's own completeness, never as a grade. `damage_blocks` is how many
-/// blocks the fixture damage lane announced, which the history's are added to.
+/// budget did not reach, forklift refusing its unfaulted readback, and damage the sample did not
+/// reach are each named in the subject's own completeness, never as a grade; git refusing its
+/// unfaulted readback, the oracle the sample was drawn from, is the run's own failure.
+/// `damage_blocks` is how many blocks the fixture damage lane announced, which the history's are
+/// added to.
 #[allow(clippy::too_many_arguments)]
 fn history_damage(
     mirror: &std::path::Path, programs: &Programs, census: &Census, seed: u64, budget: std::time::Duration, damage_blocks: usize,
@@ -263,20 +265,17 @@ fn history_damage(
         let lengths = crate::history::git_lengths(&programs.git, &git_root, &scratch, &environment, HISTORY_LIMIT).map_err(|error| format!("git: {}", error))?;
         let present = crate::history::pallets(&programs.forklift, &forklift_root, &scratch, &environment, HISTORY_LIMIT).map_err(|error| format!("forklift: {}", error))?;
         let positions = crate::history::sample(&lengths, &present, crate::history::SAMPLED, seed);
-        // A position past its ref's length is the harness's own drawing, never a subject's refusal.
-        if let Some(wrong) = positions.iter().find(|position| lengths.get(&position.reference).is_none_or(|length| position.depth >= *length)) {
-            return Err(format!("the sample drew {:?}, which {:?} does not reach", wrong, lengths.get(&wrong.reference)));
-        }
+        write_detail(output.root(), &format!("{}.json", BLOCK), &serde_json::json!({ "steps": steps, "lengths": lengths, "present": present, "positions": positions }))
+            .map_err(|error| error.to_string())?;
         if positions.is_empty() {
-            // Git's refs read, and none of them is a pallet forklift's import made.
-            return Err(if !lengths.is_empty() && present.is_empty() {
+            // Git holds a ref with commits, and forklift's import made a pallet of none of them.
+            let imported = lengths.iter().filter(|(_, length)| **length > 0).any(|(name, _)| present.contains(name));
+            return Err(if lengths.values().any(|length| *length > 0) && !imported {
                 "forklift: the import made no pallet of a ref git holds".to_string()
             } else {
                 "the sample holds no position: no ref both subjects hold has a commit".to_string()
             });
         }
-        write_detail(output.root(), &format!("{}.json", BLOCK), &serde_json::json!({ "steps": steps, "lengths": lengths, "present": present, "positions": positions }))
-            .map_err(|error| error.to_string())?;
         Ok((git_root, forklift_root, positions))
     });
     let (git_root, forklift_root, positions) = match built {
@@ -306,14 +305,16 @@ fn history_damage(
                 let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
                 faulted::baseline(tool, pristine, &positions, programs, &scratch, &environment, HISTORY_LIMIT).map_err(|error| error.to_string())
             });
-            // A subject that refuses its own unfaulted readback leaves a gap in its measure; a
-            // readback the harness could not take is the harness's fault, as a row's is.
+            // Forklift refusing its own unfaulted readback leaves a gap in its measure. Git's is the
+            // oracle the sample was drawn from, so git refusing a position it counted is the
+            // harness's fault, as a readback the harness could not take is.
             match base {
                 Ok(Ok(base)) => {
                     write_detail(output.root(), &format!("{}.json", label), &base)?;
                     subjects.push((tool, pristine.clone(), base));
                 }
-                Ok(Err(refused)) => gaps.entry(tool).or_default().push(format!("its rows: not run: the unfaulted readback failed: {}", refused)),
+                Ok(Err(refused)) if tool == Tool::Forklift => gaps.entry(tool).or_default().push(format!("its rows: not run: the unfaulted readback failed: {}", refused)),
+                Ok(Err(refused)) => errors.entry(tool).or_default().push(format!("its rows: not run: the unfaulted readback failed: {}", refused)),
                 Err(error) => errors.entry(tool).or_default().push(format!("its unfaulted readback: {}", error)),
             }
         }

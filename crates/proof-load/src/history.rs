@@ -315,7 +315,7 @@ pub(crate) mod tests {
         let (row, environment) = scratch("git-baseline-refused-row");
         let programs = programs(PathBuf::from("forklift-not-used"));
         let refused = baseline(Tool::Git, &pristine, &tip, &programs, &row, &environment, LIMIT).unwrap();
-        assert!(refused.as_ref().is_err_and(|refusal| refusal.contains("unfaulted")), "{:?}", refused);
+        assert!(refused.as_ref().is_err_and(|refusal| refusal.contains("the unfaulted readback")), "{:?}", refused);
         let (row, environment) = scratch("git-baseline-absent-row");
         assert!(baseline(Tool::Git, &shared.root().join("absent"), &tip, &programs, &row, &environment, LIMIT).is_err());
     }
