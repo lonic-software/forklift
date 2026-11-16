@@ -274,8 +274,13 @@ impl FsmonitorDaemon {
         let mut daemon = FsmonitorDaemon { child, program: program.to_path_buf(), work: work.to_path_buf(), environment: environment.clone() };
         let started = std::time::Instant::now();
         loop {
+            // Only an exit with a code is git's answer to the work tree; a death by a signal came
+            // from outside it, and is the harness's.
             if let Some(status) = daemon.child.try_wait().map_err(|error| harness(RunError::Io(error.to_string())))? {
-                return Err(Unwatched::Exited(format!("the fsmonitor daemon exited {} before it watched {}", status, work.display())));
+                return Err(match status.code() {
+                    Some(code) => Unwatched::Exited(format!("the fsmonitor daemon exited with code {} before it watched", code)),
+                    None => harness(RunError::Io(format!("the fsmonitor daemon died {} before it watched {}", status, work.display()))),
+                });
             }
             // A probe that runs past its own bound has not seen the daemon watch yet; only `limit`
             // as a whole gives up.

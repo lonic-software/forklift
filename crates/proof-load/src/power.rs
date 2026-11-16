@@ -1818,6 +1818,15 @@ pub(crate) fn harness_umask() -> Result<u32, String> {
         .ok_or_else(|| "/proc/self/status names no umask".to_string())
 }
 
+/// What a graded copy watches under, from what starting its daemon gave: the daemon, and for a
+/// state no daemon would watch, a guard from `stops` and why. What failed the harness stays its.
+fn watching<D, S>(started: Result<Result<Option<D>, String>, RunError>, stops: impl FnOnce() -> S) -> Result<(Option<D>, Option<S>, Option<String>), RunError> {
+    Ok(match started? {
+        Ok(daemon) => (daemon, None, None),
+        Err(why) => (None, Some(stops()), Some(why)),
+    })
+}
+
 /// One crash state written into a fresh copy and graded: the lines before the crash stand as the
 /// counting run ran them, a line the crash cut short as killed. Beside the grade, why a tuned git's
 /// copy was graded without its daemon, when the state let none watch.
@@ -1833,13 +1842,9 @@ fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, sett
     // the daemon's exit is git's, and its commands meet the same damage. Any daemon a command then
     // starts on its own is stopped as the grade ends, however it ends. What failed the harness
     // stays its error.
-    let (daemon, unwatched) = match kill::daemon_over(&context)? {
-        Ok(daemon) => (daemon, None),
-        Err(why) => (None, Some(why)),
-    };
-    let stops = unwatched.is_some().then(|| crate::runner::StopsDaemon {
+    let (daemon, stops, unwatched) = watching(kill::daemon_over(&context), || crate::runner::StopsDaemon {
         program: context.program().to_path_buf(), work: copy.work(), environment: environment.clone(),
-    });
+    })?;
     let mut steps: Vec<Outcome> = Vec::new();
     match &crash.moment {
         Moment::During { point: Point { line, .. } } | Moment::Synced { line, .. } | Moment::Ending { line, .. } => {
@@ -2647,6 +2652,19 @@ mod tests {
         assert_ne!(moment(0).label(), moment(1).label());
     }
 
+    /// A copy whose daemon exited is graded unwatched, under a guard and with the reason; one
+    /// that watches has no guard; what failed the harness stays an error.
+    ///
+    /// Revert: refuse an exited daemon → the state fails the run; guard a watched copy → a stop
+    /// races the harness's daemon; take a harness failure for an exit → it grades unwatched.
+    #[test]
+    fn a_copy_no_daemon_would_watch_is_graded_unwatched_under_a_guard() {
+        let exited = watching::<(), _>(Ok(Err("the fsmonitor daemon exited with code 128 before it watched".into())), || "guard").unwrap();
+        assert_eq!(exited, (None, Some("guard"), Some("the fsmonitor daemon exited with code 128 before it watched".to_string())));
+        assert_eq!(watching(Ok(Ok(Some(()))), || "guard").unwrap(), (Some(()), None, None));
+        assert!(watching::<(), _>(Err(RunError::Io("starting the fsmonitor daemon: EAGAIN".into())), || "guard").is_err());
+    }
+
     /// A client's moment names the line it is in or after, which its row pairs by; a server's
     /// names none.
     ///
@@ -2681,7 +2699,7 @@ mod tests {
         let all = vec![
             ScenarioPower { scenario: "history".into(), subject: Tool::Forklift, paired: true, not_run: Some("path-bound".into()), ..Default::default() },
             ScenarioPower { scenario: "history".into(), subject: Tool::Git, paired: true,
-                crashes: vec![GradedCrash { crash: crash.clone(), op: Some("record".into()), graded: graded.clone(), unwatched: Some("the fsmonitor daemon exited 128".into()) }], ..Default::default() },
+                crashes: vec![GradedCrash { crash: crash.clone(), op: Some("record".into()), graded: graded.clone(), unwatched: Some("the fsmonitor daemon exited with code 128 before it watched".into()) }], ..Default::default() },
             ScenarioPower { scenario: "branched".into(), subject: Tool::Git, paired: true, refusals: vec!["the replay does not reproduce the run".into()], ..Default::default() },
             ScenarioPower { scenario: "parked".into(), subject: Tool::GitTuned, not_run: Some("background maintenance".into()), ..Default::default() },
         ];
@@ -2692,7 +2710,7 @@ mod tests {
         assert_eq!((row.subject, row.binding.as_str()), (Tool::Git, "git"));
         assert_eq!(row.pairing, Some(Pairing { scenario: "history".into(), target: Target::Fault { lane: FaultLane::Power, op: "record".into() }, directions: vec![] }));
         assert_eq!(row.detail.as_deref(), Some("git-power-history.json#/crashes/0/graded"));
-        assert!(row.note.as_deref().unwrap().contains("graded without the fsmonitor daemon: the fsmonitor daemon exited 128"));
+        assert!(row.note.as_deref().unwrap().contains("graded without the fsmonitor daemon: the fsmonitor daemon exited with code 128 before it watched"));
         let check = |name: &str| summary.completeness.iter().find(|check| check.check == name).unwrap_or_else(|| panic!("no check {}", name));
         assert_eq!(check("power-loss soundness, git").subject, None, "what refused git's replay is the run's");
         assert_eq!(check("power-loss soundness, git").missing, ["branched: the replay does not reproduce the run"]);
