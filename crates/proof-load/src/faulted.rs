@@ -1969,7 +1969,7 @@ mod tests {
         assert_eq!(unserved(Mark::Position(3), false, &reads), "the unfaulted readback did not serve Position(3): its walk ended short of it");
         let long = ran(&["open"], Some(1), &"é".repeat(500), None);
         assert_eq!(said(&long), format!("{}…", "é".repeat(400)));
-        assert_eq!(said(&reads[1]), "no parcel abc");
+        assert_eq!(said(reads[1]), "no parcel abc");
     }
 
     /// A pattern resolves to one of the paths it matches, chosen by the seed, a folder without its
