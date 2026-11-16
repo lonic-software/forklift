@@ -267,13 +267,13 @@ fn history_row(tool: Tool, label: &str, run: &faulted::Faulted, scenario: &str, 
 
 /// The damage rows over a real history, from `mirror`, the copy the fidelity lane took: git's
 /// subject and forklift's built once from it, the sample drawn over the refs both hold, each
-/// subject's history bindings checked against its walk and its unfaulted readback taken on a
-/// copy, then one row per (role, kind) per subject, each on its own copy, in seed order while
-/// the rows have run less than `budget` and the run is not past its `deadline`. With the rows,
-/// every check the lane answers: a row the budget did not reach, forklift refusing its unfaulted
-/// readback, and damage the sample did not reach are each named in the subject's own completeness, never as a grade, as is git tuned
-/// refusing its readback; git at its defaults refusing its, the oracle the sample was drawn
-/// from, is the run's own failure.
+/// subject's history bindings checked against its walk and its unfaulted readback taken on a copy,
+/// then one row per (role, kind) per subject, each on its own copy, in seed order while the rows
+/// have run less than `budget` and the run is not past its `deadline`. With the rows, every check
+/// the lane answers: a row the budget did not reach, forklift refusing its unfaulted readback, and
+/// damage the sample did not reach are each named in the subject's own completeness, never as a
+/// grade, as is git tuned refusing its readback; git at its defaults refusing its, the oracle the
+/// sample was drawn from, is the run's own failure.
 /// `damage_blocks` is how many blocks the fixture damage lane announced, which the history's are
 /// added to.
 #[allow(clippy::too_many_arguments)]
