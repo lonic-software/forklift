@@ -1643,7 +1643,33 @@ mod tests {
             let faults: Vec<&Completeness> = checks.iter().filter(|entry| entry.check.starts_with("history damage faults ran")).collect();
             assert!(faults.len() == 3 && faults.iter().all(|entry| entry.missing.is_empty()), "{:?}", faults);
             assert!(rows.iter().all(|row| row.pairing.as_ref().is_some_and(|pairing| pairing.scenario.starts_with(faulted::HISTORY_SCENARIO))), "{:?}", rows);
+            if reason.is_empty() {
+                refused_for_good_is_never_silent(output.root());
+            }
         }
+    }
+
+    /// Over the forklift rows a lane wrote to `root`, one whose every stack was refused, none as
+    /// nothing to stack, made no record, so its absence is no silent read; and some such row ran.
+    fn refused_for_good_is_never_silent(root: &std::path::Path) {
+        let mut refused_for_good = Vec::new();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.starts_with(&format!("{}-", faulted::HISTORY_SCENARIO)) || !name.ends_with(".json") {
+                continue;
+            }
+            let details: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let stacks: Vec<&serde_json::Value> = details["steps"].as_array().map(Vec::as_slice).unwrap_or_default().iter()
+                .filter(|step| step["arguments"].as_array().is_some_and(|arguments| arguments.iter().any(|argument| argument == "stack"))).collect();
+            let for_good = !stacks.is_empty() && stacks.iter().all(|step| step["exit"] != 0
+                && !step["failure"]["message"].as_str().is_some_and(|message| message.starts_with("Nothing to stack")));
+            if for_good {
+                assert_ne!(details["grade"], "silent", "{}: {}", name, details["evidence"]);
+                refused_for_good.push(name);
+            }
+        }
+        assert!(!refused_for_good.is_empty(), "no forklift row in {} was refused every stack", root.display());
     }
 
     /// A binding the role map names no role for is refused, under either subject; one it knows
