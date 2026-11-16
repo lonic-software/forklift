@@ -204,6 +204,28 @@ const HISTORY_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 6
 /// completeness, never silently absent.
 const HISTORY_DAMAGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
+/// How long the history's damage rows may start, `elapsed` into a run given `budget` seconds:
+/// what the budget leaves, at most [`HISTORY_DAMAGE_BUDGET`].
+fn history_budget(budget: Option<u64>, elapsed: std::time::Duration) -> std::time::Duration {
+    budget.map_or(HISTORY_DAMAGE_BUDGET, |budget| std::time::Duration::from_secs(budget).saturating_sub(elapsed).min(HISTORY_DAMAGE_BUDGET))
+}
+
+/// Whose a history build step `tool` failed is: forklift's where forklift ran it and refused it,
+/// or ran past its limit. Git refusing one is the run's own, git being the oracle the sample is
+/// drawn from, as is a step the harness could not run at all.
+fn build_charged_to(tool: Tool, error: &crate::runner::RunError) -> Option<Tool> {
+    use crate::runner::RunError::{BuildFailed, Tool as Ran};
+    let own = tool == Tool::Forklift && matches!(error, BuildFailed { .. } | Ran(crate::tool::ToolError::TimedOut { .. }));
+    own.then_some(tool)
+}
+
+/// Whether `tool` refusing its own unfaulted readback over a history is a gap in its measure:
+/// forklift's and git tuned's are, while git at its defaults is the oracle the sample was drawn
+/// from, so its refusal is the run's own.
+fn refused_readback_is_a_gap(tool: Tool) -> bool {
+    tool != Tool::Git
+}
+
 /// Why a history's sample holds no position, and whose it is: forklift's, where git holds a ref
 /// with commits and forklift's import made a pallet of none of them; the run's own otherwise.
 fn empty_sample(lengths: &BTreeMap<String, usize>, present: &std::collections::BTreeSet<String>) -> (Option<Tool>, String) {
@@ -277,12 +299,7 @@ fn history_damage(
         let scratch = output.scratch(BLOCK).map_err(|error| harness(error.to_string()))?;
         let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| harness(error.to_string()))?;
         let (git_root, forklift_root) = (scratch.root().join("git"), scratch.root().join("forklift"));
-        // A step forklift ran and refused is forklift's. Git refusing one is the run's own, git
-        // being the oracle the sample is drawn from, as is a step the harness could not run.
-        let refused = |tool: Tool| move |error: crate::runner::RunError| {
-            let own = tool == Tool::Forklift && matches!(error, crate::runner::RunError::BuildFailed { .. });
-            (own.then_some(tool), format!("{}: {}", tool.label(), error))
-        };
+        let refused = |tool: Tool| move |error: crate::runner::RunError| (build_charged_to(tool, &error), format!("{}: {}", tool.label(), error));
         crate::history::build_git(&programs.git, mirror, &git_root, &scratch, &environment, HISTORY_LIMIT, &mut steps).map_err(refused(Tool::Git))?;
         crate::history::build_forklift(&programs.forklift, mirror, &forklift_root, &scratch, &environment, HISTORY_LIMIT, &mut steps)
             .map_err(refused(Tool::Forklift))?;
@@ -330,7 +347,7 @@ fn history_damage(
                     write_detail(output.root(), &format!("{}.json", label), &base)?;
                     subjects.push((tool, pristine.clone(), base));
                 }
-                Ok(Err(refused)) if tool != Tool::Git => gaps.entry(tool).or_default().push(format!("its rows: not run: the unfaulted readback failed: {}", refused)),
+                Ok(Err(refused)) if refused_readback_is_a_gap(tool) => gaps.entry(tool).or_default().push(format!("its rows: not run: the unfaulted readback failed: {}", refused)),
                 Ok(Err(refused)) => errors.entry(tool).or_default().push(format!("its rows: not run: the unfaulted readback failed: {}", refused)),
                 Err(error) => errors.entry(tool).or_default().push(format!("its unfaulted readback: {}", error)),
             }
@@ -1092,9 +1109,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         (Some(mirror), Ok(programs), Some(census)) => {
             // Within what the run's own budget leaves, so a run given less cuts rows, each named,
             // instead of overrunning it.
-            let left = budget.map(|budget| std::time::Duration::from_secs(budget).saturating_sub(started.elapsed()));
-            let lane_budget = left.map_or(HISTORY_DAMAGE_BUDGET, |left| left.min(HISTORY_DAMAGE_BUDGET));
-            let (history_rows, checks) = history_damage(mirror, programs, census, seed, lane_budget, damage_blocks, &mut output, &search_path, progress)?;
+            let (history_rows, checks) = history_damage(mirror, programs, census, seed, history_budget(budget, started.elapsed()), damage_blocks, &mut output, &search_path, progress)?;
             rows.extend(history_rows);
             history_checks.extend(checks);
             Cell::Run
@@ -1436,6 +1451,85 @@ mod tests {
         fn cancelled(&self) -> bool {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= self.polls
         }
+    }
+
+    /// A history build step forklift ran and refused is forklift's; one the harness could not run
+    /// at all is the run's own. Either way every step run so far is written beside the failure,
+    /// the refused one too, and no subject's rows are marked as run.
+    ///
+    /// Revert: charge every forklift error to forklift → the binary that cannot be spawned is
+    /// forklift's; write the detail only once built → no damage-history.json; leave the rows' cell
+    /// `Run` → a subject with no readback reads as run.
+    #[test]
+    #[cfg(unix)]
+    fn a_history_build_is_forklifts_only_where_forklift_refused_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let (shared, environment) = crate::history::tests::scratch("charged");
+        let mirror = crate::history::tests::mirrored(&shared, &environment);
+        let census = Census::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap().unwrap();
+        let search_path = crate::scrub::search_path(Some(&crate::scrub::path_git()), std::env::var_os("PATH"));
+        let refuses = shared.root().join("refuses");
+        std::fs::write(&refuses, "#!/bin/sh\nexit 3\n").unwrap();
+        std::fs::set_permissions(&refuses, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (name, forklift, charged, last) in [("absent", shared.root().join("absent"), None, Some(0)), ("refuses", refuses, Some(Tool::Forklift), Some(3))] {
+            let programs = Programs { forklift, git: crate::scrub::path_git(), server: None };
+            let out = shared.root().join(format!("out-{}", name));
+            let mut output = Output::claim(&out).unwrap();
+            let (rows, checks) = history_damage(&mirror, &programs, &census, 3, std::time::Duration::from_secs(3600), 0, &mut output, &search_path, &Quiet).unwrap();
+            assert!(rows.is_empty(), "{}: {:?}", name, rows);
+            let built: Vec<&Completeness> = checks.iter().filter(|entry| entry.check == "history subjects built").collect();
+            assert!(built.len() == 1 && built[0].subject == charged && built[0].missing[0].starts_with("forklift: "), "{}: {:?}", name, built);
+            let detail: serde_json::Value = serde_json::from_slice(&std::fs::read(out.join("damage-history.json")).unwrap()).unwrap();
+            let steps = detail["steps"].as_array().unwrap();
+            assert!(steps.iter().any(|step| step["arguments"] == serde_json::json!(["switch", "-q", "-c", crate::faulted::PROBE_REF])), "{}: {:?}", name, steps);
+            assert_eq!(steps.last().unwrap()["exit"].as_i64().map(|exit| exit as i32), last, "{}", name);
+            for tool in [Tool::Forklift, Tool::Git, Tool::GitTuned] {
+                let ran = checks.iter().find(|entry| entry.subject == Some(tool) && entry.check == "history damage rows ran").unwrap();
+                assert!(matches!(ran.cell, Cell::NotRun { .. }), "{}: {:?}", name, ran);
+            }
+        }
+    }
+
+    /// Forklift running past its limit is forklift's, as its refusal is; git's, and a step the
+    /// harness could not run, are the run's own.
+    ///
+    /// Revert: drop the timeout from forklift's → a hung import is the harness's.
+    #[test]
+    fn a_history_build_past_its_limit_is_forklifts() {
+        use crate::runner::RunError;
+        use crate::tool::ToolError;
+        let timed_out = || RunError::Tool(ToolError::TimedOut { program: PathBuf::from("/forklift"), limit: HISTORY_LIMIT });
+        let refused = || RunError::BuildFailed { arguments: vec![], exit: Some(1), stderr: String::new(), stdout: String::new() };
+        assert_eq!(build_charged_to(Tool::Forklift, &timed_out()), Some(Tool::Forklift));
+        assert_eq!(build_charged_to(Tool::Forklift, &refused()), Some(Tool::Forklift));
+        assert_eq!(build_charged_to(Tool::Forklift, &RunError::Io("scratch".into())), None);
+        assert_eq!(build_charged_to(Tool::Git, &timed_out()), None);
+        assert_eq!(build_charged_to(Tool::Git, &refused()), None);
+    }
+
+    /// The history lane's budget is what the run's own budget leaves, at most
+    /// [`HISTORY_DAMAGE_BUDGET`]; with no run budget, all of it.
+    ///
+    /// Revert: pass `HISTORY_DAMAGE_BUDGET` whatever the run's budget → an hour's run starts two
+    /// hours of rows.
+    #[test]
+    fn the_history_lane_starts_rows_only_within_the_runs_budget() {
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(history_budget(Some(3600), std::time::Duration::from_secs(600)), hour - std::time::Duration::from_secs(600));
+        assert_eq!(history_budget(Some(3600), hour * 2), std::time::Duration::ZERO);
+        assert_eq!(history_budget(Some(100_000), std::time::Duration::ZERO), HISTORY_DAMAGE_BUDGET);
+        assert_eq!(history_budget(None, hour * 9), HISTORY_DAMAGE_BUDGET);
+    }
+
+    /// Git tuned refusing its unfaulted readback leaves a gap in git tuned's measure, as forklift
+    /// refusing its does in forklift's; git at its defaults, the oracle, refusing its is the run's.
+    ///
+    /// Revert: treat git tuned as git → its refusal fails the run as the harness's.
+    #[test]
+    fn only_the_oracle_refusing_its_readback_is_the_runs_own() {
+        assert!(refused_readback_is_a_gap(Tool::Forklift));
+        assert!(refused_readback_is_a_gap(Tool::GitTuned));
+        assert!(!refused_readback_is_a_gap(Tool::Git));
     }
 
     /// An empty sample is forklift's when git holds a ref with commits and the import made a
