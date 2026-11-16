@@ -329,13 +329,15 @@ impl Context<'_> {
         if self.scope.is_some() {
             return Err(RunError::Io("git reads back only an unscoped history".to_string()));
         }
-        // Through the host: a fresh clone of the bare repository, made by the subject as a user
-        // would make it, then read like a work tree. A clone that fails refuses every record.
+        // Through the host: a fresh clone of the bare repository by the subject, through git's
+        // transport (a local clone would hardlink the host's objects and check nothing), then
+        // read like a work tree. Nothing is checked out, since the read is from history: a clone
+        // that fails refuses every record.
         let clone;
         let bay = if self.via_host {
             let url = self.url.ok_or_else(|| RunError::Io("a host-side readback needs a host".to_string()))?;
             clone = self.fresh("clone");
-            let arguments = self.subject(vec!["clone".into(), "-q".into(), url.to_string(), clone.display().to_string()]);
+            let arguments = self.subject(vec!["clone".into(), "-q".into(), "--no-local".into(), "--no-checkout".into(), url.to_string(), clone.display().to_string()]);
             let cloned = self.run(self.program(), arguments, self.scratch.root().to_path_buf())?;
             if !cloned.succeeded() {
                 return Ok(HistoryReadback { export: cloned, records: Vec::new(), parked: None });
@@ -1071,7 +1073,9 @@ fn own_remedies(context: &Context, expected: &Expected, trail: &mut Trail, made:
     let cloned = match (context.tool, context.scope) {
         (Tool::Forklift, Some(scope)) => run(&["--json", "clone", "--only", scope, url, &target], context.scratch.root().to_path_buf())?,
         (Tool::Forklift, None) => run(&["--json", "clone", url, &target], context.scratch.root().to_path_buf())?,
-        (Tool::Git | Tool::GitTuned, _) => run(&["clone", "-q", url, &target], context.scratch.root().to_path_buf())?,
+        // Through git's transport, as the build's clone is: a local clone would share the host's
+        // object files.
+        (Tool::Git | Tool::GitTuned, _) => run(&["clone", "-q", "--no-local", url, &target], context.scratch.root().to_path_buf())?,
     };
     if !cloned.succeeded() {
         trail.steps.push(cloned);

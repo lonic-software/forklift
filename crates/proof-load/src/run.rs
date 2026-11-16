@@ -330,8 +330,8 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     };
 
     // Git's own layout, walked after each scenario git can run is built with it, and so is the
-    // bare repository of one that hosts: every path no layout row classifies, what each build created for the git damage bindings, and the role
-    // map's gaps against the census.
+    // bare repository of one that hosts: every path no layout row classifies, what each build
+    // created for the git damage bindings, and the role map's gaps against the census.
     let git_runnable: Vec<String> = scenario::catalog().into_iter().filter(|scenario| scenario.tools().contains(&Tool::Git)).map(|scenario| scenario.id).collect();
     let mut git_walks: BTreeMap<(String, Warehouse), Vec<String>> = BTreeMap::new();
     let mut git_walk_missing = Vec::new();
@@ -393,7 +393,9 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                 fault_errors.entry(subject).or_default();
                 for kind in binding.kinds {
                     let prefix = match subject { Tool::Forklift => String::new(), other => format!("{}-", other.label()) };
-                    let label = format!("{}{}-{}-{:?}", prefix, binding.scenario, binding.name, kind).replace(['/', '<', '>', '{', '}', '*'], "_");
+                    // A host's path is named apart from the client's of the same name.
+                    let side = match binding.warehouse { Warehouse::Client => "", Warehouse::Host => "host-" };
+                    let label = format!("{}{}-{}{}-{:?}", prefix, binding.scenario, side, binding.name, kind).replace(['/', '<', '>', '{', '}', '*'], "_");
                     start_block(progress, Category::DamagedFiles, &label)?;
                     let result = output.scratch(&label).map_err(|error| error.to_string()).and_then(|scratch| {
                         let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;

@@ -71,7 +71,7 @@ impl Built {
 impl std::fmt::Debug for Built {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Built").field("outcomes", &self.outcomes).field("walked", &self.walked)
-            .field("acknowledged", &self.acknowledged).field("host_walked", &self.host_walked).field("taken", &self.taken).field("host", &self.host.as_ref().map(|host| &host.url)).finish()
+            .field("acknowledged", &self.acknowledged).field("host_walked", &self.host_walked).field("taken", &self.taken).field("host", &self.host.as_ref().map(|host| &host.url)).field("bare", &self.bare).finish()
     }
 }
 
