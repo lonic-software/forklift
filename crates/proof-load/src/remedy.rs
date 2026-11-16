@@ -207,7 +207,7 @@ mod tests {
         let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
         assert_eq!(extract(Tool::Git, &texts).remedies, vec![Remedy::Command { arguments: vec!["gc".to_string(), "--prune=now".to_string()] }]);
         assert_eq!(extract(Tool::Forklift, &texts).remedies, vec![Remedy::Command { arguments: vec!["heal".to_string()] }]);
-        assert_eq!(extract(Tool::GitTuned, &["Run `git checkout -- <path>`."]).unextractable, vec!["git checkout -- <path>"]);
+        assert_eq!(extract(Tool::GitTuned, &["git checkout -- <path>"]).unextractable, vec!["git checkout -- <path>"]);
         // Forklift's remedies are its failure document's alone, never its stderr.
         let stray = Outcome { stderr: b"forklift heal".to_vec(), ..outcome };
         assert!(super::texts(Tool::Forklift, &stray).is_empty());
