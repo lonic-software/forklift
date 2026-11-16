@@ -114,6 +114,14 @@ fn described(program: &std::path::Path) -> String {
     format!("{} ({})", program.display(), version)
 }
 
+/// What git tuned runs with beyond git at its defaults, as the report names it: its options, and
+/// the fsmonitor where this git has a daemon for it.
+fn tuned_configuration(daemon: bool) -> String {
+    let options: Vec<&str> = crate::scenario::GIT_TUNED.iter().copied().filter(|option| *option != "-c").collect();
+    let fsmonitor = if daemon { "core.fsmonitor=true (its daemon run by the harness)" } else { "core.fsmonitor: unsupported here" };
+    format!("{}; {}", options.join(" "), fsmonitor)
+}
+
 /// Runs every lane `options` asks for into `options.out`, which must be empty or new, and returns
 /// the report it wrote there as `report.json` and `report.md`. A run that is refused or cancelled
 /// leaves whatever it wrote before it stopped, but no `report.json`; a run again needs another
@@ -329,42 +337,50 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         }
     };
 
-    // Git's own layout, walked after each scenario git can run is built with it, and so is the
-    // bare repository of one that hosts: every path no layout row classifies, what each build
-    // created for the git damage bindings, and the role map's gaps against the census.
+    // Git's own layout, walked after each scenario git can run is built with it, at its defaults
+    // and tuned, and so is the bare repository of one that hosts: every path no layout row
+    // classifies, what each build created for that subject's damage bindings, and the role map's
+    // gaps against the census.
     let git_runnable: Vec<String> = scenario::catalog().into_iter().filter(|scenario| scenario.tools().contains(&Tool::Git)).map(|scenario| scenario.id).collect();
-    let mut git_walks: BTreeMap<(String, Warehouse), Vec<String>> = BTreeMap::new();
-    let mut git_walk_missing = Vec::new();
     let git_program = git.as_deref().map(tool::absolute).transpose().map_err(|error| RunError::Refused(format!("the git path: {}", error)))?;
-    if let Some(git_program) = &git_program {
-        for scenario in scenarios.iter().filter(|scenario| git_runnable.contains(&scenario.id)) {
-            let label = format!("git-{}", scenario.id);
-            let built = in_area(&mut output, &label, &search_path, |scratch, environment| {
-                runner::build(scenario, &corpus, Tool::Git, git_program, None, scratch, environment, limit, None).map_err(|error| error.to_string())
-            });
-            match built {
-                Ok(built) => {
-                    git_walk_missing.extend(crate::git_layout::unclassified(&built.walked).into_iter().map(|path| format!("{}: {}", scenario.id, path)));
-                    // The bare repository a hosting history pushed to, laid out as a `.git` is.
-                    if built.bare.is_some() {
-                        git_walk_missing.extend(crate::git_layout::unclassified(&built.host_walked).into_iter().map(|path| format!("{} host: {}", scenario.id, path)));
-                        git_walks.insert((scenario.id.clone(), Warehouse::Host), built.host_walked);
+    let daemon = git_program.as_deref().is_some_and(runner::has_fsmonitor_daemon);
+    let mut git_checks = Vec::new();
+    for subject in [Tool::Git, Tool::GitTuned] {
+        let mut walks: BTreeMap<(String, Warehouse), Vec<String>> = BTreeMap::new();
+        let mut walk_missing = Vec::new();
+        if let Some(git_program) = &git_program {
+            for scenario in scenarios.iter().filter(|scenario| git_runnable.contains(&scenario.id)) {
+                let label = format!("{}-{}", subject.label(), scenario.id);
+                let built = in_area(&mut output, &label, &search_path, |scratch, environment| {
+                    runner::build(scenario, &corpus, subject, git_program, None, scratch, environment, limit, None).map_err(|error| error.to_string())
+                });
+                match built {
+                    Ok(built) => {
+                        walk_missing.extend(crate::git_layout::unclassified(&built.walked).into_iter().map(|path| format!("{}: {}", scenario.id, path)));
+                        // The bare repository a hosting history pushed to, laid out as a `.git` is.
+                        if built.bare.is_some() {
+                            walk_missing.extend(crate::git_layout::unclassified(&built.host_walked).into_iter().map(|path| format!("{} host: {}", scenario.id, path)));
+                            walks.insert((scenario.id.clone(), Warehouse::Host), built.host_walked);
+                        }
+                        walks.insert((scenario.id.clone(), Warehouse::Client), built.walked);
                     }
-                    git_walks.insert((scenario.id.clone(), Warehouse::Client), built.walked);
+                    Err(error) => walk_missing.push(format!("{}: not built: {}", scenario.id, error)),
                 }
-                Err(error) => git_walk_missing.push(format!("{}: not built: {}", scenario.id, error)),
             }
         }
+        let git_cell = match &git_program { None => Cell::not_run("no git binary given"), Some(_) => Cell::Run };
+        git_checks.push(Completeness { subject: Some(subject), check: "git layout walk".to_string(), cell: git_cell.clone(), missing: walk_missing });
+        // Run in full only: a filtered run walks too few scenarios to answer every binding.
+        let (damage_cell, damage_missing) = match &git_program {
+            None => (git_cell, vec![]),
+            Some(_) if only.is_some() => (Cell::not_run("--only builds one scenario"), vec![]),
+            Some(_) => {
+                let (bindings, exemptions) = crate::bindings::git_subject(subject, daemon);
+                (git_cell, crate::bindings::check_git(&bindings, &exemptions, &git_runnable, &walks))
+            }
+        };
+        git_checks.push(Completeness { subject: Some(subject), check: "git damage bindings".to_string(), cell: damage_cell, missing: damage_missing });
     }
-    let git_cell = match &git_program { None => Cell::not_run("no git binary given"), Some(_) => Cell::Run };
-    let git_walk_check = Completeness { subject: Some(Tool::Git), check: "git layout walk".to_string(), cell: git_cell.clone(), missing: git_walk_missing };
-    // Run in full only: a filtered run walks too few scenarios to answer every binding.
-    let (git_damage_cell, git_damage_missing) = match &git_program {
-        None => (git_cell, vec![]),
-        Some(_) if only.is_some() => (Cell::not_run("--only builds one scenario"), vec![]),
-        Some(_) => (git_cell, crate::bindings::check_git(crate::bindings::GIT_BINDINGS, crate::bindings::GIT_EXEMPTIONS, &git_runnable, &git_walks)),
-    };
-    let git_damage_check = Completeness { subject: Some(Tool::Git), check: "git damage bindings".to_string(), cell: git_damage_cell, missing: git_damage_missing };
     let role_check = match &census {
         None => Completeness { subject: None, check: "role map".to_string(), cell: Cell::not_run("no census for this version"), missing: vec![] },
         Some(census) => Completeness { subject: None, check: "role map".to_string(), cell: Cell::Run, missing: crate::git_layout::role_gaps(census, crate::git_layout::CENSUS_ROLES) },
@@ -385,7 +401,12 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             tools.insert("git".to_string(), described(&git));
             let programs = Programs { forklift, git, server: server.clone() };
             let faulted_corpus = faulted_corpus(seed);
-            let subjects = [(Tool::Forklift, crate::bindings::BINDINGS), (Tool::Git, crate::bindings::GIT_BINDINGS), (Tool::GitTuned, crate::bindings::GIT_BINDINGS)];
+            tools.insert(Tool::GitTuned.label().to_string(), tuned_configuration(daemon));
+            let subjects = [
+                (Tool::Forklift, crate::bindings::BINDINGS.to_vec()),
+                (Tool::Git, crate::bindings::git_subject(Tool::Git, daemon).0),
+                (Tool::GitTuned, crate::bindings::git_subject(Tool::GitTuned, daemon).0),
+            ];
             let picked_bindings = || subjects.iter().flat_map(|(subject, bindings)| bindings.iter().map(move |binding| (*subject, binding)))
                 .filter_map(|(subject, binding)| scenarios.iter().find(|scenario| scenario.id == binding.scenario).map(|scenario| (subject, binding, scenario)));
             progress.lane(Category::DamagedFiles, Some(picked_bindings().map(|(_, binding, _)| binding.kinds.len()).sum()));
@@ -880,7 +901,9 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     if matches!(server_power_cell, Cell::Run | Cell::Sampled) || server_power_not_reached > 0 {
         coverage.not_reached.insert(Category::PowerLossServer, server_power_not_reached);
     }
-    let mut completeness = vec![damage_check, walk_check, git_walk_check, git_damage_check, role_check, route_check, route_write_check];
+    let mut completeness = vec![damage_check, walk_check];
+    completeness.extend(git_checks);
+    completeness.extend([role_check, route_check, route_write_check]);
     completeness.extend(fault_checks);
     completeness.extend(condition_checks);
     completeness.extend(write_checks);

@@ -51,6 +51,9 @@ pub struct Built {
     /// The bare repository a git history's `Host` made, by the path that is its URL.
     #[serde(skip)]
     pub bare: Option<String>,
+    /// The fsmonitor daemon of a tuned git work tree, watching until this is dropped.
+    #[serde(skip)]
+    pub daemon: Option<FsmonitorDaemon>,
 }
 
 impl Built {
@@ -165,6 +168,72 @@ fn prepare(tool: Tool) -> Vec<String> {
 /// exits and a grade never depends on what a leftover process did.
 pub(crate) const GIT_CREATED_CONFIG: &[[&str; 2]] = &[["gc.autoDetach", "false"], ["maintenance.autoDetach", "false"]];
 
+/// Git's fsmonitor daemon over one tuned work tree, run by the harness in the foreground rather
+/// than started by the first command that queries it: it is up before any step runs, outside every
+/// traced command, and it goes when this is dropped, whatever a fault did to the repository. A
+/// daemon git starts on its own detaches, and outlives the run in a work tree no `stop` can name
+/// once its repository is damaged.
+pub struct FsmonitorDaemon(std::process::Child);
+
+impl Drop for FsmonitorDaemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl FsmonitorDaemon {
+    /// Turns on the fsmonitor in the work tree at `work` and starts its daemon, then waits until
+    /// `status` says it watches.
+    fn start(program: &Path, work: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<(FsmonitorDaemon, Vec<Outcome>), RunError> {
+        let mut outcomes = Vec::new();
+        let configured = tool::run(&Invocation { program: program.to_path_buf(), arguments: vec!["config".into(), "core.fsmonitor".into(), "true".into()], directory: work.to_path_buf(), limit }, scratch, environment)
+            .map_err(RunError::Tool)?;
+        if !configured.succeeded() {
+            return Err(RunError::Io(format!("turning on the fsmonitor exited {:?}: {}", configured.exit, String::from_utf8_lossy(&configured.stderr))));
+        }
+        outcomes.push(configured);
+        let mut command = std::process::Command::new(program);
+        command.args(["fsmonitor--daemon", "run"]).current_dir(work)
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        environment.apply(&mut command);
+        let mut daemon = FsmonitorDaemon(command.spawn().map_err(|error| RunError::Io(format!("starting the fsmonitor daemon: {}", error)))?);
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = daemon.0.try_wait().map_err(|error| RunError::Io(error.to_string()))? {
+                return Err(RunError::Io(format!("the fsmonitor daemon exited {} before it watched {}", status, work.display())));
+            }
+            let status = tool::run(&Invocation { program: program.to_path_buf(), arguments: vec!["fsmonitor--daemon".into(), "status".into()], directory: work.to_path_buf(), limit }, scratch, environment)
+                .map_err(RunError::Tool)?;
+            if status.succeeded() {
+                outcomes.push(status);
+                return Ok((daemon, outcomes));
+            }
+            if started.elapsed() > limit {
+                return Err(RunError::Io(format!("the fsmonitor daemon did not watch {} within {:?}", work.display(), limit)));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Whether the git at `program` was built with the fsmonitor daemon, as its build options say.
+/// Asked once per binary.
+pub fn has_fsmonitor_daemon(program: &Path) -> bool {
+    static ASKED: std::sync::Mutex<BTreeMap<PathBuf, bool>> = std::sync::Mutex::new(BTreeMap::new());
+    let mut asked = ASKED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *asked.entry(program.to_path_buf()).or_insert_with(|| {
+        std::process::Command::new(program).args(["version", "--build-options"]).env_clear()
+            .envs(std::env::var_os("PATH").map(|path| ("PATH", path))).current_dir(std::env::temp_dir()).output()
+            .is_ok_and(|output| builds_fsmonitor_daemon(&output.stdout))
+    })
+}
+
+/// Whether `git version --build-options` printed the fsmonitor daemon's feature line.
+fn builds_fsmonitor_daemon(stdout: &[u8]) -> bool {
+    String::from_utf8_lossy(stdout).lines().any(|line| line.trim() == "feature: fsmonitor--daemon")
+}
+
 /// The listing of git's parked work: each stash commit, newest first.
 pub(crate) const STASH_LIST: &[&str] = &["stash", "list", "--format=%H"];
 
@@ -231,6 +300,13 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
         for [key, value] in GIT_CREATED_CONFIG {
             outcomes.push(run_in(program, vec!["config".into(), key.to_string(), value.to_string()], scratch.work())?);
         }
+    }
+    let watched = tool == Tool::GitTuned && has_fsmonitor_daemon(program);
+    let mut daemon = None;
+    if watched {
+        let (started, said) = FsmonitorDaemon::start(program, &scratch.work(), scratch, environment, limit)?;
+        daemon = Some(started);
+        outcomes.extend(said);
     }
     let mut acknowledged = Vec::new();
     let mut pushed = Pushed::default();
@@ -441,6 +517,8 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
                 continue;
             }
             Op::Clone { .. } => {
+                // The work tree's daemon goes with it.
+                daemon = None;
                 // A clone makes its target; the work tree it replaces is the harness's own scratch.
                 #[allow(clippy::disallowed_methods)] // a scratch work tree the harness made; no retry is wanted
                 std::fs::remove_dir_all(&work).map_err(|error| RunError::Io(error.to_string()))?;
@@ -466,6 +544,11 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
                 for [key, value] in GIT_CREATED_CONFIG {
                     outcomes.push(run_in(program, vec!["config".into(), key.to_string(), value.to_string()], work.clone())?);
                 }
+            }
+            if watched {
+                let (started, said) = FsmonitorDaemon::start(program, &work, scratch, environment, limit)?;
+                daemon = Some(started);
+                outcomes.extend(said);
             }
         }
         if let Some(mark) = op.mark() {
@@ -513,7 +596,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
             stopped.extend(finish(last, observer, scratch)?);
         }
     }
-    Ok(Built { outcomes, walked, host_walked, taken, acknowledged, pushed: pushed.marks, parked, host: host.take(), stopped: std::mem::take(stopped), bare })
+    Ok(Built { outcomes, walked, host_walked, taken, acknowledged, pushed: pushed.marks, parked, host: host.take(), stopped: std::mem::take(stopped), bare, daemon })
 }
 
 /// Stops `host`: through `observer` when there is one, so its traces are read, and otherwise by
@@ -742,6 +825,16 @@ mod tests {
         assert_eq!(kept_value(&document, &keep("/data/message", Some("office link"), 0)).as_deref(), Some("pk2"));
         assert_eq!(kept_value(&document, &keep("/data/message", Some("absent"), 0)), None);
         assert_eq!(kept_value(&document, &keep("/data/none", None, 0)), None);
+    }
+
+    /// Only the feature line itself says a git has the fsmonitor daemon.
+    ///
+    /// Revert: match by substring → the `no` line below reads as the feature.
+    #[test]
+    fn the_daemon_feature_is_read_from_its_own_line() {
+        assert!(builds_fsmonitor_daemon(b"git version 2.55.0\ncpu: arm64\nfeature: fsmonitor--daemon\nlibcurl: 8.7.1\n"));
+        assert!(!builds_fsmonitor_daemon(b"git version 2.43.0\ncpu: x86_64\nno commit associated with this build\n"));
+        assert!(!builds_fsmonitor_daemon(b"git version 2.43.0\nno feature: fsmonitor--daemon here\n"));
     }
 
     /// The forklift binary to drive, given by path; the harness never builds or links it.
