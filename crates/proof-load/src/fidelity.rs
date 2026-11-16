@@ -317,8 +317,9 @@ impl<'a, 'b> Comparison<'a, 'b> {
 
     /// Compares the headers either object has by name, apart from `skipped`: every value of a
     /// name, in order, so one header split into two differs from it. A header one side lacks is a
-    /// finding with nothing on that side. The headers of names both sides hold equally often, in a
-    /// different sequence, are a `header order` finding (`tag order` for a tag).
+    /// finding with nothing on that side. The headers of names both sides hold equally often,
+    /// `skipped` ones included, in a different sequence, are a `header order` finding (`tag order`
+    /// for a tag).
     fn headers(&mut self, prefix: &str, at: &str, before: &[(String, Vec<u8>)], after: &[(String, Vec<u8>)], skipped: &[&str]) {
         let names: BTreeSet<&String> = before.iter().chain(after).map(|(name, _)| name).filter(|name| !skipped.contains(&name.as_str())).collect();
         for name in &names {
@@ -327,21 +328,23 @@ impl<'a, 'b> Comparison<'a, 'b> {
             };
             let (was, now) = (values(before), values(after));
             if was != now {
-                // One value as it is; several each bracketed, so no single value reads as two.
+                // One value on each side as it is; otherwise every value bracketed, so no single
+                // value reads as several.
+                let bracket = was.len() > 1 || now.len() > 1;
                 let show = |values: Vec<Vec<u8>>| match values.as_slice() {
                     [] => None,
-                    [value] => Some(shown(value)),
+                    [value] if !bracket => Some(shown(value)),
                     values => Some(values.iter().map(|value| format!("[{}]", shown(value))).collect::<Vec<_>>().join(" ")),
                 };
                 self.find(format!("{}{}", prefix, name), at, show(was), show(now));
             }
         }
-        // Every header in sequence, of the names both sides hold equally many of: a name whose
-        // count differs is a finding above already.
+        // Every header in sequence, `skipped` ones too, of the names both sides hold equally many
+        // of: a name whose count differs is a finding already, above or where it is compared.
         let count = |headers: &[(String, Vec<u8>)], name: &str| headers.iter().filter(|(header, _)| header == name).count();
         let order = |headers: &[(String, Vec<u8>)]| -> Vec<String> {
             headers.iter().map(|(name, _)| name.clone())
-                .filter(|name| !skipped.contains(&name.as_str()) && count(before, name) == count(after, name)).collect()
+                .filter(|name| count(before, name) == count(after, name)).collect()
         };
         let (was, now) = (order(before), order(after));
         if was != now {
@@ -659,6 +662,7 @@ mod tests {
     ///
     /// Revert: join a name's values into one before comparing → the split gpgsig compares equal.
     /// Revert: order by each name's first appearance → the interleaved mergetags compare equal.
+    /// Revert: leave `skipped` names out of the order → gpgsig moved before committer is no finding.
     #[test]
     fn a_split_header_and_a_reordered_one_are_findings() {
         let (scratch, environment) = area("headers");
@@ -670,11 +674,13 @@ mod tests {
         comparison.headers("header ", "main~1", &[header("encoding", b"x"), header("mergetag", b"m")], &[header("mergetag", b"m"), header("encoding", b"x")], &[]);
         comparison.headers("header ", "main~2", &[header("mergetag", b"a"), header("encoding", b"x"), header("mergetag", b"b")],
             &[header("mergetag", b"a"), header("mergetag", b"b"), header("encoding", b"x")], &[]);
+        comparison.headers("header ", "main~3", &[header("committer", b"c"), header("gpgsig", b"g")], &[header("gpgsig", b"g"), header("committer", b"c")], &["committer"]);
         let found: Vec<(String, String, Option<String>, Option<String>)> = comparison.findings.into_iter().map(|finding| (finding.field, finding.at, finding.before, finding.after)).collect();
         assert_eq!(found, [
-            ("header gpgsig".to_string(), "main".to_string(), Some("A\\nB".to_string()), Some("[A] [B]".to_string())),
+            ("header gpgsig".to_string(), "main".to_string(), Some("[A\\nB]".to_string()), Some("[A] [B]".to_string())),
             ("header order".to_string(), "main~1".to_string(), Some("encoding mergetag".to_string()), Some("mergetag encoding".to_string())),
             ("header order".to_string(), "main~2".to_string(), Some("mergetag encoding mergetag".to_string()), Some("mergetag mergetag encoding".to_string())),
+            ("header order".to_string(), "main~3".to_string(), Some("committer gpgsig".to_string()), Some("gpgsig committer".to_string())),
         ]);
     }
 
