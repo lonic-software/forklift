@@ -368,8 +368,10 @@ mod tests {
         std::os::unix::fs::symlink("objects/ab/cd", scratch.work().join(".forklift/link")).unwrap();
         // A socket's path must be short; it is bound in the system temp folder and moved in.
         let short = PathBuf::from(format!("/tmp/pl-ipc-{}", std::process::id()));
+        #[allow(clippy::disallowed_methods)] // the test's own socket, on unix only
         let _ = std::fs::remove_file(&short);
         let _listener = std::os::unix::net::UnixListener::bind(&short).unwrap();
+        #[allow(clippy::disallowed_methods)] // the test's own socket, on unix only
         std::fs::rename(&short, scratch.work().join("ipc")).unwrap();
         let copy = scratch.copy_to(&fresh("copy-target")).unwrap();
         assert!(!copy.work().join("ipc").exists());
