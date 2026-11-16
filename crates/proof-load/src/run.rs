@@ -310,9 +310,9 @@ fn history_damage(
                 let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
                 faulted::baseline(tool, pristine, &positions, programs, &scratch, &environment, HISTORY_LIMIT).map_err(|error| error.to_string())
             });
-            // Forklift refusing its own unfaulted readback leaves a gap in its measure. Git's is the
-            // oracle the sample was drawn from, so git refusing a position it counted is the
-            // harness's fault, as a readback the harness could not take is.
+            // Forklift refusing its own unfaulted readback leaves a gap in its measure. Git's
+            // is the oracle the sample was drawn from, so git refusing a position it counted is
+            // the harness's fault, as a readback the harness could not take is.
             match base {
                 Ok(Ok(base)) => {
                     write_detail(output.root(), &format!("{}.json", label), &base)?;
