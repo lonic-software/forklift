@@ -134,7 +134,8 @@ struct Steps<'a> {
 
 impl Steps<'_> {
     /// Runs `program` with `arguments` in `directory`, refusing a run that does not exit 0 with
-    /// what it said.
+    /// what it said: its stderr, or its stdout when its stderr is empty, as forklift's `--json`
+    /// refusals are.
     fn run(&mut self, program: &Path, arguments: &[&str], directory: &Path, environment: &Environment) -> Result<Vec<u8>, String> {
         let invocation = Invocation {
             program: program.to_path_buf(), arguments: arguments.iter().map(|argument| argument.to_string()).collect(),
@@ -142,8 +143,9 @@ impl Steps<'_> {
         };
         let outcome = tool::run(&invocation, self.scratch, environment).map_err(|error| error.to_string())?;
         let mut outcome = outcome;
+        let said = if outcome.stderr.iter().all(u8::is_ascii_whitespace) { &outcome.stdout } else { &outcome.stderr };
         let refused = (!outcome.succeeded()).then(|| format!("`{}` exited {}: {}", arguments.join(" "),
-            outcome.exit.map_or("on a signal".to_string(), |code| code.to_string()), String::from_utf8_lossy(&outcome.stderr).trim()));
+            outcome.exit.map_or("on a signal".to_string(), |code| code.to_string()), String::from_utf8_lossy(&said[..said.len().min(KEPT_STDOUT)]).trim()));
         // The kept cut is a copy, so the step holds no more than it shows.
         let stdout = std::mem::take(&mut outcome.stdout);
         outcome.stdout = stdout[..self.kept.map_or(stdout.len(), |kept| stdout.len().min(kept))].to_vec();
@@ -1616,7 +1618,10 @@ mod tests {
     /// hands the whole of it to the comparison; a fixture trip keeps it whole.
     ///
     /// Revert: cut the stdout before it is handed back → the caller reads the cut length; keep it
-    /// whole → the step holds every byte; cut it regardless of `kept` → the last step is cut.
+    /// whole → the step holds every byte; cut it regardless of `kept` → the last step is cut. A
+    /// refusal says its stderr, or its stdout when that is empty.
+    ///
+    /// Revert: say only stderr → the script's refusal says nothing.
     #[test]
     fn a_trip_keeps_a_cut_of_long_output() {
         let (scratch, environment) = area("kept");
@@ -1633,6 +1638,16 @@ mod tests {
         steps.kept = None;
         steps.run(&git, &["cat-file", "blob", &hash], &repository, &environment).unwrap();
         assert_eq!(steps.outcomes.last().unwrap().stdout.len(), KEPT_STDOUT + 1000);
+        let refused = steps.run(&git, &["rev-parse", "--verify", "-q", "nowhere"], &repository, &environment).unwrap_err();
+        assert_eq!(refused, "`rev-parse --verify -q nowhere` exited 1: ");
+        let refused = steps.run(&git, &["for-each-ref", "--bogus"], &repository, &environment).unwrap_err();
+        assert!(refused.contains("unknown option"), "{}", refused);
+        let script = scratch.root().join("says");
+        write(&script, b"#!/bin/sh\necho refused on stdout\nexit 3\n").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        #[cfg(unix)]
+        assert_eq!(steps.run(&script, &[], &repository, &environment).unwrap_err(), "`` exited 3: refused on stdout");
     }
 
     /// Needs a forklift binary: `PROOF_LOAD_FORKLIFT=<path> cargo test -p proof-load -- --ignored`.

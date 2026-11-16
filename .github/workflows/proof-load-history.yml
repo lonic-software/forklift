@@ -38,6 +38,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      # A checkout holds its branches as remote-tracking refs, and Forklift imports local
+      # branches only: each origin branch is made a local one, so the history is every branch.
+      - name: Make each origin branch local
+        run: |
+          git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin | grep -vx HEAD |
+            while read -r branch; do git update-ref "refs/heads/$branch" "refs/remotes/origin/$branch"; done
+          git for-each-ref --format=x refs/heads | wc -l
+
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
