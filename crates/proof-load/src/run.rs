@@ -1488,7 +1488,7 @@ mod tests {
             assert_eq!(steps.last().unwrap()["exit"].as_i64().map(|exit| exit as i32), last, "{}", name);
             for tool in [Tool::Forklift, Tool::Git, Tool::GitTuned] {
                 let ran = checks.iter().find(|entry| entry.subject == Some(tool) && entry.check == "history damage rows ran").unwrap();
-                assert!(matches!(ran.cell, Cell::NotRun { .. }), "{}: {:?}", name, ran);
+                assert_eq!(ran.cell, Cell::not_run("the history subjects were not built"), "{}: {:?}", name, ran);
             }
         }
     }
