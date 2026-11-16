@@ -969,6 +969,20 @@ fn answered(last: Option<&Outcome>) -> bool {
     }))
 }
 
+/// Why the unfaulted readback did not serve `mark`, naming the evidence: the first command of
+/// `reads` that refused, as it exited and what it said, or a walk that ended short of the mark.
+fn unserved(mark: Mark, reached: bool, reads: &[Outcome]) -> String {
+    let said = |outcome: &Outcome| {
+        let text = outcome.failure.as_ref().map(|failure| failure.message.clone()).unwrap_or_else(|| String::from_utf8_lossy(&outcome.stderr).trim().to_string());
+        text.chars().take(400).collect::<String>()
+    };
+    match reads.iter().find(|outcome| !outcome.succeeded()) {
+        Some(refused) => format!("the unfaulted readback did not serve {:?}: {:?} exited {:?}: {}", mark, refused.arguments, refused.exit, said(refused)),
+        None if !reached => format!("the unfaulted readback did not serve {:?}: its walk ended short of it", mark),
+        None => format!("the unfaulted readback did not serve {:?}", mark),
+    }
+}
+
 /// Each pallet's head in a `--json pallet list`, by name.
 fn pallet_heads(stdout: &[u8]) -> BTreeMap<String, String> {
     let document = runner::document(stdout);
@@ -1451,13 +1465,13 @@ pub fn baseline(tool: Tool, pristine: &Path, positions: &[Position], programs: &
     let context = history_context(tool, &corpus, programs, scratch, environment, limit, positions);
     let marks: Vec<Mark> = (0..positions.len()).map(Mark::Position).chain([Mark::Record(0)]).collect();
     let trees = |marks: &[Mark]| -> Result<Result<Vec<oracle::Tree>, String>, RunError> {
-        let (export, served, _) = context.serve_history(&scratch.work(), positions, marks)?;
+        let (export, served, reads) = context.serve_history(&scratch.work(), positions, marks)?;
         if !export.succeeded() {
             return Ok(Err(format!("the unfaulted readback refused: {:?} exited {:?}: {}", export.arguments, export.exit, String::from_utf8_lossy(&export.stderr).trim())));
         }
         Ok(served.into_iter().map(|(mark, readback, reached)| match readback {
             Readback::Served { tree, .. } if reached => Ok(tree),
-            _ => Err(format!("the unfaulted readback did not serve {:?}", mark)),
+            _ => Err(unserved(mark, reached, &reads)),
         }).collect())
     };
     let mut read = match trees(&marks)? { Ok(read) => read, Err(refused) => return Ok(Err(refused)) };
@@ -1912,6 +1926,22 @@ mod tests {
     fn walked() -> Vec<String> {
         ["objects/", "objects/ab/", "objects/ab/11", "objects/cd/", "objects/cd/22", "pallets/", "pallets/main", "warehouse"]
             .iter().map(|path| path.to_string()).collect()
+    }
+
+    /// An unserved record names its evidence: the first read that refused, with its failure's
+    /// message, or else its stderr; or a walk that ended short of the record.
+    ///
+    /// Revert: drop the refused read → the CI history run's refusal names no command.
+    #[test]
+    fn an_unserved_record_names_the_read_that_refused() {
+        let ran = |arguments: &[&str], exit: Option<i32>, stderr: &str, message: Option<&str>| Outcome {
+            arguments: arguments.iter().map(|argument| argument.to_string()).collect(), exit, stdout: vec![], stderr: stderr.as_bytes().to_vec(),
+            failure: message.map(|message| crate::tool::Failure { code: "x".into(), message: message.into(), next_step: None }),
+        };
+        let reads = [ran(&["history", "main"], Some(0), "", None), ran(&["pallet", "create"], Some(2), "noise", Some("no parcel abc")), ran(&["bay", "add"], Some(1), "later", None)];
+        assert_eq!(unserved(Mark::Position(0), true, &reads), r#"the unfaulted readback did not serve Position(0): ["pallet", "create"] exited Some(2): no parcel abc"#);
+        assert_eq!(unserved(Mark::Position(1), true, &reads[2..]), r#"the unfaulted readback did not serve Position(1): ["bay", "add"] exited Some(1): later"#);
+        assert_eq!(unserved(Mark::Position(2), false, &reads[..1]), "the unfaulted readback did not serve Position(2): its walk ended short of it");
     }
 
     /// A pattern resolves to one of the paths it matches, chosen by the seed, a folder without its
