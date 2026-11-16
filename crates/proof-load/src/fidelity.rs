@@ -50,10 +50,13 @@ impl Direction {
 #[serde(deny_unknown_fields)]
 pub struct Finding {
     pub direction: Direction,
-    /// What differs, which names the loss class: `ref`, `ref kind`, `commit`, `tree entry`,
-    /// `parent count`, `author name` and the other identity parts, `message`, `header <name>`, or
-    /// `tag <part>` for an annotated tag's object; from Forklift, `pallet`, `record`, `actions`,
-    /// `<action> operator` and its time and trust, `manifest entry`, `keyed value`, or `tag <part>`.
+    /// What differs, which names the loss class: `ref`, `ref kind`, `ref target`, `commit`,
+    /// `commit identity`, `tree entry`, `parent count`, `author name` and the other identity parts,
+    /// `message`, `header <name>`, `note`, or `tag <part>` for an annotated tag's object; from
+    /// Forklift, `pallet`, `record`, `record identity`, `message`, `parent count`, `actions`,
+    /// `<action> operator` and its time and trust, `tree` (no one export commit for a record),
+    /// `tree entry`, `manifest entry`, `keyed value` and `keyed value <field>` (its operator,
+    /// signer, ...), or `tag`, `tag subject` and `tag <field>` (its message, tagger, ...).
     pub field: String,
     /// Where: a ref's, pallet's or tag's name, or a commit's or record's position from the ref or
     /// pallet the walk reached it by (`main~2^2`), then a path for a tree entry; a keyed value is
@@ -633,16 +636,17 @@ fn build_warehouse(steps: &mut Steps, forklift: &Path, root: &Path, environment:
     Ok(())
 }
 
-/// One record of a `history --json` listing: its description, its parents, its actions as name,
-/// operator, time and trust, its manifest entries but keyed values (each as its JSON without the
-/// subject, sorted), and the git tree its warehouse's export wrote for it.
+/// One record of a `history --json` listing: its description (none where it has none), its
+/// parents, its actions as name, operator, time and trust, its manifest entries but keyed values
+/// (each as its JSON without the subject, sorted), and every git tree its warehouse's export
+/// wrote for it: one, unless the export wrote no commit for it or several.
 #[derive(Clone, Debug, Default)]
 struct Record {
-    description: String,
+    description: Option<String>,
     parents: Vec<String>,
     actions: Vec<[String; 4]>,
     manifest: Vec<String>,
-    tree: Option<String>,
+    trees: BTreeSet<String>,
 }
 
 /// What was read of one warehouse of a Forklift round trip and of its git export.
@@ -699,16 +703,8 @@ fn read_side(steps: &mut Steps, forklift: &Path, git: &Path, environment: &Envir
         }
         let listing = data(&["history", "--", &name])?;
         for entry in listing["entries"].as_array().ok_or_else(|| format!("the history of {} lists no entries", name))? {
-            let parcel = text_at(entry, "parcel").ok_or_else(|| format!("an entry in the history of {} names no parcel", name))?;
-            let unlisted = |what: &str| format!("the history of {} lists {} with no {}", name, parcel, what);
-            let parents = entry["parents"].as_array().ok_or_else(|| unlisted("parents"))?.iter()
-                .map(|parent| parent.as_str().map(str::to_string).ok_or_else(|| unlisted("parent id"))).collect::<Result<_, _>>()?;
-            let actions = entry["actions"].as_array().ok_or_else(|| unlisted("actions"))?.iter().map(|action| {
-                [text_at(action, "action").unwrap_or_default().trim().to_string(), text_at(action, "operator").unwrap_or_default(),
-                    text_at(action, "timestamp").unwrap_or_default(), text_at(action, "trust").unwrap_or_default()]
-            }).collect();
-            let description = text_at(entry, "description").ok_or_else(|| unlisted("description"))?;
-            side.records.insert(parcel, Record { description, parents, actions, ..Record::default() });
+            let (parcel, record) = history_record(&name, entry)?;
+            side.records.insert(parcel, record);
         }
     }
     // Every field of an entry but the ones that place it, by name.
@@ -742,36 +738,56 @@ fn read_side(steps: &mut Steps, forklift: &Path, git: &Path, environment: &Envir
         side.keyed.insert((subject, key), (text_at(entry, "value"), rest(entry, &["subject", "key", "value"])));
     }
     let log = steps.run(git, &["log", "--all", "--format=%x00%H %T%n%B"], export, environment)?;
-    for (parcel, tree) in parcel_trees(&log).map_err(|error| format!("{}: {}", export.display(), error))? {
+    for (parcel, trees) in parcel_trees(&log) {
         if let Some(record) = side.records.get_mut(&parcel) {
-            record.tree = Some(tree);
+            record.trees = trees;
         }
     }
     Ok(side)
 }
 
-/// The tree of each parcel an export wrote a commit for, read from a `git log` of the export
-/// whose entries are a NUL, then the commit and tree ids, then the message. The export writes its
-/// `Forklift-Parcel: <parcel> export/<n>` trailer as the message's last line; a description
-/// quoting one keeps it higher up, where it names nothing. Two commits naming one parcel are an
-/// error.
-fn parcel_trees(log: &[u8]) -> Result<BTreeMap<String, String>, String> {
-    let mut trees = BTreeMap::new();
+/// One entry of the `history --json` listing of pallet `name`, as its parcel id and record. An
+/// entry missing a field the comparison reads is an error; a parcel with no description lists
+/// none, and is read as none.
+fn history_record(name: &str, entry: &serde_json::Value) -> Result<(String, Record), String> {
+    let parcel = text_at(entry, "parcel").ok_or_else(|| format!("an entry in the history of {} names no parcel", name))?;
+    let unlisted = |what: &str| format!("the history of {} lists {} with no {}", name, parcel, what);
+    let parents = entry["parents"].as_array().ok_or_else(|| unlisted("parents"))?.iter()
+        .map(|parent| parent.as_str().map(str::to_string).ok_or_else(|| unlisted("parent id"))).collect::<Result<_, _>>()?;
+    let actions = entry["actions"].as_array().ok_or_else(|| unlisted("actions"))?.iter().map(|action| {
+        let field = |key: &str| text_at(action, key).ok_or_else(|| unlisted(&format!("action {}", key)));
+        Ok([field("action")?.trim().to_string(), field("operator")?, field("timestamp")?, field("trust")?])
+    }).collect::<Result<_, String>>()?;
+    // A parcel with no description lists none; anything but text there is not a listing
+    // this reads.
+    let description = match entry.get("description") {
+        None => None,
+        Some(serde_json::Value::String(description)) => Some(description.clone()),
+        Some(_) => return Err(unlisted("description as text")),
+    };
+    Ok((parcel, Record { description, parents, actions, ..Record::default() }))
+}
+
+/// The trees of each parcel an export wrote a commit for, read from a `git log` of the export
+/// whose entries are a NUL, then the commit and tree ids, then the message. A commit names its
+/// parcel by its message's last line, `Forklift-Parcel: <parcel> export/<layout>`, read as the
+/// export's mirror reads it: an object hash and an all-digit layout, or no parcel line at all. A
+/// description quoting such a line keeps it higher up, where it names nothing. Commits naming one
+/// parcel with different trees give that parcel each of them.
+fn parcel_trees(log: &[u8]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut trees: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for chunk in log.split(|byte| *byte == 0).filter(|chunk| !chunk.is_empty()) {
         let text = String::from_utf8_lossy(chunk);
-        let mut lines = text.lines();
-        let Some(tree) = lines.next().unwrap_or_default().split_whitespace().nth(1).map(str::to_string) else { continue };
-        let Some(trailer) = lines.rev().find(|line| !line.trim().is_empty()).and_then(|line| line.strip_prefix("Forklift-Parcel: ")) else { continue };
-        let mut words = trailer.split_whitespace();
-        let (Some(parcel), Some(version)) = (words.next(), words.next()) else { continue };
-        if !version.starts_with("export/") {
-            continue;
-        }
-        if trees.insert(parcel.to_string(), tree).is_some() {
-            return Err(format!("two commits name parcel {}", parcel));
+        let (head, message) = text.split_once('\n').unwrap_or((&text, ""));
+        let Some(tree) = head.split_whitespace().nth(1) else { continue };
+        let last = message.trim_end_matches('\n').rsplit('\n').next().unwrap_or_default();
+        let Some((parcel, layout)) = last.strip_prefix("Forklift-Parcel: ").and_then(|rest| rest.split_once(" export/")) else { continue };
+        let hash = parcel.len() == 64 && parcel.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+        if hash && !layout.is_empty() && layout.bytes().all(|byte| byte.is_ascii_digit()) {
+            trees.entry(parcel.to_string()).or_default().insert(tree.to_string());
         }
     }
-    Ok(trees)
+    trees
 }
 
 /// Compares two warehouses: `before`, the history that went in, and `after`, its git export
@@ -804,7 +820,8 @@ impl Records<'_, '_> {
         let was = self.before.records.get(before).cloned().ok_or_else(|| missing(before))?;
         let now = self.after.records.get(after).cloned().ok_or_else(|| missing(after))?;
         if was.description != now.description {
-            self.find("message", at, Some(shown(was.description.as_bytes())), Some(shown(now.description.as_bytes())));
+            let show = |description: &Option<String>| description.as_ref().map(|description| shown(description.as_bytes()));
+            self.find("message", at, show(&was.description), show(&now.description));
         }
         if was.parents.len() != now.parents.len() {
             self.find("parent count", at, Some(was.parents.len().to_string()), Some(now.parents.len().to_string()));
@@ -822,10 +839,11 @@ impl Records<'_, '_> {
                 }
             }
         }
-        // A tree is read only through an export, so a record an export wrote no commit for has
-        // no tree to compare: a `tree` finding, never a pass.
-        match (&was.tree, &now.tree) {
-            (Some(was_tree), Some(now_tree)) => if was_tree != now_tree {
+        // A tree is read only through an export, so a record an export wrote no commit for, or
+        // several with different trees, has no one tree to compare: a `tree` finding, never a pass.
+        let (was_trees, now_trees) = (was.trees.iter().collect::<Vec<_>>(), now.trees.iter().collect::<Vec<_>>());
+        match (was_trees.as_slice(), now_trees.as_slice()) {
+            ([was_tree], [now_tree]) => if was_tree != now_tree {
                 let (before_export, after_export) = (self.before.export.clone(), self.after.export.clone());
                 let was_entries = tree_entries(self.steps, self.git, &before_export, was_tree, self.environment)?;
                 let now_entries = tree_entries(self.steps, self.git, &after_export, now_tree, self.environment)?;
@@ -836,9 +854,13 @@ impl Records<'_, '_> {
                     }
                 }
             },
-            (was_tree, now_tree) => {
-                let exported = |tree: &Option<String>| Some(if tree.is_some() { "exported" } else { "no export commit names it" }.to_string());
-                self.find("tree", at, exported(was_tree), exported(now_tree));
+            (was_trees, now_trees) => {
+                let exported = |trees: &[&String]| Some(match trees.len() {
+                    0 => "no export commit names it".to_string(),
+                    1 => "exported".to_string(),
+                    count => format!("{} export commits with different trees name it", count),
+                });
+                self.find("tree", at, exported(was_trees), exported(now_trees));
             }
         }
         for entry in was.manifest.iter().filter(|entry| !now.manifest.contains(entry)) {
@@ -1275,9 +1297,9 @@ mod tests {
         };
         let (kept, changed) = (tree(b"kept\n"), tree(b"changed\n"));
         let record = |description: &str, parents: &[&str]| Record {
-            description: description.to_string(), parents: parents.iter().map(|parent| parent.to_string()).collect(),
+            description: Some(description.to_string()), parents: parents.iter().map(|parent| parent.to_string()).collect(),
             actions: [["author", "op", "t1", "recorded"], ["stack", "op", "t1", "recorded"]].map(|action| action.map(str::to_string)).to_vec(),
-            manifest: Vec::new(), tree: Some(kept.clone()),
+            manifest: Vec::new(), trees: BTreeSet::from([kept.clone()]),
         };
         let some = |text: &str| Some(text.to_string());
         let fields = |pairs: &[(&str, &str)]| pairs.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect::<BTreeMap<_, _>>();
@@ -1314,7 +1336,7 @@ mod tests {
         after.pallets.insert("fresh".to_string(), Some("n1".to_string()));
         after.pallets.insert("twin".to_string(), Some("ns".to_string()));
         let merge = after.records.get_mut("n3").unwrap();
-        merge.description = "changed".to_string();
+        merge.description = Some("changed".to_string());
         merge.parents.truncate(1);
         merge.manifest.clear();
         let second = after.records.get_mut("n2").unwrap();
@@ -1325,7 +1347,7 @@ mod tests {
         after.records.insert("nx".to_string(), record("added", &["n1"]));
         let root = after.records.get_mut("n1").unwrap();
         root.actions[0][3] = "claimed".to_string();
-        root.tree = Some(changed.clone());
+        root.trees = BTreeSet::from([changed.clone()]);
         after.tags.get_mut("v1").unwrap().1.insert("message".to_string(), "one, edited".to_string());
         after.tags.get_mut("v2").unwrap().0 = some("n2");
         after.keyed.insert(("n3".to_string(), "k".to_string()), (some("w"), fields(&[("operator", "op")])));
@@ -1344,13 +1366,13 @@ mod tests {
     }
 
     /// A lost parent is counted by the records only it reaches, and a record an export never
-    /// wrote is a `tree` finding, never a pass.
+    /// wrote, or wrote twice with different trees, is a `tree` finding, never a pass.
     #[test]
     fn a_lost_parent_counts_what_only_it_reaches_and_an_unexported_record_is_a_tree_finding() {
         let (scratch, environment) = area("lost");
         let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
         let git = path_git();
-        let record = |parents: &[&str]| Record { parents: parents.iter().map(|parent| parent.to_string()).collect(), tree: Some("t".to_string()), ..Record::default() };
+        let record = |parents: &[&str]| Record { parents: parents.iter().map(|parent| parent.to_string()).collect(), trees: BTreeSet::from(["t".to_string()]), ..Record::default() };
         let before = Side {
             records: BTreeMap::from([("w3".to_string(), record(&["w2", "wb"])), ("w2".to_string(), record(&["w1"])), ("w1".to_string(), record(&[])),
                 ("wb".to_string(), record(&["wa"])), ("wa".to_string(), record(&["w1"]))]),
@@ -1368,25 +1390,54 @@ mod tests {
         assert_eq!(lost.len(), 1, "{:?}", findings);
         assert_eq!((lost[0].at.as_str(), lost[0].before.as_deref(), lost[0].after.as_deref()), ("main^2", Some("present, with 2 records only it reaches"), None));
 
-        after.records.get_mut("n2").unwrap().tree = None;
+        after.records.get_mut("n2").unwrap().trees.clear();
+        after.records.get_mut("n1").unwrap().trees.insert("u".to_string());
         let records = Records { steps: &mut steps, git: &git, environment: &environment, before, after, findings: Vec::new(), paired: BTreeMap::new(), returned: BTreeMap::new() };
         let findings = records.walk().unwrap();
         let tree: Vec<_> = findings.iter().filter(|finding| finding.field == "tree").map(|finding| (finding.at.as_str(), finding.before.as_deref(), finding.after.as_deref())).collect();
-        assert_eq!(tree, [("main~1", Some("exported"), Some("no export commit names it"))]);
+        assert_eq!(tree, [("main~1", Some("exported"), Some("no export commit names it")),
+            ("main~2", Some("exported"), Some("2 export commits with different trees name it"))]);
     }
 
-    /// Each parcel's tree is read from the trailer on its commit's last line only, and two
-    /// commits naming one parcel are an error.
+    /// A history entry is read field by field: a parcel with no description reads as none, and an
+    /// entry missing a field the comparison reads, or listing a description that is not text, is
+    /// an error.
     #[test]
-    fn a_parcel_tree_is_read_from_the_last_line_trailer() {
-        let log = b"\0c1 t1\nfirst\n\nForklift-Parcel: p1 export/1\n\
-            \0c2 t2\nsecond\n\nForklift-Parcel: p1 export/1\n\nForklift-Parcel: p2 export/1\n\
-            \0c3 t3\nquoted\nForklift-Parcel: p3 export/1\nand more\n\
-            \0c4 t4\nnot ours\n\nForklift-Parcel: p4 import/1\n";
-        let trees = parcel_trees(log).unwrap();
-        assert_eq!(trees, BTreeMap::from([("p1".to_string(), "t1".to_string()), ("p2".to_string(), "t2".to_string())]));
-        let error = parcel_trees(b"\0c1 t1\nForklift-Parcel: p1 export/1\n\0c2 t2\nForklift-Parcel: p1 export/2\n").unwrap_err();
-        assert!(error.contains("p1"), "{}", error);
+    fn a_history_entry_missing_a_compared_field_is_an_error() {
+        let entry = serde_json::json!({"parcel": "p", "parents": ["q"],
+            "actions": [{"action": "author", "operator": "op", "timestamp": "t1", "trust": "recorded"}]});
+        let (parcel, record) = history_record("main", &entry).unwrap();
+        assert_eq!((parcel.as_str(), record.description, record.parents), ("p", None, vec!["q".to_string()]));
+        assert_eq!(record.actions, [["author", "op", "t1", "recorded"].map(str::to_string)]);
+        let mut described = entry.clone();
+        described["description"] = "text".into();
+        assert_eq!(history_record("main", &described).unwrap().1.description.as_deref(), Some("text"));
+        for broken in ["/parents", "/actions", "/actions/0/action", "/actions/0/operator", "/actions/0/timestamp", "/actions/0/trust"] {
+            let mut missing = entry.clone();
+            let (parent, key) = broken.rsplit_once('/').unwrap();
+            missing.pointer_mut(if parent.is_empty() { "" } else { parent }).unwrap().as_object_mut().unwrap().remove(key);
+            let error = history_record("main", &missing).unwrap_err();
+            assert!(error.contains(key), "{}: {}", broken, error);
+        }
+        let mut numbered = entry.clone();
+        numbered["description"] = 3.into();
+        assert!(history_record("main", &numbered).unwrap_err().contains("description"));
+    }
+
+    /// Each parcel's trees are read from the parcel line its commit's message ends in, as the
+    /// mirror reads it, and every tree commits naming one parcel give is kept.
+    #[test]
+    fn a_parcel_tree_is_read_from_the_last_line_parcel_line() {
+        let parcel = |digit: char| digit.to_string().repeat(64);
+        let (one, two, three) = (parcel('1'), parcel('2'), parcel('3'));
+        let log = format!("\0c1 t1\nfirst\n\nForklift-Parcel: {one} export/1\n\n\
+            \0c2 t2\nsecond\n\nForklift-Parcel: {one} export/1\n\nForklift-Parcel: {two} export/1\n\n\
+            \0c3 t3\nquoted\nForklift-Parcel: {three} export/1\nand more\n\n\
+            \0c4 t4\nForklift-Parcel: {three} export/\n\0c5 t5\nForklift-Parcel: {three} export/1x\n\
+            \0c6 t6\nForklift-Parcel: x export/1\n\0c7 t7\nForklift-Parcel: {three} import/1\n\
+            \0c8 t8\nlast\n\nForklift-Parcel: {three} export/1\n\n\0c9 t9\nForklift-Parcel: {three} export/2\n");
+        let set = |trees: &[&str]| trees.iter().map(|tree| tree.to_string()).collect::<BTreeSet<_>>();
+        assert_eq!(parcel_trees(log.as_bytes()), BTreeMap::from([(one, set(&["t1"])), (two, set(&["t2"])), (three, set(&["t8", "t9"]))]));
     }
 
     /// Needs a forklift binary: `PROOF_LOAD_FORKLIFT=<path> cargo test -p proof-load -- --ignored`.
