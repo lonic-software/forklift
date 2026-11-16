@@ -1430,6 +1430,8 @@ mod tests {
         elsewhere.extend_from_slice(b"/s/0001-h/x");
         assert!(records_root(&elsewhere, &["/s/0001-h"]));
         assert!(records_root(&index[4..], &["/s/0001-h"]), "only an index's ident is git's to check");
+        let other: Vec<u8> = index.iter().map(|byte| if *byte == b'L' { b'l' } else { *byte }).collect();
+        assert!(records_root(&other, &["/s/0001-h"]), "only an ident of git's shape is skipped");
         // A long ident's length takes git's offset varint: 128 is 0x80 0x00.
         let long = format!("Location /s/0001-h/{}, system Linux", "w".repeat(128 - 33));
         assert_eq!(long.len(), 128);
