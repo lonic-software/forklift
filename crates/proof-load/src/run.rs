@@ -220,12 +220,16 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         return Err(RunError::Refused(format!("--only {}: no such scenario", unknown)));
     }
     // The history is read from wherever the trips run, so it is named absolutely; a path that is
-    // no folder is refused before anything is written.
+    // no folder is refused before anything is written, as is a history with `--only`, which runs
+    // no round trip to take it.
     let history_from = match history_from.as_deref().map(std::path::absolute).transpose() {
         Ok(Some(path)) if !path.is_dir() => return Err(RunError::Refused(format!("--history-from {}: not a folder", path.display()))),
         Ok(path) => path,
         Err(error) => return Err(RunError::Refused(format!("--history-from: {}", error))),
     };
+    if history_from.is_some() && only.is_some() {
+        return Err(RunError::Refused("--history-from feeds the fidelity round trips, which --only leaves out".to_string()));
+    }
     let mut output = match Output::claim(&out) {
         Ok(output) => output,
         Err(error) => {
@@ -260,9 +264,6 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     };
     if let Some(server) = &server {
         tools.insert("forklift-server".to_string(), described(server));
-    }
-    if let Some(history) = &history_from {
-        tools.insert("history-from".to_string(), history.display().to_string());
     }
 
     // The version under test's write-op universe: its schema's command ids and the server's
@@ -793,6 +794,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     // findings, never grades. A round trip that cannot finish is a gap in the run.
     let mut fidelity = Vec::new();
     let mut fidelity_missing = Vec::new();
+    let mut history_record = None;
     let fidelity_cell = match (&program, &git_program) {
         (None, _) => Cell::not_run("no forklift binary given"),
         (_, None) => Cell::not_run("no git binary given"),
@@ -804,11 +806,24 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                 ("fidelity-git-forklift-git", Direction::GitForkliftGit, git_round_trip, None),
                 ("fidelity-forklift-git-forklift", Direction::ForkliftGitForklift, forklift_round_trip, None),
             ];
+            // The history is checked and recorded once, before either trip copies it; one the
+            // check refuses is a gap, and its trips are not run.
             if let Some(history) = history_from.as_deref() {
-                trips.push(("fidelity-history-git-forklift-git", Direction::GitForkliftGit, git_round_trip, Some(history)));
-                trips.push(("fidelity-history-forklift-git-forklift", Direction::ForkliftGitForklift, forklift_round_trip, Some(history)));
+                let described = output.scratch("fidelity-history").map_err(|error| error.to_string()).and_then(|scratch| {
+                    let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
+                    crate::fidelity::describe_history(git_program, history, &scratch, &environment, HISTORY_LIMIT)
+                });
+                match described {
+                    Ok(described) => {
+                        history_record = Some(format!("{} ({})", history.display(), described));
+                        trips.push(("fidelity-history-git-forklift-git", Direction::GitForkliftGit, git_round_trip, Some(history)));
+                        trips.push(("fidelity-history-forklift-git-forklift", Direction::ForkliftGitForklift, forklift_round_trip, Some(history)));
+                    }
+                    Err(error) => fidelity_missing.push(format!("{}: {}", crate::fidelity::Input::History.label(), error)),
+                }
             }
             progress.lane(Category::Fidelity, Some(trips.len()));
+            let mut finished = 0;
             for (block, direction, round_trip, history) in trips.iter().copied() {
                 start_block(progress, Category::Fidelity, block)?;
                 let trip = output.scratch(block).map_err(|error| error.to_string()).and_then(|scratch| {
@@ -825,18 +840,20 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     Err(error) => Err(error),
                 };
                 progress.block_finished(Category::Fidelity, block, trip.is_err());
-                let input = if history.is_some() { crate::fidelity::Input::History } else { crate::fidelity::Input::Fixture };
                 match trip {
-                    Ok(findings) => fidelity.extend(findings),
-                    Err(error) => fidelity_missing.push(format!("{} from {}: {}", direction.label(), input.label(), error)),
+                    Ok(findings) => {
+                        finished += 1;
+                        fidelity.extend(findings);
+                    }
+                    Err(error) => fidelity_missing.push(format!("{} from {}: {}", direction.label(), crate::fidelity::Input::of(history).label(), error)),
                 }
             }
             // A trip that did not finish leaves the others' findings standing: the lane is
             // partial, and `fidelity_missing` names each trip it lacks.
-            match fidelity_missing.len() {
-                0 => Cell::Run,
-                missed if missed < trips.len() => Cell::Sampled,
-                _ => Cell::not_run("no round trip finished"),
+            match (fidelity_missing.len(), finished) {
+                (0, _) => Cell::Run,
+                (_, 0) => Cell::not_run("no round trip finished"),
+                _ => Cell::Sampled,
             }
         }
     };
@@ -1084,6 +1101,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             os: operating_system(),
             filesystem: filesystem_of(output.root()),
             configurations,
+            history: history_record,
             environment: environment_seen,
         },
         completeness,
@@ -1234,15 +1252,21 @@ mod tests {
         assert!(scenario::known(&coverage) && scenario::known("signed"));
     }
 
-    /// A `--history-from` that names no folder is refused before the report folder is made.
+    /// A `--history-from` that names no folder is refused before the report folder is made, as is
+    /// one given with `--only`, which runs no round trip.
     ///
-    /// Revert: drop the check → the run goes on and makes the report folder.
+    /// Revert: drop either check → the run goes on and makes the report folder.
     #[test]
     fn a_history_from_that_is_no_folder_is_refused() {
         let out = fresh("out");
         let missing = fresh("missing-history");
         let options = RunOptions { history_from: Some(missing.clone()), ..bare(out.clone()) };
         assert_eq!(run(&options, &Quiet).unwrap_err(), RunError::Refused(format!("--history-from {}: not a folder", missing.display())));
+        assert!(!out.exists());
+        let folder = fresh("history");
+        std::fs::create_dir_all(&folder).unwrap();
+        let options = RunOptions { history_from: Some(folder), only: Some("signed".to_string()), ..bare(out.clone()) };
+        assert_eq!(run(&options, &Quiet).unwrap_err(), RunError::Refused("--history-from feeds the fidelity round trips, which --only leaves out".to_string()));
         assert!(!out.exists());
     }
 

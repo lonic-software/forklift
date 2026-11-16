@@ -62,6 +62,11 @@ pub enum Input {
 }
 
 impl Input {
+    /// The input of a trip given `history`, or none.
+    pub fn of(history: Option<&Path>) -> Input {
+        if history.is_some() { Input::History } else { Input::Fixture }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Input::Fixture => "the fixture",
@@ -99,8 +104,9 @@ pub struct Finding {
 pub struct Trip {
     pub direction: Direction,
     pub input: Input,
-    /// Each command the trip ran, its stdout cut to its first `KEPT_STDOUT` bytes: a real
-    /// history's listings run to megabytes each, and the comparison reads them in full.
+    /// Each command the trip ran. From the fixture each keeps its whole stdout; from a history,
+    /// only its first `KEPT_STDOUT` bytes, with nothing marking the cut, while the comparison
+    /// reads it in full.
     pub steps: Vec<Outcome>,
     pub findings: Result<Vec<Finding>, String>,
 }
@@ -113,15 +119,18 @@ const FIXTURE_IDENTITY: &[(&str, &str)] = &[
 ];
 
 /// How much of each command's stdout a trip keeps in its steps.
-/// A real history's trip runs thousands of commands, its listings megabytes each, and a step's
-/// stdout is written as a JSON array of numbers: 64 KiB a step made a 165 MB trail.
+/// How much of each command's stdout a history trip keeps in its steps. Such a trip runs
+/// thousands of commands, its listings megabytes each, and a step's stdout is written as a JSON
+/// array of numbers: 64 KiB a step made a 165 MB trail.
 pub const KEPT_STDOUT: usize = 4 * 1024;
 
-/// Runs commands in one scratch area and keeps every outcome, its stdout cut to `KEPT_STDOUT`.
+/// Runs commands in one scratch area and keeps every outcome, its stdout cut to `kept` bytes when
+/// that is given.
 struct Steps<'a> {
     scratch: &'a Scratch,
     limit: Duration,
     outcomes: Vec<Outcome>,
+    kept: Option<usize>,
 }
 
 impl Steps<'_> {
@@ -136,8 +145,9 @@ impl Steps<'_> {
         let mut outcome = outcome;
         let refused = (!outcome.succeeded()).then(|| format!("`{}` exited {}: {}", arguments.join(" "),
             outcome.exit.map_or("on a signal".to_string(), |code| code.to_string()), String::from_utf8_lossy(&outcome.stderr).trim()));
-        let stdout = outcome.stdout.clone();
-        outcome.stdout.truncate(KEPT_STDOUT);
+        // The kept cut is a copy, so the step holds no more than it shows.
+        let stdout = std::mem::take(&mut outcome.stdout);
+        outcome.stdout = stdout[..self.kept.map_or(stdout.len(), |kept| stdout.len().min(kept))].to_vec();
         self.outcomes.push(outcome);
         match refused {
             Some(reason) => Err(reason),
@@ -1062,15 +1072,39 @@ impl Records<'_, '_> {
     }
 }
 
-/// Mirrors the repository at `from` to `to`, which must not exist yet, reading `from` only: a
-/// shallow repository is refused, as is one git cannot read.
-fn copy_history(steps: &mut Steps, git: &Path, from: &Path, to: &Path, environment: &Environment) -> Result<(), String> {
+/// Refuses a `from` that is not a whole history: a folder that is not the top of a repository
+/// (its work tree or, bare, its git folder), and a shallow repository.
+fn check_history(steps: &mut Steps, git: &Path, from: &Path, environment: &Environment) -> Result<(), String> {
     let (from_text, root) = (from.display().to_string(), steps.scratch.root().to_path_buf());
-    let shallow = steps.run(git, &["-C", &from_text, "rev-parse", "--is-shallow-repository"], &root, environment)?;
-    if printed(&shallow) != "false" {
-        return Err(format!("{} is a shallow repository; give a full clone (fetch-depth: 0 on a CI checkout)", from.display()));
+    let git_dir = PathBuf::from(printed(&steps.run(git, &["-C", &from_text, "rev-parse", "--absolute-git-dir"], &root, environment)?));
+    let real = |path: &Path| std::fs::canonicalize(path).map_err(|error| format!("cannot read {}: {}", path.display(), error));
+    let (from_real, git_dir_real) = (real(from)?, real(&git_dir)?);
+    if git_dir_real != from_real && git_dir_real != from_real.join(".git") {
+        return Err(format!("{} is not the top of a git repository", from.display()));
     }
-    steps.run(git, &["clone", "-q", "--mirror", "--no-local", "--", &from_text, &to.display().to_string()], &root, environment)?;
+    match printed(&steps.run(git, &["-C", &from_text, "rev-parse", "--is-shallow-repository"], &root, environment)?).as_str() {
+        "false" => Ok(()),
+        "true" => Err(format!("{} is a shallow repository; give a full clone (fetch-depth: 0 on a CI checkout)", from.display())),
+        other => Err(format!("git could not say whether {} is shallow: it printed {:?}", from.display(), other)),
+    }
+}
+
+/// What the history at `from` holds, for the report's record: its refs' count and a digest of
+/// their listing, each ref's object and name. `from` is checked as `copy_history` checks it.
+pub fn describe_history(git: &Path, from: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<String, String> {
+    let mut steps = Steps { scratch, limit, outcomes: Vec::new(), kept: Some(KEPT_STDOUT) };
+    check_history(&mut steps, git, from, environment)?;
+    let listing = steps.run(git, &["-C", &from.display().to_string(), "for-each-ref", "--format=%(objectname) %(refname)"], scratch.root(), environment)?;
+    let refs = listing.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).count();
+    Ok(format!("{} refs, blake3 {} of their listing", refs, blake3::hash(&listing).to_hex()))
+}
+
+/// Mirrors the repository at `from` to `to`, which must not exist yet, reading `from` only; a
+/// `from` `check_history` refuses is not copied.
+fn copy_history(steps: &mut Steps, git: &Path, from: &Path, to: &Path, environment: &Environment) -> Result<(), String> {
+    check_history(steps, git, from, environment)?;
+    let root = steps.scratch.root().to_path_buf();
+    steps.run(git, &["clone", "-q", "--mirror", "--no-local", "--", &from.display().to_string(), &to.display().to_string()], &root, environment)?;
     Ok(())
 }
 
@@ -1080,8 +1114,8 @@ fn copy_history(steps: &mut Steps, git: &Path, from: &Path, to: &Path, environme
 /// `build_warehouse` builds, or, given `history`, that repository's mirror imported into a fresh
 /// warehouse.
 pub fn forklift_round_trip(forklift: &Path, git: &Path, history: Option<&Path>, scratch: &Scratch, environment: &Environment, limit: Duration) -> Trip {
-    let mut steps = Steps { scratch, limit, outcomes: Vec::new() };
-    let input = if history.is_some() { Input::History } else { Input::Fixture };
+    let input = Input::of(history);
+    let mut steps = Steps { scratch, limit, outcomes: Vec::new(), kept: (input == Input::History).then_some(KEPT_STDOUT) };
     let (native, exported) = (scratch.root().join("native"), scratch.root().join("exported"));
     let (reimported, reexported) = (scratch.root().join("reimported"), scratch.root().join("reexported"));
     let findings = (|| -> Result<Vec<Finding>, String> {
@@ -1111,8 +1145,8 @@ pub fn forklift_round_trip(forklift: &Path, git: &Path, history: Option<&Path>, 
 /// `history`, that repository's mirror, imported by `forklift` into a fresh warehouse, exported
 /// to a new repository and compared with what went in.
 pub fn git_round_trip(forklift: &Path, git: &Path, history: Option<&Path>, scratch: &Scratch, environment: &Environment, limit: Duration) -> Trip {
-    let mut steps = Steps { scratch, limit, outcomes: Vec::new() };
-    let input = if history.is_some() { Input::History } else { Input::Fixture };
+    let input = Input::of(history);
+    let mut steps = Steps { scratch, limit, outcomes: Vec::new(), kept: (input == Input::History).then_some(KEPT_STDOUT) };
     let source = scratch.root().join(if history.is_some() { "history" } else { "fixture" });
     let warehouse = scratch.root().join("imported");
     let exported = scratch.root().join("exported");
@@ -1197,7 +1231,7 @@ mod tests {
     #[test]
     fn a_query_that_never_ran_is_an_error_not_a_no() {
         let (scratch, environment) = area("ask");
-        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
+        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new(), kept: None };
         let git = path_git();
         steps.run(&git, &["init", "-q", "repository"], scratch.root(), &environment).unwrap();
         let repository = scratch.root().join("repository");
@@ -1217,7 +1251,7 @@ mod tests {
     #[test]
     fn a_split_header_and_a_reordered_one_are_findings() {
         let (scratch, environment) = area("headers");
-        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
+        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new(), kept: None };
         let git = path_git();
         let mut comparison = Comparison::new(&mut steps, &git, &environment, scratch.root(), scratch.root(), Direction::GitForkliftGit, Input::Fixture);
         let header = |name: &str, value: &[u8]| (name.to_string(), value.to_vec());
@@ -1246,7 +1280,7 @@ mod tests {
     #[test]
     fn the_fixture_is_the_same_on_every_build_and_holds_every_shape() {
         let (scratch, environment) = area("fixture");
-        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
+        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new(), kept: None };
         let git = path_git();
         let (one, two) = (scratch.root().join("one"), scratch.root().join("two"));
         build_fixture(&mut steps, &git, &one, &environment).unwrap();
@@ -1284,7 +1318,7 @@ mod tests {
     #[test]
     fn the_walk_reports_each_field_a_changed_copy_differs_in() {
         let (scratch, environment) = area("walk");
-        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
+        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new(), kept: None };
         let git = path_git();
         let (before, after) = (scratch.root().join("before"), scratch.root().join("after"));
         let mut fixed = environment.clone();
@@ -1356,7 +1390,7 @@ mod tests {
     #[test]
     fn the_record_walk_reports_each_field_a_changed_copy_differs_in() {
         let (scratch, environment) = area("records");
-        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
+        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new(), kept: None };
         let git = path_git();
         let export = scratch.root().join("export");
         steps.run(&git, &["init", "-q", "export"], scratch.root(), &environment).unwrap();
@@ -1440,7 +1474,7 @@ mod tests {
     #[test]
     fn a_lost_parent_counts_what_only_it_reaches_and_an_unexported_record_is_a_tree_finding() {
         let (scratch, environment) = area("lost");
-        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
+        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new(), kept: None };
         let git = path_git();
         let record = |parents: &[&str]| Record { parents: parents.iter().map(|parent| parent.to_string()).collect(), trees: BTreeSet::from(["t".to_string()]), ..Record::default() };
         let before = Side {
@@ -1510,16 +1544,18 @@ mod tests {
         assert_eq!(parcel_trees(log.as_bytes()), BTreeMap::from([(one, set(&["t1"])), (two, set(&["t2"])), (three, set(&["t8", "t9"]))]));
     }
 
-    /// A given history is mirrored with every ref it holds and left exactly as it was; a shallow
-    /// one is refused by name.
+    /// A given history is mirrored with every ref it holds and left exactly as it was, from a work
+    /// tree or a bare repository; a shallow one and a folder inside a repository are refused by
+    /// name, and its record counts and digests its refs.
     ///
     /// Revert: drop the shallow check → the shallow clone is copied. Copy with a plain clone → the
-    /// mirror lacks the note, the remote-tracking ref and the side branch.
+    /// mirror lacks the note, the remote-tracking ref and the side branch. Drop the top check → the
+    /// inner folder reaches the clone, which refuses it differently.
     #[test]
     fn a_history_is_mirrored_and_a_shallow_one_refused() {
         let (scratch, environment) = area("history");
         let git = path_git();
-        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
+        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new(), kept: None };
         let source = scratch.root().join("source");
         build_fixture(&mut steps, &git, &source, &environment).unwrap();
         let listing = |steps: &mut Steps, repository: &Path| {
@@ -1539,18 +1575,28 @@ mod tests {
         let refused = copy_history(&mut steps, &git, &shallow, &scratch.root().join("copy"), &environment).unwrap_err();
         assert_eq!(refused, format!("{} is a shallow repository; give a full clone (fetch-depth: 0 on a CI checkout)", shallow.display()));
         assert!(!scratch.root().join("copy").exists());
+
+        let inside = source.join("inside");
+        std::fs::create_dir(&inside).unwrap();
+        let refused = copy_history(&mut steps, &git, &inside, &scratch.root().join("copy"), &environment).unwrap_err();
+        assert_eq!(refused, format!("{} is not the top of a git repository", inside.display()));
+        let bare = scratch.root().join("bare");
+        copy_history(&mut steps, &git, &mirror, &bare, &environment).unwrap();
+        let described = describe_history(&git, &source, &scratch, &environment, Duration::from_secs(60)).unwrap();
+        let listed = steps.run(&git, &["for-each-ref", "--format=%(objectname) %(refname)"], &source, &environment).unwrap();
+        assert_eq!(described, format!("{} refs, blake3 {} of their listing", refs.lines().count(), blake3::hash(&listed).to_hex()));
     }
 
-    /// A trip keeps the first `KEPT_STDOUT` bytes of a command's stdout in its steps, and hands
-    /// the whole of it to the comparison.
+    /// A history trip keeps the first `KEPT_STDOUT` bytes of a command's stdout in its steps, and
+    /// hands the whole of it to the comparison; a fixture trip keeps it whole.
     ///
     /// Revert: cut the stdout before it is handed back → the caller reads the cut length; keep it
-    /// whole → the step holds every byte.
+    /// whole → the step holds every byte; cut it regardless of `kept` → the last step is cut.
     #[test]
     fn a_trip_keeps_a_cut_of_long_output() {
         let (scratch, environment) = area("kept");
         let git = path_git();
-        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
+        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new(), kept: Some(KEPT_STDOUT) };
         let repository = scratch.root().join("repository");
         steps.run(&git, &["init", "-q", "--", &repository.display().to_string()], scratch.root(), &environment).unwrap();
         let long = scratch.root().join("long");
@@ -1559,6 +1605,9 @@ mod tests {
         let read = steps.run(&git, &["cat-file", "blob", &hash], &repository, &environment).unwrap();
         assert_eq!(read.len(), KEPT_STDOUT + 1000);
         assert_eq!(steps.outcomes.last().unwrap().stdout.len(), KEPT_STDOUT);
+        steps.kept = None;
+        steps.run(&git, &["cat-file", "blob", &hash], &repository, &environment).unwrap();
+        assert_eq!(steps.outcomes.last().unwrap().stdout.len(), KEPT_STDOUT + 1000);
     }
 
     /// Needs a forklift binary: `PROOF_LOAD_FORKLIFT=<path> cargo test -p proof-load -- --ignored`.
@@ -1575,7 +1624,7 @@ mod tests {
         let git = path_git();
         let (built, environment) = area("history-source");
         let source = built.root().join("source");
-        build_fixture(&mut Steps { scratch: &built, limit: Duration::from_secs(60), outcomes: Vec::new() }, &git, &source, &environment).unwrap();
+        build_fixture(&mut Steps { scratch: &built, limit: Duration::from_secs(60), outcomes: Vec::new(), kept: None }, &git, &source, &environment).unwrap();
         let (scratch, environment) = area("fixture-trip");
         let fixture = git_round_trip(&forklift, &git, None, &scratch, &environment, Duration::from_secs(120)).findings.unwrap();
         let (scratch, environment) = area("history-trip");

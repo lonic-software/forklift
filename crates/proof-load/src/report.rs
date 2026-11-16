@@ -204,6 +204,9 @@ pub struct Determinism {
     /// Each git subject's configuration by its label: what every repository the harness creates
     /// for it holds, and for git tuned the options it runs with besides. Empty with no git given.
     pub configurations: BTreeMap<String, String>,
+    /// The history `--history-from` named, when the fidelity round trips took it: its path, then
+    /// its refs' count and a digest of their listing, since a path alone does not pin a history.
+    pub history: Option<String>,
     /// The environment the tools saw, scratch paths included.
     pub environment: BTreeMap<String, String>,
 }
@@ -427,6 +430,9 @@ impl Report {
         for (subject, configuration) in &determinism.configurations {
             let _ = writeln!(out, "- {} configuration: {}", subject, configuration);
         }
+        if let Some(history) = &determinism.history {
+            let _ = writeln!(out, "- history from: {}", history);
+        }
         let _ = writeln!(out, "- scenarios: {}", determinism.scenarios.join(", "));
         let _ = writeln!(out, "- environment: {}", determinism.environment.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(" "));
 
@@ -509,14 +515,16 @@ impl Report {
             }
         }
         // A real history's findings run to thousands, so the markdown counts them by field and
-        // shows the first of each; report.json lists every one.
-        if !history.is_empty() {
+        // shows one of each, the first the walk found; report.json lists every one.
+        if history.is_empty() && self.determinism.history.is_some() {
+            out.push_str("\nNone from the given history.\n");
+        } else if !history.is_empty() {
             let mut fields: BTreeMap<(crate::fidelity::Direction, &str), (usize, &Finding)> = BTreeMap::new();
             for finding in &history {
                 fields.entry((finding.direction, finding.field.as_str())).or_insert((0, finding)).0 += 1;
             }
             let _ = writeln!(out, "\nFrom the given history, {} finding{} by field (report.json lists each):\n", history.len(), if history.len() == 1 { "" } else { "s" });
-            out.push_str("| Direction | Field | Findings | First at | Went in | Came back |\n|---|---|---|---|---|---|\n");
+            out.push_str("| Direction | Field | Findings | One at | Went in | Came back |\n|---|---|---|---|---|---|\n");
             for ((direction, field), (count, first)) in &fields {
                 let _ = writeln!(out, "| {} | {} | {} | {} | {} | {} |", direction.label(), field.replace('|', "\\|"), count, first.at.replace('|', "\\|"), cell(&first.before), cell(&first.after));
             }
@@ -633,7 +641,7 @@ mod tests {
     fn determinism(seed: u64, scenarios: Vec<String>) -> Determinism {
         let configurations = BTreeMap::from([("git-tuned".to_string(), "core.commitGraph=true".to_string())]);
         Determinism { seed, tools: BTreeMap::new(), scenarios, platform: Platform::Linux, os: "Linux 6.1".to_string(), filesystem: "ext2/ext3/ext4".to_string(),
-            configurations, environment: BTreeMap::new() }
+            configurations, history: None, environment: BTreeMap::new() }
     }
 
     fn sample() -> Report {
@@ -810,6 +818,11 @@ mod tests {
         assert!(markdown.contains("\nFrom the given history, 3 findings by field (report.json lists each):\n"), "{}", markdown);
         assert!(markdown.contains("\n| git to Forklift to git | message | 2 | main | first | nothing |\n"), "{}", markdown);
         assert!(markdown.contains("\n| Forklift to git to Forklift | message | 1 | main~4 | third | nothing |\n"), "{}", markdown);
+        let mut clean = sample();
+        clean.determinism.history = Some("/history (3 refs, blake3 00 of their listing)".to_string());
+        assert!(clean.markdown().contains("\n- history from: /history (3 refs, blake3 00 of their listing)\n"), "{}", clean.markdown());
+        assert!(clean.markdown().contains("\nNone from the fixtures.\n\nNone from the given history.\n"), "{}", clean.markdown());
+        assert!(!sample().markdown().contains("None from the given history"));
         let only_history = Report { fidelity: report.fidelity[1..].to_vec(), ..sample() };
         assert!(only_history.markdown().contains("\n## Fidelity\n\nNone from the fixtures.\n\nFrom the given history, 3 findings"), "{}", only_history.markdown());
         assert_eq!(Report::from_json(&report.json()).expect("the report reads back").fidelity, report.fidelity);
