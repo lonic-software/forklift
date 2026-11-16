@@ -732,7 +732,82 @@ pub fn without_temp(path: &str, pid: u32) -> (String, bool) {
         }
     }
     out.push_str(rest);
-    (out, changed)
+    let (out, git) = without_git_temp(&out);
+    (out, changed || git)
+}
+
+/// The prefixes of the temp names git makes with mkstemp, each followed by six random letters or
+/// digits: a loose object, a pack and its index, reverse index, mtimes and bitmap, a commit-graph,
+/// a multi-pack index, and a push's quarantine folder.
+pub const GIT_TEMP_PREFIXES: &[&str] = &["tmp_obj_", "tmp_pack_", "tmp_idx_", "tmp_rev_", "tmp_mtimes_", "tmp_bitmap_", "tmp_graph_", "tmp_midx_", "incoming-"];
+
+/// `path` with the random part of every git temp name ([`GIT_TEMP_PREFIXES`]) replaced by
+/// `<rand>`. True when anything was replaced.
+fn without_git_temp(path: &str) -> (String, bool) {
+    let mut changed = false;
+    let parts: Vec<String> = path.split('/').map(|component| {
+        for prefix in GIT_TEMP_PREFIXES {
+            if let Some(random) = component.strip_prefix(prefix) {
+                if random.len() == 6 && random.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    changed = true;
+                    return format!("{}<rand>", prefix);
+                }
+            }
+        }
+        component.to_string()
+    }).collect();
+    (parts.join("/"), changed)
+}
+
+/// The thread groups in `calls` that run a program `owns` accepts, given the canonical path of
+/// what each group last executed: a group's own last successful execve, or, for one that never
+/// executes anything, its parent's verdict, since a fork without an exec runs the same program.
+/// The traced command's own group, the trace's first, runs the program strace started when the
+/// trace shows it no exec (a trace filtered to a few calls); any other group with neither belongs
+/// to nothing.
+pub fn owned_groups(calls: &[Call], groups: &BTreeMap<u32, u32>, owns: &dyn Fn(&str) -> bool) -> std::collections::BTreeSet<u32> {
+    let group = |tid: u32| groups.get(&tid).copied().unwrap_or(tid);
+    let mut executed: BTreeMap<u32, bool> = BTreeMap::new();
+    for call in calls.iter().filter(|call| call.name == "execve" && matches!(call.returned, Returned::Value(_))) {
+        if let Some(Argument::Text(path)) = call.arguments.first().map(|text| argument(text)) {
+            executed.insert(group(call.tid), owns(&canonical(&path)));
+        }
+    }
+    let parents: BTreeMap<u32, u32> = spawns(calls).into_iter().filter(|(_, _, thread)| !thread)
+        .map(|(parent, child, _)| (group(child), group(parent))).collect();
+    if let Some(top) = calls.first().map(|call| group(call.tid)) {
+        executed.entry(top).or_insert(true);
+    }
+    let every: std::collections::BTreeSet<u32> = calls.iter().map(|call| group(call.tid)).collect();
+    every.into_iter().filter(|start| {
+        let mut at = *start;
+        // A chain of parents ends within as many steps as there are groups; a cycle reads as none.
+        for _ in 0..=parents.len() {
+            if let Some(verdict) = executed.get(&at) {
+                return *verdict;
+            }
+            match parents.get(&at) {
+                Some(parent) => at = *parent,
+                None => return false,
+            }
+        }
+        false
+    }).collect()
+}
+
+/// `path` resolved through the file system, or as given where it cannot be.
+pub fn canonical(path: &str) -> String {
+    std::fs::canonicalize(path).map(|path| path.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string())
+}
+
+/// Whether a process of the trace other than the traced command's own made a call after that
+/// command's process called exit_group: work it left running when it exited.
+pub fn outlived(calls: &[Call]) -> bool {
+    let groups = thread_groups(calls);
+    let Some(top) = calls.first().map(|call| call.tid) else { return false };
+    let group = |tid: u32| groups.get(&tid).copied().unwrap_or(tid);
+    let Some(exit) = calls.iter().position(|call| call.name == "exit_group" && group(call.tid) == top) else { return false };
+    calls[exit + 1..].iter().any(|call| group(call.tid) != top)
 }
 
 /// A path's base for grouping kill points into units: every hash-like run (a two-character shard
@@ -995,8 +1070,30 @@ mod tests {
         assert_eq!(without_temp(".compact-87-12.pack.tmp", 87), (".compact-<pid>-<n>.pack.tmp".into(), true));
         assert_eq!(without_temp(".forklift/graph/187-3", 87), (".forklift/graph/187-3".into(), false));
         assert_eq!(without_temp(".forklift/pallets/main", 87), (".forklift/pallets/main".into(), false));
+        assert!(GIT_TEMP_PREFIXES.iter().all(|prefix| without_temp(&format!("{}aB3dE9", prefix), 87) == (format!("{}<rand>", prefix), true)));
+        // Git's mkstemp names, as a container's git 2.39 staged them; the six characters must be
+        // exactly six letters or digits.
+        assert_eq!(without_temp(".git/objects/3f/tmp_obj_Ab9xQz", 87), (".git/objects/3f/tmp_obj_<rand>".into(), true));
+        assert_eq!(without_temp(".git/objects/pack/tmp_pack_k2LmN0", 87), (".git/objects/pack/tmp_pack_<rand>".into(), true));
+        assert_eq!(without_temp(".git/objects/incoming-a1B2c3/pack", 87), (".git/objects/incoming-<rand>/pack".into(), true));
+        assert_eq!(without_temp(".git/objects/3f/tmp_obj_Ab9xQ", 87), (".git/objects/3f/tmp_obj_Ab9xQ".into(), false));
+        assert_eq!(without_temp(".git/objects/3f/tmp_obj_Ab9x-z", 87), (".git/objects/3f/tmp_obj_Ab9x-z".into(), false));
         assert_eq!(base(".forklift/objects/92/0f3a5e9bc1d2e3f4a5b6c7d8e9f00112.tmp~<pid>-<n>"), ".forklift/objects/<hex>/<hex>.tmp~<pid>-<n>");
         assert_eq!(base(".forklift/pallets/main"), ".forklift/pallets/main");
         assert_eq!(base(".forklift/inventory/inv_0123456789abcdef0123/data"), ".forklift/inventory/inv_<hex>/data");
+    }
+
+    /// Work a command leaves running shows as a call by another process after the command's own
+    /// called exit_group; a child that finished first, or a thread of the command, is none.
+    ///
+    /// Revert: look before the exit too → the finished child reads as outliving it.
+    #[test]
+    fn a_process_that_runs_on_after_the_command_exits_is_seen() {
+        let finished = parse("50 clone(child_stack=NULL, flags=SIGCHLD) = 60\n60 write(3</s/a>, \"a\", 1) = 1\n50 exit_group(0) = ?\n").unwrap();
+        assert!(!outlived(&finished));
+        let detached = parse("50 clone(child_stack=NULL, flags=SIGCHLD) = 60\n50 exit_group(0) = ?\n60 write(3</s/a>, \"a\", 1) = 1\n").unwrap();
+        assert!(outlived(&detached));
+        let thread = parse("50 clone(child_stack=0x1, flags=CLONE_VM|CLONE_THREAD) = 51\n50 exit_group(0) = ?\n51 write(3</s/a>, \"a\", 1) = 1\n").unwrap();
+        assert!(!outlived(&thread));
     }
 }

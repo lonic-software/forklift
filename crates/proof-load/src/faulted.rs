@@ -316,6 +316,19 @@ impl Context<'_> {
         Ok(lines)
     }
 
+    /// The operation each of [`Context::lines`] belongs to, in the same order: its `op` tag, as
+    /// the scenario names it, so every subject's lines for one operation share a label.
+    pub(crate) fn line_ops(&self, index: usize) -> Result<Vec<String>, RunError> {
+        let mut ops = Vec::new();
+        for op in std::iter::once(&Op::Record { index }).chain(self.then) {
+            let bound = bind(self.tool, op).ok_or_else(|| RunError::Io(format!("{:?} has no {:?} binding", op, self.tool)))?;
+            let tag = serde_json::to_value(op).ok().and_then(|value| value.get("op").and_then(|tag| tag.as_str()).map(str::to_string))
+                .ok_or_else(|| RunError::Io(format!("{:?} serializes without an op tag", op)))?;
+            ops.extend(bound.iter().map(|_| tag.clone()));
+        }
+        Ok(ops)
+    }
+
     /// How many of the faulted command's leading lines acknowledge its record, as
     /// [`acknowledging`] counts them for this run's `then` and readback.
     pub(crate) fn acknowledging(&self) -> Result<usize, RunError> {

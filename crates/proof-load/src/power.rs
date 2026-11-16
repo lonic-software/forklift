@@ -1797,7 +1797,7 @@ fn grade(scenario: &Scenario, counted: &kill::Counted, programs: &Programs, sett
     let copy = Scratch::create(Path::new(&format!("{}-power-{}", template.root().display(), at))).map_err(|error| RunError::Io(error.to_string()))?;
     materialize(&crash.image, copy.root()).map_err(io)?;
     let environment = kill::environment_of(settings, &copy)?;
-    let context = kill::context_of(scenario, &counted.corpus, programs, settings, &copy, &environment);
+    let context = kill::context_of(scenario, &counted.corpus, programs, settings, &copy, &environment, counted.tool);
     let mut steps: Vec<Outcome> = Vec::new();
     match &crash.moment {
         Moment::During { point: Point { line, .. } } | Moment::Synced { line, .. } | Moment::Ending { line, .. } => {
@@ -2184,7 +2184,7 @@ mod tests {
         let texts = [rewrite(true), "2 openat(AT_FDCWD</s/w>, \"a\", O_RDONLY) = 3</s/w/a>\n".to_string()];
         let calls: Vec<Vec<Call>> = texts.iter().map(|text| trace::parse(text).unwrap()).collect();
         let points: Vec<Vec<Point>> = calls.iter().enumerate()
-            .map(|(line, calls)| kill::enumerate(calls, line, "stack", &root(), "/s/w", |_| false).unwrap().points).collect();
+            .map(|(line, calls)| kill::enumerate(calls, line, "stack", &kill::Subject { binary: "/b/forklift".into(), exec_path: None }, &root(), "/s/w", |_| false).unwrap().points).collect();
         assert_eq!(points[0].iter().map(|point| point.name.as_str()).collect::<Vec<_>>(), ["openat", "write", "fsync"]);
         let starts = starts(&texts);
         let lines: Vec<Line> = calls.iter().zip(&points).zip(&starts)
@@ -2214,7 +2214,7 @@ mod tests {
         let texts = [rewrite(true), "2 openat(AT_FDCWD</s/w>, \"a\", O_RDONLY) = 3</s/w/a>\n".to_string()];
         let calls: Vec<Vec<Call>> = texts.iter().map(|text| trace::parse(text).unwrap()).collect();
         let points: Vec<Vec<Point>> = calls.iter().enumerate()
-            .map(|(line, calls)| kill::enumerate(calls, line, "stack", &root(), "/s/w", |_| false).unwrap().points).collect();
+            .map(|(line, calls)| kill::enumerate(calls, line, "stack", &kill::Subject { binary: "/b/forklift".into(), exec_path: None }, &root(), "/s/w", |_| false).unwrap().points).collect();
         let starts = starts(&texts);
         let lines: Vec<Line> = calls.iter().zip(&points).zip(&starts)
             .map(|((calls, points), before)| Line { calls, command: "stack".into(), points: points.iter().collect(), before }).collect();
@@ -2233,10 +2233,11 @@ mod tests {
     #[test]
     fn a_crash_lands_before_every_sync_a_child_makes() {
         let text = format!("1 clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD) = 9\n\
+            9 execve(\"/usr/bin/git\", [], 0x1) = 0\n\
             9 openat(AT_FDCWD</s/w>, \"a\", O_WRONLY|O_TRUNC) = 3</s/w/a>\n{}9 fsync(3</s/w/a>) = 0\n{}9 fsync(3</s/w/a>) = 0\n",
             write(9, 3, "/s/w/a", b"new"), write(9, 3, "/s/w/a", b"more"));
         let calls = trace::parse(&text).unwrap();
-        let points = kill::enumerate(&calls, 0, "stack", &root(), "/s/w", |_| false).unwrap().points;
+        let points = kill::enumerate(&calls, 0, "stack", &kill::Subject { binary: "/b/forklift".into(), exec_path: None }, &root(), "/s/w", |_| false).unwrap().points;
         assert!(points.iter().all(|point| point.name != "fsync"), "the child's syncs are no kill points");
         let first = fixture();
         let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect(), before: &first }];
@@ -2717,7 +2718,7 @@ mod tests {
         let texts = [rewrite(false), rewrite(false)];
         let calls: Vec<Vec<Call>> = texts.iter().map(|text| trace::parse(text).unwrap()).collect();
         let points: Vec<Vec<Point>> = calls.iter().enumerate()
-            .map(|(line, calls)| kill::enumerate(calls, line, "stack", &root(), "/s/w", |_| true).unwrap().points).collect();
+            .map(|(line, calls)| kill::enumerate(calls, line, "stack", &kill::Subject { binary: "/b/forklift".into(), exec_path: None }, &root(), "/s/w", |_| true).unwrap().points).collect();
         let starts = starts(&texts);
         let lines: Vec<Line> = calls.iter().zip(&points).zip(&starts)
             .map(|((calls, points), before)| Line { calls, command: "stack".into(), points: points.iter().collect(), before }).collect();
@@ -2778,7 +2779,7 @@ mod tests {
     /// The crash states of one line, every kind among them.
     fn found(text: &str) -> Found {
         let calls = trace::parse(text).unwrap();
-        let points = kill::enumerate(&calls, 0, "stack", &root(), "/s/w", |_| true).unwrap().points;
+        let points = kill::enumerate(&calls, 0, "stack", &kill::Subject { binary: "/b/forklift".into(), exec_path: None }, &root(), "/s/w", |_| true).unwrap().points;
         let first = fixture();
         let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect(), before: &first }];
         crashes(&fixture(), &root(), "/s/w", 0o022, &lines, lines.len(), 0, 0).unwrap()
@@ -2908,7 +2909,7 @@ mod tests {
         // a variant drawn at the fsync that takes `new` matches it.
         let text = format!("{}1 mkdir(\"n\", 0755) = 0\n", rewrite(true).replace("1 close(3</s/w/a>) = 0\n", ""));
         let calls = trace::parse(&text).unwrap();
-        let points = kill::enumerate(&calls, 0, "stack", &root(), "/s/w", |_| true).unwrap().points;
+        let points = kill::enumerate(&calls, 0, "stack", &kill::Subject { binary: "/b/forklift".into(), exec_path: None }, &root(), "/s/w", |_| true).unwrap().points;
         let first = fixture();
         let lines = [Line { calls: &calls, command: "stack".into(), points: points.iter().collect(), before: &first }];
         let durable = |crashes: &[Crash]| -> Vec<(String, usize)> {

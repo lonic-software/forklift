@@ -109,9 +109,10 @@ pub enum Until {
 }
 
 /// The tools a scenario can be bound to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Tool {
+    #[default]
     Forklift,
     /// Git at its defaults.
     Git,

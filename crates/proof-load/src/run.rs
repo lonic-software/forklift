@@ -11,7 +11,7 @@ use crate::corpus;
 use crate::damage::Warehouse;
 use crate::faulted::{self, Programs};
 use crate::kill;
-use crate::report::{Category, Cell, Completeness, CoverageTable, Determinism, HistoryDirection, Pairing, Platform, Report, Row, REPORT_FORMAT};
+use crate::report::{Category, Cell, Completeness, CoverageTable, Determinism, HistoryDirection, Pairing, Platform, Report, Row, Target, REPORT_FORMAT};
 use crate::runner;
 use crate::scenario::{self, Tool};
 use crate::scrub::{Environment, Output};
@@ -319,7 +319,7 @@ fn history_row(subject: Built, label: &str, run: &faulted::Faulted, scenario: &s
         recoverability: run.recoverability.clone(),
         note: (!notes.is_empty()).then(|| notes.join("; ")),
         detail: Some(format!("{}.json#", label)),
-        pairing: Some(Pairing { scenario: scenario.to_string(), side: Warehouse::Client, role, kind: run.kind, directions: stands_on(subject) }),
+        pairing: Some(Pairing { scenario: scenario.to_string(), target: Target::File { side: Warehouse::Client, role, kind: run.kind }, directions: stands_on(subject) }),
     })
 }
 
@@ -866,7 +866,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                                 recoverability: run.recoverability,
                                 note: (!run.unextractable.is_empty()).then(|| format!("unextractable remedies: {}", run.unextractable.join("; "))),
                                 detail: Some(format!("{}.json#", label)),
-                                pairing: Some(Pairing { scenario: run.scenario.clone(), side: run.warehouse, role, kind: run.kind, directions: vec![] }),
+                                pairing: Some(Pairing { scenario: run.scenario.clone(), target: Target::File { side: run.warehouse, role, kind: run.kind }, directions: vec![] }),
                             });
                         }
                         Err(error) => fault_errors.entry(subject).or_default().push(format!("{} {:?}: {}", binding.name, kind, error)),
@@ -1285,7 +1285,9 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             let hosted = |scenario: &&scenario::Scenario| server.is_some() && scenario.hosts();
             let killed = |scenario: &&scenario::Scenario| kill::lanes(&kill, &power, &scenario.id).0;
             let powered = |scenario: &&scenario::Scenario| kill::lanes(&kill, &power, &scenario.id).1;
-            progress.lane(Category::KillPointsClient, Some(scenarios.iter().filter(killed).count()));
+            // Each git subject a scenario binds is a kill block of its own beside forklift's.
+            let git_subjects = |scenario: &scenario::Scenario| scenario.tools().into_iter().filter(|tool| *tool != Tool::Forklift).collect::<Vec<_>>();
+            progress.lane(Category::KillPointsClient, Some(scenarios.iter().filter(killed).map(|scenario| 1 + git_subjects(scenario).len()).sum()));
             progress.lane(Category::PowerLossClient, Some(scenarios.iter().filter(powered).count()));
             progress.lane(Category::KillPointsServer, Some(scenarios.iter().filter(killed).filter(hosted).count()));
             progress.lane(Category::PowerLossServer, Some(scenarios.iter().filter(powered).filter(hosted).count()));
@@ -1322,6 +1324,25 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     progress.block_finished(Category::PowerLossServer, &scenario.id, power_failed(&lost));
                     all_server_power.push(lost);
                 }
+                // The same faulted command run as each git subject, killed at its own points. A
+                // count that fails is the run's own failure, as forklift's is.
+                for subject in git_subjects(scenario).into_iter().filter(|_| killing) {
+                    let block = format!("{}-{}", subject.label(), scenario.id);
+                    start_block(progress, Category::KillPointsClient, &block)?;
+                    let failed = |error: String| kill::ScenarioKills { scenario: scenario.id.clone(), subject, errors: vec![error], ..Default::default() };
+                    let kills = match output.scratch(&format!("{}-traced", block)).map_err(|error| error.to_string()) {
+                        Err(error) => failed(error),
+                        Ok(template) => match kill::count(scenario, &faulted_corpus, &programs, &settings, &template, false, subject) {
+                            Err(error) => failed(error.to_string()),
+                            Ok(counting) => kill::run(scenario, &programs, &settings, &template, &counting, subject).unwrap_or_else(|error| failed(error.to_string())),
+                        },
+                    };
+                    write_detail(output.root(), &kill::details_file_of(kill::Side::Client, subject, &scenario.id), &kills)?;
+                    // A git grade never fails the run; only what failed the harness's own look at
+                    // git does.
+                    progress.block_finished(Category::KillPointsClient, &block, !kills.errors.is_empty() || !kills.refusals.is_empty());
+                    all_kills.push(kills);
+                }
                 // One poll for both client blocks, so a cancel never leaves one started alone.
                 stop_if_cancelled(progress)?;
                 if killing {
@@ -1331,7 +1352,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     progress.block_started(Category::PowerLossClient, &scenario.id);
                 }
                 let counted = output.scratch(&format!("{}-traced", scenario.id)).map_err(|error| error.to_string())
-                    .and_then(|template| kill::count(scenario, &faulted_corpus, &programs, &settings, &template, powering).map(|counting| (template, counting)).map_err(|error| error.to_string()));
+                    .and_then(|template| kill::count(scenario, &faulted_corpus, &programs, &settings, &template, powering, Tool::Forklift).map(|counting| (template, counting)).map_err(|error| error.to_string()));
                 let (template, counting) = match counted {
                     Ok(counted) => counted,
                     Err(error) => {
@@ -1347,7 +1368,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     }
                 };
                 if killing {
-                    let kills = match kill::run(scenario, &programs, &settings, &template, &counting) {
+                    let kills = match kill::run(scenario, &programs, &settings, &template, &counting, Tool::Forklift) {
                         Ok(kills) => {
                             write_detail(output.root(), &kill::details_file(kill::Side::Client, &scenario.id), &kills)?;
                             kills

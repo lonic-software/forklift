@@ -1,5 +1,5 @@
 {
-  "format": 7,
+  "format": 8,
   "coverage": {
     "cells": {
       "damaged-files": {
@@ -380,9 +380,12 @@
       "detail": "signed-trust-FlipByte.json#",
       "pairing": {
         "scenario": "signed",
-        "side": "client",
-        "role": "signature",
-        "kind": "flip-byte",
+        "target": {
+          "by": "file",
+          "side": "client",
+          "role": "signature",
+          "kind": "flip-byte"
+        },
         "directions": []
       }
     },
@@ -402,9 +405,12 @@
       "detail": "signed-trust-Truncate.json#",
       "pairing": {
         "scenario": "signed",
-        "side": "client",
-        "role": "signature",
-        "kind": "truncate",
+        "target": {
+          "by": "file",
+          "side": "client",
+          "role": "signature",
+          "kind": "truncate"
+        },
         "directions": []
       }
     },
@@ -424,9 +430,12 @@
       "detail": "signed-trust-Zero.json#",
       "pairing": {
         "scenario": "signed",
-        "side": "client",
-        "role": "signature",
-        "kind": "zero",
+        "target": {
+          "by": "file",
+          "side": "client",
+          "role": "signature",
+          "kind": "zero"
+        },
         "directions": []
       }
     },
@@ -446,9 +455,12 @@
       "detail": "signed-trust-Delete.json#",
       "pairing": {
         "scenario": "signed",
-        "side": "client",
-        "role": "signature",
-        "kind": "delete",
+        "target": {
+          "by": "file",
+          "side": "client",
+          "role": "signature",
+          "kind": "delete"
+        },
         "directions": []
       }
     },
@@ -468,9 +480,12 @@
       "detail": "signed-meta_-Delete.json#",
       "pairing": {
         "scenario": "signed",
-        "side": "client",
-        "role": "metadata",
-        "kind": "delete",
+        "target": {
+          "by": "file",
+          "side": "client",
+          "role": "metadata",
+          "kind": "delete"
+        },
         "directions": []
       }
     },
@@ -490,9 +505,12 @@
       "detail": "signed-meta__name_-FlipByte.json#",
       "pairing": {
         "scenario": "signed",
-        "side": "client",
-        "role": "metadata",
-        "kind": "flip-byte",
+        "target": {
+          "by": "file",
+          "side": "client",
+          "role": "metadata",
+          "kind": "flip-byte"
+        },
         "directions": []
       }
     },
@@ -512,9 +530,12 @@
       "detail": "signed-meta__name_-Truncate.json#",
       "pairing": {
         "scenario": "signed",
-        "side": "client",
-        "role": "metadata",
-        "kind": "truncate",
+        "target": {
+          "by": "file",
+          "side": "client",
+          "role": "metadata",
+          "kind": "truncate"
+        },
         "directions": []
       }
     },
@@ -534,9 +555,12 @@
       "detail": "signed-meta__name_-Zero.json#",
       "pairing": {
         "scenario": "signed",
-        "side": "client",
-        "role": "metadata",
-        "kind": "zero",
+        "target": {
+          "by": "file",
+          "side": "client",
+          "role": "metadata",
+          "kind": "zero"
+        },
         "directions": []
       }
     },
@@ -556,9 +580,12 @@
       "detail": "signed-meta__name_-Delete.json#",
       "pairing": {
         "scenario": "signed",
-        "side": "client",
-        "role": "metadata",
-        "kind": "delete",
+        "target": {
+          "by": "file",
+          "side": "client",
+          "role": "metadata",
+          "kind": "delete"
+        },
         "directions": []
       }
     },
@@ -578,9 +605,12 @@
       "detail": "signed-objects__xx___hash_.sig-FlipByte.json#",
       "pairing": {
         "scenario": "signed",
-        "side": "client",
-        "role": "signature",
-        "kind": "flip-byte",
+        "target": {
+          "by": "file",
+          "side": "client",
+          "role": "signature",
+          "kind": "flip-byte"
+        },
         "directions": []
       }
     },
@@ -600,9 +630,12 @@
       "detail": "signed-objects__xx___hash_.sig-Truncate.json#",
       "pairing": {
         "scenario": "signed",
-        "side": "client",
-        "role": "signature",
-        "kind": "truncate",
+        "target": {
+          "by": "file",
+          "side": "client",
+          "role": "signature",
+          "kind": "truncate"
+        },
         "directions": []
       }
     },
@@ -622,9 +655,12 @@
       "detail": "signed-objects__xx___hash_.sig-Zero.json#",
       "pairing": {
         "scenario": "signed",
-        "side": "client",
-        "role": "signature",
-        "kind": "zero",
+        "target": {
+          "by": "file",
+          "side": "client",
+          "role": "signature",
+          "kind": "zero"
+        },
         "directions": []
       }
     },
@@ -644,9 +680,12 @@
       "detail": "signed-objects__xx___hash_.sig-Delete.json#",
       "pairing": {
         "scenario": "signed",
-        "side": "client",
-        "role": "signature",
-        "kind": "delete",
+        "target": {
+          "by": "file",
+          "side": "client",
+          "role": "signature",
+          "kind": "delete"
+        },
         "directions": []
       }
     }

@@ -433,7 +433,7 @@ mod tests {
         let counting = Root { given: "/out/a-served".to_string(), canonical: "/out/a-served".to_string() };
         let root = Root { given: "/out/a-served-kill-0-1".to_string(), canonical: "/out/a-served-kill-0-1".to_string() };
         let point = Point {
-            line: 0, call: 0, command: "serve background".to_string(), name: "renameat2".to_string(),
+            line: 0, call: 0, command: "serve background".to_string(), op: String::new(), name: "renameat2".to_string(),
             aim: Aim::Path { path: "/out/a-served/host/.forklift/pallets/main".to_string() }, when: 2,
             target: kill::Identity { detail: String::new(), paths: Vec::new() }, base: String::new(), sampled: false,
         };
