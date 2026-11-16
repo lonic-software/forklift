@@ -19,6 +19,7 @@ use crate::host::Host;
 use crate::proxy::Exchange;
 use crate::report::{Cell, Completeness};
 use crate::routewrites::Serving;
+use crate::scenario::Tool;
 use crate::scrub::{Environment, Scratch};
 use crate::tool::{self, Invocation, Outcome, ToolError};
 use crate::trace::{self, Root};
@@ -433,8 +434,8 @@ pub fn check(universe: &[String], evidence: &[Evidence], exemptions: &[(&str, Ex
     }
     let coverage_cell = match not_traced { Some(reason) => Cell::not_run(reason), None => Cell::Run };
     vec![
-        Completeness { check: "write-op coverage".to_string(), cell: coverage_cell, missing: coverage },
-        Completeness { check: "read-only exemptions".to_string(), cell: Cell::Run, missing: read_only },
+        Completeness { subject: Some(Tool::Forklift), check: "write-op coverage".to_string(), cell: coverage_cell, missing: coverage },
+        Completeness { subject: Some(Tool::Forklift), check: "read-only exemptions".to_string(), cell: Cell::Run, missing: read_only },
     ]
 }
 

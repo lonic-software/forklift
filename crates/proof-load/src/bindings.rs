@@ -290,10 +290,122 @@ pub fn check(census: &Census, bindings: &[Binding], exemptions: &[Exemption], sc
     missing
 }
 
+/// Git's damage bindings, over the git layout's rows ([`crate::git_layout::ROWS`]): the same kinds
+/// per role as Forklift's (every kind on a file, removal on a folder, a dead holder planted for a
+/// lock), on the scenarios git can run. A lock is planted at a name its row matches.
+pub const GIT_BINDINGS: &[Binding] = &[
+    bound("HEAD", FILE),
+    bound_in("ORIG_HEAD", "branched", FILE),
+    bound("config", FILE),
+    bound("index", FILE),
+    bound("logs/**/", FOLDER),
+    bound("logs/**", FILE),
+    bound("refs/", FOLDER),
+    bound("refs/heads/**/", FOLDER),
+    bound("refs/heads/**", FILE),
+    bound("refs/tags/**/", FOLDER),
+    bound_in("refs/stash", "parked", FILE),
+    bound("objects/", FOLDER),
+    bound("objects/info/", FOLDER),
+    bound("objects/pack/", FOLDER),
+    bound("objects/<xx>/", FOLDER),
+    bound("objects/<xx>/<hash>", FILE),
+    bound("index.lock", DEAD_HOLDER),
+    bound("HEAD.lock", DEAD_HOLDER),
+    bound("refs/heads/main.lock", DEAD_HOLDER),
+];
+
+const GIT_NOT_WRITTEN: &str = "not written: only a gc, a repack or maintenance writes it, and no scenario git runs does either";
+
+/// Git layout rows that need damage and are not damaged, with the reason. One a scenario git
+/// builds does create is stale, and fails the check.
+pub const GIT_EXEMPTIONS: &[Exemption] = &[
+    Exemption { name: "FETCH_HEAD", reason: "not written: no scenario git runs fetches" },
+    Exemption { name: "refs/tags/**", reason: "not written: no scenario makes a tag" },
+    Exemption { name: "packed-refs", reason: GIT_NOT_WRITTEN },
+    Exemption { name: "info/refs", reason: GIT_NOT_WRITTEN },
+    Exemption { name: "objects/info/packs", reason: GIT_NOT_WRITTEN },
+    Exemption { name: "objects/info/commit-graph", reason: GIT_NOT_WRITTEN },
+    Exemption { name: "objects/info/commit-graphs/**", reason: GIT_NOT_WRITTEN },
+    Exemption { name: "objects/pack/multi-pack-index", reason: GIT_NOT_WRITTEN },
+    Exemption { name: "objects/pack/<name>.pack", reason: GIT_NOT_WRITTEN },
+    Exemption { name: "objects/pack/<name>.idx", reason: GIT_NOT_WRITTEN },
+    Exemption { name: "objects/pack/<name>.rev", reason: GIT_NOT_WRITTEN },
+    Exemption { name: "objects/pack/<name>.bitmap", reason: GIT_NOT_WRITTEN },
+];
+
+/// What git's damage bindings miss: every layout row that needs damage and has neither a binding
+/// nor an exemption; an exemption that names no row, or a row a git build created; and a binding
+/// whose scenario git does not build, or whose built walk holds no path of its row. `walks` holds
+/// the walk of each scenario git built, by id; `runnable` every scenario git can run, so one that
+/// failed to build is the walk check's to report, never this one's.
+pub fn check_git(bindings: &[Binding], exemptions: &[Exemption], runnable: &[String], walks: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+    use crate::git_layout::{self, ROWS};
+    let mut missing = Vec::new();
+    let plants = |binding: &Binding| binding.kinds.iter().all(|kind| kind.plants());
+    for row in ROWS.iter().filter(|row| row.class.needs_damage()) {
+        let bound = bindings.iter().any(|binding| binding.name == row.pattern
+            || (plants(binding) && git_layout::row_of(binding.name).is_some_and(|planted| planted.pattern == row.pattern)));
+        if !bound && !exemptions.iter().any(|exemption| exemption.name == row.pattern) {
+            missing.push(row.pattern.to_string());
+        }
+    }
+    for exemption in exemptions {
+        match git_layout::named(exemption.name) {
+            None => missing.push(format!("stale exemption: {} is no git layout row", exemption.name)),
+            Some(_) => missing.extend(walks.iter().filter(|(_, walked)| !git_layout::reached(exemption.name, walked).is_empty())
+                .map(|(scenario, _)| format!("stale exemption: {}: {} creates it", exemption.name, scenario))),
+        }
+    }
+    for binding in bindings {
+        if plants(binding) {
+            if !git_layout::row_of(binding.name).is_some_and(|row| row.class == crate::census::Class::Lock) {
+                missing.push(format!("{}: plants a path no lock row matches", binding.name));
+            }
+        } else if git_layout::named(binding.name).is_none() {
+            missing.push(format!("{}: is no git layout row", binding.name));
+        }
+        if !runnable.iter().any(|scenario| scenario == binding.scenario) {
+            missing.push(format!("{}: its scenario {} is not one git runs", binding.name, binding.scenario));
+        } else if !plants(binding) && walks.get(binding.scenario).is_some_and(|walked| git_layout::reached(binding.name, walked).is_empty()) {
+            missing.push(format!("{}: its scenario {} does not create it", binding.name, binding.scenario));
+        }
+    }
+    missing
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// The git bindings over git's layout: the shipped set passes over walks that create what it
+    /// binds, a damage row with no binding or exemption is named, an exemption over a path a scenario
+    /// creates is stale, and a binding over a path its scenario never creates is named.
+    ///
+    /// Revert: skip the walk check for bindings → the uncreated binding passes; skip the stale
+    /// exemption check → the created exempt path passes.
+    #[test]
+    fn git_bindings_are_checked_against_the_layout_and_the_walks() {
+        let runnable: Vec<String> = ["history", "branched", "parked"].map(String::from).to_vec();
+        let all: Vec<String> = ["HEAD", "ORIG_HEAD", "config", "index", "logs/", "logs/refs/heads/main", "refs/", "refs/heads/",
+            "refs/heads/main", "refs/tags/", "refs/stash", "objects/", "objects/info/", "objects/pack/", "objects/ab/", "objects/ab/cdef"]
+            .map(String::from).to_vec();
+        let walks: BTreeMap<String, Vec<String>> = runnable.iter().map(|scenario| (scenario.clone(), all.clone())).collect();
+        assert_eq!(check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &walks), Vec::<String>::new());
+
+        let without_index: Vec<Binding> = GIT_BINDINGS.iter().filter(|binding| binding.name != "index").cloned().collect();
+        assert_eq!(check_git(&without_index, GIT_EXEMPTIONS, &runnable, &walks), vec!["index".to_string()]);
+
+        let mut packed = walks.clone();
+        packed.get_mut("history").unwrap().push("packed-refs".to_string());
+        assert_eq!(check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &packed), vec!["stale exemption: packed-refs: history creates it".to_string()]);
+
+        let mut no_config = walks.clone();
+        no_config.get_mut("history").unwrap().retain(|path| path != "config");
+        let missing = check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &no_config);
+        assert!(missing.iter().any(|line| line.starts_with("config: its scenario history does not create it")), "{:?}", missing);
+    }
 
     const SAMPLE: &str = "<!-- census:start -->\n| Path | Class | Names |\n|---|---|---|\n\
         | `warehouse` | rewritable | `a::B` |\n\

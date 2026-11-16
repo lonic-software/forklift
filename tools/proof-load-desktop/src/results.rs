@@ -146,7 +146,8 @@ mod tests {
         std::fs::create_dir_all(&folder).expect("a scratch folder");
         std::fs::write(folder.join("report.json"), "{\"format\": 99}").expect("written");
         let other = Results::open(&folder).unwrap_err();
-        assert!(other.ends_with("report format 99 is not one this build reads (it reads 1)"), "{other}");
+        let reads = format!("report format 99 is not one this build reads (it reads {})", proof_load::report::REPORT_FORMAT);
+        assert!(other.ends_with(&reads), "{other}");
     }
 
     #[test]

@@ -459,7 +459,10 @@ impl App {
             widgets::table(ui, &columns, completeness.len(), false, None, |ui, row, column| {
                 let check = &completeness[row];
                 match column {
-                    0 => { widgets::text(ui, &check.check, Type::Body, p.ink); }
+                    0 => {
+                        let label = match check.subject { Some(subject) => format!("{} ({})", check.check, subject.label()), None => check.check.clone() };
+                        widgets::text(ui, &label, Type::Body, p.ink);
+                    }
                     1 => { widgets::coverage_cell(ui, &check.cell); }
                     _ if check.missing.is_empty() => {
                         let nothing = if matches!(check.cell, Cell::Run) { "nothing" } else { "" };

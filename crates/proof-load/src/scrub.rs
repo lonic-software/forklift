@@ -215,7 +215,7 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), CopyOnlyError> {
 const GIT_CONFIG: &str = "[user]\n\tname = Proof Load\n\temail = proof-load@invalid\n";
 
 /// The variables the scrub sets itself; a scenario may not override them.
-const RESERVED: &[&str] = &["PATH", "HOME", "XDG_CONFIG_HOME", "TMPDIR", "TMP", "TEMP", "USERPROFILE", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"];
+const RESERVED: &[&str] = &["PATH", "HOME", "XDG_CONFIG_HOME", "TMPDIR", "TMP", "TEMP", "USERPROFILE", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_CEILING_DIRECTORIES"];
 
 /// The exact environment a tool runs under.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -247,6 +247,13 @@ impl Environment {
         }
         variables.insert("GIT_CONFIG_GLOBAL".to_string(), text(scratch.git_global_config()));
         variables.insert("GIT_CONFIG_SYSTEM".to_string(), text(scratch.git_system_config()));
+        // Git never looks above the scratch area for a repository: when a fault leaves the work
+        // tree's `.git` unrecognisable, git must refuse, not find and change one in a parent.
+        let ceilings = std::iter::once(scratch.root().to_path_buf()).chain(scratch.folding.clone());
+        let ceilings = std::env::join_paths(ceilings).map_err(|error| CopyOnlyError::Io {
+            path: scratch.root().to_path_buf(), reason: format!("cannot be named to git as a ceiling directory: {}", error),
+        })?;
+        variables.insert("GIT_CEILING_DIRECTORIES".to_string(), ceilings.to_string_lossy().into_owned());
 
         let mut scenario_set = BTreeMap::new();
         for (name, value) in scenario {
@@ -301,6 +308,33 @@ mod tests {
         let path = std::env::temp_dir().join(format!("proof-load-{}-{}-{}", name, std::process::id(), nanos));
         assert!(std::fs::symlink_metadata(&path).is_err(), "the test's path is fresh");
         path
+    }
+
+    /// Git run in the scratch area never finds a repository above it: with the work tree's own
+    /// repository gone, git refuses rather than reading or changing one in a parent folder.
+    ///
+    /// Revert: drop `GIT_CEILING_DIRECTORIES` → git finds the enclosing repository.
+    #[test]
+    fn git_finds_no_repository_above_the_scratch_area() {
+        let outer = fresh("ceiling");
+        std::fs::create_dir_all(&outer).unwrap();
+        let git = |directory: &Path, environment: Option<&Environment>, arguments: &[&str]| {
+            let mut command = std::process::Command::new("git");
+            command.args(arguments).current_dir(directory);
+            if let Some(environment) = environment {
+                environment.apply(&mut command);
+                command.env("PATH", std::env::var_os("PATH").unwrap());
+            }
+            command.output().unwrap()
+        };
+        assert!(git(&outer, None, &["init", "-q"]).status.success());
+        let scratch = Scratch::create(&outer.join("area")).unwrap();
+        std::fs::create_dir_all(scratch.work()).unwrap();
+        let environment = Environment::scrubbed(&scratch, None, &BTreeMap::new()).unwrap();
+        let found = git(&scratch.work(), Some(&environment), &["rev-parse", "--git-dir"]);
+        assert!(!found.status.success(), "found {}", String::from_utf8_lossy(&found.stdout));
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
+        std::fs::remove_dir_all(&outer).unwrap();
     }
 
     /// A copy holds every folder, file and link of the area, is independent of it, and is never

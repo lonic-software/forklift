@@ -1,5 +1,5 @@
 {
-  "format": 1,
+  "format": 2,
   "coverage": {
     "cells": {
       "damaged-files": {
@@ -207,6 +207,7 @@
   },
   "completeness": [
     {
+      "subject": "forklift",
       "check": "damage bindings",
       "cell": {
         "state": "run"
@@ -214,6 +215,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "census walk",
       "cell": {
         "state": "run"
@@ -221,6 +223,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "server routes answered",
       "cell": {
         "state": "not-run",
@@ -229,6 +232,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "server route writes",
       "cell": {
         "state": "not-run",
@@ -237,6 +241,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "damaged-file faults ran",
       "cell": {
         "state": "run"
@@ -244,6 +249,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "disk-full faults ran",
       "cell": {
         "state": "not-run",
@@ -252,6 +258,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "read-only faults ran",
       "cell": {
         "state": "not-run",
@@ -260,6 +267,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "case-folding faults ran",
       "cell": {
         "state": "not-run",
@@ -268,6 +276,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "no-exec faults ran",
       "cell": {
         "state": "not-run",
@@ -276,6 +285,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "network faults ran",
       "cell": {
         "state": "not-run",
@@ -284,6 +294,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "write-op coverage",
       "cell": {
         "state": "not-run",
@@ -292,6 +303,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "read-only exemptions",
       "cell": {
         "state": "not-run",
@@ -300,6 +312,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "kill-point units",
       "cell": {
         "state": "not-run",
@@ -308,6 +321,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "server kill-point units",
       "cell": {
         "state": "not-run",
@@ -316,6 +330,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "power-loss states",
       "cell": {
         "state": "not-run",
@@ -324,6 +339,7 @@
       "missing": []
     },
     {
+      "subject": "forklift",
       "check": "server power-loss states",
       "cell": {
         "state": "not-run",
@@ -332,6 +348,7 @@
       "missing": []
     },
     {
+      "subject": null,
       "check": "wall-clock budget",
       "cell": {
         "state": "not-run",
@@ -342,6 +359,7 @@
   ],
   "rows": [
     {
+      "subject": "forklift",
       "scenario": "signed trust FlipByte",
       "category": "damaged-files",
       "binding": "forklift",
@@ -355,6 +373,7 @@
       "detail": "signed-trust-FlipByte.json#"
     },
     {
+      "subject": "forklift",
       "scenario": "signed trust Truncate",
       "category": "damaged-files",
       "binding": "forklift",
@@ -368,6 +387,7 @@
       "detail": "signed-trust-Truncate.json#"
     },
     {
+      "subject": "forklift",
       "scenario": "signed trust Zero",
       "category": "damaged-files",
       "binding": "forklift",
@@ -381,6 +401,7 @@
       "detail": "signed-trust-Zero.json#"
     },
     {
+      "subject": "forklift",
       "scenario": "signed trust Delete",
       "category": "damaged-files",
       "binding": "forklift",
@@ -394,6 +415,7 @@
       "detail": "signed-trust-Delete.json#"
     },
     {
+      "subject": "forklift",
       "scenario": "signed meta Delete",
       "category": "damaged-files",
       "binding": "forklift",
@@ -407,6 +429,7 @@
       "detail": "signed-meta_-Delete.json#"
     },
     {
+      "subject": "forklift",
       "scenario": "signed meta/office FlipByte",
       "category": "damaged-files",
       "binding": "forklift",
@@ -420,6 +443,7 @@
       "detail": "signed-meta__name_-FlipByte.json#"
     },
     {
+      "subject": "forklift",
       "scenario": "signed meta/office Truncate",
       "category": "damaged-files",
       "binding": "forklift",
@@ -433,6 +457,7 @@
       "detail": "signed-meta__name_-Truncate.json#"
     },
     {
+      "subject": "forklift",
       "scenario": "signed meta/office Zero",
       "category": "damaged-files",
       "binding": "forklift",
@@ -446,6 +471,7 @@
       "detail": "signed-meta__name_-Zero.json#"
     },
     {
+      "subject": "forklift",
       "scenario": "signed meta/office Delete",
       "category": "damaged-files",
       "binding": "forklift",
@@ -459,6 +485,7 @@
       "detail": "signed-meta__name_-Delete.json#"
     },
     {
+      "subject": "forklift",
       "scenario": "signed objects/1b/e1cc88d307dbd79534ef678121b12588c3e5d3019c72c87cbe7b2701680b7f.sig FlipByte",
       "category": "damaged-files",
       "binding": "forklift",
@@ -472,6 +499,7 @@
       "detail": "signed-objects__xx___hash_.sig-FlipByte.json#"
     },
     {
+      "subject": "forklift",
       "scenario": "signed objects/47/59002aec5b37bb1d3e10e72e6d68696d4fb53198c289660637a5752b960468.sig Truncate",
       "category": "damaged-files",
       "binding": "forklift",
@@ -485,6 +513,7 @@
       "detail": "signed-objects__xx___hash_.sig-Truncate.json#"
     },
     {
+      "subject": "forklift",
       "scenario": "signed objects/b0/2d25865843b57e0f51278480fff188e190634c8708c5e16447611b82afd4ea.sig Zero",
       "category": "damaged-files",
       "binding": "forklift",
@@ -498,6 +527,7 @@
       "detail": "signed-objects__xx___hash_.sig-Zero.json#"
     },
     {
+      "subject": "forklift",
       "scenario": "signed objects/63/d0d339b90966ee09586240b126ee11093f89c2d439128fed03d6a5d9dcdeb0.sig Delete",
       "category": "damaged-files",
       "binding": "forklift",
