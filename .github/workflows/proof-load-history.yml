@@ -49,8 +49,9 @@ jobs:
           git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin | grep -vx HEAD |
             while read -r branch; do git update-ref "refs/heads/$branch" "refs/remotes/origin/$branch"; done
           # A pull request's checkout is a detached merge commit, which the harness refuses as a
-          # history: it is put on a branch of its own, the work tree left as it is.
-          git symbolic-ref -q HEAD > /dev/null || git switch -q -c proof-load-checkout
+          # history: it is put on a branch of its own, the work tree left as it is. -C, since the
+          # loop above may already have made a branch of that name from a remote one.
+          git symbolic-ref -q HEAD > /dev/null || git switch -q -C proof-load-checkout
           git symbolic-ref HEAD
           git for-each-ref --format=x refs/heads | wc -l
 

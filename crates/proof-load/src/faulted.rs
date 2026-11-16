@@ -60,45 +60,61 @@ pub struct RecordReadback {
 }
 
 /// One readback of the whole history.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryReadback {
     /// The readback's own command: the export, or in a scoped bay the opening of the side bay it
     /// reads through. A refusal here refuses every record.
     pub export: Outcome,
     pub records: Vec<RecordReadback>,
     /// The parked work read back, when the history left work parked.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub parked: Option<ParkedReadback>,
     /// Over a real history, the commands that resolved and laid out each sampled record, in order;
     /// a refusal here refuses the record it ran for. Forklift's bay for a record opens at the
     /// current head before moving to the record, so damage only that head holds refuses every
     /// forklift record, where git still serves the records that do not hold it.
-    #[serde(skip_serializing_if = "Vec::is_empty", serialize_with = "serialize_reads")]
     pub reads: Vec<Outcome>,
 }
 
-/// Writes `reads` with each successful read's stdout left out, its length kept, as the records'
-/// verdicts already judge what it served: over a real history those bytes ran to some 100 MB a
-/// readback (CI, 2026-11-16), so a run's details came to 3.1 GB. A refused read is kept whole.
-fn serialize_reads<S: serde::Serializer>(reads: &[Outcome], serializer: S) -> Result<S::Ok, S::Error> {
-    #[derive(serde::Serialize)]
-    struct Read<'a> {
-        arguments: &'a [String],
-        exit: Option<i32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        stdout: Option<&'a [u8]>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        stdout_bytes: Option<usize>,
-        stderr: &'a [u8],
-        failure: &'a Option<tool::Failure>,
-    }
-    serializer.collect_seq(reads.iter().map(|read| {
-        let served = read.succeeded();
-        Read {
-            arguments: &read.arguments, exit: read.exit, stdout: (!served).then_some(read.stdout.as_slice()),
-            stdout_bytes: served.then_some(read.stdout.len()), stderr: &read.stderr, failure: &read.failure,
+/// Written with each successful read's stdout left out, its length kept, unless the readback is
+/// silent: over a real history those bytes ran to some 100 MB a readback (CI, 2026-11-16), so a
+/// run's details came to 3.1 GB. A refused read is kept whole, and so is every read of a silent
+/// readback, whose served bytes are what shows the wrong tree.
+impl serde::Serialize for HistoryReadback {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct Written<'a> {
+            export: &'a Outcome,
+            records: &'a [RecordReadback],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            parked: Option<&'a ParkedReadback>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            reads: Vec<Read<'a>>,
         }
-    }))
+        #[derive(serde::Serialize)]
+        struct Read<'a> {
+            arguments: &'a [String],
+            exit: Option<i32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stdout: Option<&'a [u8]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stdout_bytes: Option<usize>,
+            stderr: &'a [u8],
+            failure: &'a Option<tool::Failure>,
+        }
+        // Destructured whole, so a field added to either is a compile error here, not one the
+        // details silently leave out.
+        let HistoryReadback { export, records, parked, reads } = self;
+        let silent = self.silent();
+        let reads = reads.iter().map(|read| {
+            let Outcome { arguments, exit, stdout, stderr, failure } = read;
+            let kept = silent || !read.succeeded();
+            Read {
+                arguments, exit: *exit, stdout: kept.then_some(stdout.as_slice()),
+                stdout_bytes: (!kept).then_some(stdout.len()), stderr, failure,
+            }
+        }).collect();
+        Written { export, records, parked: parked.as_ref(), reads }.serialize(serializer)
+    }
 }
 
 /// What `park list` said of the work the history left parked.
@@ -147,6 +163,8 @@ pub struct Faulted {
     /// Every command after the fault, in order: the faulted command, retries, remedies, the
     /// subject's own remedy set.
     pub steps: Vec<Outcome>,
+    /// Every readback taken, in order, except that a settle's own follows the acknowledged one it
+    /// took and did not settle by: a settle's last readback is the one it judged by.
     pub readbacks: Vec<HistoryReadback>,
     /// The harness's reads that decided the own remedy set ([`Graded::probes`]).
     pub probes: Vec<Outcome>,
@@ -946,6 +964,10 @@ impl Trail {
                 self.readbacks.push(readback);
                 readback = settled;
                 made.promote(promoted);
+            } else {
+                // Kept for the record of what ran, its verdicts graded by nothing: the readback
+                // this settle judges by is pushed after it, the last.
+                self.readbacks.push(settled);
             }
         }
         let required = expected.required(made.acknowledged);
@@ -991,11 +1013,12 @@ fn settles(retry: bool, last: Option<&Outcome>) -> bool {
     retry && answered(last)
 }
 
-/// Whether the answer `last` settles the faulted record as acknowledged, from `settled`, the
-/// readback judged as acknowledged. A success, or a stack refused as nothing to stack, claims the
-/// record stands and is held to it. Any other refusal claims nothing of it: a damaged file refused
-/// for good on every retry is no record made, so it settles only a record already holding its
-/// own tree, never one still at the tree before it.
+/// Whether the answer `last`, the retry's last line, settles the faulted record as acknowledged,
+/// from `settled`, the readback judged as acknowledged. A last line that succeeded landed every
+/// line the retry ran, and a stack refused as nothing to stack claims the record stands: either
+/// holds the record to its own tree. Any other refusal claims nothing of the record, so it
+/// settles only one already holding its own tree: a damaged file refused for good on every retry
+/// leaves a record still at the tree before it judged as never acknowledged, not as silent.
 fn settled_by(last: Option<&Outcome>, settled: &HistoryReadback, faulted: Mark) -> bool {
     last.is_some_and(|outcome| outcome.succeeded() || already_stacked(outcome)) || settled.reads(&[faulted])
 }
@@ -2102,10 +2125,11 @@ mod tests {
     }
 
     /// A readback's details keep a refused read whole, and a successful one without its stdout,
-    /// whose length they keep.
+    /// whose length they keep; a silent readback keeps every read whole.
     ///
     /// Revert: serialize the reads as they are → the served bytes are written; drop every
-    /// stdout → the refused read's own words are lost.
+    /// stdout → the refused read's own words are lost; drop the stdout of a silent readback's
+    /// successful read → the bytes that show the wrong tree are lost.
     #[test]
     fn a_readback_writes_what_its_reads_refused_not_what_they_served() {
         let read = |exit, stdout: &[u8]| Outcome { arguments: vec!["show".into()], exit: Some(exit), stdout: stdout.to_vec(), stderr: b"said".to_vec(), failure: None };
@@ -2118,6 +2142,11 @@ mod tests {
         assert_eq!(reads[1]["stdout"], serde_json::json!(b"refused-words".to_vec()));
         assert_eq!(reads[1].get("stdout_bytes"), None);
         assert_eq!(reads[1]["exit"], 1);
+        let silent = HistoryReadback { reads: vec![read(0, b"wrong-tree")], ..served(&[(0, Verdict::Silent)]) };
+        let written = serde_json::to_value(&silent).unwrap();
+        assert_eq!(written["reads"][0]["stdout"], serde_json::json!(b"wrong-tree".to_vec()), "{}", written);
+        assert_eq!(written["reads"][0].get("stdout_bytes"), None);
+        assert_eq!(written["records"][0]["verdicts"], serde_json::json!(["silent"]));
     }
 
     /// A history reads only when every wanted record was served and every copy of it expected: a

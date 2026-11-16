@@ -222,9 +222,9 @@ fn run_deadline(started: std::time::Instant, budget: Option<u64>) -> Option<std:
     budget.and_then(|budget| started.checked_add(std::time::Duration::from_secs(budget)))
 }
 
-/// Whose a history build step `tool` failed is: forklift's where forklift ran it and refused it,
-/// or ran past its limit. Git refusing one is the run's own, git being the oracle the sample is
-/// drawn from, as is a step the harness could not run at all.
+/// Whose a history build step `tool` failed is: forklift's where forklift ran it and refused it
+/// or misbuilt it, or ran past its limit. Git refusing one is the run's own, git being the oracle
+/// the sample is drawn from, as is a step the harness could not run at all.
 fn build_charged_to(tool: Tool, error: &crate::runner::RunError) -> Option<Tool> {
     use crate::runner::RunError::{BuildFailed, Tool as Ran};
     let own = tool == Tool::Forklift && matches!(error, BuildFailed { .. } | Ran(crate::tool::ToolError::TimedOut { .. }));
@@ -1603,10 +1603,12 @@ mod tests {
     /// planned row of every subject is named in its completeness as not run, as with the run's
     /// deadline already passed, each naming which ran out; with budget enough,
     /// every planned row ran to a row or an unreached entry, paired under the history's scenario,
-    /// with no harness error, and no forklift row refused every stack for good grades silent.
+    /// with no harness error, and no forklift row refused every stack for good judges its faulted
+    /// record silent.
     ///
     /// Revert: drop the budget check → rows run with no budget; pass no deadline on → rows run
-    /// past the run's; settle a record on any answer → the zeroed config's row grades silent.
+    /// past the run's; settle a record on any answer → the zeroed config's faulted record is
+    /// judged silent; push the unsettled readback last → the same.
     #[test]
     #[ignore = "needs PROOF_LOAD_FORKLIFT"]
     fn the_history_lane_names_what_its_budget_did_not_reach() {
@@ -1650,7 +1652,9 @@ mod tests {
     }
 
     /// Over the forklift rows a lane wrote to `root`, one whose every stack was refused, none as
-    /// nothing to stack, made no record, so its absence is no silent read; and some such row ran.
+    /// nothing to stack, made no record, so the readback its last settle judged by reads no
+    /// silent copy of the faulted record; and some such row judged the record at all. A sampled
+    /// position may still be silent there, which is forklift's own.
     fn refused_for_good_is_never_silent(root: &std::path::Path) {
         let mut refused_for_good = Vec::new();
         for entry in std::fs::read_dir(root).unwrap() {
@@ -1665,11 +1669,17 @@ mod tests {
             let for_good = !stacks.is_empty() && stacks.iter().all(|step| step["exit"] != 0
                 && !step["failure"]["message"].as_str().is_some_and(|message| message.starts_with("Nothing to stack")));
             if for_good {
-                assert_ne!(details["grade"], "silent", "{}: {}", name, details["evidence"]);
-                refused_for_good.push(name);
+                let judged = details["readbacks"].as_array().and_then(|readbacks| readbacks.last());
+                let faulted = judged.and_then(|readback| readback["records"].as_array())
+                    .and_then(|records| records.iter().find(|record| record["mark"] == serde_json::json!({"mark": "record", "index": 0})));
+                let verdicts: &[serde_json::Value] = faulted.and_then(|record| record["verdicts"].as_array()).map(Vec::as_slice).unwrap_or_default();
+                assert!(!verdicts.iter().any(|verdict| verdict == "silent"), "{}: the faulted record judged {:?}", name, verdicts);
+                if !verdicts.is_empty() {
+                    refused_for_good.push(name);
+                }
             }
         }
-        assert!(!refused_for_good.is_empty(), "of the rows in {}, none of forklift's was refused every stack", root.display());
+        assert!(!refused_for_good.is_empty(), "of the rows in {}, none of forklift's was refused every stack and judged its record", root.display());
     }
 
     /// A binding the role map names no role for is refused, under either subject; one it knows

@@ -69,7 +69,8 @@ pub fn build_git(git: &Path, mirror: &Path, to: &Path, scratch: &Scratch, enviro
 /// warehouse that imports the mirror at `mirror`, its work tree restored (an import leaves it
 /// empty), and [`PROBE_REF`] made as a pallet at the current head and shifted to. The import must
 /// make `branch` current, the branch git's subject made its probe at ([`build_git`]), or the two
-/// probes would sit on different commits. Each step it ran is kept in `steps`, the failing one too.
+/// probes would sit on different commits, which fails the build as the import's step. Each step it
+/// ran is kept in `steps`, the failing one too.
 #[allow(clippy::too_many_arguments)]
 pub fn build_forklift(forklift: &Path, mirror: &Path, branch: &str, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration, steps: &mut Vec<Outcome>) -> Result<(), RunError> {
     std::fs::create_dir(to).map_err(|error| RunError::Io(format!("{}: {}", to.display(), error)))?;
@@ -79,9 +80,11 @@ pub fn build_forklift(forklift: &Path, mirror: &Path, branch: &str, to: &Path, s
     let imported = run(&["--json", "git", "import", "--", &mirror])?;
     let current = crate::runner::document(&imported.stdout)["data"]["current"].as_str().map(str::to_string);
     if current.as_deref() != Some(branch) {
-        return Err(RunError::Io(format!(
-            "forklift's import made {:?} current, not {:?}, the branch git's HEAD names: the probes would sit on different commits",
-            current, branch)));
+        // Forklift's own: the import ran and misbuilt, so it is charged as a failed build step.
+        return Err(RunError::BuildFailed {
+            arguments: imported.arguments.clone(), exit: imported.exit, stdout: String::new(),
+            stderr: format!("forklift's import made {:?} current, not {:?}, the branch git's HEAD names: the probes would sit on different commits", current, branch),
+        });
     }
     run(&["--json", "restore", "."])?;
     run(&["--json", "pallet", "create", PROBE_REF])?;
@@ -268,9 +271,11 @@ pub(crate) mod tests {
     }
 
     /// Forklift's subject is held to the branch git's made its probe at: the import making another
-    /// current is refused, naming both, and the one it made current builds.
+    /// current fails the build as the import's step, naming both, and the one it made current
+    /// builds.
     ///
-    /// Revert: drop the check of the import's current pallet → the build held to `main` passes.
+    /// Revert: drop the check of the import's current pallet → the build held to `main` passes;
+    /// refuse it as the harness's own error → it is not charged to forklift.
     #[test]
     #[ignore = "needs PROOF_LOAD_FORKLIFT"]
     fn forklift_s_probe_is_held_to_git_s_branch() {
@@ -280,7 +285,7 @@ pub(crate) mod tests {
         git(&["symbolic-ref", "HEAD", "refs/heads/side"], &mirror, &shared, &environment);
         build_forklift(&forklift, &mirror, "side", &shared.root().join("held"), &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
         let other = build_forklift(&forklift, &mirror, "main", &shared.root().join("other"), &shared, &environment, LIMIT, &mut Vec::new());
-        assert!(matches!(&other, Err(RunError::Io(reason)) if reason.contains(r#"made Some("side") current, not "main""#)), "{:?}", other);
+        assert!(matches!(&other, Err(RunError::BuildFailed { stderr, .. }) if stderr.contains(r#"made Some("side") current, not "main""#)), "{:?}", other);
     }
 
     /// Forklift's history binding set covers its history subject as an import builds it: every
