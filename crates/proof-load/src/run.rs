@@ -232,8 +232,7 @@ fn run_deadline(started: std::time::Instant, budget: Option<u64>) -> Option<std:
 /// Whose a history build step `tool` failed is: forklift's where forklift ran it and refused it
 /// or misbuilt it, or ran past its limit. Git refusing one over the given history is the run's
 /// own, git being the oracle the sample is drawn from, as is a step the harness could not run at
-/// all. Git's steps over forklift's export are charged as forklift's own, since it is forklift's
-/// output they refuse.
+/// all. Git's steps over forklift's export are charged by [`export_charged_to`] instead.
 fn build_charged_to(tool: Tool, error: &crate::runner::RunError) -> Option<Tool> {
     use crate::runner::RunError::{BuildFailed, Tool as Ran};
     let own = tool == Tool::Forklift && matches!(error, BuildFailed { .. } | Ran(crate::tool::ToolError::TimedOut { .. }));

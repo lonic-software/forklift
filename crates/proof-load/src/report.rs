@@ -357,8 +357,8 @@ pub struct Completeness {
     pub subject: Option<Tool>,
     pub check: String,
     pub cell: Cell,
-    /// What the check found missing. Anything here is a failure, of the subject's or the run's,
-    /// whatever the cell says.
+    /// What the check found missing, whatever the cell says: a failure in forklift's checks and the
+    /// run's own, a gap in measure in a git subject's.
     pub missing: Vec<String>,
 }
 
