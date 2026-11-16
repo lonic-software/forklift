@@ -363,9 +363,10 @@ impl Report {
     }
 
     /// The git subjects' completeness checks that found a gap or did not run: where any is, git
-    /// was not fully measured. None in a run given no git, which asked for no comparison.
+    /// was not fully measured. None in a run given no git, which asked for no comparison: the run
+    /// names git among its tools, by its label, exactly when it was given one.
     pub fn git_gaps(&self) -> Vec<&Completeness> {
-        if !self.determinism.tools.contains_key("git") {
+        if !self.determinism.tools.contains_key(Tool::Git.label()) {
             return vec![];
         }
         self.completeness.iter()
@@ -451,12 +452,13 @@ impl Report {
             let _ = writeln!(out, "|---|---|---|---|{}", "---|".repeat(subjects.len()));
             for line in &plate {
                 let cells: Vec<String> = subjects.iter().map(|subject| match line.standings.get(subject) {
+                    None if line.pairing.role == Role::NoCounterpart => "no counterpart".to_string(),
                     None => "not measured".to_string(),
                     Some(standing) => standing_text(standing),
                 }).collect();
                 let _ = writeln!(out, "| {} | {} | {} | {} | {} |", line.pairing.scenario, kebab(line.pairing.side), kebab(line.pairing.role), kebab(line.pairing.kind), cells.join(" | "));
             }
-            out.push_str("\nA subject's cell is its worst row on the line, by grade and then by rescue kind. A subject with no row on a line is not measured there. A role with no counterpart is never compared.\n");
+            out.push_str("\nA subject's cell is its worst row on the line, by grade and then by rescue kind. A subject with no row on a line is not measured there, unless the role has no counterpart in it: such a line is never compared.\n");
         }
 
         out.push_str("\n## Git does better\n\n");
@@ -630,7 +632,8 @@ mod tests {
     }
 
     /// Rows pair only on all four of scenario, side, role and kind; a subject with several rows on
-    /// a line stands at its worst; an unpaired row is not on the plate.
+    /// a line stands at its worst; an unpaired row is not on the plate. A subject absent from a
+    /// line reads as not measured, or as no counterpart on a line whose role has none.
     ///
     /// Revert: keep a subject's first row on a line instead of its worst → forklift stands healed.
     #[test]
@@ -644,6 +647,7 @@ mod tests {
             damage_row(Tool::Git, Client, Role::Object, Kind::Truncate, Grade::Healed, None, Some(1)),
             damage_row(Tool::Git, Client, Role::Log, Kind::Delete, Grade::Healed, None, Some(1)),
             Row { pairing: None, ..damage_row(Tool::Git, Client, Role::Config, Kind::Delete, Grade::Silent, None, None) },
+            damage_row(Tool::Forklift, Host, Role::NoCounterpart, Kind::Delete, Grade::Healed, None, Some(1)),
         ]);
         let plate = report.plate();
         let keys: Vec<(Warehouse, Role, Kind, Vec<Tool>)> = plate.iter()
@@ -653,11 +657,13 @@ mod tests {
             (Client, Role::Object, Kind::Delete, vec![Tool::Forklift, Tool::Git]),
             (Client, Role::Log, Kind::Delete, vec![Tool::Git]),
             (Host, Role::Object, Kind::Delete, vec![Tool::Git]),
+            (Host, Role::NoCounterpart, Kind::Delete, vec![Tool::Forklift]),
         ]);
         let forklift = &plate[1].standings[&Tool::Forklift];
         assert_eq!((forklift.grade, forklift.rows, forklift.detail.as_deref()), (Grade::DataLost, 2, Some("forklift-Object-DataLost.json#")));
         let markdown = report.markdown();
         assert!(markdown.contains("| history | client | object | delete | [data-lost](forklift-Object-DataLost.json#) (worst of 2) | [healed](git-Object-Healed.json#) | not measured |"), "{}", markdown);
+        assert!(markdown.contains("| history | host | no-counterpart | delete | [healed](forklift-NoCounterpart-Healed.json#) | no counterpart | no counterpart |"), "{}", markdown);
     }
 
     /// Git does better by the plate's grade order, then by rescue kind, and never by step count;

@@ -418,7 +418,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     let daemon = git_program.as_deref().is_some_and(runner::has_fsmonitor_daemon);
     let mut configurations = BTreeMap::new();
     if let Some(git_program) = &git_program {
-        tools.insert("git".to_string(), described(git_program));
+        tools.insert(Tool::Git.label().to_string(), described(git_program));
         configurations.insert(Tool::Git.label().to_string(), created_configuration());
         configurations.insert(Tool::GitTuned.label().to_string(), format!("{}; {}", created_configuration(), tuned_configuration(daemon)));
     }
@@ -485,9 +485,20 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             ];
             let picked_bindings = || subjects.iter().flat_map(|(subject, bindings)| bindings.iter().map(move |binding| (*subject, binding)))
                 .filter_map(|(subject, binding)| scenarios.iter().find(|scenario| scenario.id == binding.scenario).map(|scenario| (subject, binding, scenario)));
-            progress.lane(Category::DamagedFiles, Some(picked_bindings().map(|(_, binding, _)| binding.kinds.len()).sum()));
-            for (subject, binding, scenario) in picked_bindings() {
-                fault_errors.entry(subject).or_default();
+            // A binding the role map does not know is the harness's gap, never a row with no
+            // counterpart: that would drop it from every comparison unsaid. The tables are static,
+            // so it is refused once, before any of its faults runs.
+            for (subject, binding, _) in picked_bindings() {
+                let errors = fault_errors.entry(subject).or_default();
+                if crate::git_layout::role_of(subject, binding.name).is_none() {
+                    errors.push(format!("{}: the role map names no role for it", binding.name));
+                }
+            }
+            let roled = || picked_bindings().filter_map(|(subject, binding, scenario)| {
+                crate::git_layout::role_of(subject, binding.name).map(|role| (subject, binding, scenario, role))
+            });
+            progress.lane(Category::DamagedFiles, Some(roled().map(|(_, binding, _, _)| binding.kinds.len()).sum()));
+            for (subject, binding, scenario, role) in roled() {
                 for kind in binding.kinds {
                     let label = damage_label(subject, binding, *kind);
                     start_block(progress, Category::DamagedFiles, &label)?;
@@ -498,12 +509,6 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     });
                     // A git subject's grade is a comparison, never a failure of the run.
                     progress.block_finished(Category::DamagedFiles, &label, result.as_ref().map_or(true, |run| subject == Tool::Forklift && run.grade.is_failure()));
-                    // A binding the role map does not know is the harness's gap, never a row with no
-                    // counterpart: that would drop it from every comparison unsaid.
-                    let role = crate::git_layout::role_of(subject, binding.name);
-                    if role.is_none() {
-                        fault_errors.entry(subject).or_default().push(format!("{} {:?}: the role map names no role for it", binding.name, kind));
-                    }
                     match result {
                         Ok(run) => {
                             write_detail(output.root(), &format!("{}.json", label), &run)?;
@@ -516,7 +521,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                                 recoverability: run.recoverability,
                                 note: (!run.unextractable.is_empty()).then(|| format!("unextractable remedies: {}", run.unextractable.join("; "))),
                                 detail: Some(format!("{}.json#", label)),
-                                pairing: role.map(|role| Pairing { scenario: run.scenario.clone(), side: run.warehouse, role, kind: run.kind }),
+                                pairing: Some(Pairing { scenario: run.scenario.clone(), side: run.warehouse, role, kind: run.kind }),
                             });
                         }
                         Err(error) => fault_errors.entry(subject).or_default().push(format!("{} {:?}: {}", binding.name, kind, error)),
