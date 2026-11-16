@@ -19,8 +19,9 @@ pub enum Event {
     Started(Category, String),
     Finished(Category, String, bool),
     Message(String),
-    /// The run returned, or the harness failed under it; nothing follows.
-    Done(Result<Report, Ended>),
+    /// The run returned, or the harness failed under it; nothing follows. The report is boxed:
+    /// it outweighs every other event.
+    Done(Result<Box<Report>, Ended>),
 }
 
 /// How a run ended without a report: as the run itself said, or on a fault of the harness that
@@ -55,7 +56,7 @@ impl Lane {
 pub struct Meter {
     pub lanes: Vec<Lane>,
     pub messages: Vec<String>,
-    pub ended: Option<Result<Report, Ended>>,
+    pub ended: Option<Result<Box<Report>, Ended>>,
 }
 
 impl Meter {
@@ -156,7 +157,7 @@ impl Worker {
             // A run that panics still ends: the window is told the harness failed, and why, rather
             // than left waiting for a Done that never comes.
             let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&channel))) {
-                Ok(result) => result.map_err(Ended::Run),
+                Ok(result) => result.map(Box::new).map_err(Ended::Run),
                 Err(panic) => Err(Ended::Internal(panicked(&*panic))),
             };
             channel.send(Event::Done(result));

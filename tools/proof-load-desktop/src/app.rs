@@ -172,7 +172,7 @@ impl App {
             // The run has written into its report folder, so the fields are checked again.
             self.checked = None;
             if let Ok(report) = result {
-                self.open(Results::new(report, Path::new(self.form.out.trim()).to_path_buf()));
+                self.open(Results::new(*report, Path::new(self.form.out.trim()).to_path_buf()));
             }
         }
     }
