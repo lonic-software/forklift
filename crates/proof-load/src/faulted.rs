@@ -77,9 +77,11 @@ pub struct HistoryReadback {
 
 /// Written with each successful read's stdout left out, its length kept: over a real history
 /// those bytes ran to some 100 MB a readback (CI, 2026-11-16), so a run's details came to 3.1 GB.
-/// They are no tree's evidence: each record's tree is read from the folder it was laid out in,
-/// and a successful read's stdout is a walk's listing, a hash, or a command's document. A refused
-/// read is kept whole.
+/// They hold no tree's bytes, each record's tree being read from the folder it was laid out in:
+/// a successful read's stdout is a walk's listing, a hash, or a command's document. The listing
+/// and the hash pick which commit is laid out, so a record served from the wrong commit is told
+/// from a right commit holding the wrong tree only by running the read again. A refused read is
+/// kept whole.
 impl serde::Serialize for HistoryReadback {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(serde::Serialize)]
