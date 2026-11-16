@@ -236,11 +236,13 @@ pub const CENSUS_ROLES: &[(&str, Role)] = &[
 ];
 
 /// The role of the path a subject's damage binding names: for Forklift a census path's, from
-/// the role map, and for git a layout row's own. None for a name the subject's table lacks.
+/// the role map, and for git the layout row's own: the row the name is the pattern of, or else
+/// the row whose pattern it matches, as a lock binding names one lock. None for a name the
+/// subject's table lacks.
 pub fn role_of(subject: Tool, name: &str) -> Option<Role> {
     match subject {
         Tool::Forklift => CENSUS_ROLES.iter().find(|(path, _)| *path == name).map(|(_, role)| *role),
-        Tool::Git | Tool::GitTuned => named(name).map(|row| row.role),
+        Tool::Git | Tool::GitTuned => named(name).or_else(|| row_of(name)).map(|row| row.role),
     }
 }
 

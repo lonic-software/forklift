@@ -680,7 +680,7 @@ mod tests {
         assert_eq!(wins(Some((Grade::Healed, None, Some(9))), (Grade::Healed, None, Some(1)), object), [], "fewer steps is not a win");
         assert_eq!(wins(Some((Grade::Healed, None, Some(1))), (Grade::Healed, Some(Rescue::LocalRepair), Some(1)), object), []);
         assert_eq!(wins(Some((Grade::DataLost, None, None)), (Grade::Healed, None, Some(1)), Role::NoCounterpart), [], "no counterpart");
-        assert_eq!(wins(None, (Grade::Healed, None, Some(1)), object), [], "no forklift row");
+        assert_eq!(wins(None, (Grade::Healed, None, Some(1)), object), [], "a line with no row of forklift's");
 
         let report = with_rows(vec![
             damage_row(Tool::Forklift, Client, object, Kind::Zero, Grade::DataLost, None, None),
