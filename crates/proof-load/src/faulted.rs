@@ -465,7 +465,7 @@ impl Context<'_> {
     /// that exits 0 and ends before the depth served the record as missing, which is silent.
     fn read_back_history(&self, bay: &Path, positions: &[Position], marks: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
         let (export, served, reads) = self.serve_history(bay, positions, marks)?;
-        let records = served.into_iter().map(|(mark, readback, _)| RecordReadback { mark, verdicts: vec![oracle::judge(&readback, &expectation(mark))] }).collect();
+        let records = served.into_iter().map(|(mark, readback, reached)| RecordReadback { mark, verdicts: vec![judged_history(&readback, reached, &expectation(mark))] }).collect();
         Ok(HistoryReadback { export, records, parked: None, reads })
     }
 
@@ -973,8 +973,17 @@ fn pallet_heads(stdout: &[u8]) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The verdict on one record of a real history: a record the subject did not reach (a walk that
+/// exited 0 short of it) is silently lost whatever it was expected to hold, even an empty tree;
+/// any other is judged as read.
+fn judged_history(readback: &Readback, reached: bool, expectation: &Expectation) -> Verdict {
+    if reached { oracle::judge(readback, expectation) } else { Verdict::Silent }
+}
+
 /// What `outcome` printed with every mention of `from` written as `to`, both as given and as the
-/// platform resolves it (a temporary folder may be reached through a link).
+/// platform resolves it (a temporary folder may be reached through a link): its stdout and
+/// stderr, and the failure parsed from them, which is what remedies are read from. The failure's
+/// text is already decoded, so a path it names matches however the JSON escaped it.
 fn rebased(mut outcome: Outcome, from: &Path, to: &Path) -> Outcome {
     let mut pairs = vec![(from.display().to_string(), to.display().to_string())];
     if let (Ok(from), Ok(to)) = (std::fs::canonicalize(from), std::fs::canonicalize(to)) {
@@ -986,6 +995,13 @@ fn rebased(mut outcome: Outcome, from: &Path, to: &Path) -> Outcome {
             written = written.replace(from.as_str(), to);
         }
         *text = written.into_bytes();
+    }
+    if let Some(failure) = outcome.failure.as_mut() {
+        for text in std::iter::once(&mut failure.message).chain(failure.next_step.as_mut()) {
+            for (from, to) in &pairs {
+                *text = text.replace(from.as_str(), to);
+            }
+        }
     }
     outcome
 }
@@ -1548,14 +1564,28 @@ mod tests {
     }
 
     /// What forklift printed in a readback copy names the graded warehouse instead, so a remedy
-    /// named by path acts on it.
+    /// named by path acts on it: the remedy texts, read from the parsed failure, name it too.
     ///
-    /// Revert: return the outcome unchanged → the copy's path stays.
+    /// Revert: leave the parsed failure as it was → the remedy texts still name the copy.
     #[test]
     fn a_copy_path_is_written_back_as_the_graded_one() {
-        let outcome = Outcome { arguments: vec![], exit: Some(1), stdout: b"remove /s/readback-0/.forklift/lock".to_vec(), stderr: b"at /s/readback-0".to_vec(), failure: None };
+        let failure = crate::tool::Failure { code: "locked".into(), message: "held at /s/readback-0/.forklift/lock".into(), next_step: Some("remove /s/readback-0/.forklift/lock".into()) };
+        let outcome = Outcome { arguments: vec![], exit: Some(1), stdout: b"remove /s/readback-0/.forklift/lock".to_vec(), stderr: b"at /s/readback-0".to_vec(), failure: Some(failure) };
         let rebased = rebased(outcome, Path::new("/s/readback-0"), Path::new("/s/work"));
         assert_eq!((rebased.stdout.as_slice(), rebased.stderr.as_slice()), (&b"remove /s/work/.forklift/lock"[..], &b"at /s/work"[..]));
+        assert_eq!(rebased.remedy_texts(), ["held at /s/work/.forklift/lock", "remove /s/work/.forklift/lock"]);
+    }
+
+    /// A record a forklift walk ended short of is silently lost even where the baseline expects an
+    /// empty tree, which an unreached record reads back as; a reached one is judged as read.
+    ///
+    /// Revert: judge every record as read → the unreached empty record is expected.
+    #[test]
+    fn an_unreached_record_is_silent_even_when_empty_is_expected() {
+        let empty = Readback::Served { tree: Default::default(), documented: Default::default() };
+        let expected = Expectation::acknowledged(Default::default());
+        assert_eq!(judged_history(&empty, false, &expected), Verdict::Silent);
+        assert_eq!(judged_history(&empty, true, &expected), Verdict::Expected);
     }
 
     use crate::scrub::path_git;
