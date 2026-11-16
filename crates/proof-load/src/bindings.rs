@@ -481,8 +481,8 @@ pub fn check_history(census: &Census, bindings: &[Binding], exemptions: &[Exempt
 
 /// Git's damage bindings over a real history, the same for git at its defaults and tuned: the
 /// layout rows a mirror given a work tree holds, where [`GIT_BINDINGS`] exempts what only a gc
-/// writes, since a mirror holds its refs in `packed-refs` and its objects in a pack. The probe
-/// record writes the probe ref's loose file and nothing before the damage writes a loose object.
+/// writes, since a mirror holds its refs in `packed-refs` and its objects in a pack. The subject's
+/// build writes the probe ref's loose file, and nothing before the damage writes a loose object.
 /// Checked by [`check_git`] against the walk of the pristine subject.
 pub const HISTORY_GIT_BINDINGS: &[Binding] = &[
     over_history("HEAD", FILE),

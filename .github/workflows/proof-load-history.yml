@@ -1,7 +1,8 @@
 # Proof Load over a real history: the fidelity round trips, git to Forklift to git and Forklift to
 # git to Forklift, also take this repository's own history (--history-from), besides their
-# fixtures. Linux only, weekly, and on a pull request that changes this file, so a change to
-# this workflow runs before it merges; a change to the harness alone waits for the weekly run.
+# fixtures, and the damaged-file rows run over a sample of its positions. Linux only, weekly,
+# and on a pull request that changes this file, so a change to this workflow runs before it
+# merges; a change to the harness alone waits for the weekly run.
 # The checkout is a full clone: the harness refuses a shallow one.
 #
 # Non-blocking like the per-PR lane: the run step continues on error, and it is not part of the

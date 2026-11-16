@@ -15,7 +15,8 @@ use crate::tool::{self, Invocation, Outcome};
 pub const SAMPLED: usize = 8;
 
 /// Runs one build step in `directory`, kept in `steps`; a step that does not exit 0 fails the
-/// build, naming it.
+/// build as [`RunError::BuildFailed`], the tool's own refusal, where a step that could not be run
+/// at all is the harness's.
 #[allow(clippy::too_many_arguments)]
 fn step(steps: &mut Vec<Outcome>, program: &Path, arguments: &[&str], directory: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Outcome, RunError> {
     let invocation = Invocation {
@@ -25,7 +26,10 @@ fn step(steps: &mut Vec<Outcome>, program: &Path, arguments: &[&str], directory:
     let outcome = tool::run(&invocation, scratch, environment).map_err(RunError::Tool)?;
     steps.push(outcome.clone());
     if !outcome.succeeded() {
-        return Err(RunError::Io(format!("the history subject could not be built: {:?} exited {:?}: {}", outcome.arguments, outcome.exit, String::from_utf8_lossy(&outcome.stderr).trim())));
+        return Err(RunError::BuildFailed {
+            arguments: outcome.arguments.clone(), exit: outcome.exit,
+            stderr: String::from_utf8_lossy(&outcome.stderr).into_owned(), stdout: String::from_utf8_lossy(&outcome.stdout).into_owned(),
+        });
     }
     Ok(outcome)
 }
@@ -33,35 +37,36 @@ fn step(steps: &mut Vec<Outcome>, program: &Path, arguments: &[&str], directory:
 /// Builds git's pristine history subject at `to`, which must not exist yet, from the mirror at
 /// `mirror`: the mirror copied as `to/.git` and made a work tree's, given the configuration every
 /// repository git makes is given, its `HEAD` checked out, and [`PROBE_REF`] made at that tip and
-/// current. The copy is the harness's, so the mirror is read only. With the steps it ran.
-pub fn build_git(git: &Path, mirror: &Path, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Vec<Outcome>, RunError> {
+/// current. The copy is the harness's, so the mirror is read only. Each step it ran is kept in
+/// `steps`, the failing one too.
+#[allow(clippy::too_many_arguments)]
+pub fn build_git(git: &Path, mirror: &Path, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration, steps: &mut Vec<Outcome>) -> Result<(), RunError> {
     std::fs::create_dir(to).map_err(|error| RunError::Io(format!("{}: {}", to.display(), error)))?;
     crate::scrub::copy_tree(mirror, &to.join(".git")).map_err(|error| RunError::Io(format!("{:?}", error)))?;
-    let mut steps = Vec::new();
-    let mut run = |arguments: &[&str]| step(&mut steps, git, arguments, to, scratch, environment, limit);
+    let mut run = |arguments: &[&str]| step(steps, git, arguments, to, scratch, environment, limit);
     run(&["config", "core.bare", "false"])?;
     for [key, value] in crate::runner::GIT_CREATED_CONFIG {
         run(&["config", key, value])?;
     }
     run(&["checkout", "-f", "-q"])?;
     run(&["switch", "-q", "-c", PROBE_REF])?;
-    Ok(steps)
+    Ok(())
 }
 
 /// Builds forklift's pristine history subject at `to`, which must not exist yet: a fresh
 /// warehouse that imports the mirror at `mirror`, its work tree restored (an import leaves it
-/// empty), and [`PROBE_REF`] made as a pallet at the current head and shifted to. With the steps
-/// it ran.
-pub fn build_forklift(forklift: &Path, mirror: &Path, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Vec<Outcome>, RunError> {
+/// empty), and [`PROBE_REF`] made as a pallet at the current head and shifted to. Each step it ran
+/// is kept in `steps`, the failing one too.
+#[allow(clippy::too_many_arguments)]
+pub fn build_forklift(forklift: &Path, mirror: &Path, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration, steps: &mut Vec<Outcome>) -> Result<(), RunError> {
     std::fs::create_dir(to).map_err(|error| RunError::Io(format!("{}: {}", to.display(), error)))?;
-    let mut steps = Vec::new();
     let mirror = mirror.display().to_string();
-    let mut run = |arguments: &[&str]| step(&mut steps, forklift, arguments, to, scratch, environment, limit);
+    let mut run = |arguments: &[&str]| step(steps, forklift, arguments, to, scratch, environment, limit);
     run(&["--json", "prepare"])?;
     run(&["--json", "git", "import", "--", &mirror])?;
     run(&["--json", "restore", "."])?;
     run(&["--json", "pallet", "create", PROBE_REF])?;
-    Ok(steps)
+    Ok(())
 }
 
 /// Each local branch of git's subject at `subject` with its first-parent length, the probe ref
@@ -209,7 +214,7 @@ pub(crate) mod tests {
         let (shared, environment) = scratch("git-set");
         let mirror = mirrored(&shared, &environment);
         let pristine = shared.root().join("pristine");
-        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT).unwrap();
+        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
         let walked = crate::census::walk(&pristine.join(".git")).unwrap();
         let census = census();
         for tool in [Tool::Git, Tool::GitTuned] {
@@ -232,7 +237,7 @@ pub(crate) mod tests {
         let (shared, environment) = scratch("forklift-set");
         let mirror = mirrored(&shared, &environment);
         let pristine = shared.root().join("pristine");
-        build_forklift(&forklift, &mirror, &pristine, &shared, &environment, LIMIT).unwrap();
+        build_forklift(&forklift, &mirror, &pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
         let walked = crate::census::walk(&pristine.join(".forklift")).unwrap();
         assert_eq!(crate::bindings::check_history_subject(Tool::Forklift, &census(), &walked), Vec::<String>::new(), "{:?}", walked);
     }
@@ -268,7 +273,7 @@ pub(crate) mod tests {
         let (shared, environment) = scratch("git-baseline");
         let mirror = mirrored(&shared, &environment);
         let pristine = shared.root().join("pristine");
-        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT).unwrap();
+        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
         let lengths = git_lengths(&path_git(), &pristine, &shared, &environment, LIMIT).unwrap();
         assert_eq!(lengths, [("main".to_string(), 4), ("side".to_string(), 2)].into_iter().collect());
         let positions = vec![
@@ -294,7 +299,7 @@ pub(crate) mod tests {
         let (shared, environment) = scratch("git-baseline-refused");
         let mirror = mirrored(&shared, &environment);
         let pristine = shared.root().join("pristine");
-        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT).unwrap();
+        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
         let packs = pristine.join(crate::runner::state_folder(Tool::Git)).join("objects/pack");
         let mut zeroed = 0;
         for entry in std::fs::read_dir(&packs).unwrap() {
@@ -331,7 +336,7 @@ pub(crate) mod tests {
         let (shared, environment) = scratch("git-unreached");
         let mirror = mirrored(&shared, &environment);
         let pristine = shared.root().join("pristine");
-        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT).unwrap();
+        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
         // A loose commit on a branch of its own, holding the tip's tree: nothing sampled reaches it.
         let tip_tree = git(&["rev-parse", "main^{tree}"], &pristine, &shared, &environment);
         let lone = git(&["-c", "user.name=p", "-c", "user.email=p@example.invalid", "commit-tree", "-m", "lone", &tip_tree], &pristine, &shared, &environment);
@@ -363,7 +368,7 @@ pub(crate) mod tests {
         let (shared, environment) = scratch("git-reached");
         let mirror = mirrored(&shared, &environment);
         let pristine = shared.root().join("pristine");
-        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT).unwrap();
+        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
         let positions = vec![Position { reference: "main".into(), depth: 1 }, Position { reference: "side".into(), depth: 0 }];
         let programs = programs(PathBuf::from("forklift-not-used"));
         let (row, environment) = scratch("git-reached-base");
@@ -388,8 +393,8 @@ pub(crate) mod tests {
         let (shared, environment) = scratch("forklift-baseline");
         let mirror = mirrored(&shared, &environment);
         let (git_pristine, forklift_pristine) = (shared.root().join("git"), shared.root().join("forklift"));
-        build_git(&path_git(), &mirror, &git_pristine, &shared, &environment, LIMIT).unwrap();
-        build_forklift(&forklift, &mirror, &forklift_pristine, &shared, &environment, LIMIT).unwrap();
+        build_git(&path_git(), &mirror, &git_pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
+        build_forklift(&forklift, &mirror, &forklift_pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
         let lengths = git_lengths(&path_git(), &git_pristine, &shared, &environment, LIMIT).unwrap();
         let present = pallets(&forklift, &forklift_pristine, &shared, &environment, LIMIT).unwrap();
         assert_eq!(present, ["main".to_string(), "side".to_string()].into_iter().collect());

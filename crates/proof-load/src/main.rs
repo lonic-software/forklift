@@ -87,7 +87,8 @@ enum Command {
         #[arg(long = "network")]
         network: Vec<String>,
         /// A git repository whose history the fidelity round trips also take, both ways, besides
-        /// their fixtures. It is read only: the harness mirrors it into its scratch area first. A
+        /// their fixtures, and the damaged-file rows over a sample of its positions, up to two
+        /// hours of them. It is read only: the harness mirrors it into its scratch area first. A
         /// shallow repository is refused.
         #[arg(long)]
         history_from: Option<PathBuf>,
