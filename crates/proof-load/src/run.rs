@@ -278,7 +278,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     if let Err(error) = written {
         return Err(RunError::Refused(format!("cannot write server-writes.json: {}", error)));
     }
-    let not_run = |reason: &str| ["write-op coverage", "read-only exemptions"].map(|check| Completeness { check: check.to_string(), cell: Cell::not_run(reason), missing: vec![] }).to_vec();
+    let not_run = |reason: &str| ["write-op coverage", "read-only exemptions"].map(|check| Completeness { subject: Some(Tool::Forklift), check: check.to_string(), cell: Cell::not_run(reason), missing: vec![] }).to_vec();
     let write_checks = match (&schema, &server) {
         (None, _) => not_run("no forklift binary given"),
         (Some(_), None) => not_run("no forklift-server binary given"),
@@ -298,7 +298,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         (Some(_), None) => Cell::not_run("no census for this version"),
         (Some(_), Some(_)) => Cell::Run,
     };
-    let walk_check = Completeness { check: "census walk".to_string(), cell: walk_cell, missing: walk_missing };
+    let walk_check = Completeness { subject: Some(Tool::Forklift), check: "census walk".to_string(), cell: walk_cell, missing: walk_missing };
     // Every scenario hosts in single mode, so the routes are matched under the single prefix.
     let (route_cell, route_missing) = match (&program, &server, &routes) {
         (None, _, _) => (Cell::not_run("no forklift binary given"), vec![]),
@@ -308,7 +308,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         _ if only.is_some() => (Cell::not_run("--only builds one scenario"), vec![]),
         (Some(_), Some(_), Some(routes)) => (Cell::Run, crate::routes::check(routes, crate::routes::Mode::Single, &exchanges, crate::bindings::ROUTE_EXEMPTIONS)),
     };
-    let route_check = Completeness { check: "server routes answered".to_string(), cell: route_cell, missing: route_missing };
+    let route_check = Completeness { subject: Some(Tool::Forklift), check: "server routes answered".to_string(), cell: route_cell, missing: route_missing };
     let (route_write_cell, route_write_missing) = match (&program, &server, &routes, &traced) {
         (None, _, _, _) => (Cell::not_run("no forklift binary given"), vec![]),
         (_, None, _, _) => (Cell::not_run("no forklift-server binary given"), vec![]),
@@ -319,19 +319,56 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         (Some(_), Some(_), Some(routes), Ok(_)) => (Cell::Run, crate::routewrites::check(routes, crate::routes::Mode::Single, &servings,
             crate::bindings::ROUTE_WRITES, crate::bindings::BACKGROUND_WRITES, crate::bindings::ADMISSION_WRITES)),
     };
-    let route_write_check = Completeness { check: "server route writes".to_string(), cell: route_write_cell, missing: route_write_missing };
+    let route_write_check = Completeness { subject: Some(Tool::Forklift), check: "server route writes".to_string(), cell: route_write_cell, missing: route_write_missing };
 
     let damage_check = match &census {
-        None => Completeness { check: "damage bindings".to_string(), cell: Cell::not_run("no census for this version"), missing: vec![] },
+        None => Completeness { subject: Some(Tool::Forklift), check: "damage bindings".to_string(), cell: Cell::not_run("no census for this version"), missing: vec![] },
         Some(census) => {
             let missing = crate::bindings::check(census, crate::bindings::BINDINGS, crate::bindings::EXEMPTIONS, &scenario::catalog(), &created);
-            Completeness { check: "damage bindings".to_string(), cell: Cell::Run, missing }
+            Completeness { subject: Some(Tool::Forklift), check: "damage bindings".to_string(), cell: Cell::Run, missing }
         }
     };
 
-    // Every damage binding, every kind it names, each on a fresh build of its scenario.
+    // Git's own layout, walked after each scenario git can run is built with it: every path no
+    // layout row classifies, what each build created for the git damage bindings, and the role
+    // map's gaps against the census.
+    let git_runnable: Vec<String> = scenario::catalog().into_iter().filter(|scenario| scenario.tools().contains(&Tool::Git)).map(|scenario| scenario.id).collect();
+    let mut git_walks: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut git_walk_missing = Vec::new();
+    let git_program = git.as_deref().map(tool::absolute).transpose().map_err(|error| RunError::Refused(format!("the git path: {}", error)))?;
+    if let Some(git_program) = &git_program {
+        for scenario in scenarios.iter().filter(|scenario| git_runnable.contains(&scenario.id)) {
+            let label = format!("git-{}", scenario.id);
+            let built = in_area(&mut output, &label, &search_path, |scratch, environment| {
+                runner::build(scenario, &corpus, Tool::Git, git_program, None, scratch, environment, limit, None).map_err(|error| error.to_string())
+            });
+            match built {
+                Ok(built) => {
+                    git_walk_missing.extend(crate::git_layout::unclassified(&built.walked).into_iter().map(|path| format!("{}: {}", scenario.id, path)));
+                    git_walks.insert(scenario.id.clone(), built.walked);
+                }
+                Err(error) => git_walk_missing.push(format!("{}: not built: {}", scenario.id, error)),
+            }
+        }
+    }
+    let git_cell = match &git_program { None => Cell::not_run("no git binary given"), Some(_) => Cell::Run };
+    let git_walk_check = Completeness { subject: Some(Tool::Git), check: "git layout walk".to_string(), cell: git_cell.clone(), missing: git_walk_missing };
+    let git_damage_check = Completeness {
+        subject: Some(Tool::Git), check: "git damage bindings".to_string(), cell: git_cell,
+        missing: match &git_program {
+            None => vec![],
+            Some(_) => crate::bindings::check_git(crate::bindings::GIT_BINDINGS, crate::bindings::GIT_EXEMPTIONS, &git_runnable, &git_walks),
+        },
+    };
+    let role_check = match &census {
+        None => Completeness { subject: None, check: "role map".to_string(), cell: Cell::not_run("no census for this version"), missing: vec![] },
+        Some(census) => Completeness { subject: None, check: "role map".to_string(), cell: Cell::Run, missing: crate::git_layout::role_gaps(census, crate::git_layout::CENSUS_ROLES) },
+    };
+
+    // Every damage binding, every kind it names, each on a fresh build of its scenario: forklift's
+    // over its census, then git at its defaults and tuned over the git layout.
     let mut rows = Vec::new();
-    let mut fault_errors = Vec::new();
+    let mut fault_errors: BTreeMap<Tool, Vec<String>> = BTreeMap::new();
     let damaged_cell = match (&forklift, &git, &census) {
         (None, _, _) => Cell::not_run("no forklift binary given"),
         (_, None, _) => Cell::not_run("no git binary given to lay out the readback"),
@@ -343,16 +380,19 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             tools.insert("git".to_string(), described(&git));
             let programs = Programs { forklift, git, server: server.clone() };
             let faulted_corpus = faulted_corpus(seed);
-            let picked_bindings = || crate::bindings::BINDINGS.iter()
-                .filter_map(|binding| scenarios.iter().find(|scenario| scenario.id == binding.scenario).map(|scenario| (binding, scenario)));
-            progress.lane(Category::DamagedFiles, Some(picked_bindings().map(|(binding, _)| binding.kinds.len()).sum()));
-            for (binding, scenario) in picked_bindings() {
+            let subjects = [(Tool::Forklift, crate::bindings::BINDINGS), (Tool::Git, crate::bindings::GIT_BINDINGS), (Tool::GitTuned, crate::bindings::GIT_BINDINGS)];
+            let picked_bindings = || subjects.iter().flat_map(|(subject, bindings)| bindings.iter().map(move |binding| (*subject, binding)))
+                .filter_map(|(subject, binding)| scenarios.iter().find(|scenario| scenario.id == binding.scenario).map(|scenario| (subject, binding, scenario)));
+            progress.lane(Category::DamagedFiles, Some(picked_bindings().map(|(_, binding, _)| binding.kinds.len()).sum()));
+            for (subject, binding, scenario) in picked_bindings() {
+                fault_errors.entry(subject).or_default();
                 for kind in binding.kinds {
-                    let label = format!("{}-{}-{:?}", binding.scenario, binding.name, kind).replace(['/', '<', '>', '{', '}'], "_");
+                    let prefix = match subject { Tool::Forklift => String::new(), other => format!("{}-", other.label()) };
+                    let label = format!("{}{}-{}-{:?}", prefix, binding.scenario, binding.name, kind).replace(['/', '<', '>', '{', '}', '*'], "_");
                     start_block(progress, Category::DamagedFiles, &label)?;
                     let result = output.scratch(&label).map_err(|error| error.to_string()).and_then(|scratch| {
                         let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
-                        faulted::run(scenario, binding.name, binding.warehouse, *kind, &faulted_corpus, &programs, &scratch, &environment, std::time::Duration::from_secs(120), seed)
+                        faulted::run(scenario, binding.name, binding.warehouse, *kind, subject, &faulted_corpus, &programs, &scratch, &environment, std::time::Duration::from_secs(120), seed)
                             .map_err(|error| error.to_string())
                     });
                     progress.block_finished(Category::DamagedFiles, &label, result.as_ref().map_or(true, |run| run.grade.is_failure()));
@@ -360,23 +400,28 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                         Ok(run) => {
                             write_detail(output.root(), &format!("{}.json", label), &run)?;
                             rows.push(Row {
+                                subject,
                                 scenario: format!("{} {}{} {:?}", run.scenario, if run.warehouse == Warehouse::Host { "host:" } else { "" }, run.target, run.kind),
                                 category: if run.kind.plants() { Category::DeadPidLock } else { Category::DamagedFiles },
-                                binding: "forklift".to_string(),
+                                binding: match subject { Tool::Forklift => "forklift", Tool::Git | Tool::GitTuned => "git" }.to_string(),
                                 grade: run.grade,
                                 recoverability: run.recoverability,
                                 note: (!run.unextractable.is_empty()).then(|| format!("unextractable remedies: {}", run.unextractable.join("; "))),
                                 detail: Some(format!("{}.json#", label)),
                             });
                         }
-                        Err(error) => fault_errors.push(format!("{} {:?}: {}", binding.name, kind, error)),
+                        Err(error) => fault_errors.entry(subject).or_default().push(format!("{} {:?}: {}", binding.name, kind, error)),
                     }
                 }
             }
             Cell::Run
         }
     };
-    let fault_check = Completeness { check: "damaged-file faults ran".to_string(), cell: damaged_cell.clone(), missing: fault_errors };
+    // One check per subject that ran; forklift's even when it did not.
+    fault_errors.entry(Tool::Forklift).or_default();
+    let fault_checks: Vec<Completeness> = fault_errors.into_iter().map(|(subject, missing)| Completeness {
+        subject: Some(subject), check: "damaged-file faults ran".to_string(), cell: damaged_cell.clone(), missing,
+    }).collect();
 
     // Disk full on the capped volume and a read-only work folder, each under the faulted command of
     // the scenarios named for it, lifted before the grading readback.
@@ -521,7 +566,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         if !run.graded.unextractable.is_empty() {
             note.push_str(&format!("; unextractable remedies: {}", run.graded.unextractable.join("; ")));
         }
-        rows.push(Row {
+        rows.push(Row { subject: Tool::Forklift,
             scenario: run.label(), category: Category::Network, binding: "forklift".to_string(),
             grade: run.graded.grade, recoverability: run.graded.recoverability, note: Some(note),
             detail: Some(format!("{}.json#/graded", label)),
@@ -535,7 +580,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         if !run.graded.unextractable.is_empty() {
             note.push_str(&format!("; unextractable remedies: {}", run.graded.unextractable.join("; ")));
         }
-        rows.push(Row {
+        rows.push(Row { subject: Tool::Forklift,
             scenario: format!("{} {}", run.scenario, run.condition), category, binding: "forklift".to_string(),
             grade: run.graded.grade, recoverability: run.graded.recoverability, note: Some(note),
             detail: Some(format!("{}.json#/graded", label)),
@@ -594,7 +639,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                 if !graded.unextractable.is_empty() {
                     note.push_str(&format!("; unextractable remedies: {}", graded.unextractable.join("; ")));
                 }
-                rows.push(Row {
+                rows.push(Row { subject: Tool::Forklift,
                     scenario: format!("{} on a {}", scenario.id, category.label()), category, binding: "forklift".to_string(),
                     grade: graded.grade, recoverability: graded.recoverability, note: Some(note),
                     detail: Some(format!("{}-folding-volume.json#", scenario.id)),
@@ -616,6 +661,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         (Category::CaseFolding, "case-folding faults ran", &case_folding_cell), (Category::NoExec, "no-exec faults ran", &no_exec_cell),
         (Category::Network, "network faults ran", &network_cell),
     ].into_iter().map(|(category, check, cell)| Completeness {
+        subject: Some(Tool::Forklift),
             check: check.to_string(), cell: cell.clone(), missing: condition_errors.remove(&category).unwrap_or_default(),
         }).collect();
 
@@ -786,16 +832,16 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         Err((kill, power)) => (Cell::not_run(kill), Cell::not_run(power), Cell::not_run(kill), Cell::not_run(power)),
     };
     if kill_completeness.is_empty() {
-        kill_completeness.push(Completeness { check: "kill-point units".to_string(), cell: kill_cell.clone(), missing: vec![] });
+        kill_completeness.push(Completeness { subject: Some(Tool::Forklift), check: "kill-point units".to_string(), cell: kill_cell.clone(), missing: vec![] });
     }
     if server_kill_completeness.is_empty() {
-        server_kill_completeness.push(Completeness { check: "server kill-point units".to_string(), cell: server_kill_cell.clone(), missing: vec![] });
+        server_kill_completeness.push(Completeness { subject: Some(Tool::Forklift), check: "server kill-point units".to_string(), cell: server_kill_cell.clone(), missing: vec![] });
     }
     if power_completeness.is_empty() {
-        power_completeness.push(Completeness { check: "power-loss states".to_string(), cell: power_cell.clone(), missing: vec![] });
+        power_completeness.push(Completeness { subject: Some(Tool::Forklift), check: "power-loss states".to_string(), cell: power_cell.clone(), missing: vec![] });
     }
     if server_power_completeness.is_empty() {
-        server_power_completeness.push(Completeness { check: "server power-loss states".to_string(), cell: server_power_cell.clone(), missing: vec![] });
+        server_power_completeness.push(Completeness { subject: Some(Tool::Forklift), check: "server power-loss states".to_string(), cell: server_power_cell.clone(), missing: vec![] });
     }
 
     let mut coverage = CoverageTable::new(Platform::current(), |category: Category| match category {
@@ -821,7 +867,8 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     if matches!(server_power_cell, Cell::Run | Cell::Sampled) || server_power_not_reached > 0 {
         coverage.not_reached.insert(Category::PowerLossServer, server_power_not_reached);
     }
-    let mut completeness = vec![damage_check, walk_check, route_check, route_write_check, fault_check];
+    let mut completeness = vec![damage_check, walk_check, git_walk_check, git_damage_check, role_check, route_check, route_write_check];
+    completeness.extend(fault_checks);
     completeness.extend(condition_checks);
     completeness.extend(write_checks);
     completeness.extend(kill_completeness);

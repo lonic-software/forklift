@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::oracle::{Grade, Recoverability};
+use crate::scenario::Tool;
 use crate::tool::Outcome;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
@@ -197,10 +198,12 @@ pub struct Determinism {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Row {
+    /// The tool under test whose result the row is: forklift, git or git tuned.
+    pub subject: Tool,
     pub scenario: String,
     pub category: Category,
-    /// The program the row faulted: `forklift`, or `forklift-server` for a hosted scenario's
-    /// server. A row's steps are the forklift commands its scenario ran either way.
+    /// The program the row faulted: `forklift`, `forklift-server` for a hosted scenario's server,
+    /// or `git`. A row's steps are the commands of its subject that its scenario ran.
     pub binding: String,
     pub grade: Grade,
     pub recoverability: Recoverability,
@@ -236,6 +239,8 @@ impl Row {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Completeness {
+    /// The subject the check is about; none for one about the run itself.
+    pub subject: Option<Tool>,
     pub check: String,
     pub cell: Cell,
     /// What the check found missing; a run cell with anything here is a failure.
@@ -248,14 +253,14 @@ impl Completeness {
     pub fn budget(elapsed: std::time::Duration, budget: Option<std::time::Duration>) -> Completeness {
         let check = "wall-clock budget".to_string();
         match budget {
-            None => Completeness { check, cell: Cell::not_run("no budget given"), missing: vec![] },
+            None => Completeness { subject: None, check, cell: Cell::not_run("no budget given"), missing: vec![] },
             Some(budget) => {
                 let missing = if elapsed > budget {
                     vec![format!("the run took {} s, over its budget of {} s", elapsed.as_secs(), budget.as_secs())]
                 } else {
                     vec![]
                 };
-                Completeness { check, cell: Cell::Run, missing }
+                Completeness { subject: None, check, cell: Cell::Run, missing }
             }
         }
     }
@@ -263,7 +268,7 @@ impl Completeness {
 
 /// The report's format. A reader refuses any other, so a report written by another build of the
 /// harness is never read as if it meant the same thing.
-pub const REPORT_FORMAT: u32 = 1;
+pub const REPORT_FORMAT: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -280,9 +285,10 @@ pub struct Report {
 }
 
 impl Report {
-    /// Whether the run failed: a failing grade, or a completeness check that ran and found a gap.
+    /// Whether the run failed: a failing grade of forklift's, or a completeness check that ran and
+    /// found a gap. Another subject's grade is a comparison, never a failure of the run.
     pub fn failed(&self) -> bool {
-        self.rows.iter().chain(&self.forklift_only).any(|row| row.grade.is_failure())
+        self.rows.iter().chain(&self.forklift_only).any(|row| row.subject == Tool::Forklift && row.grade.is_failure())
             || self.completeness.iter().any(|check| !check.missing.is_empty())
     }
 
@@ -308,7 +314,8 @@ impl Report {
 
         out.push_str("\n## Completeness\n\n");
         for check in &self.completeness {
-            let _ = writeln!(out, "- {}: {}", check.check, check.cell.text());
+            let subject = check.subject.map(|subject| format!(" ({})", subject.label())).unwrap_or_default();
+            let _ = writeln!(out, "- {}{}: {}", check.check, subject, check.cell.text());
             for missing in &check.missing {
                 let _ = writeln!(out, "  - missing: {}", missing);
             }
@@ -320,12 +327,12 @@ impl Report {
                 out.push_str("None.\n");
                 continue;
             }
-            out.push_str("| Scenario | Fault | Binding | Grade | Commands to expected | Right remedy | Outside knowledge |\n|---|---|---|---|---|---|---|\n");
+            out.push_str("| Subject | Scenario | Fault | Binding | Grade | Commands to expected | Right remedy | Outside knowledge |\n|---|---|---|---|---|---|---|---|\n");
             for row in rows {
                 let grade = serde_json::to_value(row.grade).ok().and_then(|value| value.as_str().map(str::to_string)).unwrap_or_default();
                 let commands = row.recoverability.commands_to_expected.map_or("never".to_string(), |n| n.to_string());
                 let outside = if row.recoverability.outside_knowledge.is_empty() { "none".to_string() } else { row.recoverability.outside_knowledge.join("; ") };
-                let _ = writeln!(out, "| {} | {} | {} | {} | {} | {} | {} |", row.scenario, row.category.label(), row.binding, grade, commands,
+                let _ = writeln!(out, "| {} | {} | {} | {} | {} | {} | {} | {} |", row.subject.label(), row.scenario, row.category.label(), row.binding, grade, commands,
                     if row.recoverability.named_right_remedy { "yes" } else { "no" }, outside);
             }
             if rows.iter().any(|row| row.grade == Grade::DataLost) {
@@ -385,7 +392,7 @@ mod tests {
             format: REPORT_FORMAT,
             coverage: CoverageTable::new(Platform::Linux, |_| Cell::Run),
             determinism: Determinism { seed: 1, tools: BTreeMap::new(), scenarios: vec![], platform: Platform::Linux, environment: BTreeMap::new() },
-            completeness: vec![Completeness { check: "damage".to_string(), cell: Cell::Run, missing: vec!["trust".to_string()] }],
+            completeness: vec![Completeness { subject: Some(Tool::Forklift), check: "damage".to_string(), cell: Cell::Run, missing: vec!["trust".to_string()] }],
             rows: vec![],
             forklift_only: vec![],
         };
@@ -415,8 +422,8 @@ mod tests {
                 _ => Cell::not_run("not asked for"),
             }),
             determinism: Determinism { seed: 3, tools: BTreeMap::new(), scenarios: vec!["trust".to_string()], platform: Platform::Linux, environment: BTreeMap::new() },
-            completeness: vec![Completeness { check: "damage".to_string(), cell: Cell::Run, missing: vec![] }],
-            rows: vec![Row {
+            completeness: vec![Completeness { subject: Some(Tool::Forklift), check: "damage".to_string(), cell: Cell::Run, missing: vec![] }],
+            rows: vec![Row { subject: Tool::Forklift,
                 scenario: "trust".to_string(), category: Category::DamagedFiles, binding: "forklift".to_string(), grade: Grade::RefusedWorkingRemedy,
                 recoverability: Recoverability { commands_to_expected: Some(2), named_right_remedy: true, outside_knowledge: vec![] },
                 note: None, detail: Some("trust-head.json#".to_string()),
@@ -484,7 +491,7 @@ mod tests {
     }
 
     fn row_at(detail: Option<&str>) -> Row {
-        Row { detail: detail.map(str::to_string), ..sample().rows.remove(0) }
+        Row { subject: Tool::Forklift, detail: detail.map(str::to_string), ..sample().rows.remove(0) }
     }
 
     /// A row's steps are the ones at its pointer, in its file under the run's folder: a details

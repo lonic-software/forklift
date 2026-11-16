@@ -100,7 +100,7 @@ impl std::fmt::Display for RunError {
 impl std::error::Error for RunError {}
 
 /// The state folder a tool keeps beside its work tree.
-fn state_folder(tool: Tool) -> &'static str {
+pub(crate) fn state_folder(tool: Tool) -> &'static str {
     match tool {
         Tool::Forklift => ".forklift",
         Tool::Git | Tool::GitTuned => ".git",
@@ -113,6 +113,21 @@ fn prepare(tool: Tool) -> Vec<String> {
         Tool::Forklift => vec!["--json".into(), "prepare".into()],
         Tool::Git | Tool::GitTuned => vec!["init".into(), "-q".into(), "-b".into(), "main".into()],
     }
+}
+
+/// The configuration every repository git makes is given at creation, before any history: no
+/// detached background gc or maintenance, so nothing runs on in the background after a command
+/// exits and a grade never depends on what a leftover process did.
+pub(crate) const GIT_CREATED_CONFIG: &[[&str; 2]] = &[["gc.autoDetach", "false"], ["maintenance.autoDetach", "false"]];
+
+/// The listing of git's parked work: each stash commit, newest first.
+pub(crate) const STASH_LIST: &[&str] = &["stash", "list", "--format=%H"];
+
+/// The stash commits [`STASH_LIST`] printed, newest first; nothing when it printed something
+/// other than one commit id per line.
+pub fn stashed_commits(stdout: &[u8]) -> Option<Vec<String>> {
+    let text = std::str::from_utf8(stdout).ok()?;
+    text.lines().map(|line| (line.len() == 40 && line.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| line.to_string())).collect()
 }
 
 /// The host warehouse a `Host` operation serves, beside the work tree in the scratch area.
@@ -167,6 +182,11 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
     };
 
     let mut outcomes = vec![run_in(program, prepare(tool), scratch.work())?];
+    if tool != Tool::Forklift {
+        for [key, value] in GIT_CREATED_CONFIG {
+            outcomes.push(run_in(program, vec!["config".into(), key.to_string(), value.to_string()], scratch.work())?);
+        }
+    }
     let mut acknowledged = Vec::new();
     let mut taken = Vec::new();
     let mut ledger = RedactionLedger::default();
@@ -387,7 +407,15 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
         }
     }
 
-    let parked = if tool == Tool::Forklift && scenario.history.iter().any(|op| matches!(op, Op::Park { .. })) {
+    let parks = scenario.history.iter().any(|op| matches!(op, Op::Park { .. }));
+    let parked = if tool != Tool::Forklift && parks {
+        let listed = run_in(program, STASH_LIST.iter().map(|argument| argument.to_string()).collect(), scratch.work())?;
+        // Refusing or unreadable fails the build, as forklift's listing does below.
+        let parked = stashed_commits(&listed.stdout).filter(|commits| !commits.is_empty())
+            .ok_or_else(|| RunError::Io(format!("scenario {}: `git stash list` printed no stash commit: {}", scenario.id, String::from_utf8_lossy(&listed.stdout))));
+        outcomes.push(listed);
+        parked?
+    } else if tool == Tool::Forklift && parks {
         let listed = run_in(program, vec!["--json".into(), "park".into(), "list".into()], scratch.work())?;
         // The history runs on an undamaged warehouse, so a listing that refuses, or exits 0 but
         // cannot be read, fails the build: an empty list here would let every readback pass

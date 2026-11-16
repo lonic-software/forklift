@@ -108,6 +108,8 @@ pub struct Faulted {
 
 /// The parts of a faulted run that stay fixed across its steps.
 pub(crate) struct Context<'a> {
+    /// The subject the faulted command, its retries and its readback run as.
+    pub(crate) tool: Tool,
     pub(crate) corpus: &'a Corpus,
     pub(crate) programs: &'a Programs,
     pub(crate) scratch: &'a Scratch,
@@ -125,6 +127,14 @@ pub(crate) struct Context<'a> {
 }
 
 impl Context<'_> {
+    /// The binary of the subject under test.
+    pub(crate) fn program(&self) -> &Path {
+        match self.tool {
+            Tool::Forklift => &self.programs.forklift,
+            Tool::Git | Tool::GitTuned => &self.programs.git,
+        }
+    }
+
     pub(crate) fn run(&self, program: &Path, arguments: Vec<String>, directory: PathBuf) -> Result<Outcome, RunError> {
         let invocation = Invocation { program: program.to_path_buf(), arguments, directory, limit: self.limit };
         tool::run(&invocation, self.scratch, self.environment).map_err(RunError::Tool)
@@ -155,14 +165,14 @@ impl Context<'_> {
     fn retry_from(&self, index: usize, from: Resume, steps: &mut Vec<Outcome>) -> Result<(bool, Resume), RunError> {
         self.write_snapshot(index)?;
         let lines = self.lines(index)?;
-        resume_lines(lines, from, steps, |arguments| self.run(&self.programs.forklift, arguments, self.scratch.work()))
+        resume_lines(lines, from, steps, |arguments| self.run(self.program(), arguments, self.scratch.work()))
     }
 
     /// The faulted command's lines for corpus record `index`, run in order until one fails, its
     /// snapshot already written: an environment fault is set between the two.
     pub(crate) fn run_lines(&self, index: usize, steps: &mut Vec<Outcome>) -> Result<bool, RunError> {
         for arguments in self.lines(index)? {
-            let outcome = self.run(&self.programs.forklift, arguments, self.scratch.work())?;
+            let outcome = self.run(self.program(), arguments, self.scratch.work())?;
             let succeeded = outcome.succeeded();
             steps.push(outcome);
             if !succeeded {
@@ -184,7 +194,8 @@ impl Context<'_> {
     pub(crate) fn lines(&self, index: usize) -> Result<Vec<Vec<String>>, RunError> {
         let mut lines = Vec::new();
         for op in std::iter::once(&Op::Record { index }).chain(self.then) {
-            for arguments in bind(Tool::Forklift, op).expect("Tool::Forklift binds every operation") {
+            let bound = bind(self.tool, op).ok_or_else(|| RunError::Io(format!("{:?} has no {:?} binding", op, self.tool)))?;
+            for arguments in bound {
                 lines.push(runner::fill(arguments, self.url, &self.scratch.work())
                     .map_err(|placeholder| RunError::Io(format!("{:?} needs {} and the scenario hosts nothing", op, placeholder)))?);
             }
@@ -195,13 +206,16 @@ impl Context<'_> {
     /// How many of the faulted command's leading lines acknowledge its record, as
     /// [`acknowledging`] counts them for this run's `then` and readback.
     pub(crate) fn acknowledging(&self) -> Result<usize, RunError> {
-        acknowledging(self.then, self.via_host).map_err(RunError::Io)
+        acknowledging(self.tool, self.then, self.via_host).map_err(RunError::Io)
     }
 
     /// Reads every record in `marks` back through the tool. `expectation` gives what each may
     /// hold; a record in `required` that an export exiting 0 leaves out was served as missing,
     /// which is silent.
     fn read_back(&self, marks: &[Mark], required: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
+        if self.tool != Tool::Forklift {
+            return self.read_back_git(marks, required, expectation);
+        }
         if let Some(scope) = self.scope {
             return self.read_back_scoped(scope, marks, required, |mark| within(expectation(mark), scope));
         }
@@ -280,15 +294,73 @@ impl Context<'_> {
         Ok(HistoryReadback { export, records, parked: None })
     }
 
-    /// What `park list` says of the `parked` parcels, read in the work tree; nothing when none
-    /// were parked.
+    /// Git's readback, the git half of forklift's: the log of the work tree's repository, then a
+    /// checkout of each commit whose subject is a record's message into a fresh folder of its own.
+    /// Both run against a scratch index (`GIT_INDEX_FILE`), so git is read from its history, never
+    /// its index: a damaged index or a stale index lock is not in the way, and the repository's
+    /// own index is left as it was. A log or checkout git refuses is git refusing to read, never an
+    /// empty tree served; a record a log that exits 0 leaves out was served as missing.
+    fn read_back_git(&self, marks: &[Mark], required: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
+        if self.via_host || self.scope.is_some() {
+            return Err(RunError::Io("git reads back only an unscoped work tree".to_string()));
+        }
+        let mut environment = self.environment.clone();
+        environment.variables.insert("GIT_INDEX_FILE".to_string(), self.fresh("index").display().to_string());
+        let git = |arguments: &[&str]| {
+            let invocation = Invocation {
+                program: self.programs.git.clone(), arguments: arguments.iter().map(|argument| argument.to_string()).collect(),
+                directory: self.scratch.work(), limit: self.limit,
+            };
+            tool::run(&invocation, self.scratch, &environment).map_err(RunError::Tool)
+        };
+        let log = git(&["log", "--all", "--format=%H%x09%s"])?;
+        if !log.succeeded() {
+            return Ok(HistoryReadback { export: log, records: Vec::new(), parked: None });
+        }
+        let subjects: Vec<(String, String)> = String::from_utf8_lossy(&log.stdout).lines()
+            .filter_map(|line| line.split_once('\t')).map(|(hash, subject)| (hash.to_string(), subject.to_string()))
+            .collect();
+
+        let mut records = Vec::new();
+        for &mark in marks {
+            let message = mark.message();
+            let mut verdicts = Vec::new();
+            let mut hashes: Vec<&String> = subjects.iter().filter(|(_, subject)| *subject == message).map(|(hash, _)| hash).collect();
+            hashes.dedup();
+            for hash in hashes {
+                let laid_out = self.fresh("record");
+                std::fs::create_dir(&laid_out).map_err(|error| RunError::Io(format!("{}: {}", laid_out.display(), error)))?;
+                let work_tree = format!("--work-tree={}", laid_out.display());
+                let checkout = git(&[&work_tree, "checkout", "-f", "-q", hash, "--", "."])?;
+                let readback = if checkout.succeeded() {
+                    Readback::Served { tree: oracle::read_tree_when(&laid_out, self.corpus.modes.judged()).map_err(|error| RunError::Io(error.to_string()))?, documented: Default::default() }
+                } else {
+                    Readback::Refused { code: None }
+                };
+                verdicts.push(oracle::judge(&readback, &expectation(mark)));
+            }
+            if verdicts.is_empty() && required.contains(&mark) {
+                verdicts.push(Verdict::Silent);
+            }
+            records.push(RecordReadback { mark, verdicts });
+        }
+        Ok(HistoryReadback { export: log, records, parked: None })
+    }
+
+    /// What the subject's listing of parked work says of the `parked` entries, read in the work
+    /// tree: `park list` naming each parcel, or `git stash list` each stash commit. Nothing when
+    /// none were parked.
     fn read_back_parked(&self, parked: &[String]) -> Result<Option<ParkedReadback>, RunError> {
         if parked.is_empty() {
             return Ok(None);
         }
-        let listing = self.run(&self.programs.forklift, vec!["--json".into(), "park".into(), "list".into()], self.scratch.work())?;
+        let (arguments, read): (Vec<String>, fn(&[u8]) -> Option<Vec<String>>) = match self.tool {
+            Tool::Forklift => (vec!["--json".into(), "park".into(), "list".into()], runner::parked_parcels),
+            Tool::Git | Tool::GitTuned => (runner::STASH_LIST.iter().map(|argument| argument.to_string()).collect(), runner::stashed_commits),
+        };
+        let listing = self.run(self.program(), arguments, self.scratch.work())?;
         // A listing that exits 0 but cannot be read names nothing, so every park is missing.
-        let listed = if listing.succeeded() { runner::parked_parcels(&listing.stdout).unwrap_or_default() } else { Vec::new() };
+        let listed = if listing.succeeded() { read(&listing.stdout).unwrap_or_default() } else { Vec::new() };
         let missing = parked.iter().filter(|parcel| !listed.contains(parcel)).cloned().collect();
         Ok(Some(ParkedReadback { listing, missing }))
     }
@@ -437,9 +509,9 @@ fn next_record(acknowledged: &[Mark]) -> usize {
 /// the host (`via_host`), every line through the last of the last push, once it exits the host
 /// holds it. A host-side readback of a command that pushes nothing has no line that acknowledges
 /// the record, and is refused rather than graded against one.
-pub(crate) fn acknowledging(then: &[Op], via_host: bool) -> Result<usize, String> {
-    let lines = |op: &Op| bind(Tool::Forklift, op).expect("Tool::Forklift binds every operation").len();
-    let record = own_lines();
+pub(crate) fn acknowledging(tool: Tool, then: &[Op], via_host: bool) -> Result<usize, String> {
+    let lines = |op: &Op| bind(tool, op).map_or(0, |lines| lines.len());
+    let record = own_lines(tool);
     if !via_host {
         return Ok(record);
     }
@@ -455,17 +527,17 @@ pub(crate) fn acknowledging(then: &[Op], via_host: bool) -> Result<usize, String
 }
 
 /// How many lines the faulted command's record itself runs, before any of the scenario's after it.
-fn own_lines() -> usize {
-    bind(Tool::Forklift, &Op::Record { index: 0 }).expect("Tool::Forklift binds every operation").len()
+fn own_lines(tool: Tool) -> usize {
+    bind(tool, &Op::Record { index: 0 }).map_or(0, |lines| lines.len())
 }
 
 /// Per line of a faulted command that runs its record and then `then`, whether a settle that finds
 /// the record served answers for it: the record's own lines, which the record being there says
 /// ran, and a push's, which the record being on the host says ran. Any other line (a compaction)
 /// says nothing of the record, and a refusal of it is its own answer.
-fn vouched(then: &[Op]) -> Vec<bool> {
-    let lines = |op: &Op| bind(Tool::Forklift, op).expect("Tool::Forklift binds every operation").len();
-    let mut vouched = vec![true; own_lines()];
+fn vouched(tool: Tool, then: &[Op]) -> Vec<bool> {
+    let lines = |op: &Op| bind(tool, op).map_or(0, |lines| lines.len());
+    let mut vouched = vec![true; own_lines(tool)];
     for op in then {
         vouched.extend(std::iter::repeat_n(matches!(op, Op::Push), lines(op)));
     }
@@ -512,10 +584,10 @@ impl Made {
     /// runs again, so a refusal for good is refused again and never completes. An attempt
     /// acknowledged by landing stopped at or past the acknowledging lines, at a line refused for
     /// good, and is not run again.
-    fn rest(&self, before: Made, stopped: Resume, acknowledging: usize, vouched: &[bool]) -> Option<Resume> {
+    fn rest(&self, before: Made, stopped: Resume, acknowledging: usize, vouched: &[bool], own: usize) -> Option<Resume> {
         let done = vouched.get(stopped.at).copied().unwrap_or(false);
         (!before.acknowledged && self.acknowledged && !self.completed && stopped.at < acknowledging)
-            .then_some(Resume { at: if done { own_lines().max(stopped.at + 1) } else { stopped.at }, may_have_stacked: false })
+            .then_some(Resume { at: if done { own.max(stopped.at + 1) } else { stopped.at }, may_have_stacked: false })
     }
 
     /// Adds what a retry established, which landed every line or stopped where `next` resumes:
@@ -761,7 +833,8 @@ pub(crate) fn grade_after(
     let mut made = Made::of(&trail.steps, acknowledging, lines);
     let mut resume = resume_after(&trail.steps, lines);
     let promoted = Made::through(acknowledging, acknowledging, lines);
-    let vouched = vouched(context.then);
+    let vouched = vouched(context.tool, context.then);
+    let own = own_lines(context.tool);
     // A retry from where the last attempt stopped, then the readback. A retry whose answer settles
     // the record as acknowledged ran none of the lines after the record's own, or none that
     // landed, so they are run once more from the first of them: only landing completes them.
@@ -774,7 +847,7 @@ pub(crate) fn grade_after(
         };
         let before = *made;
         let reads = again(trail, resume, made)?;
-        match made.rest(before, *resume, acknowledging, &vouched) {
+        match made.rest(before, *resume, acknowledging, &vouched, own) {
             Some(rest) => {
                 *resume = rest;
                 again(trail, resume, made)
@@ -813,7 +886,7 @@ pub(crate) fn grade_after(
                         if arguments.first().map(String::as_str) != Some("--json") {
                             arguments.insert(0, "--json".into());
                         }
-                        trail.steps.push(context.run(&context.programs.forklift, arguments, context.scratch.work())?);
+                        trail.steps.push(context.run(context.program(), arguments, context.scratch.work())?);
                     }
                     Remedy::Remove { path } => trail.recoverability.outside_knowledge.push(remedy::remove(path, &context.scratch.roots()).0),
                 }
@@ -828,8 +901,9 @@ pub(crate) fn grade_after(
         (trail, unextractable) = state;
     }
 
-    // Heal last, when an acknowledged record still does not read back.
-    if !trail.evidence.acknowledged_readable {
+    // Heal last, when an acknowledged record still does not read back. Forklift's own: the
+    // other subjects' remedy sets are not run yet.
+    if context.tool == Tool::Forklift && !trail.evidence.acknowledged_readable {
         trail.steps.push(context.run(&context.programs.forklift, vec!["--json".into(), "heal".into()], context.scratch.work())?);
         trail.settle(context, expected, &mut made, promoted, false)?;
     }
@@ -840,29 +914,35 @@ pub(crate) fn grade_after(
     })
 }
 
-/// Runs one faulted run of `scenario`: damage `kind` to the path `name` resolves to after the
-/// build, then the faulted command, readback, a plain retry, the named remedies, and heal.
+/// Runs one faulted run of `scenario` as `tool`: damage `kind` to the path `name` resolves to
+/// after the build (a census name for forklift, a git layout row for git), then the faulted
+/// command, readback, a plain retry, the named remedies, and forklift's heal.
 #[allow(clippy::too_many_arguments)]
-pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, seed: u64) -> Result<Faulted, RunError> {
-    let built = runner::build(scenario, corpus, Tool::Forklift, &programs.forklift, programs.server.as_deref(), scratch, environment, limit, None)?;
+pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, tool: Tool, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, seed: u64) -> Result<Faulted, RunError> {
+    let program = match tool { Tool::Forklift => &programs.forklift, Tool::Git | Tool::GitTuned => &programs.git };
+    let built = runner::build(scenario, corpus, tool, program, programs.server.as_deref(), scratch, environment, limit, None)?;
     // What the build recorded: the corpus rooted under the scenario's scope, when it has one.
     let corpus = &scenario.corpus(corpus);
     let (walked, state) = match warehouse {
-        Warehouse::Client => (&built.walked, scratch.work().join(".forklift")),
-        Warehouse::Host if built.host.is_some() => (&built.host_walked, runner::host_root(scratch).join(".forklift")),
-        Warehouse::Host => return Err(RunError::Io(format!("{} damages a host, and {} hosts none", name, scenario.id))),
+        Warehouse::Client => (&built.walked, scratch.work().join(runner::state_folder(tool))),
+        Warehouse::Host if tool == Tool::Forklift && built.host.is_some() => (&built.host_walked, runner::host_root(scratch).join(".forklift")),
+        Warehouse::Host => return Err(RunError::Io(format!("{} damages a host, and {} hosts none for {:?}", name, scenario.id, tool))),
     };
     // A planted path is absent by definition, so it is named, not resolved against the walk.
+    let resolved = match tool {
+        Tool::Forklift => resolve(name, walked, seed),
+        Tool::Git | Tool::GitTuned => crate::git_layout::resolve(name, walked, seed),
+    };
     let target = if kind.plants() {
         damage::planted(name)
     } else {
-        resolve(name, walked, seed).ok_or_else(|| RunError::Io(format!("{} resolves to nothing {} built", name, scenario.id)))?
+        resolved.ok_or_else(|| RunError::Io(format!("{} resolves to nothing {} built", name, scenario.id)))?
     };
     damage::apply(&state.join(&target), kind, seed).map_err(|error| RunError::Io(format!("{:?}", error)))?;
 
     let (expected, faulted) = expected(scenario, corpus, &built, warehouse)?;
     let context = Context {
-        corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.host.as_ref().map(|host| host.url.as_str()),
+        tool, corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.host.as_ref().map(|host| host.url.as_str()),
         scope: scenario.scope(), via_host: warehouse == Warehouse::Host,
     };
     let graded = grade_after(&context, &expected, faulted, |context, steps| context.record(faulted, steps).map(drop))?;
@@ -877,6 +957,56 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, co
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// The git on PATH, which the git subjects' tests drive.
+    fn path_git() -> PathBuf {
+        let name = if cfg!(windows) { "git.exe" } else { "git" };
+        std::env::split_paths(&std::env::var_os("PATH").expect("a PATH")).map(|folder| folder.join(name))
+            .find(|path| path.is_file()).expect("a git on PATH")
+    }
+
+    /// Git's readback serves every acknowledged record from history whether the repository's index
+    /// is intact or damaged, and leaves that index byte for byte as it was; the repository was made
+    /// with background maintenance kept in the foreground.
+    ///
+    /// Revert: drop the scratch `GIT_INDEX_FILE` → the checkout over the damaged index refuses,
+    /// and over the intact one it rewrites the repository's index; drop the created config → the
+    /// config assertion.
+    #[test]
+    fn git_reads_back_from_history_and_leaves_the_index_alone() {
+        let git = path_git();
+        let scenario = crate::scenario::catalog().into_iter().find(|scenario| scenario.id == "history").unwrap();
+        let corpus = corpus::generate(7, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL });
+        let programs = Programs { forklift: PathBuf::from("forklift-not-used"), git: git.clone(), server: None };
+        for damaged in [false, true] {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir().join(format!("proof-load-git-readback-{}-{}", std::process::id(), nanos));
+            let scratch = Scratch::create(&root).unwrap();
+            let search = crate::scrub::search_path(Some(&git), std::env::var_os("PATH"));
+            let environment = Environment::scrubbed(&scratch, search, &BTreeMap::new()).unwrap();
+            let built = runner::build(&scenario, &corpus, Tool::Git, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
+            let config = std::fs::read_to_string(scratch.work().join(".git/config")).unwrap();
+            assert!(config.contains("[gc]\n\tautoDetach = false") && config.contains("[maintenance]\n\tautoDetach = false"), "{}", config);
+            let index = scratch.work().join(".git/index");
+            if damaged {
+                damage::apply(&index, Kind::FlipByte, 3).unwrap();
+            }
+            let before = std::fs::read(&index).unwrap();
+
+            let (expected, _) = expected(&scenario, &corpus, &built, Warehouse::Client).unwrap();
+            let context = Context {
+                tool: Tool::Git, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
+                limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false,
+            };
+            let readback = context.read_back(&expected.acknowledged, &expected.acknowledged, |mark| expected.of(&corpus, mark, false)).unwrap();
+            assert!(readback.export.succeeded(), "damaged {}: the log ran", damaged);
+            assert_eq!(readback.records.len(), 3);
+            for record in &readback.records {
+                assert_eq!(record.verdicts, [Verdict::Expected], "damaged {}: {:?}", damaged, record.mark);
+            }
+            assert!(std::fs::read(&index).unwrap() == before, "damaged {}: the index is left as it was", damaged);
+        }
+    }
 
     fn walked() -> Vec<String> {
         ["objects/", "objects/ab/", "objects/ab/11", "objects/cd/", "objects/cd/22", "pallets/", "pallets/main", "warehouse"]
@@ -1197,14 +1327,14 @@ mod tests {
     /// with no push to its record's lines → it is graded, not refused.
     #[test]
     fn a_record_is_acknowledged_by_its_own_lines_or_through_its_last_push() {
-        assert_eq!(acknowledging(&[Op::Pack], false), Ok(2));
-        assert_eq!(acknowledging(&[Op::Push], false), Ok(2));
-        assert_eq!(acknowledging(&[], false), Ok(2));
-        assert_eq!(acknowledging(&[Op::Push], true), Ok(3));
-        assert_eq!(acknowledging(&[Op::Push, Op::Pack], true), Ok(3));
-        assert_eq!(acknowledging(&[Op::Push, Op::Pack, Op::Push, Op::Pack], true), Ok(5));
-        assert!(acknowledging(&[], true).unwrap_err().contains("pushes nothing"));
-        assert!(acknowledging(&[Op::Pack], true).is_err());
+        assert_eq!(acknowledging(Tool::Forklift, &[Op::Pack], false), Ok(2));
+        assert_eq!(acknowledging(Tool::Forklift, &[Op::Push], false), Ok(2));
+        assert_eq!(acknowledging(Tool::Forklift, &[], false), Ok(2));
+        assert_eq!(acknowledging(Tool::Forklift, &[Op::Push], true), Ok(3));
+        assert_eq!(acknowledging(Tool::Forklift, &[Op::Push, Op::Pack], true), Ok(3));
+        assert_eq!(acknowledging(Tool::Forklift, &[Op::Push, Op::Pack, Op::Push, Op::Pack], true), Ok(5));
+        assert!(acknowledging(Tool::Forklift, &[], true).unwrap_err().contains("pushes nothing"));
+        assert!(acknowledging(Tool::Forklift, &[Op::Pack], true).is_err());
     }
 
     /// A first attempt acknowledges its record once the acknowledging lines landed, and completes
@@ -1263,20 +1393,20 @@ mod tests {
         assert_eq!(promoted(Made::through(2, 2, 3)), made(true, false));
         assert_eq!(promoted(Made::through(2, 2, 2)), made(true, true));
         let at = |at| Resume { at, may_have_stacked: false };
-        assert_eq!(own_lines(), 2);
-        let local = vouched(&[Op::Pack]);
+        assert_eq!(own_lines(Tool::Forklift), 2);
+        let local = vouched(Tool::Forklift, &[Op::Pack]);
         assert_eq!(local, [true, true, false]);
-        assert_eq!(made(true, false).rest(Made::default(), at(1), 2, &local), Some(at(2)));
-        assert_eq!(made(true, false).rest(Made::default(), at(0), 2, &local), Some(at(2)));
-        assert_eq!(made(true, false).rest(Made::default(), at(2), 2, &local), None, "acknowledged by landing: the compaction was refused for good");
+        assert_eq!(made(true, false).rest(Made::default(), at(1), 2, &local, 2), Some(at(2)));
+        assert_eq!(made(true, false).rest(Made::default(), at(0), 2, &local, 2), Some(at(2)));
+        assert_eq!(made(true, false).rest(Made::default(), at(2), 2, &local, 2), None, "acknowledged by landing: the compaction was refused for good");
         // Read back through the host, then [push, pack, push]: the acknowledging lines run through 5.
-        let hosted = vouched(&[Op::Push, Op::Pack, Op::Push]);
+        let hosted = vouched(Tool::Forklift, &[Op::Push, Op::Pack, Op::Push]);
         assert_eq!(hosted, [true, true, true, false, true]);
-        assert_eq!(made(true, false).rest(Made::default(), at(2), 5, &hosted), Some(at(3)), "the answered push is done, the pack and last push run");
-        assert_eq!(made(true, false).rest(Made::default(), at(1), 5, &hosted), Some(at(2)));
-        assert_eq!(made(true, false).rest(Made::default(), at(3), 5, &hosted), Some(at(3)), "a compaction refused for good runs again");
-        assert_eq!(made(true, false).rest(made(true, false), at(1), 2, &local), None, "owed before this settle");
-        assert_eq!(made(true, true).rest(Made::default(), at(1), 2, &local), None);
+        assert_eq!(made(true, false).rest(Made::default(), at(2), 5, &hosted, 2), Some(at(3)), "the answered push is done, the pack and last push run");
+        assert_eq!(made(true, false).rest(Made::default(), at(1), 5, &hosted, 2), Some(at(2)));
+        assert_eq!(made(true, false).rest(Made::default(), at(3), 5, &hosted, 2), Some(at(3)), "a compaction refused for good runs again");
+        assert_eq!(made(true, false).rest(made(true, false), at(1), 2, &local, 2), None, "owed before this settle");
+        assert_eq!(made(true, true).rest(Made::default(), at(1), 2, &local, 2), None);
     }
 
 }

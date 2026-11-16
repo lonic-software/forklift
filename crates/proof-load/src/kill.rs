@@ -706,7 +706,7 @@ pub(crate) fn environment_of(settings: &Settings, scratch: &Scratch) -> Result<E
 }
 
 pub(crate) fn context_of<'a>(scenario: &'a Scenario, corpus: &'a Corpus, programs: &'a Programs, settings: &Settings, scratch: &'a Scratch, environment: &'a Environment) -> Context<'a> {
-    Context { corpus, programs, scratch, environment, limit: settings.limit, then: &scenario.then, url: None, scope: scenario.scope(), via_host: false }
+    Context { tool: Tool::Forklift, corpus, programs, scratch, environment, limit: settings.limit, then: &scenario.then, url: None, scope: scenario.scope(), via_host: false }
 }
 
 /// One injected run: a fresh copy, the lines before the point's run plainly, the point's line run
@@ -832,7 +832,7 @@ pub fn summarize_as(kills: &[ScenarioKills], side: Side) -> Summary {
     let mut sampled = false;
     for scenario in kills {
         if let Some(reason) = &scenario.not_run {
-            not_run.push(Completeness { check: format!("{} points of {}", prefix, scenario.scenario), cell: Cell::not_run(reason), missing: vec![] });
+            not_run.push(Completeness { subject: Some(Tool::Forklift), check: format!("{} points of {}", prefix, scenario.scenario), cell: Cell::not_run(reason), missing: vec![] });
             continue;
         }
         refusals.extend(scenario.refusals.iter().map(|refusal| format!("{}: {}", scenario.scenario, refusal)));
@@ -857,7 +857,7 @@ pub fn summarize_as(kills: &[ScenarioKills], side: Side) -> Summary {
                 notes.push(format!("unextractable remedies: {}", graded.unextractable.join("; ")));
             }
             let point = &killed.point;
-            rows.push(Row {
+            rows.push(Row { subject: Tool::Forklift,
                 scenario: format!("{} {} {}#{} {}", scenario.scenario, point.command, point.name, point.when, point.base),
                 category,
                 binding: binding.to_string(),
@@ -875,9 +875,9 @@ pub fn summarize_as(kills: &[ScenarioKills], side: Side) -> Summary {
         missing.push(format!("no scenario's {} points ran", prefix));
     }
     let mut completeness = vec![
-        Completeness { check: format!("{}-point units", prefix), cell: Cell::Run, missing },
-        Completeness { check: format!("{}-point soundness", prefix), cell: Cell::Run, missing: refusals },
-        Completeness { check: format!("{} points ran", prefix), cell: Cell::Run, missing: errors },
+        Completeness { subject: Some(Tool::Forklift), check: format!("{}-point units", prefix), cell: Cell::Run, missing },
+        Completeness { subject: Some(Tool::Forklift), check: format!("{}-point soundness", prefix), cell: Cell::Run, missing: refusals },
+        Completeness { subject: Some(Tool::Forklift), check: format!("{} points ran", prefix), cell: Cell::Run, missing: errors },
     ];
     completeness.extend(not_run);
     let cell = if rows.is_empty() {

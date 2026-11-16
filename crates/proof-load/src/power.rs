@@ -51,7 +51,7 @@ use crate::faulted::{self, Graded, Programs};
 use crate::kill::{self, Counting, Directories, Point, Settings};
 use crate::report::{Category, Cell, Completeness, Row};
 use crate::runner::RunError;
-use crate::scenario::Scenario;
+use crate::scenario::{Scenario, Tool};
 use crate::scrub::Scratch;
 use crate::tool::Outcome;
 use crate::trace::{self, Argument, Call, Class, Returned, Root};
@@ -1709,7 +1709,7 @@ pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, templa
     // Each scenario draws its own variants, not the same corners of every scenario.
     let drawn = seed ^ u64::from_le_bytes(blake3::hash(scenario.id.as_bytes()).as_bytes()[..8].try_into().expect("eight bytes"));
     // A client's copy is read back from its own work tree, as [`kill::context_of`] reads it.
-    let acknowledging = faulted::acknowledging(&scenario.then, false).map_err(RunError::Io)?;
+    let acknowledging = faulted::acknowledging(Tool::Forklift, &scenario.then, false).map_err(RunError::Io)?;
     let Found { crashes, requested, replayed } = match crashes(fixture, &counted.counting_root, &start, umask, &lines, acknowledging, variants, drawn) {
         Ok(found) => found,
         Err(refusal) => {
@@ -1862,7 +1862,7 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
     let (mut rows, mut refusals, mut errors, mut not_run, mut missing) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for scenario in all {
         if let Some(reason) = &scenario.not_run {
-            not_run.push(Completeness { check: format!("{}power loss of {}", prefix, scenario.scenario), cell: Cell::not_run(reason), missing: vec![] });
+            not_run.push(Completeness { subject: Some(Tool::Forklift), check: format!("{}power loss of {}", prefix, scenario.scenario), cell: Cell::not_run(reason), missing: vec![] });
             continue;
         }
         refusals.extend(scenario.refusals.iter().map(|refusal| format!("{}: {}", scenario.scenario, refusal)));
@@ -1872,7 +1872,7 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
             missing.push(format!("{}: no crash state was graded", scenario.scenario));
         }
         if !scenario.crashes.is_empty() {
-            between.push(Completeness { check: format!("{}power loss of {}, states between durable and volatile: {}", prefix, scenario.scenario, scenario.requested.label()), cell: Cell::Run, missing: vec![] });
+            between.push(Completeness { subject: Some(Tool::Forklift), check: format!("{}power loss of {}, states between durable and volatile: {}", prefix, scenario.scenario, scenario.requested.label()), cell: Cell::Run, missing: vec![] });
         }
         for (index, GradedCrash { crash, graded }) in scenario.crashes.iter().enumerate() {
             let mut notes = vec![CAVEAT.to_string(), REWRITTEN.to_string()];
@@ -1882,7 +1882,7 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
             if !graded.unextractable.is_empty() {
                 notes.push(format!("unextractable remedies: {}", graded.unextractable.join("; ")));
             }
-            rows.push(Row {
+            rows.push(Row { subject: Tool::Forklift,
                 scenario: format!("{} power {}{}", scenario.scenario, crash.moment.label(), crash.state.label()),
                 category,
                 binding: binding.to_string(),
@@ -1897,12 +1897,12 @@ pub fn summarize_as(all: &[ScenarioPower], side: kill::Side) -> Summary {
         missing.push(format!("no scenario's {}power loss ran", prefix));
     }
     let mut completeness = vec![
-        Completeness { check: format!("{}power-loss states", prefix), cell: Cell::Run, missing },
-        Completeness { check: format!("{}power-loss soundness", prefix), cell: Cell::Run, missing: refusals },
-        Completeness { check: format!("{}power-loss states ran", prefix), cell: Cell::Run, missing: errors },
+        Completeness { subject: Some(Tool::Forklift), check: format!("{}power-loss states", prefix), cell: Cell::Run, missing },
+        Completeness { subject: Some(Tool::Forklift), check: format!("{}power-loss soundness", prefix), cell: Cell::Run, missing: refusals },
+        Completeness { subject: Some(Tool::Forklift), check: format!("{}power-loss states ran", prefix), cell: Cell::Run, missing: errors },
     ];
     if side == kill::Side::Server {
-        completeness.push(Completeness { check: "server power-loss cuts reached".to_string(), cell: Cell::Run, missing: unreached });
+        completeness.push(Completeness { subject: Some(Tool::Forklift), check: "server power-loss cuts reached".to_string(), cell: Cell::Run, missing: unreached });
     }
     completeness.extend(between);
     completeness.extend(not_run);

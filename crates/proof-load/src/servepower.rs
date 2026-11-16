@@ -108,7 +108,7 @@ fn traced(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings: &
         host.proxy.arm(Fault::Crash, at);
     }
     let context = Context {
-        corpus, programs, scratch: &scratch, environment: &environment, limit: settings.limit, then: &scenario.then,
+        tool: Tool::Forklift, corpus, programs, scratch: &scratch, environment: &environment, limit: settings.limit, then: &scenario.then,
         url: Some(host.url.as_str()), scope: scenario.scope(), via_host: true,
     };
     let mut steps = Vec::new();
@@ -213,7 +213,7 @@ fn grade_one(run: &Traced, saved: &Scratch, crash: &Crash, index: usize, corpus:
     let restored = saved.copy_to(run.scratch.root()).map_err(|error| RunError::Io(error.to_string()))?;
     power::materialize(&crash.image, run.host.root()).map_err(io)?;
     let context = Context {
-        corpus, programs, scratch: &restored, environment: &run.environment, limit: settings.limit, then: &scenario.then,
+        tool: Tool::Forklift, corpus, programs, scratch: &restored, environment: &run.environment, limit: settings.limit, then: &scenario.then,
         url: Some(run.host.url.as_str()), scope: scenario.scope(), via_host: true,
     };
     let mut restarted = None;

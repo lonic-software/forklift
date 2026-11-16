@@ -155,7 +155,7 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
     let pid = host.pid().ok_or_else(|| RunError::Io("the counted server is not running".to_string()))?;
     let since = proxy::now();
     let context = Context {
-        corpus: &corpus, programs, scratch: template, environment: &environment, limit: settings.limit, then: &scenario.then,
+        tool: Tool::Forklift, corpus: &corpus, programs, scratch: template, environment: &environment, limit: settings.limit, then: &scenario.then,
         url: Some(host.url.as_str()), scope: scenario.scope(), via_host: true,
     };
     let mut steps = Vec::new();
@@ -309,7 +309,7 @@ fn inject(scenario: &Scenario, programs: &Programs, settings: &Settings, templat
         }
     }
     let context = Context {
-        corpus: &counted.corpus, programs, scratch: &scratch, environment: &environment, limit: settings.limit, then: &scenario.then,
+        tool: Tool::Forklift, corpus: &counted.corpus, programs, scratch: &scratch, environment: &environment, limit: settings.limit, then: &scenario.then,
         url: Some(host.url.as_str()), scope: scenario.scope(), via_host: true,
     };
     let settle = (after + SETTLE).min(SETTLE_CAP);

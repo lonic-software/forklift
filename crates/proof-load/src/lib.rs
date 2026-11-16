@@ -18,6 +18,7 @@ pub mod conditions;
 pub mod corpus;
 pub mod damage;
 pub mod faulted;
+pub mod git_layout;
 pub mod host;
 pub mod kill;
 pub mod network;

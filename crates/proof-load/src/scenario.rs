@@ -108,7 +108,7 @@ pub enum Until {
 }
 
 /// The tools a scenario can be bound to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Tool {
     Forklift,
@@ -116,6 +116,17 @@ pub enum Tool {
     Git,
     /// Git tuned for durability and integrity: every fsync on, fsck on transfer.
     GitTuned,
+}
+
+impl Tool {
+    /// The name a report gives the subject, as it is serialized.
+    pub fn label(self) -> &'static str {
+        match self {
+            Tool::Forklift => "forklift",
+            Tool::Git => "git",
+            Tool::GitTuned => "git-tuned",
+        }
+    }
 }
 
 /// What a clone takes from its remote.
