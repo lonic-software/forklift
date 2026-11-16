@@ -54,7 +54,7 @@ pub struct Finding {
     /// `commit identity`, `tree entry`, `parent count`, `author name` and the other identity parts,
     /// `message`, `header <name>`, `note`, or `tag <part>` for an annotated tag's object; from
     /// Forklift, `pallet`, `record`, `record identity`, `message`, `parent count`, `actions`,
-    /// `<action> operator` and its time and trust, `tree` (no one export commit for a record),
+    /// `<action> operator` and its time and trust, `tree` (no one exported tree for a record),
     /// `tree entry`, `manifest entry`, `keyed value` and `keyed value <field>` (its operator,
     /// signer, ...), or `tag`, `tag subject` and `tag <field>` (its message, tagger, ...).
     pub field: String,
@@ -638,8 +638,9 @@ fn build_warehouse(steps: &mut Steps, forklift: &Path, root: &Path, environment:
 
 /// One record of a `history --json` listing: its description (none where it has none), its
 /// parents, its actions as name, operator, time and trust, its manifest entries but keyed values
-/// (each as its JSON without the subject, sorted), and every git tree its warehouse's export
-/// wrote for it: one, unless the export wrote no commit for it or several.
+/// (each as its JSON without the subject, sorted), and every distinct git tree its warehouse's
+/// export wrote for it: one, unless the export wrote no commit for it or commits with different
+/// trees.
 #[derive(Clone, Debug, Default)]
 struct Record {
     description: Option<String>,
