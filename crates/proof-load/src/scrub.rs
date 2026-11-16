@@ -250,7 +250,9 @@ impl Environment {
         // Git never looks above the scratch area for a repository: when a fault leaves the work
         // tree's `.git` unrecognisable, git must refuse, not find and change one in a parent.
         let ceilings = std::iter::once(scratch.root().to_path_buf()).chain(scratch.folding.clone());
-        let ceilings = std::env::join_paths(ceilings).map_err(|_| CopyOnlyError::ReservedVariable("GIT_CEILING_DIRECTORIES".to_string()))?;
+        let ceilings = std::env::join_paths(ceilings).map_err(|error| CopyOnlyError::Io {
+            path: scratch.root().to_path_buf(), reason: format!("cannot be named to git as a ceiling directory: {}", error),
+        })?;
         variables.insert("GIT_CEILING_DIRECTORIES".to_string(), ceilings.to_string_lossy().into_owned());
 
         let mut scenario_set = BTreeMap::new();

@@ -148,8 +148,8 @@ pub fn apply(path: &Path, kind: Kind, seed: u64) -> Result<(), DamageError> {
 
 /// Runs `damage` on the file at `path` as a disk fault would, whatever its mode: a file stored
 /// read-only (as git stores its objects) is made writable by its owner for the damage and given
-/// its mode back after it when `restore` (a deleted file has none to restore), damaged or not. A
-/// failed damage is reported over a failed restore.
+/// its mode back after it, damaged or not; a deletion that succeeded (`restore` false) leaves no
+/// file to give it back to. A failed damage is reported over a failed restore.
 fn through_mode(path: &Path, restore: bool, damage: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
     let before = std::fs::metadata(path)?.permissions();
     if !before.readonly() {
@@ -166,7 +166,7 @@ fn through_mode(path: &Path, restore: bool, damage: impl FnOnce() -> std::io::Re
     writable.set_readonly(false);
     std::fs::set_permissions(path, writable)?;
     let damaged = damage();
-    if !restore {
+    if !restore && damaged.is_ok() {
         return damaged;
     }
     let restored = std::fs::set_permissions(path, before);
