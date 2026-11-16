@@ -1262,9 +1262,9 @@ mod tests {
 
     /// A kill lands only on the call that is, in its thread, the counted position and the target,
     /// with the root rebased and the temp's pid normalised; a kill on another thread's call, on a
-    /// child that runs another program, or none at all is not reached, while a fork of a git subject
-    /// is its own; a sibling temp of the same base stands for a temp target, and never for a fixed
-    /// path.
+    /// child that runs another program, or none at all is not reached, while a fork of a git
+    /// subject is its own; a sibling temp of the same base stands for a temp target, and never for
+    /// a fixed path.
     ///
     /// Revert: accept any killed call of the name → the worker's object open, killed in place of
     /// the head's temp, counts as landed; compare temps exactly → the sibling object is not reached;
