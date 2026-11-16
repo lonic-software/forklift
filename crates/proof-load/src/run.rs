@@ -213,7 +213,7 @@ fn history_row(tool: Tool, label: &str, run: &faulted::Faulted, scenario: &str, 
     }
     let mut notes: Vec<String> = Vec::new();
     if tool == Tool::Forklift {
-        notes.push("forklift opens each position's bay at the current head first, so damage only that head holds refuses every position".to_string());
+        notes.push("each position's bay opens at the current head first, so damage only that head holds refuses every position".to_string());
     }
     if !run.unextractable.is_empty() {
         notes.push(format!("unextractable remedies: {}", run.unextractable.join("; ")));
