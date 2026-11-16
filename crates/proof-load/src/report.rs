@@ -752,18 +752,19 @@ mod tests {
     /// Fidelity findings are listed, one row each with both values and nothing for a side that has
     /// none, read back whole, and never fail the run.
     ///
-    /// Revert: escape no `|` in a value → the zone row gains a column.
+    /// Revert: escape no `|` in a value or a field → the zone row or the header row gains a column.
     #[test]
     fn fidelity_findings_are_listed_and_never_fail_the_run() {
         use crate::fidelity::Direction;
         let finding = |field: &str, at: &str, before: Option<&str>, after: Option<&str>| Finding {
             direction: Direction::GitForkliftGit, field: field.to_string(), at: at.to_string(), before: before.map(str::to_string), after: after.map(str::to_string),
         };
-        let report = Report { fidelity: vec![finding("author zone", "main~8", Some("+0130"), Some("+0|00")), finding("ref", "refs/notes/commits", Some("note"), None)], ..sample() };
+        let report = Report { fidelity: vec![finding("author zone", "main~8", Some("+0130"), Some("+0|00")), finding("ref", "refs/notes/commits", Some("note"), None), finding("header x|y", "main", Some("v"), None)], ..sample() };
         assert!(!report.failed());
         let markdown = report.markdown();
         assert!(markdown.contains("\n| git to Forklift to git | author zone | main~8 | +0130 | +0\\|00 |\n"), "{}", markdown);
         assert!(markdown.contains("\n| git to Forklift to git | ref | refs/notes/commits | note | nothing |\n"), "{}", markdown);
+        assert!(markdown.contains("\n| git to Forklift to git | header x\\|y | main | v | nothing |\n"), "{}", markdown);
         assert!(sample().markdown().contains("\n## Fidelity\n\nNone.\n"));
         assert_eq!(Report::from_json(&report.json()).expect("the report reads back").fidelity, report.fidelity);
     }
