@@ -803,7 +803,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                     Cell::Run
                 }
                 Err(error) => {
-                    fidelity_missing.push(format!("git to forklift to git: {}", error));
+                    fidelity_missing.push(format!("git to Forklift to git: {}", error));
                     Cell::not_run("no round trip finished")
                 }
             }

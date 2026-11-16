@@ -762,8 +762,8 @@ mod tests {
         let report = Report { fidelity: vec![finding("author zone", "main~8", Some("+0130"), Some("+0|00")), finding("ref", "refs/notes/commits", Some("note"), None)], ..sample() };
         assert!(!report.failed());
         let markdown = report.markdown();
-        assert!(markdown.contains("\n| git to forklift to git | author zone | main~8 | +0130 | +0\\|00 |\n"), "{}", markdown);
-        assert!(markdown.contains("\n| git to forklift to git | ref | refs/notes/commits | note | nothing |\n"), "{}", markdown);
+        assert!(markdown.contains("\n| git to Forklift to git | author zone | main~8 | +0130 | +0\\|00 |\n"), "{}", markdown);
+        assert!(markdown.contains("\n| git to Forklift to git | ref | refs/notes/commits | note | nothing |\n"), "{}", markdown);
         assert!(sample().markdown().contains("\n## Fidelity\n\nNone.\n"));
         assert_eq!(Report::from_json(&report.json()).expect("the report reads back").fidelity, report.fidelity);
     }

@@ -27,7 +27,7 @@ pub enum Direction {
 impl Direction {
     pub fn label(self) -> &'static str {
         match self {
-            Direction::GitForkliftGit => "git to forklift to git",
+            Direction::GitForkliftGit => "git to Forklift to git",
         }
     }
 }
