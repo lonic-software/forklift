@@ -200,7 +200,7 @@ fn line(arguments: &[&str]) -> Vec<String> {
 }
 
 /// Git's options for the tuned binding, given before the subcommand.
-const GIT_TUNED: &[&str] = &["-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "-c", "transfer.fsckObjects=true", "-c", "fetch.fsckObjects=true", "-c", "receive.fsckObjects=true"];
+pub(crate) const GIT_TUNED: &[&str] = &["-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "-c", "transfer.fsckObjects=true", "-c", "fetch.fsckObjects=true", "-c", "receive.fsckObjects=true"];
 
 /// The command lines (arguments after the binary) `op` runs for `tool`, in order, or None when the
 /// tool has no binding for it. Forklift runs every command with `--json`, so a refusal is one

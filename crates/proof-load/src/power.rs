@@ -2522,7 +2522,7 @@ mod tests {
     fn a_server_s_power_loss_is_reported_as_the_server_s() {
         let graded = Graded {
             grade: crate::oracle::Grade::Healed, evidence: Default::default(), recoverability: Default::default(),
-            steps: vec![], readbacks: vec![], unextractable: vec![],
+            steps: vec![], readbacks: vec![], probes: vec![], unextractable: vec![],
         };
         let moment = Moment::Served { request: Some(1), route: "POST /v1/pallets/{name}".into(), when: "as the server died".into() };
         let crash = Crash { moment, acknowledged: false, shared: 1, state: State::Durable, image: Default::default() };

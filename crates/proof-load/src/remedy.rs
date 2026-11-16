@@ -1,17 +1,22 @@
-//! Remedies a refusal names, extracted in exactly two forms: a `forklift …` command, quoted or
-//! standing as a whole text (a next_step that is nothing but the command), and a `remove "<path>"`
-//! instruction. Anything else is recorded as unextractable; the harness never
-//! guesses at a remedy.
+//! Remedies a refusal names, extracted per subject in exactly two forms: a command of the subject's
+//! own program (`forklift …`, or `git …` for a git subject), quoted or standing as a whole text (a
+//! next_step that is nothing but the command), and a `remove "<path>"` instruction. Anything else
+//! is recorded as unextractable; the harness never guesses at a remedy.
 //!
-//! The text comes from a client's JSON error (its message and next_step), and for a restarted
-//! server from its stderr and its 503 bodies.
+//! The text comes from a client's JSON error (its message and next_step), for a restarted server
+//! from its stderr and its 503 bodies, and for git, which writes no JSON, from its stderr, one
+//! line per text with any `hint: ` prefix taken off ([`texts`]).
 
 use std::path::{Path, PathBuf};
+
+use crate::scenario::Tool;
+use crate::tool::Outcome;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Remedy {
-    /// A forklift command, its arguments split on whitespace, without the leading `forklift`.
+    /// A command of the subject's own program, its arguments split on whitespace, without the
+    /// leading program name.
     Command { arguments: Vec<String> },
     /// Remove one file.
     Remove { path: PathBuf },
@@ -43,12 +48,35 @@ fn quoted(text: &str) -> Vec<(usize, &str)> {
     spans
 }
 
-/// Extracts the remedies `texts` name, in the order they appear.
-pub fn extract(texts: &[&str]) -> Extracted {
+/// The texts `outcome`'s remedies are extracted from, for a run of `tool`: forklift's JSON error,
+/// message and next_step; git's stderr, one line per text, a `hint: ` prefix taken off, so a hint
+/// line that is nothing but a command stands as a whole text.
+pub fn texts(tool: Tool, outcome: &Outcome) -> Vec<String> {
+    match tool {
+        Tool::Forklift => outcome.remedy_texts().into_iter().map(str::to_string).collect(),
+        Tool::Git | Tool::GitTuned => String::from_utf8_lossy(&outcome.stderr).lines()
+            .map(|line| line.strip_prefix("hint:").unwrap_or(line).trim().to_string())
+            .filter(|line| !line.is_empty()).collect(),
+    }
+}
+
+/// The program name a command of `tool` starts with, followed by its space.
+fn program(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Forklift => "forklift ",
+        Tool::Git | Tool::GitTuned => "git ",
+    }
+}
+
+/// Extracts the remedies `texts` name for a run of `tool`, in the order they appear: only commands
+/// of the subject's own program, so a git command a forklift refusal mentions is never run, nor
+/// the reverse.
+pub fn extract(tool: Tool, texts: &[&str]) -> Extracted {
+    let program = program(tool);
     let mut extracted = Extracted { remedies: Vec::new(), unextractable: Vec::new() };
 
     let command = |span: &str, extracted: &mut Extracted| {
-        let arguments: Vec<String> = span.trim_start_matches("forklift ").split_whitespace().map(str::to_string).collect();
+        let arguments: Vec<String> = span.trim_start_matches(program).split_whitespace().map(str::to_string).collect();
         if arguments.is_empty() || arguments.iter().any(|argument| argument.contains('<') || argument.contains('{')) {
             extracted.unextractable.push(span.to_string());
         } else {
@@ -60,12 +88,12 @@ pub fn extract(texts: &[&str]) -> Extracted {
         // A whole text that is one command, as a next_step often is: its field delimits it the way
         // quotes delimit one inside prose.
         let whole = text.trim();
-        if whole.starts_with("forklift ") && !whole.contains(['"', '`']) {
+        if whole.starts_with(program) && !whole.contains(['"', '`']) {
             command(whole, &mut extracted);
             continue;
         }
         for (start, span) in quoted(text) {
-            if span.starts_with("forklift ") {
+            if span.starts_with(program) {
                 command(span, &mut extracted);
             } else if text[..start].to_ascii_lowercase().trim_end().ends_with("remove") && !span.is_empty() {
                 extracted.remedies.push(Remedy::Remove { path: PathBuf::from(span) });
@@ -136,7 +164,7 @@ mod tests {
     fn both_forms_are_extracted() {
         let message = "the store is locked by process 42, which is no longer running, remove \"/s/wh/.forklift/store.lock\" and try again.";
         let next_step = "Run \"forklift heal\", then `forklift store compact --all`.";
-        assert_eq!(extract(&[message, next_step]).remedies, vec![
+        assert_eq!(extract(Tool::Forklift, &[message, next_step]).remedies, vec![
             Remedy::Remove { path: PathBuf::from("/s/wh/.forklift/store.lock") },
             Remedy::Command { arguments: vec!["heal".to_string()] },
             Remedy::Command { arguments: vec!["store".to_string(), "compact".to_string(), "--all".to_string()] },
@@ -146,7 +174,7 @@ mod tests {
     /// Revert: run a templated command as written → `load -- <path>` would be executed.
     #[test]
     fn a_templated_command_is_unextractable_not_guessed() {
-        let extracted = extract(&["Run \"forklift load -- <path>\" for each folder, or ask an admin."]);
+        let extracted = extract(Tool::Forklift, &["Run \"forklift load -- <path>\" for each folder, or ask an admin."]);
         assert!(extracted.remedies.is_empty());
         assert_eq!(extracted.unextractable, vec!["forklift load -- <path>"]);
     }
@@ -158,16 +186,37 @@ mod tests {
     /// pallet, is never run.
     #[test]
     fn a_next_step_that_is_a_command_is_extracted() {
-        assert_eq!(extract(&["This bay is behind pallet \"main\".", "forklift shift main"]).remedies,
+        assert_eq!(extract(Tool::Forklift, &["This bay is behind pallet \"main\".", "forklift shift main"]).remedies,
             vec![Remedy::Command { arguments: vec!["shift".to_string(), "main".to_string()] }]);
-        assert!(extract(&["Run forklift heal, when done."]).remedies.is_empty());
-        assert_eq!(extract(&["forklift shift <pallet>"]).unextractable, vec!["forklift shift <pallet>"]);
+        assert!(extract(Tool::Forklift, &["Run forklift heal, when done."]).remedies.is_empty());
+        assert_eq!(extract(Tool::Forklift, &["forklift shift <pallet>"]).unextractable, vec!["forklift shift <pallet>"]);
+    }
+
+    /// Git's remedies come from its stderr, one line per text with a `hint: ` prefix taken off;
+    /// each subject runs only commands of its own program, so a git command a forklift message
+    /// mentions is never run, nor the reverse.
+    ///
+    /// Revert: keep the `hint:` prefix → the whole-line command is lost; extract `forklift` for
+    /// git → the forklift command in a git hint would be run as git.
+    #[test]
+    fn each_subject_extracts_only_its_own_commands() {
+        let stderr = b"error: cannot lock ref 'refs/heads/main'\nhint: git gc --prune=now\nhint:\nhint: or run `forklift heal`\n".to_vec();
+        let outcome = Outcome { arguments: vec![], exit: Some(1), stdout: vec![], stderr, failure: None };
+        let texts = super::texts(Tool::Git, &outcome);
+        assert_eq!(texts, ["error: cannot lock ref 'refs/heads/main'", "git gc --prune=now", "or run `forklift heal`"]);
+        let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+        assert_eq!(extract(Tool::Git, &texts).remedies, vec![Remedy::Command { arguments: vec!["gc".to_string(), "--prune=now".to_string()] }]);
+        assert_eq!(extract(Tool::Forklift, &texts).remedies, vec![Remedy::Command { arguments: vec!["heal".to_string()] }]);
+        assert_eq!(extract(Tool::GitTuned, &["git checkout -- <path>"]).unextractable, vec!["git checkout -- <path>"]);
+        // Forklift's remedies are its failure document's alone, never its stderr.
+        let stray = Outcome { stderr: b"forklift heal".to_vec(), ..outcome };
+        assert!(super::texts(Tool::Forklift, &stray).is_empty());
     }
 
     /// A quoted path that no `remove` precedes is not a remedy.
     #[test]
     fn a_quoted_path_alone_is_not_a_remedy() {
-        assert!(extract(&["could not read \"/s/wh/.forklift/trust\": damaged"]).remedies.is_empty());
+        assert!(extract(Tool::Forklift, &["could not read \"/s/wh/.forklift/trust\": damaged"]).remedies.is_empty());
     }
 
     /// Revert: compare as strings → `/srv/wh` passes under `/s`; allow `..` → an escape passes.

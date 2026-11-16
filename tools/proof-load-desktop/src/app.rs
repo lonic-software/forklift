@@ -378,14 +378,16 @@ impl App {
         let (count, unit) = results::to_expected(row);
         let named = if row.recoverability.named_right_remedy { "yes" } else { "no" };
         let knowledge = results::outside_knowledge(row);
+        let rescued = results::rescued_by(row);
         let width = ui.available_width();
-        let per_line = (((width + theme::SIDE_GAP) / (220.0 + theme::SIDE_GAP)).floor() as usize).clamp(1, 3);
-        let each = (width - theme::SIDE_GAP * (per_line as f32 - 1.0)) / per_line as f32;
-        let readouts: [&dyn Fn(&mut Ui); 3] = [
+        let readouts: [&dyn Fn(&mut Ui); 4] = [
             &|ui| { widgets::readout(ui, "Commands to expected", &count, unit); },
             &|ui| { widgets::readout(ui, "Named the remedy that worked", named, ""); },
+            &|ui| { widgets::readout(ui, "Rescued by", rescued, ""); },
             &|ui| { widgets::readout_text(ui, "Outside knowledge", &knowledge); },
         ];
+        let per_line = (((width + theme::SIDE_GAP) / (220.0 + theme::SIDE_GAP)).floor() as usize).clamp(1, readouts.len());
+        let each = (width - theme::SIDE_GAP * (per_line as f32 - 1.0)) / per_line as f32;
         ui.spacing_mut().item_spacing.y = theme::SIDE_GAP;
         for line in readouts.chunks(per_line) {
             ui.horizontal_top(|ui| {

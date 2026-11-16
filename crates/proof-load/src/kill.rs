@@ -1166,7 +1166,7 @@ mod tests {
         point.sampled = sampled;
         let graded = Graded {
             grade: crate::oracle::Grade::Healed, evidence: Default::default(), recoverability: Default::default(),
-            steps: vec![], readbacks: vec![], unextractable: vec![],
+            steps: vec![], readbacks: vec![], probes: vec![], unextractable: vec![],
         };
         Killed {
             point,

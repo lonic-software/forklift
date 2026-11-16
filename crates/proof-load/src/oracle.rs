@@ -176,8 +176,8 @@ pub enum Grade {
     RefusedNoRemedy,
     /// Some readback served bytes matching no expected tree with exit 0. A failure; it wins.
     Silent,
-    /// After every named remedy, heal included, an acknowledged record cannot be read back and the
-    /// tool refuses rather than serving wrong bytes.
+    /// After every named remedy and the subject's own remedy set, an acknowledged record cannot be
+    /// read back and the tool refuses rather than serving wrong bytes.
     DataLost,
 }
 
@@ -198,7 +198,8 @@ pub struct Evidence {
     pub remedy_named: bool,
     /// Running the named remedies led to expected bytes for the faulted record.
     pub remedy_worked: bool,
-    /// After every named remedy, heal included, every record acknowledged before the fault reads back.
+    /// After every named remedy and, where one was still needed, the subject's own remedy set, every
+    /// record acknowledged before the fault reads back.
     pub acknowledged_readable: bool,
 }
 
@@ -226,6 +227,29 @@ pub struct Recoverability {
     pub named_right_remedy: bool,
     /// Steps that are not the tool's own commands (removing a file, freeing space, lifting a fault).
     pub outside_knowledge: Vec<String>,
+    /// The kind of step in the subject's own remedy set after which every acknowledged record first
+    /// read back. None when the set was not needed, or ran and rescued nothing: the grade says which.
+    pub rescued_by: Option<Rescue>,
+}
+
+/// The kinds of rescue a subject's own remedy set offers, best first. Its checks (`forklift audit`,
+/// `git fsck`) only report, so a check is never one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Rescue {
+    /// A repair of the local store in place: `forklift heal`, or a git ref restored from its reflog.
+    LocalRepair,
+    /// A fresh clone of the remote, which holds only what reached it.
+    Reclone,
+}
+
+impl Rescue {
+    pub fn label(self) -> &'static str {
+        match self {
+            Rescue::LocalRepair => "local repair",
+            Rescue::Reclone => "re-clone",
+        }
+    }
 }
 
 /// A redaction's state in one warehouse, as that warehouse reports it.

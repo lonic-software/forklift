@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use crate::proxy::{lock, Exchange, Proxy};
 use crate::remedy::{self, Remedy};
+use crate::scenario::Tool;
 use crate::scrub::{Environment, Scratch};
 use crate::tool::{self, Served, ToolError};
 
@@ -304,7 +305,7 @@ impl Host {
                     return Ok(restarted);
                 }
                 Err(ToolError::NotListening { said, .. }) => {
-                    let extracted = remedy::extract(&[said.as_str()]);
+                    let extracted = remedy::extract(Tool::Forklift, &[said.as_str()]);
                     let mut removed = false;
                     for named in extracted.remedies {
                         match named {

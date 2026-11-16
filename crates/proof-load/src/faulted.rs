@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::corpus::{self, Corpus};
 use crate::damage::{self, Kind, Warehouse};
-use crate::oracle::{self, Admissible, Evidence, Expectation, Grade, Readback, Recoverability, Verdict};
+use crate::oracle::{self, Admissible, Evidence, Expectation, Grade, Readback, Recoverability, Rescue, Verdict};
 use crate::remedy::{self, Remedy};
 use crate::runner::{self, RunError, Taken, TakenBy};
 use crate::scenario::{bind, Mark, Op, Scenario, Tool};
@@ -76,6 +76,10 @@ pub struct ParkedReadback {
     pub listing: Outcome,
     /// The parked parcels the listing did not name; all of them when it refused.
     pub missing: Vec<String>,
+    /// Whether the listing owes every park, so leaving one out with exit 0 serves it as missing,
+    /// which is silent. Not in a fresh clone, which holds only what reached the remote: a park it
+    /// lacks is lost.
+    pub owed: bool,
 }
 
 impl HistoryReadback {
@@ -86,7 +90,7 @@ impl HistoryReadback {
     /// Any record served wrong with exit 0, or parked work a listing that exited 0 left out.
     fn silent(&self) -> bool {
         self.records.iter().any(|record| record.verdicts.contains(&Verdict::Silent))
-            || self.parked.as_ref().is_some_and(|parked| parked.listing.succeeded() && !parked.missing.is_empty())
+            || self.parked.as_ref().is_some_and(|parked| parked.owed && parked.listing.succeeded() && !parked.missing.is_empty())
     }
 
     /// Every record in `wanted` served, and served as expected, and the work parked still listed.
@@ -109,9 +113,12 @@ pub struct Faulted {
     pub grade: Grade,
     pub evidence: Evidence,
     pub recoverability: Recoverability,
-    /// Every command after the fault, in order: the faulted command, retries, remedies, heal.
+    /// Every command after the fault, in order: the faulted command, retries, remedies, the
+    /// subject's own remedy set.
     pub steps: Vec<Outcome>,
     pub readbacks: Vec<HistoryReadback>,
+    /// The harness's reads that decided the own remedy set ([`Graded::probes`]).
+    pub probes: Vec<Outcome>,
     /// Remedies named in a form the harness does not run.
     pub unextractable: Vec<String>,
 }
@@ -137,6 +144,15 @@ pub(crate) struct Context<'a> {
 }
 
 impl Context<'_> {
+    /// `arguments` as the subject under test runs them: git tuned with its configuration first,
+    /// as every command of its own is bound.
+    fn subject(&self, arguments: Vec<String>) -> Vec<String> {
+        match self.tool {
+            Tool::GitTuned => crate::scenario::GIT_TUNED.iter().map(|argument| argument.to_string()).chain(arguments).collect(),
+            Tool::Forklift | Tool::Git => arguments,
+        }
+    }
+
     /// The binary of the subject under test.
     pub(crate) fn program(&self) -> &Path {
         self.programs.of(self.tool)
@@ -216,15 +232,15 @@ impl Context<'_> {
         acknowledging(self.tool, self.then, self.via_host).map_err(RunError::Io)
     }
 
-    /// Reads every record in `marks` back through the tool. `expectation` gives what each may
-    /// hold; a record in `required` that an export exiting 0 leaves out was served as missing,
-    /// which is silent.
-    fn read_back(&self, marks: &[Mark], required: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
+    /// Reads every record in `marks` back through the tool, from `bay`: the work tree, or the fresh
+    /// clone the own remedy set made in its place. `expectation` gives what each may hold; a record
+    /// in `required` that an export exiting 0 leaves out was served as missing, which is silent.
+    fn read_back(&self, bay: &Path, marks: &[Mark], required: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
         if self.tool != Tool::Forklift {
-            return self.read_back_git(marks, required, expectation);
+            return self.read_back_git(bay, marks, required, expectation);
         }
         if let Some(scope) = self.scope {
-            return self.read_back_scoped(scope, marks, required, |mark| within(expectation(mark), scope));
+            return self.read_back_scoped(bay, scope, marks, required, |mark| within(expectation(mark), scope));
         }
         // The warehouse read: the work tree's, or a fresh clone of the host. A clone that fails
         // refuses every record, as a failed export does.
@@ -237,7 +253,7 @@ impl Context<'_> {
             }
             clone
         } else {
-            self.scratch.work()
+            bay.to_path_buf()
         };
         let exported = self.fresh("readback");
         let export = self.run(&self.programs.forklift, vec!["--json".into(), "git".into(), "export".into(), exported.display().to_string()], bay.clone())?;
@@ -308,7 +324,7 @@ impl Context<'_> {
     /// not in the way, and the repository's own index is left as it was. A log, read or layout git
     /// refuses is git refusing to read, never an empty tree served; a record a log that exits 0
     /// leaves out was served as missing.
-    fn read_back_git(&self, marks: &[Mark], required: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
+    fn read_back_git(&self, bay: &Path, marks: &[Mark], required: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
         if self.via_host || self.scope.is_some() {
             return Err(RunError::Io("git reads back only an unscoped work tree".to_string()));
         }
@@ -317,7 +333,7 @@ impl Context<'_> {
             environment.variables.insert("GIT_INDEX_FILE".to_string(), index.display().to_string());
             let invocation = Invocation {
                 program: self.programs.git.clone(), arguments: arguments.iter().map(|argument| argument.to_string()).collect(),
-                directory: self.scratch.work(), limit: self.limit,
+                directory: bay.to_path_buf(), limit: self.limit,
             };
             tool::run(&invocation, self.scratch, &environment).map_err(RunError::Tool)
         };
@@ -359,10 +375,10 @@ impl Context<'_> {
         Ok(HistoryReadback { export: log, records, parked: None })
     }
 
-    /// What the subject's listing of parked work says of the `parked` entries, read in the work
-    /// tree: `park list` naming each parcel, or `git stash list` each stash commit. Nothing when
-    /// none were parked.
-    fn read_back_parked(&self, parked: &[String]) -> Result<Option<ParkedReadback>, RunError> {
+    /// What the subject's listing of parked work says of the `parked` entries, read in `bay`:
+    /// `park list` naming each parcel, or `git stash list` each stash commit; `owed` when `bay`
+    /// is the work tree, which must still list them. Nothing when none were parked.
+    fn read_back_parked(&self, bay: &Path, parked: &[String], owed: bool) -> Result<Option<ParkedReadback>, RunError> {
         if parked.is_empty() {
             return Ok(None);
         }
@@ -371,11 +387,11 @@ impl Context<'_> {
             Tool::Forklift => (vec!["--json".into(), "park".into(), "list".into()], runner::parked_parcels),
             Tool::Git | Tool::GitTuned => (runner::STASH_LIST.iter().map(|argument| argument.to_string()).collect(), runner::stashed_commits),
         };
-        let listing = self.run(self.program(), arguments, self.scratch.work())?;
+        let listing = self.run(self.program(), arguments, bay.to_path_buf())?;
         // A listing that exits 0 but cannot be read names nothing, so every park is missing.
         let listed = if listing.succeeded() { read(&listing.stdout).unwrap_or_default() } else { Vec::new() };
         let missing = parked.iter().filter(|parcel| !listed.contains(parcel)).cloned().collect();
-        Ok(Some(ParkedReadback { listing, missing }))
+        Ok(Some(ParkedReadback { listing, missing, owed }))
     }
 
     /// The readback of a scoped bay, where `git export` refuses and `show` serves no binary file's
@@ -383,8 +399,8 @@ impl Context<'_> {
     /// whose description is a record's message, which materializes that record's scope there. The
     /// work tree under test, dirty or not, is left as it is. The parcels come from the history
     /// listing; a listing that cannot be read served nothing.
-    fn read_back_scoped(&self, scope: &str, marks: &[Mark], required: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
-        let work = self.scratch.work();
+    fn read_back_scoped(&self, bay: &Path, scope: &str, marks: &[Mark], required: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
+        let work = bay.to_path_buf();
         let listing = self.run(&self.programs.forklift, vec!["--json".into(), "history".into()], work.clone())?;
         if !listing.succeeded() {
             return Ok(HistoryReadback { export: listing, records: Vec::new(), parked: None });
@@ -627,6 +643,8 @@ pub(crate) struct Expected {
     taken: Vec<(String, Vec<Admissible>)>,
     /// The parcels the history left parked, which must be listed again.
     parked: Vec<String>,
+    /// The records the history pushed, which a fresh clone of its remote must serve.
+    pushed: Vec<Mark>,
 }
 
 impl Expected {
@@ -672,6 +690,12 @@ struct Trail {
     readbacks: Vec<HistoryReadback>,
     evidence: Evidence,
     recoverability: Recoverability,
+    /// The harness's own reads that decided the own remedy set ([`Graded::probes`]).
+    probes: Vec<Outcome>,
+    /// The fresh clone the own remedy set read from in place of the work tree, once it made one.
+    /// It owes only what the history pushed: a record kept local that it lacks is lost, not
+    /// silent, while a pushed one it leaves out with exit 0 is still silent.
+    recloned: Option<PathBuf>,
 }
 
 impl Trail {
@@ -705,9 +729,27 @@ impl Trail {
     }
 
     fn read_back(&self, context: &Context, expected: &Expected, acknowledged: bool) -> Result<HistoryReadback, RunError> {
-        let mut readback = context.read_back(&expected.marks(), &expected.required(acknowledged), |mark| expected.of(context.corpus, mark, acknowledged))?;
-        readback.parked = context.read_back_parked(&expected.parked)?;
+        // A fresh clone owes what the history pushed, not what it kept local, nor its parks.
+        let (bay, required) = match &self.recloned {
+            Some(clone) => (clone.clone(), expected.pushed.clone()),
+            None => (context.scratch.work(), expected.required(acknowledged)),
+        };
+        let mut readback = context.read_back(&bay, &expected.marks(), &required, |mark| expected.of(context.corpus, mark, acknowledged))?;
+        readback.parked = context.read_back_parked(&bay, &expected.parked, self.recloned.is_none())?;
         Ok(readback)
+    }
+
+    /// Records `step`, when there is one, then, when it can change what reads back (`rescue`),
+    /// settles; true once every acknowledged record reads back, recording `rescue` as what first
+    /// got there.
+    fn rescue(&mut self, context: &Context, expected: &Expected, made: &mut Made, promoted: Made, step: Option<Outcome>, rescue: Option<Rescue>) -> Result<bool, RunError> {
+        self.steps.extend(step);
+        let Some(rescue) = rescue else { return Ok(false) };
+        self.settle(context, expected, made, promoted, false)?;
+        if self.evidence.acknowledged_readable {
+            self.recoverability.rescued_by = Some(rescue);
+        }
+        Ok(self.evidence.acknowledged_readable)
     }
 }
 
@@ -724,7 +766,8 @@ fn settles(retry: bool, last: Option<&Outcome>) -> bool {
 /// to stack. A crash with no failure document is no answer.
 fn answered(last: Option<&Outcome>) -> bool {
     last.is_some_and(|outcome| outcome.succeeded() || (outcome.exit.is_some() && outcome.failure.is_some() && {
-        let extracted = remedy::extract(&outcome.remedy_texts());
+        // A failure document is forklift's: git writes none, so no git refusal is an answer.
+        let extracted = remedy::extract(Tool::Forklift, &outcome.remedy_texts());
         extracted.remedies.is_empty() && extracted.unextractable.is_empty()
     }))
 }
@@ -738,7 +781,7 @@ pub(crate) fn expected(scenario: &Scenario, corpus: &Corpus, built: &runner::Bui
     let before = before_of(&built.acknowledged, corpus);
     let taken = built.taken.iter().map(|taken| (taken.digest.clone(), admissible(taken, scenario.withhold_reader(warehouse)))).collect();
     Ok((Expected { before, after: corpus::expected(snapshot, &corpus.modes), acknowledged: built.acknowledged.clone(), faulted: Mark::Record(faulted), taken,
-        parked: built.parked.clone() }, faulted))
+        parked: built.parked.clone(), pushed: built.pushed.clone() }, faulted))
 }
 
 /// What the steps after a fault established, and the grade they earn.
@@ -747,9 +790,15 @@ pub struct Graded {
     pub grade: Grade,
     pub evidence: Evidence,
     pub recoverability: Recoverability,
-    /// Every command from the fault on, in order: the faulted command, retries, remedies, heal.
+    /// Every command from the fault on, in order: the faulted command, retries, remedies, the
+    /// subject's own remedy set.
     pub steps: Vec<Outcome>,
     pub readbacks: Vec<HistoryReadback>,
+    /// The harness's own reads that decided the subject's own remedy set, in order: for git, each
+    /// ref's `rev-parse`, the `merge-base --is-ancestor` of a resolving ref that differs from its
+    /// reflog's newest entry, and each candidate's `rev-list`. No step: the subject was not run for
+    /// them.
+    pub probes: Vec<Outcome>,
     /// Remedies named in a form the harness does not run.
     pub unextractable: Vec<String>,
 }
@@ -834,7 +883,7 @@ fn follow_remedies<S, E>(state: &mut S, named: impl Fn(&mut S) -> Vec<Remedy>, m
 /// Grades a fault: `first` is the faulted command's first attempt, pushing one outcome per line it
 /// ran, from the first. What it established is read off those outcomes ([`Made::of`]), never
 /// taken from the lane. Then the readback, one plain retry, the remedies every refusal named, and
-/// heal.
+/// the subject's own remedy set ([`own_remedies`]).
 pub(crate) fn grade_after(
     context: &Context, expected: &Expected, faulted: usize,
     first: impl FnOnce(&Context, &mut Vec<Outcome>) -> Result<(), RunError>,
@@ -886,8 +935,8 @@ pub(crate) fn grade_after(
     if !reads {
         let named = |(trail, unextractable): &mut (Trail, Vec<String>)| {
             let texts: Vec<String> = trail.steps.iter().chain(trail.readbacks.iter().map(|readback| &readback.export))
-                .flat_map(|outcome| outcome.remedy_texts().into_iter().map(str::to_string)).collect();
-            let extracted = remedy::extract(&texts.iter().map(String::as_str).collect::<Vec<_>>());
+                .flat_map(|outcome| remedy::texts(context.tool, outcome)).collect();
+            let extracted = remedy::extract(context.tool, &texts.iter().map(String::as_str).collect::<Vec<_>>());
             for text in extracted.unextractable {
                 if !unextractable.contains(&text) {
                     unextractable.push(text);
@@ -901,10 +950,10 @@ pub(crate) fn grade_after(
                 match named {
                     Remedy::Command { arguments } => {
                         let mut arguments = arguments.clone();
-                        if arguments.first().map(String::as_str) != Some("--json") {
+                        if context.tool == Tool::Forklift && arguments.first().map(String::as_str) != Some("--json") {
                             arguments.insert(0, "--json".into());
                         }
-                        trail.steps.push(context.run(context.program(), arguments, context.scratch.work())?);
+                        trail.steps.push(context.run(context.program(), context.subject(arguments), context.scratch.work())?);
                     }
                     Remedy::Remove { path } => trail.recoverability.outside_knowledge.push(remedy::remove(path, &context.scratch.roots()).0),
                 }
@@ -919,22 +968,124 @@ pub(crate) fn grade_after(
         (trail, unextractable) = state;
     }
 
-    // Heal last, when an acknowledged record still does not read back. Forklift's own: the
-    // other subjects' remedy sets are not run yet.
-    if context.tool == Tool::Forklift && !trail.evidence.acknowledged_readable {
-        trail.steps.push(context.run(&context.programs.forklift, vec!["--json".into(), "heal".into()], context.scratch.work())?);
-        trail.settle(context, expected, &mut made, promoted, false)?;
+    // The subject's own remedy set last, when an acknowledged record still does not read back:
+    // what a user of the tool reaches for unprompted, best first, each step settled where it can
+    // change what reads back, and stopping at the first that rescues.
+    if !trail.evidence.acknowledged_readable {
+        own_remedies(context, expected, &mut trail, &mut made, promoted)?;
     }
 
     Ok(Graded {
         grade: oracle::grade(&trail.evidence), evidence: trail.evidence, recoverability: trail.recoverability,
-        steps: trail.steps, readbacks: trail.readbacks, unextractable,
+        steps: trail.steps, readbacks: trail.readbacks, probes: trail.probes, unextractable,
     })
+}
+
+/// The subject's own remedy set, run in order until one rescues: for forklift `heal`, then
+/// `audit` (a check: it reports and repairs nothing), then a fresh clone of the remote; for git
+/// `fsck --full` (a check), then each ref restored with `update-ref` to its reflog's newest entry
+/// ([`reflog_tips`]) when it no longer resolves or names a strict ancestor of that entry, and that
+/// entry's objects are all present, then a fresh clone. A ref is only ever moved forward, to a
+/// descendant of what it names, so a damaged reflog cannot rewind one; a loose ref lost over an
+/// older packed one is restored.
+/// A clone needs a remote, and is not made where the readback already reads through one, where
+/// the work tree sits on a volume the clone would leave, or over parked work, which no clone holds.
+/// What decides a restore (`rev-parse`, `merge-base`, `rev-list`) is the harness's reading, like a
+/// readback, and is no step the subject was run for.
+fn own_remedies(context: &Context, expected: &Expected, trail: &mut Trail, made: &mut Made, promoted: Made) -> Result<(), RunError> {
+    let work = context.scratch.work();
+    let run = |arguments: &[&str], directory: PathBuf| context.run(context.program(), context.subject(arguments.iter().map(|argument| argument.to_string()).collect()), directory);
+    match context.tool {
+        Tool::Forklift => {
+            if trail.rescue(context, expected, made, promoted, Some(run(&["--json", "heal"], work.clone())?), Some(Rescue::LocalRepair))? {
+                return Ok(());
+            }
+            trail.rescue(context, expected, made, promoted, Some(run(&["--json", "audit"], work.clone())?), None)?;
+        }
+        Tool::Git | Tool::GitTuned => {
+            trail.rescue(context, expected, made, promoted, Some(run(&["fsck", "--full", "--no-progress"], work.clone())?), None)?;
+            let mut restored = false;
+            let state = work.join(runner::state_folder(context.tool));
+            for (reference, hash) in reflog_tips(&state) {
+                let resolved = run(&["rev-parse", "--verify", "-q", &reference], work.clone())?;
+                let value = resolved.succeeded().then(|| String::from_utf8_lossy(&resolved.stdout).trim().to_string());
+                trail.probes.push(resolved);
+                if let Some(value) = value {
+                    // A ref that resolves is moved only forward: when it names a strict ancestor of
+                    // its reflog's newest entry (a loose ref lost over an older packed one), an
+                    // update was lost. Every move git makes is logged, so a ref git moved back
+                    // agrees with its newest entry, and an older entry never rewinds a ref. A ref
+                    // update git refused after logging it (the reflog is appended before the ref's
+                    // lock is renamed) reads the same way: the restore then lands, with git's own
+                    // command, a write git reported failed, and the row says it was rescued so.
+                    if value == hash {
+                        continue;
+                    }
+                    let behind = run(&["merge-base", "--is-ancestor", &value, &hash], work.clone())?;
+                    let lost = behind.succeeded();
+                    trail.probes.push(behind);
+                    if !lost {
+                        continue;
+                    }
+                }
+                // A candidate whose history is not all present would restore a ref the readback
+                // then refuses: only one whose every object is there is restored. `fsck` cannot ask
+                // this of one commit while a broken ref stands, since it checks every ref first.
+                let listed = run(&["rev-list", "--objects", "--quiet", &hash], work.clone())?;
+                let present = listed.succeeded();
+                trail.probes.push(listed);
+                if !present {
+                    continue;
+                }
+                trail.recoverability.outside_knowledge.push(format!("read the newest entry of .git/logs/{}", reference));
+                trail.steps.push(run(&["update-ref", &reference, &hash], work.clone())?);
+                restored = true;
+            }
+            if restored && trail.rescue(context, expected, made, promoted, None, Some(Rescue::LocalRepair))? {
+                return Ok(());
+            }
+        }
+    }
+    let Some(url) = context.url else { return Ok(()) };
+    if context.via_host || context.scratch.work_moved() || !expected.parked.is_empty() {
+        return Ok(());
+    }
+    let clone = context.fresh("reclone");
+    let target = clone.display().to_string();
+    let cloned = match (context.tool, context.scope) {
+        (Tool::Forklift, Some(scope)) => run(&["--json", "clone", "--only", scope, url, &target], context.scratch.root().to_path_buf())?,
+        (Tool::Forklift, None) => run(&["--json", "clone", url, &target], context.scratch.root().to_path_buf())?,
+        (Tool::Git | Tool::GitTuned, _) => run(&["clone", "-q", url, &target], context.scratch.root().to_path_buf())?,
+    };
+    if !cloned.succeeded() {
+        trail.steps.push(cloned);
+        return Ok(());
+    }
+    trail.recloned = Some(clone);
+    trail.rescue(context, expected, made, promoted, Some(cloned), Some(Rescue::Reclone))?;
+    Ok(())
+}
+
+/// Each ref under `refs/` with a reflog in the git folder `git`, and the commit its reflog's newest
+/// entry moved it to, in path order. Read from the log files themselves: once a ref is broken, git
+/// refuses every reflog query that names it. A log whose last line names no commit is skipped.
+fn reflog_tips(git: &Path) -> Vec<(String, String)> {
+    let logs = git.join("logs");
+    let Ok(walked) = crate::census::walk(&logs.join("refs")) else { return Vec::new() };
+    let mut tips: Vec<(String, String)> = walked.iter().filter(|path| !path.ends_with('/')).filter_map(|path| {
+        let log = std::fs::read(logs.join("refs").join(path)).ok()?;
+        let line = String::from_utf8_lossy(&log).lines().rev().find(|line| !line.trim().is_empty())?.to_string();
+        let hash = line.split_whitespace().nth(1)?;
+        (hash.len() >= 40 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) && hash.bytes().any(|byte| byte != b'0'))
+            .then(|| (format!("refs/{}", path), hash.to_string()))
+    }).collect();
+    tips.sort();
+    tips
 }
 
 /// Runs one faulted run of `scenario` as `tool`: damage `kind` to the path `name` resolves to
 /// after the build (a census name for forklift, a git layout row for git), then the faulted
-/// command, readback, a plain retry, the named remedies, and forklift's heal.
+/// command, readback, a plain retry, the named remedies, and the subject's own remedy set.
 #[allow(clippy::too_many_arguments)]
 pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, tool: Tool, corpus: &Corpus, programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration, seed: u64) -> Result<Faulted, RunError> {
     let built = runner::build(scenario, corpus, tool, programs.of(tool), programs.server.as_deref(), scratch, environment, limit, None)?;
@@ -966,7 +1117,7 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, to
     Ok(Faulted {
         scenario: scenario.id.clone(), name: name.to_string(), warehouse, kind, target,
         grade: graded.grade, evidence: graded.evidence, recoverability: graded.recoverability,
-        steps: graded.steps, readbacks: graded.readbacks, unextractable: graded.unextractable,
+        steps: graded.steps, readbacks: graded.readbacks, probes: graded.probes, unextractable: graded.unextractable,
     })
 }
 
@@ -1015,7 +1166,7 @@ mod tests {
                 tool: Tool::Git, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
                 limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false,
             };
-            let readback = context.read_back(&expected.acknowledged, &expected.acknowledged, |mark| expected.of(&corpus, mark, false)).unwrap();
+            let readback = context.read_back(&scratch.work(), &expected.acknowledged, &expected.acknowledged, |mark| expected.of(&corpus, mark, false)).unwrap();
             assert!(readback.export.succeeded(), "damaged {}: the log ran", damaged);
             assert_eq!(readback.records.len(), 3);
             for record in &readback.records {
@@ -1023,6 +1174,167 @@ mod tests {
             }
             assert!(std::fs::read(&index).unwrap() == before, "damaged {}: the index is left as it was", damaged);
         }
+    }
+
+    /// Git's own remedy set restores a deleted ref to its reflog's newest entry, git's own
+    /// `update-ref` doing the write, so the stash it held is listed again; a zeroed one git itself
+    /// refuses to rewrite, and nothing rescues it. Reading the log file is outside knowledge. Either
+    /// way the listing first served the stash as missing with exit 0, which stays silent.
+    ///
+    /// Revert: skip the restore → the deleted ref is never rescued; restore without asking
+    /// whether the ref resolves → the intact branch is rewritten too, and its steps show it.
+    #[test]
+    fn git_restores_a_lost_ref_from_its_reflog_and_only_with_its_own_command() {
+        let git = path_git();
+        let scenario = crate::scenario::catalog().into_iter().find(|scenario| scenario.id == "parked").unwrap();
+        let corpus = corpus::generate(7, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL });
+        let programs = Programs { forklift: PathBuf::from("forklift-not-used"), git: git.clone(), server: None };
+        for (kind, rescued) in [(Kind::Delete, Some(Rescue::LocalRepair)), (Kind::Zero, None)] {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir().join(format!("proof-load-git-restore-{}-{}", std::process::id(), nanos));
+            let scratch = Scratch::create(&root).unwrap();
+            let search = crate::scrub::search_path(Some(&git), std::env::var_os("PATH"));
+            let environment = Environment::scrubbed(&scratch, search, &BTreeMap::new()).unwrap();
+            let faulted = run(&scenario, "refs/stash", Warehouse::Client, kind, Tool::Git, &corpus, &programs, &scratch, &environment, Duration::from_secs(60), 0).unwrap();
+            let restores: Vec<&Outcome> = faulted.steps.iter().filter(|step| step.arguments.first().map(String::as_str) == Some("update-ref")).collect();
+            assert_eq!(restores.len(), 1, "{:?}: the stash restored, the intact branch left alone", kind);
+            assert_eq!(restores[0].arguments[1], "refs/stash");
+            assert_eq!(restores[0].succeeded(), rescued.is_some(), "{:?}", kind);
+            assert_eq!(faulted.recoverability.outside_knowledge, ["read the newest entry of .git/logs/refs/stash"], "{:?}", kind);
+            assert_eq!(faulted.recoverability.rescued_by, rescued, "{:?}: {:?}", kind, faulted.recoverability);
+            assert_eq!(faulted.evidence.acknowledged_readable, rescued.is_some(), "{:?}", kind);
+            assert_eq!(faulted.grade, Grade::Silent, "{:?}", kind);
+        }
+    }
+
+    /// Git tuned runs every command of its own with its configuration first, as its bindings do;
+    /// the other subjects run theirs as given.
+    ///
+    /// Revert: run git tuned's own remedies bare → its restores and checks are plain git's.
+    #[test]
+    fn git_tuned_runs_its_own_remedies_tuned() {
+        let (corpus, programs) = (corpus::generate(7, corpus::Shape::SMALL), Programs { forklift: PathBuf::new(), git: PathBuf::new(), server: None });
+        let scratch = Scratch::create(&std::env::temp_dir().join(format!("proof-load-subject-{}", std::process::id()))).unwrap();
+        let environment = Environment::scrubbed(&scratch, None, &BTreeMap::new()).unwrap();
+        for (tool, prefix) in [(Tool::GitTuned, crate::scenario::GIT_TUNED), (Tool::Git, &[][..]), (Tool::Forklift, &[][..])] {
+            let context = Context {
+                tool, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
+                limit: Duration::from_secs(1), then: &[], url: None, scope: None, via_host: false,
+            };
+            let expected: Vec<String> = prefix.iter().map(|argument| argument.to_string()).chain(["fsck".to_string()]).collect();
+            assert_eq!(context.subject(vec!["fsck".to_string()]), expected, "{:?}", tool);
+        }
+    }
+
+    /// A ref only ever moves forward, to a strict descendant of what it names, so a reflog whose
+    /// newest entry is older cannot rewind it; and the probes that decide a restore are no steps
+    /// the subject was run for.
+    ///
+    /// Revert: restore every ref whose value differs from its reflog's tip → `main` is rewound to
+    /// its first commit; push the probes as steps → `rev-parse` and `rev-list` are counted; run git
+    /// tuned's own remedies bare → its steps lack its configuration.
+    #[test]
+    fn a_ref_only_moves_forward_and_probes_are_no_steps() {
+        for tool in [Tool::Git, Tool::GitTuned] {
+            resolving_ref_as(tool);
+        }
+    }
+
+    fn resolving_ref_as(tool: Tool) {
+        let git = path_git();
+        let scenario = crate::scenario::catalog().into_iter().find(|scenario| scenario.id == "parked").unwrap();
+        let corpus = corpus::generate(7, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL });
+        let programs = Programs { forklift: PathBuf::from("forklift-not-used"), git: git.clone(), server: None };
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch::create(&std::env::temp_dir().join(format!("proof-load-git-rewind-{}-{}", std::process::id(), nanos))).unwrap();
+        let search = crate::scrub::search_path(Some(&git), std::env::var_os("PATH"));
+        let environment = Environment::scrubbed(&scratch, search, &BTreeMap::new()).unwrap();
+        let built = runner::build(&scenario, &corpus, tool, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
+        let context = Context {
+            tool, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
+            limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false,
+        };
+        let head = |reference: &str| String::from_utf8_lossy(&context.run(&git, vec!["rev-parse".into(), reference.into()], scratch.work()).unwrap().stdout).trim().to_string();
+        let (main, first) = (head("refs/heads/main"), head("refs/heads/main~1"));
+        let log = scratch.work().join(".git/logs/refs/heads/main");
+        let mut lines = std::fs::read_to_string(&log).unwrap();
+        lines.push_str(&format!("{} {} A <a@b> 1 +0000\treset\n", main, first));
+        std::fs::write(&log, lines).unwrap();
+        damage::apply(&scratch.work().join(".git/refs/stash"), Kind::Delete, 0).unwrap();
+
+        let (expected, _) = expected(&scenario, &corpus, &built, Warehouse::Client).unwrap();
+        let mut trail = Trail::default();
+        let mut made = Made::default();
+        own_remedies(&context, &expected, &mut trail, &mut made, Made::default()).unwrap();
+        assert_eq!(head("refs/heads/main"), main, "the intact branch stays where it was");
+        // Git tuned runs each of its own remedies with its configuration first.
+        let prefix = if tool == Tool::GitTuned { crate::scenario::GIT_TUNED.len() } else { 0 };
+        for step in &trail.steps {
+            assert_eq!(&step.arguments[..prefix], crate::scenario::GIT_TUNED[..prefix].iter().map(|a| a.to_string()).collect::<Vec<_>>(), "{:?}", tool);
+        }
+        let ran: Vec<&str> = trail.steps.iter().map(|step| step.arguments[prefix].as_str()).collect();
+        assert_eq!(ran, ["fsck", "update-ref"], "{:?}", tool);
+        assert_eq!(trail.steps[1].arguments[prefix + 1], "refs/stash");
+        // The probes are kept, apart from the steps: each ref's rev-parse, the stash's rev-list.
+        let probed: Vec<&str> = trail.probes.iter().map(|probe| probe.arguments[prefix].as_str()).collect();
+        assert!(probed.contains(&"rev-parse") && probed.contains(&"rev-list"), "{:?}: {:?}", tool, probed);
+        assert_eq!(trail.recoverability.rescued_by, Some(Rescue::LocalRepair));
+    }
+
+    /// A branch whose loose file is gone while packed-refs still holds an older commit resolves,
+    /// silently, to that commit: the update is lost, and its reflog's newest entry restores it.
+    ///
+    /// Revert: skip every ref that resolves → `main` stays on the packed, older commit.
+    #[test]
+    fn a_loose_ref_lost_over_an_older_packed_one_is_restored() {
+        let git = path_git();
+        let scenario = crate::scenario::catalog().into_iter().find(|scenario| scenario.id == "parked").unwrap();
+        let corpus = corpus::generate(7, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL });
+        let programs = Programs { forklift: PathBuf::from("forklift-not-used"), git: git.clone(), server: None };
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch::create(&std::env::temp_dir().join(format!("proof-load-git-packed-{}-{}", std::process::id(), nanos))).unwrap();
+        let search = crate::scrub::search_path(Some(&git), std::env::var_os("PATH"));
+        let environment = Environment::scrubbed(&scratch, search, &BTreeMap::new()).unwrap();
+        let built = runner::build(&scenario, &corpus, Tool::Git, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
+        let context = Context {
+            tool: Tool::Git, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
+            limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false,
+        };
+        let git_run = |arguments: &[&str]| context.run(&git, arguments.iter().map(|argument| argument.to_string()).collect(), scratch.work()).unwrap();
+        let head = |reference: &str| String::from_utf8_lossy(&git_run(&["rev-parse", reference]).stdout).trim().to_string();
+        let (main, first) = (head("refs/heads/main"), head("refs/heads/main~1"));
+        assert!(git_run(&["update-ref", "refs/heads/main", &first]).succeeded());
+        assert!(git_run(&["pack-refs", "--all"]).succeeded());
+        assert!(git_run(&["update-ref", "refs/heads/main", &main]).succeeded());
+        damage::apply(&scratch.work().join(".git/refs/heads/main"), Kind::Delete, 0).unwrap();
+        assert_eq!(head("refs/heads/main"), first, "the branch fell back to its packed value");
+
+        let (expected, _) = expected(&scenario, &corpus, &built, Warehouse::Client).unwrap();
+        let (mut trail, mut made) = (Trail::default(), Made::default());
+        own_remedies(&context, &expected, &mut trail, &mut made, Made::default()).unwrap();
+        assert_eq!(head("refs/heads/main"), main, "the lost update is restored");
+        assert!(trail.steps.iter().any(|step| step.arguments[..2] == ["update-ref".to_string(), "refs/heads/main".to_string()]));
+    }
+
+    /// The newest entry of each ref's reflog, in path order; a log whose last line names no commit
+    /// (a ref's deletion, or garbage) names nothing, and HEAD's own log is not a ref's.
+    ///
+    /// Revert: take the first line → an older commit; keep the zero hash → a deleted ref is
+    /// "restored" to nothing.
+    #[test]
+    fn a_reflog_tip_is_its_newest_entry() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let git = std::env::temp_dir().join(format!("proof-load-reflog-tips-{}-{}", std::process::id(), nanos));
+        let (a, b, zero) = ("a".repeat(40), "b".repeat(40), "0".repeat(40));
+        let line = |old: &str, new: &str| format!("{} {} A <a@b> 1 +0000\tcommit\n", old, new);
+        std::fs::create_dir_all(git.join("logs/refs/heads/topic")).unwrap();
+        std::fs::write(git.join("logs/HEAD"), line(&zero, &a)).unwrap();
+        std::fs::write(git.join("logs/refs/heads/main"), line(&zero, &a) + &line(&a, &b) + "\n").unwrap();
+        std::fs::write(git.join("logs/refs/heads/topic/x"), line(&zero, &a)).unwrap();
+        std::fs::write(git.join("logs/refs/heads/gone"), line(&zero, &a) + &line(&a, &zero)).unwrap();
+        std::fs::write(git.join("logs/refs/stash"), "not a log line\n").unwrap();
+        assert_eq!(reflog_tips(&git), [("refs/heads/main".to_string(), b.clone()), ("refs/heads/topic/x".to_string(), a.clone())]);
+        assert!(reflog_tips(&git.join("absent")).is_empty());
     }
 
     fn walked() -> Vec<String> {
@@ -1143,15 +1455,18 @@ mod tests {
     }
 
     /// Work the history left parked reads only while the listing still names it: one a listing
-    /// that exited 0 left out is silent, and a listing that refused is a refusal.
+    /// that exited 0 left out is silent, unless the listing is a fresh clone's, which owes no park
+    /// and so has lost it; and a listing that refused is a refusal.
     ///
-    /// Revert: ignore the parked readback in `reads` → a heal that drops the park passes.
+    /// Revert: ignore the parked readback in `reads` → a heal that drops the park passes; ignore
+    /// `owed` → a re-clone, which never holds a park, grades every parked scenario silent.
     #[test]
     fn parked_work_reads_only_while_it_is_listed() {
         let full = served(&[(0, Verdict::Expected)]);
-        let parked = |exit: i32, missing: &[&str]| HistoryReadback { parked: Some(ParkedReadback {
-            listing: Outcome { exit: Some(exit), ..full.export.clone() }, missing: missing.iter().map(|parcel| parcel.to_string()).collect(),
+        let listed = |exit: i32, missing: &[&str], owed: bool| HistoryReadback { parked: Some(ParkedReadback {
+            listing: Outcome { exit: Some(exit), ..full.export.clone() }, missing: missing.iter().map(|parcel| parcel.to_string()).collect(), owed,
         }), ..full.clone() };
+        let parked = |exit: i32, missing: &[&str]| listed(exit, missing, true);
         assert!(parked(0, &[]).reads(&[Mark::Record(0)]));
         let dropped = parked(0, &["p"]);
         assert!(!dropped.reads(&[Mark::Record(0)]));
@@ -1159,6 +1474,8 @@ mod tests {
         let refused = parked(1, &["p"]);
         assert!(!refused.reads(&[Mark::Record(0)]));
         assert!(!refused.silent() && refused.refused());
+        let recloned = listed(0, &["p"], false);
+        assert!(!recloned.reads(&[Mark::Record(0)]) && !recloned.silent() && !recloned.refused());
 
         // A listing that names no parked list, or an entry without a parcel, is not read as none.
         assert_eq!(runner::parked_parcels(br#"{"data":{"parked":[{"parcel":"p"}]}}"#), Some(vec!["p".to_string()]));
@@ -1229,7 +1546,7 @@ mod tests {
         let expected = Expected {
             acknowledged: vec![Mark::Record(0), Mark::Record(1)], faulted: Mark::Record(2),
             before: corpus::expected(&corpus.records[1], &corpus.modes), after: corpus::expected(&corpus.records[2], &corpus.modes),
-            taken: vec![(oracle::digest(b"x"), documented.clone())], parked: Vec::new(),
+            taken: vec![(oracle::digest(b"x"), documented.clone())], parked: Vec::new(), pushed: Vec::new(),
         };
         let first = expected.of(&corpus, Mark::Record(0), false);
         assert_eq!(first.transformed, BTreeMap::from([("a".to_string(), documented.clone())]));
