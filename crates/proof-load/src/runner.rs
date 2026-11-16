@@ -32,6 +32,8 @@ pub struct Built {
     pub taken: Vec<Taken>,
     /// Marks acknowledged: each record or variant whose binding exited 0 throughout.
     pub acknowledged: Vec<Mark>,
+    /// The marks acknowledged when the history last pushed, which its remote therefore owes.
+    pub pushed: Vec<Mark>,
     /// The parcels `park list` names after a Forklift history that parks, which every readback
     /// must find listed again.
     pub parked: Vec<String>,
@@ -188,6 +190,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
         }
     }
     let mut acknowledged = Vec::new();
+    let mut pushed = Vec::new();
     let mut taken = Vec::new();
     let mut ledger = RedactionLedger::default();
     // The folder a sparse clone scoped the work tree to, which bounds what a later write may hold.
@@ -405,6 +408,9 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
         if let Some(mark) = op.mark() {
             acknowledged.push(mark);
         }
+        if matches!(op, Op::Push) {
+            pushed = acknowledged.clone();
+        }
     }
 
     let parks = scenario.history.iter().any(|op| matches!(op, Op::Park { .. }));
@@ -445,7 +451,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
             stopped.extend(finish(last, observer, scratch)?);
         }
     }
-    Ok(Built { outcomes, walked, host_walked, taken, acknowledged, parked, host: host.take(), stopped: std::mem::take(stopped) })
+    Ok(Built { outcomes, walked, host_walked, taken, acknowledged, pushed, parked, host: host.take(), stopped: std::mem::take(stopped) })
 }
 
 /// Stops `host`: through `observer` when there is one, so its traces are read, and otherwise by

@@ -142,6 +142,15 @@ pub(crate) struct Context<'a> {
 }
 
 impl Context<'_> {
+    /// `arguments` as the subject under test runs them: git tuned with its configuration first,
+    /// as every command of its own is bound.
+    fn subject(&self, arguments: Vec<String>) -> Vec<String> {
+        match self.tool {
+            Tool::GitTuned => crate::scenario::GIT_TUNED.iter().map(|argument| argument.to_string()).chain(arguments).collect(),
+            Tool::Forklift | Tool::Git => arguments,
+        }
+    }
+
     /// The binary of the subject under test.
     pub(crate) fn program(&self) -> &Path {
         self.programs.of(self.tool)
@@ -365,9 +374,9 @@ impl Context<'_> {
     }
 
     /// What the subject's listing of parked work says of the `parked` entries, read in `bay`:
-    /// `park list` naming each parcel, or `git stash list` each stash commit. Nothing when none
-    /// were parked.
-    fn read_back_parked(&self, bay: &Path, parked: &[String]) -> Result<Option<ParkedReadback>, RunError> {
+    /// `park list` naming each parcel, or `git stash list` each stash commit; `owed` when `bay`
+    /// is the work tree, which must still list them. Nothing when none were parked.
+    fn read_back_parked(&self, bay: &Path, parked: &[String], owed: bool) -> Result<Option<ParkedReadback>, RunError> {
         if parked.is_empty() {
             return Ok(None);
         }
@@ -380,7 +389,7 @@ impl Context<'_> {
         // A listing that exits 0 but cannot be read names nothing, so every park is missing.
         let listed = if listing.succeeded() { read(&listing.stdout).unwrap_or_default() } else { Vec::new() };
         let missing = parked.iter().filter(|parcel| !listed.contains(parcel)).cloned().collect();
-        Ok(Some(ParkedReadback { listing, missing, owed: true }))
+        Ok(Some(ParkedReadback { listing, missing, owed }))
     }
 
     /// The readback of a scoped bay, where `git export` refuses and `show` serves no binary file's
@@ -632,6 +641,8 @@ pub(crate) struct Expected {
     taken: Vec<(String, Vec<Admissible>)>,
     /// The parcels the history left parked, which must be listed again.
     parked: Vec<String>,
+    /// The records the history pushed, which a fresh clone of its remote must serve.
+    pushed: Vec<Mark>,
 }
 
 impl Expected {
@@ -678,7 +689,8 @@ struct Trail {
     evidence: Evidence,
     recoverability: Recoverability,
     /// The fresh clone the own remedy set read from in place of the work tree, once it made one.
-    /// It holds only what reached the remote, so a record it lacks is lost there, not silent.
+    /// It owes only what the history pushed: a record kept local that it lacks is lost, not
+    /// silent, while a pushed one it leaves out with exit 0 is still silent.
     recloned: Option<PathBuf>,
 }
 
@@ -713,20 +725,21 @@ impl Trail {
     }
 
     fn read_back(&self, context: &Context, expected: &Expected, acknowledged: bool) -> Result<HistoryReadback, RunError> {
+        // A fresh clone owes what the history pushed, not what it kept local, nor its parks.
         let (bay, required) = match &self.recloned {
-            Some(clone) => (clone.clone(), Vec::new()),
+            Some(clone) => (clone.clone(), expected.pushed.clone()),
             None => (context.scratch.work(), expected.required(acknowledged)),
         };
         let mut readback = context.read_back(&bay, &expected.marks(), &required, |mark| expected.of(context.corpus, mark, acknowledged))?;
-        readback.parked = context.read_back_parked(&bay, &expected.parked)?
-            .map(|parked| ParkedReadback { owed: self.recloned.is_none(), ..parked });
+        readback.parked = context.read_back_parked(&bay, &expected.parked, self.recloned.is_none())?;
         Ok(readback)
     }
 
-    /// Runs `step`, then, when it can change what reads back, settles; true once every acknowledged
-    /// record reads back, recording `rescue` as what first got there.
-    fn rescue(&mut self, context: &Context, expected: &Expected, made: &mut Made, promoted: Made, step: Outcome, rescue: Option<Rescue>) -> Result<bool, RunError> {
-        self.steps.push(step);
+    /// Records `step`, when there is one, then, when it can change what reads back (`rescue`),
+    /// settles; true once every acknowledged record reads back, recording `rescue` as what first
+    /// got there.
+    fn rescue(&mut self, context: &Context, expected: &Expected, made: &mut Made, promoted: Made, step: Option<Outcome>, rescue: Option<Rescue>) -> Result<bool, RunError> {
+        self.steps.extend(step);
         let Some(rescue) = rescue else { return Ok(false) };
         self.settle(context, expected, made, promoted, false)?;
         if self.evidence.acknowledged_readable {
@@ -764,7 +777,7 @@ pub(crate) fn expected(scenario: &Scenario, corpus: &Corpus, built: &runner::Bui
     let before = before_of(&built.acknowledged, corpus);
     let taken = built.taken.iter().map(|taken| (taken.digest.clone(), admissible(taken, scenario.withhold_reader(warehouse)))).collect();
     Ok((Expected { before, after: corpus::expected(snapshot, &corpus.modes), acknowledged: built.acknowledged.clone(), faulted: Mark::Record(faulted), taken,
-        parked: built.parked.clone() }, faulted))
+        parked: built.parked.clone(), pushed: built.pushed.clone() }, faulted))
 }
 
 /// What the steps after a fault established, and the grade they earn.
@@ -931,7 +944,7 @@ pub(crate) fn grade_after(
                         if context.tool == Tool::Forklift && arguments.first().map(String::as_str) != Some("--json") {
                             arguments.insert(0, "--json".into());
                         }
-                        trail.steps.push(context.run(context.program(), arguments, context.scratch.work())?);
+                        trail.steps.push(context.run(context.program(), context.subject(arguments), context.scratch.work())?);
                     }
                     Remedy::Remove { path } => trail.recoverability.outside_knowledge.push(remedy::remove(path, &context.scratch.roots()).0),
                 }
@@ -961,78 +974,62 @@ pub(crate) fn grade_after(
 
 /// The subject's own remedy set, run in order until one rescues: for forklift `heal`, then
 /// `audit` (a check: it reports and repairs nothing), then a fresh clone of the remote; for git
-/// `fsck --full` (a check), then each ref whose reflog's newest entry ([`reflog_tips`]) it no
-/// longer names, and whose objects are all present, restored to that entry with `update-ref`, then
-/// a fresh clone. A clone needs a remote, and is not made
-/// where the readback already reads through one.
+/// `fsck --full` (a check), then each ref that no longer resolves restored with `update-ref` to
+/// its reflog's newest entry ([`reflog_tips`]) when that entry's objects are all present, then a
+/// fresh clone. A ref that still resolves is never moved, so a damaged reflog cannot rewind one.
+/// A clone needs a remote, and is not made where the readback already reads through one, where
+/// the work tree sits on a volume the clone would leave, or over parked work, which no clone holds.
+/// What decides a restore (`rev-parse`, `rev-list`) is the harness's reading, like a readback,
+/// and is no step the subject was run for.
 fn own_remedies(context: &Context, expected: &Expected, trail: &mut Trail, made: &mut Made, promoted: Made) -> Result<(), RunError> {
     let work = context.scratch.work();
-    let arguments = |arguments: &[&str]| arguments.iter().map(|argument| argument.to_string()).collect::<Vec<_>>();
+    let run = |arguments: &[&str], directory: PathBuf| context.run(context.program(), context.subject(arguments.iter().map(|argument| argument.to_string()).collect()), directory);
     match context.tool {
         Tool::Forklift => {
-            let healed = context.run(context.program(), arguments(&["--json", "heal"]), work.clone())?;
-            if trail.rescue(context, expected, made, promoted, healed, Some(Rescue::LocalRepair))? {
+            if trail.rescue(context, expected, made, promoted, Some(run(&["--json", "heal"], work.clone())?), Some(Rescue::LocalRepair))? {
                 return Ok(());
             }
-            let audited = context.run(context.program(), arguments(&["--json", "audit"]), work.clone())?;
-            trail.rescue(context, expected, made, promoted, audited, None)?;
+            trail.rescue(context, expected, made, promoted, Some(run(&["--json", "audit"], work.clone())?), None)?;
         }
         Tool::Git | Tool::GitTuned => {
-            let checked = context.run(context.program(), arguments(&["fsck", "--full", "--no-progress"]), work.clone())?;
-            trail.rescue(context, expected, made, promoted, checked, None)?;
+            trail.rescue(context, expected, made, promoted, Some(run(&["fsck", "--full", "--no-progress"], work.clone())?), None)?;
             let mut restored = false;
             for (reference, hash) in reflog_tips(&work.join(runner::state_folder(context.tool))) {
-                let named = context.run(context.program(), arguments(&["rev-parse", "--verify", "-q", &reference]), work.clone())?;
-                let intact = named.succeeded() && String::from_utf8_lossy(&named.stdout).trim() == hash;
-                trail.steps.push(named);
-                if intact {
+                if run(&["rev-parse", "--verify", "-q", &reference], work.clone())?.succeeded() {
                     continue;
                 }
                 // A candidate whose history is not all present would restore a ref the readback
                 // then refuses: only one whose every object is there is restored. `fsck` cannot ask
                 // this of one commit while a broken ref stands, since it checks every ref first.
-                let present = context.run(context.program(), arguments(&["rev-list", "--objects", "--quiet", &hash]), work.clone())?;
-                let whole = present.succeeded();
-                trail.steps.push(present);
-                if !whole {
+                if !run(&["rev-list", "--objects", "--quiet", &hash], work.clone())?.succeeded() {
                     continue;
                 }
                 trail.recoverability.outside_knowledge.push(format!("read the newest entry of .git/logs/{}", reference));
-                trail.steps.push(context.run(context.program(), arguments(&["update-ref", &reference, &hash]), work.clone())?);
+                trail.steps.push(run(&["update-ref", &reference, &hash], work.clone())?);
                 restored = true;
             }
-            if restored {
-                trail.settle(context, expected, made, promoted, false)?;
-                if trail.evidence.acknowledged_readable {
-                    trail.recoverability.rescued_by = Some(Rescue::LocalRepair);
-                    return Ok(());
-                }
+            if restored && trail.rescue(context, expected, made, promoted, None, Some(Rescue::LocalRepair))? {
+                return Ok(());
             }
         }
     }
-    let (Some(url), false) = (context.url, context.via_host) else { return Ok(()) };
+    let Some(url) = context.url else { return Ok(()) };
+    if context.via_host || context.scratch.work_moved() || !expected.parked.is_empty() {
+        return Ok(());
+    }
     let clone = context.fresh("reclone");
-    let cloned = match context.tool {
-        Tool::Forklift => {
-            let mut cloned = arguments(&["--json", "clone"]);
-            if let Some(scope) = context.scope {
-                cloned.extend(arguments(&["--only", scope]));
-            }
-            cloned.extend([url.to_string(), clone.display().to_string()]);
-            cloned
-        }
-        Tool::Git | Tool::GitTuned => arguments(&["clone", "-q", url, &clone.display().to_string()]),
+    let target = clone.display().to_string();
+    let cloned = match (context.tool, context.scope) {
+        (Tool::Forklift, Some(scope)) => run(&["--json", "clone", "--only", scope, url, &target], context.scratch.root().to_path_buf())?,
+        (Tool::Forklift, None) => run(&["--json", "clone", url, &target], context.scratch.root().to_path_buf())?,
+        (Tool::Git | Tool::GitTuned, _) => run(&["clone", "-q", url, &target], context.scratch.root().to_path_buf())?,
     };
-    let cloned = context.run(context.program(), cloned, context.scratch.root().to_path_buf())?;
-    let succeeded = cloned.succeeded();
-    trail.steps.push(cloned);
-    if succeeded {
-        trail.recloned = Some(clone);
-        trail.settle(context, expected, made, promoted, false)?;
-        if trail.evidence.acknowledged_readable {
-            trail.recoverability.rescued_by = Some(Rescue::Reclone);
-        }
+    if !cloned.succeeded() {
+        trail.steps.push(cloned);
+        return Ok(());
     }
+    trail.recloned = Some(clone);
+    trail.rescue(context, expected, made, promoted, Some(cloned), Some(Rescue::Reclone))?;
     Ok(())
 }
 
@@ -1151,8 +1148,8 @@ mod tests {
     /// refuses to rewrite, and nothing rescues it. Reading the log file is outside knowledge. Either
     /// way the listing first served the stash as missing with exit 0, which stays silent.
     ///
-    /// Revert: skip the restore → the deleted ref is never rescued; restore without the
-    /// `rev-parse` comparison → the intact branch is rewritten too, and its steps show it.
+    /// Revert: skip the restore → the deleted ref is never rescued; restore without asking
+    /// whether the ref resolves → the intact branch is rewritten too, and its steps show it.
     #[test]
     fn git_restores_a_lost_ref_from_its_reflog_and_only_with_its_own_command() {
         let git = path_git();
@@ -1175,6 +1172,65 @@ mod tests {
             assert_eq!(faulted.evidence.acknowledged_readable, rescued.is_some(), "{:?}", kind);
             assert_eq!(faulted.grade, Grade::Silent, "{:?}", kind);
         }
+    }
+
+    /// Git tuned runs every command of its own with its configuration first, as its bindings do;
+    /// the other subjects run theirs as given.
+    ///
+    /// Revert: run git tuned's own remedies bare → its restores and checks are plain git's.
+    #[test]
+    fn git_tuned_runs_its_own_remedies_tuned() {
+        let (corpus, programs) = (corpus::generate(7, corpus::Shape::SMALL), Programs { forklift: PathBuf::new(), git: PathBuf::new(), server: None });
+        let scratch = Scratch::create(&std::env::temp_dir().join(format!("proof-load-subject-{}", std::process::id()))).unwrap();
+        let environment = Environment::scrubbed(&scratch, None, &BTreeMap::new()).unwrap();
+        for (tool, prefix) in [(Tool::GitTuned, crate::scenario::GIT_TUNED), (Tool::Git, &[][..]), (Tool::Forklift, &[][..])] {
+            let context = Context {
+                tool, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
+                limit: Duration::from_secs(1), then: &[], url: None, scope: None, via_host: false,
+            };
+            let expected: Vec<String> = prefix.iter().map(|argument| argument.to_string()).chain(["fsck".to_string()]).collect();
+            assert_eq!(context.subject(vec!["fsck".to_string()]), expected, "{:?}", tool);
+        }
+    }
+
+    /// A ref that still resolves is never moved, whatever its reflog's newest entry says, so a
+    /// reflog cut back to an older entry cannot rewind it; and the probes that decide a restore are
+    /// no steps the subject was run for.
+    ///
+    /// Revert: restore every ref whose value differs from its reflog's tip → `main` is rewound to
+    /// its first commit; push the probes as steps → `rev-parse` and `rev-list` are counted.
+    #[test]
+    fn a_resolving_ref_is_never_moved_and_probes_are_no_steps() {
+        let git = path_git();
+        let scenario = crate::scenario::catalog().into_iter().find(|scenario| scenario.id == "parked").unwrap();
+        let corpus = corpus::generate(7, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL });
+        let programs = Programs { forklift: PathBuf::from("forklift-not-used"), git: git.clone(), server: None };
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch::create(&std::env::temp_dir().join(format!("proof-load-git-rewind-{}-{}", std::process::id(), nanos))).unwrap();
+        let search = crate::scrub::search_path(Some(&git), std::env::var_os("PATH"));
+        let environment = Environment::scrubbed(&scratch, search, &BTreeMap::new()).unwrap();
+        let built = runner::build(&scenario, &corpus, Tool::Git, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
+        let context = Context {
+            tool: Tool::Git, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
+            limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false,
+        };
+        let head = |reference: &str| String::from_utf8_lossy(&context.run(&git, vec!["rev-parse".into(), reference.into()], scratch.work()).unwrap().stdout).trim().to_string();
+        let (main, first) = (head("refs/heads/main"), head("refs/heads/main~1"));
+        let log = scratch.work().join(".git/logs/refs/heads/main");
+        let mut lines = std::fs::read_to_string(&log).unwrap();
+        lines.push_str(&format!("{} {} A <a@b> 1 +0000\treset\n", main, first));
+        std::fs::write(&log, lines).unwrap();
+        damage::apply(&scratch.work().join(".git/refs/stash"), Kind::Delete, 0).unwrap();
+
+        let (expected, _) = expected(&scenario, &corpus, &built, Warehouse::Client).unwrap();
+        let mut trail = Trail::default();
+        let mut made = Made::default();
+        own_remedies(&context, &expected, &mut trail, &mut made, Made::default()).unwrap();
+        assert_eq!(head("refs/heads/main"), main, "the intact branch stays where it was");
+        let ran: Vec<&str> = trail.steps.iter().map(|step| step.arguments[0].as_str()).collect();
+        assert_eq!(ran, ["fsck", "update-ref"]);
+        assert_eq!(trail.steps[1].arguments[1], "refs/stash");
+        assert_eq!(trail.recoverability.rescued_by, Some(Rescue::LocalRepair));
     }
 
     /// The newest entry of each ref's reflog, in path order; a log whose last line names no commit
@@ -1407,7 +1463,7 @@ mod tests {
         let expected = Expected {
             acknowledged: vec![Mark::Record(0), Mark::Record(1)], faulted: Mark::Record(2),
             before: corpus::expected(&corpus.records[1], &corpus.modes), after: corpus::expected(&corpus.records[2], &corpus.modes),
-            taken: vec![(oracle::digest(b"x"), documented.clone())], parked: Vec::new(),
+            taken: vec![(oracle::digest(b"x"), documented.clone())], parked: Vec::new(), pushed: Vec::new(),
         };
         let first = expected.of(&corpus, Mark::Record(0), false);
         assert_eq!(first.transformed, BTreeMap::from([("a".to_string(), documented.clone())]));
