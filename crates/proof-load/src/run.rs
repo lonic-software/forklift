@@ -195,6 +195,10 @@ fn tuned_configuration(daemon: bool) -> String {
     format!("{}; {}", options.join(" "), fsmonitor)
 }
 
+/// How long each command of a round trip over `--history-from` may run. Forklift's own history,
+/// some 3400 commits, exports in about 200 s from a debug build.
+const HISTORY_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// Runs every lane `options` asks for into `options.out`, which must be empty or new, and returns
 /// the report it wrote there as `report.json` and `report.md`. A run that is refused or cancelled
 /// leaves whatever it wrote before it stopped, but no `report.json`; a run again needs another
@@ -809,7 +813,9 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                 start_block(progress, Category::Fidelity, block)?;
                 let trip = output.scratch(block).map_err(|error| error.to_string()).and_then(|scratch| {
                     let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
-                    Ok(round_trip(program, git_program, history, &scratch, &environment, limit))
+                    // A real history's import and export take minutes, not seconds: its commands
+                    // get `HISTORY_LIMIT` each, the fixtures' the run's own limit.
+                    Ok(round_trip(program, git_program, history, &scratch, &environment, if history.is_some() { HISTORY_LIMIT } else { limit }))
                 });
                 let trip = match trip {
                     Ok(trip) => {
