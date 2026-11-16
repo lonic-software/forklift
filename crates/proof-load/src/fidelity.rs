@@ -118,7 +118,6 @@ const FIXTURE_IDENTITY: &[(&str, &str)] = &[
     ("GIT_COMMITTER_NAME", "Fixture Committer"), ("GIT_COMMITTER_EMAIL", "committer@example.com"), ("GIT_COMMITTER_DATE", "1700000000 +0000"),
 ];
 
-/// How much of each command's stdout a trip keeps in its steps.
 /// How much of each command's stdout a history trip keeps in its steps. Such a trip runs
 /// thousands of commands, its listings megabytes each, and a step's stdout is written as a JSON
 /// array of numbers: 64 KiB a step made a 165 MB trail.
@@ -1073,13 +1072,14 @@ impl Records<'_, '_> {
 }
 
 /// Refuses a `from` that is not a whole history: a folder that is not the top of a repository
-/// (its work tree or, bare, its git folder), and a shallow repository.
+/// (its work tree, a linked worktree's or a submodule's included, or, bare, its git folder), and
+/// a shallow repository.
 fn check_history(steps: &mut Steps, git: &Path, from: &Path, environment: &Environment) -> Result<(), String> {
     let (from_text, root) = (from.display().to_string(), steps.scratch.root().to_path_buf());
-    let git_dir = PathBuf::from(printed(&steps.run(git, &["-C", &from_text, "rev-parse", "--absolute-git-dir"], &root, environment)?));
+    let bare = printed(&steps.run(git, &["-C", &from_text, "rev-parse", "--is-bare-repository"], &root, environment)?) == "true";
+    let top = PathBuf::from(printed(&steps.run(git, &["-C", &from_text, "rev-parse", if bare { "--absolute-git-dir" } else { "--show-toplevel" }], &root, environment)?));
     let real = |path: &Path| std::fs::canonicalize(path).map_err(|error| format!("cannot read {}: {}", path.display(), error));
-    let (from_real, git_dir_real) = (real(from)?, real(&git_dir)?);
-    if git_dir_real != from_real && git_dir_real != from_real.join(".git") {
+    if real(&top)? != real(from)? {
         return Err(format!("{} is not the top of a git repository", from.display()));
     }
     match printed(&steps.run(git, &["-C", &from_text, "rev-parse", "--is-shallow-repository"], &root, environment)?).as_str() {
@@ -1089,14 +1089,28 @@ fn check_history(steps: &mut Steps, git: &Path, from: &Path, environment: &Envir
     }
 }
 
-/// What the history at `from` holds, for the report's record: its refs' count and a digest of
-/// their listing, each ref's object and name. `from` is checked as `copy_history` checks it.
-pub fn describe_history(git: &Path, from: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<String, String> {
+/// The history `--history-from` names, mirrored once for every trip that takes it.
+#[derive(Debug, serde::Serialize)]
+pub struct HistoryCopy {
+    /// Each command the copy ran, its stdout cut as a history trip's is.
+    pub steps: Vec<Outcome>,
+    /// The mirror's path and what it holds, for the report's record: its refs' count and a
+    /// digest of their listing, each ref's object and name. Refused as `copy_history` refuses.
+    pub copied: Result<(PathBuf, String), String>,
+}
+
+/// Mirrors the history at `from` into `scratch` once, so every trip copies the same refs the
+/// report records, however `from` moves meanwhile.
+pub fn take_history(git: &Path, from: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> HistoryCopy {
     let mut steps = Steps { scratch, limit, outcomes: Vec::new(), kept: Some(KEPT_STDOUT) };
-    check_history(&mut steps, git, from, environment)?;
-    let listing = steps.run(git, &["-C", &from.display().to_string(), "for-each-ref", "--format=%(objectname) %(refname)"], scratch.root(), environment)?;
-    let refs = listing.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).count();
-    Ok(format!("{} refs, blake3 {} of their listing", refs, blake3::hash(&listing).to_hex()))
+    let mirror = scratch.root().join("mirror");
+    let copied = (|| -> Result<(PathBuf, String), String> {
+        copy_history(&mut steps, git, from, &mirror, environment)?;
+        let listing = steps.run(git, &["for-each-ref", "--format=%(objectname) %(refname)"], &mirror, environment)?;
+        let refs = listing.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).count();
+        Ok((mirror.clone(), format!("{} refs, blake3 {} of their listing", refs, blake3::hash(&listing).to_hex())))
+    })();
+    HistoryCopy { steps: steps.outcomes, copied }
 }
 
 /// Mirrors the repository at `from` to `to`, which must not exist yet, reading `from` only; a
@@ -1545,12 +1559,13 @@ mod tests {
     }
 
     /// A given history is mirrored with every ref it holds and left exactly as it was, from a work
-    /// tree or a bare repository; a shallow one and a folder inside a repository are refused by
+    /// tree, a linked worktree or a bare repository; a shallow one and a folder inside a repository are refused by
     /// name, and its record counts and digests its refs.
     ///
     /// Revert: drop the shallow check → the shallow clone is copied. Copy with a plain clone → the
     /// mirror lacks the note, the remote-tracking ref and the side branch. Drop the top check → the
-    /// inner folder reaches the clone, which refuses it differently.
+    /// inner folder reaches the clone, which refuses it differently. Take the git folder as the
+    /// top of a work tree → the linked worktree is refused.
     #[test]
     fn a_history_is_mirrored_and_a_shallow_one_refused() {
         let (scratch, environment) = area("history");
@@ -1582,9 +1597,16 @@ mod tests {
         assert_eq!(refused, format!("{} is not the top of a git repository", inside.display()));
         let bare = scratch.root().join("bare");
         copy_history(&mut steps, &git, &mirror, &bare, &environment).unwrap();
-        let described = describe_history(&git, &source, &scratch, &environment, Duration::from_secs(60)).unwrap();
+        let worktree = scratch.root().join("worktree");
+        steps.run(&git, &["worktree", "add", "-q", "--detach", "--", &worktree.display().to_string()], &source, &environment).unwrap();
+        copy_history(&mut steps, &git, &worktree, &scratch.root().join("from-worktree"), &environment).unwrap();
+        let (taken, environment) = area("taken");
+        let copy = take_history(&git, &source, &taken, &environment, Duration::from_secs(60));
+        let (path, described) = copy.copied.unwrap();
+        assert_eq!(path, taken.root().join("mirror"));
         let listed = steps.run(&git, &["for-each-ref", "--format=%(objectname) %(refname)"], &source, &environment).unwrap();
         assert_eq!(described, format!("{} refs, blake3 {} of their listing", refs.lines().count(), blake3::hash(&listed).to_hex()));
+        assert!(copy.steps.iter().any(|step| step.arguments.iter().any(|argument| argument == "--mirror")));
     }
 
     /// A history trip keeps the first `KEPT_STDOUT` bytes of a command's stdout in its steps, and

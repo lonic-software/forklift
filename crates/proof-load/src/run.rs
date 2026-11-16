@@ -806,23 +806,38 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                 ("fidelity-git-forklift-git", Direction::GitForkliftGit, git_round_trip, None),
                 ("fidelity-forklift-git-forklift", Direction::ForkliftGitForklift, forklift_round_trip, None),
             ];
-            // The history is checked and recorded once, before either trip copies it; one the
-            // check refuses is a gap, and its trips are not run.
+            // The history is mirrored once, in a block of its own, and both its trips copy that
+            // mirror, so the record names what they compared; one the copy refuses is a gap,
+            // and its trips are not run.
+            progress.lane(Category::Fidelity, Some(trips.len() + if history_from.is_some() { 3 } else { 0 }));
+            let mut history_mirror = None;
             if let Some(history) = history_from.as_deref() {
-                let described = output.scratch("fidelity-history").map_err(|error| error.to_string()).and_then(|scratch| {
+                const BLOCK: &str = "fidelity-history";
+                start_block(progress, Category::Fidelity, BLOCK)?;
+                let copy = output.scratch(BLOCK).map_err(|error| error.to_string()).and_then(|scratch| {
                     let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
-                    crate::fidelity::describe_history(git_program, history, &scratch, &environment, HISTORY_LIMIT)
+                    Ok(crate::fidelity::take_history(git_program, history, &scratch, &environment, HISTORY_LIMIT))
                 });
-                match described {
-                    Ok(described) => {
+                let copied = match copy {
+                    Ok(copy) => {
+                        write_detail(output.root(), &format!("{}.json", BLOCK), &copy)?;
+                        copy.copied
+                    }
+                    Err(error) => Err(error),
+                };
+                progress.block_finished(Category::Fidelity, BLOCK, copied.is_err());
+                match copied {
+                    Ok((mirror, described)) => {
                         history_record = Some(format!("{} ({})", history.display(), described));
-                        trips.push(("fidelity-history-git-forklift-git", Direction::GitForkliftGit, git_round_trip, Some(history)));
-                        trips.push(("fidelity-history-forklift-git-forklift", Direction::ForkliftGitForklift, forklift_round_trip, Some(history)));
+                        history_mirror = Some(mirror);
                     }
                     Err(error) => fidelity_missing.push(format!("{}: {}", crate::fidelity::Input::History.label(), error)),
                 }
             }
-            progress.lane(Category::Fidelity, Some(trips.len()));
+            if let Some(mirror) = history_mirror.as_deref() {
+                trips.push(("fidelity-history-git-forklift-git", Direction::GitForkliftGit, git_round_trip, Some(mirror)));
+                trips.push(("fidelity-history-forklift-git-forklift", Direction::ForkliftGitForklift, forklift_round_trip, Some(mirror)));
+            }
             let mut finished = 0;
             for (block, direction, round_trip, history) in trips.iter().copied() {
                 start_block(progress, Category::Fidelity, block)?;
