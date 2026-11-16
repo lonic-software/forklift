@@ -678,7 +678,7 @@ fn subject_of(context: &Context) -> Result<Subject, RunError> {
     }
     let outcome = context.run(program, vec!["--exec-path".to_string()], context.scratch.work())?;
     if !outcome.succeeded() {
-        return Err(RunError::Io(format!("`git --exec-path` exited {:?}: {}", outcome.exit, String::from_utf8_lossy(&outcome.stderr))));
+        return Err(RunError::Io(format!("asking git for its exec path exited {:?}: {}", outcome.exit, String::from_utf8_lossy(&outcome.stderr))));
     }
     let folder = String::from_utf8_lossy(&outcome.stdout).trim().to_string();
     Ok(Subject::new(program, Some(Path::new(&folder))))
@@ -704,7 +704,7 @@ pub(crate) fn command_of(tool: Tool, schema: &crate::writeops::Schema, arguments
     while arguments.get(at).map(String::as_str) == Some("-c") {
         at += 2;
     }
-    arguments.get(at).cloned().ok_or_else(|| format!("`git {}` names no subcommand", arguments.join(" ")))
+    arguments.get(at).cloned().ok_or_else(|| format!("the git line {:?} names no subcommand", arguments))
 }
 
 /// Whether scenario `id` runs its kill points and its power loss, given the scenarios named for
@@ -1102,7 +1102,7 @@ mod tests {
 50 clone(child_stack=0x1, flags=CLONE_VM|CLONE_THREAD) = 52
 52 openat(AT_FDCWD</o/s/0001-h-count/work>, \".forklift/objects/ab/0123456789abcdef0123.tmp~50-1\", O_WRONLY|O_CREAT, 0666) = 6</o/s/0001-h-count/work/.forklift/objects/ab/0123456789abcdef0123.tmp~50-1>
 50 clone(child_stack=NULL, flags=SIGCHLD) = 60
-60 execve(\"/usr/bin/git\", [\"git\", \"status\"], 0x1 /* 3 vars */) = 0
+60 execve(\"/usr/bin/git\", [], 0x1 /* 3 vars */) = 0
 60 write(3</o/s/0001-h-count/tmp/x>, \"abc\", 3) = 3
 ";
         let calls = trace::parse(text).unwrap();
@@ -1136,7 +1136,7 @@ mod tests {
     #[test]
     fn a_process_is_the_subjects_by_what_it_last_executed() {
         let text = "\
-70 execve(\"/usr/bin/git\", [\"git\", \"commit\"], 0x1 /* 3 vars */) = 0
+70 execve(\"/usr/bin/git\", [], 0x1 /* 3 vars */) = 0
 70 clone(child_stack=NULL, flags=SIGCHLD) = 71
 71 execve(\"/usr/lib/git-core/git-gc\", [\"git-gc\"], 0x1 /* 3 vars */) = 0
 71 write(3</o/s/0001-h-count/work/.git/gc.log>, \"a\", 1) = 1
