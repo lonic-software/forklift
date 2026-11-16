@@ -757,7 +757,7 @@ fn subject_of(context: &Context) -> Result<Subject, RunError> {
 /// outside every trace, since a command that finds none starts a detached one inside its own. The
 /// build turned the fsmonitor on, so a copy's config is left as the copy holds it.
 pub(crate) fn daemon_of(context: &Context) -> Result<Option<runner::FsmonitorDaemon>, RunError> {
-    daemon_over(context)?.map_err(RunError::Io)
+    daemon_over(context)?.map_err(|why| RunError::Io(format!("{}: {}", context.scratch.work().display(), why)))
 }
 
 /// [`daemon_of`], with a daemon that exited before it watched told apart from what failed the

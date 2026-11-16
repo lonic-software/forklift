@@ -274,12 +274,12 @@ impl FsmonitorDaemon {
         let mut daemon = FsmonitorDaemon { child, program: program.to_path_buf(), work: work.to_path_buf(), environment: environment.clone() };
         let started = std::time::Instant::now();
         loop {
-            // Only an exit with a code is git's answer to the work tree; a death by a signal came
-            // from outside it, and is the harness's.
+            // Only an exit that failed with a code is git's answer to the work tree, its refusal; a
+            // clean exit before watching, or a death by a signal, is the harness's.
             if let Some(status) = daemon.child.try_wait().map_err(|error| harness(RunError::Io(error.to_string())))? {
                 return Err(match status.code() {
-                    Some(code) => Unwatched::Exited(format!("the fsmonitor daemon exited with code {} before it watched", code)),
-                    None => harness(RunError::Io(format!("the fsmonitor daemon died {} before it watched {}", status, work.display()))),
+                    Some(code) if code != 0 => Unwatched::Exited(format!("the fsmonitor daemon exited with code {} before it watched", code)),
+                    _ => harness(RunError::Io(format!("the fsmonitor daemon ended {} before it watched {}", status, work.display()))),
                 });
             }
             // A probe that runs past its own bound has not seen the daemon watch yet; only `limit`
@@ -1010,6 +1010,30 @@ mod tests {
         let head = scratch.work().join(".git").join("HEAD");
         std::fs::write(&head, b"").unwrap();
         assert!(matches!(FsmonitorDaemon::watch_or_exit(&git, &scratch.work(), &scratch, &environment, Duration::from_secs(30)), Err(Unwatched::Exited(_))));
+        let _ = crate::power::remove_tree(scratch.root());
+    }
+
+    /// A daemon that failed with a code before it watched is git's refusal; one that ended clean
+    /// before it watched is the harness's.
+    ///
+    /// Revert: take every coded exit for a refusal → the clean exit reads as git's answer.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_failed_exit_is_git_s_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("proof-load-daemon-exit-{}-{}", std::process::id(), nanos));
+        let scratch = Scratch::create(&root).unwrap();
+        let environment = Environment::scrubbed(&scratch, std::env::var_os("PATH"), &BTreeMap::new()).unwrap();
+        let unwatched = |code: i32| {
+            // `run` ends with `code`; `status` never says it watches.
+            let program = scratch.root().join(format!("daemon-{}", code));
+            std::fs::write(&program, format!("#!/bin/sh\n[ \"$2\" = run ] && exit {}\nexit 1\n", code)).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            FsmonitorDaemon::watch_or_exit(&program, &scratch.work(), &scratch, &environment, Duration::from_secs(10)).err().expect("the daemon never watched")
+        };
+        assert!(matches!(unwatched(128), Unwatched::Exited(why) if why.contains("code 128")));
+        assert!(matches!(unwatched(0), Unwatched::Harness(_)));
         let _ = crate::power::remove_tree(scratch.root());
     }
 
