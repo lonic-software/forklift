@@ -795,7 +795,9 @@ pub struct Graded {
     pub steps: Vec<Outcome>,
     pub readbacks: Vec<HistoryReadback>,
     /// The harness's own reads that decided the subject's own remedy set, in order: for git, each
-    /// ref's `rev-parse` and each candidate's `rev-list`. No step: the subject was not run for them.
+    /// ref's `rev-parse`, the `merge-base --is-ancestor` of a resolving ref that differs from its
+    /// reflog's newest entry, and each candidate's `rev-list`. No step: the subject was not run for
+    /// them.
     pub probes: Vec<Outcome>,
     /// Remedies named in a form the harness does not run.
     pub unextractable: Vec<String>,
@@ -983,12 +985,13 @@ pub(crate) fn grade_after(
 /// `audit` (a check: it reports and repairs nothing), then a fresh clone of the remote; for git
 /// `fsck --full` (a check), then each ref restored with `update-ref` to its reflog's newest entry
 /// ([`reflog_tips`]) when it no longer resolves or names a strict ancestor of that entry, and that
-/// entry's objects are all present, then a fresh clone. A ref is only ever moved forward, to a descendant of what it names, so a damaged
-/// reflog cannot rewind one; a loose ref lost over an older packed one is restored.
+/// entry's objects are all present, then a fresh clone. A ref is only ever moved forward, to a
+/// descendant of what it names, so a damaged reflog cannot rewind one; a loose ref lost over an
+/// older packed one is restored.
 /// A clone needs a remote, and is not made where the readback already reads through one, where
 /// the work tree sits on a volume the clone would leave, or over parked work, which no clone holds.
-/// What decides a restore (`rev-parse`, `merge-base`, `rev-list`) is the harness's reading, like a readback,
-/// and is no step the subject was run for.
+/// What decides a restore (`rev-parse`, `merge-base`, `rev-list`) is the harness's reading, like a
+/// readback, and is no step the subject was run for.
 fn own_remedies(context: &Context, expected: &Expected, trail: &mut Trail, made: &mut Made, promoted: Made) -> Result<(), RunError> {
     let work = context.scratch.work();
     let run = |arguments: &[&str], directory: PathBuf| context.run(context.program(), context.subject(arguments.iter().map(|argument| argument.to_string()).collect()), directory);
