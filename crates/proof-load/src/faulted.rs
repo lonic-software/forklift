@@ -60,21 +60,63 @@ pub struct RecordReadback {
 }
 
 /// One readback of the whole history.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryReadback {
     /// The readback's own command: the export, or in a scoped bay the opening of the side bay it
     /// reads through. A refusal here refuses every record.
     pub export: Outcome,
     pub records: Vec<RecordReadback>,
     /// The parked work read back, when the history left work parked.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub parked: Option<ParkedReadback>,
     /// Over a real history, the commands that resolved and laid out each sampled record, in order;
     /// a refusal here refuses the record it ran for. Forklift's bay for a record opens at the
     /// current head before moving to the record, so damage only that head holds refuses every
     /// forklift record, where git still serves the records that do not hold it.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reads: Vec<Outcome>,
+}
+
+/// Written with each successful read's stdout left out, its length kept: over a real history
+/// those bytes ran to some 100 MB a readback (CI, 2026-11-16), so a run's details came to 3.1 GB.
+/// They hold no tree's bytes, each record's tree being read from the folder it was laid out in:
+/// a successful read's stdout is a walk's listing, a hash, or a command's document. The listing
+/// and the hash pick which commit is laid out, so a record served from the wrong commit is told
+/// from a right commit holding the wrong tree only by running the read again. A refused read is
+/// kept whole.
+impl serde::Serialize for HistoryReadback {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct Written<'a> {
+            export: &'a Outcome,
+            records: &'a [RecordReadback],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            parked: Option<&'a ParkedReadback>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            reads: Vec<Read<'a>>,
+        }
+        #[derive(serde::Serialize)]
+        struct Read<'a> {
+            arguments: &'a [String],
+            exit: Option<i32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stdout: Option<&'a [u8]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stdout_bytes: Option<usize>,
+            stderr: &'a [u8],
+            failure: &'a Option<tool::Failure>,
+        }
+        // Destructured whole, so a field added to either is a compile error here, not one the
+        // details silently leave out.
+        let HistoryReadback { export, records, parked, reads } = self;
+        let reads = reads.iter().map(|read| {
+            let Outcome { arguments, exit, stdout, stderr, failure } = read;
+            let kept = !read.succeeded();
+            Read {
+                arguments, exit: *exit, stdout: kept.then_some(stdout.as_slice()),
+                stdout_bytes: (!kept).then_some(stdout.len()), stderr, failure,
+            }
+        }).collect();
+        Written { export, records, parked: parked.as_ref(), reads }.serialize(serializer)
+    }
 }
 
 /// What `park list` said of the work the history left parked.
@@ -123,6 +165,8 @@ pub struct Faulted {
     /// Every command after the fault, in order: the faulted command, retries, remedies, the
     /// subject's own remedy set.
     pub steps: Vec<Outcome>,
+    /// Every readback taken, in order, except that a settle's own follows the acknowledged one it
+    /// took and did not settle by: a settle's last readback is the one it judged by.
     pub readbacks: Vec<HistoryReadback>,
     /// The harness's reads that decided the own remedy set ([`Graded::probes`]).
     pub probes: Vec<Outcome>,
@@ -133,6 +177,10 @@ pub struct Faulted {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unreached: Option<Outcome>,
 }
+
+/// The scenario every damage row over a real history names, apart from the fixture scenarios', so
+/// a row over the history never pairs with a fixture row.
+pub const HISTORY_SCENARIO: &str = "real-history";
 
 /// The ref each history subject records the probe on: a git branch, a forklift pallet, made at the
 /// history's current tip and current before the pristine subject is copied.
@@ -150,10 +198,11 @@ pub struct Position {
     pub depth: usize,
 }
 
-/// A history readback before judging: the readback's own command, what each mark read back as
-/// and whether the subject reached it (a forklift walk that exits 0 short of the depth reads as
-/// served empty, which is not reaching it), and the commands that read them.
-type Served = (Outcome, Vec<(Mark, Readback, bool)>, Vec<Outcome>);
+/// A history readback before judging: the readback's own command; per mark, what it read back
+/// as, whether the subject reached it (a forklift walk that exits 0 short of the depth reads as
+/// served empty, which is not reaching it), and the indexes of the reads that read that mark;
+/// and the commands that read them.
+type Served = (Outcome, Vec<(Mark, Readback, bool, Vec<usize>)>, Vec<Outcome>);
 
 /// The parts of a faulted run that stay fixed across its steps.
 pub(crate) struct Context<'a> {
@@ -465,7 +514,7 @@ impl Context<'_> {
     /// that exits 0 and ends before the depth served the record as missing, which is silent.
     fn read_back_history(&self, bay: &Path, positions: &[Position], marks: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
         let (export, served, reads) = self.serve_history(bay, positions, marks)?;
-        let records = served.into_iter().map(|(mark, readback, reached)| RecordReadback { mark, verdicts: vec![judged_history(&readback, reached, &expectation(mark))] }).collect();
+        let records = served.into_iter().map(|(mark, readback, reached, _)| RecordReadback { mark, verdicts: vec![judged_history(&readback, reached, &expectation(mark))] }).collect();
         Ok(HistoryReadback { export, records, parked: None, reads })
     }
 
@@ -499,6 +548,7 @@ impl Context<'_> {
         }
         let heads = if self.tool == Tool::Forklift { pallet_heads(&export.stdout) } else { BTreeMap::new() };
         let mut chains: BTreeMap<&str, Option<Vec<String>>> = BTreeMap::new();
+        let mut listed: BTreeMap<&str, usize> = BTreeMap::new();
         let mut reads = Vec::new();
         let mut records = Vec::new();
         for &mark in marks {
@@ -508,6 +558,7 @@ impl Context<'_> {
                 Mark::Record(0) => (PROBE_REF, 0),
                 other => return Err(RunError::Io(format!("{:?} is no record of a real history", other))),
             };
+            let first = reads.len();
             let mut reached = true;
             let readback = match self.tool {
                 Tool::Git | Tool::GitTuned => {
@@ -529,6 +580,7 @@ impl Context<'_> {
                         let listing = forklift(&["history", reference], bay.to_path_buf())?;
                         let wanted = deepest.get(reference).copied().unwrap_or_default() + 1;
                         let chain = listing.succeeded().then(|| first_parents(heads.get(reference).map(String::as_str), &listing.stdout, wanted));
+                        listed.insert(reference, reads.len());
                         reads.push(listing);
                         chains.insert(reference, chain);
                     }
@@ -560,7 +612,9 @@ impl Context<'_> {
                     }
                 }
             };
-            records.push((mark, readback, reached));
+            // A walk listed for an earlier mark on the same ref is this mark's evidence too.
+            let evidence = listed.get(reference).copied().filter(|&index| index < first).into_iter().chain(first..reads.len()).collect();
+            records.push((mark, readback, reached, evidence));
         }
         Ok((export, records, reads.into_iter().map(rebase).collect()))
     }
@@ -895,9 +949,10 @@ impl Trail {
     /// Reads the history back and records what it says; true when the faulted command completed
     /// and every record reads as expected, the faulted one held to its own tree once acknowledged.
     /// A served record counts as acknowledged from here on once the tool's latest answer asks
-    /// nothing further (see [`answered`]): a command killed after its record was durable, retried,
-    /// is told there is nothing left to stack. That is `promoted`, what the acknowledging lines
-    /// landing establishes; it says nothing of any line after them, which completes only by landing.
+    /// nothing further (see [`answered`]) and settles it ([`settled_by`]): a command killed after
+    /// its record was durable, retried, is told there is nothing left to stack. That is
+    /// `promoted`, what the acknowledging lines landing establishes; it says nothing of any line
+    /// after them, which completes only by landing.
     /// `retry` says the latest step re-ran the faulted command: only a retry's answer settles a
     /// served record, since the faulted command's own refusal of a write it committed is graded as
     /// a refusal, and heal is no re-run.
@@ -905,10 +960,17 @@ impl Trail {
         let mut readback = self.read_back(context, expected, made.acknowledged)?;
         if !made.acknowledged && settles(retry, self.steps.last()) && readback.reads(&[expected.faulted]) {
             // Judged again as acknowledged: the record must now hold exactly its own tree.
-            self.evidence.any_silent |= readback.silent();
-            self.readbacks.push(readback);
-            readback = self.read_back(context, expected, true)?;
-            made.promote(promoted);
+            let settled = self.read_back(context, expected, true)?;
+            if settled_by(self.steps.last(), &settled, expected.faulted) {
+                self.evidence.any_silent |= readback.silent();
+                self.readbacks.push(readback);
+                readback = settled;
+                made.promote(promoted);
+            } else {
+                // Kept for the record of what ran, its verdicts graded by nothing: the readback
+                // this settle judges by is pushed after it, the last.
+                self.readbacks.push(settled);
+            }
         }
         let required = expected.required(made.acknowledged);
         self.evidence.any_silent |= readback.silent();
@@ -953,6 +1015,16 @@ fn settles(retry: bool, last: Option<&Outcome>) -> bool {
     retry && answered(last)
 }
 
+/// Whether the answer `last`, the retry's last line, settles the faulted record as acknowledged,
+/// from `settled`, the readback judged as acknowledged. A last line that succeeded landed every
+/// line the retry ran, and a stack refused as nothing to stack claims the record stands: either
+/// holds the record to its own tree. Any other refusal claims nothing of the record, so it
+/// settles only one already holding its own tree: a damaged file refused for good on every retry
+/// leaves a record still at the tree before it judged as never acknowledged, not as silent.
+fn settled_by(last: Option<&Outcome>, settled: &HistoryReadback, faulted: Mark) -> bool {
+    last.is_some_and(|outcome| outcome.succeeded() || already_stacked(outcome)) || settled.reads(&[faulted])
+}
+
 /// Whether `last`, the latest command run, answered and asked nothing further: it exited (a kill
 /// is no answer), and either succeeded or refused with a failure document naming no remedy and
 /// nothing unreadable as one, as a re-stack of a record already made is refused with nothing left
@@ -963,6 +1035,27 @@ fn answered(last: Option<&Outcome>) -> bool {
         let extracted = remedy::extract(Tool::Forklift, &outcome.remedy_texts());
         extracted.remedies.is_empty() && extracted.unextractable.is_empty()
     }))
+}
+
+/// What a refused `outcome` said: its failure's message, else its stderr, cut at 400 characters
+/// with the cut marked.
+fn said(outcome: &Outcome) -> String {
+    let text = outcome.failure.as_ref().map(|failure| failure.message.clone()).unwrap_or_else(|| String::from_utf8_lossy(&outcome.stderr).trim().to_string());
+    match text.char_indices().nth(400) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text,
+    }
+}
+
+/// Why the unfaulted readback did not serve `mark`, from `reads`, the reads of that mark alone: a
+/// walk that ended short of it, else the first of them that refused, as it exited and what it
+/// said.
+fn unserved(mark: Mark, reached: bool, reads: &[&Outcome]) -> String {
+    match reads.iter().find(|outcome| !outcome.succeeded()) {
+        _ if !reached => format!("the unfaulted readback did not serve {:?}: its walk ended short of it", mark),
+        Some(refused) => format!("the unfaulted readback did not serve {:?}: {:?} exited {:?}: {}", mark, refused.arguments, refused.exit, said(refused)),
+        None => format!("the unfaulted readback did not serve {:?}", mark),
+    }
 }
 
 /// Each pallet's head in a `--json pallet list`, by name.
@@ -1436,39 +1529,46 @@ fn history_context<'a>(tool: Tool, corpus: &'a Corpus, programs: &'a Programs, s
 /// the probe ref read, then the probe recorded with the subject's own record binding and the
 /// probe ref read again, then the subject's whole-store check run as every row's is. A record
 /// that does not read back unfaulted (an empty tree is read back; a walk ending short of it is
-/// not), a probe that does not land, or a check that finds damage or repairs anything, fails it,
-/// naming what refused: that subject's rows are then not run, since a check reporting the pristine
-/// subject would report it on every row.
+/// not), a probe that does not land, or a check that finds damage or repairs anything, is the
+/// subject's refusal, the inner `Err` naming what refused: that subject's rows are then not run,
+/// since a check reporting the pristine subject would report it on every row. The outer `Err` is
+/// the harness's own failure to take the readback.
 #[allow(clippy::too_many_arguments)]
-pub fn baseline(tool: Tool, pristine: &Path, positions: &[Position], programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Baseline, RunError> {
+pub fn baseline(tool: Tool, pristine: &Path, positions: &[Position], programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Result<Baseline, String>, RunError> {
     lay_out_subject(pristine, scratch)?;
     let corpus = probe_corpus();
     let context = history_context(tool, &corpus, programs, scratch, environment, limit, positions);
     let marks: Vec<Mark> = (0..positions.len()).map(Mark::Position).chain([Mark::Record(0)]).collect();
-    let trees = |marks: &[Mark]| -> Result<Vec<oracle::Tree>, RunError> {
-        let (export, served, _) = context.serve_history(&scratch.work(), positions, marks)?;
+    let trees = |marks: &[Mark]| -> Result<Result<Vec<oracle::Tree>, String>, RunError> {
+        let (export, served, reads) = context.serve_history(&scratch.work(), positions, marks)?;
         if !export.succeeded() {
-            return Err(RunError::Io(format!("the unfaulted readback refused: {:?} exited {:?}: {}", export.arguments, export.exit, String::from_utf8_lossy(&export.stderr).trim())));
+            return Ok(Err(format!("the unfaulted readback refused: {:?} exited {:?}: {}", export.arguments, export.exit, said(&export))));
         }
-        served.into_iter().map(|(mark, readback, reached)| match readback {
-            Readback::Served { tree, .. } if reached => Ok(tree),
-            _ => Err(RunError::Io(format!("the unfaulted readback did not serve {:?}", mark))),
-        }).collect()
+        let total = served.len();
+        let mut trees = Vec::new();
+        let mut refused = Vec::new();
+        for (mark, readback, reached, evidence) in served {
+            match readback {
+                Readback::Served { tree, .. } if reached => trees.push(tree),
+                _ => refused.push(unserved(mark, reached, &evidence.iter().filter_map(|&index| reads.get(index)).collect::<Vec<_>>())),
+            }
+        }
+        Ok(if refused.is_empty() { Ok(trees) } else { Err(format!("{} of {} records: {}", refused.len(), total, refused.join("; "))) })
     };
-    let mut read = trees(&marks)?;
+    let mut read = match trees(&marks)? { Ok(read) => read, Err(refused) => return Ok(Err(refused)) };
     let before = read.pop().unwrap_or_default();
     let mut steps = Vec::new();
     if !context.record(0, &mut steps)? {
         let refused = steps.last().map(|step| format!("{:?} exited {:?}", step.arguments, step.exit)).unwrap_or_default();
-        return Err(RunError::Io(format!("the unfaulted probe record did not land: {}", refused)));
+        return Ok(Err(format!("the unfaulted probe record did not land: {}", refused)));
     }
-    let after = trees(&[Mark::Record(0)])?.pop().unwrap_or_default();
+    let after = match trees(&[Mark::Record(0)])? { Ok(mut after) => after.pop().unwrap_or_default(), Err(refused) => return Ok(Err(refused)) };
     let checked = store_check(&context)?;
     if !checked.succeeded() || (tool == Tool::Forklift && heal_repaired(&checked.stdout)) {
-        return Err(RunError::Io(format!("the unfaulted store check reports the pristine subject: {:?} exited {:?}: {}{}", checked.arguments, checked.exit,
+        return Ok(Err(format!("the unfaulted store check reports the pristine subject: {:?} exited {:?}: {}{}", checked.arguments, checked.exit,
             String::from_utf8_lossy(&checked.stdout).trim(), String::from_utf8_lossy(&checked.stderr).trim())));
     }
-    Ok(Baseline { positions: read, before, after })
+    Ok(Ok(Baseline { positions: read, before, after }))
 }
 
 /// Runs one damage row over a history subject: its pristine subject copied into `scratch`, damage
@@ -1503,7 +1603,7 @@ pub fn run_history(subject: &HistorySubject, name: &str, kind: Kind, programs: &
     let mut graded = grade_after(&context, &expected, 0, |context, steps| context.record(0, steps).map(drop))?;
     let unreached = if graded.grade == Grade::Healed { whole_store_check(&context, &mut graded)? } else { None };
     Ok(Faulted {
-        scenario: "history".to_string(), name: name.to_string(), warehouse: Warehouse::Client, kind, target,
+        scenario: HISTORY_SCENARIO.to_string(), name: name.to_string(), warehouse: Warehouse::Client, kind, target,
         grade: graded.grade, evidence: graded.evidence, recoverability: graded.recoverability,
         steps: graded.steps, readbacks: graded.readbacks, probes: graded.probes, unextractable: graded.unextractable, unreached,
     })
@@ -1909,6 +2009,29 @@ mod tests {
             .iter().map(|path| path.to_string()).collect()
     }
 
+    /// An unserved record names its own evidence: a walk that ended short of it, whatever else
+    /// refused, or else the first of its reads that refused, with its failure's message or its
+    /// stderr, a long one cut and marked.
+    ///
+    /// Revert: drop the refused read → the CI history run's refusal names no command; check the
+    /// walk last → a short walk is blamed on a read that refused.
+    #[test]
+    fn an_unserved_record_names_the_read_that_refused() {
+        let ran = |arguments: &[&str], exit: Option<i32>, stderr: &str, message: Option<&str>| Outcome {
+            arguments: arguments.iter().map(|argument| argument.to_string()).collect(), exit, stdout: vec![], stderr: stderr.as_bytes().to_vec(),
+            failure: message.map(|message| crate::tool::Failure { code: "x".into(), message: message.into(), next_step: None }),
+        };
+        let reads = [ran(&["walk"], Some(0), "", None), ran(&["lay", "out"], Some(2), "noise", Some("no parcel abc")), ran(&["open"], Some(1), "later", None)];
+        let reads: Vec<&Outcome> = reads.iter().collect();
+        assert_eq!(unserved(Mark::Position(0), true, &reads), r#"the unfaulted readback did not serve Position(0): ["lay", "out"] exited Some(2): no parcel abc"#);
+        assert_eq!(unserved(Mark::Position(1), true, &reads[2..]), r#"the unfaulted readback did not serve Position(1): ["open"] exited Some(1): later"#);
+        assert_eq!(unserved(Mark::Position(2), false, &reads[..1]), "the unfaulted readback did not serve Position(2): its walk ended short of it");
+        assert_eq!(unserved(Mark::Position(3), false, &reads), "the unfaulted readback did not serve Position(3): its walk ended short of it");
+        let long = ran(&["open"], Some(1), &"é".repeat(500), None);
+        assert_eq!(said(&long), format!("{}…", "é".repeat(400)));
+        assert_eq!(said(reads[1]), "no parcel abc");
+    }
+
     /// A pattern resolves to one of the paths it matches, chosen by the seed, a folder without its
     /// trailing slash; a pattern nothing matches resolves to nothing.
     ///
@@ -2001,6 +2124,31 @@ mod tests {
             records.entry(Mark::Record(*index)).or_default().push(*verdict);
         }
         HistoryReadback { export, records: records.into_iter().map(|(mark, verdicts)| RecordReadback { mark, verdicts }).collect(), parked: None, reads: Vec::new() }
+    }
+
+    /// A readback's details keep a refused read whole, and a successful one without its stdout,
+    /// whose length they keep, a silent readback's too.
+    ///
+    /// Revert: serialize the reads as they are → the served bytes are written; drop every
+    /// stdout → the refused read's own words are lost; keep a silent readback's whole → its
+    /// served bytes are written.
+    #[test]
+    fn a_readback_writes_what_its_reads_refused_not_what_they_served() {
+        let read = |exit, stdout: &[u8]| Outcome { arguments: vec!["show".into()], exit: Some(exit), stdout: stdout.to_vec(), stderr: b"said".to_vec(), failure: None };
+        let readback = HistoryReadback { reads: vec![read(0, b"served-bytes"), read(1, b"refused-words")], ..served(&[(0, Verdict::Expected)]) };
+        let written = serde_json::to_value(&readback).unwrap();
+        let reads = written["reads"].as_array().unwrap();
+        assert_eq!(reads[0].get("stdout"), None, "{}", written);
+        assert_eq!(reads[0]["stdout_bytes"], 12);
+        assert_eq!(reads[0]["stderr"], serde_json::json!(b"said".to_vec()));
+        assert_eq!(reads[1]["stdout"], serde_json::json!(b"refused-words".to_vec()));
+        assert_eq!(reads[1].get("stdout_bytes"), None);
+        assert_eq!(reads[1]["exit"], 1);
+        let silent = HistoryReadback { reads: vec![read(0, b"wrong-tree")], ..served(&[(0, Verdict::Silent)]) };
+        let written = serde_json::to_value(&silent).unwrap();
+        assert_eq!(written["reads"][0].get("stdout"), None, "{}", written);
+        assert_eq!(written["reads"][0]["stdout_bytes"], 10);
+        assert_eq!(written["records"][0]["verdicts"], serde_json::json!(["silent"]));
     }
 
     /// A history reads only when every wanted record was served and every copy of it expected: a
@@ -2216,6 +2364,33 @@ mod tests {
         let nothing = answer(Some(1), "Nothing to stack.", None);
         assert!(settles(true, Some(&nothing)));
         assert!(!settles(false, Some(&nothing)), "the faulted command's own answer is no retry");
+    }
+
+    /// An answer settles the faulted record only by claiming it stands, a success or a stack
+    /// refused as nothing to stack, which then must hold its own tree; or, as any other refusal,
+    /// only once the record already holds it. A record still at the tree before it reads as
+    /// silent when judged as acknowledged, which a refusal for good must not make it.
+    ///
+    /// Revert: settle on any answer → a damaged file refused on every retry, the record never
+    /// stacked, grades silent; settle on a refusal only by the readback → a stack told there is
+    /// nothing to stack, its record missing, is not held to it; drop the stack condition from
+    /// already-stacked → a load told nothing to stack claims a record.
+    #[test]
+    fn a_refusal_for_good_settles_no_record_it_never_made() {
+        let missing = served(&[(0, Verdict::Silent)]);
+        let standing = served(&[(0, Verdict::Expected)]);
+        let mut refused = answer(Some(1), "Error while reading configuration file \"warehouse.toml\": stream did not contain valid UTF-8", None);
+        refused.arguments = vec!["--json".into(), "stack".into(), "-m".into(), "r".into()];
+        assert!(answered(Some(&refused)), "a refusal naming no remedy is an answer");
+        assert!(!settled_by(Some(&refused), &missing, Mark::Record(0)));
+        assert!(settled_by(Some(&refused), &standing, Mark::Record(0)));
+        let mut nothing = answer(Some(1), "Nothing to stack: the inventory matches the head of pallet \"main\".", None);
+        nothing.arguments = refused.arguments.clone();
+        assert!(settled_by(Some(&nothing), &missing, Mark::Record(0)), "told nothing to stack, the record is held to standing");
+        assert!(settled_by(Some(&answer(Some(0), "", None)), &missing, Mark::Record(0)));
+        nothing.arguments = vec!["--json".into(), "load".into(), ".".into()];
+        assert!(!settled_by(Some(&nothing), &missing, Mark::Record(0)));
+        assert!(!settled_by(None, &missing, Mark::Record(0)));
     }
 
     /// A record is acknowledged by its own lines, before any the scenario runs after them; read

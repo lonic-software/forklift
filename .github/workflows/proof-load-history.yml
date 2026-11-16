@@ -1,7 +1,8 @@
 # Proof Load over a real history: the fidelity round trips, git to Forklift to git and Forklift to
 # git to Forklift, also take this repository's own history (--history-from), besides their
-# fixtures. Linux only, weekly, and on a pull request that changes this file, so a change to
-# this workflow runs before it merges; a change to the harness alone waits for the weekly run.
+# fixtures, and the damaged-file rows run over a sample of its positions. Linux only, weekly,
+# and on a pull request that changes this file, so a change to this workflow runs before it
+# merges; a change to the harness alone waits for the weekly run.
 # The checkout is a full clone: the harness refuses a shallow one.
 #
 # Non-blocking like the per-PR lane: the run step continues on error, and it is not part of the
@@ -30,8 +31,11 @@ jobs:
     name: proof load history
     runs-on: ubuntu-latest
     # The hang guard, well past a normal run (the scenario lanes, then the history's imports and
-    # exports, each of which may take up to 30 minutes): a job cut by it writes no report. The
-    # budget the run is graded on is --budget below.
+    # exports, each of which may take up to 30 minutes, then the history's damage lane: its own
+    # build and baselines, then rows that start for at most two hours, the last of which may run
+    # on past them): a job cut by it writes no report. The budget the run is graded on is
+    # --budget below: the hour the rest takes, the damage lane's two hours of rows, and an hour
+    # for its build, its baselines and its last row.
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +48,11 @@ jobs:
         run: |
           git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin | grep -vx HEAD |
             while read -r branch; do git update-ref "refs/heads/$branch" "refs/remotes/origin/$branch"; done
+          # A pull request's checkout is a detached merge commit, which the harness refuses as a
+          # history: it is put on a branch of its own, the work tree left as it is. -C, since the
+          # loop above may already have made a branch of that name from a remote one.
+          git symbolic-ref -q HEAD > /dev/null || git switch -q -C proof-load-checkout
+          git symbolic-ref HEAD
           git for-each-ref --format=x refs/heads | wc -l
 
       - name: Install stable Rust
@@ -61,7 +70,7 @@ jobs:
         continue-on-error: true
         run: |
           bin=target/release
-          "$bin/proof-load" run --source . --out "$RUNNER_TEMP/proof-load" --budget 3600 \
+          "$bin/proof-load" run --source . --out "$RUNNER_TEMP/proof-load" --budget 14400 \
             --forklift "$bin/forklift" --forklift-server "$bin/forklift-server" --git "$(command -v git)" \
             --history-from .
 

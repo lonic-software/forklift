@@ -412,6 +412,172 @@ pub fn check_git(bindings: &[Binding], exemptions: &[Exemption], runnable: &[Str
     missing
 }
 
+/// A binding over a real history's subject: every one damages the client, which is all a history
+/// subject is.
+const fn over_history(name: &'static str, kinds: &'static [Kind]) -> Binding {
+    bound_in(name, crate::faulted::HISTORY_SCENARIO, kinds)
+}
+
+/// Forklift's damage bindings over a real history: each census name an import of a git history
+/// holds, with the same kinds per class as [`BINDINGS`], and the bay's lock planted as a dead
+/// holder. Checked by [`check_history`] against the walk of the pristine subject.
+pub const HISTORY_BINDINGS: &[Binding] = &[
+    over_history("warehouse", FILE),
+    over_history("warehouse-copy", FILE),
+    over_history("format.lock", LOCK_FILE),
+    over_history("refs.lock", LOCK_FILE),
+    over_history("store-access.lock", LOCK_FILE),
+    over_history("config/", FOLDER),
+    over_history("config/warehouse.toml", FILE),
+    over_history("config/warehouse.toml.lock", LOCK_FILE),
+    over_history("objects/", FOLDER),
+    over_history("objects/<xx>/", FOLDER),
+    over_history("objects/<xx>/<hash>", FILE),
+    over_history("objects/pack/", FOLDER),
+    over_history("objects/pack/<name>.pack", FILE),
+    over_history("objects/pack/<name>.idx", FILE),
+    over_history("objects/pack/densify-pending", FILE),
+    over_history("pallets/", FOLDER),
+    over_history("pallets/<name>", FILE),
+    over_history("graph/", FOLDER),
+    over_history("graph/<xx>", FILE),
+    over_history("meta/", FOLDER),
+    over_history("meta/<name>", FILE),
+    over_history("parked", FILE),
+    over_history("{bay}inventory/", FOLDER),
+    over_history("{bay}inventory/metadata", FILE),
+    over_history("{bay}inventory/inv_/", FOLDER),
+    over_history("{bay}inventory/inv_/<xx>/", FOLDER),
+    over_history("{bay}inventory/inv_/<xx>/<hash>/", FOLDER),
+    over_history("{bay}inventory/inv_/<xx>/<hash>/data", FILE),
+    over_history("{bay}position", FILE),
+    over_history("{bay}lock", DEAD_HOLDER),
+];
+
+/// Census names an import holds that are not damaged over a history, with the reason.
+pub const HISTORY_EXEMPTIONS: &[Exemption] = &[];
+
+/// What forklift's history bindings miss against `walked`, the walk of the pristine history
+/// subject's state folder: each census name needing damage the subject holds that neither a
+/// binding nor an exemption names; each binding the subject does not hold, unless it plants its
+/// path; each exemption the subject does not hold, which then excuses nothing; each name the
+/// census no longer lists; and each binding the role map gives no role. Names the subject does
+/// not hold need no entry: the fixture bindings answer for them.
+pub fn check_history(census: &Census, bindings: &[Binding], exemptions: &[Exemption], walked: &[String]) -> Vec<String> {
+    let held = |name: &str| walked.iter().any(|path| crate::census::matches(name, path));
+    let mut missing: Vec<String> = damage::uncovered(census, bindings, exemptions).into_iter()
+        .filter(|name| held(&name.path))
+        .map(|name| format!("{}: the history subject holds it", name.path)).collect();
+    missing.extend(damage::stale(census, bindings, exemptions).into_iter().map(|name| format!("stale binding: {}", name)));
+    for binding in bindings {
+        if !binding.kinds.iter().all(|kind| kind.plants()) && !held(binding.name) {
+            missing.push(format!("{}: the history subject does not hold it", binding.name));
+        }
+    }
+    missing.extend(exemptions.iter().filter(|exemption| !held(exemption.name))
+        .map(|exemption| format!("stale exemption: {}: the history subject does not hold it", exemption.name)));
+    missing
+}
+
+/// Git's damage bindings over a real history, the same for git at its defaults and tuned: the
+/// layout rows a mirror given a work tree holds, where [`GIT_BINDINGS`] exempts what only a gc
+/// writes, since a mirror holds its refs in `packed-refs` and its objects in a pack. The subject's
+/// build writes the probe ref's loose file, and nothing before the damage writes a loose object.
+/// Checked by [`check_git`] against the walk of the pristine subject.
+pub const HISTORY_GIT_BINDINGS: &[Binding] = &[
+    over_history("HEAD", FILE),
+    over_history("config", FILE),
+    over_history("index", FILE),
+    over_history("logs/**/", FOLDER),
+    over_history("logs/**", FILE),
+    over_history("refs/", FOLDER),
+    over_history("refs/heads/**/", FOLDER),
+    over_history("refs/heads/**", FILE),
+    over_history("refs/tags/**/", FOLDER),
+    over_history("packed-refs", FILE),
+    over_history("objects/", FOLDER),
+    over_history("objects/info/", FOLDER),
+    over_history("objects/pack/", FOLDER),
+    over_history("objects/pack/<name>.pack", FILE),
+    over_history("objects/pack/<name>.idx", FILE),
+    over_history("objects/pack/<name>.rev", FILE),
+    over_history("index.lock", DEAD_HOLDER),
+    over_history("HEAD.lock", DEAD_HOLDER),
+];
+
+const HISTORY_NOT_WRITTEN: &str = "not written: a mirror given a work tree holds none, and the probe record writes none";
+const HISTORY_PACKED: &str = "not written: a mirror holds every object in a pack, and nothing loose is written before the damage";
+
+/// Git layout rows that need damage and are not damaged over a history, with the reason.
+pub const HISTORY_GIT_EXEMPTIONS: &[Exemption] = &[
+    Exemption { name: "ORIG_HEAD", reason: HISTORY_NOT_WRITTEN },
+    Exemption { name: "FETCH_HEAD", reason: HISTORY_NOT_WRITTEN },
+    Exemption { name: "fsmonitor--daemon/", reason: "not written: no fsmonitor daemon runs over a history" },
+    Exemption { name: "fsmonitor--daemon/cookies/", reason: "not written: no fsmonitor daemon runs over a history" },
+    Exemption { name: "refs/stash", reason: HISTORY_NOT_WRITTEN },
+    Exemption { name: "refs/tags/**", reason: "not written: a mirror packs every tag into packed-refs and leaves no loose tag file" },
+    Exemption { name: "refs/remotes/**/", reason: HISTORY_NOT_WRITTEN },
+    Exemption { name: "refs/remotes/**", reason: HISTORY_NOT_WRITTEN },
+    Exemption { name: "info/refs", reason: HISTORY_NOT_WRITTEN },
+    Exemption { name: "objects/info/packs", reason: HISTORY_NOT_WRITTEN },
+    Exemption { name: "objects/info/commit-graph", reason: HISTORY_NOT_WRITTEN },
+    Exemption { name: "objects/info/commit-graphs/**", reason: HISTORY_NOT_WRITTEN },
+    Exemption { name: "objects/pack/multi-pack-index", reason: HISTORY_NOT_WRITTEN },
+    Exemption { name: "objects/pack/<name>.bitmap", reason: HISTORY_NOT_WRITTEN },
+    Exemption { name: "objects/<xx>/", reason: HISTORY_PACKED },
+    Exemption { name: "objects/<xx>/<hash>", reason: HISTORY_PACKED },
+];
+
+/// A subject's damage bindings and exemptions over a real history.
+pub fn history_subject(tool: Tool) -> (&'static [Binding], &'static [Exemption]) {
+    match tool {
+        Tool::Forklift => (HISTORY_BINDINGS, HISTORY_EXEMPTIONS),
+        Tool::Git | Tool::GitTuned => (HISTORY_GIT_BINDINGS, HISTORY_GIT_EXEMPTIONS),
+    }
+}
+
+/// What `tool`'s history bindings miss against `walked`, the walk of its pristine history
+/// subject's state folder: [`check_history`] for forklift, and for git [`check_git`] over that
+/// one walk.
+pub fn check_history_subject(tool: Tool, census: &Census, walked: &[String]) -> Vec<String> {
+    let (bindings, exemptions) = history_subject(tool);
+    let mut missing = match tool {
+        Tool::Forklift => check_history(census, bindings, exemptions, walked),
+        Tool::Git | Tool::GitTuned => {
+            let scenario = crate::faulted::HISTORY_SCENARIO.to_string();
+            let walks = [((scenario.clone(), Warehouse::Client), walked.to_vec())].into_iter().collect();
+            check_git(bindings, exemptions, &[scenario], &walks)
+        }
+    };
+    missing.extend(roleless(tool, bindings));
+    missing
+}
+
+/// Each of `bindings` the role map gives no role under `tool`, named: such a binding forms no
+/// (role, kind) group, so [`history_rows`] would never run it.
+fn roleless(tool: Tool, bindings: &[Binding]) -> Vec<String> {
+    bindings.iter().filter(|binding| crate::git_layout::role_of(tool, binding.name).is_none())
+        .map(|binding| format!("{}: the role map gives it no role", binding.name)).collect()
+}
+
+/// The damage rows a history runs for `tool`: for each (role, kind) its bindings reach, one
+/// binding picked by `seed`, as (binding, kind, role), in (role, kind) order. A binding the role
+/// map gives no role is left out; [`check_history_subject`] names it.
+pub fn history_rows(tool: Tool, seed: u64) -> Vec<(Binding, Kind, crate::git_layout::Role)> {
+    let mut groups: BTreeMap<(crate::git_layout::Role, Kind), Vec<Binding>> = BTreeMap::new();
+    for binding in history_subject(tool).0 {
+        let Some(role) = crate::git_layout::role_of(tool, binding.name) else { continue };
+        for kind in binding.kinds {
+            groups.entry((role, *kind)).or_default().push(binding.clone());
+        }
+    }
+    let mut state = seed;
+    groups.into_iter().map(|((role, kind), bindings)| {
+        let picked = bindings[(crate::history::splitmix(&mut state) % bindings.len() as u64) as usize].clone();
+        (picked, kind, role)
+    }).collect()
+}
+
 /// How a message names the warehouse a path is in: nothing for the client's.
 fn on_its(warehouse: Warehouse) -> &'static str {
     match warehouse { Warehouse::Client => "", Warehouse::Host => " on its host" }
@@ -571,6 +737,38 @@ mod tests {
     fn planting_bindings_name_literal_paths() {
         for binding in BINDINGS.iter().filter(|binding| binding.kinds.iter().any(|kind| kind.plants())) {
             assert!(!damage::planted(binding.name).contains(['<', '{']), "{} plants a pattern", binding.name);
+        }
+    }
+
+    /// A history binding the role map gives no role is named, under either subject.
+    ///
+    /// Revert: name none → both are silent.
+    #[test]
+    fn a_history_binding_with_no_role_is_named() {
+        let unknown = [over_history("no-such-path", FILE)];
+        for tool in [Tool::Forklift, Tool::Git] {
+            assert_eq!(roleless(tool, &unknown), vec!["no-such-path: the role map gives it no role".to_string()], "{:?}", tool);
+            assert_eq!(roleless(tool, history_subject(tool).0), Vec::<String>::new(), "{:?}", tool);
+        }
+    }
+
+    /// A history runs one row per (role, kind) its bindings reach, per subject: each row's binding
+    /// has that role and kind, and which binding stands for a (role, kind) is the seed's pick.
+    ///
+    /// Revert: pick a group's first binding whatever the seed → no group's pick varies.
+    #[test]
+    fn a_history_runs_one_row_per_role_and_kind() {
+        for tool in [Tool::Forklift, Tool::Git] {
+            let groups: std::collections::BTreeSet<(crate::git_layout::Role, Kind)> = history_subject(tool).0.iter()
+                .flat_map(|binding| binding.kinds.iter().map(move |kind| (crate::git_layout::role_of(tool, binding.name).unwrap(), *kind))).collect();
+            let picks: Vec<Vec<(Binding, Kind, crate::git_layout::Role)>> = (0..20).map(|seed| history_rows(tool, seed)).collect();
+            for rows in &picks {
+                assert_eq!(rows.iter().map(|(_, kind, role)| (*role, *kind)).collect::<Vec<_>>(), groups.iter().copied().collect::<Vec<_>>(), "{:?}", tool);
+                for (binding, kind, role) in rows {
+                    assert!(binding.kinds.contains(kind) && crate::git_layout::role_of(tool, binding.name) == Some(*role), "{:?}: {:?}", tool, binding);
+                }
+            }
+            assert!(picks.iter().any(|rows| rows != &picks[0]), "{:?}: the seed picks nothing", tool);
         }
     }
 

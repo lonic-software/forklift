@@ -15,7 +15,8 @@ use crate::tool::{self, Invocation, Outcome};
 pub const SAMPLED: usize = 8;
 
 /// Runs one build step in `directory`, kept in `steps`; a step that does not exit 0 fails the
-/// build, naming it.
+/// build as [`RunError::BuildFailed`], the tool's own refusal; a step that could not be run, or
+/// ran past `limit`, fails as [`RunError::Tool`].
 #[allow(clippy::too_many_arguments)]
 fn step(steps: &mut Vec<Outcome>, program: &Path, arguments: &[&str], directory: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Outcome, RunError> {
     let invocation = Invocation {
@@ -25,7 +26,10 @@ fn step(steps: &mut Vec<Outcome>, program: &Path, arguments: &[&str], directory:
     let outcome = tool::run(&invocation, scratch, environment).map_err(RunError::Tool)?;
     steps.push(outcome.clone());
     if !outcome.succeeded() {
-        return Err(RunError::Io(format!("the history subject could not be built: {:?} exited {:?}: {}", outcome.arguments, outcome.exit, String::from_utf8_lossy(&outcome.stderr).trim())));
+        return Err(RunError::BuildFailed {
+            arguments: outcome.arguments.clone(), exit: outcome.exit,
+            stderr: String::from_utf8_lossy(&outcome.stderr).into_owned(), stdout: String::from_utf8_lossy(&outcome.stdout).into_owned(),
+        });
     }
     Ok(outcome)
 }
@@ -33,35 +37,58 @@ fn step(steps: &mut Vec<Outcome>, program: &Path, arguments: &[&str], directory:
 /// Builds git's pristine history subject at `to`, which must not exist yet, from the mirror at
 /// `mirror`: the mirror copied as `to/.git` and made a work tree's, given the configuration every
 /// repository git makes is given, its `HEAD` checked out, and [`PROBE_REF`] made at that tip and
-/// current. The copy is the harness's, so the mirror is read only. With the steps it ran.
-pub fn build_git(git: &Path, mirror: &Path, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Vec<Outcome>, RunError> {
+/// current. The copy is the harness's, so the mirror is read only. Each step it ran is kept in
+/// `steps`, the failing one too.
+///
+/// Returns the branch `HEAD` names, which [`build_forklift`] is held to. A detached `HEAD` is
+/// refused: forklift's import makes its first branch current when `HEAD` names none, and leaves
+/// out a commit no branch holds, so the two subjects' probes would sit on different commits.
+#[allow(clippy::too_many_arguments)]
+pub fn build_git(git: &Path, mirror: &Path, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration, steps: &mut Vec<Outcome>) -> Result<String, RunError> {
     std::fs::create_dir(to).map_err(|error| RunError::Io(format!("{}: {}", to.display(), error)))?;
     crate::scrub::copy_tree(mirror, &to.join(".git")).map_err(|error| RunError::Io(format!("{:?}", error)))?;
-    let mut steps = Vec::new();
-    let mut run = |arguments: &[&str]| step(&mut steps, git, arguments, to, scratch, environment, limit);
+    let mut run = |arguments: &[&str]| step(steps, git, arguments, to, scratch, environment, limit);
     run(&["config", "core.bare", "false"])?;
     for [key, value] in crate::runner::GIT_CREATED_CONFIG {
         run(&["config", key, value])?;
     }
+    let head = match run(&["symbolic-ref", "-q", "HEAD"]) {
+        Ok(outcome) => String::from_utf8_lossy(&outcome.stdout).trim().to_string(),
+        Err(RunError::BuildFailed { exit: Some(1), .. }) => return Err(RunError::Io(
+            "the history's HEAD is detached, at no branch; put it on a branch first".to_string())),
+        Err(error) => return Err(error),
+    };
+    let branch = head.strip_prefix("refs/heads/")
+        .ok_or_else(|| RunError::Io(format!("the history's HEAD names {:?}, which is no branch", head)))?.to_string();
     run(&["checkout", "-f", "-q"])?;
     run(&["switch", "-q", "-c", PROBE_REF])?;
-    Ok(steps)
+    Ok(branch)
 }
 
 /// Builds forklift's pristine history subject at `to`, which must not exist yet: a fresh
 /// warehouse that imports the mirror at `mirror`, its work tree restored (an import leaves it
-/// empty), and [`PROBE_REF`] made as a pallet at the current head and shifted to. With the steps
-/// it ran.
-pub fn build_forklift(forklift: &Path, mirror: &Path, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Vec<Outcome>, RunError> {
+/// empty), and [`PROBE_REF`] made as a pallet at the current head and shifted to. The import must
+/// make `branch` current, the branch git's subject made its probe at ([`build_git`]), or the two
+/// probes would sit on different commits, which fails the build as the import's step. Each step it
+/// ran is kept in `steps`, the failing one too.
+#[allow(clippy::too_many_arguments)]
+pub fn build_forklift(forklift: &Path, mirror: &Path, branch: &str, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration, steps: &mut Vec<Outcome>) -> Result<(), RunError> {
     std::fs::create_dir(to).map_err(|error| RunError::Io(format!("{}: {}", to.display(), error)))?;
-    let mut steps = Vec::new();
     let mirror = mirror.display().to_string();
-    let mut run = |arguments: &[&str]| step(&mut steps, forklift, arguments, to, scratch, environment, limit);
+    let mut run = |arguments: &[&str]| step(steps, forklift, arguments, to, scratch, environment, limit);
     run(&["--json", "prepare"])?;
-    run(&["--json", "git", "import", "--", &mirror])?;
+    let imported = run(&["--json", "git", "import", "--", &mirror])?;
+    let current = crate::runner::document(&imported.stdout)["data"]["current"].as_str().map(str::to_string);
+    if current.as_deref() != Some(branch) {
+        // Forklift's own: the import ran and misbuilt, so it is charged as a failed build step.
+        return Err(RunError::BuildFailed {
+            arguments: imported.arguments.clone(), exit: imported.exit, stdout: String::new(),
+            stderr: format!("forklift's import made {:?} current, not {:?}, the branch git's HEAD names: the probes would sit on different commits", current, branch),
+        });
+    }
     run(&["--json", "restore", "."])?;
     run(&["--json", "pallet", "create", PROBE_REF])?;
-    Ok(steps)
+    Ok(())
 }
 
 /// Each local branch of git's subject at `subject` with its first-parent length, the probe ref
@@ -123,7 +150,7 @@ pub fn sample(lengths: &BTreeMap<String, usize>, present: &BTreeSet<String>, cou
 }
 
 /// One step of splitmix64 over `state`.
-fn splitmix(state: &mut u64) -> u64 {
+pub(crate) fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -132,7 +159,7 @@ fn splitmix(state: &mut u64) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::damage::Kind;
     use crate::faulted::{baseline, run_history, Baseline, HistorySubject, Programs, PROBE_BYTES, PROBE_FILE};
@@ -143,7 +170,7 @@ mod tests {
 
     const LIMIT: Duration = Duration::from_secs(60);
 
-    fn scratch(label: &str) -> (Scratch, Environment) {
+    pub(crate) fn scratch(label: &str) -> (Scratch, Environment) {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("proof-load-history-{}-{}-{}", label, std::process::id(), nanos));
         let scratch = Scratch::create(&root).unwrap();
@@ -164,8 +191,8 @@ mod tests {
 
     /// A small repository mirrored in `scratch`: `main` of three commits, each adding a file,
     /// then a merge of `side`, one commit off `main`'s first, so a first-parent walk of `main`
-    /// differs from a walk of every parent.
-    fn mirrored(scratch: &Scratch, environment: &Environment) -> PathBuf {
+    /// differs from a walk of every parent; the merge tagged, as a real history's releases are.
+    pub(crate) fn mirrored(scratch: &Scratch, environment: &Environment) -> PathBuf {
         let source = scratch.root().join("source");
         std::fs::create_dir(&source).unwrap();
         git(&["init", "-q", "-b", "main"], &source, scratch, environment);
@@ -183,6 +210,7 @@ mod tests {
         git(&["-c", "user.name=p", "-c", "user.email=p@example.invalid", "commit", "-q", "-m", "side"], &source, scratch, environment);
         git(&["switch", "-q", "main"], &source, scratch, environment);
         git(&["-c", "user.name=p", "-c", "user.email=p@example.invalid", "merge", "-q", "--no-ff", "--no-edit", "side"], &source, scratch, environment);
+        git(&["tag", "v1"], &source, scratch, environment);
         let mirror = scratch.root().join("mirror");
         git(&["clone", "-q", "--mirror", "--no-local", "--", &source.display().to_string(), &mirror.display().to_string()], scratch.root(), scratch, environment);
         mirror
@@ -190,6 +218,90 @@ mod tests {
 
     fn programs(forklift: PathBuf) -> Programs {
         Programs { forklift, git: path_git(), server: None }
+    }
+
+    fn census() -> crate::census::Census {
+        crate::census::Census::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap().unwrap()
+    }
+
+    /// Git's history binding set covers its history subject as built from a mirror: every layout
+    /// row needing damage the subject holds is bound or exempt, every binding it holds, and no
+    /// exemption names what it holds. Without the history set's own bindings, the fixture set
+    /// fails over the same walk, on the rows only a mirror writes.
+    ///
+    /// Revert: drop the `packed-refs` binding → the row is named unbound; exempt the loose objects
+    /// no more → their rows are named unbound.
+    #[test]
+    fn git_history_bindings_cover_the_history_subject() {
+        let (shared, environment) = scratch("git-set");
+        let mirror = mirrored(&shared, &environment);
+        let pristine = shared.root().join("pristine");
+        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
+        let walked = crate::census::walk(&pristine.join(".git")).unwrap();
+        let census = census();
+        for tool in [Tool::Git, Tool::GitTuned] {
+            assert_eq!(crate::bindings::check_history_subject(tool, &census, &walked), Vec::<String>::new(), "{:?}: {:?}", tool, walked);
+        }
+        let scenario = crate::faulted::HISTORY_SCENARIO.to_string();
+        let walks = [((scenario.clone(), crate::damage::Warehouse::Client), walked)].into_iter().collect();
+        let fixture = crate::bindings::check_git(&[], crate::bindings::GIT_EXEMPTIONS, &[scenario], &walks);
+        assert!(fixture.iter().any(|missing| missing.starts_with("stale exemption: packed-refs")), "{:?}", fixture);
+    }
+
+    /// Git's subject makes its probe at the branch the mirror's `HEAD` names and says which, so
+    /// forklift's is held to the same one; a detached `HEAD` is refused, since forklift's import
+    /// would make its first branch current instead. `HEAD` is put on `side`, which is neither
+    /// `main` nor the first branch.
+    ///
+    /// Revert: drop the `symbolic-ref` read → the detached mirror builds; return a fixed branch →
+    /// `side` reads as it.
+    #[test]
+    fn git_s_probe_sits_on_the_branch_head_names() {
+        let (shared, environment) = scratch("git-head");
+        let mirror = mirrored(&shared, &environment);
+        git(&["symbolic-ref", "HEAD", "refs/heads/side"], &mirror, &shared, &environment);
+        let pristine = shared.root().join("pristine");
+        assert_eq!(build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap(), "side");
+        let side = git(&["rev-parse", "refs/heads/side"], &pristine, &shared, &environment);
+        assert_eq!(git(&["rev-parse", PROBE_REF], &pristine, &shared, &environment), side);
+        let main = git(&["rev-parse", "refs/heads/main"], &mirror, &shared, &environment);
+        git(&["update-ref", "--no-deref", "HEAD", &main], &mirror, &shared, &environment);
+        let detached = build_git(&path_git(), &mirror, &shared.root().join("detached"), &shared, &environment, LIMIT, &mut Vec::new());
+        assert!(matches!(&detached, Err(RunError::Io(reason)) if reason.contains("HEAD is detached")), "{:?}", detached);
+    }
+
+    /// Forklift's subject is held to the branch git's made its probe at: the import making another
+    /// current fails the build as the import's step, naming both, and the one it made current
+    /// builds.
+    ///
+    /// Revert: drop the check of the import's current pallet → the build held to `main` passes;
+    /// refuse it as the harness's own error → it is not charged to forklift.
+    #[test]
+    #[ignore = "needs PROOF_LOAD_FORKLIFT"]
+    fn forklift_s_probe_is_held_to_git_s_branch() {
+        let forklift = PathBuf::from(std::env::var("PROOF_LOAD_FORKLIFT").expect("PROOF_LOAD_FORKLIFT"));
+        let (shared, environment) = scratch("forklift-head");
+        let mirror = mirrored(&shared, &environment);
+        git(&["symbolic-ref", "HEAD", "refs/heads/side"], &mirror, &shared, &environment);
+        build_forklift(&forklift, &mirror, "side", &shared.root().join("held"), &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
+        let other = build_forklift(&forklift, &mirror, "main", &shared.root().join("other"), &shared, &environment, LIMIT, &mut Vec::new());
+        assert!(matches!(&other, Err(RunError::BuildFailed { stderr, .. }) if stderr.contains(r#"made Some("side") current, not "main""#)), "{:?}", other);
+    }
+
+    /// Forklift's history binding set covers its history subject as an import builds it: every
+    /// census name needing damage the subject holds is bound, and every binding is held.
+    ///
+    /// Revert: drop the `meta/<name>` binding → the imported tag's name is named unbound.
+    #[test]
+    #[ignore = "needs PROOF_LOAD_FORKLIFT"]
+    fn forklift_history_bindings_cover_the_history_subject() {
+        let forklift = PathBuf::from(std::env::var("PROOF_LOAD_FORKLIFT").expect("PROOF_LOAD_FORKLIFT"));
+        let (shared, environment) = scratch("forklift-set");
+        let mirror = mirrored(&shared, &environment);
+        let pristine = shared.root().join("pristine");
+        build_forklift(&forklift, &mirror, "main", &pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
+        let walked = crate::census::walk(&pristine.join(".forklift")).unwrap();
+        assert_eq!(crate::bindings::check_history_subject(Tool::Forklift, &census(), &walked), Vec::<String>::new(), "{:?}", walked);
     }
 
     /// The sample names only depths each ref has, only refs both subjects hold, never repeats a
@@ -223,7 +335,7 @@ mod tests {
         let (shared, environment) = scratch("git-baseline");
         let mirror = mirrored(&shared, &environment);
         let pristine = shared.root().join("pristine");
-        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT).unwrap();
+        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
         let lengths = git_lengths(&path_git(), &pristine, &shared, &environment, LIMIT).unwrap();
         assert_eq!(lengths, [("main".to_string(), 4), ("side".to_string(), 2)].into_iter().collect());
         let positions = vec![
@@ -231,12 +343,49 @@ mod tests {
             Position { reference: "main".into(), depth: 3 }, Position { reference: "side".into(), depth: 0 },
         ];
         let (row, environment) = scratch("git-baseline-row");
-        let got = baseline(Tool::Git, &pristine, &positions, &programs(PathBuf::from("forklift-not-used")), &row, &environment, LIMIT).unwrap();
+        let got = baseline(Tool::Git, &pristine, &positions, &programs(PathBuf::from("forklift-not-used")), &row, &environment, LIMIT).unwrap().unwrap();
         let tip = tree(&[("a", "a"), ("b", "b"), ("c", "c"), ("s", "s")]);
         let mut after = tip.clone();
         after.insert(PROBE_FILE.to_string(), crate::oracle::digest(PROBE_BYTES));
         let positions = vec![tip.clone(), tree(&[("a", "a"), ("b", "b"), ("c", "c")]), tree(&[("a", "a")]), tree(&[("a", "a"), ("s", "s")])];
         assert_eq!(got, Baseline { positions, before: tip, after });
+    }
+
+    /// A subject that does not read back unfaulted refuses its baseline, which is the subject's:
+    /// its packs zeroed, git serves no position. A pristine subject that is not there is the
+    /// harness's own failure.
+    ///
+    /// Revert: return the readback's refusal as the harness's → the first assertion fails.
+    #[test]
+    fn a_refused_baseline_is_the_subjects_not_the_harnesss() {
+        let (shared, environment) = scratch("git-baseline-refused");
+        let mirror = mirrored(&shared, &environment);
+        let pristine = shared.root().join("pristine");
+        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
+        let packs = pristine.join(crate::runner::state_folder(Tool::Git)).join("objects/pack");
+        let mut zeroed = 0;
+        for entry in std::fs::read_dir(&packs).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|extension| extension == "pack") {
+                let metadata = std::fs::metadata(&path).unwrap();
+                let mut permissions = metadata.permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                permissions.set_readonly(false);
+                std::fs::set_permissions(&path, permissions).unwrap();
+                let length = metadata.len() as usize;
+                std::fs::write(&path, vec![0u8; length]).unwrap();
+                zeroed += 1;
+            }
+        }
+        assert!(zeroed > 0, "no pack under {}", packs.display());
+        let tip = vec![Position { reference: "main".into(), depth: 0 }];
+        let (row, environment) = scratch("git-baseline-refused-row");
+        let programs = programs(PathBuf::from("forklift-not-used"));
+        let refused = baseline(Tool::Git, &pristine, &tip, &programs, &row, &environment, LIMIT).unwrap();
+        // The refusal names the read that refused, so a run's report says which command did.
+        assert!(refused.as_ref().is_err_and(|refusal| refusal.contains("the unfaulted readback did not serve Position(0): ")), "{:?}", refused);
+        let (row, environment) = scratch("git-baseline-absent-row");
+        assert!(baseline(Tool::Git, &shared.root().join("absent"), &tip, &programs, &row, &environment, LIMIT).is_err());
     }
 
     /// Git's whole-store check names damage the sample did not reach: a commit only an unsampled
@@ -250,7 +399,7 @@ mod tests {
         let (shared, environment) = scratch("git-unreached");
         let mirror = mirrored(&shared, &environment);
         let pristine = shared.root().join("pristine");
-        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT).unwrap();
+        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
         // A loose commit on a branch of its own, holding the tip's tree: nothing sampled reaches it.
         let tip_tree = git(&["rev-parse", "main^{tree}"], &pristine, &shared, &environment);
         let lone = git(&["-c", "user.name=p", "-c", "user.email=p@example.invalid", "commit-tree", "-m", "lone", &tip_tree], &pristine, &shared, &environment);
@@ -259,7 +408,7 @@ mod tests {
         let positions = vec![Position { reference: "main".into(), depth: 1 }, Position { reference: "side".into(), depth: 0 }];
         let programs = programs(PathBuf::from("forklift-not-used"));
         let (row, environment) = scratch("git-unreached-base");
-        let base = baseline(Tool::Git, &pristine, &positions, &programs, &row, &environment, LIMIT).unwrap();
+        let base = baseline(Tool::Git, &pristine, &positions, &programs, &row, &environment, LIMIT).unwrap().unwrap();
         let subject = HistorySubject { tool: Tool::Git, pristine: &pristine, positions: &positions, baseline: &base };
         for (kind, name, target, unreached) in [(Kind::Zero, "objects/<xx>/<hash>", object.as_str(), true), (Kind::Delete, "refs/heads/**", "refs/heads/lone", false)] {
             let (row, environment) = scratch("git-unreached-row");
@@ -282,11 +431,11 @@ mod tests {
         let (shared, environment) = scratch("git-reached");
         let mirror = mirrored(&shared, &environment);
         let pristine = shared.root().join("pristine");
-        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT).unwrap();
+        build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
         let positions = vec![Position { reference: "main".into(), depth: 1 }, Position { reference: "side".into(), depth: 0 }];
         let programs = programs(PathBuf::from("forklift-not-used"));
         let (row, environment) = scratch("git-reached-base");
-        let base = baseline(Tool::Git, &pristine, &positions, &programs, &row, &environment, LIMIT).unwrap();
+        let base = baseline(Tool::Git, &pristine, &positions, &programs, &row, &environment, LIMIT).unwrap().unwrap();
         let subject = HistorySubject { tool: Tool::Git, pristine: &pristine, positions: &positions, baseline: &base };
         let (row, environment) = scratch("git-reached-row");
         let faulted = run_history(&subject, "packed-refs", Kind::Delete, &programs, &row, &environment, LIMIT, 0).unwrap();
@@ -307,8 +456,8 @@ mod tests {
         let (shared, environment) = scratch("forklift-baseline");
         let mirror = mirrored(&shared, &environment);
         let (git_pristine, forklift_pristine) = (shared.root().join("git"), shared.root().join("forklift"));
-        build_git(&path_git(), &mirror, &git_pristine, &shared, &environment, LIMIT).unwrap();
-        build_forklift(&forklift, &mirror, &forklift_pristine, &shared, &environment, LIMIT).unwrap();
+        build_git(&path_git(), &mirror, &git_pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
+        build_forklift(&forklift, &mirror, "main", &forklift_pristine, &shared, &environment, LIMIT, &mut Vec::new()).unwrap();
         let lengths = git_lengths(&path_git(), &git_pristine, &shared, &environment, LIMIT).unwrap();
         let present = pallets(&forklift, &forklift_pristine, &shared, &environment, LIMIT).unwrap();
         assert_eq!(present, ["main".to_string(), "side".to_string()].into_iter().collect());
@@ -316,9 +465,9 @@ mod tests {
         assert_eq!(positions.len(), 6);
         let programs = programs(forklift);
         let (row, environment) = scratch("forklift-baseline-git");
-        let git_base = baseline(Tool::Git, &git_pristine, &positions, &programs, &row, &environment, LIMIT).unwrap();
+        let git_base = baseline(Tool::Git, &git_pristine, &positions, &programs, &row, &environment, LIMIT).unwrap().unwrap();
         let (row, environment) = scratch("forklift-baseline-forklift");
-        let forklift_base = baseline(Tool::Forklift, &forklift_pristine, &positions, &programs, &row, &environment, LIMIT).unwrap();
+        let forklift_base = baseline(Tool::Forklift, &forklift_pristine, &positions, &programs, &row, &environment, LIMIT).unwrap().unwrap();
         assert_eq!(forklift_base, git_base);
 
         // A deleted pallet is reached by the sample: its positions no longer read, so the row is
