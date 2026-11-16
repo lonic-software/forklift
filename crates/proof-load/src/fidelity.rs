@@ -522,7 +522,7 @@ mod tests {
     /// finding is never the fixture's own doing. The fixture holds every shape the comparison is
     /// for, each checked here by git, not by the walk.
     ///
-    /// Revert: drop the pinned dates (FIXTURE_IDENTITY's) → the two builds' main differ.
+    /// Revert: unpin FIXTURE_IDENTITY's committer date → the two builds' main differ.
     #[test]
     fn the_fixture_is_the_same_on_every_build_and_holds_every_shape() {
         let (scratch, environment) = area("fixture");
@@ -530,6 +530,12 @@ mod tests {
         let git = git();
         let (one, two) = (scratch.root().join("one"), scratch.root().join("two"));
         build_fixture(&mut steps, &git, &one, &environment).unwrap();
+        // A second apart, so an unpinned date would differ between the two builds.
+        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let first = now();
+        while now() == first {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         build_fixture(&mut steps, &git, &two, &environment).unwrap();
         let mut in_repo = |root: &Path, arguments: &[&str]| String::from_utf8_lossy(&steps.run(&git, arguments, root, &environment).unwrap()).into_owned();
         assert_eq!(in_repo(&one, &["rev-parse", "main", "signed"]), in_repo(&two, &["rev-parse", "main", "signed"]));
