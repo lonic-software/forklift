@@ -1820,6 +1820,7 @@ pub(crate) fn harness_umask() -> Result<u32, String> {
 
 /// What a graded copy watches under, from what starting its daemon gave: the daemon, and for a
 /// state no daemon would watch, a guard from `stops` and why. What failed the harness stays its.
+#[allow(clippy::type_complexity)]
 fn watching<D, S>(started: Result<Result<Option<D>, String>, RunError>, stops: impl FnOnce() -> S) -> Result<(Option<D>, Option<S>, Option<String>), RunError> {
     Ok(match started? {
         Ok(daemon) => (daemon, None, None),
