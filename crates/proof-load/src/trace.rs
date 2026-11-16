@@ -1109,7 +1109,8 @@ mod tests {
     /// A child runs what its parent ran when it spawned it, though the parent executes another
     /// program before the child's first call prints.
     ///
-    /// Revert: take the parent's program at the child's first call → the child's write is not git's.
+    /// Revert: take the parent's program at the child's first call → the child's write is not
+    /// git's.
     #[test]
     fn a_child_runs_what_its_parent_ran_at_the_spawn() {
         let calls = parse("50 execve(\"/g\", [], 0x1) = 0\n50 clone(child_stack=NULL, flags=SIGCHLD) = 60\n50 execve(\"/sh\", [], 0x1) = 0\n60 write(3</s/a>, \"a\", 1) = 1\n").unwrap();
