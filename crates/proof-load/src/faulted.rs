@@ -1148,12 +1148,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    /// The git on PATH, which the git subjects' tests drive.
-    fn path_git() -> PathBuf {
-        let name = if cfg!(windows) { "git.exe" } else { "git" };
-        std::env::split_paths(&std::env::var_os("PATH").expect("a PATH")).map(|folder| folder.join(name))
-            .find(|path| path.is_file()).expect("a git on PATH")
-    }
+    use crate::scrub::path_git;
 
     /// A tuned git build, where this git has an fsmonitor daemon, runs one over the work tree it
     /// ends in (the clone's, for a history that clones) before any step, and the daemon goes with

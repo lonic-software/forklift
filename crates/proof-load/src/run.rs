@@ -773,6 +773,43 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     let case_folding_cell = volume_lane(volume_faults[0])?;
     let no_exec_cell = volume_lane(volume_faults[1])?;
 
+    // The fixture history round-tripped, git to forklift to git: what it changed or dropped is
+    // findings, never grades. A round trip that cannot finish is a gap in the run.
+    let mut fidelity = Vec::new();
+    let mut fidelity_missing = Vec::new();
+    let fidelity_cell = match (&program, &git_program) {
+        (None, _) => Cell::not_run("no forklift binary given"),
+        (_, None) => Cell::not_run("no git binary given"),
+        _ if only.is_some() => Cell::not_run("--only picks one scenario, and the fidelity fixture is none"),
+        (Some(program), Some(git_program)) => {
+            let block = "fidelity-git-forklift-git";
+            progress.lane(Category::Fidelity, Some(1));
+            start_block(progress, Category::Fidelity, block)?;
+            let trip = output.scratch(block).map_err(|error| error.to_string()).and_then(|scratch| {
+                let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
+                Ok(crate::fidelity::git_round_trip(program, git_program, &scratch, &environment, limit))
+            });
+            let trip = match trip {
+                Ok(trip) => {
+                    write_detail(output.root(), &format!("{}.json", block), &trip)?;
+                    trip.findings
+                }
+                Err(error) => Err(error),
+            };
+            progress.block_finished(Category::Fidelity, block, trip.is_err());
+            match trip {
+                Ok(findings) => {
+                    fidelity.extend(findings);
+                    Cell::Run
+                }
+                Err(error) => {
+                    fidelity_missing.push(format!("git to Forklift to git: {}", error));
+                    Cell::not_run("no round trip finished")
+                }
+            }
+        }
+    };
+
     let condition_checks: Vec<Completeness> = [
         (Category::DiskFull, "disk-full faults ran", &disk_full_cell), (Category::ReadOnly, "read-only faults ran", &read_only_cell),
         (Category::CaseFolding, "case-folding faults ran", &case_folding_cell), (Category::NoExec, "no-exec faults ran", &no_exec_cell),
@@ -981,6 +1018,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         Category::CaseFolding => case_folding_cell.clone(),
         Category::NoExec => no_exec_cell.clone(),
         Category::Network => network_cell.clone(),
+        Category::Fidelity => fidelity_cell.clone(),
         _ => Cell::not_run("no runner for this fault in this build of the harness"),
     });
     if matches!(kill_cell, Cell::Run | Cell::Sampled) || not_reached > 0 {
@@ -997,6 +1035,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     completeness.extend([role_check, route_check, route_write_check]);
     completeness.extend(fault_checks);
     completeness.extend(condition_checks);
+    completeness.push(Completeness { subject: None, check: "fidelity round trips ran".to_string(), cell: fidelity_cell, missing: fidelity_missing });
     completeness.extend(write_checks);
     completeness.extend(kill_completeness);
     completeness.extend(server_kill_completeness);
@@ -1019,6 +1058,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         completeness,
         rows,
         forklift_only: vec![],
+        fidelity,
     };
 
     for ((scenario, warehouse), names) in &created {

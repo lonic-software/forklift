@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::damage::{Kind, Warehouse};
+use crate::fidelity::Finding;
 use crate::git_layout::Role;
 use crate::oracle::{Grade, Recoverability, Rescue};
 use crate::scenario::Tool;
@@ -29,13 +30,14 @@ pub enum Category {
     Network,
     ClockSkew,
     AwsHead,
+    Fidelity,
 }
 
 impl Category {
-    pub const ALL: [Category; 13] = [
+    pub const ALL: [Category; 14] = [
         Category::DamagedFiles, Category::KillPointsClient, Category::KillPointsServer, Category::PowerLossClient,
         Category::PowerLossServer, Category::DiskFull, Category::ReadOnly, Category::CaseFolding, Category::NoExec,
-        Category::DeadPidLock, Category::Network, Category::ClockSkew, Category::AwsHead,
+        Category::DeadPidLock, Category::Network, Category::ClockSkew, Category::AwsHead, Category::Fidelity,
     ];
 
     pub fn label(self) -> &'static str {
@@ -53,6 +55,7 @@ impl Category {
             Category::Network => "network proxy",
             Category::ClockSkew => "clock skew",
             Category::AwsHead => "AWS head",
+            Category::Fidelity => "round-trip fidelity",
         }
     }
 }
@@ -337,7 +340,7 @@ impl Completeness {
 
 /// The report's format. A reader refuses any other, so a report written by another build of the
 /// harness is never read as if it meant the same thing.
-pub const REPORT_FORMAT: u32 = 4;
+pub const REPORT_FORMAT: u32 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -351,6 +354,8 @@ pub struct Report {
     pub rows: Vec<Row>,
     /// Rows of scenarios with an operation git has no binding for, never counted as git losses.
     pub forklift_only: Vec<Row>,
+    /// What each round trip changed or dropped: findings, never grades, so none fails the run.
+    pub fidelity: Vec<Finding>,
 }
 
 impl Report {
@@ -491,6 +496,18 @@ impl Report {
                 out.push_str("\nData lost is decided by readback: lost as far as the tool can tell the user. The bytes may still sit undecoded in the store.\n");
             }
         }
+
+        out.push_str("\n## Fidelity\n\n");
+        if self.fidelity.is_empty() {
+            out.push_str("None.\n");
+        } else {
+            out.push_str("| Direction | Field | At | Went in | Came back |\n|---|---|---|---|---|\n");
+            let cell = |value: &Option<String>| value.as_deref().map_or("nothing".to_string(), |value| value.replace('|', "\\|"));
+            for finding in &self.fidelity {
+                let _ = writeln!(out, "| {} | {} | {} | {} | {} |", finding.direction.label(), finding.field.replace('|', "\\|"), finding.at.replace('|', "\\|"), cell(&finding.before), cell(&finding.after));
+            }
+            out.push_str("\nEach finding is a field a round trip changed or dropped, compared commit by commit, never by id. Findings never fail the run; each loss class gets a ticket.\n");
+        }
         out
     }
 }
@@ -544,6 +561,7 @@ mod tests {
             completeness: vec![],
             rows: vec![],
             forklift_only: vec![],
+            fidelity: vec![],
         };
         let markdown = report.markdown();
         assert!(markdown.starts_with("# Proof Load report\n\n## Header\n\n- seed: 7\n- platform: Linux (Linux 6.1)\n- filesystem: ext2/ext3/ext4\n"), "{}", markdown);
@@ -563,6 +581,7 @@ mod tests {
             completeness: vec![Completeness { subject: Some(Tool::Forklift), check: "damage".to_string(), cell: Cell::Run, missing: vec!["trust".to_string()] }],
             rows: vec![],
             forklift_only: vec![],
+            fidelity: vec![],
         };
         assert!(report.failed());
     }
@@ -616,6 +635,7 @@ mod tests {
                 note: None, detail: Some("trust-head.json#".to_string()), pairing: None,
             }],
             forklift_only: vec![],
+            fidelity: vec![],
         }
     }
 
@@ -727,6 +747,26 @@ mod tests {
         assert!(!measured.markdown().contains("not fully measured"));
         assert!(report(vec![check(Some(Tool::Forklift), Cell::Run, &["trust"])]).failed());
         assert!(report(vec![check(None, Cell::Run, &["over budget"])]).failed());
+    }
+
+    /// Fidelity findings are listed, one row each with both values and nothing for a side that has
+    /// none, read back whole, and never fail the run.
+    ///
+    /// Revert: escape no `|` in a value or a field → the zone row or the header row gains a column.
+    #[test]
+    fn fidelity_findings_are_listed_and_never_fail_the_run() {
+        use crate::fidelity::Direction;
+        let finding = |field: &str, at: &str, before: Option<&str>, after: Option<&str>| Finding {
+            direction: Direction::GitForkliftGit, field: field.to_string(), at: at.to_string(), before: before.map(str::to_string), after: after.map(str::to_string),
+        };
+        let report = Report { fidelity: vec![finding("author zone", "main~8", Some("+0130"), Some("+0|00")), finding("ref", "refs/notes/commits", Some("note"), None), finding("header x|y", "main", Some("v"), None)], ..sample() };
+        assert!(!report.failed());
+        let markdown = report.markdown();
+        assert!(markdown.contains("\n| git to Forklift to git | author zone | main~8 | +0130 | +0\\|00 |\n"), "{}", markdown);
+        assert!(markdown.contains("\n| git to Forklift to git | ref | refs/notes/commits | note | nothing |\n"), "{}", markdown);
+        assert!(markdown.contains("\n| git to Forklift to git | header x\\|y | main | v | nothing |\n"), "{}", markdown);
+        assert!(sample().markdown().contains("\n## Fidelity\n\nNone.\n"));
+        assert_eq!(Report::from_json(&report.json()).expect("the report reads back").fidelity, report.fidelity);
     }
 
     /// Changes the sample's JSON with `change`, then reads it back.

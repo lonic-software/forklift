@@ -288,6 +288,14 @@ pub fn system_variables_when(windows: bool, inherited: impl Fn(&str) -> Option<O
         .collect()
 }
 
+/// The git on PATH, which the tests that drive git use.
+#[cfg(test)]
+pub(crate) fn path_git() -> std::path::PathBuf {
+    let name = if cfg!(windows) { "git.exe" } else { "git" };
+    std::env::split_paths(&std::env::var_os("PATH").expect("a PATH")).map(|folder| folder.join(name))
+        .find(|path| path.is_file()).expect("a git on PATH")
+}
+
 /// The PATH the tools run with: the readback git's own directory first, then the harness's PATH,
 /// so a `git` that forklift itself starts (as `git export` does) is the one the run records.
 pub fn search_path(git: Option<&Path>, inherited: Option<OsString>) -> Option<OsString> {
