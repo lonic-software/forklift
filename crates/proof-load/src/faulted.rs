@@ -354,7 +354,8 @@ impl Context<'_> {
         if parked.is_empty() {
             return Ok(None);
         }
-        let (arguments, read): (Vec<String>, fn(&[u8]) -> Option<Vec<String>>) = match self.tool {
+        type ReadListing = fn(&[u8]) -> Option<Vec<String>>;
+        let (arguments, read): (Vec<String>, ReadListing) = match self.tool {
             Tool::Forklift => (vec!["--json".into(), "park".into(), "list".into()], runner::parked_parcels),
             Tool::Git | Tool::GitTuned => (runner::STASH_LIST.iter().map(|argument| argument.to_string()).collect(), runner::stashed_commits),
         };
