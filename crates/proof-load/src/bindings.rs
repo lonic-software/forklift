@@ -549,10 +549,15 @@ pub fn check_history_subject(tool: Tool, census: &Census, walked: &[String]) -> 
             check_git(bindings, exemptions, &[scenario], &walks)
         }
     };
-    // A binding with no role forms no (role, kind) group, so its rows would never run.
-    missing.extend(bindings.iter().filter(|binding| crate::git_layout::role_of(tool, binding.name).is_none())
-        .map(|binding| format!("{}: the role map gives it no role", binding.name)));
+    missing.extend(roleless(tool, bindings));
     missing
+}
+
+/// Each of `bindings` the role map gives no role under `tool`, named: such a binding forms no
+/// (role, kind) group, so [`history_rows`] would never run it.
+fn roleless(tool: Tool, bindings: &[Binding]) -> Vec<String> {
+    bindings.iter().filter(|binding| crate::git_layout::role_of(tool, binding.name).is_none())
+        .map(|binding| format!("{}: the role map gives it no role", binding.name)).collect()
 }
 
 /// The damage rows a history runs for `tool`: for each (role, kind) its bindings reach, one
@@ -732,6 +737,18 @@ mod tests {
     fn planting_bindings_name_literal_paths() {
         for binding in BINDINGS.iter().filter(|binding| binding.kinds.iter().any(|kind| kind.plants())) {
             assert!(!damage::planted(binding.name).contains(['<', '{']), "{} plants a pattern", binding.name);
+        }
+    }
+
+    /// A history binding the role map gives no role is named, under either subject.
+    ///
+    /// Revert: name none → both are silent.
+    #[test]
+    fn a_history_binding_with_no_role_is_named() {
+        let unknown = [over_history("no-such-path", FILE)];
+        for tool in [Tool::Forklift, Tool::Git] {
+            assert_eq!(roleless(tool, &unknown), vec!["no-such-path: the role map gives it no role".to_string()], "{:?}", tool);
+            assert_eq!(roleless(tool, history_subject(tool).0), Vec::<String>::new(), "{:?}", tool);
         }
     }
 
