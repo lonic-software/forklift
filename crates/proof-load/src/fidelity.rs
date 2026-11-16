@@ -1,13 +1,23 @@
-//! The fidelity category: a git history taken through forklift and back, compared commit by commit
-//! with what went in.
+//! The fidelity category: a history taken from git through Forklift and back, and one taken from
+//! Forklift through git and back, each compared with what went in.
 //!
-//! The harness builds a fixture repository with git (`build_fixture`), every commit shape git
-//! allows and a pinned date on each, so its commit ids are the same on every run. Forklift imports
-//! it into a fresh warehouse and exports that warehouse to a second repository. No commit id
-//! survives the trip, so the two are never matched by id: from each ref both hold, the walk pairs
-//! tip with tip and parent i with parent i, and compares each pair field by field. Every
-//! difference is a finding naming the field, where it is and both values. Nothing is declared an
-//! allowed loss: a finding is reported until a fix removes it, and findings never fail a run.
+//! Git to Forklift to git: the harness builds a fixture repository with git (`build_fixture`),
+//! every commit shape git allows and a pinned date on each, so its commit ids are the same on
+//! every run. Forklift imports it into a fresh warehouse and exports that warehouse to a second
+//! repository. No commit id survives the trip, so the two are never matched by id: from each ref
+//! both hold, the walk pairs tip with tip and parent i with parent i, and compares each pair field
+//! by field.
+//!
+//! Forklift to git to Forklift: forklift builds a native history (`build_warehouse`), exports it,
+//! and imports the export into a fresh warehouse. The two warehouses' `history --json` records are
+//! walked the same way from each pallet both hold, and each record's tree is read through a git
+//! export of its own warehouse. The same exporter reads both, so a tree difference is a loss of
+//! the trip, never of the reading; a loss the exporter makes the same way twice cancels out there
+//! and is not seen here.
+//!
+//! Every difference is a finding naming the field, where it is and both values. Nothing is
+//! declared an allowed loss: a finding is reported until a fix removes it, and findings never fail
+//! a run.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -22,12 +32,15 @@ use crate::tool::{self, Invocation, Outcome};
 pub enum Direction {
     /// A git repository imported by forklift, then exported back to git.
     GitForkliftGit,
+    /// A Forklift-native history exported to git, then imported into a fresh warehouse.
+    ForkliftGitForklift,
 }
 
 impl Direction {
     pub fn label(self) -> &'static str {
         match self {
             Direction::GitForkliftGit => "git to Forklift to git",
+            Direction::ForkliftGitForklift => "Forklift to git to Forklift",
         }
     }
 }
@@ -39,10 +52,12 @@ pub struct Finding {
     pub direction: Direction,
     /// What differs, which names the loss class: `ref`, `ref kind`, `commit`, `tree entry`,
     /// `parent count`, `author name` and the other identity parts, `message`, `header <name>`, or
-    /// `tag <part>` for an annotated tag's object.
+    /// `tag <part>` for an annotated tag's object; from Forklift, `pallet`, `record`, `actions`,
+    /// `<action> operator` and its time and trust, `manifest entry`, `keyed value`, or `tag <part>`.
     pub field: String,
-    /// Where: a ref's name, or a commit's position from the ref the walk reached it by (`main~2^2`),
-    /// then a path for a tree entry.
+    /// Where: a ref's, pallet's or tag's name, or a commit's or record's position from the ref or
+    /// pallet the walk reached it by (`main~2^2`), then a path for a tree entry; a keyed value is
+    /// its key on such a position.
     pub at: String,
     /// The value that went in; none where nothing did.
     pub before: Option<String>,
@@ -273,6 +288,15 @@ fn position(start: &str, path: &[usize]) -> String {
     text
 }
 
+/// A tree's every entry in the repository at `side`, recursively, by path: its mode, type and id.
+fn tree_entries(steps: &mut Steps, git: &Path, side: &Path, tree: &str, environment: &Environment) -> Result<BTreeMap<String, String>, String> {
+    let listed = steps.run(git, &["ls-tree", "-r", "-t", "-z", "--full-tree", tree], side, environment)?;
+    Ok(listed.split(|byte| *byte == 0).filter(|entry| !entry.is_empty()).filter_map(|entry| {
+        let tab = entry.iter().position(|byte| *byte == b'\t')?;
+        Some((shown(&entry[tab + 1..]), String::from_utf8_lossy(&entry[..tab]).into_owned()))
+    }).collect())
+}
+
 /// Compares two repositories: `before`, what went in, and `after`, what came back.
 struct Comparison<'a, 'b> {
     steps: &'a mut Steps<'b>,
@@ -305,14 +329,8 @@ impl<'a, 'b> Comparison<'a, 'b> {
         self.steps.run(self.git, &["cat-file", kind, id], &side, self.environment)
     }
 
-    /// A tree's every entry, recursively, by path: its mode, type and id.
     fn entries(&mut self, side: &Path, tree: &str) -> Result<BTreeMap<String, String>, String> {
-        let side = side.to_path_buf();
-        let listed = self.steps.run(self.git, &["ls-tree", "-r", "-t", "-z", "--full-tree", tree], &side, self.environment)?;
-        Ok(listed.split(|byte| *byte == 0).filter(|entry| !entry.is_empty()).filter_map(|entry| {
-            let tab = entry.iter().position(|byte| *byte == b'\t')?;
-            Some((shown(&entry[tab + 1..]), String::from_utf8_lossy(&entry[..tab]).into_owned()))
-        }).collect())
+        tree_entries(self.steps, self.git, side, tree, self.environment)
     }
 
     /// Compares the headers either object has by name, apart from `skipped`: every value of a
@@ -569,6 +587,394 @@ impl<'a, 'b> Comparison<'a, 'b> {
     }
 }
 
+/// Builds a Forklift-native history in a fresh warehouse at `root`, which must not exist yet: a
+/// root parcel holding a CRLF file, an empty file, a binary file and a nested one, and on Unix an
+/// executable file and a symlink; a parcel with a multi-line description outside ASCII; a pallet
+/// `side` consolidated back into `main`; a parcel that removes a file; a signed tag; a keyed value;
+/// and a note. Forklift takes its dates from the clock, so the history differs from run to run in
+/// its times and parcel ids, and in nothing else.
+fn build_warehouse(steps: &mut Steps, forklift: &Path, root: &Path, environment: &Environment) -> Result<(), String> {
+    std::fs::create_dir(root).map_err(|error| format!("cannot create {}: {}", root.display(), error))?;
+    let mut forklift_in = |arguments: &[&str]| steps.run(forklift, arguments, root, environment);
+    forklift_in(&["--json", "prepare"])?;
+    std::fs::create_dir_all(root.join("d/e")).map_err(|error| format!("cannot create {}: {}", root.join("d/e").display(), error))?;
+    for (file, bytes) in [
+        ("a.txt", &b"alpha\n"[..]), ("crlf.txt", b"one\r\ntwo\r\n"), ("empty", b""), ("bin.dat", b"\x00\x01\xfe\xff\n"),
+        ("d/e/deep.txt", b"deep\n"), ("gone.txt", b"removed later\n"), ("run.sh", b"#!/bin/sh\n"),
+    ] {
+        write(&root.join(file), bytes)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root.join("run.sh"), std::fs::Permissions::from_mode(0o755)).map_err(|error| format!("cannot make run.sh executable: {}", error))?;
+        std::os::unix::fs::symlink("a.txt", root.join("link")).map_err(|error| format!("cannot make the symlink: {}", error))?;
+    }
+    forklift_in(&["--json", "load", "."])?;
+    forklift_in(&["--json", "stack", "-m", "root: every file shape"])?;
+    write(&root.join("a.txt"), b"alpha\nbeta\n")?;
+    forklift_in(&["--json", "load", "."])?;
+    forklift_in(&["--json", "stack", "-m", "second: \u{fc}n\u{ef}c\u{f6}d\u{e9}\n\nA body line, below a blank one."])?;
+    forklift_in(&["--json", "pallet", "create", "side"])?;
+    write(&root.join("side.txt"), b"side\n")?;
+    forklift_in(&["--json", "load", "."])?;
+    forklift_in(&["--json", "stack", "-m", "side work"])?;
+    forklift_in(&["--json", "shift", "main"])?;
+    write(&root.join("main.txt"), b"main\n")?;
+    forklift_in(&["--json", "load", "."])?;
+    forklift_in(&["--json", "stack", "-m", "main work"])?;
+    forklift_in(&["--json", "consolidate", "side"])?;
+    forklift_in(&["--json", "tag", "create", "v1", "main", "-m", "release one"])?;
+    forklift_in(&["--json", "manifest", "set", "main", "review.state", "done"])?;
+    forklift_in(&["--json", "remove", "gone.txt"])?;
+    forklift_in(&["--json", "stack", "-m", "drop a file"])?;
+    forklift_in(&["--json", "manifest", "note", "-m", "a note", "main"])?;
+    Ok(())
+}
+
+/// One record of a `history --json` listing: its description, its parents, its actions as name,
+/// operator, time and trust, its manifest entries but keyed values (each as its JSON without the
+/// subject, sorted), and the git tree its warehouse's export wrote for it.
+#[derive(Clone, Debug, Default)]
+struct Record {
+    description: String,
+    parents: Vec<String>,
+    actions: Vec<[String; 4]>,
+    manifest: Vec<String>,
+    tree: Option<String>,
+}
+
+/// What was read of one warehouse of a Forklift round trip and of its git export.
+#[derive(Clone, Debug, Default)]
+struct Side {
+    export: PathBuf,
+    /// Each pallet by name, with its head; none for a pallet with no parcel yet.
+    pallets: BTreeMap<String, Option<String>>,
+    /// Every record the pallets' listings named, by parcel.
+    records: BTreeMap<String, Record>,
+    /// Each tag by name: its subject, message, tagger and time.
+    tags: BTreeMap<String, [Option<String>; 4]>,
+    /// Each keyed value by parcel and key: its value and who set it.
+    keyed: BTreeMap<(String, String), (Option<String>, Option<String>)>,
+}
+
+/// The value at `key` of a JSON object as text: a string as it is, nothing as none, anything else
+/// as its JSON.
+fn text_at(value: &serde_json::Value, key: &str) -> Option<String> {
+    match &value[key] {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
+/// Reads one warehouse of a round trip, and the git export of it at `export`: its pallets, the
+/// records their listings name, each record's manifest entries and exported tree, its tags and
+/// its keyed values. An export commit is matched to its parcel by the `Forklift-Parcel` trailer
+/// the export wrote; a record no commit names has no tree, and comparing it fails the trip.
+fn read_side(steps: &mut Steps, forklift: &Path, git: &Path, environment: &Environment, warehouse: &Path, export: &Path) -> Result<Side, String> {
+    let mut data = |arguments: &[&str]| -> Result<serde_json::Value, String> {
+        let mut full = vec!["--json"];
+        full.extend_from_slice(arguments);
+        let stdout = steps.run(forklift, &full, warehouse, environment)?;
+        let document: serde_json::Value = serde_json::from_slice(&stdout)
+            .map_err(|error| format!("`{}` printed no JSON document: {}", arguments.join(" "), error))?;
+        Ok(document["data"].clone())
+    };
+    let mut side = Side { export: export.to_path_buf(), ..Side::default() };
+    let pallets = data(&["pallet", "list"])?;
+    for pallet in pallets["pallets"].as_array().ok_or("the pallet list names no pallets")? {
+        side.pallets.insert(text_at(pallet, "name").ok_or("a pallet in the list has no name")?, text_at(pallet, "head"));
+    }
+    for (name, head) in side.pallets.clone() {
+        if head.is_none() {
+            continue;
+        }
+        let listing = data(&["history", "--", &name])?;
+        for entry in listing["entries"].as_array().ok_or_else(|| format!("the history of {} lists no entries", name))? {
+            let parcel = text_at(entry, "parcel").ok_or_else(|| format!("an entry in the history of {} names no parcel", name))?;
+            let parents = entry["parents"].as_array().map(|parents| parents.iter().filter_map(|parent| parent.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            let actions = entry["actions"].as_array().map(|actions| actions.iter().map(|action| {
+                [text_at(action, "action").unwrap_or_default().trim().to_string(), text_at(action, "operator").unwrap_or_default(),
+                    text_at(action, "timestamp").unwrap_or_default(), text_at(action, "trust").unwrap_or_default()]
+            }).collect()).unwrap_or_default();
+            side.records.insert(parcel, Record { description: text_at(entry, "description").unwrap_or_default(), parents, actions, ..Record::default() });
+        }
+    }
+    for parcel in side.records.keys().cloned().collect::<Vec<_>>() {
+        let shown = data(&["manifest", "show", &parcel])?;
+        let mut entries: Vec<String> = shown["entries"].as_array().map(|entries| entries.iter().map(|entry| {
+            let mut entry = entry.clone();
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("subject");
+            }
+            entry.to_string()
+        }).collect()).unwrap_or_default();
+        entries.sort();
+        side.records.get_mut(&parcel).expect("a record just listed").manifest = entries;
+    }
+    let tags = data(&["tag", "list"])?;
+    for tag in tags["tags"].as_array().map(Vec::as_slice).unwrap_or_default() {
+        let name = text_at(tag, "name").ok_or("a tag in the list has no name")?;
+        side.tags.insert(name, [text_at(tag, "subject"), text_at(tag, "message"), text_at(tag, "tagger"), text_at(tag, "tagged_at")]);
+    }
+    let keys = data(&["manifest", "keys"])?;
+    for entry in keys["entries"].as_array().map(Vec::as_slice).unwrap_or_default() {
+        let (Some(subject), Some(key)) = (text_at(entry, "subject"), text_at(entry, "key")) else { return Err("a keyed value names no parcel or key".to_string()) };
+        side.keyed.insert((subject, key), (text_at(entry, "value"), text_at(entry, "operator")));
+    }
+    let log = steps.run(git, &["log", "--all", "--format=%x00%H %T%n%B"], export, environment)?;
+    for chunk in log.split(|byte| *byte == 0).filter(|chunk| !chunk.is_empty()) {
+        let text = String::from_utf8_lossy(chunk);
+        let mut lines = text.lines();
+        let tree = lines.next().unwrap_or_default().split_whitespace().nth(1).map(str::to_string);
+        for parcel in lines.filter_map(|line| line.strip_prefix("Forklift-Parcel: ")).filter_map(|rest| rest.split_whitespace().next()) {
+            if let Some(record) = side.records.get_mut(parcel) {
+                record.tree = tree.clone();
+            }
+        }
+    }
+    Ok(side)
+}
+
+/// Compares two warehouses: `before`, the history that went in, and `after`, its git export
+/// imported into a fresh warehouse. Each tree is read through a git export of its warehouse, the
+/// same exporter for both, so a tree difference is the import's loss or the first export's, never
+/// the reading of it.
+struct Records<'a, 'b> {
+    steps: &'a mut Steps<'b>,
+    git: &'a Path,
+    environment: &'a Environment,
+    before: Side,
+    after: Side,
+    findings: Vec<Finding>,
+    /// Each record that went in, by parcel, with the record it was compared to and its position.
+    paired: BTreeMap<String, (String, String)>,
+    /// Each record that came back, by parcel, with the record that went in it was compared to.
+    returned: BTreeMap<String, String>,
+}
+
+impl Records<'_, '_> {
+    fn find(&mut self, field: impl Into<String>, at: impl Into<String>, before: Option<String>, after: Option<String>) {
+        self.findings.push(Finding { direction: Direction::ForkliftGitForklift, field: field.into(), at: at.into(), before, after });
+    }
+
+    /// Compares one paired record: description, parent count, actions in order and each action's
+    /// operator, time and trust at its first occurrence, the exported tree entry by entry, and
+    /// the manifest entries. A record either export wrote no commit for is an error.
+    fn record(&mut self, at: &str, before: &str, after: &str) -> Result<(Vec<String>, Vec<String>), String> {
+        let missing = |parcel: &str| format!("the history lists {} as a parent but not as a record", parcel);
+        let was = self.before.records.get(before).cloned().ok_or_else(|| missing(before))?;
+        let now = self.after.records.get(after).cloned().ok_or_else(|| missing(after))?;
+        if was.description != now.description {
+            self.find("message", at, Some(shown(was.description.as_bytes())), Some(shown(now.description.as_bytes())));
+        }
+        if was.parents.len() != now.parents.len() {
+            self.find("parent count", at, Some(was.parents.len().to_string()), Some(now.parents.len().to_string()));
+        }
+        let names = |record: &Record| record.actions.iter().map(|action| action[0].clone()).collect::<Vec<_>>().join(", ");
+        if names(&was) != names(&now) {
+            self.find("actions", at, Some(names(&was)), Some(names(&now)));
+        }
+        let mut compared = BTreeSet::new();
+        for was_action in was.actions.iter().filter(|action| compared.insert(action[0].clone())) {
+            let Some(now_action) = now.actions.iter().find(|action| action[0] == was_action[0]) else { continue };
+            for (index, part) in [(1, "operator"), (2, "time"), (3, "trust")] {
+                if was_action[index] != now_action[index] {
+                    self.find(format!("{} {}", was_action[0], part), at, Some(was_action[index].clone()), Some(now_action[index].clone()));
+                }
+            }
+        }
+        // A tree is read only through an export, so a record its export wrote no commit for could
+        // not be read, which is the reading failing, never a finding.
+        let unread = |parcel: &str| format!("the export of the record at {} ({}) wrote no commit naming it", at, parcel);
+        let was_tree = was.tree.clone().ok_or_else(|| unread(before))?;
+        let now_tree = now.tree.clone().ok_or_else(|| unread(after))?;
+        if was_tree != now_tree {
+            let (before_export, after_export) = (self.before.export.clone(), self.after.export.clone());
+            let was_entries = tree_entries(self.steps, self.git, &before_export, &was_tree, self.environment)?;
+            let now_entries = tree_entries(self.steps, self.git, &after_export, &now_tree, self.environment)?;
+            for path in was_entries.keys().chain(now_entries.keys()).collect::<BTreeSet<_>>() {
+                let (was_entry, now_entry) = (was_entries.get(path), now_entries.get(path));
+                if was_entry != now_entry {
+                    self.find("tree entry", format!("{} {}", at, path), was_entry.cloned(), now_entry.cloned());
+                }
+            }
+        }
+        for entry in was.manifest.iter().filter(|entry| !now.manifest.contains(entry)) {
+            self.find("manifest entry", at, Some(entry.clone()), None);
+        }
+        for entry in now.manifest.iter().filter(|entry| !was.manifest.contains(entry)) {
+            self.find("manifest entry", at, None, Some(entry.clone()));
+        }
+        Ok((was.parents, now.parents))
+    }
+
+    /// How many records `parent` reaches that none of `kept` does, on one side, as a finding shows
+    /// it.
+    fn only_below(&self, after: bool, parent: &str, kept: &[String]) -> String {
+        let records = if after { &self.after.records } else { &self.before.records };
+        let reach = |starts: &[String]| {
+            let mut seen = BTreeSet::new();
+            let mut queue: VecDeque<String> = starts.iter().cloned().collect();
+            while let Some(parcel) = queue.pop_front() {
+                if seen.insert(parcel.clone()) {
+                    queue.extend(records.get(&parcel).map(|record| record.parents.clone()).unwrap_or_default());
+                }
+            }
+            seen
+        };
+        let kept = reach(kept);
+        let count = reach(&[parent.to_string()]).difference(&kept).count();
+        format!("present, with {} record{} only it reaches", count, if count == 1 { "" } else { "s" })
+    }
+
+    /// Walks from one pallet's heads, breadth first, as the git walk does: head with head, parent i
+    /// with parent i, each record that went in compared once, at its first position. A record
+    /// reached again paired with a different one is a `record identity` finding, and a parent one
+    /// side lacks a `record` finding saying how many records only it reaches.
+    fn lockstep(&mut self, start: &str, was: String, now: String) -> Result<(), String> {
+        let mut queue = VecDeque::from([(Vec::new(), was, now)]);
+        while let Some((path, was, now)) = queue.pop_front() {
+            let at = position(start, &path);
+            if let Some((paired, first)) = self.paired.get(&was) {
+                if *paired != now {
+                    let first = first.clone();
+                    self.find("record identity", at, Some(format!("the record at {}", first)), Some("a different record".to_string()));
+                }
+                continue;
+            }
+            if let Some(other) = self.returned.get(&now) {
+                let first = self.paired[other].1.clone();
+                self.find("record identity", at.as_str(), Some("a distinct record".to_string()), Some(format!("the record at {}", first)));
+            }
+            self.paired.insert(was.clone(), (now.clone(), at.clone()));
+            self.returned.entry(now.clone()).or_insert_with(|| was.clone());
+            let (was_parents, now_parents) = self.record(&at, &was, &now)?;
+            for index in 0..was_parents.len().max(now_parents.len()) {
+                let mut next = path.clone();
+                next.push(index + 1);
+                match (was_parents.get(index), now_parents.get(index)) {
+                    (Some(was), Some(now)) => queue.push_back((next, was.clone(), now.clone())),
+                    (Some(lost), None) => {
+                        let only = self.only_below(false, lost, &was_parents[..now_parents.len()]);
+                        self.find("record", position(start, &next), Some(only), None);
+                    }
+                    (None, Some(added)) => {
+                        let only = self.only_below(true, added, &now_parents[..was_parents.len()]);
+                        self.find("record", position(start, &next), None, Some(only));
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Where a record that went in was compared, or its parcel id where the walk never reached it.
+    fn at(&self, before: &str) -> String {
+        self.paired.get(before).map_or_else(|| before.to_string(), |(_, at)| at.clone())
+    }
+
+    /// Where a record that came back was compared, or its parcel id where the walk never reached it.
+    fn at_returned(&self, after: &str) -> String {
+        self.returned.get(after).map_or_else(|| after.to_string(), |before| self.at(before))
+    }
+
+    /// Compares every pallet either warehouse holds, walking the histories in lockstep from each
+    /// pallet both hold, `main` first so a record is named from main where main reaches it; then
+    /// the tags by name, and the keyed values through the records the walk paired.
+    fn walk(mut self) -> Result<Vec<Finding>, String> {
+        let mut names: Vec<String> = self.before.pallets.keys().chain(self.after.pallets.keys()).cloned().collect::<BTreeSet<_>>().into_iter().collect();
+        names.sort_by_key(|name| name != "main");
+        for name in names {
+            let present = |head: &Option<String>| Some(if head.is_some() { "a pallet" } else { "a pallet with no parcel" }.to_string());
+            match (self.before.pallets.get(&name).cloned(), self.after.pallets.get(&name).cloned()) {
+                (Some(Some(was)), Some(Some(now))) => self.lockstep(&name, was, now)?,
+                (Some(was), Some(now)) if was.is_some() != now.is_some() => self.find("pallet", name, present(&was), present(&now)),
+                (was, now) if was.is_some() != now.is_some() => self.find("pallet", name, was.as_ref().and_then(present), now.as_ref().and_then(present)),
+                _ => {}
+            }
+        }
+        self.tags();
+        self.keyed_values();
+        Ok(self.findings)
+    }
+
+    /// Compares the tags of both warehouses by name: what each points at, through the walk's
+    /// pairing, and its message, tagger and time.
+    fn tags(&mut self) {
+        let names: BTreeSet<String> = self.before.tags.keys().chain(self.after.tags.keys()).cloned().collect();
+        for name in names {
+            let at = format!("tag {}", name);
+            let (Some(was), Some(now)) = (self.before.tags.get(&name).cloned(), self.after.tags.get(&name).cloned()) else {
+                let held = |tags: &BTreeMap<String, [Option<String>; 4]>| tags.get(&name).map(|_| "a tag".to_string());
+                let (was, now) = (held(&self.before.tags), held(&self.after.tags));
+                self.find("tag", at, was, now);
+                continue;
+            };
+            let (was_subject, now_subject) = (was[0].clone().unwrap_or_default(), now[0].clone().unwrap_or_default());
+            if self.paired.get(&was_subject).map(|(paired, _)| paired) != Some(&now_subject) {
+                let (was_at, now_at) = (self.at(&was_subject), self.at_returned(&now_subject));
+                self.find("tag subject", at.as_str(), Some(was_at), Some(now_at));
+            }
+            for (index, field) in [(1, "tag message"), (2, "tag tagger"), (3, "tag time")] {
+                if was[index] != now[index] {
+                    let show = |value: &Option<String>| value.as_ref().map(|value| shown(value.as_bytes()));
+                    self.find(field, at.as_str(), show(&was[index]), show(&now[index]));
+                }
+            }
+        }
+    }
+
+    /// Compares the keyed values of both warehouses through the walk's pairing: each value with
+    /// the one under its key on its record's counterpart, and who set it.
+    fn keyed_values(&mut self) {
+        let mut matched = BTreeSet::new();
+        for ((subject, key), (was_value, was_operator)) in self.before.keyed.clone() {
+            let at = format!("{} on {}", key, self.at(&subject));
+            let counterpart = self.paired.get(&subject).map(|(now, _)| (now.clone(), key.clone()));
+            match counterpart.and_then(|counterpart| self.after.keyed.get(&counterpart).cloned().map(|now| (counterpart, now))) {
+                Some((counterpart, (now_value, now_operator))) => {
+                    matched.insert(counterpart);
+                    if was_value != now_value {
+                        self.find("keyed value", at.as_str(), was_value, now_value);
+                    }
+                    if was_operator != now_operator {
+                        self.find("keyed value operator", at.as_str(), was_operator, now_operator);
+                    }
+                }
+                None => self.find("keyed value", at, was_value, None),
+            }
+        }
+        for ((subject, key), (now_value, _)) in self.after.keyed.clone().into_iter().filter(|(counterpart, _)| !matched.contains(counterpart)) {
+            let at = format!("{} on {}", key, self.at_returned(&subject));
+            self.find("keyed value", at, None, now_value);
+        }
+    }
+}
+
+/// The Forklift to git to Forklift round trip in `scratch`: a native history built with
+/// `forklift`, exported to git, imported into a fresh warehouse, exported again, and compared
+/// record by record. Both warehouses' trees are read through their own exports.
+pub fn forklift_round_trip(forklift: &Path, git: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Trip {
+    let mut steps = Steps { scratch, limit, outcomes: Vec::new() };
+    let (native, exported) = (scratch.root().join("native"), scratch.root().join("exported"));
+    let (reimported, reexported) = (scratch.root().join("reimported"), scratch.root().join("reexported"));
+    let findings = (|| -> Result<Vec<Finding>, String> {
+        build_warehouse(&mut steps, forklift, &native, environment).map_err(|error| format!("the fixture could not be built: {}", error))?;
+        steps.run(forklift, &["--json", "git", "export", "--", &exported.display().to_string()], &native, environment)?;
+        std::fs::create_dir(&reimported).map_err(|error| format!("cannot create {}: {}", reimported.display(), error))?;
+        steps.run(forklift, &["--json", "prepare"], &reimported, environment)?;
+        steps.run(forklift, &["--json", "git", "import", "--", &exported.display().to_string()], &reimported, environment)?;
+        steps.run(forklift, &["--json", "git", "export", "--", &reexported.display().to_string()], &reimported, environment)?;
+        let before = read_side(&mut steps, forklift, git, environment, &native, &exported)?;
+        let after = read_side(&mut steps, forklift, git, environment, &reimported, &reexported)?;
+        Records { steps: &mut steps, git, environment, before, after, findings: Vec::new(), paired: BTreeMap::new(), returned: BTreeMap::new() }.walk()
+    })();
+    Trip { direction: Direction::ForkliftGitForklift, steps: steps.outcomes, findings }
+}
+
 /// The git to forklift to git round trip in `scratch`: the fixture built with `git`, imported by
 /// `forklift` into a fresh warehouse, exported to a new repository and compared with the fixture.
 pub fn git_round_trip(forklift: &Path, git: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Trip {
@@ -806,6 +1212,110 @@ mod tests {
 
     /// The round trip runs against a real forklift and finishes, with every command it ran kept.
     ///
+    /// A native history and its copy under other parcel ids: the copy as it is has no finding, and
+    /// a copy changed in every field the record walk reads has one finding per change, at the
+    /// position the walk reached it by.
+    ///
+    /// Revert: drop any one comparison in `Records` → its expected finding is missing.
+    #[test]
+    fn the_record_walk_reports_each_field_a_changed_copy_differs_in() {
+        let (scratch, environment) = area("records");
+        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
+        let git = path_git();
+        let export = scratch.root().join("export");
+        steps.run(&git, &["init", "-q", "export"], scratch.root(), &environment).unwrap();
+        let mut tree = |bytes: &[u8]| {
+            write(&export.join("a"), bytes).unwrap();
+            steps.run(&git, &["add", "a"], &export, &environment).unwrap();
+            printed(&steps.run(&git, &["write-tree"], &export, &environment).unwrap())
+        };
+        let (kept, changed) = (tree(b"kept\n"), tree(b"changed\n"));
+        let record = |description: &str, parents: &[&str]| Record {
+            description: description.to_string(), parents: parents.iter().map(|parent| parent.to_string()).collect(),
+            actions: [["author", "op", "t1", "recorded"], ["stack", "op", "t1", "recorded"]].map(|action| action.map(str::to_string)).to_vec(),
+            manifest: Vec::new(), tree: Some(kept.clone()),
+        };
+        let some = |text: &str| Some(text.to_string());
+        let side = |prefix: &str| {
+            let id = |name: &str| format!("{}{}", prefix, name);
+            let mut side = Side { export: export.clone(), ..Side::default() };
+            side.records.insert(id("3"), Record { manifest: vec![r#"{"kind":"note"}"#.to_string()], ..record("merge", &[&id("2"), &id("s")]) });
+            side.records.insert(id("2"), record("second", &[&id("1")]));
+            side.records.insert(id("1"), record("root", &[]));
+            side.records.insert(id("s"), record("side", &[&id("1")]));
+            side.pallets = BTreeMap::from([("main".to_string(), Some(id("3"))), ("side".to_string(), Some(id("s")))]);
+            side.tags = BTreeMap::from([("v1".to_string(), [Some(id("3")), some("one"), some("op"), some("t1")]), ("v2".to_string(), [Some(id("3")), some("two"), some("op"), some("t1")])]);
+            side.keyed = BTreeMap::from([((id("3"), "k".to_string()), (some("v"), some("op"))), ((id("2"), "j".to_string()), (some("v"), some("op")))]);
+            side
+        };
+        let walk = |steps: &mut Steps, before: Side, after: Side| -> Vec<(String, String)> {
+            let records = Records { steps, git: &git, environment: &environment, before, after, findings: Vec::new(), paired: BTreeMap::new(), returned: BTreeMap::new() };
+            records.walk().unwrap().into_iter().map(|finding| (finding.field, finding.at)).collect()
+        };
+        assert_eq!(walk(&mut steps, side("w"), side("n")), Vec::<(String, String)>::new(), "a copy as it is has no finding");
+
+        let mut before = side("w");
+        before.pallets.insert("gone".to_string(), Some("w1".to_string()));
+        before.pallets.insert("other".to_string(), Some("w2".to_string()));
+        before.tags.insert("v3".to_string(), [some("w1"), None, None, None]);
+        before.keyed.insert(("w1".to_string(), "y".to_string()), (some("v"), some("op")));
+        let mut after = side("n");
+        after.pallets.insert("other".to_string(), Some("n1".to_string()));
+        let merge = after.records.get_mut("n3").unwrap();
+        merge.description = "changed".to_string();
+        merge.parents.truncate(1);
+        merge.manifest.clear();
+        let second = after.records.get_mut("n2").unwrap();
+        second.actions[0][1] = "someone else".to_string();
+        second.actions[1][2] = "t2".to_string();
+        second.actions.push(["pick", "op", "t1", "recorded"].map(str::to_string));
+        let root = after.records.get_mut("n1").unwrap();
+        root.actions[0][3] = "claimed".to_string();
+        root.tree = Some(changed.clone());
+        after.tags.get_mut("v1").unwrap()[1] = some("one, edited");
+        after.tags.get_mut("v2").unwrap()[0] = some("n2");
+        after.keyed.insert(("n3".to_string(), "k".to_string()), (some("w"), some("op")));
+        after.keyed.insert(("n2".to_string(), "j".to_string()), (some("v"), some("another")));
+        after.keyed.insert(("n1".to_string(), "x".to_string()), (some("new"), some("op")));
+        let found: BTreeSet<(String, String)> = walk(&mut steps, before, after).into_iter().collect();
+        let expected: BTreeSet<(String, String)> = [
+            ("message", "main"), ("parent count", "main"), ("manifest entry", "main"), ("record", "main^2"),
+            ("author operator", "main~1"), ("stack time", "main~1"), ("actions", "main~1"),
+            ("author trust", "main~2"), ("tree entry", "main~2 a"),
+            ("pallet", "gone"), ("record identity", "other"),
+            ("tag message", "tag v1"), ("tag subject", "tag v2"), ("tag", "tag v3"),
+            ("keyed value", "k on main"), ("keyed value operator", "j on main~1"), ("keyed value", "x on main~2"), ("keyed value", "y on main~2"),
+        ].into_iter().map(|(field, at)| (field.to_string(), at.to_string())).collect();
+        assert_eq!(found, expected);
+    }
+
+    /// A lost parent is counted by the records only it reaches, and a record the export never
+    /// wrote is the reading failing, never a finding.
+    #[test]
+    fn a_lost_parent_counts_what_only_it_reaches_and_an_unexported_record_is_an_error() {
+        let (scratch, environment) = area("lost");
+        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
+        let git = path_git();
+        let record = |parents: &[&str]| Record { parents: parents.iter().map(|parent| parent.to_string()).collect(), tree: Some("t".to_string()), ..Record::default() };
+        let mut before = Side::default();
+        before.records = BTreeMap::from([("w3".to_string(), record(&["w2", "wb"])), ("w2".to_string(), record(&["w1"])), ("w1".to_string(), record(&[])),
+            ("wb".to_string(), record(&["wa"])), ("wa".to_string(), record(&["w1"]))]);
+        before.pallets = BTreeMap::from([("main".to_string(), Some("w3".to_string()))]);
+        let mut after = Side::default();
+        after.records = BTreeMap::from([("n3".to_string(), record(&["n2"])), ("n2".to_string(), record(&["n1"])), ("n1".to_string(), record(&[]))]);
+        after.pallets = BTreeMap::from([("main".to_string(), Some("n3".to_string()))]);
+        let records = Records { steps: &mut steps, git: &git, environment: &environment, before: before.clone(), after: after.clone(), findings: Vec::new(), paired: BTreeMap::new(), returned: BTreeMap::new() };
+        let findings = records.walk().unwrap();
+        let lost: Vec<_> = findings.iter().filter(|finding| finding.field == "record").collect();
+        assert_eq!(lost.len(), 1, "{:?}", findings);
+        assert_eq!((lost[0].at.as_str(), lost[0].before.as_deref(), lost[0].after.as_deref()), ("main^2", Some("present, with 2 records only it reaches"), None));
+
+        after.records.get_mut("n2").unwrap().tree = None;
+        let records = Records { steps: &mut steps, git: &git, environment: &environment, before, after, findings: Vec::new(), paired: BTreeMap::new(), returned: BTreeMap::new() };
+        let error = records.walk().unwrap_err();
+        assert!(error.contains("main~1") && error.contains("wrote no commit"), "{}", error);
+    }
+
     /// Needs a forklift binary: `PROOF_LOAD_FORKLIFT=<path> cargo test -p proof-load -- --ignored`.
     #[test]
     #[ignore = "drives a forklift binary named by PROOF_LOAD_FORKLIFT"]
@@ -813,6 +1323,20 @@ mod tests {
         let forklift = PathBuf::from(std::env::var_os("PROOF_LOAD_FORKLIFT").expect("PROOF_LOAD_FORKLIFT names the forklift binary under test"));
         let (scratch, environment) = area("trip");
         let trip = git_round_trip(&forklift, &path_git(), &scratch, &environment, Duration::from_secs(120));
+        let findings = trip.findings.unwrap();
+        for finding in &findings {
+            println!("{:?}", finding);
+        }
+        assert!(trip.steps.iter().any(|step| step.arguments.iter().any(|argument| argument == "import")));
+    }
+
+    /// Needs a forklift binary: `PROOF_LOAD_FORKLIFT=<path> cargo test -p proof-load -- --ignored`.
+    #[test]
+    #[ignore = "drives a forklift binary named by PROOF_LOAD_FORKLIFT"]
+    fn the_native_round_trip_finishes_against_forklift() {
+        let forklift = PathBuf::from(std::env::var_os("PROOF_LOAD_FORKLIFT").expect("PROOF_LOAD_FORKLIFT names the forklift binary under test"));
+        let (scratch, environment) = area("native-trip");
+        let trip = forklift_round_trip(&forklift, &path_git(), &scratch, &environment, Duration::from_secs(120));
         let findings = trip.findings.unwrap();
         for finding in &findings {
             println!("{:?}", finding);

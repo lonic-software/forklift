@@ -506,7 +506,7 @@ impl Report {
             for finding in &self.fidelity {
                 let _ = writeln!(out, "| {} | {} | {} | {} | {} |", finding.direction.label(), finding.field.replace('|', "\\|"), finding.at.replace('|', "\\|"), cell(&finding.before), cell(&finding.after));
             }
-            out.push_str("\nEach finding is a field a round trip changed or dropped, compared commit by commit, never by id. Findings never fail the run; each loss class gets a ticket.\n");
+            out.push_str("\nEach finding is a field a round trip changed or dropped, compared commit by commit or record by record, never by id. Findings never fail the run; each loss class gets a ticket.\n");
         }
         out
     }
