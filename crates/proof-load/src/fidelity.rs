@@ -352,7 +352,8 @@ impl<'a, 'b> Comparison<'a, 'b> {
         }
     }
 
-    /// The identity headers both objects carry, part by part.
+    /// The identity headers both objects carry, the first of each name part by part; a name held a
+    /// different number of times on each side is a `<name> count` finding too.
     fn identities(&mut self, prefix: &str, at: &str, before: &[(String, Vec<u8>)], after: &[(String, Vec<u8>)], names: &[&str]) {
         for name in names {
             let get = |headers: &[(String, Vec<u8>)]| headers.iter().find(|(header, _)| header == name).map(|(_, value)| identity_parts(value));
@@ -366,6 +367,11 @@ impl<'a, 'b> Comparison<'a, 'b> {
                 }
                 (None, None) => {}
                 (was, now) => self.find(format!("{}{}", prefix, name), at, was.map(|_| "present".to_string()), now.map(|_| "present".to_string())),
+            }
+            let count = |headers: &[(String, Vec<u8>)]| headers.iter().filter(|(header, _)| header == name).count();
+            let (was, now) = (count(before), count(after));
+            if was != now && was > 0 && now > 0 {
+                self.find(format!("{}{} count", prefix, name), at, Some(was.to_string()), Some(now.to_string()));
             }
         }
     }
@@ -658,11 +664,13 @@ mod tests {
     }
 
     /// Every value of a header is compared in order, so one header split into two is a finding,
-    /// and the names both objects have, in another order, are one too.
+    /// and the names both objects have, in another order, are one too, as is an identity header
+    /// that came back twice.
     ///
     /// Revert: join a name's values into one before comparing → the split gpgsig compares equal.
     /// Revert: order by each name's first appearance → the interleaved mergetags compare equal.
     /// Revert: leave `skipped` names out of the order → gpgsig moved before committer is no finding.
+    /// Revert: drop the identity count check → the second author is no finding.
     #[test]
     fn a_split_header_and_a_reordered_one_are_findings() {
         let (scratch, environment) = area("headers");
@@ -675,12 +683,15 @@ mod tests {
         comparison.headers("header ", "main~2", &[header("mergetag", b"a"), header("encoding", b"x"), header("mergetag", b"b")],
             &[header("mergetag", b"a"), header("mergetag", b"b"), header("encoding", b"x")], &[]);
         comparison.headers("header ", "main~3", &[header("committer", b"c"), header("gpgsig", b"g")], &[header("gpgsig", b"g"), header("committer", b"c")], &["committer"]);
+        let author = header("author", b"A <a@example.com> 1 +0000");
+        comparison.identities("", "main~4", &[author.clone()], &[author.clone(), header("author", b"B <b@example.com> 1 +0000")], &["author"]);
         let found: Vec<(String, String, Option<String>, Option<String>)> = comparison.findings.into_iter().map(|finding| (finding.field, finding.at, finding.before, finding.after)).collect();
         assert_eq!(found, [
             ("header gpgsig".to_string(), "main".to_string(), Some("[A\\nB]".to_string()), Some("[A] [B]".to_string())),
             ("header order".to_string(), "main~1".to_string(), Some("encoding mergetag".to_string()), Some("mergetag encoding".to_string())),
             ("header order".to_string(), "main~2".to_string(), Some("mergetag encoding mergetag".to_string()), Some("mergetag mergetag encoding".to_string())),
             ("header order".to_string(), "main~3".to_string(), Some("committer gpgsig".to_string()), Some("gpgsig committer".to_string())),
+            ("author count".to_string(), "main~4".to_string(), Some("1".to_string()), Some("2".to_string())),
         ]);
     }
 
