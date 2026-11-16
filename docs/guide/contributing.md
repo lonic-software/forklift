@@ -194,6 +194,12 @@ Notes:
   and proof-load, then `target/debug/proof-load run --source . --out <new dir> --forklift
   target/debug/forklift --forklift-server target/debug/forklift-server --git "$(command -v git)"
   --only <scenario>`.
+- The `proof load history` check (`.github/workflows/proof-load-history.yml`, Linux) runs the same
+  harness weekly with `--history-from .`, so its fidelity round trips, git to Forklift to git and
+  Forklift to git to Forklift, also take this repository's own history besides their fixtures.
+  It checks out the full history, since a shallow repository is refused, and runs on a pull
+  request only when the workflow file itself changes. Like the per-OS checks it is outside `ci
+  passed` and its run step continues on error.
 - The `proof load desktop` checks (`.github/workflows/proof-load-desktop.yml`, one per OS) build,
   test and Clippy `tools/proof-load-desktop`, Proof Load's egui window. It is a Cargo workspace of
   its own with its own `Cargo.lock`, so egui is in neither the root lock nor any other job's build;

@@ -488,6 +488,9 @@ impl App {
             for (subject, configuration) in &determinism.configurations {
                 widgets::text(ui, &format!("{subject} configuration: {configuration}"), Type::Data, p.muted);
             }
+            if let Some(history) = &determinism.history {
+                widgets::text(ui, &format!("history from: {history}"), Type::Data, p.muted);
+            }
         });
     }
 }
