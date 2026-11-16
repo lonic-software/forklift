@@ -1155,6 +1155,38 @@ mod tests {
             .find(|path| path.is_file()).expect("a git on PATH")
     }
 
+    /// A tuned git build, where this git has an fsmonitor daemon, runs one over the work tree it
+    /// ends in (the clone's, for a history that clones) before any step, and the daemon goes with
+    /// the build; its walk is classified either way, and git at its defaults runs none.
+    ///
+    /// Revert: skip starting the daemon after a clone → the lifted build's walk has no socket;
+    /// drop both the daemon's stop and its kill → `status` still says it watches after the build
+    /// is dropped.
+    #[test]
+    fn a_tuned_build_watches_its_work_tree_until_it_is_dropped() {
+        let git = path_git();
+        let daemon = runner::has_fsmonitor_daemon(&git);
+        let corpus = corpus::generate(7, corpus::Shape::SMALL);
+        for (id, tool) in [("history", Tool::GitTuned), ("lifted", Tool::GitTuned), ("history", Tool::Git)] {
+            let scenario = crate::scenario::catalog().into_iter().find(|scenario| scenario.id == id).unwrap();
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir().join(format!("proof-load-git-daemon-{}-{}", std::process::id(), nanos));
+            let scratch = Scratch::create(&root).unwrap();
+            let search = crate::scrub::search_path(Some(&git), std::env::var_os("PATH"));
+            let environment = Environment::scrubbed(&scratch, search, &BTreeMap::new()).unwrap();
+            let built = runner::build(&scenario, &corpus, tool, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
+            assert_eq!(crate::git_layout::unclassified(&built.walked), Vec::<&str>::new(), "{} {:?}", id, tool);
+            let watched = daemon && tool == Tool::GitTuned;
+            assert_eq!(built.walked.iter().any(|path| path == "fsmonitor--daemon/cookies/"), watched, "{} {:?}: {:?}", id, tool, built.walked);
+            let status = || crate::tool::run(&crate::tool::Invocation {
+                program: git.clone(), arguments: vec!["fsmonitor--daemon".into(), "status".into()], directory: scratch.work(), limit: Duration::from_secs(30),
+            }, &scratch, &environment).unwrap().succeeded();
+            assert_eq!(status(), watched, "{} {:?}", id, tool);
+            drop(built);
+            assert!(!status(), "{} {:?}: the daemon outlived its build", id, tool);
+        }
+    }
+
     /// Git's readback serves every acknowledged record from history whether the repository's index
     /// is intact or damaged, and leaves that index byte for byte as it was; the repository was made
     /// with background maintenance kept in the foreground.

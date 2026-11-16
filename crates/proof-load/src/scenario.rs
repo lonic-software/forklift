@@ -203,8 +203,17 @@ fn line(arguments: &[&str]) -> Vec<String> {
 /// What git's remote `origin` fetches, as `git remote add` sets it.
 const GIT_FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
 
-/// Git's options for the tuned binding, given before the subcommand.
-pub(crate) const GIT_TUNED: &[&str] = &["-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "-c", "transfer.fsckObjects=true", "-c", "fetch.fsckObjects=true", "-c", "receive.fsckObjects=true"];
+/// Git's options for the tuned binding, given before the subcommand: every write synced, every
+/// object a transfer brings checked, a commit-graph written by a gc or a fetch and read where one
+/// exists (no scenario git runs does either yet, so none is written), and the untracked-file cache
+/// kept in the index. The fsmonitor daemon, where this git has
+/// one, is the work tree's own configuration instead (see `runner::FsmonitorDaemon`), so the bare
+/// host and the harness's readback clones run without one.
+pub(crate) const GIT_TUNED: &[&str] = &[
+    "-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "-c", "transfer.fsckObjects=true", "-c", "fetch.fsckObjects=true",
+    "-c", "receive.fsckObjects=true", "-c", "core.commitGraph=true", "-c", "gc.writeCommitGraph=true", "-c", "fetch.writeCommitGraph=true",
+    "-c", "core.untrackedCache=true",
+];
 
 /// The command lines (arguments after the binary) `op` runs for `tool`, in order, or None when the
 /// tool has no binding for it. Forklift runs every command with `--json`, so a refusal is one

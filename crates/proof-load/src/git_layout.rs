@@ -71,6 +71,12 @@ pub const ROWS: &[LayoutRow] = &[
     // The last commit message as written, which git never reads back.
     row("COMMIT_EDITMSG", Class::Transient, Role::NoCounterpart),
     row("config", Class::Rewritable, Role::Config),
+    // A tuned work tree's fsmonitor daemon: its socket, which only says whether it is up, and the
+    // folder it keeps the cookie files of each query in, made again when it starts.
+    row("fsmonitor--daemon.ipc", Class::Probe, Role::NoCounterpart),
+    row("fsmonitor--daemon/", Class::Derived, Role::DerivedCache),
+    row("fsmonitor--daemon/cookies/", Class::Derived, Role::DerivedCache),
+    row("fsmonitor--daemon/cookies/<name>", Class::Transient, Role::NoCounterpart),
     // Copied from git's template folder at creation; git never reads them, and the exclude list
     // holds only comments.
     row("description", Class::Foreign, Role::NoCounterpart),

@@ -13,7 +13,7 @@ use crate::damage::{self, Binding, Exemption, Kind, Warehouse};
 use crate::routes::{Exemption as RouteExemption, Mount};
 use crate::routewrites::{Bound, Entry, RouteWrites};
 use crate::trace::Kind as Change;
-use crate::scenario::Scenario;
+use crate::scenario::{Scenario, Tool};
 use crate::writeops::Exemption as WriteExemption;
 use crate::writeops::Exemption::{ReadOnly, Unrunnable};
 
@@ -322,6 +322,30 @@ pub const GIT_BINDINGS: &[Binding] = &[
     hosted("objects/<xx>/<hash>", "lifted", FILE),
 ];
 
+/// Git tuned's bindings beyond [`GIT_BINDINGS`]: the folders of the fsmonitor daemon, which only a
+/// tuned work tree runs, where this git has one.
+pub const GIT_TUNED_BINDINGS: &[Binding] = &[
+    bound("fsmonitor--daemon/", FOLDER),
+    bound("fsmonitor--daemon/cookies/", FOLDER),
+];
+
+/// A git subject's damage bindings and exemptions: git at its defaults exempts what only the
+/// fsmonitor daemon writes, and so does git tuned where `daemon` says this git has none.
+pub fn git_subject(tool: Tool, daemon: bool) -> (Vec<Binding>, Vec<Exemption>) {
+    let mut bindings = GIT_BINDINGS.to_vec();
+    let mut exemptions = GIT_EXEMPTIONS.to_vec();
+    let unwatched = match tool {
+        Tool::GitTuned if daemon => None,
+        Tool::GitTuned => Some("not written: this git has no fsmonitor daemon"),
+        _ => Some("not written: only the fsmonitor daemon writes it, and git at its defaults runs none"),
+    };
+    match unwatched {
+        None => bindings.extend_from_slice(GIT_TUNED_BINDINGS),
+        Some(reason) => exemptions.extend(GIT_TUNED_BINDINGS.iter().map(|binding| Exemption { name: binding.name, reason })),
+    }
+    (bindings, exemptions)
+}
+
 const GIT_NOT_WRITTEN: &str = "not written: only a gc, a repack or maintenance writes it, and no scenario git runs does either";
 
 /// Git layout rows that need damage and are not damaged, with the reason. One a scenario git
@@ -406,6 +430,7 @@ mod tests {
     /// exemption check → the created exempt path passes.
     #[test]
     fn git_bindings_are_checked_against_the_layout_and_the_walks() {
+        let (git, git_exemptions) = git_subject(Tool::Git, true);
         let runnable: Vec<String> = ["history", "branched", "parked", "lifted"].map(String::from).to_vec();
         let all: Vec<String> = ["HEAD", "ORIG_HEAD", "config", "index", "logs/", "logs/refs/heads/main", "refs/", "refs/heads/",
             "refs/heads/main", "refs/tags/", "refs/stash", "refs/remotes/", "refs/remotes/origin/", "refs/remotes/origin/main",
@@ -415,33 +440,74 @@ mod tests {
             .map(String::from).to_vec();
         let mut walks: BTreeMap<(String, Warehouse), Vec<String>> = runnable.iter().map(|scenario| ((scenario.clone(), Warehouse::Client), all.clone())).collect();
         walks.insert(("lifted".to_string(), Warehouse::Host), bare.clone());
-        assert_eq!(check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &walks), Vec::<String>::new());
+        assert_eq!(check_git(&git, &git_exemptions, &runnable, &walks), Vec::<String>::new());
 
         // A host binding is checked against the host's walk, and a scenario that hosts nothing
         // creates nothing on a host.
         let mut no_host_object = walks.clone();
         no_host_object.get_mut(&("lifted".to_string(), Warehouse::Host)).unwrap().retain(|path| path != "objects/ab/cdef");
-        assert_eq!(check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &no_host_object),
+        assert_eq!(check_git(&git, &git_exemptions, &runnable, &no_host_object),
             vec!["objects/<xx>/<hash>: its scenario lifted does not create it on its host".to_string()]);
         let mut unhosted = walks.clone();
         unhosted.remove(&("lifted".to_string(), Warehouse::Host));
-        assert_eq!(check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &unhosted).len(), 5);
+        assert_eq!(check_git(&git, &git_exemptions, &runnable, &unhosted).len(), 5);
         let mut host_packed = walks.clone();
         host_packed.get_mut(&("lifted".to_string(), Warehouse::Host)).unwrap().push("packed-refs".to_string());
-        assert_eq!(check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &host_packed),
+        assert_eq!(check_git(&git, &git_exemptions, &runnable, &host_packed),
             vec!["stale exemption: packed-refs: lifted creates it on its host".to_string()]);
 
-        let without_index: Vec<Binding> = GIT_BINDINGS.iter().filter(|binding| binding.name != "index").cloned().collect();
-        assert_eq!(check_git(&without_index, GIT_EXEMPTIONS, &runnable, &walks), vec!["index".to_string()]);
+        let without_index: Vec<Binding> = git.iter().filter(|binding| binding.name != "index").cloned().collect();
+        assert_eq!(check_git(&without_index, &git_exemptions, &runnable, &walks), vec!["index".to_string()]);
 
         let mut packed = walks.clone();
         packed.get_mut(&("history".to_string(), Warehouse::Client)).unwrap().push("packed-refs".to_string());
-        assert_eq!(check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &packed), vec!["stale exemption: packed-refs: history creates it".to_string()]);
+        assert_eq!(check_git(&git, &git_exemptions, &runnable, &packed), vec!["stale exemption: packed-refs: history creates it".to_string()]);
 
         let mut no_config = walks.clone();
         no_config.get_mut(&("history".to_string(), Warehouse::Client)).unwrap().retain(|path| path != "config");
-        let missing = check_git(GIT_BINDINGS, GIT_EXEMPTIONS, &runnable, &no_config);
+        let missing = check_git(&git, &git_exemptions, &runnable, &no_config);
         assert!(missing.iter().any(|line| line.starts_with("config: its scenario history does not create it")), "{:?}", missing);
+    }
+
+    /// Git tuned binds the fsmonitor daemon's folders where this git has a daemon, and exempts them
+    /// where it has none, as git at its defaults always does; either exemption over a walk that
+    /// holds them is stale.
+    ///
+    /// Revert: give git tuned the defaults' set → its daemon folders are named unbound; bind them
+    /// for git at its defaults → its walk, which never holds them, fails both bindings.
+    #[test]
+    fn git_tuned_binds_the_daemon_folders_only_where_it_runs_one() {
+        let runnable: Vec<String> = ["history", "branched", "parked", "lifted"].map(String::from).to_vec();
+        let plain: Vec<String> = ["HEAD", "ORIG_HEAD", "config", "index", "logs/", "logs/refs/heads/main", "refs/", "refs/heads/",
+            "refs/heads/main", "refs/tags/", "refs/stash", "refs/remotes/", "refs/remotes/origin/", "refs/remotes/origin/main",
+            "objects/", "objects/info/", "objects/pack/", "objects/ab/", "objects/ab/cdef"]
+            .map(String::from).to_vec();
+        let watched: Vec<String> = plain.iter().cloned()
+            .chain(["fsmonitor--daemon.ipc", "fsmonitor--daemon/", "fsmonitor--daemon/cookies/"].map(String::from)).collect();
+        let bare: Vec<String> = ["HEAD", "config", "refs/", "refs/heads/", "refs/heads/main", "objects/", "objects/ab/", "objects/ab/cdef"]
+            .map(String::from).to_vec();
+        let walks = |client: &Vec<String>| -> BTreeMap<(String, Warehouse), Vec<String>> {
+            let mut walks: BTreeMap<_, _> = runnable.iter().map(|scenario| ((scenario.clone(), Warehouse::Client), client.clone())).collect();
+            walks.insert(("lifted".to_string(), Warehouse::Host), bare.clone());
+            walks
+        };
+        let check = |tool: Tool, daemon: bool, client: &Vec<String>| {
+            let (bindings, exemptions) = git_subject(tool, daemon);
+            check_git(&bindings, &exemptions, &runnable, &walks(client))
+        };
+        assert_eq!(check(Tool::GitTuned, true, &watched), Vec::<String>::new());
+        assert_eq!(check(Tool::GitTuned, false, &plain), Vec::<String>::new());
+        assert_eq!(check(Tool::Git, true, &plain), Vec::<String>::new());
+        assert_eq!(check(Tool::Git, false, &plain), Vec::<String>::new());
+        // A daemon folder in a walk the subject exempts it for is a stale exemption, in each of
+        // the four scenarios.
+        assert_eq!(check(Tool::Git, true, &watched).len(), 8, "{:?}", check(Tool::Git, true, &watched));
+        assert!(check(Tool::GitTuned, false, &watched).iter().all(|line| line.starts_with("stale exemption: fsmonitor--daemon/")));
+        // Bound, a folder the walk lacks is named.
+        assert_eq!(check(Tool::GitTuned, true, &plain), vec![
+            "fsmonitor--daemon/: its scenario history does not create it".to_string(),
+            "fsmonitor--daemon/cookies/: its scenario history does not create it".to_string(),
+        ]);
     }
 
     const SAMPLE: &str = "<!-- census:start -->\n| Path | Class | Names |\n|---|---|---|\n\
