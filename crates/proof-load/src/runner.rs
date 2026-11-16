@@ -412,7 +412,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
         let listed = run_in(program, STASH_LIST.iter().map(|argument| argument.to_string()).collect(), scratch.work())?;
         // Refusing or unreadable fails the build, as forklift's listing does below.
         let parked = stashed_commits(&listed.stdout).filter(|commits| !commits.is_empty())
-            .ok_or_else(|| RunError::Io(format!("scenario {}: `git stash list` printed no stash commit: {}", scenario.id, String::from_utf8_lossy(&listed.stdout))));
+            .ok_or_else(|| RunError::Io(format!("scenario {}: the stash listing printed no stash commit: {}", scenario.id, String::from_utf8_lossy(&listed.stdout))));
         outcomes.push(listed);
         parked?
     } else if tool == Tool::Forklift && parks {
