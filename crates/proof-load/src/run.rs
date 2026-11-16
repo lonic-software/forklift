@@ -1604,7 +1604,7 @@ mod tests {
         let census = Census::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap().unwrap();
         let search_path = crate::scrub::search_path(Some(&crate::scrub::path_git()), std::env::var_os("PATH"));
         let forklift = shared.root().join("refuses-export");
-        std::fs::write(&forklift, format!("#!/bin/sh\ncase \"$*\" in *\"git export\"*) exit 3;; esac\nexec '{}' \"$@\"\n", real)).unwrap();
+        std::fs::write(&forklift, format!("#!/bin/sh\n[ \"$2$3\" = gitexport ] && exit 3\nexec '{}' \"$@\"\n", real)).unwrap();
         std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o755)).unwrap();
         let programs = Programs { forklift, git: crate::scrub::path_git(), server: None };
         let mut output = Output::claim(&shared.root().join("out")).unwrap();

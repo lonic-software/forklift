@@ -770,8 +770,8 @@ mod tests {
             on(Row { detail: Some("export.json#".to_string()), ..damage_row(Tool::Git, client, role, kind, Grade::Silent, None, None) }, vec![FromForklift]),
         ]);
         let plate = report.plate();
-        let lines: Vec<(Option<HistoryDirection>, Vec<(Tool, Grade)>)> = plate.iter()
-            .map(|line| (line.direction, line.standings.iter().map(|(tool, standing)| (*tool, standing.grade)).collect())).collect();
+        let lines: Vec<_> = plate.iter()
+            .map(|line| (line.direction, line.standings.iter().map(|(tool, standing)| (*tool, standing.grade)).collect::<Vec<_>>())).collect();
         assert_eq!(lines, [
             (Some(FromGit), vec![(Tool::Forklift, Grade::DataLost), (Tool::Git, Grade::Healed)]),
             (Some(FromForklift), vec![(Tool::Forklift, Grade::DataLost), (Tool::Git, Grade::Silent)]),
