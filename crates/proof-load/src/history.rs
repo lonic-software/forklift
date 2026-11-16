@@ -96,18 +96,28 @@ pub fn pallets(forklift: &Path, subject: &Path, scratch: &Scratch, environment: 
 }
 
 /// `count` distinct positions picked by `seed` among every depth of every ref in `lengths` that
-/// `present` also holds, sorted; all of them when there are fewer.
+/// `present` also holds, sorted; all of them when there are fewer. Each is drawn as an index into
+/// the refs' lengths laid end to end, so no candidate list is built. Positions are distinct, not
+/// commits: refs sharing a trunk name its commits under several positions, and two picks may read
+/// one commit.
 pub fn sample(lengths: &BTreeMap<String, usize>, present: &BTreeSet<String>, count: usize, seed: u64) -> Vec<Position> {
-    let mut candidates: Vec<Position> = lengths.iter()
-        .filter(|(reference, _)| present.contains(*reference))
-        .flat_map(|(reference, &length)| (0..length).map(move |depth| Position { reference: reference.clone(), depth }))
-        .collect();
+    let refs: Vec<(&String, usize)> = lengths.iter().filter(|(reference, _)| present.contains(*reference)).map(|(reference, &length)| (reference, length)).collect();
+    let total: u64 = refs.iter().map(|(_, length)| *length as u64).sum();
     let mut state = seed;
-    let mut picked = Vec::new();
-    while picked.len() < count && !candidates.is_empty() {
-        let index = (splitmix(&mut state) % candidates.len() as u64) as usize;
-        picked.push(candidates.swap_remove(index));
+    let mut drawn = BTreeSet::new();
+    while (drawn.len() as u64) < total.min(count as u64) {
+        drawn.insert(splitmix(&mut state) % total);
     }
+    let mut picked: Vec<Position> = drawn.into_iter().map(|mut index| {
+        let mut refs = refs.iter();
+        loop {
+            let (reference, length) = refs.next().expect("an index below the total falls in some ref");
+            if index < *length as u64 {
+                return Position { reference: reference.to_string(), depth: index as usize };
+            }
+            index -= *length as u64;
+        }
+    }).collect();
     picked.sort();
     picked
 }
@@ -153,7 +163,8 @@ mod tests {
     }
 
     /// A small repository mirrored in `scratch`: `main` of three commits, each adding a file,
-    /// and `side`, one commit off `main`'s first.
+    /// then a merge of `side`, one commit off `main`'s first, so a first-parent walk of `main`
+    /// differs from a walk of every parent.
     fn mirrored(scratch: &Scratch, environment: &Environment) -> PathBuf {
         let source = scratch.root().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -171,6 +182,7 @@ mod tests {
         git(&["add", "-A"], &source, scratch, environment);
         git(&["-c", "user.name=p", "-c", "user.email=p@example.invalid", "commit", "-q", "-m", "side"], &source, scratch, environment);
         git(&["switch", "-q", "main"], &source, scratch, environment);
+        git(&["-c", "user.name=p", "-c", "user.email=p@example.invalid", "merge", "-q", "--no-ff", "--no-edit", "side"], &source, scratch, environment);
         let mirror = scratch.root().join("mirror");
         git(&["clone", "-q", "--mirror", "--no-local", "--", &source.display().to_string(), &mirror.display().to_string()], scratch.root(), scratch, environment);
         mirror
@@ -183,8 +195,8 @@ mod tests {
     /// The sample names only depths each ref has, only refs both subjects hold, never repeats a
     /// position, and is fixed by its seed; asked for more than there are, it names them all.
     ///
-    /// Revert: drop the `present` filter → a ref only one subject holds is named; draw with
-    /// replacement → a position repeats.
+    /// Revert: drop the `present` filter → a ref only one subject holds is named; keep every draw
+    /// rather than distinct ones → a position repeats.
     #[test]
     fn the_sample_stays_inside_both_subjects() {
         let lengths: BTreeMap<String, usize> = [("main".to_string(), 5), ("side".to_string(), 2), ("gone".to_string(), 4)].into_iter().collect();
@@ -213,17 +225,18 @@ mod tests {
         let pristine = shared.root().join("pristine");
         build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT).unwrap();
         let lengths = git_lengths(&path_git(), &pristine, &shared, &environment, LIMIT).unwrap();
-        assert_eq!(lengths, [("main".to_string(), 3), ("side".to_string(), 2)].into_iter().collect());
+        assert_eq!(lengths, [("main".to_string(), 4), ("side".to_string(), 2)].into_iter().collect());
         let positions = vec![
-            Position { reference: "main".into(), depth: 0 }, Position { reference: "main".into(), depth: 2 },
-            Position { reference: "side".into(), depth: 0 },
+            Position { reference: "main".into(), depth: 0 }, Position { reference: "main".into(), depth: 1 },
+            Position { reference: "main".into(), depth: 3 }, Position { reference: "side".into(), depth: 0 },
         ];
         let (row, environment) = scratch("git-baseline-row");
         let got = baseline(Tool::Git, &pristine, &positions, &programs(PathBuf::from("forklift-not-used")), &row, &environment, LIMIT).unwrap();
-        let tip = tree(&[("a", "a"), ("b", "b"), ("c", "c")]);
+        let tip = tree(&[("a", "a"), ("b", "b"), ("c", "c"), ("s", "s")]);
         let mut after = tip.clone();
         after.insert(PROBE_FILE.to_string(), crate::oracle::digest(PROBE_BYTES));
-        assert_eq!(got, Baseline { positions: vec![tip.clone(), tree(&[("a", "a")]), tree(&[("a", "a"), ("s", "s")])], before: tip, after });
+        let positions = vec![tip.clone(), tree(&[("a", "a"), ("b", "b"), ("c", "c")]), tree(&[("a", "a")]), tree(&[("a", "a"), ("s", "s")])];
+        assert_eq!(got, Baseline { positions, before: tip, after });
     }
 
     /// Git's whole-store check names damage the sample did not reach: a commit only an unsampled
@@ -263,8 +276,7 @@ mod tests {
     /// and nothing is reported unreached.
     ///
     /// A pin, not a falsifier of one line: git refuses an unresolvable ref however it is asked.
-    /// Resolving through the damaged copy's own refs is what `git_reads_a_real_history_by_position`
-    /// falsifies.
+    /// How a position is resolved is what `git_reads_a_real_history_by_position` falsifies.
     #[test]
     fn git_reaches_damage_to_the_sampled_refs() {
         let (shared, environment) = scratch("git-reached");
@@ -287,7 +299,7 @@ mod tests {
     /// deleted pallet is reached by the sample.
     ///
     /// Revert: create the position's pallet under the bay's own name → every position refuses
-    /// and the baseline fails.
+    /// and the baseline fails; follow a merge's last parent → `main~1` reads `side`'s commit.
     #[test]
     #[ignore = "needs PROOF_LOAD_FORKLIFT"]
     fn forklift_reads_a_real_history_as_git_does() {
@@ -301,7 +313,7 @@ mod tests {
         let present = pallets(&forklift, &forklift_pristine, &shared, &environment, LIMIT).unwrap();
         assert_eq!(present, ["main".to_string(), "side".to_string()].into_iter().collect());
         let positions = sample(&lengths, &present, SAMPLED, 0);
-        assert_eq!(positions.len(), 5);
+        assert_eq!(positions.len(), 6);
         let programs = programs(forklift);
         let (row, environment) = scratch("forklift-baseline-git");
         let git_base = baseline(Tool::Git, &git_pristine, &positions, &programs, &row, &environment, LIMIT).unwrap();

@@ -69,8 +69,10 @@ pub struct HistoryReadback {
     /// The parked work read back, when the history left work parked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parked: Option<ParkedReadback>,
-    /// Over a real history, the commands that resolved and laid out each sampled record, in order:
-    /// each speaks for one record, so a refusal here refuses that record alone.
+    /// Over a real history, the commands that resolved and laid out each sampled record, in order;
+    /// a refusal here refuses the record it ran for. Forklift's bay for a record opens at the
+    /// current head before moving to the record, so damage only that head holds refuses every
+    /// forklift record, where git still serves the records that do not hold it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reads: Vec<Outcome>,
 }
@@ -148,9 +150,10 @@ pub struct Position {
     pub depth: usize,
 }
 
-/// A history readback before judging: the readback's own command, what each mark read back as,
-/// and the commands that read them.
-type Served = (Outcome, Vec<(Mark, Readback)>, Vec<Outcome>);
+/// A history readback before judging: the readback's own command, what each mark read back as
+/// and whether the subject reached it (a forklift walk that exits 0 short of the depth reads as
+/// served empty, which is not reaching it), and the commands that read them.
+type Served = (Outcome, Vec<(Mark, Readback, bool)>, Vec<Outcome>);
 
 /// The parts of a faulted run that stay fixed across its steps.
 pub(crate) struct Context<'a> {
@@ -455,12 +458,14 @@ impl Context<'_> {
     /// a copy of `bay` taken for this readback, so nothing is written into the warehouse being
     /// graded: the pallet's `history` walked by first parents from its listed head, then a fresh
     /// bay per record with a pallet made at that parcel, read minus `.forklift`. One shared bay is
-    /// not used: an old position's ignore file wedges it for every later one. A resolve or layout
-    /// the subject refuses refuses that record; a walk that exits 0 and ends before the depth
-    /// served the record as missing, which is silent.
+    /// not used: an old position's ignore file wedges it for every later one. The bay opens at the
+    /// current head first: see [`HistoryReadback::reads`]. What forklift prints names the copy, so
+    /// the copy's path is written back as `bay`'s, and a remedy named by path acts on the
+    /// warehouse being graded. A resolve or layout the subject refuses refuses that record; a walk
+    /// that exits 0 and ends before the depth served the record as missing, which is silent.
     fn read_back_history(&self, bay: &Path, positions: &[Position], marks: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
         let (export, served, reads) = self.serve_history(bay, positions, marks)?;
-        let records = served.into_iter().map(|(mark, readback)| RecordReadback { mark, verdicts: vec![oracle::judge(&readback, &expectation(mark))] }).collect();
+        let records = served.into_iter().map(|(mark, readback, _)| RecordReadback { mark, verdicts: vec![oracle::judge(&readback, &expectation(mark))] }).collect();
         Ok(HistoryReadback { export, records, parked: None, reads })
     }
 
@@ -470,6 +475,7 @@ impl Context<'_> {
         let forklift = |arguments: &[&str], directory: PathBuf| {
             self.run(&self.programs.forklift, std::iter::once("--json").chain(arguments.iter().copied()).map(str::to_string).collect(), directory)
         };
+        let graded = bay;
         let copy;
         let (export, bay) = match self.tool {
             Tool::Forklift => {
@@ -479,8 +485,17 @@ impl Context<'_> {
             }
             Tool::Git | Tool::GitTuned => (self.git_with(bay, &self.fresh("index"), &["for-each-ref", "--format=%(refname) %(objectname)"])?, bay),
         };
+        let rebase = |outcome: Outcome| if self.tool == Tool::Forklift { rebased(outcome, bay, graded) } else { outcome };
+        let export = rebase(export);
         if !export.succeeded() {
             return Ok((export, Vec::new(), Vec::new()));
+        }
+        let mut deepest: BTreeMap<&str, usize> = BTreeMap::new();
+        for &mark in marks {
+            if let Some(position) = match mark { Mark::Position(index) => positions.get(index), _ => None } {
+                let depth = deepest.entry(position.reference.as_str()).or_default();
+                *depth = (*depth).max(position.depth);
+            }
         }
         let heads = if self.tool == Tool::Forklift { pallet_heads(&export.stdout) } else { BTreeMap::new() };
         let mut chains: BTreeMap<&str, Option<Vec<String>>> = BTreeMap::new();
@@ -493,6 +508,7 @@ impl Context<'_> {
                 Mark::Record(0) => (PROBE_REF, 0),
                 other => return Err(RunError::Io(format!("{:?} is no record of a real history", other))),
             };
+            let mut reached = true;
             let readback = match self.tool {
                 Tool::Git | Tool::GitTuned => {
                     let revision = format!("refs/heads/{}~{}^{{commit}}", reference, depth);
@@ -511,14 +527,18 @@ impl Context<'_> {
                 Tool::Forklift => {
                     if !chains.contains_key(reference) {
                         let listing = forklift(&["history", reference], bay.to_path_buf())?;
-                        let chain = listing.succeeded().then(|| first_parents(heads.get(reference).map(String::as_str), &listing.stdout));
+                        let wanted = deepest.get(reference).copied().unwrap_or_default() + 1;
+                        let chain = listing.succeeded().then(|| first_parents(heads.get(reference).map(String::as_str), &listing.stdout, wanted));
                         reads.push(listing);
                         chains.insert(reference, chain);
                     }
                     match chains.get(reference).cloned().flatten() {
                         None => Readback::Refused { code: None },
                         // A walk that exits 0 without reaching the depth leaves the record out.
-                        Some(chain) if chain.len() <= depth => Readback::Served { tree: Default::default(), documented: Default::default() },
+                        Some(chain) if chain.len() <= depth => {
+                            reached = false;
+                            Readback::Served { tree: Default::default(), documented: Default::default() }
+                        }
                         Some(chain) => {
                             let side = self.fresh("position");
                             let name = side.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
@@ -540,9 +560,9 @@ impl Context<'_> {
                     }
                 }
             };
-            records.push((mark, readback));
+            records.push((mark, readback, reached));
         }
-        Ok((export, records, reads))
+        Ok((export, records, reads.into_iter().map(rebase).collect()))
     }
 
     /// What the subject's listing of parked work says of the `parked` entries, read in `bay`:
@@ -953,21 +973,39 @@ fn pallet_heads(stdout: &[u8]) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The first-parent chain from `head` through the parcels a `--json history` lists, `head` first:
-/// it ends at a parcel with no parents, or at one the listing leaves out. Without a head, from the
-/// listing's first entry.
-fn first_parents(head: Option<&str>, stdout: &[u8]) -> Vec<String> {
+/// What `outcome` printed with every mention of `from` written as `to`, both as given and as the
+/// platform resolves it (a temporary folder may be reached through a link).
+fn rebased(mut outcome: Outcome, from: &Path, to: &Path) -> Outcome {
+    let mut pairs = vec![(from.display().to_string(), to.display().to_string())];
+    if let (Ok(from), Ok(to)) = (std::fs::canonicalize(from), std::fs::canonicalize(to)) {
+        pairs.push((from.display().to_string(), to.display().to_string()));
+    }
+    for text in [&mut outcome.stdout, &mut outcome.stderr] {
+        let mut written = String::from_utf8_lossy(text).into_owned();
+        for (from, to) in &pairs {
+            written = written.replace(from.as_str(), to);
+        }
+        *text = written.into_bytes();
+    }
+    outcome
+}
+
+/// The first `wanted` parcels of the first-parent chain from `head` through the parcels a
+/// `--json history` lists, `head` first: fewer when it ends at a parcel with no parents, at one the
+/// listing leaves out, or at one already walked. Without a head, from the listing's first entry.
+fn first_parents(head: Option<&str>, stdout: &[u8], wanted: usize) -> Vec<String> {
     let document = runner::document(stdout);
     let entries = document["data"]["entries"].as_array().cloned().unwrap_or_default();
     let parents: BTreeMap<String, Option<String>> = entries.iter()
         .filter_map(|entry| Some((entry["parcel"].as_str()?.to_string(), entry["parents"][0].as_str().map(str::to_string))))
         .collect();
     let mut chain = Vec::new();
+    let mut walked = std::collections::BTreeSet::new();
     let mut at = head.map(str::to_string).or_else(|| entries.first().and_then(|entry| entry["parcel"].as_str()).map(str::to_string));
     while let Some(parcel) = at {
         let Some(parent) = parents.get(&parcel) else { break };
         // A cycle in what a damaged store lists ends the walk rather than looping.
-        if chain.contains(&parcel) {
+        if chain.len() == wanted || !walked.insert(parcel.clone()) {
             break;
         }
         at = parent.clone();
@@ -1380,8 +1418,11 @@ fn history_context<'a>(tool: Tool, corpus: &'a Corpus, programs: &'a Programs, s
 
 /// The unfaulted readback of `tool`'s pristine subject, copied into `scratch`: every position and
 /// the probe ref read, then the probe recorded with the subject's own record binding and the
-/// probe ref read again. A record that does not read back unfaulted, or a probe that does not
-/// land, fails it, naming what refused: that subject's rows are then not run.
+/// probe ref read again, then the subject's whole-store check run as every row's is. A record
+/// that does not read back unfaulted (an empty tree is read back; a walk ending short of it is
+/// not), a probe that does not land, or a check that finds damage or repairs anything, fails it,
+/// naming what refused: that subject's rows are then not run, since a check reporting the pristine
+/// subject would report it on every row.
 #[allow(clippy::too_many_arguments)]
 pub fn baseline(tool: Tool, pristine: &Path, positions: &[Position], programs: &Programs, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Baseline, RunError> {
     lay_out_subject(pristine, scratch)?;
@@ -1393,8 +1434,8 @@ pub fn baseline(tool: Tool, pristine: &Path, positions: &[Position], programs: &
         if !export.succeeded() {
             return Err(RunError::Io(format!("the unfaulted readback refused: {:?} exited {:?}: {}", export.arguments, export.exit, String::from_utf8_lossy(&export.stderr).trim())));
         }
-        served.into_iter().map(|(mark, readback)| match readback {
-            Readback::Served { tree, .. } if !tree.is_empty() => Ok(tree),
+        served.into_iter().map(|(mark, readback, reached)| match readback {
+            Readback::Served { tree, .. } if reached => Ok(tree),
             _ => Err(RunError::Io(format!("the unfaulted readback did not serve {:?}", mark))),
         }).collect()
     };
@@ -1406,6 +1447,11 @@ pub fn baseline(tool: Tool, pristine: &Path, positions: &[Position], programs: &
         return Err(RunError::Io(format!("the unfaulted probe record did not land: {}", refused)));
     }
     let after = trees(&[Mark::Record(0)])?.pop().unwrap_or_default();
+    let checked = store_check(&context)?;
+    if !checked.succeeded() || (tool == Tool::Forklift && heal_repaired(&checked.stdout)) {
+        return Err(RunError::Io(format!("the unfaulted store check reports the pristine subject: {:?} exited {:?}: {}{}", checked.arguments, checked.exit,
+            String::from_utf8_lossy(&checked.stdout).trim(), String::from_utf8_lossy(&checked.stderr).trim())));
+    }
     Ok(Baseline { positions: read, before, after })
 }
 
@@ -1450,23 +1496,22 @@ pub fn run_history(subject: &HistorySubject, name: &str, kind: Kind, programs: &
 /// The subject's own whole-store inspection, run in the work tree once every sampled record read
 /// back as expected, and added to the steps: `git fsck --full`, or forklift's `heal` (`audit`
 /// refuses an unsigned import, and heal is the step that names corrupt objects). Its outcome when
-/// it still reports damage, the damage the sample did not reach; nothing when it exits 0. A heal
-/// that exits 0 having repaired something rescued the row by local repair, where nothing earlier
-/// did.
+/// it reports damage, or, for a heal that exits 0, repaired some: the damage the sample did not
+/// reach. Nothing when it found none. The row was already healed, so a repair here rescues nothing.
 fn whole_store_check(context: &Context, graded: &mut Graded) -> Result<Option<Outcome>, RunError> {
+    let checked = store_check(context)?;
+    graded.steps.push(checked.clone());
+    let found = !checked.succeeded() || (context.tool == Tool::Forklift && heal_repaired(&checked.stdout));
+    Ok(found.then_some(checked))
+}
+
+/// The subject's whole-store check, run in the work tree: `git fsck --full`, or forklift's `heal`.
+fn store_check(context: &Context) -> Result<Outcome, RunError> {
     let arguments: &[&str] = match context.tool {
         Tool::Forklift => &["--json", "heal"],
         Tool::Git | Tool::GitTuned => &["fsck", "--full", "--no-progress"],
     };
-    let checked = context.run(context.program(), context.subject(arguments.iter().map(|argument| argument.to_string()).collect()), context.scratch.work())?;
-    graded.steps.push(checked.clone());
-    if !checked.succeeded() {
-        return Ok(Some(checked));
-    }
-    if context.tool == Tool::Forklift && graded.recoverability.rescued_by.is_none() && heal_repaired(&checked.stdout) {
-        graded.recoverability.rescued_by = Some(Rescue::LocalRepair);
-    }
-    Ok(None)
+    context.run(context.program(), context.subject(arguments.iter().map(|argument| argument.to_string()).collect()), context.scratch.work())
 }
 
 /// Whether a `--json heal` that exited 0 repaired anything: it restaged a path, or found the
@@ -1480,6 +1525,38 @@ fn heal_repaired(stdout: &[u8]) -> bool {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// The forklift walk follows first parents from the listed head, stops at the depth it was
+    /// asked for, at a parcel the listing leaves out, and at a cycle; the pallet listing gives
+    /// each pallet's head by name.
+    ///
+    /// Revert: follow a merge's last parent → the walk takes the side parcel; drop the bound →
+    /// the bounded walk runs to the root; drop the cycle stop → the cyclic walk never ends.
+    #[test]
+    fn the_forklift_walk_follows_first_parents() {
+        let listing = |entries: &[(&str, &[&str])]| serde_json::json!({ "data": { "entries": entries.iter()
+            .map(|(parcel, parents)| serde_json::json!({ "parcel": parcel, "parents": parents })).collect::<Vec<_>>() } }).to_string().into_bytes();
+        let merged = listing(&[("m", &["b", "s"]), ("s", &["a"]), ("b", &["a"]), ("a", &[])]);
+        assert_eq!(first_parents(Some("m"), &merged, 10), ["m", "b", "a"]);
+        assert_eq!(first_parents(None, &merged, 10), ["m", "b", "a"]);
+        assert_eq!(first_parents(Some("m"), &merged, 2), ["m", "b"]);
+        assert_eq!(first_parents(Some("s"), &merged, 10), ["s", "a"]);
+        assert_eq!(first_parents(Some("m"), &listing(&[("m", &["gone"])]), 10), ["m"]);
+        assert_eq!(first_parents(Some("x"), &listing(&[("x", &["y"]), ("y", &["x"])]), 10), ["x", "y"]);
+        let pallets = serde_json::json!({ "data": { "pallets": [{ "name": "main", "head": "h1" }, { "name": "side", "head": "h2" }] } }).to_string().into_bytes();
+        assert_eq!(pallet_heads(&pallets), [("main".to_string(), "h1".to_string()), ("side".to_string(), "h2".to_string())].into_iter().collect());
+    }
+
+    /// What forklift printed in a readback copy names the graded warehouse instead, so a remedy
+    /// named by path acts on it.
+    ///
+    /// Revert: return the outcome unchanged → the copy's path stays.
+    #[test]
+    fn a_copy_path_is_written_back_as_the_graded_one() {
+        let outcome = Outcome { arguments: vec![], exit: Some(1), stdout: b"remove /s/readback-0/.forklift/lock".to_vec(), stderr: b"at /s/readback-0".to_vec(), failure: None };
+        let rebased = rebased(outcome, Path::new("/s/readback-0"), Path::new("/s/work"));
+        assert_eq!((rebased.stdout.as_slice(), rebased.stderr.as_slice()), (&b"remove /s/work/.forklift/lock"[..], &b"at /s/work"[..]));
+    }
 
     use crate::scrub::path_git;
 
