@@ -1285,7 +1285,8 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             let hosted = |scenario: &&scenario::Scenario| server.is_some() && scenario.hosts();
             let killed = |scenario: &&scenario::Scenario| kill::lanes(&kill, &power, &scenario.id).0;
             let powered = |scenario: &&scenario::Scenario| kill::lanes(&kill, &power, &scenario.id).1;
-            // Each git subject a scenario binds is a block of its own in each lane, beside forklift's.
+            // Each git subject a scenario binds is a block of its own in each lane, beside
+            // forklift's.
             let git_subjects = |scenario: &scenario::Scenario| scenario.tools().into_iter().filter(|tool| *tool != Tool::Forklift).collect::<Vec<_>>();
             progress.lane(Category::KillPointsClient, Some(scenarios.iter().filter(killed).map(|scenario| 1 + git_subjects(scenario).len()).sum()));
             progress.lane(Category::PowerLossClient, Some(scenarios.iter().filter(powered).map(|scenario| 1 + git_subjects(scenario).len()).sum()));
