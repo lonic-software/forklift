@@ -114,13 +114,15 @@ Notes:
   shares, and `--partition count:3/4` there runs a different set.
 - The `proof load` checks (`.github/workflows/proof-load.yml`, one per OS) run the fault-injection
   harness in `crates/proof-load` against forklift and forklift-server built for each OS's release
-  target: damaged files over every census name, graded by reading every record back, and on Linux
-  process kills at each of forklift's traced write calls of the `history` scenario (`--strace`,
-  `--kill`; the traces are uploaded with the report), and power loss at each of those moments,
-  before every other sync (children's included), at each line's end before it exits, and after
-  each line (`--power`): the traced calls are replayed over a model that keeps only what was
-  fsynced, POSIX-minimal semantics, so a loss there may survive on a real ext4, and every
-  power-loss row says so. Between that durable state and the volatile one, each moment also
+  target: damaged files over every census name, graded by reading every record back; the same
+  faults over git's own layout for git at its defaults and tuned, whose rows are reported beside
+  forklift's but fail nothing (a git layout path no row classifies fails the check, by name); and
+  on Linux process kills at each of forklift's traced write calls of the `history` scenario
+  (`--strace`, `--kill`; the traces are uploaded with the report), and power loss at each of
+  those moments, before every other sync (children's included), at each line's end before it
+  exits, and after each line (`--power`): the traced calls are replayed over a model that keeps
+  only what was fsynced, POSIX-minimal semantics, so a loss there may survive on a real ext4, and
+  every power-loss row says so. Between that durable state and the volatile one, each moment also
   leaves the calls' names over the synced bytes (metadata committed, data not), and each file
   changed since its sync torn under its durable names, never cut below its synced bytes, kept
   once per durable version rather than per write; `--power-variants` adds seeded partial states,

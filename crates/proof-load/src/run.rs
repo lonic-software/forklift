@@ -403,7 +403,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                                 subject,
                                 scenario: format!("{} {}{} {:?}", run.scenario, if run.warehouse == Warehouse::Host { "host:" } else { "" }, run.target, run.kind),
                                 category: if run.kind.plants() { Category::DeadPidLock } else { Category::DamagedFiles },
-                                binding: match subject { Tool::Forklift => "forklift", Tool::Git | Tool::GitTuned => "git" }.to_string(),
+                                binding: subject.label().to_string(),
                                 grade: run.grade,
                                 recoverability: run.recoverability,
                                 note: (!run.unextractable.is_empty()).then(|| format!("unextractable remedies: {}", run.unextractable.join("; "))),
