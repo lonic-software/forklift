@@ -11,7 +11,7 @@ use crate::corpus;
 use crate::damage::Warehouse;
 use crate::faulted::{self, Programs};
 use crate::kill;
-use crate::report::{Category, Cell, Completeness, CoverageTable, Determinism, Pairing, Platform, Report, Row, REPORT_FORMAT};
+use crate::report::{Category, Cell, Completeness, CoverageTable, Determinism, HistoryDirection, Pairing, Platform, Report, Row, REPORT_FORMAT};
 use crate::runner;
 use crate::scenario::{self, Tool};
 use crate::scrub::{Environment, Output};
@@ -216,6 +216,13 @@ fn row_cut(now: std::time::Instant, rows_started: std::time::Instant, budget: st
     }
 }
 
+/// Whose a git step building git's subject over forklift's export failed is: forklift's where git
+/// refused it, since what git refuses there is forklift's output; the run's own where it ran past
+/// its limit or could not be run at all.
+fn export_charged_to(error: &crate::runner::RunError) -> Option<Tool> {
+    matches!(error, crate::runner::RunError::BuildFailed { .. }).then_some(Tool::Forklift)
+}
+
 /// When a run `started` and given `budget` seconds must start its last history row: never, for
 /// a run given none or a budget past what the clock can count.
 fn run_deadline(started: std::time::Instant, budget: Option<u64>) -> Option<std::time::Instant> {
@@ -223,19 +230,20 @@ fn run_deadline(started: std::time::Instant, budget: Option<u64>) -> Option<std:
 }
 
 /// Whose a history build step `tool` failed is: forklift's where forklift ran it and refused it
-/// or misbuilt it, or ran past its limit. Git refusing one is the run's own, git being the oracle
-/// the sample is drawn from, as is a step the harness could not run at all.
+/// or misbuilt it, or ran past its limit. Git refusing one over the given history is the run's
+/// own, git being the oracle the sample is drawn from, as is a step the harness could not run at
+/// all. Git's steps over forklift's export are charged by [`export_charged_to`] instead.
 fn build_charged_to(tool: Tool, error: &crate::runner::RunError) -> Option<Tool> {
     use crate::runner::RunError::{BuildFailed, Tool as Ran};
     let own = tool == Tool::Forklift && matches!(error, BuildFailed { .. } | Ran(crate::tool::ToolError::TimedOut { .. }));
     own.then_some(tool)
 }
 
-/// Whether `tool` refusing its own unfaulted readback over a history is a gap in its measure:
-/// forklift's and git tuned's are, while git at its defaults is the oracle the sample was drawn
-/// from, so its refusal is the run's own.
-fn refused_readback_is_a_gap(tool: Tool) -> bool {
-    tool != Tool::Git
+/// Whether a history `subject` refusing its own unfaulted readback is a gap in its measure:
+/// forklift's, git tuned's, and git's over forklift's export are, while git at its defaults over
+/// the given history is the oracle the sample was drawn from, so its refusal is the run's own.
+fn refused_readback_is_a_gap(subject: Built) -> bool {
+    subject != (Tool::Git, Some(HistoryDirection::FromGit))
 }
 
 /// Why a history's sample holds no position, and whose it is: forklift's, where git holds a ref
@@ -249,11 +257,48 @@ fn empty_sample(lengths: &BTreeMap<String, usize>, present: &std::collections::B
     }
 }
 
-/// The row a damage run over a real history grades, its detail at `label`, paired under
-/// `scenario` by `role`; or, where the whole-store check found damage the sample did not reach,
-/// the completeness entry naming it instead. Such damage is no grade: never healed, never paired,
-/// so never in "git does better".
-fn history_row(tool: Tool, label: &str, run: &faulted::Faulted, scenario: &str, role: crate::git_layout::Role) -> Result<Row, String> {
+/// A history subject: its tool and, for a git subject, the direction it was built in. Forklift's
+/// one subject, the import, is both directions', so it names none.
+type Built = (Tool, Option<HistoryDirection>);
+
+/// Every history subject the lane builds, in the order it takes their readbacks.
+const HISTORY_SUBJECTS: [Built; 5] = [
+    (Tool::Forklift, None),
+    (Tool::Git, Some(HistoryDirection::FromGit)), (Tool::GitTuned, Some(HistoryDirection::FromGit)),
+    (Tool::Git, Some(HistoryDirection::FromForklift)), (Tool::GitTuned, Some(HistoryDirection::FromForklift)),
+];
+
+/// The directions whose plate lines a history subject's rows stand on: both for forklift's.
+fn stands_on((_, direction): Built) -> Vec<HistoryDirection> {
+    match direction {
+        Some(direction) => vec![direction],
+        None => vec![HistoryDirection::FromGit, HistoryDirection::FromForklift],
+    }
+}
+
+/// A history completeness check's name for `subject`: with its direction, for a git subject.
+fn history_check(check: &str, (_, direction): Built) -> String {
+    match direction {
+        Some(direction) => direction.name(check),
+        None => check.to_string(),
+    }
+}
+
+/// The label of `subject`'s detail and scratch for `label`: a git subject over forklift's export
+/// is told from the one over the given history by its prefix.
+fn history_label((_, direction): Built, label: String) -> String {
+    match direction {
+        Some(HistoryDirection::FromForklift) => format!("export-{}", label),
+        _ => label,
+    }
+}
+
+/// The row a damage run over a real history grades for `subject`, its detail at `label`, paired
+/// under `scenario` by `role` on each line of [`stands_on`]; or, where the whole-store check found
+/// damage the sample did not reach, the completeness entry naming it instead. Such damage is no
+/// grade: never healed, never paired, so never in "git does better".
+fn history_row(subject: Built, label: &str, run: &faulted::Faulted, scenario: &str, role: crate::git_layout::Role) -> Result<Row, String> {
+    let (tool, direction) = subject;
     if let Some(check) = &run.unreached {
         return Err(format!("{} {:?}: {:?} exited {:?} (details {}.json)", run.target, run.kind, check.arguments, check.exit, label));
     }
@@ -264,28 +309,33 @@ fn history_row(tool: Tool, label: &str, run: &faulted::Faulted, scenario: &str, 
     if !run.unextractable.is_empty() {
         notes.push(format!("unextractable remedies: {}", run.unextractable.join("; ")));
     }
+    let named = direction.map_or(scenario.to_string(), |direction| direction.name(scenario));
     Ok(Row {
         subject: tool,
-        scenario: format!("{} {} {:?}", scenario, run.target, run.kind),
+        scenario: format!("{} {} {:?}", named, run.target, run.kind),
         category: if run.kind.plants() { Category::DeadPidLock } else { Category::DamagedFiles },
         binding: tool.label().to_string(),
         grade: run.grade,
         recoverability: run.recoverability.clone(),
         note: (!notes.is_empty()).then(|| notes.join("; ")),
         detail: Some(format!("{}.json#", label)),
-        pairing: Some(Pairing { scenario: scenario.to_string(), side: Warehouse::Client, role, kind: run.kind }),
+        pairing: Some(Pairing { scenario: scenario.to_string(), side: Warehouse::Client, role, kind: run.kind, directions: stands_on(subject) }),
     })
 }
 
-/// The damage rows over a real history, from `mirror`, the copy the fidelity lane took: git's
-/// subject and forklift's built once from it, the sample drawn over the refs both hold, each
-/// subject's history bindings checked against its walk and its unfaulted readback taken on a copy,
-/// then one row per (role, kind) per subject, each on its own copy, in seed order while the rows
-/// have run no more than `budget` and the run is not past its `deadline`. With the rows, every
-/// check the lane answers: a row the budget did not reach, forklift refusing its unfaulted
-/// readback, and damage the sample did not reach are each named in the subject's own completeness,
-/// never as a grade, as is git tuned refusing its readback; git at its defaults refusing its, the
-/// oracle the sample was drawn from, is the run's own failure.
+/// The damage rows over a real history, from `mirror`, the copy the fidelity lane took, in both
+/// directions: git's subject and forklift's built once from it, the sample drawn over the refs
+/// both hold, and a second git subject built from forklift's git export of its own, so git's rows
+/// run over the given history (from git) and over forklift's export of it (from Forklift) while
+/// forklift's run once and stand on both. Each subject's history bindings are checked against its
+/// walk and its unfaulted readback taken on a copy, then one row per (role, kind) per subject,
+/// each on its own copy, in seed order while the rows have run no more than `budget` and the run
+/// is not past its `deadline`. With the rows, every check the lane answers: a row the budget did
+/// not reach, forklift refusing its unfaulted readback, and damage the sample did not reach are
+/// each named in the subject's own completeness, never as a grade, as is git tuned refusing its
+/// readback and git refusing its over forklift's export; git at its defaults refusing its over
+/// the given history, the oracle the sample was drawn from, is the run's own failure. Forklift's
+/// export failing leaves only the from-Forklift direction unrun.
 /// `damage_blocks` is how many blocks the fixture damage lane announced, which the history's are
 /// added to.
 #[allow(clippy::too_many_arguments)]
@@ -298,16 +348,17 @@ fn history_damage(
     let mut history_checks = Vec::new();
     // What each subject's rows found missing, the run's own errors running them, and the
     // damage the sample did not reach.
-    let mut gaps: BTreeMap<Tool, Vec<String>> = BTreeMap::new();
-    let mut errors: BTreeMap<Tool, Vec<String>> = BTreeMap::new();
-    let mut unreached: BTreeMap<Tool, Vec<String>> = BTreeMap::new();
+    let mut gaps: BTreeMap<Built, Vec<String>> = BTreeMap::new();
+    let mut errors: BTreeMap<Built, Vec<String>> = BTreeMap::new();
+    let mut unreached: BTreeMap<Built, Vec<String>> = BTreeMap::new();
     stop_if_cancelled(progress)?;
     const BLOCK: &str = "damage-history";
     // Every step the subjects were built with and what the sample was drawn from, written whether
     // or not the build finished, so a failure the report names has its evidence beside it.
     let mut steps = Vec::new();
     let mut drawn = serde_json::Value::Null;
-    let built = (|| -> Result<_, (Option<Tool>, String)> {
+    type Refusal = (Option<Tool>, String);
+    let built = (|| -> Result<(_, _, _, Result<std::path::PathBuf, Refusal>), Refusal> {
         let harness = |error: String| (None, error);
         let scratch = output.scratch(BLOCK).map_err(|error| harness(error.to_string()))?;
         let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| harness(error.to_string()))?;
@@ -323,50 +374,81 @@ fn history_damage(
         if positions.is_empty() {
             return Err(empty_sample(&lengths, &present));
         }
-        Ok((git_root, forklift_root, positions))
+        // Git's subject over forklift's export, from a copy of forklift's subject. Its failing
+        // fails only its direction: the subjects above are built and the sample drawn.
+        let root = scratch.root();
+        // Git refusing to take the export as a repository is forklift's, as the export's own
+        // refusal is: what git refuses is forklift's output, laid out by steps it takes over the
+        // given history too. A git step running past its limit, or one the harness could not
+        // run, is the run's own. Once built, git refusing to read a sampled position back is a
+        // gap in git's measure, as over the given history git tuned refusing its is.
+        let sampled: std::collections::BTreeSet<&str> = std::iter::once(branch.as_str()).chain(positions.iter().map(|position| position.reference.as_str())).collect();
+        let over_export = |error: crate::runner::RunError| (export_charged_to(&error), format!("git, over forklift's export: {}", error));
+        let exported = crate::history::export_forklift(&programs.forklift, &forklift_root, &sampled, &root.join("export-warehouse"), &root.join("export"), &scratch, &environment, HISTORY_LIMIT, &mut steps)
+            .map_err(refused(Tool::Forklift))
+            .and_then(|()| crate::history::build_git_export(&programs.git, &root.join("export"), &branch, &root.join("export-mirror"), &root.join("git-export"), &scratch, &environment, HISTORY_LIMIT, &mut steps)
+                .map_err(over_export))
+            .map(|()| root.join("git-export"));
+        Ok((git_root, forklift_root, positions, exported))
     })();
     write_detail(output.root(), &format!("{}.json", BLOCK), &serde_json::json!({ "steps": steps, "drawn": drawn }))?;
-    let (git_root, forklift_root, positions) = match built {
+    let (git_root, forklift_root, positions, exported) = match built {
         Ok(built) => built,
         Err((subject, error)) => {
             history_checks.push(Completeness { subject, check: "history subjects built".to_string(), cell: Cell::Run, missing: vec![error] });
-            (Default::default(), Default::default(), Vec::new())
+            (Default::default(), Default::default(), Vec::new(), Err((None, String::new())))
+        }
+    };
+    let export_root = match exported {
+        Ok(root) => Some(root),
+        Err((subject, error)) => {
+            if !positions.is_empty() {
+                let check = history_check("history subjects built", (Tool::Git, Some(HistoryDirection::FromForklift)));
+                history_checks.push(Completeness { subject, check, cell: Cell::Run, missing: vec![error] });
+            }
+            None
         }
     };
     let mut subjects = Vec::new();
     let mut refused_baselines = Vec::new();
     if !positions.is_empty() {
-        for tool in [Tool::Forklift, Tool::Git, Tool::GitTuned] {
-            let pristine = if tool == Tool::Forklift { &forklift_root } else { &git_root };
+        for subject in HISTORY_SUBJECTS {
+            let (tool, direction) = subject;
+            let pristine = match direction {
+                None => forklift_root.clone(),
+                Some(HistoryDirection::FromGit) => git_root.clone(),
+                Some(HistoryDirection::FromForklift) => match &export_root { Some(root) => root.clone(), None => continue },
+            };
             let state = pristine.join(runner::state_folder(tool));
             match crate::census::walk(&state) {
                 Ok(walked) => history_checks.push(Completeness {
-                    subject: Some(tool), check: "history damage bindings".to_string(), cell: Cell::Run,
+                    subject: Some(tool), check: history_check("history damage bindings", subject), cell: Cell::Run,
                     missing: crate::bindings::check_history_subject(tool, census, &walked),
                 }),
-                Err(error) => errors.entry(tool).or_default().push(format!("{}: {}", state.display(), error)),
+                Err(error) => errors.entry(subject).or_default().push(format!("{}: {}", state.display(), error)),
             }
             stop_if_cancelled(progress)?;
-            let label = format!("{}-baseline-{}", BLOCK, tool.label());
+            let label = history_label(subject, format!("{}-baseline-{}", BLOCK, tool.label()));
             let base = output.scratch(&label).map_err(|error| error.to_string()).and_then(|scratch| {
                 let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
-                faulted::baseline(tool, pristine, &positions, programs, &scratch, &environment, HISTORY_LIMIT).map_err(|error| error.to_string())
+                faulted::baseline(tool, &pristine, &positions, programs, &scratch, &environment, HISTORY_LIMIT).map_err(|error| error.to_string())
             });
             // Forklift, or git tuned, refusing its own unfaulted readback leaves a gap in its
-            // measure. Git at its defaults is the oracle the sample was drawn from, so git
-            // refusing a position it counted is the run's own failure, as a readback the harness
-            // could not take is.
+            // measure, as git does refusing its over forklift's export. Git at its defaults over
+            // the given history is the oracle the sample was drawn from, so git refusing a
+            // position it counted there is the run's own failure, as a readback the harness could
+            // not take is.
             match base {
                 Ok(Ok(base)) => {
                     write_detail(output.root(), &format!("{}.json", label), &base)?;
-                    subjects.push((tool, pristine.clone(), base));
+                    subjects.push((subject, pristine, base));
                 }
                 Ok(Err(refused)) => {
-                    refused_baselines.push(tool);
-                    let blamed = if refused_readback_is_a_gap(tool) { &mut gaps } else { &mut errors };
-                    blamed.entry(tool).or_default().push(format!("its rows: not run: the unfaulted readback failed: {}", refused));
+                    refused_baselines.push(subject);
+                    let blamed = if refused_readback_is_a_gap(subject) { &mut gaps } else { &mut errors };
+                    blamed.entry(subject).or_default().push(format!("its rows: not run: the unfaulted readback failed: {}", refused));
                 }
-                Err(error) => errors.entry(tool).or_default().push(format!("its unfaulted readback: {}", error)),
+                Err(error) => errors.entry(subject).or_default().push(format!("its unfaulted readback: {}", error)),
             }
         }
     }
@@ -374,7 +456,7 @@ fn history_damage(
     // rather than only those of the subject planned last. The shuffle draws from its own stream,
     // apart from the one the rows and the sample were picked with.
     let mut planned: Vec<_> = subjects.iter()
-        .flat_map(|(tool, pristine, base)| crate::bindings::history_rows(*tool, seed).into_iter().map(move |(binding, kind, role)| (*tool, pristine, base, binding, kind, role)))
+        .flat_map(|(subject, pristine, base)| crate::bindings::history_rows(subject.0, seed).into_iter().map(move |(binding, kind, role)| (*subject, pristine, base, binding, kind, role)))
         .collect();
     let mut state = seed ^ 0x5348_5546_464c_4521;
     for index in (1..planned.len()).rev() {
@@ -383,55 +465,68 @@ fn history_damage(
     progress.lane(Category::DamagedFiles, Some(damage_blocks + planned.len()));
     let scenario = format!("{}, over a sample of {} positions", faulted::HISTORY_SCENARIO, positions.len());
     let lane_started = std::time::Instant::now();
-    for (tool, pristine, base, binding, kind, role) in planned {
-        let label = damage_label(tool, &binding, kind);
+    for (subject, pristine, base, binding, kind, role) in planned {
+        let tool = subject.0;
+        let label = history_label(subject, damage_label(tool, &binding, kind));
         if let Some(cut) = row_cut(std::time::Instant::now(), lane_started, budget, deadline) {
             // Started and finished unrun, so the lane's announced count is still reached.
             progress.block_started(Category::DamagedFiles, &label);
             progress.block_finished(Category::DamagedFiles, &label, tool == Tool::Forklift);
-            gaps.entry(tool).or_default().push(format!("{}: not run: {}", label, cut));
+            gaps.entry(subject).or_default().push(format!("{}: not run: {}", label, cut));
             continue;
         }
-        let subject = faulted::HistorySubject { tool, pristine, positions: &positions, baseline: base };
+        let history = faulted::HistorySubject { tool, pristine, positions: &positions, baseline: base };
         start_block(progress, Category::DamagedFiles, &label)?;
         let result = output.scratch(&label).map_err(|error| error.to_string()).and_then(|scratch| {
             let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
-            faulted::run_history(&subject, binding.name, kind, programs, &scratch, &environment, HISTORY_LIMIT, seed).map_err(|error| error.to_string())
+            faulted::run_history(&history, binding.name, kind, programs, &scratch, &environment, HISTORY_LIMIT, seed).map_err(|error| error.to_string())
         });
         progress.block_finished(Category::DamagedFiles, &label, result.as_ref().map_or(true, |run| tool == Tool::Forklift && (run.grade.is_failure() || run.unreached.is_some())));
         match result {
             Ok(run) => {
                 write_detail(output.root(), &format!("{}.json", label), &run)?;
-                match history_row(tool, &label, &run, &scenario, role) {
+                match history_row(subject, &label, &run, &scenario, role) {
                     Ok(row) => rows.push(row),
-                    Err(entry) => unreached.entry(tool).or_default().push(entry),
+                    Err(entry) => unreached.entry(subject).or_default().push(entry),
                 }
             }
-            Err(error) => errors.entry(tool).or_default().push(format!("{} {:?}: {}", binding.name, kind, error)),
+            Err(error) => errors.entry(subject).or_default().push(format!("{} {:?}: {}", binding.name, kind, error)),
         }
     }
-    for tool in [Tool::Forklift, Tool::Git, Tool::GitTuned] {
+    for subject in HISTORY_SUBJECTS {
+        let (tool, direction) = subject;
         let cell = if drawn.is_null() {
             Cell::not_run("the history subjects were not built")
         } else if positions.is_empty() {
             Cell::not_run("no position was sampled")
-        } else if refused_baselines.contains(&tool) {
+        } else if direction == Some(HistoryDirection::FromForklift) && export_root.is_none() {
+            Cell::not_run("git's subject over forklift's export was not built")
+        } else if refused_baselines.contains(&subject) {
             Cell::not_run("its unfaulted readback refused")
-        } else if !subjects.iter().any(|(subject, _, _)| *subject == tool) {
+        } else if !subjects.iter().any(|(built, _, _)| *built == subject) {
             Cell::not_run("its unfaulted readback was not taken")
         } else {
             Cell::Run
         };
-        history_checks.push(Completeness { subject: Some(tool), check: "history damage rows ran".to_string(), cell, missing: gaps.remove(&tool).unwrap_or_default() });
+        history_checks.push(Completeness { subject: Some(tool), check: history_check("history damage rows ran", subject), cell: cell.clone(), missing: gaps.remove(&subject).unwrap_or_default() });
+        // A subject whose rows did not run reached no damage and ran no fault, so its two other
+        // checks say so too, rather than reading as run and clean.
         history_checks.push(Completeness {
-            subject: Some(tool), check: "damage not reached by the sample".to_string(), cell: Cell::Run, missing: unreached.remove(&tool).unwrap_or_default(),
+            subject: Some(tool), check: history_check("damage not reached by the sample", subject), cell: cell.clone(),
+            missing: unreached.remove(&subject).unwrap_or_default(),
         });
         // What kept a row from running, the harness's failures with it. Forklift's check stands
         // under forklift, as the fixture lane's does; a git subject's is the run's own. Either
         // way an entry fails the run.
-        let check = match tool { Tool::Forklift => "history damage faults ran".to_string(), other => format!("history damage faults ran under {}", other.label()) };
-        let subject = (tool == Tool::Forklift).then_some(tool);
-        history_checks.push(Completeness { subject, check, cell: Cell::Run, missing: errors.remove(&tool).unwrap_or_default() });
+        let check = match tool {
+            Tool::Forklift => "history damage faults ran".to_string(),
+            other => history_check(&format!("history damage faults ran under {}", other.label()), subject),
+        };
+        let owner = (tool == Tool::Forklift).then_some(tool);
+        // A check with a failure to name ran and found it, whether or not the rows did.
+        let missing = errors.remove(&subject).unwrap_or_default();
+        let cell = if missing.is_empty() { cell } else { Cell::Run };
+        history_checks.push(Completeness { subject: owner, check, cell, missing });
     }
     Ok((rows, history_checks))
 }
@@ -771,7 +866,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                                 recoverability: run.recoverability,
                                 note: (!run.unextractable.is_empty()).then(|| format!("unextractable remedies: {}", run.unextractable.join("; "))),
                                 detail: Some(format!("{}.json#", label)),
-                                pairing: Some(Pairing { scenario: run.scenario.clone(), side: run.warehouse, role, kind: run.kind }),
+                                pairing: Some(Pairing { scenario: run.scenario.clone(), side: run.warehouse, role, kind: run.kind, directions: vec![] }),
                             });
                         }
                         Err(error) => fault_errors.entry(subject).or_default().push(format!("{} {:?}: {}", binding.name, kind, error)),
@@ -1504,17 +1599,66 @@ mod tests {
             let steps = detail["steps"].as_array().unwrap();
             assert!(steps.iter().any(|step| step["arguments"] == serde_json::json!(["switch", "-q", "-c", crate::faulted::PROBE_REF])), "{}: {:?}", name, steps);
             assert_eq!(steps.last().unwrap()["exit"].as_i64().map(|exit| exit as i32), last, "{}", name);
-            for tool in [Tool::Forklift, Tool::Git, Tool::GitTuned] {
-                let ran = checks.iter().find(|entry| entry.subject == Some(tool) && entry.check == "history damage rows ran").unwrap();
+            for subject in HISTORY_SUBJECTS {
+                let check = history_check("history damage rows ran", subject);
+                let ran = checks.iter().find(|entry| entry.subject == Some(subject.0) && entry.check == check).unwrap();
                 assert_eq!(ran.cell, Cell::not_run("the history subjects were not built"), "{}: {:?}", name, ran);
             }
         }
     }
 
-    /// Forklift running past its limit is forklift's, as its refusal is; git's, and a step the
-    /// harness could not run, are the run's own.
+    /// Forklift refusing its git export, or git refusing what it exported, the subjects given the
+    /// history built, is forklift's and leaves only the from-Forklift direction unrun: forklift's
+    /// rows and git's over the given history still run, while every check of git's over the
+    /// export names why it did not run, none reading as run and clean.
     ///
-    /// Revert: drop the timeout from forklift's → a hung import is the harness's.
+    /// Revert: fail the whole build on the export → no subject's rows run; charge the export, or
+    /// git's clone of it, to git → the entry stands under no subject; give the sibling checks
+    /// `Cell::Run` → they read as run.
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "needs PROOF_LOAD_FORKLIFT"]
+    fn a_refused_history_export_leaves_only_its_direction_unrun() {
+        use std::os::unix::fs::PermissionsExt;
+        let real = std::env::var("PROOF_LOAD_FORKLIFT").expect("PROOF_LOAD_FORKLIFT");
+        let (shared, environment) = crate::history::tests::scratch("export-refused");
+        let mirror = crate::history::tests::mirrored(&shared, &environment);
+        let census = Census::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap().unwrap();
+        let search_path = crate::scrub::search_path(Some(&crate::scrub::path_git()), std::env::var_os("PATH"));
+        // The export's arguments are `--json git export -- <dir>`: one wrapper refuses it, the
+        // other runs it, then takes the repository's objects away, so git's clone refuses it.
+        let cases = [
+            ("refused", "[ \"$2$3\" = gitexport ] && exit 3\nexec '{}' \"$@\"", "forklift: "),
+            ("unreadable", "'{}' \"$@\" || exit\n[ \"$2$3\" = gitexport ] && rm -rf \"$5/.git/objects\"\nexit 0", "git, over forklift's export: "),
+        ];
+        for (name, script, blamed) in cases {
+            let forklift = shared.root().join(name);
+            std::fs::write(&forklift, format!("#!/bin/sh\n{}\n", script.replace("{}", &real))).unwrap();
+            std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let programs = Programs { forklift, git: crate::scrub::path_git(), server: None };
+            let mut output = Output::claim(&shared.root().join(format!("out-{}", name))).unwrap();
+            let (_, checks) = history_damage(&mirror, &programs, &census, 3, std::time::Duration::ZERO, None, 0, &mut output, &search_path, &Quiet).unwrap();
+            let built: Vec<&Completeness> = checks.iter().filter(|entry| entry.check.starts_with("history subjects built")).collect();
+            assert!(built.len() == 1 && built[0].check == "history subjects built, from Forklift" && built[0].subject == Some(Tool::Forklift)
+                && built[0].missing[0].starts_with(blamed), "{}: {:?}", name, built);
+            let unbuilt = Cell::not_run("git's subject over forklift's export was not built");
+            for subject in HISTORY_SUBJECTS {
+                let check = history_check("history damage rows ran", subject);
+                let ran = checks.iter().find(|entry| entry.subject == Some(subject.0) && entry.check == check).unwrap();
+                let expected = if subject.1 == Some(HistoryDirection::FromForklift) { unbuilt.clone() } else { Cell::Run };
+                assert_eq!(ran.cell, expected, "{}: {:?}", name, subject);
+            }
+            let over_export: Vec<&Completeness> = checks.iter().filter(|entry| entry.check.ends_with(", from Forklift") && !entry.check.starts_with("history subjects built")).collect();
+            assert!(over_export.len() == 6 && over_export.iter().all(|entry| entry.cell == unbuilt), "{}: {:?}", name, over_export);
+        }
+    }
+
+    /// Forklift running past its limit is forklift's, as its refusal is; git's, and a step the
+    /// harness could not run, are the run's own. Git refusing forklift's export is forklift's, its
+    /// running long over it is not.
+    ///
+    /// Revert: drop the timeout from forklift's → a hung import is the harness's; charge every
+    /// error over the export to forklift → git's slow clone is forklift's.
     #[test]
     fn a_history_build_past_its_limit_is_forklifts() {
         use crate::runner::RunError;
@@ -1522,6 +1666,9 @@ mod tests {
         let timed_out = || RunError::Tool(ToolError::TimedOut { program: PathBuf::from("/forklift"), limit: HISTORY_LIMIT });
         let refused = || RunError::BuildFailed { arguments: vec![], exit: Some(1), stderr: String::new(), stdout: String::new() };
         assert_eq!(build_charged_to(Tool::Forklift, &timed_out()), Some(Tool::Forklift));
+        // Git's steps over forklift's export: its refusal is forklift's, its running long is not.
+        assert_eq!(export_charged_to(&refused()), Some(Tool::Forklift));
+        assert_eq!(export_charged_to(&timed_out()), None);
         assert_eq!(build_charged_to(Tool::Forklift, &refused()), Some(Tool::Forklift));
         assert_eq!(build_charged_to(Tool::Forklift, &RunError::Io("scratch".into())), None);
         assert_eq!(build_charged_to(Tool::Git, &timed_out()), None);
@@ -1548,14 +1695,19 @@ mod tests {
     }
 
     /// Git tuned refusing its unfaulted readback leaves a gap in git tuned's measure, as forklift
-    /// refusing its does in forklift's; git at its defaults, the oracle, refusing its is the run's.
+    /// refusing its does in forklift's, and as git refusing its over forklift's export does in
+    /// git's; git at its defaults over the given history, the oracle, refusing its is the run's.
     ///
-    /// Revert: treat git tuned as git → its refusal fails the run as the harness's.
+    /// Revert: judge by the tool alone (`subject.0 != Tool::Git`) → git refusing its readback
+    /// over forklift's export fails the run as the harness's.
     #[test]
     fn only_the_oracle_refusing_its_readback_is_the_runs_own() {
-        assert!(refused_readback_is_a_gap(Tool::Forklift));
-        assert!(refused_readback_is_a_gap(Tool::GitTuned));
-        assert!(!refused_readback_is_a_gap(Tool::Git));
+        use HistoryDirection::*;
+        assert!(refused_readback_is_a_gap((Tool::Forklift, None)));
+        assert!(refused_readback_is_a_gap((Tool::GitTuned, Some(FromGit))));
+        assert!(refused_readback_is_a_gap((Tool::GitTuned, Some(FromForklift))));
+        assert!(refused_readback_is_a_gap((Tool::Git, Some(FromForklift))));
+        assert!(!refused_readback_is_a_gap((Tool::Git, Some(FromGit))));
     }
 
     /// An empty sample is forklift's when git holds a ref with commits and the import made a
@@ -1591,15 +1743,22 @@ mod tests {
             steps: vec![], readbacks: vec![], probes: vec![], unextractable: vec![], unreached: Some(check),
         };
         let scenario = "real-history, over a sample of 8 positions";
-        let entry = history_row(Tool::Git, "git-real-history-pack-Zero", &run, scenario, crate::git_layout::Role::Pack).unwrap_err();
+        let subject = (Tool::Git, Some(HistoryDirection::FromForklift));
+        let entry = history_row(subject, "git-real-history-pack-Zero", &run, scenario, crate::git_layout::Role::Pack).unwrap_err();
         assert!(entry.contains("\"fsck\"") && entry.contains("Some(4)") && entry.contains("git-real-history-pack-Zero.json"), "{}", entry);
-        let row = history_row(Tool::Git, "git-real-history-pack-Zero", &faulted::Faulted { unreached: None, ..run }, scenario, crate::git_layout::Role::Pack).unwrap();
+        let row = history_row(subject, "git-real-history-pack-Zero", &faulted::Faulted { unreached: None, ..run.clone() }, scenario, crate::git_layout::Role::Pack).unwrap();
         assert_eq!(row.grade, Grade::Healed);
-        assert_eq!(row.pairing.map(|pairing| pairing.scenario), Some(scenario.to_string()));
+        assert_eq!(row.scenario, format!("{}, from Forklift objects/pack/pack-1.pack Zero", scenario));
+        let pairing = row.pairing.expect("paired");
+        assert_eq!((pairing.scenario.as_str(), pairing.directions.as_slice()), (scenario, [HistoryDirection::FromForklift].as_slice()));
+        // Forklift's one subject is both directions': its row stands on both lines.
+        let forklift = history_row((Tool::Forklift, None), "real-history-pack-Zero", &faulted::Faulted { unreached: None, ..run }, scenario, crate::git_layout::Role::Pack).unwrap();
+        assert_eq!(forklift.pairing.expect("paired").directions, [HistoryDirection::FromGit, HistoryDirection::FromForklift]);
     }
 
-    /// The history damage lane over a small mirrored history: both subjects built, their binding
-    /// sets clean against their walks and their unfaulted readbacks taken. With no budget, every
+    /// The history damage lane over a small mirrored history: every subject built, git's over the
+    /// given history and over forklift's export of it too, their binding sets clean against their
+    /// walks and their unfaulted readbacks taken. With no budget, every
     /// planned row of every subject is named in its completeness as not run, as with the run's
     /// deadline already passed, each naming which ran out; with budget enough,
     /// every planned row ran to a row or an unreached entry, paired under the history's scenario,
@@ -1620,30 +1779,36 @@ mod tests {
         let search_path = crate::scrub::search_path(Some(&crate::scrub::path_git()), std::env::var_os("PATH"));
         let seed = 3;
         let planned = |tool| crate::bindings::history_rows(tool, seed).len();
-        let named = |checks: &[Completeness], tool: Tool, check: &str| checks.iter().find(|entry| entry.subject == Some(tool) && entry.check == check)
-            .unwrap_or_else(|| panic!("{:?} {}: {:?}", tool, check, checks)).missing.clone();
+        let named = |checks: &[Completeness], subject: Built, check: &str| {
+            let check = history_check(check, subject);
+            checks.iter().find(|entry| entry.subject == Some(subject.0) && entry.check == check)
+                .unwrap_or_else(|| panic!("{:?} {}: {:?}", subject, check, checks)).missing.clone()
+        };
+        // The subject a row was graded over: a git row's one direction names it.
+        let graded_over = |row: &Row| (row.subject, (row.subject != Tool::Forklift).then(|| row.pairing.as_ref().expect("paired").directions[0]));
         let hour = std::time::Duration::from_secs(3600);
         let cases = [(std::time::Duration::ZERO, None, "the lane's time budget was spent"), (hour, Some(std::time::Instant::now()), "the run's --budget was spent"), (hour, None, "")];
         for (index, (budget, deadline, reason)) in cases.into_iter().enumerate() {
             let mut output = Output::claim(&shared.root().join(format!("out-{}", index))).unwrap();
             let (rows, checks) = history_damage(&mirror, &programs, &census, seed, budget, deadline, 0, &mut output, &search_path, &Quiet).unwrap();
-            assert!(!checks.iter().any(|entry| entry.check == "history subjects built"), "{:?}", checks);
-            for tool in [Tool::Forklift, Tool::Git, Tool::GitTuned] {
-                assert_eq!(named(&checks, tool, "history damage bindings"), Vec::<String>::new(), "{:?}", tool);
-                let cut = named(&checks, tool, "history damage rows ran");
-                let unreached = named(&checks, tool, "damage not reached by the sample");
-                let graded = rows.iter().filter(|row| row.subject == tool).count();
+            assert!(!checks.iter().any(|entry| entry.check.starts_with("history subjects built")), "{:?}", checks);
+            for subject in HISTORY_SUBJECTS {
+                let tool = subject.0;
+                assert_eq!(named(&checks, subject, "history damage bindings"), Vec::<String>::new(), "{:?}", subject);
+                let cut = named(&checks, subject, "history damage rows ran");
+                let unreached = named(&checks, subject, "damage not reached by the sample");
+                let graded = rows.iter().filter(|row| graded_over(row) == subject).count();
                 if !reason.is_empty() {
-                    assert_eq!(cut.len(), planned(tool), "{:?}: {:?}", tool, cut);
-                    assert!(cut.iter().all(|entry| entry.ends_with(&format!(": not run: {}", reason))), "{:?}: {:?}", tool, cut);
-                    assert_eq!(graded + unreached.len(), 0, "{:?}", tool);
+                    assert_eq!(cut.len(), planned(tool), "{:?}: {:?}", subject, cut);
+                    assert!(cut.iter().all(|entry| entry.ends_with(&format!(": not run: {}", reason))), "{:?}: {:?}", subject, cut);
+                    assert_eq!(graded + unreached.len(), 0, "{:?}", subject);
                 } else {
-                    assert_eq!(cut, Vec::<String>::new(), "{:?}", tool);
-                    assert_eq!(graded + unreached.len(), planned(tool), "{:?}: {:?}", tool, checks);
+                    assert_eq!(cut, Vec::<String>::new(), "{:?}", subject);
+                    assert_eq!(graded + unreached.len(), planned(tool), "{:?}: {:?}", subject, checks);
                 }
             }
             let faults: Vec<&Completeness> = checks.iter().filter(|entry| entry.check.starts_with("history damage faults ran")).collect();
-            assert!(faults.len() == 3 && faults.iter().all(|entry| entry.missing.is_empty()), "{:?}", faults);
+            assert!(faults.len() == HISTORY_SUBJECTS.len() && faults.iter().all(|entry| entry.missing.is_empty()), "{:?}", faults);
             assert!(rows.iter().all(|row| row.pairing.as_ref().is_some_and(|pairing| pairing.scenario.starts_with(faulted::HISTORY_SCENARIO))), "{:?}", rows);
             if reason.is_empty() {
                 refused_for_good_is_never_silent(output.root());

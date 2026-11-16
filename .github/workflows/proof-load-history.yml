@@ -1,8 +1,9 @@
 # Proof Load over a real history: the fidelity round trips, git to Forklift to git and Forklift to
-# git to Forklift, also take this repository's own history (--history-from), besides their
-# fixtures, and the damaged-file rows run over a sample of its positions. Linux only, weekly,
-# and on a pull request that changes this file, so a change to this workflow runs before it
-# merges; a change to the harness alone waits for the weekly run.
+# git to Forklift, also take this repository's own history (--history-from), besides their fixtures,
+# and the damaged-file rows run over a sample of its positions, git's both over the history and over
+# Forklift's export of it. Linux only, weekly, and on a pull request that changes this file, so a
+# change to this workflow runs before it merges; a change to the harness alone waits for the weekly
+# run.
 # The checkout is a full clone: the harness refuses a shallow one.
 #
 # Non-blocking like the per-PR lane: the run step continues on error, and it is not part of the
@@ -32,10 +33,11 @@ jobs:
     runs-on: ubuntu-latest
     # The hang guard, well past a normal run (the scenario lanes, then the history's imports and
     # exports, each of which may take up to 30 minutes, then the history's damage lane: its own
-    # build and baselines, then rows that start for at most two hours, the last of which may run
-    # on past them): a job cut by it writes no report. The budget the run is graded on is
-    # --budget below: the hour the rest takes, the damage lane's two hours of rows, and an hour
-    # for its build, its baselines and its last row.
+    # builds, the export git's second subject is built from among them, and baselines, then rows
+    # that start for at most two hours, the last of which may run on past them): a job cut by it
+    # writes no report. The budget the run is graded on is --budget below: the hour the rest takes,
+    # the damage lane's two hours of rows, and an hour for its builds, its baselines and its last
+    # row.
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4

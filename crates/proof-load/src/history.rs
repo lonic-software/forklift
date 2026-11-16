@@ -65,6 +65,49 @@ pub fn build_git(git: &Path, mirror: &Path, to: &Path, scratch: &Scratch, enviro
     Ok(branch)
 }
 
+/// Exports forklift's pristine history subject at `warehouse` to git at `to`, which must not exist
+/// yet: the export runs in a copy of the warehouse at `copy`, which must not exist yet either, so
+/// the subject forklift's rows run over is the one both directions compare. The export must make a
+/// branch of each of `branches`, the pallet git's subject made its probe at and every one the
+/// sample reads, must make [`PROBE_REF`] current, the pallet forklift's subject is on, and must
+/// leave no file out, redacted or withheld, and no tag out, so git's subject over it holds the
+/// history forklift's does: an export that does not fails as the export's step. Each step it ran is
+/// kept in `steps`, the failing one too.
+#[allow(clippy::too_many_arguments)]
+pub fn export_forklift(forklift: &Path, warehouse: &Path, branches: &BTreeSet<&str>, copy: &Path, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration, steps: &mut Vec<Outcome>) -> Result<(), RunError> {
+    crate::scrub::copy_tree(warehouse, copy).map_err(|error| RunError::Io(format!("{:?}", error)))?;
+    let exported = step(steps, forklift, &["--json", "git", "export", "--", &to.display().to_string()], copy, scratch, environment, limit)?;
+    let data = &crate::runner::document(&exported.stdout)["data"];
+    let current = data["current"].as_str();
+    let made: BTreeSet<&str> = data["branches"].as_array().map(|made| made.iter().filter_map(|branch| branch.as_str()).collect()).unwrap_or_default();
+    let unmade: Vec<&&str> = branches.iter().filter(|branch| !made.contains(**branch)).collect();
+    let left_out: Vec<&str> = ["redacted", "withheld", "withheld_here", "skipped_tags", "unreadable_tags"].into_iter()
+        .filter(|field| match &data[*field] { serde_json::Value::Array(left) => !left.is_empty(), other => !other.is_null() }).collect();
+    if current != Some(PROBE_REF) || !unmade.is_empty() || !left_out.is_empty() {
+        return Err(RunError::BuildFailed {
+            arguments: exported.arguments.clone(), exit: exported.exit, stdout: String::new(),
+            stderr: format!("forklift's export made {:?} current, not {:?}; made no branch of {:?}; left files out as {:?}", current, PROBE_REF, unmade, left_out),
+        });
+    }
+    Ok(())
+}
+
+/// Builds git's pristine history subject over forklift's export at `export` ([`export_forklift`])
+/// at `to`, which must not exist yet, as [`build_git`] builds one over the given history: the
+/// export mirrored into `mirror`, which must not exist yet, as the given history was, so both git
+/// subjects hold their refs in `packed-refs` and their objects in a pack; then, in the mirror,
+/// `HEAD` put on `branch` and the probe pallet's branch the export carries deleted, so
+/// [`build_git`] makes the probe ref at `branch` as it does over the given history. Each step it
+/// ran is kept in `steps`, the failing one too.
+#[allow(clippy::too_many_arguments)]
+pub fn build_git_export(git: &Path, export: &Path, branch: &str, mirror: &Path, to: &Path, scratch: &Scratch, environment: &Environment, limit: Duration, steps: &mut Vec<Outcome>) -> Result<(), RunError> {
+    let (export, mirror_text) = (export.display().to_string(), mirror.display().to_string());
+    step(steps, git, &["clone", "-q", "--mirror", "--no-local", "--", &export, &mirror_text], scratch.root(), scratch, environment, limit)?;
+    step(steps, git, &["symbolic-ref", "HEAD", &format!("refs/heads/{}", branch)], mirror, scratch, environment, limit)?;
+    step(steps, git, &["update-ref", "-d", &format!("refs/heads/{}", PROBE_REF)], mirror, scratch, environment, limit)?;
+    build_git(git, mirror, to, scratch, environment, limit, steps).map(|_| ())
+}
+
 /// Builds forklift's pristine history subject at `to`, which must not exist yet: a fresh
 /// warehouse that imports the mirror at `mirror`, its work tree restored (an import leaves it
 /// empty), and [`PROBE_REF`] made as a pallet at the current head and shifted to. The import must
@@ -187,6 +230,43 @@ pub(crate) mod tests {
 
     fn tree(entries: &[(&str, &str)]) -> Tree {
         entries.iter().map(|(path, contents)| (path.to_string(), crate::oracle::digest(contents.as_bytes()))).collect()
+    }
+
+    /// An export is accepted only where it made the probe pallet current, made a branch of every
+    /// pallet asked for and left no file or tag out; any one missing fails as the export's own
+    /// step.
+    ///
+    /// Revert: check `current` alone → the export missing `side` is accepted; ignore the files
+    /// or tags left out → the withholding export, or the one that could not read its tags, is
+    /// accepted.
+    #[test]
+    #[cfg(unix)]
+    fn an_export_off_the_probe_or_missing_the_branch_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (scratch, environment) = scratch("export-checked");
+        let warehouse = scratch.root().join("warehouse");
+        std::fs::create_dir(&warehouse).unwrap();
+        let cases = [
+            (r#"{"data":{"current":"main","branches":["main","side","proof-load-probe"]}}"#, false),
+            (r#"{"data":{"current":"proof-load-probe","branches":["side","proof-load-probe"]}}"#, false),
+            (r#"{"data":{"current":"proof-load-probe","branches":["main","proof-load-probe"]}}"#, false),
+            (r#"{"data":{"current":"proof-load-probe","branches":["main","side","proof-load-probe"],"withheld":[{}]}}"#, false),
+            (r#"{"data":{"current":"proof-load-probe","branches":["main","side","proof-load-probe"],"unreadable_tags":"no"}}"#, false),
+            (r#"{"data":{"current":"proof-load-probe","branches":["main","side","proof-load-probe"],"redacted":[]}}"#, true),
+        ];
+        let branches: BTreeSet<&str> = ["main", "side"].into_iter().collect();
+        for (index, (printed, accepted)) in cases.into_iter().enumerate() {
+            let forklift = scratch.root().join(format!("forklift-{}", index));
+            std::fs::write(&forklift, format!("#!/bin/sh\necho '{}'\n", printed)).unwrap();
+            std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let (copy, to) = (scratch.root().join(format!("copy-{}", index)), scratch.root().join(format!("to-{}", index)));
+            let result = export_forklift(&forklift, &warehouse, &branches, &copy, &to, &scratch, &environment, LIMIT, &mut Vec::new());
+            match result {
+                Ok(()) => assert!(accepted, "{}", printed),
+                Err(RunError::BuildFailed { stderr, .. }) => assert!(!accepted && stderr.starts_with("forklift's export made"), "{}: {}", printed, stderr),
+                Err(other) => panic!("{}: {:?}", printed, other),
+            }
+        }
     }
 
     /// A small repository mirrored in `scratch`: `main` of three commits, each adding a file,

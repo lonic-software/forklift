@@ -1,5 +1,5 @@
 {
-  "format": 6,
+  "format": 7,
   "coverage": {
     "cells": {
       "damaged-files": {
@@ -382,7 +382,8 @@
         "scenario": "signed",
         "side": "client",
         "role": "signature",
-        "kind": "flip-byte"
+        "kind": "flip-byte",
+        "directions": []
       }
     },
     {
@@ -403,7 +404,8 @@
         "scenario": "signed",
         "side": "client",
         "role": "signature",
-        "kind": "truncate"
+        "kind": "truncate",
+        "directions": []
       }
     },
     {
@@ -424,7 +426,8 @@
         "scenario": "signed",
         "side": "client",
         "role": "signature",
-        "kind": "zero"
+        "kind": "zero",
+        "directions": []
       }
     },
     {
@@ -445,7 +448,8 @@
         "scenario": "signed",
         "side": "client",
         "role": "signature",
-        "kind": "delete"
+        "kind": "delete",
+        "directions": []
       }
     },
     {
@@ -466,7 +470,8 @@
         "scenario": "signed",
         "side": "client",
         "role": "metadata",
-        "kind": "delete"
+        "kind": "delete",
+        "directions": []
       }
     },
     {
@@ -487,7 +492,8 @@
         "scenario": "signed",
         "side": "client",
         "role": "metadata",
-        "kind": "flip-byte"
+        "kind": "flip-byte",
+        "directions": []
       }
     },
     {
@@ -508,7 +514,8 @@
         "scenario": "signed",
         "side": "client",
         "role": "metadata",
-        "kind": "truncate"
+        "kind": "truncate",
+        "directions": []
       }
     },
     {
@@ -529,7 +536,8 @@
         "scenario": "signed",
         "side": "client",
         "role": "metadata",
-        "kind": "zero"
+        "kind": "zero",
+        "directions": []
       }
     },
     {
@@ -550,7 +558,8 @@
         "scenario": "signed",
         "side": "client",
         "role": "metadata",
-        "kind": "delete"
+        "kind": "delete",
+        "directions": []
       }
     },
     {
@@ -571,7 +580,8 @@
         "scenario": "signed",
         "side": "client",
         "role": "signature",
-        "kind": "flip-byte"
+        "kind": "flip-byte",
+        "directions": []
       }
     },
     {
@@ -592,7 +602,8 @@
         "scenario": "signed",
         "side": "client",
         "role": "signature",
-        "kind": "truncate"
+        "kind": "truncate",
+        "directions": []
       }
     },
     {
@@ -613,7 +624,8 @@
         "scenario": "signed",
         "side": "client",
         "role": "signature",
-        "kind": "zero"
+        "kind": "zero",
+        "directions": []
       }
     },
     {
@@ -634,7 +646,8 @@
         "scenario": "signed",
         "side": "client",
         "role": "signature",
-        "kind": "delete"
+        "kind": "delete",
+        "directions": []
       }
     }
   ],
