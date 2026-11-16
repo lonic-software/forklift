@@ -231,8 +231,7 @@ mod tests {
     /// the row grades healed, and `fsck` still reports it. That branch's ref deleted instead
     /// leaves the commit dangling, which is no damage to the store: the check passes.
     ///
-    /// Revert: skip the whole-store check → nothing is unreached; grade unreached damage as a
-    /// failure → the row is no longer healed.
+    /// Revert: skip the whole-store check → nothing is unreached.
     #[test]
     fn git_names_damage_the_sample_did_not_reach() {
         let (shared, environment) = scratch("git-unreached");
@@ -263,7 +262,9 @@ mod tests {
     /// sampled branch fails to resolve, which git refuses per record, so the row is never healed
     /// and nothing is reported unreached.
     ///
-    /// Revert: resolve positions by hash taken before the damage → every position still reads.
+    /// A pin, not a falsifier of one line: git refuses an unresolvable ref however it is asked.
+    /// Resolving through the damaged copy's own refs is what `git_reads_a_real_history_by_position`
+    /// falsifies.
     #[test]
     fn git_reaches_damage_to_the_sampled_refs() {
         let (shared, environment) = scratch("git-reached");
