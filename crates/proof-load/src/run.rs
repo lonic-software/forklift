@@ -199,15 +199,15 @@ fn tuned_configuration(daemon: bool) -> String {
 /// some 3400 commits, exports in about 200 s from a debug build.
 const HISTORY_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// How long the damage rows over `--history-from` may start, at most: less where the run's own
-/// `--budget` leaves less. A row the budget does not reach is named in its subject's
+/// How long the damage rows over `--history-from` may start, at most: none starts past the
+/// run's own `--budget` either. A row the budget does not reach is named in its subject's
 /// completeness, never silently absent.
 const HISTORY_DAMAGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
-/// How long the history's damage rows may start, `elapsed` into a run given `budget` seconds:
-/// what the budget leaves, at most [`HISTORY_DAMAGE_BUDGET`].
-fn history_budget(budget: Option<u64>, elapsed: std::time::Duration) -> std::time::Duration {
-    budget.map_or(HISTORY_DAMAGE_BUDGET, |budget| std::time::Duration::from_secs(budget).saturating_sub(elapsed).min(HISTORY_DAMAGE_BUDGET))
+/// Whether a history damage row may start `now`: while the rows have run less than `budget`
+/// since `rows_started`, and the run, if given one, is not past its `deadline`.
+fn row_may_start(now: std::time::Instant, rows_started: std::time::Instant, budget: std::time::Duration, deadline: Option<std::time::Instant>) -> bool {
+    now.duration_since(rows_started) <= budget && deadline.is_none_or(|deadline| now <= deadline)
 }
 
 /// Whose a history build step `tool` failed is: forklift's where forklift ran it and refused it,
@@ -269,16 +269,17 @@ fn history_row(tool: Tool, label: &str, run: &faulted::Faulted, scenario: &str, 
 /// subject and forklift's built once from it, the sample drawn over the refs both hold, each
 /// subject's history bindings checked against its walk and its unfaulted readback taken on a
 /// copy, then one row per (role, kind) per subject, each on its own copy, in seed order while
-/// the lane has run less than `budget`. With the rows, every check the lane answers: a row the
-/// budget did not reach, forklift refusing its unfaulted readback, and damage the sample did not
-/// reach are each named in the subject's own completeness, never as a grade, as is git tuned
+/// the rows have run less than `budget` and the run is not past its `deadline`. With the rows,
+/// every check the lane answers: a row the budget did not reach, forklift refusing its unfaulted
+/// readback, and damage the sample did not reach are each named in the subject's own completeness, never as a grade, as is git tuned
 /// refusing its readback; git at its defaults refusing its, the oracle the sample was drawn
 /// from, is the run's own failure.
 /// `damage_blocks` is how many blocks the fixture damage lane announced, which the history's are
 /// added to.
 #[allow(clippy::too_many_arguments)]
 fn history_damage(
-    mirror: &std::path::Path, programs: &Programs, census: &Census, seed: u64, budget: std::time::Duration, damage_blocks: usize,
+    mirror: &std::path::Path, programs: &Programs, census: &Census, seed: u64, budget: std::time::Duration, deadline: Option<std::time::Instant>,
+    damage_blocks: usize,
     output: &mut Output, search_path: &Option<std::ffi::OsString>, progress: &dyn Progress,
 ) -> Result<(Vec<Row>, Vec<Completeness>), RunError> {
     let mut rows = Vec::new();
@@ -368,7 +369,7 @@ fn history_damage(
     let lane_started = std::time::Instant::now();
     for (tool, pristine, base, binding, kind, role) in planned {
         let label = damage_label(tool, &binding, kind);
-        if lane_started.elapsed() > budget {
+        if !row_may_start(std::time::Instant::now(), lane_started, budget, deadline) {
             // Started and finished unrun, so the lane's announced count is still reached.
             progress.block_started(Category::DamagedFiles, &label);
             progress.block_finished(Category::DamagedFiles, &label, tool == Tool::Forklift);
@@ -394,7 +395,9 @@ fn history_damage(
         }
     }
     for tool in [Tool::Forklift, Tool::Git, Tool::GitTuned] {
-        let cell = if positions.is_empty() {
+        let cell = if drawn.is_null() {
+            Cell::not_run("the history subjects were not built")
+        } else if positions.is_empty() {
             Cell::not_run("no position was sampled")
         } else if !subjects.iter().any(|(subject, _, _)| *subject == tool) {
             Cell::not_run("its unfaulted readback was not taken")
@@ -1103,13 +1106,13 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     let history_cell = match (&history_mirror, &resolved, &census) {
         _ if history_from.is_none() => Cell::not_run("no --history-from given"),
         (_, Err(reason), _) => Cell::not_run(reason),
-        _ if only.is_some() => Cell::not_run("--only picks one scenario, and the history's damage rows are none"),
         (None, _, _) => Cell::not_run("the history was not copied"),
         (_, _, None) => Cell::not_run("no census for this version"),
         (Some(mirror), Ok(programs), Some(census)) => {
-            // Within what the run's own budget leaves, so a run given less cuts rows, each named,
-            // instead of overrunning it.
-            let (history_rows, checks) = history_damage(mirror, programs, census, seed, history_budget(budget, started.elapsed()), damage_blocks, &mut output, &search_path, progress)?;
+            // No row starts past the run's own budget, so a run given less cuts rows, each named;
+            // the row running when it is spent, and the lane's build, may still take it over.
+            let deadline = budget.map(|budget| started + std::time::Duration::from_secs(budget));
+            let (history_rows, checks) = history_damage(mirror, programs, census, seed, HISTORY_DAMAGE_BUDGET, deadline, damage_blocks, &mut output, &search_path, progress)?;
             rows.extend(history_rows);
             history_checks.extend(checks);
             Cell::Run
@@ -1475,7 +1478,7 @@ mod tests {
             let programs = Programs { forklift, git: crate::scrub::path_git(), server: None };
             let out = shared.root().join(format!("out-{}", name));
             let mut output = Output::claim(&out).unwrap();
-            let (rows, checks) = history_damage(&mirror, &programs, &census, 3, std::time::Duration::from_secs(3600), 0, &mut output, &search_path, &Quiet).unwrap();
+            let (rows, checks) = history_damage(&mirror, &programs, &census, 3, std::time::Duration::from_secs(3600), None, 0, &mut output, &search_path, &Quiet).unwrap();
             assert!(rows.is_empty(), "{}: {:?}", name, rows);
             let built: Vec<&Completeness> = checks.iter().filter(|entry| entry.check == "history subjects built").collect();
             assert!(built.len() == 1 && built[0].subject == charged && built[0].missing[0].starts_with("forklift: "), "{}: {:?}", name, built);
@@ -1507,18 +1510,19 @@ mod tests {
         assert_eq!(build_charged_to(Tool::Git, &refused()), None);
     }
 
-    /// The history lane's budget is what the run's own budget leaves, at most
-    /// [`HISTORY_DAMAGE_BUDGET`]; with no run budget, all of it.
+    /// A history row starts only while the rows' own budget lasts and the run's deadline, the
+    /// clock the run is graded on, has not passed, however long the build before the rows took.
     ///
-    /// Revert: pass `HISTORY_DAMAGE_BUDGET` whatever the run's budget → an hour's run starts two
-    /// hours of rows.
+    /// Revert: ignore the deadline → a row starts past the run's budget.
     #[test]
     fn the_history_lane_starts_rows_only_within_the_runs_budget() {
-        let hour = std::time::Duration::from_secs(3600);
-        assert_eq!(history_budget(Some(3600), std::time::Duration::from_secs(600)), hour - std::time::Duration::from_secs(600));
-        assert_eq!(history_budget(Some(3600), hour * 2), std::time::Duration::ZERO);
-        assert_eq!(history_budget(Some(100_000), std::time::Duration::ZERO), HISTORY_DAMAGE_BUDGET);
-        assert_eq!(history_budget(None, hour * 9), HISTORY_DAMAGE_BUDGET);
+        let minute = std::time::Duration::from_secs(60);
+        let started = std::time::Instant::now();
+        let (rows, now) = (started + minute * 10, started + minute * 20);
+        assert!(row_may_start(now, rows, minute * 10, None));
+        assert!(!row_may_start(now, rows, minute * 9, None));
+        assert!(row_may_start(now, rows, minute * 120, Some(started + minute * 20)));
+        assert!(!row_may_start(now, rows, minute * 120, Some(started + minute * 19)));
     }
 
     /// Git tuned refusing its unfaulted readback leaves a gap in git tuned's measure, as forklift
@@ -1594,7 +1598,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{:?} {}: {:?}", tool, check, checks)).missing.clone();
         for budget in [std::time::Duration::ZERO, std::time::Duration::from_secs(3600)] {
             let mut output = Output::claim(&shared.root().join(format!("out-{}", budget.as_secs()))).unwrap();
-            let (rows, checks) = history_damage(&mirror, &programs, &census, seed, budget, 0, &mut output, &search_path, &Quiet).unwrap();
+            let (rows, checks) = history_damage(&mirror, &programs, &census, seed, budget, None, 0, &mut output, &search_path, &Quiet).unwrap();
             assert!(!checks.iter().any(|entry| entry.check == "history subjects built"), "{:?}", checks);
             for tool in [Tool::Forklift, Tool::Git, Tool::GitTuned] {
                 assert_eq!(named(&checks, tool, "history damage bindings"), Vec::<String>::new(), "{:?}", tool);

@@ -15,8 +15,8 @@ use crate::tool::{self, Invocation, Outcome};
 pub const SAMPLED: usize = 8;
 
 /// Runs one build step in `directory`, kept in `steps`; a step that does not exit 0 fails the
-/// build as [`RunError::BuildFailed`], the tool's own refusal, where a step that could not be run
-/// at all is the harness's.
+/// build as [`RunError::BuildFailed`], the tool's own refusal; a step that could not be run, or
+/// ran past `limit`, fails as [`RunError::Tool`].
 #[allow(clippy::too_many_arguments)]
 fn step(steps: &mut Vec<Outcome>, program: &Path, arguments: &[&str], directory: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Outcome, RunError> {
     let invocation = Invocation {

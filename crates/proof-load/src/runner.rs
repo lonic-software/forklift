@@ -101,7 +101,8 @@ pub enum TakenBy {
 pub enum RunError {
     Tool(tool::ToolError),
     Io(String),
-    /// A build step the history depends on failed: the history the scenario names does not exist.
+    /// A build step ran and did not exit 0: the history a scenario names, or the subject built
+    /// from a real history, does not exist.
     BuildFailed { arguments: Vec<String>, exit: Option<i32>, stderr: String, stdout: String },
 }
 
