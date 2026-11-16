@@ -457,33 +457,42 @@ pub fn recorded_root(root: &Path, needles: &[&str]) -> std::io::Result<Option<St
         } else {
             std::fs::read(&path)?
         };
-        if records_root(&bytes, needles) {
-            let relative = path.strip_prefix(root).unwrap_or(&path);
-            let parts: Vec<String> = relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
-            return Ok(Some(parts.join("/")));
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        let parts: Vec<String> = relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
+        let relative = parts.join("/");
+        if records_root(&relative, &bytes, needles) {
+            return Ok(Some(relative));
         }
     }
     Ok(None)
 }
 
-/// Whether a file's `bytes` record one of `needles` that a copy would be tied to. A git index's
-/// untracked cache names its work tree in its ident, `Location <work tree>, system <name>`, which
-/// git checks on every read and rebuilds the cache over when it differs: a copy is not tied to it.
-pub(crate) fn records_root(bytes: &[u8], needles: &[&str]) -> bool {
+/// Whether the file at root-relative `path` records in its `bytes` one of `needles` that a copy
+/// would be tied to. A git index's untracked cache names its work tree in its ident, `Location
+/// <work tree>, system <name>`, which git checks on every read and rebuilds the cache over when
+/// it differs: a copy is not tied to it. Only git's own index files are read so.
+pub(crate) fn records_root(path: &str, bytes: &[u8], needles: &[&str]) -> bool {
     let mut bytes = std::borrow::Cow::Borrowed(bytes);
-    if let Some(ident) = untracked_ident(&bytes) {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let index = path.split('/').rev().nth(1) == Some(".git") && (name == "index" || name.starts_with("sharedindex."));
+    if let Some(ident) = untracked_ident(&bytes).filter(|_| index) {
         bytes.to_mut()[ident].fill(0);
     }
     needles.iter().any(|needle| holds_root(&bytes, needle.as_bytes()))
 }
 
 /// Where a git index's untracked-cache ident stands in `bytes`: after the `UNTR` extension's
-/// name, its size and the ident's length as git's offset varint.
+/// name, its size and the ident's length as git's offset varint. A tracked path can spell `UNTR`
+/// too, so each occurrence is tried for an ident of git's shape.
 fn untracked_ident(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
     if !bytes.starts_with(b"DIRC") {
         return None;
     }
-    let at = bytes.windows(4).position(|window| window == b"UNTR")? + 8;
+    bytes.windows(4).enumerate().filter(|(_, window)| *window == b"UNTR").find_map(|(at, _)| ident_at(bytes, at + 8))
+}
+
+/// The `Location ` ident whose varint length starts at `at`, if one does.
+fn ident_at(bytes: &[u8], at: usize) -> Option<std::ops::Range<usize>> {
     let mut next = at;
     let mut byte = *bytes.get(next)?;
     next += 1;
@@ -1425,19 +1434,26 @@ mod tests {
         index.push(ident.len() as u8);
         index.extend_from_slice(ident);
         index.extend_from_slice(b"\0\x01");
-        assert!(!records_root(&index, &["/s/0001-h"]));
+        let at = ".git/index";
+        assert!(!records_root(at, &index, &["/s/0001-h"]));
+        assert!(!records_root("work/.git/sharedindex.ab12", &index, &["/s/0001-h"]));
+        assert!(records_root("work/.forklift/index", &index, &["/s/0001-h"]), "only git's own index is git's to check");
         let mut elsewhere = index.clone();
         elsewhere.extend_from_slice(b"/s/0001-h/x");
-        assert!(records_root(&elsewhere, &["/s/0001-h"]));
-        assert!(records_root(&index[4..], &["/s/0001-h"]), "only an index's ident is git's to check");
+        assert!(records_root(at, &elsewhere, &["/s/0001-h"]));
+        assert!(records_root(at, &index[4..], &["/s/0001-h"]), "only an index's ident is git's to check");
         let other: Vec<u8> = index.iter().map(|byte| if *byte == b'L' { b'l' } else { *byte }).collect();
-        assert!(records_root(&other, &["/s/0001-h"]), "only an ident of git's shape is skipped");
+        assert!(records_root(at, &other, &["/s/0001-h"]), "only an ident of git's shape is skipped");
+        // A tracked path that spells the extension's name comes first.
+        let mut named = b"DIRC\0\0\0\x02docs/UNTRUSTED.txt\0".to_vec();
+        named.extend_from_slice(&index[12..]);
+        assert!(!records_root(at, &named, &["/s/0001-h"]));
         // A long ident's length takes git's offset varint: 128 is 0x80 0x00.
         let long = format!("Location /s/0001-h/{}, system Linux", "w".repeat(128 - 33));
         assert_eq!(long.len(), 128);
         let mut wide = b"DIRCUNTR\0\0\0\0\x80\0".to_vec();
         wide.extend_from_slice(long.as_bytes());
-        assert!(!records_root(&wide, &["/s/0001-h"]));
+        assert!(!records_root(at, &wide, &["/s/0001-h"]));
     }
 
     /// An unsound trace is reported as refused even when it is also path-bound; only a sound one

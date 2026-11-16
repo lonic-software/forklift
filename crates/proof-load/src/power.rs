@@ -1777,7 +1777,7 @@ fn bound(image: &Image, needles: &[&str]) -> Option<String> {
             Entry::Link { target } => target.as_bytes(),
             Entry::Dir { .. } => return None,
         };
-        kill::records_root(bytes, needles).then(|| path.clone())
+        kill::records_root(path, bytes, needles).then(|| path.clone())
     })
 }
 
