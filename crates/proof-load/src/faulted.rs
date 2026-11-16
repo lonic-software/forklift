@@ -73,8 +73,32 @@ pub struct HistoryReadback {
     /// a refusal here refuses the record it ran for. Forklift's bay for a record opens at the
     /// current head before moving to the record, so damage only that head holds refuses every
     /// forklift record, where git still serves the records that do not hold it.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", serialize_with = "serialize_reads")]
     pub reads: Vec<Outcome>,
+}
+
+/// Writes `reads` with each successful read's stdout left out, its length kept, as the records'
+/// verdicts already judge what it served: over a real history those bytes ran to some 100 MB a
+/// readback (CI, 2026-11-16), so a run's details came to 3.1 GB. A refused read is kept whole.
+fn serialize_reads<S: serde::Serializer>(reads: &[Outcome], serializer: S) -> Result<S::Ok, S::Error> {
+    #[derive(serde::Serialize)]
+    struct Read<'a> {
+        arguments: &'a [String],
+        exit: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stdout: Option<&'a [u8]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stdout_bytes: Option<usize>,
+        stderr: &'a [u8],
+        failure: &'a Option<tool::Failure>,
+    }
+    serializer.collect_seq(reads.iter().map(|read| {
+        let served = read.succeeded();
+        Read {
+            arguments: &read.arguments, exit: read.exit, stdout: (!served).then_some(read.stdout.as_slice()),
+            stdout_bytes: served.then_some(read.stdout.len()), stderr: &read.stderr, failure: &read.failure,
+        }
+    }))
 }
 
 /// What `park list` said of the work the history left parked.
@@ -915,10 +939,13 @@ impl Trail {
         let mut readback = self.read_back(context, expected, made.acknowledged)?;
         if !made.acknowledged && settles(retry, self.steps.last()) && readback.reads(&[expected.faulted]) {
             // Judged again as acknowledged: the record must now hold exactly its own tree.
-            self.evidence.any_silent |= readback.silent();
-            self.readbacks.push(readback);
-            readback = self.read_back(context, expected, true)?;
-            made.promote(promoted);
+            let settled = self.read_back(context, expected, true)?;
+            if settled_by(self.steps.last(), &settled, expected.faulted) {
+                self.evidence.any_silent |= readback.silent();
+                self.readbacks.push(readback);
+                readback = settled;
+                made.promote(promoted);
+            }
         }
         let required = expected.required(made.acknowledged);
         self.evidence.any_silent |= readback.silent();
@@ -961,6 +988,15 @@ impl Trail {
 /// ([`Made::promote`]).
 fn settles(retry: bool, last: Option<&Outcome>) -> bool {
     retry && answered(last)
+}
+
+/// Whether the answer `last` settles the faulted record as acknowledged, from `settled`, the
+/// readback judged as acknowledged. A success, or a stack refused as nothing to stack, claims the
+/// record stands and is held to it. Any other refusal claims nothing of it: a damaged file refused
+/// for good on every retry is no record made, so it settles only a record already holding its
+/// own tree, never one still at the tree before it.
+fn settled_by(last: Option<&Outcome>, settled: &HistoryReadback, faulted: Mark) -> bool {
+    last.is_some_and(|outcome| outcome.succeeded() || already_stacked(outcome)) || settled.reads(&[faulted])
 }
 
 /// Whether `last`, the latest command run, answered and asked nothing further: it exited (a kill
@@ -2064,6 +2100,25 @@ mod tests {
         HistoryReadback { export, records: records.into_iter().map(|(mark, verdicts)| RecordReadback { mark, verdicts }).collect(), parked: None, reads: Vec::new() }
     }
 
+    /// A readback's details keep a refused read whole, and a successful one without its stdout,
+    /// whose length they keep.
+    ///
+    /// Revert: serialize the reads as they are → the served bytes are written; drop every
+    /// stdout → the refused read's own words are lost.
+    #[test]
+    fn a_readback_writes_what_its_reads_refused_not_what_they_served() {
+        let read = |exit, stdout: &[u8]| Outcome { arguments: vec!["show".into()], exit: Some(exit), stdout: stdout.to_vec(), stderr: b"said".to_vec(), failure: None };
+        let readback = HistoryReadback { reads: vec![read(0, b"served-bytes"), read(1, b"refused-words")], ..served(&[(0, Verdict::Expected)]) };
+        let written = serde_json::to_value(&readback).unwrap();
+        let reads = written["reads"].as_array().unwrap();
+        assert_eq!(reads[0].get("stdout"), None, "{}", written);
+        assert_eq!(reads[0]["stdout_bytes"], 12);
+        assert_eq!(reads[0]["stderr"], serde_json::json!(b"said".to_vec()));
+        assert_eq!(reads[1]["stdout"], serde_json::json!(b"refused-words".to_vec()));
+        assert_eq!(reads[1].get("stdout_bytes"), None);
+        assert_eq!(reads[1]["exit"], 1);
+    }
+
     /// A history reads only when every wanted record was served and every copy of it expected: a
     /// record the export left out does not read, and neither does one with a silent copy.
     ///
@@ -2277,6 +2332,33 @@ mod tests {
         let nothing = answer(Some(1), "Nothing to stack.", None);
         assert!(settles(true, Some(&nothing)));
         assert!(!settles(false, Some(&nothing)), "the faulted command's own answer is no retry");
+    }
+
+    /// An answer settles the faulted record only by claiming it stands, a success or a stack
+    /// refused as nothing to stack, which then must hold its own tree; or, as any other refusal,
+    /// only once the record already holds it. A record still at the tree before it reads as
+    /// silent when judged as acknowledged, which a refusal for good must not make it.
+    ///
+    /// Revert: settle on any answer → a damaged file refused on every retry, the record never
+    /// stacked, grades silent; settle on a refusal only by the readback → a stack told there is
+    /// nothing to stack, its record missing, is not held to it; drop the stack condition from
+    /// already-stacked → a load told nothing to stack claims a record.
+    #[test]
+    fn a_refusal_for_good_settles_no_record_it_never_made() {
+        let missing = served(&[(0, Verdict::Silent)]);
+        let standing = served(&[(0, Verdict::Expected)]);
+        let mut refused = answer(Some(1), "Error while reading configuration file \"warehouse.toml\": stream did not contain valid UTF-8", None);
+        refused.arguments = vec!["--json".into(), "stack".into(), "-m".into(), "r".into()];
+        assert!(answered(Some(&refused)), "a refusal naming no remedy is an answer");
+        assert!(!settled_by(Some(&refused), &missing, Mark::Record(0)));
+        assert!(settled_by(Some(&refused), &standing, Mark::Record(0)));
+        let mut nothing = answer(Some(1), "Nothing to stack: the inventory matches the head of pallet \"main\".", None);
+        nothing.arguments = refused.arguments.clone();
+        assert!(settled_by(Some(&nothing), &missing, Mark::Record(0)), "told nothing to stack, the record is held to standing");
+        assert!(settled_by(Some(&answer(Some(0), "", None)), &missing, Mark::Record(0)));
+        nothing.arguments = vec!["--json".into(), "load".into(), ".".into()];
+        assert!(!settled_by(Some(&nothing), &missing, Mark::Record(0)));
+        assert!(!settled_by(None, &missing, Mark::Record(0)));
     }
 
     /// A record is acknowledged by its own lines, before any the scenario runs after them; read
