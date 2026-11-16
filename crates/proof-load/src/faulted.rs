@@ -323,11 +323,29 @@ impl Context<'_> {
     /// So git is read from its history, never its index: a damaged index or a stale index lock is
     /// not in the way, and the repository's own index is left as it was. A log, read or layout git
     /// refuses is git refusing to read, never an empty tree served; a record a log that exits 0
-    /// leaves out was served as missing.
+    /// leaves out was served as missing. Read through the host, the history read is that of a
+    /// fresh clone of it.
     fn read_back_git(&self, bay: &Path, marks: &[Mark], required: &[Mark], expectation: impl Fn(Mark) -> Expectation) -> Result<HistoryReadback, RunError> {
-        if self.via_host || self.scope.is_some() {
-            return Err(RunError::Io("git reads back only an unscoped work tree".to_string()));
+        if self.scope.is_some() {
+            return Err(RunError::Io("git reads back only an unscoped history".to_string()));
         }
+        // Through the host: a fresh clone of the bare repository by the subject, through git's
+        // transport (a local clone would hardlink the host's objects and check nothing), then
+        // read like a work tree. Nothing is checked out, since the read is from history: a clone
+        // that fails refuses every record.
+        let clone;
+        let bay = if self.via_host {
+            let url = self.url.ok_or_else(|| RunError::Io("a host-side readback needs a host".to_string()))?;
+            clone = self.fresh("clone");
+            let arguments = self.subject(vec!["clone".into(), "-q".into(), "--no-local".into(), "--no-checkout".into(), url.to_string(), clone.display().to_string()]);
+            let cloned = self.run(self.program(), arguments, self.scratch.root().to_path_buf())?;
+            if !cloned.succeeded() {
+                return Ok(HistoryReadback { export: cloned, records: Vec::new(), parked: None });
+            }
+            clone.as_path()
+        } else {
+            bay
+        };
         let git_with = |index: &Path, arguments: &[&str]| {
             let mut environment = self.environment.clone();
             environment.variables.insert("GIT_INDEX_FILE".to_string(), index.display().to_string());
@@ -1055,7 +1073,9 @@ fn own_remedies(context: &Context, expected: &Expected, trail: &mut Trail, made:
     let cloned = match (context.tool, context.scope) {
         (Tool::Forklift, Some(scope)) => run(&["--json", "clone", "--only", scope, url, &target], context.scratch.root().to_path_buf())?,
         (Tool::Forklift, None) => run(&["--json", "clone", url, &target], context.scratch.root().to_path_buf())?,
-        (Tool::Git | Tool::GitTuned, _) => run(&["clone", "-q", url, &target], context.scratch.root().to_path_buf())?,
+        // Through git's transport, as the build's clone is: a local clone would share the host's
+        // object files.
+        (Tool::Git | Tool::GitTuned, _) => run(&["clone", "-q", "--no-local", url, &target], context.scratch.root().to_path_buf())?,
     };
     if !cloned.succeeded() {
         trail.steps.push(cloned);
@@ -1094,6 +1114,8 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, to
     let (walked, state) = match warehouse {
         Warehouse::Client => (&built.walked, scratch.work().join(runner::state_folder(tool))),
         Warehouse::Host if tool == Tool::Forklift && built.host.is_some() => (&built.host_walked, runner::host_root(scratch).join(".forklift")),
+        // A bare repository is its own state folder.
+        Warehouse::Host if tool != Tool::Forklift && built.bare.is_some() => (&built.host_walked, runner::host_root(scratch)),
         Warehouse::Host => return Err(RunError::Io(format!("{} damages a host, and {} hosts none for {:?}", name, scenario.id, tool))),
     };
     // A planted path is absent by definition, so it is named, not resolved against the walk.
@@ -1110,7 +1132,7 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, to
 
     let (expected, faulted) = expected(scenario, corpus, &built, warehouse)?;
     let context = Context {
-        tool, corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.host.as_ref().map(|host| host.url.as_str()),
+        tool, corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.url(),
         scope: scenario.scope(), via_host: warehouse == Warehouse::Host,
     };
     let graded = grade_after(&context, &expected, faulted, |context, steps| context.record(faulted, steps).map(drop))?;
@@ -1205,6 +1227,84 @@ mod tests {
             assert_eq!(faulted.evidence.acknowledged_readable, rescued.is_some(), "{:?}", kind);
             assert_eq!(faulted.grade, Grade::Silent, "{:?}", kind);
         }
+    }
+
+    /// Git hosts a bare repository at the host path, which its URL is: the built history pushed
+    /// every record there and tracks it, and the walk of the host lists only classified paths. A
+    /// damaged host is read back through a fresh clone of it; a broken branch on the client, which
+    /// git cannot rewrite, is rescued by cloning the host again.
+    ///
+    /// Revert: read a host-side git readback from the work tree → the host's lost object is not
+    /// what is judged; leave git rows without a URL → no re-clone is tried; clone the host
+    /// locally, for the readback or the re-clone → the clone's objects are the host's files (held
+    /// on unix only, where a file's link count is read);
+    /// check the readback clone out → it holds a work tree.
+    #[test]
+    fn git_hosts_a_bare_repository_and_clones_it_again() {
+        let git = path_git();
+        let scenario = crate::scenario::catalog().into_iter().find(|scenario| scenario.id == "lifted").unwrap();
+        assert!(scenario.tools().contains(&Tool::Git));
+        let corpus = corpus::generate(7, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL });
+        let programs = Programs { forklift: PathBuf::from("forklift-not-used"), git: git.clone(), server: None };
+        let area = |label: &str| {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let scratch = Scratch::create(&std::env::temp_dir().join(format!("proof-load-git-{}-{}-{}", label, std::process::id(), nanos))).unwrap();
+            let environment = Environment::scrubbed(&scratch, crate::scrub::search_path(Some(&git), std::env::var_os("PATH")), &BTreeMap::new()).unwrap();
+            (scratch, environment)
+        };
+
+        let (scratch, environment) = area("built");
+        let built = runner::build(&scenario, &corpus, Tool::Git, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
+        assert_eq!(built.url(), Some(runner::host_root(&scratch).display().to_string().as_str()));
+        assert_eq!(built.pushed, built.acknowledged);
+        assert_eq!(crate::git_layout::unclassified(&built.host_walked), Vec::<&str>::new());
+        assert!(!crate::git_layout::reached("refs/heads/**", &built.host_walked).is_empty(), "{:?}", built.host_walked);
+        assert!(!crate::git_layout::reached("refs/remotes/**", &built.walked).is_empty(), "{:?}", built.walked);
+
+        let (scratch, environment) = area("host");
+        let faulted = run(&scenario, "objects/<xx>/<hash>", Warehouse::Host, Kind::Delete, Tool::Git, &corpus, &programs, &scratch, &environment, Duration::from_secs(60), 0).unwrap();
+        // Which object is lost follows the commits' hashes, so it differs from run to run, and so
+        // does whether the push is refused. Every host object is reachable from its branch, so
+        // the clone of the host refuses: the records it acknowledged are lost.
+        assert_eq!(faulted.grade, Grade::DataLost, "{:?}", faulted.recoverability);
+        assert_eq!(faulted.recoverability.rescued_by, None);
+
+        let (scratch, environment) = area("client");
+        let faulted = run(&scenario, "refs/heads/**", Warehouse::Client, Kind::Zero, Tool::Git, &corpus, &programs, &scratch, &environment, Duration::from_secs(60), 0).unwrap();
+        assert_eq!(faulted.recoverability.rescued_by, Some(Rescue::Reclone), "{:?}", faulted.recoverability);
+        assert!(faulted.steps.iter().any(|step| step.arguments.first().map(String::as_str) == Some("clone") && step.succeeded()), "{:?}", faulted.steps);
+        assert_owns_its_objects(&scratch.root().join("reclone-0"));
+
+        // A host the readback can clone: the clone came through git's transport, so it shares
+        // no object file with the host, and holds no work tree.
+        let (scratch, environment) = area("readback");
+        run(&scenario, "config", Warehouse::Host, Kind::Delete, Tool::Git, &corpus, &programs, &scratch, &environment, Duration::from_secs(60), 0).unwrap();
+        let clone = scratch.root().join("clone-0");
+        assert_owns_its_objects(&clone);
+        let entries: Vec<_> = std::fs::read_dir(&clone).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from(".git")]);
+    }
+
+    /// Every object file of the clone at `repository` is its own: a local clone hardlinks the
+    /// host's.
+    fn assert_owns_its_objects(repository: &Path) {
+        let objects = repository.join(".git").join("objects");
+        let mut files = 0;
+        let mut pending = vec![objects.clone()];
+        while let Some(folder) = pending.pop() {
+            for entry in std::fs::read_dir(&folder).unwrap() {
+                let entry = entry.unwrap();
+                let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+                if metadata.is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    files += 1;
+                    #[cfg(unix)]
+                    assert_eq!(std::os::unix::fs::MetadataExt::nlink(&metadata), 1, "{}", entry.path().display());
+                }
+            }
+        }
+        assert!(files > 0, "{} holds no object", objects.display());
     }
 
     /// Git tuned runs every command of its own with its configuration first, as its bindings do;

@@ -329,11 +329,11 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
         }
     };
 
-    // Git's own layout, walked after each scenario git can run is built with it: every path no
-    // layout row classifies, what each build created for the git damage bindings, and the role
-    // map's gaps against the census.
+    // Git's own layout, walked after each scenario git can run is built with it, and so is the
+    // bare repository of one that hosts: every path no layout row classifies, what each build
+    // created for the git damage bindings, and the role map's gaps against the census.
     let git_runnable: Vec<String> = scenario::catalog().into_iter().filter(|scenario| scenario.tools().contains(&Tool::Git)).map(|scenario| scenario.id).collect();
-    let mut git_walks: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut git_walks: BTreeMap<(String, Warehouse), Vec<String>> = BTreeMap::new();
     let mut git_walk_missing = Vec::new();
     let git_program = git.as_deref().map(tool::absolute).transpose().map_err(|error| RunError::Refused(format!("the git path: {}", error)))?;
     if let Some(git_program) = &git_program {
@@ -345,7 +345,12 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             match built {
                 Ok(built) => {
                     git_walk_missing.extend(crate::git_layout::unclassified(&built.walked).into_iter().map(|path| format!("{}: {}", scenario.id, path)));
-                    git_walks.insert(scenario.id.clone(), built.walked);
+                    // The bare repository a hosting history pushed to, laid out as a `.git` is.
+                    if built.bare.is_some() {
+                        git_walk_missing.extend(crate::git_layout::unclassified(&built.host_walked).into_iter().map(|path| format!("{} host: {}", scenario.id, path)));
+                        git_walks.insert((scenario.id.clone(), Warehouse::Host), built.host_walked);
+                    }
+                    git_walks.insert((scenario.id.clone(), Warehouse::Client), built.walked);
                 }
                 Err(error) => git_walk_missing.push(format!("{}: not built: {}", scenario.id, error)),
             }
@@ -387,8 +392,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             for (subject, binding, scenario) in picked_bindings() {
                 fault_errors.entry(subject).or_default();
                 for kind in binding.kinds {
-                    let prefix = match subject { Tool::Forklift => String::new(), other => format!("{}-", other.label()) };
-                    let label = format!("{}{}-{}-{:?}", prefix, binding.scenario, binding.name, kind).replace(['/', '<', '>', '{', '}', '*'], "_");
+                    let label = damage_label(subject, binding, *kind);
                     start_block(progress, Category::DamagedFiles, &label)?;
                     let result = output.scratch(&label).map_err(|error| error.to_string()).and_then(|scratch| {
                         let environment = Environment::scrubbed(&scratch, search_path.clone(), &BTreeMap::new()).map_err(|error| error.to_string())?;
@@ -664,7 +668,15 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     ].into_iter().map(|(category, check, cell)| Completeness {
         subject: Some(Tool::Forklift),
             check: check.to_string(), cell: cell.clone(), missing: condition_errors.remove(&category).unwrap_or_default(),
-        }).collect();
+        }).chain(std::iter::once(Completeness {
+            // Git's host is a bare repository reached by its path, with no server between: the
+            // proxy has nothing of git's to fault.
+            subject: Some(Tool::Git), check: "network faults ran".to_string(), missing: vec![],
+            cell: match &git_program {
+                None => Cell::not_run("no git binary given"),
+                Some(_) => Cell::not_run("the harness's proxy faults an HTTP server, and serving git over HTTP needs a CGI backend the harness does not run"),
+            },
+        })).collect();
 
     // Every scenario's faulted command killed at each call that changes or syncs a file, and its
     // power loss at each of those moments, Linux only.
@@ -935,6 +947,15 @@ fn discarded_area<T>(
     result
 }
 
+/// A damage block's label, which names its scratch area and detail file: the subject, the
+/// scenario, the side, the binding's name and the kind. A host's path is named apart from the
+/// client's of the same name.
+fn damage_label(subject: Tool, binding: &crate::damage::Binding, kind: crate::damage::Kind) -> String {
+    let prefix = match subject { Tool::Forklift => String::new(), other => format!("{}-", other.label()) };
+    let side = match binding.warehouse { Warehouse::Client => "", Warehouse::Host => "host-" };
+    format!("{}{}-{}{}-{:?}", prefix, binding.scenario, side, binding.name, kind).replace(['/', '<', '>', '{', '}', '*'], "_")
+}
+
 /// The corpus a faulted command runs over, shared by every lane: the small shape with one record
 /// past the history, the one the faulted command writes.
 fn faulted_corpus(seed: u64) -> corpus::Corpus {
@@ -955,6 +976,18 @@ mod tests {
         fn cancelled(&self) -> bool {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= self.polls
         }
+    }
+
+    /// Revert: drop the side → a client and a host binding of one name share a label, so one
+    /// row's scratch and detail file is the other's.
+    #[test]
+    fn a_host_damage_block_is_labelled_apart_from_the_client() {
+        use crate::damage::{Binding, Kind};
+        let client = Binding { name: "HEAD", scenario: "lifted", warehouse: Warehouse::Client, kinds: &[] };
+        let host = Binding { warehouse: Warehouse::Host, ..client.clone() };
+        assert_eq!(damage_label(Tool::Git, &client, Kind::Delete), "git-lifted-HEAD-Delete");
+        assert_eq!(damage_label(Tool::Git, &host, Kind::Delete), "git-lifted-host-HEAD-Delete");
+        assert_eq!(damage_label(Tool::Forklift, &host, Kind::Zero), "lifted-host-HEAD-Zero");
     }
 
     fn fresh(name: &str) -> PathBuf {

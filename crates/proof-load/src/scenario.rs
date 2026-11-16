@@ -3,8 +3,9 @@
 //! A scenario is tool-independent: a history to build, written in an abstract operation
 //! vocabulary, and a fault. A binding maps each operation to concrete command lines for one tool.
 //! Forklift binds every operation; git binds the ones it has, twice, at its defaults and tuned. An
-//! operation git has no binding for makes the scenario Forklift-only, and the report shows those
-//! rows in their own table instead of counting them as git losses.
+//! operation git has no binding for makes the scenario Forklift-only, and so do a volume fault's
+//! files, which only Forklift is run on; the report shows those rows in their own table instead of
+//! counting them as git losses.
 
 use crate::damage::Kind;
 
@@ -199,6 +200,9 @@ fn line(arguments: &[&str]) -> Vec<String> {
     arguments.iter().map(|argument| argument.to_string()).collect()
 }
 
+/// What git's remote `origin` fetches, as `git remote add` sets it.
+const GIT_FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
+
 /// Git's options for the tuned binding, given before the subcommand.
 pub(crate) const GIT_TUNED: &[&str] = &["-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "-c", "transfer.fsckObjects=true", "-c", "fetch.fsckObjects=true", "-c", "receive.fsckObjects=true"];
 
@@ -256,7 +260,17 @@ pub fn bind(tool: Tool, op: &Op) -> Option<Vec<Vec<String>>> {
                 Op::Branch { name } => vec![line(&["branch", name])],
                 Op::Switch { name } => vec![line(&["switch", "-q", name])],
                 Op::Merge { name } => vec![line(&["merge", "-q", "--no-edit", name])],
-                Op::Push => vec![line(&["push", "-q"])],
+                // The host is a bare repository the build makes at the harness's host path, and
+                // its URL is that path.
+                Op::Host => vec![line(&["config", "remote.origin.url", URL]), line(&["config", "remote.origin.fetch", GIT_FETCH_REFSPEC])],
+                // Through git's transport, never the local shortcut: a local clone hardlinks the
+                // host's object files, so damage to one repository's object would reach the other.
+                Op::Clone { kind: CloneKind::Full } => vec![line(&["clone", "-q", "--no-local", URL, WORK])],
+                Op::MoveOrigin => vec![line(&["remote", "set-url", "origin", URL])],
+                Op::DeleteRemote { name } => vec![line(&["push", "-q", "origin", "--delete", name])],
+                // The branch the work tree is on, pushed to its namesake and tracked from then on,
+                // so a later pull knows what to take.
+                Op::Push => vec![line(&["push", "-q", "-u", "origin", "HEAD"])],
                 Op::Fetch => vec![line(&["pull", "-q", "--ff-only"])],
                 Op::Verify => vec![line(&["fsck", "--full", "--strict"])],
                 // Git has no command that rebuilds a store from what it can still reach.
@@ -264,8 +278,11 @@ pub fn bind(tool: Tool, op: &Op) -> Option<Vec<Vec<String>>> {
                 // Git's merge and cherry-pick exit 1 on a conflict, which a build reads as a
                 // failed step; and git signs nothing by enrollment.
                 Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll => return None,
-                // The host is a forklift-server; git has no server of its own to clone from.
-                Op::Host | Op::Bundle | Op::Clone { .. } | Op::MoveOrigin | Op::DeleteRemote { .. } | Op::Withhold { .. } | Op::EnrollHost => return None,
+                // A scoped clone and a cache clone are Forklift's own: git's sparse checkout and
+                // partial clone keep a different contract, which no readback here judges.
+                Op::Clone { kind: CloneKind::Only(_) | CloneKind::Cache } => return None,
+                // A bundle, a withhold and a host's enrollment are forklift-server's own commands.
+                Op::Bundle | Op::Withhold { .. } | Op::EnrollHost => return None,
                 // Git has no redaction: a rewrite of history is a different operation.
                 Op::Redact { .. } => return None,
                 // Forklift's own commands, and the harness's steps around them.
@@ -357,10 +374,11 @@ impl Scenario {
     }
 
     /// The tools this scenario runs against: Forklift always; git, both ways, only when git binds
-    /// every operation of the history.
+    /// every operation of the history and the scenario's files are not a volume fault's, which
+    /// only Forklift is run on.
     pub fn tools(&self) -> Vec<Tool> {
         let git_binds_all = self.history.iter().all(|op| bind(Tool::Git, op).is_some());
-        if git_binds_all { vec![Tool::Forklift, Tool::Git, Tool::GitTuned] } else { vec![Tool::Forklift] }
+        if git_binds_all && !matches!(self.files, Files::Folded(_)) { vec![Tool::Forklift, Tool::Git, Tool::GitTuned] } else { vec![Tool::Forklift] }
     }
 
     /// Whether the report shows this scenario in the Forklift-only table.
@@ -679,7 +697,7 @@ mod tests {
             Op::Record { index: 0 }, Op::Branch { name: "side".into() }, Op::Switch { name: "side".into() },
             Op::Merge { name: "main".into() }, Op::Push, Op::Fetch, Op::Verify, Op::Repair,
             Op::Variant { index: 0 }, Op::Conflict { name: "side".into() }, Op::Pick { name: "side".into() },
-            Op::Park { index: 0 }, Op::Enroll, Op::Pack, Op::Host, Op::Clone { kind: CloneKind::Only("src".into()) },
+            Op::Park { index: 0 }, Op::Enroll, Op::Pack, Op::Host, Op::Clone { kind: CloneKind::Full }, Op::Clone { kind: CloneKind::Only("src".into()) },
             Op::Clone { kind: CloneKind::Cache }, Op::Bundle, Op::MoveOrigin, Op::DeleteRemote { name: "side".into() },
             Op::Withhold { index: 0 }, Op::Redact { index: 0 }, Op::EnrollHost,
             run(&["undo"]), serve(&["gc"]), Op::StopHost, Op::LoseKeys, Op::Age, Op::Scribble { index: 0 },
@@ -712,16 +730,29 @@ mod tests {
 
     /// Git binds what it has, the tuned binding with its durability and fsck options before the
     /// subcommand; repair is Forklift-only, and a scenario using it runs against Forklift alone.
+    /// A host is a bare repository: git binds hosting, a full clone through its transport, pushing
+    /// the branch it is on with tracking, deleting a remote branch and re-pointing origin; a scoped
+    /// or cache clone stays Forklift's.
     ///
-    /// Revert: bind git's repair to anything → the repair scenario counts git rows it cannot earn.
+    /// Revert: bind git's repair to anything → the repair scenario counts git rows it cannot earn;
+    /// clone without `--no-local` → the clone hardlinks the host's objects; push without `-u` → a
+    /// later pull has no branch to take.
     #[test]
     fn git_binds_what_it_has_and_the_rest_is_forklift_only() {
         for op in every_op() {
-            let forklift_only = matches!(op, Op::Repair | Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll | Op::Host | Op::Bundle | Op::Clone { .. } | Op::MoveOrigin
-                | Op::DeleteRemote { .. } | Op::Withhold { .. } | Op::Redact { .. } | Op::EnrollHost | Op::Run { .. } | Op::Serve { .. } | Op::StopHost
+            let forklift_only = matches!(op, Op::Repair | Op::Conflict { .. } | Op::Pick { .. } | Op::Enroll | Op::Bundle
+                | Op::Clone { kind: CloneKind::Only(_) | CloneKind::Cache }
+                | Op::Withhold { .. } | Op::Redact { .. } | Op::EnrollHost | Op::Run { .. } | Op::Serve { .. } | Op::StopHost
                 | Op::LoseKeys | Op::Age | Op::Scribble { .. } | Op::Write { .. } | Op::Inject { .. });
             assert_eq!(bind(Tool::Git, &op).is_some(), !forklift_only, "{:?}", op);
         }
+        assert_eq!(bind(Tool::Git, &Op::Clone { kind: CloneKind::Full }).unwrap(), vec![line(&["clone", "-q", "--no-local", URL, WORK])]);
+        assert_eq!(bind(Tool::Git, &Op::Push).unwrap(), vec![line(&["push", "-q", "-u", "origin", "HEAD"])]);
+        assert_eq!(bind(Tool::Git, &Op::Host).unwrap(), vec![
+            line(&["config", "remote.origin.url", URL]), line(&["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]),
+        ]);
+        assert_eq!(bind(Tool::Git, &Op::DeleteRemote { name: "side".into() }).unwrap(), vec![line(&["push", "-q", "origin", "--delete", "side"])]);
+        assert_eq!(bind(Tool::Git, &Op::MoveOrigin).unwrap(), vec![line(&["remote", "set-url", "origin", URL])]);
         let tuned = bind(Tool::GitTuned, &Op::Verify).unwrap();
         assert_eq!(tuned[0][..2], ["-c", "core.fsync=all"]);
         assert_eq!(tuned[0].last().unwrap(), "--strict");
