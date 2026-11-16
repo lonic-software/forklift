@@ -1228,6 +1228,18 @@ mod tests {
         assert!(scenario::known(&coverage) && scenario::known("signed"));
     }
 
+    /// A `--history-from` that names no folder is refused before the report folder is made.
+    ///
+    /// Revert: drop the check → the run goes on and makes the report folder.
+    #[test]
+    fn a_history_from_that_is_no_folder_is_refused() {
+        let out = fresh("out");
+        let missing = fresh("missing-history");
+        let options = RunOptions { history_from: Some(missing.clone()), ..bare(out.clone()) };
+        assert_eq!(run(&options, &Quiet).unwrap_err(), RunError::Refused(format!("--history-from {}: not a folder", missing.display())));
+        assert!(!out.exists());
+    }
+
     /// A run asked to stop stops with `Cancelled` and writes no report.
     ///
     /// Revert: drop the poll before the volume faults → the run completes.
