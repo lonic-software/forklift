@@ -1297,13 +1297,17 @@ mod tests {
         let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
         let git = path_git();
         let record = |parents: &[&str]| Record { parents: parents.iter().map(|parent| parent.to_string()).collect(), tree: Some("t".to_string()), ..Record::default() };
-        let mut before = Side::default();
-        before.records = BTreeMap::from([("w3".to_string(), record(&["w2", "wb"])), ("w2".to_string(), record(&["w1"])), ("w1".to_string(), record(&[])),
-            ("wb".to_string(), record(&["wa"])), ("wa".to_string(), record(&["w1"]))]);
-        before.pallets = BTreeMap::from([("main".to_string(), Some("w3".to_string()))]);
-        let mut after = Side::default();
-        after.records = BTreeMap::from([("n3".to_string(), record(&["n2"])), ("n2".to_string(), record(&["n1"])), ("n1".to_string(), record(&[]))]);
-        after.pallets = BTreeMap::from([("main".to_string(), Some("n3".to_string()))]);
+        let before = Side {
+            records: BTreeMap::from([("w3".to_string(), record(&["w2", "wb"])), ("w2".to_string(), record(&["w1"])), ("w1".to_string(), record(&[])),
+                ("wb".to_string(), record(&["wa"])), ("wa".to_string(), record(&["w1"]))]),
+            pallets: BTreeMap::from([("main".to_string(), Some("w3".to_string()))]),
+            ..Side::default()
+        };
+        let mut after = Side {
+            records: BTreeMap::from([("n3".to_string(), record(&["n2"])), ("n2".to_string(), record(&["n1"])), ("n1".to_string(), record(&[]))]),
+            pallets: BTreeMap::from([("main".to_string(), Some("n3".to_string()))]),
+            ..Side::default()
+        };
         let records = Records { steps: &mut steps, git: &git, environment: &environment, before: before.clone(), after: after.clone(), findings: Vec::new(), paired: BTreeMap::new(), returned: BTreeMap::new() };
         let findings = records.walk().unwrap();
         let lost: Vec<_> = findings.iter().filter(|finding| finding.field == "record").collect();
