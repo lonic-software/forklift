@@ -92,6 +92,18 @@ impl Steps<'_> {
     }
 }
 
+impl Steps<'_> {
+    /// Runs a query whose exit 1 means "no": its stdout on exit 0, none on exit 1, and any other
+    /// end refused with what it said.
+    fn ask(&mut self, program: &Path, arguments: &[&str], directory: &Path, environment: &Environment) -> Result<Option<Vec<u8>>, String> {
+        match self.run(program, arguments, directory, environment) {
+            Ok(stdout) => Ok(Some(stdout)),
+            Err(_) if self.outcomes.last().is_some_and(|outcome| outcome.exit == Some(1) && outcome.failure.is_none()) => Ok(None),
+            Err(reason) => Err(reason),
+        }
+    }
+}
+
 /// Writes `bytes` to `path`, saying which file could not be written.
 fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|error| format!("cannot write {}: {}", path.display(), error))
@@ -271,9 +283,20 @@ struct Comparison<'a, 'b> {
     after: PathBuf,
     direction: Direction,
     findings: Vec<Finding>,
+    /// Each commit that went in, by id, with the commit it was compared to and its position.
+    paired: BTreeMap<String, (String, String)>,
+    /// Each commit that came back, by id, with the commit that went in it was compared to.
+    returned: BTreeMap<String, String>,
 }
 
-impl Comparison<'_, '_> {
+impl<'a, 'b> Comparison<'a, 'b> {
+    fn new(steps: &'a mut Steps<'b>, git: &'a Path, environment: &'a Environment, before: &Path, after: &Path, direction: Direction) -> Self {
+        Comparison {
+            steps, git, environment, before: before.to_path_buf(), after: after.to_path_buf(), direction,
+            findings: Vec::new(), paired: BTreeMap::new(), returned: BTreeMap::new(),
+        }
+    }
+
     fn find(&mut self, field: impl Into<String>, at: impl Into<String>, before: Option<String>, after: Option<String>) {
         self.findings.push(Finding { direction: self.direction, field: field.into(), at: at.into(), before, after });
     }
@@ -293,19 +316,35 @@ impl Comparison<'_, '_> {
         }).collect())
     }
 
-    /// Compares the headers both objects have by name, apart from `skipped`; a header one side
-    /// lacks is a finding with nothing on that side.
+    /// Compares the headers either object has by name, apart from `skipped`: every value of a
+    /// name, in order, so one header split into two differs from it. A header one side lacks is a
+    /// finding with nothing on that side; the names both have, first appearing in a different
+    /// order, are a `header order` finding (`tag order` for a tag).
     fn headers(&mut self, prefix: &str, at: &str, before: &[(String, Vec<u8>)], after: &[(String, Vec<u8>)], skipped: &[&str]) {
         let names: BTreeSet<&String> = before.iter().chain(after).map(|(name, _)| name).filter(|name| !skipped.contains(&name.as_str())).collect();
-        for name in names {
-            let value = |headers: &[(String, Vec<u8>)]| -> Option<Vec<u8>> {
-                let values: Vec<&[u8]> = headers.iter().filter(|(header, _)| header == name).map(|(_, value)| value.as_slice()).collect();
-                (!values.is_empty()).then(|| values.join(&b"\n"[..]))
+        for name in &names {
+            let values = |headers: &[(String, Vec<u8>)]| -> Vec<Vec<u8>> {
+                headers.iter().filter(|(header, _)| header == *name).map(|(_, value)| value.clone()).collect()
             };
-            let (was, now) = (value(before), value(after));
+            let (was, now) = (values(before), values(after));
             if was != now {
-                self.find(format!("{}{}", prefix, name), at, was.as_deref().map(shown), now.as_deref().map(shown));
+                let show = |values: Vec<Vec<u8>>| (!values.is_empty()).then(|| values.iter().map(|value| shown(value)).collect::<Vec<_>>().join(" ; "));
+                self.find(format!("{}{}", prefix, name), at, show(was), show(now));
             }
+        }
+        // The names both have, each where it first appears.
+        let order = |headers: &[(String, Vec<u8>)], other: &[(String, Vec<u8>)]| -> Vec<String> {
+            let mut names: Vec<String> = Vec::new();
+            for (name, _) in headers {
+                if !names.contains(name) && other.iter().any(|(header, _)| header == name) {
+                    names.push(name.clone());
+                }
+            }
+            names
+        };
+        let (was, now) = (order(before, after), order(after, before));
+        if was != now {
+            self.find(format!("{}order", prefix), at, Some(was.join(" ")), Some(now.join(" ")));
         }
     }
 
@@ -371,22 +410,26 @@ impl Comparison<'_, '_> {
         Ok(())
     }
 
-    /// The commit a ref's object peels to, if any.
-    fn peeled(&mut self, side: &Path, id: &str) -> Option<String> {
+    /// The commit a ref's object peels to; none where it peels to no commit, and a git that fails
+    /// otherwise is an error.
+    fn peeled(&mut self, side: &Path, id: &str) -> Result<Option<String>, String> {
         let side = side.to_path_buf();
-        self.steps.run(self.git, &["rev-parse", "--verify", "-q", &format!("{}^{{commit}}", id)], &side, self.environment).ok().map(|stdout| printed(&stdout))
+        Ok(self.steps.ask(self.git, &["rev-parse", "--verify", "-q", &format!("{}^{{commit}}", id)], &side, self.environment)?.map(|stdout| printed(&stdout)))
     }
 
-    /// Walks both repositories in lockstep from every ref either holds.
+    /// Compares every ref either repository holds: one only one side holds is a `ref` finding, one
+    /// whose kind changed a `ref kind` finding, an annotated tag's object by content. From each ref
+    /// both hold that peels to a commit on both sides, the two histories are walked in lockstep.
+    /// Notes refs are compared last, by the commits they annotate, since a notes tree names each
+    /// note by its commit's id and no id survives the trip.
     fn walk(mut self) -> Result<Vec<Finding>, String> {
         let (before_dir, after_dir) = (self.before.clone(), self.after.clone());
         let (git, environment) = (self.git, self.environment);
         let was_refs = refs(self.steps, git, &before_dir, environment)?;
         let now_refs = refs(self.steps, git, &after_dir, environment)?;
-        let names: BTreeSet<&String> = was_refs.keys().chain(now_refs.keys()).collect();
-        // Each commit that went in is compared once, at the first position the walk reaches it by:
-        // ref by ref in name order, so a branch reaches a commit before a tag on it does.
-        let mut seen = BTreeSet::new();
+        let mut names: Vec<&String> = was_refs.keys().chain(now_refs.keys()).collect::<BTreeSet<_>>().into_iter().collect();
+        names.sort_by_key(|name| (name.starts_with("refs/notes/"), !name.starts_with("refs/heads/")));
+        // Branches first, so a commit is named by a branch position where one reaches it.
         for name in names {
             match (was_refs.get(name), now_refs.get(name)) {
                 (Some((kind, _)), None) => self.find("ref", name.as_str(), Some(ref_kind(name, kind).to_string()), None),
@@ -398,8 +441,17 @@ impl Comparison<'_, '_> {
                     } else if was_type == "tag" {
                         self.tag(name, was_id, now_id)?;
                     }
-                    if let (Some(was), Some(now)) = (self.peeled(&before_dir, was_id), self.peeled(&after_dir, now_id)) {
-                        self.lockstep(name, was, now, &mut seen)?;
+                    if name.starts_with("refs/notes/") {
+                        self.notes(name)?;
+                        continue;
+                    }
+                    match (self.peeled(&before_dir, was_id)?, self.peeled(&after_dir, now_id)?) {
+                        (Some(was), Some(now)) => self.lockstep(name, was, now)?,
+                        (None, None) => {}
+                        (was, now) => {
+                            let reaches = |commit: Option<String>| Some(if commit.is_some() { "a commit" } else { "no commit" }.to_string());
+                            self.find("ref target", name.as_str(), reaches(was), reaches(now));
+                        }
                     }
                 }
                 (None, None) => {}
@@ -409,26 +461,95 @@ impl Comparison<'_, '_> {
     }
 
     /// Walks from one ref's commits, `was` and `now`, breadth first: tip with tip, parent i with
-    /// parent i, skipping a commit that went in which is `seen` already. A parent one side has and
-    /// the other lacks is a `commit` finding at its position.
-    fn lockstep(&mut self, start: &str, was: String, now: String, seen: &mut BTreeSet<String>) -> Result<(), String> {
+    /// parent i. A commit that went in is compared once, at the first position the walk reaches
+    /// it by. Reached again paired with a different commit, or a commit that came back paired with
+    /// a second one that went in, it is a `commit identity` finding: a ref or a parent that came
+    /// back pointing elsewhere. A parent one side has and the other lacks is a `commit` finding at
+    /// its position, saying how many commits only it reaches.
+    fn lockstep(&mut self, start: &str, was: String, now: String) -> Result<(), String> {
         let mut queue = VecDeque::from([(Vec::new(), was, now)]);
         while let Some((path, was, now)) = queue.pop_front() {
-            if !seen.insert(was.clone()) {
+            let at = position(start, &path);
+            if let Some((paired, first)) = self.paired.get(&was) {
+                if *paired != now {
+                    let first = first.clone();
+                    self.find("commit identity", at, Some(format!("the commit at {}", first)), Some("a different commit".to_string()));
+                }
                 continue;
             }
-            let at = position(start, &path);
+            if let Some(other) = self.returned.get(&now) {
+                let first = self.paired[other].1.clone();
+                self.find("commit identity", at.as_str(), Some("a distinct commit".to_string()), Some(format!("the commit at {}", first)));
+            }
+            self.paired.insert(was.clone(), (now.clone(), at.clone()));
+            self.returned.entry(now.clone()).or_insert_with(|| was.clone());
             let (was_parents, now_parents) = self.commit(&at, &was, &now)?;
             for index in 0..was_parents.len().max(now_parents.len()) {
                 let mut next = path.clone();
                 next.push(index + 1);
                 match (was_parents.get(index), now_parents.get(index)) {
                     (Some(was), Some(now)) => queue.push_back((next, was.clone(), now.clone())),
-                    (Some(_), None) => self.find("commit", position(start, &next), Some("present".to_string()), None),
-                    (None, Some(_)) => self.find("commit", position(start, &next), None, Some("present".to_string())),
+                    (Some(lost), None) => {
+                        let only = self.only_below(&self.before.clone(), lost, &was_parents[..now_parents.len()])?;
+                        self.find("commit", position(start, &next), Some(only), None);
+                    }
+                    (None, Some(added)) => {
+                        let only = self.only_below(&self.after.clone(), added, &now_parents[..was_parents.len()])?;
+                        self.find("commit", position(start, &next), None, Some(only));
+                    }
                     (None, None) => {}
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// How many commits `parent` reaches that none of `kept` does, as a finding shows it.
+    fn only_below(&mut self, side: &Path, parent: &str, kept: &[String]) -> Result<String, String> {
+        let side = side.to_path_buf();
+        let mut arguments = vec!["rev-list", "--count", parent, "--not"];
+        arguments.extend(kept.iter().map(String::as_str));
+        let count = printed(&self.steps.run(self.git, &arguments, &side, self.environment)?);
+        Ok(format!("present, with {} commit{} only it reaches", count, if count == "1" { "" } else { "s" }))
+    }
+
+    /// The notes of one notes ref, keyed by the commit each annotates.
+    fn note_list(&mut self, side: &Path, name: &str) -> Result<BTreeMap<String, String>, String> {
+        let side = side.to_path_buf();
+        let listed = self.steps.run(self.git, &["notes", "--ref", name, "list"], &side, self.environment)?;
+        Ok(String::from_utf8_lossy(&listed).lines().filter_map(|line| line.split_once(' ')).map(|(note, object)| (object.to_string(), note.to_string())).collect())
+    }
+
+    /// Compares a notes ref both repositories hold through the commits the walk paired: each note
+    /// with the note on its commit's counterpart, by content. A note on a commit the walk never
+    /// reached is a finding at that commit's id, which is all that names it.
+    fn notes(&mut self, name: &str) -> Result<(), String> {
+        let (before_dir, after_dir) = (self.before.clone(), self.after.clone());
+        let (was_notes, mut now_notes) = (self.note_list(&before_dir, name)?, self.note_list(&after_dir, name)?);
+        for (object, was_note) in was_notes {
+            let Some((counterpart, at)) = self.paired.get(&object).cloned() else {
+                self.find("note", format!("{} on {}", name, object), Some("a note on a commit never compared".to_string()), None);
+                continue;
+            };
+            let at = format!("{} on {}", name, at);
+            let was = self.cat(&before_dir, "blob", &was_note)?;
+            match now_notes.remove(&counterpart) {
+                Some(now_note) => {
+                    let now = self.cat(&after_dir, "blob", &now_note)?;
+                    if was != now {
+                        self.find("note", at, Some(shown(&was)), Some(shown(&now)));
+                    }
+                }
+                None => self.find("note", at, Some(shown(&was)), None),
+            }
+        }
+        for (object, now_note) in now_notes {
+            let now = self.cat(&after_dir, "blob", &now_note)?;
+            let at = match self.returned.get(&object).map(|was| self.paired[was].1.clone()) {
+                Some(at) => format!("{} on {}", name, at),
+                None => format!("{} on {}", name, object),
+            };
+            self.find("note", at, None, Some(shown(&now)));
         }
         Ok(())
     }
@@ -447,7 +568,7 @@ pub fn git_round_trip(forklift: &Path, git: &Path, scratch: &Scratch, environmen
         steps.run(forklift, &["--json", "prepare"], &warehouse, environment)?;
         steps.run(forklift, &["--json", "git", "import", "--", &fixture.display().to_string()], &warehouse, environment)?;
         steps.run(forklift, &["--json", "git", "export", "--", &exported.display().to_string()], &warehouse, environment)?;
-        Comparison { steps: &mut steps, git, environment, before: fixture.clone(), after: exported.clone(), direction: Direction::GitForkliftGit, findings: Vec::new() }.walk()
+        Comparison::new(&mut steps, git, environment, &fixture, &exported, Direction::GitForkliftGit).walk()
     })();
     Trip { direction: Direction::GitForkliftGit, steps: steps.outcomes, findings }
 }
@@ -499,9 +620,7 @@ mod tests {
     }
 
     fn git() -> PathBuf {
-        let name = if cfg!(windows) { "git.exe" } else { "git" };
-        std::env::split_paths(&std::env::var_os("PATH").expect("a PATH")).map(|folder| folder.join(name))
-            .find(|path| path.is_file()).expect("a git on PATH")
+        crate::scrub::path_git()
     }
 
     fn area(label: &str) -> (Scratch, Environment) {
@@ -514,8 +633,27 @@ mod tests {
 
     fn compare(steps: &mut Steps, environment: &Environment, before: &Path, after: &Path) -> Vec<Finding> {
         let git = git();
-        Comparison { steps, git: &git, environment, before: before.to_path_buf(), after: after.to_path_buf(), direction: Direction::GitForkliftGit, findings: Vec::new() }
-            .walk().unwrap()
+        Comparison::new(steps, &git, environment, before, after, Direction::GitForkliftGit).walk().unwrap()
+    }
+
+    /// Every value of a header is compared in order, so one header split into two is a finding,
+    /// and the names both objects have, in another order, are one too.
+    ///
+    /// Revert: join a name's values into one before comparing → the split gpgsig compares equal.
+    #[test]
+    fn a_split_header_and_a_reordered_one_are_findings() {
+        let (scratch, environment) = area("headers");
+        let mut steps = Steps { scratch: &scratch, limit: Duration::from_secs(60), outcomes: Vec::new() };
+        let git = git();
+        let mut comparison = Comparison::new(&mut steps, &git, &environment, scratch.root(), scratch.root(), Direction::GitForkliftGit);
+        let header = |name: &str, value: &[u8]| (name.to_string(), value.to_vec());
+        comparison.headers("header ", "main", &[header("encoding", b"x"), header("gpgsig", b"A\nB")], &[header("encoding", b"x"), header("gpgsig", b"A"), header("gpgsig", b"B")], &[]);
+        comparison.headers("header ", "main~1", &[header("encoding", b"x"), header("mergetag", b"m")], &[header("mergetag", b"m"), header("encoding", b"x")], &[]);
+        let found: Vec<(String, String, Option<String>, Option<String>)> = comparison.findings.into_iter().map(|finding| (finding.field, finding.at, finding.before, finding.after)).collect();
+        assert_eq!(found, [
+            ("header gpgsig".to_string(), "main".to_string(), Some("A\\nB".to_string()), Some("A ; B".to_string())),
+            ("header order".to_string(), "main~1".to_string(), Some("encoding mergetag".to_string()), Some("mergetag encoding".to_string())),
+        ]);
     }
 
     /// Two builds of the fixture are the same commits, and compared they differ in nothing: a
@@ -554,10 +692,11 @@ mod tests {
 
     /// Each kind of difference the walk is for is found, named by its field and its position, with
     /// both values: two small repositories built by hand to differ in exactly those. Before: a root
-    /// commit with an executable file under a lightweight tag and a note, and main a two-parent
-    /// merge carrying a gpgsig header. After: the file not executable, the names and zones
-    /// changed, a trailer on the root's message, main with one parent and no header, the tag
-    /// annotated and no note.
+    /// commit with an executable file, under the branch `moved`, a lightweight tag, a notes ref of
+    /// its own and a note; main a two-parent merge carrying a gpgsig header; a tag of a tree.
+    /// After: the file not executable, the names and zones changed, a trailer on the root's
+    /// message, main with one parent and no header, `moved` at main instead, the tag annotated,
+    /// the tree's tag on the root, no second notes ref, and the note's text changed.
     ///
     /// Revert: compare only the tree id, not its entries → no `tree entry` finding.
     #[test]
@@ -588,31 +727,40 @@ mod tests {
             committer Fixture Committer <committer@example.com> 1700000000 +0000\ngpgsig A\n B\n\nmerge\n", tree, first, side);
         write(&scratch.root().join("merge"), merge.as_bytes()).unwrap();
         let merge = in_before(&["hash-object", "-t", "commit", "-w", "--", &scratch.root().join("merge").display().to_string()]);
-        for (name, id) in [("refs/heads/main", &merge), ("refs/tags/v", &first), ("refs/notes/extra", &first)] {
+        for (name, id) in [("refs/heads/main", &merge), ("refs/heads/moved", &first), ("refs/tags/v", &first), ("refs/notes/extra", &first), ("refs/tags/t", &tree)] {
             in_before(&["update-ref", name, id]);
         }
+        in_before(&["notes", "add", "-m", "went in", &first]);
         let (tree, first) = make(&mut steps, &after, "author@example.com +0000", "100644", "same\n\nForklift-Parcel: x");
         let mut in_after = |arguments: &[&str]| printed(&steps.run(&git, arguments, &after, &fixed).unwrap());
         let merge = in_after(&["commit-tree", &tree, "-p", &first, "-m", "merge"]);
-        in_after(&["update-ref", "refs/heads/main", &merge]);
+        for (name, id) in [("refs/heads/main", &merge), ("refs/heads/moved", &merge), ("refs/tags/t", &first)] {
+            in_after(&["update-ref", name, id]);
+        }
         in_after(&["tag", "-a", "-m", "v", "v", &first]);
+        in_after(&["notes", "add", "-m", "came back", &first]);
 
-        let mut found: Vec<(String, String)> = compare(&mut steps, &environment, &before, &after).into_iter().map(|finding| (finding.field, finding.at)).collect();
+        let findings = compare(&mut steps, &environment, &before, &after);
+        let mut found: Vec<(String, String)> = findings.iter().map(|finding| (finding.field.clone(), finding.at.clone())).collect();
         found.sort();
         let mut expected: Vec<(String, String)> = [
             ("author name", "main"), ("author zone", "main"), ("commit", "main^2"), ("header gpgsig", "main"), ("parent count", "main"), ("tree entry", "main tool"),
             ("author name", "main~1"), ("author zone", "main~1"), ("message", "main~1"), ("tree entry", "main~1 tool"),
             ("ref", "refs/notes/extra"), ("ref kind", "refs/tags/v"),
+            ("commit identity", "moved"), ("note", "refs/notes/commits on main~1"), ("ref target", "refs/tags/t"),
         ].map(|(field, at)| (field.to_string(), at.to_string())).into_iter().collect();
         expected.sort();
         assert_eq!(found, expected);
-        let findings = compare(&mut steps, &environment, &before, &after);
         let value = |field: &str| findings.iter().find(|finding| finding.field == field).map(|finding| (finding.before.clone(), finding.after.clone())).unwrap();
         assert_eq!(value("author zone"), (Some("+0130".to_string()), Some("+0000".to_string())));
         assert_eq!(value("parent count"), (Some("2".to_string()), Some("1".to_string())));
         assert_eq!(value("header gpgsig"), (Some("A\\nB".to_string()), None));
         assert_eq!(value("ref"), (Some("note".to_string()), None));
         assert_eq!(value("ref kind"), (Some("lightweight tag".to_string()), Some("annotated tag".to_string())));
+        assert_eq!(value("commit"), (Some("present, with 1 commit only it reaches".to_string()), None));
+        assert_eq!(value("commit identity"), (Some("the commit at main~1".to_string()), Some("a different commit".to_string())));
+        assert_eq!(value("note"), (Some("went in\\n".to_string()), Some("came back\\n".to_string())));
+        assert_eq!(value("ref target"), (Some("no commit".to_string()), Some("a commit".to_string())));
         let entry = value("tree entry");
         assert!(entry.0.unwrap().starts_with("100755 blob ") && entry.1.unwrap().starts_with("100644 blob "));
     }

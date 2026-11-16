@@ -504,7 +504,7 @@ impl Report {
             out.push_str("| Direction | Field | At | Went in | Came back |\n|---|---|---|---|---|\n");
             let cell = |value: &Option<String>| value.as_deref().map_or("nothing".to_string(), |value| value.replace('|', "\\|"));
             for finding in &self.fidelity {
-                let _ = writeln!(out, "| {} | {} | {} | {} | {} |", finding.direction.label(), finding.field, finding.at.replace('|', "\\|"), cell(&finding.before), cell(&finding.after));
+                let _ = writeln!(out, "| {} | {} | {} | {} | {} |", finding.direction.label(), finding.field.replace('|', "\\|"), finding.at.replace('|', "\\|"), cell(&finding.before), cell(&finding.after));
             }
             out.push_str("\nEach finding is a field a round trip changed or dropped, compared commit by commit, never by id. Findings never fail the run; each loss class gets a ticket.\n");
         }
