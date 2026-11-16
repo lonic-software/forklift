@@ -284,9 +284,9 @@ pub(crate) mod tests {
         assert_eq!(got, Baseline { positions, before: tip, after });
     }
 
-    /// A subject that does not read back unfaulted refuses its baseline, which is the subject's
-    /// (a position past its ref's first commit serves nothing); a pristine subject that is not
-    /// there is the harness's own failure.
+    /// A subject that does not read back unfaulted refuses its baseline, which is the subject's:
+    /// its packs zeroed, git serves no position. A pristine subject that is not there is the
+    /// harness's own failure.
     ///
     /// Revert: return the readback's refusal as the harness's → the first assertion fails.
     #[test]
@@ -295,13 +295,29 @@ pub(crate) mod tests {
         let mirror = mirrored(&shared, &environment);
         let pristine = shared.root().join("pristine");
         build_git(&path_git(), &mirror, &pristine, &shared, &environment, LIMIT).unwrap();
-        let past = vec![Position { reference: "main".into(), depth: 9 }];
+        let packs = pristine.join(crate::runner::state_folder(Tool::Git)).join("objects/pack");
+        let mut zeroed = 0;
+        for entry in std::fs::read_dir(&packs).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|extension| extension == "pack") {
+                let metadata = std::fs::metadata(&path).unwrap();
+                let mut permissions = metadata.permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                permissions.set_readonly(false);
+                std::fs::set_permissions(&path, permissions).unwrap();
+                let length = metadata.len() as usize;
+                std::fs::write(&path, vec![0u8; length]).unwrap();
+                zeroed += 1;
+            }
+        }
+        assert!(zeroed > 0, "no pack under {}", packs.display());
+        let tip = vec![Position { reference: "main".into(), depth: 0 }];
         let (row, environment) = scratch("git-baseline-refused-row");
         let programs = programs(PathBuf::from("forklift-not-used"));
-        let refused = baseline(Tool::Git, &pristine, &past, &programs, &row, &environment, LIMIT).unwrap();
-        assert!(refused.as_ref().is_err_and(|refusal| refusal.contains("the unfaulted readback")), "{:?}", refused);
+        let refused = baseline(Tool::Git, &pristine, &tip, &programs, &row, &environment, LIMIT).unwrap();
+        assert!(refused.as_ref().is_err_and(|refusal| refusal.contains("unfaulted")), "{:?}", refused);
         let (row, environment) = scratch("git-baseline-absent-row");
-        assert!(baseline(Tool::Git, &shared.root().join("absent"), &past, &programs, &row, &environment, LIMIT).is_err());
+        assert!(baseline(Tool::Git, &shared.root().join("absent"), &tip, &programs, &row, &environment, LIMIT).is_err());
     }
 
     /// Git's whole-store check names damage the sample did not reach: a commit only an unsampled

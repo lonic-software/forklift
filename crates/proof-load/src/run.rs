@@ -263,6 +263,18 @@ fn history_damage(
         let lengths = crate::history::git_lengths(&programs.git, &git_root, &scratch, &environment, HISTORY_LIMIT).map_err(|error| format!("git: {}", error))?;
         let present = crate::history::pallets(&programs.forklift, &forklift_root, &scratch, &environment, HISTORY_LIMIT).map_err(|error| format!("forklift: {}", error))?;
         let positions = crate::history::sample(&lengths, &present, crate::history::SAMPLED, seed);
+        // A position past its ref's length is the harness's own drawing, never a subject's refusal.
+        if let Some(wrong) = positions.iter().find(|position| lengths.get(&position.reference).is_none_or(|length| position.depth >= *length)) {
+            return Err(format!("the sample drew {:?}, which {:?} does not reach", wrong, lengths.get(&wrong.reference)));
+        }
+        if positions.is_empty() {
+            // Git's refs read, and none of them is a pallet forklift's import made.
+            return Err(if !lengths.is_empty() && present.is_empty() {
+                "forklift: the import made no pallet of a ref git holds".to_string()
+            } else {
+                "the sample holds no position: no ref both subjects hold has a commit".to_string()
+            });
+        }
         write_detail(output.root(), &format!("{}.json", BLOCK), &serde_json::json!({ "steps": steps, "lengths": lengths, "present": present, "positions": positions }))
             .map_err(|error| error.to_string())?;
         Ok((git_root, forklift_root, positions))
@@ -277,12 +289,6 @@ fn history_damage(
         }
     };
     let mut subjects = Vec::new();
-    if positions.is_empty() && !history_checks.iter().any(|entry: &Completeness| entry.check == "history subjects built") {
-        history_checks.push(Completeness {
-            subject: None, check: "history subjects built".to_string(), cell: Cell::Run,
-            missing: vec!["the sample holds no position: no ref both subjects hold has a commit".to_string()],
-        });
-    }
     if !positions.is_empty() {
         for tool in [Tool::Forklift, Tool::Git, Tool::GitTuned] {
             let pristine = if tool == Tool::Forklift { &forklift_root } else { &git_root };
@@ -326,7 +332,8 @@ fn history_damage(
     for (tool, binding, kind, role) in planned {
         let label = damage_label(tool, &binding, kind);
         if lane_started.elapsed() > budget {
-            // Finished unstarted, so the lane's announced count is still reached.
+            // Started and finished unrun, so the lane's announced count is still reached.
+            progress.block_started(Category::DamagedFiles, &label);
             progress.block_finished(Category::DamagedFiles, &label, tool == Tool::Forklift);
             gaps.entry(tool).or_default().push(format!("{}: not run: the lane's time budget was spent", label));
             continue;
@@ -1425,9 +1432,6 @@ mod tests {
         assert_eq!(row.grade, Grade::Healed);
         assert_eq!(row.pairing.map(|pairing| pairing.scenario), Some(scenario.to_string()));
     }
-
-    struct Quiet;
-    impl Progress for Quiet {}
 
     /// The history damage lane over a small mirrored history: both subjects built, their binding
     /// sets clean against their walks and their unfaulted readbacks taken. With no budget, every

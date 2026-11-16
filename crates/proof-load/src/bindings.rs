@@ -470,9 +470,6 @@ pub fn check_history(census: &Census, bindings: &[Binding], exemptions: &[Exempt
         .map(|name| format!("{}: the history subject holds it", name.path)).collect();
     missing.extend(damage::stale(census, bindings, exemptions).into_iter().map(|name| format!("stale binding: {}", name)));
     for binding in bindings {
-        if crate::git_layout::role_of(Tool::Forklift, binding.name).is_none() {
-            missing.push(format!("{}: the role map gives it no role", binding.name));
-        }
         if !binding.kinds.iter().all(|kind| kind.plants()) && !held(binding.name) {
             missing.push(format!("{}: the history subject does not hold it", binding.name));
         }
@@ -544,18 +541,18 @@ pub fn history_subject(tool: Tool) -> (&'static [Binding], &'static [Exemption])
 /// one walk.
 pub fn check_history_subject(tool: Tool, census: &Census, walked: &[String]) -> Vec<String> {
     let (bindings, exemptions) = history_subject(tool);
-    match tool {
+    let mut missing = match tool {
         Tool::Forklift => check_history(census, bindings, exemptions, walked),
         Tool::Git | Tool::GitTuned => {
             let scenario = crate::faulted::HISTORY_SCENARIO.to_string();
             let walks = [((scenario.clone(), Warehouse::Client), walked.to_vec())].into_iter().collect();
-            let mut missing = check_git(bindings, exemptions, &[scenario], &walks);
-            // check_git asks no role of a binding; a history row without one would never run.
-            missing.extend(bindings.iter().filter(|binding| crate::git_layout::role_of(tool, binding.name).is_none())
-                .map(|binding| format!("{}: the role map gives it no role", binding.name)));
-            missing
+            check_git(bindings, exemptions, &[scenario], &walks)
         }
-    }
+    };
+    // A binding with no role forms no (role, kind) group, so its rows would never run.
+    missing.extend(bindings.iter().filter(|binding| crate::git_layout::role_of(tool, binding.name).is_none())
+        .map(|binding| format!("{}: the role map gives it no role", binding.name)));
+    missing
 }
 
 /// The damage rows a history runs for `tool`: for each (role, kind) its bindings reach, one
