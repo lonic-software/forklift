@@ -1938,9 +1938,9 @@ mod tests {
             arguments: arguments.iter().map(|argument| argument.to_string()).collect(), exit, stdout: vec![], stderr: stderr.as_bytes().to_vec(),
             failure: message.map(|message| crate::tool::Failure { code: "x".into(), message: message.into(), next_step: None }),
         };
-        let reads = [ran(&["history", "main"], Some(0), "", None), ran(&["pallet", "create"], Some(2), "noise", Some("no parcel abc")), ran(&["bay", "add"], Some(1), "later", None)];
-        assert_eq!(unserved(Mark::Position(0), true, &reads), r#"the unfaulted readback did not serve Position(0): ["pallet", "create"] exited Some(2): no parcel abc"#);
-        assert_eq!(unserved(Mark::Position(1), true, &reads[2..]), r#"the unfaulted readback did not serve Position(1): ["bay", "add"] exited Some(1): later"#);
+        let reads = [ran(&["walk"], Some(0), "", None), ran(&["lay", "out"], Some(2), "noise", Some("no parcel abc")), ran(&["open"], Some(1), "later", None)];
+        assert_eq!(unserved(Mark::Position(0), true, &reads), r#"the unfaulted readback did not serve Position(0): ["lay", "out"] exited Some(2): no parcel abc"#);
+        assert_eq!(unserved(Mark::Position(1), true, &reads[2..]), r#"the unfaulted readback did not serve Position(1): ["open"] exited Some(1): later"#);
         assert_eq!(unserved(Mark::Position(2), false, &reads[..1]), "the unfaulted readback did not serve Position(2): its walk ended short of it");
     }
 
