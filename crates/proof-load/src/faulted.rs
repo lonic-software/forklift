@@ -983,7 +983,8 @@ pub(crate) fn grade_after(
 /// `audit` (a check: it reports and repairs nothing), then a fresh clone of the remote; for git
 /// `fsck --full` (a check), then each ref that no longer resolves restored with `update-ref` to
 /// its reflog's newest entry ([`reflog_tips`]) when that entry's objects are all present, then a
-/// fresh clone. A ref that still resolves is never moved, so a damaged reflog cannot rewind one.
+/// fresh clone. A loose ref that stands is never moved, so a damaged reflog cannot rewind one; a
+/// ref whose loose file is gone while packed-refs holds an ancestor of that entry is restored.
 /// A clone needs a remote, and is not made where the readback already reads through one, where
 /// the work tree sits on a volume the clone would leave, or over parked work, which no clone holds.
 /// What decides a restore (`rev-parse`, `rev-list`) is the harness's reading, like a readback,
@@ -1001,12 +1002,24 @@ fn own_remedies(context: &Context, expected: &Expected, trail: &mut Trail, made:
         Tool::Git | Tool::GitTuned => {
             trail.rescue(context, expected, made, promoted, Some(run(&["fsck", "--full", "--no-progress"], work.clone())?), None)?;
             let mut restored = false;
-            for (reference, hash) in reflog_tips(&work.join(runner::state_folder(context.tool))) {
+            let state = work.join(runner::state_folder(context.tool));
+            for (reference, hash) in reflog_tips(&state) {
                 let resolved = run(&["rev-parse", "--verify", "-q", &reference], work.clone())?;
-                let resolves = resolved.succeeded();
+                let value = resolved.succeeded().then(|| String::from_utf8_lossy(&resolved.stdout).trim().to_string());
                 trail.probes.push(resolved);
-                if resolves {
-                    continue;
+                if let Some(value) = value {
+                    // A ref that resolves is moved only when its loose file is gone and what it
+                    // falls back to (packed-refs) is behind its reflog's newest entry: a lost
+                    // update. A loose ref that stands is never moved, whatever its reflog says.
+                    if value == hash || state.join(&reference).exists() {
+                        continue;
+                    }
+                    let behind = run(&["merge-base", "--is-ancestor", &value, &hash], work.clone())?;
+                    let lost = behind.succeeded();
+                    trail.probes.push(behind);
+                    if !lost {
+                        continue;
+                    }
                 }
                 // A candidate whose history is not all present would restore a ref the readback
                 // then refuses: only one whose every object is there is restored. `fsck` cannot ask
@@ -1259,6 +1272,41 @@ mod tests {
         let probed: Vec<&str> = trail.probes.iter().map(|probe| probe.arguments[prefix].as_str()).collect();
         assert!(probed.contains(&"rev-parse") && probed.contains(&"rev-list"), "{:?}: {:?}", tool, probed);
         assert_eq!(trail.recoverability.rescued_by, Some(Rescue::LocalRepair));
+    }
+
+    /// A branch whose loose file is gone while packed-refs still holds an older commit resolves,
+    /// silently, to that commit: the update is lost, and its reflog's newest entry restores it.
+    ///
+    /// Revert: skip every ref that resolves → `main` stays on the packed, older commit.
+    #[test]
+    fn a_loose_ref_lost_over_an_older_packed_one_is_restored() {
+        let git = path_git();
+        let scenario = crate::scenario::catalog().into_iter().find(|scenario| scenario.id == "parked").unwrap();
+        let corpus = corpus::generate(7, corpus::Shape { records: corpus::Shape::SMALL.records + 1, ..corpus::Shape::SMALL });
+        let programs = Programs { forklift: PathBuf::from("forklift-not-used"), git: git.clone(), server: None };
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch::create(&std::env::temp_dir().join(format!("proof-load-git-packed-{}-{}", std::process::id(), nanos))).unwrap();
+        let search = crate::scrub::search_path(Some(&git), std::env::var_os("PATH"));
+        let environment = Environment::scrubbed(&scratch, search, &BTreeMap::new()).unwrap();
+        let built = runner::build(&scenario, &corpus, Tool::Git, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
+        let context = Context {
+            tool: Tool::Git, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
+            limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false,
+        };
+        let git_run = |arguments: &[&str]| context.run(&git, arguments.iter().map(|argument| argument.to_string()).collect(), scratch.work()).unwrap();
+        let head = |reference: &str| String::from_utf8_lossy(&git_run(&["rev-parse", reference]).stdout).trim().to_string();
+        let (main, first) = (head("refs/heads/main"), head("refs/heads/main~1"));
+        assert!(git_run(&["update-ref", "refs/heads/main", &first]).succeeded());
+        assert!(git_run(&["pack-refs", "--all"]).succeeded());
+        assert!(git_run(&["update-ref", "refs/heads/main", &main]).succeeded());
+        damage::apply(&scratch.work().join(".git/refs/heads/main"), Kind::Delete, 0).unwrap();
+        assert_eq!(head("refs/heads/main"), first, "the branch fell back to its packed value");
+
+        let (expected, _) = expected(&scenario, &corpus, &built, Warehouse::Client).unwrap();
+        let (mut trail, mut made) = (Trail::default(), Made::default());
+        own_remedies(&context, &expected, &mut trail, &mut made, Made::default()).unwrap();
+        assert_eq!(head("refs/heads/main"), main, "the lost update is restored");
+        assert!(trail.steps.iter().any(|step| step.arguments[..2] == ["update-ref".to_string(), "refs/heads/main".to_string()]));
     }
 
     /// The newest entry of each ref's reflog, in path order; a log whose last line names no commit
