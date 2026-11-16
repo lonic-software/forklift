@@ -1160,7 +1160,8 @@ mod tests {
     /// the build; its walk is classified either way, and git at its defaults runs none.
     ///
     /// Revert: skip starting the daemon after a clone → the lifted build's walk has no socket;
-    /// drop the daemon's kill → `status` still says it watches after the build is dropped.
+    /// drop both the daemon's stop and its kill → `status` still says it watches after the build
+    /// is dropped.
     #[test]
     fn a_tuned_build_watches_its_work_tree_until_it_is_dropped() {
         let git = path_git();

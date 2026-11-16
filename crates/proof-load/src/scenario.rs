@@ -204,8 +204,9 @@ fn line(arguments: &[&str]) -> Vec<String> {
 const GIT_FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
 
 /// Git's options for the tuned binding, given before the subcommand: every write synced, every
-/// object a transfer brings checked, a commit-graph kept by every gc and fetch and read by every
-/// walk, and the untracked-file cache kept in the index. The fsmonitor daemon, where this git has
+/// object a transfer brings checked, a commit-graph written by a gc or a fetch and read where one
+/// exists (no scenario git runs does either yet, so none is written), and the untracked-file cache
+/// kept in the index. The fsmonitor daemon, where this git has
 /// one, is the work tree's own configuration instead (see `runner::FsmonitorDaemon`), so the bare
 /// host and the harness's readback clones run without one.
 pub(crate) const GIT_TUNED: &[&str] = &[
