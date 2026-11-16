@@ -317,14 +317,17 @@ impl Context<'_> {
     }
 
     /// The operation each of [`Context::lines`] belongs to, in the same order: its `op` tag, as
-    /// the scenario names it, so every subject's lines for one operation share a label.
+    /// the scenario names it, with its occurrence (`#2`) where the operations repeat it, so every
+    /// subject's lines for one operation share a label and two operations never do.
     pub(crate) fn line_ops(&self, index: usize) -> Result<Vec<String>, RunError> {
+        let record = Op::Record { index };
+        let all: Vec<&Op> = std::iter::once(&record).chain(self.then).collect();
+        let tags = all.iter().map(|op| serde_json::to_value(op).ok().and_then(|value| value.get("op").and_then(|tag| tag.as_str()).map(str::to_string))
+            .ok_or_else(|| RunError::Io(format!("{:?} serializes without an op tag", op)))).collect::<Result<Vec<String>, RunError>>()?;
         let mut ops = Vec::new();
-        for op in std::iter::once(&Op::Record { index }).chain(self.then) {
+        for (at, op) in all.iter().enumerate() {
             let bound = bind(self.tool, op).ok_or_else(|| RunError::Io(format!("{:?} has no {:?} binding", op, self.tool)))?;
-            let tag = serde_json::to_value(op).ok().and_then(|value| value.get("op").and_then(|tag| tag.as_str()).map(str::to_string))
-                .ok_or_else(|| RunError::Io(format!("{:?} serializes without an op tag", op)))?;
-            ops.extend(bound.iter().map(|_| tag.clone()));
+            ops.extend(bound.iter().map(|_| op_labels(&tags)[at].clone()));
         }
         Ok(ops)
     }
@@ -1136,6 +1139,17 @@ fn first_parents(head: Option<&str>, stdout: &[u8], wanted: usize) -> Vec<String
     chain
 }
 
+/// Each operation's label from its tag: the tag, with its occurrence where the tags repeat it.
+pub(crate) fn op_labels(tags: &[String]) -> Vec<String> {
+    tags.iter().enumerate().map(|(at, tag)| {
+        if tags.iter().filter(|other| *other == tag).count() > 1 {
+            format!("{}#{}", tag, tags[..=at].iter().filter(|other| *other == tag).count())
+        } else {
+            tag.clone()
+        }
+    }).collect()
+}
+
 /// What the faulted command of a built scenario must leave readable: the record it writes, and
 /// what every record may then hold. Fails when the corpus has no record after the history's.
 pub(crate) fn expected(scenario: &Scenario, corpus: &Corpus, built: &runner::Built, warehouse: Warehouse) -> Result<(Expected, usize), RunError> {
@@ -1652,6 +1666,16 @@ fn heal_repaired(stdout: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Each operation keeps its tag, and one the operations repeat is told apart by occurrence,
+    /// so two operations never share a plate line.
+    ///
+    /// Revert: label by tag alone → both runs read `run`.
+    #[test]
+    fn operations_are_labelled_apart() {
+        let tags = ["record", "run", "park", "run"].map(str::to_string);
+        assert_eq!(op_labels(&tags), ["record", "run#1", "park", "run#2"]);
+    }
+
     use super::*;
     use std::collections::BTreeMap;
 

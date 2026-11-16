@@ -236,9 +236,9 @@ impl Subject {
         path == self.binary || self.exec_path.as_ref().is_some_and(|folder| path.strip_prefix(folder.as_str()).is_some_and(|rest| rest.starts_with('/')))
     }
 
-    /// The thread groups of `calls` that are the subject's.
-    fn groups(&self, calls: &[Call], groups: &BTreeMap<u32, u32>) -> BTreeSet<u32> {
-        trace::owned_groups(calls, groups, &|path| self.owns(path))
+    /// For each call of `calls`, whether the subject's program made it.
+    fn calls(&self, calls: &[Call], groups: &BTreeMap<u32, u32>) -> Vec<bool> {
+        trace::owned_calls(calls, groups, &|path| self.owns(path))
     }
 }
 
@@ -250,8 +250,8 @@ impl Subject {
 #[allow(clippy::too_many_arguments)]
 pub fn enumerate(calls: &[Call], line: usize, command: &str, subject: &Subject, root: &Root, start: &str, existed: impl Fn(&str) -> bool) -> Result<Enumerated, Vec<String>> {
     let groups = trace::thread_groups(calls);
-    let owned = subject.groups(calls, &groups);
-    enumerate_in(calls, groups, &|group| owned.contains(&group), line, &|_| (command.to_string(), 0), root, start, Some(&existed))
+    let owned = subject.calls(calls, &groups);
+    enumerate_in(calls, groups, &owned, line, &|_| (command.to_string(), 0), root, start, Some(&existed))
 }
 
 /// The kill points of a trace attached to the running server `pid`: [`enumerate`], every thread
@@ -263,7 +263,9 @@ pub fn enumerate(calls: &[Call], line: usize, command: &str, subject: &Subject, 
 /// a relative one, is counted by position instead. A symlink below the root would still differ
 /// unseen; the server's warehouse layout makes none.
 pub fn enumerate_served(calls: &[Call], pid: u32, unit: &dyn Fn(&Call) -> (String, u64), root: &Root, start: &str) -> Result<Enumerated, Vec<String>> {
-    enumerate_in(calls, trace::attached_groups(calls, pid), &|group| group == pid, 0, unit, root, start, None)
+    let groups = trace::attached_groups(calls, pid);
+    let owned: Vec<bool> = calls.iter().map(|call| groups.get(&call.tid).copied().unwrap_or(call.tid) == pid).collect();
+    enumerate_in(calls, groups, &owned, 0, unit, root, start, None)
 }
 
 /// The resolved form strace adds to a -P `path` that exists when it starts, from its working
@@ -275,7 +277,7 @@ fn resolved_aim(start: &str, path: &str, root: &Root) -> (String, Option<String>
 }
 
 #[allow(clippy::too_many_arguments)]
-fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, owned: &dyn Fn(u32) -> bool, line: usize, command: &dyn Fn(&Call) -> (String, u64), root: &Root, start: &str, existed: Option<&dyn Fn(&str) -> bool>) -> Result<Enumerated, Vec<String>> {
+fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, owned: &[bool], line: usize, command: &dyn Fn(&Call) -> (String, u64), root: &Root, start: &str, existed: Option<&dyn Fn(&str) -> bool>) -> Result<Enumerated, Vec<String>> {
     let mut directories = Directories::new(groups, start);
     let mut refusals = Vec::new();
     let mut enumerated = Enumerated::default();
@@ -308,7 +310,7 @@ fn enumerate_in(calls: &[Call], groups: BTreeMap<u32, u32>, owned: &dyn Fn(u32) 
         }
         let group = directories.group(call.tid);
         let base = resolved.first().map(|path| trace::base(&trace::without_temp(&root.tokenized(path), group).0)).unwrap_or_default();
-        if !owned(group) {
+        if !owned[index] {
             enumerated.children.insert(format!("{} {}", call.name, base));
             continue;
         }
@@ -383,16 +385,21 @@ pub fn landing(calls: &[Call], point: &Point, root: &Root, exit: Option<i32>, su
     // Under -P the trace holds only selected calls and no execve, and the target is a path the
     // subject's processes alone name; a positional point's trace holds every process call.
     let groups = trace::thread_groups(calls);
-    let owned = subject.groups(calls, &groups);
-    landing_in(calls, point, root, &groups, &|group| owned.contains(&group))
+    let owned = match point.aim {
+        Aim::Position => subject.calls(calls, &groups),
+        Aim::Path { .. } => vec![true; calls.len()],
+    };
+    landing_in(calls, point, root, &groups, &owned)
 }
 
 /// [`landing`] in a trace attached to the running server `pid`, which the caller saw killed.
 pub fn landing_served(calls: &[Call], point: &Point, root: &Root, pid: u32) -> Landing {
-    landing_in(calls, point, root, &trace::attached_groups(calls, pid), &|group| group == pid)
+    let groups = trace::attached_groups(calls, pid);
+    let owned: Vec<bool> = calls.iter().map(|call| groups.get(&call.tid).copied().unwrap_or(call.tid) == pid).collect();
+    landing_in(calls, point, root, &groups, &owned)
 }
 
-fn landing_in(calls: &[Call], point: &Point, root: &Root, groups: &BTreeMap<u32, u32>, owned: &dyn Fn(u32) -> bool) -> Landing {
+fn landing_in(calls: &[Call], point: &Point, root: &Root, groups: &BTreeMap<u32, u32>, owned: &[bool]) -> Landing {
     let mut seen = Vec::new();
     for (index, call) in calls.iter().enumerate() {
         if call.name != point.name || call.returned != Returned::Unknown {
@@ -408,8 +415,15 @@ fn landing_in(calls: &[Call], point: &Point, root: &Root, groups: &BTreeMap<u32,
         };
         let group = groups.get(&call.tid).copied().unwrap_or(call.tid);
         let found = identity(&touched.operands, &touched.detail, root, group);
-        if position == point.when && stands_for(&found, &point.target, point.aim == Aim::Position) && (point.aim != Aim::Position || owned(group)) {
-            return Landing::Landed;
+        if position == point.when && stands_for(&found, &point.target, point.aim == Aim::Position) && (point.aim != Aim::Position || owned[index]) {
+            // strace counts each process's calls apart, so another process's call at the same
+            // count is killed too: such a run is two kills, not the point's.
+            let also = calls.iter().find(|other| other.name == point.name && other.returned == Returned::Unknown
+                && groups.get(&other.tid).copied().unwrap_or(other.tid) != group);
+            return match also {
+                Some(other) => Landing::NotReached { why: format!("the kill also landed on process {}'s {}", other.tid, other.name) },
+                None => Landing::Landed,
+            };
         }
         seen.push(format!("{}#{} {}", call.name, position, found.paths.join(" ")));
     }
@@ -632,7 +646,6 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
     let mut lines = Vec::new();
     let ops = counting_context.line_ops(faulted)?;
     for (index, (arguments, op)) in counting_context.lines(faulted)?.into_iter().zip(ops).enumerate() {
-        let arguments: Vec<String> = arguments;
         let before = listing(counting.root());
         let start = (dumps && index > 0).then(|| crate::power::scan(counting.root()).map_err(|error| error.to_string()));
         let trace_path = settings.traces.join(format!("{}-count-{}.trace", label, index));
@@ -649,6 +662,11 @@ pub fn count(scenario: &Scenario, corpus: &Corpus, programs: &Programs, settings
         let text = std::fs::read_to_string(&trace_path).map_err(io)?;
         let calls = trace::parse(&text).map_err(RunError::Io)?;
         if let Some(reason) = background(&calls, &counting, tool, &arguments) {
+            // Git's own maintenance is git's design; forklift leaving work behind is a finding,
+            // so it fails the lane rather than skipping it.
+            if tool == Tool::Forklift {
+                return Err(RunError::Io(reason));
+            }
             return Ok(Counting::NotRun(reason));
         }
         lines.push(CountedLine { arguments, op, outcome, calls, before, start });
@@ -667,6 +685,12 @@ fn background(calls: &[Call], counting: &Scratch, tool: Tool, arguments: &[Strin
         return Some(format!("background maintenance: `{}` left .git/gc.pid", arguments.join(" ")));
     }
     trace::outlived(calls).then(|| format!("background maintenance: a process of `{}` ran on after it exited", arguments.join(" ")))
+}
+
+/// Whether a scenario's kill rows pair on the data plate: git runs both its history and its
+/// faulted command, so a git subject's rows stand beside forklift's.
+fn paired(scenario: &Scenario) -> bool {
+    scenario.tools().len() > 1 && scenario.then.iter().all(|op| crate::scenario::bind(Tool::Git, op).is_some())
 }
 
 /// Whose processes a faulted command's points are, as `context` runs it: forklift's binary, or
@@ -756,7 +780,7 @@ pub(crate) fn points_of(counted: &Counted, schema: &crate::writeops::Schema) -> 
 /// injected run works on a copy of the template beside it.
 /// `tool` is the subject `counting` ran as.
 pub fn run(scenario: &Scenario, programs: &Programs, settings: &Settings, template: &Scratch, counting: &Counting, tool: Tool) -> Result<ScenarioKills, RunError> {
-    let mut kills = ScenarioKills { scenario: scenario.id.clone(), subject: tool, paired: scenario.tools().len() > 1, ..Default::default() };
+    let mut kills = ScenarioKills { scenario: scenario.id.clone(), subject: tool, paired: paired(scenario), ..Default::default() };
     let counted = match counting {
         Counting::Counted(counted) => counted,
         Counting::NotRun(reason) => {
@@ -958,12 +982,14 @@ pub fn summarize_as(kills: &[ScenarioKills], side: Side) -> Summary {
     for subject in subjects {
         let of: Vec<&ScenarioKills> = kills.iter().filter(|scenario| scenario.subject == subject).collect();
         let one = summarize_subject(&of, side, subject);
+        // The lane's cell and its count of unreached points are forklift's; git's gaps are its
+        // units check's.
         if subject == Tool::Forklift {
             summary.cell = one.cell;
+            summary.not_reached = one.not_reached;
         }
         summary.rows.extend(one.rows);
         summary.completeness.extend(one.completeness);
-        summary.not_reached += one.not_reached;
     }
     summary
 }
@@ -1132,7 +1158,8 @@ mod tests {
     ///
     /// Revert: own every descendant → the hook's write is a point; own the exec path's folder by
     /// prefix alone → `/usr/lib/git-core-x/hook` is git's; drop the parent's verdict → the fork of
-    /// git is listed.
+    /// git is listed; judge a process by its last execve alone → its write as git before it ran
+    /// a shell is listed.
     #[test]
     fn a_process_is_the_subjects_by_what_it_last_executed() {
         let text = "\
@@ -1147,16 +1174,20 @@ mod tests {
 73 write(3</o/s/0001-h-count/work/hook>, \"a\", 1) = 1
 73 clone(child_stack=NULL, flags=SIGCHLD) = 74
 74 write(3</o/s/0001-h-count/work/hook-fork>, \"a\", 1) = 1
+70 clone(child_stack=NULL, flags=SIGCHLD) = 75
+75 write(3</o/s/0001-h-count/work/.git/before-exec>, \"a\", 1) = 1
+75 execve(\"/bin/sh\", [], 0x1 /* 3 vars */) = 0
+75 write(3</o/s/0001-h-count/work/after-exec>, \"a\", 1) = 1
 ";
         let calls = trace::parse(text).unwrap();
         let git = Subject { binary: "/usr/bin/git".into(), exec_path: Some("/usr/lib/git-core".into()) };
         let enumerated = enumerate(&calls, 0, "commit", &git, &root(), "/o/s/0001-h-count/work", |_| false).unwrap();
         let bases: Vec<&str> = enumerated.points.iter().map(|point| point.base.as_str()).collect();
-        assert_eq!(bases, ["<root>/work/.git/gc.log", "<root>/work/.git/fork"]);
-        assert_eq!(enumerated.children, BTreeSet::from(["write <root>/work/hook".to_string(), "write <root>/work/hook-fork".to_string()]));
+        assert_eq!(bases, ["<root>/work/.git/gc.log", "<root>/work/.git/fork", "<root>/work/.git/before-exec"]);
+        assert_eq!(enumerated.children, BTreeSet::from(["write <root>/work/hook", "write <root>/work/hook-fork", "write <root>/work/after-exec"].map(str::to_string)));
         let forklift = enumerate(&calls, 0, "commit", &subject(), &root(), "/o/s/0001-h-count/work", |_| false).unwrap();
         assert!(forklift.points.is_empty(), "{:?}", forklift.points);
-        assert_eq!(forklift.children.len(), 4);
+        assert_eq!(forklift.children.len(), 6);
     }
 
     /// A served trace counts every thread the server already had as its own, and a point's
@@ -1307,6 +1338,16 @@ mod tests {
 80 openat(AT_FDCWD</o/s/0001-h-kill-4/work>, \".forklift/pallets/main.tmp~80-0\", O_WRONLY|O_CREAT) = ?
 ").unwrap();
         assert_eq!(landing(&forked, &target, &injected, None, &git), Landing::Landed, "a fork of git is git");
+        // strace counts every process apart, so a kill that also stopped another's call at the
+        // same count is two kills, not the point's.
+        let twice = trace::parse("\
+70 execve(\"/usr/bin/git\", [], 0x1) = 0
+70 clone(child_stack=NULL, flags=SIGCHLD) = 81
+70 openat(AT_FDCWD</o/s/0001-h-kill-4/work>, \"x\", O_RDONLY) = 3</o/s/0001-h-kill-4/work/x>
+70 openat(AT_FDCWD</o/s/0001-h-kill-4/work>, \".forklift/pallets/main.tmp~70-0\", O_WRONLY|O_CREAT) = ?
+81 openat(AT_FDCWD</o/s/0001-h-kill-4/work>, \"y\", O_RDONLY) = ?
+").unwrap();
+        assert!(matches!(landing(&twice, &target, &injected, None, &git), Landing::NotReached { why } if why.contains("process 81")));
         // A killed call whose place strace could not name is reported, not passed over.
         let unplaced = trace::parse("70 openat(9, \".forklift/pallets/main.tmp~70-0\", O_WRONLY|O_CREAT) = ?\n").unwrap();
         assert!(matches!(landing(&unplaced, &target, &injected, None, &subject()), Landing::NotReached { why } if why.contains("openat#1 openat of \".forklift/pallets/main.tmp~70-0\" is relative to a folder strace could not name")));
@@ -1418,7 +1459,20 @@ mod tests {
             (Some(Tool::Git), "kill-point units, git", 1), (None, "kill-point soundness, git", 1), (None, "kill points ran, git", 0),
             (Some(Tool::Git), "kill points of compacted, git", 0),
         ]);
-        assert_eq!(summary.not_reached, 1);
+        assert_eq!(summary.not_reached, 0, "git's unreached point is its units check's");
+    }
+
+    /// A scenario's kill rows pair only where git binds its faulted command too.
+    ///
+    /// Revert: pair on the history's binding alone → compacted, whose faulted command git cannot
+    /// run, pairs.
+    #[test]
+    fn kill_rows_pair_only_where_git_runs_the_faulted_command() {
+        let scenarios = crate::scenario::catalog();
+        let of = |id: &str| scenarios.iter().find(|scenario| scenario.id == id).unwrap_or_else(|| panic!("{} is in the catalog", id));
+        assert!(paired(of("history")));
+        assert!(of("compacted").tools().len() > 1, "the history git binds");
+        assert!(!paired(of("compacted")));
     }
 
     /// A git line's command id is its subcommand after any `-c` pairs; forklift's is the schema's.

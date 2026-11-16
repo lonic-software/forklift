@@ -746,6 +746,15 @@ pub const GIT_TEMP_PREFIXES: &[&str] = &["tmp_obj_", "tmp_pack_", "tmp_idx_", "t
 fn without_git_temp(path: &str) -> (String, bool) {
     let mut changed = false;
     let parts: Vec<String> = path.split('/').map(|component| {
+        // Repack's packs, `.tmp-<pid>-pack-<hash>.pack`, carry the pid of the repack that named
+        // them, not of the pack-objects that writes them.
+        if let Some(rest) = component.strip_prefix(".tmp-") {
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
+            if digits > 0 && rest[digits..].starts_with("-pack") {
+                changed = true;
+                return format!(".tmp-<pid>{}", &rest[digits..]);
+            }
+        }
         for prefix in GIT_TEMP_PREFIXES {
             if let Some(random) = component.strip_prefix(prefix) {
                 if random.len() == 6 && random.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -759,39 +768,50 @@ fn without_git_temp(path: &str) -> (String, bool) {
     (parts.join("/"), changed)
 }
 
-/// The thread groups in `calls` that run a program `owns` accepts, given the canonical path of
-/// what each group last executed: a group's own last successful execve, or, for one that never
-/// executes anything, its parent's verdict, since a fork without an exec runs the same program.
-/// The traced command's own group, the trace's first, runs the program strace started when the
-/// trace shows it no exec (a trace filtered to a few calls); any other group with neither belongs
-/// to nothing.
-pub fn owned_groups(calls: &[Call], groups: &BTreeMap<u32, u32>, owns: &dyn Fn(&str) -> bool) -> std::collections::BTreeSet<u32> {
+/// For each call in `calls`, whether the program its process ran when it made the call is one
+/// `owns` accepts, given the canonical path of each successful execve: a process runs what it
+/// last executed, and before its first execve, what its parent ran when it spawned it, since a
+/// fork without an exec runs the same program. The traced command's own process, the trace's
+/// first, runs the program strace started until it executes another.
+pub fn owned_calls(calls: &[Call], groups: &BTreeMap<u32, u32>, owns: &dyn Fn(&str) -> bool) -> Vec<bool> {
     let group = |tid: u32| groups.get(&tid).copied().unwrap_or(tid);
-    let mut executed: BTreeMap<u32, bool> = BTreeMap::new();
-    for call in calls.iter().filter(|call| call.name == "execve" && matches!(call.returned, Returned::Value(_))) {
-        if let Some(Argument::Text(path)) = call.arguments.first().map(|text| argument(text)) {
-            executed.insert(group(call.tid), owns(&canonical(&path)));
-        }
-    }
     let parents: BTreeMap<u32, u32> = spawns(calls).into_iter().filter(|(_, _, thread)| !thread)
         .map(|(parent, child, _)| (group(child), group(parent))).collect();
+    let mut running: BTreeMap<u32, bool> = BTreeMap::new();
     if let Some(top) = calls.first().map(|call| group(call.tid)) {
-        executed.entry(top).or_insert(true);
+        running.insert(top, true);
     }
-    let every: std::collections::BTreeSet<u32> = calls.iter().map(|call| group(call.tid)).collect();
-    every.into_iter().filter(|start| {
-        let mut at = *start;
-        // A chain of parents ends within as many steps as there are groups; a cycle reads as none.
-        for _ in 0..=parents.len() {
-            if let Some(verdict) = executed.get(&at) {
-                return *verdict;
-            }
-            match parents.get(&at) {
-                Some(parent) => at = *parent,
-                None => return false,
+    // A child's first call can print before its parent's clone returns: it takes what its parent
+    // runs then, or, with no parent in the trace, nothing of the subject's.
+    fn verdict(running: &mut BTreeMap<u32, bool>, parents: &BTreeMap<u32, u32>, at: u32, depth: usize) -> bool {
+        if let Some(verdict) = running.get(&at) {
+            return *verdict;
+        }
+        let inherited = match parents.get(&at) {
+            Some(parent) if depth <= parents.len() => verdict(running, parents, *parent, depth + 1),
+            _ => false,
+        };
+        running.insert(at, inherited);
+        inherited
+    }
+    calls.iter().map(|call| {
+        let at = group(call.tid);
+        let current = verdict(&mut running, &parents, at, 0);
+        if matches!(call.name.as_str(), "clone" | "clone3" | "fork" | "vfork") && !call.arguments.iter().any(|argument| argument.contains("CLONE_THREAD")) {
+            if let Returned::Value(child) = &call.returned {
+                if let Ok(child) = child.parse::<u32>() {
+                    running.entry(group(child)).or_insert(current);
+                }
             }
         }
-        false
+        if call.name == "execve" && matches!(call.returned, Returned::Value(_)) {
+            if let Some(Argument::Text(path)) = call.arguments.first().map(|text| argument(text)) {
+                let now = owns(&canonical(&path));
+                running.insert(at, now);
+                return now;
+            }
+        }
+        current
     }).collect()
 }
 
@@ -1078,6 +1098,9 @@ mod tests {
         assert_eq!(without_temp(".git/objects/incoming-a1B2c3/pack", 87), (".git/objects/incoming-<rand>/pack".into(), true));
         assert_eq!(without_temp(".git/objects/3f/tmp_obj_Ab9xQ", 87), (".git/objects/3f/tmp_obj_Ab9xQ".into(), false));
         assert_eq!(without_temp(".git/objects/3f/tmp_obj_Ab9x-z", 87), (".git/objects/3f/tmp_obj_Ab9x-z".into(), false));
+        // Repack's packs carry the repack's pid, whichever process writes them.
+        assert_eq!(without_temp(".git/objects/pack/.tmp-4242-pack-ab12.pack", 87), (".git/objects/pack/.tmp-<pid>-pack-ab12.pack".into(), true));
+        assert_eq!(without_temp(".git/objects/pack/.tmp-pack", 87), (".git/objects/pack/.tmp-pack".into(), false));
         assert_eq!(base(".forklift/objects/92/0f3a5e9bc1d2e3f4a5b6c7d8e9f00112.tmp~<pid>-<n>"), ".forklift/objects/<hex>/<hex>.tmp~<pid>-<n>");
         assert_eq!(base(".forklift/pallets/main"), ".forklift/pallets/main");
         assert_eq!(base(".forklift/inventory/inv_0123456789abcdef0123/data"), ".forklift/inventory/inv_<hex>/data");
