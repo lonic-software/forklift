@@ -1072,12 +1072,12 @@ impl Records<'_, '_> {
 }
 
 /// Refuses a `from` that is not a whole history: a folder that is not the top of a repository
-/// (its work tree, a linked worktree's or a submodule's included, or, bare, its git folder), and
-/// a shallow repository.
+/// (its work tree, a linked worktree's included, or its git folder, bare or not), and a shallow
+/// repository.
 fn check_history(steps: &mut Steps, git: &Path, from: &Path, environment: &Environment) -> Result<(), String> {
     let (from_text, root) = (from.display().to_string(), steps.scratch.root().to_path_buf());
-    let bare = printed(&steps.run(git, &["-C", &from_text, "rev-parse", "--is-bare-repository"], &root, environment)?) == "true";
-    let top = PathBuf::from(printed(&steps.run(git, &["-C", &from_text, "rev-parse", if bare { "--absolute-git-dir" } else { "--show-toplevel" }], &root, environment)?));
+    let git_folder = printed(&steps.run(git, &["-C", &from_text, "rev-parse", "--is-inside-git-dir"], &root, environment)?) == "true";
+    let top = PathBuf::from(printed(&steps.run(git, &["-C", &from_text, "rev-parse", if git_folder { "--absolute-git-dir" } else { "--show-toplevel" }], &root, environment)?));
     let real = |path: &Path| std::fs::canonicalize(path).map_err(|error| format!("cannot read {}: {}", path.display(), error));
     if real(&top)? != real(from)? {
         return Err(format!("{} is not the top of a git repository", from.display()));
@@ -1125,8 +1125,8 @@ fn copy_history(steps: &mut Steps, git: &Path, from: &Path, to: &Path, environme
 /// The Forklift to git to Forklift round trip in `scratch`: a native history, exported to git,
 /// imported into a fresh warehouse, exported again, and compared record by record. Both
 /// warehouses' trees are read through their own exports. The native history is the one
-/// `build_warehouse` builds, or, given `history`, that repository's mirror imported into a fresh
-/// warehouse.
+/// `build_warehouse` builds, or, given `history`, that repository mirrored into `scratch` and
+/// imported into a fresh warehouse: every command a trip runs stays in its own scratch area.
 pub fn forklift_round_trip(forklift: &Path, git: &Path, history: Option<&Path>, scratch: &Scratch, environment: &Environment, limit: Duration) -> Trip {
     let input = Input::of(history);
     let mut steps = Steps { scratch, limit, outcomes: Vec::new(), kept: (input == Input::History).then_some(KEPT_STDOUT) };
@@ -1156,8 +1156,9 @@ pub fn forklift_round_trip(forklift: &Path, git: &Path, history: Option<&Path>, 
 }
 
 /// The git to forklift to git round trip in `scratch`: the fixture built with `git`, or, given
-/// `history`, that repository's mirror, imported by `forklift` into a fresh warehouse, exported
-/// to a new repository and compared with what went in.
+/// `history`, that repository mirrored into `scratch`, since every command a trip runs stays in
+/// its own scratch area, imported by `forklift` into a fresh warehouse, exported to a new
+/// repository and compared with what went in.
 pub fn git_round_trip(forklift: &Path, git: &Path, history: Option<&Path>, scratch: &Scratch, environment: &Environment, limit: Duration) -> Trip {
     let input = Input::of(history);
     let mut steps = Steps { scratch, limit, outcomes: Vec::new(), kept: (input == Input::History).then_some(KEPT_STDOUT) };
@@ -1559,13 +1560,14 @@ mod tests {
     }
 
     /// A given history is mirrored with every ref it holds and left exactly as it was, from a work
-    /// tree, a linked worktree or a bare repository; a shallow one and a folder inside a repository are refused by
-    /// name, and its record counts and digests its refs.
+    /// tree, a linked worktree, a git folder or a bare repository; a shallow one and a folder
+    /// inside a repository are refused by name, and its record counts and digests its refs.
     ///
     /// Revert: drop the shallow check → the shallow clone is copied. Copy with a plain clone → the
     /// mirror lacks the note, the remote-tracking ref and the side branch. Drop the top check → the
     /// inner folder reaches the clone, which refuses it differently. Take the git folder as the
-    /// top of a work tree → the linked worktree is refused.
+    /// top of a work tree → the linked worktree is refused; ask a git folder for its work tree →
+    /// git refuses the `.git` folder.
     #[test]
     fn a_history_is_mirrored_and_a_shallow_one_refused() {
         let (scratch, environment) = area("history");
@@ -1600,8 +1602,9 @@ mod tests {
         let worktree = scratch.root().join("worktree");
         steps.run(&git, &["worktree", "add", "-q", "--detach", "--", &worktree.display().to_string()], &source, &environment).unwrap();
         copy_history(&mut steps, &git, &worktree, &scratch.root().join("from-worktree"), &environment).unwrap();
-        let (taken, environment) = area("taken");
-        let copy = take_history(&git, &source, &taken, &environment, Duration::from_secs(60));
+        copy_history(&mut steps, &git, &source.join(".git"), &scratch.root().join("from-git-folder"), &environment).unwrap();
+        let (taken, taken_environment) = area("taken");
+        let copy = take_history(&git, &source, &taken, &taken_environment, Duration::from_secs(60));
         let (path, described) = copy.copied.unwrap();
         assert_eq!(path, taken.root().join("mirror"));
         let listed = steps.run(&git, &["for-each-ref", "--format=%(objectname) %(refname)"], &source, &environment).unwrap();

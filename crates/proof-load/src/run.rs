@@ -807,8 +807,9 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
                 ("fidelity-forklift-git-forklift", Direction::ForkliftGitForklift, forklift_round_trip, None),
             ];
             // The history is mirrored once, in a block of its own, and both its trips copy that
-            // mirror, so the record names what they compared; one the copy refuses is a gap,
-            // and its trips are not run.
+            // mirror into their own scratch areas, so the record names what they compared; one
+            // the copy refuses is a gap, and its trips are not run. The lane's count is announced
+            // again once that is known.
             progress.lane(Category::Fidelity, Some(trips.len() + if history_from.is_some() { 3 } else { 0 }));
             let mut history_mirror = None;
             if let Some(history) = history_from.as_deref() {
@@ -837,6 +838,9 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
             if let Some(mirror) = history_mirror.as_deref() {
                 trips.push(("fidelity-history-git-forklift-git", Direction::GitForkliftGit, git_round_trip, Some(mirror)));
                 trips.push(("fidelity-history-forklift-git-forklift", Direction::ForkliftGitForklift, forklift_round_trip, Some(mirror)));
+            }
+            if history_from.is_some() {
+                progress.lane(Category::Fidelity, Some(trips.len() + 1));
             }
             let mut finished = 0;
             for (block, direction, round_trip, history) in trips.iter().copied() {
