@@ -203,6 +203,17 @@ const HISTORY_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 6
 /// named in its subject's completeness, never silently absent.
 const HISTORY_DAMAGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
+/// Why a history's sample holds no position: forklift's, where git holds a ref with commits and
+/// forklift's import made a pallet of none of them; the run's own otherwise.
+fn empty_sample(lengths: &BTreeMap<String, usize>, present: &std::collections::BTreeSet<String>) -> String {
+    let counted: Vec<&String> = lengths.iter().filter(|(_, length)| **length > 0).map(|(name, _)| name).collect();
+    if !counted.is_empty() && !counted.iter().any(|name| present.contains(*name)) {
+        "forklift: the import made no pallet of a ref git holds".to_string()
+    } else {
+        "the sample holds no position: no ref both subjects hold has a commit".to_string()
+    }
+}
+
 /// The row a damage run over a real history grades, its detail at `label`, paired under
 /// `scenario` by `role`; or, where the whole-store check found damage the sample did not reach,
 /// the completeness entry naming it instead. Such damage is no grade: never healed, never paired,
@@ -268,13 +279,7 @@ fn history_damage(
         write_detail(output.root(), &format!("{}.json", BLOCK), &serde_json::json!({ "steps": steps, "lengths": lengths, "present": present, "positions": positions }))
             .map_err(|error| error.to_string())?;
         if positions.is_empty() {
-            // Git holds a ref with commits, and forklift's import made a pallet of none of them.
-            let imported = lengths.iter().filter(|(_, length)| **length > 0).any(|(name, _)| present.contains(name));
-            return Err(if lengths.values().any(|length| *length > 0) && !imported {
-                "forklift: the import made no pallet of a ref git holds".to_string()
-            } else {
-                "the sample holds no position: no ref both subjects hold has a commit".to_string()
-            });
+            return Err(empty_sample(&lengths, &present));
         }
         Ok((git_root, forklift_root, positions))
     });
@@ -1406,6 +1411,20 @@ mod tests {
         fn cancelled(&self) -> bool {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= self.polls
         }
+    }
+
+    /// An empty sample is forklift's when git holds a ref with commits and the import made a
+    /// pallet of none of them, though it made others; the run's own when git holds none.
+    ///
+    /// Revert: blame forklift only when it made no pallet at all → the renamed import is the run's.
+    #[test]
+    fn an_import_missing_every_git_ref_is_forklifts() {
+        let lengths: BTreeMap<String, usize> = [("main".to_string(), 3), ("empty".to_string(), 0)].into_iter().collect();
+        let renamed = ["trunk".to_string(), "empty".to_string()].into_iter().collect();
+        assert!(empty_sample(&lengths, &renamed).starts_with("forklift: "));
+        assert!(empty_sample(&lengths, &Default::default()).starts_with("forklift: "));
+        let none: BTreeMap<String, usize> = [("empty".to_string(), 0)].into_iter().collect();
+        assert!(!empty_sample(&none, &renamed).starts_with("forklift: "));
     }
 
     /// A damage run over a real history becomes a row paired under the history's own scenario,
