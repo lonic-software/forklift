@@ -1020,20 +1020,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn only_a_failed_exit_is_git_s_refusal() {
-        use std::os::unix::fs::PermissionsExt;
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("proof-load-daemon-exit-{}-{}", std::process::id(), nanos));
         let scratch = Scratch::create(&root).unwrap();
         let environment = Environment::scrubbed(&scratch, std::env::var_os("PATH"), &BTreeMap::new()).unwrap();
         let unwatched = |code: i32| {
-            // `run` ends with `code`; `status` never says it watches.
-            let program = scratch.root().join(format!("daemon-{}", code));
-            std::fs::write(&program, format!("#!/bin/sh\n[ \"$2\" = run ] && exit {}\nexit 1\n", code)).unwrap();
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-            FsmonitorDaemon::watch_or_exit(&program, &scratch.work(), &scratch, &environment, Duration::from_secs(10)).err().expect("the daemon never watched")
+            // `sh` reads the stand-in from the work tree, `run` ending with `code` and `status`
+            // never saying it watches. Never executed itself, the file a test just wrote cannot
+            // be busy to a child another test forks meanwhile.
+            let work = scratch.root().join(format!("work-{}", code));
+            std::fs::create_dir_all(&work).unwrap();
+            std::fs::write(work.join("fsmonitor--daemon"), format!("[ \"$1\" = run ] && exit {}\nexit 1\n", code)).unwrap();
+            FsmonitorDaemon::watch_or_exit(Path::new("/bin/sh"), &work, &scratch, &environment, Duration::from_secs(10)).err().expect("the daemon never watched")
         };
         assert!(matches!(unwatched(128), Unwatched::Exited(why) if why.contains("code 128")));
-        assert!(matches!(unwatched(0), Unwatched::Harness(_)));
+        assert!(matches!(unwatched(0), Unwatched::Harness(RunError::Io(why)) if why.contains("ended exit status: 0")));
         let _ = crate::power::remove_tree(scratch.root());
     }
 
