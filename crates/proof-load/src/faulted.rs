@@ -1263,9 +1263,9 @@ mod tests {
 
         let (scratch, environment) = area("host");
         let faulted = run(&scenario, "objects/<xx>/<hash>", Warehouse::Host, Kind::Delete, Tool::Git, &corpus, &programs, &scratch, &environment, Duration::from_secs(60), 0).unwrap();
-        // The push exits 0, as git asks the host nothing of the objects its refs name, and the
-        // clone of it refuses: the record is lost.
-        assert!(faulted.steps.iter().any(|step| step.arguments.first().map(String::as_str) == Some("push") && step.succeeded()), "{:?}", faulted.steps);
+        // Which object is lost follows the commits' hashes, so it differs from run to run: a lost
+        // blob is not noticed by the push, which exits 0, while a lost branch tip makes the host
+        // reject it. Either way the clone of the host refuses: the record is lost.
         assert_eq!(faulted.grade, Grade::DataLost, "{:?}", faulted.recoverability);
         assert_eq!(faulted.recoverability.rescued_by, None);
 
