@@ -2640,6 +2640,11 @@ mod tests {
         assert_eq!(Moment::Ending { line: 2, command: "stack".into() }.line(), Some(2));
         assert_eq!(Moment::Synced { line: 3, command: "stack".into(), call: 0, name: "fsync".into() }.line(), Some(3));
         assert_eq!(Moment::Served { request: None, route: String::new(), when: String::new() }.line(), None);
+        let point = kill::Point {
+            line: 4, call: 0, command: "stack".into(), op: String::new(), name: "write".into(), aim: kill::Aim::Position, when: 1, base: String::new(), sampled: false,
+            target: kill::Identity { detail: String::new(), paths: vec![] },
+        };
+        assert_eq!(Moment::During { point }.line(), Some(4));
     }
 
     /// A git subject's power loss is its own: its rows bear its name and binding and pair by the
@@ -2680,7 +2685,10 @@ mod tests {
         assert_eq!(check("power-loss states, git-tuned").missing, ["no scenario's power loss ran"]);
         assert_eq!(check("power loss of history").subject, Some(Tool::Forklift));
         assert!(check("power-loss soundness").missing.is_empty());
-        // An unpaired scenario's row, and a server's state, pair with nothing.
+        // Forklift graded nothing, so the lane is unrun whichever subject comes last.
+        assert_eq!(summarize(&all[..2]).cell, Cell::not_run("no power-loss state was graded"));
+        // A server's state pairs with nothing, nor does an unpaired scenario's row.
+        assert_eq!(summarize_as(&all[1..2], kill::Side::Server).rows[0].pairing, None);
         let unpaired = vec![ScenarioPower { scenario: "compacted".into(), subject: Tool::Git, crashes: vec![GradedCrash { crash, op: Some("record".into()), graded }], ..Default::default() }];
         assert_eq!(summarize(&unpaired).rows[0].pairing, None);
         assert_eq!(summarize_as(&unpaired, kill::Side::Server).rows[0].pairing, None);
