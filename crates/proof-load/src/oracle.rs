@@ -185,6 +185,18 @@ impl Grade {
     pub fn is_failure(self) -> bool {
         matches!(self, Grade::RefusedNoRemedy | Grade::Silent | Grade::DataLost)
     }
+
+    /// The grade's place in the data plate's order, 0 for the best: healed, a refusal whose remedy
+    /// works, a refusal with none, data lost, silent. Not the order `grade` tests them in.
+    pub fn severity(self) -> u8 {
+        match self {
+            Grade::Healed => 0,
+            Grade::RefusedWorkingRemedy => 1,
+            Grade::RefusedNoRemedy => 2,
+            Grade::DataLost => 3,
+            Grade::Silent => 4,
+        }
+    }
 }
 
 /// What a scenario's steps established, from which its grade follows.

@@ -115,7 +115,8 @@ pub enum Tool {
     Forklift,
     /// Git at its defaults.
     Git,
-    /// Git tuned for durability and integrity: every fsync on, fsck on transfer.
+    /// Git tuned as a careful user would run it: every fsync on, fsck on transfer, a commit-graph
+    /// and an untracked cache kept, and the fsmonitor daemon running.
     GitTuned,
 }
 

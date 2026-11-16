@@ -476,9 +476,12 @@ impl App {
         });
         let determinism = &results.report.determinism;
         widgets::plate(ui, "Replay", "what determines this run", |ui| {
-            widgets::text(ui, &format!("seed {} on {}", determinism.seed, determinism.platform.label()), Type::Data, p.ink);
+            widgets::text(ui, &format!("seed {} on {} ({}), filesystem {}", determinism.seed, determinism.platform.label(), determinism.os, determinism.filesystem), Type::Data, p.ink);
             for (tool, version) in &determinism.tools {
                 widgets::text(ui, &format!("{tool}: {version}"), Type::Data, p.muted);
+            }
+            for (subject, configuration) in &determinism.configurations {
+                widgets::text(ui, &format!("{subject} configuration: {configuration}"), Type::Data, p.muted);
             }
         });
     }

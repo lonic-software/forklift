@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::census::{Census, DamageName};
 
 /// One way to damage a file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
     /// Cut to half its length. An empty file has nothing to cut, so it is refused, as for a flip.
@@ -53,7 +53,7 @@ fn dead_pid() -> std::io::Result<u32> {
 
 /// The warehouse a binding damages: the client's, beside the work tree, or the host's a scenario
 /// serves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Warehouse {
     Client,

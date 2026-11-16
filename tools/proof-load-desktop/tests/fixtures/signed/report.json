@@ -1,5 +1,5 @@
 {
-  "format": 3,
+  "format": 4,
   "coverage": {
     "cells": {
       "damaged-files": {
@@ -196,6 +196,12 @@
       "signed"
     ],
     "platform": "macos",
+    "os": "Darwin 25.1.0",
+    "filesystem": "apfs",
+    "configurations": {
+      "git": "gc.autoDetach=false maintenance.autoDetach=false",
+      "git-tuned": "gc.autoDetach=false maintenance.autoDetach=false; core.fsync=all core.fsyncMethod=fsync transfer.fsckObjects=true fetch.fsckObjects=true receive.fsckObjects=true core.commitGraph=true gc.writeCommitGraph=true fetch.writeCommitGraph=true core.untrackedCache=true; core.fsmonitor=true (its daemon run by the harness)"
+    },
     "environment": {
       "GIT_CONFIG_GLOBAL": "/run/proof-load/scratch/0002-signed/gitconfig-global",
       "GIT_CONFIG_SYSTEM": "/run/proof-load/scratch/0002-signed/gitconfig-system",
@@ -371,7 +377,13 @@
         "rescued_by": null
       },
       "note": null,
-      "detail": "signed-trust-FlipByte.json#"
+      "detail": "signed-trust-FlipByte.json#",
+      "pairing": {
+        "scenario": "signed",
+        "side": "client",
+        "role": "signature",
+        "kind": "flip-byte"
+      }
     },
     {
       "subject": "forklift",
@@ -386,7 +398,13 @@
         "rescued_by": null
       },
       "note": null,
-      "detail": "signed-trust-Truncate.json#"
+      "detail": "signed-trust-Truncate.json#",
+      "pairing": {
+        "scenario": "signed",
+        "side": "client",
+        "role": "signature",
+        "kind": "truncate"
+      }
     },
     {
       "subject": "forklift",
@@ -401,7 +419,13 @@
         "rescued_by": null
       },
       "note": null,
-      "detail": "signed-trust-Zero.json#"
+      "detail": "signed-trust-Zero.json#",
+      "pairing": {
+        "scenario": "signed",
+        "side": "client",
+        "role": "signature",
+        "kind": "zero"
+      }
     },
     {
       "subject": "forklift",
@@ -416,7 +440,13 @@
         "rescued_by": null
       },
       "note": null,
-      "detail": "signed-trust-Delete.json#"
+      "detail": "signed-trust-Delete.json#",
+      "pairing": {
+        "scenario": "signed",
+        "side": "client",
+        "role": "signature",
+        "kind": "delete"
+      }
     },
     {
       "subject": "forklift",
@@ -431,7 +461,13 @@
         "rescued_by": null
       },
       "note": null,
-      "detail": "signed-meta_-Delete.json#"
+      "detail": "signed-meta_-Delete.json#",
+      "pairing": {
+        "scenario": "signed",
+        "side": "client",
+        "role": "metadata",
+        "kind": "delete"
+      }
     },
     {
       "subject": "forklift",
@@ -446,7 +482,13 @@
         "rescued_by": null
       },
       "note": null,
-      "detail": "signed-meta__name_-FlipByte.json#"
+      "detail": "signed-meta__name_-FlipByte.json#",
+      "pairing": {
+        "scenario": "signed",
+        "side": "client",
+        "role": "metadata",
+        "kind": "flip-byte"
+      }
     },
     {
       "subject": "forklift",
@@ -461,7 +503,13 @@
         "rescued_by": null
       },
       "note": null,
-      "detail": "signed-meta__name_-Truncate.json#"
+      "detail": "signed-meta__name_-Truncate.json#",
+      "pairing": {
+        "scenario": "signed",
+        "side": "client",
+        "role": "metadata",
+        "kind": "truncate"
+      }
     },
     {
       "subject": "forklift",
@@ -476,7 +524,13 @@
         "rescued_by": null
       },
       "note": null,
-      "detail": "signed-meta__name_-Zero.json#"
+      "detail": "signed-meta__name_-Zero.json#",
+      "pairing": {
+        "scenario": "signed",
+        "side": "client",
+        "role": "metadata",
+        "kind": "zero"
+      }
     },
     {
       "subject": "forklift",
@@ -491,7 +545,13 @@
         "rescued_by": null
       },
       "note": null,
-      "detail": "signed-meta__name_-Delete.json#"
+      "detail": "signed-meta__name_-Delete.json#",
+      "pairing": {
+        "scenario": "signed",
+        "side": "client",
+        "role": "metadata",
+        "kind": "delete"
+      }
     },
     {
       "subject": "forklift",
@@ -506,7 +566,13 @@
         "rescued_by": null
       },
       "note": null,
-      "detail": "signed-objects__xx___hash_.sig-FlipByte.json#"
+      "detail": "signed-objects__xx___hash_.sig-FlipByte.json#",
+      "pairing": {
+        "scenario": "signed",
+        "side": "client",
+        "role": "signature",
+        "kind": "flip-byte"
+      }
     },
     {
       "subject": "forklift",
@@ -521,7 +587,13 @@
         "rescued_by": null
       },
       "note": null,
-      "detail": "signed-objects__xx___hash_.sig-Truncate.json#"
+      "detail": "signed-objects__xx___hash_.sig-Truncate.json#",
+      "pairing": {
+        "scenario": "signed",
+        "side": "client",
+        "role": "signature",
+        "kind": "truncate"
+      }
     },
     {
       "subject": "forklift",
@@ -536,7 +608,13 @@
         "rescued_by": null
       },
       "note": null,
-      "detail": "signed-objects__xx___hash_.sig-Zero.json#"
+      "detail": "signed-objects__xx___hash_.sig-Zero.json#",
+      "pairing": {
+        "scenario": "signed",
+        "side": "client",
+        "role": "signature",
+        "kind": "zero"
+      }
     },
     {
       "subject": "forklift",
@@ -551,7 +629,13 @@
         "rescued_by": null
       },
       "note": null,
-      "detail": "signed-objects__xx___hash_.sig-Delete.json#"
+      "detail": "signed-objects__xx___hash_.sig-Delete.json#",
+      "pairing": {
+        "scenario": "signed",
+        "side": "client",
+        "role": "signature",
+        "kind": "delete"
+      }
     }
   ],
   "forklift_only": []

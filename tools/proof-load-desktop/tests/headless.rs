@@ -379,3 +379,19 @@ fn a_harness_failure_is_not_shown_as_a_refusal() {
     assert!(status.0.starts_with("Proof Load failed: index out of bounds. This") && !status.0.contains("Refused"), "{}", status.0);
     assert_eq!(status.1, theme::palette_of(egui::Theme::Light).g_lost);
 }
+
+/// The Coverage screen's Replay plate names the run's header: the OS and filesystem, and each git
+/// subject's configuration.
+///
+/// Revert: drop the configuration lines from the Replay plate → git tuned's configuration is
+/// not drawn.
+#[test]
+fn the_replay_plate_names_the_os_filesystem_and_git_configurations() {
+    let mut coverage = App::showing(fixture());
+    coverage.screen = Screen::Coverage;
+    let texts: Vec<String> = texts(egui::Theme::Light, &mut coverage).into_iter().map(|(text, _)| text).collect();
+    let all = texts.join("\n");
+    assert!(all.contains("on macOS (Darwin 25.1.0), filesystem apfs"), "{all}");
+    assert!(all.contains("git-tuned configuration: gc.autoDetach=false maintenance.autoDetach=false; core.fsync=all"), "{all}");
+    assert!(all.contains("git configuration: gc.autoDetach=false maintenance.autoDetach=false"), "{all}");
+}

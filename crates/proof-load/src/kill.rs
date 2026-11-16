@@ -865,6 +865,7 @@ pub fn summarize_as(kills: &[ScenarioKills], side: Side) -> Summary {
                 recoverability: graded.recoverability.clone(),
                 note: (!notes.is_empty()).then(|| notes.join("; ")),
                 detail: Some(format!("{}#/killed/{}/graded", details_file(side, &scenario.scenario), index)),
+                pairing: None,
             });
         }
     }
