@@ -65,7 +65,8 @@ pub struct TreeUnread {
 
 /// What the rebuild found, before anything is written.
 pub struct Rebuild {
-    /// The recovered keys: each candidate whose shard address holds a shard data file.
+    /// The recovered keys: each candidate whose shard address holds a shard data file, and their
+    /// ancestors.
     keys: BTreeSet<String>,
 
     /// How many shard data files in the store no recovered key's address matches. Writing the
@@ -88,7 +89,7 @@ impl Rebuild {
         self.unmatched == 0 && self.unread.is_empty()
     }
 
-    /// How many keys the rebuild registers, before the ancestor closure.
+    /// How many keys the rebuild registers, ancestors included.
     pub fn recovered(&self) -> usize {
         self.keys.len()
     }
@@ -168,14 +169,13 @@ pub fn plan(marker: Option<&Operation>) -> Result<Rebuild, String> {
         tree_keys(&tree, &scope, &mut candidates, &mut failed);
     }
 
-    let keys: BTreeSet<String> = candidates.into_iter()
+    let found: BTreeSet<String> = candidates.into_iter()
         .filter(|key| shards.contains(&file_utils::shard_address(key)))
         .collect();
     // What the write registers, ancestors included: an ancestor no candidate named still keeps its
     // shard once registered, so that shard is matched.
-    let matched: BTreeSet<(String, String)> = inventory_utils::close_under_ancestors(&keys).iter()
-        .map(|key| file_utils::shard_address(key))
-        .collect();
+    let keys = inventory_utils::close_under_ancestors(&found);
+    let matched: BTreeSet<(String, String)> = keys.iter().map(|key| file_utils::shard_address(key)).collect();
 
     Ok(Rebuild {
         unmatched: shards.difference(&matched).count(),

@@ -246,18 +246,22 @@ fn an_ancestor_only_the_write_registers_keeps_its_shard_matched() {
 }
 
 /// A folder where the metadata file belongs is refused by every reader, whose message sends the
-/// user to heal once it is removed; heal names it too rather than finding nothing to heal. Revert:
-/// read anything but damage as nothing for heal to do → heal succeeds → red.
+/// user to heal once it is removed; heal names it too rather than finding nothing to heal, and only
+/// once every other repair and check has run. Revert: read anything but damage as nothing for heal
+/// to do → heal succeeds → red. Refuse where it is found → the lost tree is never reported → red.
 #[test]
 fn a_folder_in_place_of_the_metadata_file_is_named_by_heal() {
     let area = Area::new("not-a-file");
+    let tree = area.head_tree("main");
+    area.lose(&tree);
     forklift_core::util::file_utils::remove_file(area.metadata()).unwrap();
     std::fs::create_dir(area.metadata()).unwrap();
 
-    let output = area.run(&["--json", "heal"]);
+    let output = area.run(&["heal"]);
     assert!(!output.status.success(), "{}", text(&output.stdout));
     let shown = format!("{}{}", text(&output.stdout), text(&output.stderr));
     assert!(shown.contains("is not a file"), "{}", shown);
+    assert!(shown.contains(&tree), "the lost tree is reported too: {}", shown);
 }
 
 /// The folder `a/b` is gone from the working tree with its removal unstaged, so only the base's

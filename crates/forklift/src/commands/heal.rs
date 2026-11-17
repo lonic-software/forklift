@@ -315,19 +315,28 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let marker = operation_utils::read().ok().flatten();
     let partial_park = marker.as_ref()
         .filter(|marker| marker.kind == OperationKind::Park && !marker.pathspec.is_empty());
-    let damaged = |refs_rebuilt: &[ref_heal::Rebuilt], refs_removed: &[ref_heal::Removed], ref_notes: &[String]| {
-        inventory_heal::damaged().map_err(|error| changed_after(error, refs_rebuilt, refs_removed, ref_notes))
+    // A metadata path that is not a file, or a rebuild that fails once the recovery has run, ends
+    // the run like a held rebuild: every other repair runs first, and the report says what they did.
+    let mut inventory_error: Option<String> = None;
+    let not_a_file = match inventory_heal::damaged() {
+        Ok(damaged) => {
+            if partial_park.is_some() && damaged {
+                let (view, written) = rebuild_inventory(partial_park, accept_inventory_loss)
+                    .map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+                *(if written { &mut inventory_rebuilt } else { &mut inventory_held }) = Some(view);
+            }
+            false
+        }
+        Err(error) => {
+            inventory_error = Some(error);
+            true
+        }
     };
     // A step that fails after a written rebuild says so beside every other repair.
     let with_rebuilt = |error: String, rebuilt: &Option<InventoryRebuilt>| match rebuilt {
         Some(rebuilt) => forklift_core::error::append_to_message(error, &rebuilt.sentence()),
         None => error,
     };
-    if partial_park.is_some() && damaged(&refs_rebuilt, &refs_removed, &ref_notes)? {
-        let (view, written) = rebuild_inventory(partial_park, accept_inventory_loss)
-            .map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
-        *(if written { &mut inventory_rebuilt } else { &mut inventory_held }) = Some(view);
-    }
     let held_park = partial_park.is_some() && inventory_held.is_some();
     if held_park {
         ref_notes.push(
@@ -335,18 +344,32 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                 .to_string(),
         );
     }
+    // Every recovery reads the set, which a path that is not a file cannot give.
+    if not_a_file {
+        if let Some(standing) = &marker {
+            ref_notes.push(format!(
+                "The interrupted {} in this bay waits for the inventory metadata to be a file again; heal finishes or undoes it once it is.",
+                standing.kind.as_str()
+            ));
+        }
+    }
 
     // After the taint: an operation's recovery reads and writes the store the taint vouches for.
-    let recovered = match waits.is_some() || held_park {
+    let recovered = match waits.is_some() || held_park || not_a_file {
         true => Ok(None),
         false => operation_utils::recover(),
     }.map_err(|error| with_rebuilt(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), &inventory_rebuilt))?;
 
-    if waits.is_none() && !held_park && damaged(&refs_rebuilt, &refs_removed, &ref_notes)? {
-        let standing = operation_utils::read().ok().flatten();
-        let (view, written) = rebuild_inventory(standing.as_ref(), accept_inventory_loss)
-            .map_err(|error| with_rebuilt(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), &inventory_rebuilt))?;
-        *(if written { &mut inventory_rebuilt } else { &mut inventory_held }) = Some(view);
+    if waits.is_none() && !held_park && !not_a_file {
+        let rebuilt = inventory_heal::damaged().and_then(|damaged| match damaged {
+            true => rebuild_inventory(operation_utils::read().ok().flatten().as_ref(), accept_inventory_loss).map(Some),
+            false => Ok(None),
+        });
+        match rebuilt {
+            Ok(Some((view, written))) => *(if written { &mut inventory_rebuilt } else { &mut inventory_held }) = Some(view),
+            Ok(None) => {}
+            Err(error) => inventory_error = Some(error),
+        }
     }
     let operation = recovered.map(|recovery| OperationRecovery {
         operation: recovery.operation.as_str().to_string(),
@@ -718,11 +741,15 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
 
     // Ahead of every other end refusal: their remedies read the set, and an unload, the remedy for
     // lost staged content, is refused while it is damaged. Every repair above has run.
-    if let Some(held) = &report.inventory_held {
+    if inventory_error.is_some() || report.inventory_held.is_some() {
         if !output::is_json() {
             report.render_human();
         }
-        let mut lines = held.lines();
+        let mut lines = match (&inventory_error, &report.inventory_held) {
+            (Some(error), _) => vec![error.clone()],
+            (None, Some(held)) => held.lines(),
+            (None, None) => Vec::new(),
+        };
         if let Err(error) = &lost {
             lines.push(format!(
                 "heal could not finish its reachability check, so whether any object is lost is not known: {}",
@@ -737,16 +764,21 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             }
         }
         // The refusals the run would end on otherwise still stand, and are named after the rebuild.
+        // A walk that did not finish leaves the origin a note, as the run without the hold does.
         let standing = match (&report.objects_lost, report.refs_refused.is_empty()) {
             (Some(_), _) => remote_refused.as_ref(),
-            (None, true) => origin_refused.as_ref(),
-            (None, false) => None,
+            (None, true) if lost.is_ok() => origin_refused.as_ref(),
+            _ => None,
         };
-        if let Some(CoreError::Refusal { message, .. }) = standing {
-            lines.push(message.clone());
+        if let Some(CoreError::Refusal { message, next_step, .. }) = standing {
+            lines.push(format!("{} Its own next step, after the rebuild: {}", message, next_step));
         }
         if report.objects_lost.is_some() && (outcome.index_rebuild_skipped || origin_unanswered) {
             lines.push("The check for lost objects may be short; a heal after the rebuild checks again.".to_string());
+        }
+        // Not damage: the path's own remedy, which no rebuild mends, leads.
+        if inventory_error.is_some() {
+            return Err(lines.join("\n"));
         }
         return Err(CoreError::refusal_with_details(
             RefusalCode::InventoryDamaged,
@@ -815,7 +847,8 @@ fn rebuild_inventory(marker: Option<&Operation>, accept_loss: bool) -> Result<(I
 #[derive(Serialize)]
 pub(crate) struct InventoryRebuilt {
     /// How many folders it registers, found in the damaged file, the working tree, the tree the bay
-    /// stands on or a tree an interrupted operation names, with their staging in the shard store.
+    /// stands on or a tree an interrupted operation names, with their staging in the shard store,
+    /// and their ancestors.
     registered: usize,
 
     /// How many shards in the store match none of those folders or their ancestors. Written, the
@@ -849,7 +882,7 @@ impl InventoryRebuilt {
         );
         if self.dropped > 0 {
             sentence.push_str(&format!(
-                 " {} shard(s) matched no folder heal could find and are no longer registered, so whatever staging they hold is lost (a shard a removal left behind holds none).",
+                " {} shard(s) matched no folder heal could find and are no longer registered, so whatever staging they hold is lost (a shard a removal left behind holds none).",
                 self.dropped
             ));
         }
