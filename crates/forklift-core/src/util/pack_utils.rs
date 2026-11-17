@@ -11917,6 +11917,50 @@ pub(crate) mod tests {
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
+    /// FORK-519: a pack folder that changes between every listing and its opens is an error once
+    /// the listings run out, naming the folder, never the last listing's stale verdict, which
+    /// would read a healthy table as unreadable.
+    ///
+    /// Revert: let the last attempt return its set however stale → the load succeeds, recording
+    /// the deleted table as unreadable → red.
+    #[test]
+    fn a_pack_folder_that_changes_under_every_listing_is_an_error_not_a_stale_verdict() {
+        let (temp, _scope) = enter_signature_root("sig-listing-churn");
+
+        fn table(seed: u8) -> (PathBuf, Vec<u8>) {
+            let entries = vec![(hash_to_bytes(&fake_parcel("", seed as usize)).unwrap(), fake_signature(seed))];
+            let name = format!("{}.{}", signature_table::table_id(&entries), FILE_EXTENSION_SIGNATURE_TABLE);
+            (pack_folder().join(name), signature_table::build(&entries))
+        }
+
+        // Each step stands in for one more compaction: it deletes the table the listing just named
+        // and publishes the next, then arms itself for the next listing.
+        fn arm(steps: std::rc::Rc<std::cell::Cell<u8>>) {
+            std::mem::forget(between_next_listing_and_opens(move || {
+                let seed = steps.get() + 1;
+                crate::util::file_utils::remove_file(&table(seed).0).unwrap();
+                let (next, bytes) = table(seed + 1);
+                std::fs::write(next, bytes).unwrap();
+                steps.set(seed);
+                arm(steps);
+            }));
+        }
+
+        let (first, bytes) = table(1);
+        std::fs::write(first, bytes).unwrap();
+        let steps = std::rc::Rc::new(std::cell::Cell::new(0));
+        arm(std::rc::Rc::clone(&steps));
+
+        let loaded = load_packs_from_disk(&pack_folder(), IndexCheck::Lazy);
+        drop(between_next_listing_and_opens(|| {}));
+
+        assert_eq!(steps.get(), 8, "one compaction under each of the eight listings");
+        let error = loaded.err().expect("a folder that never held still must not load");
+        assert!(error.contains("kept changing while it was read: 8 times in a row"), "{}", error);
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
     /// FORK-519: a pack file deleted between a reload's listing and its open, with the pack that
     /// replaced it published first, is not read as damage, whichever of the pair's files went: a
     /// presence check, which revalidates once, finds the object in the replacement. A lone index is
