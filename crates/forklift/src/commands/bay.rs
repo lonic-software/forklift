@@ -272,7 +272,7 @@ fn list() -> Result<(), String> {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let pallet = bay_utils::read_bay_current_pallet(&name)
-                .map_err(|e| format!("Bay \"{}\" could not be listed: {}", name, e))?;
+                .map_err(|e| forklift_core::error::prefix_message(&format!("Bay \"{}\" could not be listed", name), e))?;
 
             Ok(BayEntry { name, path, pallet })
         })

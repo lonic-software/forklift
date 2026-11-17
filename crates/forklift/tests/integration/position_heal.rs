@@ -279,8 +279,9 @@ fn another_bays_damaged_position_is_refused_without_naming_a_heal_here() {
 
     let listed = area.run(&root, &["--json", "bay"]);
     assert!(!listed.status.success(), "{}", text(&listed.stdout));
-    let value = parsed(&listed);
-    assert_ne!(value["error"]["next_step"], "forklift heal", "{}", value);
+    let value = position_damaged(&listed);
+    assert!(value["error"]["message"].as_str().unwrap().contains("Bay \"b1\""), "{}", value);
+    assert!(value["error"].get("next_step").is_none(), "a heal here does not reach the bay: {}", value);
 }
 
 // An operation stopped after its marker is written and before its position write leaves a marker
@@ -289,10 +290,22 @@ fn another_bays_damaged_position_is_refused_without_naming_a_heal_here() {
 // Revert: drop the marker rule from repair → heal refuses with no evidence.
 #[test]
 fn without_a_copy_a_standing_operations_source_rebuilds_the_position() {
+    rebuilt_from_a_standing_operation(false);
+}
+
+// A copy left stale by an earlier crash, naming neither where the standing operation began nor
+// where it was going, is no witness while that operation stands: its source is.
+// Revert: drop the guard on a copy that matches neither side of the marker → from "copy".
+#[test]
+fn a_stale_copy_gives_way_to_a_standing_operations_source() {
+    rebuilt_from_a_standing_operation(true);
+}
+
+fn rebuilt_from_a_standing_operation(stale_copy: bool) {
     use forklift_core::util::file_utils::CRASH_POINT_EXIT_CODE;
 
     for at in 1..200 {
-        let area = Area::new(&format!("marker-{}", at));
+        let area = Area::new(&format!("marker-{}-{}", stale_copy, at));
         let root = area.warehouse();
         let dir = state_dir(&root, None);
 
@@ -311,6 +324,11 @@ fn without_a_copy_a_standing_operations_source_rebuilds_the_position() {
         let _ = forklift_core::util::file_utils::remove_file(dir.join("lock"));
         let _ = forklift_core::util::file_utils::remove_file(dir.join("position"));
         let _ = forklift_core::util::file_utils::remove_file(dir.join("position-copy"));
+        if stale_copy {
+            // On "main", but at feature's head: neither the shift's source nor its target.
+            let stale = forklift_core::util::record_utils::to_bytes("position", 2, ["main", &head(&root, "feature")]);
+            std::fs::write(dir.join("position-copy"), stale).unwrap();
+        }
 
         let data = parsed(&area.run_ok(&root, &["--json", "heal"]))["data"].clone();
         assert_eq!(data["position_rebuilt"]["from"], "operation", "{}", data);
