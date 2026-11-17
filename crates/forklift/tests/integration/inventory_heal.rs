@@ -281,7 +281,8 @@ fn an_unreadable_base_tree_holds_the_rebuild_until_heal_inventory() {
 /// A shard no folder heal can find holds the rebuild, and the repairs heal makes after it still
 /// land: here, the report of `top.txt`'s lost content, which the working tree no longer holds.
 /// Revert: write whatever the rebuild found → the set is written → red. Return at the gate → the
-/// lost content is not in the refusal → red.
+/// lost content is not in the refusal → red. Leave the notes unrendered → a note carries a frame →
+/// red.
 #[test]
 fn an_unmatched_shard_holds_the_rebuild_and_later_repairs_still_land() {
     let area = Area::new("gate");
@@ -297,7 +298,11 @@ fn an_unmatched_shard_holds_the_rebuild_and_later_repairs_still_land() {
     assert_eq!(error["next_step"], "forklift heal --inventory", "{}", error);
     assert_eq!(error["details"]["inventory_held"]["dropped"], 1, "{}", error);
     assert_eq!(error["details"]["objects_lost"]["hashes"][0]["hash"], lost.as_str(), "{}", error);
-    assert!(!error["details"]["notes"].to_string().contains('\u{1f}'), "a note carries no frame: {}", error);
+    // The working tree's search for lost content reads the held inventory and fails; its note
+    // quotes that refusal as words, never as the frame it travels in.
+    let notes: Vec<&str> = error["details"]["notes"].as_array().unwrap().iter().map(|note| note.as_str().unwrap()).collect();
+    assert!(notes.iter().any(|note| note.starts_with("Lost content was not looked for")), "{:?}", notes);
+    assert!(notes.iter().all(|note| !note.contains('\u{1f}')), "a note carries no frame: {:?}", notes);
     assert_eq!(std::fs::read(area.metadata()).unwrap(), damaged, "plain heal must not write the set");
 
     let value = parsed(&area.run(&["--json", "heal", "--inventory"]));
@@ -341,11 +346,12 @@ fn parked(area: &Area) -> usize {
     parsed(&area.run_ok(&["--json", "park", "list"]))["data"]["parked"].as_array().unwrap().len()
 }
 
-/// A partial park's recovery reads the set before it rewrites part of it. Revert: rebuild after
-/// the operation recovery for this marker too → the recovery fails on the damaged file → red.
+/// A partial park stopped once its folder's staging is cleared rolls forward, and that recovery
+/// reads the set before it rewrites part of it. Revert: rebuild after the operation recovery for
+/// this marker too → the recovery fails on the damaged file → red.
 #[test]
 fn a_partial_park_is_finished_over_a_damaged_inventory() {
-    let area = interrupted_park("partial", |_| (), &["n"], |area| area.root().join("n").exists());
+    let area = interrupted_park("partial", |_| (), &["n"], |area| !area.root().join("n").exists());
     damage(&area.metadata(), Damage::Zero);
 
     let data = area.healed(&[]);
