@@ -458,6 +458,15 @@ refusal_codes! {
     /// keeping each one whose shard is on disk, and `heal --inventory` writes it even when some
     /// shard matches none of them.
     InventoryDamaged => "inventory_damaged",
+
+    /// A checkout's scope, the paths it holds, is missing, does not parse, or names no path where
+    /// one is required. A scope a newer version wrote is not this, nor one that reads but lies
+    /// outside the fetch scope. Nothing was changed. The next step is `heal` when the scope is the
+    /// checkout's the command runs in, which restores it from the copy every scope write leaves
+    /// beside it; otherwise it is empty, and the message names the checkout to run it in. When
+    /// `heal` itself refuses this, no copy can be restored and the next step is empty: the message
+    /// names `heal --scope` for the paths the checkout held.
+    CheckoutScopeDamaged => "checkout_scope_damaged",
 }
 
 /// The codes of a host record that is lost or damaged, or of an object its store cannot read,

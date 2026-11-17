@@ -85,6 +85,7 @@ pub const BINDINGS: &[Binding] = &[
     bound_in("config/fetch-scope", "sparse", FILE),
     bound_in("fetched-heads", "sparse", FILE),
     bound_in("{bay}scope", "sparse", FILE),
+    bound_in("{bay}scope-copy", "sparse", FILE),
     hosted("served", "withheld", FILE),
     hosted("tombstones", "withheld", FILE),
     hosted("withheld", "withheld", FILE),

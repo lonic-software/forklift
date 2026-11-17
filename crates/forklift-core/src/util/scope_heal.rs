@@ -79,6 +79,23 @@ pub struct Unread {
 
     /// Why its scope was not used.
     pub reason: String,
+
+    /// What restores it: heal run in that checkout, or, for a bay that recorded no folder, its
+    /// removal. Absent for a scope a newer version wrote, which is not damage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub way_out: Option<String>,
+}
+
+impl Unread {
+    /// The sentence naming the checkout, why its scope was not read, and the way out.
+    pub fn sentence(&self) -> String {
+        let mut sentence = format!("{}: its scope was not read, as {}.", capitalized(&self.checkout), self.reason);
+        if let Some(way_out) = &self.way_out {
+            sentence.push(' ');
+            sentence.push_str(way_out);
+        }
+        sentence
+    }
 }
 
 /// A checkout's scope that could be read.
@@ -143,17 +160,17 @@ type Checkouts = (Vec<(String, PathScope)>, Vec<Unread>);
 /// The checkouts' scopes: those that parse and name a path, and the rest with why. A bays folder
 /// that cannot be listed is an error: the fetch scope is never judged against only some checkouts.
 fn checkout_scopes() -> Result<Checkouts, String> {
-    let mut checkouts: Vec<(String, PathBuf)> = vec![
-        ("the warehouse's own working tree".to_string(), scope_utils::main_tree_scope_path()),
+    let mut checkouts: Vec<(String, PathBuf, Option<String>)> = vec![
+        ("the warehouse's own working tree".to_string(), scope_utils::main_tree_scope_path(), None),
     ];
     let mut unread: Vec<Unread> = Vec::new();
 
     let bays = bay_utils::list_bays().map_err(|error| format!("{}. Nothing was changed.", error.trim_end_matches('.')))?;
-    checkouts.extend(bays.into_iter().map(|name| (format!("bay \"{}\"", name), scope_utils::named_bay_scope_path(&name))));
+    checkouts.extend(bays.into_iter().map(|name| (format!("bay \"{}\"", name), scope_utils::named_bay_scope_path(&name), Some(name))));
 
     let mut read: Vec<(String, PathScope)> = Vec::new();
 
-    for (checkout, path) in checkouts {
+    for (checkout, path, bay) in checkouts {
         let reason = match scope_utils::read_scope_raw(&path)? {
             RawScope::Read(scope) if !scope.is_full() => {
                 read.push((checkout, scope));
@@ -162,9 +179,12 @@ fn checkout_scopes() -> Result<Checkouts, String> {
             RawScope::Read(_) => "it names no path".to_string(),
             RawScope::Missing => "it is missing".to_string(),
             RawScope::Damaged(reason) => format!("it {}", reason.trim_end_matches('.')),
-            RawScope::Newer(reason) => format!("it {}", reason.trim_end_matches('.')),
+            RawScope::Newer(reason) => {
+                unread.push(Unread { checkout, reason: format!("it {}", reason.trim_end_matches('.')), way_out: None });
+                continue;
+            }
         };
-        unread.push(Unread { checkout, reason });
+        unread.push(Unread { checkout, reason, way_out: Some(scope_utils::heal_there(bay.as_deref())) });
     }
 
     Ok((read, unread))
@@ -281,7 +301,7 @@ fn read_lines(refused: &Refused) -> Vec<String> {
         lines.push(format!("  {} checks out {}.", capitalized(&read.checkout), listed(&read.scope)));
     }
     for unread in &refused.unread {
-        lines.push(format!("  {}: its scope was not read, as {}.", capitalized(&unread.checkout), unread.reason));
+        lines.push(format!("  {}", unread.sentence()));
     }
 
     lines
@@ -346,9 +366,9 @@ pub fn repair() -> Result<Option<ScopeRebuilt>, CoreError> {
             lines.extend(read_lines(&refused));
             lines.push(
                 "If the fetch scope is the damaged one, the next step sets it to hold them, fetching what \
-                that lacks. If a checkout's scope is, remove that bay with \"forklift bay remove\" and add \
-                it again under another name, or, for the warehouse's own working tree, clone the remote \
-                again into a new directory.".to_string(),
+                that lacks. If a checkout's scope is, run \"forklift heal\" in that checkout, which restores \
+                it from its copy when that copy can be used, and otherwise \"forklift heal --scope <path>...\" \
+                there, naming the paths it holds.".to_string(),
             );
 
             return Err(refusal(lines.join("\n"), fetch_scope_command(&widened), &refused));

@@ -216,6 +216,7 @@ pub const CENSUS_ROLES: &[(&str, Role)] = &[
     ("{bay}position", Role::HeadRef),
     ("{bay}position-copy", Role::HeadRef),
     ("{bay}scope", Role::Config),
+    ("{bay}scope-copy", Role::Config),
     ("{bay}cherry-pick", Role::Metadata),
     ("{bay}consolidation", Role::Metadata),
     ("{bay}consolidation-skeleton", Role::Metadata),

@@ -654,6 +654,22 @@ fn damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<DamagedRef, Stri
 /// `parcel` must descend from every floor the evidence still records (see
 /// [`refuse_below_a_floor`]): the hidden head itself cannot be checked.
 pub fn set_damaged_ref(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> Result<Rebuilt, String> {
+    let (damaged, head, preconditions) = admit_set(pallet, parcel, notes)?;
+    pallet_utils::repair_pallet_head(&damaged.pallet, &damaged.damage, &head, &preconditions).map_err(|error| error.to_string())?;
+
+    Ok(Rebuilt { pallet: damaged.pallet, head, source: "the parcel given".to_string() })
+}
+
+/// Whether [`set_damaged_ref`] would refuse `pallet`'s ref at `parcel`, judged as it judges and
+/// writing nothing: the parcel's full hash when it would not. Its `notes` explain a refusal; on
+/// success the write says them again.
+pub fn check_set_damaged_ref(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> Result<String, String> {
+    admit_set(pallet, parcel, notes).map(|(_, head, _)| head)
+}
+
+/// Every refusal of [`set_damaged_ref`], before its write: the damaged ref, the parcel's full
+/// hash, and the preconditions the write holds it to.
+fn admit_set(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> Result<(DamagedRef, String, pallet_utils::RefPreconditions), String> {
     let damaged = damaged_ref(pallet, notes)?;
 
     let head = pallet_utils::resolve_revision(parcel)?;
@@ -674,9 +690,7 @@ pub fn set_damaged_ref(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> R
     }
 
     let preconditions = trusted(&damaged.pallet, &head)?;
-    pallet_utils::repair_pallet_head(&damaged.pallet, &damaged.damage, &head, &preconditions).map_err(|error| error.to_string())?;
-
-    Ok(Rebuilt { pallet: damaged.pallet, head, source: "the parcel given".to_string() })
+    Ok((damaged, head, preconditions))
 }
 
 /// Refuse `head`, resolved from `parcel`, when it is a meta pallet's head or one of its ancestors.
@@ -796,9 +810,33 @@ const FOLDER_NAME_REMOVED_REFS: &str = "removed-refs";
 /// bytes in a file of their own. Allowed only when no checkout stands on the pallet, nothing names
 /// a head for it (its own bytes included), and every checkout's state could be read.
 pub fn remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<Removed, String> {
+    let damaged = admit_remove(pallet, notes)?;
+    let RefDamage::Unreadable(bytes) = &damaged.damage else {
+        unreachable!("admit_remove admits only an unreadable ref");
+    };
+
+    let folder = forklift_root().join(FOLDER_NAME_REMOVED_REFS);
+    let stem = pallet.replace('/', "%2F");
+    let kept = (0..).map(|n| folder.join(match n { 0 => stem.clone(), n => format!("{}.{}", stem, n) }))
+        .find(|path| !path.exists())
+        .expect("an unbounded range always yields a free name");
+
+    pallet_utils::remove_damaged_ref(pallet, bytes, &kept).map_err(|error| error.to_string())?;
+
+    Ok(Removed { pallet: pallet.to_string(), kept: kept.to_string_lossy().into_owned() })
+}
+
+/// Whether [`remove_damaged_ref`] would refuse to remove `pallet`'s ref, judged as it judges and
+/// writing nothing. Its `notes` explain a refusal; on success the removal says them again.
+pub fn check_remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<(), String> {
+    admit_remove(pallet, notes).map(|_| ())
+}
+
+/// Every refusal of [`remove_damaged_ref`], before its write: the damaged ref, always unreadable.
+fn admit_remove(pallet: &str, notes: &mut Vec<String>) -> Result<DamagedRef, String> {
     let damaged = damaged_ref(pallet, notes)?;
 
-    let RefDamage::Unreadable(bytes) = &damaged.damage else {
+    let RefDamage::Unreadable(_) = &damaged.damage else {
         return Err(format!(
             "Pallet \"{}\" has no ref to remove: a checkout stands on it, so heal rebuilds it instead. Nothing was changed.",
             pallet
@@ -832,15 +870,7 @@ pub fn remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<Remov
         ));
     }
 
-    let folder = forklift_root().join(FOLDER_NAME_REMOVED_REFS);
-    let stem = pallet.replace('/', "%2F");
-    let kept = (0..).map(|n| folder.join(match n { 0 => stem.clone(), n => format!("{}.{}", stem, n) }))
-        .find(|path| !path.exists())
-        .expect("an unbounded range always yields a free name");
-
-    pallet_utils::remove_damaged_ref(pallet, bytes, &kept).map_err(|error| error.to_string())?;
-
-    Ok(Removed { pallet: pallet.to_string(), kept: kept.to_string_lossy().into_owned() })
+    Ok(damaged)
 }
 
 #[cfg(test)]

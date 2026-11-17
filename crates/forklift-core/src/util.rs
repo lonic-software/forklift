@@ -23,6 +23,7 @@ pub mod manifest_utils;
 pub mod deliver_utils;
 pub mod repair_utils;
 pub mod bay_utils;
+pub mod checkout_scope_heal;
 pub mod journal_utils;
 pub mod haul_utils;
 pub mod sign_utils;

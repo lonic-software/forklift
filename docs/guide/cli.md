@@ -2680,6 +2680,7 @@ forklift heal
 forklift heal --ref <pallet>=<parcel>
 forklift heal --remove-ref <pallet>
 forklift heal --fetch-scope <path>
+forklift heal --scope <path>
 ```
 
 You will rarely see this: after certain rare write failures (a directory-sync error right
@@ -2905,6 +2906,19 @@ each).
   not hold a checkout. It walks each head from the origin under the new scope first, fetching what
   the history lacks, so it needs the origin; offline, it changes nothing. `--json` reports
   `fetch_scope_rebuilt`, with `chosen` true and the objects fetched.
+
+A checkout's own scope file (in a sparse warehouse, or a scoped bay) that is missing or damaged
+makes every command there refuse with `checkout_scope_damaged` (exit 67), naming `forklift heal`.
+Every scope write leaves a copy beside the scope file, and `heal` run in that checkout writes the
+copy back, before it looks at the fetch scope. It does not use a copy that names a path the
+warehouse never fetched or the whole tree, nor one that would leave a committed file, or an
+untracked file under a fetched path, outside the checkout; then it changes nothing and names the
+files. `--json` reports `checkout_scope_restored`: `checkout`, `scope`, `was` and `chosen`.
+
+- `forklift heal --scope <path>` sets that checkout's scope to the paths given, one per `--scope`,
+  when its scope file cannot be used. They must be what the checkout held: folders of the tree it
+  stands on and within the fetch scope, with every committed file under them on disk, every folder
+  under them in the store, and no file left stranded outside them. `chosen` is then true.
 
 #### Interrupted operations
 
