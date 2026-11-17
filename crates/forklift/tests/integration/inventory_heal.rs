@@ -249,13 +249,21 @@ fn an_ancestor_only_the_write_registers_keeps_its_shard_matched() {
 /// user to heal once it is removed; heal names it too rather than finding nothing to heal, and only
 /// once every other repair and check has run. Revert: read anything but damage as nothing for heal
 /// to do → heal succeeds → red. Refuse where it is found → the lost tree is never reported → red.
+/// Render the report of a run that did nothing else → "Nothing to heal" before the refusal → red.
+/// Refuse without the report → the details lack the lost tree → red.
 #[test]
 fn a_folder_in_place_of_the_metadata_file_is_named_by_heal() {
     let area = Area::new("not-a-file");
     let tree = area.head_tree("main");
-    area.lose(&tree);
     forklift_core::util::file_utils::remove_file(area.metadata()).unwrap();
     std::fs::create_dir(area.metadata()).unwrap();
+
+    let alone = area.run(&["heal"]);
+    let shown = format!("{}{}", text(&alone.stdout), text(&alone.stderr));
+    assert!(!alone.status.success() && shown.contains("is not a file"), "{}", shown);
+    assert!(!shown.contains("Nothing to heal"), "{}", shown);
+
+    area.lose(&tree);
 
     let output = area.run(&["heal"]);
     assert!(!output.status.success(), "{}", text(&output.stdout));
