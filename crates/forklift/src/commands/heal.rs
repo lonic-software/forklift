@@ -103,7 +103,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let named = set_ref.iter().map(|(pallet, _)| *pallet).chain(remove_ref.iter().map(String::as_str));
     if let Some(twice) = named.clone().enumerate().find(|(at, pallet)| named.clone().skip(at + 1).any(|other| other == *pallet)) {
         return Err(format!(
-            "Pallet \"{}\" is named more than once by --ref and --remove-ref, so which to apply cannot be told. Nothing was changed.",
+            "Pallet \"{}\" is named more than once by --ref and --remove-ref: name each pallet once. Nothing was changed.",
             twice.1
         ));
     }
@@ -210,12 +210,12 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let waits_on: Result<Option<Option<String>>, String> = match (early, position) {
         (false, Some(pallet)) => match set_ref.iter().find(|(named, _)| *named == pallet) {
             Some((_, parcel)) => ref_heal::check_set_damaged_ref(pallet, parcel, &mut check_notes).map(|head| Some(Some(head))),
-            None => pallet_utils::list_pallets().and_then(|pallets| match pallets.iter().any(|named| !remove_ref.contains(named)) {
-                true => Err(format!(
-                    "--position names pallet \"{}\", whose ref --remove-ref removes, so the bay cannot be put on it. Nothing was changed.",
-                    pallet
+            None => pallet_utils::list_pallets().and_then(|pallets| match pallets.iter().filter(|named| !remove_ref.contains(named)).map(|named| format!("\"{}\"", named)).collect::<Vec<_>>() {
+                left if !left.is_empty() => Err(format!(
+                    "--position names pallet \"{}\", whose ref --remove-ref removes, so the bay cannot be put on it: name one of {} with --position instead. Nothing was changed.",
+                    pallet, left.join(", ")
                 )),
-                false => ref_heal::check_remove_damaged_ref(pallet, &mut check_notes).map(|()| Some(None)),
+                _ => ref_heal::check_remove_damaged_ref(pallet, &mut check_notes).map(|()| Some(None)),
             }),
         },
         _ => Ok(None),

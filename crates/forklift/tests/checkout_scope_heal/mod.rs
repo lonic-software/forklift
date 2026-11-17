@@ -505,8 +505,8 @@ fn heal_refuses_a_ref_it_will_not_set_before_restoring_the_scope() {
     let set = format!("main={}", head);
     for (args, reason) in [
         (vec!["heal", "--position", "main", "--ref", &set], "is not damaged"),
-        (vec!["heal", "--position", "main", "--ref", &set, "--remove-ref", "main"], "is named more than once"),
-        (vec!["heal", "--position", "main", "--remove-ref", "main"], "whose ref --remove-ref removes"),
+        (vec!["heal", "--position", "main", "--ref", &set, "--remove-ref", "main"], "is named more than once by --ref and --remove-ref: name each pallet once"),
+        (vec!["heal", "--position", "main", "--remove-ref", "main"], "name one of \"b\", \"other\" with --position instead"),
     ] {
         let refused = area.forklift("sparse", &args);
         assert!(!refused.status.success(), "{:?}: {}", args, stdout(&refused));
