@@ -1766,9 +1766,11 @@ fn a_packed_object_of_another_kind_is_refused() {
 }
 
 /// A loose copy that does not decompress, beside a good packed copy, does not decide the kind: the
-/// packed copy is peeked first, as the ordinary read looks there first.
+/// packed copy is peeked first, as the ordinary read looks there first, and a loose peek that
+/// fails says nothing either way.
 ///
-/// Revert: peek the loose copy first and fail on it → red.
+/// Revert: peek the loose copy first and fail the kind read on it → red. Either defence alone
+/// passes this, so swapping only the order survives.
 #[test]
 fn a_damaged_loose_copy_beside_a_packed_one_reads_the_packed_kind() {
     use forklift_core::enums::object_type::ObjectType;

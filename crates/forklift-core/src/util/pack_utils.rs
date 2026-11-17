@@ -12512,7 +12512,8 @@ pub(crate) mod tests {
 
     /// A full record's kind is peeked from its first decompressed bytes, without the object read
     /// whole; a delta record has no header of its own, so it is left to the whole read.
-    /// Revert: decode the whole record, or peek a delta's own bytes → red.
+    /// Revert: peek nothing (`None` for every record) → red. A delta's body opens with its base
+    /// hash, which does not decode, so dropping the record-kind check alone survives.
     #[test]
     fn a_full_records_header_is_peeked_and_a_deltas_is_not() {
         let (_temp, _scope) = salvage_root("fork497-peek");
