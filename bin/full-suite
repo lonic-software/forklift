@@ -6,11 +6,13 @@
 #   build      cargo build --workspace (the tests drive the forklift and forklift-server binaries,
 #              and cargo test -p forklift does not rebuild forklift-server)
 #   test       cargo test --workspace --no-fail-fast (unit, integration and doc-tests)
-#   history    proof-load's ignored history tests, against the forklift binary just built
+#   history    proof-load's ignored tests (the history lane and the round trips), against the
+#              forklift binary cargo just built, wherever its target directory is
 #   desktop    tools/proof-load-desktop, its own workspace: tests, then clippy -D warnings
 #   clippy     cargo clippy --workspace --all-targets, so clippy.toml's bans reach the tests too;
 #              report-only like CI, its log is what bin/clippy-changed reads
-#   guards     bin/fmt-guard, bin/gen-docs --check and bin/check-no-aws-lc
+#   guards     bin/fmt-guard, bin/gen-docs --check (built into target/gen-docs, so its docgen
+#              build never replaces the tested binary) and bin/check-no-aws-lc
 #
 # usage: full-suite [--out DIR] [--only STEP,...]
 #        full-suite --list
@@ -30,15 +32,26 @@ steps() {
     cat <<'EOF'
 build|1800|cargo build --workspace
 test|3600|cargo test --workspace --no-fail-fast
-history|900|PROOF_LOAD_FORKLIFT="$PWD/target/debug/forklift" cargo test -p proof-load --lib -- --ignored history
+history|900|PROOF_LOAD_FORKLIFT="$(cargo build -q -p forklift --message-format=json | sed -n 's/.*"executable":"\([^"]*\/forklift\)".*/\1/p' | tail -1)" && [ -x "$PROOF_LOAD_FORKLIFT" ] && export PROOF_LOAD_FORKLIFT && cargo test -p proof-load --lib -- --ignored
 desktop|1800|cargo test --locked --no-fail-fast --manifest-path tools/proof-load-desktop/Cargo.toml && cargo clippy --locked --all-targets --manifest-path tools/proof-load-desktop/Cargo.toml -- -D warnings
 clippy|1800|cargo clippy --workspace --all-targets --message-format=short
-guards|900|./bin/fmt-guard && ./bin/gen-docs --check && ./bin/check-no-aws-lc
+guards|900|./bin/fmt-guard && CARGO_TARGET_DIR=target/gen-docs ./bin/gen-docs --check && ./bin/check-no-aws-lc
 EOF
 }
 
-# The line that says why a step failed, in the order a reader wants them.
-FAIL_RE='^test .* FAILED|panicked at|^error(\[|:)|^failures:|FAILED|fmt-guard:|check-no-aws-lc:|stale|^diff '
+# The patterns that say why a step failed, most telling first: the first pattern with a match in the
+# log names the step's failure. None is a bare word a passing test's name could hold.
+FAIL_RES=('^test .* FAILED$' 'panicked at' '^error(\[|:)' 'fmt-guard:' 'check-no-aws-lc:'
+    'docs/generated/ is stale' '^diff ' '^failures:')
+
+# why LOG: the first line of LOG that the most telling matching pattern finds, else its last line.
+why() {
+    local re
+    for re in "${FAIL_RES[@]}"; do
+        grep -E -m1 -- "$re" "$1" && return 0
+    done
+    tail -1 "$1"
+}
 
 # Runs the command in its own process group and kills the whole group on timeout (exit 142): a test
 # binary's children would otherwise outlive the watchdog.
@@ -49,7 +62,10 @@ bounded() {
         if ($pid == 0) { setpgrp(0, 0); exec @ARGV or exit 127 }
         setpgrp($pid, $pid);
         $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; exit 142 };
-        $SIG{$_} = sub { kill "TERM", -$pid; exit 143 } for qw(INT TERM HUP);
+        # Dies of the same signal once the group is gone, so the caller sees an interrupt, not a
+        # failure, and stops too.
+        $SIG{$_} = do { my $s = $_; sub { kill "TERM", -$pid; $SIG{$s} = "DEFAULT"; kill $s, $$; exit 143 } }
+            for qw(INT TERM HUP);
         alarm $t; waitpid $pid, 0; alarm 0;
         exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$@"
 }
@@ -76,7 +92,7 @@ run_steps() {
         if [ "$st" -eq 142 ]; then
             printf 'TIMEOUT  %-8s %5ss  (watchdog %ss; log %s)\n' "$name" "$took" "$secs" "$out/$name.log"
         else
-            why=$(grep -E -m1 -- "$FAIL_RE" "$out/$name.log" || tail -1 "$out/$name.log" || true)
+            why=$(why "$out/$name.log" || true)
             printf 'FAILED   %-8s %5ss  exit %s: %s\n' "$name" "$took" "$st" "$why"
         fi
         if [ "$name" = build ]; then
@@ -151,6 +167,25 @@ EOF
     ); st=$?
     set -e
     check "every step passing passes the run" 0 "ok       test"
+
+    mkdir -p "$tmp/e" "$tmp/f"
+    set +e
+    out=$(run_steps "$tmp/e" "" <<'EOF'
+build|5|true
+test|5|echo 'test tests::stale_requests_are_refused ... ok'; echo 'test x ... FAILED'; exit 101
+EOF
+    ); st=$?
+    set -e
+    check "a passing test named stale is not the failure" 1 "exit 101: test x ... FAILED"
+
+    # An interrupted watchdog dies of the interrupt (128 + 2), not a plain failure: that is what
+    # lets the shell running the steps stop at a Ctrl-C instead of starting the next one.
+    local sub
+    ( bounded 20 sleep 10 ) & sub=$!
+    sleep 1; pkill -INT -P "$sub" perl
+    set +e; wait "$sub"; st=$?; set -e
+    out="exit $st"
+    check "an interrupted watchdog dies of the interrupt" 130 "exit 130"
 
     rm -rf "$tmp"
     if [ "$fails" -eq 0 ]; then echo "self-test: all passed"; return 0; fi

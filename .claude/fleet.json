@@ -1,7 +1,7 @@
 {
   "worktree_root": ".claude/worktrees",
   "main_ref": "origin/main",
-  "build_dir": "per-slot: each slot keeps its own target/ (the default); never share CARGO_TARGET_DIR across slots, and gen-docs runs with CARGO_TARGET_DIR=<slot scratch>",
+  "build_dir": "per-slot: each slot keeps its own target/ (the default); never share CARGO_TARGET_DIR across slots. gen-docs builds into target/gen-docs, so its docgen-feature binary never replaces the tested target/debug/forklift",
   "heavy_commands": [
     {
       "pattern": "cargo[[:space:]]+(test|nextest|clippy|bench)",
@@ -12,7 +12,15 @@
       "bound_seconds": 1800
     },
     {
-      "pattern": "bin/(check|bench\\.sh|benchmark)",
+      "pattern": "bin/full-suite([[:space:]]|$)",
+      "bound_seconds": 10800
+    },
+    {
+      "pattern": "bin/(clippy-changed|gen-docs)([[:space:]]|$)",
+      "bound_seconds": 1800
+    },
+    {
+      "pattern": "bin/(check|bench\\.sh|benchmark)([[:space:]]|$)",
       "bound_seconds": 3600
     }
   ],
@@ -25,11 +33,15 @@
   "mechanical_files": [
     {
       "glob": "docs/generated/**",
-      "regenerate": "./bin/gen-docs"
+      "regenerate": "CARGO_TARGET_DIR=target/gen-docs ./bin/gen-docs"
     },
     {
       "glob": "Cargo.lock",
-      "regenerate": "cargo metadata --format-version 1 >/dev/null"
+      "regenerate": "git checkout --theirs Cargo.lock && cargo metadata --format-version 1 >/dev/null && ./bin/check-no-aws-lc"
+    },
+    {
+      "glob": "tools/proof-load-desktop/Cargo.lock",
+      "regenerate": "git checkout --theirs tools/proof-load-desktop/Cargo.lock && cargo metadata --format-version 1 --manifest-path tools/proof-load-desktop/Cargo.toml >/dev/null"
     }
   ],
   "branch_update": "merge",
