@@ -126,9 +126,21 @@ fn heal_does_not_restore_from_a_copy_it_cannot_use() {
     let _server = sparse_without_other(&area);
     remove(&area, MAIN_SCOPE);
 
+    // With the fetch scope lost, nothing else bounds the copy: one that names no path is still not
+    // restored.
+    let fetch = std::fs::read(area.path(FETCH_SCOPE)).unwrap();
+    remove(&area, FETCH_SCOPE);
+    std::fs::write(area.path(MAIN_COPY), scope_record(&[])).unwrap();
+    let healed = area.forklift("sparse", &["--json", "heal"]);
+    assert!(!area.path(MAIN_SCOPE).exists(), "full, fetch scope lost: nothing was restored");
+    let message = scope_damaged(&healed)["message"].as_str().unwrap().to_string();
+    assert!(message.contains("names no path"), "{}", message);
+    std::fs::write(area.path(FETCH_SCOPE), fetch).unwrap();
+
+    // A copy wider than the fetch scope strands nothing, so only the fetch-scope check stops it.
     for (what, copy, reason) in [
-        ("outside the fetch scope", Some(scope_record(&["other"])), "outside the fetch scope"),
         ("wider than the fetch scope", Some(scope_record(&["docs", "other", "src/api"])), "outside the fetch scope"),
+        ("outside the fetch scope", Some(scope_record(&["other"])), "outside the fetch scope"),
         ("full", Some(scope_record(&[])), "names no path"),
         ("deleted", None, "is missing"),
     ] {
@@ -144,17 +156,6 @@ fn heal_does_not_restore_from_a_copy_it_cannot_use() {
         assert!(error["next_step"].is_null(), "{}: no next step can be offered: {}", what, error);
         assert!(message.contains(reason) && message.contains("\"forklift heal --scope <path>...\""), "{}: {}", what, message);
     }
-
-    // With the fetch scope lost as well, nothing else bounds the copy: one that names no path is
-    // still not restored.
-    let fetch = std::fs::read(area.path(FETCH_SCOPE)).unwrap();
-    remove(&area, FETCH_SCOPE);
-    std::fs::write(area.path(MAIN_COPY), scope_record(&[])).unwrap();
-    let healed = area.forklift("sparse", &["--json", "heal"]);
-    assert!(!area.path(MAIN_SCOPE).exists(), "full, fetch scope lost: nothing was restored");
-    let message = scope_damaged(&healed)["message"].as_str().unwrap().to_string();
-    assert!(message.contains("names no path"), "{}", message);
-    std::fs::write(area.path(FETCH_SCOPE), fetch).unwrap();
 }
 
 /// A copy narrower than what the checkout holds is not restored over a committed file it would
