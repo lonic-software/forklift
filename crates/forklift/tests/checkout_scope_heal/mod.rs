@@ -171,17 +171,30 @@ fn heal_does_not_restore_a_copy_that_would_strand_a_file() {
     let _server = with_bay(&area);
 
     // The main tree holds the committed docs/guide.md, which a copy of src/api alone would strand.
+    // Its configuration file is damaged in a comment, which heal mends before the refusal: the
+    // refusal says so.
     remove(&area, MAIN_SCOPE);
     std::fs::write(area.path(MAIN_COPY), scope_record(&["src/api"])).unwrap();
+    let config = area.path("sparse/.forklift/config/warehouse.toml");
+    let mut bytes = std::fs::read(&config).unwrap();
+    let at = bytes.windows(12).position(|w| w == b"pseudonymous").unwrap();
+    bytes[at] = !bytes[at];
+    std::fs::write(&config, bytes).unwrap();
     let error = scope_damaged(&area.forklift("sparse", &["--json", "heal"]));
-    assert!(error["message"].as_str().unwrap().contains("\"docs/guide.md\""), "the committed file is named: {}", error);
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("\"docs/guide.md\""), "the committed file is named: {}", error);
+    assert!(message.contains("The configuration file"), "the config rewrite is said: {}", message);
     assert!(!area.path(MAIN_SCOPE).exists());
 
     // The bay holds src/api only; an untracked file under the fetched docs is outside it.
     remove(&area, BAY_SCOPE);
     area.write_file("b/docs/notes.txt", "untracked\n");
     let error = scope_damaged(&area.forklift("b", &["--json", "heal"]));
-    assert!(error["message"].as_str().unwrap().contains("\"docs/notes.txt\""), "the untracked file is named: {}", error);
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("\"docs/notes.txt\""), "the untracked file is named: {}", error);
+    // It may have lain outside the checkout already, where --scope would refuse it too: moving it
+    // is named, and below it works.
+    assert!(message.contains("move those files out of the working tree and run \"forklift heal\" again"), "{}", message);
     assert!(!area.path(BAY_SCOPE).exists());
 
     remove(&area, "b/docs/notes.txt");
@@ -195,17 +208,29 @@ fn heal_does_not_restore_a_copy_that_would_strand_a_file() {
 }
 
 /// A scope file that reads but names a path outside the fetch scope is restored from a usable copy
-/// that differs from it, and the copy is left as it was.
+/// that differs from it, and the copy is left as it was. A copy that would strand a file is not,
+/// and the fetch-scope heal's refusal says so.
 ///
 /// Revert: re-sync the copy from the scope before judging it → the copy takes the bad scope and
-/// nothing is restored → red.
+/// nothing is restored → red; drop the note on the stranding copy → the refusal does not say why
+/// the copy was not restored → red.
 #[test]
 fn heal_restores_a_scope_outside_the_fetch_scope_from_its_copy() {
     let area = TestArea::new("checkout-scope-heal-outside");
     let _server = sparse_without_other(&area);
     let copy = std::fs::read(area.path(MAIN_COPY)).unwrap();
 
+    // A copy that would strand the committed docs/guide.md does not settle it: the fetch-scope
+    // heal refuses, and says why the copy was not restored.
     std::fs::write(area.path(MAIN_SCOPE), scope_record(&["other"])).unwrap();
+    std::fs::write(area.path(MAIN_COPY), scope_record(&["src/api"])).unwrap();
+    let refused = area.forklift("sparse", &["--json", "heal"]);
+    let value = json_of(&refused);
+    assert_eq!(value["error"]["code"], "fetch_scope_damaged", "{}", value);
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("so it was not restored: \"docs/guide.md\""), "{}", message);
+    std::fs::write(area.path(MAIN_COPY), &copy).unwrap();
+
     let healed = area.forklift("sparse", &["--json", "heal"]);
     assert_success(&healed);
     let restored = &json_of(&healed)["data"]["checkout_scope_restored"];
@@ -372,24 +397,28 @@ fn a_pathless_bay_with_a_damaged_scope_is_removed_not_healed() {
     assert!(said.contains("forklift bay remove b"), "{}", said);
 }
 
-/// With the position lost as well, the scope waits for the position heal, whose base the stranding
-/// guard reads, and the same heal then restores it from its copy.
+/// With the position and the fetch scope lost as well, heal rebuilds the position first, whose base
+/// the stranding guard reads, then restores the scope from its copy, then rebuilds the fetch scope
+/// from the checkouts' scopes, this one's included.
 ///
-/// Revert: run the scope step before the position heal regardless → the guard cannot read the
-/// position and heal refuses → red.
+/// Revert: skip the early position heal → the guard cannot read the position and heal refuses →
+/// red; leave the position and the scope for after the fetch-scope heal → its rebuild from bay "b"
+/// alone leaves out "docs", the copy then lies outside it and is refused → red.
 #[test]
-fn heal_restores_the_scope_after_the_position_it_needs() {
+fn heal_restores_the_position_and_scope_before_the_fetch_scope() {
     let area = TestArea::new("checkout-scope-heal-after-position");
-    let _server = sparse_without_other(&area);
+    let _server = with_bay(&area);
     let scope = std::fs::read(area.path(MAIN_SCOPE)).unwrap();
     remove(&area, MAIN_SCOPE);
     remove(&area, "sparse/.forklift/position");
+    remove(&area, FETCH_SCOPE);
 
     let healed = area.forklift("sparse", &["--json", "heal"]);
     assert_success(&healed);
     let data = &json_of(&healed)["data"];
     assert_eq!(data["checkout_scope_restored"]["scope"], serde_json::json!(["docs", "src/api"]), "{}", data);
     assert!(!data["position_rebuilt"].is_null(), "{}", data);
+    assert_eq!(data["fetch_scope_rebuilt"]["scope"], serde_json::json!(["docs", "src/api"]), "{}", data);
     assert_eq!(std::fs::read(area.path(MAIN_SCOPE)).unwrap(), scope);
     assert_success(&area.forklift("sparse", &["stocktake"]));
 }

@@ -43,6 +43,7 @@ use crate::model::tree_item::TreeItem;
 use crate::util::path_utils::WarehousePath;
 use crate::util::scope_utils::{self, PathScope, RawScope, ScopeClass};
 use crate::util::warehouse_utils::{self, WarehouseMode};
+use crate::util::scope_heal::listed;
 use crate::util::{file_utils, object_utils, pallet_utils};
 
 /// A checkout scope `heal` wrote.
@@ -176,13 +177,28 @@ pub fn repair(notes: &mut Vec<String>) -> Result<Option<ScopeRestored>, CoreErro
             // A scope file that reads but lies outside a fetch scope that reads: either file may be
             // the damaged one. Only a usable copy that says otherwise settles it here.
             Some(reason) if !scope.is_full() => {
+                // A copy that does not settle it is noted, so the fetch-scope heal's refusal says why
+                // heal here did not restore it.
                 return match usable_copy(&copy_path, sparse, &fetch)? {
-                    Ok((copy, bytes)) if copy != scope => {
-                        if !stranded(&copy, &fetch)?.is_empty() {
-                            return Ok(None);
+                    Ok((copy, bytes)) if copy != scope => match stranded(&copy, &fetch) {
+                        Ok(blockers) if blockers.is_empty() => restore(&checkout, &bytes, &copy, &reason).map(Some),
+                        Ok(blockers) => {
+                            notes.push(format!(
+                                "The copy of the scope of {} (\"{}\") names {}, but would leave these files outside \
+                                the checkout, where they could never be stacked again, so it was not restored: {}.",
+                                checkout.name, copy_path.to_string_lossy(), scope_name(&copy), listed(&blockers)
+                            ));
+                            Ok(None)
                         }
-                        restore(&checkout, &bytes, &copy, &reason).map(Some)
-                    }
+                        Err(error) => {
+                            notes.push(format!(
+                                "The copy of the scope of {} (\"{}\") names {}, but whether it would leave a file \
+                                outside the checkout could not be told, so it was not restored: {}",
+                                checkout.name, copy_path.to_string_lossy(), scope_name(&copy), error
+                            ));
+                            Ok(None)
+                        }
+                    },
                     _ => Ok(None),
                 };
             }
@@ -192,27 +208,42 @@ pub fn repair(notes: &mut Vec<String>) -> Result<Option<ScopeRestored>, CoreErro
         RawScope::Damaged(reason) => reason,
     };
 
-    let refused_why = match usable_copy(&copy_path, sparse, &fetch)? {
-        Ok((copy, bytes)) => {
-            let blockers = stranded(&copy, &fetch)?;
-            if blockers.is_empty() {
-                return restore(&checkout, &bytes, &copy, &was).map(Some);
-            }
-            format!(
-                "Its copy (\"{}\") names {}, and would leave these files outside the checkout, where they \
-                could never be stacked again: {}.",
-                copy_path.to_string_lossy(), scope_name(&copy), listed(&blockers)
-            )
-        }
-        Err(why) => format!("Its copy (\"{}\") {}.", copy_path.to_string_lossy(), why.trim_end_matches('.')),
+    let choose = "Run \"forklift heal --scope <path>...\", naming the paths this checkout held.";
+
+    let (refused_why, remedy) = match usable_copy(&copy_path, sparse, &fetch)? {
+        Ok((copy, bytes)) => match stranded(&copy, &fetch) {
+            Ok(blockers) if blockers.is_empty() => return restore(&checkout, &bytes, &copy, &was).map(Some),
+            // Files that already lay outside the checkout count too, and stop --scope as well, so
+            // moving them is named first.
+            Ok(blockers) => (
+                format!(
+                    "Its copy (\"{}\") names {}, and would leave these files outside the checkout, where they \
+                    could never be stacked again: {}.",
+                    copy_path.to_string_lossy(), scope_name(&copy), listed(&blockers)
+                ),
+                "If the copy names what this checkout held, move those files out of the working tree and run \
+                \"forklift heal\" again. Otherwise run \"forklift heal --scope <path>...\", naming the paths it \
+                held.".to_string(),
+            ),
+            Err(error) => (
+                format!(
+                    "Its copy (\"{}\") names {}, but whether it would leave a file outside the checkout cannot be \
+                    told: {}",
+                    copy_path.to_string_lossy(), scope_name(&copy), error
+                ),
+                "Once that is fixed, run \"forklift heal\" again.".to_string(),
+            ),
+        },
+        Err(why) => (format!("Its copy (\"{}\") {}.", copy_path.to_string_lossy(), why.trim_end_matches('.')), choose.to_string()),
     };
 
     Err(CoreError::refusal(
         RefusalCode::CheckoutScopeDamaged,
         format!(
             "The scope file of {} (\"{}\") {}, so Forklift cannot tell which paths it checks out. {} Nothing \
-            was changed. Run \"forklift heal --scope <path>...\", naming the paths this checkout held.",
-            checkout.name, checkout.path.to_string_lossy(), was.trim_end_matches('.'), refused_why
+            was changed. {}",
+            checkout.name, checkout.path.to_string_lossy(), was.trim_end_matches('.'),
+            if refused_why.ends_with('.') { refused_why.clone() } else { format!("{}.", refused_why) }, remedy
         ),
         String::new(),
     ))
@@ -334,7 +365,8 @@ pub fn set_chosen(paths: &[String]) -> Result<ScopeRestored, CoreError> {
     if !blockers.is_empty() {
         return Err(CoreError::from(format!(
             "The scope {} would leave these files outside the checkout, where they could never be stacked \
-            again: {}. --scope was not applied, and nothing was changed. Name every path this checkout held.",
+            again: {}. --scope was not applied, and nothing was changed. Name every path this checkout held; files \
+            that lay outside it already are moved out of the working tree first.",
             scope_name(&scope), listed(&blockers)
         )));
     }
@@ -596,8 +628,4 @@ fn scope_name(scope: &PathScope) -> String {
         true => "every path".to_string(),
         false => listed(scope.prefixes()),
     }
-}
-
-fn listed(paths: &[String]) -> String {
-    paths.iter().map(|path| format!("\"{}\"", path)).collect::<Vec<_>>().join(", ")
 }

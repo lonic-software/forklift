@@ -698,27 +698,8 @@ fn checkout_scope_damaged(whose: &str, path: &Path, found: &str, checkout: &Chec
             "Heal restores it from the copy every scope write leaves beside it.".to_string(),
             "forklift heal",
         ),
-        Checkout::MainTree => {
-            let main_tree = globals::forklift_root();
-            let main_tree = main_tree.parent().map(Path::to_path_buf).unwrap_or_default();
-            let main_tree = std::path::absolute(&main_tree).unwrap_or(main_tree);
-            (format!("Run \"forklift heal\" in the main tree, \"{}\", which restores it from its copy.", main_tree.to_string_lossy()), "")
-        }
-        Checkout::OtherBay(name) => match crate::util::bay_utils::read_bay_path(name) {
-            Ok(Some(folder)) => (
-                format!("Run \"forklift heal\" in that bay, \"{}\", which restores it from its copy.", folder.to_string_lossy()),
-                "",
-            ),
-            Ok(None) => (
-                format!(
-                    "The bay \"{}\" recorded no folder, so its \"forklift bay add\" stopped before checking anything \
-                     out. Remove it with \"forklift bay remove {}\" and add a new one under another name.",
-                    name, name
-                ),
-                "",
-            ),
-            Err(e) => (format!("Run \"forklift heal\" in that bay, whose folder could not be read: {}", e), ""),
-        },
+        Checkout::MainTree => (heal_there(None), ""),
+        Checkout::OtherBay(name) => (heal_there(Some(name)), ""),
     };
 
     let message = format!(
@@ -726,6 +707,34 @@ fn checkout_scope_damaged(whose: &str, path: &Path, found: &str, checkout: &Chec
         whose, path.to_string_lossy(), found.trim_end(), remedy
     );
     refusal(RefusalCode::CheckoutScopeDamaged, message, next_step).into()
+}
+
+/// What restores a checkout scope that is missing, damaged or names no path, from a checkout other
+/// than it: heal run there, named by its folder. A bay that recorded no folder, its `bay add`
+/// stopped before checking anything out, has no checkout to run it in, so it is removed instead.
+///
+/// # Arguments
+/// * `bay` - The bay, or `None` for the warehouse's own working tree.
+pub(crate) fn heal_there(bay: Option<&str>) -> String {
+    match bay {
+        None => {
+            let main_tree = globals::forklift_root();
+            let main_tree = main_tree.parent().map(Path::to_path_buf).unwrap_or_default();
+            let main_tree = std::path::absolute(&main_tree).unwrap_or(main_tree);
+            format!("Run \"forklift heal\" in the main tree, \"{}\", which restores it from its copy.", main_tree.to_string_lossy())
+        }
+        Some(name) => match crate::util::bay_utils::read_bay_path(name) {
+            Ok(Some(folder)) => format!(
+                "Run \"forklift heal\" in that bay, \"{}\", which restores it from its copy.", folder.to_string_lossy()
+            ),
+            Ok(None) => format!(
+                "The bay \"{}\" recorded no folder, so its \"forklift bay add\" stopped before checking anything \
+                 out. Remove it with \"forklift bay remove {}\" and add a new one under another name.",
+                name, name
+            ),
+            Err(e) => format!("Run \"forklift heal\" in that bay, whose folder could not be read: {}", e),
+        },
+    }
 }
 
 /// The refusal for a checkout scope a newer version of Forklift wrote. It is not damage, so it

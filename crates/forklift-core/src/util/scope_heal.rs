@@ -184,23 +184,10 @@ fn checkout_scopes() -> Result<Checkouts, String> {
                 continue;
             }
         };
-        unread.push(Unread { checkout, reason, way_out: Some(unread_way_out(bay.as_deref())) });
+        unread.push(Unread { checkout, reason, way_out: Some(scope_utils::heal_there(bay.as_deref())) });
     }
 
     Ok((read, unread))
-}
-
-/// What restores a checkout scope that is missing, damaged or names no path: heal, run in that
-/// checkout, which restores it from its copy. A bay that recorded no folder, its `bay add` stopped
-/// before checking anything out, has no checkout to run it in, so it is removed instead.
-fn unread_way_out(bay: Option<&str>) -> String {
-    match bay.map(bay_utils::read_bay_path) {
-        Some(Ok(None)) => format!(
-            "It recorded no folder, so nothing was checked out there: remove it with \"forklift bay remove {}\".",
-            bay.unwrap_or_default()
-        ),
-        _ => "Run \"forklift heal\" in that checkout, which restores it from its copy.".to_string(),
-    }
 }
 
 fn union(scopes: &[(String, PathScope)]) -> PathScope {

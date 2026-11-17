@@ -11,7 +11,7 @@ use forklift_core::util::reseal_utils::{self, ResealError};
 use forklift_core::util::warehouse_utils::{self, WarehouseMode};
 use forklift_core::util::applied_redactions::{self, RedactionState};
 use forklift_core::util::unavailable_heal::{self, RemoteError};
-use forklift_core::util::{config_utils, origin_utils, pallet_utils, park_utils, recovery_utils, redaction_utils, sealed_utils, tree_utils, unavailable};
+use forklift_core::util::{config_utils, origin_utils, park_utils, recovery_utils, redaction_utils, sealed_utils, tree_utils, unavailable};
 use crate::output::{self, CommandOutput};
 
 /// The note of a re-apply of redactions that could not run, followed by why.
@@ -163,11 +163,12 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
     };
 
-    let records_said = |error: CoreError, notes: &[String], restored: Option<&ScopeRestored>| {
-        let mut error = String::from(error);
+    let records_said = |error: CoreError, notes: &[String], position: Option<&PositionRebuilt>, restored: Option<&ScopeRestored>| {
+        let mut error = config_said(String::from(error));
         let sentences = record_rebuilt.iter().map(RecordRebuilt::sentence)
             .chain(unavailable_rebuilt.iter().map(UnavailableRebuilt::sentence))
             .chain(applied_rebuilt.iter().map(AppliedRebuilt::sentence))
+            .chain(position.map(PositionRebuilt::sentence))
             .chain(restored.map(ScopeRestored::sentence));
         for sentence in sentences {
             error = forklift_core::error::append_to_message(error, &sentence);
@@ -178,13 +179,23 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         error
     };
 
+    // The bay's position, before the checkout's scope, whose stranding guard reads the tree the
+    // checkout stands on, and so before the fetch-scope heal too: a rebuild from the checkouts'
+    // scopes would leave out a scope not yet restored. It reads neither scope. A --position
+    // stands on a ref this run may set or remove, so beside --ref or --remove-ref it waits for
+    // those below, and the checkout's scope waits with it.
+    let early = position.is_none() || (set_ref.is_empty() && remove_ref.is_empty());
+    let early_position = match early {
+        true => position_heal::repair(position, &mut ref_notes)
+            .map_err(|error| records_said(CoreError::from(error), &ref_notes, None, None))?,
+        false => None,
+    };
+
     // The checkout's own scope, just before the fetch-scope heal, whose rebuild from the checkouts'
-    // scopes then sees it restored. The stranding guard reads the tree the checkout stands on, so
-    // with a bay position that does not read this waits for the position heal below. Nothing
-    // before it reads either scope.
-    let position_reads = pallet_utils::read_position().is_ok();
-    let early_scope = match position_reads {
-        true => heal_checkout_scope(scope, &mut ref_notes).map_err(|error| records_said(error, &ref_notes, None))?,
+    // scopes then sees it restored. Nothing before it reads either scope.
+    let early_scope = match early {
+        true => heal_checkout_scope(scope, &mut ref_notes)
+            .map_err(|error| records_said(error, &ref_notes, early_position.as_ref(), None))?,
         false => None,
     };
 
@@ -193,7 +204,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let scope_rebuilt = match &exclusive {
         Some(exclusive) => Some(scope_heal::set_chosen(fetch_scope, exclusive).await),
         None => scope_heal::repair().transpose(),
-    }.transpose().map_err(|error| records_said(error, &ref_notes, early_scope.as_ref()))?;
+    }.transpose().map_err(|error| records_said(error, &ref_notes, early_position.as_ref(), early_scope.as_ref()))?;
     drop(exclusive);
 
     let shared;
@@ -232,6 +243,9 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         if let Some(record) = &applied_rebuilt {
             error = forklift_core::error::append_to_message(error, &record.sentence());
         }
+        if let Some(position) = &early_position {
+            error = forklift_core::error::append_to_message(error, &position.sentence());
+        }
         if let Some(restored) = &early_scope {
             error = forklift_core::error::append_to_message(error, &restored.sentence());
         }
@@ -267,16 +281,20 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
     }
 
-    // After the refs the user set, which a chosen position stands on, and before the ref heal and
-    // the operation's recovery, which both read the position.
-    let position_rebuilt = position_heal::repair(position, &mut ref_notes).map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+    // A chosen position beside --ref or --remove-ref: after the refs the user set, which it stands
+    // on. Either way before the ref heal and the operation's recovery, which both read the
+    // position.
+    let late_position = match early {
+        true => None,
+        false => position_heal::repair(position, &mut ref_notes).map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?,
+    };
 
-    // The checkout's scope, when the position did not read before: now that it does.
-    let late_scope = match position_reads {
+    // The checkout's scope, when it waited for that position.
+    let late_scope = match early {
         true => None,
         false => heal_checkout_scope(scope, &mut ref_notes).map_err(|error| {
             let error = changed(String::from(error), &refs_rebuilt, &refs_removed, &ref_notes);
-            match &position_rebuilt {
+            match &late_position {
                 Some(position) => forklift_core::error::append_to_message(error, &position.sentence()),
                 None => error,
             }
@@ -284,7 +302,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     };
     let changed_after = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String]| {
         let mut error = changed(error, rebuilt, removed, notes);
-        if let Some(position) = &position_rebuilt {
+        if let Some(position) = &late_position {
             error = forklift_core::error::append_to_message(error, &position.sentence());
         }
         if let Some(restored) = &late_scope {
@@ -747,7 +765,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         checkout_scope_restored: early_scope.or(late_scope),
         fetch_scope_rebuilt: scope_rebuilt,
         parked_rebuilt,
-        position_rebuilt,
+        position_rebuilt: early_position.or(late_position),
         config_repaired,
         inventory_rebuilt,
         inventory_held,
