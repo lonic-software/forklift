@@ -100,6 +100,13 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             "--ref takes PALLET=PARCEL, not \"{}\". Nothing was changed.", spec
         )))
         .collect::<Result<Vec<_>, _>>()?;
+    let named = set_ref.iter().map(|(pallet, _)| *pallet).chain(remove_ref.iter().map(String::as_str));
+    if let Some(twice) = named.clone().enumerate().find(|(at, pallet)| named.clone().skip(at + 1).any(|other| other == *pallet)) {
+        return Err(format!(
+            "Pallet \"{}\" is named more than once by --ref and --remove-ref, so which to apply cannot be told. Nothing was changed.",
+            twice.1
+        ));
+    }
 
     // Taken before anything is read: the choice may narrow the fetch scope, so no other process may
     // use the store until it is written.
@@ -195,25 +202,31 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
 
     // The checkout's own scope, just before the fetch-scope heal, whose rebuild from the checkouts'
     // scopes then sees it restored. Nothing before it reads either scope. A position that waits is
-    // set to the parcel its --ref names, so that is the tree the guard judges against.
-    // The write it waits for is judged first, as that write judges it, so a scope is never
-    // judged against a tree the write then refuses. A --remove-ref of the last pallet puts it
-    // unborn.
+    // set to the parcel its --ref names, so that is the tree the guard judges against, or unborn
+    // when its --remove-ref removes the last pallet. The write it waits for is judged first, as
+    // that write judges it, so no scope is judged against a tree the write then refuses.
     // Some(None): the position will be unborn.
+    let mut check_notes = Vec::new();
     let waits_on: Result<Option<Option<String>>, String> = match (early, position) {
         (false, Some(pallet)) => match set_ref.iter().find(|(named, _)| *named == pallet) {
-            Some((_, parcel)) => ref_heal::check_set_damaged_ref(pallet, parcel).map(|head| Some(Some(head))),
-            None => ref_heal::check_remove_damaged_ref(pallet).and_then(|()| {
-                let left = pallet_utils::list_pallets()?.iter().any(|named| !remove_ref.contains(named));
-                Ok(match left {
-                    true => None,
-                    false => Some(None),
-                })
+            Some((_, parcel)) => ref_heal::check_set_damaged_ref(pallet, parcel, &mut check_notes).map(|head| Some(Some(head))),
+            None => pallet_utils::list_pallets().and_then(|pallets| match pallets.iter().any(|named| !remove_ref.contains(named)) {
+                true => Err(format!(
+                    "--position names pallet \"{}\", whose ref --remove-ref removes, so the bay cannot be put on it. Nothing was changed.",
+                    pallet
+                )),
+                false => ref_heal::check_remove_damaged_ref(pallet, &mut check_notes).map(|()| Some(None)),
             }),
         },
         _ => Ok(None),
     };
-    let waits_on = waits_on.map_err(|error| records_said(CoreError::from(error), &ref_notes, None, None))?;
+    let waits_on = match waits_on {
+        Ok(waits_on) => waits_on,
+        Err(error) => {
+            ref_notes.append(&mut check_notes);
+            return Err(records_said(CoreError::from(error), &ref_notes, None, None));
+        }
+    };
     let base = match &waits_on {
         Some(Some(parcel)) => Base::Parcel(parcel),
         Some(None) => Base::Unborn,

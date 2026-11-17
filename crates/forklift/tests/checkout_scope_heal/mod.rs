@@ -488,20 +488,29 @@ fn a_base_that_cannot_be_read_is_a_coded_refusal() {
     }
 }
 
-// A --position that waits for a --ref heal will refuse, since the ref is not damaged, is refused
-// before the scope is judged against that parcel. Revert: only resolve the parcel → the scope is
-// restored against it, then the --ref write is refused.
+// A --position that waits for a ref write heal will refuse is refused before the scope is judged
+// against the tree that write would give it: a --ref of a ref that is not damaged, a pallet named
+// twice, and a --remove-ref of its own pallet while another pallet remains. Revert (the first):
+// only resolve the parcel → the scope is restored against it, then the --ref write is refused.
 #[test]
 fn heal_refuses_a_ref_it_will_not_set_before_restoring_the_scope() {
     let area = TestArea::new("checkout-scope-heal-ref-refused");
     let _server = with_bay(&area);
     let head = std::fs::read_to_string(area.path("sparse/.forklift/pallets/main")).unwrap().trim().to_string();
+    assert_success(&area.forklift("sparse", &["pallet", "create", "other"]));
     remove(&area, MAIN_SCOPE);
     remove(&area, "sparse/.forklift/position");
     remove(&area, "sparse/.forklift/position-copy");
 
-    let refused = area.forklift("sparse", &["heal", "--position", "main", "--ref", &format!("main={}", head)]);
-    assert!(!refused.status.success(), "{}", stdout(&refused));
-    assert!(!area.path(MAIN_SCOPE).exists(), "no scope was written: {}", stderr(&refused));
-    assert!(stderr(&refused).contains("is not damaged"), "{}", stderr(&refused));
+    let set = format!("main={}", head);
+    for (args, reason) in [
+        (vec!["heal", "--position", "main", "--ref", &set], "is not damaged"),
+        (vec!["heal", "--position", "main", "--ref", &set, "--remove-ref", "main"], "is named more than once"),
+        (vec!["heal", "--position", "main", "--remove-ref", "main"], "whose ref --remove-ref removes"),
+    ] {
+        let refused = area.forklift("sparse", &args);
+        assert!(!refused.status.success(), "{:?}: {}", args, stdout(&refused));
+        assert!(!area.path(MAIN_SCOPE).exists(), "{:?}: no scope was written: {}", args, stderr(&refused));
+        assert!(stderr(&refused).contains(reason), "{:?}: {}", args, stderr(&refused));
+    }
 }

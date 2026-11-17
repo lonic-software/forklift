@@ -661,10 +661,10 @@ pub fn set_damaged_ref(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> R
 }
 
 /// Whether [`set_damaged_ref`] would refuse `pallet`'s ref at `parcel`, judged as it judges and
-/// writing nothing: the parcel's full hash when it would not. Its notes are its own; the write
-/// says them.
-pub fn check_set_damaged_ref(pallet: &str, parcel: &str) -> Result<String, String> {
-    admit_set(pallet, parcel, &mut Vec::new()).map(|(_, head, _)| head)
+/// writing nothing: the parcel's full hash when it would not. Its `notes` explain a refusal; on
+/// success the write says them again.
+pub fn check_set_damaged_ref(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> Result<String, String> {
+    admit_set(pallet, parcel, notes).map(|(_, head, _)| head)
 }
 
 /// Every refusal of [`set_damaged_ref`], before its write: the damaged ref, the parcel's full
@@ -827,9 +827,9 @@ pub fn remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<Remov
 }
 
 /// Whether [`remove_damaged_ref`] would refuse to remove `pallet`'s ref, judged as it judges and
-/// writing nothing. Its notes are its own; the removal says them.
-pub fn check_remove_damaged_ref(pallet: &str) -> Result<(), String> {
-    admit_remove(pallet, &mut Vec::new()).map(|_| ())
+/// writing nothing. Its `notes` explain a refusal; on success the removal says them again.
+pub fn check_remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<(), String> {
+    admit_remove(pallet, notes).map(|_| ())
 }
 
 /// Every refusal of [`remove_damaged_ref`], before its write: the damaged ref, always unreadable.
