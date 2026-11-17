@@ -1,7 +1,9 @@
 /target
 .idea/
 .forklift/
-.claude/
+# Claude Code's local state; the merge-gate config is shared.
+.claude/*
+!.claude/gates.json
 # Scratch dev warehouse used by `bin/serve` (pult serve).
 .dev/
 # macOS Finder metadata.
