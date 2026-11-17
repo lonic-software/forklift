@@ -6165,9 +6165,8 @@ mod tests {
         std::fs::write(&shard_path, bytes).unwrap();
 
         // The registration ledger was never written at all — proving there is nothing there
-        // for a ledger-based enumeration to have read.
-        let (_, metadata) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
-        assert!(metadata.is_none(), "the registration ledger must stay untouched by this test");
+        // for a ledger-based enumeration to have read (a read of it is refused as damage).
+        assert!(!file_utils::get_inventory_metadata_path().exists(), "the registration ledger must stay untouched by this test");
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
         let referenced = closure_references_any(&targets).unwrap().hashes;

@@ -3227,6 +3227,10 @@ mod tests {
             let _ = file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = crate::globals::StorageRootScope::enter(&root);
+            // No writer publishes a shard before the metadata registers its key, so a store with
+            // shards and no metadata file is damage: the fixtures plant shards over an empty set.
+            std::fs::create_dir_all(file_utils::get_path_inventory_root()).unwrap();
+            ShardLedger::rebuild(&BTreeSet::new()).unwrap();
 
             Scratch { root, _scope: scope }
         }
@@ -4205,7 +4209,7 @@ mod tests {
         std::fs::write(&path, b"./\nsrc\n").unwrap();
 
         let error = file_utils::retrieve_inventory_metadata_or_none().unwrap_err();
-        assert!(error.contains("has no format header"), "{}", error);
+        assert!(error.contains("inventory_damaged") && error.contains("does not open with its format header"), "{}", error);
     }
 
     /// Every shard folder in the store, by path.
@@ -5295,11 +5299,15 @@ mod tests {
         link_to(&outside, &metadata, false);
 
         let error = ShardLedger::read().map(|_| ()).expect_err("a linked metadata file");
-        assert!(error.contains("is not a file (a link is never followed)") && error.contains("unload ."), "{error}");
+        assert!(error.contains("is not a file (a link is never followed)") && error.contains("forklift heal"), "{error}");
 
-        // The way out: remove the link, then reset the staging area to the head (here, empty).
+        // The way out: remove the link, then heal, whose rebuild finds the staged folders' shards. A
+        // reset reads the record first, so it is refused.
         unlink(&metadata, false);
-        ShardLedger::read().unwrap().replace_subtree("", &BTreeMap::from([("".to_string(), Inventory::new())])).unwrap();
+        let refused = ShardLedger::read().map(|_| ()).expect_err("shards with no record");
+        assert!(refused.contains("inventory_damaged"), "{refused}");
+        let rebuild = crate::util::inventory_heal::plan(None).unwrap();
+        rebuild.write().unwrap();
         ShardLedger::read().unwrap().update_shard("a/b", add_new_txt).unwrap();
         assert_eq!(registered_names("a/b"), ["new.txt"]);
     }
@@ -5312,7 +5320,7 @@ mod tests {
         let scratch = Scratch::new("gate-linked-metadata");
 
         let metadata = file_utils::get_inventory_metadata_path();
-        std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        file_utils::remove_file(&metadata).unwrap();
         let outside = scratch.root.join("other-version-metadata");
         std::fs::write(&outside, "/forklift-inventory-metadata 999\n").unwrap();
         link_to(&outside, &metadata, false);

@@ -208,7 +208,7 @@ fn every_damage_is_refused_and_plain_heal_restores_the_set_exactly() {
 fn a_deleted_file_over_shards_is_refused_and_heal_rebuilds_it() {
     let area = Area::new("deleted");
     let sound = std::fs::read(area.metadata()).unwrap();
-    forklift_core::util::file_utils::remove_file(&area.metadata()).unwrap();
+    forklift_core::util::file_utils::remove_file(area.metadata()).unwrap();
 
     let error = inventory_damaged(&area.run(&["--json", "status"]));
     assert!(error["message"].as_str().unwrap().contains("is missing"), "{}", error);
@@ -408,7 +408,7 @@ fn a_wholesale_recovery_waiting_on_a_ref_leaves_the_set_alone() {
     };
     let area = interrupted_park("waits", diverged, &[], listed);
     let side = area.head("side");
-    forklift_core::util::file_utils::remove_file(&area.root().join(".forklift/journal.json")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.root().join(".forklift/journal.json")).unwrap();
     std::fs::write(area.root().join(".forklift/pallets/main"), &side.as_bytes()[..20]).unwrap();
     area.plant_shard();
     damage(&area.metadata(), Damage::Zero);
