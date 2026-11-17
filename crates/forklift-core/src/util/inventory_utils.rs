@@ -5442,7 +5442,8 @@ mod tests {
     }
 
     /// Revert: rebuild with `replace`, which clears the store → the planted shards are gone → red.
-    /// Write the keys without their ancestors → `a` is not held → red.
+    /// Write the keys without their ancestors, in the rebuild and in the metadata writer both → `a`
+    /// is not held → red.
     #[test]
     fn rebuild_registers_the_keys_and_their_ancestors_and_keeps_every_shard() {
         let _scratch = Scratch::new("ledger-rebuild");
