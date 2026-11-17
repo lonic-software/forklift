@@ -12565,7 +12565,7 @@ pub(crate) mod tests {
         invalidate_cache();
 
         let record = temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join("redactions-applied");
-        std::fs::write(&record, "/forklift-redactions-applied 99\n").unwrap();
+        std::fs::write(&record, crate::util::record_utils::with_digest(b"/forklift-redactions-applied 99\n".to_vec())).unwrap();
         invalidate_cache();
         let error = file_utils::retrieve_named_object_by_hash(&never).expect_err("undecided");
         assert_eq!(crate::error::deframe(&error).map(|(code, _, _)| code), Some("object_unreadable"), "{}", error);

@@ -1244,16 +1244,21 @@ mod tests {
         assert!(matches!(FranchiseRecord::from_bytes(&bytes[..bytes.len() - 1]), Err(MarkerError::Torn(_))));
 
         // Another version, and a field this build does not know: foreign.
-        let other = String::from_utf8(bytes.clone()).unwrap().replacen("/forklift-franchise 3", "/forklift-franchise 4", 1);
-        assert!(matches!(FranchiseRecord::from_bytes(other.as_bytes()), Err(MarkerError::Foreign(_))));
+        let body = String::from_utf8(record_utils::without_digest_line(&bytes).to_vec()).unwrap();
+        let other = record_utils::with_digest(body.replacen("/forklift-franchise 4", "/forklift-franchise 5", 1).into_bytes());
+        assert!(matches!(FranchiseRecord::from_bytes(&other), Err(MarkerError::Foreign(_))));
 
-        // A version-2 record, from before the record named its format, is foreign like any other.
-        let first = String::from_utf8(bytes.clone()).unwrap().replacen("/forklift-franchise 3", "/forklift-franchise 2", 1);
-        assert_ne!(first.as_bytes(), &bytes[..]);
-        assert!(matches!(FranchiseRecord::from_bytes(first.as_bytes()), Err(MarkerError::Foreign(_))));
+        // A version-3 record, from before the record carried a digest, is foreign like any other.
+        let undigested = body.replacen("/forklift-franchise 4", "/forklift-franchise 3", 1);
+        assert_ne!(undigested.as_bytes(), &bytes[..]);
+        assert!(matches!(FranchiseRecord::from_bytes(undigested.as_bytes()), Err(MarkerError::Foreign(_))));
 
-        let extra = format!("{}later=1\n", String::from_utf8(bytes).unwrap());
-        assert!(matches!(FranchiseRecord::from_bytes(extra.as_bytes()), Err(MarkerError::Foreign(_))));
+        let extra = record_utils::with_digest(format!("{}later=1\n", body).into_bytes());
+        assert!(matches!(FranchiseRecord::from_bytes(&extra), Err(MarkerError::Foreign(_))));
+
+        // Damage that still parses: torn, never read as true.
+        let flipped = String::from_utf8(bytes.clone()).unwrap().replacen("url=", "url=x", 1);
+        assert!(matches!(FranchiseRecord::from_bytes(flipped.as_bytes()), Err(MarkerError::Torn(_))));
     }
 
     #[test]
@@ -1323,7 +1328,7 @@ mod tests {
         assert_eq!(admit(&dir), Ok(Admission::Resume(Some(record()))));
 
         // A torn record is debris only while nothing else stands.
-        std::fs::write(record_path(&forklift), b"/forklift-franchise 3\nurl=x").unwrap();
+        std::fs::write(record_path(&forklift), b"/forklift-franchise 4\nurl=x").unwrap();
         assert!(admit(&dir).is_err(), "a torn record beside other entries is refused");
         file_utils::remove_file(dir.join("half-written")).unwrap();
         std::fs::write(forklift.join("lock"), b"1").unwrap();
@@ -1335,7 +1340,7 @@ mod tests {
         file_utils::remove_file(forklift.join(".gitignore.tmp~1-0")).unwrap();
 
         // A record from another version is refused, never guessed at.
-        std::fs::write(record_path(&forklift), b"/forklift-franchise 9\n").unwrap();
+        std::fs::write(record_path(&forklift), record_utils::with_digest(b"/forklift-franchise 9\n".to_vec())).unwrap();
         assert!(admit(&dir).is_err());
 
         // A finished warehouse is not a clone to resume.

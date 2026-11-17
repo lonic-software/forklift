@@ -135,8 +135,10 @@ mod tests {
         write_mirror_roots(&roots).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(mirror_roots_path()).unwrap(),
-            format!("/forklift-mirror-roots 1\nmain {}\nrel/x {}\n", "a1".repeat(32), "b2".repeat(32))
+            std::fs::read(mirror_roots_path()).unwrap(),
+            record_utils::with_digest(
+                format!("/forklift-mirror-roots 2\nmain {}\nrel/x {}\n", "a1".repeat(32), "b2".repeat(32)).into_bytes()
+            )
         );
         assert_eq!(read_mirror_roots().unwrap(), roots);
     }
@@ -148,24 +150,26 @@ mod tests {
         let _scratch = Scratch::new("refused");
         let hash = "c3".repeat(32);
 
+        let digested = |text: String| record_utils::with_digest(text.into_bytes());
         for (content, reason) in [
-            (String::new(), "no format header".to_string()),
-            (format!("forklift mirror roots 1\nmain {}\n", hash), "no format header".to_string()),
-            (format!("/forklift-mirror-roots 2\nmain {}\n", hash), "/forklift-mirror-roots 2".to_string()),
-            (format!("/forklift-mirror-roots 1\nmain {}", hash), "cut short".to_string()),
-            (format!("/forklift-mirror-roots 1\nmain {}\nmain {}\n", hash, hash), "twice".to_string()),
-            ("/forklift-mirror-roots 1\nmain not-a-hash\n".to_string(), "main not-a-hash".to_string()),
-            (format!("/forklift-mirror-roots 1\nBad {}\n", hash), format!("Bad {}", hash)),
-            (format!("/forklift-mirror-roots 1\nmain{}\n", hash), format!("main{}", hash)),
+            (Vec::new(), "no format header".to_string()),
+            (format!("forklift mirror roots 1\nmain {}\n", hash).into_bytes(), "no format header".to_string()),
+            (digested(format!("/forklift-mirror-roots 3\nmain {}\n", hash)), "/forklift-mirror-roots 3".to_string()),
+            (format!("/forklift-mirror-roots 1\nmain {}\n", hash).into_bytes(), "/forklift-mirror-roots 1".to_string()),
+            (format!("/forklift-mirror-roots 2\nmain {}\n", hash).into_bytes(), "damaged".to_string()),
+            (digested(format!("/forklift-mirror-roots 2\nmain {}\nmain {}\n", hash, hash)), "twice".to_string()),
+            (digested("/forklift-mirror-roots 2\nmain not-a-hash\n".to_string()), "main not-a-hash".to_string()),
+            (digested(format!("/forklift-mirror-roots 2\nBad {}\n", hash)), format!("Bad {}", hash)),
+            (digested(format!("/forklift-mirror-roots 2\nmain{}\n", hash)), format!("main{}", hash)),
         ] {
             std::fs::write(mirror_roots_path(), &content).unwrap();
-            let error = read_mirror_roots().expect_err(&content);
-            assert!(error.contains(&reason), "{:?}: {}", content, error);
+            let error = read_mirror_roots().expect_err(&String::from_utf8_lossy(&content));
+            assert!(error.contains(&reason), "{:?}: {}", String::from_utf8_lossy(&content), error);
             assert!(error.contains(&mirror_roots_path().display().to_string()), "{}", error);
             assert!(error.contains("delete it"), "{}", error);
         }
 
-        std::fs::write(mirror_roots_path(), [0xff, 0xfe]).unwrap();
+        std::fs::write(mirror_roots_path(), record_utils::with_digest(b"/forklift-mirror-roots 2\n\xff\n".to_vec())).unwrap();
         assert!(read_mirror_roots().unwrap_err().contains("not valid UTF-8"));
     }
 }

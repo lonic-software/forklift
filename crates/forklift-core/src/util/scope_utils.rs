@@ -266,33 +266,25 @@ impl PathScope {
 
     /// Serialize the scope to its on-disk form, a [`record_utils`] file of kind [`SCOPE_RECORD`]:
     /// one prefix per line, escaped, so a prefix may hold a line break or edge whitespace. A
-    /// full scope serializes to the empty string.
+    /// full scope is the record with no prefix.
     fn to_bytes(&self) -> Vec<u8> {
-        if self.prefixes.is_empty() {
-            return Vec::new();
-        }
-
         record_utils::to_bytes(SCOPE_RECORD, SCOPE_VERSION, &self.prefixes)
     }
 
     /// Parse a scope from its on-disk form; an error is phrased to follow "The scope file
-    /// \"<path>\"". An empty file is the full scope. Anything else must be a [`record_utils`]
-    /// file at [`SCOPE_VERSION`] naming at least one prefix: a file in an older format was written
+    /// \"<path>\"". It must be a [`record_utils`] file at [`SCOPE_VERSION`], and one naming no
+    /// prefix is the full scope. An empty file is refused, since a cut could leave one and the full
+    /// scope it once meant is wider than any sparse one. A file in an older format was written
     /// under an older meaning of a scope, which left out ignore files today's holds, and reading
     /// it under today's meaning would report those files as removed and commit the removal — so
-    /// it is refused, as is a header naming a format this build does not know, and a header with no
-    /// prefix after it, which no write produces and which would otherwise widen a sparse scope to
-    /// full.
+    /// it is refused, as is a header naming a format this build does not know, and a prefix that
+    /// widens the scope to full, which no write produces.
     ///
     /// # Arguments
     /// * `bytes`  - The file's contents.
     /// * `remedy` - The way out for a file that is damaged or in the older format, which depends
     ///   on whose file it is.
     fn from_bytes(bytes: &[u8], remedy: &str) -> Result<PathScope, String> {
-        if bytes.is_empty() {
-            return Ok(PathScope::full());
-        }
-
         let lines = record_utils::from_bytes(bytes, SCOPE_RECORD, SCOPE_VERSION).map_err(|e| match e {
             RecordError::Unversioned => format!(
                 "has no format header: it is damaged, or an older version of Forklift wrote it, whose \
@@ -315,12 +307,16 @@ impl PathScope {
             _ => format!("{} {}", e.describe(), remedy),
         })?;
 
+        if lines.is_empty() {
+            return Ok(PathScope::full());
+        }
+
         let scope = PathScope::from_prefixes(lines);
 
         if scope.is_full() {
             return Err(format!(
-                "has a format header but no prefix narrower than the warehouse root, so it is not \
-                a scope this version of Forklift writes. {}",
+                "names a prefix no narrower than the warehouse root, so it is not a scope this \
+                version of Forklift writes. {}",
                 remedy
             ));
         }
@@ -1023,23 +1019,24 @@ mod tests {
             "/forklift-scope x7".to_string(), format!("/forklift-scope  {}", SCOPE_VERSION), format!("/forklift-scope junk {}", SCOPE_VERSION),
             "/forklift-scope junk 2".to_string(), format!("/forklift-scope junk {}", SCOPE_VERSION + 1), format!("/forklift-scope 0{}", SCOPE_VERSION + 1),
         ] {
-            let damaged = PathScope::from_bytes(format!("{}\ndocs\n", header).as_bytes(), "REMEDY").unwrap_err();
+            let damaged = PathScope::from_bytes(&record_utils::with_digest(format!("{}\ndocs\n", header).into_bytes()), "REMEDY").unwrap_err();
             assert!(damaged.contains("damaged") && damaged.contains("REMEDY") && !damaged.contains("older version"), "{:?}: {}", header, damaged);
         }
 
         let older = PathScope::from_bytes(b"/forklift-scope 2\ndocs\n", "REMEDY").unwrap_err();
         assert!(older.contains("An older version") && older.contains("REMEDY"), "{}", older);
 
-        let newer = PathScope::from_bytes(format!("/forklift-scope {}\ndocs\n", SCOPE_VERSION + 1).as_bytes(), "REMEDY").unwrap_err();
+        let newer = PathScope::from_bytes(&record_utils::with_digest(format!("/forklift-scope {}\ndocs\n", SCOPE_VERSION + 1).into_bytes()), "REMEDY")
+            .unwrap_err();
         assert!(newer.contains("Use the Forklift that wrote it") && !newer.contains("REMEDY"), "{}", newer);
 
         // heal leaves a newer file alone, so a garbled header that ends in a higher number is not one.
         let dir = std::env::temp_dir().join(format!("forklift-scope-header-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("scope");
-        std::fs::write(&path, format!("/forklift-scope junk {}\ndocs\n", SCOPE_VERSION + 1)).unwrap();
+        std::fs::write(&path, record_utils::with_digest(format!("/forklift-scope junk {}\ndocs\n", SCOPE_VERSION + 1).into_bytes())).unwrap();
         assert!(matches!(read_scope_raw(&path).unwrap(), RawScope::Damaged(_)), "{:?}", read_scope_raw(&path));
-        std::fs::write(&path, format!("/forklift-scope {}\ndocs\n", SCOPE_VERSION + 1)).unwrap();
+        std::fs::write(&path, record_utils::with_digest(format!("/forklift-scope {}\ndocs\n", SCOPE_VERSION + 1).into_bytes())).unwrap();
         assert!(matches!(read_scope_raw(&path).unwrap(), RawScope::Newer(_)), "{:?}", read_scope_raw(&path));
         crate::util::file_utils::remove_dir_all(&dir).ok();
     }
@@ -1203,11 +1200,10 @@ mod tests {
 
         assert_eq!(PathScope::from_bytes(&bytes, "").unwrap(), scope);
 
-        // The full scope round-trips as the empty file.
-        assert!(PathScope::full().to_bytes().is_empty());
-        assert!(PathScope::from_bytes(b"", "").unwrap().is_full());
-        // Only the empty file is: whitespace is no longer trimmed away, so a file of blank lines
-        // has no header and is refused.
+        // The full scope round-trips as the record with no prefix.
+        assert_eq!(PathScope::full().to_bytes(), record_utils::to_bytes(SCOPE_RECORD, SCOPE_VERSION, [""; 0]));
+        assert!(PathScope::from_bytes(&PathScope::full().to_bytes(), "").unwrap().is_full());
+        // A file of blank lines has no header and is refused.
         assert!(PathScope::from_bytes(b"\n  \n", "").is_err());
     }
 
@@ -1215,7 +1211,7 @@ mod tests {
     fn a_scope_file_without_its_format_header_is_refused() {
         // A non-full scope is written under its format header.
         let bytes = PathScope::from_prefixes(["src"]).to_bytes();
-        assert!(bytes.starts_with(b"/forklift-scope 4\n"), "{:?}", String::from_utf8_lossy(&bytes));
+        assert!(bytes.starts_with(b"/forklift-scope 5\n"), "{:?}", String::from_utf8_lossy(&bytes));
 
         // The unversioned form an older Forklift wrote is refused, naming the way out.
         let legacy = PathScope::from_bytes(b"src\n", "Do the remedy.").unwrap_err();
@@ -1223,8 +1219,12 @@ mod tests {
         assert!(legacy.ends_with("Do the remedy."), "{}", legacy);
 
         // So is a format this build does not know.
-        let unknown = PathScope::from_bytes(b"/forklift-scope 5\nsrc\n", "").unwrap_err();
-        assert!(unknown.contains("/forklift-scope 5"), "{}", unknown);
+        let unknown = PathScope::from_bytes(&record_utils::with_digest(b"/forklift-scope 6\nsrc\n".to_vec()), "").unwrap_err();
+        assert!(unknown.contains("/forklift-scope 6"), "{}", unknown);
+
+        // Format 4 carried no digest, so it is refused as older, with the way out.
+        let undigested = PathScope::from_bytes(b"/forklift-scope 4\nsrc\n", "Do the remedy.").unwrap_err();
+        assert!(undigested.contains("before scope files carried a digest") && undigested.ends_with("Do the remedy."), "{}", undigested);
 
         // Format 3 left the spine `.gitignore` files out, so it is refused with the way out.
         let spineless = PathScope::from_bytes(b"/forklift-scope 3\nsrc\n", "Do the remedy.").unwrap_err();
@@ -1240,12 +1240,16 @@ mod tests {
         let crlf = PathScope::from_bytes(b"/forklift-scope 2\r\nsrc\r\n", "Do the remedy.").unwrap_err();
         assert!(crlf.contains("Do the remedy."), "{}", crlf);
 
-        // And a header with no prefix after it, which would otherwise read as the full scope.
-        let bare = PathScope::from_bytes(b"/forklift-scope 4\n", "Do the remedy.").unwrap_err();
-        assert!(bare.contains("no prefix narrower than the warehouse root"), "{}", bare);
-        let rooted = PathScope::from_bytes(b"/forklift-scope 4\nsrc\n/\n", "").unwrap_err();
-        assert!(rooted.contains("no prefix narrower than the warehouse root"), "{}", rooted);
-        assert!(bare.ends_with("Do the remedy."), "{}", bare);
+        // An empty file, which a cut could leave, is refused rather than read as the full scope.
+        let empty = PathScope::from_bytes(b"", "Do the remedy.").unwrap_err();
+        assert!(empty.contains("no format header") && empty.ends_with("Do the remedy."), "{}", empty);
+
+        // So is a cut that leaves the header alone, and a prefix that widens the scope to full.
+        let cut = PathScope::from_prefixes(["src"]).to_bytes();
+        let bare = PathScope::from_bytes(&cut[..b"/forklift-scope 5\n".len()], "Do the remedy.").unwrap_err();
+        assert!(bare.contains("damaged") && bare.ends_with("Do the remedy."), "{}", bare);
+        let rooted = PathScope::from_bytes(&record_utils::with_digest(b"/forklift-scope 5\nsrc\n/\n".to_vec()), "").unwrap_err();
+        assert!(rooted.contains("no narrower than the warehouse root"), "{}", rooted);
     }
 
     #[test]
@@ -1431,7 +1435,8 @@ mod tests {
         // "delete it" too.
         for (mode, file, found, remedy) in [
             (WarehouseMode::Sparse, None, "is missing", REMEDY_HEAL_FETCH_SCOPE),
-            (WarehouseMode::Sparse, Some(Vec::new()), "names no path", REMEDY_HEAL_FETCH_SCOPE),
+            (WarehouseMode::Sparse, Some(PathScope::full().to_bytes()), "names no path", REMEDY_HEAL_FETCH_SCOPE),
+            (WarehouseMode::Sparse, Some(Vec::new()), "no format header", REMEDY_HEAL_FETCH_SCOPE),
             (WarehouseMode::Full, Some(sparse.clone()), "holds a fetch scope", "Delete that file"),
             (WarehouseMode::Full, Some(Vec::new()), "holds a fetch scope", "Delete that file"),
             (WarehouseMode::Full, Some(b"not a scope file".to_vec()), "holds a fetch scope", "Delete that file"),

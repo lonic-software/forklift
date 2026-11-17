@@ -725,8 +725,9 @@ pub(crate) mod tests {
         // before the digest.
         std::fs::write(tombstones_path(), record_utils::to_bytes(TOMBSTONES_RECORD, 1, [first.as_str()])).unwrap();
         assert_damaged(&read_tombstones().unwrap_err(), FILE_NAME_TOMBSTONES);
-        std::fs::write(tombstones_path(), record_utils::to_bytes(TOMBSTONES_RECORD, 2, [first.as_str()])).unwrap();
-        assert_damaged(&read_tombstones().unwrap_err(), "does not match its digest");
+        let undigested = record_utils::to_bytes(TOMBSTONES_RECORD, 2, [first.as_str()]);
+        std::fs::write(tombstones_path(), record_utils::without_digest_line(&undigested)).unwrap();
+        assert_damaged(&read_tombstones().unwrap_err(), "(\"/forklift-tombstones 2\")");
 
         // A digit of a head flipped: the entry still parses, as a tombstone of another head, but
         // the list no longer matches its digest. Revert: read the list undigested → the deleted

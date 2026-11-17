@@ -1755,11 +1755,11 @@ mod tests {
         assert!(check.holds(&lock).unwrap());
 
         std::fs::write(crate::globals::forklift_root().join("redactions-applied"),
-                       format!("/forklift-redactions-applied 1\n{}\n", "d".repeat(64))).unwrap();
+                       crate::util::record_utils::to_bytes("redactions-applied", 2, ["d".repeat(64)])).unwrap();
         assert!(check.holds(&lock).unwrap(), "another hash applied leaves it standing");
 
         std::fs::write(crate::globals::forklift_root().join("redactions-applied"),
-                       format!("/forklift-redactions-applied 1\n{}\n", exempted)).unwrap();
+                       crate::util::record_utils::to_bytes("redactions-applied", 2, [exempted])).unwrap();
         assert!(!check.holds(&lock).unwrap());
     }
 

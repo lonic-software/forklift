@@ -1314,7 +1314,7 @@ mod tests {
         assert_eq!(read_bay_current_pallet("good").unwrap(), Some("good".to_string()));
 
         std::fs::write(bay_state_dir("bad").join(pallet_utils::FILE_NAME_POSITION),
-            record_utils::to_bytes("position", 1, ["Main", ""])).unwrap();
+            record_utils::to_bytes("position", 2, ["Main", ""])).unwrap();
         let error = read_bay_current_pallet("bad").unwrap_err();
         assert!(error.contains("\"Main\" is not a valid pallet name"), "{}", error);
 

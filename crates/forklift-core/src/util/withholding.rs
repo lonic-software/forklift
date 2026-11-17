@@ -755,7 +755,7 @@ mod tests {
         let undigested = record_utils::to_bytes(WITHHELD_RECORD, 2, [format!("{} - statement", A)]);
         for bytes in [good[..good.len() - 1].to_vec(), flipped, vec![0; good.len()], b"\xff\xfe".to_vec(),
                       record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [A]), digit, undigested,
-                      record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} - statement", A)])] {
+                      record_utils::without_digest_line(&good).to_vec()] {
             std::fs::write(withheld_path(), &bytes).unwrap();
             let refused = read_withheld().unwrap_err();
             let (code, human, next_step) = crate::error::deframe(&refused).unwrap_or_else(|| panic!("uncoded: {}", refused));

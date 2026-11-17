@@ -621,8 +621,8 @@ mod tests {
         assert_eq!(read_applied().unwrap(), set);
 
         let bytes = std::fs::read(applied_path()).unwrap();
-        assert_eq!(String::from_utf8(bytes).unwrap(),
-                   format!("/forklift-redactions-applied 1\n{}\n{}\n", hash('a'), hash('b')));
+        assert_eq!(bytes, record_utils::with_digest(
+            format!("/forklift-redactions-applied 2\n{}\n{}\n", hash('a'), hash('b')).into_bytes()));
     }
 
     #[test]
@@ -630,8 +630,9 @@ mod tests {
         let _scratch = Scratch::new("applied-unknown");
 
         for (bytes, expected) in [
-            (b"/forklift-redactions-applied 2\n".to_vec(), "does not know"),
-            (format!("/forklift-redactions-applied 1\n{}\n", "x".repeat(64)).into_bytes(), "not an object hash"),
+            (record_utils::with_digest(b"/forklift-redactions-applied 3\n".to_vec()), "does not know"),
+            (record_utils::with_digest(format!("/forklift-redactions-applied 2\n{}\n", "x".repeat(64)).into_bytes()),
+             "not an object hash"),
             (b"aaaa\n".to_vec(), "no format header"),
         ] {
             std::fs::write(applied_path(), &bytes).unwrap();

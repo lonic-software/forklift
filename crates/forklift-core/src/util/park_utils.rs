@@ -170,9 +170,8 @@ fn leftovers_in(forklift: &Path) -> Result<Vec<PathBuf>, String> {
 /// The record `bytes` at `path` lists, or why they list nothing this build can trust.
 fn decode(bytes: &[u8], path: &Path) -> Result<Vec<ParkedEntry>, String> {
     let lines = record_utils::from_bytes(bytes, PARKED_RECORD, PARKED_VERSION).map_err(|e| {
-        // Version 1 carried no digest line, so a record with one is damage whatever its header.
-        let version_1 = bytes.starts_with(format!("/forklift-{} 1\n", PARKED_RECORD).as_bytes())
-            && record_utils::without_digest_line(bytes).len() == bytes.len();
+        // Version 1 carried no digest line, so only a record without one is told apart by it.
+        let version_1 = matches!(&e, record_utils::RecordError::OtherVersion(header) if *header == record_utils::header(PARKED_RECORD, 1));
         let what = match version_1 {
             true => "was written by an older Forklift, as version 1, which this one reads only to \
                 rebuild it.".to_string(),
@@ -606,7 +605,7 @@ mod tests {
     /// Revert: read a record whose digest is absent as its header says → the v1 file reads.
     #[test]
     fn a_version_one_file_reads_as_damage() {
-        let v1 = record_utils::to_bytes(PARKED_RECORD, 1, [hash("bare")]);
+        let v1 = record_utils::without_digest_line(&record_utils::to_bytes(PARKED_RECORD, 1, [hash("bare")])).to_vec();
 
         let error = decode(&v1, Path::new("parked")).unwrap_err();
         assert!(error.contains("older Forklift, as version 1") && error.contains("forklift heal"), "{}", error);
