@@ -55,6 +55,8 @@ pub struct Repaired {
     pub refs_unread: Vec<String>,
     /// Whether the served mark was written.
     pub mark_written: bool,
+    /// The list read whole, so it was left as it was and only the mark was written.
+    pub list_whole: bool,
 }
 
 impl Repaired {
@@ -64,6 +66,13 @@ impl Repaired {
 
         for path in &self.set_aside {
             lines.push(format!("Moved the damaged \"{}\" aside.", path.to_string_lossy()));
+        }
+
+        if self.list_whole {
+            // A whole list is left alone only for a mark written in its place.
+            lines.push("The tombstone list reads whole, so it was left as it was.".to_string());
+            lines.push("Wrote the served mark.".to_string());
+            return lines;
         }
 
         lines.push(format!(
@@ -171,6 +180,7 @@ pub fn repair_tombstones() -> Result<Repaired, String> {
 
         tombstone_utils::write_mark(&lock).map_err(|e| format!("{} Run the repair again.", e))?;
         repaired.mark_written = true;
+        repaired.list_whole = true;
 
         return Ok(repaired);
     }
