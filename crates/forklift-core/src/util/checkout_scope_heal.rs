@@ -250,15 +250,18 @@ pub fn repair(base: Base, notes: &mut Vec<String>) -> Result<Option<ScopeRestore
 }
 
 /// The way out when the tree the checkout stands on cannot be read: no heal judges a scope without
-/// it, so only that tree reading again, or a new checkout, ends the refusal.
+/// it, so only the position and that tree reading again, or a new checkout, ends the refusal.
 fn base_unread_remedy() -> String {
     let replace = match crate::globals::active_bay() {
-        Some(name) => format!("remove the bay with \"forklift bay remove {}\" and add it again", name),
+        Some(name) => format!(
+            "remove the bay with \"forklift bay remove {}\" and add a new one under another name, copying any \
+            uncommitted work across by hand", name
+        ),
         None => "clone the warehouse again".to_string(),
     };
     format!(
-        "Heal judges a scope against the tree this checkout stands on, so it restores none until that tree reads \
-        again; if the store no longer holds it, {}.",
+        "Heal judges a scope against the tree this checkout stands on, read from its bay position, so it restores \
+        none until both read; if the store no longer holds that tree, {}.",
         replace
     )
 }

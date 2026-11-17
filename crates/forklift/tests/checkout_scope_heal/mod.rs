@@ -449,3 +449,38 @@ fn heal_position_beside_its_ref_restores_the_scope_before_the_fetch_scope() {
     assert_eq!(std::fs::read(area.path(MAIN_SCOPE)).unwrap(), scope);
     assert_success(&area.forklift("sparse", &["stocktake"]));
 }
+
+// A --position that heal will refuse, since the position still reads, is refused before the scope
+// is judged against the parcel its --ref names. Revert: decide from the flags alone → the scope is
+// restored against that parcel, then --position is refused.
+#[test]
+fn heal_refuses_a_position_it_will_not_set_before_restoring_the_scope() {
+    let area = TestArea::new("checkout-scope-heal-position-reads");
+    let _server = with_bay(&area);
+    let head = std::fs::read_to_string(area.path("sparse/.forklift/pallets/main")).unwrap().trim().to_string();
+    remove(&area, MAIN_SCOPE);
+
+    let refused = area.forklift("sparse", &["heal", "--position", "main", "--ref", &format!("main={}", head)]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("--position sets only a position that is lost"), "{}", stderr(&refused));
+    assert!(!area.path(MAIN_SCOPE).exists(), "no scope was written: {}", stderr(&refused));
+}
+
+// A position a newer version wrote cannot be read, so the tree the checkout stands on cannot be
+// told: heal and heal --scope both refuse with the code, and write nothing.
+#[test]
+fn a_base_that_cannot_be_read_is_a_coded_refusal() {
+    let area = TestArea::new("checkout-scope-heal-base-unread");
+    let _server = sparse_without_other(&area);
+    let head = std::fs::read_to_string(area.path("sparse/.forklift/pallets/main")).unwrap().trim().to_string();
+    let newer = forklift_core::util::record_utils::to_bytes("position", 99, ["main", &head]);
+    std::fs::write(area.path("sparse/.forklift/position"), &newer).unwrap();
+    remove(&area, MAIN_SCOPE);
+
+    for args in [&["--json", "heal"][..], &["--json", "heal", "--scope", "docs", "--scope", "src/api"][..]] {
+        let error = scope_damaged(&area.forklift("sparse", args));
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("cannot be told") && message.contains("until both read"), "{:?}: {}", args, message);
+        assert!(!area.path(MAIN_SCOPE).exists(), "{:?} wrote no scope", args);
+    }
+}

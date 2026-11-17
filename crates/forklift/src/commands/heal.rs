@@ -181,11 +181,12 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
 
     // The bay's position, before the checkout's scope, whose stranding guard reads the tree the
     // checkout stands on, and so before the fetch-scope heal too: a rebuild from the checkouts'
-    // scopes would leave out a scope not yet restored. It reads neither scope. A --position on a
-    // pallet whose ref this run sets or removes stands on that write, so it waits for it below.
+    // scopes would leave out a scope not yet restored. It reads neither scope. A --position it
+    // sets, on a pallet whose ref this run sets or removes, stands on that write, so it waits for
+    // it below; one it refuses is refused here, before anything is written.
     let early = !position.is_some_and(|pallet| {
         set_ref.iter().any(|(named, _)| *named == pallet) || remove_ref.iter().any(|named| named == pallet)
-    });
+    }) || !position_heal::sets_chosen().map_err(|error| records_said(CoreError::from(error), &ref_notes, None, None))?;
     let early_position = match early {
         true => position_heal::repair(position, &mut ref_notes)
             .map_err(|error| records_said(CoreError::from(error), &ref_notes, None, None))?,
@@ -193,8 +194,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     };
 
     // The checkout's own scope, just before the fetch-scope heal, whose rebuild from the checkouts'
-    // scopes then sees it restored. Nothing before it reads either scope. A position that waits
-    // will stand on the parcel its --ref names, so that is the tree the guard judges against.
+    // scopes then sees it restored. Nothing before it reads either scope. A position that waits is
+    // set to the parcel its --ref names, so that is the tree the guard judges against.
     // A parcel that does not resolve is refused as its --ref write would refuse it.
     let parcel = match early {
         true => None,
