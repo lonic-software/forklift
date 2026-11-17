@@ -227,8 +227,8 @@ fn an_earlier_damaged_copy_is_never_written_over() {
 
 /// A mistake made by hand anywhere but the last line is no cut, final newline or not, and nor is
 /// a string opened by hand above later sections. Revert: drop the body-parses condition from
-/// is_cut → the unended file reads as damaged → red; close a string whatever it swallows → the
-/// third ending reads as damaged → red.
+/// is_cut → the unended file reads as damaged → red; close a string whatever it swallows →
+/// the third ending reads as damaged → red.
 #[test]
 fn a_mistake_made_by_hand_keeps_its_by_hand_refusal_and_is_not_written_over() {
     let area = Area::new("hand");
