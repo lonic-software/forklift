@@ -33,6 +33,11 @@ use crate::util::warehouse_utils::{self, WarehouseMode};
 /// The bay-local file that records a bay's checkout scope (under `<bay_root>/`).
 const FILE_NAME_BAY_SCOPE: &str = "scope";
 
+/// The witness beside every checkout's scope file: the same bytes, written before the scope file
+/// on every write, so `heal` can restore a scope file that is lost. Written first, so an
+/// interrupted write never leaves a copy wider than the scope file it would replace.
+const FILE_NAME_SCOPE_COPY: &str = "scope-copy";
+
 /// The shared configuration folder (matches `config_utils`' own folder name) and the
 /// warehouse fetch-scope file inside it.
 const FOLDER_NAME_CONFIG: &str = "config";
@@ -478,11 +483,43 @@ fn write_scope_file(path: &Path, scope: &PathScope) -> Result<(), String> {
     crate::util::file_utils::write_file_atomically(path, &scope.to_bytes())
 }
 
+/// The copy beside the checkout scope file at `path` ([`FILE_NAME_SCOPE_COPY`]).
+pub(crate) fn scope_copy_path(path: &Path) -> PathBuf {
+    path.with_file_name(FILE_NAME_SCOPE_COPY)
+}
+
+/// Write a checkout's scope file at `path` and its copy, the copy first: a copy write that fails
+/// fails the whole write before the scope file is touched, and an interrupted one leaves the copy
+/// naming the scope this write intended, never a wider one than the file it would replace. The
+/// parent folder must already exist.
+///
+/// # Arguments
+/// * `path`  - The checkout's scope file.
+/// * `bytes` - The scope's bytes ([`PathScope::to_bytes`]).
+/// * `write` - How each file is written: atomically, or replacing one that may already exist.
+fn write_checkout_scope_with(path: &Path, bytes: &[u8], write: fn(&Path, &[u8]) -> Result<(), String>) -> Result<(), String> {
+    let copy = scope_copy_path(path);
+    write(&copy, bytes)
+        .map_err(|e| format!("Error while recording the scope's copy \"{}\": {}", copy.to_string_lossy(), e))?;
+    write(path, bytes)
+        .map_err(|e| format!("Error while recording the scope \"{}\": {}", path.to_string_lossy(), e))
+}
+
+/// Write a checkout's scope file and its copy, the copy first ([`write_checkout_scope_with`]).
+pub(crate) fn write_checkout_scope(path: &Path, scope: &PathScope) -> Result<(), String> {
+    write_checkout_scope_with(path, &scope.to_bytes(), crate::util::file_utils::write_file_atomically)
+}
+
+/// Write only the copy beside a checkout's scope file, from a scope file `heal` found usable.
+pub(crate) fn write_scope_copy(path: &Path, scope: &PathScope) -> Result<(), String> {
+    write_scope_file(&scope_copy_path(path), scope)
+}
+
 /// The active checkout's scope: the main tree's ([`read_main_tree_scope`]) or the
 /// active bay's ([`read_bay_scope`]), checked the same way.
 pub fn current_scope() -> Result<PathScope, String> {
     match globals::active_bay() {
-        Some(_) => read_bay_scope_at(&bay_scope_path()),
+        Some(_) => read_bay_scope_at(&bay_scope_path(), None),
         None => read_main_tree_scope(),
     }
 }
@@ -557,23 +594,31 @@ fn mode_kind(mode: WarehouseMode) -> &'static str {
 /// # Arguments
 /// * `name` - The bay's name (as listed by `bay_utils::list_bays`).
 pub fn read_bay_scope(name: &str) -> Result<PathScope, String> {
-    read_bay_scope_at(&named_bay_scope_path(name))
+    read_bay_scope_at(&named_bay_scope_path(name), Some(name))
 }
 
-fn read_bay_scope_at(path: &Path) -> Result<PathScope, String> {
-    let refused = |found: &str| format!(
-        "The bay's scope (\"{}\") {}, so Forklift cannot tell which paths the bay checks out. {}",
-        path.to_string_lossy(), found, REMEDY_READD_BAY
-    );
-    let Some(scope) = read_scope_file_if_present(path, REMEDY_READD_BAY)? else {
-        return Err(refused("is missing"));
+fn read_bay_scope_at(path: &Path, name: Option<&str>) -> Result<PathScope, String> {
+    let checkout = match name {
+        Some(name) if path != bay_scope_path() => Checkout::OtherBay(name),
+        _ => Checkout::Active,
+    };
+    let damaged = |found: &str| checkout_scope_damaged("bay's", path, found, &checkout);
+
+    let scope = match read_scope_raw(path)? {
+        RawScope::Missing => return Err(damaged("is missing, so Forklift cannot tell which paths the bay checks out.")),
+        RawScope::Damaged(reason) => return Err(damaged(&reason)),
+        RawScope::Newer(reason) => return Err(newer_scope(path, &reason)),
+        RawScope::Read(scope) => scope,
     };
 
     let fetch = read_fetch_scope()?;
 
     if !fetch.is_full() {
         if scope.is_full() {
-            return Err(refused("names no path, which only a bay of a warehouse that is not sparse may do"));
+            return Err(damaged(
+                "names no path, which only a bay of a warehouse that is not sparse may do, so Forklift \
+                 cannot tell which paths the bay checks out."
+            ));
         }
         if !scope.subset_of(&fetch) {
             return Err(outside_fetch_scope("bay's", path));
@@ -609,17 +654,84 @@ pub fn read_main_tree_scope() -> Result<PathScope, String> {
         ));
     }
 
-    let refused = |found: &str| format!(
-        "The warehouse is recorded as sparse but its main tree's scope (\"{}\") {}, so Forklift cannot \
-         tell which paths the main tree checks out. {}",
-        path.to_string_lossy(), found, REMEDY_REFRANCHISE
-    );
-    match read_scope_file_if_present(&path, REMEDY_REFRANCHISE)? {
-        None => Err(refused("is missing")),
-        Some(scope) if scope.is_full() => Err(refused("names no path")),
-        Some(scope) if !scope.subset_of(&fetch) => Err(outside_fetch_scope("main tree's", &path)),
-        Some(scope) => Ok(scope),
+    let checkout = match globals::active_bay() {
+        None => Checkout::Active,
+        Some(_) => Checkout::MainTree,
+    };
+    let damaged = |found: &str| checkout_scope_damaged("main tree's", &path, found, &checkout);
+    match read_scope_raw(&path)? {
+        RawScope::Missing => Err(damaged(
+            "is missing, though the warehouse is recorded as sparse, so Forklift cannot tell which paths \
+             the main tree checks out."
+        )),
+        RawScope::Damaged(reason) => Err(damaged(&reason)),
+        RawScope::Newer(reason) => Err(newer_scope(&path, &reason)),
+        RawScope::Read(scope) if scope.is_full() => Err(damaged(
+            "names no path, though the warehouse is recorded as sparse, so Forklift cannot tell which \
+             paths the main tree checks out."
+        )),
+        RawScope::Read(scope) if !scope.subset_of(&fetch) => Err(outside_fetch_scope("main tree's", &path)),
+        RawScope::Read(scope) => Ok(scope),
     }
+}
+
+/// The checkout whose scope a reader reads, beside the one the command runs in, so a refusal
+/// names the way out where it can be taken. Decided by comparing the two, never by which reader
+/// ran: scope prune run in a bay reads the main tree's scope and every bay's by name.
+enum Checkout<'a> {
+    /// The checkout the command runs in.
+    Active,
+    /// The warehouse's main working tree, read from a bay.
+    MainTree,
+    /// Another bay, by name.
+    OtherBay(&'a str),
+}
+
+/// The `checkout_scope_damaged` refusal for a checkout scope that is missing, does not parse, or
+/// names no path where one is required. `whose` names the checkout ("bay's"), and `found` says
+/// what is wrong, as a sentence. Only the checkout the command runs in is
+/// given `heal` as its next step: another checkout's scope is restored by heal run there, and a
+/// bay with no recorded folder has no checkout to run it in, so it is removed instead.
+fn checkout_scope_damaged(whose: &str, path: &Path, found: &str, checkout: &Checkout) -> String {
+    let (remedy, next_step) = match checkout {
+        Checkout::Active => (
+            "Heal restores it from the copy every scope write leaves beside it.".to_string(),
+            "forklift heal",
+        ),
+        Checkout::MainTree => {
+            let main_tree = globals::forklift_root();
+            let main_tree = main_tree.parent().map(Path::to_path_buf).unwrap_or_default();
+            let main_tree = std::path::absolute(&main_tree).unwrap_or(main_tree);
+            (format!("Run \"forklift heal\" in the main tree, \"{}\", which restores it from its copy.", main_tree.to_string_lossy()), "")
+        }
+        Checkout::OtherBay(name) => match crate::util::bay_utils::read_bay_path(name) {
+            Ok(Some(folder)) => (
+                format!("Run \"forklift heal\" in that bay, \"{}\", which restores it from its copy.", folder.to_string_lossy()),
+                "",
+            ),
+            Ok(None) => (
+                format!(
+                    "The bay \"{}\" recorded no folder, so its \"forklift bay add\" stopped before checking anything \
+                     out. Remove it with \"forklift bay remove {}\" and add a new one under another name.",
+                    name, name
+                ),
+                "",
+            ),
+            Err(e) => (format!("Run \"forklift heal\" in that bay, whose folder could not be read: {}", e), ""),
+        },
+    };
+
+    let message = format!(
+        "The {} scope file (\"{}\") {} {}",
+        whose, path.to_string_lossy(), found.trim_end(), remedy
+    );
+    refusal(RefusalCode::CheckoutScopeDamaged, message, next_step).into()
+}
+
+/// The refusal for a checkout scope a newer version of Forklift wrote. It is not damage, so it
+/// is left as it is, and no heal restores it.
+fn newer_scope(path: &Path, reason: &str) -> String {
+    format!("The scope file \"{}\" {} Use the Forklift that wrote it.", path.to_string_lossy(), reason.trim_end())
 }
 
 /// The refusal for a checkout scope that is not within the fetch scope, which no write leaves: one
@@ -632,16 +744,9 @@ fn outside_fetch_scope(whose: &str, path: &Path) -> String {
     )
 }
 
-/// The way out for a warehouse's main-tree scope Forklift cannot use: it is written when the
-/// warehouse is prepared, so it is cloned again.
-const REMEDY_REFRANCHISE: &str = "Clone the remote again, into a new directory.";
 /// The way out for a sparse warehouse's fetch scope Forklift cannot use: `heal` rebuilds it from
 /// the checkouts' scopes.
 const REMEDY_HEAL_FETCH_SCOPE: &str = "Run \"forklift heal\", which rebuilds it from the scopes of the warehouse's checkouts.";
-/// The way out for a bay's scope Forklift cannot use. A removed bay keeps its pallet, so its name
-/// stays taken and the new bay needs another.
-const REMEDY_READD_BAY: &str = "Remove the bay with \"forklift bay remove\" and add a new one under another name; \
-    copy any uncommitted work across by hand.";
 
 /// Set the active checkout's scope, refusing one the readers would refuse: a
 /// scope that is not ⊆ the warehouse fetch scope (a checkout can never materialize what the
@@ -685,7 +790,7 @@ fn set_bay_scope_at(path: &std::path::Path, scope: &PathScope) -> Result<(), Str
         crate::util::file_utils::create_folder_if_not_exists(parent)?;
     }
 
-    write_scope_file(path, scope)
+    write_checkout_scope(path, scope)
 }
 
 /// Replace a sparse warehouse's fetch scope (shared across bays): `scope fetch` unions new prefixes
@@ -721,12 +826,13 @@ pub(crate) fn record_sparse_scopes(forklift: &Path, scope: &PathScope) -> Result
 
     let bytes = scope.to_bytes();
 
-    for path in [forklift.join(FOLDER_NAME_CONFIG).join(FILE_NAME_FETCH_SCOPE), forklift.join(FILE_NAME_BAY_SCOPE)] {
-        crate::util::file_utils::replace_file_atomically(&path, &bytes)
-            .map_err(|e| format!("Error while recording the scope \"{}\": {}", path.to_string_lossy(), e))?;
-    }
+    // The fetch scope first, then the main tree's scope with its copy before it. The fetch scope
+    // keeps no copy: heal rebuilds it from the checkouts' scopes.
+    let fetch = forklift.join(FOLDER_NAME_CONFIG).join(FILE_NAME_FETCH_SCOPE);
+    crate::util::file_utils::replace_file_atomically(&fetch, &bytes)
+        .map_err(|e| format!("Error while recording the scope \"{}\": {}", fetch.to_string_lossy(), e))?;
 
-    Ok(())
+    write_checkout_scope_with(&forklift.join(FILE_NAME_BAY_SCOPE), &bytes, crate::util::file_utils::replace_file_atomically)
 }
 
 /// Whether the store may lack content its history names: the warehouse's mode is not full (it is

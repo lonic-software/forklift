@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 52;
+pub const SCHEMA_VERSION: u32 = 53;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -624,6 +624,9 @@ error_codes! {
     /// The inventory metadata is damaged, missing over staged shards, or not a file; nothing was
     /// changed.
     InventoryDamaged,
+
+    /// A checkout's scope is missing, damaged or names no path; nothing was changed.
+    CheckoutScopeDamaged,
 }
 
 impl ErrorCode {
@@ -695,6 +698,7 @@ impl ErrorCode {
             ErrorCode::BayPositionDamaged => RefusalCode::BayPositionDamaged.as_str(),
             ErrorCode::ConfigDamaged => RefusalCode::ConfigDamaged.as_str(),
             ErrorCode::InventoryDamaged => RefusalCode::InventoryDamaged.as_str(),
+            ErrorCode::CheckoutScopeDamaged => RefusalCode::CheckoutScopeDamaged.as_str(),
         }
     }
 
@@ -769,6 +773,7 @@ impl ErrorCode {
             ErrorCode::BayPositionDamaged => 64,
             ErrorCode::ConfigDamaged => 65,
             ErrorCode::InventoryDamaged => 66,
+            ErrorCode::CheckoutScopeDamaged => 67,
         }
     }
 
@@ -931,7 +936,9 @@ impl ErrorCode {
             ErrorCode::ConfigDamaged =>
                 "A configuration file holds bytes that are not text or that TOML never allows, or it was cut short. Nothing was changed; in the warehouse's own file heal names what mending it would drop, and heal --config keeps every entry the damage provably spared, after setting the damaged bytes aside",
             ErrorCode::InventoryDamaged =>
-                "The inventory metadata, the set of directories with staged content, does not parse, it is missing while the staging area still holds shards, or a link or folder stands in its place (remove it first). Nothing was changed; heal rebuilds it from the directories the working tree, the bay's base and an interrupted operation name, and heal --inventory writes it even when some staged shard matches none of them"
+                "The inventory metadata, the set of directories with staged content, does not parse, it is missing while the staging area still holds shards, or a link or folder stands in its place (remove it first). Nothing was changed; heal rebuilds it from the directories the working tree, the bay's base and an interrupted operation name, and heal --inventory writes it even when some staged shard matches none of them",
+            ErrorCode::CheckoutScopeDamaged =>
+                "A checkout's scope, the paths it holds, is missing, does not parse, or names no path where one is required. Nothing was changed; heal restores it from the copy beside it when run in that checkout, and otherwise names heal --scope for the paths the checkout held"
         }
     }
 
@@ -1004,6 +1011,7 @@ impl ErrorCode {
             RefusalCode::BayPositionDamaged => ErrorCode::BayPositionDamaged,
             RefusalCode::ConfigDamaged => ErrorCode::ConfigDamaged,
             RefusalCode::InventoryDamaged => ErrorCode::InventoryDamaged,
+            RefusalCode::CheckoutScopeDamaged => ErrorCode::CheckoutScopeDamaged,
         }
     }
 }
@@ -1663,6 +1671,7 @@ mod tests {
             (RefusalCode::BayPositionDamaged, "bay_position_damaged", 64),
             (RefusalCode::ConfigDamaged, "config_damaged", 65),
             (RefusalCode::InventoryDamaged, "inventory_damaged", 66),
+            (RefusalCode::CheckoutScopeDamaged, "checkout_scope_damaged", 67),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

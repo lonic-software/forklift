@@ -635,6 +635,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **A lost or damaged checkout scope is refused with a remedy, and `heal` restores it.** The scope
+  file of a sparse warehouse's working tree or of a scoped bay, deleted or garbled, was refused with
+  only a way out that discarded the checkout: clone again, or remove the bay and add it again.
+  Every reader now refuses it with `checkout_scope_damaged` (exit 67, `--json` schema 53). Every
+  scope write leaves a copy (`scope-copy`) beside the scope file, and `forklift heal` in that
+  checkout writes it back, unless the copy names a path the warehouse never fetched or would leave a
+  committed or untracked file outside the checkout, where it could never be stacked again. Then it
+  changes nothing and names the files, and `heal --scope <path>` sets the scope to the paths the
+  checkout held, refused unless they match what is on disk and in the store.
 - **A damaged inventory metadata file is refused with a remedy, and `heal` rebuilds it.** The
   inventory's record of which folders hold staged content, cut short, zeroed or with a byte
   flipped, failed `load`, `unload` and `status` with an uncoded error, and `heal` found nothing to

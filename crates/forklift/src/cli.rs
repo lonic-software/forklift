@@ -372,6 +372,14 @@ pub enum Command {
                       stood it changes nothing and lists the pallets; --position puts the bay on \
                       the pallet you name, at its head, taking the files as standing there, so a \
                       bay that stood behind that head no longer refuses its next stack.\n\n\
+                      A checkout's scope, the paths a sparse working tree or a bay holds, that \
+                      was lost or damaged (\"checkout_scope_damaged\" refusals, exit 67) is \
+                      restored from its copy, which every scope write leaves beside it, when heal \
+                      runs in that checkout. It refuses a copy that would leave a committed or \
+                      untracked file outside the checkout, where it could never be stacked again. \
+                      With no copy it can use, it changes nothing; --scope, once per path, sets \
+                      the scope to the paths the checkout held, refusing paths that leave such a \
+                      file out or that reach files the checkout does not hold.\n\n\
                       First of all, a damaged warehouse configuration file (\"config_damaged\" \
                       refusals, exit 65) is rewritten when its damage provably cost no setting. \
                       Otherwise it changes nothing and names the entries the damage may have \
@@ -401,6 +409,10 @@ pub enum Command {
         /// Set a sparse warehouse's damaged fetch scope to these paths, fetching what their history lacks
         #[arg(long, value_name = "PATH")]
         fetch_scope: Vec<String>,
+
+        /// Set this checkout's lost or damaged scope to these paths, the ones it held
+        #[arg(long, value_name = "PATH")]
+        scope: Vec<String>,
 
         /// Put a bay whose position is lost or damaged on this pallet, at its head
         #[arg(long, value_name = "PALLET")]

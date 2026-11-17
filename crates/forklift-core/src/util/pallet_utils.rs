@@ -2251,7 +2251,7 @@ pub fn all_pallet_refs() -> Result<Vec<(PalletRef, String)>, String> {
 ///                   valid pallet name.
 /// Files an operating system leaves in any folder a file browser opens. None is a valid pallet
 /// name, so none can be a ref file, and skipping them hides no pallet.
-const OS_LITTER_FILE_NAMES: [&str; 2] = [".DS_Store", "Thumbs.db"];
+pub(crate) const OS_LITTER_FILE_NAMES: [&str; 2] = [".DS_Store", "Thumbs.db"];
 
 fn collect_pallet_names(folder: &Path, prefix: &str, names: &mut Vec<String>) -> Result<(), String> {
     for entry_result in file_utils::read_directory(&folder.to_path_buf())? {

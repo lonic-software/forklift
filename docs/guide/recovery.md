@@ -139,8 +139,9 @@ warehouse root. Which step is named depends on why:
 - **No checkout's scope could be read.** The step offers the top-level folders of the working tree.
   Name fewer or others if you know what this warehouse fetched.
 - **The fetch scope can be read but does not hold a checkout's scope.** One of the two files is
-  damaged. If it is the fetch scope, the step widens it. If it is a checkout's, remove that bay with
-  `forklift bay remove` and add it again, or, for the warehouse's own working tree, clone afresh.
+  damaged. If it is the fetch scope, the step widens it. If it is a checkout's, run `forklift heal`
+  in that checkout, which restores its scope from its copy, or `forklift heal --scope <path>` there
+  (see `checkout_scope_damaged` below).
 
 A rebuilt fetch scope may be narrower than what was fetched before: paths only the old one named are
 no longer checked for loss. `forklift scope fetch <path>` adds one back.
@@ -467,6 +468,33 @@ match is no longer registered, so check `forklift stocktake` and load again what
 
 When a link or a folder stands where the record belongs, it is refused the same way. The next step
 asks you to remove it first; Forklift never follows a link there. Heal then rebuilds the record.
+
+### `checkout_scope_damaged` (exit 67)
+
+The scope file of a checkout in a sparse warehouse, or of a scoped bay, is missing, cut short or
+garbled, so no command can tell which paths it checks out. Nothing was changed. Every time a
+checkout's scope is written, a copy is written beside it, and `forklift heal`, run in that
+checkout, puts the scope back from the copy.
+
+Heal does not use a copy that names a path the warehouse never fetched, or the whole tree in a
+sparse warehouse. Nor does it use one that would leave a file outside the checkout where it could
+never be stacked again: a committed file, or an untracked file under a fetched path that no ignore
+rule covers. It then changes nothing, names the files, and asks for the scope:
+
+```sh
+forklift heal --scope <path> --scope <path>
+```
+
+Name the paths this checkout held. `--scope` is refused while the scope file can be used, and for
+paths that do not match what the checkout holds: a path the warehouse never fetched, a folder the
+store does not hold, a committed file in the named paths that is missing from your working tree,
+or a file the scope would leave out. When the fetch scope is lost as well, the same heal then
+rebuilds it from the scope you named.
+
+When the refusal names another checkout, run `forklift heal` in that checkout: a heal here does
+not reach it. A bay that recorded no folder was never checked out, since its `forklift bay add`
+stopped first: remove it with `forklift bay remove`. A scope file written by a newer version of
+Forklift is not this refusal, and no heal writes over it.
 
 ### `object_kind_mismatch` (exit 63)
 

@@ -11,7 +11,11 @@ prefixes a checkout materializes and operates on. It is used by three files:
   scope. Only a warehouse whose [marker](STATE_RECORD_FORMAT.md#files) records it as
   `sparse` has one; see [the fetch scope and the mode](#the-fetch-scope-and-the-warehouse-mode).
 
-Both files are **local only and never tracked**: scope is a property of *this* checkout, not
+Each checkout scope has a **copy** beside it, `scope-copy` in the same folder, written in the
+same format with the same bytes ([below](#the-copy-of-a-checkout-scope)). The fetch scope has
+none: `heal` rebuilds it from the checkouts' scopes.
+
+These files are **local only and never tracked**: scope is a property of *this* checkout, not
 of the project, so it is never written into a parcel, pushed to a remote, or imposed on
 collaborators. Which of them must exist is set out [below](#which-scope-files-must-exist).
 
@@ -60,11 +64,9 @@ Where:
   whose scopes left out the `.gitignore` of each folder above a prefix: read under today's
   meaning, each would show as removed in the same way, and format 4, which carried no digest,
   so a cut on a line boundary narrowed it silently. Nothing is migrated.
-  The way out depends on the file: for the fetch scope, `forklift heal`, which rebuilds it
-  from the checkouts' scopes; for the main tree's scope, clone the remote again, into a new
-  directory; for a bay's scope, remove the bay with `bay remove`
-  and add a new one under another name (a removed bay keeps its pallet, so its name stays
-  taken; copy any uncommitted work across by hand).
+  The way out is `forklift heal`: for the fetch scope it rebuilds the file from the
+  checkouts' scopes, and for a checkout's scope it restores the file from its copy, run in
+  that checkout.
 
 ## Which scope files must exist
 A file is checked against these rules each time it is read, and every refusal names the way
@@ -73,14 +75,41 @@ out.
 | File | Full or cache warehouse | Sparse warehouse | Way out |
 |---|---|---|---|
 | Fetch scope | absent | present, naming a prefix | absent where required: `forklift heal`; present where not: delete it |
-| Main-tree scope | absent | present, naming a prefix, ⊆ the fetch scope | absent where required: clone again; present where not: delete it |
-| Bay scope | present, any scope | present, naming a prefix, ⊆ the fetch scope | remove the bay, add a new one under another name |
+| Main-tree scope | absent | present, naming a prefix, ⊆ the fetch scope | absent or damaged where required: `forklift heal`; present where not: delete it |
+| Bay scope | present, any scope | present, naming a prefix, ⊆ the fetch scope | `forklift heal` in the bay; a bay that recorded no folder: `bay remove` |
 
 The main tree's scope follows the mode, as the fetch scope does: only a sparse clone
 scopes the main tree, and `scope narrow` cannot scope a checkout that holds every path. A bay's scope
 is the bay's own, since a full warehouse may hold a scoped bay, so `bay add` writes it for every
 bay, the full scope for an unscoped one, and a bay without one is refused in every mode. In a
 sparse warehouse `bay add` without `--scope` is refused before any bay state is made.
+
+### The copy of a checkout scope
+Every write of a checkout scope (`clone --only`, `bay add`, `scope narrow` and `heal --scope`)
+writes `scope-copy` first and the scope file second, each atomically, so a
+write that cannot leave its copy fails before the scope changes. A missing or damaged checkout
+scope is refused `checkout_scope_damaged`, and `forklift heal` in that checkout writes the
+copy's bytes back when the copy can be used:
+
+- it reads, names a path in a sparse warehouse, and lies within the fetch scope when the fetch
+  scope reads; and
+- it would strand no file. A file is stranded when the copy leaves it out of scope although it
+  could never be stacked again from there: a file committed in the tree the checkout stands on
+  (its position's base, not the pallet's head, which another bay may have moved), or an untracked
+  file no rule ignores, under a fetched path (anywhere when the fetch scope cannot be read).
+  Folders, ignored files, `.forklift`, another working tree inside this one, `.DS_Store` and
+  `Thumbs.db` never count.
+
+A scope that reads but lies outside a fetch scope that reads is restored only from a usable copy
+that differs from it; otherwise either file may be the damaged one, and the fetch-scope heal
+offers both ways out. A usable scope file rewrites a copy that is missing, damaged or different.
+A scope or copy a newer Forklift wrote is never written over.
+
+With no usable copy, `forklift heal --scope <path>...` sets the scope to the paths the checkout
+held. It is refused while the scope file is usable, in the main tree of a warehouse that is not
+sparse, for the root or a path outside a fetch scope that reads, for a path that is not a folder
+of the tree the checkout stands on, when a committed file in the named scope has no working
+entry or a folder in it is not in the store, and when the scope would strand a file.
 
 ### The fetch scope and the warehouse mode
 The warehouse marker records whether the warehouse is `full`, `sparse` or a `cache`, and the
