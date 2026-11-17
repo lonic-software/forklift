@@ -715,8 +715,15 @@ pub fn repair_warehouse_config(accept_loss: bool) -> Result<Option<ConfigRepaire
         let salvage = crate::util::config_salvage::salvage(&bytes, valid_entry);
         // The salvage judges entries one at a time; the file as a whole, a header naming no known
         // section for one, may still not validate, and then only the lossy rewrite can mend it.
-        let lossless = salvage.lossless
-            && salvage.text.parse::<DocumentMut>().is_ok_and(|document| parse_config(&document, target).is_ok());
+        let checked = salvage.lossless.then(|| salvage.text.parse::<DocumentMut>()
+            .map_err(|error| error.to_string().trim_end().to_string())
+            .and_then(|document| parse_config(&document, target).map(|_| document)));
+        let (whole, invalid) = match checked {
+            Some(Ok(document)) => (Some(document), None),
+            Some(Err(detail)) => (None, Some(detail)),
+            None => (None, None),
+        };
+        let lossless = whole.is_some();
 
         if !lossless && !accept_loss {
             return Err(crate::error::CoreError::refusal(
@@ -724,7 +731,7 @@ pub fn repair_warehouse_config(accept_loss: bool) -> Result<Option<ConfigRepaire
                 format!(
                     "Configuration file \"{}\" is damaged, and mending it drops what the damage may \
                      have spared: {}. Nothing was changed.",
-                    named(target).to_string_lossy(), loss_summary(&salvage)
+                    named(target).to_string_lossy(), loss_summary(&salvage, invalid.as_deref())
                 ),
                 "forklift heal --config",
             ).into());
@@ -735,10 +742,9 @@ pub fn repair_warehouse_config(accept_loss: bool) -> Result<Option<ConfigRepaire
             false => Some(set_damaged_bytes_aside(target, &bytes)?),
         };
 
-        let document = match lossless {
-            true => salvage.text.parse::<DocumentMut>()
-                .map_err(|error| not_valid(target, error.to_string().trim_end().to_string()))?,
-            false => {
+        let document = match whole {
+            Some(document) => document,
+            None => {
                 let mut document = WAREHOUSE_CONFIG_TEMPLATE.parse::<DocumentMut>()
                     .map_err(|error| format!("The configuration template does not parse: {}", error))?;
                 for entry in &salvage.kept {
@@ -782,22 +788,29 @@ fn valid_entry(path: &[String], value: &str) -> bool {
     }
 }
 
-/// The entries a refused repair would drop, named by line and key, never by value.
-fn loss_summary(salvage: &crate::util::config_salvage::Salvage) -> String {
+/// The entries a refused repair would drop, named by line and key, never by value. `invalid` is
+/// why a salvage that drops no entry still does not validate as a whole.
+fn loss_summary(salvage: &crate::util::config_salvage::Salvage, invalid: Option<&str>) -> String {
     let mut parts: Vec<String> = salvage.dropped.iter().map(|entry| match &entry.key {
         Some(key) => format!("line {} ({})", entry.line, key),
         None => format!("line {}", entry.line),
     }).collect();
 
-    if salvage.cut {
-        parts.push("its last line, which no newline ends, and whatever followed it (if that line \
-                    was edited by hand rather than cut, fix it by hand instead)".to_string());
+    match (salvage.cut, salvage.closed) {
+        (true, false) => parts.push("its last line, which no newline ends, and whatever followed it \
+                                     (if that line was edited by hand rather than cut, fix it by \
+                                     hand instead)".to_string()),
+        (true, true) => parts.push("its last line, which no newline ends, inside a multi-line \
+                                    string, and whatever followed it (if that string was left open \
+                                    by hand rather than cut, close it by hand instead)".to_string()),
+        (false, _) => {}
     }
     if !salvage.parsed {
         parts.insert(0, "the rest of the file does not parse, so no entry can be kept".to_string());
     }
-    if parts.is_empty() && salvage.lossless {
-        parts.push("its comments, since the file as read does not hold a valid configuration".to_string());
+    if let (true, Some(detail)) = (parts.is_empty(), invalid) {
+        parts.push(format!("its comments, and whatever in it does not validate, since the file \
+                            as read does not hold a valid configuration: {}", detail.trim_end_matches('.')));
     } else if parts.is_empty() {
         parts.push("a line its damage may have turned into comment text".to_string());
     }
@@ -1540,8 +1553,9 @@ fn load_document(path: &Path, scope: ConfigScope) -> Result<Option<DocumentMut>,
     content.parse::<DocumentMut>()
         .map(Some)
         .map_err(|e| match is_cut(content.as_bytes()) {
-            true => damaged(path, scope, CUT_SHORT_OR_UNENDED),
-            false => not_valid(path, e.to_string().trim_end().to_string()),
+            Some(false) => damaged(path, scope, CUT_SHORT_OR_UNENDED),
+            Some(true) => damaged(path, scope, CUT_INSIDE_A_STRING),
+            None => not_valid(path, e.to_string().trim_end().to_string()),
         })
 }
 
@@ -1554,6 +1568,12 @@ const NOT_UTF8: &str = "it holds bytes that are not UTF-8 text, from damage or f
 const CUT_SHORT_OR_UNENDED: &str = "its last line does not parse, and no newline ends it, as \
                                     happens when a file is cut short. If that line was edited by \
                                     hand rather than cut, fix it by hand instead";
+
+/// The detail of a file cut short inside a multi-line string, whose last line is the string's
+/// text. A string opened by hand and never closed reads the same.
+const CUT_INSIDE_A_STRING: &str = "it ends inside a multi-line string, and no newline ends it, as \
+                                   happens when a file is cut short. If that string was left open \
+                                   by hand rather than cut, close it by hand instead";
 
 /// What damage a configuration file's bytes show, if any: bytes that are not UTF-8, or a
 /// character TOML never allows where it stands: a control character, which is what zeroed bytes
@@ -1575,23 +1595,27 @@ fn content_damage(bytes: &[u8]) -> Option<String> {
 
 /// Whether a file that does not parse was cut short: it has bytes, the last is not the newline
 /// every write ends with, and what precedes its last line parses, once any multi-line string the
-/// cut left open is closed. A cut only ever takes the end of a file, so a file that fails to parse
-/// before its last line holds a mistake made by hand, and so does a clean file that does not
-/// parse but ends in a newline.
-fn is_cut(bytes: &[u8]) -> bool {
-    let body = match bytes.iter().rposition(|&b| b == b'\n') {
-        Some(at) => &bytes[..=at],
-        None => &[],
-    };
-    !bytes.is_empty() && !bytes.ends_with(b"\n")
-        && std::str::from_utf8(body).is_ok_and(|body| crate::util::config_salvage::parse_closed(body).is_some())
+/// cut left open is closed (`parse_closed` says when it may be). A cut only ever takes the end of
+/// a file, so a file that fails to parse before its last line holds a mistake made by hand, and so
+/// does a clean file that does not parse but ends in a newline.
+///
+/// # Returns
+/// * `Some(closed)` - A cut, and whether it left a multi-line string open.
+/// * `None`         - No cut.
+fn is_cut(bytes: &[u8]) -> Option<bool> {
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
+        return None;
+    }
+    let (body, partial) = bytes.split_at(bytes.iter().rposition(|&b| b == b'\n').map_or(0, |at| at + 1));
+    let body = std::str::from_utf8(body).ok()?;
+    crate::util::config_salvage::parse_closed(body, &String::from_utf8_lossy(partial)).map(|(_, closed)| closed)
 }
 
 /// Whether a configuration file's bytes are damaged, as [`load_document`] refuses them with
 /// [`RefusalCode::ConfigDamaged`](crate::error::RefusalCode::ConfigDamaged).
 fn is_damaged(bytes: &[u8]) -> bool {
     content_damage(bytes).is_some()
-        || (std::str::from_utf8(bytes).is_ok_and(|text| text.parse::<DocumentMut>().is_err()) && is_cut(bytes))
+        || (std::str::from_utf8(bytes).is_ok_and(|text| text.parse::<DocumentMut>().is_err()) && is_cut(bytes).is_some())
 }
 
 /// The refusal of a damaged configuration file. Only the warehouse's own file has a next step:

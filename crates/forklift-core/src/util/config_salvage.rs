@@ -48,6 +48,10 @@ pub struct Salvage {
     pub dropped: Vec<DroppedEntry>,
     /// Whether the file was cut short: it does not end in a newline.
     pub cut: bool,
+    /// Whether the text left after removing a cut line ends inside a multi-line string the cut
+    /// left open, read with that string closed: the cut line is then the string's text, never a
+    /// header.
+    pub closed: bool,
     /// Whether the text left after removing a cut line parses at all. When it does not, nothing
     /// is kept and `dropped` names what still looks like an entry, best effort.
     pub parsed: bool,
@@ -81,14 +85,30 @@ fn is_damage(c: char) -> bool {
 }
 
 /// What a cut inside a multi-line string leaves unwritten: the string's closing delimiter.
-const CLOSERS: [&str; 3] = ["", "\"\"\"\n", "'''\n"];
+const CLOSERS: [&str; 2] = ["\"\"\"\n", "'''\n"];
 
-/// `text` parsed as a document, or, when it ends inside a multi-line string, as one with that
-/// string closed. Only a cut leaves a string open at the end of the text it spares, so only a
-/// cut's text may be read this way: anywhere else, the closer would swallow what follows into the
-/// string.
-pub fn parse_closed(text: &str) -> Option<toml_edit::Document<String>> {
-    CLOSERS.iter().find_map(|closer| toml_edit::Document::parse(format!("{}{}", text, closer)).ok())
+/// `text` parsed as a document, and whether that took closing a multi-line string it ends inside.
+/// Only a cut leaves a string open at the end of the text it spares, so only a cut's text may be
+/// read this way. Even then, a string opened by hand and never closed reads the same, with every
+/// later line swallowed into it: so a string is closed only when none of the lines it would
+/// swallow, `partial` (the cut line) included, reads as a header or an entry on its own.
+pub fn parse_closed(text: &str, partial: &str) -> Option<(toml_edit::Document<String>, bool)> {
+    if let Ok(document) = toml_edit::Document::parse(text.to_string()) {
+        return Some((document, false));
+    }
+    CLOSERS.iter().find_map(|closer| {
+        let document = toml_edit::Document::parse(format!("{}{}", text, closer)).ok()?;
+        let (mut found, mut headers) = (Vec::new(), Vec::new());
+        collect(document.as_table(), &[], 0, &mut found, &mut headers);
+        let open = found.iter().filter(|entry| entry.span.end > text.len()).map(|entry| entry.span.start).min()?;
+        let mut swallowed = text[open..].split('\n').skip(1).chain(std::iter::once(partial));
+        (!swallowed.any(reads_as_a_line_of_its_own)).then_some((document, true))
+    })
+}
+
+/// Whether `line`, alone, is a header or an entry.
+fn reads_as_a_line_of_its_own(line: &str) -> bool {
+    toml_edit::Document::parse(line.to_string()).is_ok_and(|document| !document.as_table().is_empty())
 }
 
 /// One entry found in the parsed text, before the verdict on it.
@@ -133,12 +153,12 @@ pub fn salvage(bytes: &[u8], valid: impl Fn(&[String], &str) -> bool) -> Salvage
     // A cut inside a multi-line string leaves it open. With damage anywhere, the closing delimiter
     // may be what the damage hid, and closing the string would swallow what followed it.
     let document = match cut && damage.is_empty() {
-        true => parse_closed(&text),
-        false => toml_edit::Document::parse(text.clone()).ok(),
+        true => parse_closed(&text, &String::from_utf8_lossy(partial.unwrap_or_default())),
+        false => toml_edit::Document::parse(text.clone()).ok().map(|document| (document, false)),
     };
-    let Some(document) = document else {
+    let Some((document, closed)) = document else {
         let dropped = entry_lines(&text);
-        return Salvage { kept: Vec::new(), dropped, cut, parsed: false, lossless: false, text };
+        return Salvage { kept: Vec::new(), dropped, cut, closed: false, parsed: false, lossless: false, text };
     };
 
     let mut found = Vec::new();
@@ -202,7 +222,7 @@ pub fn salvage(bytes: &[u8], valid: impl Fn(&[String], &str) -> bool) -> Salvage
                 drop_group(&entry.path);
             },
         }
-        if key.is_none() {
+        if key.is_none() && may_begin_a_header(&text, at.end) {
             misread_from.push((at.start, section.clone()));
         }
         hidden.push(DroppedEntry {
@@ -213,8 +233,9 @@ pub fn salvage(bytes: &[u8], valid: impl Fn(&[String], &str) -> bool) -> Salvage
 
     // The cut line belongs to the section the last header still visible governs, and that
     // section may have run on past the cut: it goes whole. A cut header fragment ends the
-    // section above it, so that one is complete.
-    let fragment = partial.is_some_and(|line| String::from_utf8_lossy(line).trim_start().starts_with('['));
+    // section above it, so that one is complete; but a cut line inside a string the cut left open
+    // is the string's text, whatever it starts with.
+    let fragment = !closed && partial.is_some_and(|line| String::from_utf8_lossy(line).trim_start().starts_with('['));
     if cut && !fragment {
         match headers.iter().max_by_key(|(span, _)| span.start) {
             Some((_, path)) => drop_group(path),
@@ -245,7 +266,7 @@ pub fn salvage(bytes: &[u8], valid: impl Fn(&[String], &str) -> bool) -> Salvage
 
     let lossless = !cut && dropped.is_empty();
 
-    Salvage { kept, dropped, cut, parsed: true, lossless, text }
+    Salvage { kept, dropped, cut, closed, parsed: true, lossless, text }
 }
 
 /// The section an entry's path belongs to, the unit the salvage keeps or drops whole: a top-level
@@ -351,9 +372,17 @@ fn hidden_line(text: &str, after: usize) -> Option<Option<Vec<String>>> {
     }
 }
 
+/// Whether the comment text after a damaged character, from `after`, read as a line of its own,
+/// may begin a header: it starts with `[`, or with damage that may hide one. Only a header moves
+/// the entries after it into another section.
+fn may_begin_a_header(text: &str, after: usize) -> bool {
+    let rest = text[after..].trim_start_matches([' ', '\t']);
+    rest.starts_with('[') || rest.chars().next().is_some_and(is_damage)
+}
+
 /// The key of the entry `line` holds, read as a document of its own, when it holds one.
 fn one_line_key(line: &str) -> Option<Vec<String>> {
-    let document = parse_closed(&format!("{}\n", line))?;
+    let (document, _) = parse_closed(&format!("{}\n", line), "")?;
     let (mut found, mut headers) = (Vec::new(), Vec::new());
     collect(document.as_table(), &[], 0, &mut found, &mut headers);
     found.into_iter().next().map(|entry| entry.path)
@@ -365,24 +394,26 @@ fn looks_like_entry(line: &str) -> bool {
 }
 
 /// Best effort over text that does not parse: every line that still looks like an entry, named by
-/// its key while the key holds no damage.
+/// its key while the key holds no damage and no damaged character before it may hide a header
+/// that moved it into another section.
 fn entry_lines(text: &str) -> Vec<DroppedEntry> {
     let mut section = String::new();
+    let mut misread = false;
     let mut dropped = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let trimmed = line.trim_start();
         if let Some(header) = trimmed.strip_prefix('[') {
             section = header.trim_start_matches('[').split(']').next().unwrap_or("").trim().to_string();
-            continue;
-        }
-        if looks_like_entry(trimmed) {
+            misread = false;
+        } else if looks_like_entry(trimmed) {
             let key = trimmed.split_once('=').map(|(key, _)| key.trim()).unwrap_or("");
             let full = match section.is_empty() { true => key.to_string(), false => format!("{}.{}", section, key) };
             dropped.push(DroppedEntry {
                 line: index + 1,
-                key: (!full.chars().any(is_damage)).then_some(full),
+                key: (!misread && !full.chars().any(is_damage)).then_some(full),
             });
         }
+        misread |= line.char_indices().any(|(at, c)| is_damage(c) && may_begin_a_header(line, at + c.len_utf8()));
     }
     dropped
 }
@@ -532,6 +563,32 @@ mod tests {
                 "{:?}", salvage.dropped);
     }
 
+    /// A cut line inside the string the cut left open is the string's text, even when it starts
+    /// with `[`. Revert: read it as a header fragment whatever the closer → the remote is kept,
+    /// its token cut short → red.
+    #[test]
+    fn a_cut_line_inside_a_string_is_no_header_fragment() {
+        let text = "[operator]\nidentifier = \"o\"\n[remote]\ntoken = \"\"\"\nline1\n[op";
+        let salvage = salvage(text.as_bytes(), any);
+        assert!(salvage.closed && !salvage.lossless, "{:?}", salvage);
+        assert_eq!(keys(&salvage), ["operator.identifier"]);
+        assert!(salvage.dropped.contains(&DroppedEntry { line: 4, key: Some("remote.token".to_string()) }),
+                "{:?}", salvage.dropped);
+    }
+
+    /// A string opened by hand and never closed, above later sections, is no cut: the closer
+    /// would swallow those sections and name them nowhere. Revert: close the string whatever it
+    /// swallows → the text parses, operator.identifier is named nowhere → red.
+    #[test]
+    fn a_string_left_open_above_later_sections_is_never_closed() {
+        let text = "[remote]\nurl = \"u\"\ntoken = \"\"\"abc\n[operator]\nidentifier = \"o\"\n[mirror]\npallets = \"main\"";
+        assert!(parse_closed(&text[..text.rfind('\n').unwrap() + 1], "pallets = \"main\"").is_none());
+        let salvage = salvage(text.as_bytes(), any);
+        assert!(!salvage.parsed, "{:?}", salvage);
+        assert!(salvage.dropped.iter().any(|entry| entry.key.as_deref() == Some("operator.identifier")),
+                "{:?}", salvage.dropped);
+    }
+
     /// With damage beside a cut, the closer could swallow later sections into a string whose real
     /// end the damage hid, so it is not tried. Revert: try the closer whenever cut → the operator
     /// vanishes into the token, named nowhere → red.
@@ -570,6 +627,38 @@ mod tests {
             assert_eq!(keys(&salvage), ["remote.url", "remote.token"], "{:#x}", byte);
             assert!(salvage.lossless && salvage.text.contains("# Mate\u{FFFD}s server"), "{:#x}", byte);
         }
+    }
+
+    /// Damage whose rest of line starts as no header can move no entry: the section goes, but
+    /// its entries keep their names. Revert: arm the misread rule for every hidden line of unknown
+    /// kind → url and token lose their keys → red.
+    #[test]
+    fn damage_that_can_hide_no_header_keeps_the_names_after_it() {
+        let text = "[remote]\n# see docs ab cd\nurl = \"u\"\ntoken = \"t\"\n";
+        let mut bytes = text.as_bytes().to_vec();
+        let at = text.find("ab").unwrap();
+        bytes[at] = 0xFF;
+        bytes[at + 3] = 0xFF;
+        let salvage = salvage(&bytes, any);
+        assert!(salvage.kept.is_empty() && !salvage.lossless, "{:?}", salvage);
+        for key in ["remote.url", "remote.token"] {
+            assert!(salvage.dropped.iter().any(|entry| entry.key.as_deref() == Some(key)), "{} {:?}", key, salvage.dropped);
+        }
+    }
+
+    /// In text that does not parse, an entry after a hidden header is of no known section.
+    /// Revert: name it by the section above regardless → profile.work.identifier twice → red.
+    #[test]
+    fn an_unparsable_entry_after_a_hidden_header_has_no_key() {
+        let text = "[profile.work]\nidentifier = \"w\"\n# x?[profile.home]\nidentifier = \"h\"\n";
+        let mut bytes = text.as_bytes().to_vec();
+        bytes[text.find('?').unwrap()] = 0xFF;
+        let salvage = salvage(&bytes, any);
+        assert!(!salvage.parsed, "{:?}", salvage);
+        assert_eq!(salvage.dropped, [
+            DroppedEntry { line: 2, key: Some("profile.work.identifier".to_string()) },
+            DroppedEntry { line: 4, key: None },
+        ]);
     }
 
     /// Revert: skip the cut-section drop → url kept while the token was cut off → red.

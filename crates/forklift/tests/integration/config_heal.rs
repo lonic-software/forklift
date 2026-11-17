@@ -225,13 +225,16 @@ fn an_earlier_damaged_copy_is_never_written_over() {
     assert_eq!(std::fs::read(area.config()).unwrap(), damaged);
 }
 
-/// A mistake made by hand anywhere but the last line is no cut, final newline or not. Revert:
-/// drop the body-parses condition from is_cut → the unended file reads as damaged → red.
+/// A mistake made by hand anywhere but the last line is no cut, final newline or not, and nor is
+/// a string opened by hand above later sections. Revert: drop the body-parses condition from
+/// is_cut → the unended file reads as damaged → red; close a string whatever it swallows → the
+/// third ending reads as damaged → red.
 #[test]
 fn a_mistake_made_by_hand_keeps_its_by_hand_refusal_and_is_not_written_over() {
     let area = Area::new("hand");
     let sound = std::fs::read(area.config()).unwrap();
-    for (ending, unended) in [(&b"bogus = \n"[..], false), (&b"bogus = \n[mirror2]"[..], true)] {
+    let open = &b"[extra]\nnote = \"\"\"abc\n[operator2]\nidentifier = \"o\"\n[mirror3]\npallets = \"m\""[..];
+    for (ending, unended) in [(&b"bogus = \n"[..], false), (&b"bogus = \n[mirror2]"[..], true), (open, true)] {
         let mut bytes = sound.clone();
         bytes.extend_from_slice(ending);
         std::fs::write(area.config(), &bytes).unwrap();
@@ -320,7 +323,9 @@ fn a_cut_inside_a_multi_line_token_is_damage_heal_config_mends() {
     let at = multi.find(&TOKEN[6..]).unwrap() + 3;
     std::fs::write(area.config(), &multi.as_bytes()[..at]).unwrap();
 
-    config_damaged(&area.run(&["--json", "config", "get", "mirror.pallets"]));
+    // Revert: give a cut inside a string the last-line detail → no word of the string → red.
+    let refused = config_damaged(&area.run(&["--json", "config", "get", "mirror.pallets"]));
+    assert!(refused["error"]["message"].as_str().unwrap().contains("close it by hand"), "{}", refused);
     area.run_ok(&["heal", "--config"]);
     assert_eq!(area.get("operator.identifier"), "config-heal@forklift");
     assert!(!area.run(&["config", "get", "remote.token"]).status.success());
@@ -357,8 +362,10 @@ fn a_lossless_salvage_that_does_not_validate_is_refused_for_heal_config() {
 
     let refused = config_damaged(&area.run(&["--json", "heal"]));
     assert_eq!(refused["error"]["next_step"], "forklift heal --config", "{}", refused);
+    // Revert: leave the validation detail out of the summary → `bogus` is named nowhere → red.
     assert!(refused["error"]["message"].as_str().unwrap().contains("does not hold a valid configuration"),
             "{}", refused);
+    assert!(refused["error"]["message"].as_str().unwrap().contains("bogus"), "{}", refused);
     let healed = parsed(&area.run_ok(&["--json", "heal", "--config"]));
     assert_eq!(healed["data"]["config_repaired"]["lossless"], false, "{}", healed);
     assert_eq!(area.get("remote.token"), TOKEN);
