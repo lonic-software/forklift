@@ -5324,6 +5324,32 @@ mod tests {
         error.raw_os_error() == Some(7)
     }
 
+    /// The layout gate judges the metadata's header line alone, so it refuses a newer version's
+    /// header, whose digest line it never reads, as well as an older one's.
+    ///
+    /// Revert: judge the header line as a whole record → a newer header reads as damage, and
+    /// the gate lets it through.
+    #[test]
+    fn the_layout_gate_refuses_an_older_or_newer_header_from_its_first_line() {
+        for (name, version, refused) in [("older", INVENTORY_METADATA_VERSION - 1, true),
+                                         ("newer", INVENTORY_METADATA_VERSION + 1, true),
+                                         ("this", INVENTORY_METADATA_VERSION, false)] {
+            // A fresh root per case: the gate passes a root once per process.
+            let dir = std::env::temp_dir().join(format!("forklift-layout-gate-{}-{}", name, std::process::id()));
+            let _ = remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let bytes = record_utils::to_bytes(INVENTORY_METADATA_RECORD, version, ["./"]);
+            std::fs::write(dir.join(FILE_NAME_INVENTORY_METADATA), bytes).unwrap();
+
+            let gate = gate_inventory_layout(&dir);
+            assert_eq!(gate.is_err(), refused, "{}: {:?}", name, gate);
+            if refused {
+                assert!(gate.unwrap_err().contains("does not know"), "{}", name);
+            }
+            remove_dir_all(&dir).ok();
+        }
+    }
+
     /// A delete whose retry finds the path gone (another process removed it after the held
     /// failure) succeeds, rather than failing `NotFound` on a path that is gone.
     #[test]
