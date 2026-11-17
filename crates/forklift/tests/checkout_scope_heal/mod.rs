@@ -483,7 +483,25 @@ fn a_base_that_cannot_be_read_is_a_coded_refusal() {
         assert_eq!(value["error"]["code"], "checkout_scope_damaged", "{:?}: {}", args, value);
         assert_eq!(output.status.code(), Some(CHECKOUT_SCOPE_DAMAGED_EXIT), "{:?}", args);
         let message = value["error"]["message"].as_str().unwrap();
-        assert!(message.contains("cannot be told") && message.contains("until both read"), "{:?}: {}", args, message);
+        assert!(message.contains("cannot be told") && message.contains("until the position and that tree both read"), "{:?}: {}", args, message);
         assert!(!area.path(MAIN_SCOPE).exists(), "{:?} wrote no scope", args);
     }
+}
+
+// A --position that waits for a --ref heal will refuse, since the ref is not damaged, is refused
+// before the scope is judged against that parcel. Revert: only resolve the parcel → the scope is
+// restored against it, then the --ref write is refused.
+#[test]
+fn heal_refuses_a_ref_it_will_not_set_before_restoring_the_scope() {
+    let area = TestArea::new("checkout-scope-heal-ref-refused");
+    let _server = with_bay(&area);
+    let head = std::fs::read_to_string(area.path("sparse/.forklift/pallets/main")).unwrap().trim().to_string();
+    remove(&area, MAIN_SCOPE);
+    remove(&area, "sparse/.forklift/position");
+    remove(&area, "sparse/.forklift/position-copy");
+
+    let refused = area.forklift("sparse", &["heal", "--position", "main", "--ref", &format!("main={}", head)]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(!area.path(MAIN_SCOPE).exists(), "no scope was written: {}", stderr(&refused));
+    assert!(stderr(&refused).contains("is not damaged"), "{}", stderr(&refused));
 }

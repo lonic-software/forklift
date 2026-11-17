@@ -196,16 +196,27 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // The checkout's own scope, just before the fetch-scope heal, whose rebuild from the checkouts'
     // scopes then sees it restored. Nothing before it reads either scope. A position that waits is
     // set to the parcel its --ref names, so that is the tree the guard judges against.
-    // A parcel that does not resolve is refused as its --ref write would refuse it.
-    let parcel = match early {
-        true => None,
-        false => set_ref.iter().find(|(named, _)| Some(*named) == position)
-            .map(|(_, parcel)| pallet_utils::resolve_revision(parcel))
-            .transpose()
-            .map_err(|error| records_said(CoreError::from(error), &ref_notes, None, None))?,
+    // The write it waits for is judged first, as that write judges it, so a scope is never
+    // judged against a tree the write then refuses. A --remove-ref of the last pallet puts it
+    // unborn.
+    // Some(None): the position will be unborn.
+    let waits_on: Result<Option<Option<String>>, String> = match (early, position) {
+        (false, Some(pallet)) => match set_ref.iter().find(|(named, _)| *named == pallet) {
+            Some((_, parcel)) => ref_heal::check_set_damaged_ref(pallet, parcel).map(|head| Some(Some(head))),
+            None => ref_heal::check_remove_damaged_ref(pallet).and_then(|()| {
+                let left = pallet_utils::list_pallets()?.iter().any(|named| !remove_ref.contains(named));
+                Ok(match left {
+                    true => None,
+                    false => Some(None),
+                })
+            }),
+        },
+        _ => Ok(None),
     };
-    let base = match &parcel {
-        Some(parcel) => Base::Parcel(parcel),
+    let waits_on = waits_on.map_err(|error| records_said(CoreError::from(error), &ref_notes, None, None))?;
+    let base = match &waits_on {
+        Some(Some(parcel)) => Base::Parcel(parcel),
+        Some(None) => Base::Unborn,
         None => Base::Position,
     };
     let early_scope = heal_checkout_scope(scope, base, &mut ref_notes)

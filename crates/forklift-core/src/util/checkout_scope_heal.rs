@@ -260,8 +260,8 @@ fn base_unread_remedy() -> String {
         None => "clone the warehouse again".to_string(),
     };
     format!(
-        "Heal judges a scope against the tree this checkout stands on, read from its bay position, so it restores \
-        none until both read; if the store no longer holds that tree, {}.",
+        "Heal judges a scope against the tree this checkout stands on, which its position names, so it restores \
+        none until the position and that tree both read; if the store no longer holds that tree, {}.",
         replace
     )
 }
@@ -450,6 +450,8 @@ pub enum Base<'a> {
     /// The parcel the position is about to be set to, in the same heal, while the position is
     /// lost: a full hash.
     Parcel(&'a str),
+    /// The position is about to be set unborn, in the same heal, while it is lost: no tree.
+    Unborn,
 }
 
 /// The tree the checkout stands on, read as [`Base`] says.
@@ -472,6 +474,7 @@ impl BaseTree {
         let parcel = match base {
             Base::Position => pallet_utils::read_position()?.base,
             Base::Parcel(parcel) => Some(parcel.to_string()),
+            Base::Unborn => None,
         };
         let root = match parcel {
             Some(parcel) => Some(object_utils::load_parcel(&parcel)?.tree_hash),
