@@ -53,6 +53,8 @@ use forklift_core::util::office_utils::{self, OfficeState, TrustAnchor, OFFICE_P
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, RefUpdateError};
 use forklift_core::util::redaction_utils::{self, REDACTIONS_PALLET_NAME};
 use forklift_core::util::sealed_utils::Tolerated;
+use forklift_core::util::audit_utils::{ChunkProbe, ObjectProbe};
+use forklift_core::enums::object_type::ObjectType;
 use forklift_core::util::haul_utils::{self, HAUL_PALLET_NAME};
 use forklift_core::util::{
     audit_utils, bundle_utils, file_utils, merge_utils, meta_tree, object_utils, pallet_utils, sign_utils,
@@ -1051,18 +1053,20 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 materialize_state(&self.objects, old_head, &mut mirror).map_err(HeadError::internal)?;
             }
 
-            // 1. Closure presence. A working blob and a chunked file's recipe are presence-checked
-            // one hash at a time via `blob_exists`; a chunked file's recipe is read from the object
-            // store too (it is a file-entry object, so `materialize` above never mirrored it into
-            // the scratch), and its chunks are presence-checked non-tolerantly — a ref must never
-            // advance over a chunked file whose chunks never reached storage (§9.4b W4).
-            let blob_exists = |hash: &str| self.objects.exists(hash);
+            // 1. Closure presence and kind. A working blob and a chunked file's recipe are probed
+            // one hash at a time via `blob_exists`, which reads the kind each object's metadata
+            // records, so an entry naming an object of another kind is refused; a chunked file's
+            // recipe is read from the object store too (it is a file-entry object, so
+            // `materialize` above never mirrored it into the scratch), and its chunks are probed
+            // non-tolerantly — a ref must never advance over a chunked file whose chunks never
+            // reached storage (§9.4b W4), nor over one naming something else as a chunk.
+            let blob_exists = |hash: &str| self.objects.kind(hash).map(ObjectProbe::kind);
             // The chunk-presence seam (§9.4b W4): a changed chunked file's *whole* chunk list is
             // probed in one bulk call, which the S3 store answers with a bounded-concurrency batch
             // of HeadObjects. Walked serially (one HEAD per chunk), a 1–2 GiB file's ~1–2k chunks
             // already crowd API Gateway's 29 s integration ceiling; in parallel they clear in a
             // second or two. Still non-tolerant: any missing chunk refuses the ref.
-            let chunks_missing = |chunks: &[String]| self.objects.objects_missing(chunks);
+            let chunks_missing = |chunks: &[String]| chunk_probe(&self.objects, chunks);
             let load_recipe_chunks = |hash: &str| -> Result<Vec<String>, String> {
                 let bytes = self
                     .objects
@@ -2061,8 +2065,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 audit_utils::verify_parcel_closure_with(
                     head,
                     None,
-                    &|hash| self.objects.exists(hash),
-                    &|chunks| self.objects.objects_missing(chunks),
+                    &|hash| self.objects.kind(hash).map(ObjectProbe::kind),
+                    &|chunks| chunk_probe(&self.objects, chunks),
                     &|hash| {
                         let bytes = self
                             .objects
@@ -2126,6 +2130,21 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 /// The `422` for a client-sent hash spelled any way but the store's own, 64 lowercase hex
 /// characters: the same refusal the self-hosted server gives, rather than a miss decided by S3's
 /// key casing. The value is not repeated back.
+/// The closure walk's bulk probe of a recipe's chunks over `objects`: the absent ones, and those
+/// present as another kind.
+fn chunk_probe<O: ObjectStore>(objects: &O, chunks: &[String]) -> Result<ChunkProbe, String> {
+    let mut probed = ChunkProbe::default();
+
+    for (hash, kind) in objects.kinds(chunks)? {
+        match kind {
+            None => probed.missing.push(hash),
+            Some(ObjectType::Chunk) => {}
+            Some(found) => probed.mis_kinded.push((hash, found)),
+        }
+    }
+    Ok(probed)
+}
+
 fn require_object_hash(hash: &str) -> HeadResult<()> {
     if object_utils::is_object_hash(hash) {
         return Ok(());

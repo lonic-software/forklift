@@ -193,6 +193,12 @@ const MAX_PROMOTE_ATTEMPTS: u32 = 3;
 /// blocking thread the head already runs on, which is why each probe may borrow `&self`.
 const MISSING_PROBE_CONCURRENCY: usize = 64;
 
+/// The user metadata key every canonical object carries, naming its kind (`blob`, `tree`,
+/// `parcel`, `recipe` or `chunk`), so a ref update's closure walk reads an object's kind from the
+/// `HEAD` it already makes for presence. S3 sends it as `x-amz-meta-forklift-kind`. A canonical
+/// object without it is refused as unreadable, never read as present.
+pub(crate) const KIND_METADATA: &str = "forklift-kind";
+
 /// The canonical key of `warehouse`'s object — the only prefix `exists`/`get`/`access` read,
 /// and the only prefix hash-verified writes target.
 fn object_key(warehouse: &str, hash: &str) -> String {
@@ -483,6 +489,26 @@ impl S3ObjectStore {
         head_object_outcome(self.client.head_object().bucket(&self.bucket).key(key).send().await)
     }
 
+    /// The kind recorded on the object at `key` ([`KIND_METADATA`]), or `None` when the key is
+    /// absent: one `HEAD`. An object present without a kind this build reads is an error naming the
+    /// key, never read as presence: every canonical writer records it, so its absence is damage, or
+    /// an object written before the format recorded it.
+    async fn key_kind(&self, key: &str) -> Result<Option<ObjectType>, String> {
+        let result = self.client.head_object().bucket(&self.bucket).key(key).send().await;
+        let Ok(output) = result else {
+            return head_object_outcome(result).map(|_| None);
+        };
+        let recorded = output.metadata().and_then(|metadata| metadata.get(KIND_METADATA));
+
+        match recorded.map(|kind| kind.parse::<ObjectType>()) {
+            Some(Ok(kind)) => Ok(Some(kind)),
+            Some(Err(_)) | None => Err(format!(
+                "Object {} carries no kind this head reads in its {} metadata: {:?}.",
+                key, KIND_METADATA, recorded
+            )),
+        }
+    }
+
     /// The bytes at a key, or `None` when it is absent (`NoSuchKey` is `Ok(None)`; any other
     /// failure — including `NoSuchBucket` — is a genuine error, per [`is_no_such_key`]).
     async fn key_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
@@ -505,16 +531,30 @@ impl S3ObjectStore {
     /// The `If-None-Match: *` header is the byte plane's CAS — it is how immutability and
     /// racing-promoter serialization are enforced without a lock.
     async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<Conditional, String> {
-        match self
+        self.put_if_absent_as(key, bytes, None).await
+    }
+
+    /// [`put_if_absent`](Self::put_if_absent) for a canonical object, recording its kind in its
+    /// [`KIND_METADATA`]. Every canonical object is written through here or through
+    /// [`copy_staged_to_canonical`](Self::copy_staged_to_canonical), which records it too.
+    async fn put_object_if_absent(&self, key: &str, bytes: Vec<u8>, kind: ObjectType) -> Result<Conditional, String> {
+        self.put_if_absent_as(key, bytes, Some(kind)).await
+    }
+
+    async fn put_if_absent_as(&self, key: &str, bytes: Vec<u8>, kind: Option<ObjectType>) -> Result<Conditional, String> {
+        let mut request = self
             .client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
             .if_none_match("*")
-            .body(ByteStream::from(bytes))
-            .send()
-            .await
-        {
+            .body(ByteStream::from(bytes));
+
+        if let Some(kind) = kind {
+            request = request.metadata(KIND_METADATA, kind.to_string());
+        }
+
+        match request.send().await {
             Ok(_) => Ok(Conditional::Written),
             Err(err) if is_precondition_failed(&err) => Ok(Conditional::AlreadyExists),
             Err(err) => Err(describe("S3 put_object", err)),
@@ -691,10 +731,15 @@ impl S3ObjectStore {
         staged_key: &str,
         canonical_key: &str,
         source_etag: Option<&str>,
+        kind: ObjectType,
     ) -> Result<CopyOutcome, String> {
+        // The copy replaces the staged object's metadata with the kind alone: a client's presigned
+        // PUT sets whatever metadata it likes on the staged copy, and none of it is carried over.
         let mut request = self
             .client
             .copy_object()
+            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+            .metadata(KIND_METADATA, kind.to_string())
             .bucket(&self.bucket)
             .copy_source(format!(
                 "{}/{}",
@@ -725,6 +770,26 @@ impl S3ObjectStore {
 impl ObjectStore for S3ObjectStore {
     fn exists(&self, hash: &str) -> Result<bool, String> {
         self.bridge.block_on(self.key_exists(&object_key(&self.warehouse, hash)))
+    }
+
+    fn kind(&self, hash: &str) -> Result<Option<ObjectType>, String> {
+        self.bridge.block_on(self.key_kind(&object_key(&self.warehouse, hash)))
+    }
+
+    /// The bulk kind probe, [`objects_missing`](ObjectStore::objects_missing)'s bounded batch of
+    /// `HeadObject`s reading each object's recorded kind. A single failure aborts the batch.
+    fn kinds(&self, hashes: &[String]) -> Result<Vec<(String, Option<ObjectType>)>, String> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        self.bridge.block_on(async {
+            stream::iter(hashes.iter())
+                .map(|hash| async move {
+                    Ok::<_, String>((hash.clone(), self.key_kind(&object_key(&self.warehouse, hash)).await?))
+                })
+                .buffer_unordered(MISSING_PROBE_CONCURRENCY)
+                .try_collect()
+                .await
+        })
     }
 
     /// The bulk presence probe, run as a bounded-concurrency batch of `HeadObject`s rather than the
@@ -801,9 +866,10 @@ impl ObjectStore for S3ObjectStore {
             ));
         }
         object_utils::check_object_form(hash, bytes)?;
+        let kind = object_utils::peek_object_type(bytes)?;
 
         self.bridge.block_on(async {
-            match self.put_if_absent(&object_key(&self.warehouse, hash), bytes.to_vec()).await? {
+            match self.put_object_if_absent(&object_key(&self.warehouse, hash), bytes.to_vec(), kind).await? {
                 Conditional::Written => Ok(PutOutcome::Created),
                 Conditional::AlreadyExists => Ok(PutOutcome::AlreadyPresent),
             }
@@ -920,13 +986,18 @@ impl ObjectStore for S3ObjectStore {
                         return Ok(PromoteOutcome::Corrupt { actual });
                     }
 
-                    if let Err(reason) = object_utils::check_object_form(hash, &bytes) {
-                        self.drop_staged(&staged).await;
+                    let checked = object_utils::check_object_form(hash, &bytes)
+                        .and_then(|()| object_utils::peek_object_type(&bytes));
+                    let kind = match checked {
+                        Ok(kind) => kind,
+                        Err(reason) => {
+                            self.drop_staged(&staged).await;
 
-                        return Ok(PromoteOutcome::Malformed { reason });
-                    }
+                            return Ok(PromoteOutcome::Malformed { reason });
+                        }
+                    };
 
-                    return match self.put_if_absent(&canonical, bytes).await? {
+                    return match self.put_object_if_absent(&canonical, bytes, kind).await? {
                         Conditional::Written => {
                             self.drop_staged(&staged).await;
 
@@ -967,18 +1038,25 @@ impl ObjectStore for S3ObjectStore {
                         return Ok(PromoteOutcome::Corrupt { actual });
                     }
                     StreamHash::Hash { form, .. } => {
-                        if let Err(reason) = form.finish() {
-                            self.drop_staged(&staged).await;
+                        let kind = form.object_type().copied();
+                        let finished = form.finish().and_then(|()| {
+                            kind.ok_or_else(|| "The object's header was never read.".to_string())
+                        });
+                        let kind = match finished {
+                            Ok(kind) => kind,
+                            Err(reason) => {
+                                self.drop_staged(&staged).await;
 
-                            return Ok(PromoteOutcome::Malformed { reason });
-                        }
+                                return Ok(PromoteOutcome::Malformed { reason });
+                            }
+                        };
 
                         // Verified without ever buffering the body. Promote via a server-side
                         // copy pinned to exactly the bytes just hashed — see
                         // `copy_staged_to_canonical` for the two conditions and the race it
                         // does and does not resolve.
                         match self
-                            .copy_staged_to_canonical(&staged, &canonical, etag.as_deref())
+                            .copy_staged_to_canonical(&staged, &canonical, etag.as_deref(), kind)
                             .await?
                         {
                             CopyOutcome::Copied => {

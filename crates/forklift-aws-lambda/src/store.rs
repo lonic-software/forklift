@@ -43,6 +43,8 @@
 //! call on a blocking thread; an SDK-backed store bridges each future with
 //! [`AsyncBridge`](crate::blocking::AsyncBridge). See `blocking.rs` for the full argument.
 
+use forklift_core::enums::object_type::ObjectType;
+use forklift_core::util::object_utils;
 use forklift_core::util::office_utils::TrustAnchor;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 
@@ -467,6 +469,30 @@ pub trait ObjectStore {
         }
 
         Ok(missing)
+    }
+
+    /// The kind of the object at `hash`, or `None` when it is absent: the probe a ref update's
+    /// closure walk puts to every object a file entry names, so a write cannot name an object as a
+    /// kind it is not.
+    ///
+    /// The default reads the object and its header, which is right for a store holding its objects
+    /// in memory or on local disk. The S3 backend overrides it to read the kind its writers record
+    /// on every object, so a probe stays one `HEAD` however large the object.
+    fn kind(&self, hash: &str) -> Result<Option<ObjectType>, String> {
+        let Some(bytes) = self.get(hash)? else {
+            return Ok(None);
+        };
+
+        object_utils::peek_object_type(&bytes)
+            .map(Some)
+            .map_err(|reason| format!("Object {} has a header this head cannot read: {}", hash, reason))
+    }
+
+    /// [`kind`](ObjectStore::kind) for each of `hashes`, in any order: the bulk probe of a
+    /// recipe's chunks, as [`objects_missing`](ObjectStore::objects_missing) is the bulk presence
+    /// probe. The default asks serially; the S3 backend batches its `HEAD`s.
+    fn kinds(&self, hashes: &[String]) -> Result<Vec<(String, Option<ObjectType>)>, String> {
+        hashes.iter().map(|hash| Ok((hash.clone(), self.kind(hash)?))).collect()
     }
 
     /// Which of `hashes` still have a staged upload under lift `session` — the probe a lift commit

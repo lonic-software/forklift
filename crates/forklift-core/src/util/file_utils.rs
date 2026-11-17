@@ -3327,6 +3327,63 @@ pub fn does_object_exist(hash: &str) -> Result<bool, String> {
     crate::util::pack_utils::is_in_packs(hash)
 }
 
+/// The type of the object `hash` names, or `None` when the store does not hold it: presence as
+/// [`does_object_exist`] answers it, and then the type in the object's header.
+///
+/// A loose copy is read only as far as its header — at most
+/// [`object_utils::MAX_HEADER_BYTES`](crate::util::object_utils::MAX_HEADER_BYTES) of the
+/// decompressed stream — so a loose object costs one open and a short decode, whatever its size.
+/// A packed object has no header-only read, so it is read whole, once, past the read cache. The
+/// type is the header's word: the rest of the object is not hashed here, as presence is not.
+///
+/// # Returns
+/// * `Ok(Some(ObjectType))` - The object is present, of this type.
+/// * `Ok(None)`             - The object is absent.
+/// * `Err(String)`          - The store could not be consulted, or the object's header could not
+///                            be read.
+pub fn object_type_of(hash: &str) -> Result<Option<crate::enums::object_type::ObjectType>, String> {
+    if !does_object_exist(hash)? {
+        return Ok(None);
+    }
+
+    if let Some(object_type) = loose_object_type(hash)? {
+        return Ok(Some(object_type));
+    }
+
+    // Packed, or packed since the presence check: read it whole, which also says so if it went.
+    let bytes = retrieve_object_by_hash_uncached(hash)?;
+
+    crate::util::object_utils::peek_object_type(&bytes)
+        .map(Some)
+        .map_err(|reason| format!("Object {} has a header this build cannot read: {}", hash, reason))
+}
+
+/// The type in the header of `hash`'s loose copy, or `None` when it has none.
+fn loose_object_type(hash: &str) -> Result<Option<crate::enums::object_type::ObjectType>, String> {
+    use std::io::Read;
+
+    let (path, file_name) = get_path_for_object(hash)?;
+    let file_path = path.add(PATH_SEPARATOR).add(&file_name);
+    let file = match std::fs::File::open(&file_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Error while reading object from file \"{}\": {}", file_path, error)),
+    };
+    let mut decoder = crate::util::object_utils::bounded_zstd_decoder(std::io::BufReader::new(file))
+        .map_err(|e| format!("Object {} is corrupt: its stored bytes do not decompress ({}).", hash, e))?;
+
+    // The header, or the whole object when it is shorter than the longest header.
+    let mut prefix = Vec::with_capacity(crate::util::object_utils::MAX_HEADER_BYTES);
+    (&mut decoder)
+        .take(crate::util::object_utils::MAX_HEADER_BYTES as u64)
+        .read_to_end(&mut prefix)
+        .map_err(|e| format!("Object {} is corrupt: its stored bytes do not decompress ({}).", hash, e))?;
+
+    crate::util::object_utils::peek_object_type(&prefix)
+        .map(Some)
+        .map_err(|reason| format!("Object {} has a header this build cannot read: {}", hash, reason))
+}
+
 /// [`does_object_exist`] for the liveness walk of a sweep that deletes (`gc`, `compact --all`,
 /// scope prune): `false` only when the hash is genuinely absent.
 ///

@@ -23,9 +23,10 @@
 //! gate. An S3 layout change therefore has no in-place path.
 //!
 //! The chain is a parameter, so tests run the upgrade over chains of their own; [`CHAIN`] is this
-//! build's, and empty. Format 2 keys the bucket per warehouse, and format 1 shared one key per
-//! object between every warehouse in the bucket: no step can tell whose a shared key was, so a
-//! format 1 warehouse is refused, never upgraded, and made again under a new id.
+//! build's, and empty. Format 3 records every canonical object's kind in its S3 metadata, which no
+//! step can add, since a step is given no object store: a format 2 warehouse is refused, never
+//! upgraded, and made again under a new id. Format 2 keyed the bucket per warehouse, and format 1
+//! shared one key per object between every warehouse in the bucket, which no step could split.
 
 use std::fmt;
 use std::time::Duration;
@@ -34,7 +35,7 @@ use crate::error::{HeadError, HeadResult};
 use crate::store::{FormatFence, FormatStore, RefStore};
 
 /// The format this build of the AWS head reads.
-pub const AWS_FORMAT: u32 = 2;
+pub const AWS_FORMAT: u32 = 3;
 
 /// What a warehouse's format item holds.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -16,7 +16,7 @@ const CODE_RECIPE: u64 = 4;
 const CODE_CHUNK: u64 = 5;
 
 /// Types of objects recognized by Forklift.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjectType {
     Blob,
     Parcel,
