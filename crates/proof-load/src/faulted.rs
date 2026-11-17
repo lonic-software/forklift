@@ -1372,9 +1372,9 @@ pub(crate) fn grade_after(
 /// unextractable: the harness never runs a server command on a warehouse it does not hold.
 fn operate(context: &Context, arguments: &[String], trail: &mut Trail, unextractable: &mut Vec<String>) -> Result<(), RunError> {
     let written = format!("forklift-server {}", arguments.join(" "));
-    let bound = context.host.zip(context.programs.server.as_deref())
-        .and_then(|(host, server)| Some((host, server, remedy::bind_operator(arguments, host.root())?)));
-    let Some((host, server, bound)) = bound else {
+    let bound = context.host.filter(|_| context.programs.server.is_some())
+        .and_then(|host| Some((host, remedy::bind_operator(arguments, host.root())?)));
+    let Some((host, bound)) = bound else {
         if !unextractable.contains(&written) {
             unextractable.push(written);
         }
@@ -1383,7 +1383,7 @@ fn operate(context: &Context, arguments: &[String], trail: &mut Trail, unextract
     let operated = host.operate(bound.clone(), context.scratch, context.environment, context.limit).map_err(RunError::Tool)?;
     let knowledge = &mut trail.recoverability.outside_knowledge;
     knowledge.push("as the remote's operator, on the host: stop the server".to_string());
-    knowledge.push(format!("as the remote's operator, on the host: {} {}", server.display(), bound.join(" ")));
+    knowledge.push(format!("as the remote's operator, on the host: forklift-server {}", bound.join(" ")));
     knowledge.push("as the remote's operator, on the host: start the server again".to_string());
     knowledge.extend(operated.restarted.outside_knowledge);
     for text in operated.restarted.unextractable.into_iter().chain(operated.restarted.refused.map(|said| format!("the restarted server refused: {}", said))) {
@@ -1391,23 +1391,27 @@ fn operate(context: &Context, arguments: &[String], trail: &mut Trail, unextract
             unextractable.push(text);
         }
     }
-    // A server command writes no failure document, so what its report names next is never run: it
-    // is the operator's own follow-up, and kept, so the trail says what the remedy left owed.
-    let said: Vec<String> = [&operated.outcome.stdout, &operated.outcome.stderr].into_iter()
-        .flat_map(|text| String::from_utf8_lossy(text).lines().map(str::to_string).collect::<Vec<_>>()).collect();
-    let named = remedy::extract(context.tool, &said.iter().map(String::as_str).collect::<Vec<_>>());
-    let follow_ups = named.remedies.iter().map(|named| match named {
-        Remedy::Command { arguments } => format!("forklift {}", arguments.join(" ")),
-        Remedy::Operator { arguments } => format!("forklift-server {}", arguments.join(" ")),
-        Remedy::Remove { path } => format!("remove {}", path.display()),
-    });
-    for text in follow_ups.chain(named.unextractable).map(|text| format!("named by {}: {}", written, text)) {
+    for text in follow_ups(context.tool, &written, &operated.outcome) {
         if !unextractable.contains(&text) {
             unextractable.push(text);
         }
     }
     trail.steps.push(operated.outcome);
     Ok(())
+}
+
+/// What an operator command's report, `written` as extracted, names next, each recorded as
+/// unextractable: a server command writes no failure document, so nothing in its report is run.
+/// It is the operator's own follow-up, kept so the trail says what the remedy left owed.
+fn follow_ups(tool: Tool, written: &str, outcome: &Outcome) -> Vec<String> {
+    let said: Vec<String> = [&outcome.stdout, &outcome.stderr].into_iter()
+        .flat_map(|text| String::from_utf8_lossy(text).lines().map(str::to_string).collect::<Vec<_>>()).collect();
+    let named = remedy::extract(tool, &said.iter().map(String::as_str).collect::<Vec<_>>());
+    named.remedies.iter().map(|named| match named {
+        Remedy::Command { arguments } => format!("forklift {}", arguments.join(" ")),
+        Remedy::Operator { arguments } => format!("forklift-server {}", arguments.join(" ")),
+        Remedy::Remove { path } => format!("remove {}", path.display()),
+    }).chain(named.unextractable).map(|text| format!("named by {}: {}", written, text)).collect()
 }
 
 /// The subject's own remedy set, run in order until one rescues: for forklift `heal`, then
@@ -2437,6 +2441,22 @@ mod tests {
     /// drop the failure-document or unextractable conditions → a crash or an unreadable remedy
     /// settles the record; settle on the first attempt → the faulted command's refusal of a write
     /// it committed grades as acknowledged.
+    /// An operator command's report is never run from: whatever it names next, runnable or not, is
+    /// kept as unextractable, labelled with the remedy that named it.
+    ///
+    /// Revert: run what it names → the runnable `forklift heal` leaves the list; drop the
+    /// unextractable ones → the `withhold add` the operator owes is lost from the trail.
+    #[test]
+    fn what_an_operator_report_names_next_is_recorded_not_run() {
+        let stdout = b"Kept 0 entries of the old record.\n1 file is absent. Withhold each one that was with \"forklift-server withhold add --root /s/host <hash> --statement <statement>\":\n  699c\nThen run \"forklift heal\" in each clone.\n".to_vec();
+        let outcome = Outcome { arguments: vec![], exit: Some(0), stdout, stderr: vec![], failure: None };
+        assert_eq!(follow_ups(Tool::Forklift, "forklift-server withhold repair --root <warehouse>", &outcome), [
+            "named by forklift-server withhold repair --root <warehouse>: forklift heal",
+            "named by forklift-server withhold repair --root <warehouse>: forklift-server withhold add --root /s/host <hash> --statement <statement>",
+        ]);
+        assert!(follow_ups(Tool::Forklift, "x", &Outcome { stdout: b"Repaired.\n".to_vec(), ..outcome }).is_empty());
+    }
+
     #[test]
     fn only_an_answer_asking_nothing_further_settles_a_served_record() {
         assert!(answered(Some(&answer(Some(0), "", None))));
@@ -2449,6 +2469,8 @@ mod tests {
         crashed.failure = None;
         assert!(!answered(Some(&crashed)), "a crash with no failure document is no answer");
         assert!(!answered(Some(&answer(Some(1), "Stuck.", Some("forklift load -- <path>")))), "an unreadable remedy is no answer");
+        let relayed = answer(Some(55), "The remote refused the handshake (503).", Some("Ask the remote's operator to repair it where the warehouse is served from (\"forklift-server tombstone repair --root <warehouse>\"); nothing here can."));
+        assert!(!answered(Some(&relayed)), "the operator's remedy is a remedy, so the refusal is no answer");
         let nothing = answer(Some(1), "Nothing to stack.", None);
         assert!(settles(true, Some(&nothing)));
         assert!(!settles(false, Some(&nothing)), "the faulted command's own answer is no retry");
