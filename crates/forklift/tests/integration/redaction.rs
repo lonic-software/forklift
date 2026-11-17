@@ -2797,6 +2797,15 @@ fn a_lift_leaves_out_withheld_content_and_its_chunks_and_reports_them() {
     assert!(loose_copies(&objects, &recipe).is_empty(), "the recipe was stored");
 }
 
+/// Rewrite the withheld record at `record` by `edit` over its entries, digesting it again as a
+/// host would have written it.
+fn rewrite_withheld(record: &std::path::Path, edit: impl FnOnce(&str) -> String) {
+    use forklift_core::util::record_utils;
+    let bytes = std::fs::read(record).unwrap();
+    let text = std::str::from_utf8(record_utils::without_digest_line(&bytes)).unwrap();
+    std::fs::write(record, record_utils::with_digest(edit(text).into_bytes())).unwrap();
+}
+
 /// The `chunks` digest of every withheld entry the handshake at `url` lists, by hash.
 fn withheld_digests(url: &str) -> BTreeMap<String, Option<String>> {
     let (status, info) = http(url, "GET", "/v1/warehouse", b"");
@@ -2924,10 +2933,11 @@ fn a_lift_sends_the_digest_intake_a_withheld_recipe_its_walk_never_meets() {
     assert_eq!(withheld_digests(&server.url).get(&recipe), Some(&Some(digest.clone())));
 
     let record = server.root.join(".forklift/withheld");
-    let text = std::fs::read_to_string(&record).unwrap();
-    let stripped = text.replace(&format!("{} {} ", recipe, digest), &format!("{} - ", recipe));
-    assert_ne!(stripped, text, "{}", text);
-    std::fs::write(&record, stripped).unwrap();
+    rewrite_withheld(&record, |text| {
+        let stripped = text.replace(&format!("{} {} ", recipe, digest), &format!("{} - ", recipe));
+        assert_ne!(stripped, text, "{}", text);
+        stripped
+    });
     assert_eq!(withheld_digests(&server.url).get(&recipe), Some(&None));
 
     owner.run_ok(&["pallet", "create", "copy"]);
@@ -4347,15 +4357,16 @@ fn a_lift_newly_naming_a_withheld_recipe_the_host_cannot_judge_is_refused() {
 
     // The host forgets the film's digest, as when no lift sent it the recipe.
     let record = takedown.server.root.join(".forklift/withheld");
-    let text = std::fs::read_to_string(&record).unwrap();
-    let stripped: String = text.lines()
-        .map(|line| match line.strip_prefix(&format!("{} ", takedown.film)) {
-            Some(rest) => format!("{} - {}\n", takedown.film, rest.split_once(' ').unwrap().1),
-            None => format!("{}\n", line),
-        })
-        .collect();
-    assert_ne!(stripped, text, "{}", text);
-    std::fs::write(&record, stripped).unwrap();
+    rewrite_withheld(&record, |text| {
+        let stripped: String = text.lines()
+            .map(|line| match line.strip_prefix(&format!("{} ", takedown.film)) {
+                Some(rest) => format!("{} - {}\n", takedown.film, rest.split_once(' ').unwrap().1),
+                None => format!("{}\n", line),
+            })
+            .collect();
+        assert_ne!(stripped, text, "{}", text);
+        stripped
+    });
     assert_eq!(withheld_digests(&takedown.server.url).get(&takedown.film), Some(&None));
 
     // A clone holds no copy of the film, so it can send the host no recipe.
