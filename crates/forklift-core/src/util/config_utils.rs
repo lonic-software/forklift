@@ -554,10 +554,22 @@ fn known_sections() -> Vec<&'static str> {
 /// this message wants — its whole job is naming a file for a human to open in an editor — so the
 /// prefix is stripped by the one helper that owns that rule.
 fn not_valid(path: &Path, detail: String) -> String {
-    format!(
-        "Configuration file \"{}\" is not valid: {} Fix the file by hand.",
-        named(path).to_string_lossy(), detail
-    )
+    format!("{}{}{}", not_valid_prefix(path), detail, NOT_VALID_SUFFIX)
+}
+
+/// What [`not_valid`] puts before its detail.
+fn not_valid_prefix(path: &Path) -> String {
+    format!("Configuration file \"{}\" is not valid: ", named(path).to_string_lossy())
+}
+
+/// What [`not_valid`] puts after its detail: the by-hand remedy.
+const NOT_VALID_SUFFIX: &str = " Fix the file by hand.";
+
+/// The detail of a [`not_valid`] message, for a refusal that has a remedy of its own.
+fn not_valid_detail(path: &Path, message: &str) -> String {
+    let prefix = not_valid_prefix(path);
+    let detail = message.strip_prefix(prefix.as_str()).unwrap_or(message);
+    detail.strip_suffix(NOT_VALID_SUFFIX).unwrap_or(detail).to_string()
 }
 
 /// The name a refusal gives a configuration file: canonical where it resolves, as [`not_valid`]
@@ -717,7 +729,9 @@ pub fn repair_warehouse_config(accept_loss: bool) -> Result<Option<ConfigRepaire
         // section for one, may still not validate, and then only the lossy rewrite can mend it.
         let checked = salvage.lossless.then(|| salvage.text.parse::<DocumentMut>()
             .map_err(|error| error.to_string().trim_end().to_string())
-            .and_then(|document| parse_config(&document, target).map(|_| document)));
+            .and_then(|document| parse_config(&document, target)
+                .map(|_| document)
+                .map_err(|message| not_valid_detail(target, &message))));
         let (whole, invalid) = match checked {
             Some(Ok(document)) => (Some(document), None),
             Some(Err(detail)) => (None, Some(detail)),

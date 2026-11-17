@@ -413,7 +413,10 @@ fn entry_lines(text: &str) -> Vec<DroppedEntry> {
                 key: (!misread && !full.chars().any(is_damage)).then_some(full),
             });
         }
-        misread |= line.char_indices().any(|(at, c)| is_damage(c) && may_begin_a_header(line, at + c.len_utf8()));
+        // Only damage in a comment can be a newline that ended it, so only there may it hide a
+        // header.
+        let comment = line.find('#').map_or("", |at| &line[at..]);
+        misread |= comment.char_indices().any(|(at, c)| is_damage(c) && may_begin_a_header(comment, at + c.len_utf8()));
     }
     dropped
 }
@@ -659,6 +662,19 @@ mod tests {
             DroppedEntry { line: 2, key: Some("profile.work.identifier".to_string()) },
             DroppedEntry { line: 4, key: None },
         ]);
+    }
+
+    /// Damage inside a value, outside any comment, hides no header. Revert: arm the misread
+    /// rule on damage anywhere in the line → the token loses its key → red.
+    #[test]
+    fn an_unparsable_entry_after_damage_in_a_value_keeps_its_key() {
+        let text = "[remote]\nurl = \"a?[b\nurl = \"u\"\ntoken = \"t\"\n";
+        let mut bytes = text.as_bytes().to_vec();
+        bytes[text.find('?').unwrap()] = 0xFF;
+        let salvage = salvage(&bytes, any);
+        assert!(!salvage.parsed, "{:?}", salvage);
+        assert!(salvage.dropped.contains(&DroppedEntry { line: 4, key: Some("remote.token".to_string()) }),
+                "{:?}", salvage.dropped);
     }
 
     /// Revert: skip the cut-section drop → url kept while the token was cut off → red.

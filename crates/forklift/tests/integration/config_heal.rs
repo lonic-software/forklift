@@ -366,6 +366,9 @@ fn a_lossless_salvage_that_does_not_validate_is_refused_for_heal_config() {
     assert!(refused["error"]["message"].as_str().unwrap().contains("does not hold a valid configuration"),
             "{}", refused);
     assert!(refused["error"]["message"].as_str().unwrap().contains("bogus"), "{}", refused);
+    // Its remedy is heal --config, never the by-hand one. Revert: pass parse_config's whole
+    // message as the detail → "Fix the file by hand" inside it → red.
+    assert!(!refused["error"]["message"].as_str().unwrap().contains("by hand"), "{}", refused);
     let healed = parsed(&area.run_ok(&["--json", "heal", "--config"]));
     assert_eq!(healed["data"]["config_repaired"]["lossless"], false, "{}", healed);
     assert_eq!(area.get("remote.token"), TOKEN);
