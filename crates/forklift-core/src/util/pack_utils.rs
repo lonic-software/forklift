@@ -3105,9 +3105,10 @@ pub(crate) fn retrieve_from_packs(hash: &str) -> Result<PackRetrieval, String> {
 }
 
 /// The first [`object_utils::MAX_HEADER_BYTES`] decompressed bytes of the first full record any
-/// loaded pack holds for `hash`, the header a kind is peeked from, or `None` when the first pack
-/// that locates it holds a delta, or none locates it, or anything about the read fails. Nothing
-/// is verified, and `None` is never an answer about presence: the caller reads the object whole.
+/// loaded pack holds for `hash`, the header a kind is peeked from, or `None` when no pack holds a
+/// full record of it, or anything about the read fails. A delta record is passed over for a full
+/// one in a later pack. Nothing is verified, and `None` is never an answer about presence: the
+/// caller reads the object whole.
 pub(crate) fn packed_header(hash: &str) -> Option<Vec<u8>> {
     use std::io::Read;
 
@@ -3118,7 +3119,7 @@ pub(crate) fn packed_header(hash: &str) -> Option<Vec<u8>> {
         let Located::Found(offset, length) = pack.locate(&hash_bytes) else { continue };
         let (&kind, body) = pack.slice(offset, length).ok()?.split_first()?;
         if kind != RECORD_FULL {
-            return None;
+            continue;
         }
 
         let mut prefix = Vec::with_capacity(object_utils::MAX_HEADER_BYTES);

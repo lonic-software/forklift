@@ -1821,13 +1821,19 @@ fn verify_local_closure_kinded(head: &str,
                                known_complete: Option<&str>,
                                removed: &dyn Fn() -> Result<Tolerated, String>)
                                -> Result<(), ClosureRefusal> {
-    let walk = |read: fn(&str) -> Result<Option<ObjectType>, String>| {
+    // The hashes whose peeked kind the whole read did not confirm, each beside what that read
+    // found: a damaged copy, read whole from then on.
+    let mut verified: HashMap<String, Result<Option<ObjectType>, String>> = HashMap::new();
+    let walk = |verified: &HashMap<String, Result<Option<ObjectType>, String>>| {
         let kinds: RefCell<HashMap<String, Option<ObjectType>>> = RefCell::new(HashMap::new());
         let kind_of = |hash: &str| -> Result<Option<ObjectType>, String> {
             if let Some(kind) = kinds.borrow().get(hash) {
                 return Ok(*kind);
             }
-            let kind = read(hash)?;
+            let kind = match verified.get(hash) {
+                Some(read) => read.clone()?,
+                None => file_utils::object_type_of(hash)?,
+            };
 
             kinds.borrow_mut().insert(hash.to_string(), kind);
             Ok(kind)
@@ -1850,14 +1856,20 @@ fn verify_local_closure_kinded(head: &str,
     };
 
     // A peeked header is not verified, so a mis-kind is refused only when the object read whole
-    // says so too. One that does not is a damaged copy, and the walk is made again over verified
-    // kinds, which reads the damage as the ordinary read would.
-    match walk(file_utils::object_type_of) {
-        Err(ClosureRefusal::MisKinded(mis_kinded)) => match file_utils::verified_object_type_of(&mis_kinded.hash) {
-            Ok(Some(found)) if found == mis_kinded.found => Err(ClosureRefusal::MisKinded(mis_kinded)),
-            _ => walk(file_utils::verified_object_type_of),
-        },
-        outcome => outcome,
+    // says so too. One that does not is a damaged copy: the walk is made again with that one hash
+    // read whole, which reads the damage as the ordinary read would, and every other still
+    // peeked. Each pass reads one more hash whole, so the passes end.
+    loop {
+        match walk(&verified) {
+            Err(ClosureRefusal::MisKinded(mis_kinded)) if !verified.contains_key(&mis_kinded.hash) => {
+                let read = file_utils::verified_object_type_of(&mis_kinded.hash);
+                if read.as_ref().is_ok_and(|found| *found == Some(mis_kinded.found)) {
+                    return Err(ClosureRefusal::MisKinded(mis_kinded));
+                }
+                verified.insert(mis_kinded.hash.clone(), read);
+            }
+            outcome => return outcome,
+        }
     }
 }
 

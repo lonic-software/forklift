@@ -3357,7 +3357,7 @@ pub fn object_type_of(hash: &str) -> Result<Option<crate::enums::object_type::Ob
 
 /// [`object_type_of`] from the object read whole and verified against its hash: what a refusal
 /// over the type rests on, since a peeked header is not verified.
-pub fn verified_object_type_of(hash: &str) -> Result<Option<crate::enums::object_type::ObjectType>, String> {
+pub(crate) fn verified_object_type_of(hash: &str) -> Result<Option<crate::enums::object_type::ObjectType>, String> {
     if !does_object_exist(hash)? {
         return Ok(None);
     }
@@ -4951,6 +4951,33 @@ pub(crate) fn copy_aside(path: &std::path::Path, bytes: &[u8]) -> Result<PathBuf
 
 #[cfg(test)]
 mod tests {
+    /// A loose object whose frame declares a window above the bounded decoder's cap, which the
+    /// ordinary read decodes unbounded, still reads its kind: a header peek that fails falls back
+    /// to the ordinary read, never refuses.
+    ///
+    /// Revert: fail the kind read on a loose peek that does not decode → red.
+    #[test]
+    fn a_loose_object_past_the_peeks_window_bound_reads_its_kind() {
+        let temp = std::env::temp_dir().join(format!("forklift-kind-window-{}", std::process::id()));
+        let _ = remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let bytes = crate::util::object_utils::blob_bytes(b"a blob compressed with a wide window");
+        let hash = crate::util::object_utils::hash_object_bytes(&bytes);
+        let mut frame = Vec::new();
+        let mut encoder = zstd::stream::Encoder::new(&mut frame, 3).unwrap();
+        encoder.window_log(crate::util::object_utils::MAX_DECODE_WINDOW_LOG + 1).unwrap();
+        std::io::Write::write_all(&mut encoder, &bytes).unwrap();
+        encoder.finish().unwrap();
+        let (folder, file_name) = get_path_for_object(&hash).unwrap();
+        write_object_to_file(Path::new(&folder), &file_name, frame).unwrap();
+
+        assert_eq!(loose_header(&hash), None, "the bounded peek refuses the frame");
+        assert_eq!(object_type_of(&hash).unwrap(), Some(crate::enums::object_type::ObjectType::Blob));
+        let _ = remove_dir_all(&temp);
+    }
+
     use super::*;
 
     /// FORK-447: `verify_loose` tells a reader's own failure (nothing known) from bytes that do not
