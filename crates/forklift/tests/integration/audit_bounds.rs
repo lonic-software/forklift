@@ -1764,3 +1764,57 @@ fn a_packed_object_of_another_kind_is_refused() {
         assert!(matches!(refusal, audit_utils::ClosureRefusal::MisKinded(_)), "{:?}", refusal);
     });
 }
+
+/// A loose copy that does not decompress, beside a good packed copy, does not decide the kind: the
+/// packed copy is peeked first, as the ordinary read looks there first.
+///
+/// Revert: peek the loose copy first and fail on it → red.
+#[test]
+fn a_damaged_loose_copy_beside_a_packed_one_reads_the_packed_kind() {
+    use forklift_core::enums::object_type::ObjectType;
+
+    let warehouse = Warehouse::new("mis-kind-stale-loose");
+    warehouse.stack("small.txt", "a small file\n", "first");
+    let tree = warehouse.scoped(|| {
+        object_utils::load_parcel(&warehouse.head(&warehouse.current_pallet())).unwrap().tree_hash
+    });
+    warehouse.run_ok(&["store", "compact"]);
+
+    let objects = warehouse.root.join(".forklift").join("objects").join(&tree[0..2]);
+    std::fs::create_dir_all(&objects).unwrap();
+    std::fs::write(objects.join(&tree[2..]), b"a stale, truncated loose copy").unwrap();
+
+    warehouse.scoped(|| {
+        assert_eq!(file_utils::object_type_of(&tree).unwrap(), Some(ObjectType::Tree));
+    });
+}
+
+/// A loose copy whose header is damaged into another kind is not refused as a mis-kind: the header
+/// is peeked unverified, so a mis-kind is refused only when the object read whole agrees, and a
+/// copy that does not verify reads as damage, not as malformed history.
+///
+/// Revert: refuse on the peeked kind alone → `object_kind_mismatch` → red.
+#[test]
+fn a_damaged_header_is_damage_not_a_mis_kind() {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::enums::dir_entry_type::DirEntryType::Normal;
+    use forklift_core::enums::object_type::ObjectType;
+
+    let warehouse = Warehouse::new("mis-kind-damaged-header");
+
+    warehouse.scoped(|| {
+        let blob = forge(LooseObjectBuilder::build_blob(&forklift_core::model::blob::Blob { content: b"a blob".to_vec() }));
+        let head = forged_head(vec![entry(&blob, Normal)]);
+
+        // The blob's loose file now holds a tree's bytes: it decompresses, and peeks as a tree.
+        let tree = forge(LooseObjectBuilder::build_tree(&forklift_core::model::tree_item::TreeItem::new(
+            String::new(), String::new(), forklift_core::enums::dir_entry_type::DirEntryType::Tree,
+        )));
+        let loose = |hash: &str| warehouse.root.join(".forklift").join("objects").join(&hash[0..2]).join(&hash[2..]);
+        std::fs::copy(loose(&tree), loose(&blob)).unwrap();
+        assert_eq!(file_utils::object_type_of(&blob).unwrap(), Some(ObjectType::Tree));
+
+        let refusal = audit_utils::verify_parcel_closure_for_write(&head, None).expect_err("a damaged copy");
+        assert!(matches!(refusal, audit_utils::ClosureRefusal::Incomplete(_)), "{:?}", refusal);
+    });
+}

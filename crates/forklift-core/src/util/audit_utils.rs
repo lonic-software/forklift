@@ -1802,8 +1802,10 @@ pub fn require_adopted_history(
 ///                      verifies all the way down).
 ///
 /// # Returns
-/// * `Ok(())`      - If everything is present.
-/// * `Err(String)` - If a parcel, tree or blob is missing (or unreadable).
+/// * `Ok(())`      - If everything is present, and every object a file entry or a recipe names is
+///                   the kind that names it.
+/// * `Err(String)` - If a parcel, tree or blob is missing (or unreadable), or an entry names an
+///                   object of another kind ([`ClosureRefusal::MisKinded`]).
 ///
 pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result<(), String> {
     verify_local_closure_kinded(head, known_complete, &|| Ok(Tolerated::default())).map_err(String::from)
@@ -1813,45 +1815,50 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 /// file entry or a recipe names: the self-hosted server's write gates. The serverless head passes
 /// its own seams over object storage instead.
 ///
-/// The kinds are memoized for the one walk, so an object named many times is read once: a loose
-/// object costs a header read, a packed one a whole read ([`file_utils::object_type_of`]).
+/// The kinds are memoized for the one walk, so an object named many times is read once, and each
+/// costs a header peek, a delta record a whole read ([`file_utils::object_type_of`]).
 fn verify_local_closure_kinded(head: &str,
                                known_complete: Option<&str>,
                                removed: &dyn Fn() -> Result<Tolerated, String>)
                                -> Result<(), ClosureRefusal> {
-    let kinds: RefCell<HashMap<String, Option<ObjectType>>> = RefCell::new(HashMap::new());
-    let kind_of = |hash: &str| -> Result<Option<ObjectType>, String> {
-        if let Some(kind) = kinds.borrow().get(hash) {
-            return Ok(*kind);
-        }
-        let kind = file_utils::object_type_of(hash)?;
-
-        kinds.borrow_mut().insert(hash.to_string(), kind);
-        Ok(kind)
-    };
-    let chunks_probe = |chunks: &[String]| -> Result<ChunkProbe, String> {
-        let mut probed = ChunkProbe::default();
-
-        for chunk in chunks {
-            match kind_of(chunk)? {
-                None => probed.missing.push(chunk.clone()),
-                Some(ObjectType::Chunk) => {}
-                Some(found) => probed.mis_kinded.push((chunk.clone(), found)),
+    let walk = |read: fn(&str) -> Result<Option<ObjectType>, String>| {
+        let kinds: RefCell<HashMap<String, Option<ObjectType>>> = RefCell::new(HashMap::new());
+        let kind_of = |hash: &str| -> Result<Option<ObjectType>, String> {
+            if let Some(kind) = kinds.borrow().get(hash) {
+                return Ok(*kind);
             }
-        }
-        Ok(probed)
+            let kind = read(hash)?;
+
+            kinds.borrow_mut().insert(hash.to_string(), kind);
+            Ok(kind)
+        };
+        let chunks_probe = |chunks: &[String]| -> Result<ChunkProbe, String> {
+            let kinds = chunks.iter().map(|chunk| kind_of(chunk).map(|kind| (chunk.clone(), kind)));
+            Ok(ChunkProbe::from_kinds(kinds.collect::<Result<Vec<_>, String>>()?))
+        };
+
+        verify_parcel_closure_with(
+            head,
+            known_complete,
+            &|hash| kind_of(hash).map(ObjectProbe::kind),
+            &chunks_probe,
+            &|hash| object_utils::recipe_chunk_hashes(hash),
+            &|hash| object_utils::load_tree(hash),
+            removed,
+            &|hash| object_utils::load_parcel(hash),
+        )
     };
 
-    verify_parcel_closure_with(
-        head,
-        known_complete,
-        &|hash| kind_of(hash).map(ObjectProbe::kind),
-        &chunks_probe,
-        &|hash| object_utils::recipe_chunk_hashes(hash),
-        &|hash| object_utils::load_tree(hash),
-        removed,
-        &|hash| object_utils::load_parcel(hash),
-    )
+    // A peeked header is not verified, so a mis-kind is refused only when the object read whole
+    // says so too. One that does not is a damaged copy, and the walk is made again over verified
+    // kinds, which reads the damage as the ordinary read would.
+    match walk(file_utils::object_type_of) {
+        Err(ClosureRefusal::MisKinded(mis_kinded)) => match file_utils::verified_object_type_of(&mis_kinded.hash) {
+            Ok(Some(found)) if found == mis_kinded.found => Err(ClosureRefusal::MisKinded(mis_kinded)),
+            _ => walk(file_utils::verified_object_type_of),
+        },
+        outcome => outcome,
+    }
 }
 
 /// [`verify_parcel_closure`] for a ref update, returning the proof a ref write accepts in place of verifying the same head again
@@ -1961,24 +1968,13 @@ impl MisKinded {
         MisKinded {
             message: format!(
                 "The new history names object {} {}, which needs a {}, but that object is a {}.",
-                hash, named, kind_name(&expected), kind_name(&found)
+                hash, named, expected, found
             ),
             hash: hash.to_string(),
             path: path.to_string(),
             expected,
             found,
         }
-    }
-}
-
-/// The word a refusal uses for an object kind.
-fn kind_name(object_type: &ObjectType) -> &'static str {
-    match object_type {
-        ObjectType::Blob => "blob",
-        ObjectType::Tree => "tree",
-        ObjectType::Parcel => "parcel",
-        ObjectType::Recipe => "recipe",
-        ObjectType::Chunk => "chunk",
     }
 }
 
@@ -2017,6 +2013,23 @@ pub struct ChunkProbe {
     /// The chunks the store holds as another kind, with the kind each is. Always empty from a
     /// presence-only probe.
     pub mis_kinded: Vec<(String, ObjectType)>,
+}
+
+impl ChunkProbe {
+    /// The probe of chunks each beside its kind, `None` for one the store does not hold: a chunk
+    /// is missing, a chunk, or mis-kinded.
+    pub fn from_kinds(kinds: impl IntoIterator<Item = (String, Option<ObjectType>)>) -> ChunkProbe {
+        let mut probed = ChunkProbe::default();
+
+        for (chunk, kind) in kinds {
+            match kind {
+                None => probed.missing.push(chunk),
+                Some(ObjectType::Chunk) => {}
+                Some(found) => probed.mis_kinded.push((chunk, found)),
+            }
+        }
+        probed
+    }
 }
 
 /// A chunked file a ref update was refused over ([`ClosureRefusal::Uncomparable`]).
@@ -2077,8 +2090,8 @@ impl ClosureRefusal {
                 serde_json::json!({
                     "hash": mis_kinded.hash,
                     "path": mis_kinded.path,
-                    "expected": kind_name(&mis_kinded.expected),
-                    "found": kind_name(&mis_kinded.found),
+                    "expected": mis_kinded.expected.to_string(),
+                    "found": mis_kinded.found.to_string(),
                 }),
             ).into(),
             other => other.into(),
@@ -2183,23 +2196,26 @@ pub fn head_not_materializable_message(path: &str) -> String {
 /// [`verify_parcel_closure`], with the leaf-blob presence check made pluggable.
 ///
 /// Parcels and trees are always read (and parsed) from the object store — the walk
-/// cannot proceed without them. File-content blobs, by contrast, are never *read* here,
-/// only checked for presence, so their existence check is the one seam a non-filesystem
-/// head varies: the AWS serverless head mirrors the parcels and trees it must parse into
-/// a scratch `.forklift`, but leaves the (large, many) working blobs in object storage
-/// and answers this check with an S3 `HEAD` (DESIGN.html §4.6).
+/// cannot proceed without them. File-content blobs, by contrast, are never *read* here: they are
+/// probed for presence and, where the seam says, for their kind, so that probe is the one seam a
+/// non-filesystem head varies: the AWS serverless head mirrors the parcels and trees it must parse
+/// into a scratch `.forklift`, but leaves the (large, many) working blobs in object storage and
+/// answers the probe with an S3 `HEAD`, reading the kind from the metadata its writers recorded
+/// (DESIGN.html §4.6). The kind is checked before anything tolerated is consulted, on both walks,
+/// and a mis-kind is refused ([`ClosureRefusal::MisKinded`]) before any absence is judged.
 ///
 /// # Arguments
 /// * `head`               - The head parcel whose closure is verified.
 /// * `known_complete`     - A head whose history is already known complete (`None` verifies
 ///                          all the way down).
 /// * `namespace`          - The namespace of the pallet whose ref is to hold `head`.
-/// * `blob_exists`        - Returns whether a file-content blob — or a recipe object, a chunked
-///                          file's tree-entry — is present at a hash. The plain, per-hash presence
-///                          seam, left untouched; the many-per-recipe chunk presence goes through
-///                          `chunks_missing` instead.
-/// * `chunks_missing`     - The bulk chunk-presence seam (§9.4b W4): given a recipe's full
-///                          chunk-hash list, returns the subset the store lacks. A `*Chunked` file
+/// * `probe`              - Probes the object a file entry names, a blob or, at a chunked entry, a
+///                          recipe: absent, present, or present of a kind ([`ObjectProbe`]). A
+///                          presence-only probe checks no kind. The many-per-recipe chunk probe
+///                          goes through `chunks_probe` instead.
+/// * `chunks_probe`       - The bulk chunk seam (§9.4b W4): given a recipe's full chunk-hash
+///                          list, returns the subset the store lacks and those it holds as another
+///                          kind ([`ChunkProbe`]). A `*Chunked` file
 ///                          entry names a recipe whose chunks are reachable only *through* it, so
 ///                          the closure walk hands the whole list here in one call and fails
 ///                          **non-tolerantly** if any come back missing — a ref must never advance
@@ -2208,7 +2224,7 @@ pub fn head_not_materializable_message(path: &str) -> String {
 ///                          bounded-concurrency batch of S3 `HEAD`s, so a changed multi-gigabyte
 ///                          file's thousands of chunks verify in a second or two rather than one
 ///                          slow round trip apiece under API Gateway's hard timeout.
-/// * `load_recipe_chunks` - Returns the ordered chunk hashes of a recipe (the list `chunks_missing`
+/// * `load_recipe_chunks` - Returns the ordered chunk hashes of a recipe (the list `chunks_probe`
 ///                          probes). The local path reads the recipe from the object store; so does
 ///                          the AWS head, which is why the read is a parameter and not a hard-coded
 ///                          load. A recipe is a file-entry object, so the audit scratch holds one

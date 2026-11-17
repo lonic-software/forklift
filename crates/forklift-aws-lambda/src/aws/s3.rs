@@ -500,12 +500,12 @@ impl S3ObjectStore {
         };
         let recorded = output.metadata().and_then(|metadata| metadata.get(KIND_METADATA));
 
-        match recorded.map(|kind| kind.parse::<ObjectType>()) {
-            Some(Ok(kind)) => Ok(Some(kind)),
-            Some(Err(_)) | None => Err(format!(
-                "Object {} carries no kind this head reads in its {} metadata: {:?}.",
-                key, KIND_METADATA, recorded
-            )),
+        match recorded {
+            None => Err(format!("Object {} records no kind: it has no {} metadata.", key, KIND_METADATA)),
+            Some(kind) => kind.parse::<ObjectType>().map(Some).map_err(|_| {
+                format!("Object {} records a kind this head does not know in its {} metadata: \"{}\".",
+                        key, KIND_METADATA, kind)
+            }),
         }
     }
 

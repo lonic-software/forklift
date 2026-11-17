@@ -3104,6 +3104,34 @@ pub(crate) fn retrieve_from_packs(hash: &str) -> Result<PackRetrieval, String> {
     }
 }
 
+/// The first [`object_utils::MAX_HEADER_BYTES`] decompressed bytes of the first full record any
+/// loaded pack holds for `hash`, the header a kind is peeked from, or `None` when the first pack
+/// that locates it holds a delta, or none locates it, or anything about the read fails. Nothing
+/// is verified, and `None` is never an answer about presence: the caller reads the object whole.
+pub(crate) fn packed_header(hash: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let hash_bytes = hash_to_bytes(hash)?;
+    let packs = loaded_packs().ok()?;
+
+    for pack in packs.packs.iter() {
+        let Located::Found(offset, length) = pack.locate(&hash_bytes) else { continue };
+        let (&kind, body) = pack.slice(offset, length).ok()?.split_first()?;
+        if kind != RECORD_FULL {
+            return None;
+        }
+
+        let mut prefix = Vec::with_capacity(object_utils::MAX_HEADER_BYTES);
+        object_utils::bounded_zstd_decoder(body)
+            .ok()?
+            .take(object_utils::MAX_HEADER_BYTES as u64)
+            .read_to_end(&mut prefix)
+            .ok()?;
+        return Some(prefix);
+    }
+    None
+}
+
 /// [`retrieve_from_packs`] against one already-loaded set, with no revalidation.
 fn retrieve_from(packs: &PackSet, hash_bytes: &[u8; HASH_LEN], hash: &str) -> Result<PackRetrieval, String> {
     let mut first_error: Option<(String, file_utils::Unreadable)> = None;
@@ -12480,6 +12508,32 @@ pub(crate) mod tests {
         let bytes = object_utils::blob_bytes(content.as_bytes());
         let hash = object_utils::hash_object_bytes(&bytes);
         (bytes, hash)
+    }
+
+    /// A full record's kind is peeked from its first decompressed bytes, without the object read
+    /// whole; a delta record has no header of its own, so it is left to the whole read.
+    /// Revert: decode the whole record, or peek a delta's own bytes → red.
+    #[test]
+    fn a_full_records_header_is_peeked_and_a_deltas_is_not() {
+        let (_temp, _scope) = salvage_root("fork497-peek");
+        let content = vec![7u8; 64 * 1024];
+        let base = object_utils::blob_bytes(&content);
+        let base_hash = object_utils::hash_object_bytes(&base);
+        let mut changed = content.clone();
+        changed[0] = 8;
+        let target = object_utils::blob_bytes(&changed);
+        let target_hash = object_utils::hash_object_bytes(&target);
+        write_named_pack(&[
+            (base_hash.clone(), full_record(&base)),
+            (target_hash.clone(), delta_record(&base_hash, &base, &target)),
+        ]);
+        invalidate_cache();
+
+        let header = packed_header(&base_hash).expect("a full record's header");
+        assert_eq!(header.len(), object_utils::MAX_HEADER_BYTES);
+        assert_eq!(object_utils::peek_object_type(&header).unwrap(), crate::enums::object_type::ObjectType::Blob);
+        assert_eq!(packed_header(&target_hash), None);
+        assert_eq!(file_utils::object_type_of(&target_hash).unwrap(), Some(crate::enums::object_type::ObjectType::Blob));
     }
 
     /// The refusal code an ordinary uncached read of `hash` fails with, if it is framed.
