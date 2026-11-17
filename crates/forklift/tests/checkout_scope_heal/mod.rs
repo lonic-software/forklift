@@ -462,8 +462,8 @@ fn heal_refuses_a_position_it_will_not_set_before_restoring_the_scope() {
 
     let refused = area.forklift("sparse", &["heal", "--position", "main", "--ref", &format!("main={}", head)]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
-    assert!(stderr(&refused).contains("--position sets only a position that is lost"), "{}", stderr(&refused));
     assert!(!area.path(MAIN_SCOPE).exists(), "no scope was written: {}", stderr(&refused));
+    assert!(stderr(&refused).contains("--position sets only a position that is lost"), "{}", stderr(&refused));
 }
 
 // A position a newer version wrote cannot be read, so the tree the checkout stands on cannot be
@@ -478,8 +478,11 @@ fn a_base_that_cannot_be_read_is_a_coded_refusal() {
     remove(&area, MAIN_SCOPE);
 
     for args in [&["--json", "heal"][..], &["--json", "heal", "--scope", "docs", "--scope", "src/api"][..]] {
-        let error = scope_damaged(&area.forklift("sparse", args));
-        let message = error["message"].as_str().unwrap();
+        let output = area.forklift("sparse", args);
+        let value = json_of(&output);
+        assert_eq!(value["error"]["code"], "checkout_scope_damaged", "{:?}: {}", args, value);
+        assert_eq!(output.status.code(), Some(CHECKOUT_SCOPE_DAMAGED_EXIT), "{:?}", args);
+        let message = value["error"]["message"].as_str().unwrap();
         assert!(message.contains("cannot be told") && message.contains("until both read"), "{:?}: {}", args, message);
         assert!(!area.path(MAIN_SCOPE).exists(), "{:?} wrote no scope", args);
     }
