@@ -40,9 +40,11 @@ one, the way out. Every writer replaces its file atomically, so a crash never le
 Some records end with one more line, `digest <blake3 of every byte before this line, in lowercase
 hex>`, which is not an entry: the warehouse marker, `parked`, and a server's `served`,
 `tombstones` and `withheld`. Damage that still parses, such as a flipped digit in a hash, then
-shows. A reader checks the digest before anything else, and refuses a record whose digest is
-absent or does not match its bytes as damaged, never read. That includes a record a version from
-before the digest wrote. Only a record whose digest matches is told apart as a newer version's.
+shows. A reader refuses a record whose digest is absent or does not match its bytes as damaged,
+never read, and only a record whose digest matches is told apart as a newer version's. A server's
+records are checked against the digest before anything else, so one a version from before the
+digest wrote is refused as damaged too. The marker judges its header first, so an older marker
+gets its own refusal (see [the warehouse format](WAREHOUSE_FORMAT.md)).
 
 ## Files
 | File | Kind | Entries |

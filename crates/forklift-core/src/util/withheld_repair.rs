@@ -147,12 +147,14 @@ pub fn repair_withheld() -> Result<Repaired, String> {
         Some(bytes) => match withholding::parse(bytes) {
             Ok(_) => return Err("The record of withheld content reads whole; there is nothing to repair.".to_string()),
             Err(withholding::Unparsed::Record(record_utils::RecordError::OtherVersion(header)))
-                if withholding::newer_version(&header) => return Err(format!(
+                if withholding::written_by_newer(bytes) => return Err(format!(
                 "The record of withheld content says a newer version of Forklift wrote it (\"{}\"), and it \
                 matches its digest; that Forklift repairs it.",
                 header.escape_debug()
             )),
-            Err(withholding::Unparsed::Record(record_utils::RecordError::Damaged)) => unverified = true,
+            Err(withholding::Unparsed::Record(record_utils::RecordError::Damaged)) => {
+                unverified = record_utils::has_digest_line(bytes);
+            }
             Err(_) => {}
         },
         None if tombstone_utils::served_state()? == tombstone_utils::ServedState::Never => return Err(
@@ -404,7 +406,7 @@ mod tests {
         }
     }
 
-    // Revert: drop the unverified line → the operator is told every kept entry is as written,
+    // Revert: drop the caveat → the operator is told every kept entry is as written,
     // though one may hold a flipped hash; or salvage the digest line as an entry → it is counted
     // as a line naming no object.
     #[test]
@@ -424,6 +426,14 @@ mod tests {
                    "the altered entry reads whole, so it is kept: the repair cannot tell");
         let report = repaired.report().join("\n");
         assert!(report.contains("did not match its digest") && report.contains("may still have been altered"), "{}", report);
+
+        // A record from before the digest has none to fail, so nothing says an entry was altered.
+        // Revert: take every damaged record for one that failed its digest → a false alarm over
+        // every record written before the digest.
+        std::fs::write(record(), record_utils::to_bytes("withheld", 2, [format!("{} - court order 7", A)])).unwrap();
+        let repaired = repair_withheld().unwrap();
+        assert_eq!((repaired.salvaged, repaired.unverified), (1, false));
+        assert!(!repaired.report().join("\n").contains("did not match its digest"));
     }
 
     // Revert: take no serve lock → the record is rewritten under a server answering from it.

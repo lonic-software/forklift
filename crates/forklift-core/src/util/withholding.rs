@@ -58,12 +58,10 @@ const WITHHELD_VERSION: u32 = 3;
 /// The longest statement a takedown may carry, in characters: every handshake carries it.
 pub const STATEMENT_MAX_CHARS: usize = 1000;
 
-/// Whether `header`, a record header this build does not read, names a newer version of the
-/// record of withheld content, as a newer Forklift writes it, rather than being damaged.
-pub(crate) fn newer_version(header: &str) -> bool {
-    header.strip_prefix(&format!("/forklift-{} ", WITHHELD_RECORD))
-        .and_then(|text| text.parse::<u32>().ok().filter(|version| version.to_string() == text))
-        .is_some_and(|version| version > WITHHELD_VERSION)
+/// Whether `bytes` is a record of withheld content a newer Forklift wrote: it matches its digest
+/// and its header names a newer version, rather than being damaged.
+pub(crate) fn written_by_newer(bytes: &[u8]) -> bool {
+    record_utils::written_by_newer_digested(bytes, WITHHELD_RECORD, WITHHELD_VERSION)
 }
 
 pub(crate) fn withheld_path() -> PathBuf {

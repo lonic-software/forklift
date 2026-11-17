@@ -183,7 +183,7 @@ pub fn repair_tombstones() -> Result<Repaired, String> {
         Some(bytes) => {
             let (salvaged, unreadable) = salvage(record_utils::without_digest_line(bytes));
             repaired.unreadable_lines = unreadable;
-            repaired.unverified = matches!(
+            repaired.unverified = record_utils::has_digest_line(bytes) && matches!(
                 record_utils::from_bytes_digested(bytes, "tombstones", tombstone_utils::TOMBSTONES_VERSION),
                 Err(record_utils::RecordError::Damaged)
             );

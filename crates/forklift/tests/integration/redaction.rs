@@ -3128,8 +3128,10 @@ fn a_served_root_whose_withheld_record_is_lost_or_damaged_refuses_until_its_oper
     let server = Server::serve(&root);
     refuses(&server, "lost");
 
-    // Damaged: the film's entry cut inside its digest column.
-    std::fs::write(&record, format!("/forklift-withheld 3\n{} 1", film)).unwrap();
+    // Damaged: the film's entry cut inside its digest column, in a record that matches its digest,
+    // so the entry is what refuses.
+    let cut = format!("/forklift-withheld 3\n{} 1\n", film).into_bytes();
+    std::fs::write(&record, forklift_core::util::record_utils::with_digest(cut)).unwrap();
     refuses(&server, "damaged");
 
     let clone = Warehouse::empty("withheld-damaged-clone");
