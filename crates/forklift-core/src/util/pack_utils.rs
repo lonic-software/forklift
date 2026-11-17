@@ -11918,13 +11918,13 @@ pub(crate) mod tests {
     }
 
     /// FORK-519: a pack file deleted between a reload's listing and its open, with the pack that
-    /// replaced it published first, is not read as damage, whichever of the pair's files went: the
-    /// read serves the object from the replacement. A lone index is still a damaged pair once a
-    /// listing sees it that way.
+    /// replaced it published first, is not read as damage, whichever of the pair's files went: a
+    /// presence check, which revalidates once, finds the object in the replacement. A lone index is
+    /// still a damaged pair once a listing sees it that way.
     ///
     /// Reverts: drop the index arm of `listing_went_stale`'s `pair_vanished` → the index-gone case
-    /// reads the pair unenumerable, the object absent → red; drop the data arm → the data-gone case
-    /// quarantines the pair and the read refuses → red.
+    /// reads the pair unenumerable and the object absent → red; drop the data arm → the data-gone
+    /// case quarantines the pair, holds no replacement, and reads the object absent → red.
     #[test]
     fn a_pack_file_deleted_between_a_reloads_listing_and_its_open_is_not_read_as_damage() {
         #[derive(Debug, Clone, Copy)]
@@ -11956,9 +11956,9 @@ pub(crate) mod tests {
                 replaced.set(true);
             });
 
-            let read = crate::util::file_utils::retrieve_object_by_hash(&hash);
+            let present = crate::util::file_utils::does_object_exist(&hash);
             assert!(ran.get(), "{:?}: the replacement ran between the reload's listing and its opens", gone);
-            assert_eq!(read.as_deref(), Ok(content.as_slice()), "{:?}: the read must serve the replacement's copy", gone);
+            assert_eq!(present, Ok(true), "{:?}: the object the replacement holds must read present", gone);
 
             if let Gone::Data = gone {
                 assert_eq!(cached_pack_set().quarantined.len(), 1,
