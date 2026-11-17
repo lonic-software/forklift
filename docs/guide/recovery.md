@@ -465,6 +465,9 @@ tree it could not read. If a refetch or a repair heal names can bring that tree 
 run heal again. `forklift heal --inventory` writes the record anyway: the staging it could not
 match is no longer registered, so check `forklift stocktake` and load again what is missing.
 
+When a link or a folder stands where the record belongs, it is refused the same way. The next step
+asks you to remove it first; Forklift never follows a link there. Heal then rebuilds the record.
+
 ### `object_kind_mismatch` (exit 63)
 
 The remote refused to move the pallet because the new head's history names an object as a kind

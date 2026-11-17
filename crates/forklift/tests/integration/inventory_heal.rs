@@ -262,6 +262,12 @@ fn a_folder_in_place_of_the_metadata_file_is_named_by_heal() {
     let shown = format!("{}{}", text(&output.stdout), text(&output.stderr));
     assert!(shown.contains("is not a file"), "{}", shown);
     assert!(shown.contains(&tree), "the lost tree is reported too: {}", shown);
+    assert!(!shown.contains("Nothing to heal"), "{}", shown);
+
+    // Coded, with the run's report as its details.
+    let error = inventory_damaged(&area.run(&["--json", "heal"]));
+    assert!(error["next_step"].as_str().unwrap().starts_with("remove "), "{}", error);
+    assert!(error["details"]["objects_lost"]["hashes"].to_string().contains(&tree), "{}", error);
 }
 
 /// The folder `a/b` is gone from the working tree with its removal unstaged, so only the base's

@@ -315,24 +315,19 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let marker = operation_utils::read().ok().flatten();
     let partial_park = marker.as_ref()
         .filter(|marker| marker.kind == OperationKind::Park && !marker.pathspec.is_empty());
-    // A metadata path that is not a file, or a rebuild that fails once the recovery has run, ends
-    // the run like a held rebuild: every other repair runs first, and the report says what they
-    // did.
+    // A metadata path that is not a file, or a rebuild that fails, ends the run like a held
+    // rebuild: every other repair runs first, and the report says what they did. Either leaves the
+    // set unreadable, so the recovery, which reads it, does not run.
     let mut inventory_error: Option<String> = None;
-    let not_a_file = match inventory_heal::damaged() {
-        Ok(damaged) => {
-            if partial_park.is_some() && damaged {
-                let (view, written) = rebuild_inventory(partial_park, accept_inventory_loss)
-                    .map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
-                *(if written { &mut inventory_rebuilt } else { &mut inventory_held }) = Some(view);
-            }
-            false
-        }
-        Err(error) => {
-            inventory_error = Some(error);
-            true
-        }
-    };
+    match inventory_heal::damaged() {
+        Ok(true) if partial_park.is_some() => match rebuild_inventory(partial_park, accept_inventory_loss) {
+            Ok((view, written)) => *(if written { &mut inventory_rebuilt } else { &mut inventory_held }) = Some(view),
+            Err(error) => inventory_error = Some(error),
+        },
+        Ok(_) => {}
+        Err(error) => inventory_error = Some(error),
+    }
+    let unreadable = inventory_error.is_some();
     // A step that fails after a written rebuild says so beside every other repair.
     let with_rebuilt = |error: String, rebuilt: &Option<InventoryRebuilt>| match rebuilt {
         Some(rebuilt) => forklift_core::error::append_to_message(error, &rebuilt.sentence()),
@@ -345,23 +340,23 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                 .to_string(),
         );
     }
-    // Every recovery reads the set, which a path that is not a file cannot give.
-    if not_a_file {
+    // Every recovery reads the set, which neither leaves readable.
+    if unreadable {
         if let Some(standing) = &marker {
             ref_notes.push(format!(
-                "The interrupted {} in this bay waits for the inventory metadata to be a file again; heal finishes or undoes it once it is.",
+                "The interrupted {} in this bay waits for the inventory's record of staged folders to read; heal finishes or undoes it once it does.",
                 standing.kind.as_str()
             ));
         }
     }
 
     // After the taint: an operation's recovery reads and writes the store the taint vouches for.
-    let recovered = match waits.is_some() || held_park || not_a_file {
+    let recovered = match waits.is_some() || held_park || unreadable {
         true => Ok(None),
         false => operation_utils::recover(),
     }.map_err(|error| with_rebuilt(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), &inventory_rebuilt))?;
 
-    if waits.is_none() && !held_park && !not_a_file {
+    if waits.is_none() && !held_park && !unreadable {
         let rebuilt = inventory_heal::damaged().and_then(|damaged| match damaged {
             true => rebuild_inventory(operation_utils::read().ok().flatten().as_ref(), accept_inventory_loss).map(Some),
             false => Ok(None),
@@ -743,11 +738,12 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // Ahead of every other end refusal: their remedies read the set, and an unload, the remedy for
     // lost staged content, is refused while it is damaged. Every repair above has run.
     if inventory_error.is_some() || report.inventory_held.is_some() {
-        if !output::is_json() {
+        // A run that only found the step that failed says nothing of its own: the refusal speaks.
+        if !output::is_json() && !(inventory_error.is_some() && report.nothing_done()) {
             report.render_human();
         }
         let mut lines = match (&inventory_error, &report.inventory_held) {
-            (Some(error), _) => vec![error.clone()],
+            (Some(error), _) => vec![forklift_core::error::rendered_frames(error)],
             (None, Some(held)) => held.lines(),
             (None, None) => Vec::new(),
         };
@@ -777,9 +773,19 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         if report.objects_lost.is_some() && (outcome.index_rebuild_skipped || origin_unanswered) {
             lines.push("The check for lost objects may be short; a heal after the rebuild checks again.".to_string());
         }
-        // Not damage: the path's own remedy, which no rebuild mends, leads.
-        if inventory_error.is_some() {
-            return Err(lines.join("\n"));
+        // The step that failed leads, with its own code and next step when it has them. A failure
+        // without one leaves the set as damaged as it was.
+        if let Some(error) = inventory_error {
+            let also = lines.split_off(1);
+            return Err(match CoreError::from(error) {
+                refused @ CoreError::Refusal { .. } => with_report(&report, refused, also),
+                CoreError::Other(message) => CoreError::refusal_with_details(
+                    RefusalCode::InventoryDamaged,
+                    std::iter::once(message).chain(also).collect::<Vec<_>>().join("\n"),
+                    "forklift heal",
+                    serde_json::json!(report),
+                ),
+            }.into());
         }
         return Err(CoreError::refusal_with_details(
             RefusalCode::InventoryDamaged,
@@ -1677,6 +1683,22 @@ pub(crate) struct OperationRecovery {
     unheld: Vec<String>,
 }
 
+impl HealReport {
+    /// Whether the run found and did nothing: no repair, recovery, note or refusal to report.
+    fn nothing_done(&self) -> bool {
+        self.operation.is_none() && self.unsealed.is_empty() && self.newly_held_by_hash.is_empty()
+            && self.resealed.is_empty() && self.recorded_unavailable.is_empty() && self.notes.is_empty()
+            && self.unseal_failed.is_none() && self.record_rebuilt.is_none() && self.unavailable_rebuilt.is_none()
+            && self.redactions_applied_rebuilt.is_none() && self.redactions_reapplied.is_empty()
+            && self.restored_from_working_tree.is_empty()
+            && self.fetch_scope_rebuilt.is_none() && self.parked_rebuilt.is_none() && self.position_rebuilt.is_none()
+            && self.config_repaired.is_none()
+            && self.inventory_rebuilt.is_none() && self.inventory_held.is_none()
+            && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
+            && self.objects_lost.is_none()
+    }
+}
+
 impl CommandOutput for HealReport {
     fn render_human(&self) {
         if let Some(rebuilt) = &self.record_rebuilt {
@@ -1737,17 +1759,7 @@ impl CommandOutput for HealReport {
                     println!("  resolved (absent and unreferenced): {}", path);
                 }
             }
-        } else if self.operation.is_none() && self.unsealed.is_empty() && self.newly_held_by_hash.is_empty()
-            && self.resealed.is_empty() && self.recorded_unavailable.is_empty() && self.notes.is_empty()
-            && self.unseal_failed.is_none() && self.record_rebuilt.is_none() && self.unavailable_rebuilt.is_none()
-            && self.redactions_applied_rebuilt.is_none() && self.redactions_reapplied.is_empty()
-            && self.restored_from_working_tree.is_empty()
-            && self.fetch_scope_rebuilt.is_none() && self.parked_rebuilt.is_none() && self.position_rebuilt.is_none()
-            && self.config_repaired.is_none()
-            && self.inventory_rebuilt.is_none() && self.inventory_held.is_none()
-            && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
-            && self.objects_lost.is_none()
-        {
+        } else if self.nothing_done() {
             println!("Nothing to heal — no durability taint is standing.");
         }
 

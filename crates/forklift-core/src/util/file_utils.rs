@@ -3124,9 +3124,10 @@ pub fn get_inventory_metadata_path() -> PathBuf {
 ///   shard:
 ///    * `PathBuf` - The path where the inventory metadata file should have been.
 /// * `Err(String)` - The error message if the inventory metadata file exists, but there was an
-///   error while reading it, or it is not a regular file, or the inventory root does not resolve
-///   to a folder. A file that is damaged, or missing while the store holds a shard, is refused as
-///   `inventory_damaged`, and one in another version's format with its own message.
+///   error while reading it, or the inventory root does not resolve to a folder. A file that is
+///   damaged, missing while the store holds a shard, or not a regular file is refused as
+///   `inventory_damaged` (the last with removing it as the next step), and one in another
+///   version's format with its own message.
 pub fn retrieve_inventory_metadata_or_none() -> Result<(PathBuf, Option<BTreeSet<String>>), String> {
     let metadata_store_path = get_inventory_metadata_path();
 
@@ -3136,11 +3137,18 @@ pub fn retrieve_inventory_metadata_or_none() -> Result<(PathBuf, Option<BTreeSet
         Ok(metadata) if metadata.is_file() => {}
         // Once it is removed, the shards it registered read as a missing record over shards, which
         // only heal's rebuild mends: a reset reads the record first, and is refused.
-        Ok(_) => return Err(format!(
-            "The inventory metadata \"{}\" is not a file (a link is never followed). Remove it, then run \
-             \"forklift heal\" to rebuild it from the staging on disk.",
-            metadata_store_path.to_string_lossy()
-        )),
+        Ok(_) => return Err(crate::error::CoreError::refusal(
+            crate::error::RefusalCode::InventoryDamaged,
+            format!(
+                "The inventory metadata \"{}\" is not a file (a link is never followed), so which \
+                 directories have staged content is not known. Nothing was changed.",
+                metadata_store_path.to_string_lossy()
+            ),
+            format!(
+                "remove \"{}\", then run \"forklift heal\" to rebuild it from the staging on disk",
+                metadata_store_path.to_string_lossy()
+            ),
+        ).into()),
         Err(e) => {
             let inventory_root = PathBuf::from(get_path_inventory_root());
             if std::fs::symlink_metadata(&inventory_root).is_ok() && !std::fs::metadata(&inventory_root).is_ok_and(|meta| meta.is_dir()) {
