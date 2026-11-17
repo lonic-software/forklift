@@ -1447,8 +1447,9 @@ fn pair_stamp(index_path: &Path) -> PairStamp {
 /// listing so a pack published during the load moves the folder past the stamp rather than
 /// slipping in under it.
 struct FolderStamp {
-    /// The sorted names of every pack index and pack data file in the folder. Temp files end in
-    /// `.tmp`, so they are not among them.
+    /// The sorted names of every pack index, pack data file and signature table in the folder
+    /// ([`is_pack_file_name`]); [`listing_went_stale`] reads them as what the listing named. Temp
+    /// files end in `.tmp`, so they are not among them.
     names: Vec<OsString>,
     /// The folder's mtime and when it was read. Both were taken before `names` was listed, and a
     /// racy check that lists the folder again and finds the same names replaces both with the
@@ -2175,11 +2176,7 @@ pub fn densify_pending() -> Result<bool, String> {
 /// from a new one, which names the replacements, since they were published first. A folder that
 /// keeps changing under [`LISTING_ATTEMPTS`] loads in a row is an error, never a stale verdict.
 fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet, String> {
-    for attempt in 0..LISTING_ATTEMPTS {
-        if attempt > 0 {
-            // Give a sweep removing many files the moment it needs to finish.
-            std::thread::sleep(LISTING_RETRY_PAUSE * attempt as u32);
-        }
+    for _ in 0..LISTING_ATTEMPTS {
         let set = load_listed_packs(pack_folder, check)?;
         if !listing_went_stale(&set) {
             return Ok(set);
@@ -2195,13 +2192,11 @@ fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet
 }
 
 /// How many listings [`load_packs_from_disk`] takes before it gives up on a pack folder that
-/// changes under every one. One compaction deletes what it replaced in a single burst, so a load
-/// that overlaps it needs one more listing; the rest is margin for compactions back to back.
+/// changes under every one. A compaction publishes the replacements before it deletes, so the
+/// listing after an overlap names them at once, with no pause: a reload runs under the reload
+/// lock, which every other miss on the warehouse waits on. The rest is margin for compactions
+/// back to back.
 const LISTING_ATTEMPTS: usize = 8;
-
-/// The pause before [`load_packs_from_disk`]'s second listing, growing by this much before each
-/// one after it: 2.8 s in all, should every attempt find the folder changed.
-const LISTING_RETRY_PAUSE: Duration = Duration::from_millis(100);
 
 /// Whether a file the listing named for one of `set`'s broken entries is now gone: proof that the
 /// folder changed between the listing and the open, so the entry's failure says nothing about the
@@ -2249,6 +2244,38 @@ impl Drop for ListingStep {
     fn drop(&mut self) {
         BETWEEN_LISTING_AND_OPENS.with(|slot| slot.borrow_mut().take());
     }
+}
+
+/// Stand a compaction in another process between each of this thread's next `times` pack-folder
+/// listings and their opens: each deletes the signature table the listing just named and publishes
+/// the next. Returns how many have run. Writes the first table into the active pack folder.
+#[cfg(test)]
+pub(crate) fn churn_next_listings(times: u8) -> std::rc::Rc<std::cell::Cell<u8>> {
+    fn table(seed: u8) -> (PathBuf, Vec<u8>) {
+        let mut parcel = [seed; HASH_LEN];
+        parcel[0] = 0xc5;
+        let entries = vec![(parcel, vec![seed; 64])];
+        let name = format!("{}.{}", signature_table::table_id(&entries), FILE_EXTENSION_SIGNATURE_TABLE);
+        (pack_folder().join(name), signature_table::build(&entries))
+    }
+    fn arm(steps: std::rc::Rc<std::cell::Cell<u8>>, times: u8) {
+        std::mem::forget(between_next_listing_and_opens(move || {
+            let seed = steps.get() + 1;
+            crate::util::file_utils::remove_file(&table(seed).0).unwrap();
+            let (next, bytes) = table(seed + 1);
+            std::fs::write(next, bytes).unwrap();
+            steps.set(seed);
+            if seed < times {
+                arm(steps, times);
+            }
+        }));
+    }
+
+    let (first, bytes) = table(1);
+    std::fs::write(first, bytes).unwrap();
+    let steps = std::rc::Rc::new(std::cell::Cell::new(0));
+    arm(std::rc::Rc::clone(&steps), times);
+    steps
 }
 
 /// One listing of the pack folder, and the opens of what it named: [`load_packs_from_disk`]
@@ -11926,33 +11953,9 @@ pub(crate) mod tests {
     #[test]
     fn a_pack_folder_that_changes_under_every_listing_is_an_error_not_a_stale_verdict() {
         let (temp, _scope) = enter_signature_root("sig-listing-churn");
-
-        fn table(seed: u8) -> (PathBuf, Vec<u8>) {
-            let entries = vec![(hash_to_bytes(&fake_parcel("", seed as usize)).unwrap(), fake_signature(seed))];
-            let name = format!("{}.{}", signature_table::table_id(&entries), FILE_EXTENSION_SIGNATURE_TABLE);
-            (pack_folder().join(name), signature_table::build(&entries))
-        }
-
-        // Each step stands in for one more compaction: it deletes the table the listing just named
-        // and publishes the next, then arms itself for the next listing.
-        fn arm(steps: std::rc::Rc<std::cell::Cell<u8>>) {
-            std::mem::forget(between_next_listing_and_opens(move || {
-                let seed = steps.get() + 1;
-                crate::util::file_utils::remove_file(&table(seed).0).unwrap();
-                let (next, bytes) = table(seed + 1);
-                std::fs::write(next, bytes).unwrap();
-                steps.set(seed);
-                arm(steps);
-            }));
-        }
-
-        let (first, bytes) = table(1);
-        std::fs::write(first, bytes).unwrap();
-        let steps = std::rc::Rc::new(std::cell::Cell::new(0));
-        arm(std::rc::Rc::clone(&steps));
+        let steps = churn_next_listings(8);
 
         let loaded = load_packs_from_disk(&pack_folder(), IndexCheck::Lazy);
-        drop(between_next_listing_and_opens(|| {}));
 
         assert_eq!(steps.get(), 8, "one compaction under each of the eight listings");
         let error = loaded.err().expect("a folder that never held still must not load");

@@ -790,6 +790,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 - A read that overlapped a `store compact` in another process no longer refuses a healthy
   parcel's signature as unreadable. The compact had merged the signature table the read was about
   to open, and deleted it. The read now looks again and finds the signature in the merged table.
+  A pack file that was replaced and deleted the same way is no longer read as a damaged pack.
+  A pack folder that keeps changing under eight reads in a row is refused with "kept changing
+  while it was read"; run the command again once the compact has finished.
 - Many silent-loss, case-folding, durability and trust-verification fixes. Pull request titles from
   #152 to #343 have the detail.
 

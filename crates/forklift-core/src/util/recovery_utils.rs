@@ -2386,11 +2386,13 @@ impl LostObjects {
 /// * `Ok(LostObjects)` - What is lost, possibly nothing.
 /// * `Err(String)`     - The walk could not finish: nothing may be concluded about loss.
 pub fn find_lost_objects() -> Result<LostObjects, String> {
+    // An index this build cannot read may hold what reads lost, so a folder that cannot be told
+    // fails the walk: concluding "no foreign index" from it would overclaim the loss.
+    let foreign_index = !pack_utils::pack_health_snapshot()?.foreign.is_empty();
     let loose = corrupt_loose_objects()?;
     let packed = corrupt_packed_objects()?;
     let boundaries: BTreeSet<String> = loose.corrupt.keys().chain(packed.corrupt.keys()).cloned().collect();
     let walk = enumerate_absent_reachable(&boundaries)?;
-    let foreign_index = pack_utils::pack_health_snapshot().is_ok_and(|snapshot| !snapshot.foreign.is_empty());
 
     let (reached, absent): (BTreeSet<String>, BTreeSet<String>) =
         walk.hashes.into_iter().partition(|hash| boundaries.contains(hash));
@@ -4320,6 +4322,26 @@ mod tests {
     /// reach unlisted. Every corrupt file is kept. Mutation: skip the scan (the walk fails on the
     /// tree), drop the leaf's corrupt check (the leaf goes unnamed), or list every corrupt file →
     /// red.
+    /// FORK-519: a pack folder that cannot be told — here one that changed under every listing the
+    /// snapshot took — fails the walk, rather than reading as "no foreign index" and reporting a
+    /// loss with no qualification.
+    ///
+    /// Revert: swallow the snapshot's error (`is_ok_and`) → the churn is spent on the snapshot, the
+    /// rest of the walk sees a quiet folder and returns a report → red.
+    #[test]
+    fn find_lost_objects_fails_on_a_pack_folder_it_cannot_tell() {
+        let (dir, _scope) = enter_temp_root("fork519-lost-churn");
+        std::fs::create_dir_all(pack_utils::pack_folder()).unwrap();
+        let steps = pack_utils::churn_next_listings(8);
+
+        let lost = find_lost_objects();
+        assert_eq!(steps.get(), 8, "sanity: the snapshot's eight listings each met a compaction");
+        let error = lost.err().expect("a pack folder that cannot be told must fail the walk");
+        assert!(error.contains("kept changing while it was read"), "{}", error);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn find_lost_objects_names_reachable_corrupt_loose_objects_only() {
         use crate::model::tree_item::TreeItem;
