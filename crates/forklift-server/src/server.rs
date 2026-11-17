@@ -9984,7 +9984,7 @@ mod tests {
             let holding = record_utils::to_bytes("tombstones", 3, [first.as_str()]);
 
             // (what, the list's bytes, the mark's bytes), `None` for an absent file.
-            let damages: [(&str, Option<Vec<u8>>, Option<Vec<u8>>); 7] = [
+            let damages = [
                 ("a list not text", Some(b"\xff\xfe not text".to_vec()), Some(good_mark.clone())),
                 ("a bad entry", Some(record_utils::to_bytes("tombstones", 3, ["nothash gone"])), Some(good_mark.clone())),
                 ("a duplicate", Some(record_utils::to_bytes("tombstones", 3, [first.as_str(), second.as_str()])), Some(good_mark.clone())),
