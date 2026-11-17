@@ -391,10 +391,16 @@ mod tests {
         assert_eq!((repaired.salvaged, repaired.unreadable_lines, repaired.unverified), (1, 0, true));
         assert_eq!(withholding::read_withheld().unwrap().statement(A), Some("statement"));
 
+        // Undigested, and digested too: a header that matches its digest but names no newer
+        // version is damage all the same. Revert: refuse every other version that matches its
+        // digest → a digested "1" wedges the root.
         for header in ["/forklift-withheld 1", "/forklift-withheld ", "/forklift-withheld 2x", "/forklift-withheld 03", "/forklift-withheld +3"] {
-            std::fs::write(record(), format!("{}\n{} - statement\n", header, B)).unwrap();
-            assert_eq!(repair_withheld().unwrap().salvaged, 1, "{:?} is damage, not a newer version", header);
-            assert_eq!(withholding::read_withheld().unwrap().statement(B), Some("statement"));
+            let bytes = format!("{}\n{} - statement\n", header, B).into_bytes();
+            for bytes in [bytes.clone(), record_utils::with_digest(bytes)] {
+                std::fs::write(record(), &bytes).unwrap();
+                assert_eq!(repair_withheld().unwrap().salvaged, 1, "{:?} is damage, not a newer version", header);
+                assert_eq!(withholding::read_withheld().unwrap().statement(B), Some("statement"));
+            }
         }
     }
 
