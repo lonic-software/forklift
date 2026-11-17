@@ -27,8 +27,10 @@
 # Bash 3.2 compatible; the watchdog is perl's alarm, since macOS has no timeout.
 set -euo pipefail
 
-# name|seconds|command — run from the repository root.
+# name|seconds|command — run from the repository root. FULL_SUITE_TABLE names a file to read in
+# its place: the self-test's way to drive the real entry point with steps of its own.
 steps() {
+    if [ -n "${FULL_SUITE_TABLE:-}" ]; then cat "$FULL_SUITE_TABLE"; return; fi
     cat <<'EOF'
 build|1800|cargo build --workspace
 test|3600|cargo test --workspace --no-fail-fast
@@ -60,7 +62,9 @@ bounded() {
     exec perl -e '
         my $t = shift;
         my $pid = fork; defined $pid or exit 126;
-        if ($pid == 0) { setpgrp(0, 0); exec @ARGV or exit 127 }
+        # The step gets INT and QUIT back at their defaults: a background job starts with both
+        # ignored, and the tests must run in the signal environment CI gives them.
+        if ($pid == 0) { setpgrp(0, 0); $SIG{INT} = $SIG{QUIT} = "DEFAULT"; exec @ARGV or exit 127 }
         setpgrp($pid, $pid);
         $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; exit 142 };
         # Dies of the same signal once the group is gone, so the caller sees an interrupt, not a
@@ -196,25 +200,35 @@ EOF
 
     # A Ctrl-C (INT to the whole foreground group) stops the run: the step after never starts.
     # A TERM to the script alone (a parent's bound) leaves no step running behind it.
-    local sig pid n
+    local sig pid n want
+    printf '%s\n' 'test|30|echo $$ > "$FULL_SUITE_SELF_TEST_PID"; exec sleep 20' 'clippy|5|echo after' \
+        > "$tmp/table"
     for sig in INT TERM; do
         mkdir -p "$tmp/$sig"
         export FULL_SUITE_SELF_TEST_PID="$tmp/$sig/step.pid"
-        # The run in a process group of its own with INT at its default, as a terminal's foreground
-        # job would be (a background job starts with INT ignored, which a shell cannot trap).
-        printf '%s\n' 'test|30|echo $$ > "$FULL_SUITE_SELF_TEST_PID"; exec sleep 20' 'clippy|5|echo after' \
-            | perl -e '$SIG{INT} = "DEFAULT"; setpgrp(0, 0); exec @ARGV' bash "$0" --run-steps "$tmp/$sig" > "$tmp/$sig.out" 2>&1 &
+        # The real entry point, in a process group of its own with INT at its default, as a
+        # terminal's foreground job would be (a background job starts with INT ignored, which a
+        # shell cannot trap).
+        FULL_SUITE_TABLE="$tmp/table" perl -e '$SIG{INT} = "DEFAULT"; setpgrp(0, 0); exec @ARGV' \
+            bash "$0" --out "$tmp/$sig" > "$tmp/$sig.out" 2>&1 &
         pid=$!
         n=0; while [ ! -s "$tmp/$sig/step.pid" ] && [ "$n" -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
-        if [ "$sig" = INT ]; then kill -INT -- "-$pid"; else kill -TERM "$pid"; fi
+        if [ "$sig" = INT ]; then kill -INT -- "-$pid"; want=130; else kill -TERM "$pid"; want=143; fi
         set +e; { wait "$pid"; } 2>/dev/null; st=$?; set -e
         n=0; while kill -0 "$(cat "$tmp/$sig/step.pid" 2>/dev/null || echo 0)" 2>/dev/null && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
         if [ -f "$tmp/$sig/clippy.log" ]; then out="the next step ran"
         elif kill -0 "$(cat "$tmp/$sig/step.pid" 2>/dev/null || echo 0)" 2>/dev/null; then out="the step outlived the run"
         else out="stopped"; fi
-        check "a $sig stops the run and its step" "$st" "stopped"
+        check "a $sig stops the run and its step" "$want" "stopped"
     done
     unset FULL_SUITE_SELF_TEST_PID
+
+    # A step runs with INT at its default, though the watchdog is a background job.
+    printf '%s\n' 'test|5|perl -e '"'"'print $SIG{INT} // "DEFAULT"'"'"'; [ "$(perl -e '"'"'print $SIG{INT} // ""'"'"')" != IGNORE ]' > "$tmp/table2"
+    set +e
+    out=$(FULL_SUITE_TABLE="$tmp/table2" bash "$0" --out "$tmp/g" 2>&1); st=$?
+    set -e
+    check "a step does not inherit an ignored INT" 0 "ok       test"
 
     rm -rf "$tmp"
     if [ "$fails" -eq 0 ]; then echo "self-test: all passed"; return 0; fi
@@ -229,8 +243,6 @@ while [ $# -gt 0 ]; do
         --only) only=${2:?--only needs step names}; shift 2 ;;
         --list) steps | cut -d'|' -f1; exit 0 ;;
         --self-test) self_test; exit $? ;;
-        # The self-test's way to run a step table in a process of its own; not for use.
-        --run-steps) run_steps "${2:?}" ""; exit $? ;;
         *) echo "usage: full-suite [--out DIR] [--only STEP,...] | --list | --self-test" >&2; exit 2 ;;
     esac
 done
@@ -245,7 +257,9 @@ if [ -z "$out" ]; then out="$(mktemp -d)"; fi
 mkdir -p "$out"
 echo "full-suite: $(git rev-parse --short HEAD)$( [ -z "$(git status --porcelain)" ] || echo ' (uncommitted changes)'), logs in $out"
 set +e
-steps | run_steps "$out" "$only"
+# In this shell, not a pipeline's subshell: the traps run_steps sets must be this process's own,
+# so a signal sent to the script reaches them.
+run_steps "$out" "$only" < <(steps)
 st=$?
 set -e
 if [ "$st" -eq 0 ]; then echo "full-suite: every step passed"; else echo "full-suite: NOT green"; fi

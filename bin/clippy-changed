@@ -185,6 +185,13 @@ if [ -z "$log" ]; then
     trap 'rm -f "$log"' EXIT
     # Findings make clippy exit non-zero only when they are errors, so its status cannot tell a
     # finding from a run that never checked anything; the closing "Finished" line can.
-    perl -e 'alarm shift; exec @ARGV' 1800 cargo clippy --workspace --all-targets --message-format=short 2> "$log" > /dev/null || true
+    # Bounded with its whole process group, so no clippy-driver outlives the bound holding target/.
+    perl -e '
+        my $t = shift; my $pid = fork; defined $pid or exit 126;
+        if ($pid == 0) { setpgrp(0, 0); exec @ARGV or exit 127 }
+        setpgrp($pid, $pid);
+        $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; exit 142 };
+        $SIG{$_} = sub { kill "TERM", -$pid; exit 143 } for qw(INT TERM HUP);
+        alarm $t; waitpid $pid, 0; exit($? >> 8)' 1800 cargo clippy --workspace --all-targets --message-format=short 2> "$log" > /dev/null || true
 fi
 judge "$base" "$log"

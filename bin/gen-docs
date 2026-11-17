@@ -16,8 +16,9 @@
 # which the tests and proof-load drive. Runs whatever binary cargo just built.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-if [ -z "${CARGO_TARGET_DIR:-}${CARGO_BUILD_TARGET_DIR:-}" ] \
-    && ! grep -qs 'target-dir' .cargo/config.toml .cargo/config "${CARGO_HOME:-$HOME/.cargo}/config.toml"; then
+# Cargo's own answer, which every config location and variable feeds: move off only the default.
+if [ "$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')" \
+    = "$PWD/target" ]; then
     export CARGO_TARGET_DIR=target/gen-docs
 fi
 
