@@ -153,10 +153,10 @@ pub fn salvage(bytes: &[u8], valid: impl Fn(&[String], &str) -> bool) -> Salvage
             continue;
         };
         let section = governing(at.start);
-        let key = line.and_then(|key| {
+        let key = line.map(|key| {
             let mut path = section.clone().unwrap_or_default();
             path.extend(key);
-            Some(path)
+            path
         });
         match (&key, &section) {
             (Some(path), _) => drop_group(path),
