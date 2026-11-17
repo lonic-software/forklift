@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# The complete local suites: what to run before opening a pull request or pushing to one, so that CI
+# is never the first run of a test. bin/check is the fast subset; this is everything CI and the side
+# workflows would run that this machine can run:
+#
+#   build      cargo build --workspace (the tests drive the forklift and forklift-server binaries,
+#              and cargo test -p forklift does not rebuild forklift-server)
+#   test       cargo test --workspace --no-fail-fast (unit, integration and doc-tests)
+#   history    proof-load's ignored history tests, against the forklift binary just built
+#   desktop    tools/proof-load-desktop, its own workspace: tests, then clippy -D warnings
+#   clippy     cargo clippy --workspace --all-targets, so clippy.toml's bans reach the tests too;
+#              report-only like CI, its log is what bin/clippy-changed reads
+#   guards     bin/fmt-guard, bin/gen-docs --check and bin/check-no-aws-lc
+#
+# usage: full-suite [--out DIR] [--only STEP,...]
+#        full-suite --list
+#        full-suite --self-test
+#
+# Every step runs under its own watchdog, so a hung test cannot hold the run forever; its whole
+# output goes to DIR/<step>.log (default: a fresh temporary directory, printed first) and one line
+# per step is printed, with the first failing line of any step that did not pass. A failed build
+# stops the run, since every later step would rebuild and fail the same way; any other failure does
+# not. Exits 0 only when every step ran and passed, 1 otherwise, 2 on a usage error.
+#
+# Bash 3.2 compatible; the watchdog is perl's alarm, since macOS has no timeout.
+set -euo pipefail
+
+# name|seconds|command — run from the repository root.
+steps() {
+    cat <<'EOF'
+build|1800|cargo build --workspace
+test|3600|cargo test --workspace --no-fail-fast
+history|900|PROOF_LOAD_FORKLIFT="$PWD/target/debug/forklift" cargo test -p proof-load --lib -- --ignored history
+desktop|1800|cargo test --locked --no-fail-fast --manifest-path tools/proof-load-desktop/Cargo.toml && cargo clippy --locked --all-targets --manifest-path tools/proof-load-desktop/Cargo.toml -- -D warnings
+clippy|1800|cargo clippy --workspace --all-targets --message-format=short
+guards|900|./bin/fmt-guard && ./bin/gen-docs --check && ./bin/check-no-aws-lc
+EOF
+}
+
+# The line that says why a step failed, in the order a reader wants them.
+FAIL_RE='^test .* FAILED|panicked at|^error(\[|:)|^failures:|FAILED|fmt-guard:|check-no-aws-lc:|stale|^diff '
+
+# Runs the command in its own process group and kills the whole group on timeout (exit 142): a test
+# binary's children would otherwise outlive the watchdog.
+bounded() {
+    perl -e '
+        my $t = shift;
+        my $pid = fork; defined $pid or exit 126;
+        if ($pid == 0) { setpgrp(0, 0); exec @ARGV or exit 127 }
+        setpgrp($pid, $pid);
+        $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; exit 142 };
+        $SIG{$_} = sub { kill "TERM", -$pid; exit 143 } for qw(INT TERM HUP);
+        alarm $t; waitpid $pid, 0; alarm 0;
+        exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$@"
+}
+
+# run_steps OUT ONLY < table: runs each selected step, prints its line, returns 1 if any failed.
+run_steps() {
+    local out=$1 only=$2 failed=0 name secs cmd t0 st took why
+    while IFS='|' read -r name secs cmd; do
+        [ -n "$name" ] || continue
+        if [ -n "$only" ]; then
+            case ",$only," in *",$name,"*) ;; *) continue ;; esac
+        fi
+        t0=$(date +%s)
+        set +e
+        bounded "$secs" bash -c "$cmd" > "$out/$name.log" 2>&1 < /dev/null
+        st=$?
+        set -e
+        took=$(( $(date +%s) - t0 ))
+        if [ "$st" -eq 0 ]; then
+            printf 'ok       %-8s %5ss\n' "$name" "$took"
+            continue
+        fi
+        failed=1
+        if [ "$st" -eq 142 ]; then
+            printf 'TIMEOUT  %-8s %5ss  (watchdog %ss; log %s)\n' "$name" "$took" "$secs" "$out/$name.log"
+        else
+            why=$(grep -E -m1 -- "$FAIL_RE" "$out/$name.log" || tail -1 "$out/$name.log" || true)
+            printf 'FAILED   %-8s %5ss  exit %s: %s\n' "$name" "$took" "$st" "$why"
+        fi
+        if [ "$name" = build ]; then
+            echo "full-suite: the build failed, so nothing else was run (log $out/build.log)"
+            return 1
+        fi
+    done
+    return "$failed"
+}
+
+self_test() {
+    local tmp fails=0 out st
+    tmp="$(mktemp -d)"
+    check() { # name want-exit want-text
+        if [ "$st" -eq "$2" ] && printf '%s' "$out" | grep -q -- "$3"; then
+            echo "ok   $1"
+        else
+            echo "FAIL $1 (exit $st, want $2; want text: $3)"; printf '%s\n' "$out" | sed 's/^/     /'
+            fails=$((fails + 1))
+        fi
+    }
+    mkdir -p "$tmp/a" "$tmp/b" "$tmp/c" "$tmp/d"
+
+    set +e
+    out=$(run_steps "$tmp/a" "" <<'EOF'
+build|5|true
+test|5|echo 'test x ... FAILED'; exit 101
+clippy|5|echo clean
+EOF
+    ); st=$?
+    set -e
+    check "a failing step fails the run" 1 "FAILED   test"
+    check "the failing line is named" 1 "test x ... FAILED"
+    check "a step after a failure still runs" 1 "ok       clippy"
+
+    set +e
+    out=$(run_steps "$tmp/b" "" <<'EOF'
+build|5|echo 'error: could not compile'; exit 101
+test|5|true
+EOF
+    ); st=$?
+    set -e
+    check "a failed build stops the run" 1 "nothing else was run"
+    if printf '%s' "$out" | grep -q "ok       test"; then
+        echo "FAIL a failed build runs nothing after it"; fails=$((fails + 1))
+    else
+        echo "ok   a failed build runs nothing after it"
+    fi
+
+    set +e
+    out=$(run_steps "$tmp/c" "" <<'EOF'
+test|1|sleep 30 & wait
+EOF
+    ); st=$?
+    set -e
+    check "a hung step is a TIMEOUT, not a hang" 1 "TIMEOUT  test"
+
+    set +e
+    out=$(run_steps "$tmp/d" "clippy" <<'EOF'
+build|5|exit 1
+clippy|5|true
+EOF
+    ); st=$?
+    set -e
+    check "--only runs just the named steps" 0 "ok       clippy"
+
+    set +e
+    out=$(run_steps "$tmp/d" "" <<'EOF'
+build|5|true
+test|5|true
+EOF
+    ); st=$?
+    set -e
+    check "every step passing passes the run" 0 "ok       test"
+
+    rm -rf "$tmp"
+    if [ "$fails" -eq 0 ]; then echo "self-test: all passed"; return 0; fi
+    echo "self-test: $fails failed"; return 1
+}
+
+out=""
+only=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --out) out=${2:?--out needs a directory}; shift 2 ;;
+        --only) only=${2:?--only needs step names}; shift 2 ;;
+        --list) steps | cut -d'|' -f1; exit 0 ;;
+        --self-test) self_test; exit $? ;;
+        *) echo "usage: full-suite [--out DIR] [--only STEP,...] | --list | --self-test" >&2; exit 2 ;;
+    esac
+done
+
+cd "$(dirname "$0")/.."
+if [ -n "$only" ]; then
+    for name in $(printf '%s' "$only" | tr ',' ' '); do
+        steps | cut -d'|' -f1 | grep -qx -- "$name" || { echo "full-suite: no step named '$name' (see --list)" >&2; exit 2; }
+    done
+fi
+if [ -z "$out" ]; then out="$(mktemp -d)"; fi
+mkdir -p "$out"
+echo "full-suite: $(git rev-parse --short HEAD)$( [ -z "$(git status --porcelain)" ] || echo ' (uncommitted changes)'), logs in $out"
+set +e
+steps | run_steps "$out" "$only"
+st=$?
+set -e
+if [ "$st" -eq 0 ]; then echo "full-suite: every step passed"; else echo "full-suite: NOT green"; fi
+exit "$st"

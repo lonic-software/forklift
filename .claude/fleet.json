@@ -1,0 +1,45 @@
+{
+  "worktree_root": ".claude/worktrees",
+  "main_ref": "origin/main",
+  "build_dir": "per-slot: each slot keeps its own target/ (the default); never share CARGO_TARGET_DIR across slots, and gen-docs runs with CARGO_TARGET_DIR=<slot scratch>",
+  "heavy_commands": [
+    {
+      "pattern": "cargo[[:space:]]+(test|nextest|clippy|bench)",
+      "bound_seconds": 2700
+    },
+    {
+      "pattern": "cargo[[:space:]]+build[[:space:]].*--release",
+      "bound_seconds": 1800
+    },
+    {
+      "pattern": "bin/(check|bench\\.sh|benchmark)",
+      "bound_seconds": 3600
+    }
+  ],
+  "serial_resources": {
+    "exit-code": {
+      "kind": "counter",
+      "max_cmd": "git show $REF:docs/generated/errors.md | sed -n 's/^| `[a-z_]*` | \\([0-9][0-9]*\\) |.*/\\1/p' | sort -n | tail -1"
+    }
+  },
+  "mechanical_files": [
+    {
+      "glob": "docs/generated/**",
+      "regenerate": "./bin/gen-docs"
+    },
+    {
+      "glob": "Cargo.lock",
+      "regenerate": "cargo metadata --format-version 1 >/dev/null"
+    }
+  ],
+  "branch_update": "merge",
+  "areas": [
+    "core",
+    "cli",
+    "server",
+    "aws",
+    "infra",
+    "docs",
+    "bench"
+  ]
+}
