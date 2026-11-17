@@ -18,6 +18,7 @@ use crate::remedy::{self, Remedy};
 use crate::runner::{self, RunError, Taken, TakenBy};
 use crate::scenario::{bind, Mark, Op, Scenario, Tool};
 use crate::scrub::{Environment, Scratch};
+use crate::host::Host;
 use crate::tool::{self, Invocation, Outcome};
 
 /// The programs a faulted run drives, each by absolute path.
@@ -217,6 +218,9 @@ pub(crate) struct Context<'a> {
     pub(crate) then: &'a [Op],
     /// The host's URL, when the scenario serves one.
     pub(crate) url: Option<&'a str>,
+    /// The host serving at that URL, when the harness serves it itself: the warehouse a refusal's
+    /// operator remedy is run against, the harness acting as the remote's operator.
+    pub(crate) host: Option<&'a Host>,
     /// The folder the work tree is scoped to, when a sparse clone left it scoped.
     pub(crate) scope: Option<&'a str>,
     /// Read the history back through a fresh clone of the host rather than from the work tree:
@@ -1322,7 +1326,7 @@ pub(crate) fn grade_after(
             }
             extracted.remedies
         };
-        let run = |(trail, _): &mut (Trail, Vec<String>), fresh: &[Remedy]| -> Result<bool, RunError> {
+        let run = |(trail, unextractable): &mut (Trail, Vec<String>), fresh: &[Remedy]| -> Result<bool, RunError> {
             trail.evidence.remedy_named = true;
             for named in fresh {
                 match named {
@@ -1334,6 +1338,7 @@ pub(crate) fn grade_after(
                         trail.steps.push(context.run(context.program(), context.subject(arguments), context.scratch.work())?);
                     }
                     Remedy::Remove { path } => trail.recoverability.outside_knowledge.push(remedy::remove(path, &context.scratch.roots()).0),
+                    Remedy::Operator { arguments } => operate(context, arguments, trail, unextractable)?,
                 }
             }
             let reads = retry(trail, &mut resume, &mut made)?;
@@ -1357,6 +1362,37 @@ pub(crate) fn grade_after(
         grade: oracle::grade(&trail.evidence), evidence: trail.evidence, recoverability: trail.recoverability,
         steps: trail.steps, readbacks: trail.readbacks, probes: trail.probes, unextractable,
     })
+}
+
+/// Carries out an operator remedy, `arguments` of the server's program, as the remote's operator:
+/// only where the harness serves the warehouse itself, its `<warehouse>` bound to that host's root
+/// ([`remedy::bind_operator`]), with the server stopped and started again ([`Host::operate`]). The
+/// command's outcome is a step; each part of it, none of which the subject's user can take, is
+/// outside knowledge, and what starting again took is merged as a restart's is. Anything else is
+/// unextractable: the harness never runs a server command on a warehouse it does not hold.
+fn operate(context: &Context, arguments: &[String], trail: &mut Trail, unextractable: &mut Vec<String>) -> Result<(), RunError> {
+    let written = format!("forklift-server {}", arguments.join(" "));
+    let bound = context.host.zip(context.programs.server.as_deref())
+        .and_then(|(host, server)| Some((host, server, remedy::bind_operator(arguments, host.root())?)));
+    let Some((host, server, bound)) = bound else {
+        if !unextractable.contains(&written) {
+            unextractable.push(written);
+        }
+        return Ok(());
+    };
+    let operated = host.operate(bound.clone(), context.scratch, context.environment, context.limit).map_err(RunError::Tool)?;
+    let knowledge = &mut trail.recoverability.outside_knowledge;
+    knowledge.push("as the remote's operator, on the host: stop the server".to_string());
+    knowledge.push(format!("as the remote's operator, on the host: {} {}", server.display(), bound.join(" ")));
+    knowledge.push("as the remote's operator, on the host: start the server again".to_string());
+    knowledge.extend(operated.restarted.outside_knowledge);
+    for text in operated.restarted.unextractable.into_iter().chain(operated.restarted.refused.map(|said| format!("the restarted server refused: {}", said))) {
+        if !unextractable.contains(&text) {
+            unextractable.push(text);
+        }
+    }
+    trail.steps.push(operated.outcome);
+    Ok(())
 }
 
 /// The subject's own remedy set, run in order until one rescues: for forklift `heal`, then
@@ -1492,7 +1528,7 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, to
 
     let (expected, faulted) = expected(scenario, corpus, &built, warehouse)?;
     let context = Context {
-        tool, corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.url(),
+        tool, corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.url(), host: built.host.as_ref(),
         scope: scenario.scope(), via_host: warehouse == Warehouse::Host, history: None,
     };
     let graded = grade_after(&context, &expected, faulted, |context, steps| context.record(faulted, steps).map(drop))?;
@@ -1549,7 +1585,7 @@ fn lay_out_subject(pristine: &Path, scratch: &Scratch) -> Result<(), RunError> {
 
 /// The context of a faulted run over a history subject in `scratch`.
 fn history_context<'a>(tool: Tool, corpus: &'a Corpus, programs: &'a Programs, scratch: &'a Scratch, environment: &'a Environment, limit: Duration, positions: &'a [Position]) -> Context<'a> {
-    Context { tool, corpus, programs, scratch, environment, limit, then: &[], url: None, scope: None, via_host: false, history: Some(positions) }
+    Context { tool, corpus, programs, scratch, environment, limit, then: &[], url: None, host: None, scope: None, via_host: false, history: Some(positions) }
 }
 
 /// The unfaulted readback of `tool`'s pristine subject, copied into `scratch`: every position and
@@ -1790,7 +1826,7 @@ mod tests {
             let (expected, _) = expected(&scenario, &corpus, &built, Warehouse::Client).unwrap();
             let context = Context {
                 tool: Tool::Git, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
-                limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false, history: None,
+                limit: Duration::from_secs(60), then: &[], url: None, host: None, scope: None, via_host: false, history: None,
             };
             let readback = context.read_back(&scratch.work(), &expected.acknowledged, &expected.acknowledged, |mark| expected.of(&corpus, mark, false)).unwrap();
             assert!(readback.export.succeeded(), "damaged {}: the log ran", damaged);
@@ -1923,7 +1959,7 @@ mod tests {
         for (tool, prefix) in [(Tool::GitTuned, crate::scenario::GIT_TUNED), (Tool::Git, &[][..]), (Tool::Forklift, &[][..])] {
             let context = Context {
                 tool, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
-                limit: Duration::from_secs(1), then: &[], url: None, scope: None, via_host: false, history: None,
+                limit: Duration::from_secs(1), then: &[], url: None, host: None, scope: None, via_host: false, history: None,
             };
             let expected: Vec<String> = prefix.iter().map(|argument| argument.to_string()).chain(["fsck".to_string()]).collect();
             assert_eq!(context.subject(vec!["fsck".to_string()]), expected, "{:?}", tool);
@@ -1956,7 +1992,7 @@ mod tests {
         let built = runner::build(&scenario, &corpus, tool, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
         let context = Context {
             tool, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
-            limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false, history: None,
+            limit: Duration::from_secs(60), then: &[], url: None, host: None, scope: None, via_host: false, history: None,
         };
         let head = |reference: &str| String::from_utf8_lossy(&context.run(&git, vec!["rev-parse".into(), reference.into()], scratch.work()).unwrap().stdout).trim().to_string();
         let (main, first) = (head("refs/heads/main"), head("refs/heads/main~1"));
@@ -2002,7 +2038,7 @@ mod tests {
         let built = runner::build(&scenario, &corpus, Tool::Git, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
         let context = Context {
             tool: Tool::Git, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
-            limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false, history: None,
+            limit: Duration::from_secs(60), then: &[], url: None, host: None, scope: None, via_host: false, history: None,
         };
         let git_run = |arguments: &[&str]| context.run(&git, arguments.iter().map(|argument| argument.to_string()).collect(), scratch.work()).unwrap();
         let head = |reference: &str| String::from_utf8_lossy(&git_run(&["rev-parse", reference]).stdout).trim().to_string();

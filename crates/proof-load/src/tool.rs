@@ -171,6 +171,35 @@ impl Served {
     pub fn ended(&mut self) -> Option<std::process::ExitStatus> {
         self.child.try_wait().ok().flatten()
     }
+
+    /// Stops it as its operator would: asked to shut down (SIGTERM, which it drains gracefully,
+    /// releasing its serve lock), then waited on for up to `limit`. One still running then is
+    /// killed and an error: a server killed hard leaves its lock behind, and that is the harness's
+    /// doing, not a step the operator's remedy owes.
+    pub fn stop(mut self, limit: Duration) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            let pid = libc::pid_t::try_from(self.child.id()).map_err(|_| format!("the server's process id {} is out of range", self.child.id()))?;
+            // SAFETY: kill takes no pointers; the child is ours and not yet reaped, so its id is its own.
+            if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+                return Err(format!("the server could not be asked to stop: {}", std::io::Error::last_os_error()));
+            }
+            let deadline = Instant::now() + limit;
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => return Ok(()),
+                    Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                    Ok(None) => return Err(format!("the server had not stopped within {:?} of being asked to", limit)),
+                    Err(error) => return Err(format!("the server's state could not be read: {}", error)),
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = limit;
+            Err("the server can be asked to stop only on Unix".to_string())
+        }
+    }
 }
 
 impl Drop for Served {
