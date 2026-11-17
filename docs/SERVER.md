@@ -55,8 +55,11 @@ A served root must hold the full tree. A partial warehouse (one cloned with `--o
 it holds that object by hash alone, without its content, whatever its marker says, and any root
 that records an origin (`.forklift/origin`), which only a partial warehouse has, and any root
 lacking content its unavailable record (`.forklift/unavailable`) lists, which a fetch left out
-because its remote's host withholds it, until those files' bytes are loaded again; a record that
-cannot be read is refused too (a `500` from a `--warehouses` server). Clients trust a server to
+because its remote's host withholds it, until those files' bytes are loaded again. A record that
+does not parse is refused as damage, and so is a fetch scope (`.forklift/config/fetch-scope`) in a
+root that is not partial: a `--warehouses` server answers `503` with no `Retry-After` and the
+record's code (`fetch_scope_stray`, `sealed_damaged`, `unavailable_damaged` or `origin_damaged`),
+naming `forklift heal` where heal rebuilds the record. Clients trust a server to
 hold every object its pallet heads reach, and `scope prune`, `evict` and `remote move` rely on that,
 so such a root could lead a client to free content it can never fetch back. To serve a cloned
 copy, clone it without `--only` or `--cache`. A clone that has not finished is

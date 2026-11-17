@@ -369,7 +369,8 @@ refusal_codes! {
     /// A sparse warehouse's fetch scope is lost or damaged and `heal` could not rebuild it from
     /// the checkouts' scopes alone: none could be read, the history at their union is not all
     /// present, or a checkout's scope lies outside a fetch scope that parses. Nothing was changed.
-    /// `heal --fetch-scope <prefix>`, once per prefix, sets it, fetching what the history at those prefixes lacks.
+    /// `heal --fetch-scope <prefix>`, once per prefix, sets it, fetching what the history at those
+    /// prefixes lacks.
     FetchScopeDamaged => "fetch_scope_damaged",
 
     /// A served warehouse's tombstone list or its served mark is lost or damaged, so which deleted
@@ -401,7 +402,46 @@ refusal_codes! {
     /// staged content reaches them, and otherwise restores them from a backup or a copy, or re-runs
     /// heal when its index rebuild could not take the store lock.
     ObjectsLost => "objects_lost",
+
+    /// The sealed-object record, of the objects the warehouse holds by hash alone, does not parse,
+    /// so which those are cannot be told. Nothing was changed. When it is damaged past a point,
+    /// the next step is `forklift heal`, which rebuilds it from the part before the damage; when
+    /// another version wrote it, or a whole frame does not read, the next step is empty and the
+    /// message says what to do. A read that fails on the file itself carries no code.
+    SealedDamaged => "sealed_damaged",
+
+    /// The record of content this warehouse cannot get, which a fetch left out because its
+    /// remote's host withholds it, does not parse, so what the warehouse lacks cannot be told.
+    /// Nothing was changed. The next step is `forklift heal`, which rebuilds it from the entries
+    /// that still read; it is empty when a newer version wrote it, which this one never writes
+    /// over. A read that fails on the file itself carries no code.
+    UnavailableDamaged => "unavailable_damaged",
+
+    /// The origin record, of the remote a partial warehouse was cloned from, does not parse or
+    /// holds anything but one URL, so which remote holds what the warehouse lacks cannot be told.
+    /// Nothing was changed; `forklift remote move <url>` records it again, after checking that
+    /// server holds what the warehouse lacks. A read that fails on the file itself carries no code.
+    OriginDamaged => "origin_damaged",
+
+    /// A warehouse that is not sparse holds a fetch scope, which only a sparse warehouse is given,
+    /// so it was put there by hand and what the warehouse fetched cannot be told from it. Every
+    /// read refuses with it. The next step is empty: deleting that file ends it, since the
+    /// warehouse mode, not the file, says what the warehouse holds.
+    FetchScopeStray => "fetch_scope_stray",
 }
+
+/// The codes of a host record that is lost or damaged, or of an object its store cannot read,
+/// which only the operator of the server holding it repairs. A server answers each as a `503`
+/// with no `Retry-After`, and a client told one by a remote names that remote's operator.
+pub const SERVED_DAMAGE: &[RefusalCode] = &[
+    RefusalCode::TombstonesDamaged,
+    RefusalCode::WithheldDamaged,
+    RefusalCode::ObjectUnreadable,
+    RefusalCode::FetchScopeStray,
+    RefusalCode::SealedDamaged,
+    RefusalCode::UnavailableDamaged,
+    RefusalCode::OriginDamaged,
+];
 
 impl RefusalCode {
     /// Parse a stable code string back into a [`RefusalCode`]. `None` for any string that is not a
@@ -455,7 +495,7 @@ impl CoreError {
         message: impl Into<String>,
         next_step: impl Into<String>,
     ) -> CoreError {
-        let (message, next_step) = (sanitize(&message.into()), sanitize(&next_step.into()));
+        let (message, next_step) = (sanitize(&rendered_frames(&message.into())), sanitize(&next_step.into()));
         debug_assert!(!restates_next_step(&message, &next_step), "A refusal's message restates its next step: {:?}", message);
         CoreError::Refusal {
             code,
@@ -475,7 +515,7 @@ impl CoreError {
         next_step: impl Into<String>,
         details: serde_json::Value,
     ) -> CoreError {
-        let (message, next_step) = (sanitize(&message.into()), sanitize(&next_step.into()));
+        let (message, next_step) = (sanitize(&rendered_frames(&message.into())), sanitize(&next_step.into()));
         debug_assert!(!restates_next_step(&message, &next_step), "A refusal's message restates its next step: {:?}", message);
         CoreError::Refusal {
             code,
@@ -656,6 +696,13 @@ fn render_wrapped_frames(message: &str) -> Option<String> {
     any.then_some(rendered)
 }
 
+/// `text` with every frame inside it rendered as its message and next step, as a wrapped frame is
+/// when decoded: for a caller that puts an error into other text it builds (a refusal's message, a
+/// note), where the frame's separators would otherwise be sanitized into stray words.
+pub fn rendered_frames(text: &str) -> String {
+    render_wrapped_frames(text).unwrap_or_else(|| text.to_string())
+}
+
 /// What follows a frame's detail field, `text`: the detail is one JSON value, and anything after it
 /// was written by a caller that wrapped the frame.
 fn after_detail(text: &str) -> &str {
@@ -832,6 +879,18 @@ fn deframe_with_details(message: &str) -> Option<(&str, Cow<'_, str>, &str, Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal whose message quotes another refusal reads as prose: the quoted frame is rendered
+    /// as its message and step, never sanitized into its code and detail as stray words. Mutation:
+    /// build the message without `rendered_frames` → `sealed_damaged` and `null` show → red.
+    #[test]
+    fn a_refusal_quoting_a_frame_renders_it_as_prose() {
+        let inner: String = CoreError::refusal(RefusalCode::SealedDamaged, "The record is damaged.", "forklift heal").into();
+        let outer = CoreError::refusal(RefusalCode::DurabilityTaint, format!("Heal cannot go on: {}", inner), "");
+        let CoreError::Refusal { message, .. } = outer else { panic!() };
+        assert_eq!(message, "Heal cannot go on: The record is damaged. (Next step: forklift heal)");
+        assert_eq!(rendered_frames("plain"), "plain");
+    }
 
     #[test]
     fn a_frame_whose_details_do_not_parse_is_not_decoded_as_a_refusal() {

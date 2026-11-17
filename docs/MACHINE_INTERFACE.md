@@ -85,7 +85,16 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 47** (current): a corrupt loose object is now refused and reported. A read whose only
+**Schema 48** (current): four refusal codes where each failed with an uncoded message. Three are
+host records that do not parse: `sealed_damaged` (exit 59, the record of objects held by hash
+alone), `unavailable_damaged` (exit 60, the record of content the warehouse cannot get) and
+`origin_damaged` (exit 61). For the first two, `next_step` is `forklift heal` where heal rebuilds
+the record, and empty where nothing does; for the origin it is `forklift remote move <url>`. The
+fourth, `fetch_scope_stray` (exit 62), refuses every read of a warehouse that is not sparse but
+holds a fetch scope, with an empty `next_step`. A remote's refusal with any of the four names its
+operator and is not retried.
+
+**Schema 47**: a corrupt loose object is now refused and reported. A read whose only
 copy of an object is a loose file that does not decompress, or decompresses to other content,
 refuses with `object_unreadable` (exit 57), where it failed with an uncoded message. `heal`'s closing
 check reads every loose file, and one that history still reaches counts as lost: `objects_lost`

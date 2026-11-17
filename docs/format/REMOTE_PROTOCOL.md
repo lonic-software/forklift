@@ -65,17 +65,31 @@ already zstd streams (bundles, batches) are marked `identity` and never re-wrapp
 and is a refusal for now, sent before the request changed anything. The warehouse may be drained
 while content redacted or withheld from it is deleted (below), settling which redacted content it no
 longer serves (below), under maintenance, or not yet servable, or a hook it depends on may be
-unreachable. The request can be sent again after the wait. One `503` from forklift-server has no
-`Retry-After`: a damaged host record, `code` `tombstones_damaged`, a warehouse whose list of
-deleted pallets (and so which history it keeps for them) cannot be read, or `withheld_damaged`, one
-whose record of withheld content cannot be. It is refused, nothing changed, and waiting does not end
-it: the server's operator must repair the record, and `next_step` names the command with
-`<warehouse>` in place of the server's directory. `object_unreadable` is one too: an object the
-request needs is missing from the server's store, is held there only in a corrupt loose file, or
-sits in a damaged pack file there, and
-`next_step` names the operator's `forklift heal`, run where the warehouse is served from. The serverless head answers that case as a
-`500` whose body names no store path. The
-serverless head's `503`s are described with the endpoints that send them.
+unreachable. The request can be sent again after the wait.
+
+One `503` from forklift-server has no `Retry-After`: damage only the server's operator can repair.
+It is refused, nothing changed, and waiting does not end it. `code` names the damage, `message`
+names no directory of the server's, and `next_step` is the operator's, with `<warehouse>` in place
+of the server's directory:
+
+- `tombstones_damaged`: the list of deleted pallets (and so which history the warehouse keeps for
+  them) cannot be read. `next_step` names `forklift-server tombstone repair`.
+- `withheld_damaged`: the record of withheld content cannot be read. `next_step` names
+  `forklift-server withhold repair`.
+- `object_unreadable`: an object the request needs is missing from the server's store, is held
+  there only in a corrupt loose file, or sits in a damaged pack file there. `next_step` names the
+  operator's `forklift heal`, run where the warehouse is served from. The serverless head answers
+  that case as a `500` whose body names no store path.
+- `fetch_scope_stray`, `sealed_damaged`, `unavailable_damaged` and `origin_damaged`: a record the
+  server reads before it serves a full warehouse is out of place or does not parse. They are, in
+  turn, a fetch scope, which a full warehouse never holds; the record of objects held by hash alone;
+  the record of content the warehouse cannot get; and an origin record. `next_step` is
+  `forklift heal` where heal rebuilds the record, and empty where nothing does (another version
+  wrote it, a stray scope, an origin). A partial warehouse is answered `409` whatever these records
+  hold.
+
+The serverless head reads none of these records, and its `503`s are described with the endpoints
+that send them.
 
 **Refused for now, on either head:** a `429`, and a `503` that carries `Retry-After`, are
 refusals sent before the request changed anything, so the identical request may be sent again

@@ -2542,7 +2542,7 @@ fn classify_remote_error(status: u16, action: &str, message: String,
     match code.as_deref().and_then(RefusalCode::from_code) {
         // The remote's own records or store are damaged: its step is for its operator, never this
         // user's, whatever status carried it.
-        Some(code @ (RefusalCode::TombstonesDamaged | RefusalCode::WithheldDamaged | RefusalCode::ObjectUnreadable)) => String::from(CoreError::remote_refusal(code, wrapped, format!(
+        Some(code) if crate::error::SERVED_DAMAGE.contains(&code) => String::from(CoreError::remote_refusal(code, wrapped, format!(
             "Ask the remote's operator to repair it where the warehouse is served from{}; nothing here can.",
             next_step.filter(|step| !step.is_empty()).map(|step| format!(" (\"{}\")", step)).unwrap_or_default()
         ))),
@@ -2592,8 +2592,7 @@ pub const MUTATION_RERUN_CONVERGES: &str =
 /// have wrapped it). Never a local failure, whatever its text quotes.
 pub fn is_transient_failure(message: &str) -> bool {
     // A remote's damaged records or store are mended by its operator, not by time.
-    if crate::util::tombstone_utils::is_damage(message) || crate::util::withholding::is_damage(message)
-        || names_unreadable_object(message) {
+    if names_served_damage(message) {
         return false;
     }
 
@@ -2613,10 +2612,11 @@ pub fn is_transient_failure(message: &str) -> bool {
     })
 }
 
-/// Whether `message` carries an `object_unreadable` refusal frame, at its start or wrapped inside
-/// it: an object a store cannot read, which a retry reads no better.
-fn names_unreadable_object(message: &str) -> bool {
-    crate::error::frames_code(message, RefusalCode::ObjectUnreadable)
+/// Whether `message` carries a frame of [`SERVED_DAMAGE`](crate::error::SERVED_DAMAGE), at its
+/// start or wrapped inside it: a record or object a store cannot read, which a retry reads no
+/// better.
+fn names_served_damage(message: &str) -> bool {
+    crate::error::SERVED_DAMAGE.iter().any(|code| crate::error::frames_code(message, *code))
 }
 
 /// How a transport-level failure (one that never got as far as an HTTP status) classifies, given
@@ -9688,6 +9688,34 @@ mod tests {
         }
         assert!(!is_transient_failure(&classified));
         assert!(!is_transient_failure(&format!("Could not adopt the remote @office: {}", classified)));
+    }
+
+    /// Each record a server reads before serving a root is the remote operator's to repair when it
+    /// does not read, like an unreadable object: never retried, and an empty step (nothing the
+    /// operator runs mends it) still names the operator alone. Mutation: list only the first
+    /// three codes in the operator arm → the others carry no word of whose it is → red.
+    #[test]
+    fn a_remotes_damaged_gate_record_is_the_operators_and_never_retried() {
+        for (code, step) in [
+            (RefusalCode::FetchScopeStray, ""),
+            (RefusalCode::SealedDamaged, "forklift heal"),
+            (RefusalCode::UnavailableDamaged, ""),
+            (RefusalCode::OriginDamaged, ""),
+        ] {
+            let classified = classify_remote_error(
+                503, "the negotiation", "A record does not read.".to_string(),
+                Some(code.as_str().to_string()), Some(step.to_string()),
+            );
+            match CoreError::from(classified.clone()) {
+                CoreError::Refusal { code: got, next_step, .. } => {
+                    assert_eq!(got, code);
+                    assert!(next_step.starts_with("Ask the remote's operator"), "{:?}: {}", code, next_step);
+                    assert_eq!(next_step.contains("forklift heal"), !step.is_empty(), "{:?}: {}", code, next_step);
+                }
+                other => panic!("expected a typed refusal, got {:?}", other),
+            }
+            assert!(!is_transient_failure(&classified), "{:?}", code);
+        }
     }
 
     /// A code a newer server sends that this client does not know degrades to a generic error

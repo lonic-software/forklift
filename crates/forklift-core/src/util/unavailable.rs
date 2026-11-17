@@ -119,25 +119,38 @@ pub fn read_unavailable() -> Result<UnavailableSet, String> {
         Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
     };
 
-    let entries = record_utils::from_bytes(&bytes, UNAVAILABLE_RECORD, UNAVAILABLE_VERSION).map_err(|e| format!(
-        "The record of content this warehouse cannot get \"{}\" {} {}",
-        path.to_string_lossy(), e.describe(), match written_by_newer(&bytes) {
-            true => "This version of Forklift never writes over it.",
-            false => "\"forklift heal\" rebuilds it from the entries that still read.",
-        }
-    ))?;
+    // Coded, so a server answers it as damage only its operator mends; heal is the next step only
+    // for a record `rebuild` mends, never one a newer version wrote.
+    let entries = record_utils::from_bytes(&bytes, UNAVAILABLE_RECORD, UNAVAILABLE_VERSION).map_err(|e| {
+        let newer = written_by_newer(&bytes);
+        String::from(crate::error::CoreError::refusal(
+            crate::error::RefusalCode::UnavailableDamaged,
+            format!(
+                "The record of content this warehouse cannot get \"{}\" {} {}",
+                path.to_string_lossy(), e.describe(), match newer {
+                    true => "This version of Forklift never writes over it.",
+                    false => "Heal rebuilds it from the entries that still read.",
+                }
+            ),
+            if newer { "" } else { "forklift heal" },
+        ))
+    })?;
 
     let mut set = UnavailableSet::default();
 
     for entry in entries {
         match parse_entry(&entry) {
             Some((hash, parsed)) => { set.entries.insert(hash, parsed); }
-            None => return Err(format!(
-                "The record of content this warehouse cannot get \"{}\" holds an entry that is not an \
-                object hash, a chunk-list digest and a statement: \"{}\". \"forklift heal\" rebuilds it \
-                from the entries that still read.",
-                path.to_string_lossy(), entry.escape_debug()
-            )),
+            None => return Err(crate::error::CoreError::refusal(
+                crate::error::RefusalCode::UnavailableDamaged,
+                format!(
+                    "The record of content this warehouse cannot get \"{}\" holds an entry that is not \
+                    an object hash, a chunk-list digest and a statement: \"{}\". Heal rebuilds it \
+                    from the entries that still read.",
+                    path.to_string_lossy(), entry.escape_debug()
+                ),
+                "forklift heal",
+            ).into()),
         }
     }
 

@@ -116,6 +116,7 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
+use crate::error::{CoreError, RefusalCode};
 use crate::enums::object_type::ObjectType;
 use crate::globals;
 use crate::util::{applied_redactions, audit_utils, bay_utils, file_utils, object_utils, office_utils, origin_move, origin_utils, pack_utils, record_utils, recovery_utils, sign_utils};
@@ -545,21 +546,31 @@ fn read_record(path: &Path) -> Result<Option<(Vec<u8>, ParsedSealed)>, String> {
     match std::fs::read(path) {
         Ok(bytes) => match parse_classified(&bytes) {
             Ok(parsed) => Ok(Some((bytes, parsed))),
-            Err(unparsed) => Err(format!(
-                "The sealed-object record \"{}\" {} {}",
-                path.to_string_lossy(),
-                unparsed.reason(),
-                match unparsed {
-                    Unparsed::Damaged { valid_len: 0, .. } => "Run \"forklift heal\", which rebuilds it empty: \
-                        every record in it is dropped, and an absent object it held by hash then reads as missing.",
-                    Unparsed::Damaged { .. } => "Run \"forklift heal\", which rebuilds it from the part before the \
-                        damage and reports what it drops.",
-                    Unparsed::OtherVersion(_) => "Use the version of Forklift that wrote it: this one never \
-                        writes over it.",
-                    Unparsed::Unreadable(_) => "Nothing rebuilds an intact frame this version cannot read: \
-                        restore the record from a good copy.",
-                }
-            )),
+            // Coded, so a server answers it as damage only its operator mends; heal is the next
+            // step only for the damage `rebuild` mends.
+            Err(unparsed) => Err(CoreError::refusal(
+                RefusalCode::SealedDamaged,
+                format!(
+                    "The sealed-object record \"{}\" {} {}",
+                    path.to_string_lossy(),
+                    unparsed.reason(),
+                    match &unparsed {
+                        Unparsed::Damaged { valid_len: 0, .. } => "Heal rebuilds it empty: \
+                            every record in it is dropped, and an absent object it held by hash then \
+                            reads as missing.",
+                        Unparsed::Damaged { .. } => "Heal rebuilds it from the part before the \
+                            damage and reports what it drops.",
+                        Unparsed::OtherVersion(_) => "Use the version of Forklift that wrote it: this one \
+                            never writes over it.",
+                        Unparsed::Unreadable(_) => "Nothing rebuilds an intact frame this version cannot \
+                            read: restore the record from a good copy.",
+                    }
+                ),
+                match &unparsed {
+                    Unparsed::Damaged { .. } => "forklift heal",
+                    Unparsed::OtherVersion(_) | Unparsed::Unreadable(_) => "",
+                },
+            ).into()),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!(
@@ -1854,7 +1865,7 @@ mod tests {
         damaged[at + 9] ^= 0xff;
         std::fs::write(sealed_path(), &damaged).unwrap();
         let err = read_sealed().unwrap_err();
-        assert!(err.contains("damaged") && err.contains("Run \"forklift heal\""), "{}", err);
+        assert!(err.contains("damaged") && err.contains("Heal rebuilds it"), "{}", err);
 
         assert_eq!(rebuild().unwrap(), Some(Rebuilt { at, dropped_bytes: damaged.len() - at }));
         assert_eq!(std::fs::read(sealed_path()).unwrap(), record(&[(SealOp::Record, A)]));

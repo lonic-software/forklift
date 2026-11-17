@@ -1400,7 +1400,7 @@ fn a_damaged_record_names_heal_and_heal_rebuilds_it() {
 
     let failed = warehouse.run(&["audit", "--full"]);
     let stderr = String::from_utf8_lossy(&failed.stderr);
-    assert!(!failed.status.success() && stderr.contains("damaged") && stderr.contains("Run \"forklift heal\""),
+    assert!(!failed.status.success() && stderr.contains("damaged") && stderr.contains("Next step: forklift heal"),
         "{}", stderr);
 
     let healed: serde_json::Value = serde_json::from_slice(&warehouse.run_ok(&["heal", "--json"]).stdout).unwrap();

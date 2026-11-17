@@ -193,6 +193,49 @@ found, so withhold anything you know of again before serving.
 **If a remote refused**, only its operator can repair it. Your warehouse is unchanged. Try again once
 they have.
 
+### `sealed_damaged` (exit 59)
+
+The record of objects a partial warehouse holds by hash alone (`.forklift/sealed`, those its remote
+holds and a read may fetch) does not parse. Nothing was changed. When the next step is `forklift
+heal`, run it: it rebuilds the record from the part before the damage and reports what it drops; an
+object it held by hash then reads as missing, and a fetch fills it. When the next step is empty, the
+record was written by another version of Forklift, or holds a whole frame this version cannot read:
+use the version that wrote it, or restore the record from a good copy.
+
+**If a remote refused**, only its operator can repair it. Your warehouse is unchanged. Try again
+once they have.
+
+### `unavailable_damaged` (exit 60)
+
+The record of content the warehouse cannot get (`.forklift/unavailable`, left out because a remote's
+host withholds it) does not parse. Nothing was changed. When the next step is `forklift heal`, run
+it: it rebuilds the record from the entries that still read. When the next step is empty, a newer
+version of Forklift wrote the record; use that version.
+
+**If a remote refused**, only its operator can repair it. Your warehouse is unchanged. Try again
+once they have.
+
+### `origin_damaged` (exit 61)
+
+The origin record of a partial warehouse (`.forklift/origin`, the remote it was cloned from) does
+not parse or holds anything but one URL, so which remote it may talk to cannot be told. Nothing was
+changed. Record it again with `forklift remote move <url>`, naming a server that holds this
+warehouse's content: the move checks that it does before it records it.
+
+**If a remote refused**, its warehouse is recorded as full but holds an origin record, so it may
+lack content its history names. Only its operator can mend that, by serving a full clone instead.
+Your warehouse is unchanged.
+
+### `fetch_scope_stray` (exit 62)
+
+A warehouse that is not sparse holds a fetch scope (`.forklift/config/fetch-scope`), which only a
+sparse warehouse is given, so it was put there by hand. Every read refuses rather than guess what
+the warehouse fetched. Nothing was changed. Delete the file: the warehouse is what its mode says
+without it.
+
+**If a remote refused**, only its operator can delete it. Your warehouse is unchanged. Try again
+once they have.
+
 ### `clone_incomplete` (exit 30)
 
 A clone stopped part-way, and the directory keeps what it fetched. Run the same `forklift clone`

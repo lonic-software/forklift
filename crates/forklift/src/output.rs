@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 47;
+pub const SCHEMA_VERSION: u32 = 48;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -598,6 +598,18 @@ error_codes! {
 
     /// Heal found objects the history reaches that cannot be read.
     ObjectsLost,
+
+    /// The sealed-object record does not parse.
+    SealedDamaged,
+
+    /// The record of content the warehouse cannot get does not parse.
+    UnavailableDamaged,
+
+    /// The origin record does not parse or holds anything but one URL.
+    OriginDamaged,
+
+    /// A warehouse that is not sparse holds a fetch scope.
+    FetchScopeStray,
 }
 
 impl ErrorCode {
@@ -661,6 +673,10 @@ impl ErrorCode {
             ErrorCode::WithheldDamaged => RefusalCode::WithheldDamaged.as_str(),
             ErrorCode::ObjectUnreadable => RefusalCode::ObjectUnreadable.as_str(),
             ErrorCode::ObjectsLost => RefusalCode::ObjectsLost.as_str(),
+            ErrorCode::SealedDamaged => RefusalCode::SealedDamaged.as_str(),
+            ErrorCode::UnavailableDamaged => RefusalCode::UnavailableDamaged.as_str(),
+            ErrorCode::OriginDamaged => RefusalCode::OriginDamaged.as_str(),
+            ErrorCode::FetchScopeStray => RefusalCode::FetchScopeStray.as_str(),
         }
     }
 
@@ -727,6 +743,10 @@ impl ErrorCode {
             ErrorCode::WithheldDamaged => 56,
             ErrorCode::ObjectUnreadable => 57,
             ErrorCode::ObjectsLost => 58,
+            ErrorCode::SealedDamaged => 59,
+            ErrorCode::UnavailableDamaged => 60,
+            ErrorCode::OriginDamaged => 61,
+            ErrorCode::FetchScopeStray => 62,
         }
     }
 
@@ -874,6 +894,14 @@ impl ErrorCode {
                 "An object could not be read: no file holds it, its loose file is corrupt, or the only pack index that names it is damaged or has lost its data file. Nothing was changed; heal rebuilds a damaged index from its data file, or names what is lost when history still reaches it",
             ErrorCode::ObjectsLost =>
                 "Heal found objects the history or staged content reaches that no file holds, that only a corrupt loose file holds, or that only a pack index it could not rebuild names, and that heal could not store again from the working tree. Nothing was claimed repaired for them; unload the paths it names when only staged content reaches them, or else restore them from a backup or a copy that holds them",
+            ErrorCode::SealedDamaged =>
+                "The sealed-object record, of the objects the warehouse holds by hash alone, does not parse. Nothing was changed; heal rebuilds it from the part before the damage, unless another version wrote it or a whole frame does not read",
+            ErrorCode::UnavailableDamaged =>
+                "The record of content the warehouse cannot get, left out because a remote's host withholds it, does not parse. Nothing was changed; heal rebuilds it from the entries that still read, unless a newer version wrote it",
+            ErrorCode::OriginDamaged =>
+                "The origin record, of the remote a partial warehouse was cloned from, does not parse or holds anything but one URL. Nothing was changed; remote move records it again, after checking that server holds what the warehouse lacks",
+            ErrorCode::FetchScopeStray =>
+                "A warehouse that is not sparse holds a fetch scope, which only a sparse warehouse is given, so what it fetched cannot be told. Nothing was changed; deleting the file ends it",
         }
     }
 
@@ -938,6 +966,10 @@ impl ErrorCode {
             RefusalCode::WithheldDamaged => ErrorCode::WithheldDamaged,
             RefusalCode::ObjectUnreadable => ErrorCode::ObjectUnreadable,
             RefusalCode::ObjectsLost => ErrorCode::ObjectsLost,
+            RefusalCode::SealedDamaged => ErrorCode::SealedDamaged,
+            RefusalCode::UnavailableDamaged => ErrorCode::UnavailableDamaged,
+            RefusalCode::OriginDamaged => ErrorCode::OriginDamaged,
+            RefusalCode::FetchScopeStray => ErrorCode::FetchScopeStray,
         }
     }
 }
@@ -1589,6 +1621,10 @@ mod tests {
             (RefusalCode::WithheldDamaged, "withheld_damaged", 56),
             (RefusalCode::ObjectUnreadable, "object_unreadable", 57),
             (RefusalCode::ObjectsLost, "objects_lost", 58),
+            (RefusalCode::SealedDamaged, "sealed_damaged", 59),
+            (RefusalCode::UnavailableDamaged, "unavailable_damaged", 60),
+            (RefusalCode::OriginDamaged, "origin_damaged", 61),
+            (RefusalCode::FetchScopeStray, "fetch_scope_stray", 62),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.
