@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# Prints the clippy warnings and errors that fall on lines this branch changed. CI's clippy is
+# report-only and the tree carries lint debt, so the whole report is too long to read; what a change
+# owes is no new finding on the lines it touched.
+#
+# usage: clippy-changed [--base REF] [LOG]
+#        clippy-changed --self-test
+#
+# LOG is the output of `cargo clippy ... --message-format=short` (bin/full-suite keeps one as
+# clippy.log); without it, this runs `cargo clippy --workspace --all-targets --message-format=short`
+# itself. Changed lines are those added or modified since the merge base with REF (default
+# origin/main), working-tree edits included; every line of an untracked file counts as changed.
+#
+# Exits 0 when no finding is on a changed line, 1 when any is (each printed), 2 on a usage error or
+# when the log is of a clippy run that did not get through the workspace (cut off, timed out, or
+# stopped by a compile error outside the changed lines): such a run is never reported as clean.
+# That is read from cargo's closing "Finished" line, so a cargo config with term.quiet set reads
+# every run as unfinished.
+#
+# One lint is left out: doc_overindented_list_items, which fires on the hand-formatted doc comments'
+# list continuations (Forklift is formatted by hand; see docs/guide/contributing.md, "Formatting").
+set -euo pipefail
+
+IGNORE_RE='doc list item overindented'
+
+# filter BASE LOG: print the findings on changed lines and a count; return 1 if there are any.
+filter() {
+    local base=$1 log=$2 changed untracked st=0
+    changed="$(mktemp)"; untracked="$(mktemp)"
+    # Prefixes pinned: a diff.noprefix or diff.mnemonicPrefix setting would otherwise match no
+    # header below, and every finding would read as unchanged.
+    git -c diff.noprefix=false diff -U0 --no-color --no-ext-diff --src-prefix=a/ --dst-prefix=b/ "$base" -- > "$changed"
+    git ls-files --others --exclude-standard > "$untracked"
+    awk -v changed="$changed" -v untracked="$untracked" -v ignore="$IGNORE_RE" '
+        FILENAME == untracked { whole[$0] = 1; next }
+        FILENAME == changed {
+            # Inside a hunk, its header'"'"'s counts say how many "-" and "+" lines are left: a
+            # content line never reads as a header, whatever it begins with.
+            if (old > 0 || new > 0) {
+                if ($0 ~ /^-/) old--; else if ($0 ~ /^\+/) new--
+                next
+            }
+            if ($0 ~ /^\+\+\+ /) { cur = ($0 ~ /^\+\+\+ b\//) ? substr($0, 7) : ""; next }
+            if (match($0, /^@@ -[0-9]+(,[0-9]+)? \+[0-9]+(,[0-9]+)? @@/)) {
+                h = substr($0, RSTART, RLENGTH)
+                sub(/^@@ -/, "", h); sub(/ @@$/, "", h)
+                split(h, sides, " \\+")
+                n = split(sides[1], o, ","); old = (n > 1) ? o[2] + 0 : 1
+                n = split(sides[2], p, ","); new = (n > 1) ? p[2] + 0 : 1
+                start = p[1] + 0
+                if (cur != "") for (i = start; i < start + new; i++) line[cur SUBSEP i] = 1
+            }
+            next
+        }
+        $0 ~ /^[^ :]+:[0-9]+:[0-9]+: (warning|error)/ {
+            if (ignore != "" && index($0, ignore)) next
+            split($0, f, ":")
+            path = f[1]; sub(/^\.\//, "", path)
+            if ((path in whole) || ((path SUBSEP (f[2] + 0)) in line)) { print; hits++ }
+        }
+        END { printf "clippy-changed: %d finding(s) on changed lines\n", hits; exit (hits > 0) }
+    ' "$untracked" "$changed" "$log" || st=$?
+    rm -f "$changed" "$untracked"
+    return "$st"
+}
+
+# judge BASE LOG: filter, then refuse a log of a clippy run that never got through the workspace. A
+# finding on a changed line still counts (exit 1) even when it is what stopped the build; a run
+# stopped elsewhere, timed out, or never started checked nothing, so it is never 0 findings.
+judge() {
+    local st=0
+    filter "$1" "$2" || st=$?
+    if [ "$st" -eq 0 ] && ! grep -q '^ *Finished ' "$2"; then
+        if grep -q '^error: could not compile' "$2"; then
+            echo "clippy-changed: clippy stopped at a compile error outside the changed lines:" >&2
+            grep -m1 -E '^[^ :]+:[0-9]+:[0-9]+: error' "$2" >&2 || true
+        else
+            echo "clippy-changed: the clippy run in $2 did not finish; its last lines:" >&2
+            tail -5 "$2" >&2
+        fi
+        return 2
+    fi
+    return "$st"
+}
+
+self_test() {
+    local tmp fails=0 out st
+    tmp="$(mktemp -d)"
+    check() { # name want-exit want-text [unwanted-text]
+        if [ "$st" -eq "$2" ] && printf '%s' "$out" | grep -q -- "$3" \
+            && { [ -z "${4:-}" ] || ! printf '%s' "$out" | grep -q -- "$4"; }; then
+            echo "ok   $1"
+        else
+            echo "FAIL $1 (exit $st, want $2; want: $3${4:+; not: $4})"; printf '%s\n' "$out" | sed 's/^/     /'
+            fails=$((fails + 1))
+        fi
+    }
+    (
+        cd "$tmp"
+        git init -q . && git config user.email t@example.invalid && git config user.name t
+        # Diff settings that change the header prefixes: every case below runs under them.
+        git config diff.mnemonicPrefix true && git config diff.noprefix true
+        mkdir -p src && printf 'a\nb\nc\nd\ne\n' > src/lib.rs && printf 'x\ny\n' > src/gone.rs
+        printf '1\n-- old\n2\n3\n4\n5\n6\n7\n8\n' > src/doc.md && printf 'k\n' > src/kept.rs
+        git add . && git commit -qm base && git branch base
+        # line 2 modified, a line inserted after 4 (new line 5), gone.rs loses a line
+        printf 'a\nB\nc\nd\nnew\ne\n' > src/lib.rs && printf 'x\n' > src/gone.rs
+        # An added line that begins "++ ", then a later hunk in the same file (new line 8).
+        printf '1\n++ untracked/src/kept.rs\n2\n3\n4\n5\n6\nlate\n7\n8\n' > src/doc.md
+        git commit -qam change
+        printf 'fresh\n' > src/new.rs
+    )
+    cat > "$tmp/clippy.log" <<'EOF'
+src/lib.rs:2:1: warning: on a modified line
+src/lib.rs:3:1: warning: on an unchanged line
+src/lib.rs:5:1: error: on an inserted line
+src/lib.rs:6:1: warning: on a line that only moved
+src/lib.rs:2:5: warning: doc list item overindented
+src/gone.rs:1:1: warning: beside a deletion
+src/new.rs:1:1: warning: in an untracked file
+src/doc.md:8:1: warning: after a plus-plus line
+src/kept.rs:1:1: warning: in a file a content line names
+    Checking forklift v0.1.0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.00s
+EOF
+    set +e
+    out=$(cd "$tmp" && judge base clippy.log); st=$?
+    set -e
+    check "a finding on a modified line is printed" 1 "on a modified line"
+    check "a finding on an inserted line is printed" 1 "on an inserted line"
+    check "a finding in an untracked file is printed" 1 "in an untracked file"
+    check "a hunk after a '-- '/'++ ' pair is still read" 1 "after a plus-plus line"
+    check "a content line is never an untracked marker" 1 "4 finding(s)" "a content line names"
+    check "an unchanged line is not" 1 "4 finding(s)" "on an unchanged line"
+    check "a line that only moved is not" 1 "4 finding(s)" "only moved"
+    check "a deletion marks no line" 1 "4 finding(s)" "beside a deletion"
+    check "the ignored lint is left out" 1 "4 finding(s)" "overindented"
+
+    printf 'src/lib.rs:3:1: warning: on an unchanged line\n    Finished `dev`\n' > "$tmp/clean.log"
+    set +e
+    out=$(cd "$tmp" && judge base clean.log); st=$?
+    set -e
+    check "no finding on a changed line exits 0" 0 "0 finding(s)"
+
+    printf 'src/lib.rs:3:1: warning: on an unchanged line\n    Checking forklift\n' > "$tmp/cut.log"
+    set +e
+    out=$(cd "$tmp" && judge base cut.log 2>&1); st=$?
+    set -e
+    check "a run that did not finish is not 0 findings" 2 "did not finish"
+
+    printf 'src/lib.rs:3:1: error: unchanged\nerror: could not compile `x`\n' > "$tmp/stop.log"
+    set +e
+    out=$(cd "$tmp" && judge base stop.log 2>&1); st=$?
+    set -e
+    check "a compile error outside the change is not 0 findings" 2 "outside the changed lines"
+
+    printf 'src/lib.rs:2:1: error: on a changed line\nerror: could not compile `x`\n' > "$tmp/own.log"
+    set +e
+    out=$(cd "$tmp" && judge base own.log 2>&1); st=$?
+    set -e
+    check "a compile error on a changed line is a finding" 1 "on a changed line"
+
+    rm -rf "$tmp"
+    if [ "$fails" -eq 0 ]; then echo "self-test: all passed"; return 0; fi
+    echo "self-test: $fails failed"; return 1
+}
+
+base_ref=origin/main
+log=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --base) base_ref=${2:?--base needs a ref}; shift 2 ;;
+        --self-test) self_test; exit $? ;;
+        -*) echo "usage: clippy-changed [--base REF] [LOG] | --self-test" >&2; exit 2 ;;
+        *) log=$1; shift ;;
+    esac
+done
+
+[ -z "$log" ] || [ -f "$log" ] || { echo "clippy-changed: no such log: $log" >&2; exit 2; }
+if [ -n "$log" ]; then log="$(cd "$(dirname "$log")" && pwd)/$(basename "$log")"; fi
+cd "$(dirname "$0")/.."
+base="$(git merge-base "$base_ref" HEAD)" || { echo "clippy-changed: no merge base with $base_ref" >&2; exit 2; }
+if [ -z "$log" ]; then
+    log="$(mktemp)"
+    trap 'rm -f "$log"' EXIT
+    # Findings make clippy exit non-zero only when they are errors, so its status cannot tell a
+    # finding from a run that never checked anything; the closing "Finished" line can.
+    # Bounded with its whole process group, so no clippy-driver outlives the bound holding target/.
+    perl -e '
+        my $t = shift; my $pid = fork; defined $pid or exit 126;
+        if ($pid == 0) { setpgrp(0, 0); exec @ARGV or exit 127 }
+        setpgrp($pid, $pid);
+        $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; exit 142 };
+        $SIG{$_} = sub { kill "TERM", -$pid; exit 143 } for qw(INT TERM HUP);
+        alarm $t; waitpid $pid, 0; exit($? >> 8)' 1800 cargo clippy --workspace --all-targets --message-format=short 2> "$log" > /dev/null &
+    # A signal sent to this script alone (a parent's bound) is handed to the watchdog, which ends
+    # the whole clippy group, before this script dies of it.
+    watchdog=$!
+    for sig in INT TERM HUP; do
+        trap "kill -s $sig $watchdog 2>/dev/null; wait $watchdog 2>/dev/null; rm -f \"\$log\"; trap - $sig; kill -s $sig \$\$" "$sig"
+    done
+    wait "$watchdog" || true
+    trap - INT TERM HUP
+fi
+judge "$base" "$log"
