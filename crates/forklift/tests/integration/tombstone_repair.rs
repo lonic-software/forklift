@@ -428,6 +428,13 @@ fn a_flipped_head_in_the_list_is_refused_and_its_repair_says_a_kept_entry_may_be
     assert!(report.contains("Kept 1 entry") && report.contains("did not match its digest"), "{}", report);
     let listed = area.server_ok(&root, &["tombstone", "list"]);
     assert!(listed.contains(&side), "the real head comes back, kept with no name: {}", listed);
+
+    // A list from before the digest has none to fail, so nothing says an entry was altered.
+    // Revert: take every damaged list for one that failed its digest → a false alarm → red.
+    let old = forklift_core::util::record_utils::to_bytes("tombstones", 2, [format!("{} side", side)]);
+    std::fs::write(list_path(&root), old).unwrap();
+    let report = area.server_ok(&root, &["tombstone", "repair"]);
+    assert!(report.contains("Kept 1 entry") && !report.contains("did not match its digest"), "{}", report);
 }
 
 /// Revert: let a rebuild's write fail into heal's list of refused refs → exit 53, the damage
