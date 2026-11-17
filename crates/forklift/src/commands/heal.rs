@@ -315,7 +315,15 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let marker = operation_utils::read().ok().flatten();
     let partial_park = marker.as_ref()
         .filter(|marker| marker.kind == OperationKind::Park && !marker.pathspec.is_empty());
-    if partial_park.is_some() && inventory_heal::damaged() {
+    let damaged = |refs_rebuilt: &[ref_heal::Rebuilt], refs_removed: &[ref_heal::Removed], ref_notes: &[String]| {
+        inventory_heal::damaged().map_err(|error| changed_after(error, refs_rebuilt, refs_removed, ref_notes))
+    };
+    // A step that fails after a written rebuild says so beside every other repair.
+    let with_rebuilt = |error: String, rebuilt: &Option<InventoryRebuilt>| match rebuilt {
+        Some(rebuilt) => forklift_core::error::append_to_message(error, &rebuilt.sentence()),
+        None => error,
+    };
+    if partial_park.is_some() && damaged(&refs_rebuilt, &refs_removed, &ref_notes)? {
         let (view, written) = rebuild_inventory(partial_park, accept_inventory_loss)
             .map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
         *(if written { &mut inventory_rebuilt } else { &mut inventory_held }) = Some(view);
@@ -332,12 +340,12 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let recovered = match waits.is_some() || held_park {
         true => Ok(None),
         false => operation_utils::recover(),
-    }.map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+    }.map_err(|error| with_rebuilt(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), &inventory_rebuilt))?;
 
-    if waits.is_none() && !held_park && inventory_heal::damaged() {
+    if waits.is_none() && !held_park && damaged(&refs_rebuilt, &refs_removed, &ref_notes)? {
         let standing = operation_utils::read().ok().flatten();
         let (view, written) = rebuild_inventory(standing.as_ref(), accept_inventory_loss)
-            .map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+            .map_err(|error| with_rebuilt(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), &inventory_rebuilt))?;
         *(if written { &mut inventory_rebuilt } else { &mut inventory_held }) = Some(view);
     }
     let operation = recovered.map(|recovery| OperationRecovery {
@@ -728,6 +736,18 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                 lines.push(message);
             }
         }
+        // The refusals the run would end on otherwise still stand, and are named after the rebuild.
+        let standing = match (&report.objects_lost, report.refs_refused.is_empty()) {
+            (Some(_), _) => remote_refused.as_ref(),
+            (None, true) => origin_refused.as_ref(),
+            (None, false) => None,
+        };
+        if let Some(CoreError::Refusal { message, .. }) = standing {
+            lines.push(message.clone());
+        }
+        if report.objects_lost.is_some() && (outcome.index_rebuild_skipped || origin_unanswered) {
+            lines.push("The check for lost objects may be short; a heal after the rebuild checks again.".to_string());
+        }
         return Err(CoreError::refusal_with_details(
             RefusalCode::InventoryDamaged,
             lines.join("\n"),
@@ -798,8 +818,9 @@ pub(crate) struct InventoryRebuilt {
     /// stands on or a tree an interrupted operation names, with their staging in the shard store.
     registered: usize,
 
-    /// How many shards of staging in the store match none of those folders. Written, the rebuild
-    /// leaves them unregistered, and their staging is lost.
+    /// How many shards in the store match none of those folders or their ancestors. Written, the
+    /// rebuild leaves them unregistered, and whatever staging they hold is lost (a shard a removal
+    /// left behind holds none).
     dropped: usize,
 
     /// Trees it proposed folders from and could not read: the folders only they name are left out.
@@ -828,7 +849,7 @@ impl InventoryRebuilt {
         );
         if self.dropped > 0 {
             sentence.push_str(&format!(
-                " {} shard(s) of staging matched no folder heal could find and are no longer registered, so that staging is lost.",
+                 " {} shard(s) matched no folder heal could find and are no longer registered, so whatever staging they hold is lost (a shard a removal left behind holds none).",
                 self.dropped
             ));
         }
@@ -863,7 +884,7 @@ impl InventoryRebuilt {
         ];
         if self.dropped > 0 {
             lines.push(format!(
-                "  {} shard(s) of staging match no folder heal could find; rebuilt without them, that staging is lost.",
+                "  {} shard(s) match no folder heal could find; rebuilt without them, whatever staging they hold is lost (a shard a removal left behind holds none).",
                 self.dropped
             ));
         }

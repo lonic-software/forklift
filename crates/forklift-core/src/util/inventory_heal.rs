@@ -28,14 +28,22 @@ use crate::util::sealed_utils::{self, At, Held};
 use crate::util::{file_utils, inventory_utils, object_utils, pallet_utils, record_utils};
 
 /// Whether the inventory metadata reads as damaged (`inventory_damaged`): what makes heal rebuild
-/// it. Any other failure to read it is not this step's to mend.
-pub fn damaged() -> bool {
+/// it. Any other failure to read it is not this step's to mend, but a metadata path that is not a
+/// file is still refused here: its message sends the user to heal once it is removed, so a heal run
+/// before that names it rather than reporting nothing to heal.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether the metadata reads as damaged.
+/// * `Err(String)` - If the metadata path is a link, a folder or anything else but a file.
+pub fn damaged() -> Result<bool, String> {
     match file_utils::retrieve_inventory_metadata_or_none() {
-        Ok(_) => false,
-        Err(error) => matches!(
+        Ok(_) => Ok(false),
+        Err(error) if std::fs::symlink_metadata(file_utils::get_inventory_metadata_path())
+            .is_ok_and(|meta| !meta.is_file()) => Err(error),
+        Err(error) => Ok(matches!(
             CoreError::from(error),
             CoreError::Refusal { code: RefusalCode::InventoryDamaged, .. }
-        ),
+        )),
     }
 }
 
@@ -43,7 +51,8 @@ pub fn damaged() -> bool {
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct TreeUnread {
-    /// The tree's hash.
+    /// The tree's hash, or the hash of the parcel that names it when that parcel did not read (the
+    /// reason then says so).
     pub tree: String,
 
     /// What named it: `base` (the bay position's base parcel), or the standing operation's
@@ -109,7 +118,11 @@ pub fn plan(marker: Option<&Operation>) -> Result<Rebuild, String> {
     let mut trees: Vec<Result<(String, &str), TreeUnread>> = Vec::new();
     let parcel_tree = |parcel: &str, from: &'static str| object_utils::load_parcel(parcel)
         .map(|parcel| (parcel.tree_hash, from))
-        .map_err(|reason| TreeUnread { tree: parcel.to_string(), from: from.to_string(), reason: plain(reason) });
+        .map_err(|reason| TreeUnread {
+            tree: parcel.to_string(),
+            from: from.to_string(),
+            reason: format!("the parcel that names it did not read: {}", plain(reason)),
+        });
 
     // The position heal runs first; a position it left unread names no base.
     if let Ok(pallet_utils::BayPosition { base: Some(base), .. }) = pallet_utils::read_position() {
@@ -158,7 +171,11 @@ pub fn plan(marker: Option<&Operation>) -> Result<Rebuild, String> {
     let keys: BTreeSet<String> = candidates.into_iter()
         .filter(|key| shards.contains(&file_utils::shard_address(key)))
         .collect();
-    let matched: BTreeSet<(String, String)> = keys.iter().map(|key| file_utils::shard_address(key)).collect();
+    // What the write registers, ancestors included: an ancestor no candidate named still keeps its
+    // shard once registered, so that shard is matched.
+    let matched: BTreeSet<(String, String)> = inventory_utils::close_under_ancestors(&keys).iter()
+        .map(|key| file_utils::shard_address(key))
+        .collect();
 
     Ok(Rebuild {
         unmatched: shards.difference(&matched).count(),

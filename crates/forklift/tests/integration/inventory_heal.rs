@@ -217,6 +217,49 @@ fn a_deleted_file_over_shards_is_refused_and_heal_rebuilds_it() {
     assert_eq!(std::fs::read(area.metadata()).unwrap(), sound);
 }
 
+/// The folder `d` is staged and then gone from disk, and the damaged file still names only `d/e/f`.
+/// The write registers `d/e` as its ancestor, so `d/e`'s shard is matched, not staging lost.
+/// Revert: match the shards against the found folders alone, not the ancestors the write adds →
+/// `d/e`'s shard is unmatched and heal refuses → red.
+#[test]
+fn an_ancestor_only_the_write_registers_keeps_its_shard_matched() {
+    let area = Area::new("ancestor");
+    std::fs::create_dir_all(area.root().join("d/e/f")).unwrap();
+    area.write("d/e/g.txt", "5\n");
+    area.write("d/e/f/h.txt", "6\n");
+    area.run_ok(&["load", "d"]);
+    let sound = std::fs::read_to_string(area.metadata()).unwrap();
+    assert!(sound.lines().any(|line| line == "d/e"), "{}", sound);
+
+    forklift_core::util::file_utils::remove_dir_all(area.root().join("d")).unwrap();
+    // The digest no longer matches once two lines are gone: the file reads as damaged.
+    let named: String = sound.lines()
+        .filter(|line| *line != "d" && *line != "d/e")
+        .map(|line| format!("{}\n", line))
+        .collect();
+    std::fs::write(area.metadata(), named).unwrap();
+    inventory_damaged(&area.run(&["--json", "status"]));
+
+    let data = area.healed(&[]);
+    assert_eq!(data["inventory_rebuilt"]["dropped"], 0, "{}", data);
+    assert_eq!(std::fs::read_to_string(area.metadata()).unwrap(), sound);
+}
+
+/// A folder where the metadata file belongs is refused by every reader, whose message sends the
+/// user to heal once it is removed; heal names it too rather than finding nothing to heal. Revert:
+/// read anything but damage as nothing for heal to do → heal succeeds → red.
+#[test]
+fn a_folder_in_place_of_the_metadata_file_is_named_by_heal() {
+    let area = Area::new("not-a-file");
+    forklift_core::util::file_utils::remove_file(area.metadata()).unwrap();
+    std::fs::create_dir(area.metadata()).unwrap();
+
+    let output = area.run(&["--json", "heal"]);
+    assert!(!output.status.success(), "{}", text(&output.stdout));
+    let shown = format!("{}{}", text(&output.stdout), text(&output.stderr));
+    assert!(shown.contains("is not a file"), "{}", shown);
+}
+
 /// The folder `a/b` is gone from the working tree with its removal unstaged, so only the base's
 /// tree still names it. Revert: drop the base's tree from the candidates → its shard is unmatched
 /// and heal refuses → red.

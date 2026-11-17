@@ -2314,7 +2314,7 @@ impl Drop for MetadataWriteFaultGuard {
 ///
 /// # Returns
 /// * `BTreeSet<String>` - The entries plus the entries of all their ancestors.
-fn close_under_ancestors(metadata: &BTreeSet<String>) -> BTreeSet<String> {
+pub(crate) fn close_under_ancestors(metadata: &BTreeSet<String>) -> BTreeSet<String> {
     let mut closed = metadata.clone();
 
     for entry in metadata {
