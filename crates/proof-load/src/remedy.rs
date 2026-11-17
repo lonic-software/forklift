@@ -293,11 +293,11 @@ mod tests {
     #[test]
     fn an_operator_remedy_binds_only_its_warehouse() {
         let arguments: Vec<String> = ["tombstone", "repair", "--root", WAREHOUSE].map(String::from).to_vec();
-        assert_eq!(bind_operator(&arguments, Path::new("/s/0001-lane/host")),
+        assert_eq!(bind_operator_when(&arguments, Path::new("/s/0001-lane/host"), true),
             Some(["tombstone", "repair", "--root", "/s/0001-lane/host"].map(String::from).to_vec()));
-        assert_eq!(bind_operator(&["tombstone".to_string(), "repair".to_string()], Path::new("/s/host")), None);
+        assert_eq!(bind_operator_when(&["tombstone".to_string(), "repair".to_string()], Path::new("/s/host"), true), None);
         assert_eq!(bind_operator_when(&arguments, Path::new("/s/host"), false), None, "a server that cannot be asked to stop is not operated on");
-        assert!(bind_operator_when(&arguments, Path::new("/s/host"), true).is_some());
+        assert_eq!(bind_operator(&arguments, Path::new("/s/host")), bind_operator_when(&arguments, Path::new("/s/host"), cfg!(unix)), "only Unix can ask a server to stop");
     }
 
     /// A quoted path that no `remove` precedes is not a remedy.
