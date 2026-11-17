@@ -7579,7 +7579,8 @@ mod tests {
         let mut entry = std::fs::read(forklift("unavailable-entry").join("unavailable")).unwrap();
         entry.extend(b"not an entry\n");
         std::fs::write(forklift("unavailable-entry").join("unavailable"), entry).unwrap();
-        std::fs::write(forklift("unavailable-newer").join("unavailable"), b"/forklift-unavailable 999\n").unwrap();
+        std::fs::write(forklift("unavailable-newer").join("unavailable"),
+                       forklift_core::util::record_utils::with_digest(b"/forklift-unavailable 999\n".to_vec())).unwrap();
         std::fs::write(forklift("origin").join("origin"), b"not a record").unwrap();
 
         for (id, what, code, heal) in cases {

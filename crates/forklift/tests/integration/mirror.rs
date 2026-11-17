@@ -270,9 +270,10 @@ fn outcome<'a>(report: &'a serde_json::Value, pallet: &str) -> &'a serde_json::V
 
 /// The entries of a roots record, pallet to parcel.
 fn record_entries(path: &Path) -> Vec<(String, String)> {
-    let text = std::fs::read_to_string(path).unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    let text = std::str::from_utf8(forklift_core::util::record_utils::without_digest_line(&bytes)).unwrap();
     let mut lines = text.lines();
-    assert_eq!(lines.next(), Some("/forklift-mirror-roots 1"), "{}", text);
+    assert_eq!(lines.next(), Some("/forklift-mirror-roots 2"), "{}", text);
 
     lines.map(|line| {
         let (pallet, parcel) = line.split_once(' ').unwrap();

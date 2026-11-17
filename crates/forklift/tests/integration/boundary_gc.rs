@@ -977,8 +977,8 @@ fn a_pick_whose_source_was_lost_refuses_naming_the_pick_and_the_abort_works() {
 /// clears, and names the tag in a note.
 ///
 /// The taint is written directly rather than driven through a command because a torn taint is by
-/// definition crash debris: `parse_taint_content` calls a file torn when it lacks the `END\n`
-/// suffix, which is exactly what a crash mid-write leaves. Everything else here is a shipped
+/// definition crash debris: `parse_taint_content` calls a file torn when it does not match its
+/// digest, which is exactly what a crash mid-write leaves. Everything else here is a shipped
 /// command.
 ///
 /// Mutation: queue tag subjects at `AbsencePolicy::Report` in `walk_closure_for` → the rescan

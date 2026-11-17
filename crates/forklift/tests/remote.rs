@@ -2387,7 +2387,7 @@ fn a_haul_merge_lifts_with_its_target() {
     let before = remote_pallet_head(&server, "@haul");
     let position = area.read_file("a/.forklift/position");
     let header = position.lines().next().unwrap();
-    std::fs::write(area.path("a/.forklift/position"), format!("{}\nfresh\n\n", header)).unwrap();
+    std::fs::write(area.path("a/.forklift/position"), forklift_core::util::record_utils::with_digest(format!("{}\nfresh\n\n", header).into_bytes())).unwrap();
 
     let unstacked = area.forklift("a", &["lift"]);
     assert!(!unstacked.status.success());
@@ -2920,9 +2920,11 @@ fn a_digest_valid_bundle_that_fails_import_keeps_nothing() {
         if kept == Some(bad.len()) {
             // Whole but not yet imported, as a crash between the last byte and the import leaves it.
             std::fs::write(area.path(&format!("{}/.forklift/bundles/partial", name)), &bad).unwrap();
-            let record = area.read_file(&format!("{}/.forklift/franchise", name))
+            let path = area.path(&format!("{}/.forklift/franchise", name));
+            let bytes = std::fs::read(&path).unwrap();
+            let record = std::str::from_utf8(forklift_core::util::record_utils::without_digest_line(&bytes)).unwrap()
                 .replace(&format!("bundle.length={}", cut), &format!("bundle.length={}", bad.len()));
-            area.write_file(&format!("{}/.forklift/franchise", name), &record);
+            std::fs::write(&path, forklift_core::util::record_utils::with_digest(record.into_bytes())).unwrap();
         }
 
         let failed = franchise_checkpointing(&area, &stub.url, name);
@@ -3616,9 +3618,11 @@ fn a_sparse_warehouse_adopts_in_full_a_meta_parcel_its_user_head_descends_from()
     // Stacked for real, so signed: a pallet starting at the meta head, with the bay put on it by
     // hand, since nothing would shift to a tree holding the metadata folder.
     let held = user_head(&area, "a", "main");
-    let position = std::fs::read_to_string(area.path("a/.forklift/position")).unwrap();
+    let bytes = std::fs::read(area.path("a/.forklift/position")).unwrap();
+    let position = std::str::from_utf8(forklift_core::util::record_utils::without_digest_line(&bytes)).unwrap();
     area.write_file("a/.forklift/pallets/descends", &format!("{}\n", newer));
-    area.write_file("a/.forklift/position", &position.replacen("main", "descends", 1).replace(&held, &newer));
+    let moved = position.replacen("main", "descends", 1).replace(&held, &newer);
+    std::fs::write(area.path("a/.forklift/position"), forklift_core::util::record_utils::with_digest(moved.into_bytes())).unwrap();
     area.write_file("a/src/code.txt", "v2\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "-m", "on a meta head"]));
@@ -6678,7 +6682,7 @@ fn an_unscoped_bay_in_a_sparse_warehouse_is_refused_up_front() {
     assert!(message.contains("Name paths within the fetch scope (src/api)") && !message.contains("plain bay"), "{}", message);
 
     assert_success(&area.forklift("sparse", &["bay", "add", "plain", bay_dir.to_str().unwrap(), "--scope", "src/api"]));
-    assert_eq!(area.read_file("sparse/.forklift/bays/plain/scope"), "/forklift-scope 4\nsrc/api\n");
+    assert_eq!(area.read_file("sparse/.forklift/bays/plain/scope").lines().take(2).collect::<Vec<_>>(), ["/forklift-scope 5", "src/api"]);
 }
 
 /// A `--cache` clone is a partial warehouse, as a sparse one is: it skips the bundle, writes
@@ -9450,7 +9454,7 @@ fn scope_prune_asks_and_lifts_a_pallet_named_with_a_slash() {
     // holds answer.
     let record = area.path("sparse/.forklift/held-heads");
     let header = std::fs::read_to_string(&record).unwrap().lines().next().unwrap().to_string();
-    std::fs::write(&record, format!("{}\n{} feature/x\n", header, base)).unwrap();
+    std::fs::write(&record, forklift_core::util::record_utils::with_digest(format!("{}\n{} feature/x\n", header, base).into_bytes())).unwrap();
     assert_eq!(held_heads(&area, "sparse"), vec![format!("{} feature/x", base)]);
     assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
 
@@ -9516,7 +9520,7 @@ fn a_slash_named_pallet_crosses(proxy: SlashProxy, name: &str) {
     // holds answer.
     let record = area.path("sparse/.forklift/held-heads");
     let header = std::fs::read_to_string(&record).unwrap().lines().next().unwrap().to_string();
-    std::fs::write(&record, format!("{}\n{} feature/x\n", header, base)).unwrap();
+    std::fs::write(&record, forklift_core::util::record_utils::with_digest(format!("{}\n{} feature/x\n", header, base).into_bytes())).unwrap();
     assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
     let pruned = area.forklift("sparse", &["--json", "scope", "prune", "--confirm", "docs"]);
     assert_success(&pruned);
@@ -9559,9 +9563,10 @@ fn scope_prune_frees_nothing_on_a_forged_held_head() {
     let v2_blob = path_object_hash(&area, "sparse", &head, "docs/guide.md");
 
     let record = area.path("sparse/.forklift/held-heads");
-    let mut text = std::fs::read_to_string(&record).unwrap();
+    let bytes = std::fs::read(&record).unwrap();
+    let mut text = String::from_utf8(forklift_core::util::record_utils::without_digest_line(&bytes).to_vec()).unwrap();
     text.push_str(&format!("{} main\n", head));
-    std::fs::write(&record, text).unwrap();
+    std::fs::write(&record, forklift_core::util::record_utils::with_digest(text.into_bytes())).unwrap();
     assert_eq!(held_heads(&area, "sparse").last(), Some(&format!("{} main", head)));
 
     assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
@@ -9690,10 +9695,10 @@ fn scope_prune_frees_nothing_beyond_the_current_heads_when_the_remote_cannot_ans
 }
 
 /// The entries of warehouse `name`'s held-heads record, as `<head> <pallet>` lines (the header
-/// skipped); none when the record is absent.
+/// and the digest line skipped); none when the record is absent.
 fn held_heads(area: &TestArea, name: &str) -> Vec<String> {
     match std::fs::read_to_string(area.path(&format!("{}/.forklift/held-heads", name))) {
-        Ok(text) => text.lines().skip(1).map(str::to_string).collect(),
+        Ok(text) => text.lines().skip(1).filter(|line| !line.starts_with("digest ")).map(str::to_string).collect(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => panic!("the held-heads record could not be read: {}", e),
     }
@@ -10446,8 +10451,8 @@ fn plant_taint(area: &TestArea, dir: &str, paths: &[&str]) {
     std::fs::write(dir_path.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(paths)).unwrap();
 }
 
-/// Every regular taint file's recorded lines, unioned (dropping the header and the `END`
-/// terminator) — used to inspect exactly what a recovery attempt left standing. The paths these
+/// Every regular taint file's recorded lines, unioned (dropping the header and the digest line)
+/// — used to inspect exactly what a recovery attempt left standing. The paths these
 /// tests plant are plain object paths, which escaping leaves as they are.
 fn recorded_taint_paths(area: &TestArea, dir: &str) -> Vec<String> {
     let dir_path = taint_dir_path(area, dir);
@@ -10463,7 +10468,7 @@ fn recorded_taint_paths(area: &TestArea, dir: &str) -> Vec<String> {
         }
         let content = std::fs::read_to_string(entry.path()).unwrap();
         paths.extend(content.lines()
-            .filter(|line| *line != "END" && !line.starts_with("/forklift-taint "))
+            .filter(|line| !line.starts_with("digest ") && !line.starts_with("/forklift-taint "))
             .map(|line| line.to_string()));
     }
     paths
@@ -11826,7 +11831,7 @@ fn a_lift_that_fails_after_re_signing_names_the_cells_that_landed() {
             // The clone's position names a pallet with nothing stacked.
             let position = area.read_file("b/.forklift/position");
             let header = position.lines().next().unwrap().to_string();
-            std::fs::write(area.path("b/.forklift/position"), format!("{}\nfresh\n\n", header)).unwrap();
+            std::fs::write(area.path("b/.forklift/position"), forklift_core::util::record_utils::with_digest(format!("{}\nfresh\n\n", header).into_bytes())).unwrap();
         }
 
         let args: &[&str] = if json { &["--json", "lift"] } else { &["lift"] };
@@ -12722,7 +12727,7 @@ fn a_named_lower_does_not_create_a_pallet_a_bay_stands_on_unborn() {
     // position is written by hand.
     let position = area.read_file("b/.forklift/bays/w/position");
     let header = position.lines().next().unwrap();
-    std::fs::write(area.path("b/.forklift/bays/w/position"), format!("{}\nfeat\n\n", header)).unwrap();
+    std::fs::write(area.path("b/.forklift/bays/w/position"), forklift_core::util::record_utils::with_digest(format!("{}\nfeat\n\n", header).into_bytes())).unwrap();
 
     let refused = area.forklift("b", &["lower", "feat"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));

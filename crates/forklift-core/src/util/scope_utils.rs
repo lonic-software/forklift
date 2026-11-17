@@ -117,7 +117,7 @@ pub enum ScopeClass {
 ///
 /// An empty set means **full scope** — no restriction, so [`classify`](Self::classify)
 /// returns [`ScopeClass::InScope`] for every path, and every scope-aware code path collapses to
-/// the unscoped behavior. A full scope is recorded as the empty file; whether a scope file may be
+/// the unscoped behavior. A full scope is recorded as a file naming no prefix; whether one may be
 /// absent is decided by whose it is ([`read_fetch_scope`], [`read_main_tree_scope`],
 /// [`read_bay_scope`]), never by reading an absence as full.
 #[derive(Clone, Debug, PartialEq, Eq)]

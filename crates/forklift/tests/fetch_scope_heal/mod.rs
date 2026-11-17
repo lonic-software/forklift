@@ -151,7 +151,7 @@ fn heal_with_no_readable_checkout_offers_a_fetch_scope_that_works() {
 
     let error = fetch_scope_damaged(&area.forklift("sparse", &["--json", "heal"]));
     assert_eq!(error["next_step"], "forklift heal --fetch-scope docs --fetch-scope src", "{}", error);
-    assert!(error["details"]["unread"][0]["reason"].as_str().unwrap().contains("UTF-8"), "{}", error);
+    assert!(error["details"]["unread"][0]["reason"].as_str().unwrap().contains("no format header"), "{}", error);
 
     server.stop();
     let offline = run_next_step(&area, "sparse", &error);
@@ -173,7 +173,7 @@ fn heal_with_no_readable_checkout_offers_a_fetch_scope_that_works() {
 fn heal_refuses_a_fetch_scope_that_does_not_hold_a_checkout() {
     let area = TestArea::new("fetch-scope-heal-outside");
     let _server = sparse_with_docs(&area);
-    std::fs::write(area.path(FETCH_SCOPE), "/forklift-scope 4\ndocs\nsrc/apj\n").unwrap();
+    std::fs::write(area.path(FETCH_SCOPE), forklift_core::util::record_utils::to_bytes("scope", 5, ["docs", "src/apj"])).unwrap();
 
     let error = fetch_scope_damaged(&area.forklift("sparse", &["--json", "heal"]));
     let message = error["message"].as_str().unwrap();

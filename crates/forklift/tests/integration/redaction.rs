@@ -437,7 +437,7 @@ fn a_read_of_content_whose_redaction_is_applied_is_refused_as_redacted() {
 
     // An applied record that cannot be read leaves the absence undecided: the read still names
     // the missing object, with the record's own error added rather than in its place.
-    std::fs::write(warehouse.root.join(".forklift/redactions-applied"), "/forklift-redactions-applied 99\n").unwrap();
+    std::fs::write(warehouse.root.join(".forklift/redactions-applied"), forklift_core::util::record_utils::with_digest(b"/forklift-redactions-applied 99\n".to_vec())).unwrap();
     let undecided = warehouse.json(&["blame", "-r", &leak, "notes.txt"]);
     let message = undecided["error"]["message"].as_str().unwrap();
     assert!(message.contains("entity not found"), "{}", undecided);
@@ -1052,7 +1052,8 @@ fn a_head_the_remote_serves_is_adopted_while_the_remote_holds_its_redaction_pend
     assert_eq!(error["details"], serde_json::json!({ "path": "secret.env", "hash": hash }), "{}", error);
 }
 
-/// The record of applied redactions in `warehouse`, as text, without its digest line; empty when there is none.
+/// The record of applied redactions in `warehouse`, as text without its digest line; empty when
+/// there is none.
 fn applied_record(warehouse: &Warehouse) -> String {
     let bytes = std::fs::read(warehouse.root.join(".forklift/redactions-applied")).unwrap_or_default();
     String::from_utf8(forklift_core::util::record_utils::without_digest_line(&bytes).to_vec()).unwrap()
@@ -1169,7 +1170,8 @@ fn an_applied_record_this_build_cannot_read_is_refused_loudly() {
     let warehouse = Warehouse::new("apply-unknown");
     let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
     let record = warehouse.root.join(".forklift/redactions-applied");
-    std::fs::write(&record, b"/forklift-redactions-applied 2\n").unwrap();
+    let newer = forklift_core::util::record_utils::with_digest(b"/forklift-redactions-applied 3\n".to_vec());
+    std::fs::write(&record, &newer).unwrap();
 
     let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
     assert_eq!(recorded["data"]["status"]["state"], "undecided", "{}", recorded);
@@ -1181,7 +1183,7 @@ fn an_applied_record_this_build_cannot_read_is_refused_loudly() {
         assert!(String::from_utf8_lossy(&refused.stderr).contains("does not know"), "{:?}", refused);
     }
 
-    assert_eq!(std::fs::read(&record).unwrap(), b"/forklift-redactions-applied 2\n");
+    assert_eq!(std::fs::read(&record).unwrap(), newer);
 }
 
 /// Record the redaction of `content`, loaded as `file`, which nothing in `warehouse` names, and
@@ -2613,21 +2615,24 @@ fn heal_applies_again_a_redaction_a_lost_or_damaged_applied_record_held() {
     assert_eq!(recorded["data"]["status"]["state"], "applied", "{}", recorded);
     let record = warehouse.root.join(".forklift/redactions-applied");
     let whole = std::fs::read(&record).unwrap();
+    // The flips land inside the hash entry, before the digest line.
+    let body = forklift_core::util::record_utils::without_digest_line(&whole).len();
 
     for damage in ["deleted", "truncated", "flipped", "zeroed", "phantom"] {
         match damage {
             "deleted" => forklift_core::util::file_utils::remove_file(&record).unwrap(),
             "truncated" => std::fs::write(&record, &whole[..whole.len() / 2]).unwrap(),
-            "flipped" => std::fs::write(&record, whole.iter().enumerate().map(|(at, byte)| match at == whole.len() - 10 {
+            "flipped" => std::fs::write(&record, whole.iter().enumerate().map(|(at, byte)| match at == body - 10 {
                 true => !byte,
                 false => *byte,
             }).collect::<Vec<_>>()).unwrap(),
             "zeroed" => std::fs::write(&record, vec![0u8; whole.len()]).unwrap(),
             _ => {
-                let mut phantom = whole.clone();
-                let at = whole.len() - 10;
+                let mut phantom = whole[..body].to_vec();
+                let at = body - 10;
                 phantom[at] = if phantom[at] == b'0' { b'1' } else { b'0' };
                 phantom.extend_from_slice(b"\xff\n");
+                phantom.extend_from_slice(&whole[body..]);
                 std::fs::write(&record, phantom).unwrap();
             }
         }
@@ -2662,8 +2667,8 @@ fn heal_applies_again_a_redaction_a_lost_or_damaged_applied_record_held() {
     }
 
     // A newer Forklift's record is not damage: heal leaves it, and export names no rebuild.
-    let newer = b"/forklift-redactions-applied 2\nanything\n";
-    std::fs::write(&record, newer).unwrap();
+    let newer = forklift_core::util::record_utils::with_digest(b"/forklift-redactions-applied 3\nanything\n".to_vec());
+    std::fs::write(&record, &newer).unwrap();
     let healed = warehouse.json(&["heal"]);
     assert_eq!(healed["ok"], false, "the redacted content cannot be told from a lost one: {}", healed);
     assert!(healed["error"]["details"].is_object() && healed["error"]["details"]["redactions_applied_rebuilt"].is_null(), "{}", healed);
