@@ -3120,11 +3120,13 @@ pub fn get_inventory_metadata_path() -> PathBuf {
 /// * `Ok((PathBuf, Some(BTreeSet<String>)))` - If the inventory metadata was found:
 ///    * `PathBuf`                - The path of the inventory metadata file.
 ///    * `Some(BTreeSet<String>)` - The paths of inventory files in a `BTreeSet`.
-/// * `Ok((PathBuf, None))` - If the inventory metadata file does not exist:
+/// * `Ok((PathBuf, None))` - If the inventory metadata file does not exist and the store holds no
+///   shard:
 ///    * `PathBuf` - The path where the inventory metadata file should have been.
 /// * `Err(String)` - The error message if the inventory metadata file exists, but there was an
 /// error while reading it, or it is not a regular file, or the inventory root does not resolve to
-/// a folder.
+/// a folder. A file that is damaged, or missing while the store holds a shard, is refused as
+/// `inventory_damaged`, and one in another version's format with its own message.
 pub fn retrieve_inventory_metadata_or_none() -> Result<(PathBuf, Option<BTreeSet<String>>), String> {
     let metadata_store_path = get_inventory_metadata_path();
 
@@ -3274,8 +3276,9 @@ static PASSED_INVENTORY_ROOTS: std::sync::RwLock<BTreeSet<PathBuf>> = std::sync:
 /// per root. Every shard path comes from [`get_inventory_store_root`], so this guards the paths
 /// that reach a shard without reading the metadata first (`git import` resets the inventory without
 /// reading it). A damaged, unreadable or absent metadata file passes, as does one that is not a
-/// regular file, which is never opened (a link is never followed): the metadata read reports all
-/// but the absent one, and a reset rewrites the file without reading it.
+/// regular file, which is never opened (a link is never followed): the metadata read reports each
+/// of them, the absent one only while the store holds a shard, and a reset rewrites the file
+/// without reading it.
 fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
     use std::io::BufRead;
 

@@ -9223,6 +9223,39 @@ fn sparse_with_docs(area: &TestArea) -> Server {
     server
 }
 
+/// FORK-458: heal's rebuild of a damaged inventory record in a sparse clone keeps to its fetch
+/// scope, as the shard builder does: a subtree outside it was never fetched, so it names no folder
+/// and holds nothing back. Revert: walk out-of-scope subtrees too → the unfetched tree reads as
+/// unread, the rebuild is held and heal refuses → red.
+#[test]
+fn a_sparse_clone_rebuilds_its_inventory_without_the_trees_it_never_fetched() {
+    let area = TestArea::new("sparse-inventory-heal");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/other/deep/x.txt", "out of scope\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
+
+    area.write_file("sparse/src/api/b.txt", "staged\n");
+    assert_success(&area.forklift("sparse", &["load", "src/api"]));
+    let metadata = area.path("sparse/.forklift/inventory/metadata");
+    let sound = std::fs::read(&metadata).unwrap();
+    std::fs::write(&metadata, vec![0u8; sound.len()]).unwrap();
+
+    let output = area.forklift("sparse", &["--json", "status"]);
+    assert_eq!(output.status.code(), Some(66), "{}{}", stdout(&output), stderr(&output));
+
+    let output = area.forklift("sparse", &["--json", "heal"]);
+    assert_success(&output);
+    assert_eq!(std::fs::read(&metadata).unwrap(), sound, "the record is back exactly");
+    assert_success(&area.forklift("sparse", &["status"]));
+    drop(server);
+}
+
 /// FORK-490: a read of a path a sparse clone never fetched refuses `out_of_scope` naming the step
 /// that fetches it, never `object_unreadable` and a heal that finds nothing lost. The step fits the
 /// path: `scope fetch` for a directory at the base, a fresh clone for a file at the root, and

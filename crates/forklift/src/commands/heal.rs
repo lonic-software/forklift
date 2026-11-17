@@ -71,8 +71,13 @@ const UNRECORDED_SHORT: &str = "No absent object was recorded unavailable again:
 /// # Arguments
 /// * `store_access` - The command's shared store-access hold, which the record's push-down needs.
 ///   `None` under `--fetch-scope`, which takes the exclusive hold first and the shared one after.
+/// * `set_ref`, `remove_ref` - The `--ref PALLET=PARCEL` and `--remove-ref PALLET` specs.
 /// * `fetch_scope`  - The paths `--fetch-scope` names, if any.
 /// * `position`     - The pallet `--position` names, if any.
+/// * `accept_config_loss`    - `--config`: rewrite a damaged configuration file even when the
+///   damage costs entries.
+/// * `accept_inventory_loss` - `--inventory`: write the rebuilt inventory even when it leaves
+///   staging unmatched or a tree unread.
 ///
 /// # Returns
 /// * `Ok(())`      - Nothing was tainted, or the taint is now fully cleared.

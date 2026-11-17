@@ -2414,8 +2414,8 @@ impl ShardLedger {
     /// Whether `key` is registered, which is the one definition of a tracked directory. Every
     /// ancestor of a registered key is registered too (see [`write_metadata_to_file`]), so every
     /// directory between the root and a tracked file is tracked. A registered key need not have a
-    /// shard file: a directory that holds only subdirectories has none, and reads as an empty
-    /// inventory.
+    /// shard file: an ancestor registered only for a key below it has none, and reads as an empty
+    /// inventory. A loaded folder with nothing in it has one that holds no entry.
     pub fn holds(&self, key: &str) -> bool {
         self.entries.contains(&key_to_metadata_entry(key))
     }
