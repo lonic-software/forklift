@@ -1391,6 +1391,21 @@ fn operate(context: &Context, arguments: &[String], trail: &mut Trail, unextract
             unextractable.push(text);
         }
     }
+    // A server command writes no failure document, so what its report names next is never run: it
+    // is the operator's own follow-up, and kept, so the trail says what the remedy left owed.
+    let said: Vec<String> = [&operated.outcome.stdout, &operated.outcome.stderr].into_iter()
+        .flat_map(|text| String::from_utf8_lossy(text).lines().map(str::to_string).collect::<Vec<_>>()).collect();
+    let named = remedy::extract(context.tool, &said.iter().map(String::as_str).collect::<Vec<_>>());
+    let follow_ups = named.remedies.iter().map(|named| match named {
+        Remedy::Command { arguments } => format!("forklift {}", arguments.join(" ")),
+        Remedy::Operator { arguments } => format!("forklift-server {}", arguments.join(" ")),
+        Remedy::Remove { path } => format!("remove {}", path.display()),
+    });
+    for text in follow_ups.chain(named.unextractable).map(|text| format!("named by {}: {}", written, text)) {
+        if !unextractable.contains(&text) {
+            unextractable.push(text);
+        }
+    }
     trail.steps.push(operated.outcome);
     Ok(())
 }

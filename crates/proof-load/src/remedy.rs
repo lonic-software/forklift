@@ -196,7 +196,7 @@ pub fn removable_under(path: &Path, run_root: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// The two forms, as Forklift writes them, extracted in order.
+    /// The client's own two forms, as Forklift writes them, extracted in order.
     ///
     /// Revert: drop the backtick quote → the second command is lost; drop the `remove` form → the
     /// lock path is lost.
@@ -251,6 +251,40 @@ mod tests {
         // Forklift's remedies are its failure document's alone, never its stderr.
         let stray = Outcome { stderr: b"forklift heal".to_vec(), ..outcome };
         assert!(super::texts(Tool::Forklift, &stray).is_empty());
+    }
+
+    /// The client's relay of a server's 503 names the operator's repair with its warehouse as a
+    /// placeholder: extracted as an operator remedy with the placeholder kept, the only one that
+    /// survives extraction. Any other placeholder, or `<warehouse>` anywhere but as `--root`'s
+    /// value, is unextractable; a git subject never extracts a server command.
+    ///
+    /// Revert: admit any placeholder in an operator command → `withhold add … <hash>` would be run;
+    /// drop the `--root` position check → `<warehouse>` as a positional argument would be bound.
+    #[test]
+    fn an_operator_remedy_keeps_only_its_warehouse_placeholder() {
+        let relayed = "Ask the remote's operator to repair it where the warehouse is served from (\"forklift-server tombstone repair --root <warehouse>\"); nothing here can.";
+        let extracted = extract(Tool::Forklift, &[relayed]);
+        assert_eq!(extracted.remedies, vec![Remedy::Operator { arguments: vec!["tombstone".into(), "repair".into(), "--root".into(), "<warehouse>".into()] }]);
+        assert!(extracted.unextractable.is_empty());
+        assert_eq!(extract(Tool::Forklift, &["forklift-server withhold repair --root <warehouse>"]).remedies,
+            vec![Remedy::Operator { arguments: vec!["withhold".into(), "repair".into(), "--root".into(), "<warehouse>".into()] }]);
+        for templated in ["forklift-server withhold add --root <warehouse> <hash> --statement <statement>", "forklift-server tombstone repair <warehouse>", "forklift-server tombstone repair --root <root>"] {
+            let extracted = extract(Tool::Forklift, &[templated]);
+            assert!(extracted.remedies.is_empty(), "{}", templated);
+            assert_eq!(extracted.unextractable, vec![templated]);
+        }
+        assert!(extract(Tool::Git, &[relayed]).remedies.is_empty());
+        assert!(extract(Tool::GitTuned, &["forklift-server tombstone repair --root <warehouse>"]).remedies.is_empty());
+    }
+
+    /// Revert: bind a remedy with no placeholder → a server command over no named warehouse would
+    /// run; bind by position → a placeholder elsewhere would stay unbound.
+    #[test]
+    fn an_operator_remedy_binds_only_its_warehouse() {
+        let arguments: Vec<String> = ["tombstone", "repair", "--root", WAREHOUSE].map(String::from).to_vec();
+        assert_eq!(bind_operator(&arguments, Path::new("/s/0001-lane/host")),
+            Some(["tombstone", "repair", "--root", "/s/0001-lane/host"].map(String::from).to_vec()));
+        assert_eq!(bind_operator(&["tombstone".to_string(), "repair".to_string()], Path::new("/s/host")), None);
     }
 
     /// A quoted path that no `remove` precedes is not a remedy.

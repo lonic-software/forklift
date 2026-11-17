@@ -400,4 +400,31 @@ mod tests {
         assert_eq!(run(&slow, &scratch, &environment).unwrap_err(), ToolError::TimedOut { program: PathBuf::from("/bin/sleep"), limit });
         assert!(started.elapsed() < Duration::from_secs(10));
     }
+
+    /// A server is stopped as its operator stops it: asked, so its own shutdown runs (here, the
+    /// trap that writes `stopped`), and waited on. One that ignores the request is an error once
+    /// the limit passes, never reported stopped.
+    ///
+    /// Revert: send SIGKILL → the trap never runs; return Ok at the deadline → the ignoring child
+    /// reads as stopped.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_is_asked_to_stop_and_an_ignoring_one_is_an_error() {
+        let scratch = scratch("stop");
+        let marker = scratch.root().join("stopped");
+        let spawn = |script: String| Served {
+            child: Command::new("/bin/sh").arg("-c").arg(script).stdin(Stdio::null()).spawn().unwrap(),
+            url: String::new(),
+            output: Vec::new(),
+        };
+        let polite = spawn(format!("trap 'touch \"{}\"; exit 0' TERM; while :; do sleep 0.05; done", marker.display()));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(polite.stop(Duration::from_secs(10)), Ok(()));
+        assert!(marker.exists(), "the server's own shutdown ran");
+
+        let stubborn = spawn("trap '' TERM; while :; do sleep 0.05; done".to_string());
+        std::thread::sleep(Duration::from_millis(200));
+        let error = stubborn.stop(Duration::from_millis(300)).unwrap_err();
+        assert!(error.contains("had not stopped"), "{}", error);
+    }
 }
