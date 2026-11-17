@@ -449,6 +449,22 @@ When the refusal names another bay, run `forklift heal` in that bay: a heal here
 it. A position written by a newer version of Forklift is not this refusal, and no heal writes
 over it.
 
+### `inventory_damaged` (exit 66)
+
+The inventory's record of which folders hold staged content is cut short, garbled or missing, so
+no command can tell what is staged. Nothing was changed. The staged content itself is kept in the
+staging area, one entry per folder, and an entry cannot be read back to the folder it belongs
+to, so the record cannot simply be listed again.
+
+`forklift heal` rebuilds it from every folder it can find whose staging is on disk: lines of the
+damaged record that still read, the folders of your working tree, the folders of the parcel your
+files stand on, and those of an operation that was interrupted. When that accounts for all the
+staging on disk, heal writes the record, and nothing staged is lost. Otherwise it writes nothing,
+finishes its other repairs, and says how much staging it could not match to a folder, or which
+tree it could not read. If a refetch or a repair heal names can bring that tree back, do that and
+run heal again. `forklift heal --inventory` writes the record anyway: the staging it could not
+match is no longer registered, so check `forklift stocktake` and load again what is missing.
+
 ### `object_kind_mismatch` (exit 63)
 
 The remote refused to move the pallet because the new head's history names an object as a kind
