@@ -1790,6 +1790,23 @@ fn remove_value_from_document(document: &mut DocumentMut,
 mod tests {
     use super::*;
 
+    /// A lossy repair that names no dropped entry (the damage may have hidden a line) is never
+    /// told as one that kept everything. Revert: choose the sentence by `dropped` and `cut` alone
+    /// → red.
+    #[test]
+    fn a_lossy_repair_naming_no_entry_is_not_told_as_lossless() {
+        let repaired = ConfigRepaired {
+            path: PathBuf::from("warehouse.toml"),
+            dropped: Vec::new(),
+            cut: false,
+            lossless: false,
+            set_aside: Some(PathBuf::from("warehouse.toml.damaged")),
+        };
+        let said = repaired.sentences().join("\n");
+        assert!(said.contains("only the entries the damage provably spared"), "{}", said);
+        assert!(!said.contains("every entry"), "{}", said);
+    }
+
     /// Parse a document written inline, as if it had been read from `config.toml`.
     fn parse(content: &str) -> Result<ConfigFile, String> {
         parse_config(&content.parse::<DocumentMut>().unwrap(), Path::new("config.toml"))
