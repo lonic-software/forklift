@@ -998,8 +998,8 @@ mod tests {
 
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        // No terminator: torn by construction (see `taint_utils`'s own format tests).
-        std::fs::write(taint_dir.join("taint-1-0"), b"/forklift-taint 1\nobjects/ab/cdef\n").unwrap();
+        // No digest line: torn by construction (see `taint_utils`'s own format tests).
+        std::fs::write(taint_dir.join("taint-1-0"), b"/forklift-taint 2\nobjects/ab/cdef\n").unwrap();
 
         let error = heal_if_tainted().unwrap_err();
         assert_durability_taint(&error, &["record is itself incomplete"]);

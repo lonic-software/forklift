@@ -347,7 +347,7 @@ pub(crate) enum RawScope {
     /// There is no file.
     Missing,
 
-    /// The file parses. An empty one is the full scope.
+    /// The file parses. One that names no prefix is the full scope; an empty file is damaged.
     Read(PathScope),
 
     /// The file does not parse, for the reason given (phrased to follow "The scope file").

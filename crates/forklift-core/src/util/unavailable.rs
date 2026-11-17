@@ -222,7 +222,8 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
     Ok(Some(Rebuilt { set_aside, kept: set.entries.len(), dropped }))
 }
 
-/// Whether the record `bytes` opens with this record's header at a newer version.
+/// Whether the record `bytes` matches its digest and opens with this record's header at a newer
+/// version: a header damaged into a newer version's matches no digest, so it is rebuilt.
 fn written_by_newer(bytes: &[u8]) -> bool {
     record_utils::written_by_newer(bytes, UNAVAILABLE_RECORD, UNAVAILABLE_VERSION)
 }
@@ -649,8 +650,8 @@ mod tests {
         assert_eq!(set_aside_copies(), vec![rebuilt.set_aside]);
     }
 
-    // Revert: drop the newer-version check → a newer Forklift's record is rewritten as this one's;
-    // drop the readable check → a whole record is copied aside and rewritten.
+    // Revert: drop the newer-version check → a newer Forklift's record is rewritten as this
+    // one's; drop the readable check → a whole record is copied aside and rewritten.
     #[test]
     fn a_readable_missing_or_newer_record_is_left_as_it_is() {
         let _scratch = Scratch::new("left");

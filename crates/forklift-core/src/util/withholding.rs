@@ -50,7 +50,8 @@ use crate::util::{bundle_utils, file_utils, object_utils, record_utils, redactio
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
 /// The record is digested ([`record_utils::to_bytes`]), so damage that still parses, such
 /// as a flipped digit in a hash, is refused rather than read as what the host withholds. Version 3
-/// added the digest; a record of version 2, which has none, reads as damaged.
+/// added the digest; a record of version 2, which has none, is refused under the same damage code,
+/// named as another version's.
 const FILE_NAME_WITHHELD: &str = "withheld";
 const WITHHELD_RECORD: &str = "withheld";
 const WITHHELD_VERSION: u32 = 3;
@@ -752,7 +753,8 @@ mod tests {
         let mut digit = good.clone();
         digit[format!("{}\n", record_utils::header(WITHHELD_RECORD, WITHHELD_VERSION)).len()] = b'b';
         // The record as version 2 wrote it, with no digest.
-        let undigested = record_utils::to_bytes(WITHHELD_RECORD, 2, [format!("{} - statement", A)]);
+        let undigested = record_utils::without_digest_line(
+            &record_utils::to_bytes(WITHHELD_RECORD, 2, [format!("{} - statement", A)])).to_vec();
         for bytes in [good[..good.len() - 1].to_vec(), flipped, vec![0; good.len()], b"\xff\xfe".to_vec(),
                       record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [A]), digit, undigested,
                       record_utils::without_digest_line(&good).to_vec()] {

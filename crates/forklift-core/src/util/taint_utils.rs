@@ -86,8 +86,8 @@ const FOLDER_NAME_TAINT: &str = "taint";
 
 /// The [`record_utils`] kind and version of a taint file's header line. A file without it is
 /// torn, never read as raw unescaped paths.
-const TAINT_RECORD: &str = "taint";
-const TAINT_VERSION: u32 = 2;
+pub(crate) const TAINT_RECORD: &str = "taint";
+pub(crate) const TAINT_VERSION: u32 = 2;
 
 /// The bytes of a complete taint file recording `paths` (root-relative, `/`-joined): a
 /// [`record_utils`] record, one escaped path per entry, ending in its digest.

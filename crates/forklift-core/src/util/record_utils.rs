@@ -49,9 +49,6 @@ pub enum RecordError {
     /// The header names this kind of file, but a version this build does not know.
     OtherVersion(String),
 
-    /// The last line has no closing line feed, so the file was cut short.
-    Unterminated,
-
     /// An entry holds a raw carriage return, a lone `\` at its end, or a `\` before a character
     /// that is not escaped. A writer never produces one.
     BadEscape { line: usize },
@@ -70,7 +67,6 @@ impl RecordError {
             RecordError::OtherVersion(header) => format!(
                 "is in a format this version of Forklift does not know (\"{}\").", header.escape_debug()
             ),
-            RecordError::Unterminated => "is cut short: its last line has no line ending.".to_string(),
             RecordError::BadEscape { line } => format!("has a malformed escape on line {}.", line),
             RecordError::Damaged => "is damaged: it does not match its digest.".to_string(),
         }
@@ -148,6 +144,11 @@ where
 /// [`RecordError::Unversioned`], and an older version of this kind is
 /// [`RecordError::OtherVersion`], since versions from before the digest wrote none. Any other
 /// record without one is damaged: every version since writes it, so it was cut off.
+///
+/// The older-version rule holds while every older version of each kind is a pre-digest one. A
+/// kind that bumps a digested version must judge its own older digested versions, or a cut
+/// before the digest line is named as an older version's rather than as damage: it is still
+/// refused, under the wrong cause.
 pub fn from_bytes(bytes: &[u8], kind: &str, version: u32) -> Result<Vec<String>, RecordError> {
     match verified_body(bytes) {
         Some(body) => parse_body(body, kind, version),
@@ -185,7 +186,8 @@ fn parse_body(bytes: &[u8], kind: &str, version: u32) -> Result<Vec<String>, Rec
     let text = std::str::from_utf8(bytes).map_err(|_| RecordError::NotUtf8)?;
     read_header(bytes, kind, version)?;
 
-    let body = text.strip_suffix('\n').ok_or(RecordError::Unterminated)?;
+    // A verified body is empty or ends in its line feed, and an empty one has no header.
+    let body = text.strip_suffix('\n').unwrap_or(text);
 
     body.split('\n')
         .enumerate()
@@ -246,12 +248,22 @@ pub fn has_digest_line(bytes: &[u8]) -> bool {
     without_digest_line(bytes).len() != bytes.len()
 }
 
-/// `bytes` without a digested record's last line, when that line opens as a digest line, matching
-/// or not, cut short or not: what [`salvage`] reads of a damaged digested record.
+/// `bytes` without a digested record's last line, when that line has a digest line's shape,
+/// matching or not, cut short or not: what [`salvage`] reads of a damaged digested record.
+///
+/// The shape is the prefix and then lowercase hex only: a whole digest when the line ends, or
+/// part of one when a cut took its end. A last entry that merely opens with `digest ` (a folder
+/// named `digest notes`) is never taken for one.
 pub fn without_digest_line(bytes: &[u8]) -> &[u8] {
     let (body, last) = last_line(bytes);
+    let (line, whole) = last.strip_suffix(b"\n").map_or((last, false), |line| (line, true));
+    let digits = blake3::OUT_LEN * 2;
+    let shaped = line.strip_prefix(DIGEST_PREFIX.as_bytes()).is_some_and(|hex| {
+        (if whole { hex.len() == digits } else { hex.len() < digits })
+            && hex.iter().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    });
 
-    match last.starts_with(DIGEST_PREFIX.as_bytes()) {
+    match shaped {
         true => body,
         false => bytes,
     }
@@ -435,5 +447,12 @@ mod tests {
         assert_eq!(salvage(without_digest_line(&bytes[..bytes.len() - 5]), parse),
             (vec!["aa".to_string(), "bb".to_string()], 0));
         assert_eq!(without_digest_line(b"/forklift-test 2\naa\n"), b"/forklift-test 2\naa\n");
+        // An entry that only opens as a digest line is an entry. Revert: judge the prefix alone
+        // → a cut record's last entry is dropped as its digest line.
+        for entry in [&b"digest notes\n"[..], b"digest \n", b"digest abc\n",
+                      &[b"digest ".as_slice(), &[b'a'; 65], b"\n"].concat()] {
+            let bytes = [b"/forklift-test 2\n".as_slice(), entry].concat();
+            assert_eq!(without_digest_line(&bytes), bytes, "{:?}", String::from_utf8_lossy(entry));
+        }
     }
 }

@@ -15141,29 +15141,21 @@ fn a_repack_keeps_a_deleted_head_until_the_bay_that_deleted_it_is_removed() {
     assert!(!warehouse.run(&["show", &format!("{}:side.txt", head)]).status.success(), "the head is freed once its window ends");
 }
 
-// Revert: read only version 3 journals → the planted version-2 journal is refused.
+// Revert: read a version-3 journal as this version's → its entries are read under today's
+// embedded records, and undo acts on them instead of naming the version.
 #[test]
-fn a_version_two_journal_takes_a_delete_and_its_undo() {
-    let (warehouse, _) = warehouse_with_side("delete-journal-v2");
-    let second = stack_one(&warehouse, "b.txt", "two\n");
+fn an_older_journal_is_refused_by_its_version() {
+    let (warehouse, _) = warehouse_with_side("journal-older");
+    stack_one(&warehouse, "b.txt", "two\n");
 
     let path = warehouse.root.join(".forklift/journal.json");
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.contains("\"version\":3"), "{}", text);
-    std::fs::write(&path, text.replace("\"version\":3", "\"version\":2")).unwrap();
+    assert!(text.contains("\"version\":4"), "{}", text);
+    std::fs::write(&path, text.replace("\"version\":4", "\"version\":3")).unwrap();
 
-    assert_success(&warehouse.run(&["store", "compact", "--all"]));
-    assert_success(&warehouse.run(&["pallet", "delete", "side"]));
-    assert_success(&warehouse.run(&["store", "compact", "--all"]));
-    assert_success(&warehouse.run(&["undo"]));
-    assert!(pallet_heads(&warehouse).iter().any(|(name, _)| name == "side"));
-
-    let undone = warehouse.run(&["--json", "undo"]);
-    assert_success(&undone);
-    assert_eq!(json(&undone)["data"]["undone"], second.as_str(), "the version-2 stack entry undoes");
-    let restacked = stack_one(&warehouse, "c.txt", "three\n");
-    let undone = warehouse.run(&["--json", "undo"]);
-    assert_eq!(json(&undone)["data"]["undone"], restacked.as_str(), "ordinary commands still journal");
+    let refused = warehouse.run(&["undo"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("has format version 3"), "{:?}", refused);
 }
 
 #[test]
