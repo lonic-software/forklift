@@ -450,7 +450,8 @@ mod tests {
         // An entry that only opens as a digest line is an entry. Revert: judge the prefix alone
         // → a cut record's last entry is dropped as its digest line.
         for entry in [&b"digest notes\n"[..], b"digest \n", b"digest abc\n",
-                      &[b"digest ".as_slice(), &[b'a'; 65], b"\n"].concat()] {
+                      &[b"digest ".as_slice(), &[b'a'; 65], b"\n"].concat(),
+                      &[b"digest ".as_slice(), &[b'z'; 64], b"\n"].concat()] {
             let bytes = [b"/forklift-test 2\n".as_slice(), entry].concat();
             assert_eq!(without_digest_line(&bytes), bytes, "{:?}", String::from_utf8_lossy(entry));
         }
