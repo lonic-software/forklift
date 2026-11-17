@@ -2528,6 +2528,24 @@ impl ShardLedger {
         Ok(ShardLedger { entries })
     }
 
+    /// Write exactly `keys` and their ancestors as the registered set over the shards already on
+    /// disk, for heal's rebuild of a metadata file that does not read. The old metadata is never
+    /// read, and nothing is cleared or removed: the shards at these keys' addresses are the
+    /// staging the rebuild keeps, and a shard at any other address is left unregistered.
+    ///
+    /// # Arguments
+    /// * `keys` - Warehouse path keys whose shards are to be registered.
+    ///
+    /// # Returns
+    /// * `Ok(ShardLedger)` - The new registered set, durably written.
+    /// * `Err(String)`     - If the metadata could not be written.
+    pub fn rebuild(keys: &BTreeSet<String>) -> Result<ShardLedger, String> {
+        let entries = close_under_ancestors(&keys.iter().map(|key| key_to_metadata_entry(key)).collect());
+        write_metadata_to_file(&file_utils::get_inventory_metadata_path(), &entries)?;
+
+        Ok(ShardLedger { entries })
+    }
+
     /// Clear and sync `new_entries`' addresses, then write `entries` as the metadata.
     fn publish(&mut self, new_entries: &BTreeSet<String>, entries: BTreeSet<String>) -> Result<(), String> {
         if !new_entries.is_empty() {
