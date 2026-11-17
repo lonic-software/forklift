@@ -442,6 +442,12 @@ refusal_codes! {
     /// it from the copy every position write leaves beside it, or from an interrupted operation's
     /// source, and otherwise lists the pallets for `heal --position` to put the bay on.
     BayPositionDamaged => "bay_position_damaged",
+
+    /// A configuration file holds a damaged byte (it is not UTF-8, or it holds a character TOML
+    /// never allows), or it does not parse and lacks the final newline every write ends with, as
+    /// a cut file does. Nothing was changed; in the warehouse's own file `heal --config` keeps
+    /// every entry the damage provably spared, after setting the damaged bytes aside.
+    ConfigDamaged => "config_damaged",
 }
 
 /// The codes of a host record that is lost or damaged, or of an object its store cannot read,

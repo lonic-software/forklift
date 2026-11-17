@@ -82,7 +82,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                             set_ref: &[String],
                             remove_ref: &[String],
                             fetch_scope: &[String],
-                            position: Option<&str>) -> Result<(), String> {
+                            position: Option<&str>,
+                            accept_config_loss: bool) -> Result<(), String> {
     // Every spec is read before anything is written, so a malformed one changes nothing.
     let set_ref = set_ref.iter()
         .map(|spec| spec.split_once('=').ok_or_else(|| format!(
@@ -97,6 +98,11 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         false => Some(StoreAccessLock::try_exclusive()?),
     };
 
+    // Before everything else: every later step reads the configuration, and a damaged file would
+    // stop it or, worse, be read around. Nothing here is written yet, so a refusal stops the run
+    // with nothing changed.
+    let config_repaired = config_utils::repair_warehouse_config(accept_config_loss)?;
+
     let mut ref_notes: Vec<String> = Vec::new();
     let mut refs_rebuilt: Vec<ref_heal::Rebuilt> = Vec::new();
     let mut refs_removed: Vec<ref_heal::Removed> = Vec::new();
@@ -105,11 +111,16 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // rebuild writes only the record, which no recovery reads through the taint. A damaged record
     // it could not rebuild stops the run, since everything after it would read the damage. One
     // that cannot be read at all does not: the readers below degrade around it and say so.
+    let config_said = |error: String| match &config_repaired {
+        Some(repaired) => repaired.sentences().iter()
+            .fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence.trim_start())),
+        None => error,
+    };
     let record_rebuilt = sealed_utils::rebuild()
-        .map_err(|error| format!(
+        .map_err(|error| config_said(format!(
             "{}{} Nothing else was healed: once that is fixed, run \"forklift heal\" again.",
             error, if error.ends_with('.') { "" } else { "." },
-        ))?
+        )))?
         .map(RecordRebuilt::from);
 
     // Before the taint recovery too, whose walks read the record of content this warehouse cannot
@@ -188,7 +199,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // changed" speaks only for the write it refused. Its notes go along: a check they say was
     // skipped would otherwise go unreported.
     let changed = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String]| {
-        let mut error = error;
+        let mut error = config_said(error);
         if let Some(record) = &record_rebuilt {
             error = forklift_core::error::append_to_message(error, &record.sentence());
         }
@@ -380,7 +391,18 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             None
         }
     };
-    let configured = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL).ok().flatten().map(|(url, _)| url);
+    // The warehouse's own file is sound by now, so a failure here is the global file's: heal does
+    // not mend that one, and goes on as though no remote were asked for, saying why.
+    let configured = match config_utils::get_effective_value(config_utils::KEY_REMOTE_URL) {
+        Ok(configured) => configured.map(|(url, _)| url),
+        Err(why) => {
+            notes.push(format!(
+                "The remote's address could not be read, so heal went on as though none were configured: {}",
+                why.trim_end_matches('.')
+            ));
+            None
+        }
+    };
     let origin = match mode {
         Some(WarehouseMode::Full) | None => None,
         Some(_) => Some(origin_utils::recorded_origin(configured.as_deref())),
@@ -626,6 +648,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         fetch_scope_rebuilt: scope_rebuilt,
         parked_rebuilt,
         position_rebuilt,
+        config_repaired,
         was_tainted: outcome.was_tainted,
         restaged: outcome.restaged,
         resolved: outcome.resolved,
@@ -1094,6 +1117,11 @@ pub(crate) struct HealReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     position_rebuilt: Option<PositionRebuilt>,
 
+    /// The warehouse's configuration file, which was damaged and this run rewrote, first of all:
+    /// what it dropped (by line and key, never by value) and where the damaged bytes went.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_repaired: Option<config_utils::ConfigRepaired>,
+
     /// Whether a durability taint was actually standing (an already-healthy warehouse reports
     /// `false`, with `restaged` and `resolved` empty).
     was_tainted: bool,
@@ -1436,6 +1464,12 @@ impl CommandOutput for HealReport {
             println!("{}", rebuilt.sentence());
         }
 
+        if let Some(repaired) = &self.config_repaired {
+            for sentence in repaired.sentences() {
+                println!("{}", sentence);
+            }
+        }
+
         for rebuilt in &self.refs_rebuilt {
             println!("{}", rebuilt_sentence(rebuilt));
         }
@@ -1466,6 +1500,7 @@ impl CommandOutput for HealReport {
             && self.redactions_applied_rebuilt.is_none() && self.redactions_reapplied.is_empty()
             && self.restored_from_working_tree.is_empty()
             && self.fetch_scope_rebuilt.is_none() && self.parked_rebuilt.is_none() && self.position_rebuilt.is_none()
+            && self.config_repaired.is_none()
             && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
             && self.objects_lost.is_none()
         {

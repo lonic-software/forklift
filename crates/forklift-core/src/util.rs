@@ -14,6 +14,7 @@ pub(crate) mod fuzz_bytes;
 pub(crate) mod peak_alloc;
 pub(crate) mod toml_spelling;
 pub(crate) mod signature_table;
+pub mod config_salvage;
 pub mod config_utils;
 pub mod lock_utils;
 pub mod office_utils;

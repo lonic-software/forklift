@@ -371,7 +371,14 @@ pub enum Command {
                       it, or from an operation left unfinished. When neither says where the bay \
                       stood it changes nothing and lists the pallets; --position puts the bay on \
                       the pallet you name, at its head, taking the files as standing there, so a \
-                      bay that stood behind that head no longer refuses its next stack."
+                      bay that stood behind that head no longer refuses its next stack.\n\n\
+                      First of all, a damaged warehouse configuration file (\"config_damaged\" \
+                      refusals, exit 65) is rewritten when its damage provably cost no setting. \
+                      Otherwise it changes nothing and names the entries the damage may have \
+                      touched; --config rewrites the file with only the entries the damage \
+                      provably spared, after setting the damaged bytes aside beside it. A file \
+                      that is not damaged but does not read, or that holds a mistake made by \
+                      hand, is never written over."
     )]
     Heal {
         /// Set a damaged pallet ref to a parcel (a pallet, a parcel hash or a unique prefix of one)
@@ -389,6 +396,10 @@ pub enum Command {
         /// Put a bay whose position is lost or damaged on this pallet, at its head
         #[arg(long, value_name = "PALLET")]
         position: Option<String>,
+
+        /// Rewrite a damaged warehouse configuration file even though that drops entries
+        #[arg(long)]
+        config: bool,
     },
 
     /// Print the command list, or detailed help about one command
