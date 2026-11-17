@@ -107,7 +107,7 @@ pub fn extract(tool: Tool, texts: &[&str]) -> Extracted {
             && !(operator && argument == WAREHOUSE && at > 0 && arguments[at - 1] == "--root"));
         // `serve` is the server itself, which the operator's remedy stops and starts again around
         // its command: never a step of it.
-        if arguments.is_empty() || templated || (operator && arguments[0] == "serve") {
+        if arguments.is_empty() || templated || (operator && arguments.iter().any(|argument| argument == "serve")) {
             extracted.unextractable.push(span.to_string());
         } else if operator {
             extracted.remedies.push(Remedy::Operator { arguments });
@@ -279,7 +279,7 @@ mod tests {
         assert!(extracted.unextractable.is_empty());
         assert_eq!(extract(Tool::Forklift, &["forklift-server withhold repair --root <warehouse>"]).remedies,
             vec![Remedy::Operator { arguments: vec!["withhold".into(), "repair".into(), "--root".into(), "<warehouse>".into()] }]);
-        for templated in ["forklift-server withhold add --root <warehouse> <hash> --statement <statement>", "forklift-server tombstone repair <warehouse>", "forklift-server tombstone repair --root <root>", "forklift-server serve --root <warehouse>"] {
+        for templated in ["forklift-server withhold add --root <warehouse> <hash> --statement <statement>", "forklift-server tombstone repair <warehouse>", "forklift-server tombstone repair --root <root>", "forklift-server serve --root <warehouse>", "forklift-server --root <warehouse> serve"] {
             let extracted = extract(Tool::Forklift, &[templated]);
             assert!(extracted.remedies.is_empty(), "{}", templated);
             assert_eq!(extracted.unextractable, vec![templated]);

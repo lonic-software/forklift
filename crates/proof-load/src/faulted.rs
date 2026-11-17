@@ -2456,20 +2456,6 @@ mod tests {
         Outcome { arguments: vec![], exit, stdout: vec![], stderr: vec![], failure }
     }
 
-    /// A served record counts as acknowledged only after an answer that asks nothing further: success, or
-    /// a refusal naming no remedy. A kill is no answer, and a refusal naming a remedy sends the user
-    /// through it first.
-    ///
-    /// Revert: count a kill as an answer → a command killed after its record was durable heals
-    /// with no retry; count any refusal → a stale lock's refusal heals before its remedy runs;
-    /// drop the failure-document or unextractable conditions → a crash or an unreadable remedy
-    /// settles the record; settle on the first attempt → the faulted command's refusal of a write
-    /// it committed grades as acknowledged.
-    /// An operator command's report is never run from: whatever it names next, runnable or not, is
-    /// kept as unextractable, labelled with the remedy that named it.
-    ///
-    /// Revert: run what it names → the runnable `forklift heal` leaves the list; drop the
-    /// unextractable ones → the `withhold add` the operator owes is lost from the trail.
     /// An operator remedy is named only where the harness serves the warehouse it names; without a
     /// host it is unextractable, beside the client's own remedy, which is still named.
     ///
@@ -2483,6 +2469,11 @@ mod tests {
         assert_eq!(unextractable, ["forklift-server tombstone repair --root <warehouse>"]);
     }
 
+    /// An operator command's report is never run from: whatever it names next, runnable or not, is
+    /// kept as unextractable, labelled with the remedy that named it.
+    ///
+    /// Revert: run what it names → the runnable `forklift heal` leaves the list; drop the
+    /// unextractable ones → the `withhold add` the operator owes is lost from the trail.
     #[test]
     fn what_an_operator_report_names_next_is_recorded_not_run() {
         let stdout = b"Kept 0 entries of the old record.\n1 file is absent. Withhold each one that was with \"forklift-server withhold add --root /s/host <hash> --statement <statement>\":\n  699c\nThen run \"forklift heal\" in each clone.\n".to_vec();
@@ -2494,6 +2485,15 @@ mod tests {
         assert!(follow_ups(Tool::Forklift, "x", &Outcome { stdout: b"Repaired.\n".to_vec(), ..outcome }).is_empty());
     }
 
+    /// A served record counts as acknowledged only after an answer that asks nothing further: success, or
+    /// a refusal naming no remedy. A kill is no answer, and a refusal naming a remedy sends the user
+    /// through it first.
+    ///
+    /// Revert: count a kill as an answer → a command killed after its record was durable heals
+    /// with no retry; count any refusal → a stale lock's refusal heals before its remedy runs;
+    /// drop the failure-document or unextractable conditions → a crash or an unreadable remedy
+    /// settles the record; settle on the first attempt → the faulted command's refusal of a write
+    /// it committed grades as acknowledged.
     #[test]
     fn only_an_answer_asking_nothing_further_settles_a_served_record() {
         assert!(answered(Some(&answer(Some(0), "", None))));
