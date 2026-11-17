@@ -10000,6 +10000,33 @@ mod tests {
             let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
+        /// The served root's own position is what a new clone checks out: lost or damaged, the
+        /// handshake refuses with its code and names heal, and never the position file's path.
+        /// Revert: drop BayPositionDamaged from SERVED_DAMAGE → a 500 with no code → red.
+        #[tokio::test]
+        async fn a_handshake_over_a_damaged_position_refuses_with_its_code() {
+            let (root, _scope, _side) = served_with_side("handshake-position");
+            let position = forklift_core::globals::bay_root().join(forklift_core::util::pallet_utils::FILE_NAME_POSITION);
+            let bytes = std::fs::read(&position).unwrap();
+
+            for (what, damaged) in [("cut", Some(bytes[..bytes.len() / 2].to_vec())), ("missing", None)] {
+                match damaged {
+                    Some(damaged) => std::fs::write(&position, damaged).unwrap(),
+                    None => forklift_core::util::file_utils::remove_file(&position).unwrap(),
+                }
+
+                let response = get_warehouse(State(Arc::new(single_mode_state(root.clone()))), Path(PathParams::new()))
+                    .await.into_response();
+
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{}", what);
+                let body = body_text(response).await;
+                assert!(body.contains(r#""code":"bay_position_damaged""#), "{}: {}", what, body);
+                assert!(body.contains("forklift heal"), "{}: {}", what, body);
+                assert!(!body.contains(".forklift"), "{}: no server path: {}", what, body);
+            }
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+        }
+
         /// Revert: map the moved ref to `pallet_moved` alone → the refusal says "Lower and retry"
         /// → red.
         #[tokio::test]
