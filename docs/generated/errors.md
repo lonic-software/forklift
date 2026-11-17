@@ -75,4 +75,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `unavailable_damaged` | 60 | The record of content the warehouse cannot get, left out because a remote's host withholds it, does not parse. Nothing was changed; heal rebuilds it from the entries that still read, unless a newer version wrote it |
 | `origin_damaged` | 61 | The origin record, of the remote a partial warehouse was cloned from, does not parse or holds anything but one URL. Nothing was changed; remote move records it again, after checking that server holds what the warehouse lacks |
 | `fetch_scope_stray` | 62 | A warehouse that is not sparse holds a fetch scope, which only a sparse warehouse is given, so what it fetched cannot be told. Nothing was changed; deleting the file ends it |
+| `object_kind_mismatch` | 63 | The remote refused to move a pallet because the new head's history names an object as a kind it is not: a file entry's object is not a blob, or not a recipe at a chunked entry, or a recipe's chunk is not a chunk. The history is malformed and no upload changes it; nothing moved |
 

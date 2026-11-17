@@ -408,6 +408,16 @@ remote may have deleted content it owed a deletion again as the lift ran, or fai
 store for a moment: run `forklift lift` again. If it is refused the same way each time, the
 remote's store is damaged or lost content, and only whoever runs it can repair it.
 
+### `object_kind_mismatch` (exit 63)
+
+The remote refused to move the pallet because the new head's history names an object as a kind
+it is not: a file entry naming a folder's tree or a piece of a large file, a large file's entry
+naming a plain file's content, or a large file listing such content among its pieces. The error
+names the object, the path, and both kinds. Nothing moved. A warehouse written by forklift never
+makes such history, so the parcels were written by other tooling or damaged; lifting again sends
+the same history and is refused the same way, and `forklift audit` checks only that objects are
+present, so it does not find this. Only history that names the path otherwise can be lifted.
+
 ### `content_withheld` (exit 51)
 
 The remote's host withholds content the command needed: a takedown, such as a legal notice, made by

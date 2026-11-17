@@ -525,7 +525,8 @@ fn gate_entry(name: &str, hash: &str, item_type: forklift_core::enums::dir_entry
 /// parcel; a chunked entry naming a blob; and a recipe naming a blob as its chunk. Each object is
 /// present, so a presence check alone passed every one of them.
 ///
-/// Revert: make the probe report presence alone (`ObjectProbe::Present`) → every case commits → red.
+/// Revert: make the probe report presence alone (`ObjectProbe::Present`) → every case commits →
+/// red.
 #[test]
 fn a_ref_update_naming_an_object_as_another_kind_is_refused() {
     use forklift_core::enums::dir_entry_type::DirEntryType::{Normal, NormalChunked, ExecutableChunked};

@@ -85,7 +85,13 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 48** (current): four refusal codes where each failed with an uncoded message. Three are
+**Schema 49** (current): the `object_kind_mismatch` error code exists (exit 63). A remote refuses
+a ref update whose new history names a present object as a kind it is not, such as a tree or a
+chunk at a file entry, a blob at a chunked one, or a blob in a recipe's chunk list. `details` carry
+`hash`, `path`, `expected` and `found`, each kind one of `blob`, `tree`, `parcel`, `recipe` and
+`chunk`, and `next_step` is empty: no upload changes the history. It is not retried.
+
+**Schema 48**: four refusal codes where each failed with an uncoded message. Three are
 host records that do not parse: `sealed_damaged` (exit 59, the record of objects held by hash
 alone), `unavailable_damaged` (exit 60, the record of content the warehouse cannot get) and
 `origin_damaged` (exit 61). For the first two, `next_step` is `forklift heal` where heal rebuilds

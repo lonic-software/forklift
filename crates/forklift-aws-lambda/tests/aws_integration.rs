@@ -760,7 +760,8 @@ async fn s3_verify_and_promote_streams_large_staged_objects() {
         );
         assert!(objects.exists(&good_hash).expect("now canonical"));
         assert_eq!(objects.get(&good_hash).expect("read back").as_deref(), Some(good.as_slice()));
-        // Revert: copy with the source's metadata (no `MetadataDirective::Replace`) → `tree` → red.
+        // Revert: copy with the source's metadata (no `MetadataDirective::Replace`) → `tree`
+        // → red.
         assert_eq!(objects.kind(&good_hash).expect("the recorded kind"), Some(ObjectType::Blob));
 
         // Idempotent, exactly like the small-object path.
