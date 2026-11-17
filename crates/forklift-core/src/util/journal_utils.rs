@@ -20,8 +20,8 @@ const FILE_NAME_JOURNAL: &str = "journal.json";
 /// version, or anything that does not parse as this shape, is refused by name — never read as
 /// an empty journal, which would make `undo` report "nothing to undo" over a history it lost.
 ///
-/// Version 4 embeds the digested consolidation and skeleton records, so an older journal's
-/// in-progress state would not read as either: it is refused as another version, never as damage.
+/// Version 4 embeds the digested out-of-scope skeleton record, so an older journal's in-progress
+/// consolidation would not read: it is refused as another version, never as damage.
 const JOURNAL_VERSION: u64 = 4;
 
 /// The op name a pallet delete is journaled under. Its entry records the removed ref with its head

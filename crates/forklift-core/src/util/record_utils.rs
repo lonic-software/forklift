@@ -242,10 +242,13 @@ fn last_line(bytes: &[u8]) -> (&[u8], &[u8]) {
     bytes.split_at(start)
 }
 
-/// Whether `bytes` ends with a line that opens as a digest line, matching or not: a record that
-/// failed its digest rather than one that never had one, such as a record from before its digest.
+/// Whether `bytes` ends with a line that opens as a digest line, matching or not, its hex damaged
+/// or not: a record that failed its digest rather than one that never had one, such as a record
+/// from before its digest. Looser than [`without_digest_line`]'s shape, so a damaged digest line
+/// still marks a repair's output unverified; a last entry that opens the same way only errs
+/// towards that warning.
 pub fn has_digest_line(bytes: &[u8]) -> bool {
-    without_digest_line(bytes).len() != bytes.len()
+    last_line(bytes).1.starts_with(DIGEST_PREFIX.as_bytes())
 }
 
 /// `bytes` without a digested record's last line, when that line has a digest line's shape,
@@ -454,6 +457,14 @@ mod tests {
                       &[b"digest ".as_slice(), &[b'z'; 64], b"\n"].concat()] {
             let bytes = [b"/forklift-test 2\n".as_slice(), entry].concat();
             assert_eq!(without_digest_line(&bytes), bytes, "{:?}", String::from_utf8_lossy(entry));
+        }
+        // A whole digest line whose hex is damaged is no digest by shape, but still a digest line
+        // that failed. Revert: judge it by shape → a repair drops its unverified warning.
+        let good = to_bytes("test", 2, ["aa"]);
+        for damaged in [good[..good.len() - 2].iter().chain(b"\n").copied().collect::<Vec<u8>>(),
+                        [&good[..good.len() - 2], b"q\n"].concat()] {
+            assert!(has_digest_line(&damaged), "{:?}", String::from_utf8_lossy(&damaged));
+            assert_eq!(from_bytes(&damaged, "test", 2), Err(RecordError::Damaged));
         }
     }
 }

@@ -34,7 +34,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   or a cut on a line boundary, was read as a different or shorter record: a cut scope file read
   as the full scope. Such a record now refuses as damaged. A full scope is no longer the empty
   file, so an empty scope file refuses too. **Breaking:** these records written before this
-  change refuse as an older version's, so clone or make the warehouse again.
+  change refuse as an older version's, so clone or make the warehouse again. The undo journal
+  moves to version 4 with them, and an older one is refused, so undo history from before the
+  upgrade is lost.
 - **A server's withheld record, tombstone list and served mark carry a digest.** Damage that still
   parsed, such as a flipped digit in a hash, was read as true: a takedown was served again under
   another hash, or a deleted pallet's history was left for gc. A record that does not match its
