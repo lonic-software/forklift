@@ -13534,6 +13534,48 @@ fn heal_reseals_what_the_origin_holds_after_the_sealed_record_is_lost() {
     assert_success(&area.forklift("cached", &["audit"]));
 }
 
+/// A sealed record cut on a frame boundary reads as a shorter valid record, but what the cut drops
+/// is not lost silently: the dropped hash reads as a lost object, and heal re-seals it, exactly
+/// that one, from the origin's held history.
+///
+/// Revert: skip the re-seal → heal refuses as `objects_lost`.
+#[test]
+fn a_sealed_record_cut_on_a_frame_boundary_reads_as_lost_and_heal_reseals_the_cut() {
+    let area = TestArea::new("sealed-frame-cut");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    let older = sealed_older_roots(&area, "cached", &head);
+    assert!(older.len() >= 2, "a frame must stay behind the cut: {:?}", older);
+
+    // One frame per hash, so the cut drops the last whole frame and keeps the others.
+    use forklift_core::util::sealed_utils::{self, SealOp};
+    let path = area.path("cached/.forklift/sealed");
+    let mut bytes = sealed_utils::header_bytes();
+    for root in &older {
+        bytes.extend(sealed_utils::encode_frame(SealOp::Record, root).unwrap());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+    let last = older.last().unwrap();
+    let cut = bytes.len() - sealed_utils::encode_frame(SealOp::Record, last).unwrap().len();
+    std::fs::write(&path, &bytes[..cut]).unwrap();
+
+    for root in &older {
+        assert_eq!(recorded(&area, "cached", root), root != last, "{} after the cut", root);
+    }
+    let refused = refusal_of(&area.forklift("cached", &["--json", "audit"]), 1);
+    let message = refused["message"].as_str().unwrap();
+    assert!(message.contains(&format!("{} is missing", last)), "the cut reads as lost: {}", refused);
+    assert!(message.contains("forklift heal"), "{}", refused);
+
+    let healed = area.forklift("cached", &["--json", "heal"]);
+    assert_success(&healed);
+    assert_eq!(resealed_of(&healed), vec![last.clone()]);
+    for root in &older {
+        assert!(recorded(&area, "cached", root), "{} is recorded again", root);
+    }
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
 /// A cache behind a collaborator's lift holds none of the origin's live heads, but its record of
 /// earlier held heads names its own, which the origin confirms it still reaches: heal walks from
 /// there and re-seals what the lost sealed record held.
