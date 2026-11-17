@@ -139,9 +139,17 @@ pub fn extract(tool: Tool, texts: &[&str]) -> Extracted {
 /// An operator remedy's arguments with its warehouse bound to `root`, the warehouse the harness
 /// serves: each `<warehouse>`, which extraction admits only as the value of `--root`. None when it
 /// names no warehouse at all, since a server command with no root would act on whatever the
-/// harness's own folder holds.
+/// harness's own folder holds. None too where the harness cannot stop a server as its operator
+/// does ([`crate::tool::Served::stop`], Unix only): the step is then not run, never run over a
+/// server killed hard.
 pub fn bind_operator(arguments: &[String], root: &Path) -> Option<Vec<String>> {
-    arguments.iter().any(|argument| argument == WAREHOUSE)
+    bind_operator_when(arguments, root, cfg!(unix))
+}
+
+/// [`bind_operator`] with whether a server can be stopped gracefully given, so both arms are tested
+/// on every platform.
+fn bind_operator_when(arguments: &[String], root: &Path, stoppable: bool) -> Option<Vec<String>> {
+    (stoppable && arguments.iter().any(|argument| argument == WAREHOUSE))
         .then(|| arguments.iter().map(|argument| if argument == WAREHOUSE { root.display().to_string() } else { argument.clone() }).collect())
 }
 
@@ -278,13 +286,15 @@ mod tests {
     }
 
     /// Revert: bind a remedy with no placeholder → a server command over no named warehouse would
-    /// run; bind by position → a placeholder elsewhere would stay unbound.
+    /// run; ignore whether the server can be stopped → off Unix the step would fail the lane.
     #[test]
     fn an_operator_remedy_binds_only_its_warehouse() {
         let arguments: Vec<String> = ["tombstone", "repair", "--root", WAREHOUSE].map(String::from).to_vec();
         assert_eq!(bind_operator(&arguments, Path::new("/s/0001-lane/host")),
             Some(["tombstone", "repair", "--root", "/s/0001-lane/host"].map(String::from).to_vec()));
         assert_eq!(bind_operator(&["tombstone".to_string(), "repair".to_string()], Path::new("/s/host")), None);
+        assert_eq!(bind_operator_when(&arguments, Path::new("/s/host"), false), None, "a server that cannot be asked to stop is not operated on");
+        assert!(bind_operator_when(&arguments, Path::new("/s/host"), true).is_some());
     }
 
     /// A quoted path that no `remove` precedes is not a remedy.
