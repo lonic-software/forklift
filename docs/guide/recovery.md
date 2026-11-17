@@ -145,11 +145,6 @@ warehouse root. Which step is named depends on why:
 A rebuilt fetch scope may be narrower than what was fetched before: paths only the old one named are
 no longer checked for loss. `forklift scope fetch <path>` adds one back.
 
-The same code refuses every read of a warehouse that is not sparse but holds a fetch scope, which
-only a sparse warehouse is given. Its next step is empty: delete `.forklift/config/fetch-scope`, and
-the warehouse is what its mode says without it. **If a remote refused** with it, only its operator
-can delete the file.
-
 ### `tombstones_damaged` (exit 55)
 
 The list of pallets deleted on a server (`.forklift/tombstones`) or its `served` mark is lost or
@@ -224,11 +219,22 @@ once they have.
 
 The origin record of a partial warehouse (`.forklift/origin`, the remote it was cloned from) does
 not parse or holds anything but one URL, so which remote it may talk to cannot be told. Nothing was
-changed, and no command rebuilds it: restore it from a copy of the warehouse.
+changed. Record it again with `forklift remote move <url>`, naming a server that holds this
+warehouse's content: the move checks that it does before it records it.
 
 **If a remote refused**, its warehouse is recorded as full but holds an origin record, so it may
 lack content its history names. Only its operator can mend that, by serving a full clone instead.
 Your warehouse is unchanged.
+
+### `fetch_scope_stray` (exit 62)
+
+A warehouse that is not sparse holds a fetch scope (`.forklift/config/fetch-scope`), which only a
+sparse warehouse is given, so it was put there by hand. Every read refuses rather than guess what
+the warehouse fetched. Nothing was changed. Delete the file: the warehouse is what its mode says
+without it.
+
+**If a remote refused**, only its operator can delete it. Your warehouse is unchanged. Try again
+once they have.
 
 ### `clone_incomplete` (exit 30)
 

@@ -517,7 +517,7 @@ fn read_fetch_state() -> Result<(WarehouseMode, PathScope), String> {
         // remedy, which no command does, so no next step is named.
         let kind = mode_kind(mode);
         return Err(refusal(
-            RefusalCode::FetchScopeDamaged,
+            RefusalCode::FetchScopeStray,
             format!(
                 "The warehouse is recorded as {} but holds a fetch scope (\"{}\"), which only a sparse \
                  warehouse has, so Forklift cannot tell what it has fetched. Delete that file: the \

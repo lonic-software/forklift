@@ -31,10 +31,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   A `--warehouses` server answered an uncoded `500` for a root whose sealed-object, unavailable or
   origin record did not read, or whose fetch scope stood in a full warehouse. Each now answers
   `503` with no `Retry-After` and its own code: `sealed_damaged` (exit 59), `unavailable_damaged`
-  (exit 60), `origin_damaged` (exit 61) or `fetch_scope_damaged`. The message names no server
-  path, and the next step is `forklift heal` where heal rebuilds the record. A client names the
-  remote's operator and does not retry. The same codes refuse locally, and a partial warehouse is
-  refused as partial whatever its fetch scope holds.
+  (exit 60), `origin_damaged` (exit 61) or `fetch_scope_stray` (exit 62). The message names no
+  server path, and the next step is `forklift heal` where heal rebuilds the record. A client names
+  the remote's operator and does not retry. The same codes refuse locally, where a damaged origin
+  names `forklift remote move <url>`, and a partial warehouse is refused as partial whatever its
+  fetch scope holds.
 
 - **Parked work is shared by every bay, named, and rebuilt by `heal` when its record is damaged.**
   Each bay kept its parked work in its own `parked` file, read as empty when it was lost, so the

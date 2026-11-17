@@ -42,9 +42,11 @@ pub fn read_origin() -> Result<Option<String>, String> {
         Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
     };
 
-    // Coded, so a server answers it as damage only its operator mends. Nothing rebuilds the
-    // record, so no next step is named.
-    let damaged = |message: String| -> String { CoreError::refusal(RefusalCode::OriginDamaged, message, "").into() };
+    // Coded, so a server answers it as damage only its operator mends. A move records the origin
+    // again, checking first that its server holds what this warehouse lacks.
+    let damaged = |message: String| -> String {
+        CoreError::refusal(RefusalCode::OriginDamaged, message, "forklift remote move <url>").into()
+    };
 
     let entries = record_utils::from_bytes(&bytes, RECORD, VERSION)
         .map_err(|e| damaged(format!("The file \"{}\" {}", path.to_string_lossy(), e.describe())))?;
@@ -210,6 +212,8 @@ pub fn missing_origin_refusal(configured: Option<&str>) -> CoreError {
 /// * `why`        - Why the record cannot be read, as [`read_origin`] says.
 /// * `configured` - The configured `remote.url`, which the next step names when set.
 pub fn damaged_origin_refusal(why: &str, configured: Option<&str>) -> CoreError {
+    // The record's own refusal, by its words alone: this one names the step.
+    let why = crate::error::deframe(why).map_or_else(|| why.to_string(), |(_, human, _)| human.into_owned());
     CoreError::refusal(
         RefusalCode::NonOriginRemote,
         format!(
@@ -278,6 +282,17 @@ mod tests {
 
         std::fs::write(&path, record_utils::to_bytes(RECORD, VERSION, [""])).unwrap();
         assert!(read_origin().unwrap_err().contains("empty origin"));
+
+        // Coded, naming the move that records it again; and a remote command's refusal over it
+        // carries the record's words alone, not its frame's fields. Mutation: paste `why` as it
+        // comes → the code and the detail's `null` show in the message → red.
+        let damaged = read_origin().unwrap_err();
+        let (code, _, step) = crate::error::deframe(&damaged).expect("framed");
+        assert_eq!((code, step), ("origin_damaged", "forklift remote move <url>"));
+        let CoreError::Refusal { code, message, .. } = damaged_origin_refusal(&damaged, None) else { panic!() };
+        assert_eq!(code, RefusalCode::NonOriginRemote);
+        assert!(message.contains("records an empty origin") && !message.contains("origin_damaged")
+            && !message.contains("null") && !message.contains("forklift remote move <url>"), "{}", message);
 
         file_utils::remove_dir_all(&root).ok();
     }

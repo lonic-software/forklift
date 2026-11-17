@@ -80,12 +80,13 @@ of the server's directory:
   there only in a corrupt loose file, or sits in a damaged pack file there. `next_step` names the
   operator's `forklift heal`, run where the warehouse is served from. The serverless head answers
   that case as a `500` whose body names no store path.
-- `fetch_scope_damaged`, `sealed_damaged`, `unavailable_damaged` and `origin_damaged`: a record the
-  server reads before it serves a full warehouse does not parse. They are, in turn, a fetch scope,
-  which a full warehouse never holds; the record of objects held by hash alone; the record of
-  content the warehouse cannot get; and the origin record. `next_step` is `forklift heal` where heal
-  rebuilds the record, and empty where nothing does (another version wrote it, or the origin). A
-  partial warehouse is answered `409` whatever these records hold.
+- `fetch_scope_stray`, `sealed_damaged`, `unavailable_damaged` and `origin_damaged`: a record the
+  server reads before it serves a full warehouse is out of place or does not parse. They are, in
+  turn, a fetch scope, which a full warehouse never holds; the record of objects held by hash alone;
+  the record of content the warehouse cannot get; and an origin record. `next_step` is
+  `forklift heal` where heal rebuilds the record, and empty where nothing does (another version
+  wrote it, a stray scope, an origin). A partial warehouse is answered `409` whatever these records
+  hold.
 
 The serverless head reads none of these records, and its `503`s are described with the endpoints
 that send them.

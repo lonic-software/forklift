@@ -58,7 +58,7 @@ lacking content its unavailable record (`.forklift/unavailable`) lists, which a 
 because its remote's host withholds it, until those files' bytes are loaded again. A record that
 does not parse is refused as damage, and so is a fetch scope (`.forklift/config/fetch-scope`) in a
 root that is not partial: a `--warehouses` server answers `503` with no `Retry-After` and the
-record's code (`fetch_scope_damaged`, `sealed_damaged`, `unavailable_damaged` or `origin_damaged`),
+record's code (`fetch_scope_stray`, `sealed_damaged`, `unavailable_damaged` or `origin_damaged`),
 naming `forklift heal` where heal rebuilds the record. Clients trust a server to
 hold every object its pallet heads reach, and `scope prune`, `evict` and `remote move` rely on that,
 so such a root could lead a client to free content it can never fetch back. To serve a cloned

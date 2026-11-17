@@ -1822,16 +1822,20 @@ fn is_damage(message: &str) -> bool {
 }
 
 /// The operator's remedy for a damaged host record, as a client is told it: the server's own
-/// directories are not named over the wire, so the warehouse is a placeholder. A record whose own
-/// refusal names a step by damage class (`forklift heal` for the damage heal mends, none for the
-/// rest) keeps that step, `own`, which names no path.
+/// directories are not named over the wire, so the warehouse is a placeholder. The sealed and
+/// unavailable records name their step by damage class (`forklift heal` for the damage heal mends,
+/// none for the rest), and that step, `own`, names no path, so it is kept. A served root is full,
+/// so neither a stray fetch scope nor an origin record in one has a command that mends it: what
+/// the operator does is in the message.
 fn operator_remedy(code: forklift_core::error::RefusalCode, own: &str) -> String {
     use forklift_core::error::RefusalCode;
     match code {
         RefusalCode::TombstonesDamaged => "forklift-server tombstone repair --root <warehouse>".to_string(),
         RefusalCode::WithheldDamaged => "forklift-server withhold repair --root <warehouse>".to_string(),
         RefusalCode::ObjectUnreadable => "forklift heal".to_string(),
-        _ => own.to_string(),
+        RefusalCode::SealedDamaged | RefusalCode::UnavailableDamaged => own.to_string(),
+        RefusalCode::FetchScopeStray | RefusalCode::OriginDamaged => String::new(),
+        _ => unreachable!("not a damage code"),
     }
 }
 
@@ -1843,14 +1847,14 @@ fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> Str
     match code {
         RefusalCode::ObjectUnreadable =>
             "An object this request needs cannot be read from the warehouse's store: it is missing there, or a pack file holding it is damaged.".to_string(),
-        RefusalCode::FetchScopeDamaged =>
-            "The warehouse is recorded as full but holds a fetch scope, which only a sparse warehouse has, so what it has fetched cannot be told. Nothing was served; deleting the fetch scope file from the warehouse's configuration ends it.".to_string(),
+        RefusalCode::FetchScopeStray =>
+            "The warehouse is recorded as full but holds a fetch scope, which only a sparse warehouse has, so what it has fetched cannot be told, and the request was refused. Deleting the fetch scope file from the warehouse's configuration ends it.".to_string(),
         RefusalCode::SealedDamaged =>
-            "The warehouse's record of the objects it holds by hash alone does not read, so which those are cannot be told. Nothing was served.".to_string(),
+            "The warehouse's record of the objects it holds by hash alone does not read, so which those are cannot be told, and the request was refused.".to_string(),
         RefusalCode::UnavailableDamaged =>
-            "The warehouse's record of content it cannot get does not read, so what it lacks cannot be told. Nothing was served.".to_string(),
+            "The warehouse's record of content it cannot get does not read, so what it lacks cannot be told, and the request was refused.".to_string(),
         RefusalCode::OriginDamaged =>
-            "The warehouse is recorded as full but holds an origin record, which only a partial warehouse has, so content its pallets reach may be absent, and the record does not read. Nothing was served.".to_string(),
+            "The warehouse is recorded as full but holds an origin record, which only a partial warehouse has, so content its pallets reach may be absent; the record does not read, and the request was refused. Serve a full clone instead.".to_string(),
         _ => human,
     }
 }
@@ -7387,7 +7391,7 @@ mod tests {
         std::fs::write(stray.join(FOLDER_NAME_FORKLIFT_ROOT).join("config").join("fetch-scope"), b"").unwrap();
         let refused = WarehouseHandle::serving(stray, false).err().expect("a full root with a fetch scope is refused");
         assert!(matches!(&refused, ServingRefusal::Unreadable(reason) if reason.contains("holds a fetch scope")
-            && forklift_core::error::frames_code(reason, forklift_core::error::RefusalCode::FetchScopeDamaged)), "{:?}", refused);
+            && forklift_core::error::frames_code(reason, forklift_core::error::RefusalCode::FetchScopeStray)), "{:?}", refused);
 
         let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
@@ -7547,7 +7551,7 @@ mod tests {
 
         // (warehouse, the damage, its code, whether heal is the step)
         let cases: [(&str, &str, &str, bool); 6] = [
-            ("stray", "a fetch scope in a full root", "fetch_scope_damaged", false),
+            ("stray", "a fetch scope in a full root", "fetch_scope_stray", false),
             ("sealed-cut", "a sealed record damaged past a frame", "sealed_damaged", true),
             ("sealed-newer", "a sealed record another version wrote", "sealed_damaged", false),
             ("unavailable-entry", "an unavailable record with a bad entry", "unavailable_damaged", true),

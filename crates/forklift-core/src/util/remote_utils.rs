@@ -9697,7 +9697,7 @@ mod tests {
     #[test]
     fn a_remotes_damaged_gate_record_is_the_operators_and_never_retried() {
         for (code, step) in [
-            (RefusalCode::FetchScopeDamaged, ""),
+            (RefusalCode::FetchScopeStray, ""),
             (RefusalCode::SealedDamaged, "forklift heal"),
             (RefusalCode::UnavailableDamaged, ""),
             (RefusalCode::OriginDamaged, ""),

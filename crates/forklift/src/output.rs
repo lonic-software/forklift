@@ -607,6 +607,9 @@ error_codes! {
 
     /// The origin record does not parse or holds anything but one URL.
     OriginDamaged,
+
+    /// A warehouse that is not sparse holds a fetch scope.
+    FetchScopeStray,
 }
 
 impl ErrorCode {
@@ -673,6 +676,7 @@ impl ErrorCode {
             ErrorCode::SealedDamaged => RefusalCode::SealedDamaged.as_str(),
             ErrorCode::UnavailableDamaged => RefusalCode::UnavailableDamaged.as_str(),
             ErrorCode::OriginDamaged => RefusalCode::OriginDamaged.as_str(),
+            ErrorCode::FetchScopeStray => RefusalCode::FetchScopeStray.as_str(),
         }
     }
 
@@ -742,6 +746,7 @@ impl ErrorCode {
             ErrorCode::SealedDamaged => 59,
             ErrorCode::UnavailableDamaged => 60,
             ErrorCode::OriginDamaged => 61,
+            ErrorCode::FetchScopeStray => 62,
         }
     }
 
@@ -880,7 +885,7 @@ impl ErrorCode {
             ErrorCode::RefDamaged =>
                 "A pallet ref is lost or damaged: its file holds no parcel hash, or it is missing while a checkout stands on that pallet. Nothing was changed; heal rebuilds it from what the bays and the ref's own bytes still name, or lists what it found",
             ErrorCode::FetchScopeDamaged =>
-                "A sparse warehouse's fetch scope is lost or damaged, and heal could not rebuild it from the checkouts' scopes alone, or a warehouse that is not sparse holds one. Nothing was changed; heal --fetch-scope sets a sparse warehouse's, fetching what the history there lacks, and deleting the file ends the other",
+                "A sparse warehouse's fetch scope is lost or damaged, and heal could not rebuild it from the checkouts' scopes alone. Nothing was changed; heal --fetch-scope sets it, fetching what the history there lacks",
             ErrorCode::TombstonesDamaged =>
                 "A served warehouse's tombstone list or served mark is lost or damaged, so which deleted pallets' heads it keeps cannot be told. Nothing was changed, and nothing that frees history runs there; its operator repairs it with forklift-server tombstone repair while it is not served",
             ErrorCode::WithheldDamaged =>
@@ -894,7 +899,9 @@ impl ErrorCode {
             ErrorCode::UnavailableDamaged =>
                 "The record of content the warehouse cannot get, left out because a remote's host withholds it, does not parse. Nothing was changed; heal rebuilds it from the entries that still read, unless a newer version wrote it",
             ErrorCode::OriginDamaged =>
-                "The origin record, of the remote a partial warehouse was cloned from, does not parse or holds anything but one URL. Nothing was changed, and nothing rebuilds it",
+                "The origin record, of the remote a partial warehouse was cloned from, does not parse or holds anything but one URL. Nothing was changed; remote move records it again, after checking that server holds what the warehouse lacks",
+            ErrorCode::FetchScopeStray =>
+                "A warehouse that is not sparse holds a fetch scope, which only a sparse warehouse is given, so what it fetched cannot be told. Nothing was changed; deleting the file ends it",
         }
     }
 
@@ -962,6 +969,7 @@ impl ErrorCode {
             RefusalCode::SealedDamaged => ErrorCode::SealedDamaged,
             RefusalCode::UnavailableDamaged => ErrorCode::UnavailableDamaged,
             RefusalCode::OriginDamaged => ErrorCode::OriginDamaged,
+            RefusalCode::FetchScopeStray => ErrorCode::FetchScopeStray,
         }
     }
 }
@@ -1616,6 +1624,7 @@ mod tests {
             (RefusalCode::SealedDamaged, "sealed_damaged", 59),
             (RefusalCode::UnavailableDamaged, "unavailable_damaged", 60),
             (RefusalCode::OriginDamaged, "origin_damaged", 61),
+            (RefusalCode::FetchScopeStray, "fetch_scope_stray", 62),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

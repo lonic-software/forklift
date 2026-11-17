@@ -2263,7 +2263,7 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
         roots.degraded_sources.push(format!(
             "the fetch scope could not be read this run ({}), so objects outside it could not be \
             told apart from lost ones.",
-            error
+            crate::error::rendered_frames(&error)
         ));
         PathScope::full()
     });
@@ -2272,7 +2272,7 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
     let sealed = sealed_utils::read_tolerated().unwrap_or_else(|error| {
         roots.degraded_sources.push(format!(
             "objects held by hash alone, redacted or unavailable could not be told apart from lost ones this run. {}.",
-            error.trim_end_matches('.')
+            crate::error::rendered_frames(&error).trim_end_matches('.')
         ));
         Tolerated::default()
     });
