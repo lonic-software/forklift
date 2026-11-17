@@ -660,8 +660,8 @@ impl ConfigRepaired {
     }
 }
 
-/// The suffix of the copy a repair sets a damaged configuration file's bytes aside under.
-pub const DAMAGED_COPY_SUFFIX: &str = ".damaged";
+/// The copy a repair sets a damaged warehouse configuration file's bytes aside in, beside it.
+const FILE_NAME_WAREHOUSE_CONFIG_DAMAGED: &str = "warehouse.toml.damaged";
 
 /// Mend a damaged warehouse configuration file from the entries its damage provably spared
 /// ([`config_salvage`](crate::util::config_salvage)), the first step of `heal`.
@@ -790,9 +790,7 @@ fn loss_summary(salvage: &crate::util::config_salvage::Salvage) -> String {
 /// repair that drops entries writes over it. A copy already there is kept: the same bytes are
 /// nothing new, and different ones may hold the only copy of a value an earlier repair dropped.
 fn set_damaged_bytes_aside(target: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
-    let mut name = target.file_name().unwrap_or_default().to_os_string();
-    name.push(DAMAGED_COPY_SUFFIX);
-    let aside = target.with_file_name(name);
+    let aside = target.with_file_name(FILE_NAME_WAREHOUSE_CONFIG_DAMAGED);
 
     match std::fs::symlink_metadata(&aside) {
         Ok(_) => match std::fs::read(&aside) {

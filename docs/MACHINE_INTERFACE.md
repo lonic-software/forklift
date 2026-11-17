@@ -85,7 +85,18 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 50** (current): the `bay_position_damaged` error code exists (exit 64). The bay's
+**Schema 51** (current): the `config_damaged` error code exists (exit 65). A configuration file
+holds bytes that are not UTF-8 or a control character TOML never allows, or it does not parse and
+lacks its final newline, as a file cut short does. `next_step` is `forklift heal --config` for the
+warehouse's own file, and empty for the global file, which heal does not mend; heal also refuses
+this way, with the same next step, when mending the file would drop entries, and with no next step
+when an earlier repair's damaged bytes are still set aside. A file that is not damaged but does not
+parse or validate keeps its uncoded refusal. `heal` reports a rewritten file as `config_repaired`
+(`path`, `dropped`: each entry's `line`, its `key` when readable, and `falls_back_to_global` when
+that can be told; `cut`; and `set_aside`, the copy's path, when entries were dropped). It never
+carries a value.
+
+**Schema 50**: the `bay_position_damaged` error code exists (exit 64). The bay's
 position (the pallet it stands on and the parcel its files stand on) is missing, cannot be read,
 or does not parse. `next_step` is `forklift heal` for the bay the command runs in, and empty for
 another bay's, which a heal here does not reach; heal itself, finding no copy of the position and

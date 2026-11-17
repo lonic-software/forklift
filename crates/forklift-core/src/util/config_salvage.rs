@@ -328,7 +328,8 @@ mod tests {
         assert!(!salvage.lossless);
     }
 
-    /// Revert: keep entries of a section that lost another → url kept beside a dropped token → red.
+    /// Revert: keep entries of a section that lost another → url kept beside a dropped token
+    /// → red.
     #[test]
     fn a_section_that_loses_one_entry_loses_all() {
         let salvage = salvage(&flip(FILE.find("secret").unwrap()), any);
