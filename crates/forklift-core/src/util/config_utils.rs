@@ -713,8 +713,12 @@ pub fn repair_warehouse_config(accept_loss: bool) -> Result<Option<ConfigRepaire
         }
 
         let salvage = crate::util::config_salvage::salvage(&bytes, valid_entry);
+        // The salvage judges entries one at a time; the file as a whole, a header naming no known
+        // section for one, may still not validate, and then only the lossy rewrite can mend it.
+        let lossless = salvage.lossless
+            && salvage.text.parse::<DocumentMut>().is_ok_and(|document| parse_config(&document, target).is_ok());
 
-        if !salvage.lossless && !accept_loss {
+        if !lossless && !accept_loss {
             return Err(crate::error::CoreError::refusal(
                 crate::error::RefusalCode::ConfigDamaged,
                 format!(
@@ -726,12 +730,12 @@ pub fn repair_warehouse_config(accept_loss: bool) -> Result<Option<ConfigRepaire
             ).into());
         }
 
-        let set_aside = match salvage.lossless {
+        let set_aside = match lossless {
             true => None,
             false => Some(set_damaged_bytes_aside(target, &bytes)?),
         };
 
-        let document = match salvage.lossless {
+        let document = match lossless {
             true => salvage.text.parse::<DocumentMut>()
                 .map_err(|error| not_valid(target, error.to_string().trim_end().to_string()))?,
             false => {
@@ -745,10 +749,10 @@ pub fn repair_warehouse_config(accept_loss: bool) -> Result<Option<ConfigRepaire
         };
         write_validated(target, &document)?;
 
-        Ok(Some((named(target), salvage, set_aside.as_deref().map(named))))
+        Ok(Some((named(target), salvage, lossless, set_aside.as_deref().map(named))))
     })?;
 
-    let Some((path, salvage, set_aside)) = repaired else {
+    let Some((path, salvage, lossless, set_aside)) = repaired else {
         return Ok(None);
     };
 
@@ -761,7 +765,7 @@ pub fn repair_warehouse_config(accept_loss: bool) -> Result<Option<ConfigRepaire
             .map(|value| value.is_some()),
     }).collect();
 
-    Ok(Some(ConfigRepaired { path, dropped, cut: salvage.cut, lossless: salvage.lossless, set_aside }))
+    Ok(Some(ConfigRepaired { path, dropped, cut: salvage.cut, lossless, set_aside }))
 }
 
 /// Whether one salvaged entry is one a configuration file may hold: a known key with a valid
@@ -792,7 +796,9 @@ fn loss_summary(salvage: &crate::util::config_salvage::Salvage) -> String {
     if !salvage.parsed {
         parts.insert(0, "the rest of the file does not parse, so no entry can be kept".to_string());
     }
-    if parts.is_empty() {
+    if parts.is_empty() && salvage.lossless {
+        parts.push("its comments, since the file as read does not hold a valid configuration".to_string());
+    } else if parts.is_empty() {
         parts.push("a line its damage may have turned into comment text".to_string());
     }
 
@@ -1550,32 +1556,35 @@ const CUT_SHORT_OR_UNENDED: &str = "its last line does not parse, and no newline
                                     hand rather than cut, fix it by hand instead";
 
 /// What damage a configuration file's bytes show, if any: bytes that are not UTF-8, or a
-/// character TOML never allows anywhere, which is what zeroed bytes read as. Neither is a mistake
-/// made by hand in an editor that saves UTF-8, and both stop every reading of the file.
+/// character TOML never allows where it stands: a control character, which is what zeroed bytes
+/// read as, or a carriage return no line feed follows, which is what a byte flipped to 0x0D reads
+/// as. None is a mistake made by hand in an editor that saves UTF-8, and each stops every reading
+/// of the file.
 fn content_damage(bytes: &[u8]) -> Option<String> {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Some(NOT_UTF8.to_string());
     };
 
     text.char_indices()
-        .find(|&(_, c)| crate::util::config_salvage::is_forbidden_control(c))
+        .find(|&(at, c)| crate::util::config_salvage::is_damaged_char(text, at, c))
         .map(|(at, c)| format!(
-            "line {} holds the control character U+{:04X}, which TOML never allows",
+            "line {} holds the control character U+{:04X}, which TOML never allows there",
             text[..at].matches('\n').count() + 1, c as u32
         ))
 }
 
 /// Whether a file that does not parse was cut short: it has bytes, the last is not the newline
-/// every write ends with, and what precedes its last line parses. A cut only ever takes the end of
-/// a file, so a file that fails to parse before its last line holds a mistake made by hand, and so
-/// does a clean file that does not parse but ends in a newline.
+/// every write ends with, and what precedes its last line parses, once any multi-line string the
+/// cut left open is closed. A cut only ever takes the end of a file, so a file that fails to parse
+/// before its last line holds a mistake made by hand, and so does a clean file that does not
+/// parse but ends in a newline.
 fn is_cut(bytes: &[u8]) -> bool {
     let body = match bytes.iter().rposition(|&b| b == b'\n') {
         Some(at) => &bytes[..=at],
         None => &[],
     };
     !bytes.is_empty() && !bytes.ends_with(b"\n")
-        && std::str::from_utf8(body).is_ok_and(|body| body.parse::<DocumentMut>().is_ok())
+        && std::str::from_utf8(body).is_ok_and(|body| crate::util::config_salvage::parse_closed(body).is_some())
 }
 
 /// Whether a configuration file's bytes are damaged, as [`load_document`] refuses them with

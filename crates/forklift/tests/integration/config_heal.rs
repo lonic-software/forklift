@@ -307,3 +307,59 @@ fn a_damaged_global_file_is_refused_without_a_next_step_and_does_not_stop_heal()
     let healed = area.run_ok(&["heal"]);
     assert!(text(&healed.stdout).contains("could not be read"), "{}", text(&healed.stdout));
 }
+
+/// A cut inside a multi-line string is a cut, not a hand mistake. Revert: try no closer in
+/// parse_closed → is_cut fails, the file reads as not_valid (exit 1) and heal leaves it → red.
+#[test]
+fn a_cut_inside_a_multi_line_token_is_damage_heal_config_mends() {
+    let area = Area::new("multi-line-cut");
+    let written = text(&std::fs::read(area.config()).unwrap());
+    let quoted = format!("\"{}\"", TOKEN);
+    assert!(written.contains(&quoted), "{}", written);
+    let multi = written.replace(&quoted, &format!("\"\"\"\n{}\n{}\"\"\"", &TOKEN[..6], &TOKEN[6..]));
+    let at = multi.find(&TOKEN[6..]).unwrap() + 3;
+    std::fs::write(area.config(), &multi.as_bytes()[..at]).unwrap();
+
+    config_damaged(&area.run(&["--json", "config", "get", "mirror.pallets"]));
+    area.run_ok(&["heal", "--config"]);
+    assert_eq!(area.get("operator.identifier"), "config-heal@forklift");
+    assert!(!area.run(&["config", "get", "remote.token"]).status.success());
+}
+
+/// A byte flipped to a carriage return is damage, mended by plain heal when it hides nothing.
+/// Revert: let content_damage pass a lone carriage return → not_valid (exit 1) → red.
+#[test]
+fn a_lone_carriage_return_is_damage_plain_heal_mends() {
+    let area = Area::new("lone-cr");
+    let mut bytes = std::fs::read(area.config()).unwrap();
+    let at = bytes.windows(12).position(|w| w == b"pseudonymous").unwrap();
+    bytes[at] = b'\r';
+    std::fs::write(area.config(), &bytes).unwrap();
+
+    let refused = config_damaged(&area.run(&["--json", "config", "get", "mirror.pallets"]));
+    assert!(refused["error"]["message"].as_str().unwrap().contains("U+000D"), "{}", refused);
+    let healed = parsed(&area.run_ok(&["--json", "heal"]));
+    assert_eq!(healed["data"]["config_repaired"]["lossless"], true, "{}", healed);
+    assert_eq!(area.get("remote.token"), TOKEN);
+}
+
+/// A salvage that loses no entry but whose text does not validate, here for an unknown section,
+/// is mended only by the lossy rewrite. Revert: trust salvage.lossless alone → plain heal tries
+/// the lossless write, which fails validation, and heal aborts uncoded → red.
+#[test]
+fn a_lossless_salvage_that_does_not_validate_is_refused_for_heal_config() {
+    let area = Area::new("invalid-lossless");
+    let mut bytes = std::fs::read(area.config()).unwrap();
+    bytes.extend_from_slice(b"[bogus]\n");
+    let at = bytes.windows(12).position(|w| w == b"pseudonymous").unwrap();
+    bytes[at] = !bytes[at];
+    std::fs::write(area.config(), &bytes).unwrap();
+
+    let refused = config_damaged(&area.run(&["--json", "heal"]));
+    assert_eq!(refused["error"]["next_step"], "forklift heal --config", "{}", refused);
+    assert!(refused["error"]["message"].as_str().unwrap().contains("does not hold a valid configuration"),
+            "{}", refused);
+    let healed = parsed(&area.run_ok(&["--json", "heal", "--config"]));
+    assert_eq!(healed["data"]["config_repaired"]["lossless"], false, "{}", healed);
+    assert_eq!(area.get("remote.token"), TOKEN);
+}

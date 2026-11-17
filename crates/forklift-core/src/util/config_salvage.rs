@@ -66,10 +66,29 @@ pub fn is_forbidden_control(c: char) -> bool {
     (c < ' ' && c != '\t' && c != '\n' && c != '\r') || c == '\u{7f}'
 }
 
-/// Whether `c` marks damage in a lossily decoded file: the replacement character a byte that was
-/// not UTF-8 decodes to, or a control character TOML never allows.
+/// Whether the character `c` at byte `at` of `text` is one TOML never allows where it stands: a
+/// forbidden control character ([`is_forbidden_control`]), or a carriage return no line feed
+/// follows, as a byte flipped to 0x0D reads. A carriage return that ends the text is left to the
+/// cut it may be the start of.
+pub fn is_damaged_char(text: &str, at: usize, c: char) -> bool {
+    is_forbidden_control(c) || (c == '\r' && at + 1 < text.len() && !text[at + 1..].starts_with('\n'))
+}
+
+/// Whether `c` marks damage in the text the verdict reads, where every damaged character already
+/// reads as the replacement character a byte that was not UTF-8 decodes to.
 fn is_damage(c: char) -> bool {
     c == char::REPLACEMENT_CHARACTER || is_forbidden_control(c)
+}
+
+/// What a cut inside a multi-line string leaves unwritten: the string's closing delimiter.
+const CLOSERS: [&str; 3] = ["", "\"\"\"\n", "'''\n"];
+
+/// `text` parsed as a document, or, when it ends inside a multi-line string, as one with that
+/// string closed. Only a cut leaves a string open at the end of the text it spares, so only a
+/// cut's text may be read this way: anywhere else, the closer would swallow what follows into the
+/// string.
+pub fn parse_closed(text: &str) -> Option<toml_edit::Document<String>> {
+    CLOSERS.iter().find_map(|closer| toml_edit::Document::parse(format!("{}{}", text, closer)).ok())
 }
 
 /// One entry found in the parsed text, before the verdict on it.
@@ -99,18 +118,25 @@ pub fn salvage(bytes: &[u8], valid: impl Fn(&[String], &str) -> bool) -> Salvage
         false => (bytes, None),
     };
 
-    // A forbidden control character stops every TOML reader, wherever it lies; read as the
-    // replacement character, it is damage like any byte that was not UTF-8, and the rest of the
-    // file still parses around it when it lies in a comment.
-    let text: String = String::from_utf8_lossy(body).chars()
-        .map(|c| if is_forbidden_control(c) { char::REPLACEMENT_CHARACTER } else { c })
+    // A forbidden control character or a lone carriage return stops every TOML reader, wherever
+    // it lies; read as the replacement character, it is damage like any byte that was not UTF-8,
+    // and the rest of the file still parses around it when it lies in a comment.
+    let decoded = String::from_utf8_lossy(body);
+    let text: String = decoded.char_indices()
+        .map(|(at, c)| if is_damaged_char(&decoded, at, c) { char::REPLACEMENT_CHARACTER } else { c })
         .collect();
     let damage: Vec<Range<usize>> = text.char_indices()
         .filter(|&(_, c)| is_damage(c))
         .map(|(at, c)| at..at + c.len_utf8())
         .collect();
 
-    let Ok(document) = toml_edit::Document::parse(text.clone()) else {
+    // A cut inside a multi-line string leaves it open. With damage anywhere, the closing delimiter
+    // may be what the damage hid, and closing the string would swallow what followed it.
+    let document = match cut && damage.is_empty() {
+        true => parse_closed(&text),
+        false => toml_edit::Document::parse(text.clone()).ok(),
+    };
+    let Some(document) = document else {
         let dropped = entry_lines(&text);
         return Salvage { kept: Vec::new(), dropped, cut, parsed: false, lossless: false, text };
     };
@@ -143,12 +169,23 @@ pub fn salvage(bytes: &[u8], valid: impl Fn(&[String], &str) -> bool) -> Salvage
     // that spot, which goes whole; a hidden header moves every entry after it into that section,
     // which goes whole too. In the root, where no header governs, a hidden line may be of any
     // section, so every one goes.
+    //
+    // Damage inside a header, in a quoted name, leaves the header's entries under a name it never
+    // held: its section goes whole.
     let governing = |at: usize| headers.iter()
-        .filter(|(start, _)| *start <= at)
-        .max_by_key(|(start, _)| *start)
+        .filter(|(span, _)| span.start <= at)
+        .max_by_key(|(span, _)| span.start)
         .map(|(_, path)| path.clone());
     let mut hidden = Vec::new();
+    // Where a hidden header or unreadable line may start, and the section governing that spot:
+    // the entries after it in that section may belong to another, so their keys are unknown.
+    let mut misread_from: Vec<(usize, Option<Vec<String>>)> = Vec::new();
     for at in damage.iter().filter(|at| !found.iter().any(|entry| entry.span.contains(&at.start))) {
+        if let Some((_, path)) = headers.iter().find(|(span, _)| span.contains(&at.start)) {
+            drop_group(path);
+            hidden.push(DroppedEntry { line: line_of(&text, at.start), key: None });
+            continue;
+        }
         let Some(line) = hidden_line(&text, at.end) else {
             continue;
         };
@@ -165,6 +202,9 @@ pub fn salvage(bytes: &[u8], valid: impl Fn(&[String], &str) -> bool) -> Salvage
                 drop_group(&entry.path);
             },
         }
+        if key.is_none() {
+            misread_from.push((at.start, section.clone()));
+        }
         hidden.push(DroppedEntry {
             line: line_of(&text, at.start),
             key: key.map(|path| path.join(".")).filter(|key| !key.chars().any(is_damage)),
@@ -176,7 +216,7 @@ pub fn salvage(bytes: &[u8], valid: impl Fn(&[String], &str) -> bool) -> Salvage
     // section above it, so that one is complete.
     let fragment = partial.is_some_and(|line| String::from_utf8_lossy(line).trim_start().starts_with('['));
     if cut && !fragment {
-        match headers.iter().max_by_key(|(start, _)| *start) {
+        match headers.iter().max_by_key(|(span, _)| span.start) {
             Some((_, path)) => drop_group(path),
             // No header at all: the cut lies in the root, where any entry may be of any section.
             None => for entry in &found {
@@ -192,16 +232,18 @@ pub fn salvage(bytes: &[u8], valid: impl Fn(&[String], &str) -> bool) -> Salvage
             kept.push(KeptEntry { path: entry.path.clone(), value: entry.value.clone().unwrap_or_default() });
         } else {
             let key = entry.path.join(".");
+            let misread = misread_from.iter()
+                .any(|(from, section)| entry.span.start > *from && governing(entry.span.start) == *section);
             dropped.push(DroppedEntry {
                 line: line_of(&text, entry.span.start),
-                key: (!key.chars().any(is_damage)).then_some(key),
+                key: (!misread && !key.chars().any(is_damage)).then_some(key),
             });
         }
     }
     dropped.extend(hidden);
     dropped.sort_by_key(|entry| entry.line);
 
-    let lossless = !cut && dropped.is_empty() && !damage.iter().any(|at| on_last_line(&text, at.start));
+    let lossless = !cut && dropped.is_empty();
 
     Salvage { kept, dropped, cut, parsed: true, lossless, text }
 }
@@ -213,13 +255,14 @@ fn group(path: &[String]) -> Vec<String> {
     path.iter().take(depth).cloned().collect()
 }
 
-/// Gather every leaf entry under `table`, and every header with its path. `header_start`, the start
-/// of the header governing `table`, stands in for a span the parser did not keep.
+/// Gather every leaf entry under `table`, and every header with its span (`[` to `]`) and path.
+/// `header_start`, the start of the header governing `table`, stands in for a span the parser did
+/// not keep.
 fn collect(table: &toml_edit::Table,
            prefix: &[String],
            header_start: usize,
            found: &mut Vec<Found>,
-           headers: &mut Vec<(usize, Vec<String>)>) {
+           headers: &mut Vec<(Range<usize>, Vec<String>)>) {
     for (keys, value) in table.get_values() {
         let mut path = prefix.to_vec();
         path.extend(keys.iter().map(|key| key.get().to_string()));
@@ -232,20 +275,22 @@ fn collect(table: &toml_edit::Table,
         path.push(name.to_string());
         match item {
             toml_edit::Item::Table(sub) if !sub.is_dotted() => {
+                let span = sub.span().unwrap_or(header_start..header_start);
                 let start = match sub.is_implicit() {
                     true => header_start,
-                    false => sub.span().map_or(header_start, |span| span.start),
+                    false => span.start,
                 };
                 if !sub.is_implicit() {
-                    headers.push((start, path.clone()));
+                    headers.push((span, path.clone()));
                 }
                 collect(sub, &path, start, found, headers);
             }
             // An array of tables is nothing a configuration file holds: each of its tables is a
             // dropped entry, so its section goes.
             toml_edit::Item::ArrayOfTables(array) => for sub in array.iter() {
-                let start = sub.span().map_or(header_start, |span| span.start);
-                headers.push((start, path.clone()));
+                let span = sub.span().unwrap_or(header_start..header_start);
+                let start = span.start;
+                headers.push((span, path.clone()));
                 found.push(Found { path: path.clone(), value: None, span: start..start + 1 });
             },
             _ => {}
@@ -278,12 +323,6 @@ fn line_of(text: &str, at: usize) -> usize {
     text[..at.min(text.len())].matches('\n').count() + 1
 }
 
-/// Whether byte offset `at` lies on the text's last line, the one its final newline ends.
-fn on_last_line(text: &str, at: usize) -> bool {
-    let trimmed = text.strip_suffix('\n').unwrap_or(text);
-    trimmed.rfind('\n').is_none_or(|last| at > last)
-}
-
 /// What the comment text after a damaged character, from `after` to the end of its line, may
 /// hide: were that character a newline, the rest would be a line of its own.
 ///
@@ -304,8 +343,20 @@ fn hidden_line(text: &str, after: usize) -> Option<Option<Vec<String>>> {
         return Some(None);
     }
     let (key, _) = line.split_once('=')?;
-    let key = toml_edit::Key::parse(key.trim()).ok().filter(|key| !key.is_empty())?;
-    Some(Some(key.iter().map(|part| part.get().to_string()).collect()))
+    match toml_edit::Key::parse(key.trim()).ok().filter(|key| !key.is_empty()) {
+        Some(key) => Some(Some(key.iter().map(|part| part.get().to_string()).collect())),
+        // A quoted key may hold `=` itself, so the first `=` need not end the key: read the rest
+        // as a document of one line, its value closed should it open a multi-line string.
+        None => one_line_key(line).map(Some),
+    }
+}
+
+/// The key of the entry `line` holds, read as a document of its own, when it holds one.
+fn one_line_key(line: &str) -> Option<Vec<String>> {
+    let document = parse_closed(&format!("{}\n", line))?;
+    let (mut found, mut headers) = (Vec::new(), Vec::new());
+    collect(document.as_table(), &[], 0, &mut found, &mut headers);
+    found.into_iter().next().map(|entry| entry.path)
 }
 
 /// Whether `line` begins as an entry does: a key, then `=`.
@@ -415,8 +466,95 @@ mod tests {
         bytes[text.find("\n[remote]").unwrap()] = 0;
         let salvage = salvage(&bytes, any);
         assert!(salvage.parsed && salvage.kept.is_empty(), "{:?}", salvage);
+        // The url was read as a root entry only because the header was hidden: its key is unknown.
+        // Revert: drop the misread rule → Some("url") → red.
         assert_eq!(salvage.dropped, [DroppedEntry { line: 1, key: None },
-                                     DroppedEntry { line: 2, key: Some("url".to_string()) }]);
+                                     DroppedEntry { line: 2, key: None }]);
+    }
+
+    /// Entries a hidden header governs are misread only up to the next real header, and only in
+    /// the section the hidden header lies in.
+    #[test]
+    fn a_hidden_header_unnames_only_the_entries_it_governs() {
+        let text = "[mirror]\npallets = \"main\"\n# x\n[remote]\nurl = \"u\"\n[operator]\nidentifier = \"o\"\n";
+        let mut bytes = text.as_bytes().to_vec();
+        bytes[text.find("\n[remote]").unwrap()] = 0xFF;
+        let salvage = salvage(&bytes, any);
+        assert_eq!(keys(&salvage), ["operator.identifier"]);
+        assert_eq!(salvage.dropped, [DroppedEntry { line: 2, key: Some("mirror.pallets".to_string()) },
+                                     DroppedEntry { line: 3, key: None },
+                                     DroppedEntry { line: 4, key: None }]);
+    }
+
+    /// A key quoted around `=` is still a key. Revert: answer None when the split key does not
+    /// parse → the remote is kept and the salvage reads as lossless → red.
+    #[test]
+    fn a_hidden_entry_with_a_quoted_equals_sign_drops_its_section() {
+        let text = "[remote]\nurl = \"u\"\n# x\"a=b\" = \"v\"\n[operator]\nidentifier = \"o\"\n";
+        let mut bytes = text.as_bytes().to_vec();
+        bytes[text.find("x\"a=b").unwrap()] = 0xFF;
+        let salvage = salvage(&bytes, any);
+        assert_eq!(keys(&salvage), ["operator.identifier"]);
+        assert!(salvage.dropped.contains(&DroppedEntry { line: 3, key: Some("remote.a=b".to_string()) }),
+                "{:?}", salvage.dropped);
+        assert!(!salvage.lossless);
+    }
+
+    /// Damage in a quoted header name leaves the entries under a name they never had. Revert:
+    /// skip the header-span check → profile entries kept under the damaged name → red.
+    #[test]
+    fn damage_in_a_quoted_header_drops_its_section() {
+        let text = "[profile.\"work\"]\nidentifier = \"w\"\n[operator]\nidentifier = \"o\"\n";
+        let mut bytes = text.as_bytes().to_vec();
+        bytes[text.find("ork").unwrap()] = 0xFF;
+        let read = salvage(&bytes, any);
+        assert_eq!(keys(&read), ["operator.identifier"]);
+        assert!(!read.lossless);
+
+        // A damaged header with no entries under it still costs the header, so it is not lossless.
+        let text = "[operator]\nidentifier = \"o\"\n[\"remote\"]\n";
+        let mut bytes = text.as_bytes().to_vec();
+        bytes[text.find("mote").unwrap()] = 0xFF;
+        let salvage = salvage(&bytes, any);
+        assert_eq!(salvage.dropped, [DroppedEntry { line: 3, key: None }]);
+        assert!(!salvage.lossless);
+    }
+
+    /// A cut inside a multi-line string still spares the sections above it. Revert: try no closer
+    /// in parse_closed → the text does not parse → nothing kept → red.
+    #[test]
+    fn a_cut_inside_a_multi_line_string_keeps_the_sections_above() {
+        let text = "[operator]\nidentifier = \"o\"\n[remote]\ntoken = \"\"\"\nline1\nlin";
+        let salvage = salvage(text.as_bytes(), any);
+        assert!(salvage.cut && salvage.parsed && !salvage.lossless, "{:?}", salvage);
+        assert_eq!(keys(&salvage), ["operator.identifier"]);
+        assert!(salvage.dropped.contains(&DroppedEntry { line: 4, key: Some("remote.token".to_string()) }),
+                "{:?}", salvage.dropped);
+    }
+
+    /// With damage beside a cut, the closer could swallow later sections into a string whose real
+    /// end the damage hid, so it is not tried. Revert: try the closer whenever cut → the operator
+    /// vanishes into the token, named nowhere → red.
+    #[test]
+    fn a_cut_beside_damage_never_closes_a_string() {
+        let text = "[remote]\ntoken = \"\"\"\nx\n\"\"\"\n[operator]\nidentifier = \"o\"\n[mirror]\npall";
+        let mut bytes = text.as_bytes().to_vec();
+        bytes[text.find("\"\"\"\n[operator]").unwrap() + 2] = 0xFF;
+        let salvage = salvage(&bytes, any);
+        assert!(!salvage.parsed && salvage.kept.is_empty(), "{:?}", salvage);
+        assert!(salvage.dropped.iter().any(|entry| entry.key.as_deref() == Some("operator.identifier")),
+                "{:?}", salvage.dropped);
+    }
+
+    /// A byte flipped to a carriage return is damage like any other. Revert: map only forbidden
+    /// controls → the text does not parse → red.
+    #[test]
+    fn a_lone_carriage_return_is_damage() {
+        let text = "[remote]\n# a\rb\nurl = \"u\"\r\n";
+        let salvage = salvage(text.as_bytes(), any);
+        assert_eq!(keys(&salvage), ["remote.url"]);
+        assert!(salvage.lossless && salvage.text.contains("# a\u{FFFD}b\n") && salvage.text.ends_with("\r\n"),
+                "{:?}", salvage);
     }
 
     /// Damage in a comment whose rest is plain words hides nothing, even between a header and
@@ -497,12 +635,19 @@ mod tests {
         assert!(salvage.lossless);
     }
 
+    /// Damage on the last line is judged like damage anywhere: by what the rest of its line hides.
     #[test]
-    fn damage_on_the_last_line_is_not_lossless() {
+    fn damage_on_the_last_line_is_judged_by_what_it_hides() {
         let text = "[operator]\nidentifier = \"op\"\n# end\n";
         let mut bytes = text.as_bytes().to_vec();
         let at = text.find("end").unwrap();
         bytes[at] = !bytes[at];
-        assert!(!salvage(&bytes, any).lossless);
+        assert!(salvage(&bytes, any).lossless);
+
+        let text = "[operator]\nidentifier = \"op\"\n# xidentifier = \"other\"\n";
+        let mut bytes = text.as_bytes().to_vec();
+        bytes[text.find("xidentifier").unwrap()] = 0xFF;
+        let read = salvage(&bytes, any);
+        assert!(!read.lossless && read.kept.is_empty(), "{:?}", read);
     }
 }
