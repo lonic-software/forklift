@@ -269,10 +269,17 @@ impl WarehouseHandle {
             let _scope = StorageRootScope::enter(&root);
 
             // Before the locks, so a sparse root under a running scope prune is told it is partial,
-            // not busy.
-            if scope_utils::content_may_be_absent().map_err(ServingRefusal::Unreadable)? {
+            // not busy. By the mode alone, which says what the root holds whatever its fetch scope
+            // file does: a partial root with a damaged one is still partial, not damaged. The
+            // records read below without a lock are damage when they do not parse, which no wait
+            // mends: the origin and unavailable records are only ever replaced whole, and a sealed
+            // record appended to meanwhile shows at most part of one frame past its end, which
+            // reads as a torn tail, not damage.
+            if warehouse_utils::warehouse_mode().map_err(ServingRefusal::Unreadable)? != warehouse_utils::WarehouseMode::Full {
                 return Err(ServingRefusal::Partial);
             }
+            // A full root holding a fetch scope is refused as that damage.
+            scope_utils::content_may_be_absent().map_err(ServingRefusal::Unreadable)?;
             let sealed = sealed_utils::read_sealed().map_err(ServingRefusal::Unreadable)?;
             if !sealed.is_empty() {
                 return Err(ServingRefusal::Sealed(sealed.len()));
@@ -1805,12 +1812,9 @@ fn server_fault(message: String) -> HandlerError {
 }
 
 /// The refusal codes of a host record that is lost or damaged, or of an object its store cannot
-/// read (a damaged pack file), which only the server's operator repairs.
-const DAMAGE_CODES: &[forklift_core::error::RefusalCode] = &[
-    forklift_core::error::RefusalCode::TombstonesDamaged,
-    forklift_core::error::RefusalCode::WithheldDamaged,
-    forklift_core::error::RefusalCode::ObjectUnreadable,
-];
+/// read (a damaged pack file), which only the server's operator repairs: the set a client names the
+/// remote's operator for, too.
+const DAMAGE_CODES: &[forklift_core::error::RefusalCode] = forklift_core::error::SERVED_DAMAGE;
 
 /// Whether `message` is a refusal of one of the [`DAMAGE_CODES`].
 fn is_damage(message: &str) -> bool {
@@ -1818,22 +1822,35 @@ fn is_damage(message: &str) -> bool {
 }
 
 /// The operator's remedy for a damaged host record, as a client is told it: the server's own
-/// directories are not named over the wire, so the warehouse is a placeholder.
-fn operator_remedy(code: forklift_core::error::RefusalCode) -> &'static str {
+/// directories are not named over the wire, so the warehouse is a placeholder. A record whose own
+/// refusal names a step by damage class (`forklift heal` for the damage heal mends, none for the
+/// rest) keeps that step, `own`, which names no path.
+fn operator_remedy(code: forklift_core::error::RefusalCode, own: &str) -> String {
+    use forklift_core::error::RefusalCode;
     match code {
-        forklift_core::error::RefusalCode::TombstonesDamaged => "forklift-server tombstone repair --root <warehouse>",
-        forklift_core::error::RefusalCode::WithheldDamaged => "forklift-server withhold repair --root <warehouse>",
-        forklift_core::error::RefusalCode::ObjectUnreadable => "forklift heal",
-        _ => unreachable!("not a damage code"),
+        RefusalCode::TombstonesDamaged => "forklift-server tombstone repair --root <warehouse>".to_string(),
+        RefusalCode::WithheldDamaged => "forklift-server withhold repair --root <warehouse>".to_string(),
+        RefusalCode::ObjectUnreadable => "forklift heal".to_string(),
+        _ => own.to_string(),
     }
 }
 
 /// What a client is told of the damage. An unreadable object's own message names the store's
-/// pack files, which are not named over the wire, so it is replaced; a host record's is kept.
+/// pack files, and the records read before a root is served name their own paths, which are not
+/// named over the wire, so those are replaced; a tombstone list's or withheld record's is kept.
 fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> String {
+    use forklift_core::error::RefusalCode;
     match code {
-        forklift_core::error::RefusalCode::ObjectUnreadable =>
+        RefusalCode::ObjectUnreadable =>
             "An object this request needs cannot be read from the warehouse's store: it is missing there, or a pack file holding it is damaged.".to_string(),
+        RefusalCode::FetchScopeDamaged =>
+            "The warehouse is recorded as full but holds a fetch scope, which only a sparse warehouse has, so what it has fetched cannot be told. Nothing was served; deleting the fetch scope file from the warehouse's configuration ends it.".to_string(),
+        RefusalCode::SealedDamaged =>
+            "The warehouse's record of the objects it holds by hash alone does not read, so which those are cannot be told. Nothing was served.".to_string(),
+        RefusalCode::UnavailableDamaged =>
+            "The warehouse's record of content it cannot get does not read, so what it lacks cannot be told. Nothing was served.".to_string(),
+        RefusalCode::OriginDamaged =>
+            "The warehouse's origin record does not read, so whether it is a partial warehouse cannot be told. Nothing was served.".to_string(),
         _ => human,
     }
 }
@@ -1845,15 +1862,15 @@ fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> Str
 /// ([`server_fault`]). The damage itself is logged, with the local next step.
 fn damage_refusal(message: String) -> HandlerError {
     // A caller may have wrapped the damage in its own words; the frame inside still names it.
-    let damage = forklift_core::error::frames_in(&message).find_map(|(code, human, _)| {
-        DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, human.to_string()))
+    let damage = forklift_core::error::frames_in(&message).find_map(|(code, human, step)| {
+        DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, human.to_string(), step.to_string()))
     });
 
     match damage {
-        Some((code, human)) => {
+        Some((code, human, step)) => {
             tracing::error!(%message, "a host record or the store is damaged");
             let human = damage_message(code, human);
-            (StatusCode::SERVICE_UNAVAILABLE, forklift_core::error::CoreError::refusal(code, human, operator_remedy(code)).into())
+            (StatusCode::SERVICE_UNAVAILABLE, forklift_core::error::CoreError::refusal(code, human, operator_remedy(code, &step)).into())
         }
         None => server_fault(message),
     }
@@ -7311,14 +7328,13 @@ mod tests {
     }
 
     /// The single-root path gets the same refusal from the same funnel, for a sparse root and a
-    /// cache, and a fetch scope or warehouse marker that cannot be read is refused rather than read
-    /// as full.
+    /// cache, and a warehouse marker that cannot be read is refused rather than read as full. A
+    /// sparse root is partial whatever its fetch scope holds.
     ///
     /// Revert: drop the sparse check from `serving` → the sparse root is served → red. Revert:
-    /// leave the cache mode out of `content_may_be_absent` → the cache root is served → red. Revert:
-    /// read an unreadable fetch scope or marker as full (`unwrap_or(false)`) → the garbled root or
-    /// the cache is served → red. Revert: read a sparse root without its fetch scope as full → the
-    /// `gone` root is served → red.
+    /// refuse only a sparse mode → the cache root is served → red. Revert: read an unreadable
+    /// marker as full → the cache is served → red. Revert: judge the root by its fetch scope rather
+    /// than its mode → the garbled and `gone` roots are refused as unreadable → red.
     #[test]
     fn serving_refuses_a_partial_root_and_an_unreadable_scope_or_marker() {
         let base = scratch_dir("sparse-single");
@@ -7354,22 +7370,24 @@ mod tests {
             std::fs::write(scope_utils::fetch_scope_path(), b"not a scope file").unwrap();
         }
         let refused = WarehouseHandle::serving(garbled, false).err().expect("an unreadable scope is refused");
-        assert!(matches!(refused, ServingRefusal::Unreadable(_)), "{:?}", refused);
+        assert!(matches!(refused, ServingRefusal::Partial), "{:?}", refused);
 
         // The mode is recorded in the marker, so neither deleting a sparse root's fetch scope nor
-        // placing one in a full root makes either servable or reads either as full.
+        // placing one in a full root makes either servable or reads either as full. The sparse one
+        // is partial still; the full one is damaged.
         let gone = base.join("gone");
         mark_warehouse(&gone);
         make_sparse(&gone);
         forklift_core::util::file_utils::remove_file(gone.join(FOLDER_NAME_FORKLIFT_ROOT).join("config").join("fetch-scope")).unwrap();
         let refused = WarehouseHandle::serving(gone, false).err().expect("a sparse root without its scope is refused");
-        assert!(matches!(&refused, ServingRefusal::Unreadable(reason) if reason.contains("is missing")), "{:?}", refused);
+        assert!(matches!(refused, ServingRefusal::Partial), "{:?}", refused);
 
         let stray = base.join("stray");
         mark_warehouse(&stray);
         std::fs::write(stray.join(FOLDER_NAME_FORKLIFT_ROOT).join("config").join("fetch-scope"), b"").unwrap();
         let refused = WarehouseHandle::serving(stray, false).err().expect("a full root with a fetch scope is refused");
-        assert!(matches!(&refused, ServingRefusal::Unreadable(reason) if reason.contains("holds a fetch scope")), "{:?}", refused);
+        assert!(matches!(&refused, ServingRefusal::Unreadable(reason) if reason.contains("holds a fetch scope")
+            && forklift_core::error::frames_code(reason, forklift_core::error::RefusalCode::FetchScopeDamaged)), "{:?}", refused);
 
         let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
@@ -7510,6 +7528,113 @@ mod tests {
 
         drop(state);
         let _ = forklift_core::util::file_utils::remove_dir_all(&base);
+    }
+
+    /// Each record the gate reads that does not parse in a full root is damage only the operator
+    /// mends: a `503` carrying the record's code, with no `Retry-After`, no path of the server's,
+    /// and `forklift heal` as the step only where heal mends that damage.
+    ///
+    /// Revert: frame none of the four in their readers → a `500` with no code → red on each.
+    /// Revert: name `forklift heal` for every sealed or unavailable failure → the other-version
+    /// records carry it → red. Revert: keep the readers' own words (`damage_message`) → their paths
+    /// reach the client → red. Revert: add `Retry-After` to every 503 → red.
+    #[tokio::test]
+    async fn a_root_whose_gate_records_do_not_parse_refuses_with_their_codes_and_no_retry() {
+        use sealed_utils::SealOp;
+        let base = scratch_dir("gate-damage");
+        let one = "1".repeat(64);
+        let forklift = |id: &str| base.join(id).join(FOLDER_NAME_FORKLIFT_ROOT);
+
+        // (warehouse, the damage, its code, whether heal is the step)
+        let cases: [(&str, &str, &str, bool); 6] = [
+            ("stray", "a fetch scope in a full root", "fetch_scope_damaged", false),
+            ("sealed-cut", "a sealed record damaged past a frame", "sealed_damaged", true),
+            ("sealed-newer", "a sealed record another version wrote", "sealed_damaged", false),
+            ("unavailable-entry", "an unavailable record with a bad entry", "unavailable_damaged", true),
+            ("unavailable-newer", "an unavailable record a newer version wrote", "unavailable_damaged", false),
+            ("origin", "an origin record that does not parse", "origin_damaged", false),
+        ];
+        let state = Arc::new(capped_state(&base, 8, &cases.map(|(id, ..)| id)));
+
+        std::fs::write(forklift("stray").join("config").join("fetch-scope"), b"").unwrap();
+        {
+            let _scope = StorageRootScope::enter(&base.join("sealed-cut"));
+            let mut bytes = sealed_utils::header_bytes();
+            bytes.extend(sealed_utils::encode_frame(SealOp::Record, &one).unwrap());
+            bytes.extend(vec![0xab; 70_000]);
+            std::fs::write(sealed_utils::sealed_path(), bytes).unwrap();
+        }
+        {
+            let _scope = StorageRootScope::enter(&base.join("sealed-newer"));
+            std::fs::write(sealed_utils::sealed_path(), b"/forklift-sealed 999\n").unwrap();
+        }
+        {
+            let _scope = StorageRootScope::enter(&base.join("unavailable-entry"));
+            unavailable::record([(one.clone(), "DMCA notice 5".to_string())]).unwrap();
+        }
+        let mut entry = std::fs::read(forklift("unavailable-entry").join("unavailable")).unwrap();
+        entry.extend(b"not an entry\n");
+        std::fs::write(forklift("unavailable-entry").join("unavailable"), entry).unwrap();
+        std::fs::write(forklift("unavailable-newer").join("unavailable"), b"/forklift-unavailable 999\n").unwrap();
+        std::fs::write(forklift("origin").join("origin"), b"not a record").unwrap();
+
+        for (id, what, code, heal) in cases {
+            let response = get_warehouse(State(Arc::clone(&state)), Path(warehouse_params(id))).await.into_response();
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{}", what);
+            assert!(response.headers().get(axum::http::header::RETRY_AFTER).is_none(), "{}: no wait mends it", what);
+            let body = body_text(response).await;
+            let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(error["code"], code, "{}: {}", what, body);
+            assert_eq!(error["next_step"], if heal { "forklift heal" } else { "" }, "{}: {}", what, body);
+            assert!(!body.contains(base.to_string_lossy().as_ref()), "{}: no server path: {}", what, body);
+        }
+
+        drop(state);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
+    }
+
+    /// The unavailable record reads, but the store cannot say whether an object it lists is held
+    /// (an unparseable pack index might hold it): that is no damage to the record, so the refusal
+    /// carries no `unavailable_damaged` frame and is answered as the store error it is.
+    ///
+    /// Revert: frame every `absent_count` failure as the record's damage → red.
+    #[test]
+    fn a_store_error_counting_unavailable_content_is_not_the_records_damage() {
+        let root = scratch_dir("unavailable-store-error");
+        mark_warehouse(&root);
+        {
+            let _scope = StorageRootScope::enter(&root);
+            unavailable::record([("1".repeat(64), "DMCA notice 5".to_string())]).unwrap();
+            let pack = std::path::PathBuf::from(forklift_core::util::file_utils::get_path_objects_root()).join("pack");
+            std::fs::create_dir_all(&pack).unwrap();
+            std::fs::write(pack.join("pack-garbage.idx"), b"not an index").unwrap();
+        }
+
+        let refused = WarehouseHandle::serving(root.clone(), false).err().expect("the count cannot be made");
+        let ServingRefusal::Unreadable(reason) = &refused else { panic!("{:?}", refused) };
+        assert!(reason.contains("could not be parsed"), "{}", reason);
+        assert!(!forklift_core::error::frames_code(reason, forklift_core::error::RefusalCode::UnavailableDamaged), "{}", reason);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+    }
+
+    /// A partial root is refused as partial before any record is read, so its damage is never
+    /// answered as damage: its sealed record is appended to while it runs.
+    ///
+    /// Revert: read the sealed record before the mode → the cache's damaged record answers a
+    /// `503` → red.
+    #[test]
+    fn a_partial_roots_damaged_sealed_record_is_refused_as_partial() {
+        let root = scratch_dir("cache-sealed-damage");
+        mark_warehouse_as(&root, "cache");
+        {
+            let _scope = StorageRootScope::enter(&root);
+            std::fs::write(sealed_utils::sealed_path(), b"/forklift-sealed 999\n").unwrap();
+        }
+
+        let refused = WarehouseHandle::serving(root.clone(), false).err().expect("a cache root is refused");
+        assert!(matches!(refused, ServingRefusal::Partial), "{:?}", refused);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// A multi-warehouse server refuses a sealed root, and one that records an origin, with the 409

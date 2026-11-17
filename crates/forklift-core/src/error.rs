@@ -369,7 +369,10 @@ refusal_codes! {
     /// A sparse warehouse's fetch scope is lost or damaged and `heal` could not rebuild it from
     /// the checkouts' scopes alone: none could be read, the history at their union is not all
     /// present, or a checkout's scope lies outside a fetch scope that parses. Nothing was changed.
-    /// `heal --fetch-scope <prefix>`, once per prefix, sets it, fetching what the history at those prefixes lacks.
+    /// `heal --fetch-scope <prefix>`, once per prefix, sets it, fetching what the history at those
+    /// prefixes lacks. Every read refuses with it too in a warehouse that is not sparse but holds a
+    /// fetch scope, which only a sparse warehouse is given; its next step is empty, and deleting
+    /// that file ends it, since the warehouse mode, not the file, says what the warehouse holds.
     FetchScopeDamaged => "fetch_scope_damaged",
 
     /// A served warehouse's tombstone list or its served mark is lost or damaged, so which deleted
@@ -401,7 +404,40 @@ refusal_codes! {
     /// staged content reaches them, and otherwise restores them from a backup or a copy, or re-runs
     /// heal when its index rebuild could not take the store lock.
     ObjectsLost => "objects_lost",
+
+    /// The sealed-object record, of the objects the warehouse holds by hash alone, does not parse,
+    /// so which those are cannot be told. Nothing was changed. When it is damaged past a point,
+    /// the next step is `forklift heal`, which rebuilds it from the part before the damage; when
+    /// another version wrote it, or a whole frame does not read, the next step is empty and the
+    /// message says what to do. A read that fails on the file itself carries no code.
+    SealedDamaged => "sealed_damaged",
+
+    /// The record of content this warehouse cannot get, which a fetch left out because its
+    /// remote's host withholds it, does not parse, so what the warehouse lacks cannot be told.
+    /// Nothing was changed. The next step is `forklift heal`, which rebuilds it from the entries
+    /// that still read; it is empty when a newer version wrote it, which this one never writes
+    /// over. A read that fails on the file itself carries no code.
+    UnavailableDamaged => "unavailable_damaged",
+
+    /// The origin record, of the remote a partial warehouse was cloned from, does not parse or
+    /// holds anything but one URL, so which remote holds what the warehouse lacks cannot be told.
+    /// Nothing was changed, and the next step is empty: nothing rebuilds it. A read that fails on
+    /// the file itself carries no code.
+    OriginDamaged => "origin_damaged",
 }
+
+/// The codes of a host record that is lost or damaged, or of an object its store cannot read,
+/// which only the operator of the server holding it repairs. A server answers each as a `503`
+/// with no `Retry-After`, and a client told one by a remote names that remote's operator.
+pub const SERVED_DAMAGE: &[RefusalCode] = &[
+    RefusalCode::TombstonesDamaged,
+    RefusalCode::WithheldDamaged,
+    RefusalCode::ObjectUnreadable,
+    RefusalCode::FetchScopeDamaged,
+    RefusalCode::SealedDamaged,
+    RefusalCode::UnavailableDamaged,
+    RefusalCode::OriginDamaged,
+];
 
 impl RefusalCode {
     /// Parse a stable code string back into a [`RefusalCode`]. `None` for any string that is not a

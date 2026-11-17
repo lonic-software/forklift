@@ -513,13 +513,19 @@ fn read_fetch_state() -> Result<(WarehouseMode, PathScope), String> {
         if !scope_file_is_present(&path)? {
             return Ok((mode, PathScope::full()));
         }
+        // Coded, so a server answers it as damage only its operator mends. Deleting the file is the
+        // remedy, which no command does, so no next step is named.
         let kind = mode_kind(mode);
-        return Err(format!(
-            "The warehouse is recorded as {} but holds a fetch scope (\"{}\"), which only a sparse \
-             warehouse has, so Forklift cannot tell what it has fetched. Delete that file: the warehouse \
-             is {} without it.",
-            kind, path.to_string_lossy(), kind
-        ));
+        return Err(refusal(
+            RefusalCode::FetchScopeDamaged,
+            format!(
+                "The warehouse is recorded as {} but holds a fetch scope (\"{}\"), which only a sparse \
+                 warehouse has, so Forklift cannot tell what it has fetched. Delete that file: the \
+                 warehouse is {} without it.",
+                kind, path.to_string_lossy(), kind
+            ),
+            "",
+        ).into());
     }
 
     let missing = |found: &str| format!(

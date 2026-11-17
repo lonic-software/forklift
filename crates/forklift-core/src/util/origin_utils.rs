@@ -42,16 +42,20 @@ pub fn read_origin() -> Result<Option<String>, String> {
         Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
     };
 
+    // Coded, so a server answers it as damage only its operator mends. Nothing rebuilds the
+    // record, so no next step is named.
+    let damaged = |message: String| -> String { CoreError::refusal(RefusalCode::OriginDamaged, message, "").into() };
+
     let entries = record_utils::from_bytes(&bytes, RECORD, VERSION)
-        .map_err(|e| format!("The file \"{}\" {}", path.to_string_lossy(), e.describe()))?;
+        .map_err(|e| damaged(format!("The file \"{}\" {}", path.to_string_lossy(), e.describe())))?;
 
     match <[String; 1]>::try_from(entries) {
         Ok([url]) if !url.is_empty() => Ok(Some(url)),
-        Ok(_) => Err(format!("The file \"{}\" records an empty origin.", path.to_string_lossy())),
-        Err(entries) => Err(format!(
+        Ok(_) => Err(damaged(format!("The file \"{}\" records an empty origin.", path.to_string_lossy()))),
+        Err(entries) => Err(damaged(format!(
             "The file \"{}\" holds {} entries where it should hold one, the origin's URL.",
             path.to_string_lossy(), entries.len()
-        )),
+        ))),
     }
 }
 
