@@ -177,7 +177,8 @@ fn damage(path: &Path, kind: Damage) {
     std::fs::write(path, bytes).unwrap();
 }
 
-/// Revert: map the funnel's record errors back to the uncoded message → exit 1 → red. Each damage
+/// Revert: map the funnel's record errors back to the uncoded message → exit 1 → red. Read a
+/// missing header as an older Forklift's file → the zeroed file's message says so → red. Each damage
 /// leaves `c`, `a` and `a/b` named only by the working tree and the base.
 #[test]
 fn every_damage_is_refused_and_plain_heal_restores_the_set_exactly() {
@@ -189,6 +190,8 @@ fn every_damage_is_refused_and_plain_heal_restores_the_set_exactly() {
         for command in [&["load", "c"][..], &["unload", "c/z.txt"], &["status"]] {
             let error = inventory_damaged(&area.run(&[&["--json"][..], command].concat()));
             assert_eq!(error["next_step"], "forklift heal", "{:?} {:?}: {}", kind, command, error);
+            // A zeroed file has no header, which is damage, not a file an older Forklift wrote.
+            assert!(!error["message"].as_str().unwrap().contains("older"), "{:?}: {}", kind, error);
         }
 
         let data = area.healed(&[]);
