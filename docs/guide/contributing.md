@@ -448,6 +448,12 @@ so the operational commands are one launcher away; the real logic lives in `bin/
 | `pult design` | open `docs/DESIGN.html` (the source of truth) in a browser |
 | `pult gen-docs` | `bin/gen-docs` — regenerate the derived docs (error codes, the command and alias list, per-command JSON schemas); `bin/gen-docs --check` only checks they are current |
 
+Before opening or pushing to a pull request, run `bin/full-suite`. It runs every local suite
+CI would, each step under a watchdog: the build, the workspace tests, proof-load's history
+tests, the desktop tool, clippy and the guards. `bin/full-suite --list` names the steps, and
+`--only` runs a subset. Afterwards, `bin/clippy-changed <out>/clippy.log` lists the clippy
+findings on the lines your branch changed. Both have a `--self-test`.
+
 Cutting a release: `pult release` picks the next patch/minor/major from the latest `v*`
 tag (or run `bin/release <x.y.z> --dry-run` to preflight without touching anything). It
 refuses unless the working tree is clean, `main` is in sync with `origin/main`, and
