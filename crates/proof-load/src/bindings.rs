@@ -61,6 +61,7 @@ pub const BINDINGS: &[Binding] = &[
     bound("{bay}inventory/inv_/<xx>/<hash>/data", FILE),
     bound("{bay}journal.json", FILE),
     bound("{bay}position", FILE),
+    bound("{bay}position-copy", FILE),
     bound_in("trust", "signed", FILE),
     bound_in("meta/", "signed", FOLDER),
     bound_in("meta/<name>", "signed", FILE),
@@ -451,6 +452,7 @@ pub const HISTORY_BINDINGS: &[Binding] = &[
     over_history("{bay}inventory/inv_/<xx>/<hash>/", FOLDER),
     over_history("{bay}inventory/inv_/<xx>/<hash>/data", FILE),
     over_history("{bay}position", FILE),
+    over_history("{bay}position-copy", FILE),
     over_history("{bay}lock", DEAD_HOLDER),
 ];
 

@@ -213,6 +213,7 @@ pub const CENSUS_ROLES: &[(&str, Role)] = &[
     ("{bay}inventory/inv_/<xx>/<hash>/data", Role::IndexOrStaging),
     ("{bay}inventory/incomplete-load", Role::IndexOrStaging),
     ("{bay}position", Role::HeadRef),
+    ("{bay}position-copy", Role::HeadRef),
     ("{bay}scope", Role::Config),
     ("{bay}cherry-pick", Role::Metadata),
     ("{bay}consolidation", Role::Metadata),

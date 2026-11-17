@@ -652,7 +652,7 @@ pub fn write_position_in(dir: &Path, position: &BayPosition) -> Result<(), Strin
     file_utils::write_file_atomically(&dir.join(FILE_NAME_POSITION), &bytes)?;
 
     let copy = dir.join(FILE_NAME_POSITION_COPY);
-    file_utils::write_file_atomically(&copy, &bytes).or_else(|written| match std::fs::remove_file(&copy) {
+    file_utils::write_file_atomically(&copy, &bytes).or_else(|written| match file_utils::remove_file(&copy) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(removed) => Err(format!(
