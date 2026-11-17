@@ -105,7 +105,9 @@ pub fn extract(tool: Tool, texts: &[&str]) -> Extracted {
         let arguments: Vec<String> = span.trim_start_matches(prefix).split_whitespace().map(str::to_string).collect();
         let templated = arguments.iter().enumerate().any(|(at, argument)| (argument.contains('<') || argument.contains('{'))
             && !(operator && argument == WAREHOUSE && at > 0 && arguments[at - 1] == "--root"));
-        if arguments.is_empty() || templated {
+        // `serve` is the server itself, which the operator's remedy stops and starts again around
+        // its command: never a step of it.
+        if arguments.is_empty() || templated || (operator && arguments[0] == "serve") {
             extracted.unextractable.push(span.to_string());
         } else if operator {
             extracted.remedies.push(Remedy::Operator { arguments });
@@ -267,7 +269,8 @@ mod tests {
     /// value, is unextractable; a git subject never extracts a server command.
     ///
     /// Revert: admit any placeholder in an operator command → `withhold add … <hash>` would be run;
-    /// drop the `--root` position check → `<warehouse>` as a positional argument would be bound.
+    /// drop the `--root` position check → `<warehouse>` as a positional argument would be bound;
+    /// admit `serve` → the server would be run as a command that never exits.
     #[test]
     fn an_operator_remedy_keeps_only_its_warehouse_placeholder() {
         let relayed = "Ask the remote's operator to repair it where the warehouse is served from (\"forklift-server tombstone repair --root <warehouse>\"); nothing here can.";
@@ -276,7 +279,7 @@ mod tests {
         assert!(extracted.unextractable.is_empty());
         assert_eq!(extract(Tool::Forklift, &["forklift-server withhold repair --root <warehouse>"]).remedies,
             vec![Remedy::Operator { arguments: vec!["withhold".into(), "repair".into(), "--root".into(), "<warehouse>".into()] }]);
-        for templated in ["forklift-server withhold add --root <warehouse> <hash> --statement <statement>", "forklift-server tombstone repair <warehouse>", "forklift-server tombstone repair --root <root>"] {
+        for templated in ["forklift-server withhold add --root <warehouse> <hash> --statement <statement>", "forklift-server tombstone repair <warehouse>", "forklift-server tombstone repair --root <root>", "forklift-server serve --root <warehouse>"] {
             let extracted = extract(Tool::Forklift, &[templated]);
             assert!(extracted.remedies.is_empty(), "{}", templated);
             assert_eq!(extracted.unextractable, vec![templated]);

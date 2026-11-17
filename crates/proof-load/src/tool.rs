@@ -173,9 +173,9 @@ impl Served {
     }
 
     /// Stops it as its operator would: asked to shut down (SIGTERM, which it drains gracefully,
-    /// releasing its serve lock), then waited on for up to `limit`. One still running then is
-    /// killed and an error: a server killed hard leaves its lock behind, and that is the harness's
-    /// doing, not a step the operator's remedy owes.
+    /// releasing its serve lock), then waited on for up to `limit`. One still running then is an
+    /// error, and is killed hard only when dropped, as every `Served` is: a server killed hard
+    /// leaves its lock behind, so the operator's remedy is never run after one.
     pub fn stop(mut self, limit: Duration) -> Result<(), String> {
         #[cfg(unix)]
         {
