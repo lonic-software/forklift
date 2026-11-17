@@ -2231,6 +2231,73 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "ConfigRepaired": {
+      "description": "What heal did to a damaged warehouse configuration file.",
+      "properties": {
+        "cut": {
+          "description": "Whether the file was cut short, so whatever followed the cut is lost beyond naming.",
+          "type": "boolean"
+        },
+        "dropped": {
+          "description": "What was dropped; empty when the damage provably cost nothing.",
+          "items": {
+            "$ref": "#/$defs/DroppedConfigEntry"
+          },
+          "type": "array"
+        },
+        "lossless": {
+          "description": "Whether the repair provably lost nothing but the damaged characters: every entry and\ncomment is kept. When it is not, the damaged bytes are set aside.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "The file, named as its refusals name it.",
+          "type": "string"
+        },
+        "set_aside": {
+          "description": "Where the damaged bytes were set aside, when anything may have been dropped.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "dropped",
+        "cut",
+        "lossless"
+      ],
+      "type": "object"
+    },
+    "DroppedConfigEntry": {
+      "description": "One entry the repair of a damaged warehouse file dropped, for heal's report. It never carries\na value: `remote.token` holds a secret.",
+      "properties": {
+        "falls_back_to_global": {
+          "description": "What the key now resolves to: `Some(true)` the global file's value, `Some(false)` nothing\nset, `None` when that cannot be told (the key is unreadable or unknown, or the global file\ndoes not read).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "key": {
+          "description": "Its key, when still readable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line": {
+          "description": "The 1-based line it stood on.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "line"
+      ],
+      "type": "object"
+    },
     "LostObject": {
       "description": "One lost object and why it is lost.",
       "properties": {
@@ -2691,6 +2758,17 @@ A command not listed here either reports only the generic human-message shape `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of a `heal` run that fully resolved (or found nothing to resolve).",
   "properties": {
+    "config_repaired": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ConfigRepaired"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The warehouse's configuration file, which was damaged and this run rewrote, first of all:\nwhat it dropped (by line and key, never by value) and where the damaged bytes went."
+    },
     "fetch_scope_rebuilt": {
       "anyOf": [
         {

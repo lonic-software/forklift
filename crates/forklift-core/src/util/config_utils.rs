@@ -393,7 +393,7 @@ impl ConfigFile {
 pub fn load_scope(scope: ConfigScope) -> Result<ConfigFile, String> {
     let path = get_config_path(scope)?;
 
-    let Some(document) = load_document(&path)? else {
+    let Some(document) = load_document(&path, scope)? else {
         return Ok(ConfigFile::default());
     };
 
@@ -554,14 +554,30 @@ fn known_sections() -> Vec<&'static str> {
 /// this message wants — its whole job is naming a file for a human to open in an editor — so the
 /// prefix is stripped by the one helper that owns that rule.
 fn not_valid(path: &Path, detail: String) -> String {
-    let named = path.canonicalize()
-        .map(|resolved| crate::globals::strip_verbatim_prefix(&resolved))
-        .unwrap_or_else(|_| path.to_path_buf());
+    format!("{}{}{}", not_valid_prefix(path), detail, NOT_VALID_SUFFIX)
+}
 
-    format!(
-        "Configuration file \"{}\" is not valid: {} Fix the file by hand.",
-        named.to_string_lossy(), detail
-    )
+/// What [`not_valid`] puts before its detail.
+fn not_valid_prefix(path: &Path) -> String {
+    format!("Configuration file \"{}\" is not valid: ", named(path).to_string_lossy())
+}
+
+/// What [`not_valid`] puts after its detail: the by-hand remedy.
+const NOT_VALID_SUFFIX: &str = " Fix the file by hand.";
+
+/// The detail of a [`not_valid`] message, for a refusal that has a remedy of its own.
+fn not_valid_detail(path: &Path, message: &str) -> String {
+    let prefix = not_valid_prefix(path);
+    let detail = message.strip_prefix(prefix.as_str()).unwrap_or(message);
+    detail.strip_suffix(NOT_VALID_SUFFIX).unwrap_or(detail).to_string()
+}
+
+/// The name a refusal gives a configuration file: canonical where it resolves, as [`not_valid`]
+/// says.
+fn named(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .map(|resolved| crate::globals::strip_verbatim_prefix(&resolved))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 // The template ends with an (empty) section header on purpose: without any item in the
@@ -581,6 +597,294 @@ const WAREHOUSE_CONFIG_TEMPLATE: &str = r#"# Forklift warehouse configuration.
 
 [operator]
 "#;
+
+/// One entry the repair of a damaged warehouse file dropped, for heal's report. It never carries
+/// a value: `remote.token` holds a secret.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DroppedConfigEntry {
+    /// The 1-based line it stood on.
+    pub line: usize,
+    /// Its key, when still readable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// What the key now resolves to: `Some(true)` the global file's value, `Some(false)` nothing
+    /// set, `None` when that cannot be told (the key is unreadable or unknown, or the global file
+    /// does not read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub falls_back_to_global: Option<bool>,
+}
+
+/// What heal did to a damaged warehouse configuration file.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ConfigRepaired {
+    /// The file, named as its refusals name it.
+    pub path: PathBuf,
+    /// What was dropped; empty when the damage provably cost nothing.
+    pub dropped: Vec<DroppedConfigEntry>,
+    /// Whether the file was cut short, so whatever followed the cut is lost beyond naming.
+    pub cut: bool,
+    /// Whether the repair provably lost nothing but the damaged characters: every entry and
+    /// comment is kept. When it is not, the damaged bytes are set aside.
+    pub lossless: bool,
+    /// Where the damaged bytes were set aside, when anything may have been dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_aside: Option<PathBuf>,
+}
+
+impl ConfigRepaired {
+    /// The sentences a person is told. Entries are named by line and key, never by value.
+    pub fn sentences(&self) -> Vec<String> {
+        let mut sentences = vec![match self.lossless {
+            true => format!(
+                "The configuration file \"{}\" was damaged where it held no setting, and is rewritten \
+                 with every entry and comment it held.",
+                self.path.to_string_lossy()
+            ),
+            false => format!(
+                "The configuration file \"{}\" was damaged, and is rewritten with only the entries the \
+                 damage provably spared.",
+                self.path.to_string_lossy()
+            ),
+        }];
+
+        for entry in &self.dropped {
+            let resolves = match entry.falls_back_to_global {
+                Some(true) => ", and now resolves to the global file's value",
+                Some(false) => ", and is now unset",
+                None => "",
+            };
+            sentences.push(match &entry.key {
+                Some(key) => format!("  dropped: line {}, {}{}", entry.line, key, resolves),
+                None => format!("  dropped: line {}, whose key the damage hid", entry.line),
+            });
+        }
+        if self.cut {
+            sentences.push("  dropped: the last line, which no newline ended, and whatever followed it".to_string());
+        }
+        if let Some(aside) = &self.set_aside {
+            sentences.push(format!(
+                "The damaged bytes are set aside in \"{}\"; it can hold a remote token, so remove it once \
+                 nothing in it is still wanted.",
+                aside.to_string_lossy()
+            ));
+        }
+
+        sentences
+    }
+}
+
+/// The copy a repair sets a damaged warehouse configuration file's bytes aside in, beside it.
+const FILE_NAME_WAREHOUSE_CONFIG_DAMAGED: &str = "warehouse.toml.damaged";
+
+/// Mend a damaged warehouse configuration file from the entries its damage provably spared
+/// ([`config_salvage`](crate::util::config_salvage)), the first step of `heal`.
+///
+/// Only a damaged file is touched. A sound file, an absent one, one that cannot be read and one
+/// that is not damaged but does not validate, a mistake made by hand, are left as they are, and
+/// whatever reads them later refuses as it always does: a salvage of a hand mistake could drop a
+/// mistyped `operator.identifier` and mint a new identity, and an unreadable file may be sound.
+///
+/// A lossless salvage is written as the file's own text with its damaged characters read as
+/// U+FFFD, so nothing but those characters goes. Any other salvage is written only when
+/// `accept_loss` says the operator accepts what it drops, as the template and the kept entries;
+/// otherwise it is refused with
+/// [`RefusalCode::ConfigDamaged`](crate::error::RefusalCode::ConfigDamaged), naming each entry
+/// that would go. Before a lossy write, the damaged bytes are set aside beside the file with the
+/// original's permissions, for values the salvage could not prove; a different copy already there
+/// is never written over, and is refused instead.
+///
+/// # Arguments
+/// * `accept_loss` - `heal --config`: write the salvage even when it drops entries.
+///
+/// # Returns
+/// * `Ok(Some(ConfigRepaired))` - The file was damaged and is rewritten.
+/// * `Ok(None)`                 - The file is not damaged; nothing was changed.
+/// * `Err(String)`              - The file is damaged and its repair would drop entries the
+///                                operator has not accepted, or an earlier damaged copy stands;
+///                                nothing was changed.
+pub fn repair_warehouse_config(accept_loss: bool) -> Result<Option<ConfigRepaired>, String> {
+    let path = get_config_path(ConfigScope::Warehouse)?;
+
+    match std::fs::read(&path) {
+        Ok(bytes) if is_damaged(&bytes) => {}
+        // Sound, absent, a hand-edit mistake, or unreadable: not heal's to mend, and no reason to
+        // stop the rest of heal, whose readers refuse it as they always do.
+        _ => return Ok(None),
+    }
+
+    // The file can hold a remote token, and so can the copy set aside beside it.
+    crate::util::warehouse_utils::write_git_self_ignore(&forklift_root())?;
+
+    let repaired = edit_locked(&path, |target| {
+        let bytes = std::fs::read(target)
+            .map_err(|error| format!("Error while reading configuration file \"{}\": {}", target.to_string_lossy(), error))?;
+        if !is_damaged(&bytes) {
+            return Ok(None);
+        }
+
+        let salvage = crate::util::config_salvage::salvage(&bytes, valid_entry);
+        // The salvage judges entries one at a time; the file as a whole, a header naming no known
+        // section for one, may still not validate, and then only the lossy rewrite can mend it.
+        let checked = salvage.lossless.then(|| salvage.text.parse::<DocumentMut>()
+            .map_err(|error| error.to_string().trim_end().to_string())
+            .and_then(|document| parse_config(&document, target)
+                .map(|_| document)
+                .map_err(|message| not_valid_detail(target, &message))));
+        let (whole, invalid) = match checked {
+            Some(Ok(document)) => (Some(document), None),
+            Some(Err(detail)) => (None, Some(detail)),
+            None => (None, None),
+        };
+        let lossless = whole.is_some();
+
+        if !lossless && !accept_loss {
+            return Err(crate::error::CoreError::refusal(
+                crate::error::RefusalCode::ConfigDamaged,
+                format!(
+                    "Configuration file \"{}\" is damaged, and mending it drops what the damage may \
+                     have spared: {}. Nothing was changed.",
+                    named(target).to_string_lossy(), loss_summary(&salvage, invalid.as_deref())
+                ),
+                "forklift heal --config",
+            ).into());
+        }
+
+        let set_aside = match lossless {
+            true => None,
+            false => Some(set_damaged_bytes_aside(target, &bytes)?),
+        };
+
+        let document = match whole {
+            Some(document) => document,
+            None => {
+                let mut document = WAREHOUSE_CONFIG_TEMPLATE.parse::<DocumentMut>()
+                    .map_err(|error| format!("The configuration template does not parse: {}", error))?;
+                for entry in &salvage.kept {
+                    insert_kept(&mut document, entry).map_err(|detail| not_valid(target, detail))?;
+                }
+                document
+            }
+        };
+        write_validated(target, &document)?;
+
+        Ok(Some((named(target), salvage, lossless, set_aside.as_deref().map(named))))
+    })?;
+
+    let Some((path, salvage, lossless, set_aside)) = repaired else {
+        return Ok(None);
+    };
+
+    let dropped = salvage.dropped.iter().map(|entry| DroppedConfigEntry {
+        line: entry.line,
+        key: entry.key.clone(),
+        falls_back_to_global: entry.key.as_deref()
+            .filter(|key| KNOWN_KEYS.contains(key))
+            .and_then(|key| get_scoped_value(key, ConfigScope::Global).ok())
+            .map(|value| value.is_some()),
+    }).collect();
+
+    Ok(Some(ConfigRepaired { path, dropped, cut: salvage.cut, lossless, set_aside }))
+}
+
+/// Whether one salvaged entry is one a configuration file may hold: a known key with a valid
+/// value, or a profile's non-empty identifier. The per-entry form of [`parse_config`]'s checks.
+fn valid_entry(path: &[String], value: &str) -> bool {
+    match path {
+        [section, name, field] if section == SECTION_PROFILE =>
+            !name.is_empty() && field == PROFILE_FIELD_IDENTIFIER && require_non_empty(field, value).is_ok(),
+        [section, field] if section != SECTION_PROFILE => {
+            let key = format!("{}.{}", section, field);
+            KNOWN_KEYS.contains(&key.as_str()) && validate_value(&key, value).is_ok()
+        }
+        _ => false,
+    }
+}
+
+/// The entries a refused repair would drop, named by line and key, never by value. `invalid` is
+/// why a salvage that drops no entry still does not validate as a whole.
+fn loss_summary(salvage: &crate::util::config_salvage::Salvage, invalid: Option<&str>) -> String {
+    let mut parts: Vec<String> = salvage.dropped.iter().map(|entry| match &entry.key {
+        Some(key) => format!("line {} ({})", entry.line, key),
+        None => format!("line {}", entry.line),
+    }).collect();
+
+    match (salvage.cut, salvage.closed) {
+        (true, false) => parts.push("its last line, which no newline ends, and whatever followed it \
+                                     (if that line was edited by hand rather than cut, fix it by \
+                                     hand instead)".to_string()),
+        (true, true) => parts.push("its last line, which no newline ends, inside a multi-line \
+                                    string, and whatever followed it (if that string was left open \
+                                    by hand rather than cut, close it by hand instead)".to_string()),
+        (false, _) => {}
+    }
+    if !salvage.parsed {
+        parts.insert(0, "the rest of the file does not parse, so no entry can be kept".to_string());
+    }
+    if let (true, Some(detail)) = (parts.is_empty(), invalid) {
+        parts.push(format!("its comments, and whatever in it does not validate, since the file \
+                            as read does not hold a valid configuration: {}", detail.trim_end_matches('.')));
+    } else if parts.is_empty() {
+        parts.push("a line its damage may have turned into comment text".to_string());
+    }
+
+    parts.join(", ")
+}
+
+/// Set a damaged configuration file's bytes aside beside it, with its permissions, before a
+/// repair that drops entries writes over it. A copy already there is kept: the same bytes are
+/// nothing new, and different ones may hold the only copy of a value an earlier repair dropped.
+fn set_damaged_bytes_aside(target: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let aside = target.with_file_name(FILE_NAME_WAREHOUSE_CONFIG_DAMAGED);
+
+    match std::fs::symlink_metadata(&aside) {
+        Ok(_) => match std::fs::read(&aside) {
+            Ok(existing) if existing == bytes => Ok(aside),
+            _ => Err(crate::error::CoreError::refusal(
+                crate::error::RefusalCode::ConfigDamaged,
+                format!(
+                    "Configuration file \"{}\" is damaged, and the damaged bytes of an earlier \
+                     repair are still set aside in \"{}\", which may hold the only copy of a value \
+                     that repair dropped; heal does not write over it. Nothing was changed. Move \
+                     that copy elsewhere, keeping it until nothing in it is still wanted, and heal \
+                     can set these bytes aside in its place.",
+                    named(target).to_string_lossy(), named(&aside).to_string_lossy()
+                ),
+                "",
+            ).into()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // The copy takes the original's permissions before it holds a byte: it can hold a
+            // remote token, and a copy at the umask's default would be readable more widely.
+            file_utils::replace_file_atomically_with_mode_of(&aside, bytes, target)?;
+            Ok(aside)
+        }
+        Err(error) => Err(format!("Error while reading \"{}\": {}", aside.to_string_lossy(), error)),
+    }
+}
+
+/// Put one salvaged entry into a document being rebuilt from the template.
+fn insert_kept(document: &mut DocumentMut, entry: &crate::util::config_salvage::KeptEntry) -> Result<(), String> {
+    match entry.path.as_slice() {
+        [section, name, field] if section == SECTION_PROFILE => {
+            let profiles = document.entry(SECTION_PROFILE).or_insert_with(|| {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(true);
+                toml_edit::Item::Table(table)
+            });
+            let profiles = profiles.as_table_like_mut()
+                .ok_or_else(|| format!("\"{}\" must be a table.", SECTION_PROFILE))?;
+            let profile = profiles.entry(name).or_insert(toml_edit::table());
+            profile.as_table_like_mut()
+                .ok_or_else(|| format!("\"{}.{}\" must be a table.", SECTION_PROFILE, name))?
+                .insert(field, toml_edit::value(entry.value.as_str()));
+            Ok(())
+        }
+        [section, field] => set_value_in_document(document, section, field, &entry.value),
+        _ => Err(format!("\"{}\" is not a configuration key.", entry.path.join("."))),
+    }
+}
 
 /// Get the path of the configuration folder of the current warehouse.
 ///
@@ -732,7 +1036,7 @@ pub fn set_value(key: &str, value: &str, scope: ConfigScope) -> Result<String, S
     }
 
     edit_locked(&path, |path| {
-        let mut document = load_document(path)?.unwrap_or_default();
+        let mut document = load_document(path, scope)?.unwrap_or_default();
         set_value_in_document(&mut document, section, field, &stored)
             .map_err(|detail| not_valid(path, detail))?;
 
@@ -759,7 +1063,7 @@ pub fn unset_value(key: &str, scope: ConfigScope) -> Result<(), String> {
     let path = get_config_path(scope)?;
 
     edit_locked(&path, |path| {
-        let Some(mut document) = load_document(path)? else {
+        let Some(mut document) = load_document(path, scope)? else {
             return Err(format!("\"{}\" is not set.", key));
         };
 
@@ -871,7 +1175,7 @@ fn profile_identity(profile: &str) -> Result<Option<Operator>, String> {
 /// one's lock.
 fn mint_global_identifier() -> Result<String, String> {
     edit_locked(&get_config_path(ConfigScope::Global)?, |path| {
-        let mut document = load_document(path)?.unwrap_or_default();
+        let mut document = load_document(path, ConfigScope::Global)?.unwrap_or_default();
 
         if let Some(identifier) = parse_config(&document, path)?.get(KEY_OPERATOR_IDENTIFIER) {
             return Ok(identifier.to_string());
@@ -897,7 +1201,7 @@ fn mint_global_identifier() -> Result<String, String> {
 ///                   exists (it was removed since the caller read it).
 fn mint_profile_identifier(profile: &str) -> Result<String, String> {
     edit_locked(&get_config_path(ConfigScope::Global)?, |path| {
-        let mut document = load_document(path)?.unwrap_or_default();
+        let mut document = load_document(path, ConfigScope::Global)?.unwrap_or_default();
 
         let Some(record) = parse_config(&document, path)?.profile(profile).cloned() else {
             return Err(format!(
@@ -1054,7 +1358,7 @@ pub fn create_profile(profile: &str, identifier: Option<&str>) -> Result<Operato
     let identifier = identifier.map(|id| id.to_string()).unwrap_or_else(mint_uuid_v4);
 
     edit_locked(&get_config_path(ConfigScope::Global)?, |path| {
-        let mut document = load_document(path)?.unwrap_or_default();
+        let mut document = load_document(path, ConfigScope::Global)?.unwrap_or_default();
 
         // Under the lock, in the document about to be written: checked against an earlier read,
         // two creations of one name could both find it free, and the second would silently
@@ -1236,8 +1540,8 @@ fn storable_value(key: &str, value: &str) -> String {
 ///
 /// A file that is not TOML at all is reported like any other invalid file, through
 /// [`not_valid`], so it is named by its full path and the remedy is the same.
-fn load_document(path: &Path) -> Result<Option<DocumentMut>, String> {
-    let content = match std::fs::read_to_string(path) {
+fn load_document(path: &Path, scope: ConfigScope) -> Result<Option<DocumentMut>, String> {
+    let content = match std::fs::read(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => match dangling_link_in(path) {
             None => return Ok(None),
@@ -1255,9 +1559,96 @@ fn load_document(path: &Path) -> Result<Option<DocumentMut>, String> {
         )),
     };
 
+    if let Some(detail) = content_damage(&content) {
+        return Err(damaged(path, scope, &detail));
+    }
+    let content = String::from_utf8(content).map_err(|_| damaged(path, scope, NOT_UTF8))?;
+
     content.parse::<DocumentMut>()
         .map(Some)
-        .map_err(|e| not_valid(path, e.to_string().trim_end().to_string()))
+        .map_err(|e| match is_cut(content.as_bytes()) {
+            Some(false) => damaged(path, scope, CUT_SHORT_OR_UNENDED),
+            Some(true) => damaged(path, scope, CUT_INSIDE_A_STRING),
+            None => not_valid(path, e.to_string().trim_end().to_string()),
+        })
+}
+
+/// The detail of a file holding bytes that are not UTF-8.
+const NOT_UTF8: &str = "it holds bytes that are not UTF-8 text, from damage or from a hand edit \
+                        saved in another encoding";
+
+/// The detail of a file cut short. An editor can save a file without its final newline too, so
+/// the detail says what tells the two apart.
+const CUT_SHORT_OR_UNENDED: &str = "its last line does not parse, and no newline ends it, as \
+                                    happens when a file is cut short. If that line was edited by \
+                                    hand rather than cut, fix it by hand instead";
+
+/// The detail of a file cut short inside a multi-line string, whose last line is the string's
+/// text. A string opened by hand and never closed reads the same.
+const CUT_INSIDE_A_STRING: &str = "it ends inside a multi-line string, and no newline ends it, as \
+                                   happens when a file is cut short. If that string was left open \
+                                   by hand rather than cut, close it by hand instead";
+
+/// What damage a configuration file's bytes show, if any: bytes that are not UTF-8, or a
+/// character TOML never allows where it stands: a control character, which is what zeroed bytes
+/// read as, or a carriage return no line feed follows, which is what a byte flipped to 0x0D reads
+/// as. None is a mistake made by hand in an editor that saves UTF-8, and each stops every reading
+/// of the file.
+fn content_damage(bytes: &[u8]) -> Option<String> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Some(NOT_UTF8.to_string());
+    };
+
+    text.char_indices()
+        .find(|&(at, c)| crate::util::config_salvage::is_damaged_char(text, at, c))
+        .map(|(at, c)| format!(
+            "line {} holds the control character U+{:04X}, which TOML never allows there",
+            text[..at].matches('\n').count() + 1, c as u32
+        ))
+}
+
+/// Whether a file that does not parse was cut short: it has bytes, the last is not the newline
+/// every write ends with, and what precedes its last line parses, once any multi-line string the
+/// cut left open is closed (`parse_closed` says when it may be). A cut only ever takes the end of
+/// a file, so a file that fails to parse before its last line holds a mistake made by hand, and so
+/// does a clean file that does not parse but ends in a newline.
+///
+/// # Returns
+/// * `Some(closed)` - A cut, and whether it left a multi-line string open.
+/// * `None`         - No cut.
+fn is_cut(bytes: &[u8]) -> Option<bool> {
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
+        return None;
+    }
+    let (body, partial) = bytes.split_at(bytes.iter().rposition(|&b| b == b'\n').map_or(0, |at| at + 1));
+    let body = std::str::from_utf8(body).ok()?;
+    crate::util::config_salvage::parse_closed(body, &String::from_utf8_lossy(partial)).map(|(_, closed)| closed)
+}
+
+/// Whether a configuration file's bytes are damaged, as [`load_document`] refuses them with
+/// [`RefusalCode::ConfigDamaged`](crate::error::RefusalCode::ConfigDamaged).
+fn is_damaged(bytes: &[u8]) -> bool {
+    content_damage(bytes).is_some()
+        || (std::str::from_utf8(bytes).is_ok_and(|text| text.parse::<DocumentMut>().is_err()) && is_cut(bytes).is_some())
+}
+
+/// The refusal of a damaged configuration file. Only the warehouse's own file has a next step:
+/// heal mends the warehouse it runs in, and says what mending it would drop before anything is
+/// dropped. Nothing mends the global file but the user, so its refusal says so.
+fn damaged(path: &Path, scope: ConfigScope, detail: &str) -> String {
+    let (remedy, next_step) = match scope {
+        ConfigScope::Warehouse => ("", "forklift heal"),
+        ConfigScope::Global => (" Fix the file by hand, or remove the damaged lines.", ""),
+    };
+
+    crate::error::CoreError::refusal(
+        crate::error::RefusalCode::ConfigDamaged,
+        format!(
+            "Configuration file \"{}\" is damaged: {}. Nothing was changed.{}",
+            named(path).to_string_lossy(), detail, remedy
+        ),
+        next_step,
+    ).into()
 }
 
 /// The dangling symbolic link that makes `path` unreachable, if one does — the path itself or
@@ -1445,6 +1836,23 @@ fn remove_value_from_document(document: &mut DocumentMut,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lossy repair that names no dropped entry (the damage may have hidden a line) is never
+    /// told as one that kept everything. Revert: choose the sentence by `dropped` and `cut` alone
+    /// → red.
+    #[test]
+    fn a_lossy_repair_naming_no_entry_is_not_told_as_lossless() {
+        let repaired = ConfigRepaired {
+            path: PathBuf::from("warehouse.toml"),
+            dropped: Vec::new(),
+            cut: false,
+            lossless: false,
+            set_aside: Some(PathBuf::from("warehouse.toml.damaged")),
+        };
+        let said = repaired.sentences().join("\n");
+        assert!(said.contains("only the entries the damage provably spared"), "{}", said);
+        assert!(!said.contains("every entry"), "{}", said);
+    }
 
     /// Parse a document written inline, as if it had been read from `config.toml`.
     fn parse(content: &str) -> Result<ConfigFile, String> {

@@ -187,6 +187,7 @@ pub const CENSUS_ROLES: &[(&str, Role)] = &[
     ("config/", Role::Config),
     ("config/warehouse.toml", Role::Config),
     ("config/warehouse.toml.lock", Role::Lock),
+    ("config/warehouse.toml.damaged", Role::Log),
     ("config/fetch-scope", Role::Config),
     ("taint/", Role::Metadata),
     ("taint/<name>", Role::Metadata),

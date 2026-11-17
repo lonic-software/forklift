@@ -1352,7 +1352,14 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
 ///                   before; or the folder sync after the rename failed, and `file_path` holds
 ///                   `content` with the durability of its new name unproven.
 pub(crate) fn replace_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), String> {
-    publish_replacement(file_path, content, true)?;
+    replace_file_atomically_with_mode_of(file_path, content, file_path)
+}
+
+/// [`replace_file_atomically`], with the replacement given `mode_of`'s permission bits on Unix
+/// rather than `file_path`'s own: for a new file that must start as narrow as the one it copies.
+/// When `mode_of` is absent, the replacement gets the umask's default.
+pub(crate) fn replace_file_atomically_with_mode_of(file_path: &Path, content: &[u8], mode_of: &Path) -> Result<(), String> {
+    publish_replacement(file_path, content, true, mode_of)?;
 
     match file_path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent),
@@ -1389,18 +1396,18 @@ pub(crate) fn replace_file_atomically(file_path: &Path, content: &[u8]) -> Resul
 /// * `Err(String)` - The write or the rename failed, and `file_path` still holds whatever it held
 ///                   before.
 pub(crate) fn replace_file_unsynced(file_path: &Path, content: &[u8]) -> Result<(), String> {
-    publish_replacement(file_path, content, false)
+    publish_replacement(file_path, content, false, file_path)
 }
 
 /// Write a replacement into a fresh temporary file ([`create_fresh_temp`], then
 /// [`write_replacement`]) and rename it over `file_path`, removing the temporary file if either
 /// step fails. `sync` says whether the replacement's bytes are fsynced before the rename; the
-/// folder sync, if any, is the caller's.
-fn publish_replacement(file_path: &Path, content: &[u8], sync: bool) -> Result<(), String> {
+/// folder sync, if any, is the caller's. The replacement takes `mode_of`'s permissions.
+fn publish_replacement(file_path: &Path, content: &[u8], sync: bool, mode_of: &Path) -> Result<(), String> {
     let (temporary_file_path, file) = create_fresh_temp(file_path, temp_path_for)?;
     let temporary_file_path = temporary_file_path.as_path();
 
-    let written = write_replacement(file, temporary_file_path, file_path, content, sync).and_then(|()|
+    let written = write_replacement(file, temporary_file_path, mode_of, content, sync).and_then(|()|
         rename(temporary_file_path, file_path).map_err(|e| format!(
             "Error while moving file into place at \"{}\": {}", file_path.to_string_lossy(), e
         ))

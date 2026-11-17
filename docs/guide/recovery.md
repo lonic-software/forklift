@@ -408,6 +408,31 @@ remote may have deleted content it owed a deletion again as the lift ran, or fai
 store for a moment: run `forklift lift` again. If it is refused the same way each time, the
 remote's store is damaged or lost content, and only whoever runs it can repair it.
 
+### `config_damaged` (exit 65)
+
+A configuration file holds bytes that are not text, or characters a configuration file never
+holds, or it was cut short so that its last line no longer reads. Nothing was changed. It may be damage, or a
+hand edit saved in an encoding other than UTF-8. Forklift keeps no second copy of the file, so the
+only evidence of what it held is the damaged file itself.
+
+In the warehouse's own file, `forklift heal` rewrites it when the damage provably cost no setting,
+as when it lies in a comment, and the rest of the file is valid, keeping the file's own text and
+comments. Otherwise heal changes
+nothing and names, by line and key, each entry
+the damage may have touched. `forklift heal --config` then rewrites the file with only the entries
+the damage provably spared. When one entry of a section goes, the whole section goes, so a
+remote's address is never kept without its token. The damaged bytes are set aside in
+`.forklift/config/warehouse.toml.damaged`, which can hold a remote token: set again what was
+dropped, then remove it. While an earlier copy is set aside, heal will not write over it, so move
+it elsewhere first.
+
+A last line with no newline after it may also be a hand edit: some editors save a file that way.
+When the line heal names is one you edited, fix it by hand rather than running `--config`.
+
+In the global file (`.forkliftconfig` in your home folder), fix or replace the file by hand: heal
+mends only the warehouse it runs in. A file that holds a mistake made by hand, with no damaged
+byte, is refused as "not valid" instead, naming the line to fix, and heal leaves it as it is.
+
 ### `bay_position_damaged` (exit 64)
 
 The record of where this bay stands (the pallet it is on, and the parcel its files stand on) is

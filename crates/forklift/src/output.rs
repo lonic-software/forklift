@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 50;
+pub const SCHEMA_VERSION: u32 = 51;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -617,6 +617,9 @@ error_codes! {
 
     /// The bay's position is lost or damaged; nothing was changed.
     BayPositionDamaged,
+
+    /// A configuration file is damaged; nothing was changed.
+    ConfigDamaged,
 }
 
 impl ErrorCode {
@@ -686,6 +689,7 @@ impl ErrorCode {
             ErrorCode::FetchScopeStray => RefusalCode::FetchScopeStray.as_str(),
             ErrorCode::ObjectKindMismatch => RefusalCode::ObjectKindMismatch.as_str(),
             ErrorCode::BayPositionDamaged => RefusalCode::BayPositionDamaged.as_str(),
+            ErrorCode::ConfigDamaged => RefusalCode::ConfigDamaged.as_str(),
         }
     }
 
@@ -758,6 +762,7 @@ impl ErrorCode {
             ErrorCode::FetchScopeStray => 62,
             ErrorCode::ObjectKindMismatch => 63,
             ErrorCode::BayPositionDamaged => 64,
+            ErrorCode::ConfigDamaged => 65,
         }
     }
 
@@ -917,6 +922,8 @@ impl ErrorCode {
                 "The remote refused to move a pallet because the new head's history names an object as a kind it is not: a file entry's object is not a blob, or not a recipe at a chunked entry, or a recipe's chunk is not a chunk. The history is malformed and no upload changes it; nothing moved",
             ErrorCode::BayPositionDamaged =>
                 "The bay's position, the pallet it stands on and the parcel its files stand on, is missing or does not parse. Nothing was changed; heal rebuilds it from its copy or from an interrupted operation, and otherwise lists the pallets for heal --position to put the bay on",
+            ErrorCode::ConfigDamaged =>
+                "A configuration file holds bytes that are not text or that TOML never allows, or it was cut short. Nothing was changed; in the warehouse's own file heal names what mending it would drop, and heal --config keeps every entry the damage provably spared, after setting the damaged bytes aside"
         }
     }
 
@@ -987,6 +994,7 @@ impl ErrorCode {
             RefusalCode::FetchScopeStray => ErrorCode::FetchScopeStray,
             RefusalCode::ObjectKindMismatch => ErrorCode::ObjectKindMismatch,
             RefusalCode::BayPositionDamaged => ErrorCode::BayPositionDamaged,
+            RefusalCode::ConfigDamaged => ErrorCode::ConfigDamaged,
         }
     }
 }
@@ -1644,6 +1652,7 @@ mod tests {
             (RefusalCode::FetchScopeStray, "fetch_scope_stray", 62),
             (RefusalCode::ObjectKindMismatch, "object_kind_mismatch", 63),
             (RefusalCode::BayPositionDamaged, "bay_position_damaged", 64),
+            (RefusalCode::ConfigDamaged, "config_damaged", 65),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.
