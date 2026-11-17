@@ -635,6 +635,14 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **A lost or damaged bay position is refused with a remedy, and `heal` rebuilds it.** A bay
+  whose position file was deleted, cut short or garbled failed every command with a raw read
+  error and no way out, and `prepare` over a deleted one silently put the bay on `main` with no
+  parcel. Every reader now refuses with `bay_position_damaged` (exit 64, `--json` schema 50) and
+  `forklift heal` as the next step, and `prepare` refuses the same way. Each position write also
+  leaves a copy beside it, and `heal` rebuilds the position from that copy, or from an
+  interrupted operation. With neither it lists the pallets, and `heal --position <pallet>` puts
+  the bay on that pallet's head. A position or copy a newer version wrote is never written over.
 - **A remote refuses history that names an object as a kind it is not.** A ref update whose new
   history named a folder's tree or a large file's piece at a file entry, or a plain file's
   content as a large file or one of its pieces, was taken, and the pallet then pointed at history

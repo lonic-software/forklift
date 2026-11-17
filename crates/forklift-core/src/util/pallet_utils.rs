@@ -26,6 +26,10 @@ pub const META_QUALIFIER: char = '@';
 /// stand on (see [`BayPosition`]).
 pub const FILE_NAME_POSITION: &str = "position";
 
+/// The bay-local copy of the position file, written after it with the same bytes: the witness
+/// `heal` rebuilds a lost or damaged position from (see [`write_position_in`]).
+pub const FILE_NAME_POSITION_COPY: &str = "position-copy";
+
 /// The name of the default pallet (used when a warehouse is prepared).
 pub const DEFAULT_PALLET_NAME: &str = "main";
 
@@ -501,36 +505,123 @@ const POSITION_VERSION: u32 = 2;
 ///
 /// # Returns
 /// * `Ok(BayPosition)` - Where the bay stands.
-/// * `Err(String)`     - If the position file is missing, unreadable or malformed. There is no
-///                       default: a bay without one was never prepared, and guessing a pallet
-///                       would pair it with no base.
+/// * `Err(String)`     - If the position file is missing, unreadable or malformed: a
+///                       `bay_position_damaged` refusal whose next step is `forklift heal`, unless
+///                       a newer version wrote it. There is no default: a prepared bay always has
+///                       one, and guessing a pallet would pair it with no base.
 pub fn read_position() -> Result<BayPosition, String> {
-    read_position_in(&bay_root())
+    read_position_at(&bay_root(), HEAL)
 }
 
-/// Read the position of the bay whose bay-local state dir is `dir` (see [`read_position`]).
+/// Read the position of the bay whose bay-local state dir is `dir` (see [`read_position`]). A
+/// damaged one names `heal` only when `dir` is the bay this process runs in: `heal` mends only
+/// that bay, and this may be another bay's, or a bay whose creation never finished.
 pub fn read_position_in(dir: &Path) -> Result<BayPosition, String> {
+    read_position_at(dir, if dir == bay_root() { HEAL } else { "" })
+}
+
+/// The next step of a damaged position of the bay a command runs in.
+const HEAL: &str = "forklift heal";
+
+/// Read the position file in `dir`, refusing a damaged one with `next_step`.
+fn read_position_at(dir: &Path, next_step: &str) -> Result<BayPosition, String> {
     let path = dir.join(FILE_NAME_POSITION);
 
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("Error while reading the bay position file \"{}\": {}", path.to_string_lossy(), e))?;
+    let bytes = std::fs::read(&path).map_err(|e| position_damaged(&path, &match e.kind() {
+        std::io::ErrorKind::NotFound => "is missing.".to_string(),
+        _ => format!("cannot be read: {}.", e),
+    }, next_step))?;
 
-    let malformed = |reason: String| format!("The bay position file \"{}\" {}", path.to_string_lossy(), reason);
+    decode_position(&bytes).map_err(|why| match why {
+        PositionUnread::Newer(reason) => format!(
+            "The bay position file \"{}\" {} This version of Forklift never writes over it.",
+            path.to_string_lossy(), reason
+        ),
+        PositionUnread::Damaged(reason) => position_damaged(&path, &reason, next_step),
+    })
+}
 
-    let entries = crate::util::record_utils::from_bytes(&bytes, POSITION_RECORD, POSITION_VERSION)
-        .map_err(|e| malformed(e.describe()))?;
+/// Why a position record's bytes do not read: a newer version wrote them, or they are damaged.
+/// Each carries a phrase that follows "The <file> ".
+pub enum PositionUnread {
+    Newer(String),
+    Damaged(String),
+}
 
-    let [pallet, base] = <[String; 2]>::try_from(entries).map_err(|_| malformed("is malformed.".to_string()))?;
+/// Decode the position record `bytes`.
+pub fn decode_position(bytes: &[u8]) -> Result<BayPosition, PositionUnread> {
+    let entries = crate::util::record_utils::from_bytes(bytes, POSITION_RECORD, POSITION_VERSION).map_err(|e| {
+        match crate::util::record_utils::written_by_newer(bytes, POSITION_RECORD, POSITION_VERSION) {
+            true => PositionUnread::Newer(e.describe()),
+            false => PositionUnread::Damaged(e.describe()),
+        }
+    })?;
 
-    validate_pallet_name(&pallet).map_err(|e| malformed(format!("names an invalid pallet: {}", e)))?;
+    let malformed = || PositionUnread::Damaged("is malformed.".to_string());
+
+    let [pallet, base] = <[String; 2]>::try_from(entries).map_err(|_| malformed())?;
+
+    validate_pallet_name(&pallet).map_err(|e| PositionUnread::Damaged(format!("names an invalid pallet: {}", e)))?;
 
     let base = match base.as_str() {
         "" => None,
         hash if object_utils::is_object_hash(hash) => Some(base),
-        _ => return Err(malformed("is malformed.".to_string())),
+        _ => return Err(malformed()),
     };
 
     Ok(BayPosition { pallet, base })
+}
+
+/// The `bay_position_damaged` refusal for the position file at `path`, which `reason` (a phrase
+/// that follows "The bay position file <path> ") says why it does not read.
+pub fn position_damaged(path: &Path, reason: &str, next_step: &str) -> String {
+    CoreError::refusal(
+        RefusalCode::BayPositionDamaged,
+        format!("The bay position file \"{}\" {} Which pallet this bay stands on, and which parcel its files stand on, cannot be told.",
+            path.to_string_lossy(), reason),
+        next_step,
+    ).into()
+}
+
+/// What the copy of the position (see [`write_position_in`]) holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PositionCopy {
+    /// The position it holds.
+    Reads(BayPosition),
+
+    /// A newer version wrote it, for this reason: that version's record, never written over.
+    Newer(String),
+
+    /// There is none, or it is damaged: no witness of anything.
+    Unusable,
+
+    /// It is there but cannot be read now, for this reason: it may be sound.
+    Unreadable(String),
+}
+
+/// Read the copy of the position in the bay-local state dir `dir`. Read once, so every decision
+/// about it is made on the same bytes.
+pub fn read_position_copy_in(dir: &Path) -> PositionCopy {
+    match std::fs::read(dir.join(FILE_NAME_POSITION_COPY)) {
+        Ok(bytes) => match decode_position(&bytes) {
+            Ok(position) => PositionCopy::Reads(position),
+            Err(PositionUnread::Newer(reason)) => PositionCopy::Newer(reason),
+            Err(PositionUnread::Damaged(_)) => PositionCopy::Unusable,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PositionCopy::Unusable,
+        Err(e) => PositionCopy::Unreadable(e.to_string()),
+    }
+}
+
+/// Write the copy of the position in `dir` to match `position`.
+pub fn write_position_copy_in(dir: &Path, position: &BayPosition) -> Result<(), String> {
+    file_utils::write_file_atomically(&dir.join(FILE_NAME_POSITION_COPY), &position_bytes(position))
+}
+
+/// The record bytes of `position`.
+fn position_bytes(position: &BayPosition) -> Vec<u8> {
+    let base = position.base.as_deref().unwrap_or("");
+    crate::util::record_utils::to_bytes(POSITION_RECORD, POSITION_VERSION, [position.pallet.as_str(), base])
 }
 
 /// Write the active bay's position (atomically: the pallet and the base change together).
@@ -560,27 +651,57 @@ pub fn landed_but(pallet: &str, head: &str, error: &str) -> String {
 }
 
 /// [`write_position`] into the bay-local state dir `dir`, whichever bay it belongs to.
+///
+/// The same record is then written to a copy beside it, the witness `heal` rebuilds a lost or
+/// damaged position from: every position a bay is given is written here, so the copy holds the
+/// last one. A copy that cannot be written is removed instead, since a stale copy would rebuild a
+/// position the bay has left; only when neither can be done does the write fail (the position
+/// itself stands).
 pub fn write_position_in(dir: &Path, position: &BayPosition) -> Result<(), String> {
     validate_pallet_name(&position.pallet)?;
 
-    let base = position.base.as_deref().unwrap_or("");
-    let bytes = crate::util::record_utils::to_bytes(POSITION_RECORD, POSITION_VERSION, [position.pallet.as_str(), base]);
+    let bytes = position_bytes(position);
 
-    file_utils::write_file_atomically(&dir.join(FILE_NAME_POSITION), &bytes)
+    file_utils::write_file_atomically(&dir.join(FILE_NAME_POSITION), &bytes)?;
+
+    let copy = dir.join(FILE_NAME_POSITION_COPY);
+    file_utils::write_file_atomically(&copy, &bytes).or_else(|written| match file_utils::remove_file(&copy) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(removed) => Err(format!(
+            "The bay position was written, but its copy \"{}\" could neither be written ({}) nor removed ({}).",
+            copy.to_string_lossy(), written.trim_end_matches('.'), removed
+        )),
+    })
 }
 
 /// Create the active bay's position (the default pallet, unborn) if it has none, along with the
 /// pallets folder. Called by `prepare`.
 ///
+/// A position missing beside its copy, or in a warehouse that has pallets, was lost rather than
+/// never made: writing the default over it would put the bay on a pallet it never stood on, and
+/// write over the copy `heal` rebuilds it from, so that is refused instead.
+///
 /// # Returns
 /// * `Ok(true)`    - If the position file was created.
 /// * `Ok(false)`   - If it already existed.
-/// * `Err(String)` - If an error occurred.
+/// * `Err(String)` - A `bay_position_damaged` refusal for a lost position, or an error occurred.
 pub fn create_position_if_not_exists() -> Result<bool, String> {
     file_utils::create_folder_if_not_exists(&get_pallets_folder())?;
 
-    if get_position_path().exists() {
-        return Ok(false);
+    let path = get_position_path();
+
+    // Only an absent file is a position never made; one that cannot be judged is not written over.
+    // Heal cannot mend an entry it cannot read either, so that refusal names no next step.
+    let absent = |path: &Path| matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(position_damaged(&path, &format!("cannot be read: {}.", e), "")),
+    }
+
+    if !absent(&bay_root().join(FILE_NAME_POSITION_COPY)) || !list_pallets()?.is_empty() {
+        return Err(position_damaged(&path, "is missing.", "forklift heal"));
     }
 
     write_position(&BayPosition::new(DEFAULT_PALLET_NAME, None))?;
@@ -2186,6 +2307,23 @@ pub(crate) mod tests {
         if let Some(run) = BEFORE_HOLD.with(|slot| slot.borrow_mut().take()) {
             run();
         }
+    }
+
+    /// A copy that can be neither written nor removed fails the write loudly, after the primary
+    /// has landed, so a stale copy is never left standing in silence.
+    /// Revert: map a failed copy removal to Ok → the write reports success → red.
+    #[test]
+    fn a_copy_that_can_neither_be_written_nor_removed_fails_the_write() {
+        let dir = std::env::temp_dir().join(format!("forklift-position-copy-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(FILE_NAME_POSITION_COPY).join("in-the-way")).unwrap();
+
+        let position = BayPosition::new("main", None);
+        let error = write_position_in(&dir, &position).unwrap_err();
+        assert!(error.contains("could neither be written"), "{}", error);
+        assert_eq!(decode_position(&std::fs::read(dir.join(FILE_NAME_POSITION)).unwrap()).ok(), Some(position));
+
+        let _ = file_utils::remove_dir_all(&dir);
     }
 
     /// A fresh warehouse root (its `.forklift` folder exists) entered for this thread.

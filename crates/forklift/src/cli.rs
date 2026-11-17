@@ -365,7 +365,13 @@ pub enum Command {
                       loss; \"forklift scope fetch\" adds them back. When the checkouts cannot \
                       settle it, it refuses with \"fetch_scope_damaged\" (exit 54), and \
                       --fetch-scope, once per path, sets the fetch scope to the paths you name, \
-                      fetching from the origin what the history at them lacks."
+                      fetching from the origin what the history at them lacks.\n\n\
+                      A bay position that was lost or damaged (\"bay_position_damaged\" refusals, \
+                      exit 64) is rebuilt from its copy, which every position write leaves beside \
+                      it, or from an operation left unfinished. When neither says where the bay \
+                      stood it changes nothing and lists the pallets; --position puts the bay on \
+                      the pallet you name, at its head, taking the files as standing there, so a \
+                      bay that stood behind that head no longer refuses its next stack."
     )]
     Heal {
         /// Set a damaged pallet ref to a parcel (a pallet, a parcel hash or a unique prefix of one)
@@ -379,6 +385,10 @@ pub enum Command {
         /// Set a sparse warehouse's damaged fetch scope to these paths, fetching what their history lacks
         #[arg(long, value_name = "PATH")]
         fetch_scope: Vec<String>,
+
+        /// Put a bay whose position is lost or damaged on this pallet, at its head
+        #[arg(long, value_name = "PALLET")]
+        position: Option<String>,
     },
 
     /// Print the command list, or detailed help about one command

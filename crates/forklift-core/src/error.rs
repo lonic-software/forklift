@@ -435,6 +435,13 @@ refusal_codes! {
     /// nothing a lift or an upload does changes it; the details carry the hash, the path and both
     /// kinds. Nothing moved, and the next step is empty.
     ObjectKindMismatch => "object_kind_mismatch",
+
+    /// The bay's position (which pallet it stands on, and the parcel its files stand on) is lost:
+    /// the file is missing, cannot be read, or does not parse as one this build or an older one
+    /// wrote. A position a newer version wrote is not this. Nothing was changed; `heal` rebuilds
+    /// it from the copy every position write leaves beside it, or from an interrupted operation's
+    /// source, and otherwise lists the pallets for `heal --position` to put the bay on.
+    BayPositionDamaged => "bay_position_damaged",
 }
 
 /// The codes of a host record that is lost or damaged, or of an object its store cannot read,
@@ -448,6 +455,7 @@ pub const SERVED_DAMAGE: &[RefusalCode] = &[
     RefusalCode::SealedDamaged,
     RefusalCode::UnavailableDamaged,
     RefusalCode::OriginDamaged,
+    RefusalCode::BayPositionDamaged,
 ];
 
 impl RefusalCode {

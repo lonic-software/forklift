@@ -1833,7 +1833,9 @@ fn operator_remedy(code: forklift_core::error::RefusalCode, own: &str) -> String
         RefusalCode::TombstonesDamaged => "forklift-server tombstone repair --root <warehouse>".to_string(),
         RefusalCode::WithheldDamaged => "forklift-server withhold repair --root <warehouse>".to_string(),
         RefusalCode::ObjectUnreadable => "forklift heal".to_string(),
-        RefusalCode::SealedDamaged | RefusalCode::UnavailableDamaged => own.to_string(),
+        // The served root's own position names heal; another bay's names nothing, since a heal in
+        // the warehouse's root does not reach it.
+        RefusalCode::SealedDamaged | RefusalCode::UnavailableDamaged | RefusalCode::BayPositionDamaged => own.to_string(),
         RefusalCode::FetchScopeStray | RefusalCode::OriginDamaged => String::new(),
         _ => unreachable!("not a damage code"),
     }
@@ -1855,6 +1857,8 @@ fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> Str
             "The warehouse's record of content it cannot get does not read, so what it lacks cannot be told, and the request was refused.".to_string(),
         RefusalCode::OriginDamaged =>
             "The warehouse is recorded as full but holds an origin record, which only a partial warehouse has, so content its pallets reach may be absent; the record does not read, and the request was refused. Its operator can serve a full clone in its place.".to_string(),
+        RefusalCode::BayPositionDamaged =>
+            "A record of which pallet one of the warehouse's working trees stands on does not read, so the request was refused.".to_string(),
         _ => human,
     }
 }
@@ -9992,6 +9996,33 @@ mod tests {
                 assert!(body.contains(r#""code":"tombstones_damaged""#), "{}: {}", what, body);
                 assert!(body.contains("forklift-server tombstone repair --root <warehouse>"), "{}: {}", what, body);
             assert!(!body.contains("repair --root /") && !body.contains("repair --root '"), "{}: no server path: {}", what, body);
+            }
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+        }
+
+        /// The served root's own position is what a new clone checks out: lost or damaged, the
+        /// handshake refuses with its code and names heal, and never the position file's path.
+        /// Revert: drop BayPositionDamaged from SERVED_DAMAGE → a 500 with no code → red.
+        #[tokio::test]
+        async fn a_handshake_over_a_damaged_position_refuses_with_its_code() {
+            let (root, _scope, _side) = served_with_side("handshake-position");
+            let position = forklift_core::globals::bay_root().join(forklift_core::util::pallet_utils::FILE_NAME_POSITION);
+            let bytes = std::fs::read(&position).unwrap();
+
+            for (what, damaged) in [("cut", Some(bytes[..bytes.len() / 2].to_vec())), ("missing", None)] {
+                match damaged {
+                    Some(damaged) => std::fs::write(&position, damaged).unwrap(),
+                    None => forklift_core::util::file_utils::remove_file(&position).unwrap(),
+                }
+
+                let response = get_warehouse(State(Arc::new(single_mode_state(root.clone()))), Path(PathParams::new()))
+                    .await.into_response();
+
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{}", what);
+                let body = body_text(response).await;
+                assert!(body.contains(r#""code":"bay_position_damaged""#), "{}: {}", what, body);
+                assert!(body.contains("forklift heal"), "{}: {}", what, body);
+                assert!(!body.contains(".forklift"), "{}: no server path: {}", what, body);
             }
             let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }

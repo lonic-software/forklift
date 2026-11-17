@@ -289,6 +289,7 @@ name in a row is a constant, and every path in every fixture matches a row.
 | `{bay}inventory/inv_/`, `{bay}inventory/inv_/<xx>/`, `{bay}inventory/inv_/<xx>/<hash>/`, `{bay}inventory/inv_/<xx>/<hash>/data` | rewritable | `file_utils::FOLDER_NAME_INVENTORY_STORE`, `file_utils::FILE_NAME_INVENTORY_DATA` |
 | `{bay}inventory/incomplete-load` | rewritable | `load_guard_utils::FILE_NAME_INCOMPLETE_LOAD_MARKER` |
 | `{bay}position` | rewritable | `pallet_utils::FILE_NAME_POSITION` |
+| `{bay}position-copy` | rewritable | `pallet_utils::FILE_NAME_POSITION_COPY` |
 | `{bay}scope` | rewritable | `scope_utils::FILE_NAME_BAY_SCOPE` |
 | `{bay}cherry-pick` | rewritable | `cherry_pick_utils::FILE_NAME_CHERRY_PICK` |
 | `{bay}consolidation` | rewritable | `merge_utils::FILE_NAME_CONSOLIDATION` |

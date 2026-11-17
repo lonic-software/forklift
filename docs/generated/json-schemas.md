@@ -2462,6 +2462,51 @@ A command not listed here either reports only the generic human-message shape `{
         }
       ]
     },
+    "PositionRebuilt": {
+      "description": "A position `heal` wrote.",
+      "properties": {
+        "base": {
+          "description": "The parcel its files are taken to stand on; absent for an unborn pallet.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "from": {
+          "$ref": "#/$defs/PositionSource",
+          "description": "What it was rebuilt from."
+        },
+        "pallet": {
+          "description": "The pallet the bay now stands on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pallet",
+        "from"
+      ],
+      "type": "object"
+    },
+    "PositionSource": {
+      "description": "Where a rebuilt position came from.",
+      "oneOf": [
+        {
+          "const": "copy",
+          "description": "The position's own copy, the last position written.",
+          "type": "string"
+        },
+        {
+          "const": "operation",
+          "description": "The source of the operation left unfinished, which recovery then moves on.",
+          "type": "string"
+        },
+        {
+          "const": "chosen",
+          "description": "The pallet `--position` named, at its head.",
+          "type": "string"
+        }
+      ]
+    },
     "Rebuilt": {
       "description": "A ref this run rebuilt.",
       "properties": {
@@ -2703,6 +2748,17 @@ A command not listed here either reports only the generic human-message shape `{
         }
       ],
       "description": "The parked-work record, which was missing, damaged or incomplete and this run rebuilt from\nthe entries that still read, the bays' own leftovers and the parked parcels the store holds."
+    },
+    "position_rebuilt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PositionRebuilt"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The bay's position, which was lost or damaged and this run wrote: from its copy, from an\noperation left unfinished, or on the pallet `--position` named."
     },
     "record_rebuilt": {
       "anyOf": [

@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 49;
+pub const SCHEMA_VERSION: u32 = 50;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -614,6 +614,9 @@ error_codes! {
     /// The remote refused to move a pallet whose new history names an object as a kind it is not;
     /// nothing moved.
     ObjectKindMismatch,
+
+    /// The bay's position is lost or damaged; nothing was changed.
+    BayPositionDamaged,
 }
 
 impl ErrorCode {
@@ -682,6 +685,7 @@ impl ErrorCode {
             ErrorCode::OriginDamaged => RefusalCode::OriginDamaged.as_str(),
             ErrorCode::FetchScopeStray => RefusalCode::FetchScopeStray.as_str(),
             ErrorCode::ObjectKindMismatch => RefusalCode::ObjectKindMismatch.as_str(),
+            ErrorCode::BayPositionDamaged => RefusalCode::BayPositionDamaged.as_str(),
         }
     }
 
@@ -753,6 +757,7 @@ impl ErrorCode {
             ErrorCode::OriginDamaged => 61,
             ErrorCode::FetchScopeStray => 62,
             ErrorCode::ObjectKindMismatch => 63,
+            ErrorCode::BayPositionDamaged => 64,
         }
     }
 
@@ -910,6 +915,8 @@ impl ErrorCode {
                 "A warehouse that is not sparse holds a fetch scope, which only a sparse warehouse is given, so what it fetched cannot be told. Nothing was changed; deleting the file ends it",
             ErrorCode::ObjectKindMismatch =>
                 "The remote refused to move a pallet because the new head's history names an object as a kind it is not: a file entry's object is not a blob, or not a recipe at a chunked entry, or a recipe's chunk is not a chunk. The history is malformed and no upload changes it; nothing moved",
+            ErrorCode::BayPositionDamaged =>
+                "The bay's position, the pallet it stands on and the parcel its files stand on, is missing or does not parse. Nothing was changed; heal rebuilds it from its copy or from an interrupted operation, and otherwise lists the pallets for heal --position to put the bay on",
         }
     }
 
@@ -979,6 +986,7 @@ impl ErrorCode {
             RefusalCode::OriginDamaged => ErrorCode::OriginDamaged,
             RefusalCode::FetchScopeStray => ErrorCode::FetchScopeStray,
             RefusalCode::ObjectKindMismatch => ErrorCode::ObjectKindMismatch,
+            RefusalCode::BayPositionDamaged => ErrorCode::BayPositionDamaged,
         }
     }
 }
@@ -1635,6 +1643,7 @@ mod tests {
             (RefusalCode::OriginDamaged, "origin_damaged", 61),
             (RefusalCode::FetchScopeStray, "fetch_scope_stray", 62),
             (RefusalCode::ObjectKindMismatch, "object_kind_mismatch", 63),
+            (RefusalCode::BayPositionDamaged, "bay_position_damaged", 64),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

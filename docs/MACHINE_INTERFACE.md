@@ -85,7 +85,15 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 49** (current): the `object_kind_mismatch` error code exists (exit 63). A remote refuses
+**Schema 50** (current): the `bay_position_damaged` error code exists (exit 64). The bay's
+position (the pallet it stands on and the parcel its files stand on) is missing, cannot be read,
+or does not parse. `next_step` is `forklift heal` for the bay the command runs in, and empty for
+another bay's, which a heal here does not reach; heal itself, finding no copy of the position and
+no interrupted operation, names `forklift heal --position <pallet>`. `heal` reports a rebuilt
+position as `position_rebuilt` (`pallet`, `base` when the pallet has a parcel, and `from`: `copy`,
+`operation` or `chosen`). forklift-server answers its own damaged position as a `503`.
+
+**Schema 49**: the `object_kind_mismatch` error code exists (exit 63). A remote refuses
 a ref update whose new history names a present object as a kind it is not, such as a tree or a
 chunk at a file entry, a blob at a chunked one, or a blob in a recipe's chunk list. `details` carry
 `hash`, `path`, `expected` and `found`, each kind one of `blob`, `tree`, `parcel`, `recipe` and

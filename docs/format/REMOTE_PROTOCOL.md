@@ -80,6 +80,11 @@ of the server's directory:
   there only in a corrupt loose file, or sits in a damaged pack file there. `next_step` names the
   operator's `forklift heal`, run where the warehouse is served from. The serverless head answers
   that case as a `500` whose body names no store path.
+- `bay_position_damaged`: the record of which pallet the served warehouse's working tree (or one
+  of its bays) stands on cannot be read, so the default pallet a clone checks out, or which bays
+  stand on a pallet being deleted, cannot be told. `next_step` names the operator's
+  `forklift heal` for the served root's own position, and is empty for a bay's, which is healed in
+  that bay. The serverless head keeps no position: its default pallet is configuration.
 - `fetch_scope_stray`, `sealed_damaged`, `unavailable_damaged` and `origin_damaged`: a record the
   server reads before it serves a full warehouse is out of place or does not parse. They are, in
   turn, a fetch scope, which a full warehouse never holds; the record of objects held by hash alone;

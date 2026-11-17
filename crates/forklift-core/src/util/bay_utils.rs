@@ -605,8 +605,8 @@ pub fn bays_on(pallet: &str) -> Result<Vec<(String, pallet_utils::BayPosition)>,
     let mut on = Vec::new();
 
     for (which, dir) in checkouts {
-        let position = pallet_utils::read_position_in(&dir).map_err(|error| format!(
-            "Cannot tell whether {} stands on pallet \"{}\": {}", which, pallet, error
+        let position = pallet_utils::read_position_in(&dir).map_err(|error| crate::error::prefix_message(
+            &format!("Cannot tell whether {} stands on pallet \"{}\"", which, pallet), error
         ))?;
 
         if position.pallet == pallet {

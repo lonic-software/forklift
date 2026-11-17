@@ -823,8 +823,8 @@ fn refuse_a_bay_on_unborn(pallet: &str) -> Result<(), String> {
             None => "The warehouse's own working tree".to_string(),
         };
 
-        let position = pallet_utils::read_position_in(&dir).map_err(|error| format!(
-            "Cannot tell whether {} stands on pallet \"{}\": {}", which.to_lowercase(), pallet, error
+        let position = pallet_utils::read_position_in(&dir).map_err(|error| forklift_core::error::prefix_message(
+            &format!("Cannot tell whether {} stands on pallet \"{}\"", which.to_lowercase(), pallet), error
         ))?;
 
         if position.pallet == pallet {
