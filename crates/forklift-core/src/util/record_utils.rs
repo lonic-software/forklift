@@ -152,7 +152,9 @@ where
 pub fn from_bytes(bytes: &[u8], kind: &str, version: u32) -> Result<Vec<String>, RecordError> {
     match verified_body(bytes) {
         Some(body) => parse_body(body, kind, version),
-        None if has_digest_line(bytes) => Err(RecordError::Damaged),
+        // By shape, so an older record whose last entry merely opens as a digest line is still
+        // judged by its header; a current record with a damaged digest line is damaged either way.
+        None if without_digest_line(bytes).len() != bytes.len() => Err(RecordError::Damaged),
         None => Err(match read_header(bytes, kind, version) {
             Err(RecordError::OtherVersion(found)) if header_number(&found, kind).is_some_and(|n| n < version) =>
                 RecordError::OtherVersion(found),
@@ -246,7 +248,7 @@ fn last_line(bytes: &[u8]) -> (&[u8], &[u8]) {
 /// or not: a record that failed its digest rather than one that never had one, such as a record
 /// from before its digest. Looser than [`without_digest_line`]'s shape, so a damaged digest line
 /// still marks a repair's output unverified; a last entry that opens the same way only errs
-/// towards that warning.
+/// towards that warning. [`from_bytes`] judges by the shape instead.
 pub fn has_digest_line(bytes: &[u8]) -> bool {
     last_line(bytes).1.starts_with(DIGEST_PREFIX.as_bytes())
 }
@@ -465,6 +467,12 @@ mod tests {
                         [&good[..good.len() - 2], b"q\n"].concat()] {
             assert!(has_digest_line(&damaged), "{:?}", String::from_utf8_lossy(&damaged));
             assert_eq!(from_bytes(&damaged, "test", 2), Err(RecordError::Damaged));
+        }
+        // An older record, from before the digest, whose last entry opens as a digest line is
+        // judged by its header. Revert: judge by the prefix → it reads as damaged.
+        for older in [&b"/forklift-test 1\nsrc\ndigest notes\n"[..], b"/forklift-test 1\ndigest abc\n"] {
+            assert_eq!(from_bytes(older, "test", 2), Err(RecordError::OtherVersion("/forklift-test 1".to_string())),
+                       "{:?}", String::from_utf8_lossy(older));
         }
     }
 }
