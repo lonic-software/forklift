@@ -370,6 +370,13 @@ fn a_repair_over_a_lost_mark_beside_a_whole_list_writes_only_the_mark() {
     assert!(root.join(".forklift").join("served").exists());
     let listed = area.server_ok(&root, &["tombstone", "list"]);
     assert!(listed.contains(&side) && !listed.contains(&gone), "{}", listed);
+
+    // A mark of this version with no digest, as a build from before the digest wrote it, does not
+    // read either. Revert: let the repair read the mark undigested → "nothing to repair" over a
+    // mark every read refuses → red.
+    std::fs::write(root.join(".forklift").join("served"), "/forklift-served 2\n").unwrap();
+    area.server_ok(&root, &["tombstone", "repair"]);
+    area.server_ok(&root, &["tombstone", "list"]);
 }
 
 /// Revert: write only the kept heads → the entries that still read are lost → red.
