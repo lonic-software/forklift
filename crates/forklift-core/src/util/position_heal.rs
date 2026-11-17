@@ -151,6 +151,23 @@ pub fn repair(chosen: Option<&str>, notes: &mut Vec<String>) -> Result<Option<Po
     Ok(Some(PositionRebuilt { pallet: position.pallet, base: position.base, from }))
 }
 
+/// Whether [`repair`] would set a `--position` it is given: the position is lost or damaged, and
+/// neither a copy nor an operation left unfinished says where it stood. Otherwise it refuses
+/// `--position` before writing anything.
+pub fn sets_chosen() -> Result<bool, String> {
+    let dir = bay_root();
+
+    match std::fs::read(dir.join(pallet_utils::FILE_NAME_POSITION)) {
+        Ok(bytes) => if !matches!(pallet_utils::decode_position(&bytes), Err(PositionUnread::Damaged(_))) {
+            return Ok(false);
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Ok(false),
+    }
+
+    Ok(matches!(pallet_utils::read_position_copy_in(&dir), PositionCopy::Unusable) && operation_utils::read()?.is_none())
+}
+
 /// A position that reads: `--position` is refused over it, and its copy is rewritten if it does
 /// not match. A copy that holds another position is a false witness, so it is removed when it
 /// cannot be rewritten; one that holds nothing usable witnesses nothing, so failing to rewrite it

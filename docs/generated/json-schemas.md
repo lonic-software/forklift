@@ -2747,6 +2747,37 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "ScopeRestored": {
+      "description": "A checkout scope `heal` wrote.",
+      "properties": {
+        "checkout": {
+          "description": "The checkout: the warehouse's own working tree, or a bay.",
+          "type": "string"
+        },
+        "chosen": {
+          "description": "Whether `--scope` chose them, rather than the copy.",
+          "type": "boolean"
+        },
+        "scope": {
+          "description": "The prefixes of the scope written; empty for a bay that checks out every path.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "was": {
+          "description": "What the scope file held that could not be used.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "checkout",
+        "scope",
+        "chosen",
+        "was"
+      ],
+      "type": "object"
+    },
     "TreeUnread": {
       "description": "A tree the rebuild proposed directories from and could not read.",
       "properties": {
@@ -2807,6 +2838,13 @@ A command not listed here either reports only the generic human-message shape `{
         "reason": {
           "description": "Why its scope was not used.",
           "type": "string"
+        },
+        "way_out": {
+          "description": "What restores it: heal run in that checkout, or, for a bay that recorded no folder, its\nremoval. Absent for a scope a newer version wrote, which is not damage.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -2819,6 +2857,17 @@ A command not listed here either reports only the generic human-message shape `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of a `heal` run that fully resolved (or found nothing to resolve).",
   "properties": {
+    "checkout_scope_restored": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ScopeRestored"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The scope of the checkout this run healed, which was lost or damaged and this run wrote:\nrestored from the copy beside it, or set to the paths `--scope` gave."
+    },
     "config_repaired": {
       "anyOf": [
         {

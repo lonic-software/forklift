@@ -85,7 +85,20 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 52** (current): the `inventory_damaged` error code exists (exit 66). The inventory
+**Schema 53** (current): the `checkout_scope_damaged` error code exists (exit 67). The scope file
+of the checkout a command runs in, or of another checkout it reads, is missing where the mode
+requires one, does not match its digest, lacks its header, is in an older format, or is not
+UTF-8. A file in a format this version of Forklift does not know keeps its uncoded refusal. In
+the checkout the command runs in, `next_step` is `forklift heal`; for another checkout there is
+no next step, and the message names the heal to run there, or `forklift bay remove` for a bay
+that recorded no folder. `heal` reports a restored or set scope as `checkout_scope_restored`:
+`checkout` (which checkout), `scope` (its prefixes), `was` (what was wrong with the file) and
+`chosen` (true when `--scope` named it). When the copy cannot be used, heal refuses
+`checkout_scope_damaged` with no next step, and the message names `forklift heal --scope`. In
+the fetch-scope heal's `unread` list, an entry gains `way_out`, the step for that checkout,
+absent for a scope a newer version wrote.
+
+**Schema 52**: the `inventory_damaged` error code exists (exit 66). The inventory
 metadata file, the record of which folders hold staged content, does not match its digest, lacks
 its header, holds a malformed escape or is not UTF-8, or it is missing while the staging area
 holds shards. A file in a format this version of Forklift does not know keeps its uncoded refusal.

@@ -292,6 +292,7 @@ name in a row is a constant, and every path in every fixture matches a row.
 | `{bay}position` | rewritable | `pallet_utils::FILE_NAME_POSITION` |
 | `{bay}position-copy` | rewritable | `pallet_utils::FILE_NAME_POSITION_COPY` |
 | `{bay}scope` | rewritable | `scope_utils::FILE_NAME_BAY_SCOPE` |
+| `{bay}scope-copy` | rewritable | `scope_utils::FILE_NAME_SCOPE_COPY` |
 | `{bay}cherry-pick` | rewritable | `cherry_pick_utils::FILE_NAME_CHERRY_PICK` |
 | `{bay}consolidation` | rewritable | `merge_utils::FILE_NAME_CONSOLIDATION` |
 | `{bay}consolidation-skeleton` | rewritable | `merge_utils::FILE_NAME_SKELETON` |

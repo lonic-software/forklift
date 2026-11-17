@@ -137,7 +137,8 @@ fn heal_refuses_a_rebuild_over_lost_history_and_its_next_step_fetches_it() {
 
 /// With no checkout's scope readable, heal refuses 54 offering the working tree's folders, and that
 /// step works with the fetch-scope file still deleted. Offline the same step refuses and writes
-/// nothing.
+/// nothing. The main tree's scope is one a newer version wrote: a damaged one heal restores from its
+/// copy first, so the fetch scope is then rebuilt from it.
 ///
 /// Revert: build the client through `content_may_be_absent`, which reads the damaged file → the
 /// step cannot dial → red.
@@ -147,11 +148,12 @@ fn heal_with_no_readable_checkout_offers_a_fetch_scope_that_works() {
     let mut server = sparse_with_docs(&area);
 
     forklift_core::util::file_utils::remove_file(area.path(FETCH_SCOPE)).unwrap();
-    std::fs::write(area.path(MAIN_SCOPE), b"\xff\xfe").unwrap();
+    std::fs::write(area.path(MAIN_SCOPE), forklift_core::util::record_utils::to_bytes("scope", 99, ["docs", "src/api"])).unwrap();
 
     let error = fetch_scope_damaged(&area.forklift("sparse", &["--json", "heal"]));
     assert_eq!(error["next_step"], "forklift heal --fetch-scope docs --fetch-scope src", "{}", error);
-    assert!(error["details"]["unread"][0]["reason"].as_str().unwrap().contains("no format header"), "{}", error);
+    assert!(error["details"]["unread"][0]["reason"].as_str().unwrap().contains("does not know"), "{}", error);
+    assert!(error["details"]["unread"][0]["way_out"].is_null(), "a newer scope is not damage: {}", error);
 
     server.stop();
     let offline = run_next_step(&area, "sparse", &error);
@@ -177,7 +179,8 @@ fn heal_refuses_a_fetch_scope_that_does_not_hold_a_checkout() {
 
     let error = fetch_scope_damaged(&area.forklift("sparse", &["--json", "heal"]));
     let message = error["message"].as_str().unwrap();
-    assert!(message.contains("forklift bay remove") && message.contains("clone the remote"), "both ways out: {}", message);
+    assert!(message.contains("\"forklift heal --scope <path>...\" there"), "both ways out: {}", message);
+    assert!(!message.contains("forklift bay remove") && !message.contains("clone the remote"), "no way out discards the checkout: {}", message);
     assert_eq!(error["next_step"], "forklift heal --fetch-scope docs --fetch-scope src/api --fetch-scope src/apj", "{}", error);
     assert_eq!(error["details"]["outside"], serde_json::json!(["the warehouse's own working tree"]), "{}", error);
 

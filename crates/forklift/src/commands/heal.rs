@@ -1,5 +1,6 @@
 use serde::Serialize;
 use forklift_core::util::lock_utils::StoreAccessLock;
+use forklift_core::util::checkout_scope_heal::{self, Base, ScopeRestored};
 use forklift_core::util::position_heal::{self, PositionRebuilt};
 use forklift_core::util::scope_heal::{self, ScopeRebuilt};
 use forklift_core::util::inventory_heal::{self, TreeUnread};
@@ -10,7 +11,7 @@ use forklift_core::util::reseal_utils::{self, ResealError};
 use forklift_core::util::warehouse_utils::{self, WarehouseMode};
 use forklift_core::util::applied_redactions::{self, RedactionState};
 use forklift_core::util::unavailable_heal::{self, RemoteError};
-use forklift_core::util::{config_utils, origin_utils, park_utils, recovery_utils, redaction_utils, sealed_utils, tree_utils, unavailable};
+use forklift_core::util::{config_utils, origin_utils, pallet_utils, park_utils, recovery_utils, redaction_utils, sealed_utils, tree_utils, unavailable};
 use crate::output::{self, CommandOutput};
 
 /// The note of a re-apply of redactions that could not run, followed by why.
@@ -73,6 +74,7 @@ const UNRECORDED_SHORT: &str = "No absent object was recorded unavailable again:
 ///   `None` under `--fetch-scope`, which takes the exclusive hold first and the shared one after.
 /// * `set_ref`, `remove_ref` - The `--ref PALLET=PARCEL` and `--remove-ref PALLET` specs.
 /// * `fetch_scope`  - The paths `--fetch-scope` names, if any.
+/// * `scope`        - The paths `--scope` names for the checkout heal runs in, if any.
 /// * `position`     - The pallet `--position` names, if any.
 /// * `accept_config_loss`    - `--config`: rewrite a damaged configuration file even when the
 ///   damage costs entries.
@@ -88,6 +90,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                             set_ref: &[String],
                             remove_ref: &[String],
                             fetch_scope: &[String],
+                            scope: &[String],
                             position: Option<&str>,
                             accept_config_loss: bool,
                             accept_inventory_loss: bool) -> Result<(), String> {
@@ -97,6 +100,13 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             "--ref takes PALLET=PARCEL, not \"{}\". Nothing was changed.", spec
         )))
         .collect::<Result<Vec<_>, _>>()?;
+    let named = set_ref.iter().map(|(pallet, _)| *pallet).chain(remove_ref.iter().map(String::as_str));
+    if let Some(twice) = named.clone().enumerate().find(|(at, pallet)| named.clone().skip(at + 1).any(|other| other == *pallet)) {
+        return Err(format!(
+            "Pallet \"{}\" is named more than once by --ref and --remove-ref: name each pallet once. Nothing was changed.",
+            twice.1
+        ));
+    }
 
     // Taken before anything is read: the choice may narrow the fetch scope, so no other process may
     // use the store until it is written.
@@ -160,24 +170,77 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
     };
 
+    let records_said = |error: CoreError, notes: &[String], position: Option<&PositionRebuilt>, restored: Option<&ScopeRestored>| {
+        let mut error = config_said(String::from(error));
+        let sentences = record_rebuilt.iter().map(RecordRebuilt::sentence)
+            .chain(unavailable_rebuilt.iter().map(UnavailableRebuilt::sentence))
+            .chain(applied_rebuilt.iter().map(AppliedRebuilt::sentence))
+            .chain(position.map(PositionRebuilt::sentence))
+            .chain(restored.map(ScopeRestored::sentence));
+        for sentence in sentences {
+            error = forklift_core::error::append_to_message(error, &sentence);
+        }
+        for note in notes {
+            error = forklift_core::error::append_to_message(error, &format!("Note: {}", note));
+        }
+        error
+    };
+
+    // The bay's position, before the checkout's scope, whose stranding guard reads the tree the
+    // checkout stands on, and so before the fetch-scope heal too: a rebuild from the checkouts'
+    // scopes would leave out a scope not yet restored. It reads neither scope. A --position it
+    // sets, on a pallet whose ref this run sets or removes, stands on that write, so it waits for
+    // it below; one it refuses is refused here, before anything is written.
+    let early = !position.is_some_and(|pallet| {
+        set_ref.iter().any(|(named, _)| *named == pallet) || remove_ref.iter().any(|named| named == pallet)
+    }) || !position_heal::sets_chosen().map_err(|error| records_said(CoreError::from(error), &ref_notes, None, None))?;
+    let early_position = match early {
+        true => position_heal::repair(position, &mut ref_notes)
+            .map_err(|error| records_said(CoreError::from(error), &ref_notes, None, None))?,
+        false => None,
+    };
+
+    // The checkout's own scope, just before the fetch-scope heal, whose rebuild from the checkouts'
+    // scopes then sees it restored. Nothing before it reads either scope. A position that waits is
+    // set to the parcel its --ref names, so that is the tree the guard judges against, or unborn
+    // when its --remove-ref removes the last pallet. The write it waits for is judged first, as
+    // that write judges it, so no scope is judged against a tree the write then refuses.
+    // Some(None): the position will be unborn.
+    let mut check_notes = Vec::new();
+    let waits_on: Result<Option<Option<String>>, String> = match (early, position) {
+        (false, Some(pallet)) => match set_ref.iter().find(|(named, _)| *named == pallet) {
+            Some((_, parcel)) => ref_heal::check_set_damaged_ref(pallet, parcel, &mut check_notes).map(|head| Some(Some(head))),
+            None => pallet_utils::list_pallets().and_then(|pallets| match pallets.iter().filter(|named| !remove_ref.contains(named)).map(|named| format!("\"{}\"", named)).collect::<Vec<_>>() {
+                left if !left.is_empty() => Err(format!(
+                    "--position names pallet \"{}\", whose ref --remove-ref removes, so the bay cannot be put on it: name one of {} with --position instead. Nothing was changed.",
+                    pallet, left.join(", ")
+                )),
+                _ => ref_heal::check_remove_damaged_ref(pallet, &mut check_notes).map(|()| Some(None)),
+            }),
+        },
+        _ => Ok(None),
+    };
+    let waits_on = match waits_on {
+        Ok(waits_on) => waits_on,
+        Err(error) => {
+            ref_notes.append(&mut check_notes);
+            return Err(records_said(CoreError::from(error), &ref_notes, None, None));
+        }
+    };
+    let base = match &waits_on {
+        Some(Some(parcel)) => Base::Parcel(parcel),
+        Some(None) => Base::Unborn,
+        None => Base::Position,
+    };
+    let early_scope = heal_checkout_scope(scope, base, &mut ref_notes)
+        .map_err(|error| records_said(error, &ref_notes, early_position.as_ref(), None))?;
+
     // After the records, which the check of the history leans on, and before everything else,
     // which reads the fetch scope.
     let scope_rebuilt = match &exclusive {
         Some(exclusive) => Some(scope_heal::set_chosen(fetch_scope, exclusive).await),
         None => scope_heal::repair().transpose(),
-    }.transpose().map_err(|error| {
-        let mut error = String::from(error);
-        let sentences = record_rebuilt.iter().map(RecordRebuilt::sentence)
-            .chain(unavailable_rebuilt.iter().map(UnavailableRebuilt::sentence))
-            .chain(applied_rebuilt.iter().map(AppliedRebuilt::sentence));
-        for sentence in sentences {
-            error = forklift_core::error::append_to_message(error, &sentence);
-        }
-        for note in &ref_notes {
-            error = forklift_core::error::append_to_message(error, &format!("Note: {}", note));
-        }
-        error
-    })?;
+    }.transpose().map_err(|error| records_said(error, &ref_notes, early_position.as_ref(), early_scope.as_ref()))?;
     drop(exclusive);
 
     let shared;
@@ -216,6 +279,12 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         if let Some(record) = &applied_rebuilt {
             error = forklift_core::error::append_to_message(error, &record.sentence());
         }
+        if let Some(position) = &early_position {
+            error = forklift_core::error::append_to_message(error, &position.sentence());
+        }
+        if let Some(restored) = &early_scope {
+            error = forklift_core::error::append_to_message(error, &restored.sentence());
+        }
         if let Some(scope) = &scope_rebuilt {
             error = forklift_core::error::append_to_message(error, &scope_sentence(scope));
         }
@@ -248,15 +317,20 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
     }
 
-    // After the refs the user set, which a chosen position stands on, and before the ref heal and
-    // the operation's recovery, which both read the position.
-    let position_rebuilt = position_heal::repair(position, &mut ref_notes).map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+    // A chosen position beside --ref or --remove-ref: after the refs the user set, which it stands
+    // on. Either way before the ref heal and the operation's recovery, which both read the
+    // position.
+    let late_position = match early {
+        true => None,
+        false => position_heal::repair(position, &mut ref_notes).map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?,
+    };
+
     let changed_after = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String]| {
-        let error = changed(error, rebuilt, removed, notes);
-        match &position_rebuilt {
-            Some(position) => forklift_core::error::append_to_message(error, &position.sentence()),
-            None => error,
+        let mut error = changed(error, rebuilt, removed, notes);
+        if let Some(position) = &late_position {
+            error = forklift_core::error::append_to_message(error, &position.sentence());
         }
+        error
     };
 
     // Before the taint recovery, whose closure walk reads every ref: a ref rebuilt here roots
@@ -710,9 +784,10 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         record_rebuilt,
         unavailable_rebuilt,
         redactions_applied_rebuilt: applied_rebuilt,
+        checkout_scope_restored: early_scope,
         fetch_scope_rebuilt: scope_rebuilt,
         parked_rebuilt,
-        position_rebuilt,
+        position_rebuilt: early_position.or(late_position),
         config_repaired,
         inventory_rebuilt,
         inventory_held,
@@ -1231,6 +1306,14 @@ fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
     )
 }
 
+/// Restore the checkout's scope from its copy, or set it to the paths `--scope` named.
+fn heal_checkout_scope(scope: &[String], base: Base, notes: &mut Vec<String>) -> Result<Option<ScopeRestored>, CoreError> {
+    match scope.is_empty() {
+        true => checkout_scope_heal::repair(base, notes),
+        false => checkout_scope_heal::set_chosen(scope, base).map(Some),
+    }
+}
+
 fn scope_sentence(rebuilt: &ScopeRebuilt) -> String {
     let prefixes = scope_heal::listed(&rebuilt.scope);
 
@@ -1248,6 +1331,10 @@ fn scope_sentence(rebuilt: &ScopeRebuilt) -> String {
 
     for unread in &rebuilt.left_out {
         sentence.push_str(&format!(" The scope of {} was left out: {}.", unread.checkout, unread.reason));
+        if let Some(way_out) = &unread.way_out {
+            sentence.push(' ');
+            sentence.push_str(way_out);
+        }
     }
 
     sentence
@@ -1338,6 +1425,11 @@ pub(crate) struct HealReport {
     /// hashes that still read whole and that a redaction names, and where it kept a copy of it.
     #[serde(skip_serializing_if = "Option::is_none")]
     redactions_applied_rebuilt: Option<AppliedRebuilt>,
+
+    /// The scope of the checkout this run healed, which was lost or damaged and this run wrote:
+    /// restored from the copy beside it, or set to the paths `--scope` gave.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkout_scope_restored: Option<ScopeRestored>,
 
     /// The fetch scope of a sparse warehouse, which was lost or damaged and this run wrote: rebuilt
     /// from the checkouts' scopes, or set to the paths `--fetch-scope` gave.
@@ -1693,6 +1785,7 @@ impl HealReport {
             && self.unseal_failed.is_none() && self.record_rebuilt.is_none() && self.unavailable_rebuilt.is_none()
             && self.redactions_applied_rebuilt.is_none() && self.redactions_reapplied.is_empty()
             && self.restored_from_working_tree.is_empty()
+            && self.checkout_scope_restored.is_none()
             && self.fetch_scope_rebuilt.is_none() && self.parked_rebuilt.is_none() && self.position_rebuilt.is_none()
             && self.config_repaired.is_none()
             && self.inventory_rebuilt.is_none() && self.inventory_held.is_none()
@@ -1713,6 +1806,10 @@ impl CommandOutput for HealReport {
 
         if let Some(rebuilt) = &self.redactions_applied_rebuilt {
             println!("{}", rebuilt.sentence());
+        }
+
+        if let Some(restored) = &self.checkout_scope_restored {
+            println!("{}", restored.sentence());
         }
 
         if let Some(rebuilt) = &self.fetch_scope_rebuilt {

@@ -6612,11 +6612,14 @@ fn a_sparse_warehouse_whose_fetch_scope_is_gone_is_refused() {
 
 /// A sparse warehouse's main tree records its scope when it is cloned, so deleting that file
 /// does not make the main tree read as checking out every path: stocktake and stack refuse over
-/// staged work, naming the missing file and cloning again, instead of recording the paths it
-/// never fetched as removed.
+/// staged work, naming the missing file, instead of recording the paths it never fetched as
+/// removed. The refusal is `checkout_scope_damaged` (exit 67) with `forklift heal` as its next step,
+/// and heal restores the file byte for byte from the copy beside it, after which the stack goes
+/// through.
 ///
 /// Revert: read a sparse main tree with no scope file as full → the stack goes through (or tries
-/// to load the unfetched docs tree) instead of refusing → red.
+/// to load the unfetched docs tree) instead of refusing → red. Skip heal's restore → the scope stays
+/// absent → red.
 #[test]
 fn a_sparse_main_tree_whose_scope_is_gone_is_refused() {
     let area = TestArea::new("sparse-main-scope-gone");
@@ -6638,11 +6641,29 @@ fn a_sparse_main_tree_whose_scope_is_gone_is_refused() {
         let refused = area.forklift("sparse", &[&["--json"][..], args].concat());
         assert!(!refused.status.success(), "{:?} must refuse: {}", args, stdout(&refused));
         let message = json_of(&refused)["error"]["message"].as_str().unwrap().to_string();
-        assert!(message.contains("recorded as sparse but its main tree's scope"), "{:?}: {}", args, message);
-        assert!(message.contains("is missing") && message.contains("Clone the remote again"), "{:?}: {}", args, message);
+        assert!(message.contains("main tree's scope file") && message.contains("recorded as sparse"), "{:?}: {}", args, message);
+        assert!(message.contains("is missing"), "{:?}: {}", args, message);
+        assert_eq!(refused.status.code(), Some(67), "{:?}: {}", args, stdout(&refused));
+        let error = &json_of(&refused)["error"];
+        assert_eq!(error["code"], "checkout_scope_damaged", "{:?}: {}", args, error);
+        assert_eq!(error["next_step"], "forklift heal", "{:?}: {}", args, error);
     }
     let log = area.forklift("sparse", &["log"]);
     assert!(!stdout(&log).contains("second"), "nothing was stacked: {}", stdout(&log));
+
+    let healed = area.forklift("sparse", &["--json", "heal"]);
+    assert_success(&healed);
+    let restored = &json_of(&healed)["data"]["checkout_scope_restored"];
+    assert_eq!(restored["scope"], serde_json::json!(["src/api"]), "{}", restored);
+    assert_eq!(restored["chosen"], false, "{}", restored);
+    assert_eq!(
+        std::fs::read(area.path("sparse/.forklift/scope")).unwrap(),
+        std::fs::read(area.path("sparse/.forklift/scope-copy")).unwrap(),
+        "the scope is back exactly as its copy holds it"
+    );
+    assert_success(&area.forklift("sparse", &["stocktake"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "second"]));
+    drop(server);
 }
 
 /// In a sparse warehouse every checkout is scoped, so an unscoped `bay add` is refused before any
@@ -11579,6 +11600,10 @@ mod channel;
 /// `heal` rebuilds or sets a sparse warehouse's damaged fetch scope.
 #[path = "fetch_scope_heal/mod.rs"]
 mod fetch_scope_heal;
+
+/// `heal` restores or sets a checkout's damaged scope.
+#[path = "checkout_scope_heal/mod.rs"]
+mod checkout_scope_heal;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod progress_events {

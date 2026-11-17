@@ -2774,8 +2774,8 @@ fn checkout_scopes_in_a_full_warehouse_are_recorded_and_checked() {
     forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift").join("scope")).unwrap();
     assert_success(&warehouse.run(&["stack", "-m", "second"]));
 
-    // A scoped bay whose scope file is gone is refused the same way, naming its removal, instead of
-    // recording src/web, which it never checked out, as removed.
+    // A scoped bay whose scope file is gone is refused, naming heal, instead of recording src/web,
+    // which it never checked out, as removed; heal restores the scope from its copy.
     std::fs::write(scoped_dir.join("src/api/a.txt"), "api v2\n").unwrap();
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
     forklift_core::util::file_utils::remove_file(bays.join("scoped").join("scope")).unwrap();
@@ -2783,8 +2783,12 @@ fn checkout_scopes_in_a_full_warehouse_are_recorded_and_checked() {
         let refused = warehouse.run_at(&scoped_dir, args);
         assert!(!refused.status.success(), "{:?} must refuse: {}", args, stdout(&refused));
         assert!(stderr(&refused).contains("The bay's scope") && stderr(&refused).contains("is missing")
-            && stderr(&refused).contains("bay remove"), "{:?}: {}", args, stderr(&refused));
+            && stderr(&refused).contains("Next step: forklift heal"), "{:?}: {}", args, stderr(&refused));
     }
+    assert_success(&warehouse.run_at(&scoped_dir, &["heal"]));
+    assert_eq!(std::fs::read(bays.join("scoped").join("scope")).unwrap(),
+               forklift_core::util::record_utils::to_bytes("scope", 5, ["src/api"]), "heal restored the bay's scope");
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "-m", "third"]));
 
     // The other checkouts still read their scopes and work: each stages a change, so the stack
     // reads the scope.
@@ -8626,7 +8630,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 52);
+    assert_eq!(value["schema"], 53);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -8668,7 +8672,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 52);
+    assert_eq!(value["schema"], 53);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -8727,7 +8731,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 52);
+    assert_eq!(value["schema"], 53);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -8935,7 +8939,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 52,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 53,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);
@@ -12245,10 +12249,10 @@ fn a_scoped_bay_materializes_only_its_subtree_and_reports_the_scope() {
     assert_eq!(json(&main_status)["data"]["scoped"], false);
 }
 
-/// A bay scope recorded in the older, unversioned format is refused, and the way out it names is
-/// the bay's own (a new bay under another name), not the sparse warehouse's (clone again).
+/// A bay scope recorded in the older, unversioned format is refused naming heal, which restores it
+/// from the copy beside it.
 #[test]
-fn a_scoped_bay_with_an_unversioned_scope_file_names_re_adding_the_bay() {
+fn a_scoped_bay_with_an_unversioned_scope_file_is_restored_by_heal() {
     let warehouse = scoped_fixture("scoped-legacy");
 
     let scoped_dir = warehouse.home.join("bay-scoped");
@@ -12261,8 +12265,11 @@ fn a_scoped_bay_with_an_unversioned_scope_file_names_re_adding_the_bay() {
     let refused = warehouse.run_at(&scoped_dir, &["stocktake"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
     assert!(stderr(&refused).contains("older version of Forklift"), "{}", stderr(&refused));
-    assert!(stderr(&refused).contains("add a new one under another name"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("Next step: forklift heal"), "{}", stderr(&refused));
     assert!(!stderr(&refused).contains("Clone"), "{}", stderr(&refused));
+
+    assert_success(&warehouse.run_at(&scoped_dir, &["heal"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stocktake"]));
 }
 
 #[test]
