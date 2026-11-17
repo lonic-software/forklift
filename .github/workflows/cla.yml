@@ -67,5 +67,5 @@ jobs:
           path-to-signatures: '.github/cla-signatures-v2.json'
           path-to-document: 'https://github.com/lonic-software/forklift/blob/main/CLA.md'
           branch: 'cla-signatures'
-          allowlist: 'kolonicsmate,*[bot]'
+          allowlist: 'kolonicsmate,matekolonics,*[bot]'
           lock-pullrequest-aftermerge: false
