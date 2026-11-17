@@ -237,7 +237,7 @@ fn a_mistake_made_by_hand_keeps_its_by_hand_refusal_and_is_not_written_over() {
 #[test]
 fn a_file_that_does_not_read_is_never_written_over() {
     let area = Area::new("unreadable");
-    forklift_core::util::file_utils::remove_file(&area.config()).unwrap();
+    forklift_core::util::file_utils::remove_file(area.config()).unwrap();
     std::fs::create_dir(area.config()).unwrap();
 
     let refused = area.run(&["heal", "--config"]);

@@ -107,7 +107,7 @@ pub fn salvage(bytes: &[u8], valid: impl Fn(&[String], &str) -> bool) -> Salvage
 
     let mut found = Vec::new();
     let mut headers = Vec::new();
-    collect(document.as_table(), &mut Vec::new(), 0, &mut found, &mut headers);
+    collect(document.as_table(), &[], 0, &mut found, &mut headers);
     found.sort_by_key(|entry| entry.span.start);
 
     let damaged = |range: Range<usize>| damage.iter().any(|at| at.start < range.end && range.start < at.end);
@@ -179,19 +179,19 @@ fn group(path: &[String]) -> Vec<String> {
 /// Gather every leaf entry under `table`, with the start of the header that governs it, and every
 /// header with its path.
 fn collect(table: &toml_edit::Table,
-           prefix: &mut Vec<String>,
+           prefix: &[String],
            header_start: usize,
            found: &mut Vec<Found>,
            headers: &mut Vec<(usize, Vec<String>)>) {
     for (keys, value) in table.get_values() {
-        let mut path = prefix.clone();
+        let mut path = prefix.to_vec();
         path.extend(keys.iter().map(|key| key.get().to_string()));
         let start = keys.first().and_then(|key| key.span()).map_or(header_start, |span| span.start);
         collect_value(value, path, start, header_start, found);
     }
 
     for (name, item) in table.iter() {
-        let mut path = prefix.clone();
+        let mut path = prefix.to_vec();
         path.push(name.to_string());
         match item {
             toml_edit::Item::Table(sub) if !sub.is_dotted() => {
@@ -202,7 +202,7 @@ fn collect(table: &toml_edit::Table,
                 if !sub.is_implicit() {
                     headers.push((start, path.clone()));
                 }
-                collect(sub, &mut path, start, found, headers);
+                collect(sub, &path, start, found, headers);
             }
             // An array of tables is nothing a configuration file holds: each of its tables is a
             // dropped entry, so its section goes.
@@ -245,7 +245,7 @@ fn line_of(text: &str, at: usize) -> usize {
 /// Whether byte offset `at` lies on the text's last line, the one its final newline ends.
 fn on_last_line(text: &str, at: usize) -> bool {
     let trimmed = text.strip_suffix('\n').unwrap_or(text);
-    trimmed.rfind('\n').map_or(true, |last| at > last)
+    trimmed.rfind('\n').is_none_or(|last| at > last)
 }
 
 /// Whether the comment text after a damaged character, from `after` to the end of its line, may
