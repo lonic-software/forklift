@@ -512,9 +512,9 @@ mod tests {
         assert!(!read.lossless);
 
         // A damaged header with no entries under it still costs the header, so it is not lossless.
-        let text = "[operator]\nidentifier = \"o\"\n[\"remote\"]\n";
+        let text = "[operator]\nidentifier = \"o\"\n[profile.\"home\"]\n";
         let mut bytes = text.as_bytes().to_vec();
-        bytes[text.find("mote").unwrap()] = 0xFF;
+        bytes[text.find("ome").unwrap()] = 0xFF;
         let salvage = salvage(&bytes, any);
         assert_eq!(salvage.dropped, [DroppedEntry { line: 3, key: None }]);
         assert!(!salvage.lossless);
