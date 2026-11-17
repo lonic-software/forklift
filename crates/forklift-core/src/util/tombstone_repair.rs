@@ -42,6 +42,9 @@ pub struct Repaired {
     pub salvaged: usize,
     /// How many lines of the damaged list did not read and were left in the moved-aside copy.
     pub unreadable_lines: usize,
+    /// The list was there but did not match its digest, so an entry that reads whole may still
+    /// have been altered in place, such as a flipped digit in its head.
+    pub unverified: bool,
     /// Each unheld head given its name back from the journals: the pallet's wire name and the head.
     pub named: Vec<(String, String)>,
     /// Each lost tip kept with no name.
@@ -72,6 +75,14 @@ impl Repaired {
                 n => format!("; {} line{} did not read and {} only in the copy moved aside", n, if n == 1 { "" } else { "s" }, if n == 1 { "is" } else { "are" }),
             }
         ));
+
+        if self.unverified {
+            lines.push(
+                "The old list did not match its digest, so an entry kept because it reads whole may still have \
+                been altered, such as a digit of its head. Check the kept entries in \"forklift-server tombstone \
+                list\" against the pallets you deleted.".to_string()
+            );
+        }
 
         for (pallet, head) in &self.named {
             lines.push(format!("Named {} as deleted pallet \"{}\", from its deletion in an undo journal.", head, pallet));
@@ -127,7 +138,7 @@ pub fn repair_tombstones() -> Result<Repaired, String> {
 
     let mark = std::fs::read(tombstone_utils::served_path());
     let mark_reads = match &mark {
-        Ok(bytes) => record_utils::from_bytes(bytes, tombstone_utils::SERVED_RECORD, tombstone_utils::SERVED_VERSION).is_ok(),
+        Ok(bytes) => record_utils::from_bytes_digested(bytes, tombstone_utils::SERVED_RECORD, tombstone_utils::SERVED_VERSION).is_ok(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => return Err(format!("Error while reading \"{}\": {}", tombstone_utils::served_path().to_string_lossy(), e)),
     };
@@ -170,8 +181,12 @@ pub fn repair_tombstones() -> Result<Repaired, String> {
     // worked out, so a repair that fails before then leaves it in place for the next.
     let mut tombstones = match &list {
         Some(bytes) => {
-            let (salvaged, unreadable) = salvage(bytes);
+            let (salvaged, unreadable) = salvage(record_utils::without_digest_line(bytes));
             repaired.unreadable_lines = unreadable;
+            repaired.unverified = record_utils::has_digest_line(bytes) && matches!(
+                record_utils::from_bytes_digested(bytes, "tombstones", tombstone_utils::TOMBSTONES_VERSION),
+                Err(record_utils::RecordError::Damaged)
+            );
             salvaged
         }
         None => Tombstones::default(),
@@ -251,7 +266,7 @@ pub fn repair_tombstones() -> Result<Repaired, String> {
 
 /// The list in `bytes`, when it reads whole as this version's list.
 fn strict_list(bytes: &[u8]) -> Option<Tombstones> {
-    let lines = record_utils::from_bytes(bytes, "tombstones", tombstone_utils::TOMBSTONES_VERSION).ok()?;
+    let lines = record_utils::from_bytes_digested(bytes, "tombstones", tombstone_utils::TOMBSTONES_VERSION).ok()?;
     let mut tombstones = Tombstones::default();
 
     for line in &lines {

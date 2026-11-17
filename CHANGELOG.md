@@ -27,6 +27,16 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **A server's withheld record, tombstone list and served mark carry a digest.** Damage that still
+  parsed, such as a flipped digit in a hash, was read as true: a takedown was served again under
+  another hash, or a deleted pallet's history was left for gc. A record that does not match its
+  digest now refuses with `withheld_damaged` or `tombstones_damaged`, like any other damage.
+  **Breaking:** records written before this change have no digest and refuse the same way, so run
+  `forklift-server tombstone repair` and then `forklift-server withhold repair` on a warehouse
+  served before it, in that order: the withheld repair reads the tombstones. When the old record
+  failed its digest, each repair says that an entry it kept may still have been altered. `withhold
+  repair --header-damaged` is gone: a header damaged into a newer version's no longer matches its
+  digest, so it is repaired like any other damage.
 - **A served warehouse whose host records do not parse refuses with a code, and is not retried.**
   A `--warehouses` server answered an uncoded `500` for a root whose sealed-object, unavailable or
   origin record did not read, or whose fetch scope stood in a full warehouse. Each now answers
@@ -130,8 +140,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
     restate with `withhold add`. A line cut short or not valid UTF-8 counts as having lost it.
   - It lists files the history names that are absent and that no record holds: what a lost entry
     withheld once its copy was deleted, for the operator to withhold again.
-  - A record whose header names a newer version is left for that Forklift; `--header-damaged`
-    salvages it when none wrote it.
+  - A record that matches its digest but whose header names a newer version is left for that
+    Forklift.
 
   A lost entry whose content is still stored cannot be found, and the report says so. Warehouses
   served before this change have no record, so they have to be repaired before they are served.

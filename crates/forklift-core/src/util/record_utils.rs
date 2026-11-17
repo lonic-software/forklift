@@ -224,6 +224,12 @@ pub fn written_by_newer_digested(bytes: &[u8], kind: &str, version: u32) -> bool
     verified_body(bytes).is_some_and(|body| written_by_newer(body, kind, version))
 }
 
+/// Whether `bytes` ends with a line that opens as a digest line, matching or not: a record that
+/// failed its digest rather than one that never had one, such as a record from before its digest.
+pub fn has_digest_line(bytes: &[u8]) -> bool {
+    without_digest_line(bytes).len() != bytes.len()
+}
+
 /// `bytes` without a digested record's last line, when that line opens as a digest line, matching
 /// or not, cut short or not: what [`salvage`] reads of a damaged digested record.
 pub fn without_digest_line(bytes: &[u8]) -> &[u8] {

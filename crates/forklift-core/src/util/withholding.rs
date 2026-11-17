@@ -48,19 +48,20 @@ use crate::util::tombstone_utils::{self, ServedState};
 use crate::util::{bundle_utils, file_utils, object_utils, record_utils, redaction_utils};
 
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
+/// The record is digested ([`record_utils::to_bytes_digested`]), so damage that still parses, such
+/// as a flipped digit in a hash, is refused rather than read as what the host withholds. Version 3
+/// added the digest; a record of version 2, which has none, reads as damaged.
 const FILE_NAME_WITHHELD: &str = "withheld";
 const WITHHELD_RECORD: &str = "withheld";
-const WITHHELD_VERSION: u32 = 2;
+const WITHHELD_VERSION: u32 = 3;
 
 /// The longest statement a takedown may carry, in characters: every handshake carries it.
 pub const STATEMENT_MAX_CHARS: usize = 1000;
 
-/// Whether `header`, a record header this build does not read, names a newer version of the
-/// record of withheld content, as a newer Forklift writes it, rather than being damaged.
-pub(crate) fn newer_version(header: &str) -> bool {
-    header.strip_prefix(&format!("/forklift-{} ", WITHHELD_RECORD))
-        .and_then(|text| text.parse::<u32>().ok().filter(|version| version.to_string() == text))
-        .is_some_and(|version| version > WITHHELD_VERSION)
+/// Whether `bytes` is a record of withheld content a newer Forklift wrote: it matches its digest
+/// and its header names a newer version, rather than being damaged.
+pub(crate) fn written_by_newer(bytes: &[u8]) -> bool {
+    record_utils::written_by_newer_digested(bytes, WITHHELD_RECORD, WITHHELD_VERSION)
 }
 
 pub(crate) fn withheld_path() -> PathBuf {
@@ -215,7 +216,7 @@ impl WithheldSet {
     pub(crate) fn write(&self, _lock: &RefLock) -> Result<(), String> {
         let entries = self.entries.iter()
             .map(|(hash, entry)| format!("{} {} {}", hash, entry.digest.column(), entry.statement));
-        let bytes = record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, entries);
+        let bytes = record_utils::to_bytes_digested(WITHHELD_RECORD, WITHHELD_VERSION, entries);
         file_utils::replace_file_atomically(&withheld_path(), &bytes)
     }
 }
@@ -288,7 +289,7 @@ pub(crate) fn parse_entry(entry: &str) -> Option<(&str, &str, ChunkDigest)> {
 
 /// Parse the record's bytes whole.
 pub(crate) fn parse(bytes: &[u8]) -> Result<WithheldSet, Unparsed> {
-    let entries = record_utils::from_bytes(bytes, WITHHELD_RECORD, WITHHELD_VERSION).map_err(Unparsed::Record)?;
+    let entries = record_utils::from_bytes_digested(bytes, WITHHELD_RECORD, WITHHELD_VERSION).map_err(Unparsed::Record)?;
     let mut set = WithheldSet::default();
 
     for entry in entries {
@@ -734,19 +735,27 @@ mod tests {
     fn an_unreadable_record_fails_every_read() {
         let _scratch = Scratch::new("unreadable");
 
-        std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION + 1, [A])).unwrap();
+        std::fs::write(withheld_path(), record_utils::to_bytes_digested(WITHHELD_RECORD, WITHHELD_VERSION + 1, [A])).unwrap();
         assert!(read_withheld().is_err());
         assert!(removed().is_err());
 
-        std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [A])).unwrap();
+        std::fs::write(withheld_path(), record_utils::to_bytes_digested(WITHHELD_RECORD, WITHHELD_VERSION, [A])).unwrap();
         assert!(read_withheld().unwrap_err().contains("not an object hash, a chunk-list digest and a statement"));
 
         // Revert: an uncoded error → a server answers it as its own fault, a 500 naming its path.
-        let good = record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} - statement", A)]);
+        let good = record_utils::to_bytes_digested(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} - statement", A)]);
         let mut flipped = good.clone();
         flipped[3] ^= 0x80;
+        // A digit of the hash flipped: the entry still parses, as another hash, but the record no
+        // longer matches its digest. Revert: read the record undigested → the taken-down hash is
+        // served again, the flipped one withheld instead.
+        let mut digit = good.clone();
+        digit[format!("{}\n", record_utils::header(WITHHELD_RECORD, WITHHELD_VERSION)).len()] = b'b';
+        // The record as version 2 wrote it, with no digest.
+        let undigested = record_utils::to_bytes(WITHHELD_RECORD, 2, [format!("{} - statement", A)]);
         for bytes in [good[..good.len() - 1].to_vec(), flipped, vec![0; good.len()], b"\xff\xfe".to_vec(),
-                      record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [A])] {
+                      record_utils::to_bytes_digested(WITHHELD_RECORD, WITHHELD_VERSION, [A]), digit, undigested,
+                      record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} - statement", A)])] {
             std::fs::write(withheld_path(), &bytes).unwrap();
             let refused = read_withheld().unwrap_err();
             let (code, human, next_step) = crate::error::deframe(&refused).unwrap_or_else(|| panic!("uncoded: {}", refused));
@@ -757,14 +766,14 @@ mod tests {
         }
 
         // A version-1 entry, with no digest column, and a host entry recorded Conflicted.
-        std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} statement", A)])).unwrap();
+        std::fs::write(withheld_path(), record_utils::to_bytes_digested(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} statement", A)])).unwrap();
         assert!(read_withheld().is_err());
-        std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} ! statement", A)])).unwrap();
+        std::fs::write(withheld_path(), record_utils::to_bytes_digested(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} ! statement", A)])).unwrap();
         assert!(read_withheld().is_err());
-        std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} - statement", A)])).unwrap();
+        std::fs::write(withheld_path(), record_utils::to_bytes_digested(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} - statement", A)])).unwrap();
         assert_eq!(read_withheld().unwrap().digest(A), Some(&ChunkDigest::Unknown));
 
-        std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [A])).unwrap();
+        std::fs::write(withheld_path(), record_utils::to_bytes_digested(WITHHELD_RECORD, WITHHELD_VERSION, [A])).unwrap();
         assert!(withhold(B, "statement").is_err(), "never written over");
     }
 

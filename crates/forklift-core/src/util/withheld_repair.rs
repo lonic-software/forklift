@@ -28,6 +28,9 @@ pub const PLACEHOLDER_STATEMENT: &str = "Withheld by this host; the statement wa
 pub struct Repaired {
     /// Where the damaged record was copied to, if it was there.
     pub set_aside: Option<PathBuf>,
+    /// The record was there but did not match its digest, so an entry that reads whole may still
+    /// have been altered in place, such as a flipped digit in its hash.
+    pub unverified: bool,
     /// How many entries still read whole and were kept.
     pub salvaged: usize,
     /// Each hash kept withheld with the placeholder statement, from an entry that did not read whole.
@@ -52,6 +55,14 @@ impl Repaired {
         match &self.set_aside {
             Some(path) => lines.push(format!("Kept a copy of the damaged record at \"{}\".", path.to_string_lossy())),
             None => lines.push("The record of withheld content was missing; wrote it anew.".to_string()),
+        }
+
+        if self.unverified {
+            lines.push(
+                "The old record did not match its digest, so an entry kept because it reads whole may still have \
+                been altered, such as a digit of its hash. Check the kept entries against your own record of \
+                takedowns.".to_string()
+            );
         }
 
         lines.push(format!(
@@ -113,15 +124,14 @@ impl Repaired {
 /// # Returns
 /// * `Ok(Repaired)` - What was repaired.
 /// * `Err(String)`  - The record reads, or is absent from a root never served, so there is nothing
-///                    to repair; its header names a newer version, which a newer Forklift repairs,
-///                    and not `header_damaged`; the root is being served; the history could not be
+///                    to repair; it matches its digest and its header names a newer version, which
+///                    a newer Forklift repairs; the root is being served; the history could not be
 ///                    walked; or a file could not be read or written. The damaged record is left in
 ///                    place until the repaired one replaces it, so a rerun finds it as it was.
 ///
-/// # Arguments
-/// * `header_damaged` - The operator knows no newer Forklift wrote the record, so a header naming a
-///                      newer version is damage too, and the entries below it are salvaged.
-pub fn repair_withheld(header_damaged: bool) -> Result<Repaired, String> {
+/// A header damaged into a newer version's no longer matches the digest, so it is repaired as
+/// damage: only a record whose digest verifies is taken as a newer version's.
+pub fn repair_withheld() -> Result<Repaired, String> {
     let _serve_lock = ServeLock::acquire().map_err(|e| format!("Refusing to repair the record of withheld content: {}", e))?;
     let lock = RefLock::acquire()?;
 
@@ -132,16 +142,19 @@ pub fn repair_withheld(header_damaged: bool) -> Result<Repaired, String> {
         Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
     };
 
+    let mut unverified = false;
     match &bytes {
         Some(bytes) => match withholding::parse(bytes) {
             Ok(_) => return Err("The record of withheld content reads whole; there is nothing to repair.".to_string()),
             Err(withholding::Unparsed::Record(record_utils::RecordError::OtherVersion(header)))
-                if !header_damaged && withholding::newer_version(&header) => return Err(format!(
-                "The record of withheld content says a newer version of Forklift wrote it (\"{}\"); that \
-                Forklift repairs it. If none did, its header is damaged: run this again with --header-damaged \
-                to keep the entries below it.",
+                if withholding::written_by_newer(bytes) => return Err(format!(
+                "The record of withheld content says a newer version of Forklift wrote it (\"{}\"), and it \
+                matches its digest; that Forklift repairs it.",
                 header.escape_debug()
             )),
+            Err(withholding::Unparsed::Record(record_utils::RecordError::Damaged)) => {
+                unverified = record_utils::has_digest_line(bytes);
+            }
             Err(_) => {}
         },
         None if tombstone_utils::served_state()? == tombstone_utils::ServedState::Never => return Err(
@@ -151,7 +164,8 @@ pub fn repair_withheld(header_damaged: bool) -> Result<Repaired, String> {
         None => {}
     }
 
-    let (set, salvaged, placeholders, unreadable_lines) = salvage(bytes.as_deref().unwrap_or_default());
+    let (set, salvaged, placeholders, unreadable_lines) =
+        salvage(record_utils::without_digest_line(bytes.as_deref().unwrap_or_default()));
 
     // Everything is worked out before anything is written, so a repair that stops or fails leaves
     // the damaged record where it was, for a rerun to find whole.
@@ -172,7 +186,7 @@ pub fn repair_withheld(header_damaged: bool) -> Result<Repaired, String> {
     let warehouse = withholding::quoted_warehouse();
     let (absent, absent_other) = absent;
 
-    Ok(Repaired { set_aside, salvaged, placeholders, unreadable_lines, absent, absent_other, warehouse })
+    Ok(Repaired { set_aside, unverified, salvaged, placeholders, unreadable_lines, absent, absent_other, warehouse })
 }
 
 /// Every entry of a damaged record that still reads whole, and each hash kept with the
@@ -315,7 +329,7 @@ mod tests {
         std::fs::write(record(), &bytes).unwrap();
         assert!(withholding::is_damage(&withholding::read_withheld().unwrap_err()));
 
-        let repaired = repair_withheld(false).unwrap();
+        let repaired = repair_withheld().unwrap();
         let set = withholding::read_withheld().unwrap();
 
         assert_eq!(set.statement(A), Some("DMCA notice"), "a whole entry read later is kept as written");
@@ -337,48 +351,89 @@ mod tests {
         assert!(report.contains(&format!("forklift-server withhold add --root {} {} --statement <statement>", repaired.warehouse, B)), "{}", report);
         assert!(report.contains("served again"), "{}", report);
 
-        assert!(repair_withheld(false).unwrap_err().contains("nothing to repair"), "a record that reads is left alone");
+        assert!(repair_withheld().unwrap_err().contains("nothing to repair"), "a record that reads is left alone");
     }
 
     // Revert: read a missing record as nothing to repair → a served root wedged on the loss.
     #[test]
     fn a_lost_record_in_a_served_root_is_written_anew_and_a_root_never_served_is_left_alone() {
         let _scratch = Scratch::new("lost");
-        assert!(repair_withheld(false).unwrap_err().contains("never been served"));
+        assert!(repair_withheld().unwrap_err().contains("never been served"));
         assert!(!record().exists());
 
         assert!(tombstone_utils::mark_served(true).unwrap());
         file_utils::remove_file(record()).unwrap();
 
-        let repaired = repair_withheld(false).unwrap();
+        let repaired = repair_withheld().unwrap();
         assert_eq!(repaired.set_aside, None);
         assert!(withholding::read_withheld().unwrap().is_empty());
         assert!(aside().is_empty());
     }
 
-    // Revert: rewrite a record whose header names a newer version → a newer Forklift's takedowns
-    // are rewritten in a format it did not choose; refuse every header this build does not read
-    // as newer → a damaged header wedges the root, the named repair refusing; or ignore
-    // --header-damaged → a header damaged into a newer version's does.
+    // Revert: rewrite a record whose header names a newer version and matches its digest → a newer
+    // Forklift's takedowns are rewritten in a format it did not choose; or take a header that no
+    // longer matches the digest for a newer version's → a header damaged into one wedges the root,
+    // the named repair refusing.
     #[test]
     fn a_newer_record_is_left_for_the_forklift_that_wrote_it_and_a_damaged_header_is_repaired() {
         let _scratch = Scratch::new("version");
-        let newer = record_utils::to_bytes("withheld", 3, [format!("{} - statement", A)]);
+        let newer = record_utils::to_bytes_digested("withheld", 4, [format!("{} - statement", A)]);
         std::fs::write(record(), &newer).unwrap();
 
-        let refusal = repair_withheld(false).unwrap_err();
-        assert!(refusal.contains("a newer version of Forklift wrote it") && refusal.contains("--header-damaged"), "{}", refusal);
+        let refusal = repair_withheld().unwrap_err();
+        assert!(refusal.contains("a newer version of Forklift wrote it"), "{}", refusal);
         assert_eq!(std::fs::read(record()).unwrap(), newer);
         assert!(aside().is_empty());
 
-        assert_eq!(repair_withheld(true).unwrap().salvaged, 1, "the operator says no newer Forklift wrote it");
+        // The same header, damaged from version 3 into 4: it no longer matches the digest.
+        let mut damaged = record_utils::to_bytes_digested("withheld", 3, [format!("{} - statement", A)]);
+        damaged["/forklift-withheld ".len()] = b'4';
+        std::fs::write(record(), &damaged).unwrap();
+        let repaired = repair_withheld().unwrap();
+        assert_eq!((repaired.salvaged, repaired.unreadable_lines, repaired.unverified), (1, 0, true));
         assert_eq!(withholding::read_withheld().unwrap().statement(A), Some("statement"));
 
+        // Undigested, and digested too: a header that matches its digest but names no newer
+        // version is damage all the same. Revert: refuse every other version that matches its
+        // digest → a digested "1" wedges the root.
         for header in ["/forklift-withheld 1", "/forklift-withheld ", "/forklift-withheld 2x", "/forklift-withheld 03", "/forklift-withheld +3"] {
-            std::fs::write(record(), format!("{}\n{} - statement\n", header, B)).unwrap();
-            assert_eq!(repair_withheld(false).unwrap().salvaged, 1, "{:?} is damage, not a newer version", header);
-            assert_eq!(withholding::read_withheld().unwrap().statement(B), Some("statement"));
+            let bytes = format!("{}\n{} - statement\n", header, B).into_bytes();
+            for bytes in [bytes.clone(), record_utils::with_digest(bytes)] {
+                std::fs::write(record(), &bytes).unwrap();
+                assert_eq!(repair_withheld().unwrap().salvaged, 1, "{:?} is damage, not a newer version", header);
+                assert_eq!(withholding::read_withheld().unwrap().statement(B), Some("statement"));
+            }
         }
+    }
+
+    // Revert: drop the caveat → the operator is told every kept entry is as written,
+    // though one may hold a flipped hash; or salvage the digest line as an entry → it is counted
+    // as a line naming no object.
+    #[test]
+    fn a_record_that_reads_whole_but_misses_its_digest_says_a_kept_entry_may_be_altered() {
+        let _scratch = Scratch::new("altered");
+        assert!(tombstone_utils::mark_served(true).unwrap());
+
+        let mut bytes = record_utils::to_bytes_digested("withheld", 3, [format!("{} - court order 7", A)]);
+        bytes["/forklift-withheld 3\n".len()] = b'b';
+        std::fs::write(record(), &bytes).unwrap();
+        assert!(withholding::is_damage(&withholding::read_withheld().unwrap_err()));
+
+        let repaired = repair_withheld().unwrap();
+        assert_eq!((repaired.salvaged, repaired.unreadable_lines, repaired.unverified), (1, 0, true));
+        let altered = format!("b{}", &A[1..]);
+        assert_eq!(withholding::read_withheld().unwrap().statement(&altered), Some("court order 7"),
+                   "the altered entry reads whole, so it is kept: the repair cannot tell");
+        let report = repaired.report().join("\n");
+        assert!(report.contains("did not match its digest") && report.contains("may still have been altered"), "{}", report);
+
+        // A record from before the digest has none to fail, so nothing says an entry was altered.
+        // Revert: take every damaged record for one that failed its digest → a false alarm over
+        // every record written before the digest.
+        std::fs::write(record(), record_utils::to_bytes("withheld", 2, [format!("{} - court order 7", A)])).unwrap();
+        let repaired = repair_withheld().unwrap();
+        assert_eq!((repaired.salvaged, repaired.unverified), (1, false));
+        assert!(!repaired.report().join("\n").contains("did not match its digest"));
     }
 
     // Revert: take no serve lock → the record is rewritten under a server answering from it.
@@ -388,7 +443,7 @@ mod tests {
         std::fs::write(record(), b"garbage").unwrap();
 
         let _serving = ServeLock::acquire().unwrap();
-        assert!(repair_withheld(false).unwrap_err().starts_with("Refusing to repair the record of withheld content"));
+        assert!(repair_withheld().unwrap_err().starts_with("Refusing to repair the record of withheld content"));
         assert_eq!(std::fs::read(record()).unwrap(), b"garbage");
     }
 }

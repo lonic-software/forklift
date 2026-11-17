@@ -341,7 +341,7 @@ fn a_repair_that_names_a_head_the_damaged_list_kept_holds_it_once() {
     let area = Area::new("kept-named");
     let root = area.served();
     let gone = area.deleted(&root, "gone");
-    let damaged = record_utils::to_bytes("tombstones", 2, [gone.as_str(), "not an entry"]);
+    let damaged = record_utils::to_bytes_digested("tombstones", 3, [gone.as_str(), "not an entry"]);
     std::fs::write(list_path(&root), &damaged).unwrap();
 
     area.server_ok(&root, &["tombstone", "repair"]);
@@ -370,6 +370,13 @@ fn a_repair_over_a_lost_mark_beside_a_whole_list_writes_only_the_mark() {
     assert!(root.join(".forklift").join("served").exists());
     let listed = area.server_ok(&root, &["tombstone", "list"]);
     assert!(listed.contains(&side) && !listed.contains(&gone), "{}", listed);
+
+    // A mark of this version with no digest, as a build from before the digest wrote it, does not
+    // read either. Revert: let the repair read the mark undigested → "nothing to repair" over a
+    // mark every read refuses → red.
+    std::fs::write(root.join(".forklift").join("served"), "/forklift-served 2\n").unwrap();
+    area.server_ok(&root, &["tombstone", "repair"]);
+    area.server_ok(&root, &["tombstone", "list"]);
 }
 
 /// Revert: write only the kept heads → the entries that still read are lost → red.
@@ -381,12 +388,13 @@ fn a_repair_keeps_what_a_damaged_list_still_says_and_sets_the_original_aside() {
     let side = area.deleted(&root, "side");
     forget_journals(&root);
     let good = format!("{} side", side);
-    let damaged = record_utils::to_bytes("tombstones", 2, [good.as_str(), "not an entry"]);
+    let damaged = record_utils::to_bytes_digested("tombstones", 3, [good.as_str(), "not an entry"]);
     std::fs::write(list_path(&root), &damaged).unwrap();
 
     let report = area.server_ok(&root, &["tombstone", "repair"]);
 
     assert!(report.contains("Kept 1 entry") && report.contains("1 line did not read"), "{}", report);
+    assert!(!report.contains("did not match its digest"), "the list matched its digest: {}", report);
     let listed = area.server_ok(&root, &["tombstone", "list"]);
     assert!(listed.lines().any(|line| line.contains(&side) && line.contains("side")), "{}", listed);
     let aside: Vec<_> = std::fs::read_dir(root.join(".forklift")).unwrap()
@@ -395,6 +403,38 @@ fn a_repair_keeps_what_a_damaged_list_still_says_and_sets_the_original_aside() {
         .collect();
     assert_eq!(aside.len(), 1, "{:?}", aside);
     assert_eq!(std::fs::read(root.join(".forklift").join(&aside[0])).unwrap(), damaged, "the original is kept as it was");
+}
+
+/// A digit of a tombstone's head flipped: the list still parses, so only its digest tells. Revert:
+/// read the list undigested → the server serves it, the deleted pallet's real head unheld → red;
+/// or drop the unverified line → the repair reports the altered entry as kept whole → red.
+#[test]
+fn a_flipped_head_in_the_list_is_refused_and_its_repair_says_a_kept_entry_may_be_altered() {
+    let area = Area::new("flipped");
+    let root = area.served();
+    let side = area.deleted(&root, "side");
+    forget_journals(&root);
+    let mut bytes = std::fs::read(list_path(&root)).unwrap();
+    let at = bytes.windows(side.len()).position(|window| window == side.as_bytes()).unwrap();
+    bytes[at] = if bytes[at] == b'0' { b'1' } else { b'0' };
+    std::fs::write(list_path(&root), &bytes).unwrap();
+
+    let listed = area.server(&root, &["tombstone", "list"]);
+    assert!(!listed.status.success(), "{}", String::from_utf8_lossy(&listed.stdout));
+    assert!(String::from_utf8_lossy(&listed.stderr).contains("does not match its digest"),
+            "{}", String::from_utf8_lossy(&listed.stderr));
+
+    let report = area.server_ok(&root, &["tombstone", "repair"]);
+    assert!(report.contains("Kept 1 entry") && report.contains("did not match its digest"), "{}", report);
+    let listed = area.server_ok(&root, &["tombstone", "list"]);
+    assert!(listed.contains(&side), "the real head comes back, kept with no name: {}", listed);
+
+    // A list from before the digest has none to fail, so nothing says an entry was altered.
+    // Revert: take every damaged list for one that failed its digest → a false alarm → red.
+    let old = forklift_core::util::record_utils::to_bytes("tombstones", 2, [format!("{} side", side)]);
+    std::fs::write(list_path(&root), old).unwrap();
+    let report = area.server_ok(&root, &["tombstone", "repair"]);
+    assert!(report.contains("Kept 1 entry") && !report.contains("did not match its digest"), "{}", report);
 }
 
 /// Revert: let a rebuild's write fail into heal's list of refused refs → exit 53, the damage
