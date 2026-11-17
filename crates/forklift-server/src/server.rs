@@ -1841,10 +1841,10 @@ fn operator_remedy(code: forklift_core::error::RefusalCode, own: &str) -> String
     }
 }
 
-/// What a client is told of the damage. An unreadable object's own message names the store's
-/// pack files, and the records read before a root is served name their own paths, which are not
-/// named over the wire, so those are replaced; a tombstone list's or withheld record's is kept.
-fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> String {
+/// What a client is told of the damage: a fixed text per code, never the reader's own message. The
+/// readers name the files they read, by their paths on this host, and no directory of the server's
+/// is named over the wire; the reader's message is logged ([`damage_refusal`]).
+fn damage_message(code: forklift_core::error::RefusalCode) -> String {
     use forklift_core::error::RefusalCode;
     match code {
         RefusalCode::ObjectUnreadable =>
@@ -1859,7 +1859,11 @@ fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> Str
             "The warehouse is recorded as full but holds an origin record, which only a partial warehouse has, so content its pallets reach may be absent; the record does not read, and the request was refused. Its operator can serve a full clone in its place.".to_string(),
         RefusalCode::BayPositionDamaged =>
             "A record of which pallet one of the warehouse's working trees stands on does not read, so the request was refused.".to_string(),
-        _ => human,
+        RefusalCode::TombstonesDamaged =>
+            "The warehouse's list of deleted pallets, or the mark beside it that records the warehouse as served, is missing or does not read, so which history it keeps for them cannot be told, and the request was refused.".to_string(),
+        RefusalCode::WithheldDamaged =>
+            "The warehouse's record of what its head withholds is missing or does not read, so what may be served cannot be told, and the request was refused.".to_string(),
+        _ => unreachable!("not a damage code"),
     }
 }
 
@@ -1870,15 +1874,14 @@ fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> Str
 /// ([`server_fault`]). The damage itself is logged, with the local next step.
 fn damage_refusal(message: String) -> HandlerError {
     // A caller may have wrapped the damage in its own words; the frame inside still names it.
-    let damage = forklift_core::error::frames_in(&message).find_map(|(code, human, step)| {
-        DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, human.to_string(), step.to_string()))
+    let damage = forklift_core::error::frames_in(&message).find_map(|(code, _, step)| {
+        DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, step.to_string()))
     });
 
     match damage {
-        Some((code, human, step)) => {
+        Some((code, step)) => {
             tracing::error!(%message, "a host record or the store is damaged");
-            let human = damage_message(code, human);
-            (StatusCode::SERVICE_UNAVAILABLE, forklift_core::error::CoreError::refusal(code, human, operator_remedy(code, &step)).into())
+            (StatusCode::SERVICE_UNAVAILABLE, forklift_core::error::CoreError::refusal(code, damage_message(code), operator_remedy(code, &step)).into())
         }
         None => server_fault(message),
     }
@@ -9964,27 +9967,52 @@ mod tests {
             let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
+        /// Every damage code a served root can refuse with has a client message and an operator's
+        /// remedy, so none reaches a handler's `unreachable!`.
+        /// Revert: drop one code's `damage_message` arm → it panics → red.
+        #[test]
+        fn every_served_damage_code_has_a_client_message_and_a_remedy() {
+            for code in forklift_core::error::SERVED_DAMAGE {
+                assert!(!super::super::damage_message(*code).is_empty(), "{:?}", code);
+                super::super::operator_remedy(*code, "forklift heal");
+            }
+        }
+
+        /// A damaged tombstone list or served mark is a 503 naming the operator's repair, and the
+        /// message names no file of the server's: the client is told which record is damaged, not
+        /// where it lives.
+        ///
         /// Revert: map the handshake's list read through `internal` → a 500 with no code → red.
         /// Revert: add `Retry-After` to every 503 → the damage answer tells the client to wait →
-        /// red.
+        /// red. Revert: pass the reader's own message through `damage_message` → every case carries the
+        /// server's path → red.
         #[tokio::test]
-        async fn a_handshake_over_a_damaged_list_refuses_with_its_code_and_no_retry() {
+        async fn a_handshake_over_damaged_tombstones_refuses_with_its_code_and_no_retry() {
             use forklift_core::util::record_utils;
             let (root, _scope, side) = served_with_side("handshake-damaged");
             let list = forklift_core::globals::forklift_root().join("tombstones");
+            let mark = forklift_core::globals::forklift_root().join("served");
+            let (good_list, good_mark) = (std::fs::read(&list).unwrap(), std::fs::read(&mark).unwrap());
             let (first, second) = (format!("{} gone", side), format!("{} gone", "b".repeat(64)));
+            let holding = record_utils::to_bytes("tombstones", 3, [first.as_str()]);
 
-            let damages: [(&str, Option<Vec<u8>>); 4] = [
-                ("not text", Some(b"\xff\xfe not text".to_vec())),
-                ("a bad entry", Some(record_utils::to_bytes("tombstones", 3, ["nothash gone"]))),
-                ("a duplicate", Some(record_utils::to_bytes("tombstones", 3, [first.as_str(), second.as_str()]))),
-                ("an absent list", None),
+            // (what, the list's bytes, the mark's bytes), `None` for an absent file.
+            let damages = [
+                ("a list not text", Some(b"\xff\xfe not text".to_vec()), Some(good_mark.clone())),
+                ("a bad entry", Some(record_utils::to_bytes("tombstones", 3, ["nothash gone"])), Some(good_mark.clone())),
+                ("a duplicate", Some(record_utils::to_bytes("tombstones", 3, [first.as_str(), second.as_str()])), Some(good_mark.clone())),
+                ("an absent list", None, Some(good_mark.clone())),
+                ("a mark not text", Some(good_list.clone()), Some(b"\xff\xfe not text".to_vec())),
+                ("a mark with no digest", Some(good_list.clone()), Some(b"/forklift-served 2\n".to_vec())),
+                ("a lost mark beside a tombstone", Some(holding), None),
             ];
 
-            for (what, bytes) in damages {
-                match bytes {
-                    Some(bytes) => std::fs::write(&list, bytes).unwrap(),
-                    None => forklift_core::util::file_utils::remove_file(&list).unwrap(),
+            for (what, list_bytes, mark_bytes) in damages {
+                for (path, bytes) in [(&list, list_bytes), (&mark, mark_bytes)] {
+                    match bytes {
+                        Some(bytes) => std::fs::write(path, bytes).unwrap(),
+                        None => forklift_core::util::file_utils::remove_file(path).unwrap(),
+                    }
                 }
 
                 let response = get_warehouse(State(Arc::new(single_mode_state(root.clone()))), Path(PathParams::new()))
@@ -9995,7 +10023,8 @@ mod tests {
                 let body = body_text(response).await;
                 assert!(body.contains(r#""code":"tombstones_damaged""#), "{}: {}", what, body);
                 assert!(body.contains("forklift-server tombstone repair --root <warehouse>"), "{}: {}", what, body);
-            assert!(!body.contains("repair --root /") && !body.contains("repair --root '"), "{}: no server path: {}", what, body);
+                let absolute = std::path::absolute(&root).unwrap();
+                assert!(!body.contains(&*absolute.to_string_lossy()) && !body.contains(".forklift"), "{}: no server path: {}", what, body);
             }
             let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }

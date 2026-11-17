@@ -73,8 +73,9 @@ names no directory of the server's, and `next_step` is the operator's, with `<wa
 of the server's directory:
 
 - `tombstones_damaged`: the list of deleted pallets (and so which history the warehouse keeps for
-  them) cannot be read. `next_step` names `forklift-server tombstone repair`.
-- `withheld_damaged`: the record of withheld content cannot be read. `next_step` names
+  them), or the mark that says the warehouse was served, is missing or cannot be read. `next_step`
+  names `forklift-server tombstone repair`.
+- `withheld_damaged`: the record of withheld content is missing or cannot be read. `next_step` names
   `forklift-server withhold repair`.
 - `object_unreadable`: an object the request needs is missing from the server's store, is held
   there only in a corrupt loose file, or sits in a damaged pack file there. `next_step` names the
