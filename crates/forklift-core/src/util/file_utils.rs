@@ -3167,7 +3167,10 @@ pub fn retrieve_inventory_metadata_or_none() -> Result<(PathBuf, Option<BTreeSet
                     "The inventory metadata file \"{}\" {}",
                     metadata_store_path.to_string_lossy(), e.describe()
                 ),
-                // A zeroed or cut file loses its header, so a missing one is damage too.
+                // A zeroed or cut file loses its header, so a missing one is damage too, never the
+                // older Forklift that `describe` names: the gate refuses an older layout first.
+                record_utils::RecordError::Unversioned => inventory_damaged(&metadata_store_path,
+                    "does not open with its format header"),
                 _ => inventory_damaged(&metadata_store_path, e.describe().trim_end_matches('.')),
             })?
             .into_iter()

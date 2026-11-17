@@ -109,7 +109,7 @@ pub fn plan(marker: Option<&Operation>) -> Result<Rebuild, String> {
     let mut trees: Vec<Result<(String, &str), TreeUnread>> = Vec::new();
     let parcel_tree = |parcel: &str, from: &'static str| object_utils::load_parcel(parcel)
         .map(|parcel| (parcel.tree_hash, from))
-        .map_err(|reason| TreeUnread { tree: parcel.to_string(), from: from.to_string(), reason });
+        .map_err(|reason| TreeUnread { tree: parcel.to_string(), from: from.to_string(), reason: plain(reason) });
 
     // The position heal runs first; a position it left unread names no base.
     if let Ok(pallet_utils::BayPosition { base: Some(base), .. }) = pallet_utils::read_position() {
@@ -166,6 +166,15 @@ pub fn plan(marker: Option<&Operation>) -> Result<Rebuild, String> {
         unread,
         passed_over,
     })
+}
+
+/// A read's error as the words a report shows, without the step a refusal of it names: the
+/// rebuild's own refusal names the step that applies.
+fn plain(error: String) -> String {
+    match CoreError::from(error) {
+        CoreError::Refusal { message, .. } => message,
+        CoreError::Other(message) => message,
+    }
 }
 
 /// The reason of a tree passed over, which this warehouse holds by hash alone.
@@ -235,7 +244,7 @@ fn tree_keys(root: &str, scope: &PathScope, keys: &mut BTreeSet<String>, failed:
             let tree: TreeItem = match object_utils::load_tree(&hash) {
                 Ok(tree) => tree,
                 Err(reason) => {
-                    failed(&hash, reason);
+                    failed(&hash, plain(reason));
                     continue;
                 }
             };
