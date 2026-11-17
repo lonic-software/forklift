@@ -34,8 +34,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   **Breaking:** records written before this change have no digest and refuse the same way, so run
   `forklift-server tombstone repair` and then `forklift-server withhold repair` on a warehouse
   served before it, in that order: the withheld repair reads the tombstones. When the old record
-  failed its digest, each repair says that an entry it kept may still have been altered. `withhold repair --header-damaged` is gone: a header damaged into a
-  newer version's no longer matches its digest, so it is repaired like any other damage.
+  failed its digest, each repair says that an entry it kept may still have been altered. `withhold
+  repair --header-damaged` is gone: a header damaged into a newer version's no longer matches its
+  digest, so it is repaired like any other damage.
 - **A served warehouse whose host records do not parse refuses with a code, and is not retried.**
   A `--warehouses` server answered an uncoded `500` for a root whose sealed-object, unavailable or
   origin record did not read, or whose fetch scope stood in a full warehouse. Each now answers
