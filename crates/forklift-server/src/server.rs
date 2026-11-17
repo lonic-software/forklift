@@ -7766,7 +7766,7 @@ mod tests {
         let recipe = object_utils::hash_object_bytes(&object_utils::blob_bytes(b"a deleted recipe"));
         withholding::withhold(&recipe, "statement").unwrap();
         let journal = forklift_core::util::record_utils::to_bytes(
-            "redactions-chunks-owed", 1, [format!("{} {}", recipe, chunk)]
+            "redactions-chunks-owed", 2, [format!("{} {}", recipe, chunk)]
         );
         std::fs::write(root.join(FOLDER_NAME_FORKLIFT_ROOT).join("redactions-chunks-owed"), journal).unwrap();
         assert_eq!(redaction_deleter::recipes_owing_chunks().unwrap(), [recipe.clone()].into());

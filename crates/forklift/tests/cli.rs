@@ -13782,7 +13782,7 @@ fn a_torn_taint_exits_21_and_survives() {
     let dir = taint_dir_path(&warehouse);
     std::fs::create_dir_all(&dir).unwrap();
     // No terminator line: torn by construction.
-    std::fs::write(dir.join("taint-1-0"), b"/forklift-taint 1\nobjects/ab/cdef\n").unwrap();
+    std::fs::write(dir.join("taint-1-0"), b"/forklift-taint 2\nobjects/ab/cdef\n").unwrap();
 
     let status = warehouse.run(&["stocktake", "--json"]);
     assert_eq!(status.status.code(), Some(21));
@@ -14026,7 +14026,7 @@ fn heal_on_a_torn_taint_with_a_dangling_reference_rescans_into_a_named_remainder
     // the torn record's own (lower-bound, untrusted) recorded set.
     let dir = taint_dir_path(&warehouse);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("taint-1-0"), b"/forklift-taint 1\nobjects/aa/an-unrelated-surviving-line\n").unwrap();
+    std::fs::write(dir.join("taint-1-0"), b"/forklift-taint 2\nobjects/aa/an-unrelated-surviving-line\n").unwrap();
 
     let status = warehouse.run(&["heal", "--json"]);
     assert_eq!(status.status.code(), Some(21));

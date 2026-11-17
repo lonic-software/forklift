@@ -6,8 +6,8 @@ identifier = "fixture@forklift"
 F global.toml.lock 0
 
 D keys
-F keys/cc2f254daab74af9c849792dd0ac842038e11e355d9a6c343dddc87a06e0d68d.key 64
-4499295e49a5473223fd11d5e60e4c8d1f69e75c2e409f54a2e354dc65a5c33b
+F keys/45c68d41d7d3608b113b2432f3ef86d483d3fefd66bd4e598bf267d9bfdb88c6.key 64
+9363e1dd98ede5902994814a8ac8fcde987e7b015e5ed8a1cf18f59c69b4099d
 F keys/owners.toml 86
-cc2f254daab74af9c849792dd0ac842038e11e355d9a6c343dddc87a06e0d68d = "fixture@forklift"
+45c68d41d7d3608b113b2432f3ef86d483d3fefd66bd4e598bf267d9bfdb88c6 = "fixture@forklift"
 

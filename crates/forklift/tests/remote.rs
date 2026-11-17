@@ -3350,7 +3350,7 @@ fn regenesis_is_gated_by_the_static_token_and_accepted_consciously() {
 fn plant_torn_taint(area: &TestArea, warehouse: &str) {
     let taint_dir = area.path(warehouse).join(".forklift").join("taint");
     std::fs::create_dir_all(&taint_dir).unwrap();
-    std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 1\nobjects/ab/cdef\n").unwrap();
+    std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 2\nobjects/ab/cdef\n").unwrap();
 }
 
 /// Set up warehouse A on a server with static token "root", enrolled and lifted, then re-genesis

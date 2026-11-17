@@ -1052,9 +1052,10 @@ fn a_head_the_remote_serves_is_adopted_while_the_remote_holds_its_redaction_pend
     assert_eq!(error["details"], serde_json::json!({ "path": "secret.env", "hash": hash }), "{}", error);
 }
 
-/// The record of applied redactions in `warehouse`, as its raw text; empty when there is none.
+/// The record of applied redactions in `warehouse`, as text, without its digest line; empty when there is none.
 fn applied_record(warehouse: &Warehouse) -> String {
-    std::fs::read_to_string(warehouse.root.join(".forklift/redactions-applied")).unwrap_or_default()
+    let bytes = std::fs::read(warehouse.root.join(".forklift/redactions-applied")).unwrap_or_default();
+    String::from_utf8(forklift_core::util::record_utils::without_digest_line(&bytes).to_vec()).unwrap()
 }
 
 /// In a warehouse with no remote, a redaction that nothing names applies as it is recorded, and is
@@ -1070,7 +1071,7 @@ fn a_redaction_nothing_names_applies_as_it_is_recorded_without_a_remote() {
     let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
     let hash = recorded["data"]["hash"].as_str().unwrap().to_string();
     assert_eq!(recorded["data"]["status"], serde_json::json!({ "state": "applied" }), "{}", recorded);
-    assert_eq!(applied_record(&warehouse), format!("/forklift-redactions-applied 1\n{}\n", hash));
+    assert_eq!(applied_record(&warehouse), format!("/forklift-redactions-applied 2\n{}\n", hash));
 
     let listed = warehouse.redactions();
     assert_eq!(listed[0]["status"], serde_json::json!({ "state": "applied" }), "{:?}", listed);
@@ -1081,7 +1082,7 @@ fn a_redaction_nothing_names_applies_as_it_is_recorded_without_a_remote() {
     // A re-scan leaves the record as it was.
     let applied = warehouse.json(&["redact", "apply"]);
     assert_eq!(applied["data"]["redactions"], serde_json::Value::Array(listed), "{}", applied);
-    assert_eq!(applied_record(&warehouse), format!("/forklift-redactions-applied 1\n{}\n", hash));
+    assert_eq!(applied_record(&warehouse), format!("/forklift-redactions-applied 2\n{}\n", hash));
 }
 
 /// A warehouse with a remote applies nothing by its own scan: a redaction nothing here names waits
@@ -1156,7 +1157,7 @@ fn a_remote_holds_a_redaction_pending_and_a_head_holds_it_until_the_file_is_out(
 
     let applied = holder.json(&["redact", "apply"]);
     assert_eq!(applied["data"]["redactions"][0]["status"]["state"], "applied", "{}", applied);
-    assert_eq!(applied_record(&holder), format!("/forklift-redactions-applied 1\n{}\n", hash));
+    assert_eq!(applied_record(&holder), format!("/forklift-redactions-applied 2\n{}\n", hash));
 }
 
 /// A record of applied redactions this build cannot read fails every command that reads it, and is
@@ -1383,7 +1384,7 @@ fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_i
     let mut sorted = hashes.clone();
     sorted.sort();
     std::fs::write(cached.root.join(".forklift/redactions-applied"),
-                   format!("/forklift-redactions-applied 1\n{}\n", sorted.join("\n"))).unwrap();
+                   forklift_core::util::record_utils::to_bytes("redactions-applied", 2, &sorted)).unwrap();
     assert!(cached.redactions().iter().all(|listed| listed["status"] == serde_json::json!({ "state": "applied" })));
     // The deletion that follows an applied redaction, whether or not the clone fetched the bytes.
     for hash in &hashes {
@@ -1482,7 +1483,7 @@ fn a_chunk_a_deletion_cut_short_owes_is_deleted_by_the_next_apply() {
     std::fs::write(&loose, b"bytes the store holds").unwrap();
     std::fs::write(
         warehouse.root.join(".forklift/redactions-chunks-owed"),
-        forklift_core::util::record_utils::to_bytes("redactions-chunks-owed", 1, [format!("{} {}", recipe, chunk)]),
+        forklift_core::util::record_utils::to_bytes("redactions-chunks-owed", 2, [format!("{} {}", recipe, chunk)]),
     ).unwrap();
 
     let applied = warehouse.json(&["redact", "apply"]);
@@ -2069,7 +2070,7 @@ fn a_lower_applies_what_the_remote_reports_applied_and_deletes_the_copy_here() {
     assert_eq!(settled["deletion"]["deleted"], serde_json::json!([hash]), "{}", lowered);
     assert!(settled["mirror_copy"].as_str().unwrap().contains("mirror.git"), "{}", lowered);
     assert!(!holder.holds_loose(&hash), "the copy here is deleted");
-    assert_eq!(applied_record(&holder), format!("/forklift-redactions-applied 1\n{}\n", hash));
+    assert_eq!(applied_record(&holder), format!("/forklift-redactions-applied 2\n{}\n", hash));
     assert_eq!(holder.redactions()[0]["status"]["state"], "applied");
 
     // A lower that applies nothing says nothing about redactions.
@@ -2094,7 +2095,7 @@ fn a_lower_applies_what_the_remote_reports_applied_and_deletes_the_copy_here() {
     let healed = holder.json(&["heal"]);
     assert_eq!(healed["ok"], true, "{}", healed);
     assert_eq!(healed["data"]["redactions_reapplied"], serde_json::json!([hash]), "{}", healed);
-    assert_eq!(applied_record(&holder), format!("/forklift-redactions-applied 1\n{}\n", hash));
+    assert_eq!(applied_record(&holder), format!("/forklift-redactions-applied 2\n{}\n", hash));
 }
 
 /// `redact apply` in a warehouse with a remote reads the remote's handshake, and applies on its
@@ -2132,7 +2133,7 @@ fn redact_apply_reads_the_remote_s_report_and_says_when_it_cannot() {
     let applied = owner.json(&["redact", "apply"]);
     assert_eq!(applied["data"].get("remote_unread"), None, "{}", applied);
     assert_eq!(applied["data"]["redactions"][0]["status"]["state"], "applied", "{}", applied);
-    assert_eq!(applied_record(&owner), format!("/forklift-redactions-applied 1\n{}\n", hash));
+    assert_eq!(applied_record(&owner), format!("/forklift-redactions-applied 2\n{}\n", hash));
 
     // With every redaction applied, the remote is not asked, so one that cannot be reached is not
     // reported.
@@ -2151,7 +2152,7 @@ fn redact_apply_reads_the_remote_s_report_and_says_when_it_cannot() {
         .unwrap();
     let cloned: serde_json::Value = serde_json::from_slice(&cloned.stdout).unwrap();
     assert_eq!(cloned["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", cloned);
-    assert_eq!(applied_record(&empty), format!("/forklift-redactions-applied 1\n{}\n", hash));
+    assert_eq!(applied_record(&empty), format!("/forklift-redactions-applied 2\n{}\n", hash));
 }
 
 /// A lower into a warehouse that never held the content, and a fresh clone, take history naming
@@ -2192,7 +2193,7 @@ fn a_lower_and_a_clone_take_history_naming_applied_content_without_it() {
     assert_eq!(lowered["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", lowered);
     assert_eq!(late.head("main"), server.main());
     assert!(!late.holds_loose(&hash));
-    assert_eq!(applied_record(&late), format!("/forklift-redactions-applied 1\n{}\n", hash));
+    assert_eq!(applied_record(&late), format!("/forklift-redactions-applied 2\n{}\n", hash));
 
     let empty = Warehouse::empty("absent-clone");
     let cloned = forklift_command()
@@ -2207,7 +2208,7 @@ fn a_lower_and_a_clone_take_history_naming_applied_content_without_it() {
     assert_eq!(report["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", report);
     assert_eq!(empty.head("main"), server.main());
     assert!(!empty.holds_loose(&hash));
-    assert_eq!(applied_record(&empty), format!("/forklift-redactions-applied 1\n{}\n", hash));
+    assert_eq!(applied_record(&empty), format!("/forklift-redactions-applied 2\n{}\n", hash));
 }
 
 /// A sparse clone and lower walk the in-scope files of every parcel: one named by history in scope,
@@ -2242,7 +2243,7 @@ fn a_sparse_clone_and_lower_take_in_scope_history_naming_applied_content_without
     let fresh = Warehouse::cloned_with("sparse-fresh", &server.url, &["--only", "src"]);
     assert_eq!(fresh.head("main"), server.main());
     assert!(!fresh.holds_loose(&hash));
-    assert_eq!(applied_record(&fresh), format!("/forklift-redactions-applied 1\n{}\n", hash));
+    assert_eq!(applied_record(&fresh), format!("/forklift-redactions-applied 2\n{}\n", hash));
 
     // With the applied record and the origin record both lost, only heal's re-apply would ask the
     // remote, which the lost origin record refuses: a note, in prose, not the run's own refusal.
@@ -2291,7 +2292,7 @@ fn a_lower_refused_after_applying_a_redaction_warns_it_unsettled() {
     assert_eq!(late.head("main"), before);
     let warned = String::from_utf8_lossy(&refused.stderr);
     assert!(warned.contains("\"redactions_unsettled\"") && warned.contains(&hash), "{}", warned);
-    assert_eq!(applied_record(&late), format!("/forklift-redactions-applied 1\n{}\n", hash));
+    assert_eq!(applied_record(&late), format!("/forklift-redactions-applied 2\n{}\n", hash));
 
     forklift_core::util::file_utils::remove_file(late.root.join("more.txt")).unwrap();
     let lowered = late.json(&["lower"]);
@@ -2331,7 +2332,7 @@ fn a_first_contact_lower_takes_history_naming_applied_content_without_it() {
     assert_eq!(lowered["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", lowered);
     assert_eq!(fresh.head("main"), server.main());
     assert!(!fresh.holds_loose(&hash));
-    assert_eq!(applied_record(&fresh), format!("/forklift-redactions-applied 1\n{}\n", hash));
+    assert_eq!(applied_record(&fresh), format!("/forklift-redactions-applied 2\n{}\n", hash));
 }
 
 /// A sparse warehouse and a cache that took history naming a leak, before their remote applied a
@@ -2431,7 +2432,7 @@ fn a_cache_reads_content_its_remote_applied_a_redaction_of_as_redacted() {
     assert!(refused["message"].as_str().unwrap().contains("its content has been removed for good"), "{}", refused);
 
     let fresh = Warehouse::cloned_with("cache-read-fresh", &behind.server.url, &["--cache"]);
-    assert_eq!(applied_record(&fresh), format!("/forklift-redactions-applied 1\n{}\n", behind.hash));
+    assert_eq!(applied_record(&fresh), format!("/forklift-redactions-applied 2\n{}\n", behind.hash));
     let refused = content_redacted(&fresh, &["show", &target]);
     assert!(refused["message"].as_str().unwrap().contains("its content has been removed for good"), "{}", refused);
     assert!(!fresh.holds_loose(&behind.hash));

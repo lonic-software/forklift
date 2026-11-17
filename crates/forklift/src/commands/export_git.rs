@@ -1994,7 +1994,7 @@ mod tests {
 
         // A redaction applied during the run is refused the same way.
         let secret = store_blob(b"a secret\n");
-        let applied = forklift_core::util::record_utils::to_bytes("redactions-applied", 1, [secret.as_str()]);
+        let applied = forklift_core::util::record_utils::to_bytes("redactions-applied", 2, [secret.as_str()]);
         std::fs::write(forklift_core::globals::forklift_root().join("redactions-applied"), applied).unwrap();
         assert!(after.check_removed().unwrap_err().contains(&secret));
         let both = Exporter::new(&repo, applied_redactions::read_applied().unwrap(), withholding::read_withheld().unwrap(), UnavailableSet::default());

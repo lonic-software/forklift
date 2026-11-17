@@ -196,7 +196,7 @@ impl Warehouse {
         sorted.sort();
         let lines: String = sorted.iter().map(|hash| format!("{}\n", hash)).collect();
         std::fs::write(self.root.join(".forklift").join("redactions-applied"),
-                       format!("/forklift-redactions-applied 1\n{}", lines)).unwrap();
+                       forklift_core::util::record_utils::with_digest(format!("/forklift-redactions-applied 2\n{}", lines).into_bytes())).unwrap();
     }
 
     /// Run `work` inside this warehouse's storage scope.
