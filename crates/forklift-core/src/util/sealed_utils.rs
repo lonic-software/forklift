@@ -27,18 +27,23 @@
 //! validates, because the magic is nonzero. Every frame is synced before the next is written (see
 //! [`append_locked`]; with fsync turned off this does not hold, and a crash may leave the record
 //! damaged rather than torn), so a torn append is the last frame and only that: nothing after it
-//! validates, and at most the largest frame's worth of bytes, zeros included, follow the last
-//! valid frame. A valid frame anywhere past the last one read, or more bytes than that, is damage
-//! inside the log, and fails the read rather than dropping the frames behind it (until `heal`
-//! rebuilds the record, see Writing). Damage that
-//! leaves no valid frame after it within that many bytes of the end cannot be told from a torn
-//! append, so it reads as one: the entries there are not replayed. That is the one loss the log can
-//! hide, and it hides only entries: a lost record reads as a missing object, which every walk
-//! reports, and a lost removal leaves a present object recorded. That seals nothing while the
-//! object is present; were it lost later, it would be held by hash as it was before its refill,
-//! on the same premise that the remote holds it. `heal` removes such records (see Removing).
-//! A frame that validates but whose entries do not parse fails the read, as does a header naming
-//! another version: neither is guessed at.
+//! validates, and at most the largest frame's worth of bytes, zeros included, follow the last valid
+//! frame. A valid frame anywhere past the last one read, or more bytes than that, is damage inside
+//! the log, and fails the read rather than dropping the frames behind it (until `heal` rebuilds the
+//! record, see Writing). Two losses cannot be told from a shorter record, so they read as one:
+//! damage that leaves no valid frame after it within that many bytes of the end reads as a torn
+//! append, and a cut on a frame boundary, however much it drops, leaves a record that is valid as
+//! it stands (a commit point outside the log could tell it, at the cost of a second write on every
+//! append). Either hides only entries: a lost record reads as a missing object, which `audit` and
+//! `heal` report and heal records again where the origin's held history reaches it
+//! ([`reseal_utils`](crate::util::reseal_utils)), and a lost removal leaves a present object
+//! recorded. That seals nothing while the object is present; were it lost later, it would be held
+//! by hash as it was before its refill, on the same premise that the remote holds it, or, where an
+//! eviction removed the record because the origin's host withholds the object, on a premise that no
+//! longer holds: an eviction or `heal` removes such a record only while its object is present, so
+//! once the object is lost its absence stays held until a read fails to refill it. `heal` removes
+//! such records (see Removing). A frame that validates but whose entries do not parse fails the
+//! read, as does a header naming another version: neither is guessed at.
 //!
 //! ## Writing
 //!
