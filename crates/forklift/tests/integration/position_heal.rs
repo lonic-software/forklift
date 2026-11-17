@@ -268,8 +268,8 @@ fn a_position_a_newer_version_wrote_is_never_written_over() {
     assert_eq!(std::fs::read(&position).unwrap(), newer, "a newer build's position is left as it was");
 }
 
-// Revert: read_position_in passing "forklift heal" as the next step → the listing in the main tree
-// names a heal that would not reach the bay.
+// Revert: read_position_in passing "forklift heal" as the next step → the listing in the main
+// tree names a heal that would not reach the bay. Wrap the error in a plain String → no code.
 #[test]
 fn another_bays_damaged_position_is_refused_without_naming_a_heal_here() {
     let area = Area::new("other-bay");

@@ -2291,6 +2291,23 @@ pub(crate) mod tests {
         }
     }
 
+    /// A copy that can be neither written nor removed fails the write loudly, after the primary
+    /// has landed, so a stale copy is never left standing in silence.
+    /// Revert: map a failed copy removal to Ok → the write reports success → red.
+    #[test]
+    fn a_copy_that_can_neither_be_written_nor_removed_fails_the_write() {
+        let dir = std::env::temp_dir().join(format!("forklift-position-copy-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(FILE_NAME_POSITION_COPY).join("in-the-way")).unwrap();
+
+        let position = BayPosition::new("main", None);
+        let error = write_position_in(&dir, &position).unwrap_err();
+        assert!(error.contains("could neither be written"), "{}", error);
+        assert_eq!(decode_position(&std::fs::read(dir.join(FILE_NAME_POSITION)).unwrap()).ok(), Some(position));
+
+        let _ = file_utils::remove_dir_all(&dir);
+    }
+
     /// A fresh warehouse root (its `.forklift` folder exists) entered for this thread.
     pub(crate) fn scratch(name: &str) -> (PathBuf, StorageRootScope) {
         let root = std::env::temp_dir()

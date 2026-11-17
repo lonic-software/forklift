@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 49;
+pub const SCHEMA_VERSION: u32 = 50;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -916,7 +916,7 @@ impl ErrorCode {
             ErrorCode::ObjectKindMismatch =>
                 "The remote refused to move a pallet because the new head's history names an object as a kind it is not: a file entry's object is not a blob, or not a recipe at a chunked entry, or a recipe's chunk is not a chunk. The history is malformed and no upload changes it; nothing moved",
             ErrorCode::BayPositionDamaged =>
-                "The bay's position, the pallet it stands on and the parcel its files stand on, is missing or does not parse. Nothing was changed; heal rebuilds it when an interrupted operation or the undo journal says where the bay stood, and otherwise names the pallet to rebuild it on",
+                "The bay's position, the pallet it stands on and the parcel its files stand on, is missing or does not parse. Nothing was changed; heal rebuilds it from its copy or from an interrupted operation, and otherwise lists the pallets for heal --position to put the bay on",
         }
     }
 

@@ -439,8 +439,8 @@ refusal_codes! {
     /// The bay's position (which pallet it stands on, and the parcel its files stand on) is lost:
     /// the file is missing, cannot be read, or does not parse as one this build or an older one
     /// wrote. A position a newer version wrote is not this. Nothing was changed; `heal` rebuilds
-    /// it when an interrupted operation or the undo journal says exactly where the bay stood, and
-    /// otherwise names the pallet to rebuild it on.
+    /// it from the copy every position write leaves beside it, or from an interrupted operation's
+    /// source, and otherwise lists the pallets for `heal --position` to put the bay on.
     BayPositionDamaged => "bay_position_damaged",
 }
 

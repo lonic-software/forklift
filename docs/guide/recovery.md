@@ -408,6 +408,21 @@ remote may have deleted content it owed a deletion again as the lift ran, or fai
 store for a moment: run `forklift lift` again. If it is refused the same way each time, the
 remote's store is damaged or lost content, and only whoever runs it can repair it.
 
+### `bay_position_damaged` (exit 64)
+
+The record of where this bay stands (the pallet it is on, and the parcel its files stand on) is
+missing, cut short or garbled, so no command can tell what the next stack builds on. Nothing was
+changed. Every time the position is written, a copy is written beside it, and `forklift heal`
+puts the position back from that copy, or from an operation that was interrupted. If neither
+says where the bay stood, heal changes nothing and lists the pallets: `forklift heal --position
+<pallet>` puts the bay on that pallet, at its newest parcel, taking your files as standing there.
+`forklift stocktake` then shows how they differ from it. If the bay had stood behind that
+parcel, its next stack no longer warns that the pallet moved on, so check the history first.
+
+When the refusal names another bay, run `forklift heal` in that bay: a heal here does not reach
+it. A position written by a newer version of Forklift is not this refusal, and no heal writes
+over it.
+
 ### `object_kind_mismatch` (exit 63)
 
 The remote refused to move the pallet because the new head's history names an object as a kind
