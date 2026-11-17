@@ -2726,10 +2726,24 @@ thread_local! {
 }
 
 /// Run `step` once on this thread, inside the next read whose pack lookup misses, just before that
-/// read looks for a loose file.
+/// read looks for a loose file. Dropping the guard disarms a step that has not run, so it never
+/// fires inside a later read the test did not aim it at.
 #[cfg(test)]
-pub(crate) fn before_next_loose_read(step: impl FnOnce() + 'static) {
+#[must_use = "the step is disarmed when the guard drops"]
+pub(crate) fn before_next_loose_read(step: impl FnOnce() + 'static) -> LooseReadStep {
     BEFORE_LOOSE_READ.with(|slot| *slot.borrow_mut() = Some(Box::new(step)));
+    LooseReadStep(())
+}
+
+/// The guard [`before_next_loose_read`] returns.
+#[cfg(test)]
+pub(crate) struct LooseReadStep(());
+
+#[cfg(test)]
+impl Drop for LooseReadStep {
+    fn drop(&mut self) {
+        BEFORE_LOOSE_READ.with(|slot| slot.borrow_mut().take());
+    }
 }
 
 /// Take and run the step [`before_next_loose_read`] armed, if any.
@@ -8244,7 +8258,10 @@ mod tests {
         let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        // A served warehouse has its pack folder, so the read must notice a change to an existing
+        // folder, not merely its creation.
         let folder = crate::util::pack_utils::pack_folder();
+        std::fs::create_dir_all(&folder).unwrap();
 
         let content = b"a loose object another process packs while this one reads it".to_vec();
         let hash = blake3::hash(&content).to_hex().to_string();
@@ -8260,7 +8277,7 @@ mod tests {
         let compacted = std::rc::Rc::new(std::cell::Cell::new(false));
         let ran = std::rc::Rc::clone(&compacted);
         let (step_hash, step_content, step_folder, step_loose) = (hash.clone(), content.clone(), folder.clone(), loose_path.clone());
-        before_next_loose_read(move || {
+        let _step = before_next_loose_read(move || {
             // The other process's compact: publish the pack, then sweep the loose file. Nothing
             // here touches this process's cached pack set.
             let mut builder = TransportPackBuilder::new(&step_folder).unwrap();
