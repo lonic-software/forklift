@@ -232,7 +232,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
 
     // After the refs the user set, which a chosen position stands on, and before the ref heal and
     // the operation's recovery, which both read the position.
-    let position_rebuilt = position_heal::repair(position).map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+    let position_rebuilt = position_heal::repair(position, &mut ref_notes).map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     let changed_after = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String]| {
         let error = changed(error, rebuilt, removed, notes);
         match &position_rebuilt {

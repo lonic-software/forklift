@@ -76,13 +76,13 @@ impl PositionRebuilt {
 ///                                 and nothing was chosen; a refusal of `--position` on a position
 ///                                 that reads, or of a pallet it cannot stand on; or a failed
 ///                                 read or write. Nothing was changed but what a write says.
-pub fn repair(chosen: Option<&str>) -> Result<Option<PositionRebuilt>, String> {
+pub fn repair(chosen: Option<&str>, notes: &mut Vec<String>) -> Result<Option<PositionRebuilt>, String> {
     let dir = bay_root();
     let path = dir.join(pallet_utils::FILE_NAME_POSITION);
 
     let unread = match std::fs::read(&path) {
         Ok(bytes) => match pallet_utils::decode_position(&bytes) {
-            Ok(position) => return keep(&dir, position, chosen),
+            Ok(position) => return keep(&dir, position, chosen, notes),
             Err(PositionUnread::Newer(reason)) => return match chosen {
                 Some(_) => Err(format!(
                     "The bay position file \"{}\" {} This version of Forklift never writes over it, so \
@@ -102,6 +102,14 @@ pub fn repair(chosen: Option<&str>) -> Result<Option<PositionRebuilt>, String> {
     };
 
     let copy = pallet_utils::read_position_copy_in(&dir);
+
+    // A copy that is there but cannot be read now may be sound, like the position itself.
+    if let PositionCopy::Unreadable(reason) = &copy {
+        return Err(format!(
+            "The bay position file \"{}\" {} Its copy \"{}\" cannot be read: {}. Nothing was changed.",
+            path.to_string_lossy(), unread, dir.join(pallet_utils::FILE_NAME_POSITION_COPY).to_string_lossy(), reason
+        ));
+    }
 
     // A copy a newer version wrote is that version's record of the position: never written over.
     if let PositionCopy::Newer(reason) = &copy {
@@ -146,8 +154,8 @@ pub fn repair(chosen: Option<&str>) -> Result<Option<PositionRebuilt>, String> {
 /// A position that reads: `--position` is refused over it, and its copy is rewritten if it does
 /// not match. A copy that holds another position is a false witness, so it is removed when it
 /// cannot be rewritten; one that holds nothing usable witnesses nothing, so failing to rewrite it
-/// blocks no other repair. A copy a newer version wrote is kept.
-fn keep(dir: &std::path::Path, position: BayPosition, chosen: Option<&str>) -> Result<Option<PositionRebuilt>, String> {
+/// blocks no other repair and is a note. A copy a newer version wrote is kept.
+fn keep(dir: &std::path::Path, position: BayPosition, chosen: Option<&str>, notes: &mut Vec<String>) -> Result<Option<PositionRebuilt>, String> {
     if chosen.is_some() {
         return Err(format!(
             "The bay's position reads: it stands on pallet \"{}\". --position sets only a position that \
@@ -173,8 +181,14 @@ fn keep(dir: &std::path::Path, position: BayPosition, chosen: Option<&str>) -> R
                 }
             }
         }
-        PositionCopy::Unusable => {
-            let _ = pallet_utils::write_position_copy_in(dir, &position);
+        PositionCopy::Unusable | PositionCopy::Unreadable(_) => {
+            if let Err(error) = pallet_utils::write_position_copy_in(dir, &position) {
+                notes.push(format!(
+                    "The bay position's copy could not be rewritten ({}), so a later loss of the position \
+                    has no copy to rebuild it from.",
+                    error.trim_end_matches('.')
+                ));
+            }
         }
     }
 
@@ -186,10 +200,18 @@ fn keep(dir: &std::path::Path, position: BayPosition, chosen: Option<&str>) -> R
 fn chosen_position(pallet: &str) -> Result<BayPosition, String> {
     pallet_utils::validate_pallet_name(pallet)?;
 
-    // `--ref` writes run before this step, so a damaged ref can be set in the same run.
-    let head = pallet_utils::get_pallet_head(pallet).map_err(|error| crate::error::append_to_message(error, &format!(
-        "--position needs the head of pallet \"{}\": pass --ref {}=<parcel> with it to set that ref.", pallet, pallet
-    )))?;
+    // `--ref` writes run before this step, so a damaged ref can be set in the same run: the
+    // refusal's next step says so, where a bare heal would refuse the lost position again.
+    let head = pallet_utils::get_pallet_head(pallet).map_err(|error| match CoreError::from(error) {
+        CoreError::Refusal { code: RefusalCode::RefDamaged, message, details, .. } => {
+            let next = format!("forklift heal --position {} --ref {}=<parcel>", pallet, pallet);
+            match details {
+                Some(details) => CoreError::refusal_with_details(RefusalCode::RefDamaged, message, next, details),
+                None => CoreError::refusal(RefusalCode::RefDamaged, message, next),
+            }.into()
+        }
+        other => String::from(other),
+    })?;
 
     match head {
         Some(head) => Ok(BayPosition::new(pallet, Some(head))),

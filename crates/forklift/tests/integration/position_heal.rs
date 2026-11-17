@@ -390,8 +390,9 @@ fn a_newer_copy_beside_a_position_that_reads_is_kept() {
     assert_eq!(std::fs::read(dir.join("position-copy")).unwrap(), newer);
 }
 
-// A copy that cannot be read witnesses nothing, so it blocks no repair.
-// Revert: keep failing on a copy it cannot rewrite → every heal stops at the position step.
+// A copy that cannot be rewritten beside a position that reads blocks no repair, and is a note.
+// Revert: keep failing on a copy it cannot rewrite → every heal stops at the position step; drop
+// the note → nothing says the copy is gone.
 #[test]
 fn a_copy_that_cannot_be_read_does_not_stop_heal() {
     let area = Area::new("copy-dir");
@@ -402,6 +403,34 @@ fn a_copy_that_cannot_be_read_does_not_stop_heal() {
 
     let data = parsed(&area.run_ok(&root, &["--json", "heal"]))["data"].clone();
     assert!(data.get("position_rebuilt").is_none(), "{}", data);
+    assert!(data["notes"].as_array().unwrap().iter().any(|note| note.as_str().unwrap().contains("copy")), "{}", data);
+}
+
+// A copy that is there but cannot be read may be sound: nothing is written over it.
+// Revert: read every read error of the copy as no copy → heal refuses with no evidence, and
+// --position writes over it.
+#[cfg(unix)]
+#[test]
+fn a_lost_position_beside_a_copy_that_cannot_be_read_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let area = Area::new("copy-unreadable");
+    let root = area.warehouse();
+    let dir = state_dir(&root, None);
+    damage(&dir.join("position"), Damage::Delete);
+    let copy = dir.join("position-copy");
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&copy).is_ok() {
+        return; // Running as root: permissions do not stop a read.
+    }
+
+    for args in [&["--json", "heal"][..], &["--json", "heal", "--position", "main"][..]] {
+        let refused = area.run(&root, args);
+        assert!(!refused.status.success(), "{:?}: {}", args, text(&refused.stdout));
+        assert_ne!(parsed(&refused)["error"]["code"], "bay_position_damaged", "{:?}: {}", args, text(&refused.stdout));
+        assert!(!dir.join("position").exists(), "{:?}: nothing was written", args);
+    }
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
 
 // Exact evidence outranks the operator's guess.
@@ -434,8 +463,8 @@ fn deleting_a_pallet_over_another_bays_damaged_position_keeps_the_code() {
     assert!(value["error"]["message"].as_str().unwrap().contains("bay \"b1\""), "{}", value);
 }
 
-// `--ref` writes run before the position step, so the refusal says the ref can be set with it.
-// Revert: drop the hint from chosen_position → the message names no --ref.
+// `--ref` writes run before the position step, so the refusal's next step sets the ref with it.
+// Revert: keep the ref refusal's own next step → a bare heal, which refuses the position again.
 #[test]
 fn position_on_a_pallet_whose_ref_is_damaged_names_ref() {
     let area = Area::new("chosen-ref");
@@ -447,8 +476,9 @@ fn position_on_a_pallet_whose_ref_is_damaged_names_ref() {
 
     let refused = area.run(&root, &["--json", "heal", "--position", "feature"]);
     assert!(!refused.status.success(), "{}", text(&refused.stdout));
-    let message = parsed(&refused)["error"]["message"].as_str().unwrap().to_string();
-    assert!(message.contains("--ref feature=<parcel>"), "{}", message);
+    let error = parsed(&refused)["error"].clone();
+    assert_eq!(error["code"], "ref_damaged", "{}", error);
+    assert_eq!(error["next_step"], "forklift heal --position feature --ref feature=<parcel>", "{}", error);
 }
 
 // Only an absent position is one never made.

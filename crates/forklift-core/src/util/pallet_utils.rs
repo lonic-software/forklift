@@ -592,8 +592,11 @@ pub enum PositionCopy {
     /// A newer version wrote it, for this reason: that version's record, never written over.
     Newer(String),
 
-    /// There is none, it is damaged, or it cannot be read: no witness of anything.
+    /// There is none, or it is damaged: no witness of anything.
     Unusable,
+
+    /// It is there but cannot be read now, for this reason: it may be sound.
+    Unreadable(String),
 }
 
 /// Read the copy of the position in the bay-local state dir `dir`. Read once, so every decision
@@ -605,7 +608,8 @@ pub fn read_position_copy_in(dir: &Path) -> PositionCopy {
             Err(PositionUnread::Newer(reason)) => PositionCopy::Newer(reason),
             Err(PositionUnread::Damaged(_)) => PositionCopy::Unusable,
         },
-        Err(_) => PositionCopy::Unusable,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PositionCopy::Unusable,
+        Err(e) => PositionCopy::Unreadable(e.to_string()),
     }
 }
 
@@ -688,13 +692,15 @@ pub fn create_position_if_not_exists() -> Result<bool, String> {
     let path = get_position_path();
 
     // Only an absent file is a position never made; one that cannot be judged is not written over.
+    // Heal cannot mend an entry it cannot read either, so that refusal names no next step.
+    let absent = |path: &Path| matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
     match std::fs::symlink_metadata(&path) {
         Ok(_) => return Ok(false),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(position_damaged(&path, &format!("cannot be read: {}.", e), HEAL)),
+        Err(e) => return Err(position_damaged(&path, &format!("cannot be read: {}.", e), "")),
     }
 
-    if bay_root().join(FILE_NAME_POSITION_COPY).exists() || !list_pallets()?.is_empty() {
+    if !absent(&bay_root().join(FILE_NAME_POSITION_COPY)) || !list_pallets()?.is_empty() {
         return Err(position_damaged(&path, "is missing.", "forklift heal"));
     }
 
