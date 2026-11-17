@@ -1,5 +1,6 @@
 use serde::Serialize;
 use forklift_core::util::lock_utils::StoreAccessLock;
+use forklift_core::util::position_heal::{self, PositionRebuilt};
 use forklift_core::util::scope_heal::{self, ScopeRebuilt};
 use forklift_core::util::operation_utils::{self, RecoveryOutcome};
 use forklift_core::error::{CoreError, RefusalCode};
@@ -70,6 +71,7 @@ const UNRECORDED_SHORT: &str = "No absent object was recorded unavailable again:
 /// * `store_access` - The command's shared store-access hold, which the record's push-down needs.
 ///   `None` under `--fetch-scope`, which takes the exclusive hold first and the shared one after.
 /// * `fetch_scope`  - The paths `--fetch-scope` names, if any.
+/// * `position`     - The pallet `--position` names, if any.
 ///
 /// # Returns
 /// * `Ok(())`      - Nothing was tainted, or the taint is now fully cleared.
@@ -79,7 +81,8 @@ const UNRECORDED_SHORT: &str = "No absent object was recorded unavailable again:
 pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                             set_ref: &[String],
                             remove_ref: &[String],
-                            fetch_scope: &[String]) -> Result<(), String> {
+                            fetch_scope: &[String],
+                            position: Option<&str>) -> Result<(), String> {
     // Every spec is read before anything is written, so a malformed one changes nothing.
     let set_ref = set_ref.iter()
         .map(|spec| spec.split_once('=').ok_or_else(|| format!(
@@ -227,9 +230,20 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
     }
 
+    // After the refs the user set, which a chosen position stands on, and before the ref heal and
+    // the operation's recovery, which both read the position.
+    let position_rebuilt = position_heal::repair(position).map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+    let changed_after = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String]| {
+        let error = changed(error, rebuilt, removed, notes);
+        match &position_rebuilt {
+            Some(position) => forklift_core::error::append_to_message(error, &position.sentence()),
+            None => error,
+        }
+    };
+
     // Before the taint recovery, whose closure walk reads every ref: a ref rebuilt here roots
     // what it reaches for that walk.
-    let first = ref_heal::repair(Pass::BeforeTaint).map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+    let first = ref_heal::repair(Pass::BeforeTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(first.rebuilt);
     ref_notes.extend(first.notes);
 
@@ -259,7 +273,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
 
     // After the taint, which may have refetched what a candidate lacked; before the operation
     // recovery, whose landed test reads the ref.
-    let second = ref_heal::repair(Pass::AfterTaint).map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+    let second = ref_heal::repair(Pass::AfterTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(second.rebuilt);
     ref_notes.extend(second.notes);
     let refs_refused = second.refused;
@@ -277,7 +291,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let recovered = match waits {
         Some(_) => Ok(None),
         None => operation_utils::recover(),
-    }.map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+    }.map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     let operation = recovered.map(|recovery| OperationRecovery {
         operation: recovery.operation.as_str().to_string(),
         outcome: match recovery.outcome {
@@ -611,6 +625,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         redactions_applied_rebuilt: applied_rebuilt,
         fetch_scope_rebuilt: scope_rebuilt,
         parked_rebuilt,
+        position_rebuilt,
         was_tainted: outcome.was_tainted,
         restaged: outcome.restaged,
         resolved: outcome.resolved,
@@ -1074,6 +1089,11 @@ pub(crate) struct HealReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     parked_rebuilt: Option<ParkedRebuilt>,
 
+    /// The bay's position, which was lost or damaged and this run wrote: from its copy, from an
+    /// operation left unfinished, or on the pallet `--position` named.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_rebuilt: Option<PositionRebuilt>,
+
     /// Whether a durability taint was actually standing (an already-healthy warehouse reports
     /// `false`, with `restaged` and `resolved` empty).
     was_tainted: bool,
@@ -1412,6 +1432,10 @@ impl CommandOutput for HealReport {
             println!("{}", rebuilt.sentence());
         }
 
+        if let Some(rebuilt) = &self.position_rebuilt {
+            println!("{}", rebuilt.sentence());
+        }
+
         for rebuilt in &self.refs_rebuilt {
             println!("{}", rebuilt_sentence(rebuilt));
         }
@@ -1441,7 +1465,7 @@ impl CommandOutput for HealReport {
             && self.unseal_failed.is_none() && self.record_rebuilt.is_none() && self.unavailable_rebuilt.is_none()
             && self.redactions_applied_rebuilt.is_none() && self.redactions_reapplied.is_empty()
             && self.restored_from_working_tree.is_empty()
-            && self.fetch_scope_rebuilt.is_none() && self.parked_rebuilt.is_none()
+            && self.fetch_scope_rebuilt.is_none() && self.parked_rebuilt.is_none() && self.position_rebuilt.is_none()
             && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
             && self.objects_lost.is_none()
         {

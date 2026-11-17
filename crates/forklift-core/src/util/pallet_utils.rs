@@ -26,6 +26,10 @@ pub const META_QUALIFIER: char = '@';
 /// stand on (see [`BayPosition`]).
 pub const FILE_NAME_POSITION: &str = "position";
 
+/// The bay-local copy of the position file, written after it with the same bytes: the witness
+/// `heal` rebuilds a lost or damaged position from (see [`write_position_in`]).
+pub const FILE_NAME_POSITION_COPY: &str = "position-copy";
+
 /// The name of the default pallet (used when a warehouse is prepared).
 pub const DEFAULT_PALLET_NAME: &str = "main";
 
@@ -501,36 +505,110 @@ const POSITION_VERSION: u32 = 2;
 ///
 /// # Returns
 /// * `Ok(BayPosition)` - Where the bay stands.
-/// * `Err(String)`     - If the position file is missing, unreadable or malformed. There is no
-///                       default: a bay without one was never prepared, and guessing a pallet
-///                       would pair it with no base.
+/// * `Err(String)`     - If the position file is missing, unreadable or malformed: a
+///                       `bay_position_damaged` refusal whose next step is `forklift heal`, unless
+///                       a newer version wrote it. There is no default: a prepared bay always has
+///                       one, and guessing a pallet would pair it with no base.
 pub fn read_position() -> Result<BayPosition, String> {
-    read_position_in(&bay_root())
+    read_position_at(&bay_root(), HEAL)
 }
 
-/// Read the position of the bay whose bay-local state dir is `dir` (see [`read_position`]).
+/// Read the position of the bay whose bay-local state dir is `dir` (see [`read_position`]). A
+/// damaged one is refused with no next step: `heal` mends only the bay it runs in, and this may be
+/// another bay's, or a bay whose creation never finished.
 pub fn read_position_in(dir: &Path) -> Result<BayPosition, String> {
+    read_position_at(dir, "")
+}
+
+/// The next step of a damaged position of the bay a command runs in.
+const HEAL: &str = "forklift heal";
+
+/// Read the position file in `dir`, refusing a damaged one with `next_step`.
+fn read_position_at(dir: &Path, next_step: &str) -> Result<BayPosition, String> {
     let path = dir.join(FILE_NAME_POSITION);
 
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("Error while reading the bay position file \"{}\": {}", path.to_string_lossy(), e))?;
+    let bytes = std::fs::read(&path).map_err(|e| position_damaged(&path, &match e.kind() {
+        std::io::ErrorKind::NotFound => "is missing.".to_string(),
+        _ => format!("cannot be read: {}.", e),
+    }, next_step))?;
 
-    let malformed = |reason: String| format!("The bay position file \"{}\" {}", path.to_string_lossy(), reason);
+    decode_position(&bytes).map_err(|why| match why {
+        PositionUnread::Newer(reason) => format!(
+            "The bay position file \"{}\" {} This version of Forklift never writes over it.",
+            path.to_string_lossy(), reason
+        ),
+        PositionUnread::Damaged(reason) => position_damaged(&path, &reason, next_step),
+    })
+}
 
-    let entries = crate::util::record_utils::from_bytes(&bytes, POSITION_RECORD, POSITION_VERSION)
-        .map_err(|e| malformed(e.describe()))?;
+/// Why a position record's bytes do not read: a newer version wrote them, or they are damaged.
+/// Each carries a phrase that follows "The <file> ".
+pub enum PositionUnread {
+    Newer(String),
+    Damaged(String),
+}
 
-    let [pallet, base] = <[String; 2]>::try_from(entries).map_err(|_| malformed("is malformed.".to_string()))?;
+/// Decode the position record `bytes`.
+pub fn decode_position(bytes: &[u8]) -> Result<BayPosition, PositionUnread> {
+    let entries = crate::util::record_utils::from_bytes(bytes, POSITION_RECORD, POSITION_VERSION).map_err(|e| {
+        match crate::util::record_utils::written_by_newer(bytes, POSITION_RECORD, POSITION_VERSION) {
+            true => PositionUnread::Newer(e.describe()),
+            false => PositionUnread::Damaged(e.describe()),
+        }
+    })?;
 
-    validate_pallet_name(&pallet).map_err(|e| malformed(format!("names an invalid pallet: {}", e)))?;
+    let malformed = || PositionUnread::Damaged("is malformed.".to_string());
+
+    let [pallet, base] = <[String; 2]>::try_from(entries).map_err(|_| malformed())?;
+
+    validate_pallet_name(&pallet).map_err(|e| PositionUnread::Damaged(format!("names an invalid pallet: {}", e)))?;
 
     let base = match base.as_str() {
         "" => None,
         hash if object_utils::is_object_hash(hash) => Some(base),
-        _ => return Err(malformed("is malformed.".to_string())),
+        _ => return Err(malformed()),
     };
 
     Ok(BayPosition { pallet, base })
+}
+
+/// The `bay_position_damaged` refusal for the position file at `path`, which `reason` (a phrase
+/// that follows "The bay position file <path> ") says why it does not read.
+pub fn position_damaged(path: &Path, reason: &str, next_step: &str) -> String {
+    CoreError::refusal(
+        RefusalCode::BayPositionDamaged,
+        format!("The bay position file \"{}\" {} Which pallet this bay stands on, and which parcel its files stand on, cannot be told.",
+            path.to_string_lossy(), reason),
+        next_step,
+    ).into()
+}
+
+/// Read the copy of the position in the bay-local state dir `dir` (see [`write_position_in`]).
+///
+/// # Returns
+/// * `Ok(Some(BayPosition))` - The position the copy holds.
+/// * `Ok(None)`              - If there is no copy, or it does not read (its bytes are then
+///                             no witness of anything).
+/// * `Err(String)`           - If the copy could not be read for another reason than its absence.
+pub fn read_position_copy_in(dir: &Path) -> Result<Option<BayPosition>, String> {
+    let path = dir.join(FILE_NAME_POSITION_COPY);
+
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(decode_position(&bytes).ok()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("Error while reading the bay position copy \"{}\": {}", path.to_string_lossy(), e)),
+    }
+}
+
+/// Write the copy of the position in `dir` to match `position`.
+pub fn write_position_copy_in(dir: &Path, position: &BayPosition) -> Result<(), String> {
+    file_utils::write_file_atomically(&dir.join(FILE_NAME_POSITION_COPY), &position_bytes(position))
+}
+
+/// The record bytes of `position`.
+fn position_bytes(position: &BayPosition) -> Vec<u8> {
+    let base = position.base.as_deref().unwrap_or("");
+    crate::util::record_utils::to_bytes(POSITION_RECORD, POSITION_VERSION, [position.pallet.as_str(), base])
 }
 
 /// Write the active bay's position (atomically: the pallet and the base change together).
@@ -560,13 +638,28 @@ pub fn landed_but(pallet: &str, head: &str, error: &str) -> String {
 }
 
 /// [`write_position`] into the bay-local state dir `dir`, whichever bay it belongs to.
+///
+/// The same record is then written to a copy beside it, the witness `heal` rebuilds a lost or
+/// damaged position from: every position a bay is given is written here, so the copy holds the
+/// last one. A copy that cannot be written is removed instead, since a stale copy would rebuild a
+/// position the bay has left; only when neither can be done does the write fail (the position
+/// itself stands).
 pub fn write_position_in(dir: &Path, position: &BayPosition) -> Result<(), String> {
     validate_pallet_name(&position.pallet)?;
 
-    let base = position.base.as_deref().unwrap_or("");
-    let bytes = crate::util::record_utils::to_bytes(POSITION_RECORD, POSITION_VERSION, [position.pallet.as_str(), base]);
+    let bytes = position_bytes(position);
 
-    file_utils::write_file_atomically(&dir.join(FILE_NAME_POSITION), &bytes)
+    file_utils::write_file_atomically(&dir.join(FILE_NAME_POSITION), &bytes)?;
+
+    let copy = dir.join(FILE_NAME_POSITION_COPY);
+    file_utils::write_file_atomically(&copy, &bytes).or_else(|written| match std::fs::remove_file(&copy) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(removed) => Err(format!(
+            "The bay position was written, but its copy \"{}\" could neither be written ({}) nor removed ({}).",
+            copy.to_string_lossy(), written.trim_end_matches('.'), removed
+        )),
+    })
 }
 
 /// Create the active bay's position (the default pallet, unborn) if it has none, along with the
