@@ -67,7 +67,8 @@ fn refused_scope(area: &TestArea, dir: &str, scope: &str, args: &[&str]) -> Stri
 /// copy, after which the read works.
 ///
 /// Revert: return the old untyped refusal from the scope readers → no code, no next step → red;
-/// skip the restore in heal → the scope stays damaged → red.
+/// skip the restore in heal → the scope stays damaged → red; skip the copy's re-sync → the lost
+/// copy stays lost → red.
 #[test]
 fn heal_restores_a_lost_or_damaged_scope_from_its_copy() {
     let area = TestArea::new("checkout-scope-heal-restore");
@@ -105,6 +106,11 @@ fn heal_restores_a_lost_or_damaged_scope_from_its_copy() {
             assert_eq!(std::fs::read(area.path(scope)).unwrap(), original, "{} {}: the scope is back exactly", dir, what);
             assert_success(&area.forklift(dir, &["stocktake"]));
         }
+
+        // A usable scope rewrites a lost copy.
+        remove(&area, copy);
+        assert_success(&area.forklift(dir, &["heal"]));
+        assert_eq!(std::fs::read(area.path(copy)).unwrap(), original, "{}: the copy is rewritten from the scope", dir);
     }
 }
 
@@ -327,8 +333,8 @@ fn heal_scope_judges_the_tree_the_checkout_stands_on() {
 /// A bay whose `bay add` stopped before it recorded its folder checked nothing out: a read of its
 /// damaged scope from another checkout names `forklift bay remove`, not a heal it has no folder for.
 ///
-/// Revert: offer heal for every other bay → the message names a heal in a folder that does not
-/// exist → red.
+/// Revert: offer heal for every other bay, in the reader or in the fetch-scope heal's listing → the
+/// message names a heal in a folder that does not exist → red.
 #[test]
 fn a_pathless_bay_with_a_damaged_scope_is_removed_not_healed() {
     let area = TestArea::new("checkout-scope-pathless-bay");
@@ -342,6 +348,12 @@ fn a_pathless_bay_with_a_damaged_scope_is_removed_not_healed() {
     assert!(message.contains("\"forklift bay remove b\""), "{}", message);
     assert!(!message.contains("forklift heal"), "{}", message);
     assert!(error["next_step"].is_null(), "{}", error);
+
+    // The fetch-scope heal lists it with the same way out.
+    remove(&area, FETCH_SCOPE);
+    let healed = area.forklift("sparse", &["--json", "heal"]);
+    let said = format!("{}{}", stdout(&healed), stderr(&healed));
+    assert!(said.contains("forklift bay remove b"), "{}", said);
 }
 
 /// With the position lost as well, the scope waits for the position heal, whose base the stranding
