@@ -1841,11 +1841,10 @@ fn operator_remedy(code: forklift_core::error::RefusalCode, own: &str) -> String
     }
 }
 
-/// What a client is told of the damage. An unreadable object's own message names the store's
-/// pack files, and the records read before a root is served name their own paths, which are not
-/// named over the wire, so those are replaced. The tombstone list's and the withheld record's
-/// readers name their record, never its path, so theirs is kept.
-fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> String {
+/// What a client is told of the damage: a fixed text per code, never the reader's own message. The
+/// readers name the files they read, by their paths on this host, and no directory of the server's
+/// is named over the wire; the reader's message is logged ([`damage_refusal`]).
+fn damage_message(code: forklift_core::error::RefusalCode) -> String {
     use forklift_core::error::RefusalCode;
     match code {
         RefusalCode::ObjectUnreadable =>
@@ -1860,7 +1859,11 @@ fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> Str
             "The warehouse is recorded as full but holds an origin record, which only a partial warehouse has, so content its pallets reach may be absent; the record does not read, and the request was refused. Its operator can serve a full clone in its place.".to_string(),
         RefusalCode::BayPositionDamaged =>
             "A record of which pallet one of the warehouse's working trees stands on does not read, so the request was refused.".to_string(),
-        _ => human,
+        RefusalCode::TombstonesDamaged =>
+            "The warehouse's list of deleted pallets, or the mark beside it that records the warehouse as served, is missing or does not read, so which history it keeps for them cannot be told, and the request was refused.".to_string(),
+        RefusalCode::WithheldDamaged =>
+            "The warehouse's record of what its head withholds does not read, so what may be served cannot be told, and the request was refused.".to_string(),
+        _ => unreachable!("not a damage code"),
     }
 }
 
@@ -1871,15 +1874,14 @@ fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> Str
 /// ([`server_fault`]). The damage itself is logged, with the local next step.
 fn damage_refusal(message: String) -> HandlerError {
     // A caller may have wrapped the damage in its own words; the frame inside still names it.
-    let damage = forklift_core::error::frames_in(&message).find_map(|(code, human, step)| {
-        DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, human.to_string(), step.to_string()))
+    let damage = forklift_core::error::frames_in(&message).find_map(|(code, _, step)| {
+        DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, step.to_string()))
     });
 
     match damage {
-        Some((code, human, step)) => {
+        Some((code, step)) => {
             tracing::error!(%message, "a host record or the store is damaged");
-            let human = damage_message(code, human);
-            (StatusCode::SERVICE_UNAVAILABLE, forklift_core::error::CoreError::refusal(code, human, operator_remedy(code, &step)).into())
+            (StatusCode::SERVICE_UNAVAILABLE, forklift_core::error::CoreError::refusal(code, damage_message(code), operator_remedy(code, &step)).into())
         }
         None => server_fault(message),
     }
@@ -9971,7 +9973,7 @@ mod tests {
         ///
         /// Revert: map the handshake's list read through `internal` → a 500 with no code → red.
         /// Revert: add `Retry-After` to every 503 → the damage answer tells the client to wait →
-        /// red. Revert: name the served mark's path in its refusal → the mark's cases carry the
+        /// red. Revert: pass the reader's own message through `damage_message` → every case carries the
         /// server's path → red.
         #[tokio::test]
         async fn a_handshake_over_damaged_tombstones_refuses_with_its_code_and_no_retry() {

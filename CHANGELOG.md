@@ -635,12 +635,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
-- **A server's damaged tombstone list or served mark no longer names the server's directories to
-  clients.** The `tombstones_damaged` refusal a client got from the server quoted the full path of
-  the damaged file on the server's disk. It now names the record (the tombstone list or the served
-  mark), as the refusal for a damaged record of withheld content already did. When only the mark was damaged,
-  `forklift-server tombstone repair` also reported "Kept 0 entries of the old list" over a list it
-  had left untouched. It now says the list read whole and was left as it was.
+- **A server's damage refusals no longer name the server's directories to clients.** The
+  `tombstones_damaged` refusal a client got quoted the full path of the damaged tombstone list or
+  served mark on the server's disk. The server now sends a fixed message for every damage code, as
+  it already did for six of them, and keeps the reader's own message, path included, for its log.
+  When only the mark was lost or damaged, `forklift-server tombstone repair` also reported "Kept 0
+  entries of the old list" over a list it had left untouched. It now says the list read whole and
+  was left as it was.
 - **A damaged inventory metadata file is refused with a remedy, and `heal` rebuilds it.** The
   inventory's record of which folders hold staged content, cut short, zeroed or with a byte
   flipped, failed `load`, `unload` and `status` with an uncoded error, and `heal` found nothing to

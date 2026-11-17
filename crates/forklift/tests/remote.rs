@@ -12606,7 +12606,7 @@ fn a_lift_to_a_remote_whose_tombstones_are_damaged_names_its_operator_and_does_n
     assert!(next_step.contains("forklift-server tombstone repair --root <warehouse>"), "{}", refused);
     assert!(!next_step.contains(&*area.path("server-root").to_string_lossy()), "no server path: {}", refused);
     let message = refused["message"].as_str().unwrap();
-    assert!(message.contains("The tombstone list"), "{}", refused);
+    assert!(message.contains("list of deleted pallets"), "{}", refused);
     assert!(!message.contains(&*area.path("server-root").to_string_lossy()), "no server path: {}", refused);
 }
 

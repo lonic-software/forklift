@@ -124,18 +124,17 @@ pub fn is_damage(error: &str) -> bool {
     crate::error::deframe(error).is_some_and(|(code, _, _)| code == RefusalCode::TombstonesDamaged.as_str())
 }
 
-/// Read a record file's entries; `None` when the file is absent. The error names the record as
-/// `what` ("served mark"), never its path: the server sends it to clients ([`damaged`]).
-fn read_record(path: &Path, what: &str, kind: &str, version: u32) -> Result<Option<Vec<String>>, String> {
+/// Read a record file's entries; `None` when the file is absent.
+fn read_record(path: &Path, kind: &str, version: u32) -> Result<Option<Vec<String>>, String> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("The {} could not be read: {}.", what, e)),
+        Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
     };
 
     record_utils::from_bytes(&bytes, kind, version)
         .map(Some)
-        .map_err(|e| format!("The {} {}", what, e.describe()))
+        .map_err(|e| format!("The file \"{}\" {}", path.to_string_lossy(), e.describe()))
 }
 
 /// One entry of the tombstone list, as written.
@@ -161,7 +160,8 @@ pub(crate) fn parse_entry(line: &str) -> Option<Entry<'_>> {
 /// read: the file cannot be read, is not a list of this version, holds an entry of neither form,
 /// or names a pallet or keeps a head twice.
 fn read_list() -> Result<Option<Tombstones>, String> {
-    let Some(lines) = read_record(&tombstones_path(), "tombstone list", TOMBSTONES_RECORD, TOMBSTONES_VERSION)? else {
+    let path = tombstones_path();
+    let Some(lines) = read_record(&path, TOMBSTONES_RECORD, TOMBSTONES_VERSION)? else {
         return Ok(None);
     };
 
@@ -171,15 +171,15 @@ fn read_list() -> Result<Option<Tombstones>, String> {
         match parse_entry(&line) {
             // Two tombstones of one name would leave one head unrooted, so neither is chosen.
             Some(Entry::Named(head, pallet)) => if tombstones.named.insert(pallet.to_string(), head.to_string()).is_some() {
-                return Err(format!("The tombstone list holds two tombstones of pallet \"{}\".", pallet));
+                return Err(format!("The file \"{}\" holds two tombstones of pallet \"{}\".", path.to_string_lossy(), pallet));
             },
             Some(Entry::Kept(head)) => if !tombstones.kept.insert(head.to_string()) {
-                return Err(format!("The tombstone list keeps head {} twice.", head));
+                return Err(format!("The file \"{}\" keeps head {} twice.", path.to_string_lossy(), head));
             },
             None => return Err(format!(
-                "The tombstone list holds an entry that is neither a parcel hash and a pallet name nor a \
+                "The file \"{}\" holds an entry that is neither a parcel hash and a pallet name nor a \
                 parcel hash alone: \"{}\".",
-                line.escape_debug()
+                path.to_string_lossy(), line.escape_debug()
             )),
         }
     }
@@ -195,15 +195,21 @@ fn read_list() -> Result<Option<Tombstones>, String> {
 ///                                     not read, the list does not read, a served root has no list,
 ///                                     or a list that holds anything has no mark beside it.
 fn load() -> Result<(ServedState, Tombstones), String> {
-    let mark = read_record(&served_path(), "served mark", SERVED_RECORD, SERVED_VERSION).map_err(|e| damaged(&e))?;
+    let mark = read_record(&served_path(), SERVED_RECORD, SERVED_VERSION).map_err(|e| damaged(&e))?;
     let list = read_list().map_err(|e| damaged(&e))?;
 
     match (mark, list) {
         (Some(_), Some(tombstones)) => Ok((ServedState::Served, tombstones)),
-        (Some(_), None) => Err(damaged("This warehouse has been served, but its tombstone list is missing.")),
+        (Some(_), None) => Err(damaged(&format!(
+            "This warehouse has been served, but its tombstone list \"{}\" is missing.",
+            tombstones_path().to_string_lossy()
+        ))),
         (None, None) => Ok((ServedState::Never, Tombstones::default())),
         (None, Some(tombstones)) if tombstones.is_empty() => Ok((ServedState::Unfinished, tombstones)),
-        (None, Some(_)) => Err(damaged("The tombstone list holds tombstones, but the served mark beside it is missing.")),
+        (None, Some(_)) => Err(damaged(&format!(
+            "The tombstone list \"{}\" holds tombstones, but the served mark \"{}\" beside it is missing.",
+            tombstones_path().to_string_lossy(), served_path().to_string_lossy()
+        ))),
     }
 }
 
@@ -230,10 +236,11 @@ pub(crate) fn served_for_removal() -> Result<bool, String> {
     match served_state()? {
         ServedState::Served => Ok(true),
         ServedState::Never => Ok(false),
-        ServedState::Unfinished => Err(damaged(
-            "The served mark is missing beside an empty tombstone list: a first serve did not finish, \
-            or the mark was lost."
-        )),
+        ServedState::Unfinished => Err(damaged(&format!(
+            "The served mark \"{}\" is missing beside an empty tombstone list: a first serve did not \
+            finish, or the mark was lost.",
+            served_path().to_string_lossy()
+        ))),
     }
 }
 
@@ -497,9 +504,6 @@ pub(crate) mod tests {
         let (code, human, next_step) = crate::error::deframe(error).unwrap_or_else(|| panic!("not a coded refusal: {}", error));
         assert_eq!(code, "tombstones_damaged", "{}", error);
         assert!(human.contains(needle), "{}", human);
-        // The server sends the message to clients as it stands, so it names no file of the root.
-        let root = std::path::absolute(globals::forklift_root()).unwrap();
-        assert!(!human.contains(&*root.to_string_lossy()) && !human.contains(".forklift"), "no path of the root: {}", human);
         assert!(next_step.starts_with("forklift-server tombstone repair --root "), "{}", next_step);
     }
 
@@ -513,7 +517,7 @@ pub(crate) mod tests {
         assert!(is_served().unwrap(), "the mark stands");
 
         std::fs::write(served_path(), b"something else\n").unwrap();
-        assert_damaged(&is_served().unwrap_err(), "The served mark");
+        assert_damaged(&is_served().unwrap_err(), FILE_NAME_SERVED);
     }
 
     #[test]
@@ -522,14 +526,14 @@ pub(crate) mod tests {
 
         assert!(!tombstones_path().exists());
         assert!(mark_served(false).unwrap());
-        assert_eq!(read_record(&tombstones_path(), "tombstone list", TOMBSTONES_RECORD, TOMBSTONES_VERSION).unwrap(), Some(Vec::new()), "the mark brings an empty list");
+        assert_eq!(read_record(&tombstones_path(), TOMBSTONES_RECORD, TOMBSTONES_VERSION).unwrap(), Some(Vec::new()), "the mark brings an empty list");
 
         // A list already there, beside a lost mark, is never overwritten: it is damage.
         let head = "a".repeat(64);
         crate::util::file_utils::remove_file(served_path()).unwrap();
         write_list(&[&format!("{} gone", head)]);
         assert_damaged(&mark_served(false).unwrap_err(), "the served mark");
-        assert_eq!(read_record(&tombstones_path(), "tombstone list", TOMBSTONES_RECORD, TOMBSTONES_VERSION).unwrap(), Some(vec![format!("{} gone", head)]));
+        assert_eq!(read_record(&tombstones_path(), TOMBSTONES_RECORD, TOMBSTONES_VERSION).unwrap(), Some(vec![format!("{} gone", head)]));
     }
 
     #[test]
@@ -715,12 +719,12 @@ pub(crate) mod tests {
         assert_damaged(&read_tombstones().unwrap_err(), "twice");
 
         std::fs::write(tombstones_path(), b"\xff\xfe not text").unwrap();
-        assert_damaged(&read_tombstones().unwrap_err(), "The tombstone list");
+        assert_damaged(&read_tombstones().unwrap_err(), FILE_NAME_TOMBSTONES);
 
         // A list of the version before kept heads is not read as this one, nor one of the version
         // before the digest.
         std::fs::write(tombstones_path(), record_utils::to_bytes(TOMBSTONES_RECORD, 1, [first.as_str()])).unwrap();
-        assert_damaged(&read_tombstones().unwrap_err(), "The tombstone list");
+        assert_damaged(&read_tombstones().unwrap_err(), FILE_NAME_TOMBSTONES);
         let undigested = record_utils::to_bytes(TOMBSTONES_RECORD, 2, [first.as_str()]);
         std::fs::write(tombstones_path(), record_utils::without_digest_line(&undigested)).unwrap();
         assert_damaged(&read_tombstones().unwrap_err(), "(\"/forklift-tombstones 2\")");

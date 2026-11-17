@@ -379,8 +379,16 @@ fn a_repair_over_a_lost_mark_beside_a_whole_list_writes_only_the_mark() {
     // read either. Revert: let the repair read the mark undigested → "nothing to repair" over a
     // mark every read refuses → red.
     std::fs::write(root.join(".forklift").join("served"), "/forklift-served 2\n").unwrap();
-    area.server_ok(&root, &["tombstone", "repair"]);
+    let report = area.server_ok(&root, &["tombstone", "repair"]);
     area.server_ok(&root, &["tombstone", "list"]);
+
+    // The damaged mark is set aside, and the whole list beside it is reported as left alone.
+    // Revert: report the set-aside mark's repair as a salvage → "Kept 0 entries" → red.
+    assert_eq!(std::fs::read(list_path(&root)).unwrap(), before, "a whole list is left as it was");
+    assert!(report.contains("Moved the damaged") && report.contains("served.damaged-"), "{}", report);
+    assert!(report.contains("The tombstone list reads whole, so it was left as it was."), "{}", report);
+    assert!(report.contains("Wrote the served mark."), "{}", report);
+    assert!(!report.contains("Kept 0 entries"), "nothing was salvaged: {}", report);
 }
 
 /// Revert: write only the kept heads → the entries that still read are lost → red.

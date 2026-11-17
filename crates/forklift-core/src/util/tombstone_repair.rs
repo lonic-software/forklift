@@ -69,10 +69,9 @@ impl Repaired {
         }
 
         if self.list_whole {
+            // A whole list is left alone only for a mark written in its place.
             lines.push("The tombstone list reads whole, so it was left as it was.".to_string());
-            if self.mark_written {
-                lines.push("Wrote the served mark.".to_string());
-            }
+            lines.push("Wrote the served mark.".to_string());
             return lines;
         }
 
