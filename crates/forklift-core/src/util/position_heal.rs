@@ -17,8 +17,8 @@ use serde::Serialize;
 
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::bay_root;
-use crate::util::pallet_utils::{self, BayPosition, PositionUnread};
-use crate::util::{journal_utils, operation_utils};
+use crate::util::pallet_utils::{self, BayPosition, PositionCopy, PositionUnread};
+use crate::util::{file_utils, journal_utils, operation_utils};
 
 /// Where a rebuilt position came from.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
@@ -59,7 +59,7 @@ impl PositionRebuilt {
         };
         let from = match self.from {
             PositionSource::Copy => "from its copy",
-            PositionSource::Operation => "from the operation left unfinished, which recovery then took on",
+            PositionSource::Operation => "from where the operation left unfinished began",
             PositionSource::Chosen => "as --position chose; the files are taken as standing on that head, and \"forklift stocktake\" shows how they differ from it",
         };
         format!("Rebuilt the bay's position on pallet \"{}\" at {}, {}.", self.pallet, at, from)
@@ -101,29 +101,41 @@ pub fn repair(chosen: Option<&str>) -> Result<Option<PositionRebuilt>, String> {
         )),
     };
 
+    let copy = pallet_utils::read_position_copy_in(&dir);
+
     // A copy a newer version wrote is that version's record of the position: never written over.
-    let copy_path = dir.join(pallet_utils::FILE_NAME_POSITION_COPY);
-    if let Ok(bytes) = std::fs::read(&copy_path) {
-        if let Err(PositionUnread::Newer(reason)) = pallet_utils::decode_position(&bytes) {
-            return Err(format!(
-                "The bay position file \"{}\" {} Its copy \"{}\" {} This version of Forklift never \
-                writes over it, so nothing was changed.",
-                path.to_string_lossy(), unread, copy_path.to_string_lossy(), reason
-            ));
-        }
+    if let PositionCopy::Newer(reason) = &copy {
+        return Err(format!(
+            "The bay position file \"{}\" {} Its copy \"{}\" {} This version of Forklift never \
+            writes over it, so nothing was changed.",
+            path.to_string_lossy(), unread, dir.join(pallet_utils::FILE_NAME_POSITION_COPY).to_string_lossy(), reason
+        ));
     }
 
-    let (position, from) = match chosen {
-        Some(pallet) => (chosen_position(pallet)?, PositionSource::Chosen),
-        None => match (pallet_utils::read_position_copy_in(&dir)?, operation_utils::read()?) {
-            // While an operation stands, the copy is its witness only if it is where that
-            // operation began or was going: a copy left stale by an earlier crash is not.
-            (Some(copy), Some(operation)) if copy != operation.source && copy != operation.target =>
-                (operation.source, PositionSource::Operation),
-            (Some(copy), _) => (copy, PositionSource::Copy),
-            (None, Some(operation)) => (operation.source, PositionSource::Operation),
-            (None, None) => return Err(no_evidence(&path, &unread)),
-        },
+    let evidence = match (copy, operation_utils::read()?) {
+        // While an operation stands, the copy is its witness only if it is where that operation
+        // began or was going: a copy left stale by an earlier crash is not.
+        (PositionCopy::Reads(copy), Some(operation)) if copy != operation.source && copy != operation.target =>
+            Some((operation.source, PositionSource::Operation)),
+        (PositionCopy::Reads(copy), _) => Some((copy, PositionSource::Copy)),
+        (_, Some(operation)) => Some((operation.source, PositionSource::Operation)),
+        (_, None) => None,
+    };
+
+    let (position, from) = match (evidence, chosen) {
+        // Exact evidence outranks a guess: recovery of a standing operation needs the bay where
+        // that operation left it, and a copy says where it stood.
+        (Some((_, from)), Some(_)) => return Err(format!(
+            "The bay's position can be rebuilt {}, so --position was not applied and nothing was \
+            changed.",
+            match from {
+                PositionSource::Operation => "from the operation left unfinished",
+                _ => "from its copy",
+            }
+        )),
+        (Some(evidence), None) => evidence,
+        (None, Some(pallet)) => (chosen_position(pallet)?, PositionSource::Chosen),
+        (None, None) => return Err(no_evidence(&path, &unread)),
     };
 
     pallet_utils::write_position(&position)?;
@@ -132,7 +144,9 @@ pub fn repair(chosen: Option<&str>) -> Result<Option<PositionRebuilt>, String> {
 }
 
 /// A position that reads: `--position` is refused over it, and its copy is rewritten if it does
-/// not match.
+/// not match. A copy that holds another position is a false witness, so it is removed when it
+/// cannot be rewritten; one that holds nothing usable witnesses nothing, so failing to rewrite it
+/// blocks no other repair. A copy a newer version wrote is kept.
 fn keep(dir: &std::path::Path, position: BayPosition, chosen: Option<&str>) -> Result<Option<PositionRebuilt>, String> {
     if chosen.is_some() {
         return Err(format!(
@@ -142,8 +156,26 @@ fn keep(dir: &std::path::Path, position: BayPosition, chosen: Option<&str>) -> R
         ));
     }
 
-    if pallet_utils::read_position_copy_in(dir)?.as_ref() != Some(&position) {
-        pallet_utils::write_position_copy_in(dir, &position)?;
+    match pallet_utils::read_position_copy_in(dir) {
+        PositionCopy::Reads(copy) if copy == position => {}
+        PositionCopy::Newer(_) => {}
+        PositionCopy::Reads(_) => {
+            let path = dir.join(pallet_utils::FILE_NAME_POSITION_COPY);
+            if let Err(written) = pallet_utils::write_position_copy_in(dir, &position) {
+                match file_utils::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(removed) => return Err(format!(
+                        "The bay position copy \"{}\" holds another position than the bay's, and could \
+                        neither be rewritten ({}) nor removed ({}).",
+                        path.to_string_lossy(), written.trim_end_matches('.'), removed
+                    )),
+                }
+            }
+        }
+        PositionCopy::Unusable => {
+            let _ = pallet_utils::write_position_copy_in(dir, &position);
+        }
     }
 
     Ok(None)
@@ -154,7 +186,12 @@ fn keep(dir: &std::path::Path, position: BayPosition, chosen: Option<&str>) -> R
 fn chosen_position(pallet: &str) -> Result<BayPosition, String> {
     pallet_utils::validate_pallet_name(pallet)?;
 
-    match pallet_utils::get_pallet_head(pallet)? {
+    // `--ref` writes run before this step, so a damaged ref can be set in the same run.
+    let head = pallet_utils::get_pallet_head(pallet).map_err(|error| crate::error::append_to_message(error, &format!(
+        "--position needs the head of pallet \"{}\": pass --ref {}=<parcel> with it to set that ref.", pallet, pallet
+    )))?;
+
+    match head {
         Some(head) => Ok(BayPosition::new(pallet, Some(head))),
         None if pallet_utils::list_pallets()?.is_empty() => Ok(BayPosition::new(pallet, None)),
         None => Err(format!(

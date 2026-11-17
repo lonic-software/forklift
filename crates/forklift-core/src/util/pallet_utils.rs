@@ -514,10 +514,10 @@ pub fn read_position() -> Result<BayPosition, String> {
 }
 
 /// Read the position of the bay whose bay-local state dir is `dir` (see [`read_position`]). A
-/// damaged one is refused with no next step: `heal` mends only the bay it runs in, and this may be
-/// another bay's, or a bay whose creation never finished.
+/// damaged one names `heal` only when `dir` is the bay this process runs in: `heal` mends only
+/// that bay, and this may be another bay's, or a bay whose creation never finished.
 pub fn read_position_in(dir: &Path) -> Result<BayPosition, String> {
-    read_position_at(dir, "")
+    read_position_at(dir, if dir == bay_root() { HEAL } else { "" })
 }
 
 /// The next step of a damaged position of the bay a command runs in.
@@ -583,20 +583,29 @@ pub fn position_damaged(path: &Path, reason: &str, next_step: &str) -> String {
     ).into()
 }
 
-/// Read the copy of the position in the bay-local state dir `dir` (see [`write_position_in`]).
-///
-/// # Returns
-/// * `Ok(Some(BayPosition))` - The position the copy holds.
-/// * `Ok(None)`              - If there is no copy, or it does not read (its bytes are then
-///                             no witness of anything).
-/// * `Err(String)`           - If the copy could not be read for another reason than its absence.
-pub fn read_position_copy_in(dir: &Path) -> Result<Option<BayPosition>, String> {
-    let path = dir.join(FILE_NAME_POSITION_COPY);
+/// What the copy of the position (see [`write_position_in`]) holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PositionCopy {
+    /// The position it holds.
+    Reads(BayPosition),
 
-    match std::fs::read(&path) {
-        Ok(bytes) => Ok(decode_position(&bytes).ok()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("Error while reading the bay position copy \"{}\": {}", path.to_string_lossy(), e)),
+    /// A newer version wrote it, for this reason: that version's record, never written over.
+    Newer(String),
+
+    /// There is none, it is damaged, or it cannot be read: no witness of anything.
+    Unusable,
+}
+
+/// Read the copy of the position in the bay-local state dir `dir`. Read once, so every decision
+/// about it is made on the same bytes.
+pub fn read_position_copy_in(dir: &Path) -> PositionCopy {
+    match std::fs::read(dir.join(FILE_NAME_POSITION_COPY)) {
+        Ok(bytes) => match decode_position(&bytes) {
+            Ok(position) => PositionCopy::Reads(position),
+            Err(PositionUnread::Newer(reason)) => PositionCopy::Newer(reason),
+            Err(PositionUnread::Damaged(_)) => PositionCopy::Unusable,
+        },
+        Err(_) => PositionCopy::Unusable,
     }
 }
 
@@ -678,8 +687,11 @@ pub fn create_position_if_not_exists() -> Result<bool, String> {
 
     let path = get_position_path();
 
-    if path.exists() {
-        return Ok(false);
+    // Only an absent file is a position never made; one that cannot be judged is not written over.
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(position_damaged(&path, &format!("cannot be read: {}.", e), HEAL)),
     }
 
     if bay_root().join(FILE_NAME_POSITION_COPY).exists() || !list_pallets()?.is_empty() {

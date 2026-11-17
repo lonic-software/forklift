@@ -376,3 +376,95 @@ fn a_copy_a_newer_version_wrote_is_never_written_over() {
         assert_eq!(std::fs::read(dir.join("position-copy")).unwrap(), newer, "{:?}", args);
     }
 }
+
+// Revert: keep rewriting a copy that does not read as this version's → the newer record is lost.
+#[test]
+fn a_newer_copy_beside_a_position_that_reads_is_kept() {
+    let area = Area::new("newer-copy-kept");
+    let root = area.warehouse();
+    let dir = state_dir(&root, None);
+    let newer = forklift_core::util::record_utils::to_bytes("position", 99, ["feature", &head(&root, "feature")]);
+    std::fs::write(dir.join("position-copy"), &newer).unwrap();
+
+    area.run_ok(&root, &["heal"]);
+    assert_eq!(std::fs::read(dir.join("position-copy")).unwrap(), newer);
+}
+
+// A copy that cannot be read witnesses nothing, so it blocks no repair.
+// Revert: keep failing on a copy it cannot rewrite → every heal stops at the position step.
+#[test]
+fn a_copy_that_cannot_be_read_does_not_stop_heal() {
+    let area = Area::new("copy-dir");
+    let root = area.warehouse();
+    let dir = state_dir(&root, None);
+    forklift_core::util::file_utils::remove_file(dir.join("position-copy")).unwrap();
+    std::fs::create_dir_all(dir.join("position-copy").join("inner")).unwrap();
+
+    let data = parsed(&area.run_ok(&root, &["--json", "heal"]))["data"].clone();
+    assert!(data.get("position_rebuilt").is_none(), "{}", data);
+}
+
+// Exact evidence outranks the operator's guess.
+// Revert: let --position win over the copy → the bay is put on main.
+#[test]
+fn position_is_refused_while_the_copy_says_where_the_bay_stood() {
+    let area = Area::new("chosen-over-copy");
+    let root = area.warehouse();
+    let position = state_dir(&root, None).join("position");
+    let before = std::fs::read(&position).unwrap();
+    damage(&position, Damage::Delete);
+
+    let refused = area.run(&root, &["--json", "heal", "--position", "main"]);
+    assert!(!refused.status.success(), "{}", text(&refused.stdout));
+    assert!(!position.exists(), "nothing was written");
+
+    area.run_ok(&root, &["heal"]);
+    assert_eq!(std::fs::read(&position).unwrap(), before);
+}
+
+// Revert: the bay scan wrapping the error in a plain String → the code is lost.
+#[test]
+fn deleting_a_pallet_over_another_bays_damaged_position_keeps_the_code() {
+    let area = Area::new("bays-on");
+    let root = area.warehouse();
+    area.bay(&root, "b1");
+    damage(&state_dir(&root, Some("b1")).join("position"), Damage::Truncate);
+
+    let value = position_damaged(&area.run(&root, &["--json", "pallet", "delete", "main"]));
+    assert!(value["error"]["message"].as_str().unwrap().contains("bay \"b1\""), "{}", value);
+}
+
+// `--ref` writes run before the position step, so the refusal says the ref can be set with it.
+// Revert: drop the hint from chosen_position → the message names no --ref.
+#[test]
+fn position_on_a_pallet_whose_ref_is_damaged_names_ref() {
+    let area = Area::new("chosen-ref");
+    let root = area.warehouse();
+    let dir = state_dir(&root, None);
+    damage(&dir.join("position"), Damage::Delete);
+    forklift_core::util::file_utils::remove_file(dir.join("position-copy")).unwrap();
+    damage(&root.join(".forklift").join("pallets").join("feature"), Damage::Zero);
+
+    let refused = area.run(&root, &["--json", "heal", "--position", "feature"]);
+    assert!(!refused.status.success(), "{}", text(&refused.stdout));
+    let message = parsed(&refused)["error"]["message"].as_str().unwrap().to_string();
+    assert!(message.contains("--ref feature=<parcel>"), "{}", message);
+}
+
+// Only an absent position is one never made.
+// Revert: test the path with exists() → prepare writes the default over the link.
+#[cfg(unix)]
+#[test]
+fn prepare_never_writes_over_a_position_it_cannot_follow() {
+    let area = Area::new("dangling");
+    let root = area.base.join("wh");
+    std::fs::create_dir_all(&root).unwrap();
+    area.run_ok(&root, &["prepare"]);
+    let dir = state_dir(&root, None);
+    forklift_core::util::file_utils::remove_file(dir.join("position")).unwrap();
+    let _ = forklift_core::util::file_utils::remove_file(dir.join("position-copy"));
+    std::os::unix::fs::symlink(area.base.join("nowhere"), dir.join("position")).unwrap();
+
+    let _ = area.run(&root, &["prepare"]);
+    assert!(std::fs::symlink_metadata(dir.join("position")).unwrap().file_type().is_symlink());
+}

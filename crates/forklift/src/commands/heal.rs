@@ -256,7 +256,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         Err(error) => {
             // An interrupted operation waits for the taint (below), so the refusal says so: it
             // is not the only thing left standing.
-            let mut error = changed(String::from(error), &refs_rebuilt, &refs_removed, &ref_notes);
+            let mut error = changed_after(String::from(error), &refs_rebuilt, &refs_removed, &ref_notes);
             if ref_heal::detect(&mut Vec::new()).is_ok_and(|damaged| !damaged.is_empty()) {
                 error = forklift_core::error::append_to_message(error,
                     "A damaged pallet ref also stands; heal rebuilds it once the taint is resolved.");
