@@ -1,5 +1,16 @@
 {
   "forge": "github",
   "ci": true,
-  "verify_cmd": "bin/full-suite"
+  "verify_cmd": "bin/full-suite",
+  "required_checks": [
+    "ci passed",
+    "cla"
+  ],
+  "protected_paths": [
+    ".github/workflows/cla.yml",
+    "CLA.md",
+    "LICENSE*",
+    "LICENSING.md"
+  ],
+  "commit_email": "66274697+matekolonics@users.noreply.github.com"
 }
