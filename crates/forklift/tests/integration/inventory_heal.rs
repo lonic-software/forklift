@@ -122,7 +122,7 @@ impl Area {
         forklift_core::util::file_utils::remove_file(&path).unwrap();
     }
 
-    /// Put a copy of a shard on disk at an address no folder's key hashes to, and return its folder.
+    /// Put a copy of a shard at an address no folder's key hashes to, and return its folder.
     fn plant_shard(&self) -> PathBuf {
         let store = self.root().join(".forklift/inventory/inv_");
         let fan_out = std::fs::read_dir(&store).unwrap().next().unwrap().unwrap().path();
@@ -178,8 +178,8 @@ fn damage(path: &Path, kind: Damage) {
 }
 
 /// Revert: map the funnel's record errors back to the uncoded message → exit 1 → red. Read a
-/// missing header as an older Forklift's file → the zeroed file's message says so → red. Each damage
-/// leaves `c`, `a` and `a/b` named only by the working tree and the base.
+/// missing header as an older Forklift's file → the zeroed file's message says so → red. Each
+/// damage leaves `c`, `a` and `a/b` named only by the working tree and the base.
 #[test]
 fn every_damage_is_refused_and_plain_heal_restores_the_set_exactly() {
     for kind in DAMAGES {

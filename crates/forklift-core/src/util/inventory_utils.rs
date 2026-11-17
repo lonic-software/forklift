@@ -2397,7 +2397,7 @@ impl ShardLedger {
     ///
     /// # Returns
     /// * `Ok(ShardLedger)` - The registered set.
-    /// * `Err(String)`     - If the metadata could not be read or parsed, or is missing over shards.
+    /// * `Err(String)`     - If the metadata could not be read or parsed, or is missing over a shard.
     pub fn read() -> Result<ShardLedger, String> {
         LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
 
