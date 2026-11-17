@@ -1832,8 +1832,10 @@ fn operator_remedy(code: forklift_core::error::RefusalCode, own: &str) -> String
     match code {
         RefusalCode::TombstonesDamaged => "forklift-server tombstone repair --root <warehouse>".to_string(),
         RefusalCode::WithheldDamaged => "forklift-server withhold repair --root <warehouse>".to_string(),
-        RefusalCode::ObjectUnreadable | RefusalCode::BayPositionDamaged => "forklift heal".to_string(),
-        RefusalCode::SealedDamaged | RefusalCode::UnavailableDamaged => own.to_string(),
+        RefusalCode::ObjectUnreadable => "forklift heal".to_string(),
+        // The served root's own position names heal; another bay's names nothing, since a heal in
+        // the warehouse's root does not reach it.
+        RefusalCode::SealedDamaged | RefusalCode::UnavailableDamaged | RefusalCode::BayPositionDamaged => own.to_string(),
         RefusalCode::FetchScopeStray | RefusalCode::OriginDamaged => String::new(),
         _ => unreachable!("not a damage code"),
     }
@@ -1856,7 +1858,7 @@ fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> Str
         RefusalCode::OriginDamaged =>
             "The warehouse is recorded as full but holds an origin record, which only a partial warehouse has, so content its pallets reach may be absent; the record does not read, and the request was refused. Its operator can serve a full clone in its place.".to_string(),
         RefusalCode::BayPositionDamaged =>
-            "The warehouse's record of the pallet it stands on, which a new clone checks out, does not read, so its default pallet cannot be told, and the request was refused.".to_string(),
+            "A record of which pallet one of the warehouse's working trees stands on does not read, so the request was refused.".to_string(),
         _ => human,
     }
 }

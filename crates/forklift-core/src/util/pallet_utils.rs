@@ -665,15 +665,25 @@ pub fn write_position_in(dir: &Path, position: &BayPosition) -> Result<(), Strin
 /// Create the active bay's position (the default pallet, unborn) if it has none, along with the
 /// pallets folder. Called by `prepare`.
 ///
+/// A position missing beside its copy, or in a warehouse that has pallets, was lost rather than
+/// never made: writing the default over it would put the bay on a pallet it never stood on, and
+/// write over the copy `heal` rebuilds it from, so that is refused instead.
+///
 /// # Returns
 /// * `Ok(true)`    - If the position file was created.
 /// * `Ok(false)`   - If it already existed.
-/// * `Err(String)` - If an error occurred.
+/// * `Err(String)` - A `bay_position_damaged` refusal for a lost position, or an error occurred.
 pub fn create_position_if_not_exists() -> Result<bool, String> {
     file_utils::create_folder_if_not_exists(&get_pallets_folder())?;
 
-    if get_position_path().exists() {
+    let path = get_position_path();
+
+    if path.exists() {
         return Ok(false);
+    }
+
+    if bay_root().join(FILE_NAME_POSITION_COPY).exists() || !list_pallets()?.is_empty() {
+        return Err(position_damaged(&path, "is missing.", "forklift heal"));
     }
 
     write_position(&BayPosition::new(DEFAULT_PALLET_NAME, None))?;

@@ -94,17 +94,35 @@ pub fn repair(chosen: Option<&str>) -> Result<Option<PositionRebuilt>, String> {
             Err(PositionUnread::Damaged(reason)) => reason,
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => "is missing.".to_string(),
-        Err(e) => format!("cannot be read: {}.", e),
+        // A position that is there but cannot be read now (permissions, a busy device) may be
+        // sound: nothing is written over it.
+        Err(e) => return Err(format!(
+            "The bay position file \"{}\" cannot be read: {}. Nothing was changed.", path.to_string_lossy(), e
+        )),
     };
+
+    // A copy a newer version wrote is that version's record of the position: never written over.
+    let copy_path = dir.join(pallet_utils::FILE_NAME_POSITION_COPY);
+    if let Ok(bytes) = std::fs::read(&copy_path) {
+        if let Err(PositionUnread::Newer(reason)) = pallet_utils::decode_position(&bytes) {
+            return Err(format!(
+                "The bay position file \"{}\" {} Its copy \"{}\" {} This version of Forklift never \
+                writes over it, so nothing was changed.",
+                path.to_string_lossy(), unread, copy_path.to_string_lossy(), reason
+            ));
+        }
+    }
 
     let (position, from) = match chosen {
         Some(pallet) => (chosen_position(pallet)?, PositionSource::Chosen),
-        None => match pallet_utils::read_position_copy_in(&dir)? {
-            Some(copy) => (copy, PositionSource::Copy),
-            None => match operation_utils::read()? {
-                Some(operation) => (operation.source, PositionSource::Operation),
-                None => return Err(no_evidence(&path, &unread)),
-            },
+        None => match (pallet_utils::read_position_copy_in(&dir)?, operation_utils::read()?) {
+            // While an operation stands, the copy is its witness only if it is where that
+            // operation began or was going: a copy left stale by an earlier crash is not.
+            (Some(copy), Some(operation)) if copy != operation.source && copy != operation.target =>
+                (operation.source, PositionSource::Operation),
+            (Some(copy), _) => (copy, PositionSource::Copy),
+            (None, Some(operation)) => (operation.source, PositionSource::Operation),
+            (None, None) => return Err(no_evidence(&path, &unread)),
         },
     };
 
