@@ -780,8 +780,12 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             let also = lines.split_off(1);
             return Err(match CoreError::from(error) {
                 refused @ CoreError::Refusal { .. } => with_report(&report, refused, also),
+                // Under --json the recovery's outcome too, which no report shows there: its marker
+                // is cleared, so no later run reports it.
                 CoreError::Other(message) => CoreError::Other(
-                    std::iter::once(message).chain(also).collect::<Vec<_>>().join("\n"),
+                    std::iter::once(message)
+                        .chain(report.operation.iter().filter(|_| output::is_json()).flat_map(OperationRecovery::lines))
+                        .chain(also).collect::<Vec<_>>().join("\n"),
                 ),
             }.into());
         }
@@ -1842,24 +1846,30 @@ impl CommandOutput for HealReport {
 }
 
 impl OperationRecovery {
-    fn render_human(&self) {
+    /// The recovery as report lines: its outcome, then the files it left unheld.
+    fn lines(&self) -> Vec<String> {
         let at = match &self.base {
             Some(base) => format!("\"{}\" at {}", self.pallet, base),
             None => format!("\"{}\" (unborn)", self.pallet),
         };
 
-        match self.outcome {
-            OperationOutcome::Finished => println!("The interrupted {} had already finished; the bay stands on {}.", self.operation, at),
-            OperationOutcome::RolledForward => println!("Finished the interrupted {}; the bay stands on {}.", self.operation, at),
-            OperationOutcome::RolledBack => println!("Undid the interrupted {}; the bay is back on {}.", self.operation, at),
-            OperationOutcome::Cleared => println!("The interrupted {} had changed nothing to undo; its record is cleared.", self.operation),
-        }
+        let mut lines = vec![match self.outcome {
+            OperationOutcome::Finished => format!("The interrupted {} had already finished; the bay stands on {}.", self.operation, at),
+            OperationOutcome::RolledForward => format!("Finished the interrupted {}; the bay stands on {}.", self.operation, at),
+            OperationOutcome::RolledBack => format!("Undid the interrupted {}; the bay is back on {}.", self.operation, at),
+            OperationOutcome::Cleared => format!("The interrupted {} had changed nothing to undo; its record is cleared.", self.operation),
+        }];
 
         if !self.unheld.is_empty() {
-            println!("These tracked files do not hold their recorded content and show as local changes (\"forklift restore --confirm <path>\" brings one back):");
-            for path in &self.unheld {
-                println!("  {}", path);
-            }
+            lines.push("These tracked files do not hold their recorded content and show as local changes (\"forklift restore --confirm <path>\" brings one back):".to_string());
+            lines.extend(self.unheld.iter().map(|path| format!("  {}", path)));
+        }
+        lines
+    }
+
+    fn render_human(&self) {
+        for line in self.lines() {
+            println!("{}", line);
         }
     }
 }
