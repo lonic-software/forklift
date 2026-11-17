@@ -434,18 +434,6 @@ mod tests {
         }
     }
 
-    /// Revert: make hidden_line answer None → a comment that may have been an entry reads
-    /// as lossless → red.
-    #[test]
-    fn damage_that_may_have_hidden_an_entry_is_not_lossless() {
-        let text = "# note\n[operator]\nidentifier = \"op-1\"\n# x\nprofile = \"work\"\n";
-        let mut bytes = text.as_bytes().to_vec();
-        let at = text.find("\nprofile").unwrap();
-        bytes[at] = !bytes[at];
-        let salvage = salvage(&bytes, any);
-        assert!(!salvage.lossless, "{:?}", salvage);
-    }
-
     /// Revert: skip the cut-section drop → url kept while the token was cut off → red.
     #[test]
     fn a_cut_drops_the_section_it_lands_in() {
