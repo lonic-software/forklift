@@ -1843,7 +1843,8 @@ fn operator_remedy(code: forklift_core::error::RefusalCode, own: &str) -> String
 
 /// What a client is told of the damage. An unreadable object's own message names the store's
 /// pack files, and the records read before a root is served name their own paths, which are not
-/// named over the wire, so those are replaced; a tombstone list's or withheld record's is kept.
+/// named over the wire, so those are replaced. The tombstone list's and the withheld record's
+/// readers name their record, never its path, so theirs is kept.
 fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> String {
     use forklift_core::error::RefusalCode;
     match code {
@@ -9964,27 +9965,41 @@ mod tests {
             let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
+        /// A damaged tombstone list or served mark is a 503 naming the operator's repair, and the
+        /// message names no file of the server's: the client is told which record is damaged, not
+        /// where it lives.
+        ///
         /// Revert: map the handshake's list read through `internal` → a 500 with no code → red.
         /// Revert: add `Retry-After` to every 503 → the damage answer tells the client to wait →
-        /// red.
+        /// red. Revert: name the served mark's path in its refusal → the mark's cases carry the
+        /// server's path → red.
         #[tokio::test]
-        async fn a_handshake_over_a_damaged_list_refuses_with_its_code_and_no_retry() {
+        async fn a_handshake_over_damaged_tombstones_refuses_with_its_code_and_no_retry() {
             use forklift_core::util::record_utils;
             let (root, _scope, side) = served_with_side("handshake-damaged");
             let list = forklift_core::globals::forklift_root().join("tombstones");
+            let mark = forklift_core::globals::forklift_root().join("served");
+            let (good_list, good_mark) = (std::fs::read(&list).unwrap(), std::fs::read(&mark).unwrap());
             let (first, second) = (format!("{} gone", side), format!("{} gone", "b".repeat(64)));
+            let holding = record_utils::to_bytes("tombstones", 3, [first.as_str()]);
 
-            let damages: [(&str, Option<Vec<u8>>); 4] = [
-                ("not text", Some(b"\xff\xfe not text".to_vec())),
-                ("a bad entry", Some(record_utils::to_bytes("tombstones", 3, ["nothash gone"]))),
-                ("a duplicate", Some(record_utils::to_bytes("tombstones", 3, [first.as_str(), second.as_str()]))),
-                ("an absent list", None),
+            // (what, the list's bytes, the mark's bytes), `None` for an absent file.
+            let damages: [(&str, Option<Vec<u8>>, Option<Vec<u8>>); 7] = [
+                ("a list not text", Some(b"\xff\xfe not text".to_vec()), Some(good_mark.clone())),
+                ("a bad entry", Some(record_utils::to_bytes("tombstones", 3, ["nothash gone"])), Some(good_mark.clone())),
+                ("a duplicate", Some(record_utils::to_bytes("tombstones", 3, [first.as_str(), second.as_str()])), Some(good_mark.clone())),
+                ("an absent list", None, Some(good_mark.clone())),
+                ("a mark not text", Some(good_list.clone()), Some(b"\xff\xfe not text".to_vec())),
+                ("a mark with no digest", Some(good_list.clone()), Some(b"/forklift-served 2\n".to_vec())),
+                ("a lost mark beside a tombstone", Some(holding), None),
             ];
 
-            for (what, bytes) in damages {
-                match bytes {
-                    Some(bytes) => std::fs::write(&list, bytes).unwrap(),
-                    None => forklift_core::util::file_utils::remove_file(&list).unwrap(),
+            for (what, list_bytes, mark_bytes) in damages {
+                for (path, bytes) in [(&list, list_bytes), (&mark, mark_bytes)] {
+                    match bytes {
+                        Some(bytes) => std::fs::write(path, bytes).unwrap(),
+                        None => forklift_core::util::file_utils::remove_file(path).unwrap(),
+                    }
                 }
 
                 let response = get_warehouse(State(Arc::new(single_mode_state(root.clone()))), Path(PathParams::new()))
@@ -9995,7 +10010,8 @@ mod tests {
                 let body = body_text(response).await;
                 assert!(body.contains(r#""code":"tombstones_damaged""#), "{}: {}", what, body);
                 assert!(body.contains("forklift-server tombstone repair --root <warehouse>"), "{}: {}", what, body);
-            assert!(!body.contains("repair --root /") && !body.contains("repair --root '"), "{}: no server path: {}", what, body);
+                let absolute = std::path::absolute(&root).unwrap();
+                assert!(!body.contains(&*absolute.to_string_lossy()) && !body.contains(".forklift"), "{}: no server path: {}", what, body);
             }
             let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }

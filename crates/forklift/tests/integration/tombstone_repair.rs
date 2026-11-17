@@ -364,9 +364,13 @@ fn a_repair_over_a_lost_mark_beside_a_whole_list_writes_only_the_mark() {
     let before = std::fs::read(list_path(&root)).unwrap();
     forklift_core::util::file_utils::remove_file(root.join(".forklift").join("served")).unwrap();
 
-    area.server_ok(&root, &["tombstone", "repair"]);
+    let report = area.server_ok(&root, &["tombstone", "repair"]);
 
     assert_eq!(std::fs::read(list_path(&root)).unwrap(), before, "a whole list is left as it was");
+    // Revert: report a mark-only repair as a salvage → "Kept 0 entries of the old list" over a
+    // list that still holds "side" → red.
+    assert!(report.contains("The tombstone list reads whole, so it was left as it was."), "{}", report);
+    assert!(!report.contains("Kept 0 entries") && !report.contains("no head was kept"), "nothing was salvaged: {}", report);
     assert!(root.join(".forklift").join("served").exists());
     let listed = area.server_ok(&root, &["tombstone", "list"]);
     assert!(listed.contains(&side) && !listed.contains(&gone), "{}", listed);
