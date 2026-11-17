@@ -7670,12 +7670,12 @@ mod tests {
     }
 
     /// A multi-warehouse server refuses an unfinished clone (503) as single mode does: it has
-    /// not finished fetching, so what it holds cannot be trusted yet. A fetch scope that cannot be
-    /// read is a 500.
+    /// not finished fetching, so what it holds cannot be trusted yet. A sparse root whose fetch scope
+    /// cannot be read is still partial: a 409.
     ///
     /// Revert: drop the clone gate from `serving` → `unfinished` is served → red.
     #[test]
-    fn a_multi_server_refuses_an_unfinished_franchise_and_an_unreadable_scope() {
+    fn a_multi_server_refuses_an_unfinished_franchise_and_a_sparse_root_with_an_unreadable_scope() {
         let base = scratch_dir("unfinished-multi");
         let state = capped_state(&base, 4, &["unfinished", "garbled"]);
 
@@ -7693,7 +7693,7 @@ mod tests {
             std::fs::write(scope_utils::fetch_scope_path(), b"not a scope file").unwrap();
         }
         let refused = resolve_handle(&state, &warehouse_params("garbled")).err().expect("refused");
-        assert_eq!(refused.0, StatusCode::INTERNAL_SERVER_ERROR, "{}", refused.1);
+        assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
 
         assert!(live_ids(&state).is_empty());
         drop(state);

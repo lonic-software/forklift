@@ -2510,7 +2510,7 @@ mod tests {
         let Err(error) = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()) else {
             panic!("an unreadable record must fail the plan");
         };
-        assert!(error.contains("sealed-object record") && error.contains("Run \"forklift heal\"")
+        assert!(error.contains("sealed-object record") && error.contains("Heal rebuilds it")
             && error.ends_with("Then run the prune again."), "{}", error);
     }
 }
