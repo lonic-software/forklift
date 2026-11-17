@@ -1854,7 +1854,7 @@ fn damage_message(code: forklift_core::error::RefusalCode, human: String) -> Str
         RefusalCode::UnavailableDamaged =>
             "The warehouse's record of content it cannot get does not read, so what it lacks cannot be told, and the request was refused.".to_string(),
         RefusalCode::OriginDamaged =>
-            "The warehouse is recorded as full but holds an origin record, which only a partial warehouse has, so content its pallets reach may be absent; the record does not read, and the request was refused. Serve a full clone instead.".to_string(),
+            "The warehouse is recorded as full but holds an origin record, which only a partial warehouse has, so content its pallets reach may be absent; the record does not read, and the request was refused. Its operator can serve a full clone in its place.".to_string(),
         _ => human,
     }
 }
