@@ -27,6 +27,7 @@ mod events;
 mod guide_pages;
 mod mirror;
 mod nested_working_trees;
+mod config_heal;
 mod position_heal;
 mod query;
 mod recovery_page;
