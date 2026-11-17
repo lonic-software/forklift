@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 51;
+pub const SCHEMA_VERSION: u32 = 52;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -620,6 +620,9 @@ error_codes! {
 
     /// A configuration file is damaged; nothing was changed.
     ConfigDamaged,
+
+    /// The inventory metadata is damaged, or missing over staged shards; nothing was changed.
+    InventoryDamaged,
 }
 
 impl ErrorCode {
@@ -690,6 +693,7 @@ impl ErrorCode {
             ErrorCode::ObjectKindMismatch => RefusalCode::ObjectKindMismatch.as_str(),
             ErrorCode::BayPositionDamaged => RefusalCode::BayPositionDamaged.as_str(),
             ErrorCode::ConfigDamaged => RefusalCode::ConfigDamaged.as_str(),
+            ErrorCode::InventoryDamaged => RefusalCode::InventoryDamaged.as_str(),
         }
     }
 
@@ -763,6 +767,7 @@ impl ErrorCode {
             ErrorCode::ObjectKindMismatch => 63,
             ErrorCode::BayPositionDamaged => 64,
             ErrorCode::ConfigDamaged => 65,
+            ErrorCode::InventoryDamaged => 66,
         }
     }
 
@@ -923,7 +928,9 @@ impl ErrorCode {
             ErrorCode::BayPositionDamaged =>
                 "The bay's position, the pallet it stands on and the parcel its files stand on, is missing or does not parse. Nothing was changed; heal rebuilds it from its copy or from an interrupted operation, and otherwise lists the pallets for heal --position to put the bay on",
             ErrorCode::ConfigDamaged =>
-                "A configuration file holds bytes that are not text or that TOML never allows, or it was cut short. Nothing was changed; in the warehouse's own file heal names what mending it would drop, and heal --config keeps every entry the damage provably spared, after setting the damaged bytes aside"
+                "A configuration file holds bytes that are not text or that TOML never allows, or it was cut short. Nothing was changed; in the warehouse's own file heal names what mending it would drop, and heal --config keeps every entry the damage provably spared, after setting the damaged bytes aside",
+            ErrorCode::InventoryDamaged =>
+                "The inventory metadata, the set of directories with staged content, does not parse, or it is missing while the staging area still holds shards. Nothing was changed; heal rebuilds it from the directories the working tree, the bay's base and an interrupted operation name, and heal --inventory writes it even when some staged shard matches none of them"
         }
     }
 
@@ -995,6 +1002,7 @@ impl ErrorCode {
             RefusalCode::ObjectKindMismatch => ErrorCode::ObjectKindMismatch,
             RefusalCode::BayPositionDamaged => ErrorCode::BayPositionDamaged,
             RefusalCode::ConfigDamaged => ErrorCode::ConfigDamaged,
+            RefusalCode::InventoryDamaged => ErrorCode::InventoryDamaged,
         }
     }
 }
@@ -1653,6 +1661,7 @@ mod tests {
             (RefusalCode::ObjectKindMismatch, "object_kind_mismatch", 63),
             (RefusalCode::BayPositionDamaged, "bay_position_damaged", 64),
             (RefusalCode::ConfigDamaged, "config_damaged", 65),
+            (RefusalCode::InventoryDamaged, "inventory_damaged", 66),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.
