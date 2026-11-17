@@ -7579,7 +7579,8 @@ mod tests {
         let mut entry = std::fs::read(forklift("unavailable-entry").join("unavailable")).unwrap();
         entry.extend(b"not an entry\n");
         std::fs::write(forklift("unavailable-entry").join("unavailable"), entry).unwrap();
-        std::fs::write(forklift("unavailable-newer").join("unavailable"), b"/forklift-unavailable 999\n").unwrap();
+        std::fs::write(forklift("unavailable-newer").join("unavailable"),
+                       forklift_core::util::record_utils::with_digest(b"/forklift-unavailable 999\n".to_vec())).unwrap();
         std::fs::write(forklift("origin").join("origin"), b"not a record").unwrap();
 
         for (id, what, code, heal) in cases {
@@ -7766,7 +7767,7 @@ mod tests {
         let recipe = object_utils::hash_object_bytes(&object_utils::blob_bytes(b"a deleted recipe"));
         withholding::withhold(&recipe, "statement").unwrap();
         let journal = forklift_core::util::record_utils::to_bytes(
-            "redactions-chunks-owed", 1, [format!("{} {}", recipe, chunk)]
+            "redactions-chunks-owed", 2, [format!("{} {}", recipe, chunk)]
         );
         std::fs::write(root.join(FOLDER_NAME_FORKLIFT_ROOT).join("redactions-chunks-owed"), journal).unwrap();
         assert_eq!(redaction_deleter::recipes_owing_chunks().unwrap(), [recipe.clone()].into());
@@ -9971,8 +9972,8 @@ mod tests {
 
             let damages: [(&str, Option<Vec<u8>>); 4] = [
                 ("not text", Some(b"\xff\xfe not text".to_vec())),
-                ("a bad entry", Some(record_utils::to_bytes_digested("tombstones", 3, ["nothash gone"]))),
-                ("a duplicate", Some(record_utils::to_bytes_digested("tombstones", 3, [first.as_str(), second.as_str()]))),
+                ("a bad entry", Some(record_utils::to_bytes("tombstones", 3, ["nothash gone"]))),
+                ("a duplicate", Some(record_utils::to_bytes("tombstones", 3, [first.as_str(), second.as_str()]))),
                 ("an absent list", None),
             ];
 

@@ -43,7 +43,7 @@ use crate::util::applied_redactions::AppliedSet;
 /// version.
 const FILE_NAME_CHUNKS_OWED: &str = "redactions-chunks-owed";
 const CHUNKS_OWED_RECORD: &str = "redactions-chunks-owed";
-const CHUNKS_OWED_VERSION: u32 = 1;
+const CHUNKS_OWED_VERSION: u32 = 2;
 
 fn chunks_owed_path() -> PathBuf {
     forklift_root().join(FILE_NAME_CHUNKS_OWED)

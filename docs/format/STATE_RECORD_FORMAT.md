@@ -13,6 +13,7 @@ readable by eye.
 [entry_1][NL]
 [entry_2][NL]
 ...
+digest [blake3][NL]
 ```
 Where:
 - `/forklift-[kind] [version]` is the header: the kind of file and the version of its format,
@@ -21,30 +22,34 @@ Where:
 - `entry_n` is one entry, escaped: `\` is written `\\`, a line feed `\n` and a carriage return
   `\r`. No other escape exists. An escaped entry holds no line break, so a line is exactly one
   entry. An entry may be empty, which is an empty line.
+- `digest [blake3]` is the last line, and is not an entry: the BLAKE3 hash of every byte
+  before it, in lowercase hex. Damage that still parses, such as a flipped digit in a hash or a
+  cut on a line boundary, then shows. This framing is frozen across versions.
 - `NL` is an ASCII newline character (decimal value `10`), written after every line, the last
   one included.
 
 ## Reading
-A reader refuses, and never guesses at, a file that:
-- does not open with the header of its kind — an older Forklift wrote it, before the format was
-  versioned, or it is not this kind of file at all;
-- names a version of its kind the reader does not know;
-- ends without a newline, so it was cut short;
-- holds a raw carriage return, or a `\` that is not one of the three escapes;
-- is not UTF-8.
+A reader checks the digest first, and refuses, never guessing at, a file that:
+- ends in a digest line that does not match its bytes: it is damaged;
+- has no digest line, and opens with the header of an older version of its kind: an older
+  Forklift wrote it, before the record carried a digest;
+- has no digest line otherwise: it does not open with the header of its kind at all, so it is
+  not this kind of file or an older Forklift wrote it before the format was versioned, or it
+  does, and was cut short;
+- matches its digest but names a version of its kind the reader does not know: a newer
+  Forklift wrote it;
+- holds a raw carriage return, or a `\` that is not one of the three escapes, or is not UTF-8.
+
+Only a record whose digest matches is told apart as a newer version's, so damage to a header
+never passes for one.
 
 Nothing is migrated. Each error names the file and what is wrong with it, and, where Forklift has
 one, the way out. Every writer replaces its file atomically, so a crash never leaves one cut short.
 
-## Digested records
-Some records end with one more line, `digest <blake3 of every byte before this line, in lowercase
-hex>`, which is not an entry: the warehouse marker, `parked`, and a server's `served`,
-`tombstones` and `withheld`. Damage that still parses, such as a flipped digit in a hash, then
-shows. A reader refuses a record whose digest is absent or does not match its bytes as damaged,
-never read, and only a record whose digest matches is told apart as a newer version's. A server's
-records are checked against the digest before anything else, so one a version from before the
-digest wrote is refused as damaged too. The marker judges its header first, so an older marker
-gets its own refusal (see [the warehouse format](WAREHOUSE_FORMAT.md)).
+## The records with an older digest
+The warehouse marker, `parked`, and a server's `served`, `tombstones` and `withheld` carried
+the digest first. The marker names what an older marker of its own lacked (see [the warehouse
+format](WAREHOUSE_FORMAT.md)).
 
 ## Files
 | File | Kind | Entries |
@@ -58,7 +63,7 @@ gets its own refusal (see [the warehouse format](WAREHOUSE_FORMAT.md)).
 | `parked` (bay-local) | `parked` | One parked parcel hash per entry, the most recently parked last. |
 | `path` (in a bay's state folder) | `bay-path` | The bay's working directory. |
 | `position` (bay-local) | `position` | The current pallet's name, then the bay's base: the parcel its files stand on, empty while the pallet is unborn. See [pallet refs](PALLET_REFS.md). |
-| `scope` (bay-local), `.forklift/config/fetch-scope` | `scope` | See [the scope file format](SCOPE_FILE_FORMAT.md), which adds an empty-file rule of its own and says which of these files must exist. |
+| `scope` (bay-local), `.forklift/config/fetch-scope` | `scope` | See [the scope file format](SCOPE_FILE_FORMAT.md), which says which of these files must exist. |
 | `.forklift/warehouse` | `warehouse` | `format N`, then what the warehouse holds, `full`, `sparse` (cloned with `--only`) or `cache` (cloned with `--cache`), then an optional `upgrading M S`. This framing is frozen; see [the warehouse format](WAREHOUSE_FORMAT.md). `prepare` writes it last, so its presence marks a complete warehouse. A marker missing an entry, with an extra one, or with a word its own format says this build should know and does not, is refused, and so is a marker of kind version 1 or 2, which recorded no format: make the warehouse again. A sparse warehouse's fetch scope must agree with it; see [the scope file format](SCOPE_FILE_FORMAT.md#the-fetch-scope-and-the-warehouse-mode). |
 | `.forklift/served` | `served` | None. Its presence marks a warehouse a `forklift-server` has served; nothing removes it. A mark that exists but cannot be read is an error, never "not served". |
 | `.forklift/tombstones` | `tombstones` | One `<head> <pallet>` per deleted pallet of a served warehouse: the head its ref held, then its name; or `<head>` alone, a head kept with no name. |
@@ -69,9 +74,9 @@ Bay-local files live in the bay's state folder: `.forklift/` for the main tree,
 `.forklift/bays/<name>/` for a bay. Paths in the `bay` and `bay-path` records are filesystem
 paths, which must be UTF-8; a bay at a path that is not is refused.
 
-Taint files (`.forklift/taint/`) escape their paths the same way under a `/forklift-taint 1`
-header, followed by an `END` line, but are read differently: a taint file that cannot be fully
-read is not refused but counts as torn, which makes the next recovery check everything.
+Taint files (`.forklift/taint/`) are state records of kind `taint`, one path per entry, but are
+read differently: one that does not match its digest is not refused but counts as torn, which
+makes the next recovery check everything.
 
 ## Not state records
 Some other line-per-entry files keep formats of their own, because no entry of theirs can hold

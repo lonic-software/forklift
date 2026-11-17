@@ -495,7 +495,7 @@ fn catch_up_step(pallet: &str) -> String {
 /// The [`record_utils`] kind and version of a bay's position file: the pallet name, then the base
 /// parcel hash (an empty entry for an unborn pallet).
 const POSITION_RECORD: &str = "position";
-const POSITION_VERSION: u32 = 1;
+const POSITION_VERSION: u32 = 2;
 
 /// Read the active bay's position.
 ///

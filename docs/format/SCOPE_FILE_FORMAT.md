@@ -19,39 +19,47 @@ collaborators. Which of them must exist is set out [below](#which-scope-files-mu
 A [state record](STATE_RECORD_FORMAT.md) of kind `scope`: a format header line, then one
 in-scope path prefix per line, escaped:
 ```
-/forklift-scope 4[NL]
+/forklift-scope 5[NL]
 [prefix_1][NL]
 [prefix_2][NL]
 ...
+digest [blake3][NL]
 ```
 Where:
-- `/forklift-scope 4` names the format. It opens with `/`, which no stored prefix can, so it
-  cannot be mistaken for a prefix. A full scope is written as the empty file, with no header.
+- `/forklift-scope 5` names the format. It opens with `/`, which no stored prefix can, so it
+  cannot be mistaken for a prefix. A full scope is written as the header and digest alone, with
+  no prefix.
 - `prefix_n` is a **warehouse path key**: `/`-separated, relative to the warehouse root,
   with no leading or trailing `/` and no `.`/`..` components (e.g. `src/api`). A prefix names
   a directory; everything at or under it is *in scope*. It is escaped as every state record
   entry is: `\` as `\\`, a line feed as `\n`, a carriage return as `\r`, since a directory name
   may hold any of them.
-- `NL` is an ASCII newline character (decimal value `10`), written after every prefix
+- `digest [blake3]` is the digest every [state record](STATE_RECORD_FORMAT.md) ends in. A file
+  that does not match its digest is refused as damaged, so a cut never narrows or widens a
+  scope.
+- `NL` is an ASCII newline character (decimal value `10`), written after every line
   (including the last).
 
 ## Semantics
-- An **empty file** means **full scope** — no restriction, the whole tree is in scope, and
-  every scope-aware operation behaves exactly as in an unscoped checkout. An **absent** file is
-  never read as full on its own account: whether each file may be absent, or empty, is decided
+- A file naming **no prefix** means **full scope** — no restriction, the whole tree is in
+  scope, and every scope-aware operation behaves exactly as in an unscoped checkout. An **empty
+  file** is refused: a cut could leave one, and reading it as full would widen a sparse scope.
+  An **absent** file is
+  never read as full on its own account: whether each file may be absent, or full, is decided
   by whose scope it is and by the warehouse mode ([below](#which-scope-files-must-exist)).
-- A header followed by no prefix is **refused**, and so is one with a root prefix (an empty
-  string or `/`) anywhere among its prefixes, since the root takes in everything. Forklift
-  never writes either: the full scope is the empty file.
+- A file with a root prefix (an empty string or `/`) anywhere among its prefixes is
+  **refused**, since the root takes in everything. Forklift never writes one: the full scope
+  names no prefix.
 - Prefixes are trimmed of surrounding `/`, de-duplicated and sorted, giving a canonical
   on-disk form. Whitespace is part of a prefix: a directory name may begin or end with a space.
-- A non-empty file whose first line is not the header is the unversioned format 1, written
+- A file whose first line is not the header is the unversioned format 1, written
   before the root ignore file joined every scope, and is **refused** — read under today's
   meaning, the never-inventoried ignore file would show as removed and the next stack would
   commit the removal. A header naming any other version is refused too, format 2 included,
   which wrote prefixes raw, so a prefix holding a line break read back as two, and format 3,
   whose scopes left out the `.gitignore` of each folder above a prefix: read under today's
-  meaning, each would show as removed in the same way. Nothing is migrated.
+  meaning, each would show as removed in the same way, and format 4, which carried no digest,
+  so a cut on a line boundary narrowed it silently. Nothing is migrated.
   The way out depends on the file: for the fetch scope, `forklift heal`, which rebuilds it
   from the checkouts' scopes; for the main tree's scope, clone the remote again, into a new
   directory; for a bay's scope, remove the bay with `bay remove`
@@ -71,7 +79,7 @@ out.
 The main tree's scope follows the mode, as the fetch scope does: only a sparse clone
 scopes the main tree, and `scope narrow` cannot scope a checkout that holds every path. A bay's scope
 is the bay's own, since a full warehouse may hold a scoped bay, so `bay add` writes it for every
-bay, the empty file for an unscoped one, and a bay without one is refused in every mode. In a
+bay, the full scope for an unscoped one, and a bay without one is refused in every mode. In a
 sparse warehouse `bay add` without `--scope` is refused before any bay state is made.
 
 ### The fetch scope and the warehouse mode
@@ -81,7 +89,7 @@ content as it needs it, so neither has a fetch-scope file. A sparse warehouse
 must have one, naming at least one prefix. Reading the fetch scope refuses every other
 pairing:
 
-- A sparse warehouse whose file is missing or empty is never read as full, since it would then
+- A sparse warehouse whose file is missing or names no prefix is never read as full, since it would then
   claim content it never fetched. The way out is to clone the remote again, into a new
   directory.
 - A full warehouse or a cache with a fetch-scope file is refused whatever the file holds. Only

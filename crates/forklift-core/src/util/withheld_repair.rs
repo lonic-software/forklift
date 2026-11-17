@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn a_newer_record_is_left_for_the_forklift_that_wrote_it_and_a_damaged_header_is_repaired() {
         let _scratch = Scratch::new("version");
-        let newer = record_utils::to_bytes_digested("withheld", 4, [format!("{} - statement", A)]);
+        let newer = record_utils::to_bytes("withheld", 4, [format!("{} - statement", A)]);
         std::fs::write(record(), &newer).unwrap();
 
         let refusal = repair_withheld().unwrap_err();
@@ -386,7 +386,7 @@ mod tests {
         assert!(aside().is_empty());
 
         // The same header, damaged from version 3 into 4: it no longer matches the digest.
-        let mut damaged = record_utils::to_bytes_digested("withheld", 3, [format!("{} - statement", A)]);
+        let mut damaged = record_utils::to_bytes("withheld", 3, [format!("{} - statement", A)]);
         damaged["/forklift-withheld ".len()] = b'4';
         std::fs::write(record(), &damaged).unwrap();
         let repaired = repair_withheld().unwrap();
@@ -414,7 +414,7 @@ mod tests {
         let _scratch = Scratch::new("altered");
         assert!(tombstone_utils::mark_served(true).unwrap());
 
-        let mut bytes = record_utils::to_bytes_digested("withheld", 3, [format!("{} - court order 7", A)]);
+        let mut bytes = record_utils::to_bytes("withheld", 3, [format!("{} - court order 7", A)]);
         bytes["/forklift-withheld 3\n".len()] = b'b';
         std::fs::write(record(), &bytes).unwrap();
         assert!(withholding::is_damage(&withholding::read_withheld().unwrap_err()));

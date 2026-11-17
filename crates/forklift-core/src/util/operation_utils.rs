@@ -38,7 +38,7 @@ const FILE_NAME_OPERATION: &str = "operation";
 
 /// The [`record_utils`] kind and version of the marker file.
 const OPERATION_RECORD: &str = "operation";
-const OPERATION_VERSION: u32 = 5;
+const OPERATION_VERSION: u32 = 6;
 
 /// The operations that raise the marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -893,6 +893,16 @@ pub(crate) fn raise_for_fixture() {
 mod tests {
     use super::*;
 
+    /// A record's bytes before its digest line, as text, for a test that edits its entries.
+    fn body(bytes: &[u8]) -> String {
+        String::from_utf8(record_utils::without_digest_line(bytes).to_vec()).unwrap()
+    }
+
+    /// `text` digested as a writer would, so an edit to its entries reads as written.
+    fn digested(text: &str) -> Vec<u8> {
+        record_utils::with_digest(text.as_bytes().to_vec())
+    }
+
     fn operation() -> Operation {
         let mut operation = Operation::new(
             OperationKind::Merge,
@@ -929,12 +939,12 @@ mod tests {
         }
 
         // The anchor is the entry before the pathspec's count, the last one here.
-        let text = String::from_utf8(operation.to_bytes()).unwrap();
+        let text = body(&operation.to_bytes());
         let mut lines: Vec<&str> = text.strip_suffix('\n').unwrap().split('\n').collect();
         assert_eq!(lines.pop(), Some("0"));
         assert_eq!(lines.pop(), Some(""), "the anchor, not consumed");
         let unknown = [lines.as_slice(), &["bytes zz", "0"]].concat().join("\n") + "\n";
-        assert_eq!(Operation::from_bytes(unknown.as_bytes()), Err("is malformed.".to_string()));
+        assert_eq!(Operation::from_bytes(&digested(&unknown)), Err("is malformed.".to_string()));
     }
 
     // Revert: write the pathspec but drop it on the read → the round trip loses it.
@@ -947,7 +957,7 @@ mod tests {
         assert_eq!(Operation::from_bytes(&operation.to_bytes()), Ok(operation.clone()));
 
         // The count, the paths, then the carried triple.
-        let text = String::from_utf8(operation.to_bytes()).unwrap();
+        let text = body(&operation.to_bytes());
         let lines: Vec<&str> = text.strip_suffix('\n').unwrap().split('\n').collect();
         let head = &lines[..lines.len() - 6];
         assert_eq!(&lines[lines.len() - 6..], ["2", "a", "b/c.txt", "mv/from.txt", "", ""]);
@@ -967,7 +977,7 @@ mod tests {
             with(&["2", "a", "a/c.txt", "mv/from.txt", "", ""]),
             with(&["2", "a", "a", "mv/from.txt", "", ""]),
         ] {
-            assert_eq!(Operation::from_bytes(malformed.as_bytes()), Err("is malformed.".to_string()), "{}", malformed);
+            assert_eq!(Operation::from_bytes(&digested(&malformed)), Err("is malformed.".to_string()), "{}", malformed);
         }
 
         // Only a park records paths.
@@ -987,7 +997,7 @@ mod tests {
         ];
         assert_eq!(Operation::from_bytes(&operation.to_bytes()), Ok(operation.clone()));
 
-        let text = String::from_utf8(operation.to_bytes()).unwrap();
+        let text = body(&operation.to_bytes());
         let lines: Vec<&str> = text.strip_suffix('\n').unwrap().split('\n').collect();
         let with_last = |last: &[&str]| [&lines[..lines.len() - 3], last].concat().join("\n") + "\n";
         assert_eq!(with_last(&lines[lines.len() - 3..]), text, "the edits below change only the last entry");
@@ -1000,25 +1010,25 @@ mod tests {
             with_last(&["mv/from.txt", "zz", "1 0"]),
             with_last(&["", "", ""]),
         ] {
-            assert_eq!(Operation::from_bytes(malformed.as_bytes()), Err("is malformed.".to_string()), "{}", malformed);
+            assert_eq!(Operation::from_bytes(&digested(&malformed)), Err("is malformed.".to_string()), "{}", malformed);
         }
     }
 
     #[test]
     fn a_record_of_an_unknown_operation_or_another_version_refuses() {
-        let text = String::from_utf8(operation().to_bytes()).unwrap();
+        let text = body(&operation().to_bytes());
 
         let unknown = text.replace("\nmerge\n", "\nrebase\n");
-        assert!(Operation::from_bytes(unknown.as_bytes()).unwrap_err().contains("does not know (\"rebase\")"));
+        assert!(Operation::from_bytes(&digested(&unknown)).unwrap_err().contains("does not know (\"rebase\")"));
 
         let newer = text.replace(
             &format!("/forklift-operation {}", OPERATION_VERSION), &format!("/forklift-operation {}", OPERATION_VERSION + 1)
         );
         assert_ne!(newer, text);
-        assert!(Operation::from_bytes(newer.as_bytes()).unwrap_err().contains("does not know"));
+        assert!(Operation::from_bytes(&digested(&newer)).unwrap_err().contains("does not know"));
 
         let short = text.trim_end_matches('\n').rsplit_once('\n').unwrap().0.to_string() + "\n";
-        assert_eq!(Operation::from_bytes(short.as_bytes()), Err("is malformed.".to_string()));
+        assert_eq!(Operation::from_bytes(&digested(&short)), Err("is malformed.".to_string()));
     }
 
     #[test]

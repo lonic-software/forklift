@@ -33,7 +33,7 @@ use crate::util::{file_utils, origin_utils, record_utils, sign_utils};
 /// The intent's file name in the shared forklift root, and its [`record_utils`] kind and version.
 pub const FILE_NAME: &str = "origin-move";
 const RECORD: &str = "origin-move";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 /// How far a move has got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

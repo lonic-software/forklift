@@ -196,7 +196,7 @@ impl Warehouse {
         sorted.sort();
         let lines: String = sorted.iter().map(|hash| format!("{}\n", hash)).collect();
         std::fs::write(self.root.join(".forklift").join("redactions-applied"),
-                       format!("/forklift-redactions-applied 1\n{}", lines)).unwrap();
+                       forklift_core::util::record_utils::with_digest(format!("/forklift-redactions-applied 2\n{}", lines).into_bytes())).unwrap();
     }
 
     /// Run `work` inside this warehouse's storage scope.
@@ -1042,9 +1042,9 @@ fn a_full_repack_prunes_the_unavailable_record_and_never_fails_over_it() {
         "only the absent file a head names stays");
 
     let record = warehouse.root.join(".forklift").join("unavailable");
-    std::fs::write(&record, "/forklift-unavailable 999\n").unwrap();
+    std::fs::write(&record, forklift_core::util::record_utils::with_digest(b"/forklift-unavailable 999\n".to_vec())).unwrap();
     warehouse.run_ok(&["store", "compact", "--all"]);
-    assert_eq!(std::fs::read_to_string(&record).unwrap(), "/forklift-unavailable 999\n", "never written over");
+    assert_eq!(std::fs::read(&record).unwrap(), forklift_core::util::record_utils::with_digest(b"/forklift-unavailable 999\n".to_vec()), "never written over");
 }
 
 /// Heal drops the unavailable record's entry of an object the store holds again and notes it, and
@@ -1066,7 +1066,7 @@ fn heal_drops_a_present_unavailable_entry_and_keeps_an_absent_one() {
     let kept = warehouse.scoped(|| unavailable::read_unavailable().unwrap());
     assert_eq!(kept.entries().map(|(hash, _)| hash.clone()).collect::<Vec<_>>(), [unnamed]);
 
-    std::fs::write(warehouse.root.join(".forklift").join("unavailable"), "/forklift-unavailable 999\n").unwrap();
+    std::fs::write(warehouse.root.join(".forklift").join("unavailable"), forklift_core::util::record_utils::with_digest(b"/forklift-unavailable 999\n".to_vec())).unwrap();
     let healed = warehouse.run_ok(&["heal", "--json"]);
     let report: serde_json::Value = serde_json::from_slice(&healed.stdout).unwrap();
     assert!(report["data"]["notes"].to_string().contains("was not checked against the store"), "{}", report);

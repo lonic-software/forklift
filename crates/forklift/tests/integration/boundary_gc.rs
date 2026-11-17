@@ -977,8 +977,8 @@ fn a_pick_whose_source_was_lost_refuses_naming_the_pick_and_the_abort_works() {
 /// clears, and names the tag in a note.
 ///
 /// The taint is written directly rather than driven through a command because a torn taint is by
-/// definition crash debris: `parse_taint_content` calls a file torn when it lacks the `END\n`
-/// suffix, which is exactly what a crash mid-write leaves. Everything else here is a shipped
+/// definition crash debris: `parse_taint_content` calls a file torn when it does not match its
+/// digest, which is exactly what a crash mid-write leaves. Everything else here is a shipped
 /// command.
 ///
 /// Mutation: queue tag subjects at `AbsencePolicy::Report` in `walk_closure_for` → the rescan
@@ -1020,7 +1020,7 @@ fn a_torn_taint_over_an_absent_tag_subject_heals_and_names_the_tag() {
 
     let taint_dir = warehouse.root.join(".forklift").join("taint");
     std::fs::create_dir_all(&taint_dir).unwrap();
-    std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 1\nobjects/ab/cdef\n").unwrap();
+    std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 2\nobjects/ab/cdef\n").unwrap();
 
     let healed = warehouse.run(&["heal"]);
     let heal_out = String::from_utf8_lossy(&healed.stdout).to_string();
@@ -1175,7 +1175,7 @@ fn a_torn_taint_heals_over_a_malformed_tag_record_and_notes_it() {
 
     let taint_dir = warehouse.root.join(".forklift").join("taint");
     std::fs::create_dir_all(&taint_dir).unwrap();
-    std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 1\nobjects/ab/cdef\n").unwrap();
+    std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 2\nobjects/ab/cdef\n").unwrap();
 
     let healed = warehouse.run(&["heal"]);
     let heal_out = String::from_utf8_lossy(&healed.stdout).to_string();
@@ -1231,7 +1231,7 @@ fn a_lost_tagged_parcel_that_is_also_an_ancestor_still_refuses() {
 
     let taint_dir = warehouse.root.join(".forklift").join("taint");
     std::fs::create_dir_all(&taint_dir).unwrap();
-    std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 1\nobjects/ab/cdef\n").unwrap();
+    std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 2\nobjects/ab/cdef\n").unwrap();
 
     let healed = warehouse.run(&["heal"]);
     let heal_err = String::from_utf8_lossy(&healed.stderr).to_string();
@@ -1272,7 +1272,7 @@ fn a_torn_taint_alone_on_an_untouched_warehouse_is_the_control() {
 
     let taint_dir = warehouse.root.join(".forklift").join("taint");
     std::fs::create_dir_all(&taint_dir).unwrap();
-    std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 1\nobjects/ab/cdef\n").unwrap();
+    std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 2\nobjects/ab/cdef\n").unwrap();
 
     let healed = warehouse.run(&["heal"]);
     println!(
@@ -1348,7 +1348,7 @@ fn staged_content_survives_collection_and_a_torn_taint_heals_over_it() {
     // The torn taint: crash debris, per `parse_taint_content`.
     let taint_dir = warehouse.root.join(".forklift").join("taint");
     std::fs::create_dir_all(&taint_dir).unwrap();
-    std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 1\nobjects/ab/cdef\n").unwrap();
+    std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 2\nobjects/ab/cdef\n").unwrap();
 
     let healed = warehouse.run(&["heal"]);
     println!("STAGED: heal exit = {:?}\n  stderr: {}",

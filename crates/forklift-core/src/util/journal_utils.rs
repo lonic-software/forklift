@@ -16,15 +16,13 @@ use crate::util::file_utils;
 /// concern, not the journal's.
 const FILE_NAME_JOURNAL: &str = "journal.json";
 
-/// The journal file's format version. The file is `{"version":3,"entries":[...]}`; any version
-/// but this and [`OLDER_JOURNAL_VERSION`], or anything that does not parse as this shape, is
-/// refused by name — never read as an empty journal, which would make `undo` report "nothing to
-/// undo" over a history it lost.
-const JOURNAL_VERSION: u64 = 3;
-
-/// The one older version still read. Version 3 only widened a snapshot's head to optional (a
-/// removed ref, recorded by a delete), so a version-2 entry means exactly what it meant before.
-const OLDER_JOURNAL_VERSION: u64 = 2;
+/// The journal file's format version. The file is `{"version":4,"entries":[...]}`; any other
+/// version, or anything that does not parse as this shape, is refused by name — never read as
+/// an empty journal, which would make `undo` report "nothing to undo" over a history it lost.
+///
+/// Version 4 embeds the digested out-of-scope skeleton record, so an older journal's in-progress
+/// consolidation would not read: it is refused as another version, never as damage.
+const JOURNAL_VERSION: u64 = 4;
 
 /// The op name a pallet delete is journaled under. Its entry records the removed ref with its head
 /// before and none after; the removal writes it itself (see
@@ -1268,15 +1266,15 @@ fn read_from(path: &Path) -> Result<Vec<JournalEntry>, String> {
     let version = match value.get("version") {
         Some(version) => version.as_u64().ok_or_else(|| unreadable(&path, &format!(
             "has an unreadable format version ({}), which this forklift does not understand \
-            (it reads versions {} and {})", version, OLDER_JOURNAL_VERSION, JOURNAL_VERSION
+            (it reads version {})", version, JOURNAL_VERSION
         )))?,
         None => return Err(unreadable(&path, "is not a readable journal (it records no format version)")),
     };
 
-    if version != JOURNAL_VERSION && version != OLDER_JOURNAL_VERSION {
+    if version != JOURNAL_VERSION {
         return Err(unreadable(&path, &format!(
-            "has format version {}, which this forklift does not understand (it reads versions {} and {})",
-            version, OLDER_JOURNAL_VERSION, JOURNAL_VERSION
+            "has format version {}, which this forklift does not understand (it reads version {})",
+            version, JOURNAL_VERSION
         )));
     }
 
@@ -1286,14 +1284,6 @@ fn read_from(path: &Path) -> Result<Vec<JournalEntry>, String> {
     for entry in &contents.entries {
         validate_entry(entry)
             .map_err(|reason| unreadable(&path, &format!("is malformed (an entry {})", reason)))?;
-
-        // A version-2 entry means exactly what it meant before: it cannot record a removal.
-        if version == OLDER_JOURNAL_VERSION && !removed_by(entry).is_empty() {
-            return Err(unreadable(&path, &format!(
-                "is malformed (an entry records a removed ref, which a version {} journal cannot hold)",
-                OLDER_JOURNAL_VERSION
-            )));
-        }
     }
 
     Ok(contents.entries)
@@ -1782,7 +1772,7 @@ mod tests {
         write(&[entry("stack", "main", &hash('1'), &hash('2'))]).unwrap();
 
         let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path()).unwrap()).unwrap();
-        assert_eq!(value["version"], 3);
+        assert_eq!(value["version"], 4);
         assert_eq!(value["entries"][0]["op"], "stack");
         assert_eq!(value["entries"][0]["before"]["heads"]["main"], hash('1'));
         assert_eq!(value["entries"][0]["after"]["heads"]["main"], hash('2'));
@@ -1811,7 +1801,8 @@ mod tests {
 
         // Version 1 is the format before consolidations and picks recorded their base.
         assert_refused_everywhere(r#"{"version":1,"entries":[]}"#, "has format version 1");
-        assert_refused_everywhere(r#"{"version":4,"entries":[]}"#, "has format version 4");
+        assert_refused_everywhere(r#"{"version":3,"entries":[]}"#, "has format version 3");
+        assert_refused_everywhere(r#"{"version":5,"entries":[]}"#, "has format version 5");
         assert_refused_everywhere(r#"{"version":"1","entries":[]}"#, "has an unreadable format version (\"1\")");
     }
 
@@ -1829,7 +1820,7 @@ mod tests {
         let _scratch = Scratch::new("no-after-journal");
 
         let content = format!(
-            r#"{{"version":2,"entries":[{{"op":"stack","before":{{"current_pallet":"main","heads":{{"main":"{}"}},"consolidation":null}}}}]}}"#,
+            r#"{{"version":4,"entries":[{{"op":"stack","before":{{"current_pallet":"main","heads":{{"main":"{}"}},"consolidation":null}}}}]}}"#,
             hash('1')
         );
 
@@ -1907,28 +1898,6 @@ mod tests {
             let content = serde_json::to_string(&JournalFile { version: JOURNAL_VERSION, entries: &[bad] }).unwrap();
             assert_refused_everywhere(&content, reason);
         }
-    }
-
-    #[test]
-    fn a_version_2_journal_is_read_and_written_back_at_version_3() {
-        let _scratch = Scratch::new("v2-journal");
-
-        plant_journal(&format!(
-            r#"{{"version":2,"entries":[{{"op":"stack","before":{{"current_pallet":"main","heads":{{"main":"{}"}},"consolidation":null}},"after":{{"current_pallet":"main","heads":{{"main":"{}"}},"consolidation":null}}}}]}}"#,
-            hash('1'), hash('2')
-        ));
-
-        let entries = read().unwrap();
-        assert_eq!(entries, vec![entry("stack", "main", &hash('1'), &hash('2'))]);
-        assert!(removed_heads_in(&bay_root()).unwrap().is_empty(), "a version-2 journal holds no removals");
-
-        write(&entries).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path()).unwrap()).unwrap();
-        assert_eq!(value["version"], 3);
-
-        // The same delete entry a version-3 journal holds is refused by name at version 2.
-        let delete = serde_json::to_string(&JournalFile { version: OLDER_JOURNAL_VERSION, entries: &[delete_entry("side", &hash('3'))] }).unwrap();
-        assert_refused_everywhere(&delete, "which a version 2 journal cannot hold");
     }
 
     #[test]

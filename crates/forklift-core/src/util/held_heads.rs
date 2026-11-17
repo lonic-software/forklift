@@ -29,7 +29,7 @@ use crate::util::{file_utils, merge_utils, object_utils, origin_move, pallet_uti
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
 const FILE_NAME: &str = "held-heads";
 const RECORD: &str = "held-heads";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// The most heads kept for one pallet; past it, the oldest are dropped.
 pub const CAP_PER_PALLET: usize = 16;

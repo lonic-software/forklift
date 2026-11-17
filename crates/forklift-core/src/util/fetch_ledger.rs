@@ -28,7 +28,7 @@ use crate::util::{file_utils, object_utils, origin_move, record_utils};
 /// The ledger file's name in the shared forklift root, and its [`record_utils`] kind and version.
 const FILE_NAME_LEDGER: &str = "fetched-heads";
 const LEDGER_RECORD: &str = "fetched-heads";
-const LEDGER_VERSION: u32 = 1;
+const LEDGER_VERSION: u32 = 2;
 
 /// One head the ledger recorded: the head, and the pallet it was fetched for or left by. The
 /// pallet is kept for diagnosis; the ledger holds each head once.

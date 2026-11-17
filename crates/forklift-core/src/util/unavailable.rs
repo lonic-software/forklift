@@ -38,7 +38,7 @@ use crate::util::withholding::ChunkDigest;
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
 const FILE_NAME_UNAVAILABLE: &str = "unavailable";
 const UNAVAILABLE_RECORD: &str = "unavailable";
-const UNAVAILABLE_VERSION: u32 = 2;
+const UNAVAILABLE_VERSION: u32 = 3;
 
 fn unavailable_path() -> PathBuf {
     globals::forklift_root().join(FILE_NAME_UNAVAILABLE)
@@ -186,7 +186,9 @@ pub struct Rebuilt {
 /// UTF-8, its escapes read, it ends in its newline, and it parses as an entry: a record cut inside
 /// its last entry would otherwise keep an altered statement.
 ///
-/// A record whose header names a newer version of it is not damage, and is left as it is.
+/// A record that matches its digest and whose header names a newer version of it is not damage,
+/// and is left as it is. A header damaged into a newer version's no longer matches the digest, so
+/// it is rebuilt as damage.
 ///
 /// # Returns
 /// * `Ok(Some(Rebuilt))` - The record was damaged, and is rebuilt.
@@ -220,14 +222,15 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
     Ok(Some(Rebuilt { set_aside, kept: set.entries.len(), dropped }))
 }
 
-/// Whether the record `bytes` opens with this record's header at a newer version.
+/// Whether the record `bytes` matches its digest and opens with this record's header at a newer
+/// version: a header damaged into a newer version's matches no digest, so it is rebuilt.
 fn written_by_newer(bytes: &[u8]) -> bool {
     record_utils::written_by_newer(bytes, UNAVAILABLE_RECORD, UNAVAILABLE_VERSION)
 }
 
 /// Every entry of a damaged record that reads whole (see [`rebuild`]), and how many lines did not.
 fn salvage(bytes: &[u8]) -> (UnavailableSet, usize) {
-    let (entries, dropped) = record_utils::salvage(bytes, parse_entry);
+    let (entries, dropped) = record_utils::salvage(record_utils::without_digest_line(bytes), parse_entry);
 
     (UnavailableSet { entries: entries.into_iter().collect() }, dropped)
 }
@@ -604,8 +607,9 @@ mod tests {
     #[test]
     fn a_damaged_record_is_rebuilt_from_its_whole_entries_and_kept_aside() {
         let _scratch = Scratch::new("rebuild");
-        let mut bytes = recorded_bytes();
-        bytes.extend_from_slice(b"not an entry\n\xff\xfe broken\n");
+        let whole = recorded_bytes();
+        let body = record_utils::without_digest_line(&whole);
+        let bytes = [body, b"not an entry\n\xff\xfe broken\n", &whole[body.len()..]].concat();
         std::fs::write(unavailable_path(), &bytes).unwrap();
         assert!(read_unavailable().is_err());
 
@@ -623,7 +627,8 @@ mod tests {
     fn a_record_cut_inside_its_last_entry_drops_that_entry() {
         let _scratch = Scratch::new("cut");
         let bytes = recorded_bytes();
-        std::fs::write(unavailable_path(), &bytes[..bytes.len() - 3]).unwrap();
+        let body = record_utils::without_digest_line(&bytes);
+        std::fs::write(unavailable_path(), &body[..body.len() - 3]).unwrap();
 
         let rebuilt = rebuild().unwrap().unwrap();
         assert_eq!((rebuilt.kept, rebuilt.dropped), (1, 1));
@@ -645,9 +650,8 @@ mod tests {
         assert_eq!(set_aside_copies(), vec![rebuilt.set_aside]);
     }
 
-    // Revert: drop the newer-version check, or judge it by the whole record's parse → a newer
-    // Forklift's record, damaged past its header, is rewritten as this one's; drop the readable
-    // check → a whole record is copied aside and rewritten.
+    // Revert: drop the newer-version check → a newer Forklift's record is rewritten as this
+    // one's; drop the readable check → a whole record is copied aside and rewritten.
     #[test]
     fn a_readable_missing_or_newer_record_is_left_as_it_is() {
         let _scratch = Scratch::new("left");
@@ -662,14 +666,15 @@ mod tests {
         assert_eq!(rebuild().unwrap(), None);
         assert_eq!(std::fs::read(unavailable_path()).unwrap(), newer);
 
-        // Damage past its header does not make it this version's.
-        let mut damaged = newer.clone();
-        damaged.extend_from_slice(b"\xff\n");
-        std::fs::write(unavailable_path(), &damaged).unwrap();
-        assert_eq!(rebuild().unwrap(), None);
-        assert_eq!(std::fs::read(unavailable_path()).unwrap(), damaged);
         assert!(set_aside_copies().is_empty());
         assert!(read_unavailable().unwrap_err().contains("never writes over it"));
+
+        // A header damaged into a newer version's no longer matches the digest: damage, rebuilt.
+        let mut damaged = bytes.clone();
+        damaged[format!("/forklift-{} ", UNAVAILABLE_RECORD).len()] = b'9';
+        std::fs::write(unavailable_path(), &damaged).unwrap();
+        assert!(read_unavailable().unwrap_err().contains("forklift heal"));
+        assert_eq!(rebuild().unwrap().map(|rebuilt| rebuilt.kept), Some(2));
     }
 
     // Revert: drop the own-hold check → the rebuild waits on this thread's own ref lock forever.

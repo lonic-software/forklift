@@ -830,19 +830,17 @@ fn decode_marker(bytes: &[u8], path: &Path, forklift: &Path) -> Result<Warehouse
         path.to_string_lossy(), what, forklift.to_string_lossy()
     );
 
-    // The header is judged first, so an older marker's refusal names what it was; the frame next.
-    match record_utils::from_bytes(bytes, WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION) {
-        Ok(_) => (),
+    // A marker from before the digest has none, so it is judged by its header: an older marker's
+    // refusal names what it was.
+    let entries = match record_utils::from_bytes(bytes, WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION) {
+        Ok(entries) => entries,
         Err(RecordError::OtherVersion(header)) if header == record_utils::header(WAREHOUSE_MARKER_RECORD, 3) =>
             return Err(older("carried a digest")),
         Err(RecordError::OtherVersion(header))
             if (1..3).any(|version| header == record_utils::header(WAREHOUSE_MARKER_RECORD, version)) =>
             return Err(older("recorded the warehouse's format")),
         Err(e) => return Err(unknown(&e.describe())),
-    }
-
-    let entries = record_utils::from_bytes_digested(bytes, WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION)
-        .map_err(|e| unknown(&e.describe()))?;
+    };
 
     parse_marker_entries(&entries).map_err(|reason| unknown(&reason))
 }
@@ -943,7 +941,7 @@ pub(crate) fn encode_marker(marker: &WarehouseMarker) -> Vec<u8> {
     let upgrade = marker.upgrade.map(|upgrade| format!("upgrading {} {}", upgrade.target, upgrade.step));
     let entries = [Some(format.as_str()), Some(marker.mode.as_str()), upgrade.as_deref()];
 
-    record_utils::to_bytes_digested(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, entries.into_iter().flatten())
+    record_utils::to_bytes(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, entries.into_iter().flatten())
 }
 
 /// Marker bytes holding `entries` (each line ending in `\n`, as they follow the header), framed
@@ -1935,7 +1933,7 @@ mod tests {
     #[test]
     fn prepare_records_the_mode_and_a_partial_one_writes_its_origin_and_scopes_first() {
         let scope = PathScope::from_prefixes(["src"]);
-        let written = b"/forklift-scope 4\nsrc\n".to_vec();
+        let written = record_utils::with_digest(b"/forklift-scope 5\nsrc\n".to_vec());
 
         let root = fresh_dir("modes");
         let origin = "http://origin.example";

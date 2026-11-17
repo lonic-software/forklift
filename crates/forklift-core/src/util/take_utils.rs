@@ -490,7 +490,7 @@ pub struct LocalJudgement {
 /// an anchor over such a head has no file.
 const FILE_NAME_UNVOUCHED: &str = "unvouched-heads";
 const UNVOUCHED_RECORD: &str = "unvouched-heads";
-const UNVOUCHED_VERSION: u32 = 1;
+const UNVOUCHED_VERSION: u32 = 2;
 
 fn unvouched_path() -> PathBuf {
     globals::forklift_root().join(FILE_NAME_UNVOUCHED)

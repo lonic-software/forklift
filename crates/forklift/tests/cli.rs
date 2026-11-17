@@ -2756,7 +2756,8 @@ fn checkout_scopes_in_a_full_warehouse_are_recorded_and_checked() {
     assert_success(&warehouse.run(&["bay", "add", "plain", plain_dir.to_str().unwrap()]));
     assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
     let bays = warehouse.root.join(".forklift").join("bays");
-    assert_eq!(std::fs::read(bays.join("plain").join("scope")).unwrap(), b"", "a plain bay records the full scope");
+    assert_eq!(std::fs::read(bays.join("plain").join("scope")).unwrap(),
+               forklift_core::util::record_utils::to_bytes("scope", 5, [""; 0]), "a plain bay records the full scope");
     assert!(!warehouse.root.join(".forklift").join("scope").exists(), "a full warehouse's main tree has no scope");
 
     // A scope file placed in the main tree is refused whatever it holds, by the readers of staged
@@ -7177,7 +7178,7 @@ fn bay_base(warehouse: &TestWarehouse, bay: Option<&str>) -> String {
 
 /// Write a bay's position by hand, as a crash between two writes would leave it.
 fn write_position(warehouse: &TestWarehouse, bay: Option<&str>, pallet: &str, base: &str) {
-    std::fs::write(position_path(warehouse, bay), format!("/forklift-position 1\n{}\n{}\n", pallet, base)).unwrap();
+    std::fs::write(position_path(warehouse, bay), forklift_core::util::record_utils::to_bytes("position", 2, [pallet, base])).unwrap();
 }
 
 // T1. Revert: stack's compare-and-set expecting a fresh read of the ref, with the up-front check
@@ -13781,8 +13782,8 @@ fn a_torn_taint_exits_21_and_survives() {
 
     let dir = taint_dir_path(&warehouse);
     std::fs::create_dir_all(&dir).unwrap();
-    // No terminator line: torn by construction.
-    std::fs::write(dir.join("taint-1-0"), b"/forklift-taint 1\nobjects/ab/cdef\n").unwrap();
+    // No digest line: torn by construction.
+    std::fs::write(dir.join("taint-1-0"), b"/forklift-taint 2\nobjects/ab/cdef\n").unwrap();
 
     let status = warehouse.run(&["stocktake", "--json"]);
     assert_eq!(status.status.code(), Some(21));
@@ -13790,8 +13791,8 @@ fn a_torn_taint_exits_21_and_survives() {
     assert!(dir.join("taint-1-0").exists(), "a torn taint file must survive the refusal");
 }
 
-/// Every regular taint file's recorded lines, unioned (dropping the header and the `END`
-/// terminator) — used to inspect exactly what a recovery attempt left standing. The paths these
+/// Every regular taint file's recorded lines, unioned (dropping the header and the digest line)
+/// — used to inspect exactly what a recovery attempt left standing. The paths these
 /// tests plant are plain object paths, which escaping leaves as they are.
 fn recorded_taint_paths(warehouse: &TestWarehouse) -> Vec<String> {
     let dir = taint_dir_path(warehouse);
@@ -13807,7 +13808,7 @@ fn recorded_taint_paths(warehouse: &TestWarehouse) -> Vec<String> {
         }
         let content = std::fs::read_to_string(entry.path()).unwrap();
         paths.extend(content.lines()
-            .filter(|line| *line != "END" && !line.starts_with("/forklift-taint "))
+            .filter(|line| !line.starts_with("digest ") && !line.starts_with("/forklift-taint "))
             .map(|line| line.to_string()));
     }
     paths
@@ -13980,7 +13981,7 @@ fn heal_on_a_torn_taint_over_an_intact_store_rescans_and_clears() {
 
     let dir = taint_dir_path(&warehouse);
     std::fs::create_dir_all(&dir).unwrap();
-    // No terminator line: torn by construction.
+    // No digest line: torn by construction.
     std::fs::write(dir.join("taint-1-0"), b"").unwrap();
 
     let status = warehouse.run(&["heal", "--json"]);
@@ -14026,7 +14027,7 @@ fn heal_on_a_torn_taint_with_a_dangling_reference_rescans_into_a_named_remainder
     // the torn record's own (lower-bound, untrusted) recorded set.
     let dir = taint_dir_path(&warehouse);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("taint-1-0"), b"/forklift-taint 1\nobjects/aa/an-unrelated-surviving-line\n").unwrap();
+    std::fs::write(dir.join("taint-1-0"), b"/forklift-taint 2\nobjects/aa/an-unrelated-surviving-line\n").unwrap();
 
     let status = warehouse.run(&["heal", "--json"]);
     assert_eq!(status.status.code(), Some(21));
@@ -14518,10 +14519,12 @@ fn a_bay_positioned_on_an_invalid_pallet_name_fails_loudly_and_heal_keeps_the_ta
 fn a_bay_redirect_naming_an_invalid_bay_refuses_to_enter_it() {
     let (warehouse, bay_dir) = warehouse_with_a_bay("bay-invalid-redirect");
     let redirect = bay_dir.join(".forklift").join("redirect");
-    let content = std::fs::read_to_string(&redirect).unwrap();
+    let bytes = std::fs::read(&redirect).unwrap();
+    let content = std::str::from_utf8(forklift_core::util::record_utils::without_digest_line(&bytes)).unwrap();
     let rewritten: Vec<&str> = content.lines().map(|line| if line == "b1" { "B1" } else { line }).collect();
     assert_ne!(rewritten.join("\n"), content.trim_end(), "the redirect names b1 on its own line");
-    std::fs::write(&redirect, format!("{}\n", rewritten.join("\n"))).unwrap();
+    let rewritten = format!("{}\n", rewritten.join("\n")).into_bytes();
+    std::fs::write(&redirect, forklift_core::util::record_utils::with_digest(rewritten)).unwrap();
 
     let output = warehouse.run_at(&bay_dir, &["stocktake"]);
     assert!(!output.status.success(), "an invalid bay name must not be entered");
@@ -15138,29 +15141,21 @@ fn a_repack_keeps_a_deleted_head_until_the_bay_that_deleted_it_is_removed() {
     assert!(!warehouse.run(&["show", &format!("{}:side.txt", head)]).status.success(), "the head is freed once its window ends");
 }
 
-// Revert: read only version 3 journals → the planted version-2 journal is refused.
+// Revert: read a version-3 journal as this version's → its entries are read under today's
+// embedded records, and undo acts on them instead of naming the version.
 #[test]
-fn a_version_two_journal_takes_a_delete_and_its_undo() {
-    let (warehouse, _) = warehouse_with_side("delete-journal-v2");
-    let second = stack_one(&warehouse, "b.txt", "two\n");
+fn an_older_journal_is_refused_by_its_version() {
+    let (warehouse, _) = warehouse_with_side("journal-older");
+    stack_one(&warehouse, "b.txt", "two\n");
 
     let path = warehouse.root.join(".forklift/journal.json");
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.contains("\"version\":3"), "{}", text);
-    std::fs::write(&path, text.replace("\"version\":3", "\"version\":2")).unwrap();
+    assert!(text.contains("\"version\":4"), "{}", text);
+    std::fs::write(&path, text.replace("\"version\":4", "\"version\":3")).unwrap();
 
-    assert_success(&warehouse.run(&["store", "compact", "--all"]));
-    assert_success(&warehouse.run(&["pallet", "delete", "side"]));
-    assert_success(&warehouse.run(&["store", "compact", "--all"]));
-    assert_success(&warehouse.run(&["undo"]));
-    assert!(pallet_heads(&warehouse).iter().any(|(name, _)| name == "side"));
-
-    let undone = warehouse.run(&["--json", "undo"]);
-    assert_success(&undone);
-    assert_eq!(json(&undone)["data"]["undone"], second.as_str(), "the version-2 stack entry undoes");
-    let restacked = stack_one(&warehouse, "c.txt", "three\n");
-    let undone = warehouse.run(&["--json", "undo"]);
-    assert_eq!(json(&undone)["data"]["undone"], restacked.as_str(), "ordinary commands still journal");
+    let refused = warehouse.run(&["undo"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("has format version 3"), "{:?}", refused);
 }
 
 #[test]

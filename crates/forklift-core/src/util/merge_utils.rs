@@ -57,13 +57,13 @@ pub fn consolidation_description(their_label: &str, our_pallet: &str) -> String 
 // The undo journal embeds this state (`journal_utils::ConsolidationInProgress`): bump
 // `journal_utils::JOURNAL_VERSION` with it.
 const CONSOLIDATION_RECORD: &str = "consolidation";
-const CONSOLIDATION_VERSION: u32 = 2;
+const CONSOLIDATION_VERSION: u32 = 3;
 
 /// The [`record_utils`] kind and version of the out-of-scope skeleton file.
 const SKELETON_RECORD: &str = "consolidation-skeleton";
 // The undo journal embeds skeletons in this form (`journal_utils::ConsolidationInProgress`):
 // bump `journal_utils::JOURNAL_VERSION` with it, so an old journal is named as another version.
-const SKELETON_VERSION: u32 = 1;
+const SKELETON_VERSION: u32 = 2;
 
 /// How to abandon the consolidation whose files live in the bay-local state dir `dir` without
 /// putting anything back: remove both of them. A phrase such as `remove "<a>" and "<b>"`, naming

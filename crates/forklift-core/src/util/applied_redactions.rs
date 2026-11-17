@@ -31,7 +31,7 @@ use crate::util::{config_utils, file_utils, object_utils, record_utils, scope_ut
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
 const FILE_NAME_APPLIED: &str = "redactions-applied";
 const APPLIED_RECORD: &str = "redactions-applied";
-const APPLIED_VERSION: u32 = 1;
+const APPLIED_VERSION: u32 = 2;
 
 fn applied_path() -> PathBuf {
     globals::forklift_root().join(FILE_NAME_APPLIED)
@@ -178,7 +178,7 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
         return Ok(None);
     };
 
-    let (hashes, mut dropped) = record_utils::salvage(&bytes, |line| {
+    let (hashes, mut dropped) = record_utils::salvage(record_utils::without_digest_line(&bytes), |line| {
         object_utils::is_object_hash(line).then(|| line.to_string())
     });
 
@@ -621,8 +621,8 @@ mod tests {
         assert_eq!(read_applied().unwrap(), set);
 
         let bytes = std::fs::read(applied_path()).unwrap();
-        assert_eq!(String::from_utf8(bytes).unwrap(),
-                   format!("/forklift-redactions-applied 1\n{}\n{}\n", hash('a'), hash('b')));
+        assert_eq!(bytes, record_utils::with_digest(
+            format!("/forklift-redactions-applied 2\n{}\n{}\n", hash('a'), hash('b')).into_bytes()));
     }
 
     #[test]
@@ -630,8 +630,9 @@ mod tests {
         let _scratch = Scratch::new("applied-unknown");
 
         for (bytes, expected) in [
-            (b"/forklift-redactions-applied 2\n".to_vec(), "does not know"),
-            (format!("/forklift-redactions-applied 1\n{}\n", "x".repeat(64)).into_bytes(), "not an object hash"),
+            (record_utils::with_digest(b"/forklift-redactions-applied 3\n".to_vec()), "does not know"),
+            (record_utils::with_digest(format!("/forklift-redactions-applied 2\n{}\n", "x".repeat(64)).into_bytes()),
+             "not an object hash"),
             (b"aaaa\n".to_vec(), "no format header"),
         ] {
             std::fs::write(applied_path(), &bytes).unwrap();

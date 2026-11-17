@@ -63,7 +63,7 @@ pub const INVENTORY_METADATA_RECORD: &str = "inventory-metadata";
 /// doubles as the layout marker: a version-1 warehouse keeps its shards at paths this layout never
 /// reads, so [`get_inventory_store_root`] refuses it rather than reading every directory as
 /// unstaged.
-pub const INVENTORY_METADATA_VERSION: u32 = 2;
+pub const INVENTORY_METADATA_VERSION: u32 = 3;
 
 /// Create a folder if it does not exist yet.
 /// All folders in the given path will be created (if they don't exist already).
@@ -3215,7 +3215,7 @@ fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
 
     if header.ends_with(b"\n") {
         if let Err(e @ record_utils::RecordError::OtherVersion(_)) =
-            record_utils::from_bytes(&header, INVENTORY_METADATA_RECORD, INVENTORY_METADATA_VERSION) {
+            record_utils::read_header(&header, INVENTORY_METADATA_RECORD, INVENTORY_METADATA_VERSION) {
             return Err(format!(
                 "The inventory metadata file \"{}\" {}", metadata_path.to_string_lossy(), e.describe()
             ));
@@ -5322,6 +5322,32 @@ mod tests {
     /// every platform.
     fn is_stand_in_held(error: &std::io::Error) -> bool {
         error.raw_os_error() == Some(7)
+    }
+
+    /// The layout gate judges the metadata's header line alone, so it refuses a newer version's
+    /// header, whose digest line it never reads, as well as an older one's.
+    ///
+    /// Revert: judge the header line as a whole record → a newer header reads as damage, and
+    /// the gate lets it through.
+    #[test]
+    fn the_layout_gate_refuses_an_older_or_newer_header_from_its_first_line() {
+        for (name, version, refused) in [("older", INVENTORY_METADATA_VERSION - 1, true),
+                                         ("newer", INVENTORY_METADATA_VERSION + 1, true),
+                                         ("this", INVENTORY_METADATA_VERSION, false)] {
+            // A fresh root per case: the gate passes a root once per process.
+            let dir = std::env::temp_dir().join(format!("forklift-layout-gate-{}-{}", name, std::process::id()));
+            let _ = remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let bytes = record_utils::to_bytes(INVENTORY_METADATA_RECORD, version, ["./"]);
+            std::fs::write(dir.join(FILE_NAME_INVENTORY_METADATA), bytes).unwrap();
+
+            let gate = gate_inventory_layout(&dir);
+            assert_eq!(gate.is_err(), refused, "{}: {:?}", name, gate);
+            if refused {
+                assert!(gate.unwrap_err().contains("does not know"), "{}", name);
+            }
+            remove_dir_all(&dir).ok();
+        }
     }
 
     /// A delete whose retry finds the path gone (another process removed it after the held
