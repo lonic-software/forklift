@@ -100,7 +100,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
 
     // Before everything else: every later step reads the configuration, and a damaged file would
     // stop it or, worse, be read around. Nothing here is written yet, so a refusal stops the run
-    // with nothing changed.
+    // with nothing changed. A file that is not damaged is left to those readers.
     let config_repaired = config_utils::repair_warehouse_config(accept_config_loss)?;
 
     let mut ref_notes: Vec<String> = Vec::new();
@@ -391,8 +391,9 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             None
         }
     };
-    // The warehouse's own file is sound by now, so a failure here is the global file's: heal does
-    // not mend that one, and goes on as though no remote were asked for, saying why.
+    // A damaged warehouse file is mended by now, so a failure here is one heal does not mend: a
+    // mistake made by hand, an unreadable file, or the global file's damage. Heal goes on as
+    // though no remote were asked for, saying why.
     let configured = match config_utils::get_effective_value(config_utils::KEY_REMOTE_URL) {
         Ok(configured) => configured.map(|(url, _)| url),
         Err(why) => {

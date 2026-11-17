@@ -923,7 +923,7 @@ impl ErrorCode {
             ErrorCode::BayPositionDamaged =>
                 "The bay's position, the pallet it stands on and the parcel its files stand on, is missing or does not parse. Nothing was changed; heal rebuilds it from its copy or from an interrupted operation, and otherwise lists the pallets for heal --position to put the bay on",
             ErrorCode::ConfigDamaged =>
-                "A configuration file holds bytes that are not text or that TOML never allows, or it was cut short. Nothing was changed; in the warehouse's own file heal --config keeps every entry the damage provably spared, after setting the damaged bytes aside"
+                "A configuration file holds bytes that are not text or that TOML never allows, or it was cut short. Nothing was changed; in the warehouse's own file heal names what mending it would drop, and heal --config keeps every entry the damage provably spared, after setting the damaged bytes aside"
         }
     }
 

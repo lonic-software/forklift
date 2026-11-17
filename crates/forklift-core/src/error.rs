@@ -444,9 +444,10 @@ refusal_codes! {
     BayPositionDamaged => "bay_position_damaged",
 
     /// A configuration file holds a damaged byte (it is not UTF-8, or it holds a character TOML
-    /// never allows), or it does not parse and lacks the final newline every write ends with, as
-    /// a cut file does. Nothing was changed; in the warehouse's own file `heal --config` keeps
-    /// every entry the damage provably spared, after setting the damaged bytes aside.
+    /// never allows), or its last line does not parse and lacks the final newline every write ends
+    /// with, as a cut file does. Nothing was changed; in the warehouse's own file `heal` names what
+    /// mending it would drop, and `heal --config` keeps every entry the damage provably spared,
+    /// after setting the damaged bytes aside.
     ConfigDamaged => "config_damaged",
 }
 

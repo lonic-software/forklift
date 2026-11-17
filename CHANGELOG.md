@@ -638,15 +638,16 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 - **A damaged configuration file is refused with a remedy, and `heal` mends the warehouse's
   own.** A configuration file holding bytes that are not text, or zeroed, failed every command
   with a raw read error and no way out. Every reader now refuses it with `config_damaged` (exit
-  65, `--json` schema 51), as it does a file cut short so that it no longer parses. In the
-  warehouse's own file the next step is `forklift heal --config`. Plain `heal` rewrites the file
-  when the damage provably cost no setting, for instance a garbled comment. Otherwise it changes
-  nothing and names the entries the damage may have touched. `heal --config` then keeps only the
-  entries the damage provably spared. A section that loses one entry loses all of them, so a
-  remote's address is never kept without its token. The damaged bytes are set aside as
-  `config/warehouse.toml.damaged`. The report names what was dropped by line and key, and never
-  prints a value. A file with a mistake made by hand keeps its "fix the file by hand" refusal, and
-  heal never writes over a file it cannot read.
+  65, `--json` schema 51), as it does a file cut short so that its last line no longer parses. In
+  the warehouse's own file the next step is `forklift heal`, which rewrites the file when the
+  damage provably cost no setting, for instance a garbled comment, keeping its comments. Otherwise
+  it changes nothing and names the entries the damage may have touched. `heal --config` then keeps
+  only the entries the damage provably spared. A section that loses one entry loses all of them,
+  so a remote's address is never kept without its token. The damaged bytes are set aside as
+  `config/warehouse.toml.damaged`, with the file's own permissions. The report names what was
+  dropped by line and key, and never prints a value. A file with a mistake made by hand keeps its
+  "fix the file by hand" refusal and does not stop `heal`, which never writes over a file it
+  cannot read.
 - **A lost or damaged bay position is refused with a remedy, and `heal` rebuilds it.** A bay
   whose position file was deleted, cut short or garbled failed every command with a raw read
   error and no way out, and `prepare` over a deleted one silently put the bay on `main` with no

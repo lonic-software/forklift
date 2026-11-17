@@ -2245,12 +2245,16 @@ A command not listed here either reports only the generic human-message shape `{
           },
           "type": "array"
         },
+        "lossless": {
+          "description": "Whether the repair provably lost nothing but the damaged characters: every entry and\ncomment is kept. When it is not, the damaged bytes are set aside.",
+          "type": "boolean"
+        },
         "path": {
           "description": "The file, named as its refusals name it.",
           "type": "string"
         },
         "set_aside": {
-          "description": "Where the damaged bytes were set aside, when anything was dropped.",
+          "description": "Where the damaged bytes were set aside, when anything may have been dropped.",
           "type": [
             "string",
             "null"
@@ -2260,7 +2264,8 @@ A command not listed here either reports only the generic human-message shape `{
       "required": [
         "path",
         "dropped",
-        "cut"
+        "cut",
+        "lossless"
       ],
       "type": "object"
     },

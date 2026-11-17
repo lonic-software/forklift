@@ -12,11 +12,12 @@
 //! * **Decode lossily, keep what parses.** A damaged newline before a `[remote]` header swallows
 //!   the header into the comment above it, and the remote's URL then parses as `mirror.url`.
 //!
-//! So an entry is kept only when its own text holds no damaged character, no damaged character
-//! lies between it and the header that governs it (a header can only vanish at one), and it
-//! validates. A section that loses one entry loses all of them: every key resolves on its own,
-//! warehouse first, so a kept `remote.url` beside a dropped `remote.token` would hand the global
-//! file's token to the warehouse's remote.
+//! So an entry is kept only when its own text holds no damaged character and it validates. Damage
+//! anywhere else lies in a comment, and is read as the newline it may have been: when the rest of
+//! its line could be a header or an entry, the section that line would belong to goes. A section
+//! that loses one entry loses all of them: every key resolves on its own, warehouse first, so a
+//! kept `remote.url` beside a dropped `remote.token` would hand the global file's token to the
+//! warehouse's remote.
 
 use std::ops::Range;
 
@@ -53,6 +54,10 @@ pub struct Salvage {
     /// Whether writing [`Salvage::kept`] can have lost nothing the file held. Plain `heal` writes
     /// only a lossless salvage; anything else needs the operator to accept the loss.
     pub lossless: bool,
+    /// The text the verdict read: the file up to any cut line, every damaged character in it read
+    /// as U+FFFD. When the salvage is lossless, it is the file with nothing lost but the damaged
+    /// characters, comments included.
+    pub text: String,
 }
 
 /// Whether `c` is a character TOML never allows anywhere in a document: a control character
@@ -72,7 +77,6 @@ struct Found {
     path: Vec<String>,
     value: Option<String>,
     span: Range<usize>,
-    header_start: usize,
 }
 
 /// Read what a damaged file still provably holds.
@@ -95,14 +99,20 @@ pub fn salvage(bytes: &[u8], valid: impl Fn(&[String], &str) -> bool) -> Salvage
         false => (bytes, None),
     };
 
-    let text = String::from_utf8_lossy(body).into_owned();
+    // A forbidden control character stops every TOML reader, wherever it lies; read as the
+    // replacement character, it is damage like any byte that was not UTF-8, and the rest of the
+    // file still parses around it when it lies in a comment.
+    let text: String = String::from_utf8_lossy(body).chars()
+        .map(|c| if is_forbidden_control(c) { char::REPLACEMENT_CHARACTER } else { c })
+        .collect();
     let damage: Vec<Range<usize>> = text.char_indices()
         .filter(|&(_, c)| is_damage(c))
         .map(|(at, c)| at..at + c.len_utf8())
         .collect();
 
     let Ok(document) = toml_edit::Document::parse(text.clone()) else {
-        return Salvage { kept: Vec::new(), dropped: entry_lines(&text), cut, parsed: false, lossless: false };
+        let dropped = entry_lines(&text);
+        return Salvage { kept: Vec::new(), dropped, cut, parsed: false, lossless: false, text };
     };
 
     let mut found = Vec::new();
@@ -110,40 +120,69 @@ pub fn salvage(bytes: &[u8], valid: impl Fn(&[String], &str) -> bool) -> Salvage
     collect(document.as_table(), &[], 0, &mut found, &mut headers);
     found.sort_by_key(|entry| entry.span.start);
 
-    let damaged = |range: Range<usize>| damage.iter().any(|at| at.start < range.end && range.start < at.end);
+    let damaged = |range: &Range<usize>| damage.iter().any(|at| at.start < range.end && range.start < at.end);
 
     let mut dropped_groups: Vec<Vec<String>> = Vec::new();
+    let mut drop_group = |path: &[String]| {
+        if !dropped_groups.contains(&group(path)) {
+            dropped_groups.push(group(path));
+        }
+    };
     let mut verdicts = Vec::with_capacity(found.len());
     for entry in &found {
-        let keep = !damaged(entry.header_start..entry.span.end)
+        let keep = !damaged(&entry.span)
             && entry.value.as_deref().is_some_and(|value| valid(&entry.path, value));
-        if !keep && !dropped_groups.contains(&group(&entry.path)) {
-            dropped_groups.push(group(&entry.path));
+        if !keep {
+            drop_group(&entry.path);
         }
         verdicts.push(keep);
+    }
+
+    // Damage outside every entry lies in a comment. Were the damaged character a newline, the
+    // rest of its line would be a line of its own: a hidden entry belongs to the section governing
+    // that spot, which goes whole; a hidden header moves every entry after it into that section,
+    // which goes whole too. In the root, where no header governs, a hidden line may be of any
+    // section, so every one goes.
+    let governing = |at: usize| headers.iter()
+        .filter(|(start, _)| *start <= at)
+        .max_by_key(|(start, _)| *start)
+        .map(|(_, path)| path.clone());
+    let mut hidden = Vec::new();
+    for at in damage.iter().filter(|at| !found.iter().any(|entry| entry.span.contains(&at.start))) {
+        let Some(line) = hidden_line(&text, at.end) else {
+            continue;
+        };
+        let section = governing(at.start);
+        let key = line.and_then(|key| {
+            let mut path = section.clone().unwrap_or_default();
+            path.extend(key);
+            Some(path)
+        });
+        match (&key, &section) {
+            (Some(path), _) => drop_group(path),
+            (None, Some(section)) => drop_group(section),
+            (None, None) => for entry in &found {
+                drop_group(&entry.path);
+            },
+        }
+        hidden.push(DroppedEntry {
+            line: line_of(&text, at.start),
+            key: key.map(|path| path.join(".")).filter(|key| !key.chars().any(is_damage)),
+        });
     }
 
     // The cut line belongs to the section the last header still visible governs, and that
     // section may have run on past the cut: it goes whole. A cut header fragment ends the
     // section above it, so that one is complete.
     let fragment = partial.is_some_and(|line| String::from_utf8_lossy(line).trim_start().starts_with('['));
-    let mut cut_dropped = false;
     if cut && !fragment {
         match headers.iter().max_by_key(|(start, _)| *start) {
-            Some((_, path)) => {
-                let path: &Vec<String> = path;
-                if !dropped_groups.contains(&group(path)) {
-                    dropped_groups.push(group(path));
-                }
-            }
+            Some((_, path)) => drop_group(path),
             // No header at all: the cut lies in the root, where any entry may be of any section.
             None => for entry in &found {
-                if !dropped_groups.contains(&group(&entry.path)) {
-                    dropped_groups.push(group(&entry.path));
-                }
+                drop_group(&entry.path);
             },
         }
-        cut_dropped = true;
     }
 
     let mut kept = Vec::new();
@@ -159,14 +198,12 @@ pub fn salvage(bytes: &[u8], valid: impl Fn(&[String], &str) -> bool) -> Salvage
             });
         }
     }
+    dropped.extend(hidden);
+    dropped.sort_by_key(|entry| entry.line);
 
-    let lossless = !cut && !cut_dropped && dropped.is_empty()
-        && !damage.iter().any(|at| on_last_line(&text, at.start))
-        && !damage.iter().any(|at| {
-            !found.iter().any(|entry| entry.span.contains(&at.start)) && may_hide_a_line(&text, at.end)
-        });
+    let lossless = !cut && dropped.is_empty() && !damage.iter().any(|at| on_last_line(&text, at.start));
 
-    Salvage { kept, dropped, cut, parsed: true, lossless }
+    Salvage { kept, dropped, cut, parsed: true, lossless, text }
 }
 
 /// The section an entry's path belongs to, the unit the salvage keeps or drops whole: a top-level
@@ -176,8 +213,8 @@ fn group(path: &[String]) -> Vec<String> {
     path.iter().take(depth).cloned().collect()
 }
 
-/// Gather every leaf entry under `table`, with the start of the header that governs it, and every
-/// header with its path.
+/// Gather every leaf entry under `table`, and every header with its path. `header_start`, the start
+/// of the header governing `table`, stands in for a span the parser did not keep.
 fn collect(table: &toml_edit::Table,
            prefix: &[String],
            header_start: usize,
@@ -187,7 +224,7 @@ fn collect(table: &toml_edit::Table,
         let mut path = prefix.to_vec();
         path.extend(keys.iter().map(|key| key.get().to_string()));
         let start = keys.first().and_then(|key| key.span()).map_or(header_start, |span| span.start);
-        collect_value(value, path, start, header_start, found);
+        collect_value(value, path, start, found);
     }
 
     for (name, item) in table.iter() {
@@ -209,7 +246,7 @@ fn collect(table: &toml_edit::Table,
             toml_edit::Item::ArrayOfTables(array) => for sub in array.iter() {
                 let start = sub.span().map_or(header_start, |span| span.start);
                 headers.push((start, path.clone()));
-                found.push(Found { path: path.clone(), value: None, span: start..start + 1, header_start: start });
+                found.push(Found { path: path.clone(), value: None, span: start..start + 1 });
             },
             _ => {}
         }
@@ -218,7 +255,7 @@ fn collect(table: &toml_edit::Table,
 
 /// Gather one value: a string is an entry; an inline table is read through for its own entries;
 /// anything else is an entry no configuration file holds, so it is dropped.
-fn collect_value(value: &toml_edit::Value, path: Vec<String>, start: usize, header_start: usize, found: &mut Vec<Found>) {
+fn collect_value(value: &toml_edit::Value, path: Vec<String>, start: usize, found: &mut Vec<Found>) {
     let end = value.span().map_or(start + 1, |span| span.end);
     match value {
         toml_edit::Value::InlineTable(inline) => for (keys, inner) in inline.get_values() {
@@ -230,10 +267,9 @@ fn collect_value(value: &toml_edit::Value, path: Vec<String>, start: usize, head
                 path: inner_path,
                 value: inner.as_str().map(str::to_string),
                 span: start..end,
-                header_start,
             });
         },
-        _ => found.push(Found { path, value: value.as_str().map(str::to_string), span: start..end, header_start }),
+        _ => found.push(Found { path, value: value.as_str().map(str::to_string), span: start..end }),
     }
 }
 
@@ -248,19 +284,28 @@ fn on_last_line(text: &str, at: usize) -> bool {
     trimmed.rfind('\n').is_none_or(|last| at > last)
 }
 
-/// Whether the comment text after a damaged character, from `after` to the end of its line, may
-/// be a line the damage hid: were that character a newline, the rest would be a line of its own,
-/// and a header or an entry there is lost without a dropped entry to show for it. Another damaged
-/// character in the rest counts as may: nothing can be said of it.
-fn may_hide_a_line(text: &str, after: usize) -> bool {
+/// What the comment text after a damaged character, from `after` to the end of its line, may
+/// hide: were that character a newline, the rest would be a line of its own.
+///
+/// # Returns
+/// * `None`             - Nothing: the rest is no header and no entry.
+/// * `Some(Some(key))`  - An entry, whose key (dotted, relative to its section) is `key`.
+/// * `Some(None)`       - A header, or something no reading can tell, since the rest holds
+///                        damage of its own.
+fn hidden_line(text: &str, after: usize) -> Option<Option<Vec<String>>> {
     let rest = &text[after..];
     let rest = &rest[..rest.find('\n').unwrap_or(rest.len())];
     if rest.chars().any(is_damage) {
-        return true;
+        return Some(None);
     }
 
     let line = rest.trim_start();
-    line.starts_with('[') || looks_like_entry(line)
+    if line.starts_with('[') {
+        return Some(None);
+    }
+    let (key, _) = line.split_once('=')?;
+    let key = toml_edit::Key::parse(key.trim()).ok().filter(|key| !key.is_empty())?;
+    Some(Some(key.iter().map(|part| part.get().to_string()).collect()))
 }
 
 /// Whether `line` begins as an entry does: a key, then `=`.
@@ -318,8 +363,8 @@ mod tests {
         assert!(salvage.lossless && salvage.dropped.is_empty());
     }
 
-    /// Revert: drop the header-to-entry range from the damage test (check only the entry's own
-    /// span) → the URL is kept as mirror.url → red.
+    /// Revert: make a hidden header drop nothing in hidden_line's caller → the URL is kept as
+    /// mirror.url → red.
     #[test]
     fn a_swallowed_header_never_moves_an_entry_into_another_section() {
         let salvage = salvage(&flip(FILE.find("\n[remote]").unwrap()), any);
@@ -348,7 +393,48 @@ mod tests {
         assert!(salvage.lossless);
     }
 
-    /// Revert: make may_hide_a_line answer false → a comment that may have been an entry reads
+    /// A hidden entry mid-file costs its whole section: the remote's URL is not kept without the
+    /// `tor` setting that went with it. Revert: make hidden_line answer None → url kept → red.
+    #[test]
+    fn an_entry_hidden_mid_file_drops_its_section() {
+        let text = "[remote]\nurl = \"https://private\"\n# t\ntor = \"on\"\n[operator]\nidentifier = \"x\"\n";
+        let mut bytes = text.as_bytes().to_vec();
+        bytes[text.find("\ntor").unwrap()] = 0xF5;
+        let salvage = salvage(&bytes, any);
+        assert_eq!(keys(&salvage), ["operator.identifier"]);
+        assert!(salvage.dropped.contains(&DroppedEntry { line: 3, key: Some("remote.tor".to_string()) }),
+                "{:?}", salvage.dropped);
+        assert!(!salvage.lossless);
+    }
+
+    /// In the root no header says whose a hidden line is, so every section goes.
+    #[test]
+    fn a_header_hidden_in_the_root_drops_everything() {
+        let text = "# top\n[remote]\nurl = \"u\"\n";
+        let mut bytes = text.as_bytes().to_vec();
+        bytes[text.find("\n[remote]").unwrap()] = 0;
+        let salvage = salvage(&bytes, any);
+        assert!(salvage.parsed && salvage.kept.is_empty(), "{:?}", salvage);
+        assert_eq!(salvage.dropped, [DroppedEntry { line: 1, key: None },
+                                     DroppedEntry { line: 2, key: Some("url".to_string()) }]);
+    }
+
+    /// Damage in a comment whose rest is plain words hides nothing, even between a header and
+    /// its entries, and a zeroed byte reads like any other damage. Revert: check every damage
+    /// against its governing section regardless of hidden_line → the remote goes → red.
+    #[test]
+    fn damage_that_hides_nothing_keeps_its_section() {
+        let text = "[remote]\n# Mate's server\nurl = \"u\"\ntoken = \"t\"\n";
+        for byte in [0xE9u8, 0] {
+            let mut bytes = text.as_bytes().to_vec();
+            bytes[text.find("'").unwrap()] = byte;
+            let salvage = salvage(&bytes, any);
+            assert_eq!(keys(&salvage), ["remote.url", "remote.token"], "{:#x}", byte);
+            assert!(salvage.lossless && salvage.text.contains("# Mate\u{FFFD}s server"), "{:#x}", byte);
+        }
+    }
+
+    /// Revert: make hidden_line answer None → a comment that may have been an entry reads
     /// as lossless → red.
     #[test]
     fn damage_that_may_have_hidden_an_entry_is_not_lossless() {

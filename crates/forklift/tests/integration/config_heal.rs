@@ -2,7 +2,8 @@
 //! reads it. In the warehouse's own file `heal` rewrites it when the damage provably cost no
 //! setting, and otherwise refuses and names what would go; `heal --config` then keeps only the
 //! entries the damage provably spared, after setting the damaged bytes aside. A file that is not
-//! damaged but does not read, or that holds a mistake made by hand, is never written over. These
+//! damaged but does not read, or that holds a mistake made by hand, is never written over, and
+//! does not stop the rest of heal. These
 //! tests damage the file the ways Proof Load does (cut short, zeroed, a byte flipped).
 
 use std::path::{Path, PathBuf};
@@ -139,8 +140,9 @@ fn every_damage_is_refused_and_heal_config_mends_it() {
         damage(&area.config(), kind);
         let damaged = std::fs::read(area.config()).unwrap();
 
+        // Plain heal first, which names what mending would drop before anything is dropped.
         let refused = config_damaged(&area.run(&["--json", "config", "get", "mirror.pallets"]));
-        assert_eq!(refused["error"]["next_step"], "forklift heal --config", "{:?}: {}", kind, refused);
+        assert_eq!(refused["error"]["next_step"], "forklift heal", "{:?}: {}", kind, refused);
 
         // Plain heal refuses: each damage here may have cost a setting.
         let refused = config_damaged(&area.run(&["--json", "heal"]));
@@ -187,9 +189,15 @@ fn damage_in_a_comment_is_mended_by_plain_heal_with_nothing_set_aside() {
     let area = Area::new("comment");
     flip(&area.config(), "pseudonymous");
 
+    let healed = parsed(&area.run_ok(&["--json", "heal"]));
+    assert_eq!(healed["data"]["config_repaired"]["lossless"], true, "{}", healed);
     let healed = area.run_ok(&["heal"]);
-    assert!(text(&healed.stdout).contains("damaged where it held no setting"), "{}", text(&healed.stdout));
+    assert!(!text(&healed.stdout).contains("damaged"), "a second heal finds a sound file: {}", text(&healed.stdout));
     assert!(std::fs::symlink_metadata(area.aside()).is_err(), "a lossless repair sets nothing aside");
+    // The file's own text is kept, comments too, the damaged character read as U+FFFD.
+    // Revert: write the template and the kept entries for a lossless salvage too → red.
+    let kept = text(&std::fs::read(area.config()).unwrap());
+    assert!(kept.contains("\u{FFFD}seudonymous"), "{}", kept);
     assert_eq!(area.get("remote.token"), TOKEN);
     assert_eq!(area.get("remote.url"), "https://remote.example");
     assert_eq!(area.get("operator.identifier"), "config-heal@forklift");
@@ -211,38 +219,74 @@ fn an_earlier_damaged_copy_is_never_written_over() {
 
     let refused = config_damaged(&area.run(&["--json", "heal", "--config"]));
     assert!(refused["error"].get("next_step").is_none(), "{}", refused);
-    assert!(refused["error"]["message"].as_str().unwrap().contains("warehouse.toml.damaged"), "{}", refused);
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("warehouse.toml.damaged") && message.contains("Move that copy elsewhere"), "{}", refused);
     assert_eq!(std::fs::read(area.aside()).unwrap(), b"earlier");
     assert_eq!(std::fs::read(area.config()).unwrap(), damaged);
 }
 
-/// Revert: treat every failing parse as damage in load_document → a hand typo is offered a heal
-/// that could mint a new identity → red.
+/// A mistake made by hand anywhere but the last line is no cut, final newline or not. Revert:
+/// drop the body-parses condition from is_cut → the unended file reads as damaged → red.
 #[test]
 fn a_mistake_made_by_hand_keeps_its_by_hand_refusal_and_is_not_written_over() {
     let area = Area::new("hand");
+    let sound = std::fs::read(area.config()).unwrap();
+    for (ending, unended) in [(&b"bogus = \n"[..], false), (&b"bogus = \n[mirror2]"[..], true)] {
+        let mut bytes = sound.clone();
+        bytes.extend_from_slice(ending);
+        std::fs::write(area.config(), &bytes).unwrap();
+
+        let refused = area.run(&["--json", "config", "get", "mirror.pallets"]);
+        assert_eq!(refused.status.code(), Some(1), "unended {}: {}", unended, text(&refused.stdout));
+        assert!(parsed(&refused)["error"]["message"].as_str().unwrap().contains("Fix the file by hand"));
+
+        // Heal does not mend it and is not stopped by it: the remote read is a note.
+        // Revert: return load_scope's error from repair_warehouse_config → heal exits 1 → red.
+        let healed = area.run_ok(&["heal", "--config"]);
+        assert!(text(&healed.stdout).contains("Fix the file by hand"), "{}", text(&healed.stdout));
+        assert_eq!(std::fs::read(area.config()).unwrap(), bytes);
+    }
+}
+
+/// A last line no newline ends, which does not parse, may be a cut or a hand edit: the refusal
+/// says how to tell, and plain heal names the loss before anything is lost.
+#[test]
+fn an_unended_last_line_names_both_readings() {
+    let area = Area::new("unended");
     let mut bytes = std::fs::read(area.config()).unwrap();
-    bytes.extend_from_slice(b"bogus = \n");
+    bytes.extend_from_slice(b"profile = work");
     std::fs::write(area.config(), &bytes).unwrap();
 
-    for args in [&["--json", "config", "get", "mirror.pallets"][..], &["--json", "heal", "--config"][..]] {
-        let refused = area.run(args);
-        assert_eq!(refused.status.code(), Some(1), "{:?}: {}", args, text(&refused.stdout));
-        assert!(parsed(&refused)["error"]["message"].as_str().unwrap().contains("Fix the file by hand"));
-    }
+    let refused = config_damaged(&area.run(&["--json", "config", "get", "mirror.pallets"]));
+    assert!(refused["error"]["message"].as_str().unwrap().contains("edited by hand rather than cut"), "{}", refused);
+    let refused = config_damaged(&area.run(&["--json", "heal"]));
+    assert!(refused["error"]["message"].as_str().unwrap().contains("edited by hand rather than cut"), "{}", refused);
     assert_eq!(std::fs::read(area.config()).unwrap(), bytes);
 }
 
-/// A file that cannot be read at all may be sound: heal leaves it as it is.
+/// The set-aside copy can hold the token, so it is never wider than the file it copies, not even
+/// for a moment. Revert: write it with replace_file_atomically (the umask's mode) → 0644 → red.
+#[cfg(unix)]
+#[test]
+fn the_damaged_copy_keeps_the_files_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let area = Area::new("mode");
+    std::fs::set_permissions(area.config(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    flip(&area.config(), TOKEN);
+    area.run_ok(&["heal", "--config"]);
+    assert_eq!(std::fs::metadata(area.aside()).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+/// A file that cannot be read at all may be sound: heal leaves it as it is, and is not stopped.
 #[test]
 fn a_file_that_does_not_read_is_never_written_over() {
     let area = Area::new("unreadable");
     forklift_core::util::file_utils::remove_file(area.config()).unwrap();
     std::fs::create_dir(area.config()).unwrap();
 
-    let refused = area.run(&["heal", "--config"]);
-    assert!(!refused.status.success());
-    assert_ne!(refused.status.code(), Some(CONFIG_DAMAGED_EXIT), "{}", text(&refused.stderr));
+    let healed = area.run(&["heal", "--config"]);
+    assert_ne!(healed.status.code(), Some(CONFIG_DAMAGED_EXIT), "{}", text(&healed.stderr));
     assert!(std::fs::metadata(area.config()).unwrap().is_dir());
 }
 
@@ -258,6 +302,7 @@ fn a_damaged_global_file_is_refused_without_a_next_step_and_does_not_stop_heal()
 
     let refused = config_damaged(&area.run(&["--json", "config", "get", "--global", "operator.identifier"]));
     assert!(refused["error"].get("next_step").is_none(), "{}", refused);
+    assert!(refused["error"]["message"].as_str().unwrap().contains("Fix the file by hand"), "{}", refused);
 
     let healed = area.run_ok(&["heal"]);
     assert!(text(&healed.stdout).contains("could not be read"), "{}", text(&healed.stdout));
