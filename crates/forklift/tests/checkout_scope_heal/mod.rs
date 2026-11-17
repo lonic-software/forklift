@@ -343,3 +343,25 @@ fn a_pathless_bay_with_a_damaged_scope_is_removed_not_healed() {
     assert!(!message.contains("forklift heal"), "{}", message);
     assert!(error["next_step"].is_null(), "{}", error);
 }
+
+/// With the position lost as well, the scope waits for the position heal, whose base the stranding
+/// guard reads, and the same heal then restores it from its copy.
+///
+/// Revert: run the scope step before the position heal regardless → the guard cannot read the
+/// position and heal refuses → red.
+#[test]
+fn heal_restores_the_scope_after_the_position_it_needs() {
+    let area = TestArea::new("checkout-scope-heal-after-position");
+    let _server = sparse_without_other(&area);
+    let scope = std::fs::read(area.path(MAIN_SCOPE)).unwrap();
+    remove(&area, MAIN_SCOPE);
+    remove(&area, "sparse/.forklift/position");
+
+    let healed = area.forklift("sparse", &["--json", "heal"]);
+    assert_success(&healed);
+    let data = &json_of(&healed)["data"];
+    assert_eq!(data["checkout_scope_restored"]["scope"], serde_json::json!(["docs", "src/api"]), "{}", data);
+    assert!(!data["position_rebuilt"].is_null(), "{}", data);
+    assert_eq!(std::fs::read(area.path(MAIN_SCOPE)).unwrap(), scope);
+    assert_success(&area.forklift("sparse", &["stocktake"]));
+}
