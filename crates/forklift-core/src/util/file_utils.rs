@@ -2672,6 +2672,9 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
         }
     }
 
+    #[cfg(test)]
+    run_before_loose_read();
+
     // Loose fallback: a freshly written object not yet swept into a pack, or genuinely absent.
     let (path, file_name) = get_path_for_object(hash)?;
     let file_path = path.add(PATH_SEPARATOR).add(&file_name);
@@ -2712,6 +2715,30 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
         Ok(bytes) => StoreReadOutcome::Verified(bytes),
         Err(e) => StoreReadOutcome::Unverifiable(e, Unreadable::LooseCorrupt),
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A step [`read_object_classified`] runs once on this thread, after the pack lookup missed and
+    /// before the loose read: where a test puts another process's `compact`, which can land
+    /// between the two.
+    static BEFORE_LOOSE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `step` once on this thread, inside the next read whose pack lookup misses, just before that
+/// read looks for a loose file.
+#[cfg(test)]
+pub(crate) fn before_next_loose_read(step: impl FnOnce() + 'static) {
+    BEFORE_LOOSE_READ.with(|slot| *slot.borrow_mut() = Some(Box::new(step)));
+}
+
+/// Take and run the step [`before_next_loose_read`] armed, if any.
+#[cfg(test)]
+fn run_before_loose_read() {
+    let step = BEFORE_LOOSE_READ.with(|slot| slot.borrow_mut().take());
+    if let Some(step) = step {
+        step();
+    }
 }
 
 /// A loose file's bytes, decompressed and checked against `hash`: the one decode every loose read
@@ -8195,6 +8222,58 @@ mod tests {
         builder.finish().unwrap();
 
         assert!(raw_object_present(&other_hash).unwrap(), "the gate-free presence check must see it too");
+
+        remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-491: a read that a `compact` in another process overtakes still serves the object. The
+    /// server checks that an object exists, then reads it; the compact packs the loose object and
+    /// sweeps its loose file between the read's pack lookup, which misses on the set this process
+    /// cached at the check, and its loose read, which finds nothing. The read asks the packs again,
+    /// revalidated against the pack folder, so it serves the object rather than refusing a healthy
+    /// store as `object_unreadable`.
+    ///
+    /// Revert: the second pack lookup after a loose miss is dropped → the read refuses
+    /// `object_unreadable` → red.
+    #[test]
+    fn a_read_overtaken_by_a_compact_after_its_pack_lookup_still_serves() {
+        use crate::util::pack_utils::TransportPackBuilder;
+
+        let temp = std::env::temp_dir()
+            .join(format!("forklift-read-overtaken-by-compact-{}", std::process::id()));
+        let _ = remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let folder = crate::util::pack_utils::pack_folder();
+
+        let content = b"a loose object another process packs while this one reads it".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+        let (loose_folder, file_name) = get_path_for_object(&hash).unwrap();
+        write_object_to_file(Path::new(&loose_folder), &file_name, zstd::encode_all(content.as_slice(), 0).unwrap())
+            .unwrap();
+        let loose_path = Path::new(&loose_folder).join(&file_name);
+
+        // The server's existence check: it finds the loose file, and caches a pack set without
+        // the pack the compact is about to write.
+        assert!(does_object_exist(&hash).unwrap(), "sanity: the loose object is present");
+
+        let compacted = std::rc::Rc::new(std::cell::Cell::new(false));
+        let ran = std::rc::Rc::clone(&compacted);
+        let (step_hash, step_content, step_folder, step_loose) = (hash.clone(), content.clone(), folder.clone(), loose_path.clone());
+        before_next_loose_read(move || {
+            // The other process's compact: publish the pack, then sweep the loose file. Nothing
+            // here touches this process's cached pack set.
+            let mut builder = TransportPackBuilder::new(&step_folder).unwrap();
+            builder.append_full(&step_hash, step_content.as_slice()).unwrap();
+            builder.finish().unwrap();
+            remove_file(&step_loose).unwrap();
+            ran.set(true);
+        });
+
+        let read = retrieve_object_by_hash(&hash);
+        assert!(compacted.get(), "the compact ran between the pack lookup and the loose read");
+        assert!(!loose_path.exists(), "the compact swept the loose file");
+        assert_eq!(read.as_deref(), Ok(content.as_slice()), "the read must serve the object the compact packed");
 
         remove_dir_all(&temp).ok();
     }
