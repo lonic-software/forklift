@@ -2315,7 +2315,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "array"
         },
         "registered": {
-          "description": "How many folders it registers, found in the damaged file, the working tree, the tree the bay\nstands on or a tree an interrupted operation names, with their staging in the shard store.",
+          "description": "How many folders it registers, found in the damaged file, the working tree, the tree the bay\nstands on or a tree an interrupted operation names, with their staging in the shard store,\nand their ancestors.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"

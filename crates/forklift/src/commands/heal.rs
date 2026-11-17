@@ -316,7 +316,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let partial_park = marker.as_ref()
         .filter(|marker| marker.kind == OperationKind::Park && !marker.pathspec.is_empty());
     // A metadata path that is not a file, or a rebuild that fails once the recovery has run, ends
-    // the run like a held rebuild: every other repair runs first, and the report says what they did.
+    // the run like a held rebuild: every other repair runs first, and the report says what they
+    // did.
     let mut inventory_error: Option<String> = None;
     let not_a_file = match inventory_heal::damaged() {
         Ok(damaged) => {
