@@ -117,8 +117,9 @@ fn heal_restores_a_lost_or_damaged_scope_from_its_copy() {
 /// A copy that names a path outside the fetch scope, names no path at all, or is gone, is not
 /// restored: heal refuses with no next step and names `heal --scope`.
 ///
-/// Revert: drop the fetch-scope or the full-scope check on the copy → heal restores a scope that
-/// checks out what the warehouse never fetched → red.
+/// Revert: drop the fetch-scope check on the copy → heal restores the copy that also names
+/// `other`, which the warehouse never fetched → red; drop the full-scope check → with the fetch
+/// scope lost too, heal restores a copy that names no path → red.
 #[test]
 fn heal_does_not_restore_from_a_copy_it_cannot_use() {
     let area = TestArea::new("checkout-scope-heal-bad-copy");
@@ -127,6 +128,7 @@ fn heal_does_not_restore_from_a_copy_it_cannot_use() {
 
     for (what, copy, reason) in [
         ("outside the fetch scope", Some(scope_record(&["other"])), "outside the fetch scope"),
+        ("wider than the fetch scope", Some(scope_record(&["docs", "other", "src/api"])), "outside the fetch scope"),
         ("full", Some(scope_record(&[])), "names no path"),
         ("deleted", None, "is missing"),
     ] {
@@ -135,12 +137,24 @@ fn heal_does_not_restore_from_a_copy_it_cannot_use() {
             None => remove(&area, MAIN_COPY),
         }
 
-        let error = scope_damaged(&area.forklift("sparse", &["--json", "heal"]));
+        let healed = area.forklift("sparse", &["--json", "heal"]);
+        assert!(!area.path(MAIN_SCOPE).exists(), "{}: nothing was restored", what);
+        let error = scope_damaged(&healed);
         let message = error["message"].as_str().unwrap();
         assert!(error["next_step"].is_null(), "{}: no next step can be offered: {}", what, error);
         assert!(message.contains(reason) && message.contains("\"forklift heal --scope <path>...\""), "{}: {}", what, message);
-        assert!(!area.path(MAIN_SCOPE).exists(), "{}: nothing was restored", what);
     }
+
+    // With the fetch scope lost as well, nothing else bounds the copy: one that names no path is
+    // still not restored.
+    let fetch = std::fs::read(area.path(FETCH_SCOPE)).unwrap();
+    remove(&area, FETCH_SCOPE);
+    std::fs::write(area.path(MAIN_COPY), scope_record(&[])).unwrap();
+    let healed = area.forklift("sparse", &["--json", "heal"]);
+    assert!(!area.path(MAIN_SCOPE).exists(), "full, fetch scope lost: nothing was restored");
+    let message = scope_damaged(&healed)["message"].as_str().unwrap().to_string();
+    assert!(message.contains("names no path"), "{}", message);
+    std::fs::write(area.path(FETCH_SCOPE), fetch).unwrap();
 }
 
 /// A copy narrower than what the checkout holds is not restored over a committed file it would
@@ -226,7 +240,8 @@ fn a_scope_write_that_cannot_leave_its_copy_changes_nothing() {
 /// path that is no folder, and in the main tree of a warehouse that is not sparse. The true scope
 /// is then set, with its copy.
 ///
-/// Revert: drop any one admission check → that case writes a scope → red.
+/// Revert: drop any one admission check → that case writes a scope, or is refused by a later check
+/// for another reason → red.
 #[test]
 fn heal_scope_refuses_a_scope_the_checkout_does_not_hold() {
     let area = TestArea::new("checkout-scope-heal-set");
