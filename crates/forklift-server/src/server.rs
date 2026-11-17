@@ -1862,7 +1862,7 @@ fn damage_message(code: forklift_core::error::RefusalCode) -> String {
         RefusalCode::TombstonesDamaged =>
             "The warehouse's list of deleted pallets, or the mark beside it that records the warehouse as served, is missing or does not read, so which history it keeps for them cannot be told, and the request was refused.".to_string(),
         RefusalCode::WithheldDamaged =>
-            "The warehouse's record of what its head withholds does not read, so what may be served cannot be told, and the request was refused.".to_string(),
+            "The warehouse's record of what its head withholds is missing or does not read, so what may be served cannot be told, and the request was refused.".to_string(),
         _ => unreachable!("not a damage code"),
     }
 }
@@ -9965,6 +9965,17 @@ mod tests {
             assert_eq!(info.tombstones, Some(BTreeMap::from([("side".to_string(), side)])));
             assert!(!info.pallets.contains_key("side"), "a deleted pallet is not listed");
             let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+        }
+
+        /// Every damage code a served root can refuse with has a client message and an operator's
+        /// remedy, so none reaches a handler's `unreachable!`.
+        /// Revert: drop one code's `damage_message` arm → it panics → red.
+        #[test]
+        fn every_served_damage_code_has_a_client_message_and_a_remedy() {
+            for code in forklift_core::error::SERVED_DAMAGE {
+                assert!(!super::super::damage_message(*code).is_empty(), "{:?}", code);
+                super::super::operator_remedy(*code, "forklift heal");
+            }
         }
 
         /// A damaged tombstone list or served mark is a 503 naming the operator's repair, and the

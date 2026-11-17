@@ -3127,7 +3127,9 @@ fn a_served_root_whose_withheld_record_is_lost_or_damaged_refuses_until_its_oper
             assert!(!head.to_ascii_lowercase().contains("retry-after"), "{} {}: {}", what, path, head);
             assert!(body.contains(r#""code":"withheld_damaged""#), "{} {}: {}", what, path, body);
             assert!(body.contains("forklift-server withhold repair --root <warehouse>"), "{} {}: {}", what, path, body);
-            assert!(!body.contains(&*root.to_string_lossy()), "{} {}: no server path: {}", what, path, body);
+            assert!(!body.contains(&*root.to_string_lossy()) && !body.contains(".forklift"), "{} {}: no server path: {}", what, path, body);
+            // Lost or damaged, the record is said to be missing or not to read.
+            assert!(body.contains("record of what its head withholds is missing or does not read"), "{} {}: {}", what, path, body);
         }
     };
 
