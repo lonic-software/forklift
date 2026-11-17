@@ -418,6 +418,7 @@ says where the bay stood, heal changes nothing and lists the pallets: `forklift 
 <pallet>` puts the bay on that pallet, at its newest parcel, taking your files as standing there.
 `forklift stocktake` then shows how they differ from it. If the bay had stood behind that
 parcel, its next stack no longer warns that the pallet moved on, so check the history first.
+While the copy or an interrupted operation says where the bay stood, `--position` is refused.
 
 When the refusal names another bay, run `forklift heal` in that bay: a heal here does not reach
 it. A position written by a newer version of Forklift is not this refusal, and no heal writes
