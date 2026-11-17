@@ -536,12 +536,12 @@ async fn dispatch(cli: Cli, store_access: &mut Option<lock_utils::StoreAccessLoc
         Command::Help { .. } => unreachable!("help is answered in `forklift`, before dispatch"),
         Command::Clone { url, directory, pallet, token, only, cache, expect, repair } =>
             commands::clone::handle_command(&url, &directory, pallet, token, only, cache, expect, repair).await,
-        Command::Heal { set_ref, remove_ref, fetch_scope, position, config } => {
+        Command::Heal { set_ref, remove_ref, fetch_scope, position, config, inventory } => {
             // Without its shared hold only under --fetch-scope, which takes the exclusive one.
             if store_access.is_none() && fetch_scope.is_empty() {
                 return Err("heal ran without its store-access hold.".into());
             }
-            commands::heal::handle_command(store_access.as_ref(), &set_ref, &remove_ref, &fetch_scope, position.as_deref(), config).await
+            commands::heal::handle_command(store_access.as_ref(), &set_ref, &remove_ref, &fetch_scope, position.as_deref(), config, inventory).await
         }
         Command::History { revision, limit, after, oneline } => commands::history::handle_command(revision, limit, after, oneline).await,
         Command::Query { revisions, from, class, unsupervised, supervisor, signer, author_after, author_before, merges, no_merges, grep, model, tool, tag, touches, verify: _, recorded, r#where, limit, after, oneline } =>

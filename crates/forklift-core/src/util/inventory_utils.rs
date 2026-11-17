@@ -470,7 +470,8 @@ fn subtree_has_live_entry(key: &str, registered: &BTreeSet<String>) -> Result<bo
     Ok(false)
 }
 
-/// Every key registered in the inventory metadata (an empty set when there is no metadata file).
+/// Every key registered in the inventory metadata (an empty set when there is no metadata file and
+/// no shard).
 ///
 /// # Returns
 /// * `Ok(BTreeSet<String>)` - The registered warehouse path keys.
@@ -2313,7 +2314,7 @@ impl Drop for MetadataWriteFaultGuard {
 ///
 /// # Returns
 /// * `BTreeSet<String>` - The entries plus the entries of all their ancestors.
-fn close_under_ancestors(metadata: &BTreeSet<String>) -> BTreeSet<String> {
+pub(crate) fn close_under_ancestors(metadata: &BTreeSet<String>) -> BTreeSet<String> {
     let mut closed = metadata.clone();
 
     for entry in metadata {
@@ -2392,11 +2393,12 @@ impl LazyLedger<'_> {
 
 impl ShardLedger {
     /// Read the registered set from the inventory metadata. A missing metadata file is an empty
-    /// set.
+    /// set while the store holds no shard, and damage (`inventory_damaged`) while it holds one.
     ///
     /// # Returns
     /// * `Ok(ShardLedger)` - The registered set.
-    /// * `Err(String)`     - If the metadata could not be read or parsed.
+    /// * `Err(String)`     - If the metadata could not be read or parsed, or is missing over a
+    ///                       shard.
     pub fn read() -> Result<ShardLedger, String> {
         LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
 
@@ -2413,8 +2415,8 @@ impl ShardLedger {
     /// Whether `key` is registered, which is the one definition of a tracked directory. Every
     /// ancestor of a registered key is registered too (see [`write_metadata_to_file`]), so every
     /// directory between the root and a tracked file is tracked. A registered key need not have a
-    /// shard file: a directory that holds only subdirectories has none, and reads as an empty
-    /// inventory.
+    /// shard file: an ancestor registered only for a key below it has none, and reads as an empty
+    /// inventory. A loaded folder with nothing in it has one that holds no entry.
     pub fn holds(&self, key: &str) -> bool {
         self.entries.contains(&key_to_metadata_entry(key))
     }
@@ -2522,6 +2524,24 @@ impl ShardLedger {
         file_utils::create_folder_if_not_exists(&inventory_root)?;
         file_utils::sync_folders_before_flushed_write(&BTreeSet::from([inventory_root]))?;
 
+        let entries = close_under_ancestors(&keys.iter().map(|key| key_to_metadata_entry(key)).collect());
+        write_metadata_to_file(&file_utils::get_inventory_metadata_path(), &entries)?;
+
+        Ok(ShardLedger { entries })
+    }
+
+    /// Write exactly `keys` and their ancestors as the registered set over the shards already on
+    /// disk, for heal's rebuild of a metadata file that does not read. The old metadata is never
+    /// read, and nothing is cleared or removed: the shards at these keys' addresses are the
+    /// staging the rebuild keeps, and a shard at any other address is left unregistered.
+    ///
+    /// # Arguments
+    /// * `keys` - Warehouse path keys whose shards are to be registered.
+    ///
+    /// # Returns
+    /// * `Ok(ShardLedger)` - The new registered set, durably written.
+    /// * `Err(String)`     - If the metadata could not be written.
+    pub fn rebuild(keys: &BTreeSet<String>) -> Result<ShardLedger, String> {
         let entries = close_under_ancestors(&keys.iter().map(|key| key_to_metadata_entry(key)).collect());
         write_metadata_to_file(&file_utils::get_inventory_metadata_path(), &entries)?;
 
@@ -3208,6 +3228,10 @@ mod tests {
             let _ = file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = crate::globals::StorageRootScope::enter(&root);
+            // No writer publishes a shard before the metadata registers its key, so a store with
+            // shards and no metadata file is damage: the fixtures plant shards over an empty set.
+            std::fs::create_dir_all(file_utils::get_path_inventory_root()).unwrap();
+            ShardLedger::rebuild(&BTreeSet::new()).unwrap();
 
             Scratch { root, _scope: scope }
         }
@@ -4186,7 +4210,7 @@ mod tests {
         std::fs::write(&path, b"./\nsrc\n").unwrap();
 
         let error = file_utils::retrieve_inventory_metadata_or_none().unwrap_err();
-        assert!(error.contains("has no format header"), "{}", error);
+        assert!(error.contains("inventory_damaged") && error.contains("does not open with its format header"), "{}", error);
     }
 
     /// Every shard folder in the store, by path.
@@ -5276,11 +5300,15 @@ mod tests {
         link_to(&outside, &metadata, false);
 
         let error = ShardLedger::read().map(|_| ()).expect_err("a linked metadata file");
-        assert!(error.contains("is not a file (a link is never followed)") && error.contains("unload ."), "{error}");
+        assert!(error.contains("is not a file (a link is never followed)") && error.contains("forklift heal"), "{error}");
 
-        // The way out: remove the link, then reset the staging area to the head (here, empty).
+        // The way out: remove the link, then heal, whose rebuild finds the staged folders' shards.
+        // A reset reads the record first, so it is refused.
         unlink(&metadata, false);
-        ShardLedger::read().unwrap().replace_subtree("", &BTreeMap::from([("".to_string(), Inventory::new())])).unwrap();
+        let refused = ShardLedger::read().map(|_| ()).expect_err("shards with no record");
+        assert!(refused.contains("inventory_damaged"), "{refused}");
+        let rebuild = crate::util::inventory_heal::plan(None).unwrap();
+        rebuild.write().unwrap();
         ShardLedger::read().unwrap().update_shard("a/b", add_new_txt).unwrap();
         assert_eq!(registered_names("a/b"), ["new.txt"]);
     }
@@ -5293,7 +5321,7 @@ mod tests {
         let scratch = Scratch::new("gate-linked-metadata");
 
         let metadata = file_utils::get_inventory_metadata_path();
-        std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        file_utils::remove_file(&metadata).unwrap();
         let outside = scratch.root.join("other-version-metadata");
         std::fs::write(&outside, "/forklift-inventory-metadata 999\n").unwrap();
         link_to(&outside, &metadata, false);
@@ -5395,5 +5423,51 @@ mod tests {
 
         assert_eq!(read_rollup("x").as_deref(), Some("rollup"), "the kept key's shard is untouched");
         assert!(file_utils::retrieve_inventory_or_none_by_key("a/b").unwrap().1.is_none(), "the removed key republished is cleared");
+    }
+
+    /// Put a shard data file at `key`'s address, as a load would, and return its path.
+    fn plant(key: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let folder = std::path::PathBuf::from(file_utils::get_path_inventory_root()).join(file_utils::shard_folder_relative(key));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("data"), bytes).unwrap();
+        folder.join("data")
+    }
+
+    /// Revert: count every shard folder, data file or not → the bare folder is counted → red. Stop
+    /// at the first only when it is not asked for → `true` lists both → red.
+    #[test]
+    fn shard_data_addresses_lists_each_data_file_and_stops_at_the_first_when_asked() {
+        let _scratch = Scratch::new("shard-data-addresses");
+        assert!(file_utils::shard_data_addresses(false).unwrap().is_empty(), "a missing store holds none");
+
+        plant("a", b"one");
+        plant("c", b"two");
+        let bare = std::path::PathBuf::from(file_utils::get_path_inventory_root()).join(file_utils::shard_folder_relative("d"));
+        std::fs::create_dir_all(&bare).unwrap();
+
+        let all = file_utils::shard_data_addresses(false).unwrap();
+        assert_eq!(all, [file_utils::shard_address("a"), file_utils::shard_address("c")].into_iter().collect());
+        assert_eq!(file_utils::shard_data_addresses(true).unwrap().len(), 1);
+    }
+
+    /// Revert: rebuild with `replace`, which clears the store → the planted shards are gone → red.
+    /// Write the keys without their ancestors, in the rebuild and in the metadata writer both → `a`
+    /// is not held → red.
+    #[test]
+    fn rebuild_registers_the_keys_and_their_ancestors_and_keeps_every_shard() {
+        let _scratch = Scratch::new("ledger-rebuild");
+        let kept = plant("a/b", b"kept");
+        let unmatched = plant("z", b"left");
+
+        let keys: BTreeSet<String> = ["a/b".to_string(), "c".to_string()].into_iter().collect();
+        ShardLedger::rebuild(&keys).unwrap();
+
+        let ledger = ShardLedger::read().unwrap();
+        for key in ["", "a", "a/b", "c"] {
+            assert!(ledger.holds(key), "{:?} is registered", key);
+        }
+        assert!(!ledger.holds("z"));
+        assert_eq!(std::fs::read(&kept).unwrap(), b"kept", "a registered key's shard is kept");
+        assert_eq!(std::fs::read(&unmatched).unwrap(), b"left", "an unmatched shard is left for the sweep");
     }
 }

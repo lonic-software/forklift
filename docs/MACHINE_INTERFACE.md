@@ -85,7 +85,21 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 51** (current): the `config_damaged` error code exists (exit 65). A configuration file
+**Schema 52** (current): the `inventory_damaged` error code exists (exit 66). The inventory
+metadata file, the record of which folders hold staged content, does not match its digest, lacks
+its header, holds a malformed escape or is not UTF-8, or it is missing while the staging area
+holds shards. A file in a format this version of Forklift does not know keeps its uncoded refusal.
+`next_step` is `forklift heal`. When a link or a folder stands where the file belongs, the
+refusal is the same code, and `next_step` says to remove it before running `forklift heal`. `heal` reports a rebuilt record as `inventory_rebuilt`:
+`registered`, how many folders it found with staging on disk; `dropped`, how many shards of
+staging matched none of them and are no longer registered; `unread`, each tree it proposed
+folders from and could not read (`tree`, `from`, `reason`); and `passed_over`, the same for trees
+this warehouse holds by hash alone. When `dropped` or `unread` is not empty, heal does not write
+the record: it finishes its other repairs, then refuses `inventory_damaged` with next step
+`forklift heal --inventory`, carrying the report in `details` with the rebuild as
+`inventory_held`.
+
+**Schema 51**: the `config_damaged` error code exists (exit 65). A configuration file
 holds bytes that are not UTF-8 or a control character TOML never allows, or its last line does not
 parse and lacks its final newline, as a file cut short does. `next_step` is `forklift heal` for the
 warehouse's own file, and empty for the global file, which heal does not mend; heal refuses this

@@ -2298,6 +2298,44 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "InventoryRebuilt": {
+      "description": "A rebuild of the inventory's registered set of folders, as a `heal` report gives it.",
+      "properties": {
+        "dropped": {
+          "description": "How many shards in the store match none of those folders or their ancestors. Written, the\nrebuild leaves them unregistered, and whatever staging they hold is lost (a shard a removal\nleft behind holds none).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "passed_over": {
+          "description": "Trees it could not read that this warehouse holds by hash alone. They hold nothing back, but\na plain heal once the origin answers may find folders they name.",
+          "items": {
+            "$ref": "#/$defs/TreeUnread"
+          },
+          "type": "array"
+        },
+        "registered": {
+          "description": "How many folders it registers, found in the damaged file, the working tree, the tree the bay\nstands on or a tree an interrupted operation names, with their staging in the shard store,\nand their ancestors.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unread": {
+          "description": "Trees it proposed folders from and could not read: the folders only they name are left out.",
+          "items": {
+            "$ref": "#/$defs/TreeUnread"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "registered",
+        "dropped",
+        "unread",
+        "passed_over"
+      ],
+      "type": "object"
+    },
     "LostObject": {
       "description": "One lost object and why it is lost.",
       "properties": {
@@ -2709,6 +2747,29 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "TreeUnread": {
+      "description": "A tree the rebuild proposed directories from and could not read.",
+      "properties": {
+        "from": {
+          "description": "What named it: `base` (the bay position's base parcel), or the standing operation's\n`source`, `target`, `their` or `parked` tree.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it was not read.",
+          "type": "string"
+        },
+        "tree": {
+          "description": "The tree's hash, or the hash of the parcel that names it when that parcel did not read (the\nreason then says so).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tree",
+        "from",
+        "reason"
+      ],
+      "type": "object"
+    },
     "UnavailableRebuilt": {
       "description": "What `heal` kept of a damaged record of content this warehouse cannot get.",
       "properties": {
@@ -2779,6 +2840,28 @@ A command not listed here either reports only the generic human-message shape `{
         }
       ],
       "description": "The fetch scope of a sparse warehouse, which was lost or damaged and this run wrote: rebuilt\nfrom the checkouts' scopes, or set to the paths `--fetch-scope` gave."
+    },
+    "inventory_held": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/InventoryRebuilt"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The same rebuild, held and not written: it left staging unmatched or could not read a tree\nit proposed folders from. The run refuses `inventory_damaged` with it."
+    },
+    "inventory_rebuilt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/InventoryRebuilt"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The inventory's registered set of folders, which did not read and this run rebuilt from the\nfolders it could find whose staging the shard store holds."
     },
     "newly_held_by_hash": {
       "description": "Absent objects beneath those in `unsealed` that the record now holds by hash alone, so that\nremoving those records left nothing beneath them unaccounted for.",

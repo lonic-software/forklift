@@ -449,6 +449,15 @@ refusal_codes! {
     /// mending it would drop, and `heal --config` keeps every entry the damage provably spared,
     /// after setting the damaged bytes aside.
     ConfigDamaged => "config_damaged",
+
+    /// The inventory metadata, the set of directories with staged content, does not parse as one
+    /// this build or an older one wrote, or it is missing while the staging area still holds
+    /// shards, or a link or a folder stands where it belongs (the next step then says to remove
+    /// it). A file a newer version wrote is not this. Nothing was changed; `heal` rebuilds the
+    /// set from the directories the working tree, the bay's base and a standing operation name,
+    /// keeping each one whose shard is on disk, and `heal --inventory` writes it even when some
+    /// shard matches none of them.
+    InventoryDamaged => "inventory_damaged",
 }
 
 /// The codes of a host record that is lost or damaged, or of an object its store cannot read,

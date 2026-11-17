@@ -949,7 +949,7 @@ mod tests {
         operation_utils::forget_raised_for_tests();
         remove_record();
 
-        test_support::block_on(crate::commands::heal::handle_command(None, &[], &[], &[], None, false)).unwrap();
+        test_support::block_on(crate::commands::heal::handle_command(None, &[], &[], &[], None, false, false)).unwrap();
 
         assert!(park_utils::read_parked().unwrap().is_empty(), "the recovered entry is taken out");
         assert!(operation_utils::read().unwrap().is_none(), "the marker is cleared");

@@ -1,0 +1,5 @@
+{
+  "forge": "github",
+  "ci": true,
+  "verify_cmd": "cargo test --workspace --no-fail-fast"
+}

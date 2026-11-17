@@ -635,6 +635,17 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **A damaged inventory metadata file is refused with a remedy, and `heal` rebuilds it.** The
+  inventory's record of which folders hold staged content, cut short, zeroed or with a byte
+  flipped, failed `load`, `unload` and `status` with an uncoded error, and `heal` found nothing to
+  heal. Every reader now refuses it with `inventory_damaged` (exit 66, `--json` schema 52), and
+  so does a deleted record while the staging area still holds staged content. `forklift heal`
+  rebuilds the record from every folder it can find whose staging is on disk: the damaged file's
+  lines that still read, the working tree, the tree the bay's files stand on, and the trees an
+  interrupted operation names. It writes the record only when that accounts for all the staging on
+  disk and it read every one of those trees. Otherwise it writes nothing, finishes its other
+  repairs, and refuses naming what it could not account for. `heal --inventory` then writes the
+  record anyway, and the staging no folder matched is no longer registered.
 - **A damaged configuration file is refused with a remedy, and `heal` mends the warehouse's
   own.** A configuration file holding bytes that are not text, or zeroed, failed every command
   with a raw read error and no way out. Every reader now refuses it with `config_damaged` (exit
