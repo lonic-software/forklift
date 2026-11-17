@@ -169,6 +169,15 @@ impl ObjectStore for MemoryObjectStore {
             .collect())
     }
 
+    /// An object's kind, read from its header without counting a read: the S3 store answers it from
+    /// the metadata its writers recorded, on the `HEAD` a presence check already sends.
+    fn kind(&self, hash: &str) -> Result<Option<forklift_core::enums::object_type::ObjectType>, String> {
+        match self.objects.lock().unwrap().get(hash) {
+            Some(bytes) => object_utils::peek_object_type(bytes).map(Some),
+            None => Ok(None),
+        }
+    }
+
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
         self.reads.fetch_add(1, Ordering::Relaxed);
 

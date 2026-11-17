@@ -635,6 +635,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **A remote refuses history that names an object as a kind it is not.** A ref update whose new
+  history named a folder's tree or a large file's piece at a file entry, or a plain file's
+  content as a large file or one of its pieces, was taken, and the pallet then pointed at history
+  nothing could read. Both servers refuse it with `object_kind_mismatch` (exit 63, `--json`
+  schema 49), naming the object, the path and both kinds. The serverless server records each
+  object's kind as it stores it, which is AWS format 3: a format 2 warehouse is refused and must
+  be made again under a new id.
 - **`heal` no longer sends you to a backup over a load you never stacked.** When the store lost the
   content of a staged file, `heal` refused with exit 58 (`objects_lost`), saying history still
   reached it and telling you to restore from a backup or clone afresh. Now `heal` stores lost

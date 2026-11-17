@@ -1876,6 +1876,8 @@ impl RefStore for MarkedMidRequest {
 /// and a ref update that gated before an upgrade marked the warehouse writes nothing.
 #[test]
 fn every_request_is_gated_on_the_warehouse_format() {
+    let now = forklift_aws_lambda::format::AWS_FORMAT.to_string();
+    use forklift_aws_lambda::format::AWS_FORMAT;
     let area = Area::new("format-gate");
     prepare(&area, "wh");
     area.write_file("wh/app.txt", "v1\n");
@@ -1892,13 +1894,16 @@ fn every_request_is_gated_on_the_warehouse_format() {
     }
     let lift = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
     assert_eq!(status(&fixture.call(post_json("/v1/pallets/main", &lift))), 200);
-    assert_eq!(fixture.refs.read_format().unwrap().as_deref(), Some("2"), "the first write stamps the format");
+    assert_eq!(fixture.refs.read_format().unwrap().as_deref(), Some(now.as_str()), "the first write stamps the format");
 
+    let (mark, next, older) = (format!("{}>{} operator 0", now, AWS_FORMAT + 1), (AWS_FORMAT + 1).to_string(),
+                               (AWS_FORMAT - 1).to_string());
     for (state, says) in [
-        (Some("2>3 operator 0"), "being upgraded from format 2 to format 3"),
-        (Some("3"), "newer than format 2"),
-        (Some("1"), "Make it again under a new id"),
-        (None, "records no format"),
+        (Some(mark.as_str()), format!("being upgraded from format {} to format {}", now, AWS_FORMAT + 1)),
+        (Some(next.as_str()), format!("newer than format {}", now)),
+        (Some(older.as_str()), "Make it again under a new id".to_string()),
+        (Some("1"), "Make it again under a new id".to_string()),
+        (None, "records no format".to_string()),
     ] {
         fixture.refs.set_format(state);
 
@@ -1906,11 +1911,11 @@ fn every_request_is_gated_on_the_warehouse_format() {
             let response = fixture.call(request);
             assert_eq!(status(&response), 503, "{:?}", state);
             let body: serde_json::Value = body_json(&response);
-            assert!(body["error"].as_str().unwrap().contains(says), "{:?}: {}", state, body);
+            assert!(body["error"].as_str().unwrap().contains(&says), "{:?}: {}", state, body);
         }
     }
 
-    fixture.refs.set_format(Some("2"));
+    fixture.refs.set_format(Some(&now));
     assert_eq!(fixture.refs.get_head(PalletNamespace::User, "feature").unwrap(), RefHead::Absent);
 
     let refs = fixture.refs.clone();

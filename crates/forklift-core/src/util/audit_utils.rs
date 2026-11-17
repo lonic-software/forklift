@@ -7,6 +7,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::cell::RefCell;
 use std::sync::{Mutex, OnceLock};
+use crate::enums::object_type::ObjectType;
 use crate::model::tree_item::TreeItem;
 use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
 use crate::util::scope_utils::{PathScope, ScopeClass};
@@ -1801,24 +1802,75 @@ pub fn require_adopted_history(
 ///                      verifies all the way down).
 ///
 /// # Returns
-/// * `Ok(())`      - If everything is present.
-/// * `Err(String)` - If a parcel, tree or blob is missing (or unreadable).
+/// * `Ok(())`      - If everything is present, and every object a file entry or a recipe names is
+///                   the kind that names it.
+/// * `Err(String)` - If a parcel, tree or blob is missing (or unreadable), or an entry names an
+///                   object of another kind ([`ClosureRefusal::MisKinded`]).
 ///
 pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result<(), String> {
-    // The default checks read straight from the local object store; the serverless head passes an
-    // S3 HEAD for blob presence, a bounded-concurrency batch of S3 HEADs for the chunk-presence
-    // seam, a store-backed recipe read for the chunk descent, and a store-backed tree read for the
-    // base-tree prune (see `verify_parcel_closure_with`).
-    verify_parcel_closure_with(
-        head,
-        known_complete,
-        &|hash| file_utils::does_object_exist(hash),
-        &local_chunks_missing,
-        &|hash| object_utils::recipe_chunk_hashes(hash),
-        &|hash| object_utils::load_tree(hash),
-        &|| Ok(Tolerated::default()),
-        &|hash| object_utils::load_parcel(hash),
-    ).map_err(String::from)
+    verify_local_closure_kinded(head, known_complete, &|| Ok(Tolerated::default())).map_err(String::from)
+}
+
+/// [`verify_parcel_closure_with`] over the local object store, reading the kind of every object a
+/// file entry or a recipe names: the self-hosted server's write gates. The serverless head passes
+/// its own seams over object storage instead.
+///
+/// The kinds are memoized for the one walk, so an object named many times is read once, and each
+/// costs a header peek, a delta record a whole read ([`file_utils::object_type_of`]).
+fn verify_local_closure_kinded(head: &str,
+                               known_complete: Option<&str>,
+                               removed: &dyn Fn() -> Result<Tolerated, String>)
+                               -> Result<(), ClosureRefusal> {
+    // The hashes whose peeked kind the whole read did not confirm, each beside what that read
+    // found: a damaged copy, read whole from then on.
+    let mut verified: HashMap<String, Result<Option<ObjectType>, String>> = HashMap::new();
+    let walk = |verified: &HashMap<String, Result<Option<ObjectType>, String>>| {
+        let kinds: RefCell<HashMap<String, Option<ObjectType>>> = RefCell::new(HashMap::new());
+        let kind_of = |hash: &str| -> Result<Option<ObjectType>, String> {
+            if let Some(kind) = kinds.borrow().get(hash) {
+                return Ok(*kind);
+            }
+            let kind = match verified.get(hash) {
+                Some(read) => read.clone()?,
+                None => file_utils::object_type_of(hash)?,
+            };
+
+            kinds.borrow_mut().insert(hash.to_string(), kind);
+            Ok(kind)
+        };
+        let chunks_probe = |chunks: &[String]| -> Result<ChunkProbe, String> {
+            let kinds = chunks.iter().map(|chunk| kind_of(chunk).map(|kind| (chunk.clone(), kind)));
+            Ok(ChunkProbe::from_kinds(kinds.collect::<Result<Vec<_>, String>>()?))
+        };
+
+        verify_parcel_closure_with(
+            head,
+            known_complete,
+            &|hash| kind_of(hash).map(ObjectProbe::kind),
+            &chunks_probe,
+            &|hash| object_utils::recipe_chunk_hashes(hash),
+            &|hash| object_utils::load_tree(hash),
+            removed,
+            &|hash| object_utils::load_parcel(hash),
+        )
+    };
+
+    // A peeked header is not verified, so a mis-kind is refused only when the object read whole
+    // says so too. One that does not is a damaged copy: the walk is made again with that one hash
+    // read whole, which reads the damage as the ordinary read would, and every other still
+    // peeked. Each pass reads one more hash whole, so the passes end.
+    loop {
+        match walk(&verified) {
+            Err(ClosureRefusal::MisKinded(mis_kinded)) if !verified.contains_key(&mis_kinded.hash) => {
+                let read = file_utils::verified_object_type_of(&mis_kinded.hash);
+                if read.as_ref().is_ok_and(|found| *found == Some(mis_kinded.found)) {
+                    return Err(ClosureRefusal::MisKinded(mis_kinded));
+                }
+                verified.insert(mis_kinded.hash.clone(), read);
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 /// [`verify_parcel_closure`] for a ref update, returning the proof a ref write accepts in place of verifying the same head again
@@ -1843,16 +1895,7 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 ///                           record cannot be read.
 pub fn verify_parcel_closure_for_write(head: &str,
                                        known_complete: Option<&str>) -> Result<pallet_utils::VerifiedClosure, ClosureRefusal> {
-    verify_parcel_closure_with(
-        head,
-        known_complete,
-        &|hash| file_utils::does_object_exist(hash),
-        &local_chunks_missing,
-        &|hash| object_utils::recipe_chunk_hashes(hash),
-        &|hash| object_utils::load_tree(hash),
-        &crate::util::sealed_utils::read_redacted_and_withheld,
-        &|hash| object_utils::load_parcel(hash),
-    )?;
+    verify_local_closure_kinded(head, known_complete, &crate::util::sealed_utils::read_redacted_and_withheld)?;
 
     Ok(pallet_utils::VerifiedClosure::new(head, PathScope::full(), known_complete))
 }
@@ -1903,6 +1946,102 @@ pub enum ClosureRefusal {
     /// be read to judge the absence; or the walk held withheld content it would judge against the
     /// pallet's current head, and that head's tree could not be read.
     RecordsUnreadable(String),
+
+    /// The new history names a present object as a kind it is not: a file entry whose object is
+    /// not a blob (or, at a chunked entry, not a recipe), or a recipe's chunk that is not a chunk.
+    /// The history itself is malformed, so no upload changes this.
+    MisKinded(MisKinded),
+}
+
+/// A reference the walk found naming a present object of another kind
+/// ([`ClosureRefusal::MisKinded`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MisKinded {
+    /// The refusal's text.
+    pub message: String,
+    /// The object named.
+    pub hash: String,
+    /// Where the history names it: the file's path, or for a chunk the path of its file.
+    pub path: String,
+    /// The kind the reference requires.
+    pub expected: ObjectType,
+    /// The kind the object is.
+    pub found: ObjectType,
+}
+
+impl MisKinded {
+    fn new(hash: &str, path: &str, expected: ObjectType, found: ObjectType, as_chunk: bool) -> MisKinded {
+        let named = if as_chunk {
+            format!("as a chunk of the file \"{}\"", path)
+        } else {
+            format!("at \"{}\"", path)
+        };
+
+        MisKinded {
+            message: format!(
+                "The new history names object {} {}, which needs a {}, but that object is a {}.",
+                hash, named, expected, found
+            ),
+            hash: hash.to_string(),
+            path: path.to_string(),
+            expected,
+            found,
+        }
+    }
+}
+
+/// What a closure walk's probe of one object found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ObjectProbe {
+    /// The store does not hold it.
+    Absent,
+    /// The store holds it; this probe does not read kinds, so the walk checks presence alone.
+    Present,
+    /// The store holds it, and it is of this kind.
+    Is(ObjectType),
+}
+
+impl ObjectProbe {
+    /// A presence-only probe's answer.
+    pub fn presence(present: bool) -> ObjectProbe {
+        if present { ObjectProbe::Present } else { ObjectProbe::Absent }
+    }
+
+    /// A kind-reading probe's answer.
+    pub fn kind(object_type: Option<ObjectType>) -> ObjectProbe {
+        object_type.map_or(ObjectProbe::Absent, ObjectProbe::Is)
+    }
+
+    fn is_absent(self) -> bool {
+        self == ObjectProbe::Absent
+    }
+}
+
+/// What a closure walk's bulk probe of a recipe's chunks found.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct ChunkProbe {
+    /// The chunks the store does not hold, in any order.
+    pub missing: Vec<String>,
+    /// The chunks the store holds as another kind, with the kind each is. Always empty from a
+    /// presence-only probe.
+    pub mis_kinded: Vec<(String, ObjectType)>,
+}
+
+impl ChunkProbe {
+    /// The probe of chunks each beside its kind, `None` for one the store does not hold: a chunk
+    /// is missing, a chunk, or mis-kinded.
+    pub fn from_kinds(kinds: impl IntoIterator<Item = (String, Option<ObjectType>)>) -> ChunkProbe {
+        let mut probed = ChunkProbe::default();
+
+        for (chunk, kind) in kinds {
+            match kind {
+                None => probed.missing.push(chunk),
+                Some(ObjectType::Chunk) => {}
+                Some(found) => probed.mis_kinded.push((chunk, found)),
+            }
+        }
+        probed
+    }
 }
 
 /// A chunked file a ref update was refused over ([`ClosureRefusal::Uncomparable`]).
@@ -1926,6 +2065,7 @@ impl ClosureRefusal {
             | ClosureRefusal::Withheld(message)
             | ClosureRefusal::RecordsUnreadable(message) => message,
             ClosureRefusal::Uncomparable(uncomparable) => &uncomparable.message,
+            ClosureRefusal::MisKinded(mis_kinded) => &mis_kinded.message,
         }
     }
 
@@ -1952,6 +2092,18 @@ impl ClosureRefusal {
                     "hash": uncomparable.hash,
                     "path": uncomparable.path,
                     "statement": uncomparable.statement,
+                }),
+            ).into(),
+            // A malformed history: nothing a lift or an upload does changes it, so no next step.
+            ClosureRefusal::MisKinded(mis_kinded) => crate::error::CoreError::refusal_with_details(
+                crate::error::RefusalCode::ObjectKindMismatch,
+                format!("{} The pallet was not moved.", mis_kinded.message),
+                "",
+                serde_json::json!({
+                    "hash": mis_kinded.hash,
+                    "path": mis_kinded.path,
+                    "expected": mis_kinded.expected.to_string(),
+                    "found": mis_kinded.found.to_string(),
                 }),
             ).into(),
             other => other.into(),
@@ -2056,23 +2208,26 @@ pub fn head_not_materializable_message(path: &str) -> String {
 /// [`verify_parcel_closure`], with the leaf-blob presence check made pluggable.
 ///
 /// Parcels and trees are always read (and parsed) from the object store — the walk
-/// cannot proceed without them. File-content blobs, by contrast, are never *read* here,
-/// only checked for presence, so their existence check is the one seam a non-filesystem
-/// head varies: the AWS serverless head mirrors the parcels and trees it must parse into
-/// a scratch `.forklift`, but leaves the (large, many) working blobs in object storage
-/// and answers this check with an S3 `HEAD` (DESIGN.html §4.6).
+/// cannot proceed without them. File-content blobs, by contrast, are never *read* here: they are
+/// probed for presence and, where the seam says, for their kind, so that probe is the one seam a
+/// non-filesystem head varies: the AWS serverless head mirrors the parcels and trees it must parse
+/// into a scratch `.forklift`, but leaves the (large, many) working blobs in object storage and
+/// answers the probe with an S3 `HEAD`, reading the kind from the metadata its writers recorded
+/// (DESIGN.html §4.6). The kind is checked before anything tolerated is consulted, on both walks,
+/// and a mis-kind is refused ([`ClosureRefusal::MisKinded`]) before any absence is judged.
 ///
 /// # Arguments
 /// * `head`               - The head parcel whose closure is verified.
 /// * `known_complete`     - A head whose history is already known complete (`None` verifies
 ///                          all the way down).
 /// * `namespace`          - The namespace of the pallet whose ref is to hold `head`.
-/// * `blob_exists`        - Returns whether a file-content blob — or a recipe object, a chunked
-///                          file's tree-entry — is present at a hash. The plain, per-hash presence
-///                          seam, left untouched; the many-per-recipe chunk presence goes through
-///                          `chunks_missing` instead.
-/// * `chunks_missing`     - The bulk chunk-presence seam (§9.4b W4): given a recipe's full
-///                          chunk-hash list, returns the subset the store lacks. A `*Chunked` file
+/// * `probe`              - Probes the object a file entry names, a blob or, at a chunked entry, a
+///                          recipe: absent, present, or present of a kind ([`ObjectProbe`]). A
+///                          presence-only probe checks no kind. The many-per-recipe chunk probe
+///                          goes through `chunks_probe` instead.
+/// * `chunks_probe`       - The bulk chunk seam (§9.4b W4): given a recipe's full chunk-hash
+///                          list, returns the subset the store lacks and those it holds as another
+///                          kind ([`ChunkProbe`]). A `*Chunked` file
 ///                          entry names a recipe whose chunks are reachable only *through* it, so
 ///                          the closure walk hands the whole list here in one call and fails
 ///                          **non-tolerantly** if any come back missing — a ref must never advance
@@ -2081,7 +2236,7 @@ pub fn head_not_materializable_message(path: &str) -> String {
 ///                          bounded-concurrency batch of S3 `HEAD`s, so a changed multi-gigabyte
 ///                          file's thousands of chunks verify in a second or two rather than one
 ///                          slow round trip apiece under API Gateway's hard timeout.
-/// * `load_recipe_chunks` - Returns the ordered chunk hashes of a recipe (the list `chunks_missing`
+/// * `load_recipe_chunks` - Returns the ordered chunk hashes of a recipe (the list `chunks_probe`
 ///                          probes). The local path reads the recipe from the object store; so does
 ///                          the AWS head, which is why the read is a parameter and not a hard-coded
 ///                          load. A recipe is a file-entry object, so the audit scratch holds one
@@ -2129,17 +2284,26 @@ pub fn head_not_materializable_message(path: &str) -> String {
 pub fn verify_parcel_closure_with(
     head: &str,
     known_complete: Option<&str>,
-    blob_exists: &dyn Fn(&str) -> Result<bool, String>,
-    chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
+    probe: &dyn Fn(&str) -> Result<ObjectProbe, String>,
+    chunks_probe: &dyn Fn(&[String]) -> Result<ChunkProbe, String>,
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
     removed: &dyn Fn() -> Result<Tolerated, String>,
     load_parcel: &dyn Fn(&str) -> Result<crate::model::parcel::Parcel, String>,
 ) -> Result<(), ClosureRefusal> {
     let bounds = known_complete.as_ref().map(std::slice::from_ref);
-    let seams = ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed: None };
+    let mis_kinded = RefCell::new(None);
+    let seams = ClosureSeams {
+        probe, chunks_probe, load_recipe_chunks, load_base_tree, sealed: None, mis_kinded: &mis_kinded,
+    };
 
-    let Err(missing) = verify_closure_core(head, bounds, known_complete, &PathScope::full(), false, &seams) else {
+    let walked = verify_closure_core(head, bounds, known_complete, &PathScope::full(), false, &seams);
+
+    // A mis-kind is no absence, so nothing tolerated could account for it: no second walk.
+    if let Some(mis_kinded) = mis_kinded.take() {
+        return Err(ClosureRefusal::MisKinded(mis_kinded));
+    }
+    let Err(missing) = walked else {
         return Ok(());
     };
 
@@ -2155,12 +2319,17 @@ pub fn verify_parcel_closure_with(
 
     let tolerance = SealedTolerance::new(&tolerated);
     let seams = ClosureSeams { sealed: Some(&tolerance), ..seams };
+    let walked = verify_closure_core(head, bounds, known_complete, &PathScope::full(), false, &seams);
 
-    verify_closure_core(head, bounds, known_complete, &PathScope::full(), false, &seams)
-        .map_err(|refusal| match withheld_named(&refusal, &tolerated.withheld) {
-            Some(_) => ClosureRefusal::Withheld(withheld_beyond_files(refusal, &tolerated.withheld)),
-            None => ClosureRefusal::Incomplete(refusal),
-        })?;
+    // The tolerant walk checks kinds before it consults what is tolerated, so a present object of
+    // the wrong kind that the record names is refused here as well.
+    if let Some(mis_kinded) = mis_kinded.take() {
+        return Err(ClosureRefusal::MisKinded(mis_kinded));
+    }
+    walked.map_err(|refusal| match withheld_named(&refusal, &tolerated.withheld) {
+        Some(_) => ClosureRefusal::Withheld(withheld_beyond_files(refusal, &tolerated.withheld)),
+        None => ClosureRefusal::Incomplete(refusal),
+    })?;
 
     refuse_uncomparable(&tolerance, &tolerated.withheld, known_complete, load_parcel, load_base_tree)
 }
@@ -2249,15 +2418,55 @@ fn chunked_named(head: &str,
 
 /// The object-store reads [`verify_closure_core`] varies by head (see
 /// [`verify_parcel_closure_with`] for each one).
+#[derive(Clone, Copy)]
 struct ClosureSeams<'a> {
-    blob_exists: &'a dyn Fn(&str) -> Result<bool, String>,
-    chunks_missing: &'a dyn Fn(&[String]) -> Result<Vec<String>, String>,
+    probe: &'a dyn Fn(&str) -> Result<ObjectProbe, String>,
+    chunks_probe: &'a dyn Fn(&[String]) -> Result<ChunkProbe, String>,
     load_recipe_chunks: &'a dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &'a dyn Fn(&str) -> Result<TreeItem, String>,
     /// The sealed-by-hash record, the applied redactions and the withheld content, for the audit
     /// and the client's ref gate, or the last two alone for either remote's push gate; `None` for a walk that
     /// tolerates no absence.
     sealed: Option<&'a SealedTolerance<'a>>,
+    /// The first reference the walk found naming an object of another kind. The walk fails as soon
+    /// as it records one, and its caller reads it here, to tell it from an absence.
+    mis_kinded: &'a RefCell<Option<MisKinded>>,
+}
+
+impl ClosureSeams<'_> {
+    /// Probe the object a file entry at `path` names, failing the walk when the probe reads its
+    /// kind and it is not the kind the entry needs: a recipe at a chunked entry, a blob at any
+    /// other. Checked before anything tolerated is consulted, as no record tolerates a mis-kind.
+    fn probe_file(&self, file: &TreeItem, path: &str) -> Result<ObjectProbe, String> {
+        let probed = (self.probe)(&file.hash)?;
+        let expected = if file.item_type.is_chunked() { ObjectType::Recipe } else { ObjectType::Blob };
+
+        match probed {
+            ObjectProbe::Is(found) if found != expected => {
+                Err(self.refuse(MisKinded::new(&file.hash, path, expected, found, false)))
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Probe a recipe's chunks, failing the walk at the first one the probe found of another kind.
+    /// `path` is the path of the recipe's file. Returns the absent chunks.
+    fn probe_chunks(&self, chunks: &[String], path: &str) -> Result<Vec<String>, String> {
+        let probed = (self.chunks_probe)(chunks)?;
+
+        if let Some((hash, found)) = probed.mis_kinded.into_iter().min_by(|a, b| a.0.cmp(&b.0)) {
+            return Err(self.refuse(MisKinded::new(&hash, path, ObjectType::Chunk, found, true)));
+        }
+        Ok(probed.missing)
+    }
+
+    /// Record `mis_kinded` as the walk's failure, and return its text for the walk to fail with.
+    fn refuse(&self, mis_kinded: MisKinded) -> String {
+        let message = mis_kinded.message.clone();
+
+        self.mis_kinded.borrow_mut().get_or_insert(mis_kinded);
+        message
+    }
 }
 
 /// The sealed-by-hash record, the applied redactions, the withheld content and the unavailable
@@ -2387,7 +2596,6 @@ fn verify_closure_core(
     reverify: bool,
     seams: &ClosureSeams,
 ) -> Result<(), String> {
-    let ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed } = *seams;
 
     // The walk reads to learn what the store holds, and a failed read is what it reports: it
     // fetches nothing, or a cache's gate would fetch the history it holds by hash.
@@ -2563,8 +2771,7 @@ fn verify_closure_core(
         // warehouse it stops at each out-of-scope boundary. The commit gate presence-checks;
         // content re-verification is `audit --full` only.
         verify_tree_closure_scoped(
-            &parcel.tree_hash, "", &bases, &mut visited_trees, &mut spine_seen,
-            blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, scope, reverify, sealed,
+            &parcel.tree_hash, "", &bases, &mut visited_trees, &mut spine_seen, seams, scope, reverify,
         )?;
     }
 
@@ -2676,11 +2883,12 @@ pub fn verify_parcel_closure_scoped(
     // An object recorded as sealed by hash is held by hash alone, like content outside the scope:
     // absent, it is tolerated and not descended.
     let seams = ClosureSeams {
-        blob_exists: &|hash| file_utils::does_object_exist(hash),
-        chunks_missing: &local_chunks_missing,
+        probe: &local_presence,
+        chunks_probe: &local_chunks_presence,
         load_recipe_chunks: &|hash| object_utils::recipe_chunk_hashes(hash),
         load_base_tree: &|hash| object_utils::load_tree(hash),
         sealed,
+        mis_kinded: &RefCell::new(None),
     };
 
     verify_closure_core(
@@ -2723,11 +2931,12 @@ pub fn verify_ref_head_closure(head: &str,
     let bounds: Vec<&str> = known_complete.iter().map(String::as_str).collect();
     let tolerance = sealed.map(SealedTolerance::new);
     let seams = ClosureSeams {
-        blob_exists: &|hash| file_utils::does_object_exist(hash),
-        chunks_missing: &local_chunks_missing,
+        probe: &local_presence,
+        chunks_probe: &local_chunks_presence,
         load_recipe_chunks: &|hash| object_utils::recipe_chunk_hashes(hash),
         load_base_tree: &|hash| object_utils::load_tree(hash),
         sealed: tolerance.as_ref(),
+        mis_kinded: &RefCell::new(None),
     };
 
     verify_closure_core(head, Some(&bounds), base, scope, false, &seams)
@@ -2766,20 +2975,13 @@ fn verify_tree_closure_scoped(tree_hash: &str,
                               bases: &[String],
                               verified: &mut HashSet<String>,
                               spine_seen: &mut HashSet<(String, String)>,
-                              blob_exists: &dyn Fn(&str) -> Result<bool, String>,
-                              chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
-                              load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
-                              load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
+                              seams: &ClosureSeams,
                               scope: &PathScope,
-                              reverify: bool,
-                              sealed: Option<&SealedTolerance>) -> Result<(), String> {
+                              reverify: bool) -> Result<(), String> {
+    let sealed = seams.sealed;
+
     match scope.classify(prefix) {
-        ScopeClass::InScope => {
-            return verify_tree_closure(
-                tree_hash, prefix, bases, verified, blob_exists, chunks_missing, load_recipe_chunks,
-                load_base_tree, reverify, sealed,
-            )
-        }
+        ScopeClass::InScope => return verify_tree_closure(tree_hash, prefix, bases, verified, seams, reverify),
         ScopeClass::OutOfScope => return Ok(()),
         ScopeClass::Spine => {}
     }
@@ -2794,14 +2996,14 @@ fn verify_tree_closure_scoped(tree_hash: &str,
         return Ok(());
     }
 
-    if sealed_absent(sealed, tree_hash, blob_exists)? {
+    if sealed_absent(sealed, tree_hash, seams.probe)? {
         return Ok(());
     }
 
     // Loading re-hashes the object (content-addressed read), so a corrupted spine tree fails here.
     let tree = object_utils::load_tree(tree_hash)
         .map_err(|e| format!("Tree {} is missing or unreadable: {}", tree_hash, e))?;
-    let (base_files, base_subtrees) = base_entries(bases, load_base_tree);
+    let (base_files, base_subtrees) = base_entries(bases, seams.load_base_tree);
 
     for (name, file) in tree.get_files() {
         let path = child_path(prefix, &file.name);
@@ -2811,7 +3013,7 @@ fn verify_tree_closure_scoped(tree_hash: &str,
         if base_files.get(name).is_some_and(|entries| entries.contains(&file_entry(file))) {
             continue; // a base carries it here: present by the base's own verification
         }
-        if !blob_exists(&file.hash)? {
+        if seams.probe_file(file, &path)?.is_absent() {
             if holds_absent_file(sealed, file, &path) {
                 continue; // held by hash alone: a chunked file's recipe seals its chunks too
             }
@@ -2825,7 +3027,7 @@ fn verify_tree_closure_scoped(tree_hash: &str,
         // descend it and verify its chunks at the audit's content level, exactly as the
         // fully-in-scope walk does.
         if file.item_type.is_chunked() && !sealed.is_some_and(|sealed| sealed.skips_chunks_of(&file.hash)) {
-            verify_chunked_file(&file.hash, reverify, sealed, load_recipe_chunks, chunks_missing)?;
+            verify_chunked_file(&file.hash, &path, reverify, seams)?;
         }
     }
 
@@ -2836,8 +3038,7 @@ fn verify_tree_closure_scoped(tree_hash: &str,
         }
         verify_tree_closure_scoped(
             &subtree.hash, &path, base_subtrees.get(name).map_or(&[][..], Vec::as_slice), verified,
-            spine_seen, blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, scope, reverify,
-            sealed,
+            spine_seen, seams, scope, reverify,
         )?;
     }
 
@@ -2970,13 +3171,11 @@ fn verify_tree_closure(tree_hash: &str,
                        prefix: &str,
                        base_tree_hashes: &[String],
                        visited_trees: &mut HashSet<String>,
-                       blob_exists: &dyn Fn(&str) -> Result<bool, String>,
-                       chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
-                       load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
-                       load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
-                       reverify: bool,
-                       sealed: Option<&SealedTolerance>)
+                       seams: &ClosureSeams,
+                       reverify: bool)
                        -> Result<(), String> {
+    let sealed = seams.sealed;
+
     // An explicit stack rather than recursion: a ref write runs this walk, and a tree nested a
     // few thousand levels deep would otherwise overflow the thread's stack.
     let mut pending: Vec<(String, Vec<String>, String)> =
@@ -2991,7 +3190,7 @@ fn verify_tree_closure(tree_hash: &str,
         // processes the segment parents-first, so a hash a child pruned against a parent is one that
         // parent's own audit has already settled.
         // Held by hash alone: tolerated here, but never memoized as a closure proven present.
-        if sealed_absent(sealed, &tree_hash, blob_exists)? {
+        if sealed_absent(sealed, &tree_hash, seams.probe)? {
             continue;
         }
 
@@ -3023,7 +3222,7 @@ fn verify_tree_closure(tree_hash: &str,
         // caused it. Two to three bases per parcel instead of one scales the chance of hitting it, so
         // the tolerance is a deliberate trade of a rare slow refusal against a wrong fast one, not a
         // free win.
-        let (base_files, mut base_subtrees) = base_entries(&base_tree_hashes, load_base_tree);
+        let (base_files, mut base_subtrees) = base_entries(&base_tree_hashes, seams.load_base_tree);
 
         for (name, file) in tree.get_files() {
             // Base-explained: this exact file hash sits at this path under some candidate base, so its
@@ -3033,8 +3232,10 @@ fn verify_tree_closure(tree_hash: &str,
                 continue;
             }
 
-            if !blob_exists(&file.hash)? {
-                if holds_absent_file(sealed, file, &child_path(&prefix, name)) {
+            let path = child_path(&prefix, name);
+
+            if seams.probe_file(file, &path)?.is_absent() {
+                if holds_absent_file(sealed, file, &path) {
                     continue; // held by hash alone: a chunked file's recipe seals its chunks too
                 }
                 return Err(format!(
@@ -3053,7 +3254,7 @@ fn verify_tree_closure(tree_hash: &str,
             // redaction's recipe is the one exception: its chunks are never checked, as the remote
             // that redacted it may delete them before the recipe itself.
             if file.item_type.is_chunked() && !sealed.is_some_and(|sealed| sealed.skips_chunks_of(&file.hash)) {
-                verify_chunked_file(&file.hash, reverify, sealed, load_recipe_chunks, chunks_missing)?;
+                verify_chunked_file(&file.hash, &path, reverify, seams)?;
             }
         }
 
@@ -3088,19 +3289,23 @@ fn verify_tree_closure(tree_hash: &str,
 /// instead, and its recipe's content hash goes unchecked.
 ///
 /// # Arguments
-/// * `recipe_hash`        - The chunked file's tree-entry hash (a recipe).
-/// * `reverify`           - `true` re-reads and re-assembles; `false` presence-checks.
-/// * `sealed`             - The sealed-by-hash record, or `None` on the push gate.
-/// * `load_recipe_chunks` - Reads the recipe's chunk hashes.
-/// * `chunks_missing`     - Bulk chunk-presence probe: given the recipe's chunk-hash list, returns
-///                          the subset the store lacks.
+/// * `recipe_hash` - The chunked file's tree-entry hash (a recipe).
+/// * `path`        - The chunked file's path, for a refusal naming one of its chunks.
+/// * `reverify`    - `true` re-reads and re-assembles; `false` presence-checks.
+/// * `seams`       - The walk's seams: the recipe reader, the bulk chunk probe (which also fails
+///                   the walk on a chunk of another kind) and the sealed-by-hash record (`None` on
+///                   the push gate).
 fn verify_chunked_file(
     recipe_hash: &str,
+    path: &str,
     reverify: bool,
-    sealed: Option<&SealedTolerance>,
-    load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
-    chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
+    seams: &ClosureSeams,
 ) -> Result<(), String> {
+    let sealed = seams.sealed;
+    let load_recipe_chunks = seams.load_recipe_chunks;
+    // The absent chunks; a chunk present as another kind fails the walk first.
+    let chunks_missing = |chunks: &[String]| seams.probe_chunks(chunks, path);
+
     // Absent chunks the record does not hold; those it holds are tolerated.
     let unheld = |mut missing: Vec<String>| -> Vec<String> {
         missing.retain(|chunk| !holds_absent(sealed, chunk, At::Chunk));
@@ -3146,11 +3351,11 @@ fn verify_chunked_file(
 /// is held by nothing and is walked. Probes presence only for a held hash.
 fn sealed_absent(sealed: Option<&SealedTolerance>,
                  tree_hash: &str,
-                 object_exists: &dyn Fn(&str) -> Result<bool, String>) -> Result<bool, String> {
+                 probe: &dyn Fn(&str) -> Result<ObjectProbe, String>) -> Result<bool, String> {
     let Some(sealed) = sealed.filter(|sealed| sealed.tolerated.held(tree_hash, At::Tree).is_some()) else {
         return Ok(false);
     };
-    Ok(!object_exists(tree_hash)? && sealed.holds_absent(tree_hash, At::Tree))
+    Ok(probe(tree_hash)?.is_absent() && sealed.holds_absent(tree_hash, At::Tree))
 }
 
 /// How many absent chunk hashes a closure-check failure names before summarizing the rest as
@@ -3175,6 +3380,17 @@ fn local_chunks_missing(chunks: &[String]) -> Result<Vec<String>, String> {
     }
 
     Ok(missing)
+}
+
+/// The local object store's presence probe for a walk that reads no kinds: the local audit and the
+/// client's ref gate, which walk history this store already accepted.
+fn local_presence(hash: &str) -> Result<ObjectProbe, String> {
+    file_utils::does_object_exist(hash).map(ObjectProbe::presence)
+}
+
+/// [`local_chunks_missing`] as a bulk chunk probe that reads no kinds.
+fn local_chunks_presence(chunks: &[String]) -> Result<ChunkProbe, String> {
+    Ok(ChunkProbe { missing: local_chunks_missing(chunks)?, mis_kinded: Vec::new() })
 }
 
 /// Presence-check a recipe's chunks non-tolerantly, in **one bulk probe**: load the recipe's chunk

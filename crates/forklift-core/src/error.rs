@@ -428,6 +428,13 @@ refusal_codes! {
     /// read refuses with it. The next step is empty: deleting that file ends it, since the
     /// warehouse mode, not the file, says what the warehouse holds.
     FetchScopeStray => "fetch_scope_stray",
+
+    /// A remote refused to move a pallet because the new head's history names an object it holds
+    /// as a kind that object is not: a file entry whose object is not a blob (or, at a chunked
+    /// entry, not a recipe), or a recipe chunk that is not a chunk. The history is malformed, so
+    /// nothing a lift or an upload does changes it; the details carry the hash, the path and both
+    /// kinds. Nothing moved, and the next step is empty.
+    ObjectKindMismatch => "object_kind_mismatch",
 }
 
 /// The codes of a host record that is lost or damaged, or of an object its store cannot read,

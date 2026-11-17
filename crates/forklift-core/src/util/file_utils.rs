@@ -3327,6 +3327,67 @@ pub fn does_object_exist(hash: &str) -> Result<bool, String> {
     crate::util::pack_utils::is_in_packs(hash)
 }
 
+/// The type of the object `hash` names, or `None` when the store does not hold it: presence as
+/// [`does_object_exist`] answers it, and then the type in the object's header.
+///
+/// The header is peeked, not the object read: a full pack record's or a loose copy's first
+/// [`object_utils::MAX_HEADER_BYTES`](crate::util::object_utils::MAX_HEADER_BYTES) decompressed
+/// bytes, packs first as the ordinary read looks. So an object costs a short decode whatever its
+/// size. A delta record has no header of its own, and a peek that fails in any way says nothing
+/// of the object, so either is read whole, past the read cache, as the ordinary read would serve
+/// it: a damaged loose copy beside a good packed one, or a loose object compressed with a window
+/// above the decoder's bound, reads as it always has. A peeked header is not hashed with the rest,
+/// so a damaged copy can name another type: [`verified_object_type_of`] reads it whole.
+///
+/// # Returns
+/// * `Ok(Some(ObjectType))` - The object is present, of this type.
+/// * `Ok(None)`             - The object is absent.
+/// * `Err(String)`          - The store could not be consulted, or the object could not be read.
+pub fn object_type_of(hash: &str) -> Result<Option<crate::enums::object_type::ObjectType>, String> {
+    if !does_object_exist(hash)? {
+        return Ok(None);
+    }
+
+    let peeked = super::pack_utils::packed_header(hash).or_else(|| loose_header(hash));
+    if let Some(object_type) = peeked.and_then(|header| crate::util::object_utils::peek_object_type(&header).ok()) {
+        return Ok(Some(object_type));
+    }
+    whole_object_type(hash).map(Some)
+}
+
+/// [`object_type_of`] from the object read whole and verified against its hash: what a refusal
+/// over the type rests on, since a peeked header is not verified.
+pub(crate) fn verified_object_type_of(hash: &str) -> Result<Option<crate::enums::object_type::ObjectType>, String> {
+    if !does_object_exist(hash)? {
+        return Ok(None);
+    }
+    whole_object_type(hash).map(Some)
+}
+
+/// The type in `hash`'s header, from the object read whole as the ordinary read serves it.
+fn whole_object_type(hash: &str) -> Result<crate::enums::object_type::ObjectType, String> {
+    let bytes = retrieve_object_by_hash_uncached(hash)?;
+
+    crate::util::object_utils::peek_object_type(&bytes)
+        .map_err(|reason| format!("Object {} has a header this build cannot read: {}", hash, reason))
+}
+
+/// The first [`object_utils::MAX_HEADER_BYTES`](crate::util::object_utils::MAX_HEADER_BYTES)
+/// decompressed bytes of `hash`'s loose copy, or `None` when it has none or they do not read.
+fn loose_header(hash: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let (path, file_name) = get_path_for_object(hash).ok()?;
+    let file = std::fs::File::open(path.add(PATH_SEPARATOR).add(&file_name)).ok()?;
+    let mut prefix = Vec::with_capacity(crate::util::object_utils::MAX_HEADER_BYTES);
+    crate::util::object_utils::bounded_zstd_decoder(std::io::BufReader::new(file))
+        .ok()?
+        .take(crate::util::object_utils::MAX_HEADER_BYTES as u64)
+        .read_to_end(&mut prefix)
+        .ok()?;
+    Some(prefix)
+}
+
 /// [`does_object_exist`] for the liveness walk of a sweep that deletes (`gc`, `compact --all`,
 /// scope prune): `false` only when the hash is genuinely absent.
 ///
@@ -4890,6 +4951,33 @@ pub(crate) fn copy_aside(path: &std::path::Path, bytes: &[u8]) -> Result<PathBuf
 
 #[cfg(test)]
 mod tests {
+    /// A loose object whose frame declares a window above the bounded decoder's cap, which the
+    /// ordinary read decodes unbounded, still reads its kind: a header peek that fails falls back
+    /// to the ordinary read, never refuses.
+    ///
+    /// Revert: fail the kind read on a loose peek that does not decode → red.
+    #[test]
+    fn a_loose_object_past_the_peeks_window_bound_reads_its_kind() {
+        let temp = std::env::temp_dir().join(format!("forklift-kind-window-{}", std::process::id()));
+        let _ = remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let bytes = crate::util::object_utils::blob_bytes(b"a blob compressed with a wide window");
+        let hash = crate::util::object_utils::hash_object_bytes(&bytes);
+        let mut frame = Vec::new();
+        let mut encoder = zstd::stream::Encoder::new(&mut frame, 3).unwrap();
+        encoder.window_log(crate::util::object_utils::MAX_DECODE_WINDOW_LOG + 1).unwrap();
+        std::io::Write::write_all(&mut encoder, &bytes).unwrap();
+        encoder.finish().unwrap();
+        let (folder, file_name) = get_path_for_object(&hash).unwrap();
+        write_object_to_file(Path::new(&folder), &file_name, frame).unwrap();
+
+        assert_eq!(loose_header(&hash), None, "the bounded peek refuses the frame");
+        assert_eq!(object_type_of(&hash).unwrap(), Some(crate::enums::object_type::ObjectType::Blob));
+        let _ = remove_dir_all(&temp);
+    }
+
     use super::*;
 
     /// FORK-447: `verify_loose` tells a reader's own failure (nothing known) from bytes that do not

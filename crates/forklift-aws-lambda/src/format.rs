@@ -23,9 +23,10 @@
 //! gate. An S3 layout change therefore has no in-place path.
 //!
 //! The chain is a parameter, so tests run the upgrade over chains of their own; [`CHAIN`] is this
-//! build's, and empty. Format 2 keys the bucket per warehouse, and format 1 shared one key per
-//! object between every warehouse in the bucket: no step can tell whose a shared key was, so a
-//! format 1 warehouse is refused, never upgraded, and made again under a new id.
+//! build's, and empty. Format 3 records every canonical object's kind in its S3 metadata, which no
+//! step can add, since a step is given no object store: a format 2 warehouse is refused, never
+//! upgraded, and made again under a new id. Format 2 keyed the bucket per warehouse, and format 1
+//! shared one key per object between every warehouse in the bucket, which no step could split.
 
 use std::fmt;
 use std::time::Duration;
@@ -34,7 +35,7 @@ use crate::error::{HeadError, HeadResult};
 use crate::store::{FormatFence, FormatStore, RefStore};
 
 /// The format this build of the AWS head reads.
-pub const AWS_FORMAT: u32 = 2;
+pub const AWS_FORMAT: u32 = 3;
 
 /// What a warehouse's format item holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -567,16 +568,18 @@ mod tests {
 
     #[test]
     fn the_gate_refuses_every_state_but_this_format() {
+        let (now, next) = (AWS_FORMAT, AWS_FORMAT + 1);
         for (state, says) in [
-            ("1", "older than format 2"),
-            ("3", "newer than format 2"),
-            ("2>3 run 0", "being upgraded from format 2 to format 3"),
-            ("one", "cannot read"),
+            ("1".to_string(), format!("older than format {}", now)),
+            (format!("{}", now - 1), format!("older than format {}", now)),
+            (format!("{}", next), format!("newer than format {}", now)),
+            (format!("{}>{} run 0", now, next), format!("being upgraded from format {} to format {}", now, next)),
+            ("one".to_string(), "cannot read".to_string()),
         ] {
-            let refusal = gate(&store_at(Some(state))).unwrap_err();
+            let refusal = gate(&store_at(Some(&state))).unwrap_err();
 
             assert_eq!(refusal.status.as_u16(), 503, "{}", state);
-            assert!(refusal.message.contains(says), "{}: {}", state, refusal.message);
+            assert!(refusal.message.contains(&says), "{}: {}", state, refusal.message);
         }
     }
 
@@ -608,10 +611,11 @@ mod tests {
 
     #[test]
     fn a_mark_refuses_a_write_prepared_before_it() {
-        let store = store_at(Some("2"));
+        let mark = format!("{}>{} run 0", AWS_FORMAT, AWS_FORMAT + 1);
+        let store = store_at(Some(&AWS_FORMAT.to_string()));
         let fence = gate(&store).unwrap();
 
-        store.set_format(Some("2>3 run 0"));
+        store.set_format(Some(&mark));
 
         assert_eq!(lift(&store, &fence, ExpectedHead::Unborn, HEAD_A), CasOutcome::FormatMoved);
         assert_eq!(store.get_head(PalletNamespace::User, "main").unwrap(), RefHead::Absent);
@@ -621,12 +625,12 @@ mod tests {
         })
         .unwrap_err();
         assert!(refusal.message.contains("being upgraded"), "{}", refusal.message);
-        assert_eq!(store.read_format().unwrap().as_deref(), Some("2>3 run 0"));
+        assert_eq!(store.read_format().unwrap(), Some(mark));
     }
 
     #[test]
     fn a_fence_that_fails_and_reads_back_the_same_is_refused_not_retried() {
-        let store = store_at(Some("2"));
+        let store = store_at(Some(&AWS_FORMAT.to_string()));
         let mut attempts = 0;
 
         let refusal = fenced(
@@ -677,14 +681,20 @@ mod tests {
 
     #[test]
     fn this_builds_chain_has_nothing_to_do_at_its_format() {
-        let store = store_at(Some("2"));
+        let now = AWS_FORMAT.to_string();
+        let store = store_at(Some(&now));
         let report = upgrade(&store, &CHAIN, "w", &options("me", false)).unwrap();
 
-        assert_eq!(report.summary(), vec!["Warehouse w: in format 2, the one this version reads. Nothing to do."]);
-        assert_eq!(store.read_format().unwrap().as_deref(), Some("2"));
+        assert_eq!(
+            report.summary(),
+            vec![format!("Warehouse w: in format {}, the one this version reads. Nothing to do.", now)]
+        );
+        assert_eq!(store.read_format().unwrap(), Some(now));
 
-        let error = upgrade(&store_at(Some("1")), &CHAIN, "w", &options("me", false)).unwrap_err();
-        assert!(error.contains("Make it again under a new id"), "{}", error);
+        for older in ["1".to_string(), (AWS_FORMAT - 1).to_string()] {
+            let error = upgrade(&store_at(Some(&older)), &CHAIN, "w", &options("me", false)).unwrap_err();
+            assert!(error.contains("Make it again under a new id"), "{}", error);
+        }
     }
 
     #[test]

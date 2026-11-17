@@ -190,8 +190,16 @@ warehouse could learn from the answers whether another one held an object. No st
 shared key was, so the chain does not reach format 1: a format 1 warehouse is refused, never read
 against the new keys, and is made again under a new id.
 
+Since AWS format 3 every canonical object carries its kind (`blob`, `tree`, `parcel`, `recipe` or
+`chunk`) in its `forklift-kind` user metadata, which both writers set: the direct `PUT` and the
+promotion's copy, which replaces whatever metadata the staged upload carried. A ref update reads
+it from the `HEAD` it already makes for presence, so a write naming an object as a kind it is not is
+refused. An object with no kind recorded is refused as unreadable, never taken as present. No step
+can add the metadata to stored objects, so a format 2 warehouse is refused and made again under a
+new id.
+
 A format break on a deployment refuses every warehouse until each is upgraded. The AWS head's chain is
-empty: it reads format 2 and upgrades no older format.
+empty: it reads format 3 and upgrades no older format.
 
 ## What a format break ships
 

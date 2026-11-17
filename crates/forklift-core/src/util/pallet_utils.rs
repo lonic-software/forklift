@@ -2746,8 +2746,8 @@ pub(crate) mod tests {
             crate::util::audit_utils::verify_parcel_closure_with(
                 head,
                 base,
-                &|hash| file_utils::does_object_exist(hash),
-                &|_| Ok(Vec::new()),
+                &|hash| file_utils::does_object_exist(hash).map(crate::util::audit_utils::ObjectProbe::presence),
+                &|_| Ok(Default::default()),
                 &|hash| crate::util::object_utils::recipe_chunk_hashes(hash),
                 &|hash| crate::util::object_utils::load_tree(hash),
                 &|| Ok(crate::util::sealed_utils::Tolerated::removed_only(removed.0.clone(), removed.1.clone())),

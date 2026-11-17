@@ -673,7 +673,15 @@ checks every reference before building the path and sends only valid ones.
    characters), and the `new_head` parcel and the full closure of every parcel between
    `new_head` and `old_head` (parents, trees, blobs) are present, else `422` — a ref
    must never point at missing history. An object whose hash is an applied redaction is the
-   one absence allowed.
+   one absence allowed. Each present object must also be the kind the entry naming it needs: a
+   blob at a file entry, a recipe at a chunked one, and a chunk in a recipe's list. An entry
+   naming an object of another kind is `422` with `code` `object_kind_mismatch`, naming the
+   object, the path, the kind needed and the kind found, and an empty `next_step`: the history
+   is malformed, and no upload changes it. The check is made before what is withheld or redacted
+   is consulted, so a withheld object the head still holds is judged as any other. The
+   serverless head reads an object's kind from its S3 object metadata (`forklift-kind`), which
+   both of its writers record from the bytes they verified, so the check costs it no read beyond
+   the `HEAD` presence already made.
 3. **Ancestry**: `old_head` is an ancestor of `new_head` (fast-forward only; there is
    no force push in protocol v1), else `409`.
    A creation (`old_head: null`) of a user pallet that has a tombstone must acknowledge it,

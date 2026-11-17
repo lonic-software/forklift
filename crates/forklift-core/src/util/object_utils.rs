@@ -1057,7 +1057,25 @@ fn peek_object_header_prefix(bytes: &[u8]) -> Result<PeekedHeader, PeekError> {
 
 /// The longest header [`peek_object_header_prefix`] can read: three VLQs of at most ten bytes each,
 /// and the null. A prefix this long that still does not peek is malformed, not short.
-const MAX_HEADER_BYTES: usize = 31;
+pub(crate) const MAX_HEADER_BYTES: usize = 31;
+
+/// The type an object's header names, read from the object's first bytes alone: at most
+/// [`MAX_HEADER_BYTES`] of them, or the whole object when it is shorter. Nothing past the header is
+/// read, so the content is neither hashed nor checked against the declared length.
+///
+/// # Returns
+/// * `Ok(ObjectType)` - The type the header names.
+/// * `Err(String)`    - The prefix is not the start of an object header this build reads.
+pub fn peek_object_type(prefix: &[u8]) -> Result<ObjectType, String> {
+    match peek_object_header_prefix(prefix) {
+        Ok(peeked) => Ok(peeked.object_type),
+        Err(PeekError::UnknownVersion(version)) => Err(format!(
+            "The object header names version {}, which this build does not read.",
+            version
+        )),
+        Err(PeekError::Malformed(reason)) => Err(reason),
+    }
+}
 
 /// Enforce an object's form on the way *into* the store. An object whose version this build does
 /// not read is refused: it could never be read back. So is one whose header is malformed, and a

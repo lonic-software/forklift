@@ -10497,11 +10497,13 @@ mod tests {
         // takes — no production instrumentation, so this number is reproducible from the tree.
         let audit = |known_complete: Option<&str>| -> Vec<String> {
             let touched: RefCell<Vec<String>> = RefCell::new(Vec::new());
-            let blob_exists = |hash: &str| -> Result<bool, String> {
+            let blob_exists = |hash: &str| -> Result<crate::util::audit_utils::ObjectProbe, String> {
                 touched.borrow_mut().push(hash.to_string());
-                Ok(true)
+                Ok(crate::util::audit_utils::ObjectProbe::Present)
             };
-            let chunks_missing = |_: &[String]| -> Result<Vec<String>, String> { Ok(Vec::new()) };
+            let chunks_missing = |_: &[String]| -> Result<crate::util::audit_utils::ChunkProbe, String> {
+                Ok(Default::default())
+            };
             let load_recipe_chunks =
                 |_: &str| -> Result<Vec<String>, String> { Ok(Vec::new()) };
             let load_base_tree = |hash: &str| object_utils::load_tree(hash);
