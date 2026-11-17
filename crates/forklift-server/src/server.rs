@@ -9971,8 +9971,8 @@ mod tests {
 
             let damages: [(&str, Option<Vec<u8>>); 4] = [
                 ("not text", Some(b"\xff\xfe not text".to_vec())),
-                ("a bad entry", Some(record_utils::to_bytes("tombstones", 2, ["nothash gone"]))),
-                ("a duplicate", Some(record_utils::to_bytes("tombstones", 2, [first.as_str(), second.as_str()]))),
+                ("a bad entry", Some(record_utils::to_bytes_digested("tombstones", 3, ["nothash gone"]))),
+                ("a duplicate", Some(record_utils::to_bytes_digested("tombstones", 3, [first.as_str(), second.as_str()]))),
                 ("an absent list", None),
             ];
 

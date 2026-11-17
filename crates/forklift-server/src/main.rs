@@ -181,9 +181,6 @@ enum WithholdAction {
         /// The warehouse root to repair
         #[arg(long)]
         root: String,
-        /// Salvage a record whose header names a newer version, when no newer Forklift wrote it
-        #[arg(long)]
-        header_damaged: bool,
     },
 }
 
@@ -251,7 +248,7 @@ async fn async_main() {
         Command::Tombstone { action: TombstoneAction::Repair { root } } => repair_tombstones(&root),
         Command::Withhold { action: WithholdAction::Add { root, hash, statement } } => withhold(&root, &hash, &statement),
         Command::Withhold { action: WithholdAction::List { root } } => list_withheld(&root),
-        Command::Withhold { action: WithholdAction::Repair { root, header_damaged } } => repair_withheld(&root, header_damaged),
+        Command::Withhold { action: WithholdAction::Repair { root } } => repair_withheld(&root),
     };
 
     if let Err(e) = result {
@@ -848,11 +845,11 @@ fn withhold(root: &str, hash: &str, statement: &str) -> Result<(), String> {
 }
 
 /// Repair the record of withheld content of the warehouse at `root`.
-fn repair_withheld(root: &str, header_damaged: bool) -> Result<(), String> {
+fn repair_withheld(root: &str) -> Result<(), String> {
     let opened = server::open_root(root)?;
     let _scope = forklift_core::globals::StorageRootScope::enter(&opened.root);
 
-    let repaired = forklift_core::util::withheld_repair::repair_withheld(header_damaged)?;
+    let repaired = forklift_core::util::withheld_repair::repair_withheld()?;
 
     for line in repaired.report() {
         println!("{}", line);

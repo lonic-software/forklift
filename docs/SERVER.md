@@ -365,8 +365,8 @@ revocation by more than about a day.
   served. It keeps a copy of the damaged record beside it, keeps every entry that still reads (a
   line cut short or not valid UTF-8 does not), keeps a hash whose entry lost its statement withheld
   under a placeholder (restate it with `withhold add`), and lists the absent files the history names
-  that no record holds, to withhold again. A record whose header names a newer version is left for
-  that Forklift; `--header-damaged` salvages it when none wrote it. A lost entry whose copy is still
+  that no record holds, to withhold again. A record that matches its digest but whose header names
+  a newer version is left for that Forklift. A lost entry whose copy is still
   stored cannot be found: withhold it again before serving. Not yet: if a hash withheld before it arrived turns out to be a chunked
   file's, its chunks are still taken and served; and there is no command to lift a takedown.
 - **Redactions:** after every pallet update or deletion, the server applies each redaction

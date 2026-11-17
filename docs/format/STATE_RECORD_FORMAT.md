@@ -36,6 +36,14 @@ A reader refuses, and never guesses at, a file that:
 Nothing is migrated. Each error names the file and what is wrong with it, and, where Forklift has
 one, the way out. Every writer replaces its file atomically, so a crash never leaves one cut short.
 
+## Digested records
+Some records end with one more line, `digest <blake3 of every byte before this line, in lowercase
+hex>`, which is not an entry: the warehouse marker, `parked`, and a server's `served`,
+`tombstones` and `withheld`. Damage that still parses, such as a flipped digit in a hash, then
+shows. A reader checks the digest before anything else, and refuses a record whose digest is
+absent or does not match its bytes as damaged, never read. That includes a record a version from
+before the digest wrote. Only a record whose digest matches is told apart as a newer version's.
+
 ## Files
 | File | Kind | Entries |
 |------|------|---------|
@@ -51,7 +59,8 @@ one, the way out. Every writer replaces its file atomically, so a crash never le
 | `scope` (bay-local), `.forklift/config/fetch-scope` | `scope` | See [the scope file format](SCOPE_FILE_FORMAT.md), which adds an empty-file rule of its own and says which of these files must exist. |
 | `.forklift/warehouse` | `warehouse` | `format N`, then what the warehouse holds, `full`, `sparse` (cloned with `--only`) or `cache` (cloned with `--cache`), then an optional `upgrading M S`. This framing is frozen; see [the warehouse format](WAREHOUSE_FORMAT.md). `prepare` writes it last, so its presence marks a complete warehouse. A marker missing an entry, with an extra one, or with a word its own format says this build should know and does not, is refused, and so is a marker of kind version 1 or 2, which recorded no format: make the warehouse again. A sparse warehouse's fetch scope must agree with it; see [the scope file format](SCOPE_FILE_FORMAT.md#the-fetch-scope-and-the-warehouse-mode). |
 | `.forklift/served` | `served` | None. Its presence marks a warehouse a `forklift-server` has served; nothing removes it. A mark that exists but cannot be read is an error, never "not served". |
-| `.forklift/tombstones` | `tombstones` | One `<head> <pallet>` per deleted pallet of a served warehouse: the head its ref held, then its name. |
+| `.forklift/tombstones` | `tombstones` | One `<head> <pallet>` per deleted pallet of a served warehouse: the head its ref held, then its name; or `<head>` alone, a head kept with no name. |
+| `.forklift/withheld` | `withheld` | One `<hash> <digest> <statement>` per object a served warehouse withholds: the object, its chunk-list digest or `-`, then the takedown's statement. |
 | `.forklift/redactions-applied` | `redactions-applied` | One redacted object hash per applied redaction, sorted. It only grows: an applied redaction is never taken back. An entry that is not an object hash is refused, like a header of another version, and such a record is never written over. |
 
 Bay-local files live in the bay's state folder: `.forklift/` for the main tree,

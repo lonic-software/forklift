@@ -130,8 +130,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
     restate with `withhold add`. A line cut short or not valid UTF-8 counts as having lost it.
   - It lists files the history names that are absent and that no record holds: what a lost entry
     withheld once its copy was deleted, for the operator to withhold again.
-  - A record whose header names a newer version is left for that Forklift; `--header-damaged`
-    salvages it when none wrote it.
+  - A record that matches its digest but whose header names a newer version is left for that
+    Forklift.
 
   A lost entry whose content is still stored cannot be found, and the report says so. Warehouses
   served before this change have no record, so they have to be repaired before they are served.
