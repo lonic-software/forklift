@@ -19,7 +19,7 @@ pub const FILE_NAME_MIRROR_ROOTS: &str = "mirror-roots";
 /// The record's kind and version, in its header. A later format gets a new version, which this
 /// build refuses to read.
 const MIRROR_ROOTS_RECORD: &str = "mirror-roots";
-const MIRROR_ROOTS_VERSION: u32 = 1;
+const MIRROR_ROOTS_VERSION: u32 = 2;
 
 /// Where the record lives.
 pub fn mirror_roots_path() -> PathBuf {

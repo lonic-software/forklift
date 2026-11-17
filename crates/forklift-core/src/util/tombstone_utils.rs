@@ -39,7 +39,7 @@ use crate::util::lock_utils::{RefLock, ServeLock};
 use crate::util::{file_utils, object_utils, pallet_utils, record_utils, withholding};
 
 /// The mark's file name in the shared forklift root, and its [`record_utils`] kind and version.
-/// Both files are digested ([`record_utils::to_bytes_digested`]), so damage that still parses,
+/// Both files are digested ([`record_utils::to_bytes`]), so damage that still parses,
 /// such as a flipped digit in a tombstone's head, is refused rather than read as true. Version 2
 /// of the mark added the digest.
 const FILE_NAME_SERVED: &str = "served";
@@ -132,7 +132,7 @@ fn read_record(path: &Path, kind: &str, version: u32) -> Result<Option<Vec<Strin
         Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
     };
 
-    record_utils::from_bytes_digested(&bytes, kind, version)
+    record_utils::from_bytes(&bytes, kind, version)
         .map(Some)
         .map_err(|e| format!("The file \"{}\" {}", path.to_string_lossy(), e.describe()))
 }
@@ -296,7 +296,7 @@ pub fn mark_served(wait: bool) -> Result<bool, String> {
 
 /// Write the served mark, durably. Only under the ref lock.
 pub(crate) fn write_mark(_lock: &RefLock) -> Result<(), String> {
-    file_utils::write_file_atomically(&served_path(), &record_utils::to_bytes_digested(SERVED_RECORD, SERVED_VERSION, Vec::<String>::new()))
+    file_utils::write_file_atomically(&served_path(), &record_utils::to_bytes(SERVED_RECORD, SERVED_VERSION, Vec::<String>::new()))
 }
 
 /// The tombstones of the warehouse at the current storage root. Empty in a root never served, or
@@ -322,7 +322,7 @@ pub(crate) fn write_tombstones(_lock: &RefLock, tombstones: &Tombstones) -> Resu
     let named = tombstones.named.iter().map(|(pallet, head)| format!("{} {}", head, pallet));
     let lines: Vec<String> = named.chain(tombstones.kept.iter().cloned()).collect();
 
-    file_utils::write_file_atomically(&tombstones_path(), &record_utils::to_bytes_digested(TOMBSTONES_RECORD, TOMBSTONES_VERSION, lines))
+    file_utils::write_file_atomically(&tombstones_path(), &record_utils::to_bytes(TOMBSTONES_RECORD, TOMBSTONES_VERSION, lines))
 }
 
 /// Take the serve lock, then the ref lock, for a rewrite of the list at the served root's own disk.
@@ -497,7 +497,7 @@ pub(crate) mod tests {
     }
 
     fn write_list(lines: &[&str]) {
-        std::fs::write(tombstones_path(), record_utils::to_bytes_digested(TOMBSTONES_RECORD, TOMBSTONES_VERSION, lines.iter().copied())).unwrap();
+        std::fs::write(tombstones_path(), record_utils::to_bytes(TOMBSTONES_RECORD, TOMBSTONES_VERSION, lines.iter().copied())).unwrap();
     }
 
     fn assert_damaged(error: &str, needle: &str) {
@@ -723,7 +723,7 @@ pub(crate) mod tests {
 
         // A list of the version before kept heads is not read as this one, nor one of the version
         // before the digest.
-        std::fs::write(tombstones_path(), record_utils::to_bytes_digested(TOMBSTONES_RECORD, 1, [first.as_str()])).unwrap();
+        std::fs::write(tombstones_path(), record_utils::to_bytes(TOMBSTONES_RECORD, 1, [first.as_str()])).unwrap();
         assert_damaged(&read_tombstones().unwrap_err(), FILE_NAME_TOMBSTONES);
         std::fs::write(tombstones_path(), record_utils::to_bytes(TOMBSTONES_RECORD, 2, [first.as_str()])).unwrap();
         assert_damaged(&read_tombstones().unwrap_err(), "does not match its digest");

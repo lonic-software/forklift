@@ -7,7 +7,7 @@
 //! cannot be trusted fails every read, and `heal`'s [`rebuild`] restores it from what still reads
 //! and from the parked parcels the store holds.
 //!
-//! The record is digested ([`record_utils::to_bytes_digested`]): damage reads as damage, never as
+//! The record is digested ([`record_utils::to_bytes`]): damage reads as damage, never as
 //! an empty list. An absent record is damage too: preparing a warehouse writes an empty one, and
 //! no writer ever removes it. A bay's own `parked` file, the shape before parked work was shared,
 //! is a leftover `heal` merges in; while one stands, the record is incomplete and fails every read.
@@ -169,7 +169,7 @@ fn leftovers_in(forklift: &Path) -> Result<Vec<PathBuf>, String> {
 
 /// The record `bytes` at `path` lists, or why they list nothing this build can trust.
 fn decode(bytes: &[u8], path: &Path) -> Result<Vec<ParkedEntry>, String> {
-    let lines = record_utils::from_bytes_digested(bytes, PARKED_RECORD, PARKED_VERSION).map_err(|e| {
+    let lines = record_utils::from_bytes(bytes, PARKED_RECORD, PARKED_VERSION).map_err(|e| {
         // Version 1 carried no digest line, so a record with one is damage whatever its header.
         let version_1 = bytes.starts_with(format!("/forklift-{} 1\n", PARKED_RECORD).as_bytes())
             && record_utils::without_digest_line(bytes).len() == bytes.len();
@@ -201,7 +201,7 @@ fn decode(bytes: &[u8], path: &Path) -> Result<Vec<ParkedEntry>, String> {
 }
 
 fn written_by_newer(bytes: &[u8]) -> bool {
-    record_utils::written_by_newer_digested(bytes, PARKED_RECORD, PARKED_VERSION)
+    record_utils::written_by_newer(bytes, PARKED_RECORD, PARKED_VERSION)
 }
 
 /// Read the warehouse's parked work, oldest first.
@@ -243,7 +243,7 @@ pub fn write_parked(_lock: &ParkedLock, entries: &[ParkedEntry]) -> Result<(), S
 
 /// The bytes [`write_parked`] writes for `entries`.
 pub fn parked_bytes(entries: &[ParkedEntry]) -> Vec<u8> {
-    record_utils::to_bytes_digested(PARKED_RECORD, PARKED_VERSION, entries.iter().map(ParkedEntry::line))
+    record_utils::to_bytes(PARKED_RECORD, PARKED_VERSION, entries.iter().map(ParkedEntry::line))
 }
 
 /// Write an empty record into the forklift root `forklift` of a warehouse being prepared, when it
@@ -644,7 +644,7 @@ mod tests {
             "not-a-hash - x".to_string(),
         ] {
             let lines: Vec<&str> = bad.split('\n').collect();
-            let bytes = record_utils::to_bytes_digested(PARKED_RECORD, PARKED_VERSION, lines);
+            let bytes = record_utils::to_bytes(PARKED_RECORD, PARKED_VERSION, lines);
             let error = decode(&bytes, Path::new("parked")).unwrap_err();
             assert!(error.contains("cannot read on line"), "{:?}: {}", bad, error);
         }

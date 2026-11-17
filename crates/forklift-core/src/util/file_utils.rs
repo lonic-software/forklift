@@ -63,7 +63,7 @@ pub const INVENTORY_METADATA_RECORD: &str = "inventory-metadata";
 /// doubles as the layout marker: a version-1 warehouse keeps its shards at paths this layout never
 /// reads, so [`get_inventory_store_root`] refuses it rather than reading every directory as
 /// unstaged.
-pub const INVENTORY_METADATA_VERSION: u32 = 2;
+pub const INVENTORY_METADATA_VERSION: u32 = 3;
 
 /// Create a folder if it does not exist yet.
 /// All folders in the given path will be created (if they don't exist already).
@@ -3215,7 +3215,7 @@ fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
 
     if header.ends_with(b"\n") {
         if let Err(e @ record_utils::RecordError::OtherVersion(_)) =
-            record_utils::from_bytes(&header, INVENTORY_METADATA_RECORD, INVENTORY_METADATA_VERSION) {
+            record_utils::read_header(&header, INVENTORY_METADATA_RECORD, INVENTORY_METADATA_VERSION) {
             return Err(format!(
                 "The inventory metadata file \"{}\" {}", metadata_path.to_string_lossy(), e.describe()
             ));

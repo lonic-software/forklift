@@ -1,7 +1,7 @@
-//! The shared on-disk form of Forklift's small line-per-entry state files: the out-of-scope
-//! skeleton and consolidation state of a merge in progress, the load-guard marker, scope files,
-//! bay redirects, the inventory metadata and the git mirror's roots. Taint files escape their entries the same way, under
-//! a header of their own, but keep their own torn-file reading (see `taint_utils`).
+//! The shared on-disk form of Forklift's small line-per-entry state files, such as the state of a
+//! merge in progress, the load-guard marker, scope files, bay redirects and the inventory
+//! metadata. Taint files escape their entries the same way, under a header of their own, but keep
+//! their own torn-file reading (see `taint_utils`).
 //!
 //! The entries of these files are names: warehouse paths, pallet labels, filesystem paths. A tree
 //! entry name may hold any character but `/` and NUL, line breaks included, so an entry cannot be
@@ -21,14 +21,19 @@
 //! /forklift-<kind> <version>\n
 //! <escaped entry>\n
 //! ...
+//! digest <hex>\n
 //! ```
 //!
 //! Every line ends with `\n`, the last one included. An entry may be empty (the load-guard marker
 //! records the warehouse root as the empty key), which is an empty line.
 //!
-//! A digested record ([`to_bytes_digested`]) ends in one more line, `digest <hex>`, the blake3
-//! hash of every byte before it. That frame is frozen across versions, so damage reads as damage
-//! rather than as a format: the warehouse marker and the parked-work record are digested.
+//! Every record ends in one more line, `digest <hex>`, the blake3 hash of every byte before it.
+//! That frame is frozen across versions, so damage that still parses, such as a hex digit flipped
+//! to another or a cut on a line boundary, reads as damage rather than as true or as a format. A
+//! record with no digest line at all is judged by its header: an older version's is that version,
+//! since versions from before the digest wrote none, and any other was cut off. Taint files frame
+//! their entries the same way (see `taint_utils`); the sealed record keeps a log of CRC-framed
+//! entries of its own (see `sealed_utils`).
 
 /// Why a record file could not be read. [`RecordError::describe`] phrases it to follow
 /// "The <file> ", so each caller names its own file and adds its own way out, if it has one.
@@ -51,8 +56,8 @@ pub enum RecordError {
     /// that is not escaped. A writer never produces one.
     BadEscape { line: usize },
 
-    /// A digested record (see [`from_bytes_digested`]) does not end in its digest line, or the
-    /// digest does not match the bytes before it.
+    /// The record does not end in a digest line that matches the bytes before it (see
+    /// [`from_bytes`]).
     Damaged,
 }
 
@@ -73,12 +78,12 @@ impl RecordError {
 }
 
 /// The header line of a record of `kind` at `version`, such as `/forklift-marker 1`.
-pub fn header(kind: &str, version: u32) -> String {
+pub(crate) fn header(kind: &str, version: u32) -> String {
     format!("/forklift-{} {}", kind, version)
 }
 
 /// Escape one entry so that it holds no line break (see the module doc comment).
-pub fn escape(entry: &str) -> String {
+pub(crate) fn escape(entry: &str) -> String {
     let mut escaped = String::with_capacity(entry.len());
 
     for c in entry.chars() {
@@ -94,7 +99,7 @@ pub fn escape(entry: &str) -> String {
 }
 
 /// Undo [`escape`]. `None` for anything [`escape`] cannot have produced.
-pub fn unescape(line: &str) -> Option<String> {
+pub(crate) fn unescape(line: &str) -> Option<String> {
     let mut entry = String::with_capacity(line.len());
     let mut chars = line.chars();
 
@@ -114,7 +119,10 @@ pub fn unescape(line: &str) -> Option<String> {
     Some(entry)
 }
 
-/// Serialize `entries` under the header of `kind` at `version`.
+/// Serialize `entries` under the header of `kind` at `version`, then append the digest line
+/// [`from_bytes`] checks: `digest ` and the blake3 hash, in hex, of every byte before that line.
+/// This frame is frozen across versions: a record of any version ends in it, so a reader of any
+/// build tells a damaged record from one of another version.
 pub fn to_bytes<I, S>(kind: &str, version: u32, entries: I) -> Vec<u8>
 where
     I: IntoIterator<Item = S>,
@@ -128,25 +136,54 @@ where
         text.push('\n');
     }
 
-    text.into_bytes()
+    with_digest(text.into_bytes())
 }
 
-/// Parse a file written by [`to_bytes`] for `kind` at `version`, returning its entries in file
+/// Parse a record written by [`to_bytes`] for `kind` at `version`, returning its entries in file
 /// order.
+///
+/// The digest is checked first. A record whose last line opens as a digest line that does not
+/// match is [`RecordError::Damaged`], whatever its header says. A record with no digest line at
+/// all is judged by its header alone ([`read_header`]): another kind's file, or none, is
+/// [`RecordError::Unversioned`], and an older version of this kind is
+/// [`RecordError::OtherVersion`], since versions from before the digest wrote none. Any other
+/// record without one is damaged: every version since writes it, so it was cut off.
 pub fn from_bytes(bytes: &[u8], kind: &str, version: u32) -> Result<Vec<String>, RecordError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| RecordError::NotUtf8)?;
-
-    let expected = header(kind, version);
-    let tag = format!("/forklift-{} ", kind);
-
-    let first = text.split('\n').next().unwrap_or_default();
-    if first != expected {
-        return Err(if first.starts_with(&tag) {
-            RecordError::OtherVersion(first.to_string())
-        } else {
-            RecordError::Unversioned
-        });
+    match verified_body(bytes) {
+        Some(body) => parse_body(body, kind, version),
+        None if has_digest_line(bytes) => Err(RecordError::Damaged),
+        None => Err(match read_header(bytes, kind, version) {
+            Err(RecordError::OtherVersion(found)) if header_number(&found, kind).is_some_and(|n| n < version) =>
+                RecordError::OtherVersion(found),
+            Err(RecordError::Unversioned) => RecordError::Unversioned,
+            _ => RecordError::Damaged,
+        }),
     }
+}
+
+/// Judge the first line of `bytes` alone as the header of `kind` at `version`, with no digest:
+/// `Ok` for this version's header, [`RecordError::OtherVersion`] for another version of this
+/// kind, [`RecordError::Unversioned`] for anything else. Only for a reader that looks at a
+/// record's header without reading the record, such as a gate that refuses another version.
+pub fn read_header(bytes: &[u8], kind: &str, version: u32) -> Result<(), RecordError> {
+    let first = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
+    let Ok(first) = std::str::from_utf8(first) else {
+        return Err(RecordError::Unversioned);
+    };
+
+    if first == header(kind, version) {
+        Ok(())
+    } else if first.starts_with(&format!("/forklift-{} ", kind)) {
+        Err(RecordError::OtherVersion(first.to_string()))
+    } else {
+        Err(RecordError::Unversioned)
+    }
+}
+
+/// The body of a verified record parsed under the header of `kind` at `version`.
+fn parse_body(bytes: &[u8], kind: &str, version: u32) -> Result<Vec<String>, RecordError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| RecordError::NotUtf8)?;
+    read_header(bytes, kind, version)?;
 
     let body = text.strip_suffix('\n').ok_or(RecordError::Unterminated)?;
 
@@ -157,33 +194,27 @@ pub fn from_bytes(bytes: &[u8], kind: &str, version: u32) -> Result<Vec<String>,
         .collect()
 }
 
-/// Whether `bytes` open with the header of `kind` at a version newer than `version`, written as
-/// [`to_bytes`] writes one: the tag, one space, and a number without a leading zero. Judged on the
-/// first line's own bytes, so damage elsewhere, such as a byte that is not UTF-8, does not hide
-/// it. A record that does not read and passes this is a newer build's, not damage.
-pub fn written_by_newer(bytes: &[u8], kind: &str, version: u32) -> bool {
-    let first = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
-
-    std::str::from_utf8(first).ok()
-        .and_then(|header| header.strip_prefix(&format!("/forklift-{} ", kind)))
+/// The version a header of `kind` names, when it is written as [`to_bytes`] writes one: the tag,
+/// one space, and a number without a leading zero.
+fn header_number(header: &str, kind: &str) -> Option<u32> {
+    header.strip_prefix(&format!("/forklift-{} ", kind))
         .and_then(|text| text.parse::<u32>().ok().filter(|found| found.to_string() == text))
-        .is_some_and(|found| found > version)
 }
 
-/// The line prefix of a digested record's last line.
+/// Whether a record was written by a newer build: its digest verifies, and its header names
+/// `kind` at a version newer than `version`. A record whose digest does not verify is damage,
+/// whatever its header says. A record that does not read and passes this is a newer build's.
+pub fn written_by_newer(bytes: &[u8], kind: &str, version: u32) -> bool {
+    verified_body(bytes).is_some_and(|body| {
+        let first = body.split(|byte| *byte == b'\n').next().unwrap_or_default();
+        std::str::from_utf8(first).ok()
+            .and_then(|header| header_number(header, kind))
+            .is_some_and(|found| found > version)
+    })
+}
+
+/// The line prefix of a record's last line.
 const DIGEST_PREFIX: &str = "digest ";
-
-/// Serialize `entries` as [`to_bytes`] does, then append the digest line [`from_bytes_digested`]
-/// checks: `digest ` and the blake3 hash, in hex, of every byte before that line. This frame is
-/// frozen across versions: a record of any version ends in it, so a reader of any build tells a
-/// damaged record from one of another version before it reads the header.
-pub fn to_bytes_digested<I, S>(kind: &str, version: u32, entries: I) -> Vec<u8>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    with_digest(to_bytes(kind, version, entries))
-}
 
 /// `bytes` followed by the digest line of every byte before it.
 pub fn with_digest(mut bytes: Vec<u8>) -> Vec<u8> {
@@ -192,9 +223,9 @@ pub fn with_digest(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
-/// The bytes of a digested record before its digest line, when its last line is a digest line
-/// that matches them; `None` otherwise. Judged before anything else, at any version.
-fn verified_body(bytes: &[u8]) -> Option<&[u8]> {
+/// The bytes of a record before its digest line, when its last line is a digest line that
+/// matches them; `None` otherwise. Judged before anything else, at any version.
+pub(crate) fn verified_body(bytes: &[u8]) -> Option<&[u8]> {
     let (body, last) = last_line(bytes);
     let hex = last.strip_suffix(b"\n")?.strip_prefix(DIGEST_PREFIX.as_bytes())?;
 
@@ -207,21 +238,6 @@ fn last_line(bytes: &[u8]) -> (&[u8], &[u8]) {
     let start = text.iter().rposition(|byte| *byte == b'\n').map_or(0, |index| index + 1);
 
     bytes.split_at(start)
-}
-
-/// Parse a record written by [`to_bytes_digested`] for `kind` at `version`. The digest is checked
-/// first: a record whose last line is no digest line, or whose digest does not match, is
-/// [`RecordError::Damaged`] whatever its header says. Only then is the header read, as
-/// [`from_bytes`] reads it.
-pub fn from_bytes_digested(bytes: &[u8], kind: &str, version: u32) -> Result<Vec<String>, RecordError> {
-    from_bytes(verified_body(bytes).ok_or(RecordError::Damaged)?, kind, version)
-}
-
-/// Whether a digested record was written by a newer build: its digest verifies, and its header
-/// names `kind` at a version newer than `version` (see [`written_by_newer`]). A record whose
-/// digest does not verify is damage, whatever its header says.
-pub fn written_by_newer_digested(bytes: &[u8], kind: &str, version: u32) -> bool {
-    verified_body(bytes).is_some_and(|body| written_by_newer(body, kind, version))
 }
 
 /// Whether `bytes` ends with a line that opens as a digest line, matching or not: a record that
@@ -246,7 +262,7 @@ pub fn without_digest_line(bytes: &[u8]) -> &[u8] {
 /// and `parse` accepts it: a record cut inside its last entry would otherwise keep an altered one.
 /// Empty lines are skipped, and so is a first line that opens as a record header, of any kind or
 /// version.
-pub fn salvage<T>(bytes: &[u8], parse: impl Fn(&str) -> Option<T>) -> (Vec<T>, usize) {
+pub(crate) fn salvage<T>(bytes: &[u8], parse: impl Fn(&str) -> Option<T>) -> (Vec<T>, usize) {
     let mut whole = Vec::new();
     let mut dropped = 0;
 
@@ -282,12 +298,15 @@ mod tests {
     /// Revert: compare with `>=` → this version's own header reads as newer.
     #[test]
     fn only_a_newer_header_of_the_same_kind_reads_as_written_by_newer() {
-        assert!(written_by_newer(b"/forklift-k 3\n\xff\n", "k", 2));
-        assert!(written_by_newer(b"/forklift-k 10", "k", 2));
+        assert!(written_by_newer(&with_digest(b"/forklift-k 3\n\xff\n".to_vec()), "k", 2));
+        assert!(written_by_newer(&with_digest(b"/forklift-k 10\n".to_vec()), "k", 2));
         for bytes in [&b"/forklift-k 2\n"[..], b"/forklift-k 1\n", b"/forklift-j 3\n", b"/forklift-k 03\n",
                       b"/forklift-k  3\n", b"/forklift-k 3x\n", b"\xff/forklift-k 3\n", b"", b"/forklift-k \n"] {
-            assert!(!written_by_newer(bytes, "k", 2), "{:?}", String::from_utf8_lossy(bytes));
+            assert!(!written_by_newer(&with_digest(bytes.to_vec()), "k", 2), "{:?}", String::from_utf8_lossy(bytes));
         }
+
+        // A newer header without its digest is damage, never a newer build's.
+        assert!(!written_by_newer(b"/forklift-k 3\n", "k", 2));
     }
 
     /// Only a terminated, valid, parsed line is kept; the header and empty lines count nothing.
@@ -322,81 +341,99 @@ mod tests {
     }
 
     #[test]
-    fn the_file_is_the_header_then_one_line_per_entry() {
-        assert_eq!(to_bytes("test", 1, ["a\nb", "", "c\\"]), b"/forklift-test 1\na\\nb\n\nc\\\\\n".to_vec());
-        assert_eq!(to_bytes("test", 1, Vec::<String>::new()), b"/forklift-test 1\n".to_vec());
-        assert_eq!(from_bytes(b"/forklift-test 1\n", "test", 1).unwrap(), Vec::<String>::new());
+    fn the_file_is_the_header_then_one_line_per_entry_then_the_digest() {
+        let body = b"/forklift-test 1\na\\nb\n\nc\\\\\n".to_vec();
+        let digest = format!("digest {}\n", blake3::hash(&body).to_hex());
+        assert_eq!(to_bytes("test", 1, ["a\nb", "", "c\\"]), [body, digest.into_bytes()].concat());
+        assert_eq!(from_bytes(&to_bytes("test", 1, Vec::<String>::new()), "test", 1).unwrap(), Vec::<String>::new());
     }
 
+    /// With no digest line at all, the header alone is judged: another kind's file or none is
+    /// unversioned, and an older version of this kind is that version, since no version from
+    /// before the digest wrote one. Anything else without one was cut off: damage.
+    ///
+    /// Revert: read a record with no digest line as `OtherVersion` whatever its version → the
+    /// newer header without a digest reads as a newer build's.
     #[test]
-    fn a_missing_or_foreign_header_is_refused() {
-        assert_eq!(from_bytes(b"", "test", 1), Err(RecordError::Unversioned));
-        assert_eq!(from_bytes(b"src\n", "test", 1), Err(RecordError::Unversioned));
-        assert_eq!(from_bytes(b"/forklift-other 1\nsrc\n", "test", 1), Err(RecordError::Unversioned));
-        assert_eq!(from_bytes(b"/forklift-test 1\r\nsrc\n", "test", 1),
-            Err(RecordError::OtherVersion("/forklift-test 1\r".to_string())));
-        assert_eq!(from_bytes(b"/forklift-test 2\nsrc\n", "test", 1),
-            Err(RecordError::OtherVersion("/forklift-test 2".to_string())));
-    }
-
-    #[test]
-    fn a_file_cut_short_is_refused() {
-        assert_eq!(from_bytes(b"/forklift-test 1", "test", 1), Err(RecordError::Unterminated));
-        assert_eq!(from_bytes(b"/forklift-test 1\nsrc", "test", 1), Err(RecordError::Unterminated));
-    }
-
-    #[test]
-    fn an_escape_no_writer_produces_is_refused() {
-        for (line, bad) in [("a\\", 2), ("a\\t", 2), ("a\rb", 2), ("\\x41", 2)] {
-            let bytes = format!("/forklift-test 1\n{}\n", line);
-            assert_eq!(from_bytes(bytes.as_bytes(), "test", 1), Err(RecordError::BadEscape { line: bad }), "{:?}", line);
+    fn a_record_without_a_digest_line_is_judged_by_its_header() {
+        assert_eq!(from_bytes(b"", "test", 2), Err(RecordError::Unversioned));
+        assert_eq!(from_bytes(b"src\n", "test", 2), Err(RecordError::Unversioned));
+        assert_eq!(from_bytes(b"\xff\nsrc\n", "test", 2), Err(RecordError::Unversioned));
+        assert_eq!(from_bytes(b"/forklift-other 2\nsrc\n", "test", 2), Err(RecordError::Unversioned));
+        assert_eq!(from_bytes(b"/forklift-test 1\nsrc\n", "test", 2),
+            Err(RecordError::OtherVersion("/forklift-test 1".to_string())));
+        for damaged in [&b"/forklift-test 2\nsrc\n"[..], b"/forklift-test 3\nsrc\n", b"/forklift-test 01\n",
+                        b"/forklift-test 1\r\nsrc\n", b"/forklift-test 2"] {
+            assert_eq!(from_bytes(damaged, "test", 2), Err(RecordError::Damaged), "{:?}", String::from_utf8_lossy(damaged));
         }
-        let later = from_bytes(b"/forklift-test 1\nok\nok\nbad\\\n", "test", 1);
-        assert_eq!(later, Err(RecordError::BadEscape { line: 4 }));
     }
 
-    /// The digest is checked before the header, at any version, and covers every byte before it.
+    /// The header alone, with no digest: for a gate that refuses another version unread.
+    #[test]
+    fn read_header_judges_the_first_line_alone() {
+        assert_eq!(read_header(b"/forklift-test 2\n", "test", 2), Ok(()));
+        assert_eq!(read_header(b"/forklift-test 3\nanything", "test", 2),
+            Err(RecordError::OtherVersion("/forklift-test 3".to_string())));
+        assert_eq!(read_header(b"/forklift-tests 2\n", "test", 2), Err(RecordError::Unversioned));
+    }
+
+    /// Inside a verified frame, the body is still read strictly: a body no writer produces is
+    /// refused, never guessed at.
+    #[test]
+    fn a_verified_body_no_writer_produces_is_refused() {
+        let framed = |body: &[u8]| with_digest(body.to_vec());
+        assert_eq!(from_bytes(&framed(b"/forklift-test 1\r\nsrc\n"), "test", 1),
+            Err(RecordError::OtherVersion("/forklift-test 1\r".to_string())));
+        assert_eq!(from_bytes(&framed(b"/forklift-other 1\nsrc\n"), "test", 1), Err(RecordError::Unversioned));
+        for (line, bad) in [("a\\", 2), ("a\\t", 2), ("a\rb", 2), ("\\x41", 2)] {
+            let bytes = framed(format!("/forklift-test 1\n{}\n", line).as_bytes());
+            assert_eq!(from_bytes(&bytes, "test", 1), Err(RecordError::BadEscape { line: bad }), "{:?}", line);
+        }
+        let later = from_bytes(&framed(b"/forklift-test 1\nok\nok\nbad\\\n"), "test", 1);
+        assert_eq!(later, Err(RecordError::BadEscape { line: 4 }));
+        assert_eq!(from_bytes(&framed(b"/forklift-test 1\n\xff\n"), "test", 1), Err(RecordError::NotUtf8));
+    }
+
+    /// The digest is checked before the header, at any version, and covers every byte before it:
+    /// both shapes of damage that still parse, a hex digit flipped to another and a cut on a line
+    /// boundary, read as damage.
     ///
     /// Revert: read the header before the digest → the digit flipped to a newer version reads as
     /// `OtherVersion`, not damage.
     #[test]
-    fn a_digested_record_is_judged_by_its_digest_first() {
-        let bytes = to_bytes_digested("test", 2, ["a", "b"]);
-        assert_eq!(from_bytes_digested(&bytes, "test", 2).unwrap(), vec!["a", "b"]);
-        assert!(!written_by_newer_digested(&bytes, "test", 2));
+    fn a_record_is_judged_by_its_digest_first() {
+        let bytes = to_bytes("test", 2, ["aa", "bb"]);
+        assert_eq!(from_bytes(&bytes, "test", 2).unwrap(), vec!["aa", "bb"]);
+        assert!(!written_by_newer(&bytes, "test", 2));
 
-        // A digit flip to another version, a flipped entry byte, a cut and a missing digest.
+        let at = b"/forklift-test 2\n".len();
         let mut newer = bytes.clone();
         newer[b"/forklift-test ".len()] = b'3';
-        let mut flipped = bytes.clone();
-        flipped[b"/forklift-test 2\n".len()] = b'z';
-        for damaged in [&newer[..], &flipped[..], &bytes[..bytes.len() - 1], &bytes[..bytes.len() - 10],
-                        &to_bytes("test", 2, ["a", "b"])[..], b""] {
-            assert_eq!(from_bytes_digested(damaged, "test", 2), Err(RecordError::Damaged),
+        let mut hex_flip = bytes.clone();
+        hex_flip[at] = b'b';
+        let line_cut = [&bytes[..at + 3], &bytes[at + 6..]].concat();
+        for damaged in [&newer[..], &hex_flip[..], &line_cut[..], &bytes[..bytes.len() - 1],
+                        &bytes[..bytes.len() - 10], &bytes[..at + 6]] {
+            assert_eq!(from_bytes(damaged, "test", 2), Err(RecordError::Damaged),
                 "{:?}", String::from_utf8_lossy(damaged));
-            assert!(!written_by_newer_digested(damaged, "test", 2));
+            assert!(!written_by_newer(damaged, "test", 2));
         }
 
         // A newer build's record, whole, reads as newer, not as damage.
-        let theirs = to_bytes_digested("test", 3, ["a"]);
-        assert_eq!(from_bytes_digested(&theirs, "test", 2),
+        let theirs = to_bytes("test", 3, ["a"]);
+        assert_eq!(from_bytes(&theirs, "test", 2),
             Err(RecordError::OtherVersion("/forklift-test 3".to_string())));
-        assert!(written_by_newer_digested(&theirs, "test", 2));
+        assert!(written_by_newer(&theirs, "test", 2));
     }
 
     /// Salvage reads a digested record without its digest line, whole or cut.
     #[test]
     fn the_digest_line_is_left_out_of_a_salvage() {
-        let bytes = to_bytes_digested("test", 2, ["aa", "bb"]);
+        let bytes = to_bytes("test", 2, ["aa", "bb"]);
         let parse = |line: &str| Some(line.to_string());
         assert_eq!(salvage(without_digest_line(&bytes), parse), (vec!["aa".to_string(), "bb".to_string()], 0));
         assert_eq!(salvage(without_digest_line(&bytes[..bytes.len() - 5]), parse),
             (vec!["aa".to_string(), "bb".to_string()], 0));
         assert_eq!(without_digest_line(b"/forklift-test 2\naa\n"), b"/forklift-test 2\naa\n");
-    }
-
-    #[test]
-    fn invalid_utf8_is_refused() {
-        assert_eq!(from_bytes(&[0xFF, b'\n'], "test", 1), Err(RecordError::NotUtf8));
     }
 }

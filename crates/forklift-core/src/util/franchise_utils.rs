@@ -30,7 +30,7 @@ pub const FILE_NAME_FRANCHISE: &str = "franchise";
 
 /// The [`record_utils`] kind and version of the record.
 const FRANCHISE_RECORD: &str = "franchise";
-const FRANCHISE_VERSION: u32 = 3;
+const FRANCHISE_VERSION: u32 = 4;
 
 /// The name of the warehouse lock file, which a resume keeps: it is the resume's own.
 const FILE_NAME_LOCK: &str = "lock";

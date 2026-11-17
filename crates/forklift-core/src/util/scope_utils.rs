@@ -45,7 +45,7 @@ const FILE_NAME_FETCH_SCOPE: &str = "fetch-scope";
 /// The header opens with "/", which no stored prefix can (prefixes are trimmed of it), so an
 /// unversioned file can never be mistaken for a versioned one.
 const SCOPE_RECORD: &str = "scope";
-const SCOPE_VERSION: u32 = 4;
+const SCOPE_VERSION: u32 = 5;
 
 /// The stable machine-branchable refusal codes this feature contributes to the §7.4 error
 /// taxonomy, as their code strings — kept as re-exports of the typed [`RefusalCode`] (the source
@@ -301,6 +301,10 @@ impl PathScope {
             ),
             RecordError::OtherVersion(ref header) => match header_version(header) {
                 Some(version) if version > SCOPE_VERSION => format!("{} Use the Forklift that wrote it.", e.describe()),
+                Some(4) => format!(
+                    "{} An older version of Forklift wrote it, before scope files carried a digest. {}",
+                    e.describe(), remedy
+                ),
                 Some(version) if version < SCOPE_VERSION => format!(
                     "{} An older version of Forklift wrote it, whose sparse checkouts left out \
                     ignore files this one holds in scope. {}",

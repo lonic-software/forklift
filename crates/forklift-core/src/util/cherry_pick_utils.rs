@@ -32,7 +32,7 @@ const FILE_NAME_CHERRY_PICK: &str = "cherry-pick";
 const CHERRY_PICK_RECORD: &str = "cherry-pick";
 
 /// The version of the cherry-pick-state record.
-const CHERRY_PICK_VERSION: u32 = 1;
+const CHERRY_PICK_VERSION: u32 = 2;
 
 /// A cherry-pick in progress: the source parcel being applied, and the description the
 /// completing `stack` should default to.

@@ -25,7 +25,7 @@ use crate::util::{config_utils, file_utils, origin_move, record_utils, scope_uti
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
 pub const FILE_NAME: &str = "origin";
 const RECORD: &str = "origin";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 fn record_path(forklift: &Path) -> PathBuf {
     forklift.join(FILE_NAME)

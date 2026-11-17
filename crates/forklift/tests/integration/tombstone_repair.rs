@@ -341,7 +341,7 @@ fn a_repair_that_names_a_head_the_damaged_list_kept_holds_it_once() {
     let area = Area::new("kept-named");
     let root = area.served();
     let gone = area.deleted(&root, "gone");
-    let damaged = record_utils::to_bytes_digested("tombstones", 3, [gone.as_str(), "not an entry"]);
+    let damaged = record_utils::to_bytes("tombstones", 3, [gone.as_str(), "not an entry"]);
     std::fs::write(list_path(&root), &damaged).unwrap();
 
     area.server_ok(&root, &["tombstone", "repair"]);
@@ -388,7 +388,7 @@ fn a_repair_keeps_what_a_damaged_list_still_says_and_sets_the_original_aside() {
     let side = area.deleted(&root, "side");
     forget_journals(&root);
     let good = format!("{} side", side);
-    let damaged = record_utils::to_bytes_digested("tombstones", 3, [good.as_str(), "not an entry"]);
+    let damaged = record_utils::to_bytes("tombstones", 3, [good.as_str(), "not an entry"]);
     std::fs::write(list_path(&root), &damaged).unwrap();
 
     let report = area.server_ok(&root, &["tombstone", "repair"]);

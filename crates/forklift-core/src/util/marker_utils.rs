@@ -80,7 +80,7 @@ fn serialize(set: &BTreeSet<String>) -> Vec<u8> {
 
 /// The [`record_utils`] kind and version of a marker file.
 const MARKER_RECORD: &str = "marker";
-const MARKER_VERSION: u32 = 1;
+const MARKER_VERSION: u32 = 2;
 
 /// The antichain-maintaining update [`add`], [`pending_add`] and [`add_deferred`] share: absorb
 /// `key` into `existing` (see the module doc comment's antichain-invariant section).

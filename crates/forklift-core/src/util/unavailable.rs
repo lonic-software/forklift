@@ -38,7 +38,7 @@ use crate::util::withholding::ChunkDigest;
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
 const FILE_NAME_UNAVAILABLE: &str = "unavailable";
 const UNAVAILABLE_RECORD: &str = "unavailable";
-const UNAVAILABLE_VERSION: u32 = 2;
+const UNAVAILABLE_VERSION: u32 = 3;
 
 fn unavailable_path() -> PathBuf {
     globals::forklift_root().join(FILE_NAME_UNAVAILABLE)
@@ -227,7 +227,7 @@ fn written_by_newer(bytes: &[u8]) -> bool {
 
 /// Every entry of a damaged record that reads whole (see [`rebuild`]), and how many lines did not.
 fn salvage(bytes: &[u8]) -> (UnavailableSet, usize) {
-    let (entries, dropped) = record_utils::salvage(bytes, parse_entry);
+    let (entries, dropped) = record_utils::salvage(record_utils::without_digest_line(bytes), parse_entry);
 
     (UnavailableSet { entries: entries.into_iter().collect() }, dropped)
 }

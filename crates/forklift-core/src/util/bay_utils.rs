@@ -27,14 +27,14 @@ pub const FILE_NAME_BAY_REDIRECT: &str = "redirect";
 /// bay's name. Its header is how reading one refuses a stray file named `.forklift`
 /// instead of misreading it as a bay.
 const BAY_REDIRECT_RECORD: &str = "bay";
-const BAY_REDIRECT_VERSION: u32 = 1;
+const BAY_REDIRECT_VERSION: u32 = 2;
 
 /// The file inside a bay's local state recording its working directory (so the main tree
 /// can list where each bay lives), a [`record_utils`] file of kind [`BAY_PATH_RECORD`] holding
 /// that one path.
 const FILE_NAME_BAY_PATH: &str = "path";
 const BAY_PATH_RECORD: &str = "bay-path";
-const BAY_PATH_VERSION: u32 = 1;
+const BAY_PATH_VERSION: u32 = 2;
 
 /// A filesystem path as the text a bay record stores. A path that is not UTF-8 is refused rather
 /// than written lossily, which would record a different path.
