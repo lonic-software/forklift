@@ -640,7 +640,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   with a raw read error and no way out. Every reader now refuses it with `config_damaged` (exit
   65, `--json` schema 51), as it does a file cut short so that its last line no longer parses. In
   the warehouse's own file the next step is `forklift heal`, which rewrites the file when the
-  damage provably cost no setting, for instance a garbled comment, keeping its comments. Otherwise
+  damage provably cost no setting, for instance a garbled comment, and the rest of the file is
+  valid, keeping its comments. Otherwise
   it changes nothing and names the entries the damage may have touched. `heal --config` then keeps
   only the entries the damage provably spared. A section that loses one entry loses all of them,
   so a remote's address is never kept without its token. The damaged bytes are set aside as

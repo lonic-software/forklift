@@ -416,7 +416,8 @@ hand edit saved in an encoding other than UTF-8. Forklift keeps no second copy o
 only evidence of what it held is the damaged file itself.
 
 In the warehouse's own file, `forklift heal` rewrites it when the damage provably cost no setting,
-as when it lies in a comment, keeping the file's own text and comments. Otherwise heal changes
+as when it lies in a comment, and the rest of the file is valid, keeping the file's own text and
+comments. Otherwise heal changes
 nothing and names, by line and key, each entry
 the damage may have touched. `forklift heal --config` then rewrites the file with only the entries
 the damage provably spared. When one entry of a section goes, the whole section goes, so a
