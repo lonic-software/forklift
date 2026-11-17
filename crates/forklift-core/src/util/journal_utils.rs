@@ -17,8 +17,8 @@ use crate::util::file_utils;
 const FILE_NAME_JOURNAL: &str = "journal.json";
 
 /// The journal file's format version. The file is `{"version":4,"entries":[...]}`; any other
-/// version, or anything that does not parse as this shape, is refused by name — never read as an empty journal, which would make `undo` report "nothing to
-/// undo" over a history it lost.
+/// version, or anything that does not parse as this shape, is refused by name — never read as
+/// an empty journal, which would make `undo` report "nothing to undo" over a history it lost.
 ///
 /// Version 4 embeds the digested consolidation and skeleton records, so an older journal's
 /// in-progress state would not read as either: it is refused as another version, never as damage.

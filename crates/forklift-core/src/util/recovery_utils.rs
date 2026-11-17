@@ -6217,9 +6217,9 @@ mod tests {
     }
 
     /// Hand-write a torn taint file (this version's header, no digest line) recording
-    /// `surviving_lines` — mirrors `heal_utils::tests::plant_taint`'s complete-file counterpart, but
-    /// deliberately omits the digest so `taint_utils::read_taints` reports `torn: true` and still
-    /// salvages the surviving lines.
+    /// `surviving_lines` — mirrors `heal_utils::tests::plant_taint`'s complete-file counterpart,
+    /// but deliberately omits the digest so `taint_utils::read_taints` reports `torn: true` and
+    /// still salvages the surviving lines.
     fn plant_torn_taint(forklift_root: &Path, surviving_lines: &[&str]) {
         let taint_dir = forklift_root.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
