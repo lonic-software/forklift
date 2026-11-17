@@ -11,10 +11,15 @@
 #                              docs/generated; exits 1 if anything is stale, missing or extra.
 #                              bin/check and CI run this.
 #
-# Runs whatever binary cargo just built, so a CARGO_TARGET_DIR (or a configured target-dir)
-# lets it build outside the main checkout's target/.
+# Builds into target/gen-docs unless a CARGO_TARGET_DIR, CARGO_BUILD_TARGET_DIR or configured
+# target-dir says otherwise: the docgen-feature binary must never replace target/debug/forklift,
+# which the tests and proof-load drive. Runs whatever binary cargo just built.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+if [ -z "${CARGO_TARGET_DIR:-}${CARGO_BUILD_TARGET_DIR:-}" ] \
+    && ! grep -qs 'target-dir' .cargo/config.toml .cargo/config "${CARGO_HOME:-$HOME/.cargo}/config.toml"; then
+    export CARGO_TARGET_DIR=target/gen-docs
+fi
 
 # Each page is rendered by `forklift __docgen <target>` into docs/generated/<target>.md.
 pages=(errors json-schemas commands mcp-tools)

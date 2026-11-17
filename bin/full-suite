@@ -7,12 +7,12 @@
 #              and cargo test -p forklift does not rebuild forklift-server)
 #   test       cargo test --workspace --no-fail-fast (unit, integration and doc-tests)
 #   history    proof-load's ignored tests (the history lane and the round trips), against the
-#              forklift binary cargo just built, wherever its target directory is
+#              forklift binary the workspace build made, wherever its target directory is
 #   desktop    tools/proof-load-desktop, its own workspace: tests, then clippy -D warnings
 #   clippy     cargo clippy --workspace --all-targets, so clippy.toml's bans reach the tests too;
 #              report-only like CI, its log is what bin/clippy-changed reads
-#   guards     bin/fmt-guard, bin/gen-docs --check (built into target/gen-docs, so its docgen
-#              build never replaces the tested binary) and bin/check-no-aws-lc
+#   guards     bin/fmt-guard, bin/gen-docs --check (which builds into target/gen-docs, so its
+#              docgen build never replaces the tested binary) and bin/check-no-aws-lc
 #
 # usage: full-suite [--out DIR] [--only STEP,...]
 #        full-suite --list
@@ -32,10 +32,10 @@ steps() {
     cat <<'EOF'
 build|1800|cargo build --workspace
 test|3600|cargo test --workspace --no-fail-fast
-history|900|PROOF_LOAD_FORKLIFT="$(cargo build -q -p forklift --message-format=json | sed -n 's/.*"executable":"\([^"]*\/forklift\)".*/\1/p' | tail -1)" && [ -x "$PROOF_LOAD_FORKLIFT" ] && export PROOF_LOAD_FORKLIFT && cargo test -p proof-load --lib -- --ignored
+history|1800|set -o pipefail && PROOF_LOAD_FORKLIFT="$(cargo build -q --workspace --message-format=json-render-diagnostics | sed -n 's/.*"executable":"\([^"]*\/forklift\)".*/\1/p' | tail -1)" && [ -x "$PROOF_LOAD_FORKLIFT" ] && export PROOF_LOAD_FORKLIFT && cargo test -p proof-load --lib -- --ignored
 desktop|1800|cargo test --locked --no-fail-fast --manifest-path tools/proof-load-desktop/Cargo.toml && cargo clippy --locked --all-targets --manifest-path tools/proof-load-desktop/Cargo.toml -- -D warnings
 clippy|1800|cargo clippy --workspace --all-targets --message-format=short
-guards|900|./bin/fmt-guard && CARGO_TARGET_DIR=target/gen-docs ./bin/gen-docs --check && ./bin/check-no-aws-lc
+guards|900|./bin/fmt-guard && ./bin/gen-docs --check && ./bin/check-no-aws-lc
 EOF
 }
 
@@ -54,9 +54,10 @@ why() {
 }
 
 # Runs the command in its own process group and kills the whole group on timeout (exit 142): a test
-# binary's children would otherwise outlive the watchdog.
+# binary's children would otherwise outlive the watchdog. It execs, so a backgrounded call's pid is
+# the watchdog's own and a signal sent to it reaches the handler below.
 bounded() {
-    perl -e '
+    exec perl -e '
         my $t = shift;
         my $pid = fork; defined $pid or exit 126;
         if ($pid == 0) { setpgrp(0, 0); exec @ARGV or exit 127 }
@@ -70,9 +71,18 @@ bounded() {
         exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$@"
 }
 
+STEP_PID=""
+# forward SIG: hands SIG to the running step's watchdog, waits for it, then dies of SIG.
+forward() {
+    if [ -n "$STEP_PID" ]; then kill -s "$1" "$STEP_PID" 2>/dev/null || true; wait "$STEP_PID" 2>/dev/null || true; fi
+    trap - "$1"
+    kill -s "$1" $$
+}
+
 # run_steps OUT ONLY < table: runs each selected step, prints its line, returns 1 if any failed.
 run_steps() {
     local out=$1 only=$2 failed=0 name secs cmd t0 st took why
+    trap 'forward INT' INT; trap 'forward TERM' TERM; trap 'forward HUP' HUP
     while IFS='|' read -r name secs cmd; do
         [ -n "$name" ] || continue
         if [ -n "$only" ]; then
@@ -80,8 +90,14 @@ run_steps() {
         fi
         t0=$(date +%s)
         set +e
-        bounded "$secs" bash -c "$cmd" > "$out/$name.log" 2>&1 < /dev/null
+        # In the background, so a TERM or HUP sent to this script alone (a parent's bound) reaches
+        # the trap while the step runs; the trap passes it to the watchdog, which kills the step's
+        # whole group, and then this script dies of the same signal.
+        bounded "$secs" bash -c "$cmd" > "$out/$name.log" 2>&1 < /dev/null &
+        STEP_PID=$!
+        wait "$STEP_PID"
         st=$?
+        STEP_PID=""
         set -e
         took=$(( $(date +%s) - t0 ))
         if [ "$st" -eq 0 ]; then
@@ -178,14 +194,27 @@ EOF
     set -e
     check "a passing test named stale is not the failure" 1 "exit 101: test x ... FAILED"
 
-    # An interrupted watchdog dies of the interrupt (128 + 2), not a plain failure: that is what
-    # lets the shell running the steps stop at a Ctrl-C instead of starting the next one.
-    local sub
-    ( bounded 20 sleep 10 ) & sub=$!
-    sleep 1; pkill -INT -P "$sub" perl
-    set +e; wait "$sub"; st=$?; set -e
-    out="exit $st"
-    check "an interrupted watchdog dies of the interrupt" 130 "exit 130"
+    # A Ctrl-C (INT to the whole foreground group) stops the run: the step after never starts.
+    # A TERM to the script alone (a parent's bound) leaves no step running behind it.
+    local sig pid n
+    for sig in INT TERM; do
+        mkdir -p "$tmp/$sig"
+        export FULL_SUITE_SELF_TEST_PID="$tmp/$sig/step.pid"
+        # The run in a process group of its own with INT at its default, as a terminal's foreground
+        # job would be (a background job starts with INT ignored, which a shell cannot trap).
+        printf '%s\n' 'test|30|echo $$ > "$FULL_SUITE_SELF_TEST_PID"; exec sleep 20' 'clippy|5|echo after' \
+            | perl -e '$SIG{INT} = "DEFAULT"; setpgrp(0, 0); exec @ARGV' bash "$0" --run-steps "$tmp/$sig" > "$tmp/$sig.out" 2>&1 &
+        pid=$!
+        n=0; while [ ! -s "$tmp/$sig/step.pid" ] && [ "$n" -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+        if [ "$sig" = INT ]; then kill -INT -- "-$pid"; else kill -TERM "$pid"; fi
+        set +e; { wait "$pid"; } 2>/dev/null; st=$?; set -e
+        n=0; while kill -0 "$(cat "$tmp/$sig/step.pid" 2>/dev/null || echo 0)" 2>/dev/null && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+        if [ -f "$tmp/$sig/clippy.log" ]; then out="the next step ran"
+        elif kill -0 "$(cat "$tmp/$sig/step.pid" 2>/dev/null || echo 0)" 2>/dev/null; then out="the step outlived the run"
+        else out="stopped"; fi
+        check "a $sig stops the run and its step" "$st" "stopped"
+    done
+    unset FULL_SUITE_SELF_TEST_PID
 
     rm -rf "$tmp"
     if [ "$fails" -eq 0 ]; then echo "self-test: all passed"; return 0; fi
@@ -200,6 +229,8 @@ while [ $# -gt 0 ]; do
         --only) only=${2:?--only needs step names}; shift 2 ;;
         --list) steps | cut -d'|' -f1; exit 0 ;;
         --self-test) self_test; exit $? ;;
+        # The self-test's way to run a step table in a process of its own; not for use.
+        --run-steps) run_steps "${2:?}" ""; exit $? ;;
         *) echo "usage: full-suite [--out DIR] [--only STEP,...] | --list | --self-test" >&2; exit 2 ;;
     esac
 done
