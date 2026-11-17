@@ -17,8 +17,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # Cargo's own answer, which every config location and variable feeds: move off only the default.
-if [ "$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')" \
-    = "$PWD/target" ]; then
+# Cargo reports a physical path, so compare against the physical working directory.
+target_dir="$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+if [ -z "$target_dir" ]; then
+    echo "gen-docs: cargo metadata named no target directory" >&2
+    exit 1
+fi
+if [ "$target_dir" = "$(pwd -P)/target" ]; then
     export CARGO_TARGET_DIR=target/gen-docs
 fi
 

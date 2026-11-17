@@ -22,7 +22,8 @@
 # output goes to DIR/<step>.log (default: a fresh temporary directory, printed first) and one line
 # per step is printed, with the first failing line of any step that did not pass. A failed build
 # stops the run, since every later step would rebuild and fail the same way; any other failure does
-# not. Exits 0 only when every step ran and passed, 1 otherwise, 2 on a usage error.
+# not. Exits 0 only when every step ran and passed, 1 otherwise, 2 on a usage error, 3 when every
+# step passed but FULL_SUITE_TABLE replaced the real steps (never a green verdict on this tree).
 #
 # Bash 3.2 compatible; the watchdog is perl's alarm, since macOS has no timeout.
 set -euo pipefail
@@ -228,7 +229,8 @@ EOF
     set +e
     out=$(FULL_SUITE_TABLE="$tmp/table2" bash "$0" --out "$tmp/g" 2>&1); st=$?
     set -e
-    check "a step does not inherit an ignored INT" 0 "ok       test"
+    check "a step does not inherit an ignored INT" 3 "ok       test"
+    check "a replaced step table is never green" 3 "NOT a verdict"
 
     rm -rf "$tmp"
     if [ "$fails" -eq 0 ]; then echo "self-test: all passed"; return 0; fi
@@ -262,5 +264,9 @@ set +e
 run_steps "$out" "$only" < <(steps)
 st=$?
 set -e
+if [ "$st" -eq 0 ] && [ -n "${FULL_SUITE_TABLE:-}" ]; then
+    echo "full-suite: every step passed, but FULL_SUITE_TABLE replaced the suite: NOT a verdict on this tree"
+    exit 3
+fi
 if [ "$st" -eq 0 ]; then echo "full-suite: every step passed"; else echo "full-suite: NOT green"; fi
 exit "$st"

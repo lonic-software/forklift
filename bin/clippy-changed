@@ -192,6 +192,14 @@ if [ -z "$log" ]; then
         setpgrp($pid, $pid);
         $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; exit 142 };
         $SIG{$_} = sub { kill "TERM", -$pid; exit 143 } for qw(INT TERM HUP);
-        alarm $t; waitpid $pid, 0; exit($? >> 8)' 1800 cargo clippy --workspace --all-targets --message-format=short 2> "$log" > /dev/null || true
+        alarm $t; waitpid $pid, 0; exit($? >> 8)' 1800 cargo clippy --workspace --all-targets --message-format=short 2> "$log" > /dev/null &
+    # A signal sent to this script alone (a parent's bound) is handed to the watchdog, which ends
+    # the whole clippy group, before this script dies of it.
+    watchdog=$!
+    for sig in INT TERM HUP; do
+        trap "kill -s $sig $watchdog 2>/dev/null; wait $watchdog 2>/dev/null; rm -f \"\$log\"; trap - $sig; kill -s $sig \$\$" "$sig"
+    done
+    wait "$watchdog" || true
+    trap - INT TERM HUP
 fi
 judge "$base" "$log"
