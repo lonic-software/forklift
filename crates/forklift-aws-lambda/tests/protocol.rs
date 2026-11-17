@@ -495,6 +495,78 @@ fn a_ref_update_to_a_head_holding_the_metadata_folder_is_refused() {
     assert_eq!(user_head(&head, "main"), Some(clean));
 }
 
+/// An uploaded chunk holding `content`, and an uploaded recipe whose only chunk is `chunk`.
+fn gate_chunk<O: ObjectStore, R: RefStore>(head: &Head<O, R>, content: &str) -> String {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::model::chunk::Chunk;
+
+    put_object(head, LooseObjectBuilder::build_chunk(&Chunk { content: content.as_bytes().to_vec() }))
+}
+
+fn gate_recipe<O: ObjectStore, R: RefStore>(head: &Head<O, R>, chunk: &str, size: u64) -> String {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::model::recipe::{Recipe, RecipeChunk};
+
+    put_object(head, LooseObjectBuilder::build_recipe(&Recipe {
+        content_hash: "0".repeat(64),
+        total_size: size,
+        chunks: vec![RecipeChunk { hash: chunk.to_string(), size }],
+    }))
+}
+
+/// A tree entry `name` of `item_type` naming `hash`.
+fn gate_entry(name: &str, hash: &str, item_type: forklift_core::enums::dir_entry_type::DirEntryType)
+              -> forklift_core::model::tree_item::TreeItem {
+    forklift_core::model::tree_item::TreeItem::new(name.to_string(), hash.to_string(), item_type)
+}
+
+/// A ref update whose new history names a present object as a kind it is not is refused with
+/// `object_kind_mismatch`, naming the entry: a file entry naming a tree, a chunk, a recipe or a
+/// parcel; a chunked entry naming a blob; and a recipe naming a blob as its chunk. Each object is
+/// present, so a presence check alone passed every one of them.
+///
+/// Revert: make the probe report presence alone (`ObjectProbe::Present`) → every case commits → red.
+#[test]
+fn a_ref_update_naming_an_object_as_another_kind_is_refused() {
+    use forklift_core::enums::dir_entry_type::DirEntryType::{Normal, NormalChunked, ExecutableChunked};
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let blob = gate_file(&head, "x", "a blob").hash;
+    let tree = gate_dir(&head, "d", vec![gate_file(&head, "y", "inner")]).hash;
+    let chunk = gate_chunk(&head, "a chunk");
+    let recipe = gate_recipe(&head, &chunk, 7);
+    let blob_chunked = gate_recipe(&head, &blob, 6);
+    let parcel = gate_parcel(&head, &[], vec![gate_file(&head, "p", "parcel")]);
+
+    for (entry, expected, found, named) in [
+        (gate_entry("a.txt", &tree, Normal), "blob", "tree", tree.clone()),
+        (gate_entry("a.txt", &chunk, Normal), "blob", "chunk", chunk.clone()),
+        (gate_entry("a.txt", &recipe, Normal), "blob", "recipe", recipe.clone()),
+        (gate_entry("a.txt", &parcel, Normal), "blob", "parcel", parcel.clone()),
+        (gate_entry("a.txt", &blob, NormalChunked), "recipe", "blob", blob.clone()),
+        (gate_entry("a.txt", &blob_chunked, ExecutableChunked), "chunk", "blob", blob.clone()),
+    ] {
+        let new_head = gate_parcel(&head, &[], vec![gate_dir(&head, "docs", vec![entry])]);
+        let request = RefUpdateRequest { old_head: None, new_head, tombstone: None };
+        let err = head.ref_update(&Principal::Static, "main", &request).expect_err("a mis-kinded entry");
+
+        assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+        assert_eq!(refusal_code(&err.message), Some(RefusalCode::ObjectKindMismatch), "{}", err.message);
+        assert!(err.message.contains(&named) && err.message.contains("docs/a.txt"), "{}", err.message);
+        assert!(err.message.contains(&format!("needs a {}, but that object is a {}", expected, found)), "{}", err.message);
+        assert_eq!(user_head(&head, "main"), None);
+    }
+
+    // The control: the same entries, each naming its own kind, commit.
+    let clean = gate_parcel(&head, &[], vec![gate_dir(&head, "docs", vec![
+        gate_entry("a.txt", &blob, Normal),
+        gate_entry("b.bin", &recipe, NormalChunked),
+    ])]);
+    let request = RefUpdateRequest { old_head: None, new_head: clean.clone(), tombstone: None };
+    head.ref_update(&Principal::Static, "main", &request).expect("the control: every entry names its kind");
+    assert_eq!(user_head(&head, "main"), Some(clean));
+}
+
 /// A creation that names a wedged parcel as its tombstone when none stands, and keeps its tree.
 // Revert: take the base from `request.tombstone` → the creation commits → red.
 #[test]

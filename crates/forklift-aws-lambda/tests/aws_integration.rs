@@ -47,6 +47,7 @@ use forklift_aws_lambda::{
     handle, AsyncBridge, AuthConfig, DynamoRefStore, FormatFence, FormatStore, Head, HeadResult, Routing, S3ObjectStore,
 };
 
+use forklift_core::enums::object_type::ObjectType;
 use forklift_core::globals::StorageRootScope;
 use forklift_core::util::authority_utils::Principal;
 use forklift_core::model::remote::{CommitLiftRequest, RefUpdateRequest, TrustAnchorDto};
@@ -583,6 +584,19 @@ async fn s3_verify_and_promote_gates_the_canonical_namespace() {
             PromoteOutcome::Promoted
         );
         assert!(objects.exists(&good_hash).expect("now canonical"));
+        // The promotion records the object's kind, which a ref update's closure walk reads from
+        // the HEAD. Revert: promote without the metadata → the kind read errors → red.
+        assert_eq!(objects.kind(&good_hash).expect("the recorded kind"), Some(ObjectType::Blob));
+
+        // The direct writer records it too.
+        let tree = forklift_core::builder::object::loose_object_builder::LooseObjectBuilder::build_tree(
+            &forklift_core::model::tree_item::TreeItem::new(
+                String::new(), String::new(), forklift_core::enums::dir_entry_type::DirEntryType::Tree,
+            ),
+        );
+        objects.put_verified(&tree.hash, &tree.content).expect("put a tree");
+        assert_eq!(objects.kind(&tree.hash).expect("the recorded kind"), Some(ObjectType::Tree));
+        assert_eq!(objects.kind(&fresh_absent()).expect("an absent key"), None);
 
         // Promotion is idempotent.
         assert_eq!(
@@ -625,6 +639,43 @@ async fn s3_verify_and_promote_gates_the_canonical_namespace() {
             objects.verify_and_promote("lift-1", &fresh).expect("post-discard"),
             PromoteOutcome::Missing
         );
+    })
+    .await
+    .expect("the blocking assertions");
+}
+
+fn fresh_absent() -> String {
+    object_utils::hash_object_bytes(b"an object no test ever stores")
+}
+
+/// A canonical object with no kind recorded, as an AWS format 2 warehouse's every object is, is
+/// refused by the kind probe with an error naming its key, never read as present: a closure walk
+/// over it fails rather than pass an object whose kind it cannot tell.
+///
+/// Revert: read a missing kind as `Ok(None)` or as any kind → red.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_an_object_with_no_recorded_kind_is_unreadable_not_present() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (s3, _dynamodb) = raw_clients(&config).await;
+    let (objects, _refs) = build_stores(&config, bridge).await.expect("stores");
+    let bare = object_utils::blob_bytes(b"written with no kind");
+    let bare_hash = object_utils::hash_object_bytes(&bare);
+    let key = format!("objects/{}/{}", config.warehouse_id, bare_hash);
+
+    s3.put_object().bucket(&config.bucket).key(&key).body(bare.into()).send().await.expect("plant");
+
+    tokio::task::spawn_blocking(move || {
+        assert!(objects.exists(&bare_hash).expect("present"));
+        let err = objects.kind(&bare_hash).expect_err("no kind recorded");
+        assert!(err.contains(&key) && err.contains("forklift-kind"), "{}", err);
     })
     .await
     .expect("the blocking assertions");
@@ -681,7 +732,16 @@ async fn s3_verify_and_promote_streams_large_staged_objects() {
         }
     };
     let staging = format!("staging/{}/lift-big", config.warehouse_id);
-    stage(format!("{}/{}", staging, good_hash), good.clone()).await;
+    // A client's presigned PUT can set any metadata on its staged copy; the promotion's copy must
+    // replace it with the kind it read, never carry the client's word over.
+    s3.put_object()
+        .bucket(&bucket)
+        .key(format!("{}/{}", staging, good_hash))
+        .metadata("forklift-kind", "tree")
+        .body(good.clone().into())
+        .send()
+        .await
+        .expect("stage bytes");
     stage(format!("{}/{}", staging, declared_hash), wrong_content).await;
 
     tokio::task::spawn_blocking(move || {
@@ -700,6 +760,8 @@ async fn s3_verify_and_promote_streams_large_staged_objects() {
         );
         assert!(objects.exists(&good_hash).expect("now canonical"));
         assert_eq!(objects.get(&good_hash).expect("read back").as_deref(), Some(good.as_slice()));
+        // Revert: copy with the source's metadata (no `MetadataDirective::Replace`) → `tree` → red.
+        assert_eq!(objects.kind(&good_hash).expect("the recorded kind"), Some(ObjectType::Blob));
 
         // Idempotent, exactly like the small-object path.
         assert_eq!(

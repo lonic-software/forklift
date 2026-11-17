@@ -1510,3 +1510,257 @@ fn an_unreadable_record_does_not_stop_heal() {
 
     assert_eq!(healed["data"]["notes"].to_string().matches("sealed-object record").count(), 1, "{}", healed);
 }
+
+/// Store `object` in the current scope's store as it is, bypassing every writer's own checks.
+fn forge(object: forklift_core::model::object::loose_object::LooseObject) -> String {
+    object_utils::store_object_bytes(&object.hash, &object.content).expect("store the object");
+    object.hash
+}
+
+/// A parcel with no parents whose root holds the folder `docs` holding `entries`.
+fn forged_head(entries: Vec<forklift_core::model::tree_item::TreeItem>) -> String {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+    use forklift_core::model::tree_item::TreeItem;
+
+    let mut docs = TreeItem::new("docs".to_string(), String::new(), DirEntryType::Tree);
+    for entry in entries {
+        docs.add_child(entry);
+    }
+    docs.hash = forge(LooseObjectBuilder::build_tree(&docs));
+    let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+    root.add_child(docs);
+    let tree_hash = forge(LooseObjectBuilder::build_tree(&root));
+
+    forge(LooseObjectBuilder::build_parcel(&forklift_core::model::parcel::Parcel {
+        tree_hash,
+        parents: Vec::new(),
+        actions: Vec::new(),
+        description: Some("forged".to_string()),
+    }))
+}
+
+/// The objects a mis-kind test names: a blob, a tree, a chunk, a recipe of that chunk, and a
+/// recipe whose one chunk is the blob.
+struct Kinds {
+    blob: String,
+    tree: String,
+    chunk: String,
+    recipe: String,
+    blob_chunked: String,
+}
+
+fn forge_kinds() -> Kinds {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+    use forklift_core::model::recipe::{Recipe, RecipeChunk};
+
+    let blob = forge(LooseObjectBuilder::build_blob(&forklift_core::model::blob::Blob { content: b"a blob".to_vec() }));
+    let mut inner = forklift_core::model::tree_item::TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+    inner.add_child(forklift_core::model::tree_item::TreeItem::new("y".to_string(), blob.clone(), DirEntryType::Normal));
+    let tree = forge(LooseObjectBuilder::build_tree(&inner));
+    let chunk = forge(LooseObjectBuilder::build_chunk(&forklift_core::model::chunk::Chunk { content: b"a chunk".to_vec() }));
+    let recipe_of = |chunk: &str, size: u64| forge(LooseObjectBuilder::build_recipe(&Recipe {
+        content_hash: "0".repeat(64),
+        total_size: size,
+        chunks: vec![RecipeChunk { hash: chunk.to_string(), size }],
+    }));
+    let recipe = recipe_of(&chunk, 7);
+    let blob_chunked = recipe_of(&blob, 6);
+
+    Kinds { blob, tree, chunk, recipe, blob_chunked }
+}
+
+fn entry(hash: &str, item_type: forklift_core::enums::dir_entry_type::DirEntryType)
+         -> forklift_core::model::tree_item::TreeItem {
+    forklift_core::model::tree_item::TreeItem::new("a.txt".to_string(), hash.to_string(), item_type)
+}
+
+/// The code a ref update's refusal carries.
+fn refusal_code(refusal: audit_utils::ClosureRefusal) -> Option<forklift_core::error::RefusalCode> {
+    match forklift_core::error::CoreError::from(refusal.for_ref_update()) {
+        forklift_core::error::CoreError::Refusal { code, .. } => Some(code),
+        forklift_core::error::CoreError::Other(_) => None,
+    }
+}
+
+/// Both of the self-hosted server's write gates refuse a history naming a present object as a
+/// kind it is not, with `object_kind_mismatch` naming the entry: a file entry naming a tree, a
+/// chunk or a recipe; a chunked entry naming a blob; a recipe naming a blob as its chunk. The local
+/// walks, which only ever walk history this store already took, still check presence alone.
+///
+/// Revert: let the probe report presence alone → every case passes the gates → red.
+#[test]
+fn the_write_gates_refuse_an_entry_naming_an_object_of_another_kind() {
+    use forklift_core::enums::dir_entry_type::DirEntryType::{ExecutableChunked, Normal, NormalChunked};
+    use forklift_core::enums::object_type::ObjectType;
+
+    let warehouse = Warehouse::new("mis-kind");
+
+    warehouse.scoped(|| {
+        let kinds = forge_kinds();
+
+        // The last field: whether presence alone passes it. A chunked entry's recipe is read, and
+        // a blob there fails that read on every walk.
+        for (entry, expected, found, named, presence_passes) in [
+            (entry(&kinds.tree, Normal), ObjectType::Blob, ObjectType::Tree, &kinds.tree, true),
+            (entry(&kinds.chunk, Normal), ObjectType::Blob, ObjectType::Chunk, &kinds.chunk, true),
+            (entry(&kinds.recipe, Normal), ObjectType::Blob, ObjectType::Recipe, &kinds.recipe, true),
+            (entry(&kinds.blob, NormalChunked), ObjectType::Recipe, ObjectType::Blob, &kinds.blob, false),
+            (entry(&kinds.blob_chunked, ExecutableChunked), ObjectType::Chunk, ObjectType::Blob, &kinds.blob, true),
+        ] {
+            let head = forged_head(vec![entry]);
+            let refusal = audit_utils::verify_parcel_closure_for_write(&head, None).expect_err("a mis-kind");
+
+            match &refusal {
+                audit_utils::ClosureRefusal::MisKinded(mis_kinded) => {
+                    assert_eq!((&mis_kinded.hash, mis_kinded.path.as_str()), (named, "docs/a.txt"));
+                    assert_eq!((mis_kinded.expected, mis_kinded.found), (expected, found));
+                }
+                other => panic!("expected a mis-kind, got {:?}", other),
+            }
+            assert_eq!(refusal_code(refusal), Some(forklift_core::error::RefusalCode::ObjectKindMismatch));
+
+            let message = audit_utils::verify_parcel_closure(&head, None).expect_err("the adoption gate too");
+            assert!(message.contains(named.as_str()) && message.contains("docs/a.txt"), "{}", message);
+
+            // The local walks check presence alone: every object is present.
+            let local = audit_utils::verify_parcel_closure_scoped(&head, None, &PathScope::full(), false, None);
+            assert_eq!(local.is_ok(), presence_passes, "{:?}", local);
+        }
+
+        // The control: each entry naming its own kind passes.
+        let clean = forged_head(vec![entry(&kinds.blob, Normal)]);
+        audit_utils::verify_parcel_closure_for_write(&clean, None).expect("a blob at a file entry");
+        let clean = forged_head(vec![entry(&kinds.recipe, NormalChunked)]);
+        audit_utils::verify_parcel_closure_for_write(&clean, None).expect("a recipe at a chunked entry");
+    });
+}
+
+/// An absent object is still an incomplete history, not a mis-kind: the probe that reads kinds
+/// answers presence as before.
+#[test]
+fn an_absent_object_is_still_incomplete_history() {
+    use forklift_core::enums::dir_entry_type::DirEntryType::Normal;
+
+    let warehouse = Warehouse::new("mis-kind-absent");
+
+    warehouse.scoped(|| {
+        let head = forged_head(vec![entry(&"7".repeat(64), Normal)]);
+        let refusal = audit_utils::verify_parcel_closure_for_write(&head, None).expect_err("absent");
+
+        assert!(matches!(refusal, audit_utils::ClosureRefusal::Incomplete(_)), "{:?}", refusal);
+        assert_eq!(refusal_code(refusal), Some(forklift_core::error::RefusalCode::RemoteHistoryIncomplete));
+    });
+}
+
+/// A chunked entry naming withheld content the store still holds is refused when that content is a
+/// blob, though the walk that tolerates withheld content never reads a withheld file's chunks:
+/// the kind is checked before anything tolerated is consulted.
+///
+/// Revert: check kinds only after `skips_chunks_of` → the tolerant walk passes → red.
+#[test]
+fn a_withheld_but_present_blob_at_a_chunked_entry_is_refused() {
+    use forklift_core::enums::dir_entry_type::DirEntryType::NormalChunked;
+    use forklift_core::util::audit_utils::{ChunkProbe, ObjectProbe};
+    use forklift_core::util::withholding::{ChunkDigest, WithheldSet};
+
+    let warehouse = Warehouse::new("mis-kind-withheld");
+
+    warehouse.scoped(|| {
+        let kinds = forge_kinds();
+        let head = forged_head(vec![entry(&kinds.blob, NormalChunked)]);
+        let withheld = WithheldSet::of([(kinds.blob.clone(), "taken down".to_string(), ChunkDigest::Unknown)]);
+        let removed = || Ok(sealed_utils::Tolerated::removed_only(Default::default(), withheld.clone()));
+        let walk = |probe: &dyn Fn(&str) -> Result<ObjectProbe, String>| audit_utils::verify_parcel_closure_with(
+            &head,
+            None,
+            probe,
+            &|chunks: &[String]| Ok(ChunkProbe {
+                missing: chunks.iter().filter(|chunk| !file_utils::does_object_exist(chunk).unwrap()).cloned().collect(),
+                mis_kinded: Vec::new(),
+            }),
+            &|hash| object_utils::recipe_chunk_hashes(hash),
+            &|hash| object_utils::load_tree(hash),
+            &removed,
+            &|hash| object_utils::load_parcel(hash),
+        );
+
+        // Presence alone: the blob is no recipe, so the first walk fails, and the tolerant walk
+        // skips the withheld file's chunks and passes. That is the hole.
+        walk(&|hash| file_utils::does_object_exist(hash).map(ObjectProbe::presence)).expect("presence passes");
+
+        let refusal = walk(&|hash| file_utils::object_type_of(hash).map(ObjectProbe::kind)).expect_err("a mis-kind");
+        assert!(matches!(refusal, audit_utils::ClosureRefusal::MisKinded(_)), "{:?}", refusal);
+    });
+}
+
+/// A mis-kind only the walk that tolerates withheld content reaches is still refused as one: the
+/// first walk stops at an absent withheld file sorted before it, and the second walk, which
+/// tolerates that file, goes on to the mis-kinded entry.
+///
+/// Revert: read the mis-kind after the first walk alone → the second walk's failure reads as
+/// incomplete history → red.
+#[test]
+fn a_mis_kind_past_a_tolerated_absence_is_refused_as_a_mis_kind() {
+    use forklift_core::enums::dir_entry_type::DirEntryType::Normal;
+    use forklift_core::model::tree_item::TreeItem;
+    use forklift_core::util::audit_utils::{ChunkProbe, ObjectProbe};
+    use forklift_core::util::withholding::{ChunkDigest, WithheldSet};
+
+    let warehouse = Warehouse::new("mis-kind-second-walk");
+
+    warehouse.scoped(|| {
+        let kinds = forge_kinds();
+        let absent = "7".repeat(64);
+        let head = forged_head(vec![
+            TreeItem::new("a.txt".to_string(), absent.clone(), Normal),
+            TreeItem::new("b.txt".to_string(), kinds.tree.clone(), Normal),
+        ]);
+        let withheld = WithheldSet::of([(absent, "taken down".to_string(), ChunkDigest::Unknown)]);
+        let removed = || Ok(sealed_utils::Tolerated::removed_only(Default::default(), withheld.clone()));
+        let refusal = audit_utils::verify_parcel_closure_with(
+            &head,
+            None,
+            &|hash| file_utils::object_type_of(hash).map(ObjectProbe::kind),
+            &|_: &[String]| Ok(ChunkProbe::default()),
+            &|hash| object_utils::recipe_chunk_hashes(hash),
+            &|hash| object_utils::load_tree(hash),
+            &removed,
+            &|hash| object_utils::load_parcel(hash),
+        ).expect_err("a mis-kind");
+
+        match refusal {
+            audit_utils::ClosureRefusal::MisKinded(mis_kinded) => assert_eq!(mis_kinded.path, "docs/b.txt"),
+            other => panic!("expected a mis-kind, got {:?}", other),
+        }
+    });
+}
+
+/// A packed object's kind is read as a loose one's: `object_type_of` reads a packed object whole,
+/// and the gate refuses a packed tree named as a file.
+///
+/// Revert: answer a packed object as a blob, or as absent → red.
+#[test]
+fn a_packed_object_of_another_kind_is_refused() {
+    use forklift_core::enums::dir_entry_type::DirEntryType::Normal;
+    use forklift_core::enums::object_type::ObjectType;
+
+    let warehouse = Warehouse::new("mis-kind-packed");
+    warehouse.stack("small.txt", "a small file\n", "first");
+
+    let (tree, head) = warehouse.scoped(|| {
+        let tree = object_utils::load_parcel(&warehouse.head(&warehouse.current_pallet())).unwrap().tree_hash;
+        (tree.clone(), forged_head(vec![entry(&tree, Normal)]))
+    });
+    warehouse.run_ok(&["store", "compact"]);
+
+    warehouse.scoped(|| {
+        let loose = warehouse.root.join(".forklift").join("objects").join(&tree[0..2]).join(&tree[2..]);
+        assert!(!loose.exists(), "the tree was packed");
+        assert_eq!(file_utils::object_type_of(&tree).unwrap(), Some(ObjectType::Tree));
+
+        let refusal = audit_utils::verify_parcel_closure_for_write(&head, None).expect_err("a packed mis-kind");
+        assert!(matches!(refusal, audit_utils::ClosureRefusal::MisKinded(_)), "{:?}", refusal);
+    });
+}
