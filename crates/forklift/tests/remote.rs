@@ -13546,6 +13546,7 @@ fn a_sealed_record_cut_on_a_frame_boundary_reads_as_lost_and_heal_reseals_the_cu
     assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let older = sealed_older_roots(&area, "cached", &head);
     assert!(older.len() >= 2, "a frame must stay behind the cut: {:?}", older);
+    assert_record_is(&area, "cached", &older.iter().map(String::as_str).collect::<Vec<_>>());
 
     // One frame per hash, so the cut drops the last whole frame and keeps the others.
     use forklift_core::util::sealed_utils::{self, SealOp};
@@ -13554,7 +13555,6 @@ fn a_sealed_record_cut_on_a_frame_boundary_reads_as_lost_and_heal_reseals_the_cu
     for root in &older {
         bytes.extend(sealed_utils::encode_frame(SealOp::Record, root).unwrap());
     }
-    std::fs::write(&path, &bytes).unwrap();
     let last = older.last().unwrap();
     let cut = bytes.len() - sealed_utils::encode_frame(SealOp::Record, last).unwrap().len();
     std::fs::write(&path, &bytes[..cut]).unwrap();
@@ -13573,6 +13573,8 @@ fn a_sealed_record_cut_on_a_frame_boundary_reads_as_lost_and_heal_reseals_the_cu
     for root in &older {
         assert!(recorded(&area, "cached", root), "{} is recorded again", root);
     }
+    let cut_parcel = history_with_roots(&area, "a", &head).into_iter().find(|(_, root)| root == last).unwrap().0;
+    assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", cut_parcel)]));
     assert_success(&area.forklift("cached", &["audit"]));
 }
 
