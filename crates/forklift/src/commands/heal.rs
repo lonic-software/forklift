@@ -1,6 +1,6 @@
 use serde::Serialize;
 use forklift_core::util::lock_utils::StoreAccessLock;
-use forklift_core::util::checkout_scope_heal::{self, ScopeRestored};
+use forklift_core::util::checkout_scope_heal::{self, Base, ScopeRestored};
 use forklift_core::util::position_heal::{self, PositionRebuilt};
 use forklift_core::util::scope_heal::{self, ScopeRebuilt};
 use forklift_core::util::inventory_heal::{self, TreeUnread};
@@ -11,7 +11,7 @@ use forklift_core::util::reseal_utils::{self, ResealError};
 use forklift_core::util::warehouse_utils::{self, WarehouseMode};
 use forklift_core::util::applied_redactions::{self, RedactionState};
 use forklift_core::util::unavailable_heal::{self, RemoteError};
-use forklift_core::util::{config_utils, origin_utils, park_utils, recovery_utils, redaction_utils, sealed_utils, tree_utils, unavailable};
+use forklift_core::util::{config_utils, origin_utils, pallet_utils, park_utils, recovery_utils, redaction_utils, sealed_utils, tree_utils, unavailable};
 use crate::output::{self, CommandOutput};
 
 /// The note of a re-apply of redactions that could not run, followed by why.
@@ -181,10 +181,11 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
 
     // The bay's position, before the checkout's scope, whose stranding guard reads the tree the
     // checkout stands on, and so before the fetch-scope heal too: a rebuild from the checkouts'
-    // scopes would leave out a scope not yet restored. It reads neither scope. A --position
-    // stands on a ref this run may set or remove, so beside --ref or --remove-ref it waits for
-    // those below, and the checkout's scope waits with it.
-    let early = position.is_none() || (set_ref.is_empty() && remove_ref.is_empty());
+    // scopes would leave out a scope not yet restored. It reads neither scope. A --position on a
+    // pallet whose ref this run sets or removes stands on that write, so it waits for it below.
+    let early = !position.is_some_and(|pallet| {
+        set_ref.iter().any(|(named, _)| *named == pallet) || remove_ref.iter().any(|named| named == pallet)
+    });
     let early_position = match early {
         true => position_heal::repair(position, &mut ref_notes)
             .map_err(|error| records_said(CoreError::from(error), &ref_notes, None, None))?,
@@ -192,12 +193,22 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     };
 
     // The checkout's own scope, just before the fetch-scope heal, whose rebuild from the checkouts'
-    // scopes then sees it restored. Nothing before it reads either scope.
-    let early_scope = match early {
-        true => heal_checkout_scope(scope, &mut ref_notes)
-            .map_err(|error| records_said(error, &ref_notes, early_position.as_ref(), None))?,
-        false => None,
+    // scopes then sees it restored. Nothing before it reads either scope. A position that waits
+    // will stand on the parcel its --ref names, so that is the tree the guard judges against.
+    // A parcel that does not resolve is refused as its --ref write would refuse it.
+    let parcel = match early {
+        true => None,
+        false => set_ref.iter().find(|(named, _)| Some(*named) == position)
+            .map(|(_, parcel)| pallet_utils::resolve_revision(parcel))
+            .transpose()
+            .map_err(|error| records_said(CoreError::from(error), &ref_notes, None, None))?,
     };
+    let base = match &parcel {
+        Some(parcel) => Base::Parcel(parcel),
+        None => Base::Position,
+    };
+    let early_scope = heal_checkout_scope(scope, base, &mut ref_notes)
+        .map_err(|error| records_said(error, &ref_notes, early_position.as_ref(), None))?;
 
     // After the records, which the check of the history leans on, and before everything else,
     // which reads the fetch scope.
@@ -289,24 +300,10 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         false => position_heal::repair(position, &mut ref_notes).map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?,
     };
 
-    // The checkout's scope, when it waited for that position.
-    let late_scope = match early {
-        true => None,
-        false => heal_checkout_scope(scope, &mut ref_notes).map_err(|error| {
-            let error = changed(String::from(error), &refs_rebuilt, &refs_removed, &ref_notes);
-            match &late_position {
-                Some(position) => forklift_core::error::append_to_message(error, &position.sentence()),
-                None => error,
-            }
-        })?,
-    };
     let changed_after = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String]| {
         let mut error = changed(error, rebuilt, removed, notes);
         if let Some(position) = &late_position {
             error = forklift_core::error::append_to_message(error, &position.sentence());
-        }
-        if let Some(restored) = &late_scope {
-            error = forklift_core::error::append_to_message(error, &restored.sentence());
         }
         error
     };
@@ -762,7 +759,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         record_rebuilt,
         unavailable_rebuilt,
         redactions_applied_rebuilt: applied_rebuilt,
-        checkout_scope_restored: early_scope.or(late_scope),
+        checkout_scope_restored: early_scope,
         fetch_scope_rebuilt: scope_rebuilt,
         parked_rebuilt,
         position_rebuilt: early_position.or(late_position),
@@ -1285,10 +1282,10 @@ fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
 }
 
 /// Restore the checkout's scope from its copy, or set it to the paths `--scope` named.
-fn heal_checkout_scope(scope: &[String], notes: &mut Vec<String>) -> Result<Option<ScopeRestored>, CoreError> {
+fn heal_checkout_scope(scope: &[String], base: Base, notes: &mut Vec<String>) -> Result<Option<ScopeRestored>, CoreError> {
     match scope.is_empty() {
-        true => checkout_scope_heal::repair(notes),
-        false => checkout_scope_heal::set_chosen(scope).map(Some),
+        true => checkout_scope_heal::repair(base, notes),
+        false => checkout_scope_heal::set_chosen(scope, base).map(Some),
     }
 }
 

@@ -719,7 +719,11 @@ pub(crate) fn heal_there(bay: Option<&str>) -> String {
     match bay {
         None => {
             let main_tree = globals::forklift_root();
-            let main_tree = main_tree.parent().map(Path::to_path_buf).unwrap_or_default();
+            // Run from the main tree, the root is the relative ".forklift", whose parent is empty.
+            let main_tree = match main_tree.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
             let main_tree = std::path::absolute(&main_tree).unwrap_or(main_tree);
             format!("Run \"forklift heal\" in the main tree, \"{}\", which restores it from its copy.", main_tree.to_string_lossy())
         }

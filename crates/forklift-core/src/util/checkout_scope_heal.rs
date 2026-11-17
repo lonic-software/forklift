@@ -155,7 +155,7 @@ fn unusable_reason(scope: &PathScope, sparse: bool, fetch: &Fetch) -> Option<Str
 /// * `Ok(None)`                - Nothing needed restoring, or the case is the fetch-scope heal's.
 /// * `Err(CoreError)`          - A `checkout_scope_damaged` refusal, or a file that could not be
 ///   read or written.
-pub fn repair(notes: &mut Vec<String>) -> Result<Option<ScopeRestored>, CoreError> {
+pub fn repair(base: Base, notes: &mut Vec<String>) -> Result<Option<ScopeRestored>, CoreError> {
     let sparse = warehouse_utils::warehouse_mode()? == WarehouseMode::Sparse;
     let checkout = checkout();
 
@@ -180,7 +180,7 @@ pub fn repair(notes: &mut Vec<String>) -> Result<Option<ScopeRestored>, CoreErro
                 // A copy that does not settle it is noted, so the fetch-scope heal's refusal says why
                 // heal here did not restore it.
                 return match usable_copy(&copy_path, sparse, &fetch)? {
-                    Ok((copy, bytes)) if copy != scope => match stranded(&copy, &fetch) {
+                    Ok((copy, bytes)) if copy != scope => match stranded(&copy, &fetch, base) {
                         Ok(blockers) if blockers.is_empty() => restore(&checkout, &bytes, &copy, &reason).map(Some),
                         Ok(blockers) => {
                             notes.push(format!(
@@ -211,7 +211,7 @@ pub fn repair(notes: &mut Vec<String>) -> Result<Option<ScopeRestored>, CoreErro
     let choose = "Run \"forklift heal --scope <path>...\", naming the paths this checkout held.";
 
     let (refused_why, remedy) = match usable_copy(&copy_path, sparse, &fetch)? {
-        Ok((copy, bytes)) => match stranded(&copy, &fetch) {
+        Ok((copy, bytes)) => match stranded(&copy, &fetch, base) {
             Ok(blockers) if blockers.is_empty() => return restore(&checkout, &bytes, &copy, &was).map(Some),
             // Files that already lay outside the checkout count too, and stop --scope as well, so
             // moving them is named first.
@@ -221,9 +221,9 @@ pub fn repair(notes: &mut Vec<String>) -> Result<Option<ScopeRestored>, CoreErro
                     could never be stacked again: {}.",
                     copy_path.to_string_lossy(), scope_name(&copy), listed(&blockers)
                 ),
-                "If the copy names what this checkout held, move those files out of the working tree and run \
-                \"forklift heal\" again. Otherwise run \"forklift heal --scope <path>...\", naming the paths it \
-                held.".to_string(),
+                "A committed file among them means the copy is narrower than what this checkout held: run \
+                \"forklift heal --scope <path>...\", naming the paths it held. If only untracked files stand in \
+                the way, move them out of the working tree and run \"forklift heal\" again.".to_string(),
             ),
             Err(error) => (
                 format!(
@@ -231,7 +231,7 @@ pub fn repair(notes: &mut Vec<String>) -> Result<Option<ScopeRestored>, CoreErro
                     told: {}",
                     copy_path.to_string_lossy(), scope_name(&copy), error
                 ),
-                "Once that is fixed, run \"forklift heal\" again.".to_string(),
+                base_unread_remedy(),
             ),
         },
         Err(why) => (format!("Its copy (\"{}\") {}.", copy_path.to_string_lossy(), why.trim_end_matches('.')), choose.to_string()),
@@ -247,6 +247,20 @@ pub fn repair(notes: &mut Vec<String>) -> Result<Option<ScopeRestored>, CoreErro
         ),
         String::new(),
     ))
+}
+
+/// The way out when the tree the checkout stands on cannot be read: no heal judges a scope without
+/// it, so only that tree reading again, or a new checkout, ends the refusal.
+fn base_unread_remedy() -> String {
+    let replace = match crate::globals::active_bay() {
+        Some(name) => format!("remove the bay with \"forklift bay remove {}\" and add it again", name),
+        None => "clone the warehouse again".to_string(),
+    };
+    format!(
+        "Heal judges a scope against the tree this checkout stands on, so it restores none until that tree reads \
+        again; if the store no longer holds it, {}.",
+        replace
+    )
 }
 
 /// The copy, when it is usable but for the stranding guard, with its bytes; otherwise why not.
@@ -300,7 +314,7 @@ fn resync_copy(checkout: &Checkout, copy_path: &Path, scope: &PathScope, notes: 
 /// # Returns
 /// * `Ok(ScopeRestored)` - The scope was written.
 /// * `Err(CoreError)`    - Why it was refused, or a file that could not be read or written.
-pub fn set_chosen(paths: &[String]) -> Result<ScopeRestored, CoreError> {
+pub fn set_chosen(paths: &[String], base: Base) -> Result<ScopeRestored, CoreError> {
     let sparse = warehouse_utils::warehouse_mode()? == WarehouseMode::Sparse;
     let checkout = checkout();
 
@@ -333,8 +347,21 @@ pub fn set_chosen(paths: &[String]) -> Result<ScopeRestored, CoreError> {
 
     let scope = chosen_scope(paths, sparse, &fetch)?;
 
-    let mut base = Base::of_position()?;
-    let (no_entry, not_held) = beyond_checkout(&scope, &mut base)?;
+    // What the checks below read of the base tree, or why it could not be read: a base that does
+    // not read is the same coded refusal heal without --scope gives.
+    let unread = |error: String| CoreError::refusal(
+        RefusalCode::CheckoutScopeDamaged,
+        format!(
+            "The scope file of {} (\"{}\") {}, and whether the scope {} matches what this checkout holds cannot \
+            be told: {} --scope was not applied, and nothing was changed. {}",
+            checkout.name, checkout.path.to_string_lossy(), was.trim_end_matches('.'), scope_name(&scope),
+            if error.ends_with('.') { error.clone() } else { format!("{}.", error) }, base_unread_remedy()
+        ),
+        String::new(),
+    );
+
+    let mut base = BaseTree::of(base).map_err(unread)?;
+    let (no_entry, not_held) = beyond_checkout(&scope, &mut base).map_err(unread)?;
 
     if !no_entry.is_empty() || !not_held.is_empty() {
         let mut found = Vec::new();
@@ -352,7 +379,7 @@ pub fn set_chosen(paths: &[String]) -> Result<ScopeRestored, CoreError> {
     }
 
     for prefix in scope.prefixes() {
-        if !base.is_folder(prefix)? {
+        if !base.is_folder(prefix).map_err(unread)? {
             return Err(CoreError::from(format!(
                 "\"{}\" is not a folder in the tree this checkout stands on, so it cannot be in its scope. \
                 --scope was not applied, and nothing was changed.",
@@ -361,12 +388,12 @@ pub fn set_chosen(paths: &[String]) -> Result<ScopeRestored, CoreError> {
         }
     }
 
-    let blockers = stranded_against(&scope, &fetch, &mut base)?;
+    let blockers = stranded_against(&scope, &fetch, &mut base).map_err(unread)?;
     if !blockers.is_empty() {
         return Err(CoreError::from(format!(
             "The scope {} would leave these files outside the checkout, where they could never be stacked \
-            again: {}. --scope was not applied, and nothing was changed. Name every path this checkout held; files \
-            that lay outside it already are moved out of the working tree first.",
+            again: {}. --scope was not applied, and nothing was changed. Name every path this checkout held, and \
+            move any untracked file that already lay outside it out of the working tree first.",
             scope_name(&scope), listed(&blockers)
         )));
     }
@@ -411,9 +438,19 @@ fn chosen_scope(paths: &[String], sparse: bool, fetch: &Fetch) -> Result<PathSco
     Ok(scope)
 }
 
-/// The tree the checkout stands on: its bay position's base. Another bay may have moved the pallet
-/// since, so the pallet's head is not it.
-struct Base {
+/// Where the tree the checkout stands on is read from.
+#[derive(Clone, Copy, Debug)]
+pub enum Base<'a> {
+    /// The bay position's base. Another bay may have moved the pallet since, so the pallet's head
+    /// is not it.
+    Position,
+    /// The parcel the position is about to be set to, in the same heal, while the position is
+    /// lost: a full hash.
+    Parcel(&'a str),
+}
+
+/// The tree the checkout stands on, read as [`Base`] says.
+struct BaseTree {
     root: Option<String>,
     trees: HashMap<String, Option<TreeItem>>,
 }
@@ -427,14 +464,18 @@ enum Committed {
     Unknown,
 }
 
-impl Base {
-    fn of_position() -> Result<Base, String> {
-        let root = match pallet_utils::read_position()?.base {
+impl BaseTree {
+    fn of(base: Base) -> Result<BaseTree, String> {
+        let parcel = match base {
+            Base::Position => pallet_utils::read_position()?.base,
+            Base::Parcel(parcel) => Some(parcel.to_string()),
+        };
+        let root = match parcel {
             Some(parcel) => Some(object_utils::load_parcel(&parcel)?.tree_hash),
             None => None,
         };
 
-        Ok(Base { root, trees: HashMap::new() })
+        Ok(BaseTree { root, trees: HashMap::new() })
     }
 
     /// The tree `hash`, or `None` when the store does not hold it.
@@ -502,7 +543,7 @@ impl Base {
 /// The paths where `scope` reaches beyond what the checkout holds: committed files it holds in
 /// scope with no working entry, and folders it holds in scope or walks through that the store does
 /// not hold.
-fn beyond_checkout(scope: &PathScope, base: &mut Base) -> Result<(Vec<String>, Vec<String>), String> {
+fn beyond_checkout(scope: &PathScope, base: &mut BaseTree) -> Result<(Vec<String>, Vec<String>), String> {
     let mut no_entry = Vec::new();
     let mut not_held = Vec::new();
 
@@ -540,8 +581,8 @@ fn beyond_checkout(scope: &PathScope, base: &mut Base) -> Result<(Vec<String>, V
 
 /// The working-tree files `scope` would strand (see [`stranded_against`]), judged against the tree
 /// the checkout stands on.
-fn stranded(scope: &PathScope, fetch: &Fetch) -> Result<Vec<String>, String> {
-    let mut base = Base::of_position()?;
+fn stranded(scope: &PathScope, fetch: &Fetch, base: Base) -> Result<Vec<String>, String> {
+    let mut base = BaseTree::of(base)?;
     stranded_against(scope, fetch, &mut base)
 }
 
@@ -553,7 +594,7 @@ fn stranded(scope: &PathScope, fetch: &Fetch) -> Result<Vec<String>, String> {
 /// not. Folders, ignored files, the `.forklift` state, another working tree inside this one and the
 /// files every file browser leaves behind do not count. Only folders the scope walks through or
 /// leaves out are read: an in-scope folder holds nothing it would strand.
-fn stranded_against(scope: &PathScope, fetch: &Fetch, base: &mut Base) -> Result<Vec<String>, String> {
+fn stranded_against(scope: &PathScope, fetch: &Fetch, base: &mut BaseTree) -> Result<Vec<String>, String> {
     let rules = file_utils::get_ignore_rules()?;
     let mut found = Vec::new();
     let mut pending: Vec<(String, file_utils::RuleContext)> = vec![(String::new(), file_utils::RuleContext::above_root())];

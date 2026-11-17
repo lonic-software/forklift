@@ -194,7 +194,7 @@ fn heal_does_not_restore_a_copy_that_would_strand_a_file() {
     assert!(message.contains("\"docs/notes.txt\""), "the untracked file is named: {}", error);
     // It may have lain outside the checkout already, where --scope would refuse it too: moving it
     // is named, and below it works.
-    assert!(message.contains("move those files out of the working tree and run \"forklift heal\" again"), "{}", message);
+    assert!(message.contains("If only untracked files stand in the way, move them out of the working tree and run \"forklift heal\" again"), "{}", message);
     assert!(!area.path(BAY_SCOPE).exists());
 
     remove(&area, "b/docs/notes.txt");
@@ -418,6 +418,33 @@ fn heal_restores_the_position_and_scope_before_the_fetch_scope() {
     let data = &json_of(&healed)["data"];
     assert_eq!(data["checkout_scope_restored"]["scope"], serde_json::json!(["docs", "src/api"]), "{}", data);
     assert!(!data["position_rebuilt"].is_null(), "{}", data);
+    assert_eq!(data["fetch_scope_rebuilt"]["scope"], serde_json::json!(["docs", "src/api"]), "{}", data);
+    assert_eq!(std::fs::read(area.path(MAIN_SCOPE)).unwrap(), scope);
+    assert_success(&area.forklift("sparse", &["stocktake"]));
+}
+
+// A --position whose pallet's ref is damaged too, the way the position refusal steers: the
+// position waits for the --ref write, but the scope is still restored before the fetch-scope
+// heal, judged against the parcel that --ref names. Revert: judge it against the lost position →
+// the scope heal refuses: what it would strand cannot be told.
+#[test]
+fn heal_position_beside_its_ref_restores_the_scope_before_the_fetch_scope() {
+    let area = TestArea::new("checkout-scope-heal-position-ref");
+    let _server = with_bay(&area);
+    let scope = std::fs::read(area.path(MAIN_SCOPE)).unwrap();
+    let ref_file = "sparse/.forklift/pallets/main";
+    let head = std::fs::read_to_string(area.path(ref_file)).unwrap().trim().to_string();
+    remove(&area, MAIN_SCOPE);
+    remove(&area, "sparse/.forklift/position");
+    remove(&area, "sparse/.forklift/position-copy");
+    remove(&area, FETCH_SCOPE);
+    std::fs::write(area.path(ref_file), &head.as_bytes()[..20]).unwrap();
+
+    let healed = area.forklift("sparse", &["--json", "heal", "--position", "main", "--ref", &format!("main={}", head)]);
+    assert_success(&healed);
+    let data = &json_of(&healed)["data"];
+    assert_eq!(data["checkout_scope_restored"]["scope"], serde_json::json!(["docs", "src/api"]), "{}", data);
+    assert_eq!(data["position_rebuilt"]["base"], head, "{}", data);
     assert_eq!(data["fetch_scope_rebuilt"]["scope"], serde_json::json!(["docs", "src/api"]), "{}", data);
     assert_eq!(std::fs::read(area.path(MAIN_SCOPE)).unwrap(), scope);
     assert_success(&area.forklift("sparse", &["stocktake"]));
