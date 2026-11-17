@@ -40,9 +40,10 @@
 //! recorded. That seals nothing while the object is present; were it lost later, it would be held
 //! by hash as it was before its refill, on the same premise that the remote holds it, or, where an
 //! eviction removed the record because the origin's host withholds the object, on a premise that no
-//! longer holds, until the next eviction or `heal` removes it again. `heal` removes such records
-//! (see Removing). A frame that validates but whose entries do not parse fails the read, as does a
-//! header naming another version: neither is guessed at.
+//! longer holds: an eviction or `heal` removes such a record only while its object is present, so
+//! once the object is lost its absence stays held until a read fails to refill it. `heal` removes
+//! such records (see Removing). A frame that validates but whose entries do not parse fails the
+//! read, as does a header naming another version: neither is guessed at.
 //!
 //! ## Writing
 //!
