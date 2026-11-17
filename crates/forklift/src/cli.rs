@@ -378,7 +378,16 @@ pub enum Command {
                       touched; --config rewrites the file with only the entries the damage \
                       provably spared, after setting the damaged bytes aside beside it. A file \
                       that is not damaged but does not read, or that holds a mistake made by \
-                      hand, is never written over."
+                      hand, is never written over.\n\n\
+                      An inventory whose record of staged folders is damaged or lost \
+                      (\"inventory_damaged\" refusals, exit 66) gets that record rebuilt from the \
+                      folders heal can find whose staging is on disk: what the damaged record \
+                      still names, the working tree, the tree the bay stands on, and the trees an \
+                      interrupted operation names. When some staging on disk matches none of \
+                      them, or one of those trees cannot be read, it writes nothing, runs every \
+                      other repair, and ends by refusing with what it would leave out; \
+                      --inventory writes the rebuild anyway, and the staging it leaves out is \
+                      lost."
     )]
     Heal {
         /// Set a damaged pallet ref to a parcel (a pallet, a parcel hash or a unique prefix of one)
@@ -400,6 +409,10 @@ pub enum Command {
         /// Rewrite a damaged warehouse configuration file even though that drops entries
         #[arg(long)]
         config: bool,
+
+        /// Rebuild a damaged inventory record even though that drops staging it cannot account for
+        #[arg(long)]
+        inventory: bool,
     },
 
     /// Print the command list, or detailed help about one command

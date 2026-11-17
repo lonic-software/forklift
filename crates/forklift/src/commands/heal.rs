@@ -2,7 +2,8 @@ use serde::Serialize;
 use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::position_heal::{self, PositionRebuilt};
 use forklift_core::util::scope_heal::{self, ScopeRebuilt};
-use forklift_core::util::operation_utils::{self, RecoveryOutcome};
+use forklift_core::util::inventory_heal::{self, TreeUnread};
+use forklift_core::util::operation_utils::{self, Operation, OperationKind, RecoveryOutcome};
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::util::ref_heal::{self, Pass};
 use forklift_core::util::reseal_utils::{self, ResealError};
@@ -83,7 +84,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                             remove_ref: &[String],
                             fetch_scope: &[String],
                             position: Option<&str>,
-                            accept_config_loss: bool) -> Result<(), String> {
+                            accept_config_loss: bool,
+                            accept_inventory_loss: bool) -> Result<(), String> {
     // Every spec is read before anything is written, so a malformed one changes nothing.
     let set_ref = set_ref.iter()
         .map(|spec| spec.split_once('=').ok_or_else(|| format!(
@@ -298,11 +300,41 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         _ => None,
     };
 
+    // After the position heal and both ref heals: the rebuild reads the bay's base from the
+    // position, and no ref. A partial park's recovery reads the set before it rewrites part of it,
+    // so for that marker the rebuild comes first, even while the park waits; a rebuild held there
+    // holds the park's recovery too. Every other recovery rewrites staging wholesale or writes
+    // none, so the rebuild follows it, and waits with it while it waits on a ref.
+    let mut inventory_rebuilt: Option<InventoryRebuilt> = None;
+    let mut inventory_held: Option<InventoryRebuilt> = None;
+    let marker = operation_utils::read().ok().flatten();
+    let partial_park = marker.as_ref()
+        .filter(|marker| marker.kind == OperationKind::Park && !marker.pathspec.is_empty());
+    if partial_park.is_some() && inventory_heal::damaged() {
+        let (view, written) = rebuild_inventory(partial_park, accept_inventory_loss)
+            .map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+        *(if written { &mut inventory_rebuilt } else { &mut inventory_held }) = Some(view);
+    }
+    let held_park = partial_park.is_some() && inventory_held.is_some();
+    if held_park {
+        ref_notes.push(
+            "The interrupted park in this bay waits for the inventory's rebuild; heal finishes or undoes it once that is written."
+                .to_string(),
+        );
+    }
+
     // After the taint: an operation's recovery reads and writes the store the taint vouches for.
-    let recovered = match waits {
-        Some(_) => Ok(None),
-        None => operation_utils::recover(),
+    let recovered = match waits.is_some() || held_park {
+        true => Ok(None),
+        false => operation_utils::recover(),
     }.map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+
+    if waits.is_none() && !held_park && inventory_heal::damaged() {
+        let standing = operation_utils::read().ok().flatten();
+        let (view, written) = rebuild_inventory(standing.as_ref(), accept_inventory_loss)
+            .map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+        *(if written { &mut inventory_rebuilt } else { &mut inventory_held }) = Some(view);
+    }
     let operation = recovered.map(|recovery| OperationRecovery {
         operation: recovery.operation.as_str().to_string(),
         outcome: match recovery.outcome {
@@ -650,6 +682,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         parked_rebuilt,
         position_rebuilt,
         config_repaired,
+        inventory_rebuilt,
+        inventory_held,
         was_tainted: outcome.was_tainted,
         restaged: outcome.restaged,
         resolved: outcome.resolved,
@@ -667,6 +701,34 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         refs_refused,
         objects_lost,
     };
+
+    // Ahead of every other end refusal: their remedies read the set, and an unload, the remedy for
+    // lost staged content, is refused while it is damaged. Every repair above has run.
+    if let Some(held) = &report.inventory_held {
+        if !output::is_json() {
+            report.render_human();
+        }
+        let mut lines = held.lines();
+        if let Err(error) = &lost {
+            lines.push(format!(
+                "heal could not finish its reachability check, so whether any object is lost is not known: {}",
+                error.trim_end_matches('.')
+            ));
+        }
+        if let Some(lost) = &report.objects_lost {
+            lines.extend(objects_lost_lines(&report, lost));
+        } else if !report.refs_refused.is_empty() {
+            if let CoreError::Refusal { message, .. } = ref_refusal(&report, None) {
+                lines.push(message);
+            }
+        }
+        return Err(CoreError::refusal_with_details(
+            RefusalCode::InventoryDamaged,
+            lines.join("\n"),
+            "forklift heal --inventory",
+            serde_json::json!(report),
+        ).into());
+    }
 
     if let Err(error) = lost {
         if !output::is_json() {
@@ -706,6 +768,111 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     }
 
     Err(ref_refusal(&report, None).into())
+}
+
+/// Plan the inventory's rebuild for `marker`, and write it when it is complete or `accept_loss`.
+///
+/// # Returns
+/// * `Ok((view, written))` - What the rebuild found, and whether it was written.
+/// * `Err(String)`         - If the shard store could not be listed, or the set not written.
+fn rebuild_inventory(marker: Option<&Operation>, accept_loss: bool) -> Result<(InventoryRebuilt, bool), String> {
+    let rebuild = inventory_heal::plan(marker)?;
+    let written = rebuild.complete() || accept_loss;
+    if written {
+        rebuild.write()?;
+    }
+    Ok((InventoryRebuilt::of(&rebuild), written))
+}
+
+/// A rebuild of the inventory's registered set of folders, as a `heal` report gives it.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct InventoryRebuilt {
+    /// How many folders it registers, found in the damaged file, the working tree, the tree the bay
+    /// stands on or a tree an interrupted operation names, with their staging in the shard store.
+    registered: usize,
+
+    /// How many shards of staging in the store match none of those folders. Written, the rebuild
+    /// leaves them unregistered, and their staging is lost.
+    dropped: usize,
+
+    /// Trees it proposed folders from and could not read: the folders only they name are left out.
+    unread: Vec<TreeUnread>,
+
+    /// Trees it could not read that this warehouse holds by hash alone. They hold nothing back, but
+    /// a plain heal once the origin answers may find folders they name.
+    passed_over: Vec<TreeUnread>,
+}
+
+impl InventoryRebuilt {
+    fn of(rebuild: &inventory_heal::Rebuild) -> Self {
+        InventoryRebuilt {
+            registered: rebuild.recovered(),
+            dropped: rebuild.unmatched,
+            unread: rebuild.unread.clone(),
+            passed_over: rebuild.passed_over.clone(),
+        }
+    }
+
+    /// The sentence a written rebuild reports.
+    fn sentence(&self) -> String {
+        let mut sentence = format!(
+            "The inventory's record of staged folders did not read and is rebuilt: {} folder(s) are registered.",
+            self.registered
+        );
+        if self.dropped > 0 {
+            sentence.push_str(&format!(
+                " {} shard(s) of staging matched no folder heal could find and are no longer registered, so that staging is lost.",
+                self.dropped
+            ));
+        }
+        for unread in &self.unread {
+            sentence.push_str(&format!(
+                " The {} tree {} could not be read, so the folders only it names were left out: {}.",
+                unread.from, unread.tree, unread.reason.trim_end_matches('.')
+            ));
+        }
+        sentence.push_str(&self.passed_over_sentence());
+        sentence
+    }
+
+    fn passed_over_sentence(&self) -> String {
+        let mut sentence = String::new();
+        for over in &self.passed_over {
+            sentence.push_str(&format!(
+                " The {} tree {} was passed over: {}.",
+                over.from, over.tree, over.reason.trim_end_matches('.')
+            ));
+        }
+        if !self.passed_over.is_empty() {
+            sentence.push_str(" A plain heal once the origin answers may find the folders it names.");
+        }
+        sentence
+    }
+
+    /// The lines of the `inventory_damaged` refusal of a run that held the rebuild.
+    fn lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            "The inventory's record of staged folders does not read, and heal did not rewrite it: the rebuild could not account for all the staging on disk.".to_string(),
+        ];
+        if self.dropped > 0 {
+            lines.push(format!(
+                "  {} shard(s) of staging match no folder heal could find; rebuilt without them, that staging is lost.",
+                self.dropped
+            ));
+        }
+        for unread in &self.unread {
+            lines.push(format!(
+                "  The {} tree {} could not be read, so the folders only it names are not known: {}.",
+                unread.from, unread.tree, unread.reason.trim_end_matches('.')
+            ));
+        }
+        let over = self.passed_over_sentence();
+        if !over.is_empty() {
+            lines.push(format!("  {}", over.trim_start()));
+        }
+        lines
+    }
 }
 
 /// The most hashes an `objects_lost` refusal lists.
@@ -1123,6 +1290,16 @@ pub(crate) struct HealReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     config_repaired: Option<config_utils::ConfigRepaired>,
 
+    /// The inventory's registered set of folders, which did not read and this run rebuilt from the
+    /// folders it could find whose staging the shard store holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inventory_rebuilt: Option<InventoryRebuilt>,
+
+    /// The same rebuild, held and not written: it left staging unmatched or could not read a tree
+    /// it proposed folders from. The run refuses `inventory_damaged` with it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inventory_held: Option<InventoryRebuilt>,
+
     /// Whether a durability taint was actually standing (an already-healthy warehouse reports
     /// `false`, with `restaged` and `resolved` empty).
     was_tainted: bool,
@@ -1471,6 +1648,10 @@ impl CommandOutput for HealReport {
             }
         }
 
+        if let Some(rebuilt) = &self.inventory_rebuilt {
+            println!("{}", rebuilt.sentence());
+        }
+
         for rebuilt in &self.refs_rebuilt {
             println!("{}", rebuilt_sentence(rebuilt));
         }
@@ -1502,6 +1683,7 @@ impl CommandOutput for HealReport {
             && self.restored_from_working_tree.is_empty()
             && self.fetch_scope_rebuilt.is_none() && self.parked_rebuilt.is_none() && self.position_rebuilt.is_none()
             && self.config_repaired.is_none()
+            && self.inventory_rebuilt.is_none() && self.inventory_held.is_none()
             && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
             && self.objects_lost.is_none()
         {
