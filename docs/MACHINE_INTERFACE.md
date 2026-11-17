@@ -89,7 +89,8 @@ exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a deat
 metadata file, the record of which folders hold staged content, does not match its digest, lacks
 its header, holds a malformed escape or is not UTF-8, or it is missing while the staging area
 holds shards. A file in a format this version of Forklift does not know keeps its uncoded refusal.
-`next_step` is `forklift heal`. `heal` reports a rebuilt record as `inventory_rebuilt`:
+`next_step` is `forklift heal`. When a link or a folder stands where the file belongs, the
+refusal is the same code, and `next_step` says to remove it before running `forklift heal`. `heal` reports a rebuilt record as `inventory_rebuilt`:
 `registered`, how many folders it found with staging on disk; `dropped`, how many shards of
 staging matched none of them and are no longer registered; `unread`, each tree it proposed
 folders from and could not read (`tree`, `from`, `reason`); and `passed_over`, the same for trees

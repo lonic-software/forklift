@@ -452,7 +452,8 @@ refusal_codes! {
 
     /// The inventory metadata, the set of directories with staged content, does not parse as one
     /// this build or an older one wrote, or it is missing while the staging area still holds
-    /// shards. A file a newer version wrote is not this. Nothing was changed; `heal` rebuilds the
+    /// shards, or a link or a folder stands where it belongs (the next step then says to remove
+    /// it). A file a newer version wrote is not this. Nothing was changed; `heal` rebuilds the
     /// set from the directories the working tree, the bay's base and a standing operation name,
     /// keeping each one whose shard is on disk, and `heal --inventory` writes it even when some
     /// shard matches none of them.

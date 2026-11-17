@@ -621,7 +621,8 @@ error_codes! {
     /// A configuration file is damaged; nothing was changed.
     ConfigDamaged,
 
-    /// The inventory metadata is damaged, or missing over staged shards; nothing was changed.
+    /// The inventory metadata is damaged, missing over staged shards, or not a file; nothing was
+    /// changed.
     InventoryDamaged,
 }
 
@@ -930,7 +931,7 @@ impl ErrorCode {
             ErrorCode::ConfigDamaged =>
                 "A configuration file holds bytes that are not text or that TOML never allows, or it was cut short. Nothing was changed; in the warehouse's own file heal names what mending it would drop, and heal --config keeps every entry the damage provably spared, after setting the damaged bytes aside",
             ErrorCode::InventoryDamaged =>
-                "The inventory metadata, the set of directories with staged content, does not parse, or it is missing while the staging area still holds shards. Nothing was changed; heal rebuilds it from the directories the working tree, the bay's base and an interrupted operation name, and heal --inventory writes it even when some staged shard matches none of them"
+                "The inventory metadata, the set of directories with staged content, does not parse, it is missing while the staging area still holds shards, or a link or folder stands in its place (remove it first). Nothing was changed; heal rebuilds it from the directories the working tree, the bay's base and an interrupted operation name, and heal --inventory writes it even when some staged shard matches none of them"
         }
     }
 

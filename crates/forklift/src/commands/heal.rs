@@ -739,7 +739,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // lost staged content, is refused while it is damaged. Every repair above has run.
     if inventory_error.is_some() || report.inventory_held.is_some() {
         // A run that only found the step that failed says nothing of its own: the refusal speaks.
-        if !output::is_json() && !(inventory_error.is_some() && report.nothing_done()) {
+        if !output::is_json() && !(inventory_error.is_some() && !report.was_tainted && report.nothing_done()) {
             report.render_human();
         }
         let mut lines = match (&inventory_error, &report.inventory_held) {
@@ -774,16 +774,14 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             lines.push("The check for lost objects may be short; a heal after the rebuild checks again.".to_string());
         }
         // The step that failed leads, with its own code and next step when it has them. A failure
-        // without one leaves the set as damaged as it was.
+        // without one (a store that cannot be listed, a write that fails) stays uncoded: no code
+        // names it, and a heal rerun meets it again.
         if let Some(error) = inventory_error {
             let also = lines.split_off(1);
             return Err(match CoreError::from(error) {
                 refused @ CoreError::Refusal { .. } => with_report(&report, refused, also),
-                CoreError::Other(message) => CoreError::refusal_with_details(
-                    RefusalCode::InventoryDamaged,
+                CoreError::Other(message) => CoreError::Other(
                     std::iter::once(message).chain(also).collect::<Vec<_>>().join("\n"),
-                    "forklift heal",
-                    serde_json::json!(report),
                 ),
             }.into());
         }
@@ -1179,7 +1177,7 @@ fn with_report(report: &HealReport, refused: CoreError, also: Vec<String>) -> Co
 
     let mut lines = vec![match message.strip_suffix("; nothing was changed.") {
         Some(described) => format!("{}.", described),
-        None => message,
+        None => message.strip_suffix(" Nothing was changed.").map(str::to_string).unwrap_or(message),
     }];
     lines.extend(also);
 

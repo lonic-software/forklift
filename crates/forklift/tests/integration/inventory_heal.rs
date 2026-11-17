@@ -250,7 +250,8 @@ fn an_ancestor_only_the_write_registers_keeps_its_shard_matched() {
 /// once every other repair and check has run. Revert: read anything but damage as nothing for heal
 /// to do → heal succeeds → red. Refuse where it is found → the lost tree is never reported → red.
 /// Render the report of a run that did nothing else → "Nothing to heal" before the refusal → red.
-/// Refuse without the report → the details lack the lost tree → red.
+/// Refuse without the report → the details lack the lost tree → red. Keep the record's "Nothing
+/// was changed." → red.
 #[test]
 fn a_folder_in_place_of_the_metadata_file_is_named_by_heal() {
     let area = Area::new("not-a-file");
@@ -276,6 +277,8 @@ fn a_folder_in_place_of_the_metadata_file_is_named_by_heal() {
     let error = inventory_damaged(&area.run(&["--json", "heal"]));
     assert!(error["next_step"].as_str().unwrap().starts_with("remove "), "{}", error);
     assert!(error["details"]["objects_lost"]["hashes"].to_string().contains(&tree), "{}", error);
+    // The run checked, and may have repaired, more than the record: it does not claim otherwise.
+    assert!(!error["message"].as_str().unwrap().contains("Nothing was changed"), "{}", error);
 }
 
 /// The folder `a/b` is gone from the working tree with its removal unstaged, so only the base's
