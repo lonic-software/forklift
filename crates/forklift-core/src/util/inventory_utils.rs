@@ -2397,7 +2397,8 @@ impl ShardLedger {
     ///
     /// # Returns
     /// * `Ok(ShardLedger)` - The registered set.
-    /// * `Err(String)`     - If the metadata could not be read or parsed, or is missing over a shard.
+    /// * `Err(String)`     - If the metadata could not be read or parsed, or is missing over a
+    ///                       shard.
     pub fn read() -> Result<ShardLedger, String> {
         LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
 
@@ -5301,8 +5302,8 @@ mod tests {
         let error = ShardLedger::read().map(|_| ()).expect_err("a linked metadata file");
         assert!(error.contains("is not a file (a link is never followed)") && error.contains("forklift heal"), "{error}");
 
-        // The way out: remove the link, then heal, whose rebuild finds the staged folders' shards. A
-        // reset reads the record first, so it is refused.
+        // The way out: remove the link, then heal, whose rebuild finds the staged folders' shards.
+        // A reset reads the record first, so it is refused.
         unlink(&metadata, false);
         let refused = ShardLedger::read().map(|_| ()).expect_err("shards with no record");
         assert!(refused.contains("inventory_damaged"), "{refused}");

@@ -2302,7 +2302,7 @@ A command not listed here either reports only the generic human-message shape `{
       "description": "A rebuild of the inventory's registered set of folders, as a `heal` report gives it.",
       "properties": {
         "dropped": {
-          "description": "How many shards of staging in the store match none of those folders. Written, the rebuild\nleaves them unregistered, and their staging is lost.",
+          "description": "How many shards in the store match none of those folders or their ancestors. Written, the\nrebuild leaves them unregistered, and whatever staging they hold is lost (a shard a removal\nleft behind holds none).",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -2759,7 +2759,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "tree": {
-          "description": "The tree's hash.",
+          "description": "The tree's hash, or the hash of the parcel that names it when that parcel did not read (the\nreason then says so).",
           "type": "string"
         }
       },
