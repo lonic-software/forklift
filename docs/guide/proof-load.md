@@ -193,8 +193,8 @@ subjects: `git` at its defaults, and `git-tuned`:
 
 The other lanes (disk full, read-only, the two volumes, the network, and the server's kill points
 and power loss) run for Forklift only. Git's rows are reported beside Forklift's, and they never
-fail the run. Where a git lane could not run, the report says `git: not fully measured`. The
-network lane is always one of these, because git's host is a bare repository reached by its path,
+fail the run. In a run given git, where a git lane could not run, the report says
+`git: not fully measured`. The network lane is always one of these, because git's host is a bare repository reached by its path,
 with no server for the proxy to fault.
 
 ### The data plate
