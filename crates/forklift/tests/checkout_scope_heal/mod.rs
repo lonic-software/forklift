@@ -71,8 +71,8 @@ fn refused_scope(area: &TestArea, dir: &str, scope: &str, args: &[&str]) -> Stri
 /// Revert: return the old untyped refusal from the scope readers → no code, no next step → red;
 /// skip the restore in heal → the scope stays damaged → red; skip the copy's re-sync → the lost
 /// copy stays lost → red; read a record whose digest does not match as if it did → the main tree's
-/// flipped scope reads, and `stocktake` runs narrowed → red (the bay's row, reached after it, is
-/// refused for lying outside the fetch scope either way).
+/// flipped scope reads, and `stocktake` runs narrowed → red (the bay's row, outside the fetch
+/// scope, would be refused without the digest too).
 #[test]
 fn heal_restores_a_lost_or_damaged_scope_from_its_copy() {
     let area = TestArea::new("checkout-scope-heal-restore");
