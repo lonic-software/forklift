@@ -119,6 +119,10 @@ enum Command {
         /// operating system's caches. Without it the cold rows are reported as not run.
         #[arg(long)]
         drop_caches: Option<PathBuf>,
+        /// The forklift-server binary, by path, that serves Forklift's remotes for the clone, push
+        /// and pull rows. Without it those rows are reported as not run.
+        #[arg(long)]
+        forklift_server: Option<PathBuf>,
     },
 }
 
@@ -150,8 +154,8 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Perf { out, forklift, git, shape, reps, drop_caches } => {
-            let options = perf::PerfOptions { out, forklift, git, shape, reps, drop_caches };
+        Command::Perf { out, forklift, git, shape, reps, drop_caches, forklift_server } => {
+            let options = perf::PerfOptions { out, forklift, git, shape, reps, drop_caches, forklift_server };
             match perf::run(&options, &|text| eprintln!("proof-load: {}", text)) {
                 Ok(report) if report.failed() => ExitCode::from(1),
                 Ok(_) => ExitCode::SUCCESS,
