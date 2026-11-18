@@ -3326,6 +3326,11 @@ async fn put_trust(State(state): State<Arc<AppState>>,
         match office_utils::read_trust_anchor_with_bytes().map_err(internal)? {
             Some((existing, existing_bytes)) => {
                 if TrustAnchorDto::from(&existing) == anchor {
+                    // A retry of an install that stopped before its copy write brings the copy
+                    // level; it does not go through install_trust, whose preconditions refuse once
+                    // the office has moved on.
+                    let lock = forklift_core::util::lock_utils::RefLock::acquire().map_err(internal)?;
+                    office_utils::mend_trust_copy(&lock, &existing_bytes).map_err(internal)?;
                     return Ok(None);
                 }
 
@@ -10602,6 +10607,32 @@ mod tests {
         let scope = StorageRootScope::enter(&root);
 
         (root, scope)
+    }
+
+    // Revert: drop `mend_trust_copy` from `put_trust`'s equal-anchor answer → the copy stays
+    // missing.
+    #[tokio::test]
+    async fn a_trust_put_retried_after_its_copy_was_not_written_mends_the_copy() {
+        let (root, _scope) = trust_warehouse("put-trust-copy-mend");
+        let forklift = root.join(".forklift");
+
+        let first = put_trust(State(Arc::new(single_mode_state(root.clone()))), Extension(Principal::Open), Path(PathParams::new()),
+            Json(first_anchor(Vec::new()))).await.into_response();
+        assert!(first.status().is_success(), "{}", first.status());
+        let anchor = std::fs::read(forklift.join("trust")).unwrap();
+        assert_eq!(std::fs::read(forklift.join("trust-copy")).unwrap(), anchor, "the install writes its copy");
+
+        // The install stopped after its trust write, before its copy write.
+        forklift_core::util::file_utils::remove_file(&forklift.join("trust-copy")).unwrap();
+
+        let retried = put_trust(State(Arc::new(single_mode_state(root.clone()))), Extension(Principal::Open), Path(PathParams::new()),
+            Json(first_anchor(Vec::new()))).await.into_response();
+
+        assert!(retried.status().is_success(), "{}", retried.status());
+        assert_eq!(std::fs::read(forklift.join("trust")).unwrap(), anchor, "the anchor is unchanged");
+        assert_eq!(std::fs::read(forklift.join("trust-copy")).ok(), Some(anchor),
+            "the retry brings the copy level with the trust file");
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     // Revert: drop the office-shape check from `require_adopted_history` → the anchor is stored.

@@ -97,7 +97,9 @@ trust state refuses it: stack, deliver, git import, enroll, regenesis and every 
 remote's trust. `heal` refuses as `trust_damaged` where its repair needs the remote, and elsewhere
 reports a failed handshake and goes on with its other repairs. A remote's own lost trust file
 reaches a client as `trust_damaged` with a `next_step` naming the remote's operator; a local one has
-no `next_step`. `lower` alone reads a missing trust file with no copy as no anchor held, whatever the
+no `next_step`. A server's first serve of a root whose trust file does not verify its office pallet,
+or whose copy differs from it, refuses as `trust_damaged` too, with a `next_step` to run in that root
+where one command is the way out. `lower` alone reads a missing trust file with no copy as no anchor held, whatever the
 office holds, so it can adopt the remote's. The old uncoded "holds an office but no trust anchor"
 refusal is gone, and a server answers `trust_damaged` as a `503`.
 

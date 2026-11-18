@@ -4491,6 +4491,122 @@ mod tests {
         assert_eq!(refused, Err(RefUpdateError::OfficeMoved { found: office_head() }));
     }
 
+    /// Whether the scratch root carries a served mark or a tombstone list.
+    fn served_witnesses_stand() -> (bool, bool) {
+        (crate::util::tombstone_utils::served_path().exists(), crate::util::tombstone_utils::tombstones_path().exists())
+    }
+
+    // Revert: drop `refuse_unsettled_trust` from `mark_served` → the first serve marks the root
+    // over a trust file that does not verify its office.
+    #[test]
+    fn a_first_serve_refuses_a_root_whose_regenesis_stopped_between_its_writes() {
+        let fixture = PrivilegeFixture::new("first-serve-unsettled");
+        let old_bytes = anchor_bytes();
+        crate::util::office_utils::mend_trust_copy(&crate::util::lock_utils::RefLock::acquire().unwrap(), &old_bytes).unwrap();
+        let head = office_head().unwrap();
+
+        // A local re-genesis that stopped after its trust write, before its office move.
+        crate::util::office_utils::tests::BETWEEN_TRUST_WRITES.with(|seam| seam.set(Some(Box::new(|| panic!("stopped between the writes")))));
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::util::office_utils::install_trust(&crate::util::office_utils::TrustInstall {
+                anchor: &TrustAnchor {
+                    genesis: "f".repeat(64),
+                    enabled_at: 1_700_000_002,
+                    boundary: Vec::new(),
+                    prior_genesis: Some(fixture.anchor.genesis.clone()),
+                    adopts: Some(head.clone()),
+                },
+                replaces: Some(&old_bytes),
+                office: Some(&head),
+                new_office: Some(&"f".repeat(64)),
+                served: None,
+                pallets: crate::util::pallet_utils::PalletsPrecondition::NotConsumed,
+                mode: crate::util::office_utils::TrustReadMode::Checked,
+            })
+        }));
+        assert!(stopped.is_err(), "the re-genesis must stop at the seam");
+        assert_ne!(anchor_bytes(), old_bytes, "the new anchor stands beside the old office");
+        assert_eq!(office_head(), Some(head));
+
+        let refused = crate::util::tombstone_utils::mark_served(true).expect_err("the first serve must refuse");
+
+        assert!(crate::error::frames_code(&refused, crate::error::RefusalCode::TrustDamaged), "{}", refused);
+        assert!(refused.contains("forklift heal"), "the way out is heal, from the copy: {}", refused);
+        assert_eq!(served_witnesses_stand(), (false, false), "nothing is written: {}", refused);
+        assert_eq!(crate::util::tombstone_utils::served_state().unwrap(), crate::util::tombstone_utils::ServedState::Never);
+    }
+
+    /// What a first serve is refused over, by the trust file and the copy that stand.
+    struct UnsettledTrust {
+        name: &'static str,
+        trust: Vec<u8>,
+        copy: Option<Vec<u8>>,
+        code: Option<crate::error::RefusalCode>,
+        says: &'static str,
+    }
+
+    // Revert: name `forklift heal` for every unsettled trust → the cases whose way out is another
+    // are told heal.
+    #[test]
+    fn a_first_serve_names_the_way_out_of_each_unsettled_trust() {
+        use crate::error::RefusalCode;
+        let garbled = b"not a trust file".to_vec();
+
+        for case in 0..6 {
+            let fixture = PrivilegeFixture::new(&format!("first-serve-way-out-{}", case));
+            let settled = anchor_bytes();
+            let head = office_head().unwrap();
+            let encode = |anchor: &TrustAnchor| crate::util::office_utils::encode_trust_anchor(anchor).into_bytes();
+            let regenesis = encode(&TrustAnchor {
+                genesis: "f".repeat(64), enabled_at: 1_700_000_002, boundary: Vec::new(),
+                prior_genesis: Some(fixture.anchor.genesis.clone()), adopts: Some(head.clone()),
+            });
+            let resettled = encode(&TrustAnchor { enabled_at: fixture.anchor.enabled_at + 1, ..fixture.anchor.clone() });
+            let newer = String::from_utf8(settled.clone()).unwrap().replace("version = 1", "version = 2").into_bytes();
+            assert_ne!(newer, settled, "the fixture's anchor names its version");
+
+            let case = [
+                UnsettledTrust { name: "copy garbled", trust: settled.clone(), copy: Some(garbled.clone()),
+                    code: Some(RefusalCode::TrustDamaged), says: "forklift heal" },
+                UnsettledTrust { name: "trust garbled", trust: garbled.clone(), copy: Some(settled.clone()),
+                    code: Some(RefusalCode::TrustDamaged), says: "forklift heal" },
+                UnsettledTrust { name: "both verify", trust: settled.clone(), copy: Some(resettled),
+                    code: Some(RefusalCode::TrustDamaged), says: "Move aside whichever of the two you do not trust" },
+                UnsettledTrust { name: "server re-genesis", trust: regenesis.clone(), copy: Some(regenesis),
+                    code: Some(RefusalCode::TombstonesDamaged), says: "forklift-server tombstone repair --root" },
+                UnsettledTrust { name: "nothing verifies", trust: garbled.clone(), copy: None,
+                    code: Some(RefusalCode::TrustDamaged), says: "forklift lower" },
+                UnsettledTrust { name: "newer copy", trust: settled.clone(), copy: Some(newer),
+                    code: None, says: "version 2, which this version of Forklift does not read" },
+            ].into_iter().nth(case).unwrap();
+
+            let forklift = crate::globals::forklift_root();
+            file_utils::write_file_atomically(&forklift.join(crate::util::office_utils::FILE_NAME_TRUST), &case.trust).unwrap();
+            if let Some(copy) = &case.copy {
+                file_utils::write_file_atomically(&forklift.join(crate::util::office_utils::FILE_NAME_TRUST_COPY), copy).unwrap();
+            }
+
+            let refused = crate::util::tombstone_utils::mark_served(true).expect_err(case.name);
+
+            match case.code {
+                Some(code) => assert!(crate::error::frames_code(&refused, code), "{}: {}", case.name, refused),
+                None => assert!(crate::error::frames_in(&refused).next().is_none(), "{}: {}", case.name, refused),
+            }
+            assert!(refused.contains(case.says), "{}: {}", case.name, refused);
+            assert_eq!(served_witnesses_stand(), (false, false), "{}: nothing is written", case.name);
+        }
+    }
+
+    #[test]
+    fn a_first_serve_marks_a_root_whose_trust_verifies_its_office() {
+        let _fixture = PrivilegeFixture::new("first-serve-settled");
+        crate::util::office_utils::mend_trust_copy(&crate::util::lock_utils::RefLock::acquire().unwrap(), &anchor_bytes()).unwrap();
+
+        assert!(crate::util::tombstone_utils::mark_served(true).unwrap());
+
+        assert_eq!(served_witnesses_stand(), (true, true));
+    }
+
     // Revert: `resolve_signing_key` reads the office without verifying it against the anchor → a
     // key is chosen from an office the anchor does not govern.
     #[test]

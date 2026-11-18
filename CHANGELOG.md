@@ -37,6 +37,14 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   operator as the next step. `lower` alone reads a missing
   trust file as no anchor held, so it can adopt the anchor of a remote you trust. A server answers
   it as a `503`.
+- **A served warehouse's trust changes only through its server.** In a served folder,
+  `office regenesis`, `office enroll` and a `lower` that would move the office pallet now refuse,
+  leaving the trust file and the office pallet as they were; run them from a clone, against the
+  server. Every trust change now writes a
+  copy of the trust file (`.forklift/trust-copy`) last, and a change run again after it stopped
+  writes the missing copy. A server's first serve refuses a warehouse whose trust file does not
+  verify its office pallet, or whose copy differs from it, as `trust_damaged`, naming the step;
+  before, such a warehouse was served as it stood.
 - **Every local state record carries a digest.** The records of a bay, its pallet position and
   scope, a merge, cherry-pick or park in progress, the inventory metadata, the redaction and
   origin records, the clone-in-progress record and the taint files end in a digest of their

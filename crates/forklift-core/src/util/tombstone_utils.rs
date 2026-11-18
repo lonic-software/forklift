@@ -98,7 +98,7 @@ pub enum ServedState {
 }
 
 /// The command that repairs the tombstones of the warehouse at the current storage root.
-fn repair_command() -> String {
+pub(crate) fn repair_command() -> String {
     // The storage root may be relative to where the command runs, and the remedy is run elsewhere.
     let root = std::path::absolute(globals::forklift_root()).unwrap_or_else(|_| globals::forklift_root());
     let warehouse = root.parent().unwrap_or(&root);
@@ -279,6 +279,9 @@ pub fn mark_served(wait: bool) -> Result<bool, String> {
         // record of withheld content comes first: a served root without one has lost it. One that
         // does not read refuses before the list is written, so the root stays never served.
         ServedState::Never => {
+            // Served, the root takes no install that moves its office, so a client's that stopped
+            // part way is caught now or never.
+            crate::util::office_utils::refuse_unsettled_trust(&lock)?;
             withholding::create_if_absent(&lock)?;
             withholding::read_withheld()?;
             write_tombstones(&lock, &Tombstones::default())?

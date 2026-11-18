@@ -247,9 +247,9 @@ pub(crate) fn restage_object(root: &Path, relative_path: &Path) -> Result<Restag
 }
 
 /// Whether `relative_path` (under the forklift root) is written only under the ref lock: a pallet
-/// ref (anything under `pallets/` or `meta/`) or the trust anchor.
+/// ref (anything under `pallets/` or `meta/`), the trust anchor or its copy.
 fn is_ref_lock_guarded(relative_path: &Path) -> bool {
-    if relative_path == Path::new(office_utils::FILE_NAME_TRUST) {
+    if relative_path == Path::new(office_utils::FILE_NAME_TRUST) || relative_path == Path::new(office_utils::FILE_NAME_TRUST_COPY) {
         return true;
     }
 
@@ -1390,8 +1390,9 @@ mod tests {
         std::fs::create_dir_all(forklift.join("pallets")).unwrap();
         std::fs::write(forklift.join("pallets").join("main"), format!("{}\n", "a".repeat(64))).unwrap();
         std::fs::write(forklift.join(office_utils::FILE_NAME_TRUST), "genesis = \"0\"\n").unwrap();
+        std::fs::write(forklift.join(office_utils::FILE_NAME_TRUST_COPY), "genesis = \"0\"\n").unwrap();
 
-        for path in ["pallets/main", office_utils::FILE_NAME_TRUST] {
+        for path in ["pallets/main", office_utils::FILE_NAME_TRUST, office_utils::FILE_NAME_TRUST_COPY] {
             let held = crate::util::lock_utils::RefLock::acquire().unwrap();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
 
