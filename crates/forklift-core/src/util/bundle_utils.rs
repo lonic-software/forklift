@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use crate::error::CoreError;
 use crate::globals::forklift_root;
-use crate::model::remote::MAX_MISSING_BATCH;
 use crate::model::tree_item::TreeItem;
 use crate::util::{
     audit_utils, withholding, delta_utils, fanout_utils, file_utils, object_utils, pack_utils,
@@ -31,8 +30,8 @@ pub const BUNDLE_HEADER: &str = "forklift-bundle 2026-10-25";
 pub const BUNDLE_DIGEST_BYTES: usize = 32;
 
 /// Version 3: one outer zstd stream of `O` records. The format of partial bundles
-/// (`objects/batch`, subtree fetches) only, which are imported as they stream in, each record
-/// admitted against what the client asked for (see [`StreamAdmission`]). A whole-warehouse bundle
+/// (`objects/batch` answers) only, which are imported as they stream in, each record admitted
+/// against the hashes the client asked for (see [`import_streamed_bundle`]). A whole-warehouse bundle
 /// file in this format is no longer read: nothing writes one.
 const BUNDLE_HEADER_V3: &str = "forklift-bundle 2026-07-11";
 
@@ -563,7 +562,7 @@ impl BundleWriter {
 
     /// Append the object `hash` whose bytes are `object_bytes`, which the caller has verified
     /// against the hash. A hash already in the bundle is not written again: the importer admits
-    /// each requested hash at most once (see [`StreamAdmission`]), so a repeat would fail the
+    /// each requested hash at most once (see [`import_streamed_bundle`]), so a repeat would fail the
     /// whole import. An object above the whole-object ceiling is refused.
     pub fn push(&mut self, hash: &str, object_bytes: &[u8]) -> Result<(), String> {
         if self.written.contains(hash) {
@@ -1061,120 +1060,57 @@ pub fn import_bundle(path: &Path) -> Result<ImportStats, String> {
     import_bundle_reader(std::io::BufReader::new(file))
 }
 
-/// What a streamed partial bundle may store. Every record is checked against this before a byte
-/// of its payload is read, so a remote can make the client write only objects it asked for, each
-/// at most once, however long the stream runs.
-pub enum StreamAdmission {
-    /// A batch response: each record must name one of these hashes, and none twice.
-    Requested(HashSet<String>),
-
-    /// A subtree response: the object closure of this tree. The first admissible record is the
-    /// root itself, and each admitted tree makes its files and subtrees admissible — the order
-    /// the server's breadth-first closure walk emits, where every hash follows the tree naming it.
-    /// At most [`MAX_MISSING_BATCH`] records are admitted, the server's own cap on one response.
-    Closure { root: String },
-}
-
-/// The running state of a [`StreamAdmission`] over one stream.
+/// The running state of the admission of one streamed partial bundle: every record must name a
+/// requested hash, and none twice. Every record is checked before a byte of its payload is read, so
+/// a remote can make the client write only objects it asked for, each at most once, however long
+/// the stream runs.
 struct Admitter {
-    /// Every hash a record may still name, mapped to whether it is a tree whose entries become
-    /// admissible once it is admitted — only ever true in a closure.
-    expected: HashMap<String, bool>,
+    requested: HashSet<String>,
     admitted: HashSet<String>,
-
-    /// A closure's root and record cap. A batch has neither: its requested set is its own bound.
-    closure: Option<(String, usize)>,
 }
 
 impl Admitter {
-    fn new(admission: StreamAdmission) -> Self {
-        match admission {
-            StreamAdmission::Requested(hashes) => Admitter {
-                expected: hashes.into_iter().map(|hash| (hash, false)).collect(),
-                admitted: HashSet::new(),
-                closure: None,
-            },
-            StreamAdmission::Closure { root } => Admitter {
-                expected: HashMap::from([(root.clone(), true)]),
-                admitted: HashSet::new(),
-                closure: Some((root, MAX_MISSING_BATCH)),
-            },
-        }
+    fn new(requested: HashSet<String>) -> Self {
+        Admitter { requested, admitted: HashSet::new() }
     }
 
-    /// Admit a record naming `hash`, or refuse it. `Ok(true)` when it is a tree whose entries
-    /// [`Self::expand`] must make admissible once it is in the store.
-    fn admit(&mut self, hash: &str) -> Result<bool, String> {
+    /// Admit a record naming `hash`, or refuse it.
+    fn admit(&mut self, hash: &str) -> Result<(), String> {
         if self.admitted.contains(hash) {
             return Err(format!("The remote sent object {} twice in one response; refusing it.", hash));
         }
 
-        let Some(&is_tree) = self.expected.get(hash) else {
-            if let (Some((root, _)), true) = (&self.closure, self.admitted.is_empty()) {
-                return Err(format!(
-                    "The remote's subtree response starts at {}, not at the requested tree {}; \
-                    refusing it.", hash, root
-                ));
-            }
-
+        if !self.requested.contains(hash) {
             return Err(format!(
                 "The remote sent object {}, which this request did not ask for; refusing it.", hash
             ));
-        };
-
-        if let Some((_, cap)) = &self.closure {
-            if self.admitted.len() >= *cap {
-                return Err(format!(
-                    "The remote sent more than {} objects in one response; refusing it.", cap
-                ));
-            }
         }
 
         self.admitted.insert(hash.to_string());
-
-        Ok(is_tree)
-    }
-
-    /// Make an admitted tree's files and subtrees admissible. The tree is read from the store,
-    /// which holds it whether this record stored it or it was already present (and the record
-    /// skipped): the server sends every closure object it has, including ones the client holds.
-    ///
-    /// A chunked file's recipe is admitted as the file entry, but never its chunks: chunk
-    /// transport has not shipped, and the server's closure walk does not descend into recipes.
-    /// When it does, this must learn to expand a recipe too, or every such response is refused.
-    fn expand(&mut self, tree_hash: &str) -> Result<(), String> {
-        let tree = object_utils::load_tree(tree_hash)?;
-
-        for (_, file) in tree.get_files() {
-            self.expected.entry(file.hash.clone()).or_insert(false);
-        }
-
-        for (_, subtree) in tree.get_subtrees() {
-            self.expected.entry(subtree.hash.clone()).or_insert(true);
-        }
 
         Ok(())
     }
 }
 
-/// Import a bundle streamed from a remote (a batch or subtree response) as it arrives, holding at
-/// most one record in memory, and storing only what `admission` allows.
+/// Import a bundle streamed from a remote (a batch response) as it arrives, holding at most one
+/// record in memory, and storing only the `requested` hashes, each at most once.
 ///
-/// Only a version-3 bundle is accepted: that is what every batch and subtree producer writes, and
+/// Only a version-3 bundle is accepted: that is what every batch producer writes, and
 /// it is the version whose records stream. A whole-warehouse bundle imports through
 /// temporary pack files and has no business arriving here, so it is refused rather than imported
 /// by a path this one was never meant to take.
 ///
 /// # Arguments
 /// * `reader`    - The response body, as it arrives.
-/// * `admission` - What the request asked for.
+/// * `requested` - The hashes the request asked for.
 ///
 /// # Returns
 /// * `Ok(ImportStats)` - What was stored.
-/// * `Err(String)`     - On any header but version 3, a record `admission` refuses, a corrupt or
+/// * `Err(String)`     - On any header but version 3, a record naming a hash not requested or one
+///   already admitted, a corrupt or
 ///   truncated record, or an I/O error (including the transfer ending before the bundle did).
 pub fn import_streamed_bundle<R: std::io::BufRead>(mut reader: R,
-                                                   admission: StreamAdmission) -> Result<ImportStats, String> {
+                                                   requested: HashSet<String>) -> Result<ImportStats, String> {
     let header = read_bundle_header(&mut reader)?;
 
     if header != BUNDLE_HEADER_V3.as_bytes() {
@@ -1184,13 +1120,11 @@ pub fn import_streamed_bundle<R: std::io::BufRead>(mut reader: R,
         ));
     }
 
-    import_record_stream(reader, Admitter::new(admission))
+    import_record_stream(reader, Admitter::new(requested))
 }
 
-/// Read a streamed bundle answering a request for `requested` (see [`StreamAdmission::Requested`])
-/// as [`import_streamed_bundle`] does, handing each record's hash and bytes to `deliver` instead
-/// of storing it. Only a requested-hash answer is read this way: a closure's admission reads the
-/// trees it admitted back from the store, which delivered records never reach. The bytes are unverified: the
+/// Read a streamed bundle answering a request for `requested` as [`import_streamed_bundle`] does,
+/// handing each record's hash and bytes to `deliver` instead of storing it. The bytes are unverified: the
 /// receiver checks them against the hash before it keeps them. Every record is buffered whole,
 /// up to [`object_utils::MAX_OBJECT_BYTES`].
 ///
@@ -1210,7 +1144,7 @@ pub fn read_streamed_bundle<R: std::io::BufRead>(mut reader: R,
         ));
     }
 
-    let stats = read_record_stream(reader, Admitter::new(StreamAdmission::Requested(requested)), |hash, mut payload, length| {
+    let stats = read_record_stream(reader, Admitter::new(requested), |hash, mut payload, length| {
         deliver(hash.to_string(), read_exact_payload(&mut payload, length)?)?;
         Ok(true)
     })?;
@@ -1380,7 +1314,7 @@ fn read_record_stream<R: std::io::BufRead>(reader: R,
             return Err(format!("Unknown bundle record kind 0x{:02x}.", kind[0]));
         }
 
-        let is_tree = admitter.admit(&hash)?;
+        admitter.admit(&hash)?;
 
         // The ceiling as *policy*: no writer emits an over-ceiling record. It is not the memory
         // defense — that is the streaming path below, which bounds memory whatever the length.
@@ -1391,10 +1325,6 @@ fn read_record_stream<R: std::io::BufRead>(reader: R,
         let stored = take(&hash, &mut decoder, length)?;
 
         if stored { stats.stored_objects += 1; } else { stats.skipped_records += 1; }
-
-        if is_tree {
-            admitter.expand(&hash)?;
-        }
     }
 
     Ok(stats)
@@ -1707,13 +1637,8 @@ mod tests {
         import_streamed_bundle(std::io::Cursor::new(bytes), requested(hashes))
     }
 
-    fn requested(hashes: &[&str]) -> StreamAdmission {
-        StreamAdmission::Requested(hashes.iter().map(|hash| hash.to_string()).collect())
-    }
-
-    /// Import an in-memory subtree response for the tree `root`, as `fetch_subtree` imports one.
-    fn import_closure_bytes(bytes: &[u8], root: &str) -> Result<ImportStats, String> {
-        import_streamed_bundle(std::io::Cursor::new(bytes), StreamAdmission::Closure { root: root.to_string() })
+    fn requested(hashes: &[&str]) -> HashSet<String> {
+        hashes.iter().map(|hash| hash.to_string()).collect()
     }
 
     /// A fresh warehouse root for one test, entered as the active storage-root scope for
@@ -1955,97 +1880,6 @@ mod tests {
         let stats = import_batch_bytes(&bytes, &[&hash]).unwrap();
         assert_eq!(stats.stored_objects, 1);
         assert_eq!(stats.skipped_records, 0);
-    }
-
-    /// A subtree response's fixture: a root tree holding a file and a subtree holding another file,
-    /// as the server's breadth-first closure walk emits them — root, its file, its subtree, then
-    /// the subtree's file.
-    struct ClosureFixture {
-        records: Vec<u8>,
-        root: String,
-        subtree: (String, Vec<u8>),
-        hashes: Vec<String>,
-    }
-
-    fn closure_fixture() -> ClosureFixture {
-        let top = LooseObjectBuilder::build_blob(&Blob { content: b"top file".to_vec() });
-        let nested = LooseObjectBuilder::build_blob(&Blob { content: b"nested file".to_vec() });
-
-        let mut subtree_item = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-        subtree_item.add_child(TreeItem::new("nested.txt".to_string(), nested.hash.clone(), DirEntryType::Normal));
-        let subtree = LooseObjectBuilder::build_tree(&subtree_item);
-
-        let mut root_item = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-        root_item.add_child(TreeItem::new("top.txt".to_string(), top.hash.clone(), DirEntryType::Normal));
-        root_item.add_child(TreeItem::new("sub".to_string(), subtree.hash.clone(), DirEntryType::Tree));
-        let root = LooseObjectBuilder::build_tree(&root_item);
-
-        let mut records = Vec::new();
-        let mut hashes = Vec::new();
-        for object in [&root, &top, &subtree, &nested] {
-            records.extend(record(b'O', &object.hash, &object.content));
-            hashes.push(object.hash.clone());
-        }
-
-        ClosureFixture {
-            records,
-            root: root.hash.clone(),
-            subtree: (subtree.hash.clone(), subtree.content.clone()),
-            hashes,
-        }
-    }
-
-    #[test]
-    fn a_subtree_response_imports_its_closure_in_full() {
-        let fixture = closure_fixture();
-        let _scratch = Scratch::new("closure-ok");
-
-        let stats = import_closure_bytes(&raw_bundle(BUNDLE_HEADER_V3, &fixture.records), &fixture.root).unwrap();
-        assert_eq!(stats.stored_objects, 4);
-        assert!(fixture.hashes.iter().all(|hash| file_utils::does_object_exist(hash).unwrap()));
-    }
-
-    /// The first admissible record is the requested root, so a response rooted anywhere else is
-    /// refused at its first record.
-    #[test]
-    fn a_subtree_response_for_another_root_is_refused() {
-        let fixture = closure_fixture();
-        let _scratch = Scratch::new("closure-wrong-root");
-
-        let error = import_closure_bytes(&raw_bundle(BUNDLE_HEADER_V3, &fixture.records), &fixture.subtree.0)
-            .err().unwrap();
-        assert!(error.contains("not at the requested tree"), "{}", error);
-        assert!(!file_utils::does_object_exist(&fixture.root).unwrap(), "the foreign root never lands");
-    }
-
-    #[test]
-    fn a_subtree_response_carrying_an_object_outside_the_closure_is_refused() {
-        let fixture = closure_fixture();
-        let _scratch = Scratch::new("closure-stray");
-
-        let stray_content: &[u8] = &object_utils::blob_bytes(b"outside the closure");
-        let stray = object_utils::hash_object_bytes(stray_content);
-        let mut records = fixture.records.clone();
-        records.extend(record(b'O', &stray, stray_content));
-
-        let error = import_closure_bytes(&raw_bundle(BUNDLE_HEADER_V3, &records), &fixture.root).err().unwrap();
-        assert!(error.contains("did not ask for"), "{}", error);
-        assert!(!file_utils::does_object_exist(&stray).unwrap(), "the stray object never lands");
-    }
-
-    /// The server sends every closure object it has, including a tree the client already holds.
-    /// That record is skipped, but the tree is still expanded — from the store — so the objects
-    /// below it stay admissible and the response imports in full.
-    #[test]
-    fn a_subtree_response_imports_in_full_when_the_client_already_holds_a_tree_inside_it() {
-        let fixture = closure_fixture();
-        let _scratch = Scratch::new("closure-held-tree");
-        object_utils::store_object_bytes(&fixture.subtree.0, &fixture.subtree.1).unwrap();
-
-        let stats = import_closure_bytes(&raw_bundle(BUNDLE_HEADER_V3, &fixture.records), &fixture.root).unwrap();
-        assert_eq!(stats.stored_objects, 3);
-        assert_eq!(stats.skipped_records, 1, "the held tree is skipped");
-        assert!(fixture.hashes.iter().all(|hash| file_utils::does_object_exist(hash).unwrap()));
     }
 
     /// (FORK-118) The largest pack a writer produces — exactly `PACK_ROLLOVER_OBJECTS` records,

@@ -45,7 +45,7 @@ use forklift_core::util::lock_utils::{self, BaseServeLock, FormatLease, ServeLoc
 use forklift_core::util::{
     applied_redactions, audit_utils, body_utils, bay_utils, bundle_utils, file_utils, franchise_utils, hook_utils, merge_utils, meta_tree,
     object_utils, office_utils, origin_utils, pack_utils, pallet_utils, progress_utils, redaction_deleter, redaction_utils, scope_utils,
-    sealed_utils, sign_utils, tree_utils, unavailable, warehouse_utils,
+    sealed_utils, sign_utils, unavailable, warehouse_utils,
 };
 use forklift_core::util::applied_redactions::AppliedSet;
 use forklift_core::util::withholding::{self, WithheldSet};
@@ -1224,8 +1224,6 @@ const ROUTES: &[RouteEntry] = &[
         access: Access::Authenticated, handler: |method| on(method, post_upload_targets) },
     RouteEntry { verb: Verb::Post, path: "/objects/batch", mount: Mount::Protocol, modes: Modes::Both,
         access: Access::Authenticated, handler: |method| on(method, post_objects_batch) },
-    RouteEntry { verb: Verb::Get, path: "/parcels/{parcel}/subtree/{*path}", mount: Mount::Protocol,
-        modes: Modes::Both, access: Access::Authenticated, handler: |method| on(method, get_subtree) },
     RouteEntry { verb: Verb::Get, path: "/objects/{hash}", mount: Mount::Protocol, modes: Modes::Both,
         access: Access::Authenticated, handler: |method| on(method, get_object) },
     RouteEntry { verb: Verb::Put, path: "/objects/{hash}", mount: Mount::Protocol, modes: Modes::Both,
@@ -1504,7 +1502,7 @@ fn fault_body() -> ErrorResponse {
     ErrorResponse { error: FAULT_MESSAGE.to_string(), code: None, next_step: None }
 }
 
-/// The partial bundle of `hashes` a batch or subtree answers with, its failure classified by
+/// The partial bundle of `hashes` a batch answers with, its failure classified by
 /// [`bundle_refusal`].
 fn partial_bundle(hashes: &[String]) -> Result<Vec<u8>, HandlerError> {
     bundle_utils::build_partial_bundle(hashes).map_err(bundle_refusal)
@@ -3098,102 +3096,6 @@ async fn post_objects_batch(State(state): State<Arc<AppState>>,
     }
 }
 
-/// `GET /v1/parcels/{parcel}/subtree/{path}` — the object closure of the subtree at `path` in
-/// `parcel`, as a bundle-format stream.
-///
-/// This is the **path-addressed** fetch (the client's `RemoteClient::fetch_subtree`): the
-/// remote resolves `path` to a subtree itself, which is what lets it authorize a fetch by path.
-/// A hash-addressed `GET /v1/objects/{hash}` is path-blind — it cannot enforce a per-path grant
-/// without a hash→path index — so this endpoint is the wire surface file-level path enforcement
-/// (FORK-10) is designed to gate; see [`authorize_subtree`]. The endpoint is additive: a client
-/// whose remote predates the route gets a `404` and falls back to the hash-addressed scoped
-/// walk, so shipping it needs no protocol bump.
-async fn get_subtree(State(state): State<Arc<AppState>>,
-                     Extension(principal): Extension<Principal>,
-                     Path(params): Path<PathParams>) -> Response {
-    let warehouse = match resolve_warehouse(&state, &params) {
-        Ok(warehouse) => warehouse,
-        Err(error) => return error_response(error),
-    };
-
-    let parcel = match param(&params, "parcel") {
-        Ok(parcel) => parcel,
-        Err(error) => return error_response(error),
-    };
-
-    let path = match param(&params, "path") {
-        Ok(path) => path,
-        Err(error) => return error_response(error),
-    };
-
-    if let Err(error) = authorize_subtree(&state, &params, &principal, &path).await {
-        return error_response(error);
-    }
-
-    if let Err(error) = await_applies(&warehouse).await {
-        return error_response(error);
-    }
-
-    let result = blocking(warehouse, move || {
-        let root = object_utils::load_parcel(&parcel)
-            .map_err(|_| (StatusCode::NOT_FOUND, format!("No parcel {} exists.", parcel)))?
-            .tree_hash;
-
-        let outcome = tree_utils::collect_subtree_closure(&root, &path, MAX_MISSING_BATCH)
-            .map_err(internal)?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("No subtree at \"{}\" in {}.", path, parcel)))?;
-
-        // The same cap `objects/batch` enforces, for the same reason: an uncapped subtree would
-        // buffer an arbitrarily large bundle in memory before it can even check the size. The
-        // empty path (the whole tree) is exactly the request expected to blow this cap on a big
-        // repo — that is the correct outcome: the client falls back to the hash-addressed walk,
-        // the same fallback a 404 already triggers, so a 422 here reuses that exact path.
-        //
-        // The cap bounds the walk itself, not just this check: `collect_subtree_closure` aborts
-        // as soon as the closure exceeds it, so an oversized subtree is refused without first
-        // loading every tree and blob beneath it.
-        let closure = match outcome {
-            tree_utils::SubtreeClosure::Overflowed => {
-                return Err(unprocessable(format!(
-                    "The subtree at \"{}\" has more than {} objects; fetch it with the \
-                    hash-addressed walk instead.",
-                    path, MAX_MISSING_BATCH
-                )));
-            }
-            tree_utils::SubtreeClosure::Complete(closure) => closure,
-        };
-
-        partial_bundle(&closure)
-    }).await;
-
-    match result {
-        Ok(bytes) => (
-            [
-                (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
-                // Already a zstd stream; the compression layer must not wrap it again.
-                (axum::http::header::CONTENT_ENCODING, "identity"),
-            ],
-            bytes,
-        ).into_response(),
-        Err(error) => error_response(error),
-    }
-}
-
-/// The file-level path-authorization seam (FORK-10) for the path-addressed subtree fetch.
-///
-/// Today a read is open to every authenticated principal — exactly what a hash-addressed object
-/// `GET` already allows — so this admits everything and adds no enforcement: the endpoint
-/// exposes nothing a path-blind object fetch does not. It is kept as a distinct function because
-/// the request names a *path*: once file-level grants land, the office resolves the principal's
-/// granted paths here and refuses (`403`) a subtree outside them — the one enforcement point,
-/// wired in one place rather than scattered across the read handlers.
-async fn authorize_subtree(_state: &AppState,
-                           _params: &PathParams,
-                           _principal: &Principal,
-                           _path: &str) -> Result<(), HandlerError> {
-    Ok(())
-}
-
 /// `GET /v1/objects/{hash}` — the raw object bytes.
 ///
 /// This buffers the whole object in memory. `put_object` below buffers the whole request body too,
@@ -4577,7 +4479,7 @@ async fn delete_applied_content(state: &AppState, warehouse: &Arc<WarehouseHandl
 /// From the mark on, every request that resolves the warehouse is refused, and every reference to
 /// its handle is taken under the registry mutex (see [`resolve_handle`]), so once nothing holds
 /// the handle but the registry (or single mode's own) and this run, nothing can again. A request
-/// already answered whose body is in memory (an object, a batch, a subtree) dropped its reference
+/// already answered whose body is in memory (an object or a batch) dropped its reference
 /// when the body was read: those bytes already left, and nothing here can call them back.
 ///
 /// # Returns
@@ -4796,7 +4698,7 @@ async fn apply_discharging(warehouse: &Arc<WarehouseHandle>) -> (bool, Result<()
 /// Wait, up to [`APPLY_WAIT`], until no apply is owed for `warehouse` (see
 /// [`WarehouseHandle::applies_owed`]): content is answered only once every redaction a ref write
 /// here may have let apply is applied, and so refused. Every request that answers with content
-/// waits here first: an object, a batch, a subtree and the bundle.
+/// waits here first: an object, a batch and the bundle.
 ///
 /// # Returns
 /// * `Ok(())`            - No apply is owed.
