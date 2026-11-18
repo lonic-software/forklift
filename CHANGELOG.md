@@ -51,7 +51,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   repair` records each absent file it cannot account for, and each absent folder or part of history
   it cannot walk beneath, and the warehouse is not served while one is outstanding: `serve --root`
   will not start, and a `--warehouses` server answers `409`. Before, a takedown whose entry was lost
-  was served again unless its operator withheld it again by hand. Put the bytes back, withhold it
+  was served again unless its operator withheld it again by hand. Put the bytes back and run the repair again, withhold it
   with `withhold add`, or, once nothing kept names it, run the repair again; `withhold list` names
   each. **Breaking:** the withheld record moves to version 4, so a record written before this change
   refuses as an older version's; run `forklift-server withhold repair` on it.

@@ -106,7 +106,7 @@ impl Repaired {
             n => lines.push(format!(
                 "{} file{} the history here names {} absent, and no record holds {}: content a lost entry may \
                 have withheld, once its copy was deleted, or damage to the store. {} recorded as unaccounted, \
-                and this warehouse is not served while one is. Put back the bytes of any you hold a copy of. \
+                and this warehouse is not served while one is. Put back the bytes of any you hold a copy of, then run this repair again. \
                 Withhold each one that was taken down, or is gone for good, with \"forklift-server withhold \
                 add --root {} <hash> --statement <statement>\", stating honestly why; a withholding is never \
                 lifted. Once nothing a sweep keeps (pallets, hauls, bays, staged work) names one any more, \
@@ -683,6 +683,15 @@ mod tests {
             delete(&folder);
             let (repaired, count) = lose_and_repair();
             assert_eq!((repaired.absent.clone(), repaired.undescended.clone(), count), (vec![folder.clone()], vec![folder.clone()], 2));
+
+            // Withheld as the file, it is still a folder nothing beneath which was walked, whichever
+            // entry the walk meets first. Revert: judge a hash met again as a tree by `absent` alone
+            // → the withholding drops the folder, and the root is served unwalked.
+            withholding::withhold(&folder, "court order").unwrap();
+            assert_eq!(withholding::unaccounted_count().unwrap(), 1);
+            let rerun = repair_withheld().unwrap();
+            assert_eq!((rerun.absent.clone(), rerun.undescended.clone()), (Vec::new(), vec![folder.clone()]));
+            assert_eq!(withholding::unaccounted_count().unwrap(), 1);
         }
 
         // A pallet's head parcel absent.

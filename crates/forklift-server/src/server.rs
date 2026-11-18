@@ -468,9 +468,9 @@ impl ServingRefusal {
                 "{} is not served: a repair of its damaged record of withheld content left {} file{}, \
                 folder{} or part{} of history unaccounted. A takedown whose entry was lost may be among them, and a \
                 client trusts a server to list every file it withholds. `forklift-server withhold list` \
-                names each. For a file: put its bytes back from any copy; or withhold it with \
-                `forklift-server withhold add`, if it was taken down or is gone for good (a withholding \
-                is never lifted); or, once nothing a sweep keeps (pallets, hauls, bays, staged work) \
+                names each. For a file: put its bytes back from any copy, then run `forklift-server \
+                withhold repair` again; or withhold it with `forklift-server withhold add`, if it was \
+                taken down or is gone for good (a withholding is never lifted); or, once nothing a sweep keeps (pallets, hauls, bays, staged work) \
                 names it, run `forklift-server withhold repair` again, which drops it. For a folder or \
                 part of history: put it back from a copy and run the repair again; or run the repair \
                 again once nothing a sweep keeps reaches it. Then serve it again.",
@@ -7600,7 +7600,7 @@ mod tests {
         assert_eq!(refused.message("Warehouse \"wh\""), "Warehouse \"wh\" is not served: a repair of its damaged record of withheld \
             content left 2 files, folders or parts of history unaccounted. A takedown whose entry was lost may be among them, and a client \
             trusts a server to list every file it withholds. `forklift-server withhold list` names each. For a file: put its bytes \
-            back from any copy; or withhold it with `forklift-server withhold add`, if it was taken down or is gone for good (a \
+            back from any copy, then run `forklift-server withhold repair` again; or withhold it with `forklift-server withhold add`, if it was taken down or is gone for good (a \
             withholding is never lifted); or, once nothing a sweep keeps (pallets, hauls, bays, staged work) names it, run \
             `forklift-server withhold repair` again, which drops it. For a folder or part of history: put it back from a copy and \
             run the repair again; or run the repair again once nothing a sweep keeps reaches it. Then serve it again.");

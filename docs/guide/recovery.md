@@ -188,7 +188,8 @@ placeholder statement; restate it with
 `forklift-server withhold add --root <warehouse> <hash> --statement "…"`. It then lists the files
 the history names that are absent and that no record holds: what a lost entry withheld, once its copy
 was deleted. Each is recorded as unaccounted, and the warehouse is not served while one is. Put back
-the bytes of any you hold a copy of, and withhold each one that was taken down, or is gone for good,
+the bytes of any you hold a copy of and run the repair again, so it stops counting for good if they
+go once more, and withhold each one that was taken down, or is gone for good,
 again. Absent folders and parts of history are listed apart: nothing beneath them could be walked,
 so a takedown's file may sit there unseen, and the warehouse is not served while one is listed,
 even once it is back. Restore each from a copy of the warehouse and run the repair again to walk

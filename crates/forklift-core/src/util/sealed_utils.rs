@@ -1077,6 +1077,9 @@ pub struct Walked {
     /// root or an enrollment or revocation pin reaches is not among them: that may be history this
     /// warehouse never held, and nothing here can tell it from history held and lost.
     pub lost_parcels: HashSet<String>,
+    /// The absent hashes a record held as file content, which `absent` leaves out: one an entry
+    /// names as a tree too is still a boundary the walk could not see beneath.
+    held_absent: HashSet<String>,
 }
 
 impl Walked {
@@ -1088,8 +1091,9 @@ impl Walked {
             if at == At::File && self.absent.contains(hash) && tolerated.held(hash, At::File).is_none() {
                 self.absent_files.insert(hash.to_string());
             }
-            // Met first as a chunk or file of the same bytes, held by nothing, it is a tree too.
-            if at == At::Tree && self.absent.contains(hash) {
+            // Met first as a chunk or file of the same bytes, held or not, it is a tree too: a
+            // withholding is of file content, and holds nothing beneath a folder.
+            if at == At::Tree && (self.absent.contains(hash) || self.held_absent.contains(hash)) {
                 self.absent_trees.insert(hash.to_string());
             }
             return Ok(Met::Again);
@@ -1101,7 +1105,10 @@ impl Walked {
 
         match tolerated.held(hash, at) {
             // A boundary too, but never one a remote is leaned on for, so not among `absent`.
-            Some(Held::Redacted | Held::Withheld | Held::Unavailable) => return Ok(Met::Absent),
+            Some(Held::Redacted | Held::Withheld | Held::Unavailable) => {
+                self.held_absent.insert(hash.to_string());
+                return Ok(Met::Absent);
+            }
             Some(Held::Sealed) => {}
             None if unrecorded == Unrecorded::Damage => return Ok(Met::Unrecorded),
             None => {}

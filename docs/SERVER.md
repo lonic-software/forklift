@@ -370,8 +370,8 @@ revocation by more than about a day.
   that no record holds, to withhold again. It records each such file as unaccounted, and each absent
   folder or part of history it could not walk beneath as undescended, and the root is not served
   while one is (`serve --root` will not start; a `--warehouses` server answers `409`):
-  a takedown whose entry was lost may be among them. A file stops counting once its bytes are back,
-  once it is withheld again with `withhold add`, or once nothing a sweep keeps names it and the
+  a takedown whose entry was lost may be among them. A file stops counting once its bytes are back
+  (run the repair again then, or it counts again if they go), once it is withheld again with `withhold add`, or once nothing a sweep keeps names it and the
   repair is run again; a folder or part of history only once the repair, run again, walks beneath
   it or finds nothing reaches it. `withhold list` names each. A record that matches its digest but
   whose header names a newer version is left for that Forklift. A lost entry whose copy is still
