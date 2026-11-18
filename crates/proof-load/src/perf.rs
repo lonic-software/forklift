@@ -8,6 +8,9 @@
 //! median, minimum and maximum, once warm and once cold. Before a pair is timed the harness checks
 //! that every subject sees the same change; a pair that fails the check is reported as not
 //! comparable, never timed.
+//!
+//! The rows are then judged ([`judge`]): the gate a run is given names which checks fail it, and
+//! the verdict is written into the document beside the rows.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -23,7 +26,7 @@ use crate::scrub::{Environment, Output, Scratch};
 use crate::tool::{self, Invocation, ToolError};
 
 /// The perf document's format. A reader refuses any other number rather than guess at it.
-pub const PERF_FORMAT: u32 = 3;
+pub const PERF_FORMAT: u32 = 4;
 
 /// How long one timed or untimed command of the loop may run.
 const COMMAND_LIMIT: Duration = Duration::from_secs(10 * 60);
@@ -50,6 +53,26 @@ const SERVE_LIMIT: Duration = Duration::from_secs(60);
 const NO_SERVER: &str = "no forklift-server given (--forklift-server)";
 /// Why the remote rows were not run on Windows.
 const NO_REMOTE_ON_WINDOWS: &str = "remote rows are not built on Windows in this harness, which stops a forklift-server gracefully only on unix";
+/// Why switch and merge were not run on a real history whose side branch was not named.
+const NO_SIDE: &str = "no side branch given (--side-branch)";
+/// Why the one-core audit was not run.
+const NO_ONE_CORE: &str = "pinning a command to one core is built only on Linux, with taskset on the PATH";
+/// The gate subject's tracked files, and how many of them each parcel after the first changes.
+const GATE_FILES: usize = 240;
+const GATE_TOUCHED: usize = 5;
+/// The gate subject's parcels: more than the count at which Forklift's audit verifies signatures
+/// in parallel (audit_utils's PARALLEL_THRESHOLD, 256 when this was written), so the one-core
+/// ratio judges that fan-out.
+const GATE_PARCELS: usize = 300;
+/// The gate subject's rows, Forklift's alone, warm only.
+pub const FRESH_COMPACT: &str = "fresh compact";
+pub const REPACK: &str = "repack";
+pub const AUDIT: &str = "audit main";
+pub const AUDIT_ONE_CORE: &str = "audit main, one core";
+/// The paired rows a gross regression fails under either gate.
+pub const GROSS: [&str; 7] = ["status", "diff", "diff --staged", "switch", "commit", "verify", "pack"];
+/// How many times tuned git's median Forklift's may be on a gross row.
+const GROSS_TIMES: u64 = 10;
 
 /// One perf run's document.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -58,16 +81,21 @@ pub struct PerfReport {
     pub format: u32,
     pub header: Header,
     pub rows: Vec<Row>,
+    pub verdict: Verdict,
 }
 
 /// What a perf run ran on: everything the graded report's header records, plus the hardware.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Header {
-    pub seed: u64,
+    /// The generated shape's seed; none for a real history.
+    pub seed: Option<u64>,
+    /// The generated shape's name, or `history` for a real one.
     pub shape: String,
-    /// The shape's scale, spelled out.
+    /// The shape's scale, or the real history's source and what was mirrored of it, spelled out.
     pub shape_detail: String,
+    /// The branch switch and merge time against; none when none was given for a real history.
+    pub side_branch: Option<String>,
     pub reps: usize,
     /// Each binary by path with the first line of its `--version`.
     pub tools: BTreeMap<String, String>,
@@ -103,7 +131,7 @@ pub struct Row {
 }
 
 /// What a row's repetitions start from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Cache {
     /// The page cache as the untimed run before the repetitions left it.
@@ -193,6 +221,179 @@ pub enum Cores {
     NotMeasured { reason: String },
 }
 
+/// Which checks fail a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Gate {
+    /// The checks a run on a shared machine can hold: Forklift against its own ratios, a gross
+    /// regression against tuned git, and a gated row that could not be run.
+    #[serde(rename = "self")]
+    SelfOnly,
+    /// Every check: the self checks, any row that could not be run, and a clearly slower row no
+    /// ticket tracks.
+    All,
+}
+
+impl Gate {
+    pub fn named(name: &str) -> Option<Gate> {
+        match name {
+            "self" => Some(Gate::SelfOnly),
+            "all" => Some(Gate::All),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Gate::SelfOnly => "self",
+            Gate::All => "all",
+        }
+    }
+}
+
+/// What the rows came to under the run's gate.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Verdict {
+    pub gate: Gate,
+    /// What fails the run under its gate; it passed when there is none.
+    pub failures: Vec<Failure>,
+    /// Every clearly slower row, gated or not, with the ticket that tracks it, if any.
+    pub slower: Vec<Slower>,
+    /// Tickets for a row this run timed and did not find clearly slower, which may be closable.
+    pub closable: Vec<Ticket>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Failure {
+    pub operation: String,
+    pub cache: Cache,
+    pub check: Check,
+    pub detail: String,
+}
+
+/// The check a failure failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Check {
+    /// The row was not comparable, or a cell has no timing.
+    CouldNotRun,
+    /// Forklift's median is more than ten times tuned git's on a gross row.
+    Gross,
+    /// Forklift against its own other row: the repack against the fresh compact, or the audit
+    /// against the one-core audit.
+    SelfRatio,
+    /// A clearly slower row no ticket tracks.
+    Untracked,
+}
+
+/// A row where Forklift's median is more than 1.25 times tuned git's and its fastest repetition
+/// slower than tuned git's slowest.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Slower {
+    pub operation: String,
+    pub cache: Cache,
+    pub forklift: Spread,
+    pub git_tuned: Spread,
+    pub ticket: Option<String>,
+}
+
+/// One entry of perf-tickets.json: the ticket tracking a clearly slower row, by the row's
+/// operation and cache and the shape and platform it was slower on.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ticket {
+    pub operation: String,
+    pub shape: String,
+    pub cache: Cache,
+    pub os: Platform,
+    pub ticket: String,
+}
+
+/// The tickets this build was shipped with, crates/proof-load/perf-tickets.json.
+pub fn tickets() -> Result<Vec<Ticket>, String> {
+    serde_json::from_str(include_str!("../perf-tickets.json")).map_err(|error| format!("perf-tickets.json: {}", error))
+}
+
+/// Forklift's and tuned git's timings in `cells`, where both were timed.
+fn forklift_and_tuned(cells: &[Cell]) -> Option<(Spread, Spread)> {
+    let wall = |tool: Tool| cells.iter().find(|cell| cell.subject == tool).and_then(|cell| match cell.result {
+        Measured::Timed { wall, .. } => Some(wall),
+        _ => None,
+    });
+    wall(Tool::Forklift).zip(wall(Tool::GitTuned))
+}
+
+/// Forklift's timing in the warm row `operation`, where it was timed.
+fn forklift_warm(rows: &[Row], operation: &str) -> Option<Spread> {
+    rows.iter().filter(|row| row.operation == operation && row.cache == Cache::Warm).find_map(|row| match &row.outcome {
+        Outcome::Timed { cells } => cells.iter().find(|cell| cell.subject == Tool::Forklift).and_then(|cell| match cell.result {
+            Measured::Timed { wall, .. } => Some(wall),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
+/// Judges `rows`, timed on `shape` and `platform`, under `gate`, given the tickets that track
+/// clearly slower rows. Under either gate: a gross row where Forklift's median is more than
+/// [`GROSS_TIMES`] tuned git's; the repack's median above 1.5 times the fresh compact's, and the
+/// audit's above twice the one-core audit's; and a gross or gate-subject row that could not be
+/// run. Under `all` besides: any row that could not be run, and a clearly slower row with no
+/// ticket. A row not run, for its stated reason, never fails, and only rows this run timed are
+/// looked up in the tickets: a ticket for one that is no longer clearly slower is reported as
+/// possibly closable, never as a failure.
+pub fn judge(rows: &[Row], shape: &str, platform: Platform, gate: Gate, tickets: &[Ticket]) -> Verdict {
+    let mut verdict = Verdict { gate, failures: Vec::new(), slower: Vec::new(), closable: Vec::new() };
+    let gate_row = |operation: &str| [FRESH_COMPACT, REPACK, AUDIT, AUDIT_ONE_CORE].contains(&operation);
+    let mut fail = |row: &Row, check: Check, detail: String| verdict.failures.push(Failure { operation: row.operation.clone(), cache: row.cache, check, detail });
+    let mut slower = Vec::new();
+    let mut closable = Vec::new();
+    for row in rows {
+        let gated = gate == Gate::All || GROSS.contains(&row.operation.as_str()) || gate_row(&row.operation);
+        let unrun = match &row.outcome {
+            Outcome::NotRun { .. } => None,
+            Outcome::NotComparable { reason } => Some(format!("not comparable: {}", reason)),
+            Outcome::Timed { cells } => cells.iter().find(|cell| !matches!(cell.result, Measured::Timed { .. })).map(|cell| format!("{}'s cell has no timing", cell.subject.label())),
+        };
+        if let Some(detail) = unrun.filter(|_| gated) {
+            fail(row, Check::CouldNotRun, detail);
+        }
+        let Outcome::Timed { cells } = &row.outcome else { continue };
+        let Some((forklift, tuned)) = forklift_and_tuned(cells) else { continue };
+        if GROSS.contains(&row.operation.as_str()) && forklift.median > tuned.median.saturating_mul(GROSS_TIMES) {
+            fail(row, Check::Gross, format!("Forklift's median {} is more than {} times tuned git's {}", micros(forklift.median), GROSS_TIMES, micros(tuned.median)));
+        }
+        let ticket = tickets.iter().find(|ticket| ticket.operation == row.operation && ticket.shape == shape && ticket.cache == row.cache && ticket.os == platform);
+        let clearly = forklift.median.saturating_mul(4) > tuned.median.saturating_mul(5) && forklift.min > tuned.max;
+        if clearly {
+            if ticket.is_none() && gate == Gate::All {
+                fail(row, Check::Untracked, format!(
+                    "clearly slower, Forklift's median {} against tuned git's {} and its fastest {} against tuned git's slowest {}, and perf-tickets.json names no ticket for it",
+                    micros(forklift.median), micros(tuned.median), micros(forklift.min), micros(tuned.max),
+                ));
+            }
+            slower.push(Slower { operation: row.operation.clone(), cache: row.cache, forklift, git_tuned: tuned, ticket: ticket.map(|ticket| ticket.ticket.clone()) });
+        } else if let Some(ticket) = ticket {
+            closable.push(ticket.clone());
+        }
+    }
+    let ratios: [(&str, &str, u64, u64, &str); 2] = [(REPACK, FRESH_COMPACT, 3, 2, "1.5 times"), (AUDIT, AUDIT_ONE_CORE, 2, 1, "twice")];
+    for (row, against, times, per, said) in ratios {
+        if let Some((timed, bound)) = forklift_warm(rows, row).zip(forklift_warm(rows, against)) {
+            if timed.median.saturating_mul(per) > bound.median.saturating_mul(times) {
+                let at = rows.iter().find(|candidate| candidate.operation == row && candidate.cache == Cache::Warm).expect("a row timed is a row");
+                fail(at, Check::SelfRatio, format!("its median {} is more than {} the {}'s {}", micros(timed.median), said, against, micros(bound.median)));
+            }
+        }
+    }
+    verdict.slower = slower;
+    verdict.closable = closable;
+    verdict
+}
+
 impl PerfReport {
     /// Reads a perf.json, refusing a format other than [`PERF_FORMAT`] by its number before
     /// anything else, and any field this build does not know.
@@ -210,21 +411,23 @@ impl PerfReport {
         serde_json::to_string_pretty(self).unwrap_or_else(|error| format!("{{\"error\":\"{}\"}}", error))
     }
 
-    /// Whether the run failed to compare something it set out to: a row not comparable, or a cell
-    /// with no timing. A row not run for its stated reason is not a failure.
+    /// Whether the verdict failed the run under its gate.
     pub fn failed(&self) -> bool {
-        self.rows.iter().any(|row| match &row.outcome {
-            Outcome::NotComparable { .. } => true,
-            Outcome::NotRun { .. } => false,
-            Outcome::Timed { cells } => cells.iter().any(|cell| !matches!(cell.result, Measured::Timed { .. })),
-        })
+        !self.verdict.failures.is_empty()
     }
 
     pub fn markdown(&self) -> String {
         let header = &self.header;
         let mut out = String::from("# Proof Load performance\n\n## Header\n\n");
         let _ = writeln!(out, "- format: {}", self.format);
-        let _ = writeln!(out, "- shape: {} (seed {}): {}", header.shape, header.seed, header.shape_detail);
+        match header.seed {
+            Some(seed) => { let _ = writeln!(out, "- shape: {} (seed {}): {}", header.shape, seed, header.shape_detail); }
+            None => { let _ = writeln!(out, "- shape: {}: {}", header.shape, header.shape_detail); }
+        }
+        match &header.side_branch {
+            Some(side) => { let _ = writeln!(out, "- side branch: {}", side); }
+            None => out.push_str("- side branch: none given\n"),
+        }
         let _ = writeln!(out, "- repetitions per cell: {}", header.reps);
         let _ = writeln!(out, "- platform: {} ({})\n- filesystem: {}", header.platform.label(), header.os, header.filesystem);
         let ram = header.hardware.ram_bytes.map_or_else(|| "not read".to_string(), bytes);
@@ -238,6 +441,27 @@ impl PerfReport {
         match &header.drop_caches {
             Some(program) => { let _ = writeln!(out, "- cold rows: the caches dropped by `{}` before each repetition", program); }
             None => out.push_str("- cold rows: not run\n"),
+        }
+        let verdict = &self.verdict;
+        let _ = writeln!(out, "\n## Verdict\n\n- gate: {}", verdict.gate.label());
+        if verdict.failures.is_empty() {
+            out.push_str("- passed\n");
+        }
+        for failure in &verdict.failures {
+            let check = match failure.check {
+                Check::CouldNotRun => "could not run",
+                Check::Gross => "gross regression",
+                Check::SelfRatio => "against its own ratio",
+                Check::Untracked => "clearly slower, no ticket",
+            };
+            let _ = writeln!(out, "- failed: {}, {}: {}: {}", failure.operation, failure.cache.label(), check, failure.detail);
+        }
+        for slower in &verdict.slower {
+            let ticket = slower.ticket.as_deref().map_or_else(|| "no ticket".to_string(), |ticket| format!("tracked by {}", ticket));
+            let _ = writeln!(out, "- clearly slower: {}, {}: Forklift's median {} against tuned git's {}; {}", slower.operation, slower.cache.label(), micros(slower.forklift.median), micros(slower.git_tuned.median), ticket);
+        }
+        for ticket in &verdict.closable {
+            let _ = writeln!(out, "- possibly closable: {} names {}, {}, which this run timed and did not find clearly slower", ticket.ticket, ticket.operation, ticket.cache.label());
         }
         out.push_str("\n## Rows\n");
         for row in &self.rows {
@@ -313,8 +537,16 @@ pub struct PerfOptions {
     pub out: PathBuf,
     pub forklift: PathBuf,
     pub git: PathBuf,
-    pub shape: String,
+    /// The generated history to time on, `small` when neither it nor `history_from` is given.
+    pub shape: Option<String>,
+    /// A real history to time on instead of a generated one: a git repository, mirrored first.
+    pub history_from: Option<PathBuf>,
+    /// The branch of `history_from`'s history that switch and merge time against; without it
+    /// they are not run on a real history.
+    pub side_branch: Option<String>,
     pub reps: usize,
+    /// Which checks fail the run.
+    pub gate: Gate,
     /// The program each cold repetition runs first to drop the operating system's caches; without
     /// it the cold rows are not run.
     pub drop_caches: Option<PathBuf>,
@@ -373,10 +605,8 @@ fn cold_when(windows: bool, drop_caches: Option<PathBuf>) -> Cold {
 /// a run that stopped leaves none. Refuses, writing no perf.json, when it cannot build what it
 /// times.
 pub fn run(options: &PerfOptions, progress: &dyn Fn(&str)) -> Result<PerfReport, String> {
-    let shape = Shape::named(&options.shape).ok_or_else(|| {
-        let names: Vec<&str> = Shape::ALL.iter().map(|shape| shape.name).collect();
-        format!("--shape {}: not a shape this build has (it has {})", options.shape, names.join(", "))
-    })?;
+    let source = source(options)?;
+    let tickets = tickets()?;
     if options.reps == 0 {
         return Err("--reps 0: a cell needs at least one repetition".to_string());
     }
@@ -392,10 +622,13 @@ pub fn run(options: &PerfOptions, progress: &dyn Fn(&str)) -> Result<PerfReport,
     let search_path = crate::scrub::search_path(Some(&git), std::env::var_os("PATH"));
     let environment = Environment::scrubbed(&scratch, search_path, &BTreeMap::new()).map_err(|error| error.to_string())?;
 
-    let built = build(&forklift, &git, &shape, &scratch, &environment, progress).map_err(|error| format!("building the subjects failed: {}", error))?;
+    let built = build(&forklift, &git, &source, &scratch, &environment, progress).map_err(|error| format!("building the subjects failed: {}", error))?;
     let daemon = built.daemon.is_some();
-    let rows = pairs(&built, options.reps, &cold, &remote, &scratch, &environment, progress).map_err(|error| error.to_string())?;
+    let mut rows = pairs(&built, options.reps, &cold, &remote, &scratch, &environment, progress).map_err(|error| error.to_string())?;
+    let (shape_detail, side_branch) = (built.detail.clone(), built.side.clone());
     drop(built);
+    let one_core = one_core_when(cfg!(target_os = "linux"), std::env::var_os("PATH"));
+    gate_rows(&forklift, options.reps, &one_core, &scratch, &environment, progress, &mut rows).map_err(|error| error.to_string())?;
 
     let mut tools = BTreeMap::new();
     tools.insert("forklift".to_string(), crate::run::described(&forklift));
@@ -406,21 +639,71 @@ pub fn run(options: &PerfOptions, progress: &dyn Fn(&str)) -> Result<PerfReport,
     let mut configurations = BTreeMap::new();
     configurations.insert(Tool::Git.label().to_string(), crate::run::created_configuration());
     configurations.insert(Tool::GitTuned.label().to_string(), format!("{}; a commit-graph written untimed after the build", crate::run::tuned_configuration(daemon)));
+    let (seed, shape) = match &source {
+        Source::Generated(shape) => (Some(shape.seed), shape.name.to_string()),
+        Source::History(_) => (None, "history".to_string()),
+    };
+    let platform = Platform::current();
+    let verdict = judge(&rows, &shape, platform, options.gate, &tickets);
     let header = Header {
-        seed: shape.seed, shape: shape.name.to_string(), shape_detail: shape.describe(), reps: options.reps, tools,
-        platform: Platform::current(), os: crate::run::operating_system(), filesystem: crate::run::filesystem_of(output.root()),
+        seed, shape, shape_detail, side_branch, reps: options.reps, tools,
+        platform, os: crate::run::operating_system(), filesystem: crate::run::filesystem_of(output.root()),
         configurations, hardware: hardware(), drop_caches: cold.as_ref().ok().map(|drop| drop.program.display().to_string()),
     };
-    let report = PerfReport { format: PERF_FORMAT, header, rows };
+    let report = PerfReport { format: PERF_FORMAT, header, rows, verdict };
     for (name, text) in [("perf.md", report.markdown()), ("perf.json", report.json())] {
         std::fs::write(output.root().join(name), text).map_err(|error| format!("cannot write {}: {}", name, error))?;
     }
     Ok(report)
 }
 
-/// The three subjects over one generated history, and the daemon kept running for tuned git.
+/// What a run times on: a generated shape, or a real history by path, with the branch switch and
+/// merge time against, if one was named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Source {
+    Generated(Shape),
+    History(History),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct History {
+    from: PathBuf,
+    side: Option<String>,
+}
+
+/// The history `options` name, refusing two at once, a side branch for a generated shape, which
+/// has its own, a shape this build does not have, and a history that is no folder.
+fn source(options: &PerfOptions) -> Result<Source, String> {
+    match (&options.shape, &options.history_from) {
+        (Some(_), Some(_)) => Err("--shape and --history-from each name the history to time on; give one".to_string()),
+        (shape, None) => {
+            if options.side_branch.is_some() {
+                return Err(format!("--side-branch names a branch of --history-from's history; a generated shape has its own, {}", SIDE_BRANCH));
+            }
+            let name = shape.as_deref().unwrap_or("small");
+            Shape::named(name).map(Source::Generated).ok_or_else(|| {
+                let names: Vec<&str> = Shape::ALL.iter().map(|shape| shape.name).collect();
+                format!("--shape {}: not a shape this build has (it has {})", name, names.join(", "))
+            })
+        }
+        (None, Some(from)) => {
+            let from = std::path::absolute(from).map_err(|error| format!("--history-from {}: {}", from.display(), error))?;
+            if !from.is_dir() {
+                return Err(format!("--history-from {}: not a folder", from.display()));
+            }
+            Ok(Source::History(History { from, side: options.side_branch.clone() }))
+        }
+    }
+}
+
+/// The three subjects over one history, and the daemon kept running for tuned git.
 struct Built {
     generated: Generated,
+    /// The history's description for the header: the shape's scale, or the real history's source
+    /// and what was mirrored of it.
+    detail: String,
+    /// The branch switch and merge time against, if any.
+    side: Option<String>,
     /// The generated history's branch, which every subject also has [`PROBE_REF`] at the tip of.
     branch: String,
     subjects: Vec<Subject>,
@@ -428,11 +711,31 @@ struct Built {
     daemon: Option<runner::FsmonitorDaemon>,
 }
 
-fn build(forklift: &Path, git: &Path, shape: &Shape, scratch: &Scratch, environment: &Environment, progress: &dyn Fn(&str)) -> Result<Built, BuildError> {
+fn build(forklift: &Path, git: &Path, source: &Source, scratch: &Scratch, environment: &Environment, progress: &dyn Fn(&str)) -> Result<Built, BuildError> {
     let work = scratch.work();
-    progress(&format!("generating the {} history", shape.name));
-    let mirror = work.join("mirror.git");
-    let generated = generate::mirror(git, shape, &mirror, scratch, environment, BUILD_LIMIT)?;
+    let (mirror, generated, detail, side) = match source {
+        Source::Generated(shape) => {
+            progress(&format!("generating the {} history", shape.name));
+            let mirror = work.join("mirror.git");
+            let generated = generate::mirror(git, shape, &mirror, scratch, environment, BUILD_LIMIT)?;
+            (mirror, generated, shape.describe(), Some(SIDE_BRANCH.to_string()))
+        }
+        Source::History(history) => {
+            progress(&format!("mirroring the history at {}", history.from.display()));
+            let copy = crate::fidelity::take_history(git, &history.from, scratch, environment, BUILD_LIMIT);
+            let (mirror, described) = copy.copied.map_err(|reason| BuildError::Io(format!("the history could not be mirrored: {}", reason)))?;
+            if let Some(side) = &history.side {
+                let reference = format!("refs/heads/{}", side);
+                let found = tool::run(&Invocation { program: git.to_path_buf(), arguments: vec!["rev-parse".into(), "--verify".into(), "-q".into(), reference], directory: mirror.clone(), limit: BUILD_LIMIT }, scratch, environment).map_err(BuildError::Tool)?;
+                if !found.succeeded() {
+                    return Err(BuildError::Io(format!("--side-branch {}: the history at {} has no branch of that name", side, history.from.display())));
+                }
+            }
+            let generated = generate::read_history(git, &mirror, scratch, environment, BUILD_LIMIT)?;
+            let detail = format!("the history at {}, mirrored: {}; {} text files at HEAD", history.from.display(), described, generated.text_files.len());
+            (mirror, generated, detail, history.side.clone())
+        }
+    };
     let mut steps = Vec::new();
     progress("building git's subject");
     let branch = crate::history::build_git(git, &mirror, &work.join("git"), scratch, environment, BUILD_LIMIT, &mut steps)?;
@@ -472,7 +775,7 @@ fn build(forklift: &Path, git: &Path, shape: &Shape, scratch: &Scratch, environm
             watched: daemon.is_some(),
         },
     ];
-    Ok(Built { generated, branch, subjects, daemon })
+    Ok(Built { generated, detail, side, branch, subjects, daemon })
 }
 
 /// Why a loop step could not go on: a tool that could not be run at all, or a file the harness
@@ -492,8 +795,9 @@ impl From<ToolError> for Stopped {
     }
 }
 
-/// Every pair, each as a warm row and then a cold one: status, log and blame on the clean tree; the
-/// write pairs, commit, switch and merge, each repetition on a fresh copy of the clean subject;
+/// Every pair, each as a warm row and then a cold one: status, log, blame and verify on the clean
+/// tree; the write pairs, commit, switch, merge and pack, each repetition on a fresh copy of the
+/// clean subject;
 /// the remote pairs, clone, push and pull, each repetition against a fresh copy of its remote;
 /// then diff and diff --staged over one edit set.
 #[allow(clippy::too_many_arguments)]
@@ -510,10 +814,15 @@ fn pairs(built: &Built, reps: usize, cold: &Cold, remote: &Remote, scratch: &Scr
 
     let edited_set: BTreeSet<String> = edited.iter().map(|file| file.to_string()).collect();
     let clean = same(subjects, &Changes::default(), scratch, environment)?;
-    let reads: [(&str, String, [&[&str]; 2]); 3] = [
+    let reads: [(&str, String, [&[&str]; 2]); 4] = [
         ("status", "Forklift's stocktake --summary against git's status, on the clean tree".to_string(), [&["stocktake", "--summary"], &["status"]]),
         ("log", "Forklift's history against git's log, the whole history".to_string(), [&["history"], &["log"]]),
         ("blame", format!("{}, the file the history changes most, first-parent on both", blame), [&["blame", blame], &["blame", "--first-parent", blame]]),
+        (
+            "verify",
+            "Forklift's audit --full against git's fsck --full --strict, every record of the whole history; the imported parcels carry no signatures, which the audit counts as legacy".to_string(),
+            [&["audit", "--full"], &["fsck", "--full", "--strict"]],
+        ),
     ];
     for (operation, note, [forklift, git]) in reads {
         progress(&format!("timing {}", operation));
@@ -521,7 +830,7 @@ fn pairs(built: &Built, reps: usize, cold: &Cold, remote: &Remote, scratch: &Scr
         both(&mut rows, operation, &note, check, cold, |cold| timed_pair(subjects, forklift, git, reps, cold, scratch, environment))?;
     }
 
-    writes(subjects, &edited, reps, cold, scratch, environment, progress, &mut rows)?;
+    writes(subjects, built.side.as_deref(), &edited, reps, cold, scratch, environment, progress, &mut rows)?;
     remotes(subjects, &built.branch, &edited, reps, cold, remote, scratch, environment, progress, &mut rows)?;
 
     for subject in subjects {
@@ -596,6 +905,7 @@ enum Write {
     Commit,
     Switch,
     Merge,
+    Pack,
 }
 
 /// A write pair's timed lines, Forklift's and then git's, before a subject's own prefix, given its
@@ -606,16 +916,18 @@ fn write_lines(write: Write, argument: &str) -> [Vec<&str>; 2] {
         Write::Commit => [vec!["stack", "-m", argument], vec!["commit", "-q", "-m", argument]],
         Write::Switch => [vec!["shift", argument], vec!["switch", "-q", argument]],
         Write::Merge => [vec!["consolidate", argument], vec!["merge", "-q", "--no-edit", argument]],
+        Write::Pack => [vec!["store", "compact", "--all"], vec!["gc", "-q"]],
     }
 }
 
-/// The write pairs, warm and cold: commit over the edit set, staged untimed, then switch to
-/// [`SIDE_BRANCH`] and merge it. Switch is not comparable unless the side branch is at another
-/// commit than the current branch in every subject, and merge unless neither of the two contains
-/// the other, so that it joins two lines of history. Each repetition runs on a fresh copy of the
-/// clean subject, which every write must leave clean; the subjects themselves are not changed.
+/// The write pairs, warm and cold: commit over the edit set, staged untimed, then switch to the
+/// side branch and merge it, not run when there is none, then pack the whole store. Switch is not
+/// comparable unless the side branch is at another commit than the current branch in every
+/// subject, and merge unless neither of the two contains the other, so that it joins two lines of
+/// history. Each repetition runs on a fresh copy of the clean subject, which every write must
+/// leave clean; the subjects themselves are not changed.
 #[allow(clippy::too_many_arguments)]
-fn writes(subjects: &[Subject], edited: &[&str], reps: usize, cold: &Cold, scratch: &Scratch, environment: &Environment, progress: &dyn Fn(&str), rows: &mut Vec<Row>) -> Result<(), Stopped> {
+fn writes(subjects: &[Subject], side: Option<&str>, edited: &[&str], reps: usize, cold: &Cold, scratch: &Scratch, environment: &Environment, progress: &dyn Fn(&str), rows: &mut Vec<Row>) -> Result<(), Stopped> {
     let copies = scratch.work().join("copies");
     std::fs::create_dir_all(&copies).map_err(|error| Stopped(format!("{}: {}", copies.display(), error)))?;
     let staged = Changes { staged: edited.iter().map(|file| file.to_string()).collect(), unstaged: BTreeSet::new() };
@@ -630,15 +942,189 @@ fn writes(subjects: &[Subject], edited: &[&str], reps: usize, cold: &Cold, scrat
     let [forklift, git] = write_lines(Write::Commit, COMMIT_MESSAGE);
     both(rows, "commit", &note, Ok(()), cold, |cold| fresh_pair(subjects, &forklift, &git, reps, cold, &fresh, scratch, environment))?;
 
-    let (switch, merge) = sides(subjects, scratch, environment)?;
-    for (write, operation, note, check) in [
-        (Write::Switch, "switch", format!("from the current branch to {}, which leaves it a few commits before its tip, on a fresh copy for each repetition", SIDE_BRANCH), switch),
-        (Write::Merge, "merge", format!("{} into the current branch, each with commits the other lacks, a merge with no conflict, on a fresh copy for each repetition", SIDE_BRANCH), merge),
-    ] {
+    match side {
+        None => {
+            for operation in ["switch", "merge"] {
+                for cache in [Cache::Warm, Cache::Cold] {
+                    rows.push(Row { operation: operation.to_string(), cache, note: "against the side branch".to_string(), outcome: Outcome::NotRun { reason: NO_SIDE.to_string() } });
+                }
+            }
+        }
+        Some(side) => {
+            let (switch, merge) = sides(subjects, side, scratch, environment)?;
+            for (write, operation, note, check) in [
+                (Write::Switch, "switch", format!("from the current branch to {}, on a fresh copy for each repetition", side), switch),
+                (Write::Merge, "merge", format!("{} into the current branch, each with commits the other lacks, on a fresh copy for each repetition", side), merge),
+            ] {
+                progress(&format!("timing {}", operation));
+                let fresh = Fresh { operation, edit: &[], before: &clean, copies: &copies };
+                let [forklift, git] = write_lines(write, side);
+                both(rows, operation, &note, check, cold, |cold| fresh_pair(subjects, &forklift, &git, reps, cold, &fresh, scratch, environment))?;
+            }
+        }
+    }
+
+    progress("timing pack");
+    let note = "every object of the store repacked, on a fresh copy for each repetition: Forklift's store compact --all against git's gc; an import leaves Forklift's store packed already";
+    let fresh = Fresh { operation: "pack", edit: &[], before: &clean, copies: &copies };
+    let [forklift, git] = write_lines(Write::Pack, "");
+    both(rows, "pack", note, Ok(()), cold, |cold| fresh_pair(subjects, &forklift, &git, reps, cold, &fresh, scratch, environment))?;
+    Ok(())
+}
+
+/// The program, with the arguments before Forklift's own, that pins a command to one core, or
+/// why the one-core row is not run.
+type OneCore = Result<(PathBuf, Vec<String>), String>;
+
+/// The one-core plan on a platform that is Linux or not, given the harness's PATH: taskset, the
+/// first one on it, pinning to core 0.
+fn one_core_when(linux: bool, path: Option<std::ffi::OsString>) -> OneCore {
+    if !linux {
+        return Err(NO_ONE_CORE.to_string());
+    }
+    let found = path.iter().flat_map(std::env::split_paths).map(|folder| folder.join("taskset")).find(|candidate| candidate.is_file());
+    found.map(|taskset| (taskset, vec!["-c".to_string(), "0".to_string()])).ok_or_else(|| NO_ONE_CORE.to_string())
+}
+
+/// The gate subject's text file at `index`, and its first content, the same on every run.
+fn gate_file(index: usize) -> (String, String) {
+    let path = format!("src/mod{:02}/file{:03}.txt", index / 20, index);
+    let mut text = String::new();
+    for line in 0..8 {
+        let _ = writeln!(text, "file {} line {}: value={}", index, line, (index * 8 + line).wrapping_mul(2_654_435_761) % 1_000_003);
+    }
+    (path, text)
+}
+
+/// The files the gate subject's parcel `parcel` changes after the first.
+fn gate_touched(parcel: usize) -> impl Iterator<Item = usize> {
+    (0..GATE_TOUCHED).map(move |touch| (parcel * 7 + touch * 31 + parcel * touch * 17) % GATE_FILES)
+}
+
+/// Builds Forklift's gate subject at `at`, which must not exist yet: a fresh warehouse whose
+/// first parcel is stacked before it is enrolled and every later one after, [`GATE_PARCELS`] in
+/// all, each after the first changing [`GATE_TOUCHED`] of its [`GATE_FILES`] files, its objects
+/// left loose. Gives why it could not, as a command's own failure.
+fn gate_subject(forklift: &Path, at: &Path, scratch: &Scratch, environment: &Environment) -> Result<Result<(), String>, Stopped> {
+    std::fs::create_dir(at).map_err(|error| Stopped(format!("{}: {}", at.display(), error)))?;
+    let run = |arguments: &[&str]| -> Result<Result<(), String>, Stopped> {
+        let invocation = Invocation { program: forklift.to_path_buf(), arguments: arguments.iter().map(|argument| argument.to_string()).collect(), directory: at.to_path_buf(), limit: BUILD_LIMIT };
+        let outcome = tool::run(&invocation, scratch, environment)?;
+        Ok(if outcome.succeeded() { Ok(()) } else {
+            Err(format!("Forklift's {} exited {:?}: {}", arguments.join(" "), outcome.exit, String::from_utf8_lossy(&outcome.stderr).trim()))
+        })
+    };
+    let write = |path: &Path, text: &[u8]| -> Result<(), Stopped> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| Stopped(format!("{}: {}", parent.display(), error)))?;
+        }
+        std::fs::write(path, text).map_err(|error| Stopped(format!("{}: {}", path.display(), error)))
+    };
+    macro_rules! step {
+        ($arguments:expr) => {
+            if let Err(reason) = run($arguments)? {
+                return Ok(Err(reason));
+            }
+        };
+    }
+    step!(&["--json", "prepare"]);
+    for index in 0..GATE_FILES {
+        let (path, text) = gate_file(index);
+        write(&at.join(path), text.as_bytes())?;
+    }
+    step!(&["--json", "load", "."]);
+    step!(&["--json", "stack", "-m", "gate parcel 0"]);
+    step!(&["--json", "office", "enroll"]);
+    for parcel in 1..GATE_PARCELS {
+        for index in gate_touched(parcel) {
+            let path = at.join(gate_file(index).0);
+            let mut text = std::fs::read(&path).map_err(|error| Stopped(format!("{}: {}", path.display(), error)))?;
+            text.extend_from_slice(format!("parcel {} update: value={}\n", parcel, parcel.wrapping_mul(40_503) % 65_521).as_bytes());
+            write(&path, &text)?;
+        }
+        step!(&["--json", "load", "."]);
+        let message = format!("gate parcel {}", parcel);
+        step!(&["--json", "stack", "-m", &message]);
+    }
+    Ok(Ok(()))
+}
+
+/// Whether Forklift's audit of the gate subject's main pallet counts every parcel after the first
+/// as verified, its signature checked, and the first alone as legacy, or why not: the audit rows
+/// must time signature checks, not their absence.
+fn gate_signed(forklift: &Path, at: &Path, scratch: &Scratch, environment: &Environment) -> Result<Result<(), String>, Stopped> {
+    let invocation = Invocation { program: forklift.to_path_buf(), arguments: vec!["--json".into(), "audit".into(), "main".into()], directory: at.to_path_buf(), limit: BUILD_LIMIT };
+    let outcome = tool::run(&invocation, scratch, environment)?;
+    if !outcome.succeeded() {
+        return Ok(Err(format!("Forklift's --json audit main exited {:?}: {}", outcome.exit, String::from_utf8_lossy(&outcome.stderr).trim())));
+    }
+    let document = runner::document(&outcome.stdout);
+    let (verified, legacy) = (document["data"]["verified_parcels"].as_u64(), document["data"]["legacy_parcels"].as_u64());
+    let expected = (u64::try_from(GATE_PARCELS - 1).ok(), Some(1));
+    Ok(if (verified, legacy) == expected { Ok(()) } else {
+        Err(format!("Forklift's audit of the gate subject counted {:?} parcels verified and {:?} legacy, not {} and 1", verified, legacy, GATE_PARCELS - 1))
+    })
+}
+
+/// The gate subject's rows, Forklift's alone and warm only: the fresh compact, once, of the loose
+/// objects its build left; the repack of its whole store; its audit of main; and that audit pinned
+/// to one core, when `one_core` allows. Every row is not comparable when the subject could not be
+/// built or its audit verified other than every signed parcel, and the fresh compact when it
+/// packed nothing.
+#[allow(clippy::too_many_arguments)]
+fn gate_rows(forklift: &Path, reps: usize, one_core: &OneCore, scratch: &Scratch, environment: &Environment, progress: &dyn Fn(&str), rows: &mut Vec<Row>) -> Result<(), Stopped> {
+    progress(&format!("building the gate subject, {} parcels", GATE_PARCELS));
+    let at = scratch.work().join("gate");
+    let built = match gate_subject(forklift, &at, scratch, environment)? {
+        Ok(()) => gate_signed(forklift, &at, scratch, environment)?,
+        Err(reason) => Err(format!("the gate subject could not be built: {}", reason)),
+    };
+    let notes = [
+        (FRESH_COMPACT, format!("Forklift's store compact over the loose objects of a warehouse of {} signed parcels, once, since it leaves nothing loose", GATE_PARCELS)),
+        (REPACK, "Forklift's store compact --all over the same store, packed by the fresh compact".to_string()),
+        (AUDIT, "Forklift's audit of main, which checks every parcel's signature".to_string()),
+        (AUDIT_ONE_CORE, "the same audit pinned to one core with taskset -c 0".to_string()),
+    ];
+    let subject = Subject { tool: Tool::Forklift, program: forklift.to_path_buf(), prefix: vec![], work: at.clone(), watched: false };
+    for (operation, note) in notes {
+        let row = |outcome: Outcome| Row { operation: operation.to_string(), cache: Cache::Warm, note: note.clone(), outcome };
+        if let Err(reason) = &built {
+            rows.push(row(Outcome::NotComparable { reason: reason.clone() }));
+            continue;
+        }
         progress(&format!("timing {}", operation));
-        let fresh = Fresh { operation, edit: &[], before: &clean, copies: &copies };
-        let [forklift, git] = write_lines(write, SIDE_BRANCH);
-        both(rows, operation, &note, check, cold, |cold| fresh_pair(subjects, &forklift, &git, reps, cold, &fresh, scratch, environment))?;
+        let cell = |command: Vec<String>, result: Measured| Outcome::Timed { cells: vec![Cell { subject: Tool::Forklift, command, result }] };
+        let outcome = match operation {
+            FRESH_COMPACT => {
+                let command = subject.line(&["--json", "store", "compact"]);
+                settle(&at)?;
+                match repetition(&subject.invocation(command.clone()), None, scratch, environment)? {
+                    Err(ended) => cell(command, ended),
+                    Ok(timed) => match runner::document(&timed.outcome.stdout)["data"]["objects_packed"].as_u64() {
+                        Some(packed) if packed > 0 => cell(command, summarise(&[timed])),
+                        packed => Outcome::NotComparable { reason: format!("the fresh compact packed {:?} objects, so it timed no packing", packed) },
+                    },
+                }
+            }
+            REPACK => {
+                let command = subject.line(&["store", "compact", "--all"]);
+                cell(command.clone(), measure(&subject.invocation(command), reps, None, scratch, environment)?)
+            }
+            AUDIT => {
+                let command = subject.line(&["audit", "main"]);
+                cell(command.clone(), measure(&subject.invocation(command), reps, None, scratch, environment)?)
+            }
+            _ => match one_core {
+                Err(reason) => Outcome::NotRun { reason: reason.clone() },
+                Ok((program, prefix)) => {
+                    let pinned = Subject { tool: Tool::Forklift, program: program.clone(), prefix: prefix.iter().cloned().chain([forklift.display().to_string()]).collect(), work: at.clone(), watched: false };
+                    let command = pinned.line(&["audit", "main"]);
+                    let shown: Vec<String> = std::iter::once(program.display().to_string()).chain(command.iter().cloned()).collect();
+                    cell(shown, measure(&pinned.invocation(command), reps, None, scratch, environment)?)
+                }
+            },
+        };
+        rows.push(row(outcome));
     }
     Ok(())
 }
@@ -1174,7 +1660,7 @@ fn moved(transfer: Transfer, tool: Tool, before: &Refs, after: &Refs) -> Result<
     }
 }
 
-/// Where [`SIDE_BRANCH`] stands against the current branch in one subject.
+/// Where the side branch stands against the current branch in one subject.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Side {
     /// At the commit the current branch is at.
@@ -1190,24 +1676,25 @@ enum Side {
 /// Whether a pair can be timed, or why not.
 type Comparable = Result<(), String>;
 
-/// Whether switching to [`SIDE_BRANCH`] changes anything in every subject, and whether merging it
-/// joins two lines of history in every subject, as each tool reads its own history, or why not.
-fn sides(subjects: &[Subject], scratch: &Scratch, environment: &Environment) -> Result<(Comparable, Comparable), Stopped> {
+/// Whether switching to the side branch `name` changes anything in every subject, and whether
+/// merging it joins two lines of history in every subject, as each tool reads its own history, or
+/// why not.
+fn sides(subjects: &[Subject], name: &str, scratch: &Scratch, environment: &Environment) -> Result<(Comparable, Comparable), Stopped> {
     let (mut switch, mut merge) = (Vec::new(), Vec::new());
     for subject in subjects {
         let label = subject.tool.label();
-        match side(subject, scratch, environment)? {
+        match side(subject, name, scratch, environment)? {
             Err(reason) => {
                 switch.push(reason.clone());
                 merge.push(reason);
             }
             Ok(Side::Same) => {
-                let reason = format!("{} has {} at the commit its current branch is at, so switching to it or merging it would time a change of nothing", label, SIDE_BRANCH);
+                let reason = format!("{} has {} at the commit its current branch is at, so switching to it or merging it would time a change of nothing", label, name);
                 switch.push(reason.clone());
                 merge.push(reason);
             }
             Ok(Side::Unread(reason)) => merge.push(reason),
-            Ok(Side::OneLine) => merge.push(format!("{} has {} and its current branch on one line of history, one containing the other, so merging it would not join two lines", label, SIDE_BRANCH)),
+            Ok(Side::OneLine) => merge.push(format!("{} has {} and its current branch on one line of history, one containing the other, so merging it would not join two lines", label, name)),
             Ok(Side::Forked) => {}
         }
     }
@@ -1215,13 +1702,13 @@ fn sides(subjects: &[Subject], scratch: &Scratch, environment: &Environment) -> 
     Ok((verdict(switch), verdict(merge)))
 }
 
-/// Where [`SIDE_BRANCH`] stands in `subject`: git's by `rev-list --left-right --count`, Forklift's
-/// by its pallets' heads and the history of each. Gives why when the heads could not be read; a
-/// history that could not be read leaves the heads apart, [`Side::Unread`].
-fn side(subject: &Subject, scratch: &Scratch, environment: &Environment) -> Result<Result<Side, String>, Stopped> {
+/// Where the side branch `name` stands in `subject`: git's by `rev-list --left-right --count`,
+/// Forklift's by its pallets' heads and the history of each. Gives why when the heads could not be
+/// read; a history that could not be read leaves the heads apart, [`Side::Unread`].
+fn side(subject: &Subject, name: &str, scratch: &Scratch, environment: &Environment) -> Result<Result<Side, String>, Stopped> {
     let label = subject.tool.label();
     if subject.tool != Tool::Forklift {
-        let range = format!("HEAD...{}", SIDE_BRANCH);
+        let range = format!("HEAD...refs/heads/{}", name);
         let text = match output(subject, &["rev-list", "--left-right", "--count", &range], scratch, environment)? {
             Ok(text) => text,
             Err(reason) => return Ok(Err(reason)),
@@ -1241,8 +1728,8 @@ fn side(subject: &Subject, scratch: &Scratch, environment: &Environment) -> Resu
     let document = runner::document(text.as_bytes());
     let pallets = document["data"]["pallets"].as_array().cloned().unwrap_or_default();
     let head = |found: &dyn Fn(&serde_json::Value) -> bool| pallets.iter().find(|pallet| found(pallet)).and_then(|pallet| pallet["head"].as_str()).map(str::to_string);
-    let Some((current, side)) = head(&|pallet| pallet["current"] == true).zip(head(&|pallet| pallet["name"] == SIDE_BRANCH)) else {
-        return Ok(Err(format!("{} named no head for the current branch or for {}", label, SIDE_BRANCH)));
+    let Some((current, side)) = head(&|pallet| pallet["current"] == true).zip(head(&|pallet| pallet["name"] == name)) else {
+        return Ok(Err(format!("{} named no head for the current branch or for {}", label, name)));
     };
     if current == side {
         return Ok(Ok(Side::Same));
@@ -1797,7 +2284,7 @@ mod tests {
     fn report() -> PerfReport {
         let wall = Spread { median: 1500, min: 1200, max: 2100 };
         let header = Header {
-            seed: 1, shape: "small".into(), shape_detail: "detail".into(), reps: 3, tools: BTreeMap::new(), platform: Platform::Linux,
+            seed: Some(1), shape: "small".into(), shape_detail: "detail".into(), side_branch: Some("perf-side".into()), reps: 3, tools: BTreeMap::new(), platform: Platform::Linux,
             os: "Linux 6".into(), filesystem: "ext2/ext3/ext4".into(), configurations: BTreeMap::new(),
             hardware: Hardware { cpu: "a cpu".into(), logical_cores: 8, ram_bytes: Some(1 << 34) }, drop_caches: Some("/usr/local/bin/purge-caches".into()),
         };
@@ -1809,7 +2296,137 @@ mod tests {
             Row { operation: "log".into(), cache: Cache::Warm, note: "n".into(), outcome: Outcome::Timed { cells: vec![cell] } },
             Row { operation: "log".into(), cache: Cache::Cold, note: "n".into(), outcome: Outcome::NotRun { reason: "r".into() } },
         ];
-        PerfReport { format: PERF_FORMAT, header, rows }
+        let verdict = judge(&rows, "small", Platform::Linux, Gate::All, &[]);
+        PerfReport { format: PERF_FORMAT, header, rows, verdict }
+    }
+
+    /// A warm row timed on Forklift and tuned git, each at its own median, fastest and slowest.
+    fn paired(operation: &str, forklift: [u64; 3], tuned: [u64; 3]) -> Row {
+        let cell = |subject: Tool, [median, min, max]: [u64; 3]| Cell { subject, command: vec![], result: Measured::Timed {
+            wall: Spread { median, min, max }, memory: Memory::NotMeasured { reason: "r".into() }, cores: Cores::NotMeasured { reason: "r".into() },
+        } };
+        Row { operation: operation.into(), cache: Cache::Warm, note: "n".into(), outcome: Outcome::Timed { cells: vec![cell(Tool::Forklift, forklift), cell(Tool::GitTuned, tuned)] } }
+    }
+
+    /// A warm gate-subject row timed on Forklift alone.
+    fn alone(operation: &str, median: u64) -> Row {
+        Row { operation: operation.into(), cache: Cache::Warm, note: "n".into(), outcome: Outcome::Timed { cells: vec![Cell { subject: Tool::Forklift, command: vec![], result: Measured::Timed {
+            wall: Spread { median, min: median, max: median }, memory: Memory::NotMeasured { reason: "r".into() }, cores: Cores::NotMeasured { reason: "r".into() },
+        } }] } }
+    }
+
+    fn failures(verdict: &Verdict) -> Vec<(&str, Check)> {
+        verdict.failures.iter().map(|failure| (failure.operation.as_str(), failure.check)).collect()
+    }
+
+    /// Under either gate a gross row fails at more than ten times tuned git's median and passes
+    /// at nine, and names the row; Forklift's own ratios fail the repack past 1.5 times the fresh
+    /// compact and the audit past twice the one-core audit; a gross or gate-subject row that could
+    /// not run fails, a row not run never does.
+    ///
+    /// Revert: judge gross rows under all alone → 11× status passes self; a gross bound of 8 → 9×
+    /// fails.
+    #[test]
+    fn the_self_gate_fails_a_gross_regression_and_a_broken_own_ratio() {
+        let fast = [1_000, 900, 1_100];
+        let judged = |rows: &[Row]| judge(rows, "small", Platform::Linux, Gate::SelfOnly, &[]);
+
+        let verdict = judged(&[paired("status", [11_000, 10_500, 11_500], fast)]);
+        assert_eq!(failures(&verdict), [("status", Check::Gross)]);
+        assert_eq!(verdict.failures[0].detail, "Forklift's median 11.00 ms is more than 10 times tuned git's 1.00 ms");
+        let verdict = judged(&[paired("status", [9_000, 8_500, 9_500], fast)]);
+        assert_eq!(failures(&verdict), []);
+        // Clearly slower, so reported, but that alone fails only the all gate.
+        assert_eq!(verdict.slower.iter().map(|slower| slower.operation.as_str()).collect::<Vec<_>>(), ["status"]);
+        // Log is no gross row: eleven times is reported, never failed, under self.
+        assert_eq!(failures(&judged(&[paired("log", [11_000, 10_500, 11_500], fast)])), []);
+
+        let own = |repack: u64, audit: u64| failures(&judged(&[alone(FRESH_COMPACT, 1_000), alone(REPACK, repack), alone(AUDIT, audit), alone(AUDIT_ONE_CORE, 1_000)])).into_iter().map(|(operation, check)| (operation.to_string(), check)).collect::<Vec<_>>();
+        assert_eq!(own(1_400, 1_900), []);
+        assert_eq!(own(1_600, 2_100), [(REPACK.to_string(), Check::SelfRatio), (AUDIT.to_string(), Check::SelfRatio)]);
+
+        let unrun = |operation: &str, outcome: Outcome| Row { operation: operation.into(), cache: Cache::Warm, note: "n".into(), outcome };
+        let not_comparable = Outcome::NotComparable { reason: "why".into() };
+        let verdict = judged(&[unrun("diff", not_comparable.clone()), unrun(AUDIT, not_comparable.clone()), unrun("log", not_comparable), unrun("switch", Outcome::NotRun { reason: "r".into() })]);
+        assert_eq!(failures(&verdict), [("diff", Check::CouldNotRun), (AUDIT, Check::CouldNotRun)]);
+        assert_eq!(verdict.failures[0].detail, "not comparable: why");
+    }
+
+    /// Under all, a clearly slower row with no ticket fails and one with a ticket for its
+    /// operation, shape, cache and platform does not; a ticket whose row was timed and is not
+    /// clearly slower is reported as possibly closable and fails nothing, and a row not clearly
+    /// slower by its spread (its fastest within tuned git's slowest) is neither. Any row that could
+    /// not run fails under all; a row not run never does.
+    ///
+    /// Revert: never fail an untracked row → the missing ticket passes; take a ticket as clearly
+    /// slower → the stale one is not reported closable.
+    #[test]
+    fn the_all_gate_fails_an_untracked_slower_row_and_reports_a_stale_ticket() {
+        let fast = [1_000, 900, 1_100];
+        let ticket = |operation: &str, os: Platform| Ticket { operation: operation.into(), shape: "small".into(), cache: Cache::Warm, os, ticket: "FORK-1".into() };
+        let rows = [paired("log", [2_000, 1_900, 2_100], fast), paired("blame", [1_100, 950, 1_200], fast), paired("commit", [1_400, 1_000, 1_500], fast)];
+
+        let verdict = judge(&rows, "small", Platform::Linux, Gate::All, &[]);
+        assert_eq!(failures(&verdict), [("log", Check::Untracked)]);
+        assert!(verdict.failures[0].detail.contains("perf-tickets.json names no ticket for it"), "{}", verdict.failures[0].detail);
+        // Commit's median is 1.4 times, but its fastest is within tuned git's slowest.
+        assert_eq!(verdict.slower.iter().map(|slower| slower.operation.as_str()).collect::<Vec<_>>(), ["log"]);
+
+        let tracked = [ticket("log", Platform::Linux), ticket("blame", Platform::Linux)];
+        let verdict = judge(&rows, "small", Platform::Linux, Gate::All, &tracked);
+        assert_eq!(failures(&verdict), []);
+        assert_eq!(verdict.slower[0].ticket.as_deref(), Some("FORK-1"));
+        assert_eq!(verdict.closable, [ticket("blame", Platform::Linux)]);
+        // A ticket for another platform or shape tracks nothing here.
+        assert_eq!(failures(&judge(&rows, "small", Platform::Macos, Gate::All, &tracked)), [("log", Check::Untracked)]);
+        assert_eq!(failures(&judge(&rows, "medium", Platform::Linux, Gate::All, &tracked)), [("log", Check::Untracked)]);
+        // A ticket for a row this run did not time is not reported either way.
+        assert_eq!(judge(&rows, "small", Platform::Linux, Gate::All, &[ticket("pull", Platform::Linux)]).closable, []);
+
+        let log = Row { operation: "log".into(), cache: Cache::Cold, note: "n".into(), outcome: Outcome::NotComparable { reason: "why".into() } };
+        let not_run = Row { operation: "pull".into(), cache: Cache::Warm, note: "n".into(), outcome: Outcome::NotRun { reason: "r".into() } };
+        assert_eq!(failures(&judge(&[log, not_run], "small", Platform::Linux, Gate::All, &[])), [("log", Check::CouldNotRun)]);
+    }
+
+    /// The tickets this build ships parse, name a FORK ticket, a shape this build has and a row
+    /// it times, and track each row at most once.
+    #[test]
+    fn the_shipped_tickets_name_real_rows_once() {
+        let operations = [
+            "status", "log", "blame", "verify", "commit", "switch", "merge", "pack", "clone", "push", "pull", "diff", "diff --staged",
+            "fresh compact", "repack", "audit main", "audit main, one core",
+        ];
+        let tickets = tickets().unwrap();
+        let mut seen = BTreeSet::new();
+        for ticket in &tickets {
+            assert!(ticket.ticket.strip_prefix("FORK-").is_some_and(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())), "{:?}", ticket);
+            assert!(Shape::named(&ticket.shape).is_some(), "{:?}", ticket);
+            assert!(operations.contains(&ticket.operation.as_str()), "{:?}", ticket);
+            assert!(seen.insert((ticket.operation.clone(), ticket.shape.clone(), ticket.cache, ticket.os)), "tracked twice: {:?}", ticket);
+        }
+        let parsed: Result<Vec<Ticket>, _> = serde_json::from_str(r#"[{"operation":"log","shape":"small","cache":"warm","os":"linux","ticket":"FORK-1","note":"x"}]"#);
+        assert!(parsed.is_err(), "an unknown field is refused");
+    }
+
+    /// The options name one history: two are refused, a side branch without a real history is,
+    /// a shape this build lacks is, and a history that is no folder is; no shape and no history
+    /// is the small shape.
+    #[test]
+    fn perf_options_name_one_history() {
+        let options = |shape: Option<&str>, history: Option<&str>, side: Option<&str>| PerfOptions {
+            out: PathBuf::from("out"), forklift: PathBuf::from("f"), git: PathBuf::from("g"), shape: shape.map(str::to_string),
+            history_from: history.map(PathBuf::from), side_branch: side.map(str::to_string), reps: 1, gate: Gate::All, drop_caches: None, forklift_server: None,
+        };
+        assert_eq!(source(&options(None, None, None)), Ok(Source::Generated(Shape::SMALL)));
+        assert_eq!(source(&options(Some("huge"), None, None)), Ok(Source::Generated(Shape::HUGE)));
+        assert_eq!(source(&options(Some("vast"), None, None)), Err("--shape vast: not a shape this build has (it has small, medium, huge)".into()));
+        assert_eq!(source(&options(Some("small"), Some("."), None)), Err("--shape and --history-from each name the history to time on; give one".into()));
+        assert_eq!(source(&options(None, None, Some("s"))), Err("--side-branch names a branch of --history-from's history; a generated shape has its own, perf-side".into()));
+        let here = std::env::current_dir().unwrap();
+        let Ok(Source::History(history)) = source(&options(None, Some("."), Some("s"))) else { panic!("a real history") };
+        assert_eq!((std::fs::canonicalize(&history.from).unwrap(), history.side.as_deref()), (std::fs::canonicalize(&here).unwrap(), Some("s")));
+        let missing = here.join("no-such-folder-here");
+        assert_eq!(source(&options(None, Some(&missing.display().to_string()), None)), Err(format!("--history-from {}: not a folder", missing.display())));
     }
 
     /// A perf.json reads back as written; one naming another format number, or none, is refused by
@@ -1821,13 +2438,13 @@ mod tests {
 
         let mut value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
         value["format"] = serde_json::json!(1);
-        assert_eq!(PerfReport::from_json(&value.to_string()).unwrap_err(), "perf report format 1 is not one this build reads (it reads 3)");
+        assert_eq!(PerfReport::from_json(&value.to_string()).unwrap_err(), "perf report format 1 is not one this build reads (it reads 4)");
         value.as_object_mut().unwrap().remove("format");
         assert_eq!(PerfReport::from_json(&value.to_string()).unwrap_err(), "not a perf report: it names no format");
 
         let mut value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
         value["rows"][0]["outcome"]["cells"][0]["result"]["guessed"] = serde_json::json!(true);
-        assert!(PerfReport::from_json(&value.to_string()).unwrap_err().starts_with("not a perf report of format 3: "));
+        assert!(PerfReport::from_json(&value.to_string()).unwrap_err().starts_with("not a perf report of format 4: "));
     }
 
     /// A repetition that exits non-zero voids its cell, which carries the exit and the stderr and
@@ -1965,6 +2582,7 @@ mod tests {
             (Cache::Warm, &Outcome::Timed { cells: vec![] }), (Cache::Cold, &Outcome::NotRun { reason: "why".into() }),
         ]);
         let mut report = report();
+        report.verdict = judge(&rows, "small", Platform::Linux, Gate::All, &[]);
         report.rows = rows;
         assert!(!report.failed());
     }
@@ -2066,7 +2684,7 @@ esac
         let read = |content: &str| {
             std::fs::write(&page, content).unwrap();
             let _ = std::fs::write(folder.join("count"), "0");
-            side(&subject, &scratch, &environment).unwrap()
+            side(&subject, SIDE_BRANCH, &scratch, &environment).unwrap()
         };
 
         assert_eq!(read(r#"{"data":{"entries":[{"parcel":"b"},{"parcel":"a"}]}}"#), Ok(Side::Forked));
@@ -2074,7 +2692,7 @@ esac
         assert_eq!(read("not json"), Ok(Side::Unread("Forklift's --json history m2 gave no entries".into())));
         std::fs::write(folder.join("repeat"), "").unwrap();
         assert_eq!(read(r#"{"data":{"entries":[]}}"#), Ok(Side::Unread("Forklift's --json history m2 gave the cursor c2 twice".into())));
-        let (switch, merge) = sides(std::slice::from_ref(&subject), &scratch, &environment).unwrap();
+        let (switch, merge) = sides(std::slice::from_ref(&subject), SIDE_BRANCH, &scratch, &environment).unwrap();
         assert_eq!(switch, Ok(()));
         assert_eq!(merge, Err("Forklift's --json history m2 gave the cursor c2 twice".into()));
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
@@ -2113,7 +2731,7 @@ esac
         let subjects = [Subject { tool: Tool::Git, program: git.clone(), prefix: vec![], work: work.clone(), watched: false }];
         let writes_now = || {
             let mut rows = Vec::new();
-            writes(&subjects, &["a", "b"], 1, &Err("r".into()), &scratch, &environment, &|_| {}, &mut rows).unwrap();
+            writes(&subjects, Some(SIDE_BRANCH), &["a", "b"], 1, &Err("r".into()), &scratch, &environment, &|_| {}, &mut rows).unwrap();
             rows.into_iter().map(|row| (row.operation, row.cache, row.outcome)).collect::<Vec<_>>()
         };
         let timed = |outcome: &Outcome| matches!(outcome, Outcome::Timed { cells } if cells.len() == 1 && matches!(cells[0].result, Measured::Timed { .. }));
@@ -2124,10 +2742,20 @@ esac
         let same = Outcome::NotComparable { reason: "git has perf-side at the commit its current branch is at, so switching to it or merging it would time a change of nothing".into() };
         assert_eq!(rows.iter().map(|(operation, cache, _)| (operation.as_str(), *cache)).collect::<Vec<_>>(), [
             ("commit", Cache::Warm), ("commit", Cache::Cold), ("switch", Cache::Warm), ("switch", Cache::Cold), ("merge", Cache::Warm), ("merge", Cache::Cold),
+            ("pack", Cache::Warm), ("pack", Cache::Cold),
         ]);
         assert!(timed(&rows[0].2), "{:?}", rows[0]);
         assert_eq!(rows[1].2, not_run);
-        assert_eq!(outcomes(&rows[2..]), [same.clone(), same.clone(), same.clone(), same]);
+        assert_eq!(outcomes(&rows[2..6]), [same.clone(), same.clone(), same.clone(), same]);
+        assert!(timed(&rows[6].2), "{:?}", rows[6]);
+
+        // With no side branch, switch and merge are not run, and say why; the other writes are
+        // timed as before.
+        let mut rows = Vec::new();
+        writes(&subjects, None, &["a", "b"], 1, &Err("r".into()), &scratch, &environment, &|_| {}, &mut rows).unwrap();
+        let no_side = Outcome::NotRun { reason: "no side branch given (--side-branch)".into() };
+        assert_eq!(rows[2..6].iter().map(|row| row.outcome.clone()).collect::<Vec<_>>(), [no_side.clone(), no_side.clone(), no_side.clone(), no_side]);
+        assert!(timed(&rows[0].outcome) && timed(&rows[6].outcome), "{:?}", rows);
 
         // The side branch ahead of the current one: a switch changes something, a merge would only
         // fast-forward.
@@ -2137,7 +2765,7 @@ esac
         let rows = writes_now();
         let one_line = Outcome::NotComparable { reason: "git has perf-side and its current branch on one line of history, one containing the other, so merging it would not join two lines".into() };
         assert!(timed(&rows[2].2), "{:?}", rows[2]);
-        assert_eq!(outcomes(&rows[3..]), [not_run.clone(), one_line.clone(), one_line]);
+        assert_eq!(outcomes(&rows[3..6]), [not_run.clone(), one_line.clone(), one_line]);
 
         commit_file("d");
         let head = run(&["rev-parse", "HEAD"]);
@@ -2203,7 +2831,7 @@ esac
                     corrupt();
                 }
                 let mut rows = Vec::new();
-                let stopped = writes(&subjects, &["a", "b"], 1, &Err("r".into()), &scratch, &environment, &|_| {}, &mut rows).unwrap_err();
+                let stopped = writes(&subjects, Some(SIDE_BRANCH), &["a", "b"], 1, &Err("r".into()), &scratch, &environment, &|_| {}, &mut rows).unwrap_err();
                 assert_eq!(stopped.0, format!("removing the copy {}: Permission denied (os error 13)", copy.display()), "broken index: {}", broken);
                 mode(&copy.join("locked"), 0o755);
                 #[allow(clippy::disallowed_methods)] // a test's own temporary folder
@@ -2402,7 +3030,8 @@ esac
             reason: format!("repetition 1: git's head was {} before the pull and after it, so the pull moved nothing", head),
         }]);
         let cells = vec![Cell { subject: Tool::Git, command: vec!["pull".into(), "-q".into()], result: Measured::NothingMoved { reason: "a | b".into() } }];
-        let shown = PerfReport { rows: vec![Row { operation: "pull".into(), cache: Cache::Warm, note: "n".into(), outcome: Outcome::Timed { cells } }], ..report() };
+        let rows = vec![Row { operation: "pull".into(), cache: Cache::Warm, note: "n".into(), outcome: Outcome::Timed { cells } }];
+        let shown = PerfReport { verdict: judge(&rows, "small", Platform::Linux, Gate::All, &[]), rows, ..report() };
         assert!(shown.markdown().contains("| git | voided: did not move the head: a \\| b | | | | | `pull -q` |\n"), "{}", shown.markdown());
         assert!(shown.failed());
         assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0, "copies left behind");
@@ -2435,19 +3064,35 @@ esac
         let server = std::env::var_os("PROOF_LOAD_FORKLIFT_SERVER").map(PathBuf::from)
             .unwrap_or_else(|| forklift.with_file_name(format!("forklift-server{}", std::env::consts::EXE_SUFFIX)));
         let options = PerfOptions {
-            out: out.clone(), forklift: forklift.clone(), git: crate::scrub::path_git(), shape: "small".into(), reps: 1, drop_caches: None, forklift_server: Some(server),
+            out: out.clone(), forklift: forklift.clone(), git: crate::scrub::path_git(), shape: None, history_from: None, side_branch: None, reps: 1, gate: Gate::All,
+            drop_caches: None, forklift_server: Some(server),
         };
         let report = run(&options, &|_| {}).unwrap();
         let operations: Vec<&str> = report.rows.iter().filter(|row| row.cache == Cache::Warm).map(|row| row.operation.as_str()).collect();
-        assert_eq!(operations, ["status", "log", "blame", "commit", "switch", "merge", "clone", "push", "pull", "diff", "diff --staged"]);
-        assert_eq!(report.rows.len(), 2 * operations.len());
+        let paired = ["status", "log", "blame", "verify", "commit", "switch", "merge", "pack", "clone", "push", "pull", "diff", "diff --staged"];
+        let gated = [FRESH_COMPACT, REPACK, AUDIT, AUDIT_ONE_CORE];
+        assert_eq!(operations, paired.iter().chain(&gated).copied().collect::<Vec<_>>());
+        assert_eq!(report.rows.len(), 2 * paired.len() + gated.len());
         assert_eq!(report.header.drop_caches, None);
         assert!(report.header.tools.contains_key("forklift-server"), "{:?}", report.header.tools);
-        for pair in report.rows.chunks(2) {
+        let (pairs, gate) = report.rows.split_at(2 * paired.len());
+        // The gate subject's rows are timed on Forklift alone: its audit counted every parcel after
+        // the first as signed, and its fresh compact packed something, or they would not be.
+        for row in gate {
+            let pinned = row.operation == AUDIT_ONE_CORE && one_core_when(cfg!(target_os = "linux"), std::env::var_os("PATH")).is_err();
+            if pinned {
+                assert_eq!(row.outcome, Outcome::NotRun { reason: NO_ONE_CORE.into() });
+                continue;
+            }
+            let Outcome::Timed { cells } = &row.outcome else { panic!("{} was not timed: {:?}", row.operation, row.outcome) };
+            assert_eq!(cells.iter().map(|cell| cell.subject).collect::<Vec<_>>(), [Tool::Forklift], "{}", row.operation);
+            assert!(matches!(cells[0].result, Measured::Timed { .. }), "{}: {:?}", row.operation, cells[0].result);
+        }
+        for pair in pairs.chunks(2) {
             assert_eq!((pair[0].cache, pair[1].cache, &pair[0].operation), (Cache::Warm, Cache::Cold, &pair[1].operation));
             assert_eq!(pair[1].outcome, Outcome::NotRun { reason: "no cache-drop program given (--drop-caches)".into() });
         }
-        for row in report.rows.iter().filter(|row| row.cache == Cache::Warm) {
+        for row in pairs.iter().filter(|row| row.cache == Cache::Warm) {
             let Outcome::Timed { cells } = &row.outcome else { panic!("{} was not timed: {:?}", row.operation, row.outcome) };
             let subjects: Vec<Tool> = cells.iter().map(|cell| cell.subject).collect();
             assert_eq!(subjects, [Tool::Forklift, Tool::Git, Tool::GitTuned], "{}", row.operation);
@@ -2455,7 +3100,9 @@ esac
                 assert!(matches!(cell.result, Measured::Timed { .. }), "{} {:?}: {:?}", row.operation, cell.subject, cell.result);
             }
         }
-        assert!(!report.failed());
+        // A debug build may be slower than the gate allows; it must still have run every row.
+        let unrun: Vec<&Failure> = report.verdict.failures.iter().filter(|failure| failure.check == Check::CouldNotRun).collect();
+        assert_eq!(unrun, Vec::<&Failure>::new());
         let written = std::fs::read_to_string(out.join("perf.json")).unwrap();
         assert_eq!(PerfReport::from_json(&written).unwrap(), report);
         assert!(std::fs::read_to_string(out.join("perf.md")).unwrap().contains("### diff --staged, warm\n"));
