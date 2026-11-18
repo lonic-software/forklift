@@ -733,10 +733,24 @@ fn trust_copy_stands() -> Result<bool, String> {
 /// a lost trust file as absent, so its production callers are an exact set the tests pin; every
 /// other reader takes [`read_trust_anchor`].
 pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
-    match std::fs::read(forklift_root().join(FILE_NAME_TRUST)) {
+    let path = forklift_root().join(FILE_NAME_TRUST);
+    match std::fs::read(&path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("Error while reading the trust file: {}", e)),
+        // A folder or a link to one where the file belongs is damage, like a file that does not
+        // parse; a file the filesystem fails to read is not.
+        Err(e) => match std::fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.is_file() => Err(CoreError::refusal(
+                RefusalCode::TrustDamaged,
+                format!(
+                    "The warehouse's trust file (\"{}\") is not a file, so its anchor cannot be read. \
+                    Nothing was changed. {}",
+                    path.to_string_lossy(), LOST_ANCHOR_WAYS_OUT
+                ),
+                "",
+            ).into()),
+            _ => Err(format!("Error while reading the trust file: {}", e)),
+        },
     }
 }
 
@@ -2827,8 +2841,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A trust file that does not parse is damage, whatever stands beside it; one a newer version
-    /// wrote is not, and is refused uncoded.
+    /// A trust file that does not parse, or a folder in its place, is damage, whatever stands beside
+    /// it; one a newer version wrote is not, and is refused uncoded.
     // Revert: map `TrustDecodeError::Damaged` to the plain message → no code on the garbled file.
     #[test]
     fn a_garbled_trust_file_is_trust_damaged_and_a_newer_one_is_not() {
@@ -2836,9 +2850,16 @@ pub(crate) mod tests {
             ("garbled", "version = 1\ngenesis = \"g", true),
             ("unversioned", "genesis = \"g\"\nenabled_at = 1\nboundary = []\n", true),
             ("newer", "version = 2\ngenesis = \"g\"\n", false),
+            // Its content is replaced by a folder below.
+            ("folder", "", true),
         ] {
             let dir = trust_read_root(name, Some(content), false, false);
             let _scope = crate::globals::StorageRootScope::enter(&dir);
+            if name == "folder" {
+                let trust = dir.join(".forklift").join(FILE_NAME_TRUST);
+                file_utils::remove_file(&trust).unwrap();
+                std::fs::create_dir(&trust).unwrap();
+            }
 
             for mode in [TrustReadMode::Checked, TrustReadMode::Adopt] {
                 let error = read_trust_anchor_in(mode).expect_err(name);

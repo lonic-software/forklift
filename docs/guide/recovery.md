@@ -662,9 +662,14 @@ using that remote.
 
 ### `trust_damaged` (exit 69)
 
-The warehouse's trust file (`.forklift/trust`) is gone while trust was established here (the office
-pallet is born, or the file's copy `.forklift/trust-copy` stands), or it does not parse. Nothing was
-changed: the warehouse can neither sign nor write unsigned until its anchor is back.
+First read the message. If it says the remote refused the handshake, and the next step names the
+remote's operator, the damage is on the remote and nothing here needs repair: change nothing in
+this warehouse, and ask the operator to restore the trust file where the warehouse is served from.
+
+Otherwise the damage is here. This warehouse's trust file (`.forklift/trust`) is gone while trust was
+established (the office pallet is born, or the file's copy `.forklift/trust-copy` stands), or it does
+not parse, or something other than a file stands in its place. Nothing was changed: the warehouse
+can neither sign nor write unsigned until its anchor is back.
 
 - Restore `.forklift/trust` from a backup, if you have one.
 - Otherwise move aside whichever of `trust` and `trust-copy` stands, then take the configured
@@ -678,9 +683,6 @@ changed: the warehouse can neither sign nor write unsigned until its anchor is b
   reset its trust, clone it again instead.
 - With neither, run `forklift prepare` in another folder, which starts without this warehouse's
   history, and enroll there.
-
-When the message says the remote refused the handshake, the damage is on the remote: its operator
-restores the trust file where the warehouse is served from.
 
 ### Lost keys: re-genesis
 

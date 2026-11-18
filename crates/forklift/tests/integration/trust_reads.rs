@@ -23,13 +23,15 @@ const BYTE_READS: &[(&str, &str)] = &[
     // a missing file as permission to sign.
     ("crates/forklift-core/src/util/office_utils.rs", "install_trust"),
     ("crates/forklift-core/src/util/office_utils.rs", "install_trust"),
-    // A ref write's anchor precondition compares the file's bytes to the ones the caller judged,
-    // so a missing file meets only a caller that read none.
+    // A ref write's anchor precondition compares the file's bytes to the ones the caller judged;
+    // a missing file meets only a caller that read none, and is then read through the witnesses
+    // unless the write pins the office.
     ("crates/forklift-core/src/util/pallet_utils.rs", "check_preconditions"),
 ];
 
 /// Every production construction of the adoption read: lower's check and its adoption, which
-/// verify the office against the remote's anchor before writing it.
+/// verify the office against the remote's anchor before writing it. The mode travels from them
+/// into the adoption's read-back (`PreparedTrust::commit`), which names no mode of its own.
 const ADOPTS: &[(&str, &str)] = &[
     ("crates/forklift/src/commands/lower.rs", "handle_command"),
     ("crates/forklift/src/commands/lower.rs", "handle_command"),
@@ -38,10 +40,20 @@ const ADOPTS: &[(&str, &str)] = &[
 /// The production callers of the byte read and the constructions of the adoption read are
 /// exactly the listed ones. Revert: call `read_trust_anchor_bytes` from another production
 /// function, or pass `TrustReadMode::Adopt` from another caller, and this fails naming it.
+/// The identifiers in `line`.
+fn words(line: &str) -> impl Iterator<Item = &str> {
+    line.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|word| !word.is_empty())
+}
+
 #[test]
 fn every_trust_read_that_can_skip_the_witnesses_is_listed() {
     let byte_reads = production_sites(DIRS, |line| usize::from(calls(line, "read_trust_anchor_bytes")));
-    let adopts = production_sites(DIRS, |line| line.matches("TrustReadMode::Adopt").count());
+    // The variant by name, however it is reached: through the enum, or bare after an import of it.
+    // Its own declaration is not a construction.
+    let adopts = production_sites(DIRS, |line| match line.trim() == "Adopt," {
+        true => 0,
+        false => words(line).filter(|word| *word == "Adopt").count(),
+    });
 
     for (what, found, expected) in [("byte read", &byte_reads, BYTE_READS), ("adoption read", &adopts, ADOPTS)] {
         let (unlisted, gone) = differences(found, expected);

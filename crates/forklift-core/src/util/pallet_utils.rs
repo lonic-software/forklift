@@ -1179,6 +1179,13 @@ pub(crate) fn check_preconditions(_lock: &crate::util::lock_utils::RefLock,
         }
     }
 
+    // No trust file is no anchor only where nothing says trust was established: an enrollment
+    // whose file was lost since the decision read none must not take an unsigned write. A write
+    // that pins the office (an install, an adoption) judged it already.
+    if preconditions.anchor == AnchorPrecondition::Absent && preconditions.office == OfficePrecondition::NotConsumed {
+        crate::util::office_utils::read_trust_anchor()?;
+    }
+
     match &preconditions.pallets {
         PalletsPrecondition::NotConsumed => {}
         PalletsPrecondition::WithinBoundary { boundary, scope } => check_within_boundary(boundary, *scope)?,
@@ -3595,6 +3602,28 @@ pub(crate) mod tests {
 
         assert_eq!(get_pallet_head("main").unwrap(), Some(hash('1')), "the target must be unchanged");
         assert_eq!(refused, Err(RefUpdateError::AnchorMoved));
+    }
+
+    // Revert: drop the witness read from an `Absent` with the office not consumed → the unsigned
+    // write lands under a born office whose trust file was lost.
+    #[test]
+    fn a_write_judged_without_an_anchor_is_refused_once_trust_was_established_and_lost() {
+        let (_root, _scope) = scratch("anchor-established-lost");
+        update_pallet_head("main", None, &hash('1'), &RefPreconditions::NONE).unwrap();
+        update_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME, None, &hash('9'), &RefPreconditions::NONE).unwrap();
+
+        let refused = update_pallet_head("main", Some(&hash('1')), &hash('2'), &anchor_is(AnchorPrecondition::Absent));
+
+        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('1')), "the target must be unchanged");
+        match refused {
+            Err(RefUpdateError::Failed(why)) => assert!(crate::error::frames_code(&why, crate::error::RefusalCode::TrustDamaged), "{}", why),
+            other => panic!("expected the lost anchor refused: {:?}", other),
+        }
+
+        // A write that pins the office judged it already: the same office, pinned, lets it land.
+        let pinned = RefPreconditions { office: OfficePrecondition::At(Some(hash('9'))), anchor: AnchorPrecondition::Absent, ..RefPreconditions::NONE };
+        update_pallet_head("main", Some(&hash('1')), &hash('2'), &pinned).unwrap();
+        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('2')));
     }
 
     // Revert: treat `Absent` as `NotConsumed` → an unsigned write lands under an anchor.

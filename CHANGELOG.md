@@ -31,7 +31,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   a born office was read by `stack` and `deliver` as a warehouse that never enrolled, and one that
   did not parse refused uncoded. Now every command that reads the trust state, stack, deliver, git
   import, enroll, regenesis and every command that judges a remote's trust, refuses either as
-  `trust_damaged`, before writing anything, and names the ways out. `lower` alone reads a missing
+  `trust_damaged`, before writing anything, and names the ways out (`heal` notes it and goes on with
+  its other repairs). A remote whose own trust file is lost answers `trust_damaged` too, with its
+  operator as the next step. `lower` alone reads a missing
   trust file as no anchor held, so it can adopt the anchor of a remote you trust. A server answers
   it as a `503`.
 - **Every local state record carries a digest.** The records of a bay, its pallet position and

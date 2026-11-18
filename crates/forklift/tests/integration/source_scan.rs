@@ -56,18 +56,11 @@ pub(crate) fn production_sites(dirs: &[&str], matches: impl Fn(&str) -> usize) -
         let text = std::fs::read_to_string(&file).unwrap();
         let lines: Vec<&str> = text.lines().collect();
 
-        // A file's test module comes last; nothing from it on is production code.
-        let end = (0..lines.len())
-            .find(|&i| lines[i].trim() == "#[cfg(test)]" && lines.get(i + 1).is_some_and(|next| {
-                let next = next.trim_start();
-                next.starts_with("mod ") || next.starts_with("pub mod ") || next.starts_with("pub(crate) mod ")
-            }))
-            .unwrap_or(lines.len());
-
         let relative = file.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
-        for index in 0..end {
+        let test_lines = test_module_lines(&lines);
+        for index in 0..lines.len() {
             let line = lines[index];
-            if line.trim_start().starts_with("//") {
+            if test_lines[index] || line.trim_start().starts_with("//") {
                 continue;
             }
 
@@ -118,4 +111,31 @@ fn the_scan_finds_calls_and_skips_definitions() {
 
     let lines = ["pub(crate) async fn outer() {", "    let f = |x| x;", "    update_pallet_head(a);", "}"];
     assert_eq!(enclosing_fn(&lines, 2), "outer");
+}
+
+/// Which of a file's lines belong to an inline test module (`#[cfg(test)]` over `mod name {`): from
+/// the attribute to the module's closing brace, the first line after it that is `}` at the left
+/// margin, as every top-level item here closes. A module in its own file (`mod name;`) marks
+/// nothing: that file is scanned like any other. Production code after a test module is still
+/// scanned.
+pub(crate) fn test_module_lines(lines: &[&str]) -> Vec<bool> {
+    let mut marked = vec![false; lines.len()];
+    let mut index = 0;
+    while index < lines.len() {
+        let opens = lines[index].trim() == "#[cfg(test)]" && lines.get(index + 1).is_some_and(|next| {
+            let next = next.trim_start();
+            (next.starts_with("mod ") || next.starts_with("pub mod ") || next.starts_with("pub(crate) mod "))
+                && next.trim_end().ends_with('{')
+        });
+        if !opens {
+            index += 1;
+            continue;
+        }
+        let close = (index + 2..lines.len()).find(|&i| lines[i] == "}").unwrap_or(lines.len() - 1);
+        for line in &mut marked[index..=close] {
+            *line = true;
+        }
+        index = close + 1;
+    }
+    marked
 }
