@@ -283,7 +283,8 @@ revocation by more than about a day.
   filter (default `info`). They are coloured only when stderr is a terminal, so a log file
   or a journal holds plain text. A request that fails on a fault of the server's own answers
   500 with a fixed message and no code; the cause, which may name the server's files, is logged
-  only.
+  only. The same holds for a warehouse refused because another process holds its lock: the client
+  gets a 503, and the log names the lock.
 - **Bundles:** `forklift-server bundle --root …` builds the snapshot served at
   `/v1/bundles/latest` (fast cloning); `rebuild_after_lifts` automates it. The
   bundle is written atomically and streamed, so rebuilds never interrupt serving. A build

@@ -1475,15 +1475,20 @@ fn parse_operator_tokens(path: &str) -> Result<HashMap<String, String>, String> 
 /// yet servable), never for good. A [`damage_refusal`] is the exception: no retry mends it, so it
 /// says no time, and a client takes it as an answer.
 ///
-/// A `500` is the server's own fault, and its message is the reader's: it may name this host's
-/// directories, a pack index among them. So the client is told only that the server failed, with no
-/// code, and the message goes to the log ([`fault_body`]).
+/// A `500` whose message is no classified refusal is the server's own fault, and its message is
+/// the reader's: it may name this host's directories, a pack index among them. So the client is
+/// told only that the server failed, and the message is logged. A classified refusal keeps its
+/// code and text at any status: a client takes its exit code from it, and its text is written for
+/// the requester.
 fn error_response(error: HandlerError) -> Response {
     let status = error.0;
     let damaged = is_damage(&error.1);
-    let body = match status {
-        StatusCode::INTERNAL_SERVER_ERROR => fault_body(error.1),
-        _ => error_body(error.1),
+    let body = match status == StatusCode::INTERNAL_SERVER_ERROR && forklift_core::error::deframe(&error.1).is_none() {
+        true => {
+            tracing::error!(message = %error.1, "a request failed on a fault of the server's own");
+            fault_body()
+        }
+        false => error_body(error.1),
     };
     let mut response = (status, Json(body)).into_response();
 
@@ -1494,15 +1499,13 @@ fn error_response(error: HandlerError) -> Response {
     response
 }
 
-/// The JSON body of a `500`: a fixed text, whatever `message` says, framed or not. A refusal that
-/// reaches a `500` is one no handler classified, and its text names what the server read where it
-/// read it; `message` is logged.
-fn fault_body(message: String) -> ErrorResponse {
-    tracing::error!(%message, "a request failed on a fault of the server's own");
+/// The JSON body of a `500` that is the server's own fault ([`error_response`]): a fixed text and
+/// no code.
+fn fault_body() -> ErrorResponse {
     ErrorResponse { error: FAULT_MESSAGE.to_string(), code: None, next_step: None }
 }
 
-/// What a client is told of a `500` ([`fault_body`]).
+/// What a client is told of a fault of the server's own ([`fault_body`]).
 const FAULT_MESSAGE: &str = "The server failed to answer the request. Its operator can find the cause in the server's log.";
 
 /// Build the JSON error body, threading a classified refusal's stable code (§7.4) onto the wire.
@@ -2470,11 +2473,8 @@ fn resolve_handle(state: &AppState,
     // refuse the create a 404 points at, so it is answered as unusable instead. One that cannot
     // be judged is a server fault, with no remedy offered. An unfinished clone, which may not
     // have marked its folder yet, goes on to `serving` and its 503.
-    // The cause of a check that failed is logged, never sent: it names this server's paths.
-    let unchecked = |error: String| {
-        tracing::error!(warehouse = %id, %error, "whether the warehouse is one could not be checked");
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("Whether \"{}\" on this server is a warehouse could not be checked.", id))
-    };
+    // A fault of the server's own: its cause is logged, never sent ([`error_response`]).
+    let unchecked = |error: String| server_fault(format!("Whether warehouse \"{}\" is one could not be checked: {}", id, error));
     let missing = match bay_utils::classify_forklift(&root.join(FOLDER_NAME_FORKLIFT_ROOT)) {
         Ok(bay_utils::ForkliftKind::Warehouse) => None,
         Ok(bay_utils::ForkliftKind::Unprepared) if franchise_utils::gate(&root).is_err() => None,
@@ -2512,10 +2512,19 @@ fn resolve_handle(state: &AppState,
     // it is resumed or deleted.
     let handle = Arc::new(
         WarehouseHandle::serving(root, false).map_err(|refusal| match refusal {
-            ServingRefusal::Busy(reason) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Warehouse \"{}\" is temporarily unavailable (under maintenance): {}", id, reason),
-            ),
+            // Not the reader's words: a lock's names its file on this server, the process holding
+            // it, and a removal only the operator can run. They go to the log.
+            ServingRefusal::Busy(reason) => {
+                tracing::warn!(warehouse = %id, %reason, "the warehouse is not served for now");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "Warehouse \"{}\" is temporarily unavailable: another process on the server is \
+                        working on it. Try again once it finishes.",
+                        id
+                    ),
+                )
+            }
             // Not the gate's own refusal: its code and next step name this server's directories,
             // and a client would read them as a clone of its own to resume.
             ServingRefusal::Unfinished(_) => (
@@ -5429,23 +5438,26 @@ mod tests {
         assert!(!body.error.contains('\u{1f}'), "the raw frame never leaks: {:?}", body.error);
     }
 
-    /// A `500` carries a fixed text and no code, whether its message is plain or a refusal no
-    /// handler classified, so neither form's words reach the client; any other status keeps the
-    /// handler's own.
+    /// A `500` whose message is no classified refusal carries a fixed text and no code, so its words
+    /// never reach the client; a classified refusal at `500`, and any other status, keeps its own.
     ///
-    /// Revert: answer a `500` with `error_body` → the path, then the code, reach the client → red.
+    /// Revert: answer a `500` with `error_body` → the path reaches the client → red. Hide every
+    /// `500` → the refusal's code is lost → red.
     #[tokio::test]
     async fn a_500_answers_a_fixed_text_and_no_code() {
         let plain = "Error while reading \"/srv/wh/.forklift/objects/pack/x.idx\": denied".to_string();
-        let framed: String = scope_utils::chunked_transport_refusal("/srv/wh/big.bin").into();
 
-        for message in [plain.clone(), framed] {
-            let body = body_text(error_response(server_fault(message.clone()))).await;
-            let error: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(error["error"], "The server failed to answer the request. Its operator can find the cause in the server's log.", "{}", body);
-            assert!(error.get("code").is_none() && error.get("next_step").is_none(), "{}", body);
-            assert!(!body.contains("/srv/wh"), "{}", body);
-        }
+        let body = body_text(error_response(server_fault(plain.clone()))).await;
+        let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(error["error"], "The server failed to answer the request. Its operator can find the cause in the server's log.", "{}", body);
+        assert!(error.get("code").is_none() && error.get("next_step").is_none(), "{}", body);
+        assert!(!body.contains("/srv/wh"), "{}", body);
+
+        let framed: String = scope_utils::chunked_transport_refusal("big.bin").into();
+        let body = body_text(error_response(server_fault(framed))).await;
+        let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(error["code"], "chunked_transport_unsupported", "a classified refusal keeps its code: {}", body);
+        assert!(error["error"].as_str().unwrap().contains("big.bin"), "{}", body);
 
         let body = body_text(error_response((StatusCode::UNPROCESSABLE_ENTITY, plain))).await;
         assert!(body.contains("/srv/wh/.forklift/objects/pack/x.idx"), "another status keeps its message: {}", body);
@@ -7772,6 +7784,9 @@ mod tests {
     /// names nothing of the server's: not the pack index the reader named, nor the warehouse's
     /// directory, and no code.
     ///
+    /// The handler's own error is checked first, so the `500` is the gate's over this index and not
+    /// any other.
+    ///
     /// Revert: answer a `500` with the handler's message (`error_body`) → the index path reaches
     /// the client → red.
     #[tokio::test]
@@ -7786,6 +7801,12 @@ mod tests {
             std::fs::write(pack.join("pack-garbage.idx"), b"not an index").unwrap();
         }
 
+        let probe = Arc::new(capped_state(&base, 4, &["w"]));
+        let refused = resolve_handle(&probe, &warehouse_params("w")).map(|_| ()).unwrap_err();
+        assert_eq!(refused.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(refused.1.contains("pack-garbage.idx") && refused.1.contains("could not be parsed"), "{}", refused.1);
+        drop(probe);
+
         let response = get_warehouse(State(Arc::clone(&state)), Path(warehouse_params("w"))).await.into_response();
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -7795,6 +7816,30 @@ mod tests {
         assert!(error.get("code").is_none() && error.get("next_step").is_none(), "{}", body);
         assert!(!body.contains("pack-garbage") && !body.contains(base.to_string_lossy().as_ref()), "{}", body);
 
+        drop(state);
+        let _ = forklift_core::util::file_utils::remove_dir_all(&base);
+    }
+
+    /// A multi-warehouse server refused a warehouse's serve lock answers a `503` that names nothing
+    /// of the server's: the lock's own words name its file and the process holding it.
+    ///
+    /// Revert: put the lock's reason in the `503` → the base directory reaches the client → red.
+    #[test]
+    fn a_busy_warehouse_is_refused_without_the_locks_words() {
+        let base = scratch_dir("busy-no-path");
+        let state = Arc::new(capped_state(&base, 4, &["w"]));
+        let held = {
+            let _scope = StorageRootScope::enter(&base.join("w"));
+            ServeLock::acquire().unwrap()
+        };
+
+        let refused = resolve_handle(&state, &warehouse_params("w")).map(|_| ()).unwrap_err();
+
+        assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(refused.1.starts_with("Warehouse \"w\" is temporarily unavailable"), "{}", refused.1);
+        assert!(!refused.1.contains(base.to_string_lossy().as_ref()), "{}", refused.1);
+
+        let _ = ServeLock::release(held);
         drop(state);
         let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }

@@ -645,8 +645,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 - **A server's `500` no longer names its files.** A request that failed on a fault of
   `forklift-server`'s own answered with the failure's own message, which could carry the server's
-  absolute paths, such as a pack index that does not parse. A `500` now carries a fixed message and
-  no code, and the cause goes to the server's log.
+  absolute paths, such as a pack index that does not parse. Such a `500` now carries a fixed
+  message and no code, and the cause goes to the server's log; a classified refusal keeps its code
+  and text. A warehouse busy under another process's lock is refused with a `503` that no longer
+  names the lock file or the process holding it.
 - **A damaged record of a merge in progress is refused with a command that ends it.** A garbled,
   cut or digest-mismatched consolidation or pick state file was refused in prose that said to
   remove the file by hand. Every reader now refuses it with `merge_state_damaged` (exit 68,
