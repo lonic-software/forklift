@@ -874,9 +874,9 @@ fn switching_runs_as_written() {
 
 /// A page's `git` sees no configuration but what the page itself set. The test plants a global file
 /// in the home folder and configuration passed in the environment, so those two fail wherever the
-/// isolation does. The system file cannot be planted, since the variable naming one is itself
-/// removed: that arm fails only on a machine that has a system file, such as one with Git for
-/// Windows or Homebrew's git.
+/// isolation does. Two arms cannot be planted here: the system file, since the variable naming one
+/// is itself removed, fails only on a machine that has one (Git for Windows, Homebrew's git); a
+/// git variable the test process inherits fails only when the test's environment carries one.
 #[test]
 fn git_reads_none_of_the_developers_configuration() {
     let area = std::env::temp_dir().join(format!("forklift-git-config-{}", std::process::id()));
