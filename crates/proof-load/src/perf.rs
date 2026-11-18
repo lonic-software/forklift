@@ -1135,17 +1135,17 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path
         };
-        let log = scratch.work().join("log");
-        let drop = script("drop", &format!("echo drop >> '{}'", log.display()));
-        let failing = script("failing", "echo no caches here >&2; exit 3");
-        let command = Invocation {
+        let command = |log: &Path| Invocation {
             program: PathBuf::from("/bin/sh"), arguments: vec!["-c".into(), format!("echo run >> '{}'", log.display())], directory: scratch.work(), limit: Duration::from_secs(30),
         };
-        assert!(matches!(measure(&command, 3, Some(&drop), &scratch, &environment).unwrap(), Measured::Timed { .. }));
+        let log = scratch.work().join("log");
+        let drop = script("drop", &format!("echo drop >> '{}'", log.display()));
+        assert!(matches!(measure(&command(&log), 3, Some(&drop), &scratch, &environment).unwrap(), Measured::Timed { .. }));
         assert_eq!(std::fs::read_to_string(&log).unwrap(), "drop\nrun\ndrop\nrun\ndrop\nrun\n");
-        std::fs::remove_file(&log).unwrap();
-        assert_eq!(measure(&command, 3, Some(&failing), &scratch, &environment).unwrap(), Measured::DropFailed { exit: Some(3), stderr: "no caches here\n".into() });
-        assert!(!log.exists());
+        let unrun = scratch.work().join("unrun");
+        let failing = script("failing", "echo no caches here >&2; exit 3");
+        assert_eq!(measure(&command(&unrun), 3, Some(&failing), &scratch, &environment).unwrap(), Measured::DropFailed { exit: Some(3), stderr: "no caches here\n".into() });
+        assert!(!unrun.exists());
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1208,6 +1208,18 @@ mod tests {
         assert_eq!(run(&["rev-parse", "HEAD"]), head);
         assert_eq!(run(&["status", "--porcelain"]), "");
         assert_eq!(std::fs::read_dir(scratch.work().join("copies")).unwrap().count(), 0);
+
+        // A commit whose copy does not start with exactly the edit set staged, or does not end
+        // clean, is not comparable, and says which.
+        let commit = || writes_now().into_iter().next().unwrap().2;
+        std::fs::write(work.join("stray"), "s\n").unwrap();
+        assert_eq!(commit(), Outcome::NotComparable { reason: "before repetition 1, git saw 3 staged of 2 expected, 1 more (stray)".into() });
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "stray"]);
+        let hook = work.join(".git").join("hooks").join("post-commit");
+        std::fs::write(&hook, "#!/bin/sh\necho left > left-behind\n").unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert_eq!(commit(), Outcome::NotComparable { reason: "after repetition 1, git saw 1 unstaged of 0 expected, 1 more (left-behind)".into() });
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&root);
     }
