@@ -276,6 +276,14 @@ pub fn load_parcel(hash: &str) -> Result<Parcel, String> {
     decode_parcel(hash, &bytes)
 }
 
+/// [`load_parcel`], telling a store that cannot give the parcel's bytes (the outer error) from
+/// bytes that are not a parcel (the inner one): the first says nothing of what the parcel holds.
+pub(crate) fn load_parcel_judged(hash: &str) -> Result<Result<Parcel, String>, String> {
+    let bytes = read_parcel_bytes(hash)?;
+
+    Ok(decode_parcel(hash, &bytes))
+}
+
 /// Decode a parcel's object bytes. A refusal names the parcel it came from, so a walk that meets a
 /// malformed one says which.
 pub(crate) fn decode_parcel(hash: &str, bytes: &[u8]) -> Result<Parcel, String> {

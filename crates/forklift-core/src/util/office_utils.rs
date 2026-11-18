@@ -1684,14 +1684,19 @@ fn judge_trust_bytes(bytes: &Result<Vec<u8>, String>, office_head: &str) -> Resu
 /// installs that leave the office where it stands ([`install_trust`]), so this is where a client
 /// install that stopped part way, or a trust file damaged meanwhile, is caught. Refused when a
 /// trust file stands beside a born office and its anchor does not verify the office, or a copy
-/// stands that differs from it.
+/// stands that differs from it; when a trust file is missing where trust was established; and
+/// when a trust file stands beside an unborn office with no copy that matches it.
 ///
 /// # Returns
-/// * `Ok(())`      - No trust file stands, the office is unborn, or the trust file verifies the
-///                   office and any copy matches it.
-/// * `Err(String)` - A [`RefusalCode::TrustDamaged`] refusal naming the way out (or a
-///                   [`RefusalCode::TombstonesDamaged`] one, for a server's re-genesis standing where
-///                   the served witnesses were lost), or why a file could not be read.
+/// * `Ok(())`      - No trust file and no trace of established trust; a trust file and an equal
+///                   copy, both readable, beside an unborn office; or a trust file that verifies
+///                   the office, with any copy matching it.
+/// * `Err(String)` - A [`RefusalCode::TrustDamaged`] refusal (a lost trust file is the coded
+///                   trust read's), a [`RefusalCode::TombstonesDamaged`] one for a server's
+///                   re-genesis standing where the served witnesses were lost, or a
+///                   [`RefusalCode::RefDamaged`] one for a trust file beside an unborn office; a
+///                   newer version's refusal of a file it wrote; or why the store or a file could
+///                   not be read.
 pub(crate) fn refuse_unsettled_trust(_lock: &crate::util::lock_utils::RefLock) -> Result<(), String> {
     let read = |name: &str| match read_trust_file(name) {
         Ok(bytes) => Ok(bytes.map(Ok)),
@@ -1724,9 +1729,12 @@ pub(crate) fn refuse_unsettled_trust(_lock: &crate::util::lock_utils::RefLock) -
 
     let Some(office_head) = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)? else {
         // A trust change writes its copy last, so a trust file with an equal copy beside an unborn
-        // office is an anchor put before its office was lifted: the window a served root is
-        // bootstrapped through, or a clone taken in it.
-        if trust.is_ok() && copy.as_ref() == Some(&trust) {
+        // office is an anchor put before its office was lifted: a clone taken from a server in
+        // the window its first anchor was put and its office not yet lifted. The office ref of a
+        // finished install lost since reads the same, and nothing here tells the two apart, so
+        // that loss is let through too: a lower from the remote holding the office mends it.
+        let reads = |bytes: &[u8]| std::str::from_utf8(bytes).is_ok_and(|text| parse_trust_anchor_classified(text).is_ok());
+        if trust.as_ref().is_ok_and(|bytes| reads(bytes)) && copy.as_ref() == Some(&trust) {
             return Ok(());
         }
         // Without one, an enrollment or a first lower stopped between its writes.
@@ -1736,8 +1744,10 @@ pub(crate) fn refuse_unsettled_trust(_lock: &crate::util::lock_utils::RefLock) -
                 "The trust file (\"{}\") stands beside an unborn office pallet, with no copy that matches it: \
                 an enrollment or a first \"forklift lower\" stopped between its writes, or the office pallet's \
                 ref was lost. {} To run the enrollment or the lower again, move the trust file aside, and its \
-                copy (\"{}\") if one stands, then run it. Where a remote holds this warehouse's office, \
-                \"forklift lower\" takes it instead, and verifies it against the trust file.",
+                copy (\"{}\") if one stands, then run it; where it was the office pallet's ref that was lost, \
+                that starts a new office, and nothing signed under the old one verifies again, so restore \
+                the ref from a backup instead if you have one. Where a remote holds this warehouse's \
+                office, \"forklift lower\" takes it instead, and verifies it against the trust file.",
                 trust_path, not_served, copy_path
             ),
             String::new(),

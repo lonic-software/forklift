@@ -115,8 +115,8 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
         chain.push(cursor.clone());
 
         // Read before the genesis is recognised, so that a genesis the store cannot give is
-        // told as unreadable too, not as a shape the check below refuses.
-        let parcel = object_utils::load_parcel(&cursor).map_err(Unreadable)?;
+        // told as unreadable too. An object that is there but is not a parcel is a verdict.
+        let parcel = object_utils::load_parcel_judged(&cursor).map_err(Unreadable)?.map_err(Inauthentic)?;
 
         if cursor == anchor.genesis {
             break;
@@ -4570,6 +4570,22 @@ mod tests {
 
     /// An office chain the store cannot read says nothing about the trust file: the first serve
     /// refuses with the store's own refusal, never as damaged trust heal would be sent to repair.
+    /// An office head that names an object the store gives, but which is not a parcel, is a
+    /// verdict on the chain, never a store that cannot be read.
+    // Revert: map the walk's decode failure to `Unreadable` → refused as unreadable.
+    #[test]
+    fn an_office_head_that_is_not_a_parcel_is_inauthentic() {
+        let fixture = PrivilegeFixture::new("office-head-not-a-parcel");
+        let blob = crate::builder::object::loose_object_builder::LooseObjectBuilder::build_blob(
+            &crate::model::blob::Blob { content: b"not an office parcel".to_vec() },
+        );
+        object_utils::store_object_bytes(&blob.hash, &blob.content).unwrap();
+
+        let refusal = chain_refusal(&fixture.anchor, &blob.hash);
+
+        assert!(refusal.contains("not a parcel"), "{}", refusal);
+    }
+
     // Revert: read a coded chain error as an unverified anchor → `trust_damaged`. Revert: read an
     // unreadable parcel as one → the uncoded read failure is refused as `trust_damaged`.
     #[test]
@@ -4635,7 +4651,7 @@ mod tests {
         use crate::error::RefusalCode;
         let garbled = b"not a trust file".to_vec();
 
-        for case in 0..10 {
+        for case in 0..11 {
             let fixture = PrivilegeFixture::new(&format!("first-serve-way-out-{}", case));
             let settled = anchor_bytes();
             let head = office_head().unwrap();
@@ -4675,6 +4691,9 @@ mod tests {
                     code: Some(RefusalCode::TrustDamaged), says: "is missing, but the office pallet is born", not: None },
                 UnsettledTrust { name: "office unborn", trust: Some(settled.clone()), copy: None, unborn: true,
                     code: Some(RefusalCode::RefDamaged), says: "move the trust file aside, and its copy", not: None },
+                // Equal, but neither reads as an anchor: nothing was put before an office.
+                UnsettledTrust { name: "garbled twins, office unborn", trust: Some(garbled.clone()), copy: Some(garbled.clone()),
+                    unborn: true, code: Some(RefusalCode::RefDamaged), says: "restore the ref from a backup", not: None },
             ].into_iter().nth(case).unwrap();
 
             let forklift = crate::globals::forklift_root();
