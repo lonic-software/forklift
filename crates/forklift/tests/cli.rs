@@ -15619,7 +15619,9 @@ fn a_damaged_skeleton_is_refused_naming_the_abort() {
     // first, naming its own next step, and never reads the skeleton.
     let asked = warehouse.run(&["--json", "abort"]);
     assert_eq!(asked.status.code(), Some(39), "{}{}", stdout(&asked), stderr(&asked));
-    assert_eq!(json(&asked)["error"]["next_step"].as_str(), Some("forklift abort --confirm"), "{}", stdout(&asked));
+    let error = json(&asked)["error"].clone();
+    assert_eq!(error["code"].as_str(), Some("confirmation_required"), "{}", error);
+    assert!(error["next_step"].as_str().is_some_and(|step| step.contains("\"forklift abort --confirm\"")), "{}", error);
 
     assert_success(&warehouse.run(&["abort", "--confirm"]));
     assert_eq!(read(&warehouse, "f.txt"), "ours\n");
