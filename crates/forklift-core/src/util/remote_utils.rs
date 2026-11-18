@@ -139,10 +139,11 @@ const RESOLVE_REQUESTS_IN_FLIGHT: usize = 4;
 
 /// The characters a path SEGMENT (a pallet name, split on `/`) must be percent-encoded against
 /// before it is spliced into a URL. Everything but RFC 3986 unreserved characters (ASCII
-/// alphanumerics, `-`, `_`, `.`, `~`) is encoded — so a segment holding a space, `#`, `?`, `%`, or any other character
-/// that is reserved or unsafe in the URL grammar round-trips instead of producing an invalid or
-/// misrouted request. Non-ASCII UTF-8 bytes are always percent-encoded by `utf8_percent_encode`
-/// regardless of this set, since an `AsciiSet` only classifies the ASCII range.
+/// alphanumerics, `-`, `_`, `.`, `~`) is encoded — so a segment holding a space, `#`, `?`, `%`,
+/// or any other character that is reserved or unsafe in the URL grammar round-trips instead of
+/// producing an invalid or misrouted request. Non-ASCII UTF-8 bytes are always percent-encoded by
+/// `utf8_percent_encode` regardless of this set, since an `AsciiSet` only classifies the ASCII
+/// range.
 const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
@@ -1577,7 +1578,7 @@ mod clients {
         /// **Its consumers all need a client that never auto-follows.** `fetch_batch`'s `POST` so
         /// that a `307`/`308` cannot re-`POST` its body at a URL presigned for `GET` only (see
         /// [`super::RemoteClient::fetch_batch`]'s own doc), and every other one because it is a
-        /// mutation (`commit_lift` and `update_ref` among them). A read whose redirect is safe
+        /// mutation (`commit_lift` and `delete_ref` among them). A read whose redirect is safe
         /// to follow with every header it sent rides [`Self::HeadDeadline`] instead.
         HeadDeadlineNoRedirect {
             head: std::time::Duration,
@@ -4228,7 +4229,8 @@ impl RemoteClient {
         }
     }
 
-    /// Follow an offloading head's redirect of a batch response by hand, or hand back `response` and `posture` unchanged when it is not one.
+    /// Follow an offloading head's redirect of a batch response by hand, or hand back `response`
+    /// and `posture` unchanged when it is not one.
     /// Any `301`/`302`/`303`/`307`/`308` is followed with a bodyless `GET`. To another origin (a
     /// presigned storage URL, which is self-authorizing) it carries no `Authorization` header, so
     /// a token meant for this remote never leaves it; to this remote's own origin it carries the
