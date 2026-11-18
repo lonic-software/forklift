@@ -1677,7 +1677,7 @@ fn a_server_deletes_the_content_of_a_redaction_it_applied() {
 
 /// A server root as a crash before an apply leaves it: a redaction is recorded, the ref write that
 /// let it apply landed, and the server stopped before applying it, so its bytes are still held. The
-/// killed server's lock stays behind, and is removed as its operator would.
+/// killed server holds no lock, so nothing is cleared after it.
 ///
 /// # Returns
 /// The root, the redacted hash, and a kept file's hash.

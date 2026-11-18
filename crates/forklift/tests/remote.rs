@@ -4778,6 +4778,10 @@ fn a_second_server_and_gc_are_refused_while_serving_but_bundle_is_allowed() {
         .output()
         .unwrap();
     assert!(!gc.status.success(), "gc must be refused while serving");
+    // As a coded refusal, its next step on a line of its own, like the server's other commands.
+    let refused = String::from_utf8_lossy(&gc.stderr);
+    assert!(refused.contains("Refusing to gc: Another forklift process that is still running holds the warehouse root"), "{}", refused);
+    assert!(refused.contains("\nNext step: Stop the server serving it"), "{}", refused);
 
     // bundle, by contrast, is deliberately *allowed* against a live server: it never deletes an
     // object, writes atomically, and a stale bundle is self-healing.

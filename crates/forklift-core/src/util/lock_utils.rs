@@ -835,7 +835,9 @@ fn open_lock_sidecar(path: &Path) -> Result<std::fs::File, String> {
 /// Whether another handle — in this process or another — holds the kernel lock on the sidecar at
 /// `path`, which [`WarehouseLock`] takes. A missing sidecar is held by nothing; one that cannot be
 /// opened or tried counts as held, so the caller says a holder may be running rather than that
-/// none is. The probe never creates the sidecar; a free lock is taken and released at once.
+/// none is. The probe never creates the sidecar. It tries the lock *shared*, which an exclusive
+/// holder refuses, and releases it at once: for that instant a command taking the lock exclusively
+/// is refused as if another forklift process held it, and running it again succeeds.
 pub fn held_by_another_handle(path: &Path) -> bool {
     let sidecar = match std::fs::File::open(path) {
         Ok(sidecar) => sidecar,
@@ -843,7 +845,7 @@ pub fn held_by_another_handle(path: &Path) -> bool {
         Err(_) => return true,
     };
 
-    !matches!(sidecar.try_lock(), Ok(()))
+    !matches!(sidecar.try_lock_shared(), Ok(()))
 }
 
 /// Open the sidecar at `path` (creating it if needed) and take its kernel lock without waiting.

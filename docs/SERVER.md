@@ -309,7 +309,9 @@ revocation by more than about a day.
   make a concurrent lift fail its ref update — so stop the server, gc, then restart (run it
   in a maintenance window, not against a live server). The server's lock on the root is a
   kernel lock, released when its process ends however it ends, so a server that was killed
-  holds nothing: `gc` and a restart both go ahead with no file to remove. It is also refused
+  holds nothing: `gc` and a restart both go ahead with no file to remove. (Windows releases a
+  dead process's file locks shortly after it ends rather than always at once, so a command run the
+  instant after a kill can still be refused; running it again succeeds.) It is also refused
   while a `forklift` command that writes objects runs against the root, which could reuse an
   unreachable object the sweep is about to delete; that lock is a kernel lock too.
   It refuses, deleting nothing, when an object it must read to find what is still live is

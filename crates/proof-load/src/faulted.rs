@@ -2709,6 +2709,14 @@ mod tests {
         }
         assert!(answered(Some(&answer(Some(6), "Another forklift process that is still running holds the lock.", Some("Wait for it to finish, then run the command again.")))),
             "the same refusal under another code answers, so the code is what is read");
+        // The codes read are every code Forklift refuses on its lock exit, as its error table lists them.
+        let table = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/generated/errors.md")).unwrap();
+        let mut on_lock_exit: Vec<&str> = table.lines().filter_map(|line| line.strip_prefix("| `"))
+            .filter_map(|row| row.split_once("` | ")).filter(|(_, rest)| rest.starts_with("6 |")).map(|(code, _)| code).collect();
+        on_lock_exit.sort_unstable();
+        let mut read = LOCK_CODES.to_vec();
+        read.sort_unstable();
+        assert_eq!(read, on_lock_exit, "the lock codes answered() reads are the codes on exit 6");
         assert!(!answered(None));
         let mut crashed = answer(Some(101), "", None);
         crashed.failure = None;

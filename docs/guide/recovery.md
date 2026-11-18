@@ -44,7 +44,8 @@ To throw away edits on purpose, `forklift restore` previews what it would discar
 Another forklift process that is still running holds a lock the command needs:
 
 - `warehouse_locked`: the bay's lock, held by any command that changes the bay;
-- `store_locked`: the object store's lock, held by a compaction;
+- `store_locked`: the object store's lock, held by `store compact`, `store evict`, a redaction's
+  deletion and heal's rebuild of an index while they run;
 - `serve_locked`: the warehouse root's lock, held by a `forklift-server` serving it, and by `gc`,
   `store compact --all` and `store evict` while they run.
 
