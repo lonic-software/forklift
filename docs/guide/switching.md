@@ -97,7 +97,7 @@ Forklift always ignores `.git`, so both read clean. Git rewrites some files as i
 import warns, naming it, and `stocktake` shows it as modified. Load and stack it as it stands, or
 `forklift restore --confirm` it to write the stored content back. Git for Windows converts line
 endings by default (`core.autocrlf=true`), so on Windows every text file of this clone reads as
-modified after the import, and the import warns about each one. [The CLI
+modified after the import, and the import warns, naming the first few. [The CLI
 guide](cli.md#git-import--migrate-a-git-repository) says more.
 
 ## 3. Sign from here on
@@ -151,10 +151,11 @@ import:
 
 Some repositories stop the import with an error that names what to change in git. Before anything is
 imported, a branch name that would become an invalid pallet name, or two branches that would become
-the same one (`Feature` and `feature`), stop it. As the history is read, a file or directory name
-anywhere in it that is not UTF-8 or is more than one path component, or one that some file system
-opens as `.forklift`, stops it. Change what the error names, then import again into a fresh
-warehouse.
+the same one (`Feature` and `feature`), stop it. Rename such branches in git and import again. As
+the history is read, a file or directory name anywhere in it that is not UTF-8 or is not a single
+plain path component (`..`, a name containing `/`), or one that some file system opens as
+`.forklift`, stops it. Changing such a name means rewriting the git history (with a tool such as
+`git filter-repo`, which gives new commit ids); then import again into a fresh warehouse.
 
 ## 5. Habits that carry over, and the ones that do not
 

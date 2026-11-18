@@ -564,15 +564,19 @@ impl Reader {
     /// Git reads only the machine's own global file, which starts empty, so a page shows git as it
     /// behaves with no configuration: not as Git for Windows' own system file sets it up.
     fn environment(&self, command: &mut Command) {
-        let inherited: Vec<std::ffi::OsString> = std::env::vars_os()
-            .map(|(key, _)| key)
-            .chain(command.get_envs().map(|(key, _)| key.to_os_string()))
+        // Git's variables go wherever they were set, on the command too; forklift's own launch
+        // settings on the command (`test_command`'s) are the test's and stay.
+        let set_on_command: Vec<std::ffi::OsString> = command
+            .get_envs()
+            .map(|(key, _)| key.to_os_string())
+            .filter(|key| key.to_string_lossy().starts_with("GIT_"))
             .collect();
-        for key in inherited {
+        let inherited = std::env::vars_os().map(|(key, _)| key).filter(|key| {
             let key_text = key.to_string_lossy();
-            if ["FORKLIFT_", "RUST_LOG", "GIT_"].iter().any(|prefix| key_text.starts_with(prefix)) {
-                command.env_remove(&key);
-            }
+            ["FORKLIFT_", "RUST_LOG", "GIT_"].iter().any(|prefix| key_text.starts_with(prefix))
+        });
+        for key in inherited.chain(set_on_command) {
+            command.env_remove(&key);
         }
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")
