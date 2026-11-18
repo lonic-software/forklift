@@ -367,9 +367,10 @@ pub struct Operated {
 impl Host {
     /// Runs `arguments`, a command of the server's program over this warehouse, as its operator
     /// does: the server stopped as [`Served::stop`] stops it, the command run in the scratch root,
-    /// then each command `then` names from its outcome, in order, still before serving, then the
-    /// server started again behind the same URL ([`Host::restart`]), even when a command could not
-    /// be run. A server that will not stop is an error, and nothing is run after it.
+    /// then each command `then` names from its outcome, in order, still before serving, up to the
+    /// first that cannot be run, then the server started again behind the same URL
+    /// ([`Host::restart`]), even when a command could not be run. A server that will not stop is an
+    /// error, and nothing is run after it.
     pub fn operate(&self, arguments: Vec<String>, then: impl FnOnce(&tool::Outcome) -> Vec<Vec<String>>, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Operated, ToolError> {
         let spawn = |reason: String| ToolError::Spawn { program: self.program.clone(), reason: format!("stopping the server for its operator's remedy: {}", reason) };
         // Out of the slot first, as a kill takes it, so the stop never reads as a server that ended.
