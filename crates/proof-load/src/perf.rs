@@ -14,15 +14,16 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::faulted::PROBE_REF;
 use crate::generate::{self, Generated, Shape, SIDE_BRANCH};
 use crate::report::Platform;
-use crate::runner::{self, RunError as BuildError};
-use crate::scenario::{Tool, GIT_TUNED};
+use crate::runner::{self, RunError as BuildError, GIT_CREATED_CONFIG};
+use crate::scenario::{Tool, GIT_TUNED, URL, WORK};
 use crate::scrub::{Environment, Output, Scratch};
 use crate::tool::{self, Invocation, ToolError};
 
 /// The perf document's format. A reader refuses any other number rather than guess at it.
-pub const PERF_FORMAT: u32 = 2;
+pub const PERF_FORMAT: u32 = 3;
 
 /// How long one timed or untimed command of the loop may run.
 const COMMAND_LIMIT: Duration = Duration::from_secs(10 * 60);
@@ -40,6 +41,15 @@ const COMMIT_MESSAGE: &str = "perf: a timed commit";
 const NO_DROP: &str = "no cache-drop program given (--drop-caches)";
 /// Why a cold row was not run on Windows.
 const NO_COLD_ON_WINDOWS: &str = "cold runs are not built on Windows in this harness";
+/// How many commits the push pair's remote stands behind the subject's head, and the pull pair's
+/// stands past it.
+const DISTANCE: usize = 3;
+/// How long a forklift-server may take to start listening, and to stop once asked.
+const SERVE_LIMIT: Duration = Duration::from_secs(60);
+/// Why the remote rows were not run when no forklift-server was given.
+const NO_SERVER: &str = "no forklift-server given (--forklift-server)";
+/// Why the remote rows were not run on Windows.
+const NO_REMOTE_ON_WINDOWS: &str = "remote rows are not built on Windows in this harness, which stops a forklift-server gracefully only on unix";
 
 /// One perf run's document.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -127,7 +137,8 @@ pub enum Outcome {
 #[serde(deny_unknown_fields)]
 pub struct Cell {
     pub subject: Tool,
-    /// The arguments after the binary, as every repetition ran them.
+    /// The arguments after the binary, as every repetition ran them. A clone's names its remote's
+    /// URL and its new folder as `{url}` and `{work}`, since each repetition has its own.
     pub command: Vec<String>,
     pub result: Measured,
 }
@@ -149,6 +160,10 @@ pub enum Measured {
     /// The cache-drop program ran past its limit before a cold repetition and was killed, so the
     /// repetition was not run.
     DropKilledAtLimit { limit_ms: u64 },
+    /// A transfer succeeded but did not carry the head across, so its time would be of no
+    /// transfer: a push or a pull by the refs read before and after it, a clone by the head its new
+    /// work tree landed on. What the reads said.
+    NothingMoved { reason: String },
 }
 
 /// Microseconds over the repetitions: never the mean.
@@ -268,6 +283,9 @@ impl PerfReport {
                             Measured::DropKilledAtLimit { limit_ms } => {
                                 let _ = writeln!(out, "| {} | voided: the cache-drop program was killed at its {} limit | | | | | {} |", cell.subject.label(), micros(limit_ms.saturating_mul(1000)), command);
                             }
+                            Measured::NothingMoved { reason } => {
+                                let _ = writeln!(out, "| {} | voided: did not move the head: {} | | | | | {} |", cell.subject.label(), reason.replace('|', "\\|"), command);
+                            }
                         }
                     }
                 }
@@ -300,6 +318,8 @@ pub struct PerfOptions {
     /// The program each cold repetition runs first to drop the operating system's caches; without
     /// it the cold rows are not run.
     pub drop_caches: Option<PathBuf>,
+    /// The forklift-server that serves Forklift's remotes; without it the remote rows are not run.
+    pub forklift_server: Option<PathBuf>,
 }
 
 /// One subject a pair runs on: its tool, the binary, the arguments every one of its command lines
@@ -365,6 +385,8 @@ pub fn run(options: &PerfOptions, progress: &dyn Fn(&str)) -> Result<PerfReport,
     let git = absolute("--git", &options.git)?;
     let drop_caches = options.drop_caches.as_deref().map(|program| absolute("--drop-caches", program)).transpose()?;
     let cold = cold_when(cfg!(windows), drop_caches);
+    let forklift_server = options.forklift_server.as_deref().map(|program| absolute("--forklift-server", program)).transpose()?;
+    let remote = remote_when(cfg!(windows), forklift_server);
     let mut output = Output::claim(&options.out).map_err(|error| error.to_string())?;
     let scratch = output.scratch("perf").map_err(|error| error.to_string())?;
     let search_path = crate::scrub::search_path(Some(&git), std::env::var_os("PATH"));
@@ -372,12 +394,15 @@ pub fn run(options: &PerfOptions, progress: &dyn Fn(&str)) -> Result<PerfReport,
 
     let built = build(&forklift, &git, &shape, &scratch, &environment, progress).map_err(|error| format!("building the subjects failed: {}", error))?;
     let daemon = built.daemon.is_some();
-    let rows = pairs(&built, options.reps, &cold, &scratch, &environment, progress).map_err(|error| error.to_string())?;
+    let rows = pairs(&built, options.reps, &cold, &remote, &scratch, &environment, progress).map_err(|error| error.to_string())?;
     drop(built);
 
     let mut tools = BTreeMap::new();
     tools.insert("forklift".to_string(), crate::run::described(&forklift));
     tools.insert("git".to_string(), crate::run::described(&git));
+    if let Ok(server) = &remote {
+        tools.insert("forklift-server".to_string(), crate::run::described(server));
+    }
     let mut configurations = BTreeMap::new();
     configurations.insert(Tool::Git.label().to_string(), crate::run::created_configuration());
     configurations.insert(Tool::GitTuned.label().to_string(), format!("{}; a commit-graph written untimed after the build", crate::run::tuned_configuration(daemon)));
@@ -396,6 +421,8 @@ pub fn run(options: &PerfOptions, progress: &dyn Fn(&str)) -> Result<PerfReport,
 /// The three subjects over one generated history, and the daemon kept running for tuned git.
 struct Built {
     generated: Generated,
+    /// The generated history's branch, which every subject also has [`PROBE_REF`] at the tip of.
+    branch: String,
     subjects: Vec<Subject>,
     /// Stopped when dropped.
     daemon: Option<runner::FsmonitorDaemon>,
@@ -445,7 +472,7 @@ fn build(forklift: &Path, git: &Path, shape: &Shape, scratch: &Scratch, environm
             watched: daemon.is_some(),
         },
     ];
-    Ok(Built { generated, subjects, daemon })
+    Ok(Built { generated, branch, subjects, daemon })
 }
 
 /// Why a loop step could not go on: a tool that could not be run at all, or a file the harness
@@ -467,8 +494,10 @@ impl From<ToolError> for Stopped {
 
 /// Every pair, each as a warm row and then a cold one: status, log and blame on the clean tree; the
 /// write pairs, commit, switch and merge, each repetition on a fresh copy of the clean subject;
+/// the remote pairs, clone, push and pull, each repetition against a fresh copy of its remote;
 /// then diff and diff --staged over one edit set.
-fn pairs(built: &Built, reps: usize, cold: &Cold, scratch: &Scratch, environment: &Environment, progress: &dyn Fn(&str)) -> Result<Vec<Row>, Stopped> {
+#[allow(clippy::too_many_arguments)]
+fn pairs(built: &Built, reps: usize, cold: &Cold, remote: &Remote, scratch: &Scratch, environment: &Environment, progress: &dyn Fn(&str)) -> Result<Vec<Row>, Stopped> {
     let subjects = &built.subjects;
     let blame = built.generated.blame_file.as_str();
     let edited: Vec<&str> = built.generated.text_files.iter().take(EDITED).map(String::as_str).collect();
@@ -493,6 +522,7 @@ fn pairs(built: &Built, reps: usize, cold: &Cold, scratch: &Scratch, environment
     }
 
     writes(subjects, &edited, reps, cold, scratch, environment, progress, &mut rows)?;
+    remotes(subjects, &built.branch, &edited, reps, cold, remote, scratch, environment, progress, &mut rows)?;
 
     for subject in subjects {
         edit(&subject.work, &edited)?;
@@ -611,6 +641,537 @@ fn writes(subjects: &[Subject], edited: &[&str], reps: usize, cold: &Cold, scrat
         both(rows, operation, &note, check, cold, |cold| fresh_pair(subjects, &forklift, &git, reps, cold, &fresh, scratch, environment))?;
     }
     Ok(())
+}
+
+/// The forklift-server the remote rows serve Forklift's remotes with, or why they are not run.
+type Remote = Result<PathBuf, String>;
+
+/// The remote rows' plan on a platform that is Windows or not, given the forklift-server the
+/// caller named, if any.
+fn remote_when(windows: bool, server: Option<PathBuf>) -> Remote {
+    match server {
+        _ if windows => Err(NO_REMOTE_ON_WINDOWS.to_string()),
+        Some(server) => Ok(server),
+        None => Err(NO_SERVER.to_string()),
+    }
+}
+
+/// The value of a step whose inner error says why it failed, or that reason returned as the
+/// enclosing function's own inner error.
+macro_rules! or_return {
+    ($step:expr) => {
+        match $step {
+            Ok(value) => value,
+            Err(reason) => return Ok(Err(reason)),
+        }
+    };
+}
+
+/// A remote pair: one that talks to a remote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transfer {
+    Clone,
+    Push,
+    Pull,
+}
+
+impl Transfer {
+    fn operation(self) -> &'static str {
+        match self {
+            Transfer::Clone => "clone",
+            Transfer::Push => "push",
+            Transfer::Pull => "pull",
+        }
+    }
+}
+
+/// A remote pair's timed lines, Forklift's and then git's, before a subject's own prefix, with the
+/// remote as [`URL`] and a clone's new folder as [`WORK`]: the lines scenario::bind runs for its
+/// full clone, push and fetch, less the `--json` it gives Forklift's. A test holds the two tables
+/// to each other.
+fn remote_lines(transfer: Transfer) -> [Vec<&'static str>; 2] {
+    match transfer {
+        Transfer::Clone => [vec!["clone", URL, WORK], vec!["clone", "-q", "--no-local", URL, WORK]],
+        Transfer::Push => [vec!["lift"], vec!["push", "-q", "-u", "origin", "HEAD"]],
+        Transfer::Pull => [vec!["lower"], vec!["pull", "-q", "--ff-only"]],
+    }
+}
+
+/// What one subject's remote pairs start from, each copied afresh for every repetition. `level`
+/// is a remote, a forklift-server root for Forklift's and a bare repository for git's, holding the
+/// history's branch and [`PROBE_REF`], the subject's current branch, at the subject's head: the
+/// clone's remote, and the push's. `ahead` is the subject with [`DISTANCE`] commits more on
+/// [`PROBE_REF`], the push's subject; and `past` a remote holding that branch there, the pull's.
+///
+/// The push's subject goes ahead rather than its remote behind because Forklift's subject is
+/// enrolled at its head: a remote behind it would lack the parcel trust begins at, and
+/// forklift-server refuses an unsigned parcel it cannot place before that boundary.
+#[derive(Clone, Debug)]
+struct Hosts {
+    level: PathBuf,
+    ahead: PathBuf,
+    past: PathBuf,
+}
+
+impl Hosts {
+    /// The remote `transfer` runs against.
+    fn remote(&self, transfer: Transfer) -> &Path {
+        match transfer {
+            Transfer::Clone | Transfer::Push => &self.level,
+            Transfer::Pull => &self.past,
+        }
+    }
+
+    /// The work tree a push or a pull runs in, copied for each repetition: the subject's own, but
+    /// the push's ahead of it.
+    fn work<'a>(&'a self, subject: &'a Subject, transfer: Transfer) -> &'a Path {
+        match transfer {
+            Transfer::Push => &self.ahead,
+            Transfer::Clone | Transfer::Pull => &subject.work,
+        }
+    }
+}
+
+/// The remote pairs, warm and cold: clone, push and pull, each repetition against a fresh copy of
+/// a remote built untimed from the clean subject, and push and pull in a fresh copy of a work
+/// tree too. Not run without a forklift-server, and not comparable when the remotes could not be
+/// built.
+#[allow(clippy::too_many_arguments)]
+fn remotes(subjects: &[Subject], branch: &str, edited: &[&str], reps: usize, cold: &Cold, remote: &Remote, scratch: &Scratch, environment: &Environment, progress: &dyn Fn(&str), rows: &mut Vec<Row>) -> Result<(), Stopped> {
+    let transports = "Forklift's over HTTP on loopback to a forklift-server, git's to a bare repository by path";
+    let transfers = [
+        (Transfer::Clone, format!("the whole history of {}, cloned into a new folder from a fresh copy of the remote for each repetition; {}", branch, transports)),
+        (Transfer::Push, format!(
+            "the current branch with {} commits more than the remote's, pushed from a fresh copy of the subject so advanced to a fresh copy of the remote for each repetition, which must leave the remote's branch at the pushed head; {}",
+            DISTANCE, transports,
+        )),
+        (Transfer::Pull, format!(
+            "the remote's branch, {} commits past the current one, pulled as a fast-forward into a fresh copy of the subject from a fresh copy of the remote for each repetition, which must leave the subject's head at the remote's; {}",
+            DISTANCE, transports,
+        )),
+    ];
+    let server = match remote {
+        Ok(server) => server,
+        Err(reason) => {
+            for (transfer, note) in transfers {
+                for cache in [Cache::Warm, Cache::Cold] {
+                    rows.push(Row { operation: transfer.operation().to_string(), cache, note: note.clone(), outcome: Outcome::NotRun { reason: reason.clone() } });
+                }
+            }
+            return Ok(());
+        }
+    };
+    let copies = scratch.work().join("copies");
+    std::fs::create_dir_all(&copies).map_err(|error| Stopped(format!("{}: {}", copies.display(), error)))?;
+    progress("building the remotes");
+    let folder = Copied(Some(scratch.work().join("remotes")));
+    let built = hosts(subjects, server, branch, edited, folder.path(), scratch, environment)?;
+    let check = built.as_ref().map(|_| ()).map_err(|reason| format!("building the remotes failed: {}", reason));
+    let hosts = built.as_deref().unwrap_or(&[]);
+    for (transfer, note) in transfers {
+        progress(&format!("timing {}", transfer.operation()));
+        both(rows, transfer.operation(), &note, check.clone(), cold, |cold| remote_pair(subjects, hosts, transfer, branch, reps, cold, server, &copies, scratch, environment))?;
+    }
+    // A full tree for each subject, and its remotes: removed as the write pairs' copies are.
+    folder.remove()
+}
+
+/// Builds every subject's remotes and its advanced work tree under `folder`, untimed, or gives
+/// why one could not be built.
+#[allow(clippy::too_many_arguments)]
+fn hosts(subjects: &[Subject], server: &Path, branch: &str, edited: &[&str], folder: &Path, scratch: &Scratch, environment: &Environment) -> Result<Result<Vec<Hosts>, String>, Stopped> {
+    std::fs::create_dir_all(folder).map_err(|error| Stopped(format!("{}: {}", folder.display(), error)))?;
+    if edited.is_empty() {
+        return Ok(Err("the history has no text file to make the advanced commits with".to_string()));
+    }
+    let mut all = Vec::new();
+    for subject in subjects {
+        let at = |name: &str| folder.join(format!("{}-{}", subject.tool.label(), name));
+        let hosts = Hosts { level: at("level"), ahead: at("ahead"), past: at("past") };
+        // A watched copy's untimed git commands start git's own fsmonitor daemon over it; these
+        // stop it once the copy is done with, as the write pairs' daemons are stopped.
+        let stops = |work: &Path| subject.watched.then(|| runner::StopsDaemon { program: subject.program.clone(), work: work.to_path_buf(), environment: environment.clone() });
+        let source = Copied(Some(at("level-source")));
+        crate::scrub::copy_tree(&subject.work, source.path()).map_err(|error| Stopped(format!("copying {} to {}: {:?}", subject.work.display(), source.path().display(), error)))?;
+        let level = {
+            let _stops = stops(source.path());
+            host(&subject.at(source.path().to_path_buf()), &[branch, PROBE_REF], server, &hosts.level, scratch, environment)
+        };
+        let removed = source.remove();
+        let level = level?;
+        removed?;
+        if let Err(reason) = level {
+            return Ok(Err(format!("{}'s remote at its head: {}", named(subject.tool), reason)));
+        }
+        crate::scrub::copy_tree(&subject.work, &hosts.ahead).map_err(|error| Stopped(format!("copying {} to {}: {:?}", subject.work.display(), hosts.ahead.display(), error)))?;
+        keep_times(&subject.work, &hosts.ahead)?;
+        let _stops = stops(&hosts.ahead);
+        let ahead = subject.at(hosts.ahead.clone());
+        let advanced = advance(&ahead, edited, scratch, environment)?;
+        if let Err(reason) = advanced {
+            return Ok(Err(format!("{}'s commits past its head: {}", named(subject.tool), reason)));
+        }
+        if let Err(reason) = host(&ahead, &[PROBE_REF], server, &hosts.past, scratch, environment)? {
+            return Ok(Err(format!("{}'s remote past its head: {}", named(subject.tool), reason)));
+        }
+        all.push(hosts);
+    }
+    Ok(Ok(all))
+}
+
+/// Makes [`DISTANCE`] commits on `copy`'s current branch, each an edit of one of `edited`.
+fn advance(copy: &Subject, edited: &[&str], scratch: &Scratch, environment: &Environment) -> Result<Result<(), String>, Stopped> {
+    for (index, file) in edited.iter().cycle().take(DISTANCE).enumerate() {
+        edit(&copy.work, &[file])?;
+        let message = format!("perf: commit {} of {} past the subject's head", index + 1, DISTANCE);
+        let lines: [&[&str]; 2] = if copy.tool == Tool::Forklift {
+            [&["load", "."], &["stack", "-m", &message]]
+        } else {
+            [&["add", "-A"], &["commit", "-q", "-m", &message]]
+        };
+        for line in lines {
+            or_return!(output(copy, line, scratch, environment)?);
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// Runs `arguments` with `program` in `directory`, untimed, giving what it printed on stdout, or
+/// why it did not succeed.
+fn untimed(program: &Path, arguments: &[&str], directory: &Path, scratch: &Scratch, environment: &Environment) -> Result<Result<String, String>, Stopped> {
+    let invocation = Invocation { program: program.to_path_buf(), arguments: arguments.iter().map(|argument| argument.to_string()).collect(), directory: directory.to_path_buf(), limit: COMMAND_LIMIT };
+    let outcome = tool::run(&invocation, scratch, environment)?;
+    if !outcome.succeeded() {
+        return Ok(Err(format!("{} {} exited {:?}: {}", program.display(), arguments.join(" "), outcome.exit, String::from_utf8_lossy(&outcome.stderr).trim())));
+    }
+    Ok(Ok(String::from_utf8_lossy(&outcome.stdout).into_owned()))
+}
+
+/// Builds a remote at `root` holding `branches` where `source`, a copy of a subject on
+/// [`PROBE_REF`], has them: a forklift-server root lifted to from the copy, which it shifts
+/// between them, for Forklift's; a bare repository pushed to, its HEAD naming the first of
+/// `branches`, for git's, so that git's clone checks out the branch Forklift's does.
+fn host(source: &Subject, branches: &[&str], server: &Path, root: &Path, scratch: &Scratch, environment: &Environment) -> Result<Result<(), String>, Stopped> {
+    let root_text = root.display().to_string();
+    if source.tool != Tool::Forklift {
+        or_return!(untimed(&source.program, &["init", "--bare", "-q", "-b", branches[0], &root_text], scratch.root(), scratch, environment)?);
+        for [key, value] in GIT_CREATED_CONFIG {
+            or_return!(untimed(&source.program, &["config", key, value], root, scratch, environment)?);
+        }
+        let mut push = vec!["push".to_string(), "-q".to_string(), root_text];
+        push.extend(branches.iter().map(|branch| format!("refs/heads/{0}:refs/heads/{0}", branch)));
+        or_return!(output(source, &push.iter().map(String::as_str).collect::<Vec<_>>(), scratch, environment)?);
+        return Ok(Ok(()));
+    }
+    or_return!(untimed(server, &["prepare", "--root", &root_text], scratch.root(), scratch, environment)?);
+    let served = match tool::serve(server, root, scratch, environment, SERVE_LIMIT) {
+        Ok(served) => served,
+        Err(error) => return Ok(Err(format!("forklift-server over {} did not start: {}", root.display(), error))),
+    };
+    let mut lifted = output(source, &["config", "set", "remote.url", &served.url], scratch, environment)?.map(|_| ());
+    // Lifted from PROBE_REF last, so the copy ends on the branch it started on.
+    let order = branches.iter().filter(|branch| **branch != PROBE_REF).chain(branches.iter().filter(|branch| **branch == PROBE_REF));
+    'lifting: for branch in order {
+        for line in [&["shift", branch][..], &["lift"]] {
+            if lifted.is_err() {
+                break 'lifting;
+            }
+            lifted = output(source, line, scratch, environment)?.map(|_| ());
+        }
+    }
+    if let Err(reason) = served.stop(SERVE_LIMIT) {
+        return Ok(Err(format!("forklift-server over {}: {}", root.display(), reason)));
+    }
+    Ok(lifted)
+}
+
+/// Times a remote pair: every repetition against a fresh copy of each subject's remote for
+/// `transfer`, and for push and pull from a fresh copy of the subject. Not comparable when a copy
+/// did not reach the state the pair starts from, or the transfer left it not clean.
+#[allow(clippy::too_many_arguments)]
+fn remote_pair(subjects: &[Subject], hosts: &[Hosts], transfer: Transfer, branch: &str, reps: usize, cold: Option<&DropCaches>, server: &Path, copies: &Path, scratch: &Scratch, environment: &Environment) -> Result<Outcome, Stopped> {
+    let [forklift, git] = remote_lines(transfer);
+    let mut cells = Vec::new();
+    for (subject, hosts) in subjects.iter().zip(hosts) {
+        let command = subject.line(if subject.tool == Tool::Forklift { &forklift } else { &git });
+        let cloned = match transfer {
+            Transfer::Clone => match head(subject, scratch, environment)? {
+                Ok(at) => Some(Head { branch: branch.to_string(), commit: at.commit }),
+                Err(reason) => return Ok(Outcome::NotComparable { reason }),
+            },
+            Transfer::Push | Transfer::Pull => None,
+        };
+        let remote = Against { transfer, template: hosts.remote(transfer), work: hosts.work(subject, transfer), cloned, server, copies };
+        match remote_cell(subject, &command, reps, cold, &remote, scratch, environment)? {
+            Ok(result) => cells.push(Cell { subject: subject.tool, command, result }),
+            Err(reason) => return Ok(Outcome::NotComparable { reason }),
+        }
+    }
+    Ok(Outcome::Timed { cells })
+}
+
+/// What each repetition of a remote cell runs against: a fresh copy of `template`, served by
+/// `server` for Forklift's, from a fresh copy of `work` for a push or a pull, each copy and a
+/// clone's folder under `copies`. A clone must land on `cloned`, which only a clone has.
+struct Against<'a> {
+    transfer: Transfer,
+    template: &'a Path,
+    work: &'a Path,
+    cloned: Option<Head>,
+    server: &'a Path,
+    copies: &'a Path,
+}
+
+/// One remote cell, as a write cell is: a warm cell's untimed run first, on copies of its own,
+/// and every copy removed after its repetition, however the repetition ended.
+fn remote_cell(subject: &Subject, command: &[String], reps: usize, cold: Option<&DropCaches>, remote: &Against, scratch: &Scratch, environment: &Environment) -> Result<Result<Measured, String>, Stopped> {
+    let cache = if cold.is_some() { Cache::Cold } else { Cache::Warm };
+    let first = if cold.is_some() { 1 } else { 0 };
+    let mut runs = Vec::with_capacity(reps);
+    for rep in first..=reps {
+        let name = format!("{}-{}-{}-{}", remote.transfer.operation(), cache.label(), subject.tool.label(), rep);
+        let work = Copied(Some(remote.copies.join(&name)));
+        let host = Copied(Some(remote.copies.join(format!("{}-remote", name))));
+        let step = remote_rep(subject, command, rep, cold, remote, work.path(), host.path(), scratch, environment);
+        let removed = [if remote.transfer == Transfer::Clone { work.remove_if_made() } else { work.remove() }, host.remove()];
+        let step = step?;
+        for removed in removed {
+            removed?;
+        }
+        match step {
+            Step::Ran(timed) => runs.extend(timed),
+            Step::Ended(ended) => return Ok(ended),
+        }
+    }
+    Ok(Ok(summarise(&runs)))
+}
+
+/// Repetition `rep` of a remote cell, against a fresh copy of the remote at `host`, served for
+/// Forklift's, and with the subject's copy, or the clone, at `work`; repetition 0 is the untimed
+/// run. A push or a pull is judged by the refs read before and after it as well as clean after; a
+/// clone, by where its new work tree landed and its reading clean.
+#[allow(clippy::too_many_arguments)]
+fn remote_rep(subject: &Subject, command: &[String], rep: usize, cold: Option<&DropCaches>, remote: &Against, work: &Path, host: &Path, scratch: &Scratch, environment: &Environment) -> Result<Step, Stopped> {
+    let before = if rep == 0 { "before the untimed run".to_string() } else { format!("before repetition {}", rep) };
+    crate::scrub::copy_tree(remote.template, host).map_err(|error| Stopped(format!("copying {} to {}: {:?}", remote.template.display(), host.display(), error)))?;
+    if subject.tool != Tool::Forklift {
+        return transfer_rep(subject, command, rep, cold, remote, work, host, &host.display().to_string(), &before, scratch, environment);
+    }
+    let mut served = match tool::serve(remote.server, host, scratch, environment, SERVE_LIMIT) {
+        Ok(served) => served,
+        Err(error) => return Ok(Step::Ended(Err(format!("{}, forklift-server over the remote did not start: {}", before, error)))),
+    };
+    let url = served.url.clone();
+    let step = transfer_rep(subject, command, rep, cold, remote, work, host, &url, &before, scratch, environment);
+    // Stopped before the copies are removed; one that ended on its own served a repetition
+    // nothing can vouch for.
+    let stopped = match served.ended() {
+        Some(status) => Err(format!("forklift-server over the remote ended on its own, {}", status)),
+        None => served.stop(SERVE_LIMIT).map_err(|reason| format!("forklift-server over the remote did not stop: {}", reason)),
+    };
+    let step = step?;
+    let Err(reason) = stopped else {
+        return Ok(step);
+    };
+    let at = if rep == 0 { "after the untimed run".to_string() } else { format!("after repetition {}", rep) };
+    // What the command itself gave is kept beside the server's failure, which may be its cause.
+    let own = match step {
+        Step::Ended(Ok(Measured::Voided { exit, signal, stderr })) => {
+            let ended = exit.map(|code| format!("exited {}", code)).or_else(|| signal.map(|signal| format!("died of signal {}", signal))).unwrap_or_else(|| "ended".to_string());
+            format!("; the command had {}: {}", ended, stderr.trim())
+        }
+        Step::Ended(Ok(Measured::NothingMoved { reason })) => format!("; the command had moved nothing: {}", reason),
+        Step::Ended(Err(reason)) => format!("; the repetition was already not comparable: {}", reason),
+        Step::Ended(Ok(_)) | Step::Ran(_) => String::new(),
+    };
+    Ok(Step::Ended(Err(format!("{}, {}{}", at, reason, own))))
+}
+
+/// The repetition itself, against the copy of the remote at `host`, reached at `url`.
+#[allow(clippy::too_many_arguments)]
+fn transfer_rep(subject: &Subject, command: &[String], rep: usize, cold: Option<&DropCaches>, remote: &Against, work: &Path, host: &Path, url: &str, before: &str, scratch: &Scratch, environment: &Environment) -> Result<Step, Stopped> {
+    let untimed_run = |invocation: &Invocation| match tool::run(invocation, scratch, environment) {
+        Ok(_) => Ok(Step::Ran(None)),
+        Err(ToolError::TimedOut { .. }) => Ok(Step::Ended(Ok(killed(invocation.limit)))),
+        Err(error) => Err(Stopped::from(error)),
+    };
+
+    if remote.transfer == Transfer::Clone {
+        let arguments = runner::fill(command.to_vec(), Some(url), work).map_err(|placeholder| Stopped(format!("the clone's line left {} unfilled", placeholder)))?;
+        let invocation = Invocation { program: subject.program.clone(), arguments, directory: remote.copies.to_path_buf(), limit: COMMAND_LIMIT };
+        settle(host)?;
+        if rep == 0 {
+            return untimed_run(&invocation);
+        }
+        let timed = match repetition(&invocation, cold, scratch, environment)? {
+            Ok(timed) => timed,
+            Err(ended) => return Ok(Step::Ended(Ok(ended))),
+        };
+        let clone = Subject { watched: false, ..subject.at(work.to_path_buf()) };
+        match head(&clone, scratch, environment)? {
+            Err(reason) => return Ok(Step::Ended(Err(format!("after repetition {}, the clone: {}", rep, reason)))),
+            Ok(landed) => {
+                let expected = remote.cloned.as_ref().expect("a clone's cell knows where it must land");
+                if let Err(reason) = landed_on(clone.tool, expected, &landed) {
+                    return Ok(Step::Ended(Ok(Measured::NothingMoved { reason: format!("repetition {}: {}", rep, reason) })));
+                }
+            }
+        }
+        if let Err(reason) = same(std::slice::from_ref(&clone), &Changes::default(), scratch, environment)? {
+            return Ok(Step::Ended(Err(format!("after repetition {}, the clone: {}", rep, reason))));
+        }
+        return Ok(Step::Ran(Some(timed)));
+    }
+
+    crate::scrub::copy_tree(remote.work, work).map_err(|error| Stopped(format!("copying {} to {}: {:?}", remote.work.display(), work.display(), error)))?;
+    keep_times(remote.work, work)?;
+    let copy = subject.at(work.to_path_buf());
+    let _daemon = if copy.watched {
+        Some(runner::FsmonitorDaemon::watch(&copy.program, &copy.work, scratch, environment, COMMAND_LIMIT).map_err(|error| Stopped(error.to_string()))?.0)
+    } else {
+        None
+    };
+    let mut configure: Vec<Vec<String>> = if copy.tool == Tool::Forklift {
+        vec![vec!["config".into(), "set".into(), "remote.url".into(), url.to_string()]]
+    } else {
+        vec![
+            vec!["config".into(), "remote.origin.url".into(), url.to_string()],
+            vec!["config".into(), "remote.origin.fetch".into(), "+refs/heads/*:refs/remotes/origin/*".into()],
+        ]
+    };
+    if copy.tool != Tool::Forklift && remote.transfer == Transfer::Pull {
+        configure.push(vec!["config".into(), format!("branch.{}.remote", PROBE_REF), "origin".into()]);
+        configure.push(vec!["config".into(), format!("branch.{}.merge", PROBE_REF), format!("refs/heads/{}", PROBE_REF)]);
+    }
+    for line in configure {
+        if let Err(reason) = output(&copy, &line.iter().map(String::as_str).collect::<Vec<_>>(), scratch, environment)? {
+            return Ok(Step::Ended(Err(format!("{}, setting the remote failed: {}", before, reason))));
+        }
+    }
+    if let Err(reason) = refresh_untimed(&copy, scratch, environment)? {
+        return Ok(Step::Ended(Err(format!("{}, the refresh failed: {}", before, reason))));
+    }
+    let invocation = copy.invocation(command.to_vec());
+    if rep == 0 {
+        settle(work)?;
+        settle(host)?;
+        return untimed_run(&invocation);
+    }
+    if let Err(reason) = same(std::slice::from_ref(&copy), &Changes::default(), scratch, environment)? {
+        return Ok(Step::Ended(Err(format!("{}, {}", before, reason))));
+    }
+    let refs_before = match refs(&copy, scratch, environment)? {
+        Ok(refs) => refs,
+        Err(reason) => return Ok(Step::Ended(Err(format!("{}, {}", before, reason)))),
+    };
+    settle(work)?;
+    settle(host)?;
+    let timed = match repetition(&invocation, cold, scratch, environment)? {
+        Ok(timed) => timed,
+        Err(ended) => return Ok(Step::Ended(Ok(ended))),
+    };
+    let refs_after = match refs(&copy, scratch, environment)? {
+        Ok(refs) => refs,
+        Err(reason) => return Ok(Step::Ended(Err(format!("after repetition {}, {}", rep, reason)))),
+    };
+    if let Err(reason) = moved(remote.transfer, copy.tool, &refs_before, &refs_after) {
+        return Ok(Step::Ended(Ok(Measured::NothingMoved { reason: format!("repetition {}: {}", rep, reason) })));
+    }
+    if let Err(reason) = same(std::slice::from_ref(&copy), &Changes::default(), scratch, environment)? {
+        return Ok(Step::Ended(Err(format!("after repetition {}, {}", rep, reason))));
+    }
+    Ok(Step::Ran(Some(timed)))
+}
+
+/// A subject's name at the start of a reason: its label, but Forklift's capitalised.
+fn named(tool: Tool) -> &'static str {
+    if tool == Tool::Forklift { "Forklift" } else { tool.label() }
+}
+
+/// Where [`PROBE_REF`], a subject's current branch, stands in the subject and in its remote: its
+/// head, and the remote's branch of that name, none when the remote has no such branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Refs {
+    local: String,
+    remote: Option<String>,
+}
+
+/// Where a subject's work tree stands: its current branch, and the commit at its head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Head {
+    branch: String,
+    commit: String,
+}
+
+/// The head of `subject`: git's by `symbolic-ref` and `rev-parse HEAD`, Forklift's by its pallet
+/// list. Gives why when it could not be read.
+fn head(subject: &Subject, scratch: &Scratch, environment: &Environment) -> Result<Result<Head, String>, Stopped> {
+    if subject.tool != Tool::Forklift {
+        let branch = or_return!(output(subject, &["symbolic-ref", "--short", "HEAD"], scratch, environment)?).trim().to_string();
+        let commit = or_return!(output(subject, &["rev-parse", "HEAD"], scratch, environment)?).trim().to_string();
+        return Ok(Ok(Head { branch, commit }));
+    }
+    let listed = runner::document(or_return!(output(subject, &["--json", "pallet", "list"], scratch, environment)?).as_bytes());
+    let Some(branch) = listed["data"]["current"].as_str().map(str::to_string) else {
+        return Ok(Err(format!("Forklift's --json pallet list named {} current, not a pallet", listed["data"]["current"])));
+    };
+    let pallets = listed["data"]["pallets"].as_array();
+    let Some(commit) = pallets.and_then(|pallets| pallets.iter().find(|pallet| pallet["name"] == branch.as_str())).and_then(|pallet| pallet["head"].as_str()).map(str::to_string) else {
+        return Ok(Err(format!("Forklift's --json pallet list named no head for {}", branch)));
+    };
+    Ok(Ok(Head { branch, commit }))
+}
+
+/// Whether a clone landed on `expected`: the branch it names, at its commit. Gives why not.
+fn landed_on(tool: Tool, expected: &Head, landed: &Head) -> Result<(), String> {
+    if landed == expected {
+        return Ok(());
+    }
+    Err(format!("{}'s clone checked out {} at {}, not {} at the subject's head {}", named(tool), landed.branch, landed.commit, expected.branch, expected.commit))
+}
+
+/// The refs of `subject` and its remote: its [`head`], and the remote's branch by `ls-remote` for
+/// git's, by the remote's pallet list for Forklift's. Gives why when either could not be read, or
+/// the subject is not on [`PROBE_REF`].
+fn refs(subject: &Subject, scratch: &Scratch, environment: &Environment) -> Result<Result<Refs, String>, Stopped> {
+    let at = or_return!(head(subject, scratch, environment)?);
+    if at.branch != PROBE_REF {
+        return Ok(Err(format!("{} is on {}, not {}", named(subject.tool), at.branch, PROBE_REF)));
+    }
+    let local = at.commit;
+    if subject.tool != Tool::Forklift {
+        let listed = or_return!(output(subject, &["ls-remote", "origin", &format!("refs/heads/{}", PROBE_REF)], scratch, environment)?);
+        return Ok(Ok(Refs { local, remote: listed.split_whitespace().next().map(str::to_string) }));
+    }
+    let named = |document: &serde_json::Value, field: &str| -> Option<serde_json::Value> {
+        document["data"]["pallets"].as_array()?.iter().find(|pallet| pallet["name"] == PROBE_REF).map(|pallet| pallet[field].clone())
+    };
+    let remote = runner::document(or_return!(output(subject, &["--json", "pallet", "list", "--remote"], scratch, environment)?).as_bytes());
+    if !remote["data"]["pallets"].is_array() {
+        return Ok(Err("Forklift's --json pallet list --remote gave no pallets".to_string()));
+    }
+    let remote = match named(&remote, "remote_head") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(head)) => Some(head),
+        Some(other) => return Ok(Err(format!("Forklift's --json pallet list --remote gave {} as the remote head of {}", other, PROBE_REF))),
+    };
+    Ok(Ok(Refs { local, remote }))
+}
+
+/// Whether a push or a pull carried the head across, by the refs read before and after it: a push
+/// must have changed the remote's branch, to the subject's head, and a pull the subject's head, to
+/// the remote's branch. Gives why not.
+fn moved(transfer: Transfer, tool: Tool, before: &Refs, after: &Refs) -> Result<(), String> {
+    let label = named(tool);
+    let shown = |head: &Option<String>| head.clone().unwrap_or_else(|| "no such branch".to_string());
+    let across = after.remote.as_deref() == Some(after.local.as_str());
+    match transfer {
+        Transfer::Push if before.remote == after.remote => Err(format!("{}'s remote held {} before the push and after it, so the push moved nothing", label, shown(&after.remote))),
+        Transfer::Push if !across => Err(format!("after the push, {}'s remote held {}, not the subject's head {}", label, shown(&after.remote), after.local)),
+        Transfer::Pull if before.local == after.local => Err(format!("{}'s head was {} before the pull and after it, so the pull moved nothing", label, after.local)),
+        Transfer::Pull if !across => Err(format!("after the pull, {}'s head was {}, not its remote's {}", label, after.local, shown(&after.remote))),
+        _ => Ok(()),
+    }
 }
 
 /// Where [`SIDE_BRANCH`] stands against the current branch in one subject.
@@ -777,10 +1338,24 @@ impl Copied {
 
     /// Removes the copy, or stops the run naming it: copies left behind would fill the disk with
     /// a full tree each.
-    fn remove(mut self) -> Result<(), Stopped> {
+    fn remove(self) -> Result<(), Stopped> {
+        self.removed(false)
+    }
+
+    /// As [`Copied::remove`], for a folder a timed command makes, which it may not have: a clone
+    /// that failed before making its folder leaves nothing to remove.
+    fn remove_if_made(self) -> Result<(), Stopped> {
+        self.removed(true)
+    }
+
+    fn removed(mut self, may_be_missing: bool) -> Result<(), Stopped> {
         let path = self.0.take().expect("a copy is removed only once");
         #[allow(clippy::disallowed_methods, reason = "a scratch copy the harness made itself, under its own output directory")]
-        std::fs::remove_dir_all(&path).map_err(|error| Stopped(format!("removing the copy {}: {}", path.display(), error)))
+        match std::fs::remove_dir_all(&path) {
+            Err(error) if may_be_missing && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Stopped(format!("removing the copy {}: {}", path.display(), error))),
+            Ok(()) => Ok(()),
+        }
     }
 }
 
@@ -1246,13 +1821,13 @@ mod tests {
 
         let mut value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
         value["format"] = serde_json::json!(1);
-        assert_eq!(PerfReport::from_json(&value.to_string()).unwrap_err(), "perf report format 1 is not one this build reads (it reads 2)");
+        assert_eq!(PerfReport::from_json(&value.to_string()).unwrap_err(), "perf report format 1 is not one this build reads (it reads 3)");
         value.as_object_mut().unwrap().remove("format");
         assert_eq!(PerfReport::from_json(&value.to_string()).unwrap_err(), "not a perf report: it names no format");
 
         let mut value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
         value["rows"][0]["outcome"]["cells"][0]["result"]["guessed"] = serde_json::json!(true);
-        assert!(PerfReport::from_json(&value.to_string()).unwrap_err().starts_with("not a perf report of format 2: "));
+        assert!(PerfReport::from_json(&value.to_string()).unwrap_err().starts_with("not a perf report of format 3: "));
     }
 
     /// A repetition that exits non-zero voids its cell, which carries the exit and the stderr and
@@ -1653,24 +2228,221 @@ esac
         assert_eq!(spread(vec![4, 1, 10, 2]), Spread { median: 3, min: 1, max: 10 });
     }
 
+    /// The remote rows are not run on Windows, with or without a forklift-server, nor anywhere
+    /// without one; elsewhere they are served by the one given.
+    #[test]
+    fn remote_rows_need_a_forklift_server_and_unix() {
+        let server = PathBuf::from("/opt/bin/forklift-server");
+        assert_eq!(remote_when(false, Some(server.clone())), Ok(server.clone()));
+        assert_eq!(remote_when(false, None), Err("no forklift-server given (--forklift-server)".to_string()));
+        let windows = Err("remote rows are not built on Windows in this harness, which stops a forklift-server gracefully only on unix".to_string());
+        assert_eq!(remote_when(true, Some(server)), windows);
+        assert_eq!(remote_when(true, None), windows);
+    }
+
+    /// A push is judged moved only when the remote's branch changed to the subject's head, and a
+    /// pull only when the subject's head changed to the remote's branch.
+    #[test]
+    fn a_transfer_moved_something_only_when_the_head_crossed() {
+        let refs = |local: &str, remote: Option<&str>| Refs { local: local.into(), remote: remote.map(str::to_string) };
+        assert_eq!(moved(Transfer::Push, Tool::Git, &refs("h", Some("b")), &refs("h", Some("h"))), Ok(()));
+        assert_eq!(moved(Transfer::Push, Tool::Forklift, &refs("h", None), &refs("h", Some("h"))), Ok(()));
+        assert_eq!(moved(Transfer::Push, Tool::Git, &refs("h", Some("h")), &refs("h", Some("h"))),
+            Err("git's remote held h before the push and after it, so the push moved nothing".to_string()));
+        assert_eq!(moved(Transfer::Push, Tool::Forklift, &refs("h", None), &refs("h", None)),
+            Err("Forklift's remote held no such branch before the push and after it, so the push moved nothing".to_string()));
+        assert_eq!(moved(Transfer::Push, Tool::Git, &refs("h", Some("b")), &refs("h", Some("x"))),
+            Err("after the push, git's remote held x, not the subject's head h".to_string()));
+        assert_eq!(moved(Transfer::Pull, Tool::Git, &refs("b", Some("a")), &refs("a", Some("a"))), Ok(()));
+        assert_eq!(moved(Transfer::Pull, Tool::GitTuned, &refs("b", Some("a")), &refs("b", Some("a"))),
+            Err("git-tuned's head was b before the pull and after it, so the pull moved nothing".to_string()));
+        assert_eq!(moved(Transfer::Pull, Tool::Forklift, &refs("b", Some("a")), &refs("c", Some("a"))),
+            Err("after the pull, Forklift's head was c, not its remote's a".to_string()));
+        let at = |branch: &str, commit: &str| Head { branch: branch.into(), commit: commit.into() };
+        assert_eq!(landed_on(Tool::Forklift, &at("main", "h"), &at("main", "h")), Ok(()));
+        assert_eq!(landed_on(Tool::Forklift, &at("main", "h"), &at("main", "x")), Err("Forklift's clone checked out main at x, not main at the subject's head h".to_string()));
+        assert_eq!(landed_on(Tool::Git, &at("main", "h"), &at("probe", "h")), Err("git's clone checked out probe at h, not main at the subject's head h".to_string()));
+    }
+
+    /// A copy gone before it is removed stops the run; only a folder a timed command may not have
+    /// made, a clone's, is let go missing.
+    #[test]
+    fn only_a_clones_folder_may_be_missing_when_removed() {
+        let missing = std::env::temp_dir().join(format!("proof-load-never-made-{}", std::process::id()));
+        assert!(matches!(Copied(Some(missing.clone())).remove(), Err(Stopped(reason)) if reason.starts_with("removing the copy ")));
+        assert!(matches!(Copied(Some(missing)).remove_if_made(), Ok(())));
+    }
+
+    /// Forklift's refs are read from its pallet list, which must name the probe pallet current,
+    /// and from the remote's, where a pallet the remote lacks, or one it lists with no head, has
+    /// none; a list with no pallets, or a head of another kind, is not read as none.
+    #[cfg(unix)]
+    #[test]
+    fn forklifts_refs_are_its_probe_pallet_and_the_remotes() {
+        let (root, scratch, environment) = scratch("forklift-refs");
+        let folder = scratch.work().to_path_buf();
+        let program = folder.join("forklift");
+        std::fs::write(&program, format!(r#"#!/bin/sh
+case "$*" in
+"--json pallet list") cat '{0}/local';;
+"--json pallet list --remote") cat '{0}/remote';;
+*) echo "no $*" >&2; exit 2;;
+esac
+"#, folder.display())).unwrap();
+        std::fs::set_permissions(&program, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let subject = Subject { tool: Tool::Forklift, program, prefix: vec![], work: folder.clone(), watched: false };
+        let read = |local: &str, remote: &str| {
+            std::fs::write(folder.join("local"), local).unwrap();
+            std::fs::write(folder.join("remote"), remote).unwrap();
+            refs(&subject, &scratch, &environment).unwrap()
+        };
+        let local = r#"{"data":{"current":"proof-load-probe","pallets":[{"name":"main","current":false,"head":"m"},{"name":"proof-load-probe","current":true,"head":"p"}]}}"#;
+        let refs = |local: &str, remote: Option<&str>| Refs { local: local.into(), remote: remote.map(str::to_string) };
+
+        assert_eq!(read(local, r#"{"data":{"pallets":[{"name":"main","remote_head":"m"},{"name":"proof-load-probe","remote_head":"r"}]}}"#), Ok(refs("p", Some("r"))));
+        assert_eq!(read(local, r#"{"data":{"pallets":[{"name":"main","remote_head":"m"}]}}"#), Ok(refs("p", None)));
+        assert_eq!(read(local, r#"{"data":{"pallets":[{"name":"proof-load-probe","remote_head":null}]}}"#), Ok(refs("p", None)));
+        assert_eq!(read(local, r#"{"data":{}}"#), Err("Forklift's --json pallet list --remote gave no pallets".to_string()));
+        assert_eq!(read(local, r#"{"data":{"pallets":[{"name":"proof-load-probe","remote_head":7}]}}"#),
+            Err("Forklift's --json pallet list --remote gave 7 as the remote head of proof-load-probe".to_string()));
+        assert_eq!(read(&local.replace(r#""current":"proof-load-probe""#, r#""current":"main""#), "{}"),
+            Err("Forklift is on main, not proof-load-probe".to_string()));
+        assert_eq!(read(&local.replace(r#""current":"proof-load-probe""#, r#""current":null"#), "{}"), Err("Forklift's --json pallet list named null current, not a pallet".to_string()));
+        assert_eq!(read(&local.replace(r#""head":"p""#, r#""head":null"#), "{}"), Err("Forklift's --json pallet list named no head for proof-load-probe".to_string()));
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// git's remote pairs are timed against the remotes the harness builds, each repetition on
+    /// fresh copies that are gone afterwards; with the remote at the head being pushed or pulled
+    /// to, a push and a pull succeed but move nothing, and are voided saying so.
+    #[cfg(unix)]
+    #[test]
+    fn gits_remote_pairs_are_timed_and_a_transfer_of_nothing_is_voided() {
+        let (root, scratch, environment) = scratch("remotes");
+        let git = crate::scrub::path_git();
+        let work = scratch.work().join("repo");
+        let run = |directory: &Path, arguments: &[&str]| {
+            let invocation = Invocation { program: git.clone(), arguments: arguments.iter().map(|argument| argument.to_string()).collect(), directory: directory.to_path_buf(), limit: Duration::from_secs(30) };
+            let outcome = tool::run(&invocation, &scratch, &environment).unwrap();
+            assert!(outcome.succeeded(), "{:?}: {}", arguments, String::from_utf8_lossy(&outcome.stderr));
+            String::from_utf8_lossy(&outcome.stdout).trim().to_string()
+        };
+        std::fs::create_dir(&work).unwrap();
+        run(&work, &["init", "-q", "-b", PROBE_REF]);
+        for name in ["a", "b", "c", "d", "e"] {
+            std::fs::write(work.join(name), format!("{}\n", name)).unwrap();
+            run(&work, &["add", "-A"]);
+            run(&work, &["commit", "-q", "-m", name]);
+        }
+        run(&work, &["branch", "main"]);
+        let head = run(&work, &["rev-parse", "HEAD"]);
+        let subjects = [Subject { tool: Tool::Git, program: git.clone(), prefix: vec![], work: work.clone(), watched: false }];
+        let server = PathBuf::from("/nonexistent/forklift-server");
+
+        let mut rows = Vec::new();
+        remotes(&subjects, "main", &["a", "b"], 1, &Err("r".into()), &Ok(server.clone()), &scratch, &environment, &|_| {}, &mut rows).unwrap();
+        assert_eq!(rows.iter().map(|row| (row.operation.as_str(), row.cache)).collect::<Vec<_>>(), [
+            ("clone", Cache::Warm), ("clone", Cache::Cold), ("push", Cache::Warm), ("push", Cache::Cold), ("pull", Cache::Warm), ("pull", Cache::Cold),
+        ]);
+        for row in &rows {
+            match row.cache {
+                Cache::Warm => assert!(matches!(&row.outcome, Outcome::Timed { cells } if cells.len() == 1 && matches!(cells[0].result, Measured::Timed { .. })), "{} {:?}", row.operation, row.outcome),
+                Cache::Cold => assert_eq!(row.outcome, Outcome::NotRun { reason: "r".into() }),
+            }
+        }
+        let Outcome::Timed { cells } = &rows[0].outcome else { unreachable!() };
+        assert_eq!(cells[0].command, ["clone", "-q", "--no-local", "{url}", "{work}"]);
+        // The remotes were built from copies of the subject, which neither moved nor kept them.
+        assert_eq!(run(&work, &["rev-parse", "HEAD"]), head);
+        assert_eq!(run(&work, &["status", "--porcelain"]), "");
+        let copies = scratch.work().join("copies");
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0, "copies left behind");
+        assert!(!scratch.work().join("remotes").exists(), "remotes left behind");
+        // The remotes, built again to be read: git's level one names main as its HEAD, as
+        // Forklift's clone checks out main.
+        let built = hosts(&subjects, &server, "main", &["a", "b"], &scratch.work().join("built"), &scratch, &environment).unwrap().unwrap();
+        let built = &built[0];
+        assert_eq!(run(&built.level, &["rev-parse", "main", PROBE_REF]), format!("{}\n{}", head, head));
+        assert_eq!(run(&built.level, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+        let ahead = run(&built.ahead, &["rev-parse", "HEAD"]);
+        assert_eq!(run(&built.ahead, &["rev-list", "--count", &format!("{}..{}", head, ahead)]), "3");
+        assert_eq!(run(&built.ahead, &["status", "--porcelain"]), "");
+        assert_eq!(run(&built.past, &["rev-parse", PROBE_REF]), ahead);
+        let voided = |hosts: &[Hosts], transfer: Transfer| match remote_pair(&subjects, hosts, transfer, "main", 1, None, &server, &copies, &scratch, &environment).unwrap() {
+            Outcome::Timed { cells } => cells.into_iter().map(|cell| cell.result).collect::<Vec<_>>(),
+            other => panic!("{:?}", other),
+        };
+        // A clone that lands on another branch, at another commit, is voided saying where.
+        let past = [Hosts { level: built.past.clone(), ahead: work.clone(), past: built.past.clone() }];
+        assert_eq!(voided(&past, Transfer::Clone), [Measured::NothingMoved {
+            reason: format!("repetition 1: git's clone checked out {} at {}, not main at the subject's head {}", PROBE_REF, ahead, head),
+        }]);
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0, "copies left behind");
+        // A watched subject's untimed commands start git's own fsmonitor daemon over its advanced
+        // copy, which is stopped once the copy is built.
+        if crate::runner::has_fsmonitor_daemon(&git) {
+            let tuned = scratch.work().join("tuned");
+            crate::scrub::copy_tree(&work, &tuned).unwrap();
+            run(&tuned, &["config", "core.fsmonitor", "true"]);
+            let tuned = [Subject { tool: Tool::GitTuned, program: git.clone(), prefix: vec![], work: tuned, watched: true }];
+            let built = hosts(&tuned, &server, "main", &["a", "b"], &scratch.work().join("tuned-built"), &scratch, &environment).unwrap().unwrap();
+            let status = Invocation { program: git.clone(), arguments: vec!["fsmonitor--daemon".into(), "status".into()], directory: built[0].ahead.clone(), limit: Duration::from_secs(30) };
+            assert!(!tool::run(&status, &scratch, &environment).unwrap().succeeded(), "git's own daemon still watches the advanced copy");
+        }
+
+        let level = scratch.work().join("level");
+        run(scratch.root(), &["init", "--bare", "-q", "-b", PROBE_REF, &level.display().to_string()]);
+        run(&work, &["push", "-q", &level.display().to_string(), &format!("HEAD:refs/heads/{}", PROBE_REF)]);
+        let hosts = [Hosts { level: level.clone(), ahead: work.clone(), past: level.clone() }];
+        assert_eq!(voided(&hosts, Transfer::Push), [Measured::NothingMoved {
+            reason: format!("repetition 1: git's remote held {} before the push and after it, so the push moved nothing", head),
+        }]);
+        assert_eq!(voided(&hosts, Transfer::Pull), [Measured::NothingMoved {
+            reason: format!("repetition 1: git's head was {} before the pull and after it, so the pull moved nothing", head),
+        }]);
+        let cells = vec![Cell { subject: Tool::Git, command: vec!["pull".into(), "-q".into()], result: Measured::NothingMoved { reason: "a | b".into() } }];
+        let shown = PerfReport { rows: vec![Row { operation: "pull".into(), cache: Cache::Warm, note: "n".into(), outcome: Outcome::Timed { cells } }], ..report() };
+        assert!(shown.markdown().contains("| git | voided: did not move the head: a \\| b | | | | | `pull -q` |\n"), "{}", shown.markdown());
+        assert!(shown.failed());
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0, "copies left behind");
+
+        // A clone that fails leaves no folder, which voids its cell rather than stopping the run.
+        let empty = scratch.work().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let hosts = [Hosts { level: empty, ahead: work.clone(), past: level.clone() }];
+        let Outcome::Timed { cells } = remote_pair(&subjects, &hosts, Transfer::Clone, "main", 1, None, &server, &copies, &scratch, &environment).unwrap() else { panic!() };
+        assert!(matches!(cells[0].result, Measured::Voided { exit: Some(128), .. }), "{:?}", cells[0].result);
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0, "copies left behind");
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A perf run over the small shape writes perf.json and perf.md, every pair timed warm on all
-    /// three subjects and its cold row not run without a cache-drop program: the sameness, differ
-    /// and clean checks pass on a generated history, both subjects were built from one mirror
-    /// (history.rs refuses an import whose current branch differs), and Forklift's is enrolled.
+    /// three subjects and its cold row not run without a cache-drop program: the sameness, differ,
+    /// clean and moved-something checks pass on a generated history, both subjects were built from
+    /// one mirror (history.rs refuses an import whose current branch differs), and Forklift's is
+    /// enrolled.
     ///
-    /// Needs a forklift binary: `PROOF_LOAD_FORKLIFT=<path> cargo test -p proof-load -- --ignored`.
+    /// Needs a forklift binary: `PROOF_LOAD_FORKLIFT=<path> cargo test -p proof-load -- --ignored`;
+    /// the forklift-server is `PROOF_LOAD_FORKLIFT_SERVER`, or the one beside that forklift.
     #[test]
     #[ignore = "drives a forklift binary named by PROOF_LOAD_FORKLIFT"]
     fn a_perf_run_times_every_pair_on_every_subject() {
         let forklift = PathBuf::from(std::env::var_os("PROOF_LOAD_FORKLIFT").expect("PROOF_LOAD_FORKLIFT names the forklift binary under test"));
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let out = std::env::temp_dir().join(format!("proof-load-perf-run-{}-{}", std::process::id(), nanos));
-        let options = PerfOptions { out: out.clone(), forklift: forklift.clone(), git: crate::scrub::path_git(), shape: "small".into(), reps: 1, drop_caches: None };
+        let server = std::env::var_os("PROOF_LOAD_FORKLIFT_SERVER").map(PathBuf::from)
+            .unwrap_or_else(|| forklift.with_file_name(format!("forklift-server{}", std::env::consts::EXE_SUFFIX)));
+        let options = PerfOptions {
+            out: out.clone(), forklift: forklift.clone(), git: crate::scrub::path_git(), shape: "small".into(), reps: 1, drop_caches: None, forklift_server: Some(server),
+        };
         let report = run(&options, &|_| {}).unwrap();
         let operations: Vec<&str> = report.rows.iter().filter(|row| row.cache == Cache::Warm).map(|row| row.operation.as_str()).collect();
-        assert_eq!(operations, ["status", "log", "blame", "commit", "switch", "merge", "diff", "diff --staged"]);
+        assert_eq!(operations, ["status", "log", "blame", "commit", "switch", "merge", "clone", "push", "pull", "diff", "diff --staged"]);
         assert_eq!(report.rows.len(), 2 * operations.len());
         assert_eq!(report.header.drop_caches, None);
+        assert!(report.header.tools.contains_key("forklift-server"), "{:?}", report.header.tools);
         for pair in report.rows.chunks(2) {
             assert_eq!((pair[0].cache, pair[1].cache, &pair[0].operation), (Cache::Warm, Cache::Cold, &pair[1].operation));
             assert_eq!(pair[1].outcome, Outcome::NotRun { reason: "no cache-drop program given (--drop-caches)".into() });
