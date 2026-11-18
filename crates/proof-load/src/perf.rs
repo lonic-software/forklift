@@ -2210,6 +2210,7 @@ esac
     /// git's remote pairs are timed against the remotes the harness builds, each repetition on
     /// fresh copies that are gone afterwards; with the remote at the head being pushed or pulled
     /// to, a push and a pull succeed but move nothing, and are voided saying so.
+    #[cfg(unix)]
     #[test]
     fn gits_remote_pairs_are_timed_and_a_transfer_of_nothing_is_voided() {
         let (root, scratch, environment) = scratch("remotes");
