@@ -355,25 +355,51 @@ pub enum Change {
     NotCompared { reason: String },
 }
 
-/// Forklift's median as a percentage of tuned git's, where both were timed and tuned git's is
-/// above zero.
-fn percent_of_tuned(row: &Row) -> Option<u64> {
-    let Outcome::Timed { cells } = &row.outcome else { return None };
-    let (forklift, tuned) = forklift_and_tuned(cells)?;
-    (tuned.median > 0).then(|| (u128::from(forklift.median) * 100 + u128::from(tuned.median) / 2) / u128::from(tuned.median)).map(|percent| u64::try_from(percent).unwrap_or(u64::MAX))
+/// Forklift's median as a percentage of tuned git's, rounded half up, or why the row has none.
+fn percent_of_tuned(row: &Row) -> Result<u64, &'static str> {
+    const NOT_BOTH: &str = "Forklift and tuned git were not both timed";
+    let Outcome::Timed { cells } = &row.outcome else { return Err(NOT_BOTH) };
+    let (forklift, tuned) = forklift_and_tuned(cells).ok_or(NOT_BOTH)?;
+    if tuned.median == 0 {
+        return Err("tuned git's median was 0 µs");
+    }
+    let percent = (u128::from(forklift.median) * 100 + u128::from(tuned.median) / 2) / u128::from(tuned.median);
+    Ok(u64::try_from(percent).unwrap_or(u64::MAX))
+}
+
+/// The `--against` report at `path`: an error when no file can be read there, and otherwise the
+/// path as given beside the report, or why it is not one this build reads.
+fn read_against(path: &Path) -> Result<(String, Result<PerfReport, String>), String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("--against {}: {}", path.display(), error))?;
+    let earlier = String::from_utf8(bytes).map_err(|error| format!("it is not UTF-8 text: {}", error)).and_then(|text| PerfReport::from_json(&text));
+    Ok((path.display().to_string(), earlier))
 }
 
 /// `rows`, timed under `header`, beside the earlier report: each row of either run by its
 /// operation and cache, this run's first and then the rows only the earlier run has. A report of
-/// another shape, another shape detail (the history spelled out) or another platform is not
-/// compared at all.
+/// another history (shape, shape detail, seed or side branch), another platform, or git subjects
+/// configured otherwise is not compared at all, since its ratios were taken of something else.
 pub fn drift(rows: &[Row], header: &Header, earlier: &PerfReport) -> DriftOutcome {
     let then = &earlier.header;
+    let not_compared = |reason: String| DriftOutcome::NotCompared { reason };
     if (then.shape.as_str(), then.shape_detail.as_str()) != (header.shape.as_str(), header.shape_detail.as_str()) {
-        return DriftOutcome::NotCompared { reason: format!("it timed {}: {}, and this run {}: {}", then.shape, then.shape_detail, header.shape, header.shape_detail) };
+        return not_compared(format!("it timed {}: {}, and this run {}: {}", then.shape, then.shape_detail, header.shape, header.shape_detail));
+    }
+    let seed = |seed: Option<u64>| seed.map_or_else(|| "no seed".to_string(), |seed| format!("seed {}", seed));
+    if then.seed != header.seed {
+        return not_compared(format!("it timed {}, and this run {}", seed(then.seed), seed(header.seed)));
+    }
+    let side = |side: &Option<String>| side.as_deref().map_or_else(|| "no side branch".to_string(), |side| format!("side branch {}", side));
+    if then.side_branch != header.side_branch {
+        return not_compared(format!("it switched and merged against {}, and this run against {}", side(&then.side_branch), side(&header.side_branch)));
     }
     if then.platform != header.platform {
-        return DriftOutcome::NotCompared { reason: format!("it ran on {}, and this run on {}", then.platform.label(), header.platform.label()) };
+        return not_compared(format!("it ran on {}, and this run on {}", then.platform.label(), header.platform.label()));
+    }
+    let subjects: std::collections::BTreeSet<&String> = then.configurations.keys().chain(header.configurations.keys()).collect();
+    if let Some(subject) = subjects.into_iter().find(|subject| then.configurations.get(*subject) != header.configurations.get(*subject)) {
+        let configured = |configurations: &BTreeMap<String, String>| configurations.get(subject).map_or_else(|| "nothing recorded".to_string(), |configuration| format!("`{}`", configuration));
+        return not_compared(format!("its {} was configured {}, and this run's {}", subject, configured(&then.configurations), configured(&header.configurations)));
     }
     let key = |row: &Row| (row.operation.clone(), row.cache);
     let mut changes = Vec::new();
@@ -381,15 +407,11 @@ pub fn drift(rows: &[Row], header: &Header, earlier: &PerfReport) -> DriftOutcom
         let change = match earlier.rows.iter().find(|candidate| key(candidate) == key(row)) {
             None => Change::NotCompared { reason: "the earlier run has no such row".to_string() },
             Some(before) => match (percent_of_tuned(before), percent_of_tuned(row)) {
-                (Some(earlier_percent), Some(percent)) => Change::Compared { earlier_percent, percent },
-                (before, now) => {
-                    let lacking = match (before, now) {
-                        (None, None) => "either run",
-                        (None, Some(_)) => "the earlier run",
-                        _ => "this run",
-                    };
-                    Change::NotCompared { reason: format!("Forklift and tuned git were not both timed in {}", lacking) }
-                }
+                (Ok(earlier_percent), Ok(percent)) => Change::Compared { earlier_percent, percent },
+                (Err(then), Err(now)) if then == now => Change::NotCompared { reason: format!("{} in either run", then) },
+                (Err(then), Err(now)) => Change::NotCompared { reason: format!("{} in the earlier run, and {} in this run", then, now) },
+                (Err(then), Ok(_)) => Change::NotCompared { reason: format!("{} in the earlier run", then) },
+                (Ok(_), Err(now)) => Change::NotCompared { reason: format!("{} in this run", now) },
             },
         };
         changes.push(RowDrift { operation: row.operation.clone(), cache: row.cache, change });
@@ -566,8 +588,8 @@ impl PerfReport {
             match &against.outcome {
                 DriftOutcome::NotCompared { reason } => { let _ = writeln!(out, "- not compared: {}", reason); }
                 DriftOutcome::Compared { tools, hardware, rows } => {
-                    let forklift = tools.get("forklift").map_or("not recorded", String::as_str);
-                    let _ = writeln!(out, "- its forklift: {}\n- its hardware: {}, {} logical cores", forklift, hardware.cpu, hardware.logical_cores);
+                    let tool = |name: &str| tools.get(name).map_or("not recorded", String::as_str);
+                    let _ = writeln!(out, "- its forklift: {}\n- its git: {}\n- its hardware: {}, {} logical cores", tool("forklift"), tool("git"), hardware.cpu, hardware.logical_cores);
                     out.push_str("- each row: Forklift's median as a percentage of tuned git's, in the earlier run and in this one. The two runs may have run on two machines, so this never fails the run.\n");
                     for row in rows {
                         match &row.change {
@@ -736,10 +758,7 @@ pub fn run(options: &PerfOptions, progress: &dyn Fn(&str)) -> Result<PerfReport,
     let forklift_server = options.forklift_server.as_deref().map(|program| absolute("--forklift-server", program)).transpose()?;
     // Read before anything is timed, so a path that names nothing stops the run at once; a report
     // that is read but not comparable is said so in the report instead.
-    let against = options.against.as_deref().map(|path| {
-        let text = std::fs::read_to_string(path).map_err(|error| format!("--against {}: {}", path.display(), error))?;
-        Ok::<_, String>((path.display().to_string(), PerfReport::from_json(&text)))
-    }).transpose()?;
+    let against = options.against.as_deref().map(read_against).transpose()?;
     let remote = remote_when(cfg!(windows), forklift_server);
     let mut output = Output::claim(&options.out).map_err(|error| error.to_string())?;
     let scratch = output.scratch("perf").map_err(|error| error.to_string())?;
@@ -2722,7 +2741,21 @@ mod tests {
         let elsewhere = |header: Header| drift(&rows, &report().header, &PerfReport { header, ..earlier.clone() });
         assert_eq!(elsewhere(Header { shape: "medium".into(), shape_detail: "more".into(), ..report().header }), DriftOutcome::NotCompared { reason: "it timed medium: more, and this run small: detail".into() });
         assert_eq!(elsewhere(Header { shape_detail: "fewer".into(), ..report().header }), DriftOutcome::NotCompared { reason: "it timed small: fewer, and this run small: detail".into() });
+        assert_eq!(elsewhere(Header { seed: Some(2), ..report().header }), DriftOutcome::NotCompared { reason: "it timed seed 2, and this run seed 1".into() });
+        assert_eq!(elsewhere(Header { side_branch: None, ..report().header }), DriftOutcome::NotCompared { reason: "it switched and merged against no side branch, and this run against side branch perf-side".into() });
         assert_eq!(elsewhere(Header { platform: Platform::Macos, ..report().header }), DriftOutcome::NotCompared { reason: "it ran on macOS, and this run on Linux".into() });
+        let tuned = |configuration: &str| BTreeMap::from([("git-tuned".to_string(), configuration.to_string())]);
+        assert_eq!(elsewhere(Header { configurations: tuned("fsync on"), ..report().header }), DriftOutcome::NotCompared { reason: "its git-tuned was configured `fsync on`, and this run's nothing recorded".into() });
+        assert_eq!(drift(&rows, &Header { configurations: tuned("fsync on"), ..report().header }, &PerfReport { header: Header { configurations: tuned("fsync off"), ..report().header }, ..earlier.clone() }),
+            DriftOutcome::NotCompared { reason: "its git-tuned was configured `fsync off`, and this run's `fsync on`".into() });
+        let instant = |operation: &str| paired(operation, [1_000, 900, 1_100], [0, 0, 0]);
+        let zero_then = PerfReport { rows: vec![instant("log"), instant("diff"), instant("status")], ..report() };
+        let DriftOutcome::Compared { rows: zeroed, .. } = drift(&[rows[1].clone(), rows[2].clone(), instant("status")], &header, &zero_then) else { panic!() };
+        assert_eq!(zeroed, [
+            not("log", "tuned git's median was 0 µs in the earlier run"),
+            not("diff", "tuned git's median was 0 µs in the earlier run, and Forklift and tuned git were not both timed in this run"),
+            not("status", "tuned git's median was 0 µs in either run"),
+        ]);
 
         let verdict = judge(&rows, "small", Platform::Linux, Gate::SelfOnly, &[]);
         assert_eq!(failures(&verdict), [("status", Check::Gross)]);
@@ -2732,7 +2765,7 @@ mod tests {
         assert_eq!(PerfReport::from_json(&shown.json()).unwrap(), shown);
         let markdown = shown.markdown();
         for line in [
-            "\n## Against an earlier run\n\n- earlier run: `earlier/perf.json`\n- its forklift: not recorded\n- its hardware: a cpu, 8 logical cores\n",
+            "\n## Against an earlier run\n\n- earlier run: `earlier/perf.json`\n- its forklift: not recorded\n- its git: not recorded\n- its hardware: a cpu, 8 logical cores\n",
             "\n- status, warm: 300% then, 1200% now\n",
             "\n- blame, warm: not compared: this run has no such row\n",
         ] {
@@ -2789,6 +2822,15 @@ mod tests {
         let error = run(&options, &|_| {}).unwrap_err();
         assert!(error.starts_with(&format!("--against {}: ", missing.display())), "{}", error);
         assert!(!out.exists(), "the output folder was made");
+        // A file that is read but is no report this build reads is the report's to say, not a stop.
+        for (bytes, reason) in [(&b"{\"format\": \xff}"[..], "it is not UTF-8 text: "), (&b"{\"format\": "[..], "not a perf report: ")] {
+            std::fs::write(&missing, bytes).unwrap();
+            let (path, earlier) = read_against(&missing).unwrap();
+            assert_eq!(path, missing.display().to_string());
+            assert!(earlier.as_ref().unwrap_err().starts_with(reason), "{:?}", earlier);
+        }
+        #[allow(clippy::disallowed_methods, reason = "the test's own report")]
+        let _ = std::fs::remove_file(&missing);
     }
 
     /// A repetition that exits non-zero voids its cell, which carries the exit and the stderr and

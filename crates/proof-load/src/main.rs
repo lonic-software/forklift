@@ -141,8 +141,8 @@ enum Command {
         forklift_server: Option<PathBuf>,
         /// An earlier run's perf.json, by path. The report then sets each row's Forklift median,
         /// as a share of tuned git's, beside the earlier run's. It never fails the run; an earlier
-        /// report this build does not read, or of another history or platform, is reported as
-        /// not compared.
+        /// report this build does not read, or of another history, platform or git configuration,
+        /// is reported as not compared. A path that names no readable file stops the run.
         #[arg(long)]
         against: Option<PathBuf>,
     },

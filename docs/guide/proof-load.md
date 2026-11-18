@@ -521,12 +521,14 @@ With `--against`, `perf.md` has a section after the verdict, and `perf.json` a f
 row beside the same row of the earlier run, by its operation and cache. For each row, it gives
 Forklift's median as a percentage of tuned git's, rounded, in the earlier run and in this one. A
 ratio is compared rather than a time, because the two runs may have run on two machines; the
-section names the earlier run's forklift and hardware. A row where either run did not time both
-Forklift and tuned git, or that only one run has, is listed as not compared, with why.
+section names the earlier run's forklift, git and hardware. A row where either run did not time
+both Forklift and tuned git, or where tuned git's median was 0 µs, or that only one run has, is
+listed as not compared, with why.
 
-The earlier report is not compared at all when this build does not read its format, or when it
-timed another history (another shape, or the same shape with other numbers) or ran on another
-platform. The section then says why. However far a ratio moved, the comparison never fails the
+The earlier report is not compared at all when this build does not read it (another format, or not
+UTF-8 text), or when it timed another history (another shape, the same shape with other numbers or
+another seed, or another side branch), ran on another platform, or gave either git subject another
+configuration. The section then says why. However far a ratio moved, the comparison never fails the
 run: the verdict alone does.
 
 ### Before you quote a number
