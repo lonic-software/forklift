@@ -646,8 +646,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 - **A server's `500` no longer names its files.** A request that failed on a fault of
   `forklift-server`'s own answered with the failure's own message, which could carry the server's
   absolute paths, such as a pack index that does not parse or a damaged ref. A `500` now carries a
-  fixed message and no code, and the cause goes to the server's log. A bundle that would have to
-  carry a chunked file or an object over the ceiling is refused with a `422` and its code, not a
+  fixed message and no code, and the cause goes to the server's log. A batch or subtree bundle
+  that would have to carry an object over the ceiling is refused with a `422` and its code, not a
   `500`: a batch fetch stops on it rather than retrying, and a subtree fetch falls back to
   fetching object by object, as it does for a subtree over the cap. A warehouse whose locks could not be taken is refused
   with a `503` that no longer names the lock file or the process holding it.

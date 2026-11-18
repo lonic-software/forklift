@@ -1504,13 +1504,12 @@ fn fault_body() -> ErrorResponse {
     ErrorResponse { error: FAULT_MESSAGE.to_string(), code: None, next_step: None }
 }
 
-/// A bundle that could not be built: a `422` when the request asked for an object no bundle can
-/// carry (a chunked file, or one over the object ceiling), since that refusal is the requester's
-/// and repeats on every retry; else a fault of the server's own ([`internal`]).
+/// A partial bundle that could not be built: a `422` when the request asked for an object over
+/// the object ceiling, which no bundle may carry, since that refusal is the requester's and
+/// repeats on every retry; else a fault of the server's own ([`internal`]).
 fn bundle_refusal(error: String) -> HandlerError {
-    let requester = [scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED, scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED];
     match forklift_core::error::deframe(&error) {
-        Some((code, _, _)) if requester.contains(&code) => (StatusCode::UNPROCESSABLE_ENTITY, error),
+        Some((code, _, _)) if code == scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED => (StatusCode::UNPROCESSABLE_ENTITY, error),
         _ => internal(error),
     }
 }
@@ -5482,19 +5481,30 @@ mod tests {
         assert!(body.contains("/srv/wh/.forklift/objects/pack/x.idx"), "another status keeps its message: {}", body);
     }
 
-    /// A bundle refused for an object no bundle can carry is the requester's: a `422` with its code,
-    /// which no retry changes. Any other bundle failure is the server's own.
+    /// A batch asking for an object over the ceiling (one stored before the ceiling existed) is
+    /// the requester's refusal: a `422` with its code, which no retry changes. Any other bundle
+    /// failure, a classified refusal included, is the server's own.
     ///
-    /// Revert: map a bundle's error with `internal` → the chunked refusal is a `500` → red.
-    #[test]
-    fn a_bundle_no_transport_can_carry_is_a_422_with_its_code() {
-        let chunked: String = scope_utils::chunked_transport_refusal("big.bin").into();
-        let oversized: String = scope_utils::oversized_transport_refusal("object x", 1 << 40).into();
-        for refusal in [chunked, oversized] {
-            let (status, message) = bundle_refusal(refusal.clone());
-            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", refusal);
-            assert_eq!(message, refusal);
-        }
+    /// Revert: map the batch's bundle error with `internal` → a `500` with no code → red. Answer
+    /// every framed bundle error `422` → the damaged ref is not a `500` → red.
+    #[tokio::test]
+    async fn a_batch_over_the_object_ceiling_is_a_422_with_its_code() {
+        let fixture = OfficeFixture::genesis("batch-giant");
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
+        let giant = forklift_core::builder::object::loose_object_builder::LooseObjectBuilder::build_blob(
+            &forklift_core::model::blob::Blob { content: vec![0u8; object_utils::MAX_OBJECT_BYTES + 1] },
+        );
+        object_utils::store_object_stream(&giant.hash, &mut std::io::Cursor::new(&giant.content), giant.content.len() as u64)
+            .expect("the giant stores through the unchecked stream path");
+
+        let response = post_objects_batch(
+            State(state), Path(PathParams::new()), Json(MissingObjectsRequest { hashes: vec![giant.hash.clone()] }),
+        ).await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = body_text(response).await;
+        let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(error["code"], "oversized_transport_unsupported", "{}", body);
 
         let damaged: String = forklift_core::error::CoreError::refusal(
             forklift_core::error::RefusalCode::RefDamaged, "damaged", "forklift heal",
