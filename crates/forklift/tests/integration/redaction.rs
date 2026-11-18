@@ -152,6 +152,30 @@ impl Warehouse {
     }
 }
 
+/// The object closure of the directory at `path` in the tree `root`: its tree and every tree and
+/// blob beneath it, each once. Read from the active storage root.
+fn subtree_closure(root: &str, path: &str) -> Vec<String> {
+    let top = forklift_core::util::tree_utils::resolve_subtree_hash(root, path).unwrap()
+        .unwrap_or_else(|| panic!("{} is not a directory", path));
+    let mut seen = std::collections::HashSet::new();
+    let mut closure = Vec::new();
+    let mut frontier = vec![top];
+    while let Some(hash) = frontier.pop() {
+        if !seen.insert(hash.clone()) {
+            continue;
+        }
+        let tree = object_utils::load_tree(&hash).unwrap();
+        closure.push(hash);
+        for (_, file) in tree.get_files() {
+            if seen.insert(file.hash.clone()) {
+                closure.push(file.hash.clone());
+            }
+        }
+        frontier.extend(tree.get_subtrees().map(|(_, subtree)| subtree.hash.clone()));
+    }
+    closure
+}
+
 fn hash_of(content: &[u8]) -> String {
     object_utils::hash_object_bytes(&object_utils::blob_bytes(content))
 }
@@ -1918,8 +1942,7 @@ fn a_server_owing_a_deletion_serves_the_chunks_only_its_recipe_names_as_absent()
     let (own, shared): (Vec<String>, Vec<String>) = {
         let _scope = forklift_core::globals::StorageRootScope::enter(&owner.root);
         let root = object_utils::load_parcel(&owner.head("main")).unwrap().tree_hash;
-        let kept = forklift_core::util::tree_utils::collect_subtree_closure(&root, "keep").unwrap()
-            .expect("keep is a directory");
+        let kept = subtree_closure(&root, "keep");
         let kept: std::collections::HashSet<String> = kept.iter()
             .filter_map(|hash| object_utils::recipe_chunk_hashes(hash).ok())
             .flatten()
@@ -3343,13 +3366,11 @@ fn a_served_root_withholds_a_chunked_file_and_the_chunks_only_it_names() {
     owner.run_ok(&["lift"]);
 
     // The film's recipe and its chunks, split by whether the kept file names them too.
-    let closure = |root: &str, path: &str| forklift_core::util::tree_utils::collect_subtree_closure(root, path).unwrap()
-        .expect("the path is a directory");
     let (recipe, own, shared): (String, Vec<String>, Vec<String>) = {
         let _scope = forklift_core::globals::StorageRootScope::enter(&owner.root);
         let root = object_utils::load_parcel(&owner.head("main")).unwrap().tree_hash;
         let recipes = |path: &str| -> Vec<String> {
-            closure(&root, path).into_iter().filter(|hash| object_utils::recipe_chunk_hashes(hash).is_ok()).collect()
+            subtree_closure(&root, path).into_iter().filter(|hash| object_utils::recipe_chunk_hashes(hash).is_ok()).collect()
         };
         let recipe = recipes("film").pop().unwrap();
         let kept: std::collections::HashSet<String> = recipes("keep").iter()

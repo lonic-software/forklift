@@ -1022,49 +1022,8 @@ pub fn resolve_subtree_hash(root_tree_hash: &str, key: &str) -> Result<Option<St
     Ok(Some(current))
 }
 
-/// The object closure of the subtree at a warehouse path key inside a parcel's tree: the subtree
-/// root object and every tree and blob beneath it, de-duplicated. `Ok(None)` when the key names
-/// nothing (or a file) in this tree.
-///
-/// # Arguments
-/// * `root_tree_hash` - The parcel's root tree hash.
-/// * `key`            - The warehouse path key of the subtree.
-pub fn collect_subtree_closure(root_tree_hash: &str, key: &str) -> Result<Option<Vec<String>>, String> {
-    let subtree = match resolve_subtree_hash(root_tree_hash, key)? {
-        Some(hash) => hash,
-        None => return Ok(None),
-    };
-
-    let mut closure: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut frontier: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-    frontier.push_back(subtree);
-
-    while let Some(tree_hash) = frontier.pop_front() {
-        if !seen.insert(tree_hash.clone()) {
-            continue;
-        }
-
-        closure.push(tree_hash.clone());
-
-        let tree = object_utils::load_tree(&tree_hash)?;
-
-        for (_, file) in tree.get_files() {
-            if seen.insert(file.hash.clone()) {
-                closure.push(file.hash.clone());
-            }
-        }
-
-        for (_, subtree) in tree.get_subtrees() {
-            frontier.push_back(subtree.hash.clone());
-        }
-    }
-
-    Ok(Some(closure))
-}
-
 #[cfg(test)]
-mod subtree_closure_tests {
+mod tests {
     use super::*;
     use crate::builder::object::loose_object_builder::LooseObjectBuilder;
     use crate::enums::dir_entry_type::DirEntryType;
@@ -1087,7 +1046,7 @@ mod subtree_closure_tests {
             let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             let root = std::env::temp_dir().join(format!(
-                "forklift-subtree-closure-test-{}-{}-{}", name, std::process::id(), id
+                "forklift-tree-utils-test-{}-{}-{}", name, std::process::id(), id
             ));
             let _ = file_utils::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
@@ -1107,36 +1066,6 @@ mod subtree_closure_tests {
         let mut object = LooseObjectBuilder::build_blob(&Blob { content: content.as_bytes().to_vec() });
         object.store().unwrap();
         object.hash
-    }
-
-    /// A one-file tree whose content (hence hash) is unique to `marker` — trees are
-    /// content-addressed, so two calls with the same `marker` collide on the same hash and two
-    /// calls with different markers never do. Plain empty trees would all collide with each other
-    /// (an empty tree has no content to vary), which the walk's own de-duplication would then
-    /// silently fold into one node — exactly the trap this fixture needs to avoid to keep the
-    /// closure size predictable.
-    fn store_marked_tree(marker: &str) -> String {
-        let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-        tree.add_child(TreeItem::new("v".to_string(), store_blob(marker), DirEntryType::Normal));
-        let mut object = LooseObjectBuilder::build_tree(&tree);
-        object.store().unwrap();
-        object.hash
-    }
-
-    #[test]
-    fn the_closure_is_every_tree_and_blob_beneath_the_key() {
-        let _scratch = Scratch::new("closure");
-
-        // Root + two distinct one-file subtrees. Closure: root, x's tree, x's blob, y's tree,
-        // y's blob = 5 objects.
-        let mut small = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-        small.add_child(TreeItem::new("x".to_string(), store_marked_tree("x"), DirEntryType::Tree));
-        small.add_child(TreeItem::new("y".to_string(), store_marked_tree("y"), DirEntryType::Tree));
-        let mut object = LooseObjectBuilder::build_tree(&small);
-        object.store().unwrap();
-
-        let closure = collect_subtree_closure(&object.hash, "").unwrap().unwrap();
-        assert_eq!(closure.len(), 5, "root + (tree, blob) for each of x and y, none deduped away");
     }
 
     /// A remedy command's path is one argument: plain paths stay as they are, anything a shell

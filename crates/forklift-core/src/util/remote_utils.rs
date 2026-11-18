@@ -137,9 +137,9 @@ const RESOLVE_REQUEST_IDENTIFIER_BYTES: usize = 256 * 1024;
 /// rather than one per request, few enough not to swamp a server's directory hook.
 const RESOLVE_REQUESTS_IN_FLIGHT: usize = 4;
 
-/// The characters a warehouse path SEGMENT must be percent-encoded against before it is spliced
-/// into a URL. Everything but RFC 3986 unreserved characters (ASCII alphanumerics, `-`, `_`,
-/// `.`, `~`) is encoded — so a segment holding a space, `#`, `?`, `%`, or any other character
+/// The characters a path SEGMENT (a pallet name, split on `/`) must be percent-encoded against
+/// before it is spliced into a URL. Everything but RFC 3986 unreserved characters (ASCII
+/// alphanumerics, `-`, `_`, `.`, `~`) is encoded — so a segment holding a space, `#`, `?`, `%`, or any other character
 /// that is reserved or unsafe in the URL grammar round-trips instead of producing an invalid or
 /// misrouted request. Non-ASCII UTF-8 bytes are always percent-encoded by `utf8_percent_encode`
 /// regardless of this set, since an `AsciiSet` only classifies the ASCII range.
@@ -149,7 +149,7 @@ const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'~');
 
-/// Percent-encode a warehouse path's SEGMENTS for use in a URL, preserving the `/` separators
+/// Percent-encode a pallet name's SEGMENTS for use in a URL, preserving the `/` separators
 /// between them (so a multi-segment path still round-trips as multiple segments on the wire,
 /// never one opaque `%2F`-joined blob). Each segment — including an empty one, e.g. from a
 /// leading, trailing, or doubled `/` — is encoded independently against [`PATH_SEGMENT`].
@@ -1576,8 +1576,8 @@ mod clients {
         ///
         /// **Its consumers all need a client that never auto-follows.** `fetch_batch`'s `POST` so
         /// that a `307`/`308` cannot re-`POST` its body at a URL presigned for `GET` only (see
-        /// [`super::RemoteClient::fetch_batch`]'s own doc), `commit_lift`, `upload_signature` and
-        /// `put_trust` because they are mutations. A read whose redirect is safe
+        /// [`super::RemoteClient::fetch_batch`]'s own doc), and every other one because it is a
+        /// mutation (`commit_lift` and `update_ref` among them). A read whose redirect is safe
         /// to follow with every header it sent rides [`Self::HeadDeadline`] instead.
         HeadDeadlineNoRedirect {
             head: std::time::Duration,
@@ -1745,8 +1745,8 @@ mod clients {
         /// [`Posture::HeadDeadlineNoRedirect`], whose consumers need both at once: `fetch_batch`'s
         /// `POST` must not let a `307`/`308` replay its body at a `GET`-only presigned URL, and its
         /// response body must not be able to stall forever; `commit_lift` is a mutation, so it
-        /// never follows a redirect, and its retry deadline needs the head-wait bounded;
-        /// `upload_signature` and `put_trust` are mutations bounded by the retryable floor.
+        /// never follows a redirect, and its retry deadline needs the head-wait bounded; the
+        /// other consumers are mutations bounded by the retryable floor.
         ///
         /// **Its own client rather than one more line on an existing one**, because neither
         /// existing client could be given the axis it lacks. [`Self::no_redirect`] cannot take a
@@ -4123,7 +4123,7 @@ impl RemoteClient {
         // `GET`'s own silence budget when there was. The two budgets are the same size and reached
         // by different arguments, so a single posture would render the right figure with the wrong
         // provenance, and the composer's two arms would have nothing left to tell apart.
-        let (response, body_posture) = self.follow_bundle_redirect(response, post_posture, "batch").await?;
+        let (response, body_posture) = self.follow_bundle_redirect(response, post_posture).await?;
 
         if !response.status().is_success() {
             return Err(self.error_of(response, "the batch fetch").await);
@@ -4228,8 +4228,7 @@ impl RemoteClient {
         }
     }
 
-    /// Follow an offloading head's redirect of a bundle response (`what` names it in the
-    /// messages) by hand, or hand back `response` and `posture` unchanged when it is not one.
+    /// Follow an offloading head's redirect of a batch response by hand, or hand back `response` and `posture` unchanged when it is not one.
     /// Any `301`/`302`/`303`/`307`/`308` is followed with a bodyless `GET`. To another origin (a
     /// presigned storage URL, which is self-authorizing) it carries no `Authorization` header, so
     /// a token meant for this remote never leaves it; to this remote's own origin it carries the
@@ -4242,8 +4241,7 @@ impl RemoteClient {
     /// so a body failure is reported against the station that actually produced the bytes.
     async fn follow_bundle_redirect(&self,
                                     response: reqwest::Response,
-                                    posture: Posture,
-                                    what: &str) -> Result<(reqwest::Response, Posture), String> {
+                                    posture: Posture) -> Result<(reqwest::Response, Posture), String> {
         match response.status() {
             reqwest::StatusCode::MOVED_PERMANENTLY
             | reqwest::StatusCode::FOUND
@@ -4257,7 +4255,7 @@ impl RemoteClient {
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| response.url().join(value).ok())
                     .ok_or_else(|| {
-                        format!("The remote's {} redirect carried no usable Location header.", what)
+                        "The remote's batch redirect carried no usable Location header.".to_string()
                     })?;
 
                 let redirect_posture = Posture::BoundedObjectReads;
@@ -4271,7 +4269,7 @@ impl RemoteClient {
                     ).await
                 };
                 let response = self.response_from_send(
-                    &format!("following the {} redirect", what), redirect_posture, outcome
+                    "following the batch redirect", redirect_posture, outcome
                 )?;
                 Ok((response, redirect_posture))
             }
@@ -11936,6 +11934,7 @@ mod tests {
                 "the batch POST itself still carries this remote's bearer token, status {}",
                 redirect_status
             );
+            assert_eq!(remote.hits_for("/responses/bundle"), 1, "one bundle GET, status {}", redirect_status);
             let same_origin = matches!(redirect_status, 301 | 302);
             assert_eq!(
                 remote.any_had_auth("/responses/bundle"), same_origin,
@@ -13849,6 +13848,36 @@ mod tests {
 
         assert!(message.contains(CONNECTION_FAILED), "{}", message);
         assert_eq!(remote.connections(), 1);
+    }
+
+    /// A `GET` on a head-deadline posture is sent again the same way, on either redirect policy.
+    /// No public read sends one today, so this drives the send itself: the answer after the
+    /// dropped connection is the `404` the second attempt received.
+    #[test]
+    fn a_head_deadline_get_whose_connection_drops_before_any_answer_is_sent_again() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        for no_redirect in [false, true] {
+            let remote = CommitRemote::start(vec![CommitAnswer::Drop, CommitAnswer::Reply("HTTP/1.1 404 Not Found")]);
+            let client = RemoteClient::new_test_with_budgets(&remote.url, FAST);
+            let head = client.retryable_head_budget();
+            let posture = if no_redirect {
+                Posture::HeadDeadlineNoRedirect { head }
+            } else {
+                Posture::HeadDeadline { head }
+            };
+
+            let outcome = runtime.block_on(client.send_waiting_out(
+                posture, reqwest::Method::GET, "/v1/objects/ab", SendBody::Empty, "the probe"
+            ));
+
+            match outcome {
+                Ok(SendOutcome::Sent(response)) => assert_eq!(response.status(), 404, "no_redirect {}", no_redirect),
+                Ok(SendOutcome::Transport(error)) => panic!("no_redirect {}: not resent: {}", no_redirect, error),
+                Ok(SendOutcome::HeadWaitExpired { budget }) => panic!("no_redirect {}: head wait {:?}", no_redirect, budget),
+                Err(error) => panic!("no_redirect {}: {}", no_redirect, error),
+            }
+            assert_eq!(remote.connections(), 2, "no_redirect {}", no_redirect);
+        }
     }
 
     /// A `POST` may have taken effect before its connection dropped, so it is never sent again

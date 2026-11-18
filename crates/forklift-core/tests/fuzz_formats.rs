@@ -630,7 +630,7 @@ mod regressions {
         assert!(err.is_err(), "a huge field length must be an error, not a panic");
     }
 
-    /// A batch or subtree response arrives from an untrusted remote, and its records carry an
+    /// A batch response arrives from an untrusted remote, and its records carry an
     /// 8-byte length prefix. A record that declares a `u64::MAX` length used to
     /// `vec![0u8; length]` before reading — a one-record denial of service (capacity-overflow
     /// panic / allocator abort). This is the most exposed of the length bugs, so it is pinned

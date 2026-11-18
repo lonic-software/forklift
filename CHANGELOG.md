@@ -645,7 +645,6 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 - **forklift-server no longer serves `GET /v1/parcels/{parcel}/subtree/{path}`.** No client
   command sent it; a sparse clone fetches its subtrees by hash through `objects/batch`, as before.
-  The route comes back with file-level path grants, which it exists to check.
 
 ### Fixed
 
