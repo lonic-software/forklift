@@ -14,8 +14,8 @@ use crate::source_scan::{calls, differences, production_sites};
 /// Where production code is read: the client, the core and the server.
 const DIRS: &[&str] = &["crates/forklift/src", "crates/forklift-core/src", "crates/forklift-server/src"];
 
-/// Every production call of the byte reads (the coded one and the raw file read beneath it), by
-/// file and function, once per call.
+/// Every production call of the byte reads (the coded one, the raw file read beneath it, and the
+/// entry read over that), by file and function, once per call.
 const BYTE_READS: &[(&str, &str)] = &[
     // The read layer itself: the file before the witnesses are read, and again after one stood;
     // and the coded byte read over the raw one.
@@ -32,9 +32,16 @@ const BYTE_READS: &[(&str, &str)] = &[
     ("crates/forklift-core/src/util/office_utils.rs", "mend_trust_copy"),
     // The check before a copy write reads only the copy, never the trust file.
     ("crates/forklift-core/src/util/office_utils.rs", "refuse_unwritable_copy"),
+    // The entry read only tells a file from what is not one; its callers below judge it.
+    ("crates/forklift-core/src/util/office_utils.rs", "read_trust_entry"),
     // The first serve's check judges a trust file that stands; a missing one it leaves to the
     // coded read, which refuses it where trust was established.
     ("crates/forklift-core/src/util/office_utils.rs", "refuse_unsettled_trust"),
+    ("crates/forklift-core/src/util/office_utils.rs", "refuse_unsettled_trust"),
+    // heal's repair reads both files under the ref lock and writes one from the other; a missing
+    // trust file it restores only from a copy that stands, and with neither it writes nothing,
+    // leaving the coded read to refuse a lost anchor.
+    ("crates/forklift-core/src/util/office_utils.rs", "repair_trust_noting"),
     // A ref write's anchor precondition compares the file's bytes to the ones the caller judged;
     // a missing file meets only a caller that read none, and is then read through the witnesses.
     ("crates/forklift-core/src/util/pallet_utils.rs", "check_preconditions"),
@@ -81,6 +88,7 @@ fn words(line: &str) -> impl Iterator<Item = &str> {
 fn every_trust_read_that_can_skip_the_witnesses_is_listed() {
     let byte_reads = production_sites(DIRS, |line| {
         usize::from(calls(line, "read_trust_anchor_bytes")) + usize::from(calls(line, "read_trust_file"))
+            + usize::from(calls(line, "read_trust_entry"))
     });
     let adopts = production_sites(DIRS, adoptions);
 

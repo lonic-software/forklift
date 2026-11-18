@@ -85,7 +85,14 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 56** (current): the `trust_damaged` error code exists (exit 69). The trust file is
+**Schema 57** (current): `heal` emits `data.trust_restored` when it wrote the trust file from its
+copy, or the copy from the trust file, before anything read the anchor: `written` (`trust` or
+`copy`) names the file written, `path` its path and `from` the file it was written from. It does so
+whether or not a taint stands. Where the trust file and its copy differ and both would serve, it
+refuses as `trust_damaged` with nothing written and no `next_step`, and asks for the one not trusted
+to be moved aside first.
+
+**Schema 56**: the `trust_damaged` error code exists (exit 69). The trust file is
 missing while the office pallet is born or the file's copy (`trust-copy`, beside it) stands, so trust
 was established and its anchor is gone; or it does not parse (not UTF-8, not TOML, no version entry,
 or an entry the anchor needs is missing or mistyped), or something other than a file stands in its
