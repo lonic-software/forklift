@@ -1965,13 +1965,25 @@ fn unprocessable(message: String) -> HandlerError {
     (StatusCode::UNPROCESSABLE_ENTITY, message)
 }
 
+/// A verification of what the warehouse holds that refused: the operator's 503
+/// ([`damage_refusal`]) when the refusal carries a damage frame anywhere in it, since a stored
+/// record that does not read is the server's to repair and its reader's words may name the
+/// server's paths; a 422 otherwise.
+fn refused_or_damaged(message: String) -> HandlerError {
+    let damaged = forklift_core::error::frames_in(&message).any(|(code, _, _)| DAMAGE_CODES.iter().any(|damage| damage.as_str() == code));
+    match damaged {
+        true => damage_refusal(message),
+        false => unprocessable(message),
+    }
+}
+
 /// Map a lifted office chain that did not verify: a 403 when a parcel the lift brings
 /// oversteps its signer's privileges, a 422 otherwise (see
 /// `audit_utils::classify_office_lift_refusal`).
 fn office_lift_refusal(error: audit_utils::OfficeChainError, held_head: Option<&str>) -> HandlerError {
     match audit_utils::classify_office_lift_refusal(error, held_head) {
         audit_utils::OfficeLiftRefusal::Overstep(message) => (StatusCode::FORBIDDEN, message),
-        audit_utils::OfficeLiftRefusal::Unprocessable(message) => unprocessable(message),
+        audit_utils::OfficeLiftRefusal::Unprocessable(message) => refused_or_damaged(message),
     }
 }
 
@@ -3702,7 +3714,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     office_head.as_deref(),
                     request.old_head.as_deref(),
                     &request.new_head
-                ).map_err(unprocessable)?;
+                ).map_err(refused_or_damaged)?;
             } else if let Some(anchor) = anchor {
                 // A trusted warehouse accepts nothing a local audit would reject. This is the
                 // user-pallet path (the office and the meta-tree pallets took the branches above). The office head is the one
@@ -3712,12 +3724,8 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     office first.".to_string()
                 ))?;
 
-                // The office chain is the server's own: damage met on it is the operator's to repair.
                 let office_state = audit_utils::verify_office_chain_memoized(&anchor, &office_head)
-                    .map_err(|error| match String::from(error) {
-                        damaged if forklift_core::error::frames_in(&damaged).any(|(code, _, _)| DAMAGE_CODES.iter().any(|damage| damage.as_str() == code)) => damage_refusal(damaged),
-                        refused => unprocessable(refused),
-                    })?;
+                    .map_err(|error| refused_or_damaged(error.into()))?;
 
                 // Incremental: everything reachable from old_head was verified when
                 // old_head was committed, so only the new slice is audited.
@@ -3726,7 +3734,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     &anchor,
                     &office_state,
                     request.old_head.as_deref().as_slice()
-                ).map_err(|refusal| unprocessable(refusal.into()))?;
+                ).map_err(|refusal| refused_or_damaged(refusal.into()))?;
             }
 
             ref_write_test_checkpoint(&name);

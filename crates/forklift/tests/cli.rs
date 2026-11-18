@@ -7843,7 +7843,7 @@ fn damaged_trust_refuses_with_its_code_and_names_heal_where_heal_mends() {
         ("office ref lost, a remote configured", Box::new(move |w| {
             lose(w, "meta/office");
             assert_success(&w.run(&["config", "set", "remote.url", "http://127.0.0.1:9"]));
-        }), &["stack", "-m", "r"], 53, "ref_damaged", "forklift lower", "Lowering takes the office pallet from the remote"),
+        }), &["stack", "-m", "r"], 53, "ref_damaged", "", "If the configured remote holds this warehouse's office pallet"),
         ("head signature garbled", Box::new(|w| std::fs::write(sidecar_of_head(w), b"xx").unwrap()),
             &["audit", "--full"], 70, "signature_damaged", "", "clone the warehouse again from a remote that holds the parcel"),
         ("head signature lost", Box::new(|w| forklift_core::util::file_utils::remove_file(sidecar_of_head(w)).unwrap()),

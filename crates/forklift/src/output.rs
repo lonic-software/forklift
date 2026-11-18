@@ -930,7 +930,7 @@ impl ErrorCode {
             ErrorCode::RemoteHistoryIncomplete =>
                 "The remote refused to move a pallet because part of the new head's history is absent there or unreadable, even after the lift negotiated and uploaded again; nothing moved",
             ErrorCode::RefDamaged =>
-                "A pallet ref is lost or damaged: its file holds no parcel hash, or it is missing while a checkout stands on that pallet, or the office pallet's ref is missing beside a held trust file. Nothing was changed; heal rebuilds a working pallet's ref from what the bays and the ref's own bytes still name, or lists what it found, and lower takes a missing office from a configured remote",
+                "A pallet ref is lost or damaged: its file holds no parcel hash, or it is missing while a checkout stands on that pallet, or the office pallet's ref is missing beside a held trust file. Nothing was changed; heal rebuilds a working pallet's ref from what the bays and the ref's own bytes still name, or lists what it found, and lower takes a missing office from a remote that holds it",
             ErrorCode::FetchScopeDamaged =>
                 "A sparse warehouse's fetch scope is lost or damaged, and heal could not rebuild it from the checkouts' scopes alone. Nothing was changed; heal --fetch-scope sets it, fetching what the history there lacks",
             ErrorCode::TombstonesDamaged =>

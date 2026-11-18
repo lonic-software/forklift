@@ -2291,7 +2291,7 @@ const SERVED_LOST_ANCHOR_WAYS_OUT: &str = "Restore the trust file or its copy fr
 fn unborn_office_note() -> String {
     format!(
         "The office pallet is unborn beside a trust file, so nothing signed here can be checked until it stands. {}",
-        unborn_office_remedy(crate::util::remote_utils::RemoteClient::is_configured()).1
+        unborn_office_remedy(unchecked_remote()).1
     )
 }
 
@@ -2300,18 +2300,31 @@ fn unborn_office_note() -> String {
 /// does not say why the office is missing, since a lost ref and an enrollment or a first lower
 /// stopped between its writes look alike. `closing` says what the refused command left as it was.
 pub fn office_unborn_refusal(closing: &str) -> String {
-    office_unborn_refusal_over(closing, crate::util::remote_utils::RemoteClient::is_configured())
+    office_unborn_refusal_over(closing, unchecked_remote())
 }
 
-/// [`office_unborn_refusal`], `lowerable` saying whether a remote stands that a lower can take
-/// the office pallet from. A served root's office is unborn while its first enrollment has lifted
-/// the anchor and not yet the office, so there it is refused uncoded, with no hand fix.
-pub fn office_unborn_refusal_over(closing: &str, lowerable: bool) -> String {
+/// What is known, without asking it, of a remote a lower could take the office pallet from:
+/// `None` when one is configured, which may or may not hold it; `Some(false)` when none is.
+fn unchecked_remote() -> Option<bool> {
+    match crate::util::remote_utils::RemoteClient::is_configured() {
+        true => None,
+        false => Some(false),
+    }
+}
+
+/// [`office_unborn_refusal`], `lowerable` saying whether a remote is known to hold this
+/// warehouse's office pallet (`Some`), or one is configured that was not asked (`None`). Only a
+/// remote known to hold it is named as the next step. A served root's office is unborn while the
+/// first enrollment has lifted the anchor and not yet the office, and also when its ref was lost,
+/// which nothing here tells apart, so there it is refused uncoded, saying both.
+pub fn office_unborn_refusal_over(closing: &str, lowerable: Option<bool>) -> String {
     if served_or_unknown() {
         return format!(
             "The trust file holds this warehouse's anchor, but the office pallet is unborn, so nothing signed here \
-            can be checked. {} On a served warehouse the office pallet stands once the enrolling client lifts it.",
-            closing
+            can be checked. {} On a served warehouse that is the state before the enrolling client lifts the office \
+            pallet. If it was lifted here before, its ref (\"{}\") was lost: restore it from a backup.",
+            closing,
+            pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME).to_string_lossy()
         );
     }
     let (next_step, ways_out) = match unborn_office_remedy(lowerable) {
@@ -2334,23 +2347,29 @@ pub fn office_unborn_refusal_over(closing: &str, lowerable: bool) -> String {
 }
 
 /// The next step and the ways out of a client's unborn office beside a trust file: `forklift
-/// lower` takes the office from a remote that holds it (`lowerable`), verified against the trust
-/// file; without one, the office ref is restored or written by hand.
-fn unborn_office_remedy(lowerable: bool) -> (String, String) {
+/// lower` takes the office from a remote known to hold it (`lowerable`, as for
+/// [`office_unborn_refusal_over`]), verified against the trust file; a configured remote not asked
+/// is named only as a way out; without one, the office ref is restored or written by hand.
+fn unborn_office_remedy(lowerable: Option<bool>) -> (String, String) {
+    let by_hand = format!(
+        "restore its ref (\"{}\") from a backup, or write the office pallet's head parcel hash into it by hand; \
+        an older head than the last re-admits any key revoked since.",
+        pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME).to_string_lossy()
+    );
     match lowerable {
-        true => (
+        Some(true) => (
             "forklift lower".to_string(),
             "\"forklift lower\" takes the office pallet from the remote, and verifies it against the trust file.".to_string(),
         ),
-        false => (
+        None => (
             String::new(),
             format!(
-                "With no remote to take it from, restore its ref (\"{}\") from a backup, or write the office \
-                pallet's head parcel hash into it by hand; an older head than the last re-admits any key revoked \
-                since.",
-                pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME).to_string_lossy()
+                "If the configured remote holds this warehouse's office pallet, \"forklift lower\" takes it and \
+                verifies it against the trust file. Otherwise {}",
+                by_hand
             ),
         ),
+        Some(false) => (String::new(), format!("With no remote that holds it to take it from, {}", by_hand)),
     }
 }
 
@@ -3762,26 +3781,41 @@ pub(crate) mod tests {
         }
     }
 
-    /// An unborn office beside the trust file is a lost ref on a client, named `ref_damaged` with
-    /// its hand fix; on a served root it is the window before the enrolling client lifts the
-    /// office, refused uncoded with no fix to make.
+    /// An unborn office beside the trust file is a lost ref on a client, named `ref_damaged`: lower
+    /// is the next step only from a remote known to hold the office, a configured remote not asked
+    /// is a way out, and with none the hand fix. On a served root it is the window before the
+    /// enrolling client lifts the office or a lost ref, refused uncoded, saying both.
     // Revert: drop the served check in `office_unborn_refusal_over` → the served row is coded → red.
+    // Revert: name lower as the step for `None` → that row's step is lower → red.
     #[test]
     fn an_unborn_office_is_ref_damaged_on_a_client_and_not_on_a_served_root() {
         let dir = trust_read_root("unborn-office", Some(TRUST_FILE), false, false);
         let _scope = crate::globals::StorageRootScope::enter(&dir);
 
-        let client = office_unborn_refusal_over("Nothing was changed.", false);
-        assert!(crate::error::frames_code(&client, RefusalCode::RefDamaged), "{}", client);
-        assert!(client.contains("by hand"), "{}", client);
+        // (what is known of a remote, the step named, a phrase the message holds)
+        for (lowerable, step, phrase) in [
+            (Some(true), "forklift lower", "Lowering takes the office pallet from the remote"),
+            (None, "", "If the configured remote holds this warehouse's office pallet"),
+            (Some(false), "", "With no remote that holds it to take it from"),
+        ] {
+            let client = office_unborn_refusal_over("Nothing was changed.", lowerable);
+            assert!(crate::error::frames_code(&client, RefusalCode::RefDamaged), "{:?}: {}", lowerable, client);
+            let (_, message, next_step) = crate::error::deframe(&client).unwrap();
+            assert_eq!(next_step, step, "{:?}: {}", lowerable, client);
+            assert!(message.contains(phrase), "{:?}: {}", lowerable, client);
+            assert_eq!(message.contains("by hand"), lowerable != Some(true), "{:?}: {}", lowerable, client);
+        }
 
         let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
         crate::util::tombstone_utils::write_tombstones(&lock, &Default::default()).unwrap();
         crate::util::tombstone_utils::write_mark(&lock).unwrap();
         drop(lock);
-        let served = office_unborn_refusal_over("Nothing was changed.", true);
-        assert!(crate::error::frames_in(&served).next().is_none(), "{}", served);
-        assert!(served.contains("Nothing was changed.") && !served.contains("by hand") && !served.contains("forklift lower"), "{}", served);
+        for lowerable in [Some(true), None, Some(false)] {
+            let served = office_unborn_refusal_over("Nothing was changed.", lowerable);
+            assert!(crate::error::frames_in(&served).next().is_none(), "{:?}: {}", lowerable, served);
+            assert!(served.contains("Nothing was changed.") && served.contains("was lost: restore it from a backup"), "{:?}: {}", lowerable, served);
+            assert!(!served.contains("by hand") && !served.contains("forklift lower"), "{:?}: {}", lowerable, served);
+        }
 
         drop(_scope);
         file_utils::remove_dir_all(&dir).ok();

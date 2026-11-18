@@ -8978,9 +8978,10 @@ pub async fn push_local_trust(client: &RemoteClient,
 
     // Read before anything is uploaded, so a missing office refuses with the remote untouched.
     let Some(office_head) = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)? else {
-        // Lower is the way out only where this remote holds an office to take.
-        let lowerable = info.trust.is_some() && info.pallets.contains_key(&office_utils::office_wire_key());
-        return Err(office_utils::office_unborn_refusal_over("Nothing was lifted.", lowerable));
+        // Lower is the way out only where this remote holds this warehouse's office to take.
+        let lowerable = info.trust.as_ref().is_some_and(|trust| trust.genesis == local.genesis)
+            && info.pallets.contains_key(&office_utils::office_wire_key());
+        return Err(office_utils::office_unborn_refusal_over("Nothing was lifted.", Some(lowerable)));
     };
 
     if let Some(remote_trust) = &info.trust {

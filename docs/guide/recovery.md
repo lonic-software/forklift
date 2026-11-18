@@ -121,8 +121,10 @@ journal records its head. Restore its file from a backup, or write the head parc
 
 The office pallet's ref (`.forklift/meta/office`) missing beside a trust file refuses as `ref_damaged`
 too, in the commands that need the verified office, such as `stack`, `audit` and `office enroll`: the anchor stands, but there is no office to check
-anything against. With a remote configured, the next step is `forklift lower`, which takes the office
-pallet from the remote and verifies it against the trust file. Without one, restore the ref from a
+anything against. `forklift lower` takes the office pallet from a remote that holds it and verifies it against the
+trust file. `forklift lift` asks the remote, so it names lower as the next step only where the remote
+holds this warehouse's office; other commands name it as a way out where a remote is configured.
+Without one, restore the ref from a
 backup, or write the office pallet's head parcel hash into it by hand. Write the latest head you know
 of: an older one re-admits any key revoked since.
 

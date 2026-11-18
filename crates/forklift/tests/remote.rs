@@ -5853,10 +5853,25 @@ fn a_lift_over_a_damaged_office_signature_on_the_server_names_its_operator() {
 // holds a trust file. Revert: pass `true` for `lowerable` → the fresh remote's row names lower.
 #[test]
 fn a_lift_over_a_lost_office_ref_refuses_before_uploading_the_anchor() {
-    // (name, lift the office first, the step named)
-    for (name, lifted_first, step) in [("fresh remote", false, ""), ("remote holds the office", true, "forklift lower")] {
+    // (name, who lifted an office to the remote first, the step named)
+    for (name, lifted_first, step) in [
+        ("fresh remote", "", ""),
+        ("remote holds the office", "w", "forklift lower"),
+        ("remote holds another warehouse's office", "x", ""),
+    ] {
         let area = TestArea::new(&format!("lift-lost-office-{}", lifted_first));
         let server = Server::start(&area, None);
+        if lifted_first == "x" {
+            std::fs::create_dir_all(area.path("x")).unwrap();
+            assert_success(&area.forklift("x", &["prepare"]));
+            assert_success(&area.forklift("x", &["config", "set", "--global", "operator.identifier", "tester@forklift"]));
+            area.write_file("x/other.txt", "x\n");
+            assert_success(&area.forklift("x", &["load", "."]));
+            assert_success(&area.forklift("x", &["stack", "-m", "other"]));
+            assert_success(&area.forklift("x", &["office", "enroll"]));
+            assert_success(&area.forklift("x", &["config", "set", "remote.url", &server.url]));
+            assert_success(&area.forklift("x", &["lift"]));
+        }
         std::fs::create_dir_all(area.path("w")).unwrap();
         assert_success(&area.forklift("w", &["prepare"]));
         assert_success(&area.forklift("w", &["config", "set", "--global", "operator.identifier", "tester@forklift"]));
@@ -5865,7 +5880,7 @@ fn a_lift_over_a_lost_office_ref_refuses_before_uploading_the_anchor() {
         assert_success(&area.forklift("w", &["stack", "-m", "first"]));
         assert_success(&area.forklift("w", &["office", "enroll"]));
         assert_success(&area.forklift("w", &["config", "set", "remote.url", &server.url]));
-        if lifted_first {
+        if lifted_first == "w" {
             assert_success(&area.forklift("w", &["lift"]));
         }
         forklift_core::util::file_utils::remove_file(area.path("w/.forklift/meta/office")).unwrap();
@@ -5878,8 +5893,8 @@ fn a_lift_over_a_lost_office_ref_refuses_before_uploading_the_anchor() {
         assert_eq!(value["error"]["next_step"].as_str().unwrap_or(""), step, "{}: {}", name, value);
         let message = value["error"]["message"].as_str().unwrap();
         assert!(message.contains("Nothing was lifted."), "{}: {}", name, value);
-        assert_eq!(message.contains("by hand"), !lifted_first, "{}: {}", name, value);
-        assert_eq!(area.path("server-root/.forklift/trust").exists(), lifted_first, "{}: no anchor reaches a fresh remote", name);
+        assert_eq!(message.contains("by hand"), step.is_empty(), "{}: {}", name, value);
+        assert_eq!(area.path("server-root/.forklift/trust").exists(), !lifted_first.is_empty(), "{}: no anchor reaches a fresh remote", name);
     }
 }
 
