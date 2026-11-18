@@ -382,8 +382,9 @@ These lines are the ones the fault scenarios run for their record, switch and me
 `--json` the scenarios give Forklift's. A test holds the two to each other.
 
 Clone, push and pull talk to a remote. Forklift's is a forklift-server root, served over HTTP on
-loopback for each repetition and stopped after it. git's is a bare repository, reached by its
-path. Before they are timed, the harness builds, untimed, two remotes for each subject:
+loopback for each repetition and stopped after it. A server that ends on its own during a
+repetition, or does not stop when asked, makes the row **not comparable**. git's is a bare
+repository, reached by its path, whose `HEAD` names `main`. Before they are timed, the harness builds, untimed, two remotes for each subject:
 
 - one holding `main` and the subject's current branch at the subject's head, which clone and push
   run against;
@@ -392,10 +393,10 @@ path. Before they are timed, the harness builds, untimed, two remotes for each s
 Each of those commits appends a line to one of the 20 edited files. For Forklift they are signed,
 like every other record it makes. Each repetition runs against a fresh copy of its remote, so no
 repetition starts from what another one left behind. The copies are removed afterwards, like the
-write pairs' copies.
+write pairs' copies, and the remotes themselves once the three rows are timed.
 
 - Clone clones `main` into a new folder, named in the command as `WORK`. The new work tree must then
-  be clean.
+  be on `main` at the subject's head, by the same reads as below, and clean.
 - Push runs in a fresh copy of the subject with the same 3 commits made on its current branch. git's
   remote is set as `origin`.
 - Pull runs in a fresh copy of the subject itself.
@@ -403,8 +404,8 @@ write pairs' copies.
 Push and pull are judged by where the current branch stands, read before and after the timed
 command: Forklift's pallet list and the remote's, and git's `rev-parse` and `ls-remote`. A push must
 leave the remote's branch changed, and at the subject's head. A pull must leave the subject's head
-changed, and at the remote's branch. A command that succeeded without carrying the head across voids its
-cell (see below). Each copy must also be clean before and after, as for the write pairs.
+changed, and at the remote's branch. A command that succeeded without carrying the head across, or a
+clone that landed anywhere else, voids its cell (see below). Each copy must also be clean before and after, as for the write pairs.
 
 Push makes the subject 3 commits ahead of its remote, rather than the remote 3 commits behind the
 subject, because Forklift's subject is enrolled at its head. A remote behind that head would lack the
@@ -450,7 +451,8 @@ included, voids its cell too, which then says so and shows no stderr. In a cold 
 program that exits non-zero, or dies of a signal, voids the cell before the command runs, and the
 cell shows the program's exit or signal and its stderr. A cache-drop program that runs past its 10
 minutes is killed and voids the cell too, and the cell says it was the cache-drop program. A push or
-pull that exits 0 without carrying the head across voids its cell as well. The cell then says *did
+pull that exits 0 without carrying the head across, or a clone that exits 0 on another branch or
+commit, voids its cell as well. The cell then says *did
 not move the head*, with the repetition and the refs it read.
 
 Read two medians together with their spreads. A difference where one subject's fastest run is
