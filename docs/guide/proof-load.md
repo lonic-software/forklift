@@ -305,12 +305,20 @@ target/release/proof-load perf --out ../perf-out \
   files three directories deep, two binary files of 2 MiB, 40 commits on `main`, and a `perf-side`
   branch that leaves `main` a few commits before its tip. Each shape has a fixed seed, so every run
   of a shape times the same history. The report's header spells the shape out.
-- `--reps` sets how many timed repetitions each cell gets (5 unless you say otherwise). Each cell
-  also gets one untimed run first, so every repetition runs on a warm cache.
+- `--reps` sets how many timed repetitions each cell gets (5 unless you say otherwise). Each warm
+  cell also gets one untimed run first, so every repetition runs on a warm cache.
+- `--drop-caches` names a program, by path, that drops the operating system's file caches. The
+  harness runs it with no arguments just before each repetition of a cold row, untimed. Without it,
+  every cold row is reported as not run, with the reason "no cache-drop program given
+  (--drop-caches)". Dropping the caches usually needs root, so the program is yours to provide: on
+  Linux, one that runs `sync` and writes `3` to `/proc/sys/vm/drop_caches`; on macOS, one that runs
+  `purge`. On Windows the harness has no cold runs, and every cold row reads "cold runs are not built
+  on Windows in this harness".
 
 The history is written as a `git fast-import` stream into a bare repository. Each subject is built
 from that repository the way `--history-from` builds one: git's subjects by copying it, Forklift's
-by its own `git import`. There are three subjects, as in section 7. `git` has the configuration
+by its own `git import`, and then enrolled with `office enroll`, so every record it makes is signed,
+as a Forklift user's is. There are three subjects, as in section 7. `git` has the configuration
 every repository the harness makes is given. `git-tuned` has every fsync on, fsck on transfer, the
 untracked cache, the fsmonitor daemon where this git has one, and a commit-graph written untimed
 after the build.
@@ -322,10 +330,30 @@ It times these operations:
 | status | `stocktake --summary` | `status` |
 | log | `history` | `log` |
 | blame | `blame FILE` | `blame --first-parent FILE` |
+| commit | `stack -m MESSAGE` | `commit -q -m MESSAGE` |
+| switch | `shift perf-side` | `switch -q perf-side` |
+| merge | `consolidate perf-side` | `merge -q --no-edit perf-side` |
 | diff | `diff` | `diff` |
 | diff --staged | `diff --staged` | `diff --staged` |
 
+Every row runs twice: once warm, and once cold, with the caches dropped before each repetition by the
+`--drop-caches` program. A cold cell has no untimed run first.
+
 Status, log and blame run on the clean tree, and blame names the file the history changes most.
+
+Commit, switch and merge change the subject, so each of their repetitions runs on a fresh copy of the
+clean subject, made untimed and read once untimed, as after the build. The subjects themselves are
+never changed. Before each commit, the harness appends a line to the same 20 tracked files and
+stages them untimed, with `load .` and `add -A`. Forklift's stack is signed and git's commit is
+not, and the commit row's note says so. Switch moves from the current branch to `perf-side`, and
+merge merges `perf-side` into it, a merge with no conflict. Both are reported as **not comparable**
+when `perf-side` is at the commit the current branch is at in any subject, since they would then
+time a change of nothing. After each commit and merge, the copy must be clean, with nothing staged,
+changed or untracked, or the row is not comparable.
+
+These lines are the ones the fault scenarios run for their record, switch and merge steps, less the
+`--json` the scenarios give Forklift's. A test holds the two to each other.
+
 Then the harness appends a line to the same 20 tracked files in every subject, for diff. For diff
 --staged, it stages them untimed with `load .` and `add -A`. Every Forklift line runs without
 `--json`.
@@ -345,7 +373,8 @@ is not timed.
 number. A reader refuses a `perf.json` of any other format. The header records what the graded
 report's header records, plus the machine: its CPU model, logical cores and memory.
 
-Each row has one cell per subject:
+Each row is named by its operation and its cache, as in `### merge, cold`, and has one cell per
+subject:
 
 - **median**, **fastest** and **slowest**: the wall time over the repetitions, never the mean. The
   clock starts just before the command is started and stops when it exits (on Windows, within a
@@ -360,13 +389,16 @@ Windows*.
 
 A repetition that exits non-zero, or dies of a signal, voids its cell, which then shows the exit or
 the signal and the command's stderr instead of a timing. A run killed at its limit, the untimed one
-included, voids its cell too, which then says so and shows no stderr.
+included, voids its cell too, which then says so and shows no stderr. In a cold row, a cache-drop
+program that exits non-zero, or dies of a signal, voids the cell before the command runs, and the
+cell shows the program's exit and its stderr.
 
 Read two medians together with their spreads. A difference where one subject's fastest run is
 slower than the other's slowest is clear. One where the ranges overlap is likely to be noise. This
 build does not yet judge any row as slower.
 
 `perf` exits 0 when every pair was compared and every cell was timed, and 1 when a pair was not
-comparable or a cell was voided. It exits 2 when the run could not go ahead, such as over a
+comparable or a cell was voided. A cold row not run, for either reason above, does not make it exit
+1. It exits 2 when the run could not go ahead, such as over a
 non-empty output folder, an unknown shape, or a subject that could not be built. A run that exits 2
 writes no `perf.json`.
