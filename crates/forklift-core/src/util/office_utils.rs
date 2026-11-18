@@ -3722,7 +3722,12 @@ pub(crate) mod tests {
                 }
             }
             if checked_refuses {
-                assert!(crate::util::tombstone_utils::mark_served(true).unwrap());
+                // The mark alone: serving reads the trust, which refuses here.
+                let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
+                crate::util::tombstone_utils::write_tombstones(&lock, &Default::default()).unwrap();
+                crate::util::tombstone_utils::write_mark(&lock).unwrap();
+                drop(lock);
+                assert!(crate::util::tombstone_utils::is_served().unwrap());
                 let e = read_trust_anchor_in(TrustReadMode::Checked).expect_err(name);
                 assert!(e.contains("a served warehouse's trust changes only through its server"), "{}: {}", name, e);
                 assert!(!e.contains("forklift lower"), "{}: a served root is never told to lower: {}", name, e);
