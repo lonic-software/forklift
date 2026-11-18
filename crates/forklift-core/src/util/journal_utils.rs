@@ -1824,7 +1824,7 @@ mod tests {
         write(&[entry("stack", "main", &hash('1'), &hash('2'))]).unwrap();
 
         let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path()).unwrap()).unwrap();
-        assert_eq!(value["version"], 4);
+        assert_eq!(value["version"], 5);
         assert_eq!(value["entries"][0]["op"], "stack");
         assert_eq!(value["entries"][0]["before"]["heads"]["main"], hash('1'));
         assert_eq!(value["entries"][0]["after"]["heads"]["main"], hash('2'));
@@ -1854,7 +1854,9 @@ mod tests {
         // Version 1 is the format before consolidations and picks recorded their base.
         assert_refused_everywhere(r#"{"version":1,"entries":[]}"#, "has format version 1");
         assert_refused_everywhere(r#"{"version":3,"entries":[]}"#, "has format version 3");
-        assert_refused_everywhere(r#"{"version":5,"entries":[]}"#, "has format version 5");
+        // Version 4 is the format before a consolidation recorded its skeleton's digest.
+        assert_refused_everywhere(r#"{"version":4,"entries":[]}"#, "has format version 4");
+        assert_refused_everywhere(r#"{"version":6,"entries":[]}"#, "has format version 6");
         assert_refused_everywhere(r#"{"version":"1","entries":[]}"#, "has an unreadable format version (\"1\")");
     }
 
@@ -1872,7 +1874,7 @@ mod tests {
         let _scratch = Scratch::new("no-after-journal");
 
         let content = format!(
-            r#"{{"version":4,"entries":[{{"op":"stack","before":{{"current_pallet":"main","heads":{{"main":"{}"}},"consolidation":null}}}}]}}"#,
+            r#"{{"version":5,"entries":[{{"op":"stack","before":{{"current_pallet":"main","heads":{{"main":"{}"}},"consolidation":null}}}}]}}"#,
             hash('1')
         );
 

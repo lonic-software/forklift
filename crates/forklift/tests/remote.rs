@@ -13938,7 +13938,8 @@ fn heal_reseals_nothing_over_a_check_that_could_not_read_every_source() {
     assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let older = sealed_older_roots(&area, "cached", &head);
     lose_sealed_record(&area, "cached");
-    std::fs::write(area.path("cached/.forklift/consolidation"), "not a record\n").unwrap();
+    // A record the walk reads its roots from and heal does not repair: the walk reads past it.
+    std::fs::write(area.path(&format!("cached/.forklift/{}", forklift_core::util::mirror_utils::FILE_NAME_MIRROR_ROOTS)), "not a record\n").unwrap();
 
     let output = area.forklift("cached", &["--json", "heal"]);
     assert!(!output.status.success(), "{}", stdout(&output));

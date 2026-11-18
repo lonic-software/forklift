@@ -300,7 +300,7 @@ fn crashed_with_a_marker(name: &str, prepare: &dyn Fn(&str) -> Area, args: &[&st
         let pending = std::fs::read_dir(area.state("")).unwrap().map(|entry| entry.unwrap().path())
             .find(|path| path.file_name().unwrap().to_string_lossy().starts_with("consolidation.tmp~"));
         if let Some(pending) = pending {
-            std::fs::rename(pending, area.state("consolidation")).unwrap();
+            forklift_core::util::file_utils::rename(pending, area.state("consolidation")).unwrap();
         }
         let marker = std::fs::read_to_string(area.state("operation")).unwrap_or_default();
         if marker.contains(kind) && area.state("consolidation").exists() {

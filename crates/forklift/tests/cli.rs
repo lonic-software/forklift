@@ -15148,7 +15148,7 @@ fn a_repack_keeps_a_deleted_head_until_the_bay_that_deleted_it_is_removed() {
     assert!(!warehouse.run(&["show", &format!("{}:side.txt", head)]).status.success(), "the head is freed once its window ends");
 }
 
-// Revert: read a version-3 journal as this version's → its entries are read under today's
+// Revert: read a version-4 journal as this version's → its entries are read under today's
 // embedded records, and undo acts on them instead of naming the version.
 #[test]
 fn an_older_journal_is_refused_by_its_version() {
@@ -15157,12 +15157,12 @@ fn an_older_journal_is_refused_by_its_version() {
 
     let path = warehouse.root.join(".forklift/journal.json");
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.contains("\"version\":4"), "{}", text);
-    std::fs::write(&path, text.replace("\"version\":4", "\"version\":3")).unwrap();
+    assert!(text.contains("\"version\":5"), "{}", text);
+    std::fs::write(&path, text.replace("\"version\":5", "\"version\":4")).unwrap();
 
     let refused = warehouse.run(&["undo"]);
     assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("has format version 3"), "{:?}", refused);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("has format version 4"), "{:?}", refused);
 }
 
 #[test]
@@ -15478,12 +15478,13 @@ fn an_abort_under_a_pallet_delete_leaves_both_undoable() {
         "the consolidate's entry went with the abort: {}", stdout(&unstack));
 }
 
-/// `undo` reads the skeleton with the consolidation, and its refusal names the abort: the abort
-/// must not need it, or that way out would loop.
+/// `undo` reads the skeleton with the consolidation, and with no copy of it left for heal to
+/// restore, its refusal names the abort: the abort must not need it, or that way out would loop.
 #[test]
 fn abort_works_with_the_skeleton_missing() {
     let warehouse = a_conflicted_consolidation("abort-no-skeleton");
     forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/consolidation-skeleton")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/consolidation-skeleton-copy")).unwrap();
 
     let undo = warehouse.run(&["undo"]);
     assert!(!undo.status.success() && stderr(&undo).contains("Next step: forklift abort\n"),
