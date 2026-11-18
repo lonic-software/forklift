@@ -285,3 +285,82 @@ error, so for now they report grades without failing a pull request.
 shows the grade tally and the rows (with filters for failures and by binding) and a row's steps;
 a **Coverage** screen; and a **Run** screen that starts a run itself. See its
 [README](../../tools/proof-load-desktop/README.md).
+
+## 11. Measuring performance
+
+`proof-load perf` times Forklift against git on one generated history. It is a separate command
+from `run` and faults nothing. It runs one timed command at a time, with nothing else from the
+harness running, so no timing shares the machine with a faulted job.
+
+```sh
+cargo build --release -p forklift -p proof-load
+target/release/proof-load perf --out ../perf-out \
+  --forklift target/release/forklift --git "$(command -v git)"
+```
+
+- `--out` receives the subjects and the report, and must be empty or new, as for `run`.
+- `--forklift` and `--git` name the binaries to time, by path. Time a release build: a debug build
+  mostly measures unoptimised code.
+- `--shape` names the generated history. This build has one shape, `small`: a few hundred text
+  files three directories deep, two binary files of 2 MiB, 40 commits on `main`, and a `perf-side`
+  branch that leaves `main` a few commits before its tip. Each shape has a fixed seed, so every run
+  of a shape times the same history. The report's header spells the shape out.
+- `--reps` sets how many timed repetitions each cell gets (5 unless you say otherwise). Each cell
+  also gets one untimed run first, so every repetition runs on a warm cache.
+
+The history is written as a `git fast-import` stream into a bare repository. Each subject is built
+from that repository the way `--history-from` builds one: git's subjects by copying it, Forklift's
+by its own `git import`. There are three subjects, as in section 7. `git` has the configuration
+every repository the harness makes is given. `git-tuned` has every fsync on, fsck on transfer, the
+untracked cache, the fsmonitor daemon where this git has one, and a commit-graph written untimed
+after the build.
+
+It times these operations:
+
+| Row | Forklift | git |
+|---|---|---|
+| status | `stocktake --summary` | `status` |
+| log | `history` | `log` |
+| blame | `blame FILE` | `blame --first-parent FILE` |
+| diff | `diff` | `diff` |
+| diff --staged | `diff --staged` | `diff --staged` |
+
+Status, log and blame run on the clean tree, and blame names the file the history changes most.
+Then the harness appends a line to the same 20 tracked files in every subject, for diff. For diff
+--staged, it stages them untimed with `load .` and `add -A`. Every Forklift line runs without
+`--json`.
+
+Before a pair is timed, the harness checks that every subject sees the same change. Before the
+clean-tree rows, nothing may be staged in Forklift's subject, and `git status --porcelain` must
+print nothing in either git's. Before diff, each subject must count the 20
+edited files as changed. Before diff --staged, each must count them as staged. A pair that fails
+its check is reported as **not comparable**, with what each subject saw, and is not timed.
+
+### Reading perf.md
+
+`perf.md` is for reading, and `perf.json` holds the same report for programs, under its own format
+number. A reader refuses a `perf.json` of any other format. The header records what the graded
+report's header records, plus the machine: its CPU model, logical cores and memory.
+
+Each row has one cell per subject:
+
+- **median**, **fastest** and **slowest**: the wall time over the repetitions, never the mean. The
+  clock starts just before the command is started and stops when it exits (on Windows, within a
+  millisecond of it, because the harness polls for the exit there).
+- **peak memory**: the most memory the command held resident at once, as the median with its range.
+- **cores**: CPU time over wall time, so a figure above 1 means the command ran on several cores at
+  once. A cell where any repetition used under 20 ms of CPU time reads *too short to
+  measure*.
+
+On Windows only the wall time is measured, and the memory and cores cells say *not measured on
+Windows*.
+
+A repetition that exits non-zero voids its cell, which then shows the exit and the command's stderr
+instead of a timing. Read two medians together with their spreads. A difference where one subject's
+fastest run is slower than the other's slowest is clear. One where the ranges overlap is likely to
+be noise. This build does not yet judge any row as slower.
+
+`perf` exits 0 when every pair was compared and every cell was timed, and 1 when a pair was not
+comparable or a cell was voided. It exits 2 when the run could not go ahead, such as over a
+non-empty output folder, an unknown shape, or a subject that could not be built. A run that exits 2
+writes no `perf.json`.

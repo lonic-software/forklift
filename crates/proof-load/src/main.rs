@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use proof_load::perf;
 use proof_load::run::{self, Progress, RunOptions};
 
 #[derive(Parser)]
@@ -95,6 +96,25 @@ enum Command {
         #[arg(long)]
         history_from: Option<PathBuf>,
     },
+    /// Times Forklift side by side with git on a generated history, one command at a time, and
+    /// writes perf.json and perf.md.
+    Perf {
+        /// An empty or new directory for the subjects and the perf report.
+        #[arg(long)]
+        out: PathBuf,
+        /// The forklift binary to time, by path: a release build.
+        #[arg(long)]
+        forklift: PathBuf,
+        /// The git binary to time, by path; it also builds the history.
+        #[arg(long)]
+        git: PathBuf,
+        /// The generated history to time on.
+        #[arg(long, default_value = "small")]
+        shape: String,
+        /// Timed repetitions per cell, after one untimed run.
+        #[arg(long, default_value_t = 5)]
+        reps: usize,
+    },
 }
 
 /// Shows a run's messages on stderr; the report itself is the files the run writes.
@@ -107,20 +127,34 @@ impl Progress for Stderr {
 }
 
 fn main() -> ExitCode {
-    let Command::Run {
-        source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, power, power_variants, jobs,
-        capped_volume, disk_full, read_only, folding_volume, network, history_from,
-    } = Cli::parse().command;
-    let options = RunOptions {
-        source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, power, power_variants, jobs,
-        capped_volume, disk_full, read_only, folding_volume, network, history_from,
-    };
-    match run::run(&options, &Stderr) {
-        Ok(report) if report.failed() => ExitCode::from(1),
-        Ok(_) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("proof-load: {}", error);
-            ExitCode::from(2)
+    match Cli::parse().command {
+        Command::Run {
+            source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, power, power_variants, jobs,
+            capped_volume, disk_full, read_only, folding_volume, network, history_from,
+        } => {
+            let options = RunOptions {
+                source, out, seed, only, forklift, git, forklift_server, budget, strace, kill, power, power_variants, jobs,
+                capped_volume, disk_full, read_only, folding_volume, network, history_from,
+            };
+            match run::run(&options, &Stderr) {
+                Ok(report) if report.failed() => ExitCode::from(1),
+                Ok(_) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("proof-load: {}", error);
+                    ExitCode::from(2)
+                }
+            }
+        }
+        Command::Perf { out, forklift, git, shape, reps } => {
+            let options = perf::PerfOptions { out, forklift, git, shape, reps };
+            match perf::run(&options, &|text| eprintln!("proof-load: {}", text)) {
+                Ok(report) if report.failed() => ExitCode::from(1),
+                Ok(_) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("proof-load: {}", error);
+                    ExitCode::from(2)
+                }
+            }
         }
     }
 }
@@ -129,14 +163,15 @@ fn main() -> ExitCode {
 mod tests {
     use clap::CommandFactory;
 
-    /// The guide page names every flag `proof-load run` takes in its prose or tables, outside its
-    /// code blocks, so a new flag fails until the page mentions it where it explains things; an
-    /// example command line alone does not count.
+    /// The guide page names every flag of every `proof-load` subcommand in its prose or tables,
+    /// outside its code blocks, so a new flag fails until the page mentions it where it explains
+    /// things; an example command line alone does not count.
     ///
     /// Revert: drop `--jobs` from the guide → it is named missing; count the code blocks → a flag
-    /// only the example shows passes.
+    /// only the example shows passes; look up `run` alone → a `perf` flag the guide leaves out
+    /// passes.
     #[test]
-    fn the_guide_names_every_run_flag() {
+    fn the_guide_names_every_subcommand_flag() {
         let prose = |page: &str| -> String {
             let mut fenced = false;
             page.lines().filter(|line| {
@@ -150,12 +185,15 @@ mod tests {
         assert_eq!(prose("one `--seed`\n```sh\nproof-load run --jobs 2\n```\ntwo"), "one `--seed`\ntwo");
         let guide = prose(&std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/guide/proof-load.md")).unwrap());
         let cli = super::Cli::command();
-        let run = cli.find_subcommand("run").expect("the run subcommand");
-        let flags: Vec<String> = run.get_arguments().filter_map(|argument| argument.get_long()).map(|long| format!("--{}", long)).collect();
-        assert!(flags.len() > 10, "{:?}", flags);
+        let subcommands: Vec<&clap::Command> = cli.get_subcommands().collect();
+        assert_eq!(subcommands.iter().map(|subcommand| subcommand.get_name()).collect::<Vec<_>>(), ["run", "perf"]);
         // A flag counts where it stands alone: `--forklift` inside `--forklift-server` is not it.
         let named = |flag: &str| guide.match_indices(flag).any(|(at, _)| !guide[at + flag.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-'));
-        let missing: Vec<&String> = flags.iter().filter(|flag| !named(flag)).collect();
-        assert_eq!(missing, Vec::<&String>::new(), "docs/guide/proof-load.md does not name these flags");
+        for subcommand in subcommands {
+            let flags: Vec<String> = subcommand.get_arguments().filter_map(|argument| argument.get_long()).map(|long| format!("--{}", long)).collect();
+            assert!(flags.len() >= 5, "{}: {:?}", subcommand.get_name(), flags);
+            let missing: Vec<&String> = flags.iter().filter(|flag| !named(flag)).collect();
+            assert_eq!(missing, Vec::<&String>::new(), "docs/guide/proof-load.md does not name these flags of {}", subcommand.get_name());
+        }
     }
 }

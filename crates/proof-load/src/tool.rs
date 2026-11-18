@@ -111,9 +111,10 @@ pub(crate) fn drain(mut source: impl Read + Send + 'static) -> std::thread::Join
     })
 }
 
-/// Runs `invocation` in `scratch` under `environment` and captures what it said. Its stdin is
-/// closed, so a tool that would prompt sees end of input instead of waiting.
-pub fn run(invocation: &Invocation, scratch: &Scratch, environment: &Environment) -> Result<Outcome, ToolError> {
+/// The command `invocation` names, checked: its program by an absolute path, its working
+/// directory inside `scratch`, its environment `environment` and nothing inherited, its output
+/// piped.
+fn prepared(invocation: &Invocation, scratch: &Scratch, environment: &Environment) -> Result<Command, ToolError> {
     if !invocation.program.is_absolute() {
         return Err(ToolError::NotAbsolute(invocation.program.clone()));
     }
@@ -124,9 +125,26 @@ pub fn run(invocation: &Invocation, scratch: &Scratch, environment: &Environment
     }
 
     let mut command = Command::new(&invocation.program);
-    command.args(&invocation.arguments).current_dir(&invocation.directory)
-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command.args(&invocation.arguments).current_dir(&invocation.directory).stdout(Stdio::piped()).stderr(Stdio::piped());
     environment.apply(&mut command);
+    Ok(command)
+}
+
+/// Runs `invocation` in `scratch` under `environment` and captures what it said. Its stdin is
+/// closed, so a tool that would prompt sees end of input instead of waiting.
+pub fn run(invocation: &Invocation, scratch: &Scratch, environment: &Environment) -> Result<Outcome, ToolError> {
+    run_from(invocation, Stdio::null(), scratch, environment)
+}
+
+/// [`run`], with the file at `input` as the tool's stdin, as `git fast-import` reads its stream.
+pub fn run_with_input(invocation: &Invocation, input: &Path, scratch: &Scratch, environment: &Environment) -> Result<Outcome, ToolError> {
+    let file = std::fs::File::open(input).map_err(|error| ToolError::Spawn { program: invocation.program.clone(), reason: format!("{}: {}", input.display(), error) })?;
+    run_from(invocation, Stdio::from(file), scratch, environment)
+}
+
+fn run_from(invocation: &Invocation, stdin: Stdio, scratch: &Scratch, environment: &Environment) -> Result<Outcome, ToolError> {
+    let mut command = prepared(invocation, scratch, environment)?;
+    command.stdin(stdin);
 
     let spawn = |error: std::io::Error| ToolError::Spawn { program: invocation.program.clone(), reason: error.to_string() };
     let mut child = command.spawn().map_err(spawn)?;
@@ -149,6 +167,133 @@ pub fn run(invocation: &Invocation, scratch: &Scratch, environment: &Environment
     let stdout = stdout.join().unwrap_or_default();
     let stderr = stderr.join().unwrap_or_default();
     Ok(Outcome { arguments: invocation.arguments.clone(), exit: status.code(), failure: failure_of(&stdout), stdout, stderr })
+}
+
+/// What the operating system measured of one waited child: its CPU time, and the most memory it
+/// held resident at once, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Usage {
+    pub user: Duration,
+    pub system: Duration,
+    pub peak_bytes: u64,
+}
+
+/// One timed run: what it said, how long it took from just before its spawn to its exit, and its
+/// [`Usage`] where the platform reports one (unix; never Windows).
+#[derive(Clone, Debug)]
+pub struct Timed {
+    pub outcome: Outcome,
+    pub wall: Duration,
+    pub usage: Option<Usage>,
+}
+
+/// Runs `invocation` as [`run`] does, timed for a measurement rather than polled. On unix the
+/// harness blocks until the child exits, so the wall time is not rounded up to a poll's interval;
+/// the child's own rusage gives its CPU time and peak memory. Its limit is still enforced, by a
+/// watchdog that kills it. On Windows only the wall time is read, polled every millisecond.
+pub fn timed(invocation: &Invocation, scratch: &Scratch, environment: &Environment) -> Result<Timed, ToolError> {
+    let mut command = prepared(invocation, scratch, environment)?;
+    command.stdin(Stdio::null());
+
+    let spawn = |error: std::io::Error| ToolError::Spawn { program: invocation.program.clone(), reason: error.to_string() };
+    let started = Instant::now();
+    let mut child = command.spawn().map_err(spawn)?;
+    let stdout = drain(child.stdout.take().expect("stdout is piped"));
+    let stderr = drain(child.stderr.take().expect("stderr is piped"));
+
+    let reaped = reap(&mut child, invocation.limit).map_err(spawn)?;
+    let wall = reaped.ended.duration_since(started);
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    if reaped.killed {
+        return Err(ToolError::TimedOut { program: invocation.program.clone(), limit: invocation.limit });
+    }
+    let outcome = Outcome { arguments: invocation.arguments.clone(), exit: reaped.exit, failure: failure_of(&stdout), stdout, stderr };
+    Ok(Timed { outcome, wall, usage: reaped.usage })
+}
+
+/// How a timed child ended.
+struct Reaped {
+    exit: Option<i32>,
+    /// When the harness saw it exit.
+    ended: Instant,
+    usage: Option<Usage>,
+    /// Whether the watchdog killed it at its limit.
+    killed: bool,
+}
+
+/// Waits for `child` to exit, then reaps it with its rusage. The wait does not reap
+/// (`WNOWAIT`), so until the watchdog is stopped the child's id is still its own and the
+/// watchdog's kill can reach no other process.
+#[cfg(unix)]
+fn reap(child: &mut std::process::Child, limit: Duration) -> std::io::Result<Reaped> {
+    let pid = libc::pid_t::try_from(child.id()).map_err(|_| std::io::Error::other(format!("process id {} is out of range", child.id())))?;
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || match stopped.recv_timeout(limit) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // SAFETY: kill takes no pointers; the child is not reaped until this thread is joined.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            true
+        }
+        _ => false,
+    });
+    let waited = loop {
+        // SAFETY: waitid fills the zeroed siginfo it is given and returns -1 on failure.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        #[allow(clippy::unnecessary_cast)]
+        if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0 {
+            break Ok(Instant::now());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            break Err(error);
+        }
+    };
+    drop(stop);
+    let killed = watchdog.join().unwrap_or(false);
+    let ended = waited?;
+
+    let mut status: libc::c_int = 0;
+    // SAFETY: wait4 fills the status and the zeroed rusage it is given and returns -1 on failure.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        let reaped = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+        if reaped == pid {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    let exit = if libc::WIFEXITED(status) { Some(libc::WEXITSTATUS(status)) } else { None };
+    let time = |value: libc::timeval| Duration::from_secs(u64::try_from(value.tv_sec).unwrap_or(0)) + Duration::from_micros(u64::try_from(value.tv_usec).unwrap_or(0));
+    #[allow(clippy::unnecessary_cast)]
+    let peak_bytes = peak_bytes_when(!cfg!(target_os = "macos"), usage.ru_maxrss as i64);
+    Ok(Reaped { exit, ended, usage: Some(Usage { user: time(usage.ru_utime), system: time(usage.ru_stime), peak_bytes }), killed })
+}
+
+#[cfg(not(unix))]
+fn reap(child: &mut std::process::Child, limit: Duration) -> std::io::Result<Reaped> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Reaped { exit: status.code(), ended: Instant::now(), usage: None, killed: false });
+        }
+        if started.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(Reaped { exit: None, ended: Instant::now(), usage: None, killed: true });
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A peak resident set size as rusage's `ru_maxrss` gives it, in bytes: when `kibibytes`, as Linux
+/// and the BSDs report it, in KiB; otherwise, as macOS reports it, already in bytes.
+pub fn peak_bytes_when(kibibytes: bool, maxrss: i64) -> u64 {
+    let maxrss = u64::try_from(maxrss).unwrap_or(0);
+    if kibibytes { maxrss.saturating_mul(1024) } else { maxrss }
 }
 
 /// A forklift-server serving one warehouse for the length of a scenario, killed when dropped.
@@ -426,5 +571,68 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         let error = stubborn.stop(Duration::from_millis(300)).unwrap_err();
         assert!(error.contains("had not stopped"), "{}", error);
+    }
+
+    /// The wall time `timed` reports is the child's, not a poll's: a child that exits at once
+    /// takes well under the 5 ms `run` sleeps between polls, so a reap through a poll would read
+    /// every run as at least that long. The median of ten runs, so one slow spawn on a loaded
+    /// machine does not decide it.
+    #[cfg(unix)]
+    #[test]
+    fn wall_time_is_not_quantised_by_a_poll() {
+        let scratch = scratch("timed-wall");
+        let environment = Environment::scrubbed(&scratch, None, &BTreeMap::new()).unwrap();
+        let invocation = Invocation { program: PathBuf::from("/usr/bin/true"), arguments: vec![], directory: scratch.root().to_path_buf(), limit: Duration::from_secs(10) };
+        let mut walls: Vec<Duration> = (0..10).map(|_| {
+            let timed = timed(&invocation, &scratch, &environment).unwrap();
+            assert_eq!(timed.outcome.exit, Some(0));
+            timed.wall
+        }).collect();
+        walls.sort();
+        assert!(walls[5] < Duration::from_millis(5), "median wall time {:?} of {:?}", walls[5], walls);
+        let _ = std::fs::remove_dir_all(scratch.root());
+    }
+
+    /// The peak memory `timed` reports is in bytes on every unix: a child that fills a 64 MiB
+    /// buffer reports at least that and less than four times it, whichever unit its platform's
+    /// rusage counts in.
+    #[cfg(unix)]
+    #[test]
+    fn peak_memory_is_in_bytes() {
+        let scratch = scratch("timed-peak");
+        let environment = Environment::scrubbed(&scratch, None, &BTreeMap::new()).unwrap();
+        let arguments = ["if=/dev/zero", "of=/dev/null", "bs=67108864", "count=1"].map(String::from).to_vec();
+        let invocation = Invocation { program: PathBuf::from("/bin/dd"), arguments, directory: scratch.root().to_path_buf(), limit: Duration::from_secs(30) };
+        let timed = timed(&invocation, &scratch, &environment).unwrap();
+        assert_eq!(timed.outcome.exit, Some(0), "{}", String::from_utf8_lossy(&timed.outcome.stderr));
+        let peak = timed.usage.expect("unix reads rusage").peak_bytes;
+        assert!((64 << 20..256 << 20).contains(&peak), "peak {} bytes", peak);
+        let _ = std::fs::remove_dir_all(scratch.root());
+    }
+
+    /// `timed` still enforces the invocation's limit, and a child it killed is a timeout, not an
+    /// exit; it gives what the child said and how it exited, as `run` does.
+    #[cfg(unix)]
+    #[test]
+    fn timed_kills_at_the_limit_and_keeps_the_exit() {
+        let scratch = scratch("timed-limit");
+        let environment = Environment::scrubbed(&scratch, None, &BTreeMap::new()).unwrap();
+        let shell = |script: &str, limit: Duration| Invocation {
+            program: PathBuf::from("/bin/sh"), arguments: vec!["-c".into(), script.into()], directory: scratch.root().to_path_buf(), limit,
+        };
+        let started = Instant::now();
+        assert!(matches!(timed(&shell("sleep 30", Duration::from_millis(300)), &scratch, &environment), Err(ToolError::TimedOut { .. })));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let exited = timed(&shell("echo out; echo err >&2; exit 3", Duration::from_secs(10)), &scratch, &environment).unwrap();
+        assert_eq!((exited.outcome.exit, exited.outcome.stdout.as_slice(), exited.outcome.stderr.as_slice()), (Some(3), b"out\n".as_slice(), b"err\n".as_slice()));
+        let _ = std::fs::remove_dir_all(scratch.root());
+    }
+
+    /// A KiB count is multiplied out and a byte count is kept.
+    #[test]
+    fn a_peak_is_normalised_to_bytes_by_its_unit() {
+        assert_eq!(peak_bytes_when(true, 65_536), 64 << 20);
+        assert_eq!(peak_bytes_when(false, 65_536), 65_536);
+        assert_eq!(peak_bytes_when(true, -1), 0);
     }
 }

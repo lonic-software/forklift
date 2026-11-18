@@ -107,7 +107,7 @@ fn write_detail(root: &std::path::Path, name: &str, value: &impl serde::Serializ
 
 /// A tool as the determinism record names it: its path and the first line of its `--version`.
 /// Asked with nothing inherited but PATH, from the temp directory, so nothing of the user's is read.
-fn described(program: &std::path::Path) -> String {
+pub(crate) fn described(program: &std::path::Path) -> String {
     let version = std::process::Command::new(program).arg("--version").env_clear()
         .envs(std::env::var_os("PATH").map(|path| ("PATH", path))).current_dir(std::env::temp_dir()).output().ok()
         .and_then(|output| String::from_utf8_lossy(&output.stdout).lines().next().map(|line| line.trim().to_string()))
@@ -117,7 +117,7 @@ fn described(program: &std::path::Path) -> String {
 
 /// The operating system the run was on, as the plate's header names it: its name and release.
 #[cfg(unix)]
-fn operating_system() -> String {
+pub(crate) fn operating_system() -> String {
     // SAFETY: uname fills the zeroed struct it is given and returns -1 on failure, writing nothing.
     let mut name: libc::utsname = unsafe { std::mem::zeroed() };
     if unsafe { libc::uname(&mut name) } != 0 {
@@ -131,13 +131,13 @@ fn operating_system() -> String {
 }
 
 #[cfg(not(unix))]
-fn operating_system() -> String {
+pub(crate) fn operating_system() -> String {
     format!("{} (release not read in this harness)", Platform::current().label())
 }
 
 /// The type of the filesystem `path` is on, as the plate's header names it.
 #[cfg(target_os = "macos")]
-fn filesystem_of(path: &std::path::Path) -> String {
+pub(crate) fn filesystem_of(path: &std::path::Path) -> String {
     use std::os::unix::ffi::OsStrExt;
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return "unknown: the path holds a NUL".to_string() };
     // SAFETY: statfs fills the zeroed struct from a NUL-terminated path and returns -1 on failure.
@@ -151,7 +151,7 @@ fn filesystem_of(path: &std::path::Path) -> String {
 
 /// The type of the filesystem `path` is on, by its magic number, as the plate's header names it.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn filesystem_of(path: &std::path::Path) -> String {
+pub(crate) fn filesystem_of(path: &std::path::Path) -> String {
     use std::os::unix::ffi::OsStrExt;
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return "unknown: the path holds a NUL".to_string() };
     // SAFETY: statfs fills the zeroed struct from a NUL-terminated path and returns -1 on failure.
@@ -177,19 +177,19 @@ fn filesystem_of(path: &std::path::Path) -> String {
 }
 
 #[cfg(not(unix))]
-fn filesystem_of(_path: &std::path::Path) -> String {
+pub(crate) fn filesystem_of(_path: &std::path::Path) -> String {
     "not read on Windows in this harness".to_string()
 }
 
 /// What every repository the harness creates for git holds in its own config, as the plate's
 /// header names it.
-fn created_configuration() -> String {
+pub(crate) fn created_configuration() -> String {
     runner::GIT_CREATED_CONFIG.iter().map(|[key, value]| format!("{}={}", key, value)).collect::<Vec<_>>().join(" ")
 }
 
 /// What git tuned runs with beyond git at its defaults, as the report names it: its options, and
 /// the fsmonitor where this git has a daemon for it.
-fn tuned_configuration(daemon: bool) -> String {
+pub(crate) fn tuned_configuration(daemon: bool) -> String {
     let options: Vec<&str> = crate::scenario::GIT_TUNED.iter().copied().filter(|option| *option != "-c").collect();
     let fsmonitor = if daemon { "core.fsmonitor=true (its daemon run by the harness)" } else { "core.fsmonitor: unsupported here" };
     format!("{}; {}", options.join(" "), fsmonitor)
