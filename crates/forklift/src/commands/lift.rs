@@ -12,6 +12,7 @@ use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use crate::commands::consolidate::{self, MergeStatus};
 use crate::commands::lower::{self, MetaPalletFailure};
 use crate::commands::mirror::{self, LiftMirror};
+use crate::commands::shift;
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -345,6 +346,13 @@ async fn try_auto_merge(client: &RemoteClient,
                         head: &str,
                         remote_head: &str,
                         progress: &Progress) -> Result<bool, String> {
+    // A merge in progress here would be written over by this one, so a lift there makes none and
+    // falls through to the diverged error before fetching anything for it: the lower that error
+    // names says what to finish first.
+    if shift::merge_in_progress()? {
+        return Ok(false);
+    }
+
     // Their work must be local before we can compare ancestry or merge it. Path-pruned in a
     // sparse workspace (a full fetch scope makes this the whole closure, as before), so an
     // optimistic auto-merge stays as sparse as the workspace it runs in. A cache fetches only

@@ -275,12 +275,16 @@ pub fn write_consolidation_state(state: &ConsolidationState) -> Result<(), Strin
 }
 
 /// Write a merge record at `path` and its copy at `copy`, both atomically and the copy first: a copy
-/// write that fails fails the whole write before the record is touched, so while a record is
-/// present its copy holds the bytes of that record's last write.
+/// write that fails fails the whole write before the record is touched. A record write that fails
+/// takes the copy it would have matched away again, so a copy never holds bytes a record write did
+/// not commit; only a stop between the two writes leaves one ahead of its record, which the next
+/// heal over a usable record writes back over.
 pub(crate) fn write_record_and_copy(path: &Path, copy: &Path, bytes: &[u8]) -> Result<(), String> {
     file_utils::write_file_atomically(copy, bytes)
         .map_err(|e| format!("Error while recording the copy \"{}\": {}", copy.to_string_lossy(), e))?;
-    file_utils::write_file_atomically(path, bytes)
+    file_utils::write_file_atomically(path, bytes).inspect_err(|_| {
+        let _ = remove_record(copy);
+    })
 }
 
 /// Remove a merge record at `path` and then its copy at `copy`, the reverse of
@@ -1766,6 +1770,23 @@ fn split_lines(content: &[u8]) -> Vec<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A record write that fails after its copy's takes the copy away again, so the copy never
+    /// holds bytes no record write committed.
+    ///
+    /// Revert: keep the copy when the record's write fails → the copy is still there, red.
+    #[test]
+    fn a_record_write_that_fails_leaves_no_copy_of_it() {
+        let root = std::env::temp_dir().join(format!("forklift-record-copy-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&root);
+        let record = root.join("consolidation");
+        std::fs::create_dir_all(record.join("held")).unwrap();
+        let copy = root.join("consolidation-copy");
+
+        assert!(write_record_and_copy(&record, &copy, b"bytes").is_err(), "a folder holds the record's place");
+        assert!(!copy.exists(), "the copy went with the failed write");
+        let _ = file_utils::remove_dir_all(&root);
+    }
 
     #[test]
     fn the_executable_bit_merges_like_content() {

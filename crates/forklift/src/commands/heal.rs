@@ -240,16 +240,15 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // against the pallet and parcel heal settled for the bay, and before the passes and the
     // operation's recovery, which read them.
     let agreement = match base {
-        Base::Position => pallet_utils::read_position().ok()
-            .and_then(|position| position.base.map(|head| Agreement { pallet: position.pallet, head })),
+        Base::Position => merge_state_heal::agreement_in(&forklift_core::globals::bay_root()),
         Base::Parcel(head) => position.map(|pallet| Agreement { pallet: pallet.to_string(), head: head.to_string() }),
         Base::Unborn => None,
     };
-    let merge_repair = merge_state_heal::repair(agreement.as_ref(), &mut ref_notes)
+    let mut merge_repair = merge_state_heal::repair(agreement.as_ref(), &mut ref_notes)
         .map_err(|error| records_said(error, &ref_notes, early_position.as_ref(), early_scope.as_ref()))?;
-    let merge_restored = merge_repair.restored;
+    let early_restored = merge_repair.restored.clone();
     let with_merge = |mut error: String| {
-        for sentence in merge_restored.iter().flat_map(MergeStateRestored::sentences) {
+        for sentence in early_restored.iter().flat_map(MergeStateRestored::sentences) {
             error = forklift_core::error::append_to_message(error, &sentence);
         }
         error
@@ -451,12 +450,16 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         false => operation_utils::recover(),
     }.map_err(|error| with_rebuilt(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), &inventory_rebuilt))?;
 
-    // A merge record left damaged under another kind of operation is refused once that operation's
-    // recovery has lowered its marker, so the way out it names is one that can now run.
+    // A merge record left damaged under another kind of operation is repaired again once that
+    // operation's recovery has lowered its marker, so a refusal it ends with names a way out that
+    // can now run.
     if merge_repair.deferred {
         match operation_utils::read() {
-            Ok(None) => merge_state_heal::check()
-                .map_err(|error| with_rebuilt(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), &inventory_rebuilt))?,
+            Ok(None) => {
+                let later = merge_state_heal::repair(agreement.as_ref(), &mut ref_notes)
+                    .map_err(|error| with_rebuilt(changed_after(String::from(error), &refs_rebuilt, &refs_removed, &ref_notes), &inventory_rebuilt))?;
+                merge_repair = merge_repair.then(later);
+            }
             _ => ref_notes.push(
                 "A damaged record of the merge in progress in this bay waits for the interrupted operation there to be \
                  finished or undone; heal says what to run for it once that is done."
@@ -497,6 +500,11 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             notes.push(note);
         }
     }
+    // A damaged merge record no copy could restore is refused last, once every repair has run: its
+    // way out reads what they mend. While another refusal leads, it stays a note.
+    let merge_refusal = merge_repair.refusal;
+    let merge_note = merge_refusal.clone().map(String::from);
+    notes.extend(merge_note.clone());
     if let Some(kind) = waits {
         notes.push(format!(
             "The interrupted {} in this bay waits for its pallet's ref; heal finishes or undoes it once that ref is set.",
@@ -820,7 +828,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         unavailable_rebuilt,
         redactions_applied_rebuilt: applied_rebuilt,
         checkout_scope_restored: early_scope,
-        merge_state_restored: merge_restored,
+        merge_state_restored: merge_repair.restored,
         fetch_scope_rebuilt: scope_rebuilt,
         parked_rebuilt,
         position_rebuilt: early_position.or(late_position),
@@ -924,6 +932,15 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     }
 
     if report.refs_refused.is_empty() && report.objects_lost.is_none() && origin_refused.is_none() {
+        if let (Some(refused), Some(note)) = (merge_refusal, &merge_note) {
+            let mut report = report;
+            let note = forklift_core::error::rendered_frames(note);
+            report.notes.retain(|kept| *kept != note);
+            if !output::is_json() {
+                report.render_human();
+            }
+            return Err(with_report(&report, refused, Vec::new()).into());
+        }
         output::emit(&report);
         return Ok(());
     }

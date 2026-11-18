@@ -286,7 +286,7 @@ pub(crate) async fn merge_head_into_current(current: &str,
 
     // Every caller merges into a bay that has no merge in progress: one standing would be written
     // over by this merge's records and lost with them.
-    shift::refuse_mid_merge("merging again")?;
+    shift::refuse_mid_merge("starting another merge")?;
 
     let our_tree_hash = object_utils::load_parcel(our_head)?.tree_hash;
     let their_tree_hash = object_utils::load_parcel(their_head)?.tree_hash;

@@ -5,9 +5,10 @@
 //!
 //! Every write of one of these records puts the same bytes in a copy beside it first, then in the
 //! record, and every clear removes the record first, then the copy
-//! ([`merge_utils::write_record_and_copy`]). So while a record is present its copy holds the bytes
-//! of that record's last write, and a copy with no record beside it is an interrupted clear or a
-//! failed write, never a merge in progress.
+//! ([`merge_utils::write_record_and_copy`]), which takes the copy away again when the record's own
+//! write fails. So while a record is present its copy holds the bytes of that record's last write,
+//! or of a write that stopped before reaching the record, and a copy with no record beside it is
+//! an interrupted clear or write, never a merge in progress.
 //!
 //! ## Usable
 //!
@@ -22,10 +23,12 @@
 //! by the operation marker standing in the bay:
 //! - Under a merge or pick marker, it is written back from a usable copy, or removed with its copy:
 //!   that operation's recovery clears all three records whatever its outcome. Never refused.
-//! - With no marker, it is written back from a usable copy that agrees with the bay, or refused with
-//!   `merge_state_damaged` and the record's way out.
-//! - Under any other marker, it is written back as with no marker, or left for heal to refuse once
-//!   that operation's recovery has lowered its marker, since the way out is refused while it stands.
+//! - With no marker, it is written back from a usable copy that agrees with the bay, or left for
+//!   heal to refuse with `merge_state_damaged` and the record's way out once every other repair has
+//!   run, since that way out reads what those repairs mend (the inventory above all).
+//! - Under any other marker, it is written back as with no marker, or left as it is: heal judges it
+//!   again once that operation's recovery has lowered its marker, since the way out is refused while
+//!   it stands.
 //!
 //! An absent state is never written back, even with a copy beside it: that is how every clear
 //! leaves a finished, aborted or recovered merge. A usable record re-syncs a copy that is missing,
@@ -121,7 +124,7 @@ pub struct Agreement {
 
 /// The agreement of the bay whose state lives in `dir`, read from its position: none when the
 /// position does not read or stands on no parcel, so no copy agrees.
-fn agreement_in(dir: &Path) -> Option<Agreement> {
+pub fn agreement_in(dir: &Path) -> Option<Agreement> {
     let position = pallet_utils::read_position_in(dir).ok()?;
     position.base.map(|head| Agreement { pallet: position.pallet, head })
 }
@@ -230,9 +233,27 @@ pub struct Repair {
     /// The records it wrote back or removed, if any.
     pub restored: Option<MergeStateRestored>,
 
-    /// Whether a damaged record was left under a marker of another kind, for heal to refuse with
-    /// [`check`] once that operation's recovery has lowered its marker.
+    /// Whether a damaged record was left under a marker of another kind, for heal to repair again
+    /// once that operation's recovery has lowered its marker.
     pub deferred: bool,
+
+    /// The `merge_state_damaged` refusal of the first record no copy could restore with no marker
+    /// standing, which heal ends with once every other repair has run.
+    pub refusal: Option<CoreError>,
+}
+
+impl Repair {
+    /// This repair followed by `later`, one made after the marker that deferred this one was lowered.
+    pub fn then(self, later: Repair) -> Repair {
+        let restored = match (self.restored, later.restored) {
+            (Some(mut first), Some(second)) => {
+                first.records.extend(second.records);
+                Some(first)
+            }
+            (first, second) => first.or(second),
+        };
+        Repair { restored, deferred: later.deferred, refusal: self.refusal.or(later.refusal) }
+    }
 }
 
 /// The operation marker standing in the bay, as the repair branches on it.
@@ -292,9 +313,8 @@ fn status(dir: &Path, record: MergeRecord, digest: Option<&str>) -> Result<Statu
 /// * `notes`     - Where a copy that could not be re-synced is noted.
 ///
 /// # Returns
-/// * `Ok(Repair)`     - What was written back or removed, and whether a refusal waits.
-/// * `Err(CoreError)` - A `merge_state_damaged` refusal, or a file that could not be read or
-///   written.
+/// * `Ok(Repair)`     - What was written back or removed, and the refusal or the repair that waits.
+/// * `Err(CoreError)` - A file that could not be read or written.
 pub fn repair(agreement: Option<&Agreement>, notes: &mut Vec<String>) -> Result<Repair, CoreError> {
     let dir = bay_root();
     let marker = match operation_utils::marker_stands_in(&dir) {
@@ -309,7 +329,7 @@ pub fn repair(agreement: Option<&Agreement>, notes: &mut Vec<String>) -> Result<
         None => "the warehouse's own working tree".to_string(),
     };
 
-    let mut repaired = Repair { restored: None, deferred: false };
+    let mut repaired = Repair { restored: None, deferred: false, refusal: None };
     let mut records: Vec<MergeRecordRestored> = Vec::new();
 
     // The state first: the skeleton is judged against the digest of the state that is left.
@@ -339,6 +359,9 @@ pub fn repair(agreement: Option<&Agreement>, notes: &mut Vec<String>) -> Result<
             Marker::None | Marker::Other => Ok(agreement),
         };
         if let Some(bytes) = restorable_copy(&dir, record, copy_agreement, digest.as_deref()) {
+            // Whatever stands there goes first: a folder in the record's place would refuse the
+            // rename that writes it, and every heal would meet it again.
+            merge_utils::remove_record(&path)?;
             file_utils::write_file_atomically(&path, &bytes)
                 .map_err(|e| format!("Error while restoring the {} \"{}\": {}", record.what(), path.to_string_lossy(), e))?;
             if record == MergeRecord::State {
@@ -350,22 +373,27 @@ pub fn repair(agreement: Option<&Agreement>, notes: &mut Vec<String>) -> Result<
 
         match marker {
             Marker::Merge => {
-                merge_utils::remove_record(&path)?;
                 let copy = dir.join(record.copy_name());
                 if !matches!(merge_utils::read_record_bytes(&copy), Ok(Some(bytes)) if copy_is_newer(record, &bytes)) {
                     merge_utils::remove_record(&copy)?;
                 }
-                records.push(MergeRecordRestored { record: record.what().to_string(), file: path.to_string_lossy().into_owned(), removed: true, was });
+                // A missing skeleton has nothing to remove, and is reported as nothing removed.
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    merge_utils::remove_record(&path)?;
+                    records.push(MergeRecordRestored { record: record.what().to_string(), file: path.to_string_lossy().into_owned(), removed: true, was });
+                }
             }
             Marker::Other => repaired.deferred = true,
             Marker::None => {
-                let found = format!("The {} file \"{}\" {}", record.what(), path.to_string_lossy(), with_stop(&was));
-                let mut error = damaged_with(&dir, &found, record, agreement, digest.as_deref());
-                let done = MergeStateRestored { checkout: checkout.clone(), records: records.clone() };
-                for sentence in done.sentences() {
-                    error = crate::error::append_to_message(error, &sentence);
+                if repaired.refusal.is_none() {
+                    let found = format!("The {} file \"{}\" {}", record.what(), path.to_string_lossy(), with_stop(&was));
+                    let mut refusal = CoreError::from(damaged_with(&dir, &found, record, agreement, digest.as_deref()));
+                    // Heal ends with it after its other repairs, which may have changed files.
+                    if let CoreError::Refusal { message, .. } = &mut refusal {
+                        *message = message.replacen(" Nothing was changed.", "", 1);
+                    }
+                    repaired.refusal = Some(refusal);
                 }
-                return Err(CoreError::from(error));
             }
         }
     }
@@ -415,13 +443,4 @@ fn resync_copy(dir: &Path, record: MergeRecord, bytes: &[u8], checkout: &str, no
     }
 }
 
-/// Read every merge record of the bay heal runs in as the commands that use them do, for the
-/// refusal a deferred repair ends heal with once the marker is lowered: the first record that does
-/// not read is refused with the next step judged now.
-pub fn check() -> Result<(), String> {
-    if let Some(state) = merge_utils::read_consolidation_state()? {
-        merge_utils::OutOfScopeSkeleton::read_required(&state)?;
-    }
-    cherry_pick_utils::read_state()?;
-    Ok(())
-}
+

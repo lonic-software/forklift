@@ -186,14 +186,25 @@ fn heal_writes_a_damaged_merge_record_back_from_its_copy() {
     assert_eq!(names(&data["merge_state_restored"]), vec![("pick state".to_string(), false)], "{}", data);
     assert_eq!(std::fs::read(area.state("cherry-pick")).unwrap(), original);
     area.ok(&["abort"]);
+
+    // A folder in the record's place goes first, or the write back would fail on every heal.
+    let area = Area::conflicted("restore-over-folder");
+    let original = std::fs::read(area.state("consolidation")).unwrap();
+    forklift_core::util::file_utils::remove_file(area.state("consolidation")).unwrap();
+    std::fs::create_dir(area.state("consolidation")).unwrap();
+    let data = area.healed();
+    assert_eq!(names(&data["merge_state_restored"]), vec![("consolidation state".to_string(), false)], "{}", data);
+    assert_eq!(std::fs::read(area.state("consolidation")).unwrap(), original, "the folder is replaced by the record");
 }
 
 /// T2. A reader of a damaged record names `forklift heal` exactly when heal can restore it: with a
 /// usable copy beside it. With the copy damaged too, it names the record's way out, which then
-/// runs.
+/// runs: heal refuses with it only after its other repairs, so a damaged inventory, which that way
+/// out reads, is rebuilt first.
 ///
 /// Revert: make the shared predicate answer that heal can run whatever the copy holds → the second
-/// half names `forklift heal`, red.
+/// half names `forklift heal`, red. Refuse before the inventory's rebuild → the abort meets the
+/// damaged inventory, red.
 #[test]
 fn a_damaged_record_names_heal_only_while_its_copy_can_be_used() {
     for (file, way_out) in [("consolidation", "forklift abort --keep-files"), ("consolidation-skeleton", "forklift abort")] {
@@ -207,9 +218,14 @@ fn a_damaged_record_names_heal_only_while_its_copy_can_be_used() {
         let error = merge_state_damaged(&area.run(&["--json", "undo"]));
         assert_eq!(error["next_step"], way_out, "{}: {}", file, error);
 
+        let inventory = area.state("inventory/metadata");
+        let sound = std::fs::read(&inventory).unwrap();
+        std::fs::write(&inventory, vec![0u8; sound.len()]).unwrap();
         let refused = area.run(&["--json", "heal"]);
         let error = merge_state_damaged(&refused);
         assert_eq!(error["next_step"], way_out, "{}: heal names the same way out: {}", file, error);
+        assert!(!error["message"].as_str().unwrap().contains("Nothing was changed"), "{}: {}", file, error);
+        assert_eq!(std::fs::read(&inventory).unwrap(), sound, "{}: the inventory was rebuilt before the refusal", file);
 
         let args: Vec<&str> = way_out.split(' ').skip(1).collect();
         area.ok(&args);
@@ -315,24 +331,41 @@ fn crashed_with_a_marker(name: &str, prepare: &dyn Fn(&str) -> Area, args: &[&st
 /// heal never refuses a damaged record: it writes it back from a usable copy, and removes it with
 /// its copy when there is none. The recovery then undoes the merge.
 ///
+/// A skeleton missing with its copy is no record to remove, and is reported as nothing.
+///
 /// Revert: refuse under a merge marker as with none → heal exits 68, red; remove the record even
-/// when its copy can be used → the report names it removed, red.
+/// when its copy can be used → the report names it removed, red; report a missing skeleton as
+/// removed → the third case names it, red.
 #[test]
 fn under_an_interrupted_merge_heal_restores_or_removes_never_refuses() {
-    for both in [true, false] {
-        let area = crashed_with_a_marker(&format!("merge-marker-{}", both), &|name| Area::new(name), &["consolidate", "other"], "merge");
+    for case in ["both", "state", "no-skeleton"] {
+        let area = crashed_with_a_marker(&format!("merge-marker-{}", case), &|name| Area::new(name), &["consolidate", "other"], "merge");
         let ours = area.head("main");
-        flip(&area.state("consolidation"));
-        if both {
-            flip(&area.state("consolidation-copy"));
-        }
+        let expected = match case {
+            "no-skeleton" => {
+                for name in ["consolidation-skeleton", "consolidation-skeleton-copy"] {
+                    forklift_core::util::file_utils::remove_file(area.state(name)).unwrap();
+                }
+                Vec::new()
+            }
+            _ => {
+                flip(&area.state("consolidation"));
+                if case == "both" {
+                    flip(&area.state("consolidation-copy"));
+                }
+                vec![("consolidation state".to_string(), case == "both")]
+            }
+        };
 
         let data = area.healed();
-        assert_eq!(names(&data["merge_state_restored"]), vec![("consolidation state".to_string(), both)], "{}", data);
+        match expected.is_empty() {
+            true => assert!(data.get("merge_state_restored").is_none(), "{}: {}", case, data),
+            false => assert_eq!(names(&data["merge_state_restored"]), expected, "{}: {}", case, data),
+        }
         assert!(data["operation"].is_object(), "the recovery ran: {}", data);
         assert!(!area.state("operation").exists(), "{}", data);
         for name in MERGE_FILES {
-            assert!(!area.state(name).exists(), "both={}: {} is gone with the undone merge", both, name);
+            assert!(!area.state(name).exists(), "{}: {} is gone with the undone merge", case, name);
         }
         assert_eq!(area.head("main"), ours, "the merge is undone");
     }
