@@ -27,6 +27,7 @@ machine/agent interface).
 | Setting up signing, users, or agents | [`trust-and-identity.md`](trust-and-identity.md) |
 | Running a forklift server | [`../SERVER.md`](../SERVER.md) |
 | Driving forklift from a script or AI agent | [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md) |
+| Asking how Forklift's durability is tested, or reading a Proof Load report | [`proof-load.md`](proof-load.md) — the fault classes, the grades, the comparison with git, and the report; the harness is [`crates/proof-load`](../../crates/proof-load/README.md) and its window [`tools/proof-load-desktop`](../../tools/proof-load-desktop/README.md) |
 | Contributing to forklift itself | [`contributing.md`](contributing.md) |
 | Looking for the design rationale / roadmap | [`../DESIGN.html`](../DESIGN.html) (the source of truth) |
 | Reading a byte-level format spec | [`../format/`](../format/) |

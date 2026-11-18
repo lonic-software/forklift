@@ -124,3 +124,25 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    /// The guide page names every flag `proof-load run` takes, so a new flag fails until the page
+    /// says what it does.
+    ///
+    /// Revert: drop `--jobs` from the guide → it is named missing.
+    #[test]
+    fn the_guide_names_every_run_flag() {
+        let guide = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/guide/proof-load.md")).unwrap();
+        let cli = super::Cli::command();
+        let run = cli.find_subcommand("run").expect("the run subcommand");
+        let flags: Vec<String> = run.get_arguments().filter_map(|argument| argument.get_long()).map(|long| format!("--{}", long)).collect();
+        assert!(flags.len() > 10, "{:?}", flags);
+        // A flag counts where it stands alone: `--forklift` inside `--forklift-server` is not it.
+        let named = |flag: &str| guide.match_indices(flag).any(|(at, _)| !guide[at + flag.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-'));
+        let missing: Vec<&String> = flags.iter().filter(|flag| !named(flag)).collect();
+        assert_eq!(missing, Vec::<&String>::new(), "docs/guide/proof-load.md does not name these flags");
+    }
+}
