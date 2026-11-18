@@ -1897,20 +1897,27 @@ pub struct TrustRepair {
 /// from, and the readers after heal judge the anchor they hold.
 ///
 /// # Returns
-/// * `Ok(TrustRepair)` - What was written, and notes for what was left: a file or the store that
-///                       could not be read (nothing is written then), and an unborn office beside
+/// * `Ok(TrustRepair)` - What was written, and notes for what was left: the ref lock, a file or
+///                       the store that could not be read (nothing is written then), and an unborn office beside
 ///                       a trust file on a client.
 /// * `Err(String)`     - A [`RefusalCode::TrustDamaged`] refusal of two files heal cannot choose
 ///                       between or restore from, or of a file it will not write over; a newer
-///                       version's refusal; or why the ref lock could not be taken or a file
-///                       could not be written.
+///                       version's refusal; or why a file could not be written.
 pub fn repair_trust() -> Result<TrustRepair, String> {
-    let lock = crate::util::lock_utils::RefLock::acquire()?;
     let mut repair = TrustRepair::default();
     let unchecked = |why: String| format!(
         "The trust file and its copy were not checked, and nothing was written to them: {}",
         why.trim_end()
     );
+    // A ref lock that cannot be taken stops nothing here: the repairs after this one that need it
+    // report it themselves.
+    let lock = match crate::util::lock_utils::RefLock::acquire() {
+        Ok(lock) => lock,
+        Err(why) => {
+            repair.notes.push(unchecked(why));
+            return Ok(repair);
+        }
+    };
 
     let read = |name: &str| match read_trust_file(name) {
         Ok(bytes) => Ok(bytes.map(Ok)),
