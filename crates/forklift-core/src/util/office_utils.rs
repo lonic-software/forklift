@@ -2295,7 +2295,12 @@ fn unborn_office_note() -> String {
 /// does not say why the office is missing, since a lost ref and an enrollment or a first lower
 /// stopped between its writes look alike. `closing` says what the refused command left as it was.
 pub fn office_unborn_refusal(closing: &str) -> String {
-    let (next_step, ways_out) = unborn_office_remedy();
+    let (next_step, ways_out) = match unborn_office_remedy() {
+        // The step names lower on a line of its own; the message says only what it does.
+        (step, _) if !step.is_empty() =>
+            (step, "Lowering takes the office pallet from the remote, and verifies it against the trust file.".to_string()),
+        remedy => remedy,
+    };
     CoreError::refusal(
         RefusalCode::RefDamaged,
         format!(
@@ -3684,9 +3689,11 @@ pub(crate) mod tests {
 
     /// A missing trust file is "never enrolled" only with no witness that trust was established:
     /// a born office or a standing copy refuses it as lost, under both reads where they apply,
-    /// and with neither it reads as no anchor.
-    // Revert: drop the @office read, or the copy read, in `read_trust_anchor_in` → the witnessed
-    // row reads `None`.
+    /// and with neither it reads as no anchor. A copy that holds no anchor gives heal nothing to
+    /// restore, so the refusal names no next step; the ways out it names leave out lower once the
+    /// root is served, where lower is refused.
+    // Reverts: drop the @office read, or the copy read, in `read_trust_anchor_in` → the witnessed
+    // row reads `None`; `trust_remedy` passes `false` for served → the served pass names lower.
     #[test]
     fn a_missing_trust_file_with_a_witness_refuses_and_without_one_reads_as_none() {
         // (name, office born, copy stands, checked refuses, adopt refuses)
@@ -3708,8 +3715,17 @@ pub(crate) mod tests {
                     Err(e) => {
                         assert!(refuses, "{}, {:?}: refused with no witness: {}", name, mode, e);
                         assert!(crate::error::frames_code(&e, RefusalCode::TrustDamaged), "{}, {:?}: {}", name, mode, e);
+                        let (_, message, next_step) = crate::error::deframe(&e).unwrap();
+                        assert_eq!(next_step, "", "{}, {:?}: heal has no anchor to restore: {}", name, mode, e);
+                        assert!(message.contains("\"forklift lower\" takes the anchor"), "{}, {:?}: {}", name, mode, e);
                     }
                 }
+            }
+            if checked_refuses {
+                assert!(crate::util::tombstone_utils::mark_served(true).unwrap());
+                let e = read_trust_anchor_in(TrustReadMode::Checked).expect_err(name);
+                assert!(e.contains("a served warehouse's trust changes only through its server"), "{}: {}", name, e);
+                assert!(!e.contains("forklift lower"), "{}: a served root is never told to lower: {}", name, e);
             }
 
             drop(_scope);

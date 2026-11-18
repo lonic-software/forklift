@@ -419,8 +419,9 @@ revocation by more than about a day.
   from the store altogether, or held only in a corrupt loose file, answers the same way.
 - **Lost trust file:** a root whose trust file is missing while its office pallet is born or its
   copy (`.forklift/trust-copy`) stands, or whose trust file does not parse or is not a file, answers
-  every request that reads its trust 503 with `trust_damaged` and no `Retry-After`. Restore the file
-  from a backup.
+  every request that reads its trust 503 with `trust_damaged` and no `Retry-After`. Where the copy
+  still verifies the office pallet, the response's `next_step` is `forklift heal`, run in the root,
+  which writes the trust file back from it. Otherwise restore the file from a backup.
 - **First serve and trust:** the first serve of a root refuses as `trust_damaged`, writing no served
   mark, when its trust file stands beside a born office pallet but does not verify it, or its copy
   differs from it: a client's trust change there stopped part way, or a file was damaged. It refuses

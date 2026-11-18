@@ -552,15 +552,15 @@ fn encode_parcel_signature(signature: &ParcelSignature) -> Vec<u8> {
 ///                                   version this Forklift does not read.
 pub fn load_parcel_signature(parcel_hash: &str) -> Result<Option<ParcelSignature>, String> {
     match load_raw_parcel_signature(parcel_hash)? {
-        Some(bytes) => parse_parcel_signature(&bytes, parcel_hash).map(Some).map_err(|why| signature_damaged(parcel_hash, why)),
+        Some(bytes) => parse_parcel_signature(&bytes, parcel_hash).map(Some).map_err(signature_damaged),
         None => Ok(None),
     }
 }
 
-/// The refusal of parcel `parcel_hash`'s stored signature, which cannot be read or does not parse,
-/// for `why`, which names the parcel. A signature is never stored twice with different bytes, so taking the parcel's again
-/// from a remote does not replace it: the store, or the warehouse, is taken again instead.
-fn signature_damaged(parcel_hash: &str, why: String) -> String {
+/// The refusal of a parcel's stored signature, which cannot be read or does not parse, for `why`,
+/// which names the parcel. A signature is never stored twice with different bytes, so taking the
+/// parcel's again from a remote does not replace it: the store, or the warehouse, is taken again.
+fn signature_damaged(why: String) -> String {
     crate::error::CoreError::refusal(
         crate::error::RefusalCode::SignatureDamaged,
         format!(
@@ -602,7 +602,7 @@ pub fn load_raw_parcel_signature(parcel_hash: &str) -> Result<Option<Vec<u8>>, S
     match pack_utils::tabled_signature(parcel_hash, true)? {
         pack_utils::TabledSignature::Found(bytes) => Ok(Some(bytes)),
         pack_utils::TabledSignature::Missing => Ok(None),
-        pack_utils::TabledSignature::Unreadable(message) => Err(signature_damaged(parcel_hash, format!(
+        pack_utils::TabledSignature::Unreadable(message) => Err(signature_damaged(format!(
             "The signature of parcel {} cannot be read: {}", parcel_hash, message
         ))),
     }
@@ -615,7 +615,7 @@ fn load_loose_signature(parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
     match std::fs::read(&path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(signature_damaged(parcel_hash, format!(
+        Err(e) => Err(signature_damaged(format!(
             "Error while reading the signature of parcel {}: {}", parcel_hash, e
         ))),
     }

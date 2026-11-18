@@ -3637,7 +3637,10 @@ fn a_lost_anchor_over_a_remote_that_reset_its_trust_clones_again() {
     let server = regenesis_on_remote(&area, |server| {
         assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "root"]));
     });
-    forklift_core::util::file_utils::remove_file(area.path("b/.forklift/trust")).unwrap();
+    // The copy goes too: beside a copy that verifies, the way out is heal, not a new clone.
+    for lost in ["trust", "trust-copy"] {
+        forklift_core::util::file_utils::remove_file(area.path("b/.forklift").join(lost)).unwrap();
+    }
 
     let refused = area.forklift("b", &["office", "enroll"]);
     assert!(stderr(&refused).contains("clone it again"), "{}", stderr(&refused));
@@ -5824,6 +5827,35 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_and_reads_the
 /// server. Retrying the very same `feature` lift then succeeds — the identical command that
 /// just refused — and a fresh clone cloned from the server afterwards audits `main` as
 /// fully legacy: the definitive, resolved answer.
+/// A lift from a warehouse whose office ref is lost beside its trust file refuses as ref_damaged
+/// before it uploads anything: a fresh remote is left with no trust anchor, rather than one with
+/// no office behind it.
+// Revert: read the office head after the anchor's upload in `push_local_trust` → the server root
+// holds a trust file.
+#[test]
+fn a_lift_over_a_lost_office_ref_refuses_before_uploading_the_anchor() {
+    let area = TestArea::new("lift-lost-office");
+    let server = Server::start(&area, None);
+    std::fs::create_dir_all(area.path("w")).unwrap();
+    assert_success(&area.forklift("w", &["prepare"]));
+    assert_success(&area.forklift("w", &["config", "set", "--global", "operator.identifier", "tester@forklift"]));
+    area.write_file("w/app.txt", "v1\n");
+    assert_success(&area.forklift("w", &["load", "."]));
+    assert_success(&area.forklift("w", &["stack", "-m", "first"]));
+    assert_success(&area.forklift("w", &["office", "enroll"]));
+    assert_success(&area.forklift("w", &["config", "set", "remote.url", &server.url]));
+    forklift_core::util::file_utils::remove_file(area.path("w/.forklift/meta/office")).unwrap();
+
+    let lifted = area.forklift("w", &["--json", "lift"]);
+
+    assert_eq!(lifted.status.code(), Some(53), "{}{}", stdout(&lifted), stderr(&lifted));
+    let value = json_of(&lifted);
+    assert_eq!(value["error"]["code"], "ref_damaged", "{}", value);
+    assert_eq!(value["error"]["next_step"], "forklift lower", "{}", value);
+    assert!(value["error"]["message"].as_str().unwrap().contains("Nothing was lifted."), "{}", value);
+    assert!(!area.path("server-root/.forklift/trust").exists(), "no anchor reaches the remote");
+}
+
 #[test]
 fn enrolling_then_lifting_to_a_fresh_remote_with_an_unlifted_other_pallet_refuses_instead_of_accusing() {
     let area = TestArea::new("construction-t");

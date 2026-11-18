@@ -10205,17 +10205,27 @@ mod tests {
         }
 
         /// A trust file that does not parse, or one missing beside its standing copy, is a 503
-        /// trust_damaged with the fixed message, naming no file of the server's.
+        /// trust_damaged with the fixed message, naming no file of the server's. Its operator is
+        /// told `forklift heal` exactly where heal restores the trust file from a usable copy (a
+        /// served root's office still unborn makes any copy that parses usable).
         /// Revert: drop TrustDamaged from SERVED_DAMAGE → a 500 with no code → red.
         #[tokio::test]
         async fn a_handshake_over_a_damaged_trust_file_refuses_with_its_code() {
             let (root, _scope, _side) = served_with_side("handshake-trust");
             let trust = forklift_core::globals::forklift_root().join("trust");
             let copy = forklift_core::globals::forklift_root().join("trust-copy");
+            let usable = office_utils::encode_trust_anchor(&TrustAnchor {
+                genesis: "0".repeat(64),
+                enabled_at: 0,
+                boundary: Vec::new(),
+                prior_genesis: None,
+                adopts: None,
+            });
 
-            for (what, trust_bytes, copy_bytes) in [
-                ("garbled", Some(&b"version = 1\ngenesis = \""[..]), None),
-                ("missing beside its copy", None, Some(&b"a copy"[..])),
+            for (what, trust_bytes, copy_bytes, step) in [
+                ("garbled", Some(&b"version = 1\ngenesis = \""[..]), None, ""),
+                ("missing beside its copy", None, Some(&b"a copy"[..]), ""),
+                ("missing beside a usable copy", None, Some(usable.as_bytes()), "forklift heal"),
             ] {
                 for (path, bytes) in [(&trust, trust_bytes), (&copy, copy_bytes)] {
                     match bytes {
@@ -10231,6 +10241,8 @@ mod tests {
                 let body = body_text(response).await;
                 assert!(body.contains(r#""code":"trust_damaged""#), "{}: {}", what, body);
                 assert!(body.contains("The warehouse's trust file, or the copy beside it, is lost or does not read"), "{}: {}", what, body);
+                let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(value["next_step"].as_str().unwrap_or(""), step, "{}: {}", what, body);
                 let absolute = std::path::absolute(&root).unwrap();
                 assert!(!body.contains(&*absolute.to_string_lossy()) && !body.contains(".forklift"), "{}: no server path: {}", what, body);
             }

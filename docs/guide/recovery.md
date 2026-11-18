@@ -119,6 +119,13 @@ what only that ref reached is then no longer kept by any pallet.
 A meta pallet's ref (a name starting with `@`, such as `@redactions`) is not rebuilt: no checkout or
 journal records its head. Restore its file from a backup, or write the head parcel's hash into it.
 
+The office pallet's ref (`.forklift/meta/office`) missing beside a trust file refuses as `ref_damaged`
+too, in the commands that need the verified office, such as `stack`, `audit` and `office enroll`: the anchor stands, but there is no office to check
+anything against. With a remote configured, the next step is `forklift lower`, which takes the office
+pallet from the remote and verifies it against the trust file. Without one, restore the ref from a
+backup, or write the office pallet's head parcel hash into it by hand. Write the latest head you know
+of: an older one re-admits any key revoked since.
+
 ### `fetch_scope_damaged` (exit 54)
 
 A sparse warehouse's fetch scope (`.forklift/config/fetch-scope`, the paths it fetched) is lost or
@@ -671,6 +678,12 @@ established (the office pallet is born, or the file's copy `.forklift/trust-copy
 not parse, or something other than a file stands in its place. Nothing was changed: the warehouse
 can neither sign nor write unsigned until its anchor is back.
 
+When heal can mend it, the refusal's next step is `forklift heal`: the copy still verifies the office
+pallet, while the trust file is missing, does not parse, or parses but verifies nothing. When the next
+step is empty, heal cannot, and the message names the ways out below. A warehouse that is served, or
+whose first serve began, gets ways out without `forklift lower`, since its trust moves only through
+its server.
+
 - Run `forklift heal` first. Where the copy `.forklift/trust-copy` still holds the anchor, heal
   writes the trust file back from it (and a missing or stale copy from the trust file), and reports
   it as restored. Where the two differ and both would serve, it refuses and changes nothing: move
@@ -698,6 +711,20 @@ standing copy, and as `ref_damaged` when the trust file stands beside an unborn 
 copy that matches it, or not reading as an anchor: an enrollment or a first `lower` stopped part way. To run it again, move the
 trust file aside, and its copy if one stands. Where a remote holds the warehouse's office,
 `forklift lower` takes it instead, and verifies it against the trust file.
+
+### `signature_damaged` (exit 70)
+
+A parcel's stored signature cannot be read or does not parse, so what signed the parcel cannot be
+told. The message names the parcel. Nothing was changed. A signature is never stored twice with
+different bytes, so fetching the parcel again does not replace it: restore the warehouse's objects
+(`.forklift/objects`) from a backup, or clone the warehouse again from a remote that holds the parcel.
+
+### `signature_missing` (exit 71)
+
+A parcel stacked after trust was established carries no signature. A lost signature and a stripped
+one look alike, so the warehouse may have been tampered with. As for `signature_damaged`, restore the
+objects from a backup or clone again from a remote you trust. Signing the parcel now would not tell
+you who stacked it.
 
 ### Lost keys: re-genesis
 
