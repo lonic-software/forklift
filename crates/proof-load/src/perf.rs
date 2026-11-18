@@ -1615,26 +1615,26 @@ esac
         let corrupt = || std::fs::write(work.join(".git").join("index"), "not an index").unwrap();
         // SAFETY: geteuid(2) takes no arguments and cannot fail.
         if unsafe { libc::geteuid() } != 0 {
-        let locked = work.join("locked");
-        std::fs::create_dir(&locked).unwrap();
-        std::fs::write(locked.join("f"), "f\n").unwrap();
-        run(&["add", "-A"]);
-        run(&["commit", "-q", "-m", "locked"]);
-        let mode = |folder: &Path, bits| std::fs::set_permissions(folder, std::os::unix::fs::PermissionsExt::from_mode(bits)).unwrap();
-        mode(&locked, 0o555);
-        let copy = scratch.work().join("copies").join("commit-warm-git-0");
-        for broken in [false, true] {
-            if broken {
-                corrupt();
+            let locked = work.join("locked");
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::write(locked.join("f"), "f\n").unwrap();
+            run(&["add", "-A"]);
+            run(&["commit", "-q", "-m", "locked"]);
+            let mode = |folder: &Path, bits| std::fs::set_permissions(folder, std::os::unix::fs::PermissionsExt::from_mode(bits)).unwrap();
+            mode(&locked, 0o555);
+            let copy = scratch.work().join("copies").join("commit-warm-git-0");
+            for broken in [false, true] {
+                if broken {
+                    corrupt();
+                }
+                let mut rows = Vec::new();
+                let stopped = writes(&subjects, &["a", "b"], 1, &Err("r".into()), &scratch, &environment, &|_| {}, &mut rows).unwrap_err();
+                assert_eq!(stopped.0, format!("removing the copy {}: Permission denied (os error 13)", copy.display()), "broken index: {}", broken);
+                mode(&copy.join("locked"), 0o755);
+                #[allow(clippy::disallowed_methods)] // a test's own temporary folder
+                let _ = std::fs::remove_dir_all(&copy);
             }
-            let mut rows = Vec::new();
-            let stopped = writes(&subjects, &["a", "b"], 1, &Err("r".into()), &scratch, &environment, &|_| {}, &mut rows).unwrap_err();
-            assert_eq!(stopped.0, format!("removing the copy {}: Permission denied (os error 13)", copy.display()), "broken index: {}", broken);
-            mode(&copy.join("locked"), 0o755);
-            #[allow(clippy::disallowed_methods)] // a test's own temporary folder
-            let _ = std::fs::remove_dir_all(&copy);
-        }
-        mode(&locked, 0o755);
+            mode(&locked, 0o755);
         }
 
         // A copy whose refresh failed is not comparable, since it would still read clean.
