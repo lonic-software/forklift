@@ -614,7 +614,7 @@ fn writes(subjects: &[Subject], edited: &[&str], reps: usize, cold: &Cold, scrat
 }
 
 /// Where [`SIDE_BRANCH`] stands against the current branch in one subject.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Side {
     /// At the commit the current branch is at.
     Same,
@@ -622,6 +622,8 @@ enum Side {
     OneLine,
     /// Each has commits the other lacks.
     Forked,
+    /// At another commit, on what line of history could not be read, and why.
+    Unread(String),
 }
 
 /// Whether a pair can be timed, or why not.
@@ -643,6 +645,7 @@ fn sides(subjects: &[Subject], scratch: &Scratch, environment: &Environment) -> 
                 switch.push(reason.clone());
                 merge.push(reason);
             }
+            Ok(Side::Unread(reason)) => merge.push(reason),
             Ok(Side::OneLine) => merge.push(format!("{} has {} and its current branch on one line of history, one containing the other, so merging it would not join two lines", label, SIDE_BRANCH)),
             Ok(Side::Forked) => {}
         }
@@ -652,7 +655,8 @@ fn sides(subjects: &[Subject], scratch: &Scratch, environment: &Environment) -> 
 }
 
 /// Where [`SIDE_BRANCH`] stands in `subject`: git's by `rev-list --left-right --count`, Forklift's
-/// by its pallets' heads and the history of each. Gives why when a read failed.
+/// by its pallets' heads and the history of each. Gives why when the heads could not be read; a
+/// history that could not be read leaves the heads apart, [`Side::Unread`].
 fn side(subject: &Subject, scratch: &Scratch, environment: &Environment) -> Result<Result<Side, String>, Stopped> {
     let label = subject.tool.label();
     if subject.tool != Tool::Forklift {
@@ -682,20 +686,20 @@ fn side(subject: &Subject, scratch: &Scratch, environment: &Environment) -> Resu
     if current == side {
         return Ok(Ok(Side::Same));
     }
-    let behind = match parcels(subject, &side, scratch, environment)? {
-        Ok(parcels) => parcels.contains(&current),
-        Err(reason) => return Ok(Err(reason)),
-    };
-    let ahead = match parcels(subject, &current, scratch, environment)? {
-        Ok(parcels) => parcels.contains(&side),
-        Err(reason) => return Ok(Err(reason)),
-    };
-    Ok(Ok(if behind || ahead { Side::OneLine } else { Side::Forked }))
+    for (from, to) in [(&side, &current), (&current, &side)] {
+        match reaches(subject, from, to, scratch, environment)? {
+            Ok(true) => return Ok(Ok(Side::OneLine)),
+            Ok(false) => {}
+            Err(reason) => return Ok(Ok(Side::Unread(reason))),
+        }
+    }
+    Ok(Ok(Side::Forked))
 }
 
-/// Every parcel in Forklift's history of `revision`, itself included, read page by page.
-fn parcels(subject: &Subject, revision: &str, scratch: &Scratch, environment: &Environment) -> Result<Result<BTreeSet<String>, String>, Stopped> {
-    let mut parcels = BTreeSet::new();
+/// Whether `target` is in Forklift's history of `revision`, itself included, read page by page
+/// until it turns up. Gives why when a page could not be read, or a page's cursor came round again.
+fn reaches(subject: &Subject, revision: &str, target: &str, scratch: &Scratch, environment: &Environment) -> Result<Result<bool, String>, Stopped> {
+    let mut seen = BTreeSet::new();
     let mut after: Option<String> = None;
     loop {
         let mut arguments = vec!["--json".to_string(), "history".to_string(), revision.to_string()];
@@ -715,11 +719,14 @@ fn parcels(subject: &Subject, revision: &str, scratch: &Scratch, environment: &E
             let Some(parcel) = entry["parcel"].as_str() else {
                 return Ok(Err(format!("Forklift's --json history {} gave an entry with no parcel", revision)));
             };
-            parcels.insert(parcel.to_string());
+            if parcel == target {
+                return Ok(Ok(true));
+            }
         }
         match document["data"]["next"].as_str() {
+            Some(next) if !seen.insert(next.to_string()) => return Ok(Err(format!("Forklift's --json history {} gave the cursor {} twice", revision, next))),
             Some(next) => after = Some(next.to_string()),
-            None => return Ok(Ok(parcels)),
+            None => return Ok(Ok(false)),
         }
     }
 }
@@ -759,80 +766,173 @@ fn fresh_pair(subjects: &[Subject], forklift: &[&str], git: &[&str], reps: usize
     Ok(Outcome::Timed { cells })
 }
 
-/// A folder the harness copied a subject into, removed when dropped. A copy that cannot be removed
-/// is left where it is: every copy has a name of its own, so a leftover is in no later one's way.
-struct Copied(PathBuf);
+/// A folder the harness copied a subject into. [`Copied::remove`] removes it and says when it
+/// could not; one left behind on an early return is removed when dropped, as far as it can be.
+struct Copied(Option<PathBuf>);
+
+impl Copied {
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("a copy is removed only by consuming it")
+    }
+
+    /// Removes the copy, or stops the run naming it: copies left behind would fill the disk with
+    /// a full tree each.
+    fn remove(mut self) -> Result<(), Stopped> {
+        let path = self.0.take().expect("a copy is removed only once");
+        #[allow(clippy::disallowed_methods, reason = "a scratch copy the harness made itself, under its own output directory")]
+        std::fs::remove_dir_all(&path).map_err(|error| Stopped(format!("removing the copy {}: {}", path.display(), error)))
+    }
+}
 
 impl Drop for Copied {
     fn drop(&mut self) {
-        #[allow(clippy::disallowed_methods, reason = "a scratch copy the harness made itself, under its own output directory")]
-        let _ = std::fs::remove_dir_all(&self.0);
+        if let Some(path) = self.0.take() {
+            #[allow(clippy::disallowed_methods, reason = "a scratch copy the harness made itself, under its own output directory")]
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
+}
+
+/// Gives every file `copy_tree` copied from `from` to `to` the modification time it has in
+/// `from`, and on unix every folder too, after its contents. A copy that is newer than the tool's
+/// last look at its files reads as possibly edited: Forklift's stat cache does not trust a stat
+/// within its anchor's two seconds, and git's index does not trust one as new as the index, so
+/// each would hash files inside the timed write that the subject's own caches had settled.
+fn keep_times(from: &Path, to: &Path) -> Result<(), Stopped> {
+    fn failed(path: &Path) -> impl Fn(std::io::Error) -> Stopped + '_ {
+        move |error| Stopped(format!("keeping the times of {}: {}", path.display(), error))
+    }
+    let metadata = std::fs::symlink_metadata(from).map_err(failed(from))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(from).map_err(failed(from))? {
+            let entry = entry.map_err(failed(from))?;
+            keep_times(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        #[cfg(unix)]
+        std::fs::File::open(to).and_then(|folder| folder.set_modified(metadata.modified()?)).map_err(failed(to))?;
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type()) {
+        return Ok(());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    // Windows sets a time only through a handle opened to write attributes, which a read-only
+    // file still grants; elsewhere any handle the owner opens will do.
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::access_mode(&mut options, runner::FILE_WRITE_ATTRIBUTES);
+    #[cfg(not(windows))]
+    options.read(true);
+    options.open(to).and_then(|file| file.set_modified(metadata.modified()?)).map_err(failed(to))
 }
 
 /// The untimed run that brings a fresh copy's caches up to date with its copied files, as git's
 /// status refreshes its index: Forklift's `load .`, since its stocktake keeps nothing it learns
-/// about a file, and git's `status`.
-fn refresh_untimed(copy: &Subject, scratch: &Scratch, environment: &Environment) -> Result<(), Stopped> {
-    let refresh = if copy.tool == Tool::Forklift { copy.line(&["load", "."]) } else { copy.line(&["status"]) };
-    tool::run(&copy.invocation(refresh), scratch, environment)?;
-    Ok(())
+/// about a file, and git's `status`. Gives why when it did not succeed, since a copy whose caches
+/// were not brought up to date would still read clean.
+fn refresh_untimed(copy: &Subject, scratch: &Scratch, environment: &Environment) -> Result<Result<(), String>, Stopped> {
+    let refresh: &[&str] = if copy.tool == Tool::Forklift { &["load", "."] } else { &["status"] };
+    Ok(output(copy, refresh, scratch, environment)?.map(|_| ()))
 }
 
-/// Writes every dirty page out, untimed, so that a timed write which syncs pays for its own writes
-/// and not for the copy's. Only on unix, which has sync(2); on Windows it does nothing.
-fn settle() {
+/// Writes the copy at `root` out to disk, untimed, so that a timed write which syncs pays for its
+/// own writes and not for the copy's: sync(2) on unix, and on macOS, whose sync(2) may return
+/// before the writes are done and does not flush the drive's cache, an fsync of every file and
+/// then one full flush. On Windows it does nothing.
+fn settle(root: &Path) -> Result<(), Stopped> {
     #[cfg(unix)]
     // SAFETY: sync(2) takes no arguments and has no failure to report.
     unsafe {
         libc::sync();
     }
+    #[cfg(target_os = "macos")]
+    {
+        fn each(path: &Path, last: &mut Option<std::fs::File>) -> std::io::Result<()> {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.is_dir() {
+                for entry in std::fs::read_dir(path)? {
+                    each(&entry?.path(), last)?;
+                }
+            } else if metadata.is_file() {
+                let file = std::fs::File::open(path)?;
+                // SAFETY: fsync(2) on a descriptor this function owns for the call.
+                if unsafe { libc::fsync(std::os::fd::AsRawFd::as_raw_fd(&file)) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                *last = Some(file);
+            }
+            Ok(())
+        }
+        let failed = |error: std::io::Error| Stopped(format!("writing the copy {} out to disk: {}", root.display(), error));
+        let mut last = None;
+        each(root, &mut last).map_err(failed)?;
+        if let Some(file) = last {
+            // SAFETY: fcntl(2) F_FULLFSYNC on a descriptor this function owns; it flushes the
+            // drive's cache, which holds every file fsync(2) wrote, not only this one's.
+            if unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&file), libc::F_FULLFSYNC) } == -1 {
+                return Err(failed(std::io::Error::last_os_error()));
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = root;
+    Ok(())
 }
 
 /// One write cell: each repetition on a fresh copy of `subject` as `fresh` describes it, watched
 /// by a daemon of its own where the subject is, and judged clean after the timed run. A warm cell
 /// first runs the command once untimed and unjudged, on a copy of its own, as a warm read cell
-/// does. Gives why the pair is not comparable when a copy's check failed.
+/// does. Gives why the pair is not comparable when a copy's refresh or check failed.
 fn fresh_cell(subject: &Subject, command: &[String], reps: usize, cold: Option<&DropCaches>, fresh: &Fresh, scratch: &Scratch, environment: &Environment) -> Result<Result<Measured, String>, Stopped> {
     let cache = if cold.is_some() { Cache::Cold } else { Cache::Warm };
     let first = if cold.is_some() { 1 } else { 0 };
     let mut runs = Vec::with_capacity(reps);
     for rep in first..=reps {
+        let before = if rep == 0 { "before the untimed run".to_string() } else { format!("before repetition {}", rep) };
         let name = format!("{}-{}-{}-{}", fresh.operation.replace(' ', "-"), cache.label(), subject.tool.label(), rep);
-        let copied = Copied(fresh.copies.join(name));
-        crate::scrub::copy_tree(&subject.work, &copied.0).map_err(|error| Stopped(format!("copying {} to {}: {:?}", subject.work.display(), copied.0.display(), error)))?;
-        let copy = subject.at(copied.0.clone());
+        let copied = Copied(Some(fresh.copies.join(name)));
+        crate::scrub::copy_tree(&subject.work, copied.path()).map_err(|error| Stopped(format!("copying {} to {}: {:?}", subject.work.display(), copied.path().display(), error)))?;
+        keep_times(&subject.work, copied.path())?;
+        let copy = subject.at(copied.path().to_path_buf());
         // Dropped before the copy is removed. The copy's fsmonitor setting came with it.
-        let _daemon = if copy.watched {
+        let daemon = if copy.watched {
             Some(runner::FsmonitorDaemon::watch(&copy.program, &copy.work, scratch, environment, COMMAND_LIMIT).map_err(|error| Stopped(error.to_string()))?.0)
         } else {
             None
         };
-        refresh_untimed(&copy, scratch, environment)?;
+        if let Err(reason) = refresh_untimed(&copy, scratch, environment)? {
+            return Ok(Err(format!("{}, the refresh failed: {}", before, reason)));
+        }
         if !fresh.edit.is_empty() {
             edit(&copy.work, fresh.edit)?;
             stage(&copy, scratch, environment)?;
         }
         let invocation = copy.invocation(command.to_vec());
         if rep == 0 {
-            settle();
+            settle(&copy.work)?;
             match tool::run(&invocation, scratch, environment) {
-                Ok(_) => continue,
+                Ok(_) => {}
                 Err(ToolError::TimedOut { .. }) => return Ok(Ok(killed(invocation.limit))),
                 Err(error) => return Err(error.into()),
             }
+        } else {
+            if let Err(reason) = same(std::slice::from_ref(&copy), fresh.before, scratch, environment)? {
+                return Ok(Err(format!("{}, {}", before, reason)));
+            }
+            settle(&copy.work)?;
+            match repetition(&invocation, cold, scratch, environment)? {
+                Ok(timed) => runs.push(timed),
+                Err(ended) => return Ok(Ok(ended)),
+            }
+            if let Err(reason) = same(std::slice::from_ref(&copy), &Changes::default(), scratch, environment)? {
+                return Ok(Err(format!("after repetition {}, {}", rep, reason)));
+            }
         }
-        if let Err(reason) = same(std::slice::from_ref(&copy), fresh.before, scratch, environment)? {
-            return Ok(Err(format!("before repetition {}, {}", rep, reason)));
-        }
-        settle();
-        match repetition(&invocation, cold, scratch, environment)? {
-            Ok(timed) => runs.push(timed),
-            Err(ended) => return Ok(Ok(ended)),
-        }
-        if let Err(reason) = same(std::slice::from_ref(&copy), &Changes::default(), scratch, environment)? {
-            return Ok(Err(format!("after repetition {}, {}", rep, reason)));
-        }
+        drop(daemon);
+        copied.remove()?;
     }
     Ok(Ok(summarise(&runs)))
 }
@@ -1303,6 +1403,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Forklift's side is read from its pallets' heads and the history of each, page by page: one
+    /// head in the other's history is one line, neither is forked, and a history that cannot be
+    /// read, or whose cursor comes round again, refuses merge alone, since switch needs only the
+    /// heads. Against a stand-in that prints what Forklift's --json pallet list and history would.
+    #[cfg(unix)]
+    #[test]
+    fn forklifts_side_is_read_from_its_heads_and_paged_history() {
+        let (root, scratch, environment) = scratch("forklift-side");
+        let folder = scratch.work().to_path_buf();
+        let page = folder.join("page");
+        let program = folder.join("forklift");
+        std::fs::write(&program, format!(r#"#!/bin/sh
+case "$*" in
+"--json pallet list") echo '{{"data":{{"pallets":[{{"name":"main","current":true,"head":"m2"}},{{"name":"perf-side","current":false,"head":"s1"}}]}}}}';;
+"--json history s1") echo '{{"data":{{"entries":[{{"parcel":"s1"}},{{"parcel":"b"}}],"next":"c1"}}}}';;
+"--json history s1 --after c1") echo '{{"data":{{"entries":[{{"parcel":"a"}}]}}}}';;
+"--json history m2") echo '{{"data":{{"entries":[{{"parcel":"m2"}},{{"parcel":"m1"}}],"next":"c2"}}}}';;
+"--json history m2 --after c2")
+  n=$(cat '{0}/count' 2>/dev/null || echo 0); n=$((n + 1)); echo $n > '{0}/count'
+  if [ -f '{0}/repeat' ] && [ $n -lt 5 ]; then echo '{{"data":{{"entries":[{{"parcel":"x"}}],"next":"c2"}}}}'; else cat '{0}/page'; fi;;
+*) echo "no $*" >&2; exit 2;;
+esac
+"#, folder.display())).unwrap();
+        std::fs::set_permissions(&program, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let subject = Subject { tool: Tool::Forklift, program, prefix: vec![], work: folder.clone(), watched: false };
+        let read = |content: &str| {
+            std::fs::write(&page, content).unwrap();
+            let _ = std::fs::write(folder.join("count"), "0");
+            side(&subject, &scratch, &environment).unwrap()
+        };
+
+        assert_eq!(read(r#"{"data":{"entries":[{"parcel":"b"},{"parcel":"a"}]}}"#), Ok(Side::Forked));
+        assert_eq!(read(r#"{"data":{"entries":[{"parcel":"s1"},{"parcel":"b"}]}}"#), Ok(Side::OneLine));
+        assert_eq!(read("not json"), Ok(Side::Unread("Forklift's --json history m2 gave no entries".into())));
+        std::fs::write(folder.join("repeat"), "").unwrap();
+        assert_eq!(read(r#"{"data":{"entries":[]}}"#), Ok(Side::Unread("Forklift's --json history m2 gave the cursor c2 twice".into())));
+        let (switch, merge) = sides(std::slice::from_ref(&subject), &scratch, &environment).unwrap();
+        assert_eq!(switch, Ok(()));
+        assert_eq!(merge, Err("Forklift's --json history m2 gave the cursor c2 twice".into()));
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Switch and merge are reported not comparable, with the reason, on a subject whose side
     /// branch is at the commit its current branch is at; merge is too while one of the two
     /// contains the other, and both are timed once each has commits the other lacks. Every write
@@ -1382,9 +1525,16 @@ mod tests {
             std::fs::write(&hook, format!("#!/bin/sh\n{}\n", body)).unwrap();
             std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         };
-        set_hook(&format!("echo ran >> '{}'", ran.display()));
+        // The hook also lists `d` if the copy's `d` is newer than a file made now: the subject's `d`
+        // is set back years, and a copy keeps that time.
+        let newer = scratch.work().join("newer");
+        let now = scratch.work().join("now");
+        std::fs::write(&now, "").unwrap();
+        std::fs::File::options().write(true).open(work.join("d")).unwrap().set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000)).unwrap();
+        set_hook(&format!("echo ran >> '{}'; find d -newer '{}' >> '{}'", ran.display(), now.display(), newer.display()));
         assert!(writes_now().iter().all(|(_, cache, outcome)| *cache == Cache::Cold || timed(outcome)));
         assert_eq!(std::fs::read_to_string(&ran).unwrap(), "ran\nran\n");
+        assert_eq!(std::fs::read_to_string(&newer).unwrap(), "");
         set_hook(":");
 
         // A write whose copy does not start exactly as the pair expects, or does not end clean, is
@@ -1397,6 +1547,30 @@ mod tests {
         commit_file("stray");
         set_hook("echo left > left-behind");
         assert_eq!(writes_now()[0].2, Outcome::NotComparable { reason: "after repetition 1, git saw 1 unstaged of 0 expected, 1 more (left-behind)".into() });
+        set_hook(":");
+
+        // A copy that cannot be removed stops the run and says which, rather than leaving a tree
+        // behind for every repetition.
+        let locked = work.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("f"), "f\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "locked"]);
+        let mode = |folder: &Path, bits| std::fs::set_permissions(folder, std::os::unix::fs::PermissionsExt::from_mode(bits)).unwrap();
+        mode(&locked, 0o555);
+        let mut rows = Vec::new();
+        let stopped = writes(&subjects, &["a", "b"], 1, &Err("r".into()), &scratch, &environment, &|_| {}, &mut rows).unwrap_err();
+        mode(&locked, 0o755);
+        let copy = scratch.work().join("copies").join("commit-warm-git-0");
+        assert_eq!(stopped.0, format!("removing the copy {}: Permission denied (os error 13)", copy.display()));
+        mode(&copy.join("locked"), 0o755);
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
+        let _ = std::fs::remove_dir_all(&copy);
+
+        // A copy whose refresh failed is not comparable, since it would still read clean.
+        std::fs::write(work.join(".git").join("index"), "not an index").unwrap();
+        let rows = writes_now();
+        assert!(matches!(&rows[0].2, Outcome::NotComparable { reason } if reason.starts_with("before the untimed run, the refresh failed: git status exited Some(128): ")), "{:?}", rows[0]);
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -344,15 +344,19 @@ Every row runs twice: once warm, and once cold, with the caches dropped before e
 Status, log and blame run on the clean tree, and blame names the file the history changes most.
 
 Commit, switch and merge change the subject, so each of their repetitions runs on a fresh copy of the
-clean subject, made untimed. The subjects themselves are never changed. A copy's files are new to
-the file system, so before anything else the harness runs, untimed, the command that brings each
-tool's record of its files up to date: Forklift's `load .` and git's `status`. Where tuned git runs
+clean subject, made untimed. The subjects themselves are never changed. A copy keeps each file's
+modification time, so that neither tool reads a settled file as possibly edited. Before anything
+else the harness runs, untimed, the command that brings each tool's record of its files up to date:
+Forklift's `load .` and git's `status`. A copy whose refresh fails makes its row **not
+comparable**. Where tuned git runs
 the fsmonitor daemon, its copy gets a daemon of its own. Before each commit, the harness appends a line to the same 20
 tracked files and stages them untimed, with `load .` and `add -A`. Forklift's stack is signed and
 git's commit is not, and the commit row's note says so. Switch moves from the current branch to
 `perf-side`, and merge merges `perf-side` into it, a merge with no conflict. On unix, the harness
-then writes the copy out to disk with `sync`, untimed, so that a command which syncs its own
-writes is not also timed writing out the copy.
+then writes the copy out to disk, untimed, so that a command which syncs its own writes is not also
+timed writing out the copy: `sync` on Linux, and on macOS, whose `sync` can return early, an fsync
+of every file in the copy and one flush of the drive's cache. On Windows it does neither. A copy
+that cannot be removed afterwards stops the run, naming it.
 
 Each write is judged before and after it runs. Before, the copy must report exactly the 20 staged
 files for commit, and nothing at all for switch and merge. After each write, the copy must be
