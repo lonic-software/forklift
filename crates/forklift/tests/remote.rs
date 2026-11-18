@@ -5842,7 +5842,8 @@ fn a_lift_over_a_damaged_office_signature_on_the_server_names_its_operator() {
     assert_eq!(value["error"]["code"], "signature_damaged", "{}", value);
     let said = value.to_string();
     assert!(said.contains("operator"), "{}", value);
-    assert!(!said.contains("server-root"), "no server path crosses the wire: {}", value);
+    assert!(said.contains("(503)"), "the server answers its own damage as a 503: {}", value);
+    assert!(!said.contains("server-root") && !said.contains("Restore the warehouse's objects"), "the server's fixed text, not its reader's: {}", value);
 }
 
 /// A lift from a warehouse whose office ref is lost beside its trust file refuses as ref_damaged
