@@ -330,11 +330,14 @@ Then the harness appends a line to the same 20 tracked files in every subject, f
 --staged, it stages them untimed with `load .` and `add -A`. Every Forklift line runs without
 `--json`.
 
-Before a pair is timed, the harness checks that every subject sees the same change. Before the
-clean-tree rows, nothing may be staged in Forklift's subject, and `git status --porcelain` must
-print nothing in either git's. Before diff, each subject must count the 20
-edited files as changed. Before diff --staged, each must count them as staged. A pair that fails
-its check is reported as **not comparable**, with what each subject saw, and is not timed.
+Before a pair is timed, the harness checks that every subject sees the same change, by the paths
+each one reports: Forklift's `stocktake`, and git's `status --porcelain` with every untracked file
+listed. Before the clean-tree rows, no subject may report any path, untracked ones included. Before
+diff, each must report exactly the 20 edited files as changed and not staged. Before diff --staged,
+each must report exactly those 20 as staged and nothing else. A count that agrees is not enough: a
+subject that misses one edited file and reports one other path does not pass. A pair that fails its
+check is reported as **not comparable**, with each subject's extra and missing paths, and is not
+timed.
 
 ### Reading perf.md
 
@@ -355,8 +358,9 @@ Each row has one cell per subject:
 On Windows only the wall time is measured, and the memory and cores cells say *not measured on
 Windows*.
 
-A repetition that exits non-zero voids its cell, which then shows the exit and the command's stderr
-instead of a timing. Read two medians together with their spreads. A difference where one subject's
+A repetition that exits non-zero, or dies of a signal, voids its cell, which then shows the exit or
+the signal and the command's stderr instead of a timing. A run killed at its limit, the untimed one
+included, voids its cell too, which then says so and shows no stderr. Read two medians together with their spreads. A difference where one subject's
 fastest run is slower than the other's slowest is clear. One where the ranges overlap is likely to
 be noise. This build does not yet judge any row as slower.
 

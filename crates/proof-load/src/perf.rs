@@ -8,7 +8,7 @@
 //! median, minimum and maximum. Before a pair is timed the harness checks that every subject sees
 //! the same change; a pair that fails the check is reported as not comparable, never timed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -77,8 +77,6 @@ pub struct Hardware {
 #[serde(deny_unknown_fields)]
 pub struct Row {
     pub operation: String,
-    /// Whether the operation ran on a warm cache. Every row of this build is warm.
-    pub warm: bool,
     pub note: String,
     pub outcome: Outcome,
 }
@@ -91,7 +89,6 @@ pub enum Outcome {
     /// The subjects did not see the same change before the pair, so their timings would compare
     /// different work.
     NotComparable { reason: String },
-    NotRun { reason: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -107,9 +104,12 @@ pub struct Cell {
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Measured {
     Timed { wall: Spread, memory: Memory, cores: Cores },
-    /// A repetition did not succeed, so the cell has no timing: the exit (none when the command
-    /// was killed at its limit) and what it said on stderr.
-    Voided { exit: Option<i32>, stderr: String },
+    /// A run did not succeed, so the cell has no timing: its exit, or the signal it died of when
+    /// it had no exit, and what it said on stderr.
+    Voided { exit: Option<i32>, signal: Option<i32>, stderr: String },
+    /// A run, the untimed one or a repetition, ran past its limit and was killed; what it said is
+    /// not kept.
+    KilledAtLimit { limit_seconds: u64 },
 }
 
 /// Microseconds over the repetitions: never the mean.
@@ -157,13 +157,11 @@ impl PerfReport {
     }
 
     /// Whether the run failed to compare something it set out to: a row not comparable, or a cell
-    /// voided by a repetition that did not succeed. A row not run for a stated reason is not a
-    /// failure.
+    /// with no timing.
     pub fn failed(&self) -> bool {
         self.rows.iter().any(|row| match &row.outcome {
             Outcome::NotComparable { .. } => true,
-            Outcome::Timed { cells } => cells.iter().any(|cell| matches!(cell.result, Measured::Voided { .. })),
-            Outcome::NotRun { .. } => false,
+            Outcome::Timed { cells } => cells.iter().any(|cell| !matches!(cell.result, Measured::Timed { .. })),
         })
     }
 
@@ -184,10 +182,9 @@ impl PerfReport {
         }
         out.push_str("\n## Rows\n");
         for row in &self.rows {
-            let _ = writeln!(out, "\n### {} ({})\n\n{}\n", row.operation, if row.warm { "warm" } else { "cold" }, row.note);
+            let _ = writeln!(out, "\n### {}\n\n{}\n", row.operation, row.note);
             match &row.outcome {
                 Outcome::NotComparable { reason } => { let _ = writeln!(out, "Not comparable: {}", reason); }
-                Outcome::NotRun { reason } => { let _ = writeln!(out, "Not run: {}", reason); }
                 Outcome::Timed { cells } => {
                     out.push_str("| subject | median | fastest | slowest | peak memory | cores | command |\n|---|---|---|---|---|---|---|\n");
                     for cell in cells {
@@ -204,9 +201,16 @@ impl PerfReport {
                                 };
                                 let _ = writeln!(out, "| {} | {} | {} | {} | {} | {} | {} |", cell.subject.label(), micros(wall.median), micros(wall.min), micros(wall.max), memory, cores, command);
                             }
-                            Measured::Voided { exit, stderr } => {
-                                let exit = exit.map_or_else(|| "no exit (killed at its limit)".to_string(), |exit| format!("exit {}", exit));
-                                let _ = writeln!(out, "| {} | voided: {}: {} | | | | | {} |", cell.subject.label(), exit, stderr.trim().replace('\n', " ").replace('|', "\\|"), command);
+                            Measured::Voided { exit, signal, stderr } => {
+                                let ended = match (exit, signal) {
+                                    (Some(exit), _) => format!("exit {}", exit),
+                                    (None, Some(signal)) => format!("signal {}", signal),
+                                    (None, None) => "no exit".to_string(),
+                                };
+                                let _ = writeln!(out, "| {} | voided: {}: {} | | | | | {} |", cell.subject.label(), ended, stderr.trim().replace('\n', " ").replace('|', "\\|"), command);
+                            }
+                            Measured::KilledAtLimit { limit_seconds } => {
+                                let _ = writeln!(out, "| {} | voided: killed at its {} s limit | | | | | {} |", cell.subject.label(), limit_seconds, command);
                             }
                         }
                     }
@@ -373,9 +377,8 @@ fn pairs(built: &Built, reps: usize, scratch: &Scratch, environment: &Environmen
         tool::run(&subject.invocation(read), scratch, environment)?;
     }
 
-    let clean = clean(subjects, scratch, environment)?;
-    let baseline = clean.as_ref().map_or(0, |counts| counts.unstaged);
-    let clean = clean.map(|_| ());
+    let edited_set: BTreeSet<String> = edited.iter().map(|file| file.to_string()).collect();
+    let clean = same(subjects, &Changes::default(), scratch, environment)?;
     let reads: [(&str, String, [&[&str]; 2]); 3] = [
         ("status", "Forklift's stocktake --summary against git's status, on the clean tree".to_string(), [&["stocktake", "--summary"], &["status"]]),
         ("log", "Forklift's history against git's log, the whole history".to_string(), [&["history"], &["log"]]),
@@ -385,9 +388,9 @@ fn pairs(built: &Built, reps: usize, scratch: &Scratch, environment: &Environmen
         progress(&format!("timing {}", operation));
         let outcome = match &clean {
             Ok(()) => timed_pair(subjects, forklift, git, reps, scratch, environment)?,
-            Err(reason) => Outcome::NotComparable { reason: reason.clone() },
+            Err(reason) => Outcome::NotComparable { reason: format!("before the clean-tree rows, {}", reason) },
         };
-        rows.push(Row { operation: operation.to_string(), warm: true, note, outcome });
+        rows.push(Row { operation: operation.to_string(), note, outcome });
     }
 
     for subject in subjects {
@@ -404,11 +407,12 @@ fn pairs(built: &Built, reps: usize, scratch: &Scratch, environment: &Environmen
     let count = edited.len();
     let note = format!("{} tracked files edited, unstaged", count);
     progress("timing diff");
-    let outcome = match changed(subjects, &["diff", "--name-only"], |counts| counts.unstaged.saturating_sub(baseline), count, scratch, environment)? {
+    let unstaged = Changes { staged: BTreeSet::new(), unstaged: edited_set.clone() };
+    let outcome = match same(subjects, &unstaged, scratch, environment)? {
         Ok(()) => timed_pair(subjects, &["diff"], &["diff"], reps, scratch, environment)?,
-        Err(reason) => Outcome::NotComparable { reason },
+        Err(reason) => Outcome::NotComparable { reason: format!("before diff, {}", reason) },
     };
-    rows.push(Row { operation: "diff".to_string(), warm: true, note, outcome });
+    rows.push(Row { operation: "diff".to_string(), note, outcome });
 
     for subject in subjects {
         let stage = if subject.tool == Tool::Forklift { subject.line(&["load", "."]) } else { subject.line(&["add", "-A"]) };
@@ -416,91 +420,94 @@ fn pairs(built: &Built, reps: usize, scratch: &Scratch, environment: &Environmen
     }
     let note = format!("the same {} files staged, untimed, by Forklift's load . and git's add -A", count);
     progress("timing diff --staged");
-    let outcome = match changed(subjects, &["diff", "--cached", "--name-only"], |counts| counts.staged, count, scratch, environment)? {
+    let staged = Changes { staged: edited_set, unstaged: BTreeSet::new() };
+    let outcome = match same(subjects, &staged, scratch, environment)? {
         Ok(()) => timed_pair(subjects, &["diff", "--staged"], &["diff", "--staged"], reps, scratch, environment)?,
-        Err(reason) => Outcome::NotComparable { reason },
+        Err(reason) => Outcome::NotComparable { reason: format!("before diff --staged, {}", reason) },
     };
-    rows.push(Row { operation: "diff --staged".to_string(), warm: true, note, outcome });
+    rows.push(Row { operation: "diff --staged".to_string(), note, outcome });
     Ok(rows)
 }
 
-/// What forklift's `stocktake --summary` counts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Counts {
-    staged: usize,
-    unstaged: usize,
+/// The paths a subject's work tree differs from its last commit at: those staged, and those
+/// changed but not staged, untracked ones included.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Changes {
+    staged: BTreeSet<String>,
+    unstaged: BTreeSet<String>,
 }
 
-fn forklift_counts(subject: &Subject, scratch: &Scratch, environment: &Environment) -> Result<Result<Counts, String>, Stopped> {
-    let outcome = tool::run(&subject.invocation(subject.line(&["--json", "stocktake", "--summary"])), scratch, environment)?;
-    let document = runner::document(&outcome.stdout);
-    let count = |field: &str| document["data"][field].as_u64().and_then(|count| usize::try_from(count).ok());
-    Ok(match (outcome.succeeded(), count("staged_count"), count("unstaged_count")) {
-        (true, Some(staged), Some(unstaged)) => Ok(Counts { staged, unstaged }),
-        _ => Err(format!("Forklift's --json stocktake --summary gave no counts (exit {:?}): {}", outcome.exit, String::from_utf8_lossy(&outcome.stderr).trim())),
-    })
-}
-
-/// The lines a git subject's read printed, or why it could not be read.
-fn git_lines(subject: &Subject, arguments: &[&str], scratch: &Scratch, environment: &Environment) -> Result<Result<usize, String>, Stopped> {
-    let outcome = tool::run(&subject.invocation(subject.line(arguments)), scratch, environment)?;
-    Ok(if outcome.succeeded() {
-        Ok(String::from_utf8_lossy(&outcome.stdout).lines().count())
-    } else {
-        Err(format!("{} {} exited {:?}: {}", subject.tool.label(), arguments.join(" "), outcome.exit, String::from_utf8_lossy(&outcome.stderr).trim()))
-    })
-}
-
-/// Whether every subject's tree is clean: nothing staged in forklift's, and nothing in either
-/// git's `status --porcelain`. Gives forklift's counts, whose unstaged count is the baseline the
-/// diff check subtracts (it counts untracked entries, which `git diff` never shows).
-fn clean(subjects: &[Subject], scratch: &Scratch, environment: &Environment) -> Result<Result<Counts, String>, Stopped> {
-    let mut counts = None;
-    let mut dirty = Vec::new();
-    for subject in subjects {
-        if subject.tool == Tool::Forklift {
-            match forklift_counts(subject, scratch, environment)? {
-                Ok(read) if read.staged == 0 => counts = Some(read),
-                Ok(read) => dirty.push(format!("Forklift's subject has {} staged", read.staged)),
-                Err(reason) => dirty.push(reason),
+impl Changes {
+    /// How `self`, what a subject saw, differs from `expected`: each side's extra and missing
+    /// paths, a few of each.
+    fn against(&self, expected: &Changes) -> String {
+        let side = |name: &str, seen: &BTreeSet<String>, wanted: &BTreeSet<String>| -> Option<String> {
+            let few = |paths: Vec<&String>| paths.iter().take(3).map(|path| path.as_str()).collect::<Vec<_>>().join(", ");
+            let extra: Vec<&String> = seen.difference(wanted).collect();
+            let missing: Vec<&String> = wanted.difference(seen).collect();
+            let mut parts = Vec::new();
+            if !extra.is_empty() {
+                parts.push(format!("{} more ({})", extra.len(), few(extra)));
             }
-        } else {
-            match git_lines(subject, &["status", "--porcelain"], scratch, environment)? {
-                Ok(0) => {}
-                Ok(lines) => dirty.push(format!("{} has {} changed", subject.tool.label(), lines)),
-                Err(reason) => dirty.push(reason),
+            if !missing.is_empty() {
+                parts.push(format!("{} missing ({})", missing.len(), few(missing)));
             }
-        }
-    }
-    Ok(match counts {
-        Some(counts) if dirty.is_empty() => Ok(counts),
-        _ => Err(format!("a subject's tree was not clean before the clean-tree pairs: {}", dirty.join("; "))),
-    })
-}
-
-/// Whether every subject sees `expected` changed files: forklift by `forklift_count` of its
-/// counts, each git by the lines `git_read` prints.
-fn changed(subjects: &[Subject], git_read: &[&str], forklift_count: impl Fn(Counts) -> usize, expected: usize, scratch: &Scratch, environment: &Environment) -> Result<Result<(), String>, Stopped> {
-    let mut seen = Vec::new();
-    let mut agree = true;
-    for subject in subjects {
-        let count = if subject.tool == Tool::Forklift {
-            forklift_counts(subject, scratch, environment)?.map(&forklift_count)
-        } else {
-            git_lines(subject, git_read, scratch, environment)?
+            (!parts.is_empty()).then(|| format!("{} {} of {} expected, {}", seen.len(), name, wanted.len(), parts.join(" and ")))
         };
-        match count {
-            Ok(count) => {
-                agree &= count == expected;
-                seen.push(format!("{} {}", subject.tool.label(), count));
-            }
-            Err(reason) => {
-                agree = false;
-                seen.push(reason);
-            }
+        [side("staged", &self.staged, &expected.staged), side("unstaged", &self.unstaged, &expected.unstaged)].into_iter().flatten().collect::<Vec<_>>().join("; ")
+    }
+}
+
+/// What `subject` reports as changed: Forklift by `--json stocktake`'s path lists, git by
+/// `status --porcelain` with every untracked file listed. Gives why when the read failed.
+fn changes(subject: &Subject, scratch: &Scratch, environment: &Environment) -> Result<Result<Changes, String>, Stopped> {
+    let arguments: &[&str] = if subject.tool == Tool::Forklift { &["--json", "stocktake"] } else { &["status", "--porcelain", "--untracked-files=all"] };
+    let outcome = tool::run(&subject.invocation(subject.line(arguments)), scratch, environment)?;
+    if !outcome.succeeded() {
+        return Ok(Err(format!("{} {} exited {:?}: {}", subject.tool.label(), arguments.join(" "), outcome.exit, String::from_utf8_lossy(&outcome.stderr).trim())));
+    }
+    if subject.tool == Tool::Forklift {
+        let document = runner::document(&outcome.stdout);
+        let paths = |field: &str| -> Option<BTreeSet<String>> {
+            document["data"][field].as_array()?.iter().map(|change| change["path"].as_str().map(str::to_string)).collect()
+        };
+        return Ok(match (paths("staged"), paths("unstaged")) {
+            (Some(staged), Some(unstaged)) => Ok(Changes { staged, unstaged }),
+            _ => Err("Forklift's --json stocktake gave no staged and unstaged path lists".to_string()),
+        });
+    }
+    Ok(Ok(porcelain(&String::from_utf8_lossy(&outcome.stdout))))
+}
+
+/// The changes in `git status --porcelain` lines `XY path`: X, the index's column, names a staged
+/// change; Y, the work tree's, an unstaged one, and `??` an untracked file.
+fn porcelain(text: &str) -> Changes {
+    let mut changes = Changes::default();
+    for line in text.lines().filter(|line| line.len() > 3) {
+        let (columns, path) = line.split_at(3);
+        let path = path.split(" -> ").last().unwrap_or(path).to_string();
+        let mut columns = columns.chars();
+        if columns.next().is_some_and(|index| index != ' ' && index != '?') {
+            changes.staged.insert(path.clone());
+        }
+        if columns.next().is_some_and(|tree| tree != ' ') {
+            changes.unstaged.insert(path);
         }
     }
-    Ok(if agree { Ok(()) } else { Err(format!("the subjects did not all see the {} edited files: {}", expected, seen.join(", "))) })
+    changes
+}
+
+/// Whether every subject reports exactly `expected` changed, or what each one that did not saw.
+fn same(subjects: &[Subject], expected: &Changes, scratch: &Scratch, environment: &Environment) -> Result<Result<(), String>, Stopped> {
+    let mut differ = Vec::new();
+    for subject in subjects {
+        match changes(subject, scratch, environment)? {
+            Ok(seen) if seen == *expected => {}
+            Ok(seen) => differ.push(format!("{} saw {}", subject.tool.label(), seen.against(expected))),
+            Err(reason) => differ.push(reason),
+        }
+    }
+    Ok(if differ.is_empty() { Ok(()) } else { Err(differ.join("; ")) })
 }
 
 /// Times forklift's `forklift` line and both gits' `git` line.
@@ -515,18 +522,24 @@ fn timed_pair(subjects: &[Subject], forklift: &[&str], git: &[&str], reps: usize
 }
 
 /// One cell: an untimed run first, whose exit is not judged, so the cache is warm; then `reps`
-/// timed repetitions. The first repetition that does not succeed voids the cell.
+/// timed repetitions. The first repetition that does not succeed voids the cell, and so does any
+/// run, the untimed one included, killed at its limit.
 fn measure(invocation: &Invocation, reps: usize, scratch: &Scratch, environment: &Environment) -> Result<Measured, Stopped> {
-    tool::run(invocation, scratch, environment)?;
+    let killed = || Measured::KilledAtLimit { limit_seconds: invocation.limit.as_secs() };
+    match tool::run(invocation, scratch, environment) {
+        Ok(_) => {}
+        Err(ToolError::TimedOut { .. }) => return Ok(killed()),
+        Err(error) => return Err(error.into()),
+    }
     let mut runs = Vec::with_capacity(reps);
     for _ in 0..reps {
         let timed = match tool::timed(invocation, scratch, environment) {
             Ok(timed) => timed,
-            Err(error @ ToolError::TimedOut { .. }) => return Ok(Measured::Voided { exit: None, stderr: error.to_string() }),
+            Err(ToolError::TimedOut { .. }) => return Ok(killed()),
             Err(error) => return Err(error.into()),
         };
         if !timed.outcome.succeeded() {
-            return Ok(Measured::Voided { exit: timed.outcome.exit, stderr: String::from_utf8_lossy(&timed.outcome.stderr).into_owned() });
+            return Ok(Measured::Voided { exit: timed.outcome.exit, signal: timed.signal, stderr: String::from_utf8_lossy(&timed.outcome.stderr).into_owned() });
         }
         runs.push(timed);
     }
@@ -635,7 +648,7 @@ mod tests {
             wall, memory: Memory::Measured { peak_bytes: Spread { median: 3 << 20, min: 3 << 20, max: 4 << 20 } },
             cores: Cores::NotMeasured { reason: "too short to measure: under 20 ms of CPU time".into() },
         } };
-        let rows = vec![Row { operation: "log".into(), warm: true, note: "n".into(), outcome: Outcome::Timed { cells: vec![cell] } }];
+        let rows = vec![Row { operation: "log".into(), note: "n".into(), outcome: Outcome::Timed { cells: vec![cell] } }];
         PerfReport { format: PERF_FORMAT, header, rows }
     }
 
@@ -666,8 +679,68 @@ mod tests {
         let shell = |script: &str| Invocation {
             program: PathBuf::from("/bin/sh"), arguments: vec!["-c".into(), script.into()], directory: scratch.work(), limit: Duration::from_secs(30),
         };
-        assert_eq!(measure(&shell("echo boom >&2; exit 1"), 3, &scratch, &environment).unwrap(), Measured::Voided { exit: Some(1), stderr: "boom\n".into() });
+        assert_eq!(measure(&shell("echo boom >&2; exit 1"), 3, &scratch, &environment).unwrap(), Measured::Voided { exit: Some(1), signal: None, stderr: "boom\n".into() });
         assert!(matches!(measure(&shell("exit 0"), 3, &scratch, &environment).unwrap(), Measured::Timed { .. }));
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A command that dies of a signal voids its cell with that signal and no exit, and is not
+    /// read as killed at its limit, even when the signal is SIGKILL; a run killed at its limit
+    /// voids its cell as killed, the untimed run as well as a repetition.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_is_not_a_timeout_and_a_warm_up_timeout_voids_its_cell() {
+        let (root, scratch, environment) = scratch("signal");
+        let shell = |script: &str, limit: Duration| Invocation {
+            program: PathBuf::from("/bin/sh"), arguments: vec!["-c".into(), script.into()], directory: scratch.work(), limit,
+        };
+        let long = Duration::from_secs(30);
+        assert_eq!(measure(&shell("kill -9 $$", long), 3, &scratch, &environment).unwrap(), Measured::Voided { exit: None, signal: Some(9), stderr: String::new() });
+        assert_eq!(measure(&shell("kill -SEGV $$", long), 3, &scratch, &environment).unwrap(), Measured::Voided { exit: None, signal: Some(libc::SIGSEGV), stderr: String::new() });
+        assert_eq!(measure(&shell("sleep 30", Duration::from_millis(300)), 3, &scratch, &environment).unwrap(), Measured::KilledAtLimit { limit_seconds: 0 });
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Porcelain lines are read by their two columns: the index's names a staged change, the work
+    /// tree's an unstaged one, `??` an untracked file, and a rename counts at its new path.
+    #[test]
+    fn porcelain_columns_are_staged_and_unstaged() {
+        let set = |paths: &[&str]| paths.iter().map(|path| path.to_string()).collect::<BTreeSet<String>>();
+        let changes = porcelain(" M a/one\nM  b\n?? c\nR  old -> new\nMM d\n");
+        assert_eq!(changes, Changes { staged: set(&["b", "new", "d"]), unstaged: set(&["a/one", "c", "d"]) });
+    }
+
+    /// The sameness check compares the paths each subject reports, not how many: a git subject with
+    /// one file it should not have, even beside one it lacks, so that the count agrees, is told
+    /// apart from what was expected, and a subject that sees exactly the expected set passes.
+    #[cfg(unix)]
+    #[test]
+    fn sameness_compares_the_changed_paths_not_their_count() {
+        let (root, scratch, environment) = scratch("same");
+        let git = crate::scrub::path_git();
+        let work = scratch.work().join("repo");
+        let run = |arguments: &[&str]| {
+            let invocation = Invocation { program: git.clone(), arguments: arguments.iter().map(|argument| argument.to_string()).collect(), directory: scratch.work(), limit: Duration::from_secs(30) };
+            assert!(tool::run(&invocation, &scratch, &environment).unwrap().succeeded(), "{:?}", arguments);
+        };
+        let at = work.display().to_string();
+        run(&["init", "-q", &at]);
+        std::fs::write(work.join("a"), "a\n").unwrap();
+        std::fs::write(work.join("b"), "b\n").unwrap();
+        run(&["-C", &at, "add", "-A"]);
+        run(&["-C", &at, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "one"]);
+        let subjects = [Subject { tool: Tool::Git, program: git.clone(), prefix: vec![], work: work.clone() }];
+        let set = |paths: &[&str]| paths.iter().map(|path| path.to_string()).collect::<BTreeSet<String>>();
+        assert_eq!(same(&subjects, &Changes::default(), &scratch, &environment).unwrap(), Ok(()));
+
+        std::fs::write(work.join("a"), "a\nedit\n").unwrap();
+        std::fs::write(work.join("stray"), "s\n").unwrap();
+        let expected = Changes { staged: BTreeSet::new(), unstaged: set(&["a", "b"]) };
+        assert_eq!(same(&subjects, &expected, &scratch, &environment).unwrap(), Err("git saw 2 unstaged of 2 expected, 1 more (stray) and 1 missing (b)".to_string()));
+        let expected = Changes { staged: BTreeSet::new(), unstaged: set(&["a", "stray"]) };
+        assert_eq!(same(&subjects, &expected, &scratch, &environment).unwrap(), Ok(()));
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -706,7 +779,7 @@ mod tests {
         assert!(!report.failed());
         let written = std::fs::read_to_string(out.join("perf.json")).unwrap();
         assert_eq!(PerfReport::from_json(&written).unwrap(), report);
-        assert!(std::fs::read_to_string(out.join("perf.md")).unwrap().contains("### diff --staged (warm)"));
+        assert!(std::fs::read_to_string(out.join("perf.md")).unwrap().contains("### diff --staged\n"));
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&out);
     }

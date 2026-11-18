@@ -178,13 +178,15 @@ pub struct Usage {
     pub peak_bytes: u64,
 }
 
-/// One timed run: what it said, how long it took from just before its spawn to its exit, and its
-/// [`Usage`] where the platform reports one (unix; never Windows).
+/// One timed run: what it said, how long it took from just before its spawn to its exit, its
+/// [`Usage`] where the platform reports one (unix; never Windows), and the signal that ended it,
+/// when one did (unix; never Windows).
 #[derive(Clone, Debug)]
 pub struct Timed {
     pub outcome: Outcome,
     pub wall: Duration,
     pub usage: Option<Usage>,
+    pub signal: Option<i32>,
 }
 
 /// Runs `invocation` as [`run`] does, timed for a measurement rather than polled. On unix the
@@ -203,28 +205,34 @@ pub fn timed(invocation: &Invocation, scratch: &Scratch, environment: &Environme
 
     let reaped = reap(&mut child, invocation.limit).map_err(spawn)?;
     let wall = reaped.ended.duration_since(started);
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
+    // A child killed at its limit may have left a process of its own holding its output open, so
+    // its output is not waited for, as [`run`] does not wait for it.
     if reaped.killed {
         return Err(ToolError::TimedOut { program: invocation.program.clone(), limit: invocation.limit });
     }
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
     let outcome = Outcome { arguments: invocation.arguments.clone(), exit: reaped.exit, failure: failure_of(&stdout), stdout, stderr };
-    Ok(Timed { outcome, wall, usage: reaped.usage })
+    Ok(Timed { outcome, wall, usage: reaped.usage, signal: reaped.signal })
 }
 
 /// How a timed child ended.
 struct Reaped {
     exit: Option<i32>,
+    /// The signal that ended it, when one did.
+    signal: Option<i32>,
     /// When the harness saw it exit.
     ended: Instant,
     usage: Option<Usage>,
-    /// Whether the watchdog killed it at its limit.
+    /// Whether the watchdog killed it at its limit: the watchdog sent its kill and the child died
+    /// of that signal. A child that exited on its own just as the limit passed was not killed.
     killed: bool,
 }
 
 /// Waits for `child` to exit, then reaps it with its rusage. The wait does not reap
 /// (`WNOWAIT`), so until the watchdog is stopped the child's id is still its own and the
-/// watchdog's kill can reach no other process.
+/// watchdog's kill can reach no other process. When the wait itself fails the child is killed and
+/// reaped before the error is returned, so no child outlives the call.
 #[cfg(unix)]
 fn reap(child: &mut std::process::Child, limit: Duration) -> std::io::Result<Reaped> {
     let pid = libc::pid_t::try_from(child.id()).map_err(|_| std::io::Error::other(format!("process id {} is out of range", child.id())))?;
@@ -250,8 +258,15 @@ fn reap(child: &mut std::process::Child, limit: Duration) -> std::io::Result<Rea
         }
     };
     drop(stop);
-    let killed = watchdog.join().unwrap_or(false);
-    let ended = waited?;
+    let fired = watchdog.join().unwrap_or(false);
+    let ended = match waited {
+        Ok(ended) => ended,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
 
     let mut status: libc::c_int = 0;
     // SAFETY: wait4 fills the status and the zeroed rusage it is given and returns -1 on failure.
@@ -267,10 +282,19 @@ fn reap(child: &mut std::process::Child, limit: Duration) -> std::io::Result<Rea
         }
     }
     let exit = if libc::WIFEXITED(status) { Some(libc::WEXITSTATUS(status)) } else { None };
+    let signal = if libc::WIFSIGNALED(status) { Some(libc::WTERMSIG(status)) } else { None };
+    let killed = killed_when(fired, signal);
     let time = |value: libc::timeval| Duration::from_secs(u64::try_from(value.tv_sec).unwrap_or(0)) + Duration::from_micros(u64::try_from(value.tv_usec).unwrap_or(0));
     #[allow(clippy::unnecessary_cast)]
     let peak_bytes = peak_bytes_when(!cfg!(target_os = "macos"), usage.ru_maxrss as i64);
-    Ok(Reaped { exit, ended, usage: Some(Usage { user: time(usage.ru_utime), system: time(usage.ru_stime), peak_bytes }), killed })
+    Ok(Reaped { exit, signal, ended, usage: Some(Usage { user: time(usage.ru_utime), system: time(usage.ru_stime), peak_bytes }), killed })
+}
+
+/// Whether a child was killed at its limit: the watchdog `fired` its kill, and the child ended on
+/// that kill's signal rather than exiting first.
+#[cfg(unix)]
+fn killed_when(fired: bool, signal: Option<i32>) -> bool {
+    fired && signal == Some(libc::SIGKILL)
 }
 
 #[cfg(not(unix))]
@@ -278,12 +302,12 @@ fn reap(child: &mut std::process::Child, limit: Duration) -> std::io::Result<Rea
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(Reaped { exit: status.code(), ended: Instant::now(), usage: None, killed: false });
+            return Ok(Reaped { exit: status.code(), signal: None, ended: Instant::now(), usage: None, killed: false });
         }
         if started.elapsed() > limit {
             let _ = child.kill();
             let _ = child.wait();
-            return Ok(Reaped { exit: None, ended: Instant::now(), usage: None, killed: true });
+            return Ok(Reaped { exit: None, signal: None, ended: Instant::now(), usage: None, killed: true });
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -610,6 +634,18 @@ mod tests {
         assert!((64 << 20..256 << 20).contains(&peak), "peak {} bytes", peak);
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(scratch.root());
+    }
+
+    /// A child counts as killed at its limit only when the watchdog fired and the child died of
+    /// SIGKILL: one that exited on its own as the limit passed, or died of a kill the watchdog did
+    /// not send, was not.
+    #[cfg(unix)]
+    #[test]
+    fn killed_means_the_watchdog_fired_and_the_child_died_of_it() {
+        assert!(killed_when(true, Some(libc::SIGKILL)));
+        assert!(!killed_when(true, None));
+        assert!(!killed_when(true, Some(libc::SIGTERM)));
+        assert!(!killed_when(false, Some(libc::SIGKILL)));
     }
 
     /// `timed` still enforces the invocation's limit, and a child it killed is a timeout, not an
