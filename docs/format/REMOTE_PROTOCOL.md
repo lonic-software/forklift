@@ -18,7 +18,8 @@ prefix: `/v1/…`. Errors use conventional status codes with a JSON body
 fields to that body: `code` — the stable refusal code string — and `next_step` — its
 machine-actionable recovery step. When a server-side operation fails with a classified refusal,
 the head sets them so a client classifies it with the same code and exit code as a local refusal;
-`error` is the human message. Both are **additive**: an older head omits them, and a client that
+`error` is the human message. A `500` is the exception: forklift-server sets neither on one (see
+*A fault of the server's own* below). Both are **additive**: an older head omits them, and a client that
 does not understand them ignores them (a plain error simply has no `code`). Example:
 `{"error":"…","code":"out_of_scope","next_step":"…"}`.
 
