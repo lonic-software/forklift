@@ -42,6 +42,10 @@ target/debug/proof-load run --source . --out ../proof-load-out \
 The exit status is 0 when the report passes, 1 when it fails, and 2 when the run could not go
 ahead.
 
+`proof-load perf --out <folder> --forklift <path> --git <path>` times Forklift beside git on a
+generated history instead, faulting nothing, and writes `perf.md` and `perf.json`. See
+[Measuring performance](../../docs/guide/proof-load.md#11-measuring-performance).
+
 To look at a report in a window, use [`tools/proof-load-desktop`](../../tools/proof-load-desktop/README.md).
 
 ## Tests
