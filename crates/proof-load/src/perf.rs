@@ -1148,42 +1148,50 @@ fn gate_of(options: &PerfOptions) -> Gate {
 
 /// The fresh compact's `reps` timed runs, each on a fresh copy of the gate subject's loose store
 /// after one untimed run on another, and then the subject's own compact, untimed, so the repack
-/// after it runs over a packed store. Every run must pack something, since the subject is built
-/// loose: gives why the row is not comparable when one packed nothing, and the cell's ending when
-/// a run ended without a timing.
+/// after it runs over a packed store, whatever the copies gave. Every run must pack something,
+/// since the subject is built loose: gives why the row is not comparable when one packed nothing
+/// or the subject's own ended without a timing, and the cell's ending when a timed run did.
 fn fresh_compact(subject: &Subject, command: &[String], reps: usize, scratch: &Scratch, environment: &Environment) -> Result<Result<Result<Vec<tool::Timed>, Measured>, String>, Stopped> {
     let copies = scratch.work().join("gate-copies");
     std::fs::create_dir_all(&copies).map_err(|error| Stopped(format!("{}: {}", copies.display(), error)))?;
     let mut runs = Vec::with_capacity(reps);
+    let mut stopped = None;
     for rep in 0..=reps {
         let copied = Copied(Some(copies.join(format!("fresh-compact-{}", rep))));
         let compacted = crate::scrub::copy_tree(&subject.work, copied.path())
             .map_err(|error| Stopped(format!("copying {} to {}: {:?}", subject.work.display(), copied.path().display(), error)))
-            .and_then(|()| compact_once(&subject.at(copied.path().to_path_buf()), command, scratch, environment));
+            .and_then(|()| compact_once(&subject.at(copied.path().to_path_buf()), "the fresh compact", command, scratch, environment));
         let removed = copied.remove();
         let compacted = compacted?;
         removed?;
         match compacted {
             Ok(Ok(timed)) => if rep > 0 { runs.push(timed) },
-            ended => return Ok(ended.map(|ended| ended.map(|_| Vec::new()))),
+            ended => {
+                stopped = Some(ended.map(|ended| ended.map(|_| Vec::new())));
+                break;
+            }
         }
     }
-    Ok(match compact_once(subject, command, scratch, environment)? {
-        Ok(Ok(_)) => Ok(Ok(runs)),
-        Ok(Err(ended)) => Err(format!("the gate subject's own compact, untimed, ended without packing: {:?}", ended)),
-        Err(reason) => Err(reason),
+    // The subject is packed even when a copy's compact gave out, so the rows after it are timed
+    // over the packed store their notes name.
+    let own = compact_once(subject, "the gate subject's own compact, untimed,", command, scratch, environment)?;
+    Ok(match (stopped, own) {
+        (Some(stopped), _) => stopped,
+        (None, Ok(Ok(_))) => Ok(Ok(runs)),
+        (None, Ok(Err(_))) => Err("the gate subject's own compact, untimed, ended without a timing, so the repack would not run over a packed store".to_string()),
+        (None, Err(reason)) => Err(reason),
     })
 }
 
 /// One `store compact` of `subject`'s store, after its writes are settled, which must pack at least
-/// one object.
-fn compact_once(subject: &Subject, command: &[String], scratch: &Scratch, environment: &Environment) -> Result<Result<Result<tool::Timed, Measured>, String>, Stopped> {
+/// one object; `what` names it in the reason when it packs none.
+fn compact_once(subject: &Subject, what: &str, command: &[String], scratch: &Scratch, environment: &Environment) -> Result<Result<Result<tool::Timed, Measured>, String>, Stopped> {
     settle(&subject.work)?;
     Ok(match repetition(&subject.invocation(command.to_vec()), None, scratch, environment)? {
         Err(ended) => Ok(Err(ended)),
         Ok(timed) => match runner::document(&timed.outcome.stdout)["data"]["objects_packed"].as_u64() {
             Some(packed) if packed > 0 => Ok(Ok(timed)),
-            packed => Err(format!("the fresh compact packed {:?} objects, so it timed no packing", packed)),
+            packed => Err(format!("{} packed {:?} objects of a store built loose", what, packed)),
         },
     })
 }

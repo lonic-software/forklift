@@ -275,8 +275,9 @@ on error, so for now they report grades without failing a pull request.
   files, `report.md` and the traces are uploaded.
 - **`proof load history`** runs weekly on Linux with `--history-from .`, over Forklift's own history.
 - **`proof load perf`** runs `perf --shape small --reps 3 --gate self` on Linux, with a
-  forklift-server, on every push to `main` and on a pull request that touches Forklift's core, its
-  commands or the harness. A verdict that fails anything fails the job, and `perf.md` and
+  forklift-server, on every push to `main` and on a pull request that touches the code the timed binaries or the
+  harness are built from (the forklift, forklift-core, forklift-server and proof-load crates, the
+  workspace's `Cargo.toml` and `Cargo.lock`, `.cargo/`). A verdict that fails anything fails the job, and `perf.md` and
   `perf.json` are uploaded.
 - **`proof load desktop`** builds, tests and runs Clippy on the desktop window on each OS. It runs no
   faults, and a failing step fails it.
@@ -485,7 +486,7 @@ built only on Linux, with `taskset` on the `PATH`; elsewhere the last row is rep
 - a **broken ratio of Forklift's own**: the repack's median above 1.5 times the fresh compact's, or
   the audit's above twice the one-core audit's;
 - any of those rows, or of the gate subject's, that **could not run**: not comparable, with a
-  voided cell, or missing a cell it is judged by (Forklift's, and on the gross rows tuned git's).
+  voided cell, or missing a cell it is judged by (Forklift's, and on a pair row tuned git's).
 
 Each of these compares two timings taken on the same machine in the same run, so a shared, noisy
 CI runner can hold them. `--gate self` stops there. CI runs it on the small shape in `proof-load-perf.yml`, on every push
@@ -564,5 +565,5 @@ slower than the other's slowest is clear. One where the ranges overlap is likely
 
 `perf` exits 0 when the verdict failed nothing under its gate, and 1 when it failed a row. It exits
 2 when the run could not go ahead, such as over a non-empty output folder, an unknown shape, both
-`--shape` and `--history-from`, a history it cannot mirror or read, a side branch the history does
+`--shape` and `--history-from`, `--gate all` with `--history-from`, a history it cannot mirror or read, a side branch the history does
 not have, or a subject that could not be built. A run that exits 2 writes no `perf.json`.
