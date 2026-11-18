@@ -109,7 +109,7 @@ pub enum Measured {
     Voided { exit: Option<i32>, signal: Option<i32>, stderr: String },
     /// A run, the untimed one or a repetition, ran past its limit and was killed; what it said is
     /// not kept.
-    KilledAtLimit { limit_seconds: u64 },
+    KilledAtLimit { limit_ms: u64 },
 }
 
 /// Microseconds over the repetitions: never the mean.
@@ -209,8 +209,8 @@ impl PerfReport {
                                 };
                                 let _ = writeln!(out, "| {} | voided: {}: {} | | | | | {} |", cell.subject.label(), ended, stderr.trim().replace('\n', " ").replace('|', "\\|"), command);
                             }
-                            Measured::KilledAtLimit { limit_seconds } => {
-                                let _ = writeln!(out, "| {} | voided: killed at its {} s limit | | | | | {} |", cell.subject.label(), limit_seconds, command);
+                            Measured::KilledAtLimit { limit_ms } => {
+                                let _ = writeln!(out, "| {} | voided: killed at its {} limit | | | | | {} |", cell.subject.label(), micros(limit_ms.saturating_mul(1000)), command);
                             }
                         }
                     }
@@ -461,7 +461,7 @@ impl Changes {
 /// What `subject` reports as changed: Forklift by `--json stocktake`'s path lists, git by
 /// `status --porcelain` with every untracked file listed. Gives why when the read failed.
 fn changes(subject: &Subject, scratch: &Scratch, environment: &Environment) -> Result<Result<Changes, String>, Stopped> {
-    let arguments: &[&str] = if subject.tool == Tool::Forklift { &["--json", "stocktake"] } else { &["status", "--porcelain", "--untracked-files=all"] };
+    let arguments: &[&str] = if subject.tool == Tool::Forklift { &["--json", "stocktake"] } else { &["status", "--porcelain", "-z", "--untracked-files=all"] };
     let outcome = tool::run(&subject.invocation(subject.line(arguments)), scratch, environment)?;
     if !outcome.succeeded() {
         return Ok(Err(format!("{} {} exited {:?}: {}", subject.tool.label(), arguments.join(" "), outcome.exit, String::from_utf8_lossy(&outcome.stderr).trim())));
@@ -488,13 +488,19 @@ fn stocktake_changes(document: &serde_json::Value) -> Option<Changes> {
     Some(Changes { staged: paths("staged")?, unstaged: paths("unstaged")? })
 }
 
-/// The changes in `git status --porcelain` lines `XY path`: X, the index's column, names a staged
-/// change; Y, the work tree's, an unstaged one, and `??` an untracked file.
+/// The changes in `git status --porcelain -z` entries `XY path`, each ended by a NUL, the path
+/// unquoted: X, the index's column, names a staged change; Y, the work tree's, an unstaged one, and
+/// `??` an untracked file. A rename or copy names its new path, then its old one as an entry of its
+/// own, which is skipped.
 fn porcelain(text: &str) -> Changes {
     let mut changes = Changes::default();
-    for line in text.lines().filter(|line| line.len() > 3) {
-        let (columns, path) = line.split_at(3);
-        let path = path.split(" -> ").last().unwrap_or(path).to_string();
+    let mut entries = text.split('\0').filter(|entry| !entry.is_empty());
+    while let Some(entry) = entries.next() {
+        let Some((columns, path)) = entry.split_at_checked(3) else { continue };
+        let path = path.to_string();
+        if columns.starts_with(['R', 'C']) {
+            entries.next();
+        }
         let mut columns = columns.chars();
         if columns.next().is_some_and(|index| index != ' ' && index != '?') {
             changes.staged.insert(path.clone());
@@ -534,7 +540,7 @@ fn timed_pair(subjects: &[Subject], forklift: &[&str], git: &[&str], reps: usize
 /// timed repetitions. The first repetition that does not succeed voids the cell, and so does any
 /// run, the untimed one included, killed at its limit.
 fn measure(invocation: &Invocation, reps: usize, scratch: &Scratch, environment: &Environment) -> Result<Measured, Stopped> {
-    let killed = || Measured::KilledAtLimit { limit_seconds: invocation.limit.as_secs() };
+    let killed = || Measured::KilledAtLimit { limit_ms: u64::try_from(invocation.limit.as_millis()).unwrap_or(u64::MAX) };
     match tool::run(invocation, scratch, environment) {
         Ok(_) => {}
         Err(ToolError::TimedOut { .. }) => return Ok(killed()),
@@ -707,18 +713,19 @@ mod tests {
         let long = Duration::from_secs(30);
         assert_eq!(measure(&shell("kill -9 $$", long), 3, &scratch, &environment).unwrap(), Measured::Voided { exit: None, signal: Some(9), stderr: String::new() });
         assert_eq!(measure(&shell("kill -SEGV $$", long), 3, &scratch, &environment).unwrap(), Measured::Voided { exit: None, signal: Some(libc::SIGSEGV), stderr: String::new() });
-        assert_eq!(measure(&shell("sleep 30", Duration::from_millis(300)), 3, &scratch, &environment).unwrap(), Measured::KilledAtLimit { limit_seconds: 0 });
+        assert_eq!(measure(&shell("sleep 30", Duration::from_millis(300)), 3, &scratch, &environment).unwrap(), Measured::KilledAtLimit { limit_ms: 300 });
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Porcelain lines are read by their two columns: the index's names a staged change, the work
-    /// tree's an unstaged one, `??` an untracked file, and a rename counts at its new path.
+    /// tree's an unstaged one, `??` an untracked file, and a rename counts at its new path; a path
+    /// with a space, an arrow or a non-ASCII letter is read as it is, unquoted.
     #[test]
     fn porcelain_columns_are_staged_and_unstaged() {
         let set = |paths: &[&str]| paths.iter().map(|path| path.to_string()).collect::<BTreeSet<String>>();
-        let changes = porcelain(" M a/one\nM  b\n?? c\nR  old -> new\nMM d\n");
-        assert_eq!(changes, Changes { staged: set(&["b", "new", "d"]), unstaged: set(&["a/one", "c", "d"]) });
+        let changes = porcelain(" M a/one\0M  b\0?? c d\0R  new\0old\0MM d -> e\0?? ü\0");
+        assert_eq!(changes, Changes { staged: set(&["b", "new", "d -> e"]), unstaged: set(&["a/one", "c d", "d -> e", "ü"]) });
     }
 
     /// A stocktake document's paths are read beside their counts: a list left out reads as empty

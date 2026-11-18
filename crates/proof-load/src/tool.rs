@@ -232,7 +232,8 @@ struct Reaped {
 /// Waits for `child` to exit, then reaps it with its rusage. The wait does not reap
 /// (`WNOWAIT`), so until the watchdog is stopped the child's id is still its own and the
 /// watchdog's kill can reach no other process. When the wait itself fails the child is killed and
-/// reaped before the error is returned, so no child outlives the call.
+/// reaped before the error is returned, so no child outlives the call, unless it failed because the
+/// child was already reaped elsewhere.
 #[cfg(unix)]
 fn reap(child: &mut std::process::Child, limit: Duration) -> std::io::Result<Reaped> {
     let pid = libc::pid_t::try_from(child.id()).map_err(|_| std::io::Error::other(format!("process id {} is out of range", child.id())))?;
@@ -261,6 +262,9 @@ fn reap(child: &mut std::process::Child, limit: Duration) -> std::io::Result<Rea
     let fired = watchdog.join().unwrap_or(false);
     let ended = match waited {
         Ok(ended) => ended,
+        // ECHILD: the child was reaped by someone else, so its id may be another process's now,
+        // and nothing is sent to it.
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return Err(error),
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
