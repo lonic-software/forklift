@@ -603,21 +603,21 @@ mod tests {
 
     /// The wall time `timed` reports is the child's, not a poll's: a child that exits at once
     /// takes well under the 5 ms `run` sleeps between polls, so a reap through a poll would read
-    /// every run as at least that long. The median of ten runs, so one slow spawn on a loaded
-    /// machine does not decide it.
+    /// every run as at least that long. So the fastest of twenty runs must be under it. The median
+    /// is not asked: on a loaded macOS runner the spawn alone took that long in half the runs.
     #[cfg(unix)]
     #[test]
     fn wall_time_is_not_quantised_by_a_poll() {
         let scratch = scratch("timed-wall");
         let environment = Environment::scrubbed(&scratch, None, &BTreeMap::new()).unwrap();
         let invocation = Invocation { program: PathBuf::from("/usr/bin/true"), arguments: vec![], directory: scratch.root().to_path_buf(), limit: Duration::from_secs(10) };
-        let mut walls: Vec<Duration> = (0..10).map(|_| {
+        let walls: Vec<Duration> = (0..20).map(|_| {
             let timed = timed(&invocation, &scratch, &environment).unwrap();
             assert_eq!(timed.outcome.exit, Some(0));
             timed.wall
         }).collect();
-        walls.sort();
-        assert!(walls[5] < Duration::from_millis(5), "median wall time {:?} of {:?}", walls[5], walls);
+        let fastest = walls.iter().min().copied().unwrap_or_default();
+        assert!(fastest < Duration::from_millis(5), "fastest wall time {:?} of {:?}", fastest, walls);
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(scratch.root());
     }
