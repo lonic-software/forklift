@@ -767,7 +767,7 @@ fn fresh_pair(subjects: &[Subject], forklift: &[&str], git: &[&str], reps: usize
 }
 
 /// A folder the harness copied a subject into. [`Copied::remove`] removes it and says when it
-/// could not; one left behind on an early return is removed when dropped, as far as it can be.
+/// could not; one dropped without it, on a panic, is removed as far as it can be.
 struct Copied(Option<PathBuf>);
 
 impl Copied {
@@ -793,30 +793,36 @@ impl Drop for Copied {
     }
 }
 
-/// Gives every file `copy_tree` copied from `from` to `to` the modification time it has in
-/// `from`, and on unix every folder too, after its contents. A copy that is newer than the tool's
-/// last look at its files reads as possibly edited: Forklift's stat cache does not trust a stat
-/// within its anchor's two seconds, and git's index does not trust one as new as the index, so
-/// each would hash files inside the timed write that the subject's own caches had settled.
+/// Gives every file in the copy `to` the modification time its original under `from` has, and
+/// on unix every folder too, after its contents. A copy that is newer than the tool's last look at
+/// its files reads as possibly edited: Forklift's stat cache does not trust a stat within its
+/// anchor's two seconds, and git's index does not trust one as new as the index, so each would
+/// hash files inside the timed write that the subject's own caches had settled. It walks the copy,
+/// so a file the original gained after the copy (a running daemon's cookie) is not looked for; one
+/// the original lost since is left with the copy's time.
 fn keep_times(from: &Path, to: &Path) -> Result<(), Stopped> {
     fn failed(path: &Path) -> impl Fn(std::io::Error) -> Stopped + '_ {
         move |error| Stopped(format!("keeping the times of {}: {}", path.display(), error))
     }
-    let metadata = std::fs::symlink_metadata(from).map_err(failed(from))?;
+    let metadata = std::fs::symlink_metadata(to).map_err(failed(to))?;
     if metadata.file_type().is_symlink() {
         return Ok(());
     }
     if metadata.is_dir() {
-        for entry in std::fs::read_dir(from).map_err(failed(from))? {
-            let entry = entry.map_err(failed(from))?;
-            keep_times(&entry.path(), &to.join(entry.file_name()))?;
+        for entry in std::fs::read_dir(to).map_err(failed(to))? {
+            let entry = entry.map_err(failed(to))?;
+            keep_times(&from.join(entry.file_name()), &entry.path())?;
         }
-        #[cfg(unix)]
-        std::fs::File::open(to).and_then(|folder| folder.set_modified(metadata.modified()?)).map_err(failed(to))?;
-        return Ok(());
     }
-    #[cfg(unix)]
-    if std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type()) {
+    let original = match std::fs::symlink_metadata(from) {
+        Ok(original) => original,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(failed(from)(error)),
+    };
+    let time = original.modified().map_err(failed(from))?;
+    if metadata.is_dir() {
+        #[cfg(unix)]
+        std::fs::File::open(to).and_then(|folder| folder.set_modified(time)).map_err(failed(to))?;
         return Ok(());
     }
     let mut options = std::fs::OpenOptions::new();
@@ -826,7 +832,7 @@ fn keep_times(from: &Path, to: &Path) -> Result<(), Stopped> {
     std::os::windows::fs::OpenOptionsExt::access_mode(&mut options, runner::FILE_WRITE_ATTRIBUTES);
     #[cfg(not(windows))]
     options.read(true);
-    options.open(to).and_then(|file| file.set_modified(metadata.modified()?)).map_err(failed(to))
+    options.open(to).and_then(|file| file.set_modified(time)).map_err(failed(to))
 }
 
 /// The untimed run that brings a fresh copy's caches up to date with its copied files, as git's
@@ -882,59 +888,81 @@ fn settle(root: &Path) -> Result<(), Stopped> {
     Ok(())
 }
 
+/// What one repetition of a write cell came to.
+enum Step {
+    /// It ran: timed, or the untimed run first.
+    Ran(Option<tool::Timed>),
+    /// The cell ends here: voided or killed, or not comparable and why.
+    Ended(Result<Measured, String>),
+}
+
 /// One write cell: each repetition on a fresh copy of `subject` as `fresh` describes it, watched
 /// by a daemon of its own where the subject is, and judged clean after the timed run. A warm cell
 /// first runs the command once untimed and unjudged, on a copy of its own, as a warm read cell
-/// does. Gives why the pair is not comparable when a copy's refresh or check failed.
+/// does. Every copy is removed after its repetition, however the repetition ended. Gives why the
+/// pair is not comparable when a copy's refresh or check failed.
 fn fresh_cell(subject: &Subject, command: &[String], reps: usize, cold: Option<&DropCaches>, fresh: &Fresh, scratch: &Scratch, environment: &Environment) -> Result<Result<Measured, String>, Stopped> {
     let cache = if cold.is_some() { Cache::Cold } else { Cache::Warm };
     let first = if cold.is_some() { 1 } else { 0 };
     let mut runs = Vec::with_capacity(reps);
     for rep in first..=reps {
-        let before = if rep == 0 { "before the untimed run".to_string() } else { format!("before repetition {}", rep) };
         let name = format!("{}-{}-{}-{}", fresh.operation.replace(' ', "-"), cache.label(), subject.tool.label(), rep);
         let copied = Copied(Some(fresh.copies.join(name)));
-        crate::scrub::copy_tree(&subject.work, copied.path()).map_err(|error| Stopped(format!("copying {} to {}: {:?}", subject.work.display(), copied.path().display(), error)))?;
-        keep_times(&subject.work, copied.path())?;
-        let copy = subject.at(copied.path().to_path_buf());
-        // Dropped before the copy is removed. The copy's fsmonitor setting came with it.
-        let daemon = if copy.watched {
-            Some(runner::FsmonitorDaemon::watch(&copy.program, &copy.work, scratch, environment, COMMAND_LIMIT).map_err(|error| Stopped(error.to_string()))?.0)
-        } else {
-            None
-        };
-        if let Err(reason) = refresh_untimed(&copy, scratch, environment)? {
-            return Ok(Err(format!("{}, the refresh failed: {}", before, reason)));
+        let step = fresh_rep(subject, command, rep, cold, fresh, copied.path(), scratch, environment);
+        let removed = copied.remove();
+        let step = step?;
+        removed?;
+        match step {
+            Step::Ran(timed) => runs.extend(timed),
+            Step::Ended(ended) => return Ok(ended),
         }
-        if !fresh.edit.is_empty() {
-            edit(&copy.work, fresh.edit)?;
-            stage(&copy, scratch, environment)?;
-        }
-        let invocation = copy.invocation(command.to_vec());
-        if rep == 0 {
-            settle(&copy.work)?;
-            match tool::run(&invocation, scratch, environment) {
-                Ok(_) => {}
-                Err(ToolError::TimedOut { .. }) => return Ok(Ok(killed(invocation.limit))),
-                Err(error) => return Err(error.into()),
-            }
-        } else {
-            if let Err(reason) = same(std::slice::from_ref(&copy), fresh.before, scratch, environment)? {
-                return Ok(Err(format!("{}, {}", before, reason)));
-            }
-            settle(&copy.work)?;
-            match repetition(&invocation, cold, scratch, environment)? {
-                Ok(timed) => runs.push(timed),
-                Err(ended) => return Ok(Ok(ended)),
-            }
-            if let Err(reason) = same(std::slice::from_ref(&copy), &Changes::default(), scratch, environment)? {
-                return Ok(Err(format!("after repetition {}, {}", rep, reason)));
-            }
-        }
-        drop(daemon);
-        copied.remove()?;
     }
     Ok(Ok(summarise(&runs)))
+}
+
+/// Repetition `rep` of a write cell, on a fresh copy of `subject` at `at`; repetition 0 is the
+/// untimed run.
+#[allow(clippy::too_many_arguments)]
+fn fresh_rep(subject: &Subject, command: &[String], rep: usize, cold: Option<&DropCaches>, fresh: &Fresh, at: &Path, scratch: &Scratch, environment: &Environment) -> Result<Step, Stopped> {
+    let before = if rep == 0 { "before the untimed run".to_string() } else { format!("before repetition {}", rep) };
+    crate::scrub::copy_tree(&subject.work, at).map_err(|error| Stopped(format!("copying {} to {}: {:?}", subject.work.display(), at.display(), error)))?;
+    keep_times(&subject.work, at)?;
+    let copy = subject.at(at.to_path_buf());
+    // Dropped, when this returns, before the copy is removed. The copy's fsmonitor setting came
+    // with it.
+    let _daemon = if copy.watched {
+        Some(runner::FsmonitorDaemon::watch(&copy.program, &copy.work, scratch, environment, COMMAND_LIMIT).map_err(|error| Stopped(error.to_string()))?.0)
+    } else {
+        None
+    };
+    if let Err(reason) = refresh_untimed(&copy, scratch, environment)? {
+        return Ok(Step::Ended(Err(format!("{}, the refresh failed: {}", before, reason))));
+    }
+    if !fresh.edit.is_empty() {
+        edit(&copy.work, fresh.edit)?;
+        stage(&copy, scratch, environment)?;
+    }
+    let invocation = copy.invocation(command.to_vec());
+    if rep == 0 {
+        settle(&copy.work)?;
+        return match tool::run(&invocation, scratch, environment) {
+            Ok(_) => Ok(Step::Ran(None)),
+            Err(ToolError::TimedOut { .. }) => Ok(Step::Ended(Ok(killed(invocation.limit)))),
+            Err(error) => Err(error.into()),
+        };
+    }
+    if let Err(reason) = same(std::slice::from_ref(&copy), fresh.before, scratch, environment)? {
+        return Ok(Step::Ended(Err(format!("{}, {}", before, reason))));
+    }
+    settle(&copy.work)?;
+    let timed = match repetition(&invocation, cold, scratch, environment)? {
+        Ok(timed) => timed,
+        Err(ended) => return Ok(Step::Ended(Ok(ended))),
+    };
+    if let Err(reason) = same(std::slice::from_ref(&copy), &Changes::default(), scratch, environment)? {
+        return Ok(Step::Ended(Err(format!("after repetition {}, {}", rep, reason))));
+    }
+    Ok(Step::Ran(Some(timed)))
 }
 
 /// The paths a subject's work tree differs from its last commit at: those staged, and those
@@ -1419,6 +1447,11 @@ mod tests {
         set(&from.join("folder").join("file"), then);
         set(&from.join("folder"), then);
         crate::scrub::copy_tree(&from, &to).unwrap();
+        // The original gains a file after the copy, as a daemon's cookie, and the copy has one the
+        // original lacks: neither stops it.
+        std::fs::write(from.join("folder").join("cookie"), "").unwrap();
+        set(&from.join("folder"), then);
+        std::fs::write(to.join("folder").join("only-here"), "").unwrap();
         let now = std::time::SystemTime::now();
         set(&to.join("folder").join("file"), now);
         set(&to.join("folder"), now);
@@ -1577,7 +1610,11 @@ esac
         set_hook(":");
 
         // A copy that cannot be removed stops the run and says which, rather than leaving a tree
-        // behind for every repetition.
+        // behind for every repetition, however its repetition ended: here after the untimed run,
+        // and after a refresh that failed. Root removes it anyway, so not as root.
+        let corrupt = || std::fs::write(work.join(".git").join("index"), "not an index").unwrap();
+        // SAFETY: geteuid(2) takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
         let locked = work.join("locked");
         std::fs::create_dir(&locked).unwrap();
         std::fs::write(locked.join("f"), "f\n").unwrap();
@@ -1585,17 +1622,23 @@ esac
         run(&["commit", "-q", "-m", "locked"]);
         let mode = |folder: &Path, bits| std::fs::set_permissions(folder, std::os::unix::fs::PermissionsExt::from_mode(bits)).unwrap();
         mode(&locked, 0o555);
-        let mut rows = Vec::new();
-        let stopped = writes(&subjects, &["a", "b"], 1, &Err("r".into()), &scratch, &environment, &|_| {}, &mut rows).unwrap_err();
-        mode(&locked, 0o755);
         let copy = scratch.work().join("copies").join("commit-warm-git-0");
-        assert_eq!(stopped.0, format!("removing the copy {}: Permission denied (os error 13)", copy.display()));
-        mode(&copy.join("locked"), 0o755);
-        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
-        let _ = std::fs::remove_dir_all(&copy);
+        for broken in [false, true] {
+            if broken {
+                corrupt();
+            }
+            let mut rows = Vec::new();
+            let stopped = writes(&subjects, &["a", "b"], 1, &Err("r".into()), &scratch, &environment, &|_| {}, &mut rows).unwrap_err();
+            assert_eq!(stopped.0, format!("removing the copy {}: Permission denied (os error 13)", copy.display()), "broken index: {}", broken);
+            mode(&copy.join("locked"), 0o755);
+            #[allow(clippy::disallowed_methods)] // a test's own temporary folder
+            let _ = std::fs::remove_dir_all(&copy);
+        }
+        mode(&locked, 0o755);
+        }
 
         // A copy whose refresh failed is not comparable, since it would still read clean.
-        std::fs::write(work.join(".git").join("index"), "not an index").unwrap();
+        corrupt();
         let rows = writes_now();
         assert!(matches!(&rows[0].2, Outcome::NotComparable { reason } if reason.starts_with("before the untimed run, the refresh failed: git status exited Some(128): ")), "{:?}", rows[0]);
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder

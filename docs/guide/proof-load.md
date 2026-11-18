@@ -350,7 +350,9 @@ else the harness runs, untimed, the command that brings each tool's record of it
 Forklift's `load .` and git's `status`. A copy whose refresh fails makes its row **not
 comparable**. Where tuned git runs
 the fsmonitor daemon, its copy gets a daemon of its own. Before each commit, the harness appends a line to the same 20
-tracked files and stages them untimed, with `load .` and `add -A`. Forklift's stack is signed and
+tracked files and stages them untimed, with `load .` and `add -A`. Those 20 files are as new to each tool as
+just after a user's edit, so a tool that looks again at a file changed moments ago pays for that
+in the timed commit. Forklift's stack is signed and
 git's commit is not, and the commit row's note says so. Switch moves from the current branch to
 `perf-side`, and merge merges `perf-side` into it, a merge with no conflict. On unix, the harness
 then writes the copy out to disk, untimed, so that a command which syncs its own writes is not also
