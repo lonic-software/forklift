@@ -423,11 +423,7 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
         // (see the doc comment above) so a lock-waiting command's own entry-heal never races the
         // lock-holder's deletions.
         if cli.command.requires_warehouse_lock() {
-            _lock = Some(lock_utils::WarehouseLock::acquire().map_err(|message| ForkliftError::new(
-                ErrorCode::WarehouseLocked,
-                message,
-                "Wait for the other forklift process to finish, or clear a stale lock as instructed."
-            ))?);
+            _lock = Some(lock_utils::WarehouseLock::acquire()?);
         }
 
         // Order this command's whole decide-then-publish window against every operation that

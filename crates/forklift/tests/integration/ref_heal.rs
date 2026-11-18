@@ -518,8 +518,6 @@ fn an_interrupted_consolidation_is_rebuilt_at_its_parcel_and_rolled_forward() {
             continue;
         }
 
-        // A stopped process leaves its lock behind, as a power loss would; the operator clears it.
-        let _ = forklift_core::util::file_utils::remove_file(root.join(".forklift").join("lock"));
         forklift_core::util::file_utils::remove_file(ref_path(&root, "main")).unwrap();
 
         let data = healed(&area, &root);

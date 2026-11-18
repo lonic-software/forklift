@@ -1048,14 +1048,19 @@ fn settled_by(last: Option<&Outcome>, settled: &HistoryReadback, faulted: Mark) 
 /// Whether `last`, the latest command run, answered and asked nothing further: it exited (a kill
 /// is no answer), and either succeeded or refused with a failure document naming no remedy and
 /// nothing unreadable as one, as a re-stack of a record already made is refused with nothing left
-/// to stack. A crash with no failure document is no answer.
+/// to stack. A crash with no failure document is no answer, and neither is a refusal because
+/// another process still holds a lock: it says the command did not run, not what it would answer.
 fn answered(last: Option<&Outcome>) -> bool {
-    last.is_some_and(|outcome| outcome.succeeded() || (outcome.exit.is_some() && outcome.failure.is_some() && {
+    last.is_some_and(|outcome| outcome.succeeded() || (outcome.exit.is_some() && outcome.failure.as_ref()
+        .is_some_and(|failure| !LOCK_CODES.contains(&failure.code.as_str())) && {
         // A failure document is forklift's: git writes none, so no git refusal is an answer.
         let extracted = remedy::extract(Tool::Forklift, &outcome.remedy_texts());
         extracted.remedies.is_empty() && extracted.unextractable.is_empty()
     }))
 }
+
+/// The codes of a refusal because another forklift process holds one of the locks a command takes.
+const LOCK_CODES: [&str; 3] = ["warehouse_locked", "store_locked", "serve_locked"];
 
 /// What a refused `outcome` said: its failure's message, else its stderr, cut at 400 characters
 /// with the cut marked.
@@ -2685,6 +2690,7 @@ mod tests {
     ///
     /// Revert: count a kill as an answer → a command killed after its record was durable heals
     /// with no retry; count any refusal → a stale lock's refusal heals before its remedy runs;
+    /// count a lock code's refusal → a command another process kept from running settles it;
     /// drop the failure-document or unextractable conditions → a crash or an unreadable remedy
     /// settles the record; settle on the first attempt → the faulted command's refusal of a write
     /// it committed grades as acknowledged.
@@ -2695,6 +2701,22 @@ mod tests {
         assert!(!answered(Some(&answer(None, "", None))), "a kill is no answer");
         assert!(!answered(Some(&answer(Some(26), "This bay is behind pallet \"main\".", Some("forklift shift main")))));
         assert!(!answered(Some(&answer(Some(6), "If that process is no longer running, remove \"/s/work/.forklift/lock\" and try again.", None))));
+        // A lock refusal names no remedy, and is no answer either: the command never ran.
+        for code in ["warehouse_locked", "store_locked", "serve_locked"] {
+            let mut busy = answer(Some(6), "Another forklift process that is still running holds the lock.", Some("Wait for it to finish, then run the command again."));
+            busy.failure.as_mut().unwrap().code = code.into();
+            assert!(!answered(Some(&busy)), "{} is no answer", code);
+        }
+        assert!(answered(Some(&answer(Some(6), "Another forklift process that is still running holds the lock.", Some("Wait for it to finish, then run the command again.")))),
+            "the same refusal under another code answers, so the code is what is read");
+        // The codes read are every code Forklift refuses on its lock exit, as its error table lists them.
+        let table = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/generated/errors.md")).unwrap();
+        let mut on_lock_exit: Vec<&str> = table.lines().filter_map(|line| line.strip_prefix("| `"))
+            .filter_map(|row| row.split_once("` | ")).filter(|(_, rest)| rest.starts_with("6 |")).map(|(code, _)| code).collect();
+        on_lock_exit.sort_unstable();
+        let mut read = LOCK_CODES.to_vec();
+        read.sort_unstable();
+        assert_eq!(read, on_lock_exit, "the lock codes answered() reads are the codes on exit 6");
         assert!(!answered(None));
         let mut crashed = answer(Some(101), "", None);
         crashed.failure = None;

@@ -63,7 +63,7 @@ Each cell reads `run`, `sampled` (the lane ran over a sample of what it could re
 | Class | What is done |
 |---|---|
 | damaged files | Each file and folder name in Forklift's on-disk census is truncated, has a byte flipped, is zeroed, or is deleted, and git's own layout gets the same treatment. A census name with neither a fault bound to it nor an exemption fails the run. |
-| dead-PID lock | A lock file is planted for a holder that no longer runs. |
+| dead-PID lock | One of git's lock files is planted for a holder that no longer runs. Forklift's locks are kernel locks on files that stay in place, so a holder that dies leaves nothing to plant; deleting their files is a damaged-file fault. |
 | kill points (client) | The command is killed at each call it makes that changes or syncs a file. Needs strace, so Linux only. |
 | kill points (server) | The same, for the server of a hosted scenario. |
 | power loss (client) | The command's traced calls are replayed over a model that keeps only what was synced. Each moment is graded as the disk could be left after a power cut. Linux only. |

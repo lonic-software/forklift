@@ -279,39 +279,6 @@ fn repacking_is_byte_reproducible() {
 }
 
 #[test]
-fn a_mutating_command_is_refused_while_the_warehouse_lock_is_held() {
-    // The warehouse lock is an on-disk sentinel, so another process's held lock is exactly a lock
-    // file on disk. A mutating command must be refused (with the exit code and message that name
-    // the lock), while a read-only command is unaffected.
-    let warehouse = Warehouse::new("lock");
-    warehouse.prepare();
-    warehouse.write_file("a.txt", "hello\n");
-    warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "-m", "base"]);
-
-    // Simulate the other process holding the lock.
-    let lock = warehouse.root.join(".forklift").join("lock");
-    std::fs::write(&lock, "424242\n").unwrap();
-
-    warehouse.write_file("a.txt", "changed\n");
-    let refused = warehouse.run(&["load", "a.txt"]);
-    assert!(!refused.status.success(), "a mutating command must be refused while the lock is held");
-    assert_eq!(refused.status.code(), Some(6), "the warehouse-locked exit code is 6");
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("locked by another forklift process"),
-        "the refusal must name the lock: {}", String::from_utf8_lossy(&refused.stderr));
-
-    // A read-only command does not take the lock, so it still works.
-    let stocktake = warehouse.run(&["stocktake"]);
-    assert!(stocktake.status.success(), "a read-only command must not be blocked by the lock");
-
-    // Once the lock is cleared (the other process finished / the operator removed a stale lock),
-    // the mutating command works again.
-    forklift_core::util::file_utils::remove_file(&lock).unwrap();
-    warehouse.run_ok(&["load", "a.txt"]);
-    warehouse.run_ok(&["stack", "-m", "after the lock cleared"]);
-}
-
-#[test]
 fn lift_takes_the_warehouse_lock() {
     // A diverged `lift` merges into the working directory, and moves refs, so it is a mutating
     // command like any other: it must not run beside another process that holds the lock.
@@ -321,9 +288,13 @@ fn lift_takes_the_warehouse_lock() {
     warehouse.run_ok(&["load", "."]);
     warehouse.run_ok(&["stack", "-m", "base"]);
 
-    std::fs::write(warehouse.root.join(".forklift").join("lock"), "424242\n").unwrap();
+    // Another process's live hold on the lock: the kernel lock, taken from this test process.
+    let held = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(warehouse.root.join(".forklift").join("lock")).unwrap();
+    held.try_lock().unwrap();
 
     let refused = warehouse.run(&["lift"]);
     assert_eq!(refused.status.code(), Some(6), "lift must be refused while the lock is held: {}",
         String::from_utf8_lossy(&refused.stderr));
+    drop(held);
 }

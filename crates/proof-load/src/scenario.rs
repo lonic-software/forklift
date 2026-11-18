@@ -71,7 +71,7 @@ pub enum Op {
     /// Run one of the host's server commands over the host warehouse: `--root` is added.
     Serve { line: Vec<String> },
     /// Stop the host's server, for the server commands refused while it serves. The server is
-    /// killed, and the lock it leaves behind cleared.
+    /// killed; it holds no lock once it is gone, so nothing is cleared after it.
     StopHost,
     /// Delete every signing key the operator holds, so no one can extend the office chain.
     LoseKeys,

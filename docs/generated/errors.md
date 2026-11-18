@@ -20,6 +20,8 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `conflict` | 4 | Changes to tracked files block the operation, which would write over them; nothing was changed |
 | `diverged` | 5 | The local pallet and the remote's both hold parcels the other lacks; nothing was lifted or lowered |
 | `warehouse_locked` | 6 | Another forklift process holds the warehouse lock |
+| `store_locked` | 6 | Another forklift process is maintaining the warehouse's object store (a compaction, an eviction, a redaction's deletion or an index rebuild); run the command again once it finishes |
+| `serve_locked` | 6 | Another forklift process holds the warehouse root's serve lock (a server serving it, or a gc, full repack or eviction); stop the server or let the operation finish, then run the command again |
 | `out_of_scope` | 7 | A path argument is outside a scoped (sparse) bay's scope, or a read needs content the warehouse never fetched |
 | `scope_path_type_changed` | 8 | A scoped bay's spine path flipped dir↔file; scope no longer valid |
 | `sparse_workspace` | 9 | A whole-tree verb is not supported in a scoped (sparse) bay yet |

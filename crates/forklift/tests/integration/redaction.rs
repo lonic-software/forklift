@@ -1431,8 +1431,6 @@ fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_i
     let _ = forklift_core::util::file_utils::remove_dir_all(&second_root);
     let copied = std::process::Command::new("cp").arg("-R").arg(&first_root).arg(&second_root).output().unwrap();
     assert!(copied.status.success(), "{:?}", copied);
-    // The lock the first server held is not the copy's: no process holds it.
-    forklift_core::util::file_utils::remove_file(second_root.join(".forklift/serve.lock")).unwrap();
     let server = Server::serve(&second_root);
 
     let moved = cached.json(&["remote", "move", &server.url]);
@@ -1677,9 +1675,24 @@ fn a_server_deletes_the_content_of_a_redaction_it_applied() {
     assert_eq!(fresh.head("main"), server.main());
 }
 
+/// Copy the root of a warehouse a live server serves, leaving out its serve lock's sidecar: Windows
+/// refuses another process a read of a file whose kernel lock is held, and the sidecar holds
+/// nothing a copy needs. The copy's server makes its own.
+fn copy_served_root(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            copy_served_root(&entry.path(), &to.join(entry.file_name()));
+        } else if entry.file_name() != "serve.lock" {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
 /// A server root as a crash before an apply leaves it: a redaction is recorded, the ref write that
 /// let it apply landed, and the server stopped before applying it, so its bytes are still held. The
-/// killed server's lock stays behind, and is removed as its operator would.
+/// killed server holds no lock, so nothing is cleared after it.
 ///
 /// # Returns
 /// The root, the redacted hash, and a kept file's hash.
@@ -1711,7 +1724,6 @@ fn crashed_before_apply(name: &str) -> (PathBuf, String, String) {
     assert!(gone, "the server deleted the content");
     drop(server);
 
-    forklift_core::util::file_utils::remove_file(root.join(".forklift/serve.lock")).unwrap();
     forklift_core::util::file_utils::remove_file(root.join(".forklift/redactions-applied")).unwrap();
     std::fs::create_dir_all(loose.parent().unwrap()).unwrap();
     std::fs::write(&loose, &bytes).unwrap();
@@ -1771,7 +1783,6 @@ fn a_server_back_from_a_crash_before_an_apply_serves_none_of_its_content() {
 
     // Back again with nothing left to apply or delete: content is served while the first run is
     // held.
-    forklift_core::util::file_utils::remove_file(root.join(".forklift/serve.lock")).unwrap();
     let _scope = forklift_core::globals::StorageRootScope::enter(&root);
     let _lock = forklift_core::util::lock_utils::RefLock::acquire().unwrap();
     let server = Server::serve(&root);
@@ -3122,11 +3133,8 @@ fn http_raw(url: &str, path: &str) -> String {
 #[test]
 fn a_served_root_whose_withheld_record_is_lost_or_damaged_refuses_until_its_operator_repairs_it() {
     let root = std::env::temp_dir().join(format!("forklift-withheld-damaged-{}", std::process::id()));
-    // A killed server leaves its serve lock behind; no process holds it.
-    let stop = |server: Server| {
-        drop(server);
-        forklift_core::util::file_utils::remove_file(root.join(".forklift/serve.lock")).unwrap();
-    };
+    // A killed server holds nothing: nothing is removed before the next command.
+    let stop = |server: Server| drop(server);
     let record = root.join(".forklift/withheld");
     let server = Server::start(&root);
 
@@ -3265,11 +3273,8 @@ fn serve_refused(root: &std::path::Path) -> String {
 fn a_served_root_deletes_a_withheld_copy_and_rebuilds_its_bundle() {
     let root = std::env::temp_dir().join(format!("forklift-takedown-deletion-{}", std::process::id()));
     let serve = ["--rebuild-after-lifts", "1000"];
-    // A killed server leaves its serve lock behind; no process holds it.
-    let stop = |server: Server| {
-        drop(server);
-        forklift_core::util::file_utils::remove_file(root.join(".forklift/serve.lock")).unwrap();
-    };
+    // A killed server holds nothing: nothing is removed before the next command.
+    let stop = |server: Server| drop(server);
     stop(Server::start(&root));
     let server = Server::serve_with(&root, &serve);
 
@@ -3490,10 +3495,7 @@ fn a_move_to_an_origin_withholding_leaned_on_content_reads_the_previous_origin()
     // A copy of the server's root whose host withholds the draft.
     let second_root = temp.join(format!("forklift-takedown-move-copy-{}", std::process::id()));
     let _ = forklift_core::util::file_utils::remove_dir_all(&second_root);
-    let copied = std::process::Command::new("cp").arg("-R").arg(&first_root).arg(&second_root).output().unwrap();
-    assert!(copied.status.success(), "{:?}", copied);
-    // The lock the first server holds is not the copy's.
-    forklift_core::util::file_utils::remove_file(second_root.join(".forklift/serve.lock")).unwrap();
+    copy_served_root(&first_root, &second_root);
     let added = withhold(&second_root, &["add", &draft, "--statement", statement]);
     assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
     let second = Server::serve(&second_root);

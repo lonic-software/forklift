@@ -39,27 +39,20 @@ To throw away edits on purpose, `forklift restore` previews what it would discar
 
 ## Interrupted and locked
 
-### `warehouse_locked` (exit 6)
+### `warehouse_locked` (exit 6), `store_locked` (exit 6), `serve_locked` (exit 6)
 
-Another forklift process holds the warehouse lock, or one was killed and left the lock file behind.
-The message names the file, and the process id if the lock file holds one.
+Another forklift process that is still running holds a lock the command needs:
 
-First check that process is gone. With no id to check, look for any forklift still running in this
-warehouse. If one is, wait for it. If none is, remove the file the message names and run your command
-again.
+- `warehouse_locked`: the bay's lock, held by any command that changes the bay;
+- `store_locked`: the object store's lock, held by `store compact`, `store evict`, a redaction's
+  deletion and heal's rebuild of an index while they run;
+- `serve_locked`: the warehouse root's lock, held by a `forklift-server` serving it, and by `gc`,
+  `store compact --all` and `store evict` while they run.
 
-**Do not** remove the lock while that process is alive: it guards the staging area while it is being
-rewritten.
-
-### A stale `serve.lock`
-
-`forklift-server gc` or `forklift-server serve` refuses with "The warehouse root is locked by another
-forklift process (held by process N)" after a server was hard-killed. A graceful stop removes this
-file; `kill -9` or a power cut does not.
-
-Check process N is gone, then remove the `serve.lock` the message names and run the command again.
-**Do not** remove it while the server is running: `gc` would then sweep objects its in-flight lifts
-still need.
+Wait for that process to finish, or stop the server, then run the command again. There is nothing
+to remove. Each lock is a kernel lock on a file that stays in place, and the kernel releases it when
+its process ends, however it ends: a `kill -9`, a crash or a power cut leaves nothing held, so the
+next command and a restarted server go ahead on their own.
 
 ### `incomplete_load` (exit 20)
 

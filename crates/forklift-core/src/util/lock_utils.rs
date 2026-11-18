@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{bay_root, forklift_root};
@@ -170,44 +169,40 @@ pub fn create_format_lock(forklift: &Path) -> Result<(), String> {
 /// working directory holds that bay's lock, which is what lets [`WarehouseLock::acquire`] clear
 /// the bay's assembly folder.
 ///
-/// The lock is a lock *file* created with `create_new` (atomic on every platform); it is
-/// removed when the guard is dropped. If the process is killed hard, the file stays
-/// behind and the next command reports it — with the owning PID — so the user can remove
-/// it once they verified the process is gone.
+/// A *kernel* lock (`File::try_lock`) on the bay's sidecar `lock`, which is never deleted, like
+/// [`StoreAccessLock`]. A process that dies holding it, however it dies, holds nothing: the
+/// kernel releases the lock when the process's handle closes, so a hard kill leaves nothing that
+/// refuses the next command. A command that finds it held does not wait: it is refused with a
+/// `warehouse_locked` refusal.
 pub struct WarehouseLock {
-    path: PathBuf,
+    // Held only to keep the lock: closing the handle releases it.
+    _file: std::fs::File,
 }
 
 impl WarehouseLock {
-    /// Acquire the warehouse lock. The current directory must be the warehouse root
-    /// (see `warehouse_utils::enter_warehouse`). Once it is held, everything in the bay's
+    /// Acquire the warehouse lock without waiting. The current directory must be the warehouse
+    /// root (see `warehouse_utils::enter_warehouse`). Once it is held, everything in the bay's
     /// chunked-file assembly folder is removed as a leftover, so a process takes a bay's lock
     /// before it assembles anything there.
     ///
     /// # Returns
     /// * `Ok(WarehouseLock)` - The acquired lock (released when dropped).
-    /// * `Err(String)`       - If another process holds the lock, or the lock file could
-    ///                         not be created.
-    pub fn acquire() -> Result<WarehouseLock, String> {
+    /// * `Err(CoreError)`    - A `warehouse_locked` refusal when another forklift process holds
+    ///                         it, or the sidecar could not be opened or locked.
+    pub fn acquire() -> Result<WarehouseLock, CoreError> {
         // The lock is bay-local: each bay serializes its own mutations independently. Pallet
         // refs are shared by every bay, so a ref write does not rely on this lock: it is a
         // compare-and-set (`pallet_utils::update_pallet_head_in`) under the shared `RefLock`.
-        //
-        // Store an *absolute* path: `bay add` changes the working directory mid-command
-        // (to materialize the new bay), and the lock must still release at the file it
-        // created — a relative path would resolve against the new cwd on drop.
         let path = absolute(bay_root().join(FILE_NAME_LOCK));
-        acquire_lock_file(&path, "warehouse")?;
+        let file = try_lock_sidecar(&path, || CoreError::refusal(
+            RefusalCode::WarehouseLocked,
+            "Another forklift process that is still running holds the warehouse lock of this bay.",
+            "Wait for the other forklift process to finish, then run the command again.",
+        ))?;
 
         // Holding the lock is what makes anything in the bay's assembly folder a leftover.
         crate::util::shift_utils::clear_assembly_leftovers();
-        Ok(WarehouseLock { path })
-    }
-}
-
-impl Drop for WarehouseLock {
-    fn drop(&mut self) {
-        release_lock_file(&self.path);
+        Ok(WarehouseLock { _file: file })
     }
 }
 
@@ -222,34 +217,38 @@ impl Drop for WarehouseLock {
 /// lock. It orders compaction against compaction only; ordering a full repack against the store's
 /// writers is [`StoreAccessLock`]'s job.
 ///
-/// Like the bay lock it is a lock *file* created with `create_new` (atomic on every platform) and
-/// removed on drop; a hard-killed process leaves it behind for the next command to report by PID.
+/// Like the bay lock it is a kernel lock on a never-deleted sidecar (`store.lock`), so a holder
+/// that dies holds nothing. It never waits: a taker that finds it held gets a `store_locked`
+/// refusal.
 pub struct StoreLock {
-    path: PathBuf,
+    // Held only to keep the lock: closing the handle releases it.
+    _file: std::fs::File,
 }
 
 impl StoreLock {
     /// Acquire the shared object-store lock. Errors immediately (does not block) if another
     /// process or bay already holds it — the caller decides whether that is fatal (an explicit
     /// `compact`) or a reason to skip (auto-maintenance, which already ignores compaction errors).
-    pub fn acquire() -> Result<StoreLock, String> {
-        // Shared across bays: the store lives at `forklift_root`, not `bay_root`. Absolute for the
-        // same reason as the bay lock — the working directory can change before the guard drops.
+    ///
+    /// # Returns
+    /// * `Ok(StoreLock)`  - The acquired lock (released when dropped).
+    /// * `Err(CoreError)` - A `store_locked` refusal when another forklift process holds it, or
+    ///                      the sidecar could not be opened or locked.
+    pub fn acquire() -> Result<StoreLock, CoreError> {
+        // Shared across bays: the store lives at `forklift_root`, not `bay_root`.
         let path = absolute(forklift_root().join(FILE_NAME_STORE_LOCK));
-        acquire_lock_file(&path, "object store")?;
-        Ok(StoreLock { path })
-    }
-}
+        let file = try_lock_sidecar(&path, || CoreError::refusal(
+            RefusalCode::StoreLocked,
+            format!(
+                "Another forklift process that is still running is maintaining the object store of the \
+                warehouse at \"{}\".",
+                warehouse_root_of(&path)
+            ),
+            "Wait for that maintenance to finish, then run the command again.",
+        ))?;
 
-impl Drop for StoreLock {
-    fn drop(&mut self) {
-        release_lock_file(&self.path);
+        Ok(StoreLock { _file: file })
     }
-}
-
-/// Where the current warehouse's [`ServeLock`] file lives, held or not.
-fn serve_lock_path() -> PathBuf {
-    absolute(forklift_root().join(FILE_NAME_SERVE_LOCK))
 }
 
 /// An exclusive lock marking a warehouse root as **served by a live server** (or held for the
@@ -270,49 +269,57 @@ fn serve_lock_path() -> PathBuf {
 /// (compaction vs compaction) — a server never compacts, so it never takes that lock; this one is
 /// the serve-vs-maintenance gate. It is not what orders a deleter against the objects a server
 /// writes: a served warehouse also holds [`StoreAccessLock`] shared, which every deleter's
-/// exclusive try refuses beside, scope prune included. Like the other locks it is a lock *file* created with
-/// `create_new` (atomic on every platform) and removed on drop; a hard-killed holder leaves it
-/// behind for the next command to report by PID (a crashed server thus blocks `gc` and a repack until
-/// the operator removes it, which is the safe default — better than sweeping a root that might
-/// still be served).
+/// exclusive try refuses beside, scope prune included.
+///
+/// A kernel lock on a never-deleted sidecar (`serve.lock`), like the bay lock. A server that dies
+/// holds nothing, however it dies, so a supervisor restarting a killed server is not refused, and
+/// neither is a `gc` or a repack after it. A held lock means its holder is still running. A taker
+/// that finds it held does not wait: it gets a `serve_locked` refusal.
 pub struct ServeLock {
-    path: PathBuf,
+    // Held only to keep the lock: closing the handle releases it.
+    _file: std::fs::File,
 }
 
 impl ServeLock {
     /// Acquire the serve lock at the current storage root. Errors immediately (does not block) if
     /// another process already holds it — a live server on this root, or a `gc` or full repack
     /// already running against it.
-    pub fn acquire() -> Result<ServeLock, String> {
+    ///
+    /// # Returns
+    /// * `Ok(ServeLock)`  - The acquired lock (released when dropped).
+    /// * `Err(CoreError)` - A `serve_locked` refusal when another forklift process holds it, or
+    ///                      the sidecar could not be opened or locked.
+    pub fn acquire() -> Result<ServeLock, CoreError> {
         // Lives at `forklift_root` (the shared store root), like the store lock: the server, `gc`
-        // and a repack all enter the same storage-root scope, so they agree on the path. Absolute
-        // for the same reason as the other locks — the working directory can change before drop.
-        let path = serve_lock_path();
-        acquire_lock_file(&path, "warehouse root")?;
-        Ok(ServeLock { path })
-    }
+        // and a repack all enter the same storage-root scope, so they agree on the path.
+        let path = absolute(forklift_root().join(FILE_NAME_SERVE_LOCK));
+        let file = try_lock_sidecar(&path, || CoreError::refusal(
+            RefusalCode::ServeLocked,
+            format!(
+                "Another forklift process that is still running holds the warehouse root at \"{}\": a \
+                server serving it, or a gc, a full repack or another operation that must not run beside \
+                a server.",
+                warehouse_root_of(&path)
+            ),
+            "Stop the server serving it, or wait for the other operation to finish, then run the command again.",
+        ))?;
 
-    /// Release the lock now and say whether its file is gone, where a drop releases silently. For
-    /// a holder that keeps running after letting go: a file it failed to remove refuses that
-    /// warehouse to it and everyone else, and only this result tells that apart from a lock another
-    /// process took the moment it was free. An already-missing file counts as released.
-    pub fn release(mut self) -> Result<(), String> {
-        let path = std::mem::take(&mut self.path);
-
-        match crate::util::file_utils::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("Could not remove the lock file \"{}\": {}", path.display(), e)),
-        }
+        Ok(ServeLock { _file: file })
     }
 }
 
-impl Drop for ServeLock {
-    fn drop(&mut self) {
-        // Empty once `release` has taken it.
-        if !self.path.as_os_str().is_empty() {
-            release_lock_file(&self.path);
-        }
+/// A lock refusal with the operation it refused named first, keeping its code and next step: a
+/// caller that wrapped the refusal's text in its own (`format!("Refusing to …: {}", e)`) would lose
+/// the code on the way to the failure document.
+pub fn refusing_to(what: &str, error: CoreError) -> CoreError {
+    match error {
+        CoreError::Refusal { code, message, next_step, details } => CoreError::Refusal {
+            code,
+            message: format!("Refusing to {}: {}", what, message),
+            next_step,
+            details,
+        },
+        CoreError::Other(message) => CoreError::Other(format!("Refusing to {}: {}", what, message)),
     }
 }
 
@@ -341,10 +348,10 @@ impl Drop for ServeLock {
 ///   deletes the loose copies, so it must not interleave with a deleter's loose deletions.
 /// * **exclusive, try** — the deleters, at the deleter itself so no caller can forget it.
 ///
-/// Unlike [`StoreLock`] and [`ServeLock`], this is a *kernel* lock (`File::lock_shared` /
-/// `File::try_lock`: `flock` on Unix, `LockFileEx` on Windows) on a sidecar that is never
-/// deleted, as [`ConfigFileLock`] is. A hard-killed holder leaves nothing stale, because the
-/// kernel drops the lock with the process. That is what makes it safe for a writer to *wait*:
+/// Like every lock in this module, this is a *kernel* lock (`File::lock_shared` / `File::try_lock`:
+/// `flock` on Unix, `LockFileEx` on Windows) on a sidecar that is never deleted. A hard-killed
+/// holder leaves nothing stale, because the kernel drops the lock with the process. That is what
+/// makes it safe for a writer to *wait*:
 /// a wait can only end, never hang on a dead holder. Deleters never wait on anything a writer
 /// holds, so the waits cannot deadlock. The sidecar is never read or written, so Windows'
 /// mandatory locking blocks nothing else.
@@ -435,9 +442,9 @@ pub struct StoreAccessExclusive {
 #[cfg(target_os = "macos")]
 const MACOS_OPEN_MAX: libc::rlim_t = 10240;
 
-/// Raise this process's soft limit on open files toward its hard limit. A server keeps one
-/// store-access hold — one open file — per warehouse it serves, for as long as it serves it, so in
-/// multi-warehouse mode the count grows with the warehouses served, and the default soft limit
+/// Raise this process's soft limit on open files toward its hard limit. A server keeps a serve
+/// lock, a store-access hold and a format lease (three open files) per warehouse it serves, for as
+/// long as it serves it, so in multi-warehouse mode the count grows with the warehouses served, and the default soft limit
 /// (256 on macOS) is far below what the hard limit allows. Tries the hard limit, then searches for
 /// the largest limit below it the kernel accepts (on macOS, whose kernel also caps the limit at
 /// `kern.maxfilesperproc`, trying `OPEN_MAX` first when it is above the current limit); never
@@ -825,6 +832,34 @@ fn open_lock_sidecar(path: &Path) -> Result<std::fs::File, String> {
     }.map_err(|e| format!("Error while opening the lock file \"{}\": {}", path.to_string_lossy(), e))
 }
 
+/// Whether another handle — in this process or another — holds the kernel lock on the sidecar at
+/// `path`, which [`WarehouseLock`] takes. A missing sidecar is held by nothing; one that cannot be
+/// opened or tried counts as held, so the caller says a holder may be running rather than that
+/// none is. The probe never creates the sidecar. It tries the lock *shared*, which an exclusive
+/// holder refuses, and releases it at once: for that instant a command taking the lock exclusively
+/// is refused as if another forklift process held it, and running it again succeeds.
+pub fn held_by_another_handle(path: &Path) -> bool {
+    let sidecar = match std::fs::File::open(path) {
+        Ok(sidecar) => sidecar,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+
+    !matches!(sidecar.try_lock_shared(), Ok(()))
+}
+
+/// Open the sidecar at `path` (creating it if needed) and take its kernel lock without waiting.
+/// `refused` builds the refusal for a lock another handle holds, in this process or another.
+fn try_lock_sidecar(path: &Path, refused: impl FnOnce() -> CoreError) -> Result<std::fs::File, CoreError> {
+    let file = open_lock_sidecar(path)?;
+
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(refused()),
+        Err(std::fs::TryLockError::Error(e)) => Err(lock_error(path, &e).into()),
+    }
+}
+
 fn lock_error(path: &Path, error: &std::io::Error) -> String {
     format!("Error while locking \"{}\": {}", path.to_string_lossy(), error)
 }
@@ -837,13 +872,12 @@ fn warehouse_root_of(sidecar: &Path) -> String {
 /// An exclusive lock serializing every edit of one **configuration file**, held for one
 /// load → edit → write and no longer.
 ///
-/// Unlike the lock files above, this is a *kernel* lock (`File::lock`: `flock` on Unix,
-/// `LockFileEx` on Windows) on a sidecar `<config file>.lock` that is never deleted. A second
-/// writer **waits** instead of failing: config edits are short, and the cost of refusing is high
-/// (operator identity is minted on first use by any command). And a hard-killed holder leaves
-/// nothing stale, because the kernel drops the lock with the process. A `create_new` lock file
-/// in the home directory, left behind by a crash, would refuse identity minting for every
-/// warehouse on the machine until someone deleted it by hand.
+/// Like the other locks here, this is a *kernel* lock (`File::lock`: `flock` on Unix,
+/// `LockFileEx` on Windows) on a sidecar `<config file>.lock` that is never deleted, so a
+/// hard-killed holder leaves nothing stale: the kernel drops the lock with the process. Unlike the
+/// warehouse, store and serve locks, a second writer **waits** instead of failing: config edits
+/// are short, and the cost of refusing is high (operator identity is minted on first use by any
+/// command).
 ///
 /// The lock is on a sidecar, never the config file itself: a write replaces the config by rename,
 /// so a lock on the old file would exclude nothing, and on Windows the lock may be mandatory and
@@ -882,71 +916,6 @@ fn config_lock_path(config_path: &Path) -> Result<PathBuf, String> {
     lock_name.push(".lock");
 
     Ok(config_path.with_file_name(lock_name))
-}
-
-/// How many times `acquire_lock_file` retries a transient permission-denied create, and the
-/// delay between attempts (see the function doc for what this absorbs).
-const LOCK_CREATE_MAX_ATTEMPTS: u32 = 6;
-const LOCK_CREATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
-
-/// Create an exclusive lock file at `path`, atomically (`create_new`, atomic on every platform).
-/// `subject` names what is being locked, for the contention message. Shared by every lock scope.
-///
-/// Retries a narrow, Windows-only failure a few times before giving up: NTFS can leave a
-/// just-deleted file in a brief "pending delete" state — e.g. while an antivirus scanner still
-/// holds a handle open on it — during which `CREATE_NEW` against the same path reports
-/// access-denied rather than a clean create. POSIX `unlink` has no such state (the directory
-/// entry is gone immediately, regardless of any other open handle), so this path is never taken
-/// on Unix. The retry is bounded (at most ~120ms total) and scoped to exactly this error kind —
-/// the moment a create instead reports `AlreadyExists`, that is the genuine "another process
-/// holds it" signal and returns immediately, no retry.
-fn acquire_lock_file(path: &Path, subject: &str) -> Result<(), String> {
-    let mut attempts = 0;
-
-    loop {
-        attempts += 1;
-
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
-            Ok(mut file) => {
-                // The PID is informational only (it helps the user identify a stale lock);
-                // failing to write it must not fail the command.
-                let _ = writeln!(file, "{}", std::process::id());
-                return Ok(());
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let owner = std::fs::read_to_string(path).unwrap_or_default();
-                let owner = owner.trim();
-                let owner_info = if owner.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (held by process {})", owner)
-                };
-
-                return Err(format!(
-                    "The {} is locked by another forklift process{}. If that process \
-                    is no longer running, remove \"{}\" and try again.",
-                    subject,
-                    owner_info,
-                    path.to_string_lossy()
-                ));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
-                && attempts < LOCK_CREATE_MAX_ATTEMPTS => {
-                std::thread::sleep(LOCK_CREATE_RETRY_DELAY);
-            }
-            Err(e) => return Err(format!(
-                "Error while creating the lock file \"{}\": {}",
-                path.to_string_lossy(),
-                e
-            )),
-        }
-    }
-}
-
-/// Release a lock file. Nothing sensible can be done about a failed removal here; the next
-/// command will report the leftover lock file with the owning process's PID.
-fn release_lock_file(path: &Path) {
-    let _ = crate::util::file_utils::remove_file(path);
 }
 
 /// Resolve a path against the current directory when it is relative, so it stays valid if
@@ -993,7 +962,7 @@ mod tests {
         let temp = std::env::temp_dir().join(format!("forklift-storelock-{}", std::process::id()));
         let _ = crate::util::file_utils::remove_dir_all(&temp);
         // The shared lock lives in `forklift_root` (the `.forklift` folder), which must exist for
-        // the atomic `create_new`.
+        // its sidecar.
         std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&temp);
 
@@ -1157,29 +1126,49 @@ mod tests {
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
-    /// An explicit release reports a lock file it could not remove, and only that: a missing file
-    /// is released, and a released lock leaves nothing for its drop to remove — not even a lock
-    /// someone else has taken since.
+    /// Each of the three refusing locks is a kernel lock on a sidecar that stays: while one is
+    /// held, a second taker is refused with that lock's own code and a next step that removes
+    /// nothing, and any other handle's try on the sidecar is refused by the kernel; once it is
+    /// dropped, the sidecar is still there and the lock is free.
     #[test]
-    fn a_serve_lock_release_reports_a_file_it_could_not_remove() {
-        let temp = std::env::temp_dir().join(format!("forklift-servelock-release-{}", std::process::id()));
+    fn each_refusing_lock_is_a_kernel_lock_on_a_sidecar_that_stays() {
+        let temp = std::env::temp_dir().join(format!("forklift-kernel-locks-{}", std::process::id()));
         let _ = crate::util::file_utils::remove_dir_all(&temp);
         std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        let forklift = temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT);
 
-        ServeLock::acquire().unwrap().release().expect("a held lock releases");
-        let taken = ServeLock::acquire().expect("free again after a release");
-        assert!(serve_lock_path().exists());
+        type Take = fn() -> Result<Box<dyn std::any::Any>, CoreError>;
+        let cases: [(&str, &str, Take); 3] = [
+            ("lock", "warehouse_locked", || WarehouseLock::acquire().map(|l| Box::new(l) as Box<dyn std::any::Any>)),
+            ("store.lock", "store_locked", || StoreLock::acquire().map(|l| Box::new(l) as Box<dyn std::any::Any>)),
+            ("serve.lock", "serve_locked", || ServeLock::acquire().map(|l| Box::new(l) as Box<dyn std::any::Any>)),
+        ];
+        for (file, code, take) in cases {
+            let sidecar = forklift.join(file);
+            let held = take().unwrap_or_else(|e| panic!("{}: the first acquire succeeds: {}", file, e));
 
-        let gone = ServeLock { path: serve_lock_path() };
-        std::mem::forget(taken);
-        crate::util::file_utils::remove_file(serve_lock_path()).unwrap();
-        gone.release().expect("a missing file counts as released");
+            match take() {
+                Err(CoreError::Refusal { code: refused, message, next_step, .. }) => {
+                    assert_eq!(refused.as_str(), code, "{}", file);
+                    for text in [&message, &next_step] {
+                        assert!(!text.to_lowercase().contains("remov"), "{}: {:?} names a removal", file, text);
+                    }
+                }
+                Err(other) => panic!("{}: a held lock is refused with a code, not {:?}", file, other),
+                Ok(_) => panic!("{}: a second acquire must be refused while the first is held", file),
+            }
+            let other_handle = std::fs::OpenOptions::new().read(true).write(true).open(&sidecar).unwrap();
+            assert!(
+                matches!(other_handle.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+                "{}: the kernel refuses another handle while the lock is held", file,
+            );
+            drop(other_handle);
 
-        // Something that cannot be removed as a file stands where the lock was.
-        std::fs::create_dir(serve_lock_path()).unwrap();
-        let stuck = ServeLock { path: serve_lock_path() };
-        assert!(stuck.release().is_err(), "a lock file that stays must be reported");
+            drop(held);
+            assert!(sidecar.exists(), "{}: dropping the lock leaves its sidecar in place", file);
+            drop(take().unwrap_or_else(|e| panic!("{}: free again once dropped: {}", file, e)));
+        }
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }

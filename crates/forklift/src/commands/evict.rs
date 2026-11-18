@@ -51,11 +51,7 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
     // reports the plan a real run would carry out. None waits. `main` takes no shared hold for
     // this command, which would refuse the last.
     let store_lock = StoreLock::acquire()?;
-    let serve_lock = ServeLock::acquire().map_err(|e| format!(
-        "\"forklift store evict\" cannot run while this warehouse root is being served; stop the server first. If \
-        no server is running, the lock below was left by a server, gc or full repack that was killed \
-        and can be removed. {}", e
-    ))?;
+    let serve_lock = ServeLock::acquire()?;
     let store_access = StoreAccessLock::try_exclusive()?;
     let plan = evict_utils::plan_evict(&held.heads, &held.withheld, &store_access)?;
 

@@ -132,11 +132,6 @@ impl Area {
         std::fs::copy(shard.join("data"), planted.join("data")).unwrap();
         planted
     }
-
-    /// A stopped process leaves its lock behind, as a power loss would; the operator clears it.
-    fn clear_stale_lock(&self) {
-        let _ = forklift_core::util::file_utils::remove_file(self.root().join(".forklift/lock"));
-    }
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -391,7 +386,6 @@ fn interrupted_park(name: &str, setup: impl Fn(&Area), args: &[&str], keep: impl
             .output().unwrap();
         assert_eq!(output.status.code(), Some(CRASH_POINT_EXIT_CODE),
             "park finished before a rename left its marker: {}{}", text(&output.stdout), text(&output.stderr));
-        area.clear_stale_lock();
         if area.root().join(".forklift/operation").exists() && keep(&area) {
             return area;
         }

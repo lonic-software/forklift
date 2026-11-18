@@ -142,7 +142,7 @@ impl Repaired {
 /// one loss the files cannot show (see [`tombstone_utils::served_state`]), so an operator who knows
 /// the root was served repairs it like any other, keeping every unheld tip.
 pub fn repair_tombstones() -> Result<Repaired, String> {
-    let _serve_lock = ServeLock::acquire().map_err(|e| format!("Refusing to repair the tombstones: {}", e))?;
+    let _serve_lock = ServeLock::acquire().map_err(|e| crate::util::lock_utils::refusing_to("repair the tombstones", e))?;
     let lock = RefLock::acquire()?;
 
     let mark = std::fs::read(tombstone_utils::served_path());

@@ -708,8 +708,7 @@ fn prepare(root: &str) -> Result<(), String> {
 
 /// Upgrade the warehouse at `root` to the format this build reads. No serve lock is taken: the
 /// format lease the upgrade holds exclusively already refuses while a server, a bundle or a gc
-/// has the warehouse open, and a serve lock left behind by a killed server would refuse an
-/// upgrade nothing else is in the way of.
+/// has the warehouse open.
 fn upgrade(root: &str) -> Result<(), String> {
     use forklift_core::util::{upgrade_utils, warehouse_utils};
 
@@ -756,7 +755,7 @@ fn gc(root: &str, grace_hours: u64) -> Result<(), String> {
     // staged objects, and a lift slower than the grace period then fails its ref update. Held for
     // the whole command so a server cannot start mid-sweep.
     let _serve_lock = forklift_core::util::lock_utils::ServeLock::acquire()
-        .map_err(|e| format!("Refusing to gc: {}", e))?;
+        .map_err(|e| forklift_core::util::lock_utils::refusing_to("gc", e))?;
 
     let stats = forklift_core::util::gc_utils::collect_garbage(grace_hours * 3600)?;
 

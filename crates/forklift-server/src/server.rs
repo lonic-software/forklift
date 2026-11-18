@@ -297,7 +297,7 @@ impl WarehouseHandle {
                 return Err(ServingRefusal::Unavailable(unavailable));
             }
 
-            let serve_lock = ServeLock::acquire().map_err(ServingRefusal::Busy)?;
+            let serve_lock = ServeLock::acquire().map_err(|refused| ServingRefusal::Busy(refused.to_string()))?;
             let store_access = StoreAccessLock::try_shared().map_err(ServingRefusal::Busy)?;
 
             if !forklift_core::util::tombstone_utils::mark_served(wait).map_err(ServingRefusal::Unreadable)? {
@@ -497,13 +497,17 @@ enum ServeMode {
 /// allows. Above it, the least recently used idle warehouse is let go before another is served.
 const MAX_LIVE_WAREHOUSES: usize = 1024;
 
+/// The files a live warehouse keeps open for as long as it is live: its serve lock, its
+/// store-access hold and its format lease ([`WarehouseHandle`]).
+const FILES_PER_LIVE_WAREHOUSE: u64 = 3;
+
 /// How many warehouses to keep live given the soft open-file limit (`None` where there is none to
-/// read). Each live warehouse holds one open file, its store-access hold, and every request needs
-/// files of its own, so half the limit goes to live warehouses, never more than
-/// [`MAX_LIVE_WAREHOUSES`]. An unlimited soft limit (`RLIM_INFINITY`) is capped the same way.
+/// read). Every request needs files of its own, so half the limit goes to the files live
+/// warehouses hold, [`FILES_PER_LIVE_WAREHOUSE`] each, never more than [`MAX_LIVE_WAREHOUSES`]. An
+/// unlimited soft limit (`RLIM_INFINITY`) is capped the same way.
 fn live_warehouse_cap(open_file_limit: Option<u64>) -> usize {
     match open_file_limit {
-        Some(limit) => usize::try_from(limit / 2).unwrap_or(usize::MAX).clamp(1, MAX_LIVE_WAREHOUSES),
+        Some(limit) => usize::try_from(limit / 2 / FILES_PER_LIVE_WAREHOUSE).unwrap_or(usize::MAX).clamp(1, MAX_LIVE_WAREHOUSES),
         None => MAX_LIVE_WAREHOUSES,
     }
 }
@@ -593,9 +597,8 @@ impl WarehouseRegistry {
 /// and to the closure check a ref update must pass. The caller holds the registry mutex, so this
 /// finishes before any request can serve the warehouse again.
 ///
-/// The serve lock is a file, released here explicitly: one left behind would refuse this server the
-/// warehouse from then on, so a failed removal is logged as the error it is. Probing for the file
-/// afterwards could not say whose it is — letting go is what lets `gc` or a repack take it.
+/// Dropping the handle releases its serve lock, a kernel lock that leaves nothing behind: letting go
+/// is what lets `gc` or a repack take it.
 fn let_go(handle: Arc<WarehouseHandle>) {
     {
         let _scope = StorageRootScope::enter(&handle.root);
@@ -603,13 +606,7 @@ fn let_go(handle: Arc<WarehouseHandle>) {
     }
 
     // The registry held the only reference; anything else is let go by its last holder's drop.
-    let Ok(mut handle) = Arc::try_unwrap(handle) else {
-        return;
-    };
-
-    if let Some(Err(error)) = handle._serve_lock.take().map(ServeLock::release) {
-        tracing::error!(%error, "a warehouse let go kept its serve lock; it is refused until the file is removed");
-    }
+    drop(handle);
 }
 
 /// The shared server state.
@@ -2544,10 +2541,9 @@ fn resolve_handle(state: &AppState,
     // it is resumed or deleted.
     let handle = Arc::new(
         WarehouseHandle::serving(root, false).map_err(|refusal| match refusal {
-            // Not the reader's words: a lock's names its file on this server, the process holding
-            // it, and a removal only the operator can run. They go to the log. The cause may be one
-            // that does not clear by itself (a lock left by a process that died, an I/O error), so
-            // the text promises nothing.
+            // Not the reader's words: a lock's names its path on this server and what holds it, a
+            // process only the operator can stop. They go to the log. The cause may be one that does
+            // not clear by itself (a holder that runs on, an I/O error), so the text promises nothing.
             ServingRefusal::Busy(reason) => {
                 tracing::error!(warehouse = %id, %reason, "the warehouse's locks could not be taken");
                 (
@@ -4556,7 +4552,8 @@ fn delete_drained(warehouse: &WarehouseHandle) -> (Result<redaction_deleter::Del
     let deletion = (|| {
         // Taken before the shared hold is let go, so other maintenance refuses this attempt
         // without the hold ever being released for it.
-        let store_lock = lock_utils::StoreLock::acquire()?;
+        // Readable text, not a frame: the reason goes to the log.
+        let store_lock = lock_utils::StoreLock::acquire().map_err(|refused| refused.to_string())?;
 
         *store_access = None;
 
@@ -7098,7 +7095,7 @@ mod tests {
         assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);
         assert!(error.1.starts_with("\"old\" exists on this server but is not a usable warehouse"), "{}", error.1);
         assert!(!error.1.contains(&*base.to_string_lossy()), "no server path reaches the client: {}", error.1);
-        assert!(!serve_lock_exists(&base, "old"));
+        assert!(!serve_lock_held(&base, "old"));
 
         // Nor is anything else there that is not a warehouse: a bay's folder, or a marker this
         // build cannot read.
@@ -7232,8 +7229,18 @@ mod tests {
         state.warehouses.lock().unwrap().entries.keys().cloned().collect()
     }
 
-    fn serve_lock_exists(base: &std::path::Path, id: &str) -> bool {
-        base.join(id).join(FOLDER_NAME_FORKLIFT_ROOT).join("serve.lock").exists()
+    /// Whether something holds the serve lock of warehouse `id`: the kernel refuses another
+    /// handle's try. The sidecar stays once released, so its presence says nothing.
+    fn serve_lock_held(base: &std::path::Path, id: &str) -> bool {
+        root_serve_lock_held(&base.join(id))
+    }
+
+    /// [`serve_lock_held`] for the warehouse at `root`.
+    fn root_serve_lock_held(root: &std::path::Path) -> bool {
+        let Ok(sidecar) = std::fs::File::open(root.join(FOLDER_NAME_FORKLIFT_ROOT).join("serve.lock")) else {
+            return false;
+        };
+        matches!(sidecar.try_lock(), Err(std::fs::TryLockError::WouldBlock))
     }
 
     /// One warehouse in another format is answered as unavailable, without this server's paths,
@@ -7326,8 +7333,8 @@ mod tests {
         // w2 is idle now, w1 is not: serving w3 lets exactly w2 go.
         drop(resolve_handle(&state, &warehouse_params("w3")).unwrap());
         assert_eq!(live_ids(&state), ["w1", "w3"].map(String::from).into());
-        assert!(!serve_lock_exists(&base, "w2"), "a warehouse let go releases its serve lock");
-        assert!(serve_lock_exists(&base, "w1"));
+        assert!(!serve_lock_held(&base, "w2"), "a warehouse let go releases its serve lock");
+        assert!(serve_lock_held(&base, "w1"));
 
         let again = resolve_handle(&state, &warehouse_params("w1"))
             .unwrap_or_else(|e| panic!("the busy warehouse must still be live: {:?}", e));
@@ -7336,7 +7343,7 @@ mod tests {
         // A warehouse that was let go is served again, under a new serve lock.
         drop((held, again));
         resolve_handle(&state, &warehouse_params("w2")).unwrap();
-        assert!(serve_lock_exists(&base, "w2"));
+        assert!(serve_lock_held(&base, "w2"));
 
         drop(state);
         let _ = forklift_core::util::file_utils::remove_dir_all(&base);
@@ -7351,14 +7358,17 @@ mod tests {
     fn a_refused_warehouse_costs_no_live_one_its_place() {
         let base = scratch_dir("cap-refused");
         let state = capped_state(&base, 1, &["w1", "busy"]);
-        std::fs::write(base.join("busy").join(FOLDER_NAME_FORKLIFT_ROOT).join("serve.lock"), b"1").unwrap();
+        let gc = {
+            let _scope = StorageRootScope::enter(&base.join("busy"));
+            ServeLock::acquire().unwrap()
+        };
 
         drop(resolve_handle(&state, &warehouse_params("w1")).unwrap());
         let refused = resolve_handle(&state, &warehouse_params("busy")).err().expect("refused");
         assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE, "{}", refused.1);
         assert_eq!(live_ids(&state), ["w1"].map(String::from).into());
 
-        drop(state);
+        drop((gc, state));
         let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
@@ -7392,7 +7402,7 @@ mod tests {
         assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
         assert!(refused.1.starts_with("Warehouse \"sparse\" is a partial warehouse"), "{}", refused.1);
         assert!(refused.1.contains("without --only or --cache"), "{}", refused.1);
-        assert!(!serve_lock_exists(&base, "sparse"), "a refused warehouse keeps no serve lock");
+        assert!(!serve_lock_held(&base, "sparse"), "a refused warehouse keeps no serve lock");
 
         drop(resolve_handle(&state, &warehouse_params("full")).unwrap());
         assert_eq!(live_ids(&state), ["full"].map(String::from).into());
@@ -7501,7 +7511,7 @@ mod tests {
         let message = refused.message("\"/srv/wh\"");
         assert!(message.starts_with("\"/srv/wh\" records 1 object it holds by hash alone"), "{}", message);
         assert!(message.contains("clone the warehouse it was copied from again, from its server, into a new root"), "{}", message);
-        assert!(!sealed.join(FOLDER_NAME_FORKLIFT_ROOT).join("serve.lock").exists(), "a refused root keeps no serve lock");
+        assert!(!root_serve_lock_held(&sealed), "a refused root keeps no serve lock");
 
         let emptied = base.join("emptied");
         mark_warehouse(&emptied);
@@ -7572,7 +7582,7 @@ mod tests {
         let message = refused.message("\"/srv/wh\"");
         assert!(message.starts_with("\"/srv/wh\" lacks 1 file its record of unavailable content lists"), "{}", message);
         assert!(message.contains("Load the missing files' bytes into this warehouse"), "{}", message);
-        assert!(!lacking.join(FOLDER_NAME_FORKLIFT_ROOT).join("serve.lock").exists(), "a refused root keeps no serve lock");
+        assert!(!root_serve_lock_held(&lacking), "a refused root keeps no serve lock");
 
         let back = base.join("back");
         mark_warehouse(&back);
@@ -7633,7 +7643,7 @@ mod tests {
             withholding is never lifted); or, once nothing a sweep keeps (pallets, hauls, bays, staged work) names it, run \
             `forklift-server withhold repair` again, which drops it. For a folder or part of history: put it back from a copy and \
             run the repair again; or run the repair again once nothing a sweep keeps reaches it. Then serve it again.");
-        assert!(!unaccounted.join(FOLDER_NAME_FORKLIFT_ROOT).join("serve.lock").exists(), "a refused root keeps no serve lock");
+        assert!(!root_serve_lock_held(&unaccounted), "a refused root keeps no serve lock");
 
         let back = base.join("back");
         mark_warehouse(&back);
@@ -7815,8 +7825,7 @@ mod tests {
         assert!(refused.1.starts_with("Warehouse \"w\" is temporarily unavailable: the server could not take its locks"), "{}", refused.1);
         assert!(!refused.1.contains(base.to_string_lossy().as_ref()), "{}", refused.1);
 
-        let _ = ServeLock::release(held);
-        drop(state);
+        drop((held, state));
         let _ = forklift_core::util::file_utils::remove_dir_all(&base);
     }
 
@@ -7857,12 +7866,12 @@ mod tests {
         let refused = resolve_handle(&state, &warehouse_params("sealed")).err().expect("refused");
         assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
         assert!(refused.1.starts_with("Warehouse \"sealed\" records 1 object it holds by hash alone"), "{}", refused.1);
-        assert!(!serve_lock_exists(&base, "sealed"), "a refused warehouse keeps no serve lock");
+        assert!(!serve_lock_held(&base, "sealed"), "a refused warehouse keeps no serve lock");
 
         let refused = resolve_handle(&state, &warehouse_params("origined")).err().expect("refused");
         assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
         assert!(refused.1.starts_with("Warehouse \"origined\" records an origin (.forklift/origin)"), "{}", refused.1);
-        assert!(!serve_lock_exists(&base, "origined"), "a refused warehouse keeps no serve lock");
+        assert!(!serve_lock_held(&base, "origined"), "a refused warehouse keeps no serve lock");
 
         drop(resolve_handle(&state, &warehouse_params("full")).unwrap());
         assert_eq!(live_ids(&state), ["full"].map(String::from).into());
@@ -7887,7 +7896,7 @@ mod tests {
         assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE, "{}", refused.1);
         assert!(refused.1.starts_with("Warehouse \"unfinished\" is temporarily unavailable"), "{}", refused.1);
         assert!(!refused.1.contains(&*base.to_string_lossy()), "no server path reaches the client: {}", refused.1);
-        assert!(!serve_lock_exists(&base, "unfinished"), "a refused warehouse keeps no serve lock");
+        assert!(!serve_lock_held(&base, "unfinished"), "a refused warehouse keeps no serve lock");
 
         make_sparse(&base.join("garbled"));
         {
@@ -8640,9 +8649,12 @@ mod tests {
     }
 
     #[test]
-    fn the_live_warehouse_cap_is_half_the_open_file_limit_within_bounds() {
-        assert_eq!(live_warehouse_cap(Some(256)), 128);
-        assert_eq!(live_warehouse_cap(Some(1000)), 500);
+    fn the_live_warehouse_files_take_half_the_open_file_limit_within_bounds() {
+        // Three files a warehouse: 256 / 2 / 3 = 42, whose 126 files fit in half of 256.
+        assert_eq!(live_warehouse_cap(Some(256)), 42);
+        assert_eq!(live_warehouse_cap(Some(1000)), 166);
+        assert_eq!(live_warehouse_cap(Some(6144)), MAX_LIVE_WAREHOUSES);
+        assert_eq!(live_warehouse_cap(Some(6138)), MAX_LIVE_WAREHOUSES - 1);
         assert_eq!(live_warehouse_cap(Some(1_048_576)), MAX_LIVE_WAREHOUSES);
         assert_eq!(live_warehouse_cap(Some(u64::MAX)), MAX_LIVE_WAREHOUSES, "RLIM_INFINITY");
         assert_eq!(live_warehouse_cap(Some(1)), 1, "never zero");

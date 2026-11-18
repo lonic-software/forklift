@@ -502,6 +502,24 @@ refusal_codes! {
     /// stripped one look alike, so the warehouse may have been tampered with; the next step is
     /// empty.
     SignatureMissing => "signature_missing",
+
+    /// Another forklift process that is still running holds the bay's warehouse lock, which every
+    /// mutating command takes for its whole run. Nothing waits on it, and nothing was changed; the
+    /// next step is to let that process finish, then run the command again. The lock is a kernel
+    /// lock, so a process that died holds nothing.
+    WarehouseLocked => "warehouse_locked",
+
+    /// Another forklift process that is still running holds the warehouse's object-store lock,
+    /// which object-store maintenance (a compaction, an eviction, a redaction's deletion, an index
+    /// rebuild) holds while it runs. Nothing waits on it; the next step is to let it finish, then run
+    /// the command again.
+    StoreLocked => "store_locked",
+
+    /// Another forklift process that is still running holds the warehouse root's serve lock: a
+    /// server serving it, or a gc, a full repack, an eviction or another operation that must not run
+    /// beside a server. Nothing waits on it; the next step is to stop the server or let the other
+    /// operation finish, then run the command again.
+    ServeLocked => "serve_locked",
 }
 
 /// The codes of a host record that is lost or damaged, or of an object its store cannot read,

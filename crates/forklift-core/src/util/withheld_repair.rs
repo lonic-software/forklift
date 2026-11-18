@@ -170,7 +170,7 @@ impl Repaired {
 /// A header damaged into a newer version's no longer matches the digest, so it is repaired as
 /// damage: only a record whose digest verifies is taken as a newer version's.
 pub fn repair_withheld() -> Result<Repaired, String> {
-    let _serve_lock = ServeLock::acquire().map_err(|e| format!("Refusing to repair the record of withheld content: {}", e))?;
+    let _serve_lock = ServeLock::acquire().map_err(|e| crate::util::lock_utils::refusing_to("repair the record of withheld content", e))?;
     let lock = RefLock::acquire()?;
 
     let path = withholding::withheld_path();
@@ -517,7 +517,9 @@ mod tests {
         std::fs::write(record(), b"garbage").unwrap();
 
         let _serving = ServeLock::acquire().unwrap();
-        assert!(repair_withheld().unwrap_err().starts_with("Refusing to repair the record of withheld content"));
+        let error = repair_withheld().unwrap_err();
+        let (code, message, _) = crate::error::deframe(&error).expect("a coded refusal");
+        assert_eq!((code, message.starts_with("Refusing to repair the record of withheld content")), ("serve_locked", true), "{}", error);
         assert_eq!(std::fs::read(record()).unwrap(), b"garbage");
     }
 

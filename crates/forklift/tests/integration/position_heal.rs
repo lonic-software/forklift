@@ -320,8 +320,6 @@ fn rebuilt_from_a_standing_operation(stale_copy: bool) {
             continue;
         }
 
-        // A stopped process leaves its lock behind, as a power loss would; the operator clears it.
-        let _ = forklift_core::util::file_utils::remove_file(dir.join("lock"));
         let _ = forklift_core::util::file_utils::remove_file(dir.join("position"));
         let _ = forklift_core::util::file_utils::remove_file(dir.join("position-copy"));
         if stale_copy {

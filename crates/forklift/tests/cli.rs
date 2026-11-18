@@ -4026,6 +4026,20 @@ fn park_pop_refuses_conflicting_head_changes() {
     assert!(stdout(&warehouse.run(&["park", "list"])).contains(" main 20"));
 }
 
+/// Hold the kernel lock on the sidecar at `path` from this test process, as another forklift
+/// process would; dropping the handle releases it.
+fn hold_lock(path: &std::path::Path) -> std::fs::File {
+    let sidecar = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).unwrap();
+    sidecar.try_lock().expect("the lock is free before the test holds it");
+    sidecar
+}
+
+/// A mutating command beside a live holder of the warehouse lock is refused with the coded
+/// `warehouse_locked` refusal (exit 6), whose way out waits and removes nothing; once the holder
+/// lets go, the command runs, and the lock is free again after it.
+///
+/// Revert: name a removal in the refusal → the "remov" assertion is red; code it as generic → the
+/// code assertion is red.
 #[test]
 fn mutating_commands_respect_the_warehouse_lock() {
     let warehouse = TestWarehouse::new("lock");
@@ -4033,22 +4047,25 @@ fn mutating_commands_respect_the_warehouse_lock() {
 
     assert_success(&warehouse.run(&["prepare"]));
 
-    // Simulate another process holding the lock.
-    std::fs::write(warehouse.root.join(".forklift/lock"), "12345\n").unwrap();
+    let sidecar = warehouse.root.join(".forklift/lock");
+    let held = hold_lock(&sidecar);
 
-    let locked = warehouse.run(&["load", "."]);
-    assert!(!locked.status.success());
-    assert!(stderr(&locked).contains("locked by another forklift process"));
-    assert!(stderr(&locked).contains("12345"));
+    let locked = warehouse.run(&["load", ".", "--json"]);
+    assert_eq!(locked.status.code(), Some(6), "{}", stderr(&locked));
+    let error = &json(&locked)["error"];
+    assert_eq!(error["code"], "warehouse_locked", "{}", error);
+    assert_eq!(error["next_step"], "Wait for the other forklift process to finish, then run the command again.", "{}", error);
+    assert!(error["message"].as_str().unwrap().contains("still running"), "{}", error);
+    assert!(!error.to_string().to_lowercase().contains("remov"), "the way out removes nothing: {}", error);
 
     // Read-only commands still work while the lock is held.
     assert_success(&warehouse.run(&["help"]));
 
-    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/lock")).unwrap();
+    drop(held);
     assert_success(&warehouse.run(&["load", "."]));
 
-    // The lock is released after the command finishes.
-    assert!(!warehouse.root.join(".forklift/lock").exists());
+    // The lock is released after the command finishes; its sidecar stays.
+    drop(hold_lock(&sidecar));
 }
 
 #[test]
@@ -8869,7 +8886,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 58);
+    assert_eq!(value["schema"], 59);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -8911,7 +8928,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 58);
+    assert_eq!(value["schema"], 59);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -8970,7 +8987,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 58);
+    assert_eq!(value["schema"], 59);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -9178,7 +9195,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 58,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 59,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);
@@ -14323,12 +14340,12 @@ fn a_mutating_command_reports_the_lock_before_the_taint_when_both_apply() {
     // A valid-hex, loose-object-shaped, never-written path: an unhealable ("vanished") taint that
     // would refuse with exit 21 if entry-heal ever got to run.
     plant_taint(&warehouse, &["objects/ab/cdef"]);
-    std::fs::write(warehouse.root.join(".forklift/lock"), "12345\n").unwrap();
+    let held = hold_lock(&warehouse.root.join(".forklift/lock"));
 
     // Mutating: the lock wins the race — `WarehouseLocked`, not `durability_taint`.
     let locked = warehouse.run(&["load", "."]);
     assert!(!locked.status.success());
-    assert!(stderr(&locked).contains("locked by another forklift process"),
+    assert!(stderr(&locked).contains("holds the warehouse lock"),
         "a mutating command must report the lock before its own entry-heal runs, got: {}",
         stderr(&locked));
 
@@ -14337,7 +14354,7 @@ fn a_mutating_command_reports_the_lock_before_the_taint_when_both_apply() {
     assert_eq!(read_only.status.code(), Some(21));
     assert_eq!(json(&read_only)["error"]["code"], "durability_taint");
 
-    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/lock")).unwrap();
+    drop(held);
 }
 
 #[test]
@@ -14439,8 +14456,8 @@ fn heal_is_never_serialized_against_another_bays_warehouse_lock_or_the_shared_st
     // pack. `forklift heal` (`recovery_utils.rs`/`heal_utils.rs`/`commands/heal.rs`) never
     // references `StoreLock` at all — grep-confirmed, not just asserted here.
     //
-    // Proven deterministically, with no real second process and no timing dependency: hand-
-    // plant BOTH lock files a concurrent `compact` in another bay would be holding at the exact
+    // Proven deterministically, with no real second process and no timing dependency: hold
+    // BOTH kernel locks from this test process that a concurrent `compact` in another bay would be holding at the exact
     // instant it is about to delete a superseded pack (its own bay's lock, taken first via the
     // ordinary `requires_warehouse_lock()` dispatch, then the shared store lock), and show
     // `forklift heal` in THIS (different) bay still runs to completion — clearing a real taint —
@@ -14463,11 +14480,9 @@ fn heal_is_never_serialized_against_another_bays_warehouse_lock_or_the_shared_st
 
     // Simulate bay B's `compact` mid-flight, holding both locks it takes in sequence: its own
     // (bay-local) `WarehouseLock`...
-    let bay_b_lock = warehouse.root.join(".forklift/bays/other/lock");
-    std::fs::write(&bay_b_lock, "99999\n").unwrap();
+    let bay_b_lock = hold_lock(&warehouse.root.join(".forklift/bays/other/lock"));
     // ...and the shared `StoreLock`, acquired right before the destructive old-pack sweep.
-    let store_lock = warehouse.root.join(".forklift/store.lock");
-    std::fs::write(&store_lock, "99999\n").unwrap();
+    let store_lock = hold_lock(&warehouse.root.join(".forklift/store.lock"));
 
     // A real taint for bay A's heal to resolve, so a successful run below is not vacuous: a
     // fabricated, never-existing loose-object hash — the same "absent and unreferenced" fixture
@@ -14486,13 +14501,7 @@ fn heal_is_never_serialized_against_another_bays_warehouse_lock_or_the_shared_st
         "bay A's heal must actually run its recovery logic (not merely happen to exit 0): {}", value
     );
 
-    // Both hand-planted lock files are untouched: bay A's heal neither waited on nor cleared
-    // either one — proof it never contended for bay B's lock or the shared store lock.
-    assert!(bay_b_lock.exists(), "bay B's own lock file must be untouched by bay A's heal");
-    assert!(store_lock.exists(), "the shared store lock must be untouched by bay A's heal");
-
-    forklift_core::util::file_utils::remove_file(&bay_b_lock).unwrap();
-    forklift_core::util::file_utils::remove_file(&store_lock).unwrap();
+    drop((bay_b_lock, store_lock));
 }
 
 /// Every `.pack` data file currently present under a warehouse's pack folder, sorted.

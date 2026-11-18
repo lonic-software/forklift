@@ -223,10 +223,9 @@ impl Server {
         let _ = self.child.wait();
     }
 
-    /// Serve `server-root` again at the same address, after [`Server::stop`], whose kill left the
-    /// stopped server's lock behind.
+    /// Serve `server-root` again at the same address, after [`Server::stop`] killed it: the killed
+    /// server holds nothing, so nothing is removed first.
     fn restart(&mut self, area: &TestArea) {
-        forklift_core::util::file_utils::remove_file(area.path("server-root/.forklift/serve.lock")).unwrap();
         let addr = self.url.trim_start_matches("http://").to_string();
         let restarted = Server::spawn(vec![
             "serve".to_string(),
@@ -4646,15 +4645,13 @@ fn gc_is_refused_while_serving_then_sweeps_orphans_once_the_server_stops() {
         .unwrap();
     assert!(!refused.status.success(),
             "gc must be refused while a server serves this root");
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("locked by another forklift process"),
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("still running holds the warehouse root"),
             "the refusal should name the serve lock: {}", String::from_utf8_lossy(&refused.stderr));
     assert!(orphan.exists(), "a refused gc must not have swept anything");
 
-    // Stop the server. A graceful shutdown (SIGTERM/SIGINT) drops the serve lock automatically; the
-    // test harness hard-kills the child (SIGKILL), which leaves the lock behind — exactly the
-    // stale-lock case an operator clears after a crash — so we clear it here before gc.
+    // Stop the server. The harness hard-kills the child (SIGKILL), and the kernel releases its
+    // serve lock with the process, so gc runs next with nothing removed.
     drop(server);
-    let _ = forklift_core::util::file_utils::remove_file(root.join(".forklift").join("serve.lock"));
 
     // Within the grace period the orphan is protected...
     let output = server_command()
@@ -4771,7 +4768,7 @@ fn a_second_server_and_gc_are_refused_while_serving_but_bundle_is_allowed() {
         .unwrap();
     assert!(!second.status.success(),
             "a second server on the same root must be refused");
-    assert!(String::from_utf8_lossy(&second.stderr).contains("locked by another forklift process"),
+    assert!(String::from_utf8_lossy(&second.stderr).contains("still running holds the warehouse root"),
             "second-server refusal should name the serve lock: {}",
             String::from_utf8_lossy(&second.stderr));
 
@@ -4781,6 +4778,10 @@ fn a_second_server_and_gc_are_refused_while_serving_but_bundle_is_allowed() {
         .output()
         .unwrap();
     assert!(!gc.status.success(), "gc must be refused while serving");
+    // As a coded refusal, its next step on a line of its own, like the server's other commands.
+    let refused = String::from_utf8_lossy(&gc.stderr);
+    assert!(refused.contains("Refusing to gc: Another forklift process that is still running holds the warehouse root"), "{}", refused);
+    assert!(refused.contains("\nNext step: Stop the server serving it"), "{}", refused);
 
     // bundle, by contrast, is deliberately *allowed* against a live server: it never deletes an
     // object, writes atomically, and a stale bundle is self-healing.
@@ -5817,8 +5818,6 @@ fn a_lift_over_a_damaged_office_signature_on_the_server_names_its_operator() {
     assert_success(&area.forklift("w", &["config", "set", "remote.url", &server.url]));
     assert_success(&area.forklift("w", &["lift"]));
     drop(server);
-    // A killed server leaves its lock behind.
-    let _ = forklift_core::util::file_utils::remove_file(area.path("server-root/.forklift/serve.lock"));
 
     let office = std::fs::read_to_string(area.path("server-root/.forklift/meta/office")).unwrap();
     let office = office.trim();
@@ -8062,8 +8061,8 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
 }
 
 /// Copy the warehouse `from` to `to`, as an operator copies a server's warehouse on the server's
-/// side, and serve the copy. The copied serve lock is a file a kill would have left; it holds no
-/// lock.
+/// side, and serve the copy. The copied serve lock's sidecar holds no lock: a kernel lock is not
+/// copied with its file.
 fn serve_copy(area: &TestArea, from: &str, to: &str) -> Server {
     fn copy_dir(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).unwrap();
@@ -8079,7 +8078,6 @@ fn serve_copy(area: &TestArea, from: &str, to: &str) -> Server {
 
     let _ = forklift_core::util::file_utils::remove_dir_all(area.path(to));
     copy_dir(&area.path(from), &area.path(to));
-    let _ = forklift_core::util::file_utils::remove_file(area.path(&format!("{}/.forklift/serve.lock", to)));
 
     Server::spawn(vec![
         "serve".to_string(),
@@ -8757,8 +8755,8 @@ fn evict_refuses_while_the_root_is_served() {
     let before = forklift_dir_snapshot(&area, "cached");
 
     let refused = area.forklift("cached", &["store", "evict"]);
-    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
-    assert!(stderr(&refused).contains("being served"), "{}", stderr(&refused));
+    assert_eq!(refused.status.code(), Some(6), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("a server serving it"), "{}", stderr(&refused));
     assert!(forklift_dir_snapshot(&area, "cached") == before, "a refused evict changes nothing");
 
     drop(served);

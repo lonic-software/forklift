@@ -3,7 +3,7 @@
 Proof Load is Forklift's fault-injection harness. It runs `forklift`, `forklift-server` and `git` as
 programs, injects faults while they work, and grades what each one reads back afterwards. The
 faults include damaged files, kill points, power loss, a full disk, a read-only warehouse,
-case-folding and no-exec volumes, dead-PID locks, network faults and round trips between the two
+case-folding and no-exec volumes, git's dead-PID locks, network faults and round trips between the two
 tools. Each read is graded against an oracle built from a seed.
 
 The harness never links Forklift's code, so its expectations cannot share Forklift's bugs.

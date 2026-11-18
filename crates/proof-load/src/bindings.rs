@@ -21,7 +21,9 @@ const FILE: &[Kind] = &[Kind::FlipByte, Kind::Truncate, Kind::Zero, Kind::Delete
 /// A lock file left in place between commands: empty, so there is no byte to flip and nothing to cut.
 const LOCK_FILE: &[Kind] = &[Kind::Delete];
 const FOLDER: &[Kind] = &[Kind::Delete];
-/// A lock file that exists only while a command holds it, planted as a holder killed hard leaves it.
+/// git's lock file, which exists only while a command holds it, planted as a holder killed hard
+/// leaves it. Forklift's locks are kernel locks on sidecars that stay, so a dead holder of one
+/// leaves nothing to plant.
 const DEAD_HOLDER: &[Kind] = &[Kind::DeadPidLock];
 
 const fn bound(name: &'static str, kinds: &'static [Kind]) -> Binding {
@@ -96,9 +98,9 @@ pub const BINDINGS: &[Binding] = &[
     bound_in("unavailable", "withheld", FILE),
     bound_in("redactions-applied", "redacted", FILE),
     bound_in("unvouched-heads", "unvouched", FILE),
-    bound("{bay}lock", DEAD_HOLDER),
-    bound_in("store.lock", "compacted", DEAD_HOLDER),
-    bound_in("serve.lock", "compacted", DEAD_HOLDER),
+    bound("{bay}lock", LOCK_FILE),
+    bound_in("store.lock", "compacted", LOCK_FILE),
+    bound_in("serve.lock", "compacted", LOCK_FILE),
 ];
 
 const NO_MIRROR_ORACLE: &str = "no mirror oracle: the corpus configures no mirror url, so nothing reads a mirror back";
@@ -457,7 +459,7 @@ pub const HISTORY_BINDINGS: &[Binding] = &[
     over_history("{bay}inventory/inv_/<xx>/<hash>/data", FILE),
     over_history("{bay}position", FILE),
     over_history("{bay}position-copy", FILE),
-    over_history("{bay}lock", DEAD_HOLDER),
+    over_history("{bay}lock", LOCK_FILE),
 ];
 
 /// Census names an import holds that are not damaged over a history, with the reason.
@@ -741,9 +743,27 @@ mod tests {
     /// Revert: plant `objects/<xx>/<hash>` → it names no file.
     #[test]
     fn planting_bindings_name_literal_paths() {
-        for binding in BINDINGS.iter().filter(|binding| binding.kinds.iter().any(|kind| kind.plants())) {
+        let lists = [BINDINGS, GIT_BINDINGS, GIT_TUNED_BINDINGS, HISTORY_BINDINGS, HISTORY_GIT_BINDINGS];
+        let planting: Vec<&Binding> = lists.iter().flat_map(|list| list.iter())
+            .filter(|binding| binding.kinds.iter().any(|kind| kind.plants())).collect();
+        assert!(!planting.is_empty(), "no list plants anything, so nothing was checked");
+        for binding in planting {
             assert!(!damage::planted(binding.name).contains(['<', '{']), "{} plants a pattern", binding.name);
         }
+    }
+
+    /// A dead holder's lock file is git's alone: Forklift's locks are kernel locks, so a killed
+    /// holder leaves nothing to plant, and none of its bindings plants one.
+    ///
+    /// Revert: plant a dead holder over Forklift's `{bay}lock` again → red.
+    #[test]
+    fn only_git_lock_files_are_planted_as_a_dead_holder() {
+        let dead_holders = |lists: &[&[Binding]]| -> Vec<&'static str> {
+            lists.iter().flat_map(|list| list.iter())
+                .filter(|binding| binding.kinds.contains(&Kind::DeadPidLock)).map(|binding| binding.name).collect()
+        };
+        assert_eq!(dead_holders(&[BINDINGS, HISTORY_BINDINGS]), Vec::<&str>::new());
+        assert!(dead_holders(&[GIT_BINDINGS, HISTORY_GIT_BINDINGS]).contains(&"index.lock"), "git's lock files are planted");
     }
 
     /// A history binding the role map gives no role is named, under either subject.

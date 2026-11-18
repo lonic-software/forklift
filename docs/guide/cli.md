@@ -2547,8 +2547,7 @@ does when packs pile up). Because it drops unreachable packed objects with no gr
 `forklift-server gc` is running against it): a lift in flight would lose objects it had already
 uploaded. Stop the server, repack, then restart. Plain `store compact` drops nothing and stays
 allowed; the automatic repack simply waits until the root is no longer served. A server that was
-hard-killed leaves its `serve.lock` behind, which blocks repacks (automatic ones silently) until
-it is removed, exactly as it blocks `gc`.
+killed holds nothing: its lock is released when its process ends.
 
 A full repack checks each pack's whole index before copying anything out of it. A pack whose
 index fails that check (a **damaged** pack, as `store` lists it) is **salvaged** instead of copied:

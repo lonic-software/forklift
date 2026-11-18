@@ -582,7 +582,7 @@ fn freeze_the_current_format_fixtures() {
 
     for (name, _) in fixtures() {
         let warehouse = at(name);
-        // A dead server's lock is the one file a stopped process leaves that no command would.
+        // The serve lock's sidecar is the server's own, not the warehouse's: a fixture leaves it out.
         let _ = forklift_core::util::file_utils::remove_file(warehouse.join(".forklift").join("serve.lock"));
         let left = unclassified(&warehouse);
         assert!(left.is_empty(), "{}: paths no census row matches: {:?}", name, left);

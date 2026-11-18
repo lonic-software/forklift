@@ -1007,15 +1007,15 @@ pub fn gate(root: &Path) -> Result<(), CoreError> {
         Ok(None) | Err(MarkerError::Torn(_) | MarkerError::Foreign(_)) => None,
         Err(e) => return Err(unknowable(e.describe(&record_path(&forklift)))),
     };
-    let lock = forklift.join(FILE_NAME_LOCK);
-    let locked = std::fs::symlink_metadata(&lock).is_ok();
+    let locked = crate::util::lock_utils::held_by_another_handle(&forklift.join(FILE_NAME_LOCK));
 
     let Some(record) = record else {
         let next_step = if locked {
             format!(
-                "A clone may still be running there. If none is, remove the stale lock \"{}\" and run \
-                \"forklift clone <url> {}\" with the URL it was started with; or delete \"{}\".",
-                lock.to_string_lossy(), quote(&directory), directory
+                "A forklift process that is still running holds its lock. Let it finish; if the clone \
+                is still unfinished then, run \"forklift clone <url> {}\" with the URL it was started with, \
+                or delete \"{}\".",
+                quote(&directory), directory
             )
         } else {
             format!(
@@ -1051,9 +1051,9 @@ pub fn gate(root: &Path) -> Result<(), CoreError> {
 
     let next_step = if locked {
         format!(
-            "A clone may still be running there. If none is, remove the stale lock \"{}\", then run \
-            \"{}\" to resume it; or delete \"{}\".",
-            lock.to_string_lossy(), command, directory
+            "A forklift process that is still running holds its lock. Let it finish; if the clone is \
+            still unfinished then, run \"{}\" to resume it, or delete \"{}\".",
+            command, directory
         )
     } else {
         match failure {
@@ -1463,6 +1463,29 @@ mod tests {
         assert_eq!(refused, RefusalCode::CloneIncomplete);
         assert_eq!(details["cause_code"], "error");
         assert_eq!(details["retry"], "unknown");
+
+        // A clone's lock tells a running clone apart only while a process holds it: the sidecar a
+        // dead one left says nothing. Under a record (the first next step) and without one (the second).
+        let lock = forklift.join(FILE_NAME_LOCK);
+        let running = |result: Result<(), CoreError>| match result {
+            Err(CoreError::Refusal { next_step, .. }) => {
+                assert!(!next_step.to_lowercase().contains("remov"), "{}", next_step);
+                next_step.contains("still running holds its lock")
+            }
+            other => panic!("expected a refusal, got {:?}", other),
+        };
+        std::fs::write(&lock, b"").unwrap();
+        for torn in [false, true] {
+            if torn {
+                std::fs::write(record_path(&forklift), b"torn").unwrap();
+            }
+            assert!(!running(gate(&dir)), "torn {}: a lock nothing holds is not a running clone", torn);
+            let held = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+            held.try_lock().unwrap();
+            assert!(running(gate(&dir)), "torn {}: a held lock is a running clone", torn);
+            drop(held);
+        }
+        file_utils::remove_file(&lock).unwrap();
 
         std::fs::write(record_path(&forklift), b"torn").unwrap();
         assert_eq!(code(gate(&dir)).0, RefusalCode::CloneIncomplete);

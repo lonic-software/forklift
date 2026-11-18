@@ -78,13 +78,6 @@ impl Area {
         command
     }
 
-    /// A crashed command leaves the warehouse lock behind (no destructor runs), exactly as a real
-    /// power loss would; the operator clears it. Do the same before the next command so the lock
-    /// is never the reason a later step fails — we are testing store integrity, not the lock.
-    fn clear_stale_lock(&self) {
-        let _ = forklift_core::util::file_utils::remove_file(self.warehouse().join(".forklift").join("lock"));
-    }
-
     /// Assert the store is internally consistent right now: any pallet head is a whole 64-hex hash
     /// (an atomic ref write never leaves a partial one), and the commands that read the committed
     /// tree and history succeed (a torn object would fail the read-side hash check).
@@ -226,7 +219,6 @@ fn a_crash_point_stops_the_run_before_that_rename() {
         String::from_utf8_lossy(&stopped.stderr));
     assert_eq!(current_head(&area.warehouse()), None, "a stack stopped before its first rename publishes no head");
 
-    area.clear_stale_lock();
     let completed = area.command(&["stack", "-m", "completed"]).env("FORKLIFT_DEBUG_CRASH_AT_RENAME", "100000").output().unwrap();
     assert!(completed.status.success(), "a crash point past the last rename must never fire, stderr: {}",
         String::from_utf8_lossy(&completed.stderr));
@@ -268,7 +260,6 @@ fn stopping_stack_at_every_rename_never_corrupts_the_store() {
     let stopped = crash_at_every_rename(&area, &["stack", "-m", "under test"],
         |at| {
             // Recover from the previous stop and check it left the store consistent.
-            area.clear_stale_lock();
             let context = format!("before stack crash point {at}");
             if area.assert_head_whole(&context).is_some() {
                 area.assert_history_reads(&context);
@@ -308,7 +299,6 @@ fn stopping_stack_at_every_rename_never_corrupts_the_store() {
     // Final recovery: every object reachable from the final head must read back (git export walks
     // the whole graph — parcels, trees, blobs — so a torn or missing object anywhere fails here via
     // the read-side hash check).
-    area.clear_stale_lock();
     area.assert_consistent("final");
 
     let export_dir = area.root.join("git-export");
@@ -384,11 +374,9 @@ fn stopping_load_at_every_rename_never_leaves_a_shard_referencing_a_missing_or_t
     // object any of them committed.
     let stopped = crash_at_every_rename(&area, &["load", "."],
         |at| {
-            area.clear_stale_lock();
             rewrite_corpus(&files, &format!("load {at}"));
         },
         |at, _| {
-            area.clear_stale_lock();
             let _ = forklift_core::util::file_utils::remove_file(
                 forklift_core::util::load_guard_utils::marker_path_under(&area.warehouse())
             );
@@ -406,7 +394,6 @@ fn stopping_load_at_every_rename_never_leaves_a_shard_referencing_a_missing_or_t
     assert!(stopped >= 2, "load must have been stopped at its renames, it was stopped {stopped} times");
     assert!(stacked >= 1, "the completed load must have staged something a stack committed");
 
-    area.clear_stale_lock();
     area.assert_consistent("final");
 
     let export_dir = area.root.join("git-export");
@@ -466,13 +453,11 @@ fn stopping_park_at_every_rename_never_leaves_a_parked_parcel_referencing_a_miss
             // `park` never moves the head, so between stops only the bay it resets is checked,
             // after the heal or pop that follows each stop; the head and history are checked once,
             // at the end. Each process launch costs about a third of a second on Windows.
-            area.clear_stale_lock();
             area.assert_stocktake_reads(&format!("before park crash point {at}"));
             rewrite_corpus(&files, &format!("park {at}"));
             before.set(parked_count(&warehouse));
         },
         |at, _| {
-            area.clear_stale_lock();
 
             if operation_standing(&warehouse) {
                 let heal = area.run(&["heal"]);
@@ -494,7 +479,6 @@ fn stopping_park_at_every_rename_never_leaves_a_parked_parcel_referencing_a_miss
     assert!(stopped >= 2, "park must have been stopped at its renames, it was stopped {stopped} times");
     assert!(parked >= 1, "the completed park must have been parked and popped");
 
-    area.clear_stale_lock();
     area.assert_consistent("final");
 }
 

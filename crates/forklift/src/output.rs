@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 58;
+pub const SCHEMA_VERSION: u32 = 59;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -394,6 +394,12 @@ error_codes! {
     /// Another forklift process holds the warehouse lock.
     WarehouseLocked,
 
+    /// Another forklift process holds the object-store lock.
+    StoreLocked,
+
+    /// Another forklift process holds the warehouse root's serve lock.
+    ServeLocked,
+
     /// A path argument is outside the bay's checkout scope, or a read needs content outside the
     /// warehouse's fetch scope (§7.6).
     OutOfScope,
@@ -648,7 +654,9 @@ impl ErrorCode {
             ErrorCode::Generic              => "error",
             ErrorCode::Usage                => "usage",
             ErrorCode::NotAWarehouse        => "not_a_warehouse",
-            ErrorCode::WarehouseLocked      => "warehouse_locked",
+            ErrorCode::WarehouseLocked      => RefusalCode::WarehouseLocked.as_str(),
+            ErrorCode::StoreLocked          => RefusalCode::StoreLocked.as_str(),
+            ErrorCode::ServeLocked          => RefusalCode::ServeLocked.as_str(),
             ErrorCode::Conflict             => RefusalCode::Conflict.as_str(),
             ErrorCode::Diverged             => RefusalCode::Diverged.as_str(),
             ErrorCode::OutOfScope           => scope_utils::CODE_OUT_OF_SCOPE,
@@ -729,6 +737,8 @@ impl ErrorCode {
             ErrorCode::Conflict             => 4,
             ErrorCode::Diverged             => 5,
             ErrorCode::WarehouseLocked      => 6,
+            ErrorCode::StoreLocked          => 6,
+            ErrorCode::ServeLocked          => 6,
             ErrorCode::OutOfScope           => 7,
             ErrorCode::ScopePathTypeChanged => 8,
             ErrorCode::SparseWorkspace      => 9,
@@ -813,6 +823,10 @@ impl ErrorCode {
                 "The local pallet and the remote's both hold parcels the other lacks; nothing was \
                  lifted or lowered",
             ErrorCode::WarehouseLocked => "Another forklift process holds the warehouse lock",
+            ErrorCode::StoreLocked =>
+                "Another forklift process is maintaining the warehouse's object store (a compaction, an eviction, a redaction's deletion or an index rebuild); run the command again once it finishes",
+            ErrorCode::ServeLocked =>
+                "Another forklift process holds the warehouse root's serve lock (a server serving it, or a gc, full repack or eviction); stop the server or let the operation finish, then run the command again",
             ErrorCode::OutOfScope => "A path argument is outside a scoped (sparse) bay's scope, or a read needs content the warehouse never fetched",
             ErrorCode::ScopePathTypeChanged =>
                 "A scoped bay's spine path flipped dir\u{2194}file; scope no longer valid",
@@ -975,7 +989,7 @@ impl ErrorCode {
     /// over `RefusalCode`, so adding a refusal code in `forklift-core` without wiring its exit code
     /// here is a *compile error* — which is the entire point of the type. The two enums are kept
     /// distinct because `ErrorCode` also classifies head-only conditions core never raises
-    /// (`WarehouseLocked`, …).
+    /// (`EmptyHistory`, `Usage`, …).
     fn from_refusal(code: RefusalCode) -> ErrorCode {
         match code {
             RefusalCode::OutOfScope => ErrorCode::OutOfScope,
@@ -1017,6 +1031,9 @@ impl ErrorCode {
             RefusalCode::WarehouseUpgradeRunning => ErrorCode::WarehouseUpgradeRunning,
             RefusalCode::WarehouseLeaseMissing => ErrorCode::WarehouseLeaseMissing,
             RefusalCode::WarehouseInUse => ErrorCode::WarehouseInUse,
+            RefusalCode::WarehouseLocked => ErrorCode::WarehouseLocked,
+            RefusalCode::StoreLocked => ErrorCode::StoreLocked,
+            RefusalCode::ServeLocked => ErrorCode::ServeLocked,
             RefusalCode::HeadNotMaterializable => ErrorCode::HeadNotMaterializable,
             RefusalCode::Conflict => ErrorCode::Conflict,
             RefusalCode::MergeConflicts => ErrorCode::MergeConflicts,
@@ -1708,6 +1725,9 @@ mod tests {
             (RefusalCode::TrustDamaged, "trust_damaged", 69),
             (RefusalCode::SignatureDamaged, "signature_damaged", 70),
             (RefusalCode::SignatureMissing, "signature_missing", 71),
+            (RefusalCode::WarehouseLocked, "warehouse_locked", 6),
+            (RefusalCode::StoreLocked, "store_locked", 6),
+            (RefusalCode::ServeLocked, "serve_locked", 6),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

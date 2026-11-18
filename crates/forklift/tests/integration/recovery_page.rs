@@ -195,41 +195,81 @@ fn the_page_has_an_entry_for_every_code_with_its_exit() {
     }
 }
 
+/// Hold the kernel lock on the sidecar at `path` from this test process, as another forklift
+/// process that is still running would.
+fn hold_lock(path: &Path) -> std::fs::File {
+    let sidecar = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).unwrap();
+    sidecar.try_lock().expect("the lock is free before the test holds it");
+    sidecar
+}
+
+/// `warehouse_locked`, `store_locked` and `serve_locked`: each is refused while another process
+/// holds its lock, with a way out that waits (or stops the server) and removes nothing, and the
+/// command runs once the holder lets go.
+///
+/// Revert: name a removal in a refusal → the "remov" assertion is red.
 #[test]
-fn a_lock_a_killed_process_left_is_cleared_by_removing_the_file_it_names() {
+fn a_held_lock_is_refused_until_its_holder_lets_go() {
     let area = Area::new("lock");
     area.prepare("w");
     area.write("w/a.txt", "a\n");
-    let lock = area.path("w/.forklift/lock");
-    std::fs::write(&lock, "999999").unwrap();
 
-    let error = area.refused("w", &["load", "a.txt"], "warehouse_locked", 6);
-    let message = error["message"].as_str().unwrap();
-    assert!(message.contains(".forklift") && message.contains("999999"), "{}", error);
+    let cases: [(&str, &[&str], &str, &str); 3] = [
+        ("w/.forklift/lock", &["load", "a.txt"], "warehouse_locked", "Wait for the other forklift process to finish"),
+        ("w/.forklift/store.lock", &["store", "compact"], "store_locked", "Wait for that maintenance to finish"),
+        ("w/.forklift/serve.lock", &["store", "compact", "--all"], "serve_locked", "Stop the server serving it"),
+    ];
+    for (lock, args, code, way_out) in cases {
+        let held = hold_lock(&area.path(lock));
+        let error = area.refused("w", args, code, 6);
+        assert!(error["message"].as_str().unwrap().contains("still running"), "{}", error);
+        assert!(error["next_step"].as_str().unwrap().starts_with(way_out), "{}", error);
+        assert!(!error.to_string().to_lowercase().contains("remov"), "the way out removes nothing: {}", error);
 
-    forklift_core::util::file_utils::remove_file(&lock).unwrap();
+        drop(held);
+        area.ok("w", args);
+    }
+}
+
+/// A forklift process that dies holding the warehouse lock holds nothing: the next command runs
+/// with nothing removed.
+///
+/// Revert: a lock file the holder must delete → the command after the crash is refused → red.
+#[test]
+fn a_lock_a_dead_process_held_refuses_nothing() {
+    let area = Area::new("dead-lock");
+    area.prepare("w");
+    area.write("w/a.txt", "a\n");
+
+    // Exits just before its first rename, holding the lock, with no destructor run.
+    let mut load = forklift_command();
+    let crashed = load.args(["load", "a.txt"]).current_dir(area.path("w"))
+        .env("FORKLIFT_GLOBAL_CONFIG", area.path("global.toml")).env("FORKLIFT_KEYS_DIR", area.path("keys"))
+        .env("FORKLIFT_DEBUG_CRASH_AT_RENAME", "1").output().unwrap();
+    assert_eq!(crashed.status.code(), Some(forklift_core::util::file_utils::CRASH_POINT_EXIT_CODE), "{}", stderr(&crashed));
+    assert!(area.path("w/.forklift/lock").exists(), "the dead holder's sidecar stays");
+
     area.ok("w", &["load", "a.txt"]);
 }
 
+/// A server killed with SIGKILL holds nothing: `gc` runs, and the server serves again, with
+/// nothing removed — what a supervisor restarting it relies on.
+///
+/// Revert: a serve lock file a killed server leaves → `gc` is refused → red.
 #[test]
-fn a_serve_lock_a_hard_kill_left_is_cleared_by_removing_the_file_it_names() {
+fn a_hard_killed_server_holds_no_serve_lock() {
     let area = Area::new("serve-lock");
     let mut server = Server::start(&area, "server");
     server.child.kill().unwrap();
     server.child.wait().unwrap();
     let root = area.path("server");
     let root = root.to_str().unwrap();
-    let lock = area.path("server/.forklift/serve.lock");
-    assert!(lock.exists(), "a hard kill leaves the lock");
+    assert!(area.path("server/.forklift/serve.lock").exists(), "the killed server's sidecar stays");
 
-    let gc = Command::new(server_binary()).args(["gc", "--root", root]).output().unwrap();
-    assert!(!gc.status.success(), "{}", stdout(&gc));
-    assert!(stderr(&gc).contains("serve.lock"), "{}", stderr(&gc));
-
-    forklift_core::util::file_utils::remove_file(&lock).unwrap();
     let gc = Command::new(server_binary()).args(["gc", "--root", root]).output().unwrap();
     assert!(gc.status.success(), "{}", stderr(&gc));
-    let _restarted = Server::serve(root);
+    let restarted = Server::serve(root);
+    assert!(restarted.url.starts_with("http://"), "the server serves again: {:?}", restarted.url);
 }
 
 #[cfg(unix)]
