@@ -1675,6 +1675,21 @@ fn a_server_deletes_the_content_of_a_redaction_it_applied() {
     assert_eq!(fresh.head("main"), server.main());
 }
 
+/// Copy the root of a warehouse a live server serves, leaving out its serve lock's sidecar: Windows
+/// refuses another process a read of a file whose kernel lock is held, and the sidecar holds
+/// nothing a copy needs. The copy's server makes its own.
+fn copy_served_root(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            copy_served_root(&entry.path(), &to.join(entry.file_name()));
+        } else if entry.file_name() != "serve.lock" {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
 /// A server root as a crash before an apply leaves it: a redaction is recorded, the ref write that
 /// let it apply landed, and the server stopped before applying it, so its bytes are still held. The
 /// killed server holds no lock, so nothing is cleared after it.
@@ -3480,9 +3495,7 @@ fn a_move_to_an_origin_withholding_leaned_on_content_reads_the_previous_origin()
     // A copy of the server's root whose host withholds the draft.
     let second_root = temp.join(format!("forklift-takedown-move-copy-{}", std::process::id()));
     let _ = forklift_core::util::file_utils::remove_dir_all(&second_root);
-    let copied = std::process::Command::new("cp").arg("-R").arg(&first_root).arg(&second_root).output().unwrap();
-    assert!(copied.status.success(), "{:?}", copied);
-    // The lock the first server holds is not the copy's: a kernel lock is not copied with its file.
+    copy_served_root(&first_root, &second_root);
     let added = withhold(&second_root, &["add", &draft, "--statement", statement]);
     assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
     let second = Server::serve(&second_root);
