@@ -5278,7 +5278,10 @@ mod tests {
             new_office: None,
             served: None,
             pallets: PalletsPrecondition::NotConsumed,
-            mode: office_utils::TrustReadMode::Checked,
+            // The fixtures move the office to its genesis before planting its anchor, where enroll
+            // moves both in the install: the checked read would take that born office for a lost
+            // anchor.
+            mode: office_utils::TrustReadMode::Adopt,
         }).map(|_| ())
     }
     /// The durable-taint machinery (module `taint_utils` in `forklift_core`) is activation-gated
