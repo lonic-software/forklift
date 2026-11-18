@@ -113,6 +113,19 @@ fn the_scan_finds_calls_and_skips_definitions() {
     assert_eq!(enclosing_fn(&lines, 2), "outer");
 }
 
+/// A test module's lines are skipped and the production code after it is not; a module in its own
+/// file skips nothing here.
+// Revert: skip from the first test module to the end of the file → `after` is marked.
+#[test]
+fn production_code_after_a_test_module_is_scanned() {
+    let lines = [
+        "fn before() {}", "#[cfg(test)]", "mod tests {", "    fn inside() {", "    }", "}",
+        "fn after() {}", "#[cfg(test)]", "mod elsewhere;", "fn last() {}",
+    ];
+    let marked = test_module_lines(&lines);
+    assert_eq!(marked, [false, true, true, true, true, true, false, false, false, false]);
+}
+
 /// Which of a file's lines belong to an inline test module (`#[cfg(test)]` over `mod name {`): from
 /// the attribute to the module's closing brace, the first line after it that is `}` at the left
 /// margin, as every top-level item here closes. A module in its own file (`mod name;`) marks
