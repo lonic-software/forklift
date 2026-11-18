@@ -368,7 +368,7 @@ pub fn judge(rows: &[Row], shape: &str, platform: Platform, gate: Gate, tickets:
         // A timed row compares Forklift with tuned git, and a gate-subject row is Forklift's alone:
         // a row missing a subject it needs was never compared, which is not a pass.
         let needs: &[Tool] = if gate_row(&row.operation) { &[Tool::Forklift] } else { &[Tool::Forklift, Tool::GitTuned] };
-        let missing = needs.iter().find(|tool| !cells.iter().any(|cell| cell.subject == **tool)).map(|tool| format!("it has no {} cell", tool.label()));
+        let missing = needs.iter().find(|tool| !cells.iter().any(|cell| cell.subject == **tool)).map(|tool| format!("it has no cell for {}", tool.label()));
         if let Some(detail) = unrun.or(missing).filter(|_| gated) {
             fail(row, Check::CouldNotRun, detail);
         }
@@ -2416,7 +2416,7 @@ mod tests {
         let forklift_only = Outcome::Timed { cells: cells[..1].to_vec() };
         let verdict = judged(&[unrun("status", forklift_only.clone()), unrun(REPACK, Outcome::Timed { cells: vec![] }), unrun("log", forklift_only)]);
         assert_eq!(failures(&verdict), [("status", Check::CouldNotRun), (REPACK, Check::CouldNotRun)]);
-        assert_eq!((verdict.failures[0].detail.as_str(), verdict.failures[1].detail.as_str()), ("it has no git-tuned cell", "it has no forklift cell"));
+        assert_eq!((verdict.failures[0].detail.as_str(), verdict.failures[1].detail.as_str()), ("it has no cell for git-tuned", "it has no cell for forklift"));
     }
 
     /// Under all, a clearly slower row with no ticket fails and one with a ticket for its
