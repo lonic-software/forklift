@@ -9,7 +9,8 @@ does not carry, so you can decide before you rely on it. The switch is not a tra
 As in the [tutorial](tutorial.md), each `$` line is a command and the lines under it are what it
 prints. A `…` stands for text that differs on your machine. The test suite runs this page
 (`crates/forklift/tests/integration/guide_pages.rs`), so it cannot drift from the CLI. You need
-`git` on your PATH.
+`git` on your PATH, one recent enough to have `git switch` and `git init -b`. The git lines show
+git with no configuration of its own, so on Windows the outputs differ (section 2 says how).
 
 ## 1. A git repository to start from
 
@@ -57,7 +58,7 @@ $ cd copy
 $ git branch
 * main
 $ git branch feature origin/feature
-branch 'feature' set up to track 'origin/feature'.
+… 'feature' set up to track …
 ```
 
 Tell Forklift who you are, make a warehouse in the same folder and import:
@@ -94,7 +95,9 @@ Git and Forklift now share the folder. `.forklift/` ignores itself, so git does 
 Forklift always ignores `.git`, so both read clean. Git rewrites some files as it checks them out: line endings under
 `core.autocrlf`, filters such as Git LFS. Such a file does not hold the content git stored, so the
 import warns, naming it, and `stocktake` shows it as modified. Load and stack it as it stands, or
-`forklift restore --confirm` it to write the stored content back. [The CLI
+`forklift restore --confirm` it to write the stored content back. Git for Windows converts line
+endings by default (`core.autocrlf=true`), so on Windows every text file of this clone reads as
+modified after the import, and the import warns about each one. [The CLI
 guide](cli.md#git-import--migrate-a-git-repository) says more.
 
 ## 3. Sign from here on
@@ -122,9 +125,10 @@ Pallet "main" verified: 0 signed parcel(s) valid, 1 legacy parcel(s) predate tru
 The import carries the history of every local branch and the tags on it:
 
 - every commit's tree, files, executable bits and symbolic links, its message, and its author's
-  and committer's email and date;
-- each local branch, as a pallet of the same name in lower case (characters a pallet name does not
-  allow become `-`);
+  and committer's email and time;
+- each local branch, as a pallet of the same name in lower case: characters a pallet name does not
+  allow become `-`, and a part that would then start with `-` gets `branch` in front (`@wip`
+  becomes `branch-wip`);
 - each annotated tag, with its tagger's email, its date and its message.
 
 It does not carry everything. Check this list against your repository before you rely on the
@@ -133,19 +137,24 @@ import:
 | Git has | After the import |
 |---------|------------------|
 | A person's name | Gone. Forklift records the email as the operator and keeps no names. |
+| A time's zone (`+0100`) | Gone. The time is kept as an instant, and `git export` writes it as `+0000`. |
 | A commit's GPG or SSH signature | Gone, and the import does not say so. The history is unsigned until you enroll. |
 | A tag's signature | Gone. The import says how many tags carried one. |
 | A commit message that is not UTF-8 (`i18n.commitEncoding`) | Changed: each byte that is not UTF-8 becomes `�`, and the import does not say so. |
 | A lightweight tag | A tag recorded by your operator, dated at the import. |
 | Branches that are not local (`origin/…`) | Not imported. Make a local branch for each first (section 2). |
-| Any other ref: notes, the stash, `refs/remotes`, replace refs | Not imported, and the import does not say so. |
+| Any other ref: notes, the stash, `refs/remotes` | Not imported, and the import does not say so. |
+| A replace ref (`git replace`) | Applied: the import reads the history as replaced, and does not say so. |
 | A tag that Forklift cannot name, on a tree or blob, or on a commit no local branch holds | Left out, named with the reason. |
 | A submodule | Skipped, with a warning. |
 | The commit ids | New ones. Every parcel has its own id, and a later `git export` writes new commit ids again. |
 
-A branch name that would become an invalid pallet name, or two branches that would become the same
-one (`Feature` and `feature`), stop the import before it starts, naming them. Rename them in git
-and import again.
+Some repositories stop the import with an error that names what to change in git. Before anything is
+imported, a branch name that would become an invalid pallet name, or two branches that would become
+the same one (`Feature` and `feature`), stop it. As the history is read, a file or directory name
+anywhere in it that is not UTF-8 or is more than one path component, or one that some file system
+opens as `.forklift`, stops it. Change what the error names, then import again into a fresh
+warehouse.
 
 ## 5. Habits that carry over, and the ones that do not
 
@@ -194,7 +203,8 @@ lifts the project, and admits a second person who clones it.
 
 Two parts of a move are not there yet, so plan around them:
 
-- **Running beside a live git repository.** The import runs once. Run it again and it refuses,
+- **Running beside a live git repository.** The import runs once. Run it again and it refuses:
+  once the office is enrolled, because the history it would bring is unsigned, and before that,
   because the branches it would create are already pallets. A team cannot keep importing a git
   repository that people still commit to. What works today is the other direction: make Forklift
   the place people commit, and let [`forklift git mirror`](cli.md#git-mirror--keep-a-git-remote-in-step)
@@ -204,6 +214,8 @@ Two parts of a move are not there yet, so plan around them:
 
 ## 7. If you want to go back
 
-[Leaving Forklift](leaving.md) exports a warehouse into a new git repository, including the pallets
-that are only on the server, and says which records git has nowhere to keep. The same history
-always exports to the same commits, so trying Forklift costs you nothing you cannot take back.
+[Leaving Forklift](leaving.md) exports a warehouse into a new git repository, after a step that
+brings down the pallets that are only on the server, and says which records git has nowhere to
+keep. The same history always exports to the same commits. The way back does not restore what the
+import left behind (section 4): names, time zones, signatures and the old commit ids. Keep the old
+git repository for as long as you might need those.

@@ -530,6 +530,22 @@ fn machine_folders(area: &Path, machine: &Option<String>) -> (PathBuf, PathBuf) 
 }
 
 impl Reader {
+    /// A reader of `page` in the run area `area`, starting on `machine` with its folder empty.
+    fn new(page: String, area: PathBuf, machine: Option<String>) -> Reader {
+        let (home, cwd) = machine_folders(&area, &machine);
+        Reader {
+            page,
+            area,
+            machine,
+            home,
+            cwd,
+            others: HashMap::new(),
+            bound: HashMap::new(),
+            address: None,
+            servers: Vec::new(),
+        }
+    }
+
     /// Make `machine` the current one, giving it an empty folder the first time.
     fn switch_to(&mut self, machine: Option<String>) {
         if machine == self.machine {
@@ -545,9 +561,14 @@ impl Reader {
 
     /// The reader's environment: none of the developer's forklift settings, debug switches or log
     /// filters, and none of their git configuration, which would change what a command prints.
-    /// Git reads only the machine's own global file, which starts empty.
+    /// Git reads only the machine's own global file, which starts empty, so a page shows git as it
+    /// behaves with no configuration: not as Git for Windows' own system file sets it up.
     fn environment(&self, command: &mut Command) {
-        for (key, _) in std::env::vars_os() {
+        let inherited: Vec<std::ffi::OsString> = std::env::vars_os()
+            .map(|(key, _)| key)
+            .chain(command.get_envs().map(|(key, _)| key.to_os_string()))
+            .collect();
+        for key in inherited {
             let key_text = key.to_string_lossy();
             if ["FORKLIFT_", "RUST_LOG", "GIT_"].iter().any(|prefix| key_text.starts_with(prefix)) {
                 command.env_remove(&key);
@@ -770,18 +791,7 @@ fn run_page(name: &str) {
 
     // The run starts on the first block's machine.
     let machine = steps.first().and_then(|step| step.machine.clone());
-    let (home, cwd) = machine_folders(&area, &machine);
-    let mut reader = Reader {
-        page: label.clone(),
-        area: area.clone(),
-        machine,
-        home,
-        cwd,
-        others: HashMap::new(),
-        bound: HashMap::new(),
-        address: None,
-        servers: Vec::new(),
-    };
+    let mut reader = Reader::new(label.clone(), area.clone(), machine);
 
     for step in &steps {
         reader.switch_to(step.machine.clone());
@@ -858,34 +868,40 @@ fn switching_runs_as_written() {
     run_page("switching.md");
 }
 
-/// A page's `git` sees no configuration but what the page itself set, whatever the developer's
-/// global and system files hold. Configuration passed in the environment (`GIT_CONFIG_COUNT` and
-/// its keys) is removed too, but this checks that only when the test's own environment carries it.
+/// A page's `git` sees no configuration but what the page itself set. The test plants one setting
+/// in each place git would otherwise read, so it fails wherever the isolation does, not only on a
+/// machine whose own git is configured: a system file, a global file in the home folder, and
+/// configuration passed in the environment.
 #[test]
 fn git_reads_none_of_the_developers_configuration() {
     let area = std::env::temp_dir().join(format!("forklift-git-config-{}", std::process::id()));
     let _ = forklift_core::util::file_utils::remove_dir_all(&area);
-    let (home, cwd) = machine_folders(&area, &None);
-    let mut reader = Reader {
-        page: "a page".to_string(),
-        area: area.clone(),
-        machine: None,
-        home,
-        cwd,
-        others: HashMap::new(),
-        bound: HashMap::new(),
-        address: None,
-        servers: Vec::new(),
-    };
-    let step = |command: &str| Step { line: 1, machine: None, command: command.to_string(), expected: Vec::new() };
+    std::fs::create_dir_all(&area).unwrap();
+    let mut reader = Reader::new("a page".to_string(), area.clone(), None);
 
-    let (status, output) = reader.run(&step("git config --list"));
-    assert_eq!((status, printed_lines(&output)), (Some(0), Vec::<String>::new()));
+    let planted = area.join("planted");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(planted.join("system"), "[planted]\n\tsystem = yes\n").unwrap();
+    std::fs::write(planted.join(".gitconfig"), "[planted]\n\tglobal = yes\n").unwrap();
+    let list = |reader: &Reader| {
+        let mut command = Command::new("git");
+        command
+            .args(["config", "--list"])
+            .env("HOME", &planted)
+            .env("XDG_CONFIG_HOME", &planted)
+            .env("GIT_CONFIG_SYSTEM", planted.join("system"))
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "planted.environment")
+            .env("GIT_CONFIG_VALUE_0", "yes");
+        let (status, output) = reader.capture(command);
+        (status, printed_lines(&output))
+    };
+    assert_eq!(list(&reader), (Some(0), Vec::<String>::new()));
 
     // The positive: what the page sets is seen.
+    let step = |command: &str| Step { line: 1, machine: None, command: command.to_string(), expected: Vec::new() };
     assert_eq!(reader.run(&step("git config --global user.name Ada")).0, Some(0));
-    let (status, output) = reader.run(&step("git config --list"));
-    assert_eq!((status, printed_lines(&output)), (Some(0), vec!["user.name=Ada".to_string()]));
+    assert_eq!(list(&reader), (Some(0), vec!["user.name=Ada".to_string()]));
 
     drop(reader);
     let _ = forklift_core::util::file_utils::remove_dir_all(&area);
