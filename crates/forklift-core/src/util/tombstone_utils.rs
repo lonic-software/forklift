@@ -779,9 +779,11 @@ pub(crate) mod tests {
 
         let _server = ServeLock::acquire().unwrap();
         let error = drop_tombstone("x").unwrap_err();
-        assert!(error.starts_with("Refusing to drop a tombstone"), "{}", error);
+        let (code, message, _) = crate::error::deframe(&error).expect("a coded refusal");
+        assert_eq!((code, message.starts_with("Refusing to drop a tombstone")), ("serve_locked", true), "{}", error);
         let error = drop_kept_head(&"b".repeat(64)).unwrap_err();
-        assert!(error.starts_with("Refusing to drop a kept head"), "{}", error);
+        let (code, message, _) = crate::error::deframe(&error).expect("a coded refusal");
+        assert_eq!((code, message.starts_with("Refusing to drop a kept head")), ("serve_locked", true), "{}", error);
         assert_eq!(read_tombstones().unwrap().heads().len(), 2, "nothing was dropped");
     }
 }

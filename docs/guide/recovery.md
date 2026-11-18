@@ -39,7 +39,7 @@ To throw away edits on purpose, `forklift restore` previews what it would discar
 
 ## Interrupted and locked
 
-### `warehouse_locked`, `store_locked`, `serve_locked` (exit 6)
+### `warehouse_locked` (exit 6), `store_locked` (exit 6), `serve_locked` (exit 6)
 
 Another forklift process that is still running holds a lock the command needs:
 

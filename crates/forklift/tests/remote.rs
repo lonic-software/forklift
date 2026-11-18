@@ -8751,8 +8751,8 @@ fn evict_refuses_while_the_root_is_served() {
     let before = forklift_dir_snapshot(&area, "cached");
 
     let refused = area.forklift("cached", &["store", "evict"]);
-    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
-    assert!(stderr(&refused).contains("being served"), "{}", stderr(&refused));
+    assert_eq!(refused.status.code(), Some(6), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("a server serving it"), "{}", stderr(&refused));
     assert!(forklift_dir_snapshot(&area, "cached") == before, "a refused evict changes nothing");
 
     drop(served);

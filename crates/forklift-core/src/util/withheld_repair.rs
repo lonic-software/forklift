@@ -517,7 +517,9 @@ mod tests {
         std::fs::write(record(), b"garbage").unwrap();
 
         let _serving = ServeLock::acquire().unwrap();
-        assert!(repair_withheld().unwrap_err().starts_with("Refusing to repair the record of withheld content"));
+        let error = repair_withheld().unwrap_err();
+        let (code, message, _) = crate::error::deframe(&error).expect("a coded refusal");
+        assert_eq!((code, message.starts_with("Refusing to repair the record of withheld content")), ("serve_locked", true), "{}", error);
         assert_eq!(std::fs::read(record()).unwrap(), b"garbage");
     }
 

@@ -11642,7 +11642,7 @@ pub(crate) mod tests {
 
         let served = lock_utils::ServeLock::acquire().expect("hold the serve lock, as a live server does");
         let error = compact(true, false, true, &Progress::NONE).expect_err("a repack must refuse while the root is served");
-        assert!(error.contains("being served"), "the refusal should say the root is served: {}", error);
+        assert!(crate::error::frames_code(&error, crate::error::RefusalCode::ServeLocked), "the refusal should say the root is served: {}", error);
         assert!(compact(false, false, false, &Progress::NONE).is_ok(), "incremental compaction runs beside a server");
         drop(served);
         assert!(compact(true, false, true, &Progress::NONE).is_ok(), "a repack runs once the root is no longer served");
