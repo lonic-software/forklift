@@ -796,6 +796,8 @@ pub fn read_bay_state_roots_in(dir: &Path) -> Result<BayStateRoots, String> {
 /// [`BayReadPolicy::Tolerate`] — names the bay and the in-tool cleanup route (`forklift bay
 /// remove`) a user can actually run, never a Rust path or internal identifier.
 fn degraded_bay_note(dir: &Path, error: &str) -> String {
+    // A refusal read there carries its frame; the note is plain prose.
+    let error = crate::error::CoreError::from(error.to_string()).to_string();
     if dir == forklift_root() {
         format!(
             "the current tree's own saved state could not be read this run ({}); it was treated \
@@ -889,6 +891,17 @@ pub fn current_bay_state() -> PathBuf {
 mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
+
+    /// A refusal read in another bay reaches a degraded note as prose: its message and its way out,
+    /// never the frame that carries its code.
+    #[test]
+    fn a_degraded_note_carries_a_refusal_as_prose() {
+        let refusal: String = crate::util::scope_utils::refusal(crate::error::RefusalCode::MergeStateDamaged, "The record is garbled.", "forklift abort").into();
+        let note = degraded_bay_note(Path::new("/elsewhere/bays/b"), &refusal);
+
+        assert!(note.contains("The record is garbled.") && note.contains("forklift abort"), "{}", note);
+        assert!(!note.contains('\u{1f}') && !note.contains("merge_state_damaged"), "{:?}", note);
+    }
 
     /// Pins that `collect_bay_scoped_parcel_roots` — the helper both
     /// `recovery_utils::collect_walk_roots` and `gc_utils::collect_live_set` call for their

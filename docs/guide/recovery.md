@@ -504,6 +504,28 @@ not reach it. A bay that recorded no folder was never checked out, since its `fo
 stopped first: remove it with `forklift bay remove`. A scope file written by a newer version of
 Forklift is not this refusal, and no heal writes over it.
 
+### `merge_state_damaged` (exit 68)
+
+The record a bay keeps of the consolidation or pick in progress there is not a file, is not text,
+is cut short or garbled, or does not match its digest, or a consolidation's skeleton is missing,
+so no command can tell what the merge was. Nothing was
+changed. Run the next step it names in that bay:
+
+- For the consolidation or pick state, `forklift abort --keep-files` abandons the merge without
+  reading the record. It removes the record and leaves every file as it is, the merge's own
+  writes and conflict markers included, in the working directory and the inventory. Resolve
+  what is still in conflict (`forklift conflicts` lists it), load it, and stack: the parcel is an
+  ordinary one, with no second parent. To have the merge again, consolidate or pick again after
+  putting the files back with `forklift restore`.
+- For a consolidation's skeleton, `forklift abort` abandons the consolidation and puts back what
+  it changed, as it always does; it does not need the skeleton.
+
+When the refusal names another bay, run that command in the bay it names: an abort here does not
+reach it. A record written by a newer version of Forklift is not this refusal; use the Forklift
+that wrote it. Nor is a record the filesystem fails to read (a permission or device error): it may
+be whole, so the refusal stays a plain read error. Fix the cause and run the command again, or, to
+give the merge up anyway, `forklift abort --keep-files` still removes it.
+
 ### `object_kind_mismatch` (exit 63)
 
 The remote refused to move the pallet because the new head's history names an object as a kind

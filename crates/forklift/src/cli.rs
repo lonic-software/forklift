@@ -232,12 +232,19 @@ pub enum Command {
                       of it is recorded. A change made since to a file the merge left alone is \
                       kept as it is, staged or not. A file the merge touched that was changed \
                       since (a resolution, loaded or not) holds work the merge cannot reproduce, \
-                      so the abort lists such files and changes nothing unless --confirm is given."
+                      so the abort lists such files and changes nothing unless --confirm is given. \
+                      With --keep-files it puts nothing back: it drops the record of the merge, \
+                      even one that cannot be read, and leaves every file as it is, so the next \
+                      stack records what the files hold as an ordinary parcel."
     )]
     Abort {
         /// Also discard the changes made since the merge to the files it touched
         #[arg(long)]
         confirm: bool,
+
+        /// Drop the record of the merge without reading it and leave every file as it is
+        #[arg(long, conflicts_with = "confirm")]
+        keep_files: bool,
     },
 
     /// Consolidate (merge) another pallet into the current one

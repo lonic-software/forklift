@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 53;
+pub const SCHEMA_VERSION: u32 = 54;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -627,6 +627,9 @@ error_codes! {
 
     /// A checkout's scope is missing, damaged or names no path; nothing was changed.
     CheckoutScopeDamaged,
+
+    /// A bay's record of the merge in progress there cannot be read; nothing was changed.
+    MergeStateDamaged,
 }
 
 impl ErrorCode {
@@ -699,6 +702,7 @@ impl ErrorCode {
             ErrorCode::ConfigDamaged => RefusalCode::ConfigDamaged.as_str(),
             ErrorCode::InventoryDamaged => RefusalCode::InventoryDamaged.as_str(),
             ErrorCode::CheckoutScopeDamaged => RefusalCode::CheckoutScopeDamaged.as_str(),
+            ErrorCode::MergeStateDamaged => RefusalCode::MergeStateDamaged.as_str(),
         }
     }
 
@@ -774,6 +778,7 @@ impl ErrorCode {
             ErrorCode::ConfigDamaged => 65,
             ErrorCode::InventoryDamaged => 66,
             ErrorCode::CheckoutScopeDamaged => 67,
+            ErrorCode::MergeStateDamaged => 68,
         }
     }
 
@@ -938,7 +943,9 @@ impl ErrorCode {
             ErrorCode::InventoryDamaged =>
                 "The inventory metadata, the set of directories with staged content, does not parse, it is missing while the staging area still holds shards, or a link or folder stands in its place (remove it first). Nothing was changed; heal rebuilds it from the directories the working tree, the bay's base and an interrupted operation name, and heal --inventory writes it even when some staged shard matches none of them",
             ErrorCode::CheckoutScopeDamaged =>
-                "A checkout's scope, the paths it holds, is missing, does not parse, or names no path where one is required. Nothing was changed; heal restores it from the copy beside it when run in that checkout, and otherwise names heal --scope for the paths the checkout held"
+                "A checkout's scope, the paths it holds, is missing, does not parse, or names no path where one is required. Nothing was changed; heal restores it from the copy beside it when run in that checkout, and otherwise names heal --scope for the paths the checkout held",
+            ErrorCode::MergeStateDamaged =>
+                "A bay's record of the consolidation or pick in progress there, its state file or a consolidation's out-of-scope skeleton, is not a file, is not text, is cut short or garbled, does not match its digest, or is missing beside a consolidation. Nothing was changed; abort --keep-files run in that bay drops a damaged state file and leaves every file as it is, and abort abandons a merge whose skeleton is damaged"
         }
     }
 
@@ -1012,6 +1019,7 @@ impl ErrorCode {
             RefusalCode::ConfigDamaged => ErrorCode::ConfigDamaged,
             RefusalCode::InventoryDamaged => ErrorCode::InventoryDamaged,
             RefusalCode::CheckoutScopeDamaged => ErrorCode::CheckoutScopeDamaged,
+            RefusalCode::MergeStateDamaged => ErrorCode::MergeStateDamaged,
         }
     }
 }
@@ -1672,6 +1680,7 @@ mod tests {
             (RefusalCode::ConfigDamaged, "config_damaged", 65),
             (RefusalCode::InventoryDamaged, "inventory_damaged", 66),
             (RefusalCode::CheckoutScopeDamaged, "checkout_scope_damaged", 67),
+            (RefusalCode::MergeStateDamaged, "merge_state_damaged", 68),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

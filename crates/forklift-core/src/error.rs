@@ -467,6 +467,17 @@ refusal_codes! {
     /// `heal` itself refuses this, no copy can be restored and the next step is empty: the message
     /// names `heal --scope` for the paths the checkout held.
     CheckoutScopeDamaged => "checkout_scope_damaged",
+
+    /// A bay's record of the consolidation or pick in progress there (its state file, or a
+    /// consolidation's out-of-scope skeleton) is damaged: something other than a file is at its
+    /// path, it is not text, it is cut short or garbled, it does not match its digest, or the
+    /// skeleton is missing beside a consolidation. A record a newer version wrote, or one the
+    /// filesystem fails to read, is not this.
+    /// Nothing was changed. In the bay the command runs in, the next step is `abort --keep-files`
+    /// for a damaged state file, which drops the record and leaves every file as it is, and
+    /// `abort` for a damaged skeleton, which the abort never reads. For another bay the next step
+    /// is empty, and the message names the bay to run it in.
+    MergeStateDamaged => "merge_state_damaged",
 }
 
 /// The codes of a host record that is lost or damaged, or of an object its store cannot read,

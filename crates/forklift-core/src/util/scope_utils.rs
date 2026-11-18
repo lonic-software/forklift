@@ -296,7 +296,7 @@ impl PathScope {
                 sparse checkouts left out the ignore files, so it cannot be read safely. {}",
                 remedy
             ),
-            RecordError::OtherVersion(ref header) => match header_version(header) {
+            RecordError::OtherVersion(ref header) => match record_utils::header_version(header, SCOPE_RECORD) {
                 Some(version) if version > SCOPE_VERSION => format!("{} Use the Forklift that wrote it.", e.describe()),
                 Some(4) => format!(
                     "{} An older version of Forklift wrote it, before scope files carried a digest. {}",
@@ -330,20 +330,6 @@ impl PathScope {
     }
 }
 
-/// Whether a scope header names a version newer than this build's. A header whose version cannot
-/// be read is not newer: no Forklift wrote it.
-fn is_newer_header(header: &str) -> bool {
-    header_version(header).is_some_and(|version| version > SCOPE_VERSION)
-}
-
-/// The version a scope file's header names, when it is written as Forklift writes one: the tag, one
-/// space, and a number without a leading zero. Any other header is damaged, whatever number it holds.
-fn header_version(header: &str) -> Option<u32> {
-    let digits = header.strip_prefix(&format!("/forklift-{} ", SCOPE_RECORD))?;
-    let plain = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) && (digits == "0" || !digits.starts_with('0'));
-
-    if plain { digits.parse().ok() } else { None }
-}
 
 /// A scope file as `heal` reads it: on its own, never against the warehouse's mode or another
 /// scope, so that each one can be judged whatever the others hold.
@@ -375,7 +361,7 @@ pub(crate) fn read_scope_raw(path: &Path) -> Result<RawScope, String> {
     };
 
     if let Err(error @ RecordError::OtherVersion(_)) = record_utils::from_bytes(&bytes, SCOPE_RECORD, SCOPE_VERSION) {
-        if matches!(&error, RecordError::OtherVersion(header) if is_newer_header(header)) {
+        if error.is_newer(SCOPE_RECORD, SCOPE_VERSION) {
             return Ok(RawScope::Newer(error.describe()));
         }
     }
@@ -709,6 +695,18 @@ fn checkout_scope_damaged(whose: &str, path: &Path, found: &str, checkout: &Chec
     refusal(RefusalCode::CheckoutScopeDamaged, message, next_step).into()
 }
 
+/// The main tree's folder, absolute where it can be made so: the folder a user runs a command in
+/// to reach the main tree's own state.
+pub(crate) fn main_tree_folder() -> PathBuf {
+    let main_tree = globals::forklift_root();
+    // Run from the main tree, the root is the relative ".forklift", whose parent is empty.
+    let main_tree = match main_tree.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    std::path::absolute(&main_tree).unwrap_or(main_tree)
+}
+
 /// What restores a checkout scope that is missing, damaged or names no path, from a checkout other
 /// than it: heal run there, named by its folder. A bay that recorded no folder, its `bay add`
 /// stopped before checking anything out, has no checkout to run it in, so it is removed instead.
@@ -717,16 +715,10 @@ fn checkout_scope_damaged(whose: &str, path: &Path, found: &str, checkout: &Chec
 /// * `bay` - The bay, or `None` for the warehouse's own working tree.
 pub(crate) fn heal_there(bay: Option<&str>) -> String {
     match bay {
-        None => {
-            let main_tree = globals::forklift_root();
-            // Run from the main tree, the root is the relative ".forklift", whose parent is empty.
-            let main_tree = match main_tree.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-                _ => PathBuf::from("."),
-            };
-            let main_tree = std::path::absolute(&main_tree).unwrap_or(main_tree);
-            format!("Run \"forklift heal\" in the main tree, \"{}\", which restores it from its copy.", main_tree.to_string_lossy())
-        }
+        None => format!(
+            "Run \"forklift heal\" in the main tree, \"{}\", which restores it from its copy.",
+            main_tree_folder().to_string_lossy()
+        ),
         Some(name) => match crate::util::bay_utils::read_bay_path(name) {
             Ok(Some(folder)) => format!(
                 "Run \"forklift heal\" in that bay, \"{}\", which restores it from its copy.", folder.to_string_lossy()

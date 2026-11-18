@@ -918,6 +918,36 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+### `Abandoned`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of `abort --keep-files`.",
+  "properties": {
+    "abandoned": {
+      "description": "The merges whose record was removed: `consolidation`, `pick`, or both when the bay held both.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "conflicts": {
+      "description": "How many files the inventory still holds in conflict, each left as it is: resolve and load\nthem before the next stack.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "abandoned",
+    "conflicts"
+  ],
+  "title": "Abandoned",
+  "type": "object"
+}
+```
+
 ## `consolidate`
 
 ### `ConsolidateReport`

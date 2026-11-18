@@ -612,7 +612,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   It refuses without `--confirm` (exit 39) where it would throw away what you changed since, such as a
   resolution. `undo` right after such a consolidate or pick now aborts it, where it used to drop the
   record of the merge and leave the files it wrote, conflict markers included. Removing `.forklift/consolidation` or `.forklift/cherry-pick` by
-  hand is no longer the way out, except where the abort cannot run, and those refusals say so.
+  hand is no longer the way out; where the abort cannot run, `abort --keep-files` is.
 - `forklift upgrade` and `forklift-server upgrade --root` upgrade a warehouse, with all its bays, to the
   format the build reads, and resume an upgrade that was interrupted. Both refuse while anything else has
   the warehouse open (exit 45). No format before the first is upgraded.
@@ -643,6 +643,14 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **A damaged record of a merge in progress is refused with a command that ends it.** A garbled,
+  cut or digest-mismatched consolidation or pick state file was refused in prose that said to
+  remove the file by hand. Every reader now refuses it with `merge_state_damaged` (exit 68,
+  `--json` schema 54) and names `forklift abort --keep-files`, a new form of `abort` that drops the
+  record without reading it and leaves every file as it is, so the next `stack` records them as
+  an ordinary parcel and `undo` reaches the operation before the merge. A damaged consolidation
+  skeleton names the plain `forklift abort`. The abort's own refusals, for a pallet that moved or
+  a source parcel it cannot read, name `abort --keep-files` too.
 - **A lost or damaged checkout scope is refused with a remedy, and `heal` restores it.** The scope
   file of a sparse warehouse's working tree or of a scoped bay, deleted or garbled, was refused with
   only a way out that discarded the checkout: clone again, or remove the bay and add it again.

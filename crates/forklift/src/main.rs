@@ -528,7 +528,7 @@ async fn dispatch(cli: Cli, store_access: &mut Option<lock_utils::StoreAccessLoc
         },
         Command::Conflicts => commands::conflicts::handle_command(),
         Command::Bay { action } => commands::bay::handle_command(action),
-        Command::Abort { confirm } => commands::merge_abort::handle_command(confirm).await,
+        Command::Abort { confirm, keep_files } => commands::merge_abort::handle_command(confirm, keep_files).await,
         Command::Consolidate { pallet } => commands::consolidate::handle_command(&pallet).await,
         Command::Pick { revision, message } => commands::pick::handle_command(&revision, message).await,
         Command::Deliver { target, message } => commands::deliver::handle_command(&target, message),

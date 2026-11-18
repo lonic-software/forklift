@@ -8630,7 +8630,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 53);
+    assert_eq!(value["schema"], 54);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -8672,7 +8672,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 53);
+    assert_eq!(value["schema"], 54);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -8731,7 +8731,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 53);
+    assert_eq!(value["schema"], 54);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -8939,7 +8939,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 53,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 54,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);
@@ -15486,7 +15486,7 @@ fn abort_works_with_the_skeleton_missing() {
     forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/consolidation-skeleton")).unwrap();
 
     let undo = warehouse.run(&["undo"]);
-    assert!(!undo.status.success() && stderr(&undo).contains("\"forklift abort\""),
+    assert!(!undo.status.success() && stderr(&undo).contains("Next step: forklift abort\n"),
         "the skeleton refusal names the abort: {}", stderr(&undo));
 
     assert_success(&warehouse.run(&["abort"]));
@@ -15550,6 +15550,91 @@ fn abort_puts_back_a_conflicted_pick() {
 
     let unstack = warehouse.run(&["undo"]);
     assert!(stdout(&unstack).contains("Undid stack") && stdout(&unstack).contains("(ours)"), "{}", stdout(&unstack));
+}
+
+/// A damaged record of the merge in progress — the consolidation's state file or the pick's — is
+/// refused `merge_state_damaged` (exit 68) by every command that reads it, with `abort
+/// --keep-files` as the next step: it drops the record without reading it, leaves every file and
+/// the inventory as they are, and pops the journal entry of the operation that started the merge,
+/// so `undo` reaches the stack before it. With no merge recorded it has nothing to drop.
+#[test]
+fn a_damaged_merge_record_is_refused_and_abort_keep_files_drops_it_keeping_every_file() {
+    for kind in ["consolidation", "pick"] {
+        let warehouse = a_conflicted_consolidation(&format!("damaged-{}", kind));
+        let state = match kind {
+            "consolidation" => ".forklift/consolidation",
+            _ => {
+                assert_success(&warehouse.run(&["abort"]));
+                let source = pallet_head_hash(&warehouse, "other");
+                assert_success(&warehouse.run(&["pick", &source]));
+                ".forklift/cherry-pick"
+            }
+        };
+        warehouse.write_file("f.txt", "resolved\n");
+        assert_success(&warehouse.run(&["load", "f.txt"]));
+        std::fs::write(warehouse.root.join(state), b"/forklift-garbled\n").unwrap();
+
+        for command in [&["stack", "-m", "resolved"][..], &["abort"], &["undo"]] {
+            let refused = warehouse.run(&[&["--json"][..], command].concat());
+            assert_eq!(refused.status.code(), Some(68), "{} {:?}: {}{}", kind, command, stdout(&refused), stderr(&refused));
+            let error = json(&refused)["error"].clone();
+            assert_eq!((error["code"].as_str(), error["next_step"].as_str()), (Some("merge_state_damaged"), Some("forklift abort --keep-files")),
+                "{} {:?}: {}", kind, command, error);
+        }
+
+        // An inventory it cannot count conflicts in refuses the abandon, changing nothing, rather
+        // than report none.
+        let metadata = warehouse.root.join(".forklift/inventory/metadata");
+        let intact = std::fs::read(&metadata).unwrap();
+        std::fs::write(&metadata, b"/forklift-garbled\n").unwrap();
+        let uncounted = warehouse.run(&["--json", "abort", "--keep-files"]);
+        assert_eq!(json(&uncounted)["error"]["code"].as_str(), Some("inventory_damaged"), "{}", stdout(&uncounted));
+        assert!(warehouse.root.join(state).exists(), "a refused abandon leaves the record");
+        std::fs::write(&metadata, intact).unwrap();
+
+        let abandoned = warehouse.run(&["--json", "abort", "--keep-files"]);
+        assert_success(&abandoned);
+        assert_eq!(json(&abandoned)["data"], serde_json::json!({"abandoned": [kind], "conflicts": 0}), "{}", stdout(&abandoned));
+        assert!(!warehouse.root.join(state).exists(), "{}: the record is gone", kind);
+        assert!(!warehouse.root.join(".forklift/consolidation-skeleton").exists(), "{}: no skeleton stays behind", kind);
+        assert_eq!(read(&warehouse, "f.txt"), "resolved\n", "{}: the file is left as it is", kind);
+        assert_eq!(staged_and_unstaged(&warehouse), (vec!["f.txt".to_string()], vec![]), "{}: the inventory is left as it is", kind);
+
+        let unstack = warehouse.run(&["undo"]);
+        assert!(stdout(&unstack).contains("Undid stack") && stdout(&unstack).contains("(ours)"),
+            "{}: the entry that started the merge went with it: {}{}", kind, stdout(&unstack), stderr(&unstack));
+
+        let nothing = warehouse.run(&["abort", "--keep-files"]);
+        assert_eq!(nothing.status.code(), Some(1), "{}", stderr(&nothing));
+        assert!(stderr(&nothing).contains("No consolidation or pick is in progress"), "{}", stderr(&nothing));
+    }
+}
+
+/// A consolidation whose skeleton is damaged is refused `merge_state_damaged` naming the plain
+/// abort, which puts back what the merge changed without reading the skeleton. `undo` reads the
+/// skeleton in every checkout (`stack` only in a scoped one).
+#[test]
+fn a_damaged_skeleton_is_refused_naming_the_abort() {
+    let warehouse = a_conflicted_consolidation("damaged-skeleton");
+    warehouse.write_file("f.txt", "resolved\n");
+    assert_success(&warehouse.run(&["load", "f.txt"]));
+    std::fs::write(warehouse.root.join(".forklift/consolidation-skeleton"), b"/forklift-garbled\n").unwrap();
+
+    let refused = warehouse.run(&["--json", "undo"]);
+    assert_eq!(refused.status.code(), Some(68), "{}{}", stdout(&refused), stderr(&refused));
+    let error = json(&refused)["error"].clone();
+    assert_eq!((error["code"].as_str(), error["next_step"].as_str()), (Some("merge_state_damaged"), Some("forklift abort")), "{}", error);
+
+    // The named step runs as it always does: the resolution is a change since the merge, so it asks
+    // first, naming its own next step, and never reads the skeleton.
+    let asked = warehouse.run(&["--json", "abort"]);
+    assert_eq!(asked.status.code(), Some(39), "{}{}", stdout(&asked), stderr(&asked));
+    let error = json(&asked)["error"].clone();
+    assert_eq!(error["code"].as_str(), Some("confirmation_required"), "{}", error);
+    assert!(error["next_step"].as_str().is_some_and(|step| step.contains("\"forklift abort --confirm\"")), "{}", error);
+
+    assert_success(&warehouse.run(&["abort", "--confirm"]));
+    assert_eq!(read(&warehouse, "f.txt"), "ours\n");
 }
 
 #[test]
