@@ -127,8 +127,8 @@ holds this warehouse's office; other commands name it as a way out where a remot
 Without one, restore the ref from a
 backup, or write the office pallet's head parcel hash into it by hand. Write the latest head you know
 of: an older one re-admits any key revoked since. If `office enroll` stopped before it wrote the office
-pallet, there is no ref to restore. Where no remote holds this anchor, move the trust file and its
-copy (`.forklift/trust-copy`) aside and run `forklift office enroll` again.
+pallet, there is no ref to restore. Where no remote holds this anchor, move the trust file (`.forklift/trust`) and
+its copy (`.forklift/trust-copy`) aside and run `forklift office enroll` again.
 
 ### `fetch_scope_damaged` (exit 54)
 

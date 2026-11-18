@@ -2321,7 +2321,11 @@ fn unchecked_remote() -> Option<bool> {
 pub fn office_unborn_refusal_over(closing: &str, lowerable: Option<bool>) -> String {
     let served = match crate::util::tombstone_utils::served_state() {
         Ok(state) => state != crate::util::tombstone_utils::ServedState::Never,
-        Err(unreadable) => return unreadable,
+        Err(unreadable) => return crate::error::append_to_message(unreadable, &format!(
+            "The office pallet is also unborn beside the trust file, and which remedy that takes turns on \
+            whether this warehouse is served. {}",
+            closing
+        )),
     };
     if served {
         return format!(
@@ -3825,6 +3829,7 @@ pub(crate) mod tests {
             let unreadable = office_unborn_refusal_over("Nothing was changed.", lowerable);
             assert!(crate::error::frames_code(&unreadable, RefusalCode::TombstonesDamaged), "{:?}: {}", lowerable, unreadable);
             assert!(!unreadable.contains("forklift lower") && !unreadable.contains("by hand"), "{:?}: {}", lowerable, unreadable);
+            assert!(unreadable.contains("office pallet is also unborn") && unreadable.contains("Nothing was changed."), "{:?}: {}", lowerable, unreadable);
         }
 
         crate::util::tombstone_utils::write_tombstones(&lock, &Default::default()).unwrap();
