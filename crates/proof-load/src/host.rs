@@ -315,6 +315,7 @@ impl Host {
                                 removed |= done;
                             }
                             Remedy::Command { arguments } => restarted.unextractable.push(format!("forklift {}", arguments.join(" "))),
+                            Remedy::Operator { arguments } => restarted.unextractable.push(format!("forklift-server {}", arguments.join(" "))),
                         }
                     }
                     for text in extracted.unextractable {
@@ -331,6 +332,33 @@ impl Host {
             }
         }
         Ok(restarted)
+    }
+}
+
+/// What the harness did as the remote's operator: the server command it ran, with the server
+/// stopped, and what starting the server again took.
+#[derive(Debug)]
+pub struct Operated {
+    pub outcome: crate::tool::Outcome,
+    pub restarted: Restarted,
+}
+
+impl Host {
+    /// Runs `arguments`, a command of the server's program over this warehouse, as its operator
+    /// does: the server stopped as [`Served::stop`] stops it, the command run in the scratch root,
+    /// then the server started again behind the same URL ([`Host::restart`]), even when the command
+    /// could not be run. A server that will not stop is an error, and the command is not run after it.
+    pub fn operate(&self, arguments: Vec<String>, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Operated, ToolError> {
+        let spawn = |reason: String| ToolError::Spawn { program: self.program.clone(), reason: format!("stopping the server for its operator's remedy: {}", reason) };
+        // Out of the slot first, as a kill takes it, so the stop never reads as a server that ended.
+        let served = lock(&self.server).take();
+        if let Some(served) = served {
+            served.stop(limit).map_err(spawn)?;
+        }
+        let invocation = tool::Invocation { program: self.program.clone(), arguments, directory: scratch.root().to_path_buf(), limit };
+        let outcome = tool::run(&invocation, scratch, environment);
+        let restarted = self.restart(scratch, environment, limit)?;
+        Ok(Operated { outcome: outcome?, restarted })
     }
 }
 

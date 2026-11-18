@@ -1,7 +1,14 @@
-//! Remedies a refusal names, extracted per subject in exactly two forms: a command of the subject's
-//! own program (`forklift …`, or `git …` for a git subject), quoted or standing as a whole text (a
-//! next_step that is nothing but the command), and a `remove "<path>"` instruction. Anything else
-//! is recorded as unextractable; the harness never guesses at a remedy.
+//! Remedies a refusal names, extracted per subject in exactly three forms: a command of the
+//! subject's own program (`forklift …`, or `git …` for a git subject), quoted or standing as a whole
+//! text (a next_step that is nothing but the command); for forklift, a command of its server's
+//! program (`forklift-server …`), the remote's operator's step, in the same two ways; and a
+//! `remove "<path>"` instruction. Anything else is recorded as unextractable; the harness never
+//! guesses at a remedy.
+//!
+//! A server command reaches a client with its warehouse as the `<warehouse>` placeholder, since a
+//! server names none of its own directories over the wire. Extraction keeps the placeholder, and the
+//! harness binds it ([`bind_operator`]) only where it serves that warehouse itself, so it holds the
+//! referent as the remote's operator does.
 //!
 //! The text comes from a client's JSON error (its message and next_step), for a restarted server
 //! from its stderr and its 503 bodies, and for git, which writes no JSON, from its stderr, one
@@ -18,6 +25,9 @@ pub enum Remedy {
     /// A command of the subject's own program, its arguments split on whitespace, without the
     /// leading program name.
     Command { arguments: Vec<String> },
+    /// A command of the subject's server program, the remote's operator's step, its arguments split
+    /// on whitespace without the leading program name, any `<warehouse>` still in place.
+    Operator { arguments: Vec<String> },
     /// Remove one file.
     Remove { path: PathBuf },
 }
@@ -68,33 +78,56 @@ fn program(tool: Tool) -> &'static str {
     }
 }
 
+/// The program name the subject's server's commands start with, followed by its space: only
+/// forklift has one.
+fn server_program(tool: Tool) -> Option<&'static str> {
+    match tool {
+        Tool::Forklift => Some("forklift-server "),
+        Tool::Git | Tool::GitTuned => None,
+    }
+}
+
+/// The placeholder a server command names its warehouse by when a client relays it.
+pub const WAREHOUSE: &str = "<warehouse>";
+
 /// Extracts the remedies `texts` name for a run of `tool`, in the order they appear: only commands
-/// of the subject's own program, so a git command a forklift refusal mentions is never run, nor
-/// the reverse.
+/// of the subject's own program and its server's, so a git command a forklift refusal mentions is
+/// never run, nor the reverse.
 pub fn extract(tool: Tool, texts: &[&str]) -> Extracted {
     let program = program(tool);
+    let server = server_program(tool);
     let mut extracted = Extracted { remedies: Vec::new(), unextractable: Vec::new() };
 
-    let command = |span: &str, extracted: &mut Extracted| {
-        let arguments: Vec<String> = span.trim_start_matches(program).split_whitespace().map(str::to_string).collect();
-        if arguments.is_empty() || arguments.iter().any(|argument| argument.contains('<') || argument.contains('{')) {
+    // `span` as a command of `program`, or of the server's when `operator`: a placeholder makes it
+    // unextractable, except a server command's `<warehouse>` as the value of its `--root`.
+    let command = |span: &str, operator: bool, extracted: &mut Extracted| {
+        let prefix = if operator { server.unwrap_or_default() } else { program };
+        let arguments: Vec<String> = span.trim_start_matches(prefix).split_whitespace().map(str::to_string).collect();
+        let templated = arguments.iter().enumerate().any(|(at, argument)| (argument.contains('<') || argument.contains('{'))
+            && !(operator && argument == WAREHOUSE && at > 0 && arguments[at - 1] == "--root"));
+        // `serve` is the server itself, which the operator's remedy stops and starts again around
+        // its command: never a step of it.
+        if arguments.is_empty() || templated || (operator && arguments.iter().any(|argument| argument == "serve")) {
             extracted.unextractable.push(span.to_string());
+        } else if operator {
+            extracted.remedies.push(Remedy::Operator { arguments });
         } else {
             extracted.remedies.push(Remedy::Command { arguments });
         }
     };
+    let kind = |span: &str| if span.starts_with(program) { Some(false) } else { server.filter(|server| span.starts_with(server)).map(|_| true) };
 
     for text in texts {
         // A whole text that is one command, as a next_step often is: its field delimits it the way
         // quotes delimit one inside prose.
         let whole = text.trim();
-        if whole.starts_with(program) && !whole.contains(['"', '`']) {
-            command(whole, &mut extracted);
+        if let Some(operator) = kind(whole).filter(|_| !whole.contains(['"', '`'])) {
+            command(whole, operator, &mut extracted);
             continue;
         }
         for (start, span) in quoted(text) {
-            if span.starts_with(program) {
-                command(span, &mut extracted);
+            if let Some(operator) = kind(span) {
+                command(span, operator, &mut extracted);
             } else if text[..start].to_ascii_lowercase().trim_end().ends_with("remove") && !span.is_empty() {
                 extracted.remedies.push(Remedy::Remove { path: PathBuf::from(span) });
             }
@@ -103,6 +136,23 @@ pub fn extract(tool: Tool, texts: &[&str]) -> Extracted {
 
     extracted.remedies.dedup();
     extracted
+}
+
+/// An operator remedy's arguments with its warehouse bound to `root`, the warehouse the harness
+/// serves: each `<warehouse>`, which extraction admits only as the value of `--root`. None when it
+/// names no warehouse at all, since a server command with no root would act on whatever the
+/// harness's own folder holds. None too where the harness cannot stop a server as its operator
+/// does ([`crate::tool::Served::stop`], Unix only): the step is then not run, never run over a
+/// server killed hard.
+pub fn bind_operator(arguments: &[String], root: &Path) -> Option<Vec<String>> {
+    bind_operator_when(arguments, root, cfg!(unix))
+}
+
+/// [`bind_operator`] with whether a server can be stopped gracefully given, so both arms are tested
+/// on every platform.
+fn bind_operator_when(arguments: &[String], root: &Path, stoppable: bool) -> Option<Vec<String>> {
+    (stoppable && arguments.iter().any(|argument| argument == WAREHOUSE))
+        .then(|| arguments.iter().map(|argument| if argument == WAREHOUSE { root.display().to_string() } else { argument.clone() }).collect())
 }
 
 /// The path the harness may remove for a remove remedy, if any: only one inside one of the run's
@@ -156,7 +206,7 @@ pub fn removable_under(path: &Path, run_root: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// The two forms, as Forklift writes them, extracted in order.
+    /// The client's own two forms, as Forklift writes them, extracted in order.
     ///
     /// Revert: drop the backtick quote → the second command is lost; drop the `remove` form → the
     /// lock path is lost.
@@ -211,6 +261,43 @@ mod tests {
         // Forklift's remedies are its failure document's alone, never its stderr.
         let stray = Outcome { stderr: b"forklift heal".to_vec(), ..outcome };
         assert!(super::texts(Tool::Forklift, &stray).is_empty());
+    }
+
+    /// The client's relay of a server's 503 names the operator's repair with its warehouse as a
+    /// placeholder: extracted as an operator remedy with the placeholder kept, the only one that
+    /// survives extraction. Any other placeholder, or `<warehouse>` anywhere but as `--root`'s
+    /// value, is unextractable; a git subject never extracts a server command.
+    ///
+    /// Revert: admit any placeholder in an operator command → `withhold add … <hash>` would be run;
+    /// drop the `--root` position check → `<warehouse>` as a positional argument would be bound;
+    /// admit `serve` → the server would be run as a command that never exits.
+    #[test]
+    fn an_operator_remedy_keeps_only_its_warehouse_placeholder() {
+        let relayed = "Ask the remote's operator to repair it where the warehouse is served from (\"forklift-server tombstone repair --root <warehouse>\"); nothing here can.";
+        let extracted = extract(Tool::Forklift, &[relayed]);
+        assert_eq!(extracted.remedies, vec![Remedy::Operator { arguments: vec!["tombstone".into(), "repair".into(), "--root".into(), "<warehouse>".into()] }]);
+        assert!(extracted.unextractable.is_empty());
+        assert_eq!(extract(Tool::Forklift, &["forklift-server withhold repair --root <warehouse>"]).remedies,
+            vec![Remedy::Operator { arguments: vec!["withhold".into(), "repair".into(), "--root".into(), "<warehouse>".into()] }]);
+        for templated in ["forklift-server withhold add --root <warehouse> <hash> --statement <statement>", "forklift-server tombstone repair <warehouse>", "forklift-server tombstone repair --root <root>", "forklift-server serve --root <warehouse>", "forklift-server --root <warehouse> serve"] {
+            let extracted = extract(Tool::Forklift, &[templated]);
+            assert!(extracted.remedies.is_empty(), "{}", templated);
+            assert_eq!(extracted.unextractable, vec![templated]);
+        }
+        assert!(extract(Tool::Git, &[relayed]).remedies.is_empty());
+        assert!(extract(Tool::GitTuned, &["forklift-server tombstone repair --root <warehouse>"]).remedies.is_empty());
+    }
+
+    /// Revert: bind a remedy with no placeholder → a server command over no named warehouse would
+    /// run; ignore whether the server can be stopped → off Unix the step would fail the lane.
+    #[test]
+    fn an_operator_remedy_binds_only_its_warehouse() {
+        let arguments: Vec<String> = ["tombstone", "repair", "--root", WAREHOUSE].map(String::from).to_vec();
+        assert_eq!(bind_operator_when(&arguments, Path::new("/s/0001-lane/host"), true),
+            Some(["tombstone", "repair", "--root", "/s/0001-lane/host"].map(String::from).to_vec()));
+        assert_eq!(bind_operator_when(&["tombstone".to_string(), "repair".to_string()], Path::new("/s/host"), true), None);
+        assert_eq!(bind_operator_when(&arguments, Path::new("/s/host"), false), None, "a server that cannot be asked to stop is not operated on");
+        assert_eq!(bind_operator(&arguments, Path::new("/s/host")), bind_operator_when(&arguments, Path::new("/s/host"), cfg!(unix)), "only Unix can ask a server to stop");
     }
 
     /// A quoted path that no `remove` precedes is not a remedy.

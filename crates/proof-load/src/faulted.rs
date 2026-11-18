@@ -18,6 +18,7 @@ use crate::remedy::{self, Remedy};
 use crate::runner::{self, RunError, Taken, TakenBy};
 use crate::scenario::{bind, Mark, Op, Scenario, Tool};
 use crate::scrub::{Environment, Scratch};
+use crate::host::Host;
 use crate::tool::{self, Invocation, Outcome};
 
 /// The programs a faulted run drives, each by absolute path.
@@ -217,6 +218,9 @@ pub(crate) struct Context<'a> {
     pub(crate) then: &'a [Op],
     /// The host's URL, when the scenario serves one.
     pub(crate) url: Option<&'a str>,
+    /// The host serving at that URL, when the harness serves it itself: the warehouse a refusal's
+    /// operator remedy is run against, the harness acting as the remote's operator.
+    pub(crate) host: Option<&'a Host>,
     /// The folder the work tree is scoped to, when a sparse clone left it scoped.
     pub(crate) scope: Option<&'a str>,
     /// Read the history back through a fresh clone of the host rather than from the work tree:
@@ -1314,15 +1318,9 @@ pub(crate) fn grade_after(
         let named = |(trail, unextractable): &mut (Trail, Vec<String>)| {
             let texts: Vec<String> = trail.steps.iter().chain(trail.readbacks.iter().flat_map(|readback| std::iter::once(&readback.export).chain(&readback.reads)))
                 .flat_map(|outcome| remedy::texts(context.tool, outcome)).collect();
-            let extracted = remedy::extract(context.tool, &texts.iter().map(String::as_str).collect::<Vec<_>>());
-            for text in extracted.unextractable {
-                if !unextractable.contains(&text) {
-                    unextractable.push(text);
-                }
-            }
-            extracted.remedies
+            named_remedies(context.tool, context.host, &texts, unextractable)
         };
-        let run = |(trail, _): &mut (Trail, Vec<String>), fresh: &[Remedy]| -> Result<bool, RunError> {
+        let run = |(trail, unextractable): &mut (Trail, Vec<String>), fresh: &[Remedy]| -> Result<bool, RunError> {
             trail.evidence.remedy_named = true;
             for named in fresh {
                 match named {
@@ -1334,6 +1332,7 @@ pub(crate) fn grade_after(
                         trail.steps.push(context.run(context.program(), context.subject(arguments), context.scratch.work())?);
                     }
                     Remedy::Remove { path } => trail.recoverability.outside_knowledge.push(remedy::remove(path, &context.scratch.roots()).0),
+                    Remedy::Operator { arguments } => operate(context, arguments, trail, unextractable)?,
                 }
             }
             let reads = retry(trail, &mut resume, &mut made)?;
@@ -1357,6 +1356,86 @@ pub(crate) fn grade_after(
         grade: oracle::grade(&trail.evidence), evidence: trail.evidence, recoverability: trail.recoverability,
         steps: trail.steps, readbacks: trail.readbacks, probes: trail.probes, unextractable,
     })
+}
+
+/// The remedies `texts` name for a run of `tool`, what cannot be extracted recorded once each in
+/// `unextractable`, and so is every operator remedy the harness cannot carry out without `host`,
+/// the warehouse it serves: a remedy the harness will not run is never a remedy named, so it
+/// makes no retry and claims no remedy worked.
+fn named_remedies(tool: Tool, host: Option<&Host>, texts: &[String], unextractable: &mut Vec<String>) -> Vec<Remedy> {
+    let extracted = remedy::extract(tool, &texts.iter().map(String::as_str).collect::<Vec<_>>());
+    let mut record = |text: String| {
+        if !unextractable.contains(&text) {
+            unextractable.push(text);
+        }
+    };
+    let mut remedies = Vec::new();
+    for named in extracted.remedies {
+        match &named {
+            Remedy::Operator { arguments } if bound(host, arguments).is_none() => record(format!("forklift-server {}", arguments.join(" "))),
+            _ => remedies.push(named),
+        }
+    }
+    extracted.unextractable.into_iter().for_each(record);
+    remedies
+}
+
+/// The host an operator remedy runs on and its arguments bound there: only where the harness
+/// serves the warehouse itself ([`remedy::bind_operator`]).
+fn bound<'a>(host: Option<&'a Host>, arguments: &[String]) -> Option<(&'a Host, Vec<String>)> {
+    host.and_then(|host| Some((host, remedy::bind_operator(arguments, host.root())?)))
+}
+
+/// Carries out an operator remedy, `arguments` of the server's program, as the remote's operator:
+/// on the warehouse the harness serves, its `<warehouse>` bound to that host's root, with the
+/// server stopped and started again ([`Host::operate`]). The command's outcome is a step; each
+/// part of it, none of which the subject's user can take, is outside knowledge, in the order it
+/// was taken, what starting again took included. [`named_remedies`] has already set aside any remedy
+/// the harness cannot carry out; one reaching here regardless is recorded as unextractable.
+fn operate(context: &Context, arguments: &[String], trail: &mut Trail, unextractable: &mut Vec<String>) -> Result<(), RunError> {
+    let written = format!("forklift-server {}", arguments.join(" "));
+    let Some((host, bound)) = bound(context.host, arguments) else {
+        if !unextractable.contains(&written) {
+            unextractable.push(written);
+        }
+        return Ok(());
+    };
+    let operated = host.operate(bound.clone(), context.scratch, context.environment, context.limit).map_err(RunError::Tool)?;
+    let knowledge = &mut trail.recoverability.outside_knowledge;
+    knowledge.push("as the remote's operator, on the host: stop the server".to_string());
+    knowledge.push(format!("as the remote's operator, on the host: forklift-server {}", bound.join(" ")));
+    knowledge.extend(operated.restarted.outside_knowledge);
+    knowledge.push("as the remote's operator, on the host: start the server again".to_string());
+    for text in operated.restarted.unextractable.into_iter().chain(operated.restarted.refused.map(|said| format!("the restarted server refused: {}", said))) {
+        if !unextractable.contains(&text) {
+            unextractable.push(text);
+        }
+    }
+    for text in follow_ups(context.tool, &written, &operated.outcome) {
+        if !unextractable.contains(&text) {
+            unextractable.push(text);
+        }
+    }
+    trail.steps.push(operated.outcome);
+    Ok(())
+}
+
+/// What an operator command's report, `written` as extracted, names next, each recorded as
+/// unextractable in the order the report names it: a server command writes no failure document,
+/// so nothing in its report is run. It is the operator's own follow-up, kept so the trail says
+/// what the remedy left owed.
+fn follow_ups(tool: Tool, written: &str, outcome: &Outcome) -> Vec<String> {
+    [&outcome.stdout, &outcome.stderr].into_iter()
+        .flat_map(|text| String::from_utf8_lossy(text).lines().map(str::to_string).collect::<Vec<_>>())
+        .flat_map(|line| {
+            let named = remedy::extract(tool, &[line.as_str()]);
+            named.remedies.iter().map(|named| match named {
+                Remedy::Command { arguments } => format!("forklift {}", arguments.join(" ")),
+                Remedy::Operator { arguments } => format!("forklift-server {}", arguments.join(" ")),
+                Remedy::Remove { path } => format!("remove {}", path.display()),
+            }).chain(named.unextractable).collect::<Vec<_>>()
+        })
+        .map(|text| format!("named by {}: {}", written, text)).collect()
 }
 
 /// The subject's own remedy set, run in order until one rescues: for forklift `heal`, then
@@ -1492,7 +1571,7 @@ pub fn run(scenario: &Scenario, name: &str, warehouse: Warehouse, kind: Kind, to
 
     let (expected, faulted) = expected(scenario, corpus, &built, warehouse)?;
     let context = Context {
-        tool, corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.url(),
+        tool, corpus, programs, scratch, environment, limit, then: &scenario.then, url: built.url(), host: built.host.as_ref(),
         scope: scenario.scope(), via_host: warehouse == Warehouse::Host, history: None,
     };
     let graded = grade_after(&context, &expected, faulted, |context, steps| context.record(faulted, steps).map(drop))?;
@@ -1549,7 +1628,7 @@ fn lay_out_subject(pristine: &Path, scratch: &Scratch) -> Result<(), RunError> {
 
 /// The context of a faulted run over a history subject in `scratch`.
 fn history_context<'a>(tool: Tool, corpus: &'a Corpus, programs: &'a Programs, scratch: &'a Scratch, environment: &'a Environment, limit: Duration, positions: &'a [Position]) -> Context<'a> {
-    Context { tool, corpus, programs, scratch, environment, limit, then: &[], url: None, scope: None, via_host: false, history: Some(positions) }
+    Context { tool, corpus, programs, scratch, environment, limit, then: &[], url: None, host: None, scope: None, via_host: false, history: Some(positions) }
 }
 
 /// The unfaulted readback of `tool`'s pristine subject, copied into `scratch`: every position and
@@ -1790,7 +1869,7 @@ mod tests {
             let (expected, _) = expected(&scenario, &corpus, &built, Warehouse::Client).unwrap();
             let context = Context {
                 tool: Tool::Git, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
-                limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false, history: None,
+                limit: Duration::from_secs(60), then: &[], url: None, host: None, scope: None, via_host: false, history: None,
             };
             let readback = context.read_back(&scratch.work(), &expected.acknowledged, &expected.acknowledged, |mark| expected.of(&corpus, mark, false)).unwrap();
             assert!(readback.export.succeeded(), "damaged {}: the log ran", damaged);
@@ -1923,7 +2002,7 @@ mod tests {
         for (tool, prefix) in [(Tool::GitTuned, crate::scenario::GIT_TUNED), (Tool::Git, &[][..]), (Tool::Forklift, &[][..])] {
             let context = Context {
                 tool, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
-                limit: Duration::from_secs(1), then: &[], url: None, scope: None, via_host: false, history: None,
+                limit: Duration::from_secs(1), then: &[], url: None, host: None, scope: None, via_host: false, history: None,
             };
             let expected: Vec<String> = prefix.iter().map(|argument| argument.to_string()).chain(["fsck".to_string()]).collect();
             assert_eq!(context.subject(vec!["fsck".to_string()]), expected, "{:?}", tool);
@@ -1956,7 +2035,7 @@ mod tests {
         let built = runner::build(&scenario, &corpus, tool, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
         let context = Context {
             tool, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
-            limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false, history: None,
+            limit: Duration::from_secs(60), then: &[], url: None, host: None, scope: None, via_host: false, history: None,
         };
         let head = |reference: &str| String::from_utf8_lossy(&context.run(&git, vec!["rev-parse".into(), reference.into()], scratch.work()).unwrap().stdout).trim().to_string();
         let (main, first) = (head("refs/heads/main"), head("refs/heads/main~1"));
@@ -2002,7 +2081,7 @@ mod tests {
         let built = runner::build(&scenario, &corpus, Tool::Git, &git, None, &scratch, &environment, Duration::from_secs(60), None).unwrap();
         let context = Context {
             tool: Tool::Git, corpus: &corpus, programs: &programs, scratch: &scratch, environment: &environment,
-            limit: Duration::from_secs(60), then: &[], url: None, scope: None, via_host: false, history: None,
+            limit: Duration::from_secs(60), then: &[], url: None, host: None, scope: None, via_host: false, history: None,
         };
         let git_run = |arguments: &[&str]| context.run(&git, arguments.iter().map(|argument| argument.to_string()).collect(), scratch.work()).unwrap();
         let head = |reference: &str| String::from_utf8_lossy(&git_run(&["rev-parse", reference]).stdout).trim().to_string();
@@ -2377,6 +2456,35 @@ mod tests {
         Outcome { arguments: vec![], exit, stdout: vec![], stderr: vec![], failure }
     }
 
+    /// An operator remedy is named only where the harness serves the warehouse it names; without a
+    /// host it is unextractable, beside the client's own remedy, which is still named.
+    ///
+    /// Revert: keep an operator remedy with no host → it is named, so a retry runs and claims it
+    /// worked though nothing ran.
+    #[test]
+    fn an_operator_remedy_without_its_host_is_not_named() {
+        let texts = ["Ask the remote's operator to repair it where the warehouse is served from (\"forklift-server tombstone repair --root <warehouse>\"); nothing here can.".to_string(), "forklift heal".to_string()];
+        let mut unextractable = Vec::new();
+        assert_eq!(named_remedies(Tool::Forklift, None, &texts, &mut unextractable), [Remedy::Command { arguments: vec!["heal".into()] }]);
+        assert_eq!(unextractable, ["forklift-server tombstone repair --root <warehouse>"]);
+    }
+
+    /// An operator command's report is never run from: whatever it names next, runnable or not, is
+    /// kept as unextractable, labelled with the remedy that named it.
+    ///
+    /// Revert: run what it names → the runnable `forklift heal` leaves the list; drop the
+    /// unextractable ones → the `withhold add` the operator owes is lost from the trail.
+    #[test]
+    fn what_an_operator_report_names_next_is_recorded_not_run() {
+        let stdout = b"Kept 0 entries of the old record.\n1 file is absent. Withhold each one that was with \"forklift-server withhold add --root /s/host <hash> --statement <statement>\":\n  699c\nThen run \"forklift heal\" in each clone.\n".to_vec();
+        let outcome = Outcome { arguments: vec![], exit: Some(0), stdout, stderr: vec![], failure: None };
+        assert_eq!(follow_ups(Tool::Forklift, "forklift-server withhold repair --root <warehouse>", &outcome), [
+            "named by forklift-server withhold repair --root <warehouse>: forklift-server withhold add --root /s/host <hash> --statement <statement>",
+            "named by forklift-server withhold repair --root <warehouse>: forklift heal",
+        ], "in the order the report names them");
+        assert!(follow_ups(Tool::Forklift, "x", &Outcome { stdout: b"Repaired.\n".to_vec(), ..outcome }).is_empty());
+    }
+
     /// A served record counts as acknowledged only after an answer that asks nothing further: success, or
     /// a refusal naming no remedy. A kill is no answer, and a refusal naming a remedy sends the user
     /// through it first.
@@ -2398,6 +2506,8 @@ mod tests {
         crashed.failure = None;
         assert!(!answered(Some(&crashed)), "a crash with no failure document is no answer");
         assert!(!answered(Some(&answer(Some(1), "Stuck.", Some("forklift load -- <path>")))), "an unreadable remedy is no answer");
+        let relayed = answer(Some(55), "The remote refused the handshake (503).", Some("Ask the remote's operator to repair it where the warehouse is served from (\"forklift-server tombstone repair --root <warehouse>\"); nothing here can."));
+        assert!(!answered(Some(&relayed)), "the operator's remedy is a remedy, so the refusal is no answer");
         let nothing = answer(Some(1), "Nothing to stack.", None);
         assert!(settles(true, Some(&nothing)));
         assert!(!settles(false, Some(&nothing)), "the faulted command's own answer is no retry");
