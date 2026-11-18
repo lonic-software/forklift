@@ -624,9 +624,12 @@ enum Side {
     Forked,
 }
 
+/// Whether a pair can be timed, or why not.
+type Comparable = Result<(), String>;
+
 /// Whether switching to [`SIDE_BRANCH`] changes anything in every subject, and whether merging it
 /// joins two lines of history in every subject, as each tool reads its own history, or why not.
-fn sides(subjects: &[Subject], scratch: &Scratch, environment: &Environment) -> Result<(Result<(), String>, Result<(), String>), Stopped> {
+fn sides(subjects: &[Subject], scratch: &Scratch, environment: &Environment) -> Result<(Comparable, Comparable), Stopped> {
     let (mut switch, mut merge) = (Vec::new(), Vec::new());
     for subject in subjects {
         let label = subject.tool.label();
