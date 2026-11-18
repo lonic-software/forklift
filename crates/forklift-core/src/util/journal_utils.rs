@@ -16,16 +16,13 @@ use crate::util::file_utils;
 /// concern, not the journal's.
 const FILE_NAME_JOURNAL: &str = "journal.json";
 
-/// The journal file's format version. The file is `{"version":5,"entries":[...]}`; any other
+/// The journal file's format version. The file is `{"version":4,"entries":[...]}`; any other
 /// version, or anything that does not parse as this shape, is refused by name — never read as
 /// an empty journal, which would make `undo` report "nothing to undo" over a history it lost.
 ///
 /// Version 4 embeds the digested out-of-scope skeleton record, so an older journal's in-progress
 /// consolidation would not read: it is refused as another version, never as damage.
-///
-/// Version 5 goes with the consolidation state that records its skeleton's digest: an undo
-/// writes the journaled skeleton back with the digest of exactly its bytes.
-const JOURNAL_VERSION: u64 = 5;
+const JOURNAL_VERSION: u64 = 4;
 
 /// The op name a pallet delete is journaled under. Its entry records the removed ref with its head
 /// before and none after; the removal writes it itself (see
@@ -1824,7 +1821,7 @@ mod tests {
         write(&[entry("stack", "main", &hash('1'), &hash('2'))]).unwrap();
 
         let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path()).unwrap()).unwrap();
-        assert_eq!(value["version"], 5);
+        assert_eq!(value["version"], 4);
         assert_eq!(value["entries"][0]["op"], "stack");
         assert_eq!(value["entries"][0]["before"]["heads"]["main"], hash('1'));
         assert_eq!(value["entries"][0]["after"]["heads"]["main"], hash('2'));
@@ -1854,9 +1851,7 @@ mod tests {
         // Version 1 is the format before consolidations and picks recorded their base.
         assert_refused_everywhere(r#"{"version":1,"entries":[]}"#, "has format version 1");
         assert_refused_everywhere(r#"{"version":3,"entries":[]}"#, "has format version 3");
-        // Version 4 is the format before a consolidation recorded its skeleton's digest.
-        assert_refused_everywhere(r#"{"version":4,"entries":[]}"#, "has format version 4");
-        assert_refused_everywhere(r#"{"version":6,"entries":[]}"#, "has format version 6");
+        assert_refused_everywhere(r#"{"version":5,"entries":[]}"#, "has format version 5");
         assert_refused_everywhere(r#"{"version":"1","entries":[]}"#, "has an unreadable format version (\"1\")");
     }
 
@@ -1874,7 +1869,7 @@ mod tests {
         let _scratch = Scratch::new("no-after-journal");
 
         let content = format!(
-            r#"{{"version":5,"entries":[{{"op":"stack","before":{{"current_pallet":"main","heads":{{"main":"{}"}},"consolidation":null}}}}]}}"#,
+            r#"{{"version":4,"entries":[{{"op":"stack","before":{{"current_pallet":"main","heads":{{"main":"{}"}},"consolidation":null}}}}]}}"#,
             hash('1')
         );
 

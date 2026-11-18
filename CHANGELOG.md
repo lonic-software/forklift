@@ -652,12 +652,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   once no copy can be used. Under an interrupted merge or pick, heal removes a record no copy can
   restore, since finishing that operation drops it anyway. A consolidation records its skeleton's
   digest, so a skeleton left by another merge is refused as damaged. The consolidation state's
-  format and the undo journal's format change: a merge in progress, or undo history, written by an
-  older Forklift is refused.
-- **A merge no longer starts over one in progress.** `haul consolidate`, and the merge a `lift` or
-  `lower` makes, refuse while a consolidation or pick is in progress in the bay; `haul consolidate`
-  over a conflicted consolidation whose files were resolved used to write a second merge's record
-  over the first one's.
+  format changes: a merge in progress written by an older Forklift is refused.
+- **A merge no longer starts over one in progress.** `haul consolidate`, and the merge a `lower`
+  makes, refuse while a consolidation or pick is in progress in the bay, and a `lift` there makes
+  no merge of its own and stops as diverged; `haul consolidate` over a conflicted consolidation
+  whose files were resolved used to write a second merge's record over the first one's.
 - **A damaged record of a merge in progress is refused with a command that ends it.** A garbled,
   cut or digest-mismatched consolidation or pick state file was refused in prose that said to
   remove the file by hand. Every reader now refuses it with `merge_state_damaged` (exit 68,
