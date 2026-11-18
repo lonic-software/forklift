@@ -2175,7 +2175,7 @@ fn bundled(area: &Area, name: &str, answer: BatchResult, requested: &[String]) -
 
     prepare(area, name);
     let _scope = StorageRootScope::enter(&area.path(name));
-    let admission = bundle_utils::StreamAdmission::Requested(requested.iter().cloned().collect());
+    let admission: std::collections::HashSet<String> = requested.iter().cloned().collect();
     bundle_utils::import_streamed_bundle(&bundle[..], admission).expect("the bundle imports");
 
     requested.iter().filter(|hash| file_utils::does_object_exist(hash).expect("presence")).cloned().collect()

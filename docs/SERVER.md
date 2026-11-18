@@ -342,7 +342,7 @@ revocation by more than about a day.
   file's content on the host's own authority, as for a legal takedown, and `forklift-server
   withhold list --root …` shows what is withheld. It takes effect at once, while the root is
   served: a read or upload of the content's bytes by its hash is answered with `451`
-  (`content_withheld`) and the statement, a batch or subtree fetch leaves it out, the latest bundle is taken down and every bundle built
+  (`content_withheld`) and the statement, a batch fetch leaves it out, the latest bundle is taken down and every bundle built
   after leaves the content out. Pallets keep naming the file, and a lift may name it without
   the server ever holding it: nothing asks for its bytes, and the ref write tolerates their
   absence, as when the file is moved or copied. For a chunked file whose chunk list the server

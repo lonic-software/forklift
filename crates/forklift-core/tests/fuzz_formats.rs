@@ -630,7 +630,7 @@ mod regressions {
         assert!(err.is_err(), "a huge field length must be an error, not a panic");
     }
 
-    /// A batch or subtree response arrives from an untrusted remote, and its records carry an
+    /// A batch response arrives from an untrusted remote, and its records carry an
     /// 8-byte length prefix. A record that declares a `u64::MAX` length used to
     /// `vec![0u8; length]` before reading — a one-record denial of service (capacity-overflow
     /// panic / allocator abort). This is the most exposed of the length bugs, so it is pinned
@@ -655,8 +655,8 @@ mod regressions {
         record.extend(b"only a few real bytes");
         raw.extend(zstd::encode_all(&record[..], 3).unwrap());
 
-        use forklift_core::util::bundle_utils::{import_streamed_bundle, StreamAdmission};
-        let admission = StreamAdmission::Requested(std::collections::HashSet::from(["a".repeat(64)]));
+        use forklift_core::util::bundle_utils::import_streamed_bundle;
+        let admission = std::collections::HashSet::from(["a".repeat(64)]);
         let result = import_streamed_bundle(std::io::Cursor::new(&raw), admission);
         let error = result.err().expect("a huge record length must be an error, not a panic/abort");
         assert!(error.contains("declares 18446744073709551615 bytes"), "refused on its length: {}", error);
