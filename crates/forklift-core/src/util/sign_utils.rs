@@ -530,7 +530,7 @@ pub(crate) fn overwrite_signature_sidecar_for_test(parcel_hash: &str, signature:
 fn encode_parcel_signature(signature: &ParcelSignature) -> Vec<u8> {
     let mut content: Vec<u8> = Vec::new();
 
-    content.extend(crate::util::byte_utils::number_to_vlq_bytes(SIGNATURE_FORMAT_VERSION));
+    content.extend(crate::util::byte_utils::number_to_vlq_bytes(1)); // format version
     content.extend(crate::util::byte_utils::number_to_vlq_bytes(signature.key_id.len() as u64));
     content.extend(signature.key_id.as_bytes());
     content.extend(crate::util::byte_utils::number_to_vlq_bytes(signature.signature.len() as u64));
@@ -562,17 +562,15 @@ pub fn load_parcel_signature(parcel_hash: &str) -> Result<Option<ParcelSignature
 /// newer than this Forklift reads says so too, and that an upgrade reads it if a newer one wrote it.
 fn stored_signature_refusal(bytes: &[u8], why: String) -> String {
     match crate::util::byte_utils::number_from_vlq_bytes(0, bytes) {
-        Ok((version, _)) if version > SIGNATURE_FORMAT_VERSION => signature_damaged_saying(format!(
-            "{} This Forklift reads signatures up to format version {}, so if a newer Forklift wrote it, \
+        // Format version 1 is the only one this Forklift reads (see `parse_parcel_signature`).
+        Ok((version, _)) if version > 1 => signature_damaged_saying(format!(
+            "{} This Forklift reads signatures up to format version 1, so if a newer Forklift wrote it, \
             upgrading Forklift reads it",
-            why.trim_end(), SIGNATURE_FORMAT_VERSION
+            why.trim_end()
         ), "Otherwise that stored signature is damaged"),
         _ => signature_damaged(why),
     }
 }
-
-/// The signature format version this Forklift writes and reads.
-const SIGNATURE_FORMAT_VERSION: u64 = 1;
 
 /// The refusal of a parcel's stored signature, which cannot be read or does not parse, for `why`,
 /// which names the parcel. A signature is never stored twice with different bytes, so taking the
@@ -833,7 +831,7 @@ fn parse_parcel_signature(bytes: &[u8], parcel_hash: &str) -> Result<ParcelSigna
         .map_err(|_| malformed())?;
     cursor += read;
 
-    if version != SIGNATURE_FORMAT_VERSION {
+    if version != 1 {
         return Err(format!(
             "The signature of parcel {} uses unknown format version {}.", parcel_hash, version
         ));
