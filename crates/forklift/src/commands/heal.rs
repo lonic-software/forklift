@@ -248,8 +248,9 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         .map_err(|error| records_said(error, &ref_notes, early_position.as_ref(), early_scope.as_ref()))?;
     let early_restored = merge_repair.restored.clone();
     // A refusal heal ends with once every repair has run: a note until then, so a refusal that
-    // ends the run earlier still names it.
-    let mut merge_note = merge_repair.refusal.clone().map(String::from);
+    // ends the run earlier still names it. Rendered, since a note is plain text in a sentence.
+    let merge_note_of = |refusal: &Option<CoreError>| refusal.clone().map(|refusal| forklift_core::error::rendered_frames(&String::from(refusal)));
+    let mut merge_note = merge_note_of(&merge_repair.refusal);
     ref_notes.extend(merge_note.clone());
     let with_merge = |mut error: String| {
         for sentence in early_restored.iter().flat_map(MergeStateRestored::sentences) {
@@ -466,7 +467,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                     .map_err(|error| with_rebuilt(changed_after(String::from(error), &refs_rebuilt, &refs_removed, &ref_notes), &inventory_rebuilt))?;
                 merge_repair = merge_repair.then(later);
                 if merge_note.is_none() {
-                    merge_note = merge_repair.refusal.clone().map(String::from);
+                    merge_note = merge_note_of(&merge_repair.refusal);
                     ref_notes.extend(merge_note.clone());
                 }
             }
@@ -942,8 +943,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     if report.refs_refused.is_empty() && report.objects_lost.is_none() && origin_refused.is_none() {
         if let (Some(refused), Some(note)) = (merge_refusal, &merge_note) {
             let mut report = report;
-            let note = forklift_core::error::rendered_frames(note);
-            report.notes.retain(|kept| *kept != note);
+            report.notes.retain(|kept| kept != note);
             if !output::is_json() {
                 report.render_human();
             }
