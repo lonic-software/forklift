@@ -643,6 +643,21 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **`heal` restores a damaged record of a merge in progress from a copy kept beside it.** Every
+  write of a consolidation's state, its out-of-scope skeleton or a pick's state now leaves a copy
+  (`consolidation-copy`, `consolidation-skeleton-copy`, `cherry-pick-copy`), and `forklift heal`
+  writes a damaged record back from it when the copy reads and agrees with where the bay stands,
+  reporting it in `merge_state_restored` (`--json` schema 55). The refusal of a damaged record
+  names `forklift heal` while that can run, and `abort --keep-files` (or `abort` for the skeleton)
+  once no copy can be used. Under an interrupted merge or pick, heal removes a record no copy can
+  restore, since finishing that operation drops it anyway. A consolidation records its skeleton's
+  digest, so a skeleton left by another merge is refused as damaged. The consolidation state's
+  format and the undo journal's format change: a merge in progress, or undo history, written by an
+  older Forklift is refused.
+- **A merge no longer starts over one in progress.** `haul consolidate`, and the merge a `lift` or
+  `lower` makes, refuse while a consolidation or pick is in progress in the bay; `haul consolidate`
+  over a conflicted consolidation whose files were resolved used to write a second merge's record
+  over the first one's.
 - **A damaged record of a merge in progress is refused with a command that ends it.** A garbled,
   cut or digest-mismatched consolidation or pick state file was refused in prose that said to
   remove the file by hand. Every reader now refuses it with `merge_state_damaged` (exit 68,
