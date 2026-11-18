@@ -643,6 +643,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **A server's `500` no longer names its files.** A request that failed on a fault of
+  `forklift-server`'s own answered with the failure's own message, which could carry the server's
+  absolute paths, such as a pack index that does not parse. A `500` now carries a fixed message and
+  no code, and the cause goes to the server's log.
 - **A damaged record of a merge in progress is refused with a command that ends it.** A garbled,
   cut or digest-mismatched consolidation or pick state file was refused in prose that said to
   remove the file by hand. Every reader now refuses it with `merge_state_damaged` (exit 68,

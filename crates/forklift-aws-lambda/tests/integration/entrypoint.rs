@@ -1516,9 +1516,7 @@ fn unknown_routes_are_404() {
 
 /// Review fix: a `500` must not forward `Head`'s internal message verbatim — that message can
 /// wrap a raw SDK failure carrying a request id, a bucket or table name, which this hosted,
-/// multi-tenant edge must not hand to whoever is asking (unlike `forklift-server`, which
-/// forwards its `500`s because that self-host head only ever runs on the operator's own
-/// infrastructure). Force one via a failing `build_head` (the same path a real client-building
+/// multi-tenant edge must not hand to whoever is asking. Force one via a failing `build_head` (the same path a real client-building
 /// failure takes) and assert the body is generic, not the detailed message.
 #[test]
 fn an_internal_error_is_redacted_at_the_edge_not_forwarded_verbatim() {

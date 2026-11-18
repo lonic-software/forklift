@@ -998,11 +998,10 @@ const COMMIT_NOT_READY_RETRY_AFTER_SECONDS: &str = "1";
 ///
 /// A raw `500`'s message is the one the client never sees as written. `Head`'s internal errors wrap
 /// raw storage failures (an SDK `DisplayErrorContext` can carry a request id, a bucket or table
-/// name), and this router sits behind the hosted service's public edge. `forklift-server`
-/// forwards its `500` messages verbatim, and that is fine there — a self-host head only ever
-/// runs on the operator's own infrastructure — but this head must not hand a stranger's bucket
-/// name to whoever happens to be asking. The detail is logged instead (Lambda ships stderr to
-/// CloudWatch) and the client gets a generic message. Every other status is the protocol's own
+/// name), and this router sits behind the hosted service's public edge, which must not hand a
+/// stranger's bucket name to whoever happens to be asking. (`forklift-server` hides its `500`s'
+/// messages too, framed or not: they may name the server's directories.) The detail is logged
+/// instead (Lambda ships stderr to CloudWatch) and the client gets a generic message. Every other status is the protocol's own
 /// diagnostic (a bad hash, a stale ref, a malformed body) and stays as-is — it is meant to be
 /// read. A classified refusal (§7.4) is decoded regardless of status — see [`error_body`].
 fn error_response(error: HeadError) -> Response<Vec<u8>> {

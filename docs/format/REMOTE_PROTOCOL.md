@@ -97,6 +97,11 @@ of the server's directory:
 The serverless head reads none of these records, and its `503`s are described with the endpoints
 that send them.
 
+**A fault of the server's own:** a `500` from forklift-server carries a fixed `message`, and no
+`code` or `next_step`, whatever failed: the cause may name the server's directories, so it is
+logged and not sent. The serverless head hides a `500`'s message the same way, except that it
+passes on a classified refusal's `code` and text.
+
 **Refused for now, on either head:** a `429`, and a `503` that carries `Retry-After`, are
 refusals sent before the request changed anything, so the identical request may be sent again
 once the wait has passed, a mutation as well as a read. A head that cannot say that of a `503`
