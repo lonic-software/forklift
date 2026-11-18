@@ -413,8 +413,8 @@ enum ServingRefusal {
     /// served until that content is back.
     Unavailable(usize),
 
-    /// A repair of its damaged record of withheld content left this many files or parts of history
-    /// unaccounted, and they still are: a takedown whose entry was lost may be among them, so it is
+    /// A repair of its damaged record of withheld content left this many files, folders or parts of
+    /// history unaccounted, and they still are: a takedown whose entry was lost may be among them, so it is
     /// not served until the operator accounts for each.
     Unaccounted(usize),
 }
@@ -465,8 +465,8 @@ impl ServingRefusal {
                 if count == 1 { "it" } else { "them" },
             ),
             ServingRefusal::Unaccounted(count) => format!(
-                "{} is not served: a repair of its damaged record of withheld content left {} file{} or \
-                part{} of history unaccounted. A takedown whose entry was lost may be among them, and a \
+                "{} is not served: a repair of its damaged record of withheld content left {} file{}, \
+                folder{} or part{} of history unaccounted. A takedown whose entry was lost may be among them, and a \
                 client trusts a server to list every file it withholds. `forklift-server withhold list` \
                 names each. For a file: put its bytes back from any copy; or withhold it with \
                 `forklift-server withhold add`, if it was taken down or is gone for good (a withholding \
@@ -476,6 +476,7 @@ impl ServingRefusal {
                 again once nothing a sweep keeps reaches it. Then serve it again.",
                 name,
                 count,
+                if count == 1 { "" } else { "s" },
                 if count == 1 { "" } else { "s" },
                 if count == 1 { "" } else { "s" },
             ),
@@ -7597,7 +7598,7 @@ mod tests {
         let refused = WarehouseHandle::serving(unaccounted.clone(), false).err().expect("a root left unaccounted is refused");
         assert!(matches!(refused, ServingRefusal::Unaccounted(2)), "{:?}", refused);
         assert_eq!(refused.message("Warehouse \"wh\""), "Warehouse \"wh\" is not served: a repair of its damaged record of withheld \
-            content left 2 files or parts of history unaccounted. A takedown whose entry was lost may be among them, and a client \
+            content left 2 files, folders or parts of history unaccounted. A takedown whose entry was lost may be among them, and a client \
             trusts a server to list every file it withholds. `forklift-server withhold list` names each. For a file: put its bytes \
             back from any copy; or withhold it with `forklift-server withhold add`, if it was taken down or is gone for good (a \
             withholding is never lifted); or, once nothing a sweep keeps (pallets, hauls, bays, staged work) names it, run \
@@ -7627,7 +7628,7 @@ mod tests {
         let refused = resolve_handle(&state, &warehouse_params("lacking")).err().expect("refused");
         assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
         assert!(refused.1.starts_with("Warehouse \"lacking\" is not served: a repair of its damaged record of withheld content \
-            left 1 file or part of history unaccounted."), "{}", refused.1);
+            left 1 file, folder or part of history unaccounted."), "{}", refused.1);
         assert!(!refused.1.contains(&*multi.to_string_lossy()), "no path of the server's: {}", refused.1);
         std::fs::write(multi.join("damaged").join(FOLDER_NAME_FORKLIFT_ROOT).join("withheld"), b"garbage").unwrap();
         let refused = resolve_handle(&state, &warehouse_params("damaged")).err().expect("refused");

@@ -56,7 +56,7 @@ it holds that object by hash alone, without its content, whatever its marker say
 that records an origin (`.forklift/origin`), which only a partial warehouse has, and any root
 lacking content its unavailable record (`.forklift/unavailable`) lists, which a fetch left out
 because its remote's host withholds it, until those files' bytes are loaded again, and any root
-whose withheld record a repair left with a file or part of history unaccounted (below), until each is
+whose withheld record a repair left with a file, folder or part of history unaccounted (below), until each is
 accounted for. A record that
 does not parse is refused as damage, and so is a fetch scope (`.forklift/config/fetch-scope`) in a
 root that is not partial: a `--warehouses` server answers `503` with no `Retry-After` and the

@@ -156,7 +156,8 @@ impl Repaired {
 /// Repair the record of withheld content of the warehouse at the current storage root (see the
 /// module doc). Takes the serve lock, so it refuses while a server serves the root, then the ref
 /// lock. A record that reads whole is walked again, keeping its entries, when it holds an
-/// outstanding unaccounted hash or any undescended line; nothing is set aside then.
+/// line of either kind an earlier repair wrote, outstanding or not, since a hash whose bytes are
+/// back now counts again if they go; nothing is set aside then.
 ///
 /// # Returns
 /// * `Ok(Repaired)` - What was repaired.
@@ -183,8 +184,7 @@ pub fn repair_withheld() -> Result<Repaired, String> {
     let mut whole = None;
     match &bytes {
         Some(bytes) => match withholding::parse(bytes) {
-            Ok(set) if set.undescended().next().is_some()
-                || !withholding::outstanding_unaccounted(&set, &applied_redactions::read_applied()?)?.is_empty() => whole = Some(set),
+            Ok(set) if set.undescended().next().is_some() || set.unaccounted().next().is_some() => whole = Some(set),
             Ok(_) => return Err("The record of withheld content reads whole; there is nothing to repair.".to_string()),
             Err(withholding::Unparsed::Record(record_utils::RecordError::OtherVersion(header)))
                 if withholding::written_by_newer(bytes) => return Err(format!(
@@ -321,8 +321,9 @@ fn absent_unheld(withheld: &WithheldSet) -> Result<Unheld, String> {
     let unheld = |hash: &&String| !tolerated.sealed.contains(hash);
     let mut absent: Vec<String> = walked.absent_files.iter().filter(unheld).cloned().collect();
     absent.sort();
-    let mut undescended: Vec<String> = walked.absent_trees.iter().chain(&walked.lost_parcels).filter(unheld)
-        .filter(|hash| !walked.absent_files.contains(*hash)).cloned().collect();
+    // A hash some entry names as a file and another as a folder is both: its bytes back stop the
+    // first counting, never the second, since nothing beneath it was walked.
+    let mut undescended: Vec<String> = walked.absent_trees.iter().chain(&walked.lost_parcels).filter(unheld).cloned().collect();
     undescended.sort();
     undescended.dedup();
     let mut other: Vec<String> = walked.absent.iter().filter(unheld)
@@ -604,6 +605,19 @@ mod tests {
         assert_eq!(withholding::read_withheld().unwrap().statement(A), Some("court order"), "its entries are kept");
 
         assert!(repair_withheld().unwrap_err().contains("nothing to repair"), "nothing is left to walk again for");
+
+        // A file back counts nothing, yet its line still reruns the repair, which drops it: else it
+        // lingers unlisted, to count again once the bytes go. Revert: rerun only for an outstanding
+        // hash → refused as nothing to repair.
+        let film = store_blob("a film put back");
+        store_root_parcel(&store_tree(&[("film.mkv", &film, DirEntryType::Normal)]));
+        delete(&film);
+        assert_eq!(lose_and_repair().1, 1);
+        assert_eq!(store_blob("a film put back"), film);
+        assert_eq!(withholding::unaccounted_count().unwrap(), 0);
+        let rerun = repair_withheld().unwrap();
+        assert!(rerun.rerun && rerun.absent.is_empty(), "{:?}", rerun.report());
+        assert_eq!(withholding::read_withheld().unwrap().unaccounted().count(), 0, "the walk finds it present");
     }
 
     // Revert: salvage a repair's line as an entry, its second token the hash → what the record left
@@ -656,6 +670,19 @@ mod tests {
             let rerun = repair_withheld().unwrap();
             assert_eq!((rerun.absent.clone(), rerun.undescended.clone()), (vec![film.clone()], Vec::new()));
             assert_eq!(withholding::unaccounted_count().unwrap(), 1, "now for the file beneath it");
+        }
+
+        // Named as a file by one entry and as a folder by another, it is both. Revert: leave a hash
+        // among the files out of the folders → its bytes back stop it counting, though nothing
+        // beneath it was ever walked.
+        {
+            let _scratch = Scratch::new("both");
+            assert!(tombstone_utils::mark_served(true).unwrap());
+            let folder = store_tree(&[("film.mkv", &film(), DirEntryType::Normal)]);
+            store_root_parcel(&store_tree(&[("as-file", &folder, DirEntryType::Normal), ("films", &folder, DirEntryType::Tree)]));
+            delete(&folder);
+            let (repaired, count) = lose_and_repair();
+            assert_eq!((repaired.absent.clone(), repaired.undescended.clone(), count), (vec![folder.clone()], vec![folder.clone()], 2));
         }
 
         // A pallet's head parcel absent.
