@@ -264,8 +264,8 @@ HTTP exchange) and `server-writes.json`, and on Linux the strace traces.
 
 ## 9. How CI runs it
 
-Three workflows run Proof Load, all outside `ci passed`. The two that run the harness continue on
-error, so for now they report grades without failing a pull request.
+Four workflows run Proof Load, all outside `ci passed`. The two that run fault scenarios continue
+on error, so for now they report grades without failing a pull request.
 
 - **`proof load`** runs on every pull request, once per OS, against forklift and forklift-server
   built for that OS's release target. It sets `--budget 2700`, the read-only and network lanes, and
@@ -274,6 +274,10 @@ error, so for now they report grades without failing a pull request.
   volume (vfat on Linux, exFAT on macOS). `report.md` is added to the job summary, and the JSON
   files, `report.md` and the traces are uploaded.
 - **`proof load history`** runs weekly on Linux with `--history-from .`, over Forklift's own history.
+- **`proof load perf`** runs `perf --shape small --reps 3 --gate self` on Linux, with a
+  forklift-server, on every push to `main` and on a pull request that touches Forklift's core, its
+  commands or the harness. A verdict that fails anything fails the job, and `perf.md` and
+  `perf.json` are uploaded.
 - **`proof load desktop`** builds, tests and runs Clippy on the desktop window on each OS. It runs no
   faults, and a failing step fails it.
 
@@ -288,8 +292,8 @@ a **Coverage** screen; and a **Run** screen that starts a run itself. See its
 
 ## 11. Measuring performance
 
-`proof-load perf` times Forklift against git on one generated history. It is a separate command
-from `run` and faults nothing. It runs one timed command at a time, with nothing else from the
+`proof-load perf` times Forklift against git on a generated history or a real one, and judges the
+rows under a gate. It is a separate command from `run` and faults nothing. It runs one timed command at a time, with nothing else from the
 harness running, so no timing shares the machine with a faulted job.
 
 ```sh
@@ -302,10 +306,26 @@ target/release/proof-load perf --out ../perf-out \
 - `--out` receives the subjects and the report, and must be empty or new, as for `run`.
 - `--forklift` and `--git` name the binaries to time, by path. Time a release build: a debug build
   mostly measures unoptimised code.
-- `--shape` names the generated history. This build has one shape, `small`: a few hundred text
-  files three directories deep, two binary files of 2 MiB, 40 commits on `main`, and a `perf-side`
-  branch that leaves `main` a few commits before its tip. Each shape has a fixed seed, so every run
-  of a shape times the same history. The report's header spells the shape out.
+- `--shape` names the generated history, `small` unless you say otherwise. Each shape has a fixed
+  seed, so every run of a shape times the same history, and the report's header spells it out.
+  Every shape has a `perf-side` branch that leaves `main` a few commits before its tip:
+
+  | Shape | Text files | Directory levels | Binary files | Commits on `main` |
+  |---|---|---|---|---|
+  | `small` | 400 | 3 | two of 2 MiB | 40 |
+  | `medium` | 5,000 | 4 | four of 4 MiB | 400 |
+  | `huge` | 50,000 | 4 | eight of 8 MiB | 2,000 |
+
+  `huge` is a large monorepo's scale, and is not meant for a run on every change.
+- `--history-from` names a git repository to time on instead of a generated shape, so it and
+  `--shape` cannot both be given. It is read only: the harness mirrors it into its scratch area
+  first, as `run --history-from` does, and refuses a shallow repository or a folder that is not a
+  repository's top. The header names the history and how many text files its `HEAD` holds.
+- `--side-branch` names the branch of that history which switch and merge time against. It needs
+  `--history-from`, since a generated shape has `perf-side`, and the history must have a branch of
+  that name. Without it, switch and merge are reported as not run, with the reason "no side branch
+  given (--side-branch)".
+- `--gate` says which checks fail the run: `self` or `all` (the default). See *The verdict* below.
 - `--reps` sets how many timed repetitions each cell gets (5 unless you say otherwise). Each warm
   cell also gets one untimed run of its command first, so that the first repetition does not pay
   for loading what the later ones find cached.
@@ -341,6 +361,8 @@ It times these operations:
 | commit | `stack -m MESSAGE` | `commit -q -m MESSAGE` |
 | switch | `shift perf-side` | `switch -q perf-side` |
 | merge | `consolidate perf-side` | `merge -q --no-edit perf-side` |
+| verify | `audit --full` | `fsck --full --strict` |
+| pack | `store compact --all` | `gc -q` |
 | clone | `clone URL WORK` | `clone -q --no-local URL WORK` |
 | push | `lift` | `push -q -u origin HEAD` |
 | pull | `lower` | `pull -q --ff-only` |
@@ -350,9 +372,12 @@ It times these operations:
 Every row runs twice: once warm, and once cold, with the caches dropped before each repetition by the
 `--drop-caches` program. A cold cell has no untimed run first.
 
-Status, log and blame run on the clean tree, and blame names the file the history changes most.
+Status, log, blame and verify run on the clean tree. Blame names the text file the history changes
+most: for a real history, the one the last 1,000 first-parent commits of `HEAD` change most, the
+first in path order on a tie. A file git takes for binary is never blamed, nor is a symbolic link.
+Switch and merge name the side branch: `perf-side`, or the `--side-branch` of a real history.
 
-Commit, switch and merge change the subject, so each of their repetitions runs on a fresh copy of the
+Commit, switch, merge and pack change the subject, so each of their repetitions runs on a fresh copy of the
 clean subject, made untimed. The subjects themselves are never changed. A copy keeps each file's
 modification time, so that neither tool reads a settled file as possibly edited. Before anything
 else the harness runs, untimed, the command that brings each tool's record of its files up to date:
@@ -363,17 +388,19 @@ tracked files and stages them untimed, with `load .` and `add -A`. Those 20 file
 just after a user's edit, so a tool that looks again at a file changed moments ago pays for that
 in the timed commit. Forklift's stack is signed and
 git's commit is not, and the commit row's note says so. Switch moves from the current branch to
-`perf-side`, and merge merges `perf-side` into it, a merge with no conflict. On unix, the harness
+the side branch, and merge merges the side branch into it. On a generated shape that merge has no
+conflict, since the two branches never change the same lines; on a real history, pick a side
+branch that merges cleanly, since a merge that stops on a conflict is never timed as a merge. On unix, the harness
 then writes the copy out to disk, untimed, so that a command which syncs its own writes is not also
 timed writing out the copy: `sync` on Linux, and on macOS, whose `sync` can return early, an fsync
 of every file in the copy and one flush of the drive's cache. On Windows it does neither. A copy
 that cannot be removed afterwards stops the run, naming it.
 
 Each write is judged before and after it runs. Before, the copy must report exactly the 20 staged
-files for commit, and nothing at all for switch and merge. After each write, the copy must be
+files for commit, and nothing at all for switch, merge and pack. After each write, the copy must be
 clean, with nothing staged, changed or untracked. A copy that fails either check makes its row
 **not comparable**, naming the repetition and the paths. Switch and merge are also not comparable
-when `perf-side` is at the commit the current branch is at in any subject, since they would then
+when the side branch is at the commit the current branch is at in any subject, since they would then
 time a change of nothing. Merge is not comparable either when one of the two branches contains the
 other in any subject, since it would then not join two lines of history. A warm cell's untimed run
 of its command is made on a copy of its own, and is not judged.
@@ -425,6 +452,80 @@ enough: a subject that misses one edited file and reports one other path does no
 fails its check is reported as **not comparable**, with each subject's extra and missing paths, and
 is not timed.
 
+### The gate subject
+
+Two checks compare Forklift with itself rather than with git, and they need a subject the paired
+ones cannot give. An import packs Forklift's store as it goes, so a compact of the paired subject
+has nothing loose to pack, and its imported history carries no signature for an audit to verify.
+So the harness builds one more subject, Forklift's alone, through Forklift's own commands and with
+no import: `prepare`, 240 text files and a first `stack`, then `office enroll`, then 299 more
+stacks that each change 5 files. That leaves 300 parcels, 299 of them signed, in a loose store. The
+harness checks that `audit main` reads 299 verified parcels and 1 unsigned one before timing
+anything. Its rows have one cell, Forklift's, and run warm:
+
+| Row | Forklift |
+|---|---|
+| fresh compact | `store compact`, once, on the loose store |
+| repack | `store compact --all` |
+| audit main | `audit main` |
+| audit main, one core | `audit main` pinned to one core with `taskset -c 0` |
+
+A fresh compact that packs nothing makes its row not comparable. Pinning a command to one core is
+built only on Linux, with `taskset` on the `PATH`; elsewhere the last row is reported as not run.
+
+### The verdict
+
+`perf.md` ends with the verdict, and `perf.json` holds it too. Under either gate, a run fails on:
+
+- a **gross regression**: on the status, diff, diff --staged, switch, commit, verify and pack rows,
+  Forklift's median more than 10 times tuned git's in the same run. This is a net for an order of
+  magnitude, such as an accidental quadratic loop, not a benchmark;
+- a **broken ratio of Forklift's own**: the repack's median above 1.5 times the fresh compact's, or
+  the audit's above twice the one-core audit's;
+- any of those rows, or of the gate subject's, that **could not run**: not comparable, or with a
+  voided cell.
+
+Each of these compares two timings taken on the same machine in the same run, so a shared, noisy
+CI runner can hold them. `--gate self` stops there. CI runs it on the small shape in `proof-load-perf.yml`, on every push
+to `main` and on a pull request that touches a perf-sensitive path. `--gate
+all` also fails on any other row that could not run, and on a row that is **clearly slower** with
+no ticket tracking it. Clearly slower means Forklift's median is more than 1.25 times tuned git's,
+and its fastest run is slower than tuned git's slowest. The verdict lists every clearly slower row
+under either gate, with its ticket when one tracks it. A row not run, for any reason above, never
+fails the run.
+
+The tickets live in `crates/proof-load/perf-tickets.json`, a list of entries that each name an
+operation, a shape, a cache (`warm` or `cold`), a platform (`linux`, `macos` or `windows`) and a
+`FORK-N` ticket. An entry tracks only the row it names on that shape and platform. When a row an
+entry tracks was timed and is not clearly slower, the verdict lists the entry as possibly closable;
+that never fails the run. A change that makes a row clearly slower on purpose adds its entry, and
+the change that closes the ticket removes it. A test holds every entry to a row this build times
+and a shape it has, and to one entry per row.
+
+### Before you quote a number
+
+These matter as much as the numbers.
+
+- **Disk.** A real history takes several times its own size: the mirror, three subjects built from
+  it, and one fresh copy at a time for the write rows. git.git is a few hundred MB of history and
+  fits in a few GB. A kernel-scale history such as `torvalds/linux` is about 5 GB of history, needs
+  tens of GB, and takes minutes to import. Check `df -h` before you start one.
+- **Log output differs.** `history` and `log` do not print the same text. The row compares the cost
+  of each tool's default command, not byte-for-byte output.
+- **Status is a summary.** `stocktake --summary` prints counts, and git's `status` a short list.
+  Neither formats a long per-file report.
+- **Durability and signing differ.** Every Forklift record is signed, and git's commit is not, as
+  the commit row's note says. Tuned git runs with `core.fsync=all` and `core.fsyncMethod=fsync`,
+  which plain git does not set; git's own default sync method on macOS is documented as possibly not
+  durable over a crash. Read the tuned column when the question is like for like.
+- **The git binary matters.** An old or emulated git slows git's side a great deal: a git running
+  under Rosetta once more than halved the ratios of some rows against the same Forklift. Check `git
+  --version` and the binary's architecture, which the header records with the tools.
+- **One machine, one run.** Quote the header's hardware with any number. A ratio between two
+  subjects of one run travels better than an absolute time.
+- **Imported text may be coerced.** An imported history with author names that are not UTF-8 has
+  them made valid, and shows U+FFFD where it did. The author's email is kept as it was.
+
 ### Reading perf.md
 
 `perf.md` is for reading, and `perf.json` holds the same report for programs, under its own format
@@ -456,11 +557,9 @@ commit, voids its cell as well. The cell then says *did
 not move the head*, with the repetition and the refs it read.
 
 Read two medians together with their spreads. A difference where one subject's fastest run is
-slower than the other's slowest is clear. One where the ranges overlap is likely to be noise. This
-build does not yet judge any row as slower.
+slower than the other's slowest is clear. One where the ranges overlap is likely to be noise.
 
-`perf` exits 0 when every pair was compared and every cell was timed, and 1 when a pair was not
-comparable or a cell was voided. A cold row not run, or a remote row not run, for any reason above, does not
-make it exit 1. It exits 2 when the run could not go ahead, such as over a
-non-empty output folder, an unknown shape, or a subject that could not be built. A run that exits 2
-writes no `perf.json`.
+`perf` exits 0 when the verdict failed nothing under its gate, and 1 when it failed a row. It exits
+2 when the run could not go ahead, such as over a non-empty output folder, an unknown shape, both
+`--shape` and `--history-from`, a history it cannot mirror or read, a side branch the history does
+not have, or a subject that could not be built. A run that exits 2 writes no `perf.json`.

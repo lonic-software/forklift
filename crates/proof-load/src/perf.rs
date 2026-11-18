@@ -2429,6 +2429,48 @@ mod tests {
         assert_eq!(source(&options(None, Some(&missing.display().to_string()), None)), Err(format!("--history-from {}: not a folder", missing.display())));
     }
 
+    /// The four files `perf` replaced are named, outside this file, only on the lines kept as
+    /// dated records of them: every tracked line the sweep finds is one kept line, and every kept
+    /// line is found once. Kept lines are keyed by their file and a fragment of their text, never
+    /// by number, since DESIGN.html's changelog moves down with each new row.
+    ///
+    /// Revert: drop a kept entry → its line is named as a referrer; name a retired file on a new
+    /// line → that line is.
+    #[test]
+    fn the_retired_benchmarks_are_named_only_where_kept() {
+        const KEPT: [(&str, &str); 9] = [
+            ("CHANGELOG.md", "**The benchmark scripts"),
+            ("docs/DESIGN.html", "Performance is measured by <code>proof-load perf</code> alone"),
+            ("docs/DESIGN.html", "§5.0 milestone D, item 5 shipped — a benchmark regression job in CI (T5)."),
+            ("docs/PERFORMANCE_BACKLOG.md", "taken against the Rosetta git 2.33.0. Later the same day (2026-07-15)"),
+            ("docs/PERFORMANCE_BACKLOG.md", "branch or expected;"),
+            ("docs/PERFORMANCE_BACKLOG.md", "was re-run in full on 2026-10-17 (hyperfine"),
+            ("docs/PERFORMANCE_BACKLOG.md", "**Baseline** ("),
+            ("docs/PERFORMANCE_BACKLOG.md", "**After** ("),
+            ("docs/PERFORMANCE_BACKLOG.md", "**Where the benchmark stands** ("),
+        ];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let output = std::process::Command::new("git").current_dir(&root)
+            .args(["grep", "-n", "-I", "-E", r"bench\.s[h]|bin/benchmar[k]|BENCHMARK\.md|bench\.ym[l]", "--", ".", ":(exclude)crates/proof-load/src/perf.rs"])
+            .output().unwrap();
+        assert!(output.status.success() || (output.status.code() == Some(1) && output.stderr.is_empty()), "{}", String::from_utf8_lossy(&output.stderr));
+        let hits = String::from_utf8(output.stdout).unwrap();
+        let mut found = [0usize; KEPT.len()];
+        let mut referrers = Vec::new();
+        for hit in hits.lines() {
+            let mut fields = hit.splitn(3, ':');
+            let (file, text) = (fields.next().unwrap(), fields.nth(1).unwrap_or(""));
+            let kept: Vec<usize> = (0..KEPT.len()).filter(|&at| KEPT[at].0 == file && text.contains(KEPT[at].1)).collect();
+            match kept[..] {
+                [at] => found[at] += 1,
+                _ => referrers.push(hit.chars().take(160).collect::<String>()),
+            }
+        }
+        assert_eq!(referrers, Vec::<String>::new(), "these lines name a file perf replaced; name proof-load perf or its guide instead");
+        let missing: Vec<_> = KEPT.iter().zip(found).filter(|(_, count)| *count != 1).map(|(kept, count)| (kept, count)).collect();
+        assert_eq!(missing, [], "each kept line is found exactly once");
+    }
+
     /// A perf.json reads back as written; one naming another format number, or none, is refused by
     /// that, before any field is read; one with a field this build does not know is refused too.
     #[test]

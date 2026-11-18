@@ -212,6 +212,13 @@ Notes:
   It checks out the full history, since a shallow repository is refused, and runs on a pull request
   only when the workflow file itself changes. Like the per-OS checks it is outside `ci passed` and
   its run step continues on error.
+- The `proof load perf` check (`.github/workflows/proof-load-perf.yml`, Linux) times Forklift
+  against git with `proof-load perf --shape small --reps 3 --gate self`, on every push to `main`
+  and on a pull request that touches `crates/forklift-core/src/`, `crates/forklift/src/commands/`,
+  `crates/forklift/src/cli.rs` or `crates/proof-load/`. It fails on the checks a shared runner can
+  hold: a gross regression against tuned git, a broken ratio of Forklift's own, or one of those rows
+  that could not run ([the guide](proof-load.md#the-verdict) has each). It is outside `ci passed`.
+  `perf.md` and `perf.json` are uploaded.
 - The `proof load desktop` checks (`.github/workflows/proof-load-desktop.yml`, one per OS) build,
   test and Clippy `tools/proof-load-desktop`, Proof Load's egui window. It is a Cargo workspace of
   its own with its own `Cargo.lock`, so egui is in neither the root lock nor any other job's build;
@@ -699,8 +706,11 @@ it touched, or that none applied. When a change alters:
   feature's status chip in its §5 when it lands;
 - **the parallelism of an operation** → update its status in
   [`../PARALLELIZATION_PLAN.md`](../PARALLELIZATION_PLAN.md);
-- **a performance item listed in [`../PERFORMANCE_BACKLOG.md`](../PERFORMANCE_BACKLOG.md) or a
-  number in [`../BENCHMARK.md`](../BENCHMARK.md)** → update the entry, with the measurement.
+- **a performance item listed in [`../PERFORMANCE_BACKLOG.md`](../PERFORMANCE_BACKLOG.md)** → update
+  the entry, with the measurement;
+- **a row `proof-load perf` judges clearly slower, or one it no longer does** → add or remove its
+  entry in `crates/proof-load/perf-tickets.json`, as
+  [the guide's performance section](proof-load.md#the-verdict) says.
 
 The guides intentionally *reference* rather than duplicate `SERVER.md`,
 `MACHINE_INTERFACE.md`, `DESIGN.html`, and `format/`, so there's a single place to

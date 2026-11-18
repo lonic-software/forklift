@@ -121,8 +121,8 @@ once (dedup). The meaningful divergences:
 - **Delta compression.** Both systems delta-compress packed history, and Forklift finds delta
   bases the way Git does, by walking history to pair each version of a file with the one
   before it. New objects stay loose until automatic or explicit
-  [`store compact`](guide/cli.md#store-compact--pack-the-object-store); the measured result on git.git is
-  in [the benchmark guide](BENCHMARK.md).
+  [`store compact`](guide/cli.md#store-compact--pack-the-object-store);
+  [the object-store scaling note](OBJECT_STORE_SCALING.md) covers how the store scales on git.git.
 - **Large files.** Forklift chunks large files natively, with no pointer files and no second
   tool: an edit re-stores only the chunks it touched. See
   [Large files](guide/cli.md#large-files) for how they travel and their limits.
@@ -257,7 +257,8 @@ comparison — this is the honest, dominant practical gap.]**
   designs for it explicitly.
 - **Caveat.** Git has 20 years of profiling and pathological-case hardening. Forklift has been
   measured against Git on git.git, where it is faster on some operations and slower on others
-  ([the benchmark guide](BENCHMARK.md)), but not at monorepo scale.
+  ([the performance backlog](PERFORMANCE_BACKLOG.md) records those measurements, and
+  [`proof-load perf`](guide/proof-load.md#11-measuring-performance) takes new ones), but not at monorepo scale.
 
 ### 2.8 AI-agent orientation
 

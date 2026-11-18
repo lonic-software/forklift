@@ -417,26 +417,21 @@ synthetic corpus built for that change). T5 turns that into a standing CI job so
 regression on any of these hot paths gets caught automatically, not only when someone happens to
 re-run a benchmark by hand.
 
-- **Harness:** `bin/bench.sh` — builds a small, deterministically-generated warehouse fresh in the
-  job (a seeded, index-derived corpus, not a committed binary blob: a few hundred files, a few
-  hundred signed parcels, two diverging pallets), then times the hot ops already covered above
-  (`stocktake`, `diff`, `compact`/`compact --all`) plus the axes this plan never measured in CI:
-  `shift` (checkout), a signed `stack` + `audit` (after `office enroll` — every parcel from there
-  on is signed), cold vs warm cache (first invocation vs. the mean of later ones — a CLI process
-  never carries its object caches across invocations, so "cold" here is real: the first touch of a
-  given file after the corpus is built), peak RSS (`/usr/bin/time -l`/`-v`), and core-count scaling
-  (`audit` — which crosses `audit_utils::PARALLEL_THRESHOLD` at this corpus size — pinned to one
-  core via `taskset` vs. unrestricted; Linux-only, since there is no worker-count env/flag to pass
-  instead and macOS has no affinity equivalent `num_cpus` honors).
-- **CI job:** `.github/workflows/bench.yml` — one `ubuntu-latest` job, runs on every push to `main`
-  and on pull requests that touch a perf-sensitive path (`crates/forklift-core/src/**`,
-  `crates/forklift/src/commands/**`, `bin/bench.sh`). Uploads `bench-results.json`/`.md` as a build
-  artifact — **that is where the numbers live**; they are not committed to the repo (a fixed corpus
-  regenerated every run keeps them comparable run-to-run without needing a tracked baseline file).
-- **Gating philosophy — deliberately narrow.** A CI runner is noisy and shared; an absolute-ms
-  baseline gate on it is flake theater. The job gates only on a handful of *same-run ratio* checks
-  (repack ≤ 1.5× a fresh `compact`, per D/P3 above; unrestricted `audit` ≤ 2× `audit` pinned to one
-  core) plus generous absolute ceilings sized to catch an order-of-magnitude regression (an
-  accidental O(n²), a broken fan-out) and nothing tighter. Absolute-time trend-watching is left to
-  a human reading the uploaded report over time, exactly as this plan's hand-run numbers have been
-  — the gate's job is only to catch the kind of regression a noisy runner cannot hide.
+- **Harness:** `proof-load perf` ([its guide](guide/proof-load.md#11-measuring-performance)),
+  which since 2026-11-18 replaces the shell harness this job first ran. It times Forklift side by side
+  with git on a generated history, and on a gate subject of its own built through Forklift's own
+  commands (240 files, 300 parcels, 299 of them signed after `office enroll`): a fresh `compact`, a
+  `compact --all` repack, and `audit main` unrestricted and pinned to one core with `taskset`, which
+  crosses `audit_utils::PARALLEL_THRESHOLD` at that size. Linux only for the pinned row, since there
+  is no worker-count env/flag to pass instead and macOS has no affinity equivalent `num_cpus` honors.
+- **CI job:** `.github/workflows/proof-load-perf.yml`: one `ubuntu-latest` job, on every push to
+  `main` and on pull requests that touch a perf-sensitive path (`crates/forklift-core/src/**`,
+  `crates/forklift/src/commands/**`, `crates/forklift/src/cli.rs`, `crates/proof-load/**`). It
+  uploads `perf.json`/`perf.md` as a build artifact; the numbers are not committed to the repo.
+- **Gating philosophy, deliberately narrow.** A CI runner is noisy and shared, and an absolute-ms
+  baseline gate on it is flake theater. The job runs `--gate self`, which fails only on same-run
+  ratios: repack ≤ 1.5× a fresh `compact` (per D/P3 above), unrestricted `audit` ≤ 2× `audit`
+  pinned to one core, and Forklift's median at most 10× tuned git's on the status, diff, switch,
+  commit, verify and pack rows and both diffs, sized to catch an order-of-magnitude regression (an accidental
+  O(n²), a broken fan-out) and nothing tighter. The 10× ratio replaced the first harness's absolute
+  ceilings. Absolute-time trend-watching is left to a human reading the uploaded report.
