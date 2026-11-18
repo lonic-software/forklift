@@ -424,11 +424,14 @@ re-run a benchmark by hand.
   `compact --all` repack, and `audit main` unrestricted and pinned to one core with `taskset`, which
   crosses `audit_utils::PARALLEL_THRESHOLD` at that size. Linux only for the pinned row, since there
   is no worker-count env/flag to pass instead and macOS has no affinity equivalent `num_cpus` honors.
-- **CI job:** `.github/workflows/proof-load-perf.yml`: one `ubuntu-latest` job, on every push to
+- **CI jobs:** `.github/workflows/proof-load-perf.yml`: an `ubuntu-latest` job, on every push to
   `main` and on pull requests that touch what the timed binaries are built from (`crates/forklift-core/`,
   `crates/forklift/`, `crates/forklift-server/`, the workspace's `Cargo.toml` and `Cargo.lock`,
   `.cargo/`) or the harness (`crates/proof-load/`). It
-  uploads `perf.json`/`perf.md` as a build artifact; the numbers are not committed to the repo.
+  uploads `perf.json`/`perf.md` as a build artifact; its numbers are not kept. A weekly job (and
+  `workflow_dispatch`) runs the small and medium shapes under `--gate all`, warm and cold, and keeps
+  each run's reports on the orphan branch `proof-load-perf`, never on `main`, each run set beside
+  the last with `--against`.
 - **Gating philosophy, deliberately narrow.** A CI runner is noisy and shared, and an absolute-ms
   baseline gate on it is flake theater. The job runs `--gate self`, which fails only on same-run
   ratios: repack ≤ 1.5× a fresh `compact` (per D/P3 above), unrestricted `audit` ≤ 2× `audit`
