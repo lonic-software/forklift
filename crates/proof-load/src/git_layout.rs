@@ -167,6 +167,7 @@ pub const CENSUS_ROLES: &[(&str, Role)] = &[
     ("removed-refs/<name>", Role::Log),
     ("removed-refs/<name>.<n>", Role::Log),
     ("trust", Role::Signature),
+    ("trust-copy", Role::Signature),
     ("served", Role::Metadata),
     ("tombstones", Role::Metadata),
     ("sealed", Role::Metadata),
