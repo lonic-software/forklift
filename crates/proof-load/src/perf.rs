@@ -1403,9 +1403,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A copy gets back every file's modification time, and on unix every folder's, whatever time
+    /// A copy gets back every file's and every folder's modification time, whatever time
     /// the copy itself left. On macOS a copy keeps them anyway, so the copy's times are moved here
     /// first; on Linux the write-pair test sees the wiring too, through a hook in the copy.
+    #[cfg(unix)]
     #[test]
     fn a_copy_keeps_its_files_times() {
         let (root, scratch, _) = scratch("keep-times");
@@ -1416,17 +1417,14 @@ mod tests {
         let then = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
         let set = |path: &Path, time| std::fs::File::options().write(path.is_file()).read(true).open(path).unwrap().set_modified(time).unwrap();
         set(&from.join("folder").join("file"), then);
-        #[cfg(unix)]
         set(&from.join("folder"), then);
         crate::scrub::copy_tree(&from, &to).unwrap();
         let now = std::time::SystemTime::now();
         set(&to.join("folder").join("file"), now);
-        #[cfg(unix)]
         set(&to.join("folder"), now);
         keep_times(&from, &to).unwrap();
         let modified = |path: PathBuf| std::fs::metadata(path).unwrap().modified().unwrap();
         assert_eq!(modified(to.join("folder").join("file")), then);
-        #[cfg(unix)]
         assert_eq!(modified(to.join("folder")), then);
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&root);
