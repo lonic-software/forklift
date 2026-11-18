@@ -1741,9 +1741,9 @@ pub(crate) fn refuse_unsettled_trust(_lock: &crate::util::lock_utils::RefLock) -
         return Err(CoreError::refusal(
             RefusalCode::RefDamaged,
             format!(
-                "The trust file (\"{}\") stands beside an unborn office pallet, with no copy that matches it: \
-                an enrollment or a first \"forklift lower\" stopped between its writes, or the office pallet's \
-                ref was lost. {} To run the enrollment or the lower again, move the trust file aside, and its \
+                "The trust file (\"{}\") stands beside an unborn office pallet, with no copy that matches it \
+                or not reading as an anchor: an enrollment or a first \"forklift lower\" stopped between its \
+                writes, the trust file was damaged, or the office pallet's ref was lost. {} To run the enrollment or the lower again, move the trust file aside, and its \
                 copy (\"{}\") if one stands, then run it; where it was the office pallet's ref that was lost, \
                 that starts a new office, and nothing signed under the old one verifies again, so restore \
                 the ref from a backup instead if you have one. Where a remote holds this warehouse's \

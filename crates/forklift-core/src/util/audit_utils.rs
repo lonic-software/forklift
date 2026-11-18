@@ -4693,7 +4693,7 @@ mod tests {
                     code: Some(RefusalCode::RefDamaged), says: "move the trust file aside, and its copy", not: None },
                 // Equal, but neither reads as an anchor: nothing was put before an office.
                 UnsettledTrust { name: "garbled twins, office unborn", trust: Some(garbled.clone()), copy: Some(garbled.clone()),
-                    unborn: true, code: Some(RefusalCode::RefDamaged), says: "restore the ref from a backup", not: None },
+                    unborn: true, code: Some(RefusalCode::RefDamaged), says: "or not reading as an anchor", not: None },
             ].into_iter().nth(case).unwrap();
 
             let forklift = crate::globals::forklift_root();

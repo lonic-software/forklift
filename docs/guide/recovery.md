@@ -690,7 +690,7 @@ the warehouse, run `forklift heal` when one of the two files verifies the office
 differ, move aside the one you do not trust first. When neither does, take the ways out above. It
 refuses as `trust_damaged` too when the trust file is missing beside a born office pallet or a
 standing copy, and as `ref_damaged` when the trust file stands beside an unborn office pallet with no
-copy that matches it: an enrollment or a first `lower` stopped part way. To run it again, move the
+copy that matches it, or not reading as an anchor: an enrollment or a first `lower` stopped part way. To run it again, move the
 trust file aside, and its copy if one stands. Where a remote holds the warehouse's office,
 `forklift lower` takes it instead, and verifies it against the trust file.
 

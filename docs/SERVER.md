@@ -426,7 +426,7 @@ revocation by more than about a day.
   differs from it: a client's trust change there stopped part way, or a file was damaged. It refuses
   as `trust_damaged` too when the trust file is missing beside a born office pallet or a standing
   copy, and as `ref_damaged` when the trust file stands beside an unborn office pallet with no copy
-  that matches it. The log says what to do. A re-genesis a server installed, standing in a root that has lost both its
+  that matches it, or not reading as an anchor. The log says what to do. A re-genesis a server installed, standing in a root that has lost both its
   served mark and its tombstone list, refuses as `tombstones_damaged` instead: run
   `forklift-server tombstone repair --root <warehouse>`.
 - **Trust changes in a served root:** once a root is served, `forklift office regenesis`,

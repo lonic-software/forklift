@@ -45,7 +45,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   writes the missing copy. A server's first serve refuses a warehouse whose trust file does not
   verify its office pallet, whose copy differs from it, or whose trust file is missing beside a born
   office pallet or a standing copy, as `trust_damaged`, and one whose trust file stands beside an
-  unborn office pallet with no matching copy (an enrollment or first `lower` that stopped part way)
+  unborn office pallet with no matching copy, or not reading as an anchor (an enrollment or first `lower` that stopped part way)
   as `ref_damaged`; before, such a warehouse was served as it stood. A trust change refuses before
   it writes anything when the copy's path holds something other than a file, or a copy a newer
   Forklift wrote.
