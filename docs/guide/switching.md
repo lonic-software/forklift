@@ -90,8 +90,8 @@ The import writes the history straight into packed storage, so a large repositor
 The tip it prints is optional: one `store compact --all --redelta` can shrink the store further.
 A long history takes a while: the Linux kernel's takes minutes.
 
-Git and Forklift now share the folder. Git never sees `.forklift/`, and Forklift always ignores
-`.git`, so both read clean. Git rewrites some files as it checks them out: line endings under
+Git and Forklift now share the folder. `.forklift/` ignores itself, so git does not list it, and
+Forklift always ignores `.git`, so both read clean. Git rewrites some files as it checks them out: line endings under
 `core.autocrlf`, filters such as Git LFS. Such a file does not hold the content git stored, so the
 import warns, naming it, and `stocktake` shows it as modified. Load and stack it as it stands, or
 `forklift restore --confirm` it to write the stored content back. [The CLI
@@ -121,8 +121,8 @@ Pallet "main" verified: 0 signed parcel(s) valid, 1 legacy parcel(s) predate tru
 
 The import carries the history of every local branch and the tags on it:
 
-- every commit's tree, files, executable bits and symbolic links, its message, and its author's and committer's
-  email and date;
+- every commit's tree, files, executable bits and symbolic links, its message, and its author's
+  and committer's email and date;
 - each local branch, as a pallet of the same name in lower case (characters a pallet name does not
   allow become `-`);
 - each annotated tag, with its tagger's email, its date and its message.
@@ -170,9 +170,9 @@ Fast-forwarded "main" to the head of "docs" (…).
 These are the differences that catch people coming from git:
 
 - **`pallet create` switches to the new pallet**, as `git switch -c` does. `forklift branch <name>`
-  is refused rather than run, because git's `branch <name>` would not switch.
+  is refused, naming `pallet create <name>` instead.
 - **`stack` never stages for you.** There is no `commit -a`: run `forklift load .` first, which
-  stages new, changed and deleted files alike. `stack` always needs `-m`; it opens no editor.
+  stages new, changed and deleted files alike. `stack` needs `-m`: it opens no editor.
 - **Pallets are not renamed**, and a deleted pallet comes back with `undo`.
 - **`lower` is `pull`**: it fast-forwards, or merges the remote's head when the two have diverged.
 - **`park` is `stash`**, with named parks every bay shares (`park list`, `park pop <name>`).
