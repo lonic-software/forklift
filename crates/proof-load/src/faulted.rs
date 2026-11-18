@@ -1396,9 +1396,10 @@ fn bound<'a>(host: Option<&'a Host>, arguments: &[String]) -> Option<(&'a Host, 
 /// What the command's report names next is recorded, never run ([`follow_ups`]), but for one
 /// thing only the operator can supply: a takedown it asks to be restated ([`restatements`]) is
 /// restated from the operator's own record of takedowns ([`Host::takedowns`]), and only for a hash
-/// both name. A hash the report names that the record lacks stays owed, so content the store lost
-/// is never restated into a takedown; a takedown the report does not name is left to the
-/// readback, which grades what the repair made of it.
+/// both name, inside the same stop, before the server serves again, as the report asks. A hash the
+/// report names that the record lacks stays owed, so content the store lost is never restated into
+/// a takedown; a takedown the report does not name is left to the readback, which grades what the
+/// repair made of it.
 fn operate(context: &Context, arguments: &[String], trail: &mut Trail, unextractable: &mut Vec<String>) -> Result<(), RunError> {
     let written = format!("forklift-server {}", arguments.join(" "));
     let Some((host, bound)) = bound(context.host, arguments) else {
@@ -1407,26 +1408,36 @@ fn operate(context: &Context, arguments: &[String], trail: &mut Trail, unextract
         }
         return Ok(());
     };
-    let outcome = as_operator(context, host, bound.clone(), format!("forklift-server {}", bound.join(" ")), trail, unextractable)?;
-    let report = [&outcome.stdout, &outcome.stderr].into_iter().map(|text| String::from_utf8_lossy(text).into_owned()).collect::<Vec<_>>().join("\n");
-    let mut owed = follow_ups(context.tool, &written, &outcome);
-    trail.steps.push(outcome);
+    // The restatements run before the server serves again, as the report asks.
+    let (tool, root, takedowns) = (context.tool, host.root().to_path_buf(), host.takedowns());
+    let (mut restates, mut planned) = (Vec::new(), Vec::new());
+    let operated = host.operate(bound.clone(), |outcome| {
+        let report = [&outcome.stdout, &outcome.stderr].into_iter().map(|text| String::from_utf8_lossy(text).into_owned()).collect::<Vec<_>>().join("\n");
+        restates = restatements(tool, &report, &root);
+        planned = restating(&restates, &takedowns).into_iter().map(|(hash, statement)| (hash.clone(), restatement(&root, &hash, &statement))).collect::<Vec<_>>();
+        planned.iter().map(|(_, arguments)| arguments.clone()).collect()
+    }, context.scratch, context.environment, context.limit).map_err(RunError::Tool)?;
 
-    let restates = restatements(context.tool, &report, host.root());
+    let knowledge = &mut trail.recoverability.outside_knowledge;
+    knowledge.push("as the remote's operator, on the host: stop the server".to_string());
+    knowledge.push(format!("as the remote's operator, on the host: {}", command_line(&bound)));
+    knowledge.extend(planned.iter().map(|(_, arguments)| format!("as the remote's operator, on the host, from its own record of takedowns: {}", command_line(arguments))));
+    knowledge.extend(operated.restarted.outside_knowledge);
+    knowledge.push("as the remote's operator, on the host: start the server again".to_string());
+    let restart = operated.restarted.unextractable.into_iter().chain(operated.restarted.refused.map(|said| format!("the restarted server refused: {}", said)));
+
+    let mut owed = follow_ups(tool, &written, &operated.outcome);
+    trail.steps.push(operated.outcome);
     let mut restated = Vec::new();
-    for (hash, statement) in restating(&restates, &host.takedowns()) {
-        let root = host.root().display().to_string();
-        let arguments = vec!["withhold".to_string(), "add".into(), "--root".into(), root.clone(), "--statement".into(), statement.clone(), hash.clone()];
-        let known = format!("forklift-server withhold add --root {} --statement {:?} {}, from its own record of takedowns", root, statement, hash);
-        let outcome = as_operator(context, host, arguments, known, trail, unextractable)?;
-        owed.extend(follow_ups(context.tool, "forklift-server withhold add", &outcome));
+    for ((hash, arguments), outcome) in planned.into_iter().zip(operated.then) {
+        owed.extend(follow_ups(tool, &command_line(&arguments), &outcome));
         if outcome.succeeded() {
             restated.push(hash);
         }
         trail.steps.push(outcome);
     }
     discharge(&mut owed, &written, &restates, &restated);
-    for text in owed {
+    for text in restart.chain(owed) {
         if !unextractable.contains(&text) {
             unextractable.push(text);
         }
@@ -1434,23 +1445,20 @@ fn operate(context: &Context, arguments: &[String], trail: &mut Trail, unextract
     Ok(())
 }
 
-/// Runs `arguments` on `host` as its operator ([`Host::operate`]), `known` naming the command as
-/// outside knowledge between the server's stop and its start again, with what starting again took;
-/// what the restart could not do is recorded as unextractable. The command's outcome is returned,
-/// for the caller to make a step.
-fn as_operator(context: &Context, host: &Host, arguments: Vec<String>, known: String, trail: &mut Trail, unextractable: &mut Vec<String>) -> Result<Outcome, RunError> {
-    let operated = host.operate(arguments, context.scratch, context.environment, context.limit).map_err(RunError::Tool)?;
-    let knowledge = &mut trail.recoverability.outside_knowledge;
-    knowledge.push("as the remote's operator, on the host: stop the server".to_string());
-    knowledge.push(format!("as the remote's operator, on the host: {}", known));
-    knowledge.extend(operated.restarted.outside_knowledge);
-    knowledge.push("as the remote's operator, on the host: start the server again".to_string());
-    for text in operated.restarted.unextractable.into_iter().chain(operated.restarted.refused.map(|said| format!("the restarted server refused: {}", said))) {
-        if !unextractable.contains(&text) {
-            unextractable.push(text);
-        }
-    }
-    Ok(operated.outcome)
+/// The server command that withholds `hash` again over the warehouse at `root`, with `statement`.
+fn restatement(root: &Path, hash: &str, statement: &str) -> Vec<String> {
+    ["withhold", "add", "--root", &root.display().to_string(), "--statement", statement, hash].map(str::to_string).to_vec()
+}
+
+/// `arguments` of the server's program as one command line, each quoted as the server quotes an
+/// argument for one: in single quotes unless it is plain.
+fn command_line(arguments: &[String]) -> String {
+    let quote = |argument: &String| if !argument.is_empty() && argument.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:@%+=,~".contains(c)) {
+        argument.clone()
+    } else {
+        format!("'{}'", argument.replace('\'', "'\\''"))
+    };
+    std::iter::once("forklift-server".to_string()).chain(arguments.iter().map(quote)).collect::<Vec<_>>().join(" ")
 }
 
 /// Each takedown to restate, hash and statement, once: a hash `restates` names that `takedowns`,
@@ -1467,19 +1475,21 @@ fn restating(restates: &[Restate], takedowns: &[(String, String)]) -> Vec<(Strin
 }
 
 /// Takes off `owed`, what the report of `written` named next, each restatement it asked for whose
-/// every hash is `restated`: one with a hash left unrestated stays owed, whole.
+/// every hash is `restated`: one with a hash left unrestated, or whose list did not read whole,
+/// stays owed, whole.
 fn discharge(owed: &mut Vec<String>, written: &str, restates: &[Restate], restated: &[String]) {
-    let discharged: Vec<String> = restates.iter().filter(|restate| restate.hashes.iter().all(|hash| restated.contains(hash)))
+    let discharged: Vec<String> = restates.iter().filter(|restate| restate.whole && restate.hashes.iter().all(|hash| restated.contains(hash)))
         .map(|restate| format!("named by {}: {}", written, restate.named)).collect();
     owed.retain(|text| !discharged.contains(text));
 }
 
 /// A takedown an operator command's report asks its operator to restate: the command as the report
-/// quotes it, and each hash it names for it.
+/// quotes it, each hash it names for it, and whether every line of its list read as one.
 #[derive(Debug, PartialEq, Eq)]
 struct Restate {
     named: String,
     hashes: Vec<String>,
+    whole: bool,
 }
 
 /// Each takedown `report`, an operator command's output over the warehouse at `root`, asks its
@@ -1488,33 +1498,38 @@ struct Restate {
 /// left as `<hash>` and listed one per indented line right after the line quoting it. Nothing else
 /// is one: any other placeholder or argument, another root, or a hash that is not one. The root may
 /// be written as the server quotes one for a command line, in single quotes, as it does a path
-/// holding a backslash or a space.
+/// holding a backslash or a space, and as the server resolves it, through a link or to its
+/// canonical form. An indented line of the list that is no hash leaves it not [`Restate::whole`].
 fn restatements(tool: Tool, report: &str, root: &Path) -> Vec<Restate> {
     let is_hash = |text: &str| text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
     let unquoted = |written: &str| match written.strip_prefix('\'').and_then(|inner| inner.strip_suffix('\'')) {
         Some(inner) => inner.replace("'\\''", "'"),
         None => written.to_string(),
     };
-    let root = root.display().to_string();
+    let resolved = std::fs::canonicalize(root).ok();
+    let same_root = |written: &str| {
+        let written = PathBuf::from(unquoted(written));
+        written == root || resolved.as_ref().is_some_and(|resolved| std::fs::canonicalize(&written).ok().as_ref() == Some(resolved))
+    };
     let lines: Vec<&str> = report.lines().collect();
     let mut found = Vec::new();
     for (at, line) in lines.iter().enumerate() {
         for named in remedy::extract(tool, &[line]).unextractable {
             let Some((written, hash)) = named.strip_prefix("forklift-server withhold add --root ")
                 .and_then(|rest| rest.strip_suffix(" --statement <statement>")).and_then(|rest| rest.rsplit_once(' ')) else { continue };
-            if unquoted(written) != root {
+            if !same_root(written) {
                 continue;
             }
-            let hashes = if hash == "<hash>" {
-                lines[at + 1..].iter().take_while(|listed| listed.starts_with(char::is_whitespace) && is_hash(listed.trim()))
-                    .map(|listed| listed.trim().to_string()).collect()
+            let (hashes, whole) = if hash == "<hash>" {
+                let listed: Vec<&str> = lines[at + 1..].iter().take_while(|listed| listed.starts_with(char::is_whitespace)).map(|listed| listed.trim()).collect();
+                (listed.iter().filter(|listed| is_hash(listed)).map(|listed| listed.to_string()).collect::<Vec<_>>(), listed.iter().all(|listed| is_hash(listed)))
             } else if is_hash(hash) {
-                vec![hash.to_string()]
+                (vec![hash.to_string()], true)
             } else {
                 continue;
             };
             if !hashes.is_empty() {
-                found.push(Restate { named, hashes });
+                found.push(Restate { named, hashes, whole });
             }
         }
     }
@@ -2606,16 +2621,31 @@ mod tests {
         );
         let template = "forklift-server withhold add --root /s/host <hash> --statement <statement>".to_string();
         assert_eq!(restatements(Tool::Forklift, &report, Path::new("/s/host")), [
-            Restate { named: format!("forklift-server withhold add --root /s/host {} --statement <statement>", a), hashes: vec![a.clone()] },
-            Restate { named: template, hashes: vec![b.clone(), c.clone()] },
+            Restate { named: format!("forklift-server withhold add --root /s/host {} --statement <statement>", a), hashes: vec![a.clone()], whole: true },
+            Restate { named: template, hashes: vec![b.clone(), c.clone()], whole: true },
         ]);
         assert_eq!(restatements(Tool::Forklift, &report, Path::new("/s/other")), [
-            Restate { named: format!("forklift-server withhold add --root /s/other {} --statement <statement>", d), hashes: vec![d.clone()] },
+            Restate { named: format!("forklift-server withhold add --root /s/other {} --statement <statement>", d), hashes: vec![d.clone()], whole: true },
         ], "the root decides which lines ask");
         assert!(restatements(Tool::Forklift, &report, Path::new("/s/third")).is_empty());
         // A root the server quotes, as it does one holding a backslash: `'C:\s\it'\''s'`.
         let quoted = format!("Withhold it with \"forklift-server withhold add --root 'C:\\s\\it'\\''s' {} --statement <statement>\".\n", a);
         assert_eq!(restatements(Tool::Forklift, &quoted, Path::new("C:\\s\\it's")).len(), 1, "{}", quoted);
+
+        // A list with a line that is no hash is not whole: what it lists past that line is unread.
+        let broken = format!("Withhold each with \"forklift-server withhold add --root /s/host <hash> --statement <statement>\":\n  {a}\n  not-a-hash\n  {b}\n");
+        assert_eq!(restatements(Tool::Forklift, &broken, Path::new("/s/host")), [
+            Restate { named: "forklift-server withhold add --root /s/host <hash> --statement <statement>".into(), hashes: vec![a.clone(), b.clone()], whole: false },
+        ]);
+
+        // The server names the root it resolved; the harness serves it by the path it was given.
+        let given = std::env::temp_dir().join(format!("proof-load-restate-{}", std::process::id()));
+        std::fs::create_dir_all(&given).unwrap();
+        let resolved = std::fs::canonicalize(&given).unwrap();
+        let named = format!("Withhold it with \"forklift-server withhold add --root {} {} --statement <statement>\".\n", resolved.display(), a);
+        let found = restatements(Tool::Forklift, &named, &given).len();
+        std::fs::remove_dir_all(&given).unwrap();
+        assert_eq!(found, 1, "{} resolved to {}", given.display(), resolved.display());
     }
 
     /// Only a hash both the report and the operator's own record name is restated, with the
@@ -2628,16 +2658,21 @@ mod tests {
     /// was not, is no longer owed.
     #[test]
     fn a_takedown_is_restated_only_from_the_operators_own_record() {
-        let restate = |hashes: &[&str]| Restate { named: String::new(), hashes: hashes.iter().map(|hash| hash.to_string()).collect() };
+        let restate = |hashes: &[&str]| Restate { named: String::new(), hashes: hashes.iter().map(|hash| hash.to_string()).collect(), whole: true };
         let takedowns = [("z".to_string(), "zs".to_string()), ("c".to_string(), "cs".to_string()), ("a".to_string(), "as".to_string())];
         assert_eq!(restating(&[restate(&["a"]), restate(&["b", "c", "a"])], &takedowns), [("a".to_string(), "as".to_string()), ("c".to_string(), "cs".to_string())]);
         assert!(restating(&[restate(&["b"])], &takedowns).is_empty());
+        // Recorded as a command line the operator can run as written.
+        assert_eq!(command_line(&restatement(Path::new("/s/a b"), "a", "it's")), "forklift-server withhold add --root '/s/a b' --statement 'it'\\''s' a");
 
         // What was asked stays owed until every hash it named is restated.
         let asked = |named: &str, hashes: &[&str]| Restate { named: named.to_string(), ..restate(hashes) };
         let mut owed = vec!["named by R: one".to_string(), "named by R: both".to_string(), "named by R: heal".to_string()];
-        discharge(&mut owed, "R", &[asked("one", &["a"]), asked("both", &["a", "b"])], &["a".to_string()]);
-        assert_eq!(owed, ["named by R: both", "named by R: heal"]);
+        let mut torn = asked("torn", &["a"]);
+        torn.whole = false;
+        owed.push("named by R: torn".to_string());
+        discharge(&mut owed, "R", &[asked("one", &["a"]), asked("both", &["a", "b"]), torn], &["a".to_string()]);
+        assert_eq!(owed, ["named by R: both", "named by R: heal", "named by R: torn"]);
     }
 
     /// A served record counts as acknowledged only after an answer that asks nothing further: success, or

@@ -448,7 +448,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
                 outcomes.push(run_in(server, vec!["bundle".into(), "--root".into(), root.display().to_string()], scratch.root().to_path_buf())?);
             }
             Op::Withhold { index } => {
-                let server = server.filter(|_| host.is_some())
+                let (server, hosted) = server.zip(host.as_ref())
                     .ok_or_else(|| RunError::Io(format!("scenario {} withholds before it hosts a warehouse", scenario.id)))?;
                 let (path, bytes) = crate::scenario::taken(corpus, *index)
                     .ok_or_else(|| RunError::Io(format!("scenario {}: record {} holds nothing no later record holds", scenario.id, index)))?;
@@ -471,9 +471,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 // The copy gone is the takedown taken: from here it is in the operator's record.
-                if let Some(host) = host.as_ref() {
-                    host.took_down(&hash, crate::scenario::TAKEN_BECAUSE);
-                }
+                hosted.took_down(&hash, crate::scenario::TAKEN_BECAUSE);
                 let digest = crate::corpus::expected_entry(&path, &bytes, &corpus.modes);
                 taken.push(Taken { path, digest, by: TakenBy::Withheld });
             }
