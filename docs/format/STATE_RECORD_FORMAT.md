@@ -55,8 +55,9 @@ format](WAREHOUSE_FORMAT.md)).
 | File | Kind | Entries |
 |------|------|---------|
 | `cherry-pick` (bay-local) | `cherry-pick` | The parcel being picked, the head and then the pallet it is applied to, then the description the completing `stack` defaults to, when there is one. |
-| `consolidation` (bay-local) | `consolidation` | The head parcel hash of the pallet being consolidated in, then its name. |
+| `consolidation` (bay-local) | `consolidation` | The head parcel hash of the pallet being consolidated in, then its name; the head parcel hash and the name of the pallet consolidated into; then the blake3 digest, in lowercase hex, of the whole `consolidation-skeleton` file written with it. A skeleton whose bytes do not match it is refused as damaged. |
 | `consolidation-skeleton` (bay-local) | `consolidation-skeleton` | One out-of-scope entry of a scoped merge per line: `S <code> <hash> <path>` or `D <path>`. The whole line is the escaped entry. |
+| `cherry-pick-copy`, `consolidation-copy`, `consolidation-skeleton-copy` (bay-local) | as the record | A copy of the record of the same name without `-copy`, written before it on every write and removed after it, so while the record exists its copy holds the bytes of its last write. Only `heal` reads a copy, to write a damaged record back; a copy with no record beside it is never read as a merge in progress. |
 | `inventory/incomplete-load` (bay-local) | `marker` | The warehouse path key of each load root left incomplete; the root is the empty entry. |
 | `inventory/metadata` (bay-local) | `inventory-metadata` | The warehouse path key of every directory with an inventory shard; the root is `./`. |
 | `redirect` (in a bay's own `.forklift` folder) | `bay` | The warehouse root, then the bay's name. Its presence is what makes the folder a bay's rather than a warehouse's; its header is how reading one refuses a stray file instead of misreading it as a bay. |
