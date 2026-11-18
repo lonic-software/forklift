@@ -2230,7 +2230,7 @@ mod tests {
         // A record the filesystem fails to read may be whole: that is no damage, and it names no
         // step that would drop it. (Skipped where permissions do not bind, as for root.)
         #[cfg(unix)]
-        for (name, bytes) in [(FILE_NAME_CONSOLIDATION, state.clone()), (FILE_NAME_SKELETON, skeleton.clone())] {
+        for (name, bytes) in [(FILE_NAME_CONSOLIDATION, state.clone()), (crate::util::cherry_pick_utils::FILE_NAME_CHERRY_PICK, pick.clone()), (FILE_NAME_SKELETON, skeleton.clone())] {
             use std::os::unix::fs::PermissionsExt;
             let path = root.join(name);
             std::fs::write(&path, bytes).unwrap();

@@ -514,7 +514,9 @@ changed. Run the next step it names in that bay:
 
 When the refusal names another bay, run that command in the bay it names: an abort here does not
 reach it. A record written by a newer version of Forklift is not this refusal; use the Forklift
-that wrote it.
+that wrote it. Nor is a record the filesystem fails to read (a permission or device error): it may
+be whole, so the refusal stays a plain read error. Fix the cause and run the command again, or, to
+give the merge up anyway, `forklift abort --keep-files` still removes it.
 
 ### `object_kind_mismatch` (exit 63)
 
