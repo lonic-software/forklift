@@ -1986,7 +1986,8 @@ fn optimistic_lift_refuses_on_an_incomplete_load_before_writing_consolidation_st
 /// merge in progress is left byte for byte.
 ///
 /// Revert: drop the lift's mid-merge check → the merge primitive's own guard refuses instead,
-/// after fetching their work, naming no lower, red.
+/// naming no lower, red. Read the merge records before the diverged test → the lift of a pallet
+/// that is only ahead is refused over a damaged pick state, red.
 #[test]
 fn a_lift_over_a_merge_in_progress_stops_diverged_and_leaves_it() {
     let area = TestArea::new("lift-mid-merge");
@@ -2026,7 +2027,7 @@ fn a_lift_over_a_merge_in_progress_stops_diverged_and_leaves_it() {
 
     let refused = area.forklift("b", &["lift"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
-    assert!(stderr(&refused).contains("lower them first") && stderr(&refused).contains("Next step: forklift lower"),
+    assert!(stderr(&refused).contains("diverged") && stderr(&refused).contains("Next step: forklift lower; then forklift lift"),
         "{}", stderr(&refused));
     assert_eq!(std::fs::read(area.path("b/.forklift/consolidation")).unwrap(), state, "the merge in progress is untouched");
     assert!(!area.path("b/from_a.txt").exists(), "nothing of theirs was merged in");
