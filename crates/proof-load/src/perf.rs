@@ -467,16 +467,25 @@ fn changes(subject: &Subject, scratch: &Scratch, environment: &Environment) -> R
         return Ok(Err(format!("{} {} exited {:?}: {}", subject.tool.label(), arguments.join(" "), outcome.exit, String::from_utf8_lossy(&outcome.stderr).trim())));
     }
     if subject.tool == Tool::Forklift {
-        let document = runner::document(&outcome.stdout);
-        let paths = |field: &str| -> Option<BTreeSet<String>> {
-            document["data"][field].as_array()?.iter().map(|change| change["path"].as_str().map(str::to_string)).collect()
-        };
-        return Ok(match (paths("staged"), paths("unstaged")) {
-            (Some(staged), Some(unstaged)) => Ok(Changes { staged, unstaged }),
-            _ => Err("Forklift's --json stocktake gave no staged and unstaged path lists".to_string()),
-        });
+        return Ok(stocktake_changes(&runner::document(&outcome.stdout)).ok_or_else(|| "Forklift's --json stocktake gave no staged and unstaged paths that agree with its counts".to_string()));
     }
     Ok(Ok(porcelain(&String::from_utf8_lossy(&outcome.stdout))))
+}
+
+/// The changes in a `--json stocktake` document, or None when it holds none that can be trusted. A
+/// list is left out when it is empty, so each is read only beside its count, and must hold as many
+/// distinct paths as the count says.
+fn stocktake_changes(document: &serde_json::Value) -> Option<Changes> {
+    let paths = |field: &str| -> Option<BTreeSet<String>> {
+        let count = document["data"][format!("{}_count", field)].as_u64()?;
+        let list = match &document["data"][field] {
+            serde_json::Value::Null => Vec::new(),
+            list => list.as_array()?.iter().map(|change| change["path"].as_str().map(str::to_string)).collect::<Option<Vec<String>>>()?,
+        };
+        let paths: BTreeSet<String> = list.into_iter().collect();
+        (u64::try_from(paths.len()).ok() == Some(count)).then_some(paths)
+    };
+    Some(Changes { staged: paths("staged")?, unstaged: paths("unstaged")? })
 }
 
 /// The changes in `git status --porcelain` lines `XY path`: X, the index's column, names a staged
@@ -710,6 +719,20 @@ mod tests {
         let set = |paths: &[&str]| paths.iter().map(|path| path.to_string()).collect::<BTreeSet<String>>();
         let changes = porcelain(" M a/one\nM  b\n?? c\nR  old -> new\nMM d\n");
         assert_eq!(changes, Changes { staged: set(&["b", "new", "d"]), unstaged: set(&["a/one", "c", "d"]) });
+    }
+
+    /// A stocktake document's paths are read beside their counts: a list left out reads as empty
+    /// only when its count is 0, and a list that holds fewer paths than its count, or one whose
+    /// entry names no path, is not trusted.
+    #[test]
+    fn stocktake_paths_are_read_beside_their_counts() {
+        let set = |paths: &[&str]| paths.iter().map(|path| path.to_string()).collect::<BTreeSet<String>>();
+        let read = |data: serde_json::Value| stocktake_changes(&serde_json::json!({ "ok": true, "data": data }));
+        assert_eq!(read(serde_json::json!({ "staged_count": 0, "unstaged_count": 1, "unstaged": [{ "kind": "untracked", "path": "a" }] })), Some(Changes { staged: BTreeSet::new(), unstaged: set(&["a"]) }));
+        assert_eq!(read(serde_json::json!({ "staged_count": 1, "unstaged_count": 0 })), None);
+        assert_eq!(read(serde_json::json!({ "staged_count": 0, "unstaged_count": 2, "unstaged": [{ "path": "a" }] })), None);
+        assert_eq!(read(serde_json::json!({ "staged_count": 0, "unstaged_count": 1, "unstaged": [{ "kind": "added" }] })), None);
+        assert_eq!(read(serde_json::json!({ "staged_count": 0 })), None);
     }
 
     /// The sameness check compares the paths each subject reports, not how many: a git subject with
