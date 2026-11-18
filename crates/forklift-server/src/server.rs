@@ -1946,12 +1946,7 @@ fn damage_message(code: forklift_core::error::RefusalCode) -> String {
 /// ([`error_response`]), since only the operator's repair mends it; any other error is a 500
 /// ([`server_fault`]). The damage itself is logged, with the local next step.
 fn damage_refusal(message: String) -> HandlerError {
-    // A caller may have wrapped the damage in its own words; the frame inside still names it.
-    let damage = forklift_core::error::frames_in(&message).find_map(|(code, _, step)| {
-        DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, step.to_string()))
-    });
-
-    match damage {
+    match damage_in(&message) {
         Some((code, step)) => {
             tracing::error!(%message, "a host record or the store is damaged");
             (StatusCode::SERVICE_UNAVAILABLE, forklift_core::error::CoreError::refusal(code, damage_message(code), operator_remedy(code, &step)).into())
@@ -1965,15 +1960,21 @@ fn unprocessable(message: String) -> HandlerError {
     (StatusCode::UNPROCESSABLE_ENTITY, message)
 }
 
+/// The first of the [`DAMAGE_CODES`] framed anywhere in `message`, with its step: a caller may have
+/// wrapped the damage in its own words, and the frame inside still names it.
+fn damage_in(message: &str) -> Option<(forklift_core::error::RefusalCode, String)> {
+    forklift_core::error::frames_in(message).find_map(|(code, _, step)| {
+        DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, step.to_string()))
+    })
+}
+
 /// A verification of what the warehouse holds that refused: the operator's 503
-/// ([`damage_refusal`]) when the refusal carries a damage frame anywhere in it, since a stored
-/// record that does not read is the server's to repair and its reader's words may name the
-/// server's paths; a 422 otherwise.
+/// ([`damage_refusal`]) when the refusal carries a damage frame anywhere in it, a 422 otherwise.
+/// A read failure the reader did not frame as damage still goes out as the 422.
 fn refused_or_damaged(message: String) -> HandlerError {
-    let damaged = forklift_core::error::frames_in(&message).any(|(code, _, _)| DAMAGE_CODES.iter().any(|damage| damage.as_str() == code));
-    match damaged {
-        true => damage_refusal(message),
-        false => unprocessable(message),
+    match damage_in(&message) {
+        Some(_) => damage_refusal(message),
+        None => unprocessable(message),
     }
 }
 

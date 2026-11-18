@@ -2316,9 +2316,14 @@ fn unchecked_remote() -> Option<bool> {
 /// warehouse's office pallet (`Some`), or one is configured that was not asked (`None`). Only a
 /// remote known to hold it is named as the next step. A served root's office is unborn while the
 /// first enrollment has lifted the anchor and not yet the office, and also when its ref was lost,
-/// which nothing here tells apart, so there it is refused uncoded, saying both.
+/// which nothing here tells apart, so there it is refused uncoded, saying both. A served state that
+/// does not read is refused as itself: which of the two remedies applies turns on it.
 pub fn office_unborn_refusal_over(closing: &str, lowerable: Option<bool>) -> String {
-    if served_or_unknown() {
+    let served = match crate::util::tombstone_utils::served_state() {
+        Ok(state) => state != crate::util::tombstone_utils::ServedState::Never,
+        Err(unreadable) => return unreadable,
+    };
+    if served {
         return format!(
             "The trust file holds this warehouse's anchor, but the office pallet is unborn, so nothing signed here \
             can be checked. {} On a served warehouse that is the state before the enrolling client lifts the office \
@@ -2353,8 +2358,12 @@ pub fn office_unborn_refusal_over(closing: &str, lowerable: Option<bool>) -> Str
 fn unborn_office_remedy(lowerable: Option<bool>) -> (String, String) {
     let by_hand = format!(
         "restore its ref (\"{}\") from a backup, or write the office pallet's head parcel hash into it by hand; \
-        an older head than the last re-admits any key revoked since.",
-        pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME).to_string_lossy()
+        an older head than the last re-admits any key revoked since. If an enrollment stopped before it wrote \
+        the office pallet, there is no ref to restore: where no remote holds this anchor, move the trust file \
+        (\"{}\") and its copy (\"{}\") aside and run \"forklift office enroll\" again.",
+        pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME).to_string_lossy(),
+        forklift_root().join(FILE_NAME_TRUST).to_string_lossy(),
+        forklift_root().join(FILE_NAME_TRUST_COPY).to_string_lossy()
     );
     match lowerable {
         Some(true) => (
@@ -3787,6 +3796,7 @@ pub(crate) mod tests {
     /// enrolling client lifts the office or a lost ref, refused uncoded, saying both.
     // Revert: drop the served check in `office_unborn_refusal_over` → the served row is coded → red.
     // Revert: name lower as the step for `None` → that row's step is lower → red.
+    // Revert: read an unreadable served state as a client → the unreadable rows are ref_damaged → red.
     #[test]
     fn an_unborn_office_is_ref_damaged_on_a_client_and_not_on_a_served_root() {
         let dir = trust_read_root("unborn-office", Some(TRUST_FILE), false, false);
@@ -3804,11 +3814,20 @@ pub(crate) mod tests {
             assert_eq!(next_step, step, "{:?}: {}", lowerable, client);
             assert!(message.contains(phrase), "{:?}: {}", lowerable, client);
             assert_eq!(message.contains("by hand"), lowerable != Some(true), "{:?}: {}", lowerable, client);
+            assert_eq!(message.contains("run \"forklift office enroll\" again"), lowerable != Some(true), "{:?}: {}", lowerable, client);
         }
 
+        // A served mark with no tombstone list beside it does not read: it is refused as itself,
+        // never guessed to be a client or a served root.
         let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
-        crate::util::tombstone_utils::write_tombstones(&lock, &Default::default()).unwrap();
         crate::util::tombstone_utils::write_mark(&lock).unwrap();
+        for lowerable in [Some(true), None, Some(false)] {
+            let unreadable = office_unborn_refusal_over("Nothing was changed.", lowerable);
+            assert!(crate::error::frames_code(&unreadable, RefusalCode::TombstonesDamaged), "{:?}: {}", lowerable, unreadable);
+            assert!(!unreadable.contains("forklift lower") && !unreadable.contains("by hand"), "{:?}: {}", lowerable, unreadable);
+        }
+
+        crate::util::tombstone_utils::write_tombstones(&lock, &Default::default()).unwrap();
         drop(lock);
         for lowerable in [Some(true), None, Some(false)] {
             let served = office_unborn_refusal_over("Nothing was changed.", lowerable);

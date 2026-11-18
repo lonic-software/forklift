@@ -7923,6 +7923,31 @@ fn undoing_a_delete_over_a_damaged_office_signature_names_what_was_refused() {
     assert!(!warehouse.root.join(".forklift/pallets/side").exists(), "{}", value);
 }
 
+/// An enrollment stopped before it wrote the office pallet leaves an anchor with no office ref to
+/// restore. The refusal names moving the trust files aside and enrolling again, and that way out
+/// is taken here, to an enrolled warehouse that audits clean.
+#[test]
+fn an_enrollment_stopped_before_the_office_names_a_way_out_that_works() {
+    let (warehouse, _) = enrolled_warehouse("enroll-stopped");
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/meta/office")).unwrap();
+
+    let refused = warehouse.run(&["--json", "office", "enroll"]);
+
+    assert_eq!(refused.status.code(), Some(53), "{}{}", stdout(&refused), stderr(&refused));
+    let value = json(&refused);
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("move the trust file") && message.contains("run \"forklift office enroll\" again"), "{}", value);
+
+    for name in ["trust", "trust-copy"] {
+        let path = warehouse.root.join(".forklift").join(name);
+        if path.exists() {
+            forklift_core::util::file_utils::remove_file(&path).unwrap();
+        }
+    }
+    assert_success(&warehouse.run(&["office", "enroll"]));
+    assert_success(&warehouse.run(&["audit"]));
+}
+
 // Revert: drop deliver's target-coverage check → the delivery lands and other.txt is back to v1.
 #[test]
 fn deliver_onto_a_target_that_moved_after_the_draft_forked_is_refused() {
