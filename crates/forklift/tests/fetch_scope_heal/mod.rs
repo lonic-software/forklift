@@ -171,8 +171,9 @@ fn heal_with_no_readable_checkout_offers_a_fetch_scope_that_works() {
     assert_eq!(json_of(&healed)["data"]["fetch_scope_rebuilt"]["scope"], serde_json::json!(["docs", "src"]));
 }
 
-/// A fetch scope that matches its digest but does not hold a checkout's scope (one of the two was
-/// written over whole, by hand or from elsewhere) is refused with both ways out; choosing the fetch scope as the damaged one fetches and sets it.
+/// A fetch scope that matches its digest but does not hold a checkout's scope (one of the two holds
+/// the wrong scope whole, as a file put back from elsewhere would) is refused with both ways out;
+/// choosing the fetch scope as the damaged one fetches and sets it.
 ///
 /// Revert: skip the check of the checkouts against a readable fetch scope → heal exits 0 → red.
 #[test]

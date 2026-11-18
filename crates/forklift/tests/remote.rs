@@ -9247,7 +9247,8 @@ fn sparse_with_docs(area: &TestArea) -> Server {
 /// Flip one byte of the scope record at `path`, leaving its digest line as it was, so that only
 /// the digest tells the damage apart: the body, digested again, is still a scope naming a path.
 /// "docs" and "src/api" become the one prefix "docs/src/api", a narrowing that stays within a
-/// fetch scope naming "docs"; a record without "docs" has "src/api" become "src/apj".
+/// fetch scope naming "docs"; a record without "docs" has "src/api" become "src/apj", which lies
+/// outside one naming "src/api", a state the readers refused before the digest too.
 fn flip_a_scope_byte(area: &TestArea, path: &str) {
     use forklift_core::util::record_utils;
 
@@ -9261,8 +9262,11 @@ fn flip_a_scope_byte(area: &TestArea, path: &str) {
 
     let body = record_utils::without_digest_line(&bytes).to_vec();
     assert_ne!(body.len(), bytes.len(), "the stale digest line is kept");
-    let prefixes = record_utils::from_bytes(&record_utils::with_digest(body), "scope", 5).expect("the flipped body is a scope");
-    assert!(!prefixes.is_empty() && !prefixes.iter().any(|prefix| prefix.as_str() == "src/api"), "{:?}", prefixes);
+    let header = String::from_utf8_lossy(body.split(|byte| *byte == b'\n').next().unwrap()).into_owned();
+    let version: u32 = header.strip_prefix("/forklift-scope ").and_then(|version| version.parse().ok()).expect("a scope header");
+    let prefixes = record_utils::from_bytes(&record_utils::with_digest(body), "scope", version).expect("the flipped body is a record");
+    let scope = forklift_core::util::scope_utils::PathScope::from_prefixes(prefixes);
+    assert!(!scope.is_full() && !scope.prefixes().iter().any(|prefix| prefix.as_str() == "src/api"), "{:?}", scope.prefixes());
 
     std::fs::write(area.path(path), bytes).unwrap();
 }

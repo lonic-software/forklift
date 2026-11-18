@@ -19,9 +19,10 @@
 //! ref moves between the check and the write.
 //!
 //! Every scope record ends in its digest, so a damaged byte makes the file unreadable and the
-//! rebuild above, or the checkout's own heal, takes it. When both read and a checkout's scope
-//! still lies outside the fetch scope, one of them was written over whole, and its digest says
-//! nothing about which. Heal refuses with `fetch_scope_damaged`, offering both ways out.
+//! rebuild above, or the checkout's own heal, takes it. When both match their digests and a
+//! checkout's scope still lies outside the fetch scope, one of them holds the wrong scope whole (a
+//! file put back from elsewhere, say), and no digest says which. Heal refuses with
+//! `fetch_scope_damaged`, offering both ways out.
 //!
 //! ## The chosen scope
 //!
