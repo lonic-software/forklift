@@ -271,6 +271,7 @@ mod tests {
         let work = scratch.work().join("merge");
         read(&["clone", "-q", "--", &path.display().to_string(), &work.display().to_string()], scratch.work().as_path());
         read(&["-c", "user.name=t", "-c", "user.email=t@example.invalid", "merge", "-q", "--no-edit", "origin/perf-side"], &work);
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -590,6 +590,7 @@ mod tests {
         }).collect();
         walls.sort();
         assert!(walls[5] < Duration::from_millis(5), "median wall time {:?} of {:?}", walls[5], walls);
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(scratch.root());
     }
 
@@ -607,6 +608,7 @@ mod tests {
         assert_eq!(timed.outcome.exit, Some(0), "{}", String::from_utf8_lossy(&timed.outcome.stderr));
         let peak = timed.usage.expect("unix reads rusage").peak_bytes;
         assert!((64 << 20..256 << 20).contains(&peak), "peak {} bytes", peak);
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(scratch.root());
     }
 
@@ -625,6 +627,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
         let exited = timed(&shell("echo out; echo err >&2; exit 3", Duration::from_secs(10)), &scratch, &environment).unwrap();
         assert_eq!((exited.outcome.exit, exited.outcome.stdout.as_slice(), exited.outcome.stderr.as_slice()), (Some(3), b"out\n".as_slice(), b"err\n".as_slice()));
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(scratch.root());
     }
 

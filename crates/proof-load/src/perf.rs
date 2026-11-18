@@ -538,7 +538,7 @@ fn measure(invocation: &Invocation, reps: usize, scratch: &Scratch, environment:
 fn spread(mut values: Vec<u64>) -> Spread {
     values.sort_unstable();
     let middle = values.len() / 2;
-    let median = if values.len() % 2 == 0 { (values[middle - 1] + values[middle]) / 2 } else { values[middle] };
+    let median = if values.len().is_multiple_of(2) { (values[middle - 1] + values[middle]) / 2 } else { values[middle] };
     Spread { median, min: values[0], max: values[values.len() - 1] }
 }
 
@@ -668,6 +668,7 @@ mod tests {
         };
         assert_eq!(measure(&shell("echo boom >&2; exit 1"), 3, &scratch, &environment).unwrap(), Measured::Voided { exit: Some(1), stderr: "boom\n".into() });
         assert!(matches!(measure(&shell("exit 0"), 3, &scratch, &environment).unwrap(), Measured::Timed { .. }));
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -706,6 +707,7 @@ mod tests {
         let written = std::fs::read_to_string(out.join("perf.json")).unwrap();
         assert_eq!(PerfReport::from_json(&written).unwrap(), report);
         assert!(std::fs::read_to_string(out.join("perf.md")).unwrap().contains("### diff --staged (warm)"));
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&out);
     }
 }

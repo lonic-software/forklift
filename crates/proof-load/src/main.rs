@@ -15,6 +15,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant, reason = "parsed once per process, so the size of the larger variant costs nothing")]
 enum Command {
     /// Runs the completeness checks and the scenarios, and writes report.json and report.md.
     Run {
