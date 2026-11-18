@@ -40,6 +40,26 @@ const ADOPTS: &[(&str, &str)] = &[
 /// The production callers of the byte read and the constructions of the adoption read are
 /// exactly the listed ones. Revert: call `read_trust_anchor_bytes` from another production
 /// function, or pass `TrustReadMode::Adopt` from another caller, and this fails naming it.
+/// How often `line` names the adoption variant, however it reaches it: through the enum, or bare
+/// after an import of it. Its own declaration is not a construction.
+fn adoptions(line: &str) -> usize {
+    match line.trim() == "Adopt," {
+        true => 0,
+        false => words(line).filter(|word| *word == "Adopt").count(),
+    }
+}
+
+/// An import of the variant counts as a use of it, as the enum path does; the declaration does not.
+// Revert: count only the `TrustReadMode::Adopt` spelling → the import and the bare use are missed.
+#[test]
+fn the_adoption_read_is_found_however_it_is_named() {
+    assert_eq!(adoptions("    check_remote_trust(&client, &info, None, TrustReadMode::Adopt)?;"), 1);
+    assert_eq!(adoptions("use forklift_core::util::office_utils::TrustReadMode::{self, Adopt};"), 1);
+    assert_eq!(adoptions("    let mode = Adopt;"), 1);
+    assert_eq!(adoptions("    Adopt,"), 0);
+    assert_eq!(adoptions("    let adopted = adopt_anchor(Adopted);"), 0);
+}
+
 /// The identifiers in `line`.
 fn words(line: &str) -> impl Iterator<Item = &str> {
     line.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|word| !word.is_empty())
@@ -48,12 +68,7 @@ fn words(line: &str) -> impl Iterator<Item = &str> {
 #[test]
 fn every_trust_read_that_can_skip_the_witnesses_is_listed() {
     let byte_reads = production_sites(DIRS, |line| usize::from(calls(line, "read_trust_anchor_bytes")));
-    // The variant by name, however it is reached: through the enum, or bare after an import of it.
-    // Its own declaration is not a construction.
-    let adopts = production_sites(DIRS, |line| match line.trim() == "Adopt," {
-        true => 0,
-        false => words(line).filter(|word| *word == "Adopt").count(),
-    });
+    let adopts = production_sites(DIRS, adoptions);
 
     for (what, found, expected) in [("byte read", &byte_reads, BYTE_READS), ("adoption read", &adopts, ADOPTS)] {
         let (unlisted, gone) = differences(found, expected);
