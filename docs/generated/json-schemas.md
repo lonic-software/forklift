@@ -2880,6 +2880,44 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "TrustFileWritten": {
+      "description": "Which of the trust file and its copy heal wrote.",
+      "oneOf": [
+        {
+          "const": "trust",
+          "description": "The trust file, from its copy.",
+          "type": "string"
+        },
+        {
+          "const": "copy",
+          "description": "The copy, from the trust file.",
+          "type": "string"
+        }
+      ]
+    },
+    "TrustRestored": {
+      "description": "What heal wrote to the trust file or its copy, from the other.",
+      "properties": {
+        "from": {
+          "description": "The file whose bytes were written there.",
+          "type": "string"
+        },
+        "path": {
+          "description": "The file written.",
+          "type": "string"
+        },
+        "written": {
+          "$ref": "#/$defs/TrustFileWritten",
+          "description": "Which file was written."
+        }
+      },
+      "required": [
+        "written",
+        "path",
+        "from"
+      ],
+      "type": "object"
+    },
     "UnavailableRebuilt": {
       "description": "What `heal` kept of a damaged record of content this warehouse cannot get.",
       "properties": {
@@ -3144,6 +3182,17 @@ A command not listed here either reports only the generic human-message shape `{
         "type": "string"
       },
       "type": "array"
+    },
+    "trust_restored": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TrustRestored"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The trust file or its copy, which was missing or did not hold the anchor and this run wrote\nfrom the other, before anything read the anchor."
     },
     "unavailable_rebuilt": {
       "anyOf": [

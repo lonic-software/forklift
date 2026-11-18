@@ -81,7 +81,8 @@ writes the copy when it is run again.
 A warehouse that holds an office but has lost its trust file, or whose trust file
 does not parse, is refused as `trust_damaged` by every command that reads its trust:
 it neither signs nor writes unsigned, and a new genesis would orphan every parcel
-that office vouches for. Restore the file from a
+that office vouches for. `forklift heal` writes the trust file back from its copy
+when the copy still holds the anchor. Otherwise restore the file from a
 backup if you have one. Otherwise `forklift lower` takes the configured remote's
 anchor, with nothing local to compare it against, so use it only with a remote you
 trust; if that remote has reset its trust, clone it again instead. With neither, trust
