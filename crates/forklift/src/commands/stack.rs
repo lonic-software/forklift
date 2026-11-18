@@ -1,6 +1,5 @@
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
-use forklift_core::globals::bay_root;
 use forklift_core::util::pallet_utils::RefUpdateError;
 use forklift_core::util::stack_utils::{self, StackError};
 use forklift_core::util::stocktake_utils::{self, ChangeKind};
@@ -64,13 +63,13 @@ async fn moved_under_merge(pallet: &str, found: Option<&str>) -> Result<Option<S
         (Some(state), _) => (
             "consolidation",
             state.our_head,
-            merge_utils::state_removal_hint_in(&bay_root()),
+            merge_utils::abandon_hint(),
             "merge again (\"forklift consolidate\", or the \"forklift haul consolidate\" or \"forklift lift\" that started it)".to_string(),
         ),
         (None, Some(state)) => (
             "pick",
             state.our_head,
-            cherry_pick_utils::state_removal_hint(),
+            merge_utils::abandon_hint(),
             format!("pick {} again", state.source),
         ),
         (None, None) => return Ok(None),

@@ -709,6 +709,18 @@ fn checkout_scope_damaged(whose: &str, path: &Path, found: &str, checkout: &Chec
     refusal(RefusalCode::CheckoutScopeDamaged, message, next_step).into()
 }
 
+/// The main tree's folder, absolute where it can be made so: the folder a user runs a command in
+/// to reach the main tree's own state.
+pub(crate) fn main_tree_folder() -> PathBuf {
+    let main_tree = globals::forklift_root();
+    // Run from the main tree, the root is the relative ".forklift", whose parent is empty.
+    let main_tree = match main_tree.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    std::path::absolute(&main_tree).unwrap_or(main_tree)
+}
+
 /// What restores a checkout scope that is missing, damaged or names no path, from a checkout other
 /// than it: heal run there, named by its folder. A bay that recorded no folder, its `bay add`
 /// stopped before checking anything out, has no checkout to run it in, so it is removed instead.
@@ -717,16 +729,10 @@ fn checkout_scope_damaged(whose: &str, path: &Path, found: &str, checkout: &Chec
 /// * `bay` - The bay, or `None` for the warehouse's own working tree.
 pub(crate) fn heal_there(bay: Option<&str>) -> String {
     match bay {
-        None => {
-            let main_tree = globals::forklift_root();
-            // Run from the main tree, the root is the relative ".forklift", whose parent is empty.
-            let main_tree = match main_tree.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-                _ => PathBuf::from("."),
-            };
-            let main_tree = std::path::absolute(&main_tree).unwrap_or(main_tree);
-            format!("Run \"forklift heal\" in the main tree, \"{}\", which restores it from its copy.", main_tree.to_string_lossy())
-        }
+        None => format!(
+            "Run \"forklift heal\" in the main tree, \"{}\", which restores it from its copy.",
+            main_tree_folder().to_string_lossy()
+        ),
         Some(name) => match crate::util::bay_utils::read_bay_path(name) {
             Ok(Some(folder)) => format!(
                 "Run \"forklift heal\" in that bay, \"{}\", which restores it from its copy.", folder.to_string_lossy()

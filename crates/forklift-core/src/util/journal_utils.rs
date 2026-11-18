@@ -751,24 +751,44 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// * `Ok(false)`   - No such entry is the latest, or the journal is empty.
 /// * `Err(String)` - If the journal or the bay's state could not be read, or the journal rewritten.
 pub fn pop_if_it_left_in_progress() -> Result<bool, String> {
+    pop_latest_left_in_progress_if(|entry| {
+        // Without the skeleton: an abort clears whatever it holds, and is the way out of one that
+        // is missing or unreadable.
+        let mut after = entry.after.bay_state();
+        if let Some(consolidation) = after.consolidation.as_mut() {
+            consolidation.skeleton.clear();
+        }
+
+        Ok(BayState::read_without_skeleton()? == after)
+    })
+}
+
+/// [`pop_if_it_left_in_progress`] for an abort that abandons a merge whose record it does not read,
+/// since the record may be damaged: the latest entry other than a pallet delete is removed when it
+/// left a consolidation or pick in progress and the bay still stands where it left it, on the same
+/// pallet and base. Whichever merge that entry recorded, none is in progress once the abort is
+/// through, so kept, it would refuse every later undo. Any other entry is left alone.
+///
+/// # Returns
+/// * `Ok(true)`    - The entry was removed.
+/// * `Ok(false)`   - No such entry is the latest, or the journal is empty.
+/// * `Err(String)` - If the journal or the bay's position could not be read, or the journal rewritten.
+pub fn pop_if_it_left_in_progress_unread() -> Result<bool, String> {
+    pop_latest_left_in_progress_if(|entry| {
+        let position = pallet_utils::read_position()?;
+        Ok(position.pallet == entry.after.current_pallet && position.base.as_ref() == entry.after.current_head())
+    })
+}
+
+/// Remove the latest entry other than a pallet delete when it [left a merge in
+/// progress](left_in_progress) and `still_there` holds for it.
+fn pop_latest_left_in_progress_if(still_there: impl FnOnce(&JournalEntry) -> Result<bool, String>) -> Result<bool, String> {
     let mut entries = read()?;
     let Some(index) = entries.iter().rposition(|entry| entry.op != DELETE_OP) else {
         return Ok(false);
     };
-    let entry = &entries[index];
 
-    if !left_in_progress(entry) {
-        return Ok(false);
-    }
-
-    // Without the skeleton: an abort clears whatever it holds, and is the way out of one that is
-    // missing or unreadable.
-    let mut after = entry.after.bay_state();
-    if let Some(consolidation) = after.consolidation.as_mut() {
-        consolidation.skeleton.clear();
-    }
-
-    if BayState::read_without_skeleton()? != after {
+    if !left_in_progress(&entries[index]) || !still_there(&entries[index])? {
         return Ok(false);
     }
 

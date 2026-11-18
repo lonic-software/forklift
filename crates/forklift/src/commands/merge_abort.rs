@@ -26,7 +26,7 @@ pub enum MergeKind {
 }
 
 /// The command that aborts a merge in progress, as the user types it.
-pub const ABORT_COMMAND: &str = "forklift abort";
+pub const ABORT_COMMAND: &str = merge_utils::ABORT_COMMAND;
 
 impl MergeKind {
     fn noun(self) -> &'static str {
@@ -41,13 +41,21 @@ impl MergeKind {
 /// (see [`abort`]), and report it. A bay holds at most one: each refuses to start over the other.
 ///
 /// # Arguments
-/// * `confirm` - Whether to discard the changes made since the merge to the files it touched.
+/// * `confirm`    - Whether to discard the changes made since the merge to the files it touched.
+/// * `keep_files` - Whether to abandon the merge without reading its record or putting anything
+///                  back (see [`abandon`]).
 ///
 /// # Returns
 /// * `Ok(())`      - If the merge was aborted.
 /// * `Err(String)` - If no merge is in progress, the abort would discard changes made since the
 ///                   merge and `confirm` is not set, or the abort failed.
-pub async fn handle_command(confirm: bool) -> Result<(), String> {
+pub async fn handle_command(confirm: bool, keep_files: bool) -> Result<(), String> {
+    if keep_files {
+        let abandoned = abandon()?;
+        output::emit(&abandoned);
+        return Ok(());
+    }
+
     let kind = match (merge_utils::read_consolidation_state()?, cherry_pick_utils::read_state()?) {
         (Some(_), _) => MergeKind::Consolidation,
         (None, Some(_)) => MergeKind::Pick,
@@ -115,7 +123,7 @@ pub(crate) async fn abort(kind: MergeKind, confirm: bool, command: &str) -> Resu
             aborted: the abort puts back that head's files, and would put them over another one's. To \
             abandon it and leave every file as it is, {}.",
             kind.noun(), recorded.our_pallet, recorded.our_head, position.pallet,
-            position.base.as_deref().unwrap_or("no parcel"), removal_hint(kind)
+            position.base.as_deref().unwrap_or("no parcel"), merge_utils::abandon_hint()
         ));
     }
 
@@ -123,7 +131,7 @@ pub(crate) async fn abort(kind: MergeKind, confirm: bool, command: &str) -> Resu
     let (written, unknown, their_tree) = merge_output(&recorded, &our_tree).map_err(|e| format!(
         "Cannot abort the {}: what it wrote cannot be worked out ({}). Nothing was aborted. To abandon it \
         and leave every file as it is, {}.",
-        kind.noun(), e, removal_hint(kind)
+        kind.noun(), e, merge_utils::abandon_hint()
     ))?;
 
     // Every path the merge wrote, every path whose output needs content this warehouse leaves out,
@@ -416,11 +424,64 @@ fn emptied_directories(removed: &[String], our_tree: &str) -> Result<Vec<String>
     Ok(dirs)
 }
 
-/// How to abandon the `kind` of merge without the abort: remove its state files.
-fn removal_hint(kind: MergeKind) -> String {
-    match kind {
-        MergeKind::Consolidation => merge_utils::state_removal_hint_in(&forklift_core::globals::bay_root()),
-        MergeKind::Pick => cherry_pick_utils::state_removal_hint(),
+/// Abandon the merge in progress in this bay without reading what it recorded, which may be
+/// damaged, and without putting anything back: its record (a consolidation's state and skeleton,
+/// or a pick's state) is removed, and every file, in the working directory and the inventory, is
+/// left as it is. The journal entry of the operation that started it is popped first (see
+/// [`journal_utils::pop_if_it_left_in_progress_unread`]), so `undo` reaches past it; an abandon
+/// interrupted after that is finished by running it again.
+///
+/// # Returns
+/// * `Ok(Abandoned)` - The records removed.
+/// * `Err(String)`   - If no merge is recorded in this bay, or a file could not be removed.
+fn abandon() -> Result<Abandoned, String> {
+    let consolidation = merge_utils::state_present();
+    let pick = cherry_pick_utils::state_present();
+
+    if !consolidation && !pick {
+        return Err("No consolidation or pick is in progress; there is nothing to abort.".to_string());
+    }
+
+    journal_utils::pop_if_it_left_in_progress_unread()?;
+
+    // The state before the skeleton, as `stack` clears them: a state left without its skeleton is
+    // refused as damaged, never completed without it.
+    let mut kinds = Vec::new();
+    if consolidation {
+        merge_utils::clear_consolidation_state()?;
+        merge_utils::OutOfScopeSkeleton::clear()?;
+        kinds.push(MergeKind::Consolidation.noun().to_string());
+    }
+    if pick {
+        cherry_pick_utils::clear_state()?;
+        kinds.push(MergeKind::Pick.noun().to_string());
+    }
+
+    Ok(Abandoned { abandoned: kinds, conflicts: inventory_utils::list_conflict_paths().unwrap_or_default().len() })
+}
+
+/// The result of `abort --keep-files`.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Debug, Serialize)]
+pub(crate) struct Abandoned {
+    /// The merges whose record was removed: `consolidation`, `pick`, or both when the bay held both.
+    abandoned: Vec<String>,
+
+    /// How many files the inventory still holds in conflict, each left as it is: resolve and load
+    /// them before the next stack.
+    conflicts: usize,
+}
+
+impl CommandOutput for Abandoned {
+    fn render_human(&self) {
+        println!("Abandoned the {} in progress; every file is left as it is.", self.abandoned.join(" and the "));
+
+        if self.conflicts > 0 {
+            println!(
+                "{} file(s) are still in conflict: resolve them and \"forklift load\" them before stacking.",
+                self.conflicts
+            );
+        }
     }
 }
 
@@ -490,6 +551,7 @@ impl CommandOutput for Aborted {
 pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
         crate::docgen::OutputSchema::of::<Aborted>(),
+        crate::docgen::OutputSchema::of::<Abandoned>(),
     ]
 }
 
