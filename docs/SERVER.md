@@ -312,8 +312,8 @@ revocation by more than about a day.
   holds nothing: `gc` and a restart both go ahead with no file to remove. (Windows releases a
   dead process's file locks shortly after it ends rather than always at once, so a command run the
   instant after a kill can still be refused; running it again succeeds. While the server runs,
-  Windows also refuses other processes a read of `.forklift/serve.lock`, so a file copy of a root
-  being served fails on that file: stop the server first, or leave the file out, since it holds
+  Windows also refuses other processes a read of `.forklift/serve.lock`, so a copy tool that reads
+  that file's bytes fails on it: stop the server first, or leave the file out, since it holds
   nothing.) It is also refused
   while a `forklift` command that writes objects runs against the root, which could reuse an
   unreachable object the sweep is about to delete; that lock is a kernel lock too.
