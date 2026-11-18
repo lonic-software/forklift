@@ -15600,7 +15600,8 @@ fn a_damaged_merge_record_is_refused_and_abort_keep_files_drops_it_keeping_every
 }
 
 /// A consolidation whose skeleton is damaged is refused `merge_state_damaged` naming the plain
-/// abort, which puts back what the merge changed without reading the skeleton.
+/// abort, which puts back what the merge changed without reading the skeleton. `undo` reads the
+/// skeleton in every checkout (`stack` only in a scoped one).
 #[test]
 fn a_damaged_skeleton_is_refused_naming_the_abort() {
     let warehouse = a_conflicted_consolidation("damaged-skeleton");
@@ -15608,7 +15609,7 @@ fn a_damaged_skeleton_is_refused_naming_the_abort() {
     assert_success(&warehouse.run(&["load", "f.txt"]));
     std::fs::write(warehouse.root.join(".forklift/consolidation-skeleton"), b"/forklift-garbled\n").unwrap();
 
-    let refused = warehouse.run(&["--json", "stack", "-m", "resolved"]);
+    let refused = warehouse.run(&["--json", "undo"]);
     assert_eq!(refused.status.code(), Some(68), "{}{}", stdout(&refused), stderr(&refused));
     let error = json(&refused)["error"].clone();
     assert_eq!((error["code"].as_str(), error["next_step"].as_str()), (Some("merge_state_damaged"), Some("forklift abort")), "{}", error);

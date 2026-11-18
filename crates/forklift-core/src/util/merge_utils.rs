@@ -311,15 +311,10 @@ impl OutOfScopeSkeleton {
     /// stack (e.g. inspection); the completing stack itself uses [`OutOfScopeSkeleton::read_required`]
     /// instead, since *there* an absent file is not "no resolutions" but a broken invariant.
     pub fn read() -> Result<OutOfScopeSkeleton, String> {
-        let path = OutOfScopeSkeleton::path();
-
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OutOfScopeSkeleton::default()),
-            Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
-        };
-
-        OutOfScopeSkeleton::from_bytes(&bytes, &path)
+        match std::fs::symlink_metadata(OutOfScopeSkeleton::path()) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(OutOfScopeSkeleton::default()),
+            _ => OutOfScopeSkeleton::read_required(),
+        }
     }
 
     /// Read the skeleton beside an in-progress consolidation, **requiring the file to exist**.
