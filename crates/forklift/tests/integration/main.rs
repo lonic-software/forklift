@@ -29,6 +29,7 @@ mod mirror;
 mod nested_working_trees;
 mod config_heal;
 mod inventory_heal;
+mod merge_state_heal;
 mod position_heal;
 mod query;
 mod recovery_page;

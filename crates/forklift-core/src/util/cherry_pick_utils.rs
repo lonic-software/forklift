@@ -19,13 +19,19 @@ use std::path::{Path, PathBuf};
 use crate::enums::parcel_action_type::ParcelActionType;
 use crate::globals::bay_root;
 use crate::model::operator::Operator;
-use crate::util::{file_utils, merge_utils, object_utils, record_utils};
+use crate::util::{merge_utils, object_utils, record_utils};
+use crate::util::merge_state_heal::{self, MergeRecord};
+use crate::util::merge_utils::Unusable;
 
 /// The name of the cherry-pick-state file (inside the bay root). While a pick is in
 /// progress (its merge left conflicts), it records the source parcel, the head and pallet the pick
 /// was applied to, and the intended description; the next `stack` reads it to complete the pick
 /// single-parent and remove it.
 pub(crate) const FILE_NAME_CHERRY_PICK: &str = "cherry-pick";
+
+/// The copy beside the cherry-pick-state file: the same bytes, written first and removed last (see
+/// [`merge_utils::write_record_and_copy`]), which `heal` restores a damaged state from.
+pub(crate) const FILE_NAME_CHERRY_PICK_COPY: &str = "cherry-pick-copy";
 
 /// The state record kind of the cherry-pick-state file. Its entries are the source, the head, the
 /// pallet, and then the description when there is one.
@@ -78,25 +84,30 @@ pub fn read_state() -> Result<Option<CherryPickState>, String> {
 /// * `dir` - The bay's state directory.
 pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
     let path = dir.join(FILE_NAME_CHERRY_PICK);
+    let found = |reason: &str| format!("The pick state file \"{}\" {}", path.to_string_lossy(), reason);
+    let damaged = |reason: String| merge_state_heal::damaged_in(dir, &found(&reason), MergeRecord::Pick, None);
 
-    let damaged = |reason: &str| merge_utils::merge_state_damaged(
-        dir,
-        &format!("The pick state file \"{}\" {}", path.to_string_lossy(), reason),
-        merge_utils::KEEPING_FILES_EFFECT,
-        merge_utils::ABORT_KEEPING_FILES,
-    );
-    let malformed = || damaged("is malformed.");
-
-    let Some(bytes) = merge_utils::read_record_bytes(&path).map_err(|e| e.map_or_else(|e| e, |reason| damaged(&reason)))? else {
+    let Some(bytes) = merge_utils::read_record_bytes(&path).map_err(|e| e.map_or_else(|e| e, &damaged))? else {
         return Ok(None);
     };
 
-    let entries = record_utils::from_bytes(&bytes, CHERRY_PICK_RECORD, CHERRY_PICK_VERSION).map_err(|e| {
+    match parse_state(&bytes) {
+        Ok(state) => Ok(Some(state)),
+        Err(Unusable::Newer(reason)) => Err(format!("{} Use the Forklift that wrote it.", found(&reason))),
+        Err(Unusable::Damaged(reason)) => Err(damaged(reason)),
+    }
+}
+
+/// Parse the bytes of a cherry-pick-state file, or of its copy.
+pub(crate) fn parse_state(bytes: &[u8]) -> Result<CherryPickState, Unusable> {
+    let entries = record_utils::from_bytes(bytes, CHERRY_PICK_RECORD, CHERRY_PICK_VERSION).map_err(|e| {
         match e.is_newer(CHERRY_PICK_RECORD, CHERRY_PICK_VERSION) {
-            true => format!("The pick state file \"{}\" {} Use the Forklift that wrote it.", path.to_string_lossy(), e.describe()),
-            false => damaged(&e.describe()),
+            true => Unusable::Newer(e.describe()),
+            false => Unusable::Damaged(e.describe()),
         }
     })?;
+
+    let malformed = || Unusable::Damaged("is malformed.".to_string());
 
     let mut entries = entries.into_iter();
     let (Some(source), Some(our_head), Some(our_pallet)) = (entries.next(), entries.next(), entries.next()) else {
@@ -114,9 +125,7 @@ pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
         return Err(malformed());
     }
 
-    let state = CherryPickState { source, description, our_head, our_pallet };
-
-    Ok(Some(state))
+    Ok(CherryPickState { source, description, our_head, our_pallet })
 }
 
 /// Write the cherry-pick state (atomically).
@@ -128,7 +137,7 @@ pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
 /// * `Ok(())`      - If the state was written.
 /// * `Err(String)` - If the file could not be written.
 pub fn write_state(state: &CherryPickState) -> Result<(), String> {
-    file_utils::write_file_atomically(&state_path(), &state_bytes(state))
+    merge_utils::write_record_and_copy(&state_path(), &bay_root().join(FILE_NAME_CHERRY_PICK_COPY), &state_bytes(state))
 }
 
 /// The bytes [`write_state`] writes for `state`.
@@ -145,7 +154,7 @@ pub(crate) fn state_bytes(state: &CherryPickState) -> Vec<u8> {
 /// * `Ok(())`      - If the state file is gone.
 /// * `Err(String)` - If the file exists but could not be removed.
 pub fn clear_state() -> Result<(), String> {
-    merge_utils::remove_record(&state_path())
+    merge_utils::remove_record_and_copy(&state_path(), &bay_root().join(FILE_NAME_CHERRY_PICK_COPY))
 }
 
 /// The distinct authors of a source parcel, in first-seen order (by identifier) — the
@@ -181,6 +190,7 @@ pub fn collect_source_authors(source: &str, picker: &Operator) -> Result<Vec<Ope
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::file_utils;
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("forklift-pick-state-{}-{}", tag, std::process::id()));

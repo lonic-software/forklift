@@ -15552,9 +15552,10 @@ fn abort_puts_back_a_conflicted_pick() {
     assert!(stdout(&unstack).contains("Undid stack") && stdout(&unstack).contains("(ours)"), "{}", stdout(&unstack));
 }
 
-/// A damaged record of the merge in progress — the consolidation's state file or the pick's — is
-/// refused `merge_state_damaged` (exit 68) by every command that reads it, with `abort
-/// --keep-files` as the next step: it drops the record without reading it, leaves every file and
+/// A damaged record of the merge in progress — the consolidation's state file or the pick's — with
+/// its copy damaged too, so heal has nothing to restore it from, is refused `merge_state_damaged`
+/// (exit 68) by every command that reads it, with `abort --keep-files` as the next step: it drops
+/// the record and its copy without reading them, leaves every file and
 /// the inventory as they are, and pops the journal entry of the operation that started the merge,
 /// so `undo` reaches the stack before it. With no merge recorded it has nothing to drop.
 #[test]
@@ -15573,6 +15574,7 @@ fn a_damaged_merge_record_is_refused_and_abort_keep_files_drops_it_keeping_every
         warehouse.write_file("f.txt", "resolved\n");
         assert_success(&warehouse.run(&["load", "f.txt"]));
         std::fs::write(warehouse.root.join(state), b"/forklift-garbled\n").unwrap();
+        std::fs::write(warehouse.root.join(format!("{}-copy", state)), b"/forklift-garbled\n").unwrap();
 
         for command in [&["stack", "-m", "resolved"][..], &["abort"], &["undo"]] {
             let refused = warehouse.run(&[&["--json"][..], command].concat());
@@ -15596,6 +15598,7 @@ fn a_damaged_merge_record_is_refused_and_abort_keep_files_drops_it_keeping_every
         assert_success(&abandoned);
         assert_eq!(json(&abandoned)["data"], serde_json::json!({"abandoned": [kind], "conflicts": 0}), "{}", stdout(&abandoned));
         assert!(!warehouse.root.join(state).exists(), "{}: the record is gone", kind);
+        assert!(!warehouse.root.join(format!("{}-copy", state)).exists(), "{}: its copy is gone", kind);
         assert!(!warehouse.root.join(".forklift/consolidation-skeleton").exists(), "{}: no skeleton stays behind", kind);
         assert_eq!(read(&warehouse, "f.txt"), "resolved\n", "{}: the file is left as it is", kind);
         assert_eq!(staged_and_unstaged(&warehouse), (vec!["f.txt".to_string()], vec![]), "{}: the inventory is left as it is", kind);
@@ -15610,8 +15613,8 @@ fn a_damaged_merge_record_is_refused_and_abort_keep_files_drops_it_keeping_every
     }
 }
 
-/// A consolidation whose skeleton is damaged is refused `merge_state_damaged` naming the plain
-/// abort, which puts back what the merge changed without reading the skeleton. `undo` reads the
+/// A consolidation whose skeleton is damaged, with its copy, is refused `merge_state_damaged` naming
+/// the plain abort, which puts back what the merge changed without reading the skeleton. `undo` reads the
 /// skeleton in every checkout (`stack` only in a scoped one).
 #[test]
 fn a_damaged_skeleton_is_refused_naming_the_abort() {
@@ -15619,6 +15622,7 @@ fn a_damaged_skeleton_is_refused_naming_the_abort() {
     warehouse.write_file("f.txt", "resolved\n");
     assert_success(&warehouse.run(&["load", "f.txt"]));
     std::fs::write(warehouse.root.join(".forklift/consolidation-skeleton"), b"/forklift-garbled\n").unwrap();
+    std::fs::write(warehouse.root.join(".forklift/consolidation-skeleton-copy"), b"/forklift-garbled\n").unwrap();
 
     let refused = warehouse.run(&["--json", "undo"]);
     assert_eq!(refused.status.code(), Some(68), "{}{}", stdout(&refused), stderr(&refused));

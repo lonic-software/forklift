@@ -1,6 +1,7 @@
 use serde::Serialize;
 use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::checkout_scope_heal::{self, Base, ScopeRestored};
+use forklift_core::util::merge_state_heal::{self, Agreement, MergeStateRestored};
 use forklift_core::util::position_heal::{self, PositionRebuilt};
 use forklift_core::util::scope_heal::{self, ScopeRebuilt};
 use forklift_core::util::inventory_heal::{self, TreeUnread};
@@ -235,12 +236,31 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let early_scope = heal_checkout_scope(scope, base, &mut ref_notes)
         .map_err(|error| records_said(error, &ref_notes, early_position.as_ref(), None))?;
 
+    // The records of the merge in progress, after the position and the scope, so a copy is judged
+    // against the pallet and parcel heal settled for the bay, and before the passes and the
+    // operation's recovery, which read them.
+    let agreement = match base {
+        Base::Position => pallet_utils::read_position().ok()
+            .and_then(|position| position.base.map(|head| Agreement { pallet: position.pallet, head })),
+        Base::Parcel(head) => position.map(|pallet| Agreement { pallet: pallet.to_string(), head: head.to_string() }),
+        Base::Unborn => None,
+    };
+    let merge_repair = merge_state_heal::repair(agreement.as_ref(), &mut ref_notes)
+        .map_err(|error| records_said(error, &ref_notes, early_position.as_ref(), early_scope.as_ref()))?;
+    let merge_restored = merge_repair.restored;
+    let with_merge = |mut error: String| {
+        for sentence in merge_restored.iter().flat_map(MergeStateRestored::sentences) {
+            error = forklift_core::error::append_to_message(error, &sentence);
+        }
+        error
+    };
+
     // After the records, which the check of the history leans on, and before everything else,
     // which reads the fetch scope.
     let scope_rebuilt = match &exclusive {
         Some(exclusive) => Some(scope_heal::set_chosen(fetch_scope, exclusive).await),
         None => scope_heal::repair().transpose(),
-    }.transpose().map_err(|error| records_said(error, &ref_notes, early_position.as_ref(), early_scope.as_ref()))?;
+    }.transpose().map_err(|error| with_merge(records_said(error, &ref_notes, early_position.as_ref(), early_scope.as_ref())))?;
     drop(exclusive);
 
     let shared;
@@ -285,6 +305,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         if let Some(restored) = &early_scope {
             error = forklift_core::error::append_to_message(error, &restored.sentence());
         }
+        error = with_merge(error);
         if let Some(scope) = &scope_rebuilt {
             error = forklift_core::error::append_to_message(error, &scope_sentence(scope));
         }
@@ -429,6 +450,20 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         true => Ok(None),
         false => operation_utils::recover(),
     }.map_err(|error| with_rebuilt(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), &inventory_rebuilt))?;
+
+    // A merge record left damaged under another kind of operation is refused once that operation's
+    // recovery has lowered its marker, so the way out it names is one that can now run.
+    if merge_repair.deferred {
+        match operation_utils::read() {
+            Ok(None) => merge_state_heal::check()
+                .map_err(|error| with_rebuilt(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), &inventory_rebuilt))?,
+            _ => ref_notes.push(
+                "A damaged record of the merge in progress in this bay waits for the interrupted operation there to be \
+                 finished or undone; heal says what to run for it once that is done."
+                    .to_string(),
+            ),
+        }
+    }
 
     if waits.is_none() && !held_park && !unreadable {
         let rebuilt = inventory_heal::damaged().and_then(|damaged| match damaged {
@@ -785,6 +820,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         unavailable_rebuilt,
         redactions_applied_rebuilt: applied_rebuilt,
         checkout_scope_restored: early_scope,
+        merge_state_restored: merge_restored,
         fetch_scope_rebuilt: scope_rebuilt,
         parked_rebuilt,
         position_rebuilt: early_position.or(late_position),
@@ -1431,6 +1467,12 @@ pub(crate) struct HealReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     checkout_scope_restored: Option<ScopeRestored>,
 
+    /// The records of the merge in progress in the checkout this run healed that were damaged or
+    /// missing and this run wrote back from the copy beside each, or removed with it under an
+    /// interrupted merge or pick whose recovery clears them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_state_restored: Option<MergeStateRestored>,
+
     /// The fetch scope of a sparse warehouse, which was lost or damaged and this run wrote: rebuilt
     /// from the checkouts' scopes, or set to the paths `--fetch-scope` gave.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1785,7 +1827,7 @@ impl HealReport {
             && self.unseal_failed.is_none() && self.record_rebuilt.is_none() && self.unavailable_rebuilt.is_none()
             && self.redactions_applied_rebuilt.is_none() && self.redactions_reapplied.is_empty()
             && self.restored_from_working_tree.is_empty()
-            && self.checkout_scope_restored.is_none()
+            && self.checkout_scope_restored.is_none() && self.merge_state_restored.is_none()
             && self.fetch_scope_rebuilt.is_none() && self.parked_rebuilt.is_none() && self.position_rebuilt.is_none()
             && self.config_repaired.is_none()
             && self.inventory_rebuilt.is_none() && self.inventory_held.is_none()
@@ -1810,6 +1852,10 @@ impl CommandOutput for HealReport {
 
         if let Some(restored) = &self.checkout_scope_restored {
             println!("{}", restored.sentence());
+        }
+
+        for sentence in self.merge_state_restored.iter().flat_map(MergeStateRestored::sentences) {
+            println!("{}", sentence);
         }
 
         if let Some(rebuilt) = &self.fetch_scope_rebuilt {
