@@ -752,6 +752,20 @@ mod tests {
         }
     }
 
+    /// A dead holder's lock file is git's alone: Forklift's locks are kernel locks, so a killed
+    /// holder leaves nothing to plant, and none of its bindings plants one.
+    ///
+    /// Revert: plant a dead holder over Forklift's `{bay}lock` again → red.
+    #[test]
+    fn only_git_lock_files_are_planted_as_a_dead_holder() {
+        let dead_holders = |lists: &[&[Binding]]| -> Vec<&'static str> {
+            lists.iter().flat_map(|list| list.iter())
+                .filter(|binding| binding.kinds.contains(&Kind::DeadPidLock)).map(|binding| binding.name).collect()
+        };
+        assert_eq!(dead_holders(&[BINDINGS, HISTORY_BINDINGS]), Vec::<&str>::new());
+        assert!(dead_holders(&[GIT_BINDINGS, HISTORY_GIT_BINDINGS]).contains(&"index.lock"), "git's lock files are planted");
+    }
+
     /// A history binding the role map gives no role is named, under either subject.
     ///
     /// Revert: name none → both are silent.
