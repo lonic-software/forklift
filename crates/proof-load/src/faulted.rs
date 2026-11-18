@@ -1412,31 +1412,20 @@ fn operate(context: &Context, arguments: &[String], trail: &mut Trail, unextract
     let mut owed = follow_ups(context.tool, &written, &outcome);
     trail.steps.push(outcome);
 
-    let takedowns = host.takedowns();
-    let mut restated: Vec<String> = Vec::new();
-    for restate in restatements(context.tool, &report, host.root()) {
-        for hash in &restate.hashes {
-            let Some((_, statement)) = takedowns.iter().find(|(taken, _)| taken == hash) else { continue };
-            if restated.contains(hash) {
-                continue;
-            }
-            let root = host.root().display().to_string();
-            let restating = vec!["withhold".to_string(), "add".into(), "--root".into(), root.clone(), "--statement".into(), statement.clone(), hash.clone()];
-            let known = format!("forklift-server withhold add --root {} --statement {:?} {}, from its own record of takedowns", root, statement, hash);
-            let outcome = as_operator(context, host, restating, known, trail, unextractable)?;
-            owed.extend(follow_ups(context.tool, "forklift-server withhold add", &outcome));
-            let took = outcome.succeeded();
-            trail.steps.push(outcome);
-            if took {
-                restated.push(hash.clone());
-            }
+    let restates = restatements(context.tool, &report, host.root());
+    let mut restated = Vec::new();
+    for (hash, statement) in restating(&restates, &host.takedowns()) {
+        let root = host.root().display().to_string();
+        let arguments = vec!["withhold".to_string(), "add".into(), "--root".into(), root.clone(), "--statement".into(), statement.clone(), hash.clone()];
+        let known = format!("forklift-server withhold add --root {} --statement {:?} {}, from its own record of takedowns", root, statement, hash);
+        let outcome = as_operator(context, host, arguments, known, trail, unextractable)?;
+        owed.extend(follow_ups(context.tool, "forklift-server withhold add", &outcome));
+        if outcome.succeeded() {
+            restated.push(hash);
         }
-        // Discharged only once every hash it named is restated.
-        if restate.hashes.iter().all(|hash| restated.contains(hash)) {
-            let named = format!("named by {}: {}", written, restate.named);
-            owed.retain(|text| *text != named);
-        }
+        trail.steps.push(outcome);
     }
+    discharge(&mut owed, &written, &restates, &restated);
     for text in owed {
         if !unextractable.contains(&text) {
             unextractable.push(text);
@@ -1464,6 +1453,27 @@ fn as_operator(context: &Context, host: &Host, arguments: Vec<String>, known: St
     Ok(operated.outcome)
 }
 
+/// Each takedown to restate, hash and statement, once: a hash `restates` names that `takedowns`,
+/// the operator's own record, holds, with the statement recorded there, in the order the report
+/// names them. A hash the record lacks is never restated: that is content the store lost.
+fn restating(restates: &[Restate], takedowns: &[(String, String)]) -> Vec<(String, String)> {
+    let mut restating: Vec<(String, String)> = Vec::new();
+    for hash in restates.iter().flat_map(|restate| &restate.hashes) {
+        if let Some(taken) = takedowns.iter().find(|(taken, _)| taken == hash).filter(|_| !restating.iter().any(|(listed, _)| listed == hash)) {
+            restating.push(taken.clone());
+        }
+    }
+    restating
+}
+
+/// Takes off `owed`, what the report of `written` named next, each restatement it asked for whose
+/// every hash is `restated`: one with a hash left unrestated stays owed, whole.
+fn discharge(owed: &mut Vec<String>, written: &str, restates: &[Restate], restated: &[String]) {
+    let discharged: Vec<String> = restates.iter().filter(|restate| restate.hashes.iter().all(|hash| restated.contains(hash)))
+        .map(|restate| format!("named by {}: {}", written, restate.named)).collect();
+    owed.retain(|text| !discharged.contains(text));
+}
+
 /// A takedown an operator command's report asks its operator to restate: the command as the report
 /// quotes it, and each hash it names for it.
 #[derive(Debug, PartialEq, Eq)]
@@ -1476,15 +1486,25 @@ struct Restate {
 /// operator to restate: a quoted `forklift-server withhold add --root <root> <hash> --statement
 /// <statement>`, exactly that shape and over exactly `root`, its hash either written in place or
 /// left as `<hash>` and listed one per indented line right after the line quoting it. Nothing else
-/// is one: any other placeholder or argument, another root, or a hash that is not one.
+/// is one: any other placeholder or argument, another root, or a hash that is not one. The root may
+/// be written as the server quotes one for a command line, in single quotes, as it does a path
+/// holding a backslash or a space.
 fn restatements(tool: Tool, report: &str, root: &Path) -> Vec<Restate> {
     let is_hash = |text: &str| text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-    let prefix = format!("forklift-server withhold add --root {} ", root.display());
+    let unquoted = |written: &str| match written.strip_prefix('\'').and_then(|inner| inner.strip_suffix('\'')) {
+        Some(inner) => inner.replace("'\\''", "'"),
+        None => written.to_string(),
+    };
+    let root = root.display().to_string();
     let lines: Vec<&str> = report.lines().collect();
     let mut found = Vec::new();
     for (at, line) in lines.iter().enumerate() {
         for named in remedy::extract(tool, &[line]).unextractable {
-            let Some(hash) = named.strip_prefix(&prefix).and_then(|rest| rest.strip_suffix(" --statement <statement>")) else { continue };
+            let Some((written, hash)) = named.strip_prefix("forklift-server withhold add --root ")
+                .and_then(|rest| rest.strip_suffix(" --statement <statement>")).and_then(|rest| rest.rsplit_once(' ')) else { continue };
+            if unquoted(written) != root {
+                continue;
+            }
             let hashes = if hash == "<hash>" {
                 lines[at + 1..].iter().take_while(|listed| listed.starts_with(char::is_whitespace) && is_hash(listed.trim()))
                     .map(|listed| listed.trim().to_string()).collect()
@@ -2593,6 +2613,31 @@ mod tests {
             Restate { named: format!("forklift-server withhold add --root /s/other {} --statement <statement>", d), hashes: vec![d.clone()] },
         ], "the root decides which lines ask");
         assert!(restatements(Tool::Forklift, &report, Path::new("/s/third")).is_empty());
+        // A root the server quotes, as it does one holding a backslash: `'C:\s\it'\''s'`.
+        let quoted = format!("Withhold it with \"forklift-server withhold add --root 'C:\\s\\it'\\''s' {} --statement <statement>\".\n", a);
+        assert_eq!(restatements(Tool::Forklift, &quoted, Path::new("C:\\s\\it's")).len(), 1, "{}", quoted);
+    }
+
+    /// Only a hash both the report and the operator's own record name is restated, with the
+    /// record's statement, once, in the report's order: one the record lacks is content the store
+    /// lost, and one the report does not name is left to the readback.
+    ///
+    /// Revert: restate every hash the report names → `b`, missing from the record, is restated as a
+    /// takedown; restate the whole record → `z`, which no report line names, is restated; drop the
+    /// once → `a`, named twice, is restated twice; discharge on any hash restated → "both", whose `b`
+    /// was not, is no longer owed.
+    #[test]
+    fn a_takedown_is_restated_only_from_the_operators_own_record() {
+        let restate = |hashes: &[&str]| Restate { named: String::new(), hashes: hashes.iter().map(|hash| hash.to_string()).collect() };
+        let takedowns = [("z".to_string(), "zs".to_string()), ("c".to_string(), "cs".to_string()), ("a".to_string(), "as".to_string())];
+        assert_eq!(restating(&[restate(&["a"]), restate(&["b", "c", "a"])], &takedowns), [("a".to_string(), "as".to_string()), ("c".to_string(), "cs".to_string())]);
+        assert!(restating(&[restate(&["b"])], &takedowns).is_empty());
+
+        // What was asked stays owed until every hash it named is restated.
+        let asked = |named: &str, hashes: &[&str]| Restate { named: named.to_string(), ..restate(hashes) };
+        let mut owed = vec!["named by R: one".to_string(), "named by R: both".to_string(), "named by R: heal".to_string()];
+        discharge(&mut owed, "R", &[asked("one", &["a"]), asked("both", &["a", "b"])], &["a".to_string()]);
+        assert_eq!(owed, ["named by R: both", "named by R: heal"]);
     }
 
     /// A served record counts as acknowledged only after an answer that asks nothing further: success, or
