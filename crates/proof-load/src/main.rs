@@ -112,9 +112,13 @@ enum Command {
         /// The generated history to time on.
         #[arg(long, default_value = "small")]
         shape: String,
-        /// Timed repetitions per cell, after one untimed run.
+        /// Timed repetitions per cell, after one untimed run on a warm cache.
         #[arg(long, default_value_t = 5)]
         reps: usize,
+        /// A program, by path, run with no arguments before each cold repetition to drop the
+        /// operating system's caches. Without it the cold rows are reported as not run.
+        #[arg(long)]
+        drop_caches: Option<PathBuf>,
     },
 }
 
@@ -146,8 +150,8 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Perf { out, forklift, git, shape, reps } => {
-            let options = perf::PerfOptions { out, forklift, git, shape, reps };
+        Command::Perf { out, forklift, git, shape, reps, drop_caches } => {
+            let options = perf::PerfOptions { out, forklift, git, shape, reps, drop_caches };
             match perf::run(&options, &|text| eprintln!("proof-load: {}", text)) {
                 Ok(report) if report.failed() => ExitCode::from(1),
                 Ok(_) => ExitCode::SUCCESS,

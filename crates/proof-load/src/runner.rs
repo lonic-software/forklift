@@ -803,7 +803,7 @@ pub fn kept_value(document: &serde_json::Value, keep: &Keep) -> Option<String> {
 }
 
 #[cfg(windows)]
-const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+pub(crate) const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
 
 /// Sets every file under `root` back by `by`, so a grace period measured from a write has passed.
 fn age(root: &Path, by: Duration) -> std::io::Result<()> {
