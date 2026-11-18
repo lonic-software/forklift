@@ -41,10 +41,10 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
     };
 
     let Some(office_head) = pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)? else {
-        return Err("Trust is established but the office pallet is missing.".to_string());
+        return Err(office_utils::office_unborn_refusal("Nothing was changed."));
     };
 
-    let office_state = audit_utils::verify_office_chain(&anchor, &office_head)?;
+    let office_state = audit_utils::verify_office_chain(&anchor, &office_head).map_err(|refused| audit_utils::office_chain_refusal(refused, "Nothing was changed."))?;
 
     let mut report = AuditReport {
         genesis: anchor.genesis.clone(),

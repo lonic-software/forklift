@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 57;
+pub const SCHEMA_VERSION: u32 = 58;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -633,6 +633,12 @@ error_codes! {
 
     /// The trust file is lost or damaged; nothing was changed.
     TrustDamaged,
+
+    /// A parcel's stored signature cannot be read or does not parse.
+    SignatureDamaged,
+
+    /// A parcel stacked after trust carries no signature.
+    SignatureMissing,
 }
 
 impl ErrorCode {
@@ -707,6 +713,8 @@ impl ErrorCode {
             ErrorCode::CheckoutScopeDamaged => RefusalCode::CheckoutScopeDamaged.as_str(),
             ErrorCode::MergeStateDamaged => RefusalCode::MergeStateDamaged.as_str(),
             ErrorCode::TrustDamaged => RefusalCode::TrustDamaged.as_str(),
+            ErrorCode::SignatureDamaged => RefusalCode::SignatureDamaged.as_str(),
+            ErrorCode::SignatureMissing => RefusalCode::SignatureMissing.as_str(),
         }
     }
 
@@ -784,6 +792,8 @@ impl ErrorCode {
             ErrorCode::CheckoutScopeDamaged => 67,
             ErrorCode::MergeStateDamaged => 68,
             ErrorCode::TrustDamaged => 69,
+            ErrorCode::SignatureDamaged => 70,
+            ErrorCode::SignatureMissing => 71,
         }
     }
 
@@ -920,7 +930,7 @@ impl ErrorCode {
             ErrorCode::RemoteHistoryIncomplete =>
                 "The remote refused to move a pallet because part of the new head's history is absent there or unreadable, even after the lift negotiated and uploaded again; nothing moved",
             ErrorCode::RefDamaged =>
-                "A pallet ref is lost or damaged: its file holds no parcel hash, or it is missing while a checkout stands on that pallet. Nothing was changed; heal rebuilds it from what the bays and the ref's own bytes still name, or lists what it found",
+                "A pallet ref is lost or damaged: its file holds no parcel hash, or it is missing while a checkout stands on that pallet, or the office pallet's ref is missing beside a held trust file. Nothing was changed; heal rebuilds a working pallet's ref from what the bays and the ref's own bytes still name, or lists what it found, and lower takes a missing office from a remote that holds it",
             ErrorCode::FetchScopeDamaged =>
                 "A sparse warehouse's fetch scope is lost or damaged, and heal could not rebuild it from the checkouts' scopes alone. Nothing was changed; heal --fetch-scope sets it, fetching what the history there lacks",
             ErrorCode::TombstonesDamaged =>
@@ -952,7 +962,11 @@ impl ErrorCode {
             ErrorCode::MergeStateDamaged =>
                 "A bay's record of the consolidation or pick in progress there, its state file or a consolidation's out-of-scope skeleton, is not a file, is not text, is cut short or garbled, does not match its digest, or is missing beside a consolidation. Nothing was changed; abort --keep-files run in that bay drops a damaged state file and leaves every file as it is, and abort abandons a merge whose skeleton is damaged",
             ErrorCode::TrustDamaged =>
-                "The warehouse's trust file is missing while the office pallet is born or its copy stands, so trust was established and its anchor is gone, or it does not parse. Nothing was changed; restore it from a backup, or move the trust file and its copy aside and lower from a remote you trust"
+                "The warehouse's trust file is missing while the office pallet is born or its copy stands, so trust was established and its anchor is gone, or it does not parse, or it does not verify the office pallet while its copy does. Nothing was changed; heal restores it from its copy where the copy is usable, and otherwise restore it from a backup, or move the trust file and its copy aside and lower from a remote you trust",
+            ErrorCode::SignatureDamaged =>
+                "A parcel's stored signature, in its sidecar or a signature table, cannot be read, does not parse, or names a format version this Forklift does not read, so what signed the parcel cannot be told. Restore the warehouse's objects from a backup, or clone it again from a remote that holds the parcel",
+            ErrorCode::SignatureMissing =>
+                "A parcel stacked after trust was established carries no signature. A lost signature and a stripped one look alike, so the warehouse may have been tampered with"
         }
     }
 
@@ -1028,6 +1042,8 @@ impl ErrorCode {
             RefusalCode::CheckoutScopeDamaged => ErrorCode::CheckoutScopeDamaged,
             RefusalCode::MergeStateDamaged => ErrorCode::MergeStateDamaged,
             RefusalCode::TrustDamaged => ErrorCode::TrustDamaged,
+            RefusalCode::SignatureDamaged => ErrorCode::SignatureDamaged,
+            RefusalCode::SignatureMissing => ErrorCode::SignatureMissing,
         }
     }
 }
@@ -1690,6 +1706,8 @@ mod tests {
             (RefusalCode::CheckoutScopeDamaged, "checkout_scope_damaged", 67),
             (RefusalCode::MergeStateDamaged, "merge_state_damaged", 68),
             (RefusalCode::TrustDamaged, "trust_damaged", 69),
+            (RefusalCode::SignatureDamaged, "signature_damaged", 70),
+            (RefusalCode::SignatureMissing, "signature_missing", 71),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

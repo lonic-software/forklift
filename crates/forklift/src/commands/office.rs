@@ -26,6 +26,11 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
     let operator = config_utils::get_operator()?;
 
     if office_utils::read_trust_anchor()?.is_some() {
+        // An anchor beside an unborn office is an enrollment stopped between its writes, or a lost
+        // office ref: neither is mended by enrolling again.
+        if pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.is_none() {
+            return Err(office_utils::office_unborn_refusal("Nothing was changed."));
+        }
         return Err(
             "Trust is already established for this warehouse. Ask an enrolled operator \
             to admit you: generate a keypair with \"forklift profile keygen\" and hand them the \
@@ -763,7 +768,7 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
     };
 
     let Some(old_office_head) = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)? else {
-        return Err("Trust is established but the office pallet is missing.".to_string());
+        return Err(office_utils::office_unborn_refusal("Nothing was changed."));
     };
 
     // A working admin has every self-service and admin tool available; a trust reset
