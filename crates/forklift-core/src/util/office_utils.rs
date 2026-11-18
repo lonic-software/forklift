@@ -2889,8 +2889,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A trust file that does not parse, or a folder in its place, is damage, whatever stands beside
-    /// it; one a newer version wrote is not, and is refused uncoded.
+    /// A trust file that does not parse, or a folder or a dangling link in its place, is damage,
+    /// whatever stands beside it; one a newer version wrote is not, and is refused uncoded.
     // Revert: map `TrustDecodeError::Damaged` to the plain message → no code on the garbled file.
     #[test]
     fn a_garbled_trust_file_is_trust_damaged_and_a_newer_one_is_not() {
@@ -2898,15 +2898,22 @@ pub(crate) mod tests {
             ("garbled", "version = 1\ngenesis = \"g", true),
             ("unversioned", "genesis = \"g\"\nenabled_at = 1\nboundary = []\n", true),
             ("newer", "version = 2\ngenesis = \"g\"\n", false),
-            // Its content is replaced by a folder below.
+            // Its content is replaced by a folder below, or by a link whose target is gone.
             ("folder", "", true),
+            #[cfg(unix)]
+            ("dangling-link", "", true),
         ] {
             let dir = trust_read_root(name, Some(content), false, false);
             let _scope = crate::globals::StorageRootScope::enter(&dir);
+            let trust = dir.join(".forklift").join(FILE_NAME_TRUST);
             if name == "folder" {
-                let trust = dir.join(".forklift").join(FILE_NAME_TRUST);
                 file_utils::remove_file(&trust).unwrap();
                 std::fs::create_dir(&trust).unwrap();
+            }
+            #[cfg(unix)]
+            if name == "dangling-link" {
+                file_utils::remove_file(&trust).unwrap();
+                std::os::unix::fs::symlink(dir.join("gone"), &trust).unwrap();
             }
 
             for mode in [TrustReadMode::Checked, TrustReadMode::Adopt] {
