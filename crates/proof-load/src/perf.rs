@@ -1191,7 +1191,8 @@ fn compact_once(subject: &Subject, what: &str, command: &[String], scratch: &Scr
         Err(ended) => Ok(Err(ended)),
         Ok(timed) => match runner::document(&timed.outcome.stdout)["data"]["objects_packed"].as_u64() {
             Some(packed) if packed > 0 => Ok(Ok(timed)),
-            packed => Err(format!("{} packed {:?} objects of a store built loose", what, packed)),
+            Some(_) => Err(format!("{} packed no object of a store built loose", what)),
+            None => Err(format!("{} gave no objects_packed count", what)),
         },
     })
 }
