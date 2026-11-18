@@ -9635,7 +9635,7 @@ mod tests {
                 let pallet_utils::RefUpdateError::Failed(message) = &refused else {
                     panic!("{:?}, {:?}: {:?}", install, witnesses, refused);
                 };
-                assert!(message.contains("its trust changes only through its server") && message.contains("in a clone of the warehouse and lift it to the server"),
+                assert!(message.contains("its trust changes only through its server") && message.contains("Run it in a clone of the warehouse instead"),
                     "{:?}, {:?}: {}", install, witnesses, message);
             }
         }

@@ -1456,7 +1456,8 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
     if anchor_is_new && office_now.as_deref() == office_target {
         return Err(RefUpdateError::Failed(format!(
             "{} The trust anchor and the office were both written and stand, so nothing was put \
-            back, but they may not be on disk durably yet, and the trust file's copy may not be written.",
+            back, but they may not be on disk durably yet, and the trust file's copy may not be written \
+            (running the change again writes it).",
             error
         )));
     }
@@ -1582,8 +1583,8 @@ pub fn mend_trust_copy(lock: &crate::util::lock_utils::RefLock, anchor_bytes: &[
 
     match read_trust_file(FILE_NAME_TRUST_COPY) {
         Ok(Some(copy)) if copy == anchor_bytes => Ok(()),
-        _ => {
-            refuse_unwritable_copy()?;
+        copy => {
+            refuse_unwritable_copy_in(copy)?;
             write_trust_copy(lock, anchor_bytes)
         }
     }
@@ -1592,8 +1593,13 @@ pub fn mend_trust_copy(lock: &crate::util::lock_utils::RefLock, anchor_bytes: &[
 /// Refuse to write the trust file's copy over what stands at its path when that is not a file,
 /// does not read, or was written by a newer version of Forklift, which is never written over.
 fn refuse_unwritable_copy() -> Result<(), String> {
+    refuse_unwritable_copy_in(read_trust_file(FILE_NAME_TRUST_COPY))
+}
+
+/// [`refuse_unwritable_copy`], over the copy's read `copy`.
+fn refuse_unwritable_copy_in(copy: Result<Option<Vec<u8>>, TrustFileError>) -> Result<(), String> {
     let path = forklift_root().join(FILE_NAME_TRUST_COPY);
-    let bytes = match read_trust_file(FILE_NAME_TRUST_COPY) {
+    let bytes = match copy {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Ok(()),
         Err(TrustFileError::NotAFile(_)) => return Err(CoreError::refusal(
@@ -1608,9 +1614,18 @@ fn refuse_unwritable_copy() -> Result<(), String> {
         Err(TrustFileError::Unreadable(why)) => return Err(why),
     };
 
-    match std::str::from_utf8(&bytes).map(parse_trust_anchor_classified) {
-        Ok(Err(TrustDecodeError::Newer(refusal))) => Err(newer_copy_refusal(&refusal, &path)),
-        _ => Ok(()),
+    match newer_refusal_in(&bytes) {
+        Some(refusal) => Err(newer_copy_refusal(&refusal, &path)),
+        None => Ok(()),
+    }
+}
+
+/// The refusal of trust-file `bytes` a newer version of Forklift wrote, which only that version
+/// judges; `None` for any others.
+fn newer_refusal_in(bytes: &[u8]) -> Option<String> {
+    match std::str::from_utf8(bytes).map(parse_trust_anchor_classified) {
+        Ok(Err(TrustDecodeError::Newer(refusal))) => Some(refusal),
+        _ => None,
     }
 }
 
@@ -1655,6 +1670,9 @@ fn judge_trust_bytes(bytes: &Result<Vec<u8>, String>, office_head: &str) -> Resu
 
     match crate::util::audit_utils::verify_office_chain_memoized(&anchor, office_head) {
         Ok(_) => Ok(TrustJudged::Usable),
+        // A parcel the store cannot give says nothing of the anchor; nor does a coded refusal met
+        // past the walk, such as a key object that does not read.
+        Err(crate::util::audit_utils::OfficeChainError::Unreadable(why)) => Err(why),
         Err(refused) if crate::error::frames_in(refused.message()).next().is_some() => Err(refused.message().to_string()),
         Err(_) => Ok(TrustJudged::Unverified(anchor)),
     }
@@ -1692,34 +1710,42 @@ pub(crate) fn refuse_unsettled_trust(_lock: &crate::util::lock_utils::RefLock) -
     let trust_path = forklift_root().join(FILE_NAME_TRUST).to_string_lossy().into_owned();
     let copy_path = forklift_root().join(FILE_NAME_TRUST_COPY).to_string_lossy().into_owned();
 
-    // A trust file beside an unborn office is what an enrollment or a first lower leaves when it
-    // stops between its two writes, on a root never served; served, the office is lifted after the
-    // anchor is put, but a root that was served carries its witnesses.
+    let copy = read(FILE_NAME_TRUST_COPY)?;
+
+    // What a newer version wrote is that version's to judge.
+    if let Some(refusal) = trust.as_ref().ok().and_then(|bytes| newer_refusal_in(bytes)) {
+        return Err(format!("{} It stands at \"{}\". {}", refusal, trust_path, not_served));
+    }
+    if let Some(Ok(bytes)) = &copy {
+        if let Some(refusal) = newer_refusal_in(bytes) {
+            return Err(format!("{} {}", newer_copy_refusal(&refusal, std::path::Path::new(&copy_path)), not_served));
+        }
+    }
+
     let Some(office_head) = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)? else {
+        // A trust change writes its copy last, so a trust file with an equal copy beside an unborn
+        // office is an anchor put before its office was lifted: the window a served root is
+        // bootstrapped through, or a clone taken in it.
+        if trust.is_ok() && copy.as_ref() == Some(&trust) {
+            return Ok(());
+        }
+        // Without one, an enrollment or a first lower stopped between its writes.
         return Err(CoreError::refusal(
             RefusalCode::RefDamaged,
             format!(
-                "The trust file (\"{}\") stands, but the office pallet is unborn: an enrollment or a first \
-                \"forklift lower\" stopped between its two writes, or the office pallet's ref was lost. {} \
-                Where a remote holds this warehouse's office, \"forklift lower\" takes it and verifies it \
-                against the trust file; otherwise restore the office pallet's ref from a backup.",
-                trust_path, not_served
+                "The trust file (\"{}\") stands beside an unborn office pallet, with no copy that matches it: \
+                an enrollment or a first \"forklift lower\" stopped between its writes, or the office pallet's \
+                ref was lost. {} To run the enrollment or the lower again, move the trust file aside, and its \
+                copy (\"{}\") if one stands, then run it. Where a remote holds this warehouse's office, \
+                \"forklift lower\" takes it instead, and verifies it against the trust file.",
+                trust_path, not_served, copy_path
             ),
             String::new(),
         ).into());
     };
-    let copy = read(FILE_NAME_TRUST_COPY)?;
 
     let trust_judged = judge_trust_bytes(&trust, &office_head)?;
     let copy_judged = copy.as_ref().map(|copy| judge_trust_bytes(copy, &office_head)).transpose()?;
-
-    // What a newer version wrote is that version's to judge.
-    if let TrustJudged::Newer(refusal) = &trust_judged {
-        return Err(format!("{} It stands at \"{}\". {}", refusal, trust_path, not_served));
-    }
-    if let Some(TrustJudged::Newer(refusal)) = &copy_judged {
-        return Err(format!("{} {}", newer_copy_refusal(refusal, std::path::Path::new(&copy_path)), not_served));
-    }
 
     let copy_differs = copy.as_ref().is_some_and(|copy| match (copy, &trust) {
         (Ok(copy), Ok(trust)) => copy != trust,
@@ -1733,26 +1759,27 @@ pub(crate) fn refuse_unsettled_trust(_lock: &crate::util::lock_utils::RefLock) -
     let copy_usable = copy_judged == Some(TrustJudged::Usable);
     let heal = "forklift heal".to_string();
 
-    let (code, why, next_step) = match (&trust_judged, copy_usable) {
+    // Ways out no one command takes are told in the message, after it, as the coded trust read
+    // tells them.
+    let (code, why, ways_out, next_step) = match (&trust_judged, copy_usable) {
         // Both verify the office, and they differ: a change of bytes can leave an anchor that
         // still verifies, so nothing here tells which to keep.
         (TrustJudged::Usable, true) => (
             RefusalCode::TrustDamaged,
-            format!(
-                "The trust file (\"{}\") and its copy (\"{}\") both verify the office pallet, but they differ. \
-                {} Move aside whichever of the two you do not trust, then run \"forklift heal\".",
-                trust_path, copy_path, not_served
-            ),
+            format!("The trust file (\"{}\") and its copy (\"{}\") both verify the office pallet, but they differ.", trust_path, copy_path),
+            "Move aside whichever of the two you do not trust, then run \"forklift heal\".",
             String::new(),
         ),
         (TrustJudged::Usable, false) => (
             RefusalCode::TrustDamaged,
             format!("The trust file (\"{}\") verifies the office pallet, but its copy (\"{}\") differs from it.", trust_path, copy_path),
+            "",
             heal,
         ),
         (_, true) => (
             RefusalCode::TrustDamaged,
             format!("The trust file (\"{}\") does not verify the office pallet, but its copy (\"{}\") does.", trust_path, copy_path),
+            "",
             heal,
         ),
         // A server's re-genesis adopts the office as it stands and leaves it there, so its anchor
@@ -1769,20 +1796,20 @@ pub(crate) fn refuse_unsettled_trust(_lock: &crate::util::lock_utils::RefLock) -
                 tombstone list: they were lost.",
                 trust_path
             ),
+            "",
             crate::util::tombstone_utils::repair_command(),
         ),
         (_, false) => (
             RefusalCode::TrustDamaged,
             format!("The trust file (\"{}\") does not verify the office pallet, and no copy beside it does.", trust_path),
+            LOST_ANCHOR_WAYS_OUT,
             String::new(),
         ),
     };
 
-    // Ways out no one command takes are told in the message, as the coded trust read tells them.
-    let message = match (&code, next_step.is_empty(), why.contains(not_served)) {
-        (_, _, true) => why,
-        (RefusalCode::TrustDamaged, true, false) => format!("{} {} {}", why, not_served, LOST_ANCHOR_WAYS_OUT),
-        _ => format!("{} {}", why, not_served),
+    let message = match ways_out.is_empty() {
+        true => format!("{} {}", why, not_served),
+        false => format!("{} {} {}", why, not_served, ways_out),
     };
 
     Err(CoreError::refusal(code, message, next_step).into())
@@ -1792,7 +1819,7 @@ pub(crate) fn refuse_unsettled_trust(_lock: &crate::util::lock_utils::RefLock) -
 const SERVED_TRUST_REFUSAL: &str = "This warehouse is served, or its first serve began, so its trust changes \
     only through its server: an install here would move the office pallet its clients take from the server. \
     The trust file and the office pallet were left as they were. \
-    Make the change in a clone of the warehouse and lift it to the server.";
+    Run it in a clone of the warehouse instead, and lift any change it makes to the server.";
 
 /// Write a trust anchor where none is held, for a test that needs a signed warehouse without an
 /// office ceremony.

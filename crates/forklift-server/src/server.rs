@@ -1933,7 +1933,7 @@ fn damage_message(code: forklift_core::error::RefusalCode) -> String {
         RefusalCode::WithheldDamaged =>
             "The warehouse's record of what its head withholds is missing or does not read, so what may be served cannot be told, and the request was refused.".to_string(),
         RefusalCode::TrustDamaged =>
-            "The warehouse's trust anchor is lost or does not read, so what it trusts cannot be told, and the request was refused.".to_string(),
+            "The warehouse's trust file, or the copy beside it, is lost or does not read, so what it trusts cannot be told, and the request was refused.".to_string(),
         _ => unreachable!("not a damage code"),
     }
 }
@@ -10230,7 +10230,7 @@ mod tests {
                 assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{}", what);
                 let body = body_text(response).await;
                 assert!(body.contains(r#""code":"trust_damaged""#), "{}: {}", what, body);
-                assert!(body.contains("The warehouse's trust anchor is lost or does not read"), "{}: {}", what, body);
+                assert!(body.contains("The warehouse's trust file, or the copy beside it, is lost or does not read"), "{}: {}", what, body);
                 let absolute = std::path::absolute(&root).unwrap();
                 assert!(!body.contains(&*absolute.to_string_lossy()) && !body.contains(".forklift"), "{}: no server path: {}", what, body);
             }

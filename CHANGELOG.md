@@ -39,12 +39,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   it as a `503`.
 - **A served warehouse's trust changes only through its server.** In a served folder,
   `office regenesis`, `office enroll` and a `lower` that would move the office pallet now refuse,
-  leaving the trust file and the office pallet as they were; make the change in a clone and lift
-  it to the server. Every trust change now writes a
+  leaving the trust file and the office pallet as they were; run them in a clone of the warehouse
+  instead. Every trust change now writes a
   copy of the trust file (`.forklift/trust-copy`) last, and a change run again after it stopped
   writes the missing copy. A server's first serve refuses a warehouse whose trust file does not
   verify its office pallet, whose copy differs from it, or whose trust file is missing beside a born
-  office pallet, as `trust_damaged`, and one whose trust file stands beside an unborn office pallet
+  office pallet or a standing copy, as `trust_damaged`, and one whose trust file stands beside an
+  unborn office pallet with no matching copy (an enrollment or first `lower` that stopped part way)
   as `ref_damaged`; before, such a warehouse was served as it stood. A trust change refuses before
   it writes anything when the copy's path holds something other than a file, or a copy a newer
   Forklift wrote.

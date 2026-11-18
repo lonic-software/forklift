@@ -25,6 +25,9 @@ pub enum OfficeChainError {
     /// verify against a then-active key, or a key it adds lacks valid proofs (its
     /// proof-of-possession, its endorsement, its chain to the identity root).
     Inauthentic(String),
+    /// A parcel of the chain, or its signature, could not be read from the store. That says
+    /// nothing of whether the chain is authentic, only that it cannot be told.
+    Unreadable(String),
     /// Every parcel up to `parcel` is authentic, but `parcel` breaks key permanence, exceeds
     /// its signer's privileges, or adds a key for another user endorsed by a non-admin.
     Unauthorized {
@@ -39,7 +42,9 @@ impl OfficeChainError {
     /// The refusal, phrased for the user.
     pub fn message(&self) -> &str {
         match self {
-            OfficeChainError::Inauthentic(message) | OfficeChainError::Unauthorized { message, .. } => message,
+            OfficeChainError::Inauthentic(message)
+            | OfficeChainError::Unreadable(message)
+            | OfficeChainError::Unauthorized { message, .. } => message,
         }
     }
 }
@@ -92,14 +97,16 @@ impl From<OfficeChainError> for String {
 /// # Returns
 /// * `Ok(OfficeState)`                       - The verified head state.
 /// * `Err(OfficeChainError::Inauthentic(_))`  - If the chain does not reach the genesis, or
-///                                              a parcel is unreadable or fails its signature
-///                                              or endorsement checks.
+///                                              a parcel fails its shape, signature or
+///                                              endorsement checks.
+/// * `Err(OfficeChainError::Unreadable(_))`   - If a parcel or its signature cannot be read
+///                                              from the store.
 /// * `Err(OfficeChainError::Unauthorized{..})` - If, before any inauthentic parcel, a parcel
 ///                                              breaks key permanence, exceeds its signer's
 ///                                              privileges, or adds a key endorsed beyond
 ///                                              its authorizer's authority.
 pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<OfficeState, OfficeChainError> {
-    use OfficeChainError::{Inauthentic, Unauthorized};
+    use OfficeChainError::{Inauthentic, Unauthorized, Unreadable};
 
     let mut chain: Vec<String> = Vec::new();
     let mut cursor = office_head.to_string();
@@ -107,11 +114,13 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
     loop {
         chain.push(cursor.clone());
 
+        // Read before the genesis is recognised, so that a genesis the store cannot give is
+        // told as unreadable too, not as a shape the check below refuses.
+        let parcel = object_utils::load_parcel(&cursor).map_err(Unreadable)?;
+
         if cursor == anchor.genesis {
             break;
         }
-
-        let parcel = object_utils::load_parcel(&cursor).map_err(Inauthentic)?;
 
         match parcel.parents.first() {
             Some(parent) => cursor = parent.clone(),
@@ -140,6 +149,9 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
 
         let lookup_state = previous_state.as_ref().unwrap_or(&state);
 
+        // A signature the store cannot give is unreadable, not a verdict: only what reads is
+        // judged below.
+        sign_utils::load_raw_parcel_signature(hash).map_err(Unreadable)?;
         verify_one_signature(hash, lookup_state, "office parcel").map_err(Inauthentic)?;
 
         // A revoked key must not extend the office chain: the signer has to be
@@ -1108,7 +1120,9 @@ pub enum OfficeLiftRefusal {
 /// * `held_head` - The office head before the lift (`None` for the first office lift).
 pub fn classify_office_lift_refusal(error: OfficeChainError, held_head: Option<&str>) -> OfficeLiftRefusal {
     match error {
-        OfficeChainError::Inauthentic(message) => OfficeLiftRefusal::Unprocessable(message),
+        // A lift that leaves a parcel of its chain unreadable did not bring it: the lift is the
+        // input at fault, as it is for an inauthentic chain.
+        OfficeChainError::Inauthentic(message) | OfficeChainError::Unreadable(message) => OfficeLiftRefusal::Unprocessable(message),
         OfficeChainError::Unauthorized { parcel, message } => {
             if held_head.map_or(false, |head| office_history_holds(head, &parcel)) {
                 OfficeLiftRefusal::Unprocessable(format!(
@@ -4345,6 +4359,7 @@ mod tests {
         match verify_office_chain(anchor, head) {
             Err(OfficeChainError::Inauthentic(message)) => message,
             Err(OfficeChainError::Unauthorized { message, .. }) => panic!("refused as unauthorized: {}", message),
+            Err(OfficeChainError::Unreadable(message)) => panic!("refused as unreadable: {}", message),
             Ok(_) => panic!("the chain at {} must be refused", head),
         }
     }
@@ -4536,23 +4551,68 @@ mod tests {
         assert_eq!(crate::util::tombstone_utils::served_state().unwrap(), crate::util::tombstone_utils::ServedState::Never);
     }
 
+    /// A trust change writes its copy last, so a trust file and an equal copy beside an unborn
+    /// office are an anchor put before its office was lifted, which a server is first served in.
+    // Revert: refuse every trust file beside an unborn office → this first serve refuses.
+    #[test]
+    fn a_first_serve_marks_a_root_whose_anchor_waits_for_its_office() {
+        let _fixture = PrivilegeFixture::new("first-serve-anchor-before-office");
+        let forklift = crate::globals::forklift_root();
+        file_utils::write_file_atomically(&forklift.join(crate::util::office_utils::FILE_NAME_TRUST_COPY), &anchor_bytes()).unwrap();
+        file_utils::remove_file(crate::util::pallet_utils::get_pallet_ref_path(
+            crate::util::pallet_utils::PalletNamespace::Meta, crate::util::office_utils::OFFICE_PALLET_NAME,
+        )).unwrap();
+
+        assert!(crate::util::tombstone_utils::mark_served(true).unwrap());
+
+        assert_eq!(crate::util::tombstone_utils::served_state().unwrap(), crate::util::tombstone_utils::ServedState::Served);
+    }
+
     /// An office chain the store cannot read says nothing about the trust file: the first serve
     /// refuses with the store's own refusal, never as damaged trust heal would be sent to repair.
-    // Revert: read every chain error as an unverified anchor → `trust_damaged`.
+    // Revert: read a coded chain error as an unverified anchor → `trust_damaged`. Revert: read an
+    // unreadable parcel as one → the uncoded read failure is refused as `trust_damaged`.
     #[test]
     fn a_first_serve_over_an_unreadable_office_refuses_as_the_store() {
-        let _fixture = PrivilegeFixture::new("first-serve-unreadable-office");
+        let garbled = PrivilegeFixture::new("first-serve-unreadable-office");
         let head = office_head().unwrap();
         let forklift = crate::globals::forklift_root();
         file_utils::write_file_atomically(&forklift.join(crate::util::office_utils::FILE_NAME_TRUST_COPY), &anchor_bytes()).unwrap();
         let (folder, file_name) = file_utils::get_path_for_object(&head).unwrap();
-        file_utils::write_file_atomically(&std::path::Path::new(&folder).join(file_name), b"not an object").unwrap();
+        let object = std::path::Path::new(&folder).join(file_name);
+        file_utils::write_file_atomically(&object, b"not an object").unwrap();
 
         let refused = crate::util::tombstone_utils::mark_served(true).expect_err("the first serve must refuse");
 
         assert!(crate::error::frames_code(&refused, crate::error::RefusalCode::ObjectUnreadable), "{}", refused);
         assert!(!crate::error::frames_code(&refused, crate::error::RefusalCode::TrustDamaged), "{}", refused);
         assert_eq!(served_witnesses_stand(), (false, false), "nothing is written: {}", refused);
+        drop(garbled);
+
+        // A read the store refuses with no code of its own: the file cannot be opened.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _fixture = PrivilegeFixture::new("first-serve-unopenable-office");
+            let head = office_head().unwrap();
+            file_utils::write_file_atomically(
+                &crate::globals::forklift_root().join(crate::util::office_utils::FILE_NAME_TRUST_COPY), &anchor_bytes(),
+            ).unwrap();
+            let (folder, file_name) = file_utils::get_path_for_object(&head).unwrap();
+            let object = std::path::Path::new(&folder).join(file_name);
+            std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Run as root, the mode stops no read, and there is nothing to test.
+            if std::fs::read(&object).is_ok() {
+                return;
+            }
+
+            let refused = crate::util::tombstone_utils::mark_served(true).expect_err("the first serve must refuse");
+            std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            assert!(!crate::error::frames_code(&refused, crate::error::RefusalCode::TrustDamaged), "{}", refused);
+            assert!(!crate::error::frames_code(&refused, crate::error::RefusalCode::TombstonesDamaged), "{}", refused);
+            assert_eq!(served_witnesses_stand(), (false, false), "nothing is written: {}", refused);
+        }
     }
 
     /// What a first serve is refused over, by the trust file and the copy that stand.
@@ -4575,7 +4635,7 @@ mod tests {
         use crate::error::RefusalCode;
         let garbled = b"not a trust file".to_vec();
 
-        for case in 0..9 {
+        for case in 0..10 {
             let fixture = PrivilegeFixture::new(&format!("first-serve-way-out-{}", case));
             let settled = anchor_bytes();
             let head = office_head().unwrap();
@@ -4605,13 +4665,16 @@ mod tests {
                     code: Some(RefusalCode::TrustDamaged), says: "forklift lower", not: Some("tombstone repair") },
                 UnsettledTrust { name: "nothing verifies", trust: Some(garbled.clone()), copy: None, unborn: false,
                     code: Some(RefusalCode::TrustDamaged), says: "forklift lower", not: None },
-                UnsettledTrust { name: "newer copy", trust: Some(settled.clone()), copy: Some(newer), unborn: false,
+                UnsettledTrust { name: "newer copy", trust: Some(settled.clone()), copy: Some(newer.clone()), unborn: false,
                     code: None, says: "The trust file's copy has version 2, which this version of Forklift does not read",
+                    not: None },
+                UnsettledTrust { name: "newer trust, office unborn", trust: Some(newer.clone()), copy: None, unborn: true,
+                    code: None, says: "The trust file has version 2, which this version of Forklift does not read",
                     not: None },
                 UnsettledTrust { name: "trust missing", trust: None, copy: None, unborn: false,
                     code: Some(RefusalCode::TrustDamaged), says: "is missing, but the office pallet is born", not: None },
-                UnsettledTrust { name: "office unborn", trust: Some(settled.clone()), copy: Some(settled.clone()), unborn: true,
-                    code: Some(RefusalCode::RefDamaged), says: "stopped between its two writes", not: None },
+                UnsettledTrust { name: "office unborn", trust: Some(settled.clone()), copy: None, unborn: true,
+                    code: Some(RefusalCode::RefDamaged), says: "move the trust file aside, and its copy", not: None },
             ].into_iter().nth(case).unwrap();
 
             let forklift = crate::globals::forklift_root();
