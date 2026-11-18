@@ -15,6 +15,10 @@
 //! one reuses, such as a key, is written `<name>`: in the output a page shows, it stands for one
 //! word and binds it, and in a later command it is replaced by what it bound.
 //!
+//! A `git` command runs the reader's git with none of the developer's git configuration (system,
+//! global or environment), so a setting such as `core.autocrlf` or `init.defaultBranch` cannot
+//! change what it prints or writes; the same holds for the git that forklift runs itself.
+//!
 //! A server the page starts runs in the background, as the page's second terminal. The first
 //! line under its `$` line is the line it starts with; any lines after it are everything that
 //! terminal prints later, while the rest of the page runs, checked when the run ends. A server
@@ -30,7 +34,8 @@ use common::{fence, forklift_command, repository_root, server_binary, tracked_pa
 
 /// The pages under `docs/guide/` this test runs, each from an empty folder.
 const RUN_PAGES: &[&str] =
-    &["tutorial.md", "concepts.md", "team.md", "cache.md", "leaving.md", "leaked-secret.md"];
+    &["tutorial.md", "concepts.md", "team.md", "cache.md", "leaving.md", "leaked-secret.md",
+      "switching.md"];
 
 /// The address the pages tell the reader to serve on. The test serves on a port the server picks
 /// itself, so a busy 7171 on a CI machine cannot fail it, and rewrites this address wherever a
@@ -539,14 +544,18 @@ impl Reader {
     }
 
     /// The reader's environment: none of the developer's forklift settings, debug switches or log
-    /// filters, which would change what a command prints.
+    /// filters, and none of their git configuration, which would change what a command prints.
+    /// Git reads only the machine's own global file, which starts empty.
     fn environment(&self, command: &mut Command) {
         for (key, _) in std::env::vars_os() {
             let key_text = key.to_string_lossy();
-            if key_text.starts_with("FORKLIFT_") || key_text.starts_with("RUST_LOG") {
+            if ["FORKLIFT_", "RUST_LOG", "GIT_"].iter().any(|prefix| key_text.starts_with(prefix)) {
                 command.env_remove(&key);
             }
         }
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", self.home.join("gitconfig"));
 
         command
             .current_dir(&self.cwd)
@@ -594,7 +603,7 @@ impl Reader {
 
         let unsupported = || -> ! {
             fail(&"this test cannot run it; use a command it knows (forklift, forklift-server, \
-                cd, mkdir, cat, echo > file, forklift > file) or teach it")
+                git, cd, mkdir, cat, echo > file, forklift > file) or teach it")
         };
 
         match (words[0].as_str(), redirect) {
@@ -676,6 +685,11 @@ impl Reader {
             }
             ("forklift-server", None) => {
                 let mut command = Command::new(server_binary());
+                command.args(&words[1..]);
+                self.capture(command)
+            }
+            ("git", None) => {
+                let mut command = Command::new("git");
                 command.args(&words[1..]);
                 self.capture(command)
             }
@@ -837,6 +851,43 @@ fn leaving_runs_as_written() {
 #[test]
 fn leaked_secret_runs_as_written() {
     run_page("leaked-secret.md");
+}
+
+#[test]
+fn switching_runs_as_written() {
+    run_page("switching.md");
+}
+
+/// A page's `git` sees no configuration but what the page itself set: not the developer's global
+/// or system files, nor configuration passed in the environment (`GIT_CONFIG_COUNT`).
+#[test]
+fn git_reads_none_of_the_developers_configuration() {
+    let area = std::env::temp_dir().join(format!("forklift-git-config-{}", std::process::id()));
+    let _ = forklift_core::util::file_utils::remove_dir_all(&area);
+    let (home, cwd) = machine_folders(&area, &None);
+    let mut reader = Reader {
+        page: "a page".to_string(),
+        area: area.clone(),
+        machine: None,
+        home,
+        cwd,
+        others: HashMap::new(),
+        bound: HashMap::new(),
+        address: None,
+        servers: Vec::new(),
+    };
+    let step = |command: &str| Step { line: 1, machine: None, command: command.to_string(), expected: Vec::new() };
+
+    let (status, output) = reader.run(&step("git config --list"));
+    assert_eq!((status, printed_lines(&output)), (Some(0), Vec::<String>::new()));
+
+    // The positive: what the page sets is seen.
+    assert_eq!(reader.run(&step("git config --global user.name Ada")).0, Some(0));
+    let (status, output) = reader.run(&step("git config --list"));
+    assert_eq!((status, printed_lines(&output)), (Some(0), vec!["user.name=Ada".to_string()]));
+
+    drop(reader);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&area);
 }
 
 /// A page that shows commands in a `console` block promises they run as shown, so a page with one
