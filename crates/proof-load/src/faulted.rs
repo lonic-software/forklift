@@ -2644,7 +2644,8 @@ mod tests {
         let resolved = std::fs::canonicalize(&given).unwrap();
         let named = format!("Withhold it with \"forklift-server withhold add --root {} {} --statement <statement>\".\n", resolved.display(), a);
         let found = restatements(Tool::Forklift, &named, &given).len();
-        std::fs::remove_dir_all(&given).unwrap();
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
+        std::fs::remove_dir(&given).unwrap();
         assert_eq!(found, 1, "{} resolved to {}", given.display(), resolved.display());
     }
 
