@@ -3200,8 +3200,8 @@ fn a_served_root_whose_withheld_record_is_lost_or_damaged_refuses_until_its_oper
     let listed = withhold(&root, &["list"]);
     assert_eq!(String::from_utf8_lossy(&listed.stdout), format!("unaccounted {}\n", film));
     let refused = serve_refused(&root);
-    assert!(refused.contains("is not served: a repair of its damaged record of withheld content left 1 file or part of \
-        history unaccounted.") && refused.contains("`forklift-server withhold list` names each."), "{}", refused);
+    assert!(refused.contains("is not served: a repair of its damaged record of withheld content left 1 file, folder or part \
+        of history unaccounted.") && refused.contains("`forklift-server withhold list` names each."), "{}", refused);
     let added = withhold(&root, &["add", &film, "--statement", "court order 2026-90"]);
     assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
     let listed = withhold(&root, &["list"]);
