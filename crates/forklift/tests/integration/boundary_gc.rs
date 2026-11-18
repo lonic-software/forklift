@@ -941,12 +941,13 @@ fn a_pick_whose_source_was_lost_refuses_naming_the_pick_and_the_abort_works() {
         err
     );
     assert!(
-        err.contains(&format!("Abort the pick (remove \"{}\")", PathBuf::from(".forklift").join("cherry-pick").display())),
+        err.contains("Abort the pick (run \"forklift abort --keep-files\")"),
         "the refusal must name the abort; stderr: {}",
         err
     );
 
-    file_utils::remove_file(pick_state_file(&warehouse)).unwrap();
+    warehouse.run_ok(&["abort", "--keep-files"]);
+    assert!(!pick_state_file(&warehouse).exists(), "the abort drops the pick state");
     warehouse.run_ok(&["stack", "-m", "completed pick"]);
 
     // As the refusal says, the stacked changes record the operator as their only author. With the

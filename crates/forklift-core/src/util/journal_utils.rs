@@ -751,24 +751,44 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// * `Ok(false)`   - No such entry is the latest, or the journal is empty.
 /// * `Err(String)` - If the journal or the bay's state could not be read, or the journal rewritten.
 pub fn pop_if_it_left_in_progress() -> Result<bool, String> {
+    pop_latest_left_in_progress_if(|entry| {
+        // Without the skeleton: an abort clears whatever it holds, and is the way out of one that
+        // is missing or unreadable.
+        let mut after = entry.after.bay_state();
+        if let Some(consolidation) = after.consolidation.as_mut() {
+            consolidation.skeleton.clear();
+        }
+
+        Ok(BayState::read_without_skeleton()? == after)
+    })
+}
+
+/// [`pop_if_it_left_in_progress`] for an abort that abandons a merge whose record it does not read,
+/// since the record may be damaged: the latest entry other than a pallet delete is removed when it
+/// left a consolidation or pick in progress and the bay still stands where it left it, on the same
+/// pallet and base. Whichever merge that entry recorded, none is in progress once the abort is
+/// through, so kept, it would refuse every later undo. Any other entry is left alone.
+///
+/// # Returns
+/// * `Ok(true)`    - The entry was removed.
+/// * `Ok(false)`   - No such entry is the latest, or the journal is empty.
+/// * `Err(String)` - If the journal or the bay's position could not be read, or the journal rewritten.
+pub fn pop_if_it_left_in_progress_unread() -> Result<bool, String> {
+    pop_latest_left_in_progress_if(|entry| {
+        let position = pallet_utils::read_position()?;
+        Ok(position.pallet == entry.after.current_pallet && position.base.as_ref() == entry.after.current_head())
+    })
+}
+
+/// Remove the latest entry other than a pallet delete when it [left a merge in
+/// progress](left_in_progress) and `still_there` holds for it.
+fn pop_latest_left_in_progress_if(still_there: impl FnOnce(&JournalEntry) -> Result<bool, String>) -> Result<bool, String> {
     let mut entries = read()?;
     let Some(index) = entries.iter().rposition(|entry| entry.op != DELETE_OP) else {
         return Ok(false);
     };
-    let entry = &entries[index];
 
-    if !left_in_progress(entry) {
-        return Ok(false);
-    }
-
-    // Without the skeleton: an abort clears whatever it holds, and is the way out of one that is
-    // missing or unreadable.
-    let mut after = entry.after.bay_state();
-    if let Some(consolidation) = after.consolidation.as_mut() {
-        consolidation.skeleton.clear();
-    }
-
-    if BayState::read_without_skeleton()? != after {
+    if !left_in_progress(&entries[index]) || !still_there(&entries[index])? {
         return Ok(false);
     }
 
@@ -1665,6 +1685,32 @@ mod tests {
         assert_eq!(popped.after.cherry_pick, Some(PickInProgress { source: hash('c'), our_head: hash('e'), our_pallet: "main".to_string(), description: None }));
     }
 
+    /// The pop for an abort that does not read the merge's record removes the latest entry when it
+    /// left a merge in progress and the bay stands where it left it, on the same pallet and base,
+    /// and leaves it in place when the bay stands anywhere else, or the entry left none.
+    #[test]
+    fn the_unread_pop_takes_the_entry_that_left_the_merge_only_while_the_bay_stands_where_it_left_it() {
+        let _scratch = Scratch::new("pop-unread");
+
+        let mut started = entry("pick", "main", &hash('a'), &hash('a'));
+        started.after.cherry_pick = Some(PickInProgress { source: hash('c'), our_head: hash('a'), our_pallet: "main".to_string(), description: None });
+        let plain = entry("stack", "main", &hash('1'), &hash('a'));
+
+        let cases = [
+            ("where it left it", &started, "main", hash('a'), true),
+            ("on another base", &started, "main", hash('b'), false),
+            ("on another pallet", &started, "feature", hash('a'), false),
+            ("after an entry that left none", &plain, "main", hash('a'), false),
+        ];
+        for (what, latest, pallet, base, popped) in cases {
+            write(std::slice::from_ref(latest)).unwrap();
+            pallet_utils::write_position(&pallet_utils::BayPosition::new(pallet, Some(base))).unwrap();
+
+            assert_eq!(pop_if_it_left_in_progress_unread().unwrap(), popped, "{}", what);
+            assert_eq!(read().unwrap().len(), usize::from(!popped), "{}", what);
+        }
+    }
+
     #[test]
     fn push_if_changed_records_a_switch_of_the_current_pallet() {
         let _scratch = Scratch::new("push-switch");
@@ -2332,7 +2378,7 @@ mod tests {
         ).unwrap();
         restore_refs(&entry("stack", "main", &hash('1'), &hash('2'))).unwrap();
         assert!(merge_utils::read_consolidation_state().unwrap().is_none());
-        assert!(OutOfScopeSkeleton::read().unwrap().is_empty());
+        assert!(std::fs::symlink_metadata(OutOfScopeSkeleton::path()).is_err(), "no skeleton stays behind");
     }
 
     #[test]

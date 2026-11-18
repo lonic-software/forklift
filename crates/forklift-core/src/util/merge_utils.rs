@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::model::remote::{HoldAnswer, MAX_HOLDS_CANDIDATES};
+use crate::error::RefusalCode;
 use crate::globals::bay_root;
 use crate::util::scope_utils::{self, PathScope, ScopeClass};
 use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, lcs, object_utils, pallet_utils, record_utils, shift_utils};
@@ -65,26 +66,106 @@ const SKELETON_RECORD: &str = "consolidation-skeleton";
 // bump `journal_utils::JOURNAL_VERSION` with it, so an old journal is named as another version.
 const SKELETON_VERSION: u32 = 2;
 
-/// How to abandon the consolidation whose files live in the bay-local state dir `dir` without
-/// putting anything back: remove both of them. A phrase such as `remove "<a>" and "<b>"`, naming
-/// that bay's own paths. For where `abort` cannot run: an unreadable state, or a bay
-/// no longer at the head the merge was built on.
-pub fn state_removal_hint_in(dir: &Path) -> String {
-    format!(
-        "remove \"{}\" and \"{}\"",
-        dir.join(FILE_NAME_CONSOLIDATION).to_string_lossy(),
-        dir.join(FILE_NAME_SKELETON).to_string_lossy()
-    )
+/// The command that abandons the consolidation or pick in progress in the bay it runs in without
+/// reading what it recorded and without putting anything back: it drops the record and leaves
+/// every file as it is.
+pub const ABORT_KEEPING_FILES: &str = "forklift abort --keep-files";
+
+/// The command that abandons the consolidation or pick in progress in the bay it runs in, putting
+/// back what it changed.
+pub const ABORT_COMMAND: &str = "forklift abort";
+
+/// How to abandon the merge in progress in this bay without putting anything back, as a phrase that
+/// follows "Abort it (" or "To abandon it and leave every file as it is, ". For where `abort` cannot
+/// run: a bay no longer at the head the merge was built on, or output it cannot work out.
+pub fn abandon_hint() -> String {
+    format!("run \"{}\"", ABORT_KEEPING_FILES)
 }
 
-/// The way out of an unreadable consolidation state in `dir`: both of its files go, and the merge
-/// starts over. The abort cannot run: it reads what the state recorded.
-fn abort_remedy_in(dir: &Path) -> String {
-    format!("Abandon the consolidation ({}) and consolidate again.", state_removal_hint_in(dir))
+/// The `merge_state_damaged` refusal for a record of the merge in progress in the bay whose state
+/// lives in `dir`: `found` says which file and what is wrong with it, as a sentence. In the bay the
+/// command runs in, `next_step` is the way out; in another, the message names the bay to run it in
+/// and the next step is empty, since it runs only there.
+///
+/// # Arguments
+/// * `dir`       - The bay-local state dir the record was read from.
+/// * `found`     - The file and its damage, as a sentence.
+/// * `effect`    - What `next_step` does, as a sentence that does not name it.
+/// * `next_step` - The command that is the way out, run in that bay.
+pub(crate) fn merge_state_damaged(dir: &Path, found: &str, effect: &str, next_step: &str) -> String {
+    let found = found.trim_end();
+    if dir == bay_root().as_path() {
+        let message = format!("{} Nothing was changed. {}", found, effect);
+        return scope_utils::refusal(RefusalCode::MergeStateDamaged, message, next_step).into();
+    }
+
+    let there = match dir == crate::globals::forklift_root().as_path() {
+        true => format!("in the main tree (\"{}\")", scope_utils::main_tree_folder().to_string_lossy()),
+        false => {
+            let name = dir.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+            match crate::util::bay_utils::read_bay_path(&name) {
+                Ok(Some(folder)) => format!("in bay \"{}\" (\"{}\")", name, folder.to_string_lossy()),
+                Ok(None) => {
+                    let message = format!(
+                        "{} Nothing was changed. The bay \"{}\" recorded no folder, so its \"forklift bay add\" \
+                         stopped before checking anything out. Remove it with \"forklift bay remove {}\" and add a \
+                         new one under another name.",
+                        found, name, name
+                    );
+                    return scope_utils::refusal(RefusalCode::MergeStateDamaged, message, "").into();
+                }
+                Err(e) => format!("in bay \"{}\", whose folder could not be read ({})", name, e.trim_end_matches('.')),
+            }
+        }
+    };
+    let message = format!("{} Nothing was changed. Run \"{}\" {}: {}", found, next_step, there, effect);
+    scope_utils::refusal(RefusalCode::MergeStateDamaged, message, "").into()
 }
 
-/// The way out of a missing or unreadable skeleton: the abort, which never reads it.
-const SKELETON_REMEDY: &str = "Abort the consolidation (\"forklift abort\") and consolidate again.";
+/// What [`ABORT_KEEPING_FILES`] does for a damaged state file, as a sentence that does not name it.
+pub(crate) const KEEPING_FILES_EFFECT: &str = "Abandoning the merge without reading it drops that record and leaves every file as it is.";
+
+/// What `abort` does for a damaged skeleton, as a sentence that does not name it: the abort never
+/// reads the skeleton.
+const SKELETON_EFFECT: &str = "The abort puts back what the merge changed without reading it.";
+
+/// The bytes of the bay-local record at `path`, read without following a link at it.
+///
+/// # Returns
+/// * `Ok(Some(bytes))` - The file's bytes.
+/// * `Ok(None)`        - Nothing is at `path`.
+/// * `Err(Ok(String))`  - Something other than a file is there: why, as a phrase that follows
+///                       "The <file> ", for the caller to refuse as damage.
+/// * `Err(Err(String))` - The file could not be read. That says nothing about its bytes, which may
+///                       be whole, so it is no damage and names no way out that drops the record.
+pub(crate) fn read_record_bytes(path: &Path) -> Result<Option<Vec<u8>>, Result<String, String>> {
+    let unreadable = |e: std::io::Error| Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e));
+
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(e)),
+        Ok(metadata) if !metadata.file_type().is_file() => return Err(Ok("is not a file.".to_string())),
+        Ok(_) => {}
+    }
+
+    std::fs::read(path).map(Some).map_err(unreadable)
+}
+
+/// Remove the bay-local record at `path`, whatever is there: a file, a link (never followed) or a
+/// folder that a damaged record left. A no-op when nothing is.
+pub(crate) fn remove_record(path: &Path) -> Result<(), String> {
+    let removed = match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Ok(metadata) => file_utils::remove_entry_unfollowed(path, metadata.file_type()),
+        Err(_) => file_utils::remove_file(path),
+    };
+
+    match removed {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Error while removing \"{}\": {}", path.to_string_lossy(), e)),
+    }
+}
 
 /// Get the path of the consolidation-state file (bay-local: a merge in progress belongs
 /// to the bay resolving it).
@@ -107,19 +188,25 @@ fn get_consolidation_state_path() -> PathBuf {
 pub fn read_consolidation_state_in(dir: &Path) -> Result<Option<ConsolidationState>, String> {
     let path = dir.join(FILE_NAME_CONSOLIDATION);
 
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e))?;
-
-    let malformed = |reason: String| format!(
-        "The consolidation state file \"{}\" {} {}", path.to_string_lossy(), reason, abort_remedy_in(dir)
+    let malformed = |reason: String| merge_state_damaged(
+        dir,
+        &format!("The consolidation state file \"{}\" {}", path.to_string_lossy(), reason),
+        KEEPING_FILES_EFFECT,
+        ABORT_KEEPING_FILES,
     );
 
-    let lines = record_utils::from_bytes(&bytes, CONSOLIDATION_RECORD, CONSOLIDATION_VERSION)
-        .map_err(|e| malformed(e.describe()))?;
+    let Some(bytes) = read_record_bytes(&path).map_err(|e| e.map_or_else(|e| e, &malformed))? else {
+        return Ok(None);
+    };
+
+    let lines = record_utils::from_bytes(&bytes, CONSOLIDATION_RECORD, CONSOLIDATION_VERSION).map_err(|e| {
+        match e.is_newer(CONSOLIDATION_RECORD, CONSOLIDATION_VERSION) {
+            true => format!(
+                "The consolidation state file \"{}\" {} Use the Forklift that wrote it.", path.to_string_lossy(), e.describe()
+            ),
+            false => malformed(e.describe()),
+        }
+    })?;
 
     let [their_head, their_pallet, our_head, our_pallet] = <[String; 4]>::try_from(lines)
         .map_err(|_| malformed("is malformed.".to_string()))?;
@@ -159,19 +246,18 @@ pub(crate) fn consolidation_state_bytes(state: &ConsolidationState) -> Vec<u8> {
     record_utils::to_bytes(CONSOLIDATION_RECORD, CONSOLIDATION_VERSION, [&state.their_head, &state.their_pallet, &state.our_head, &state.our_pallet])
 }
 
+/// Whether this bay holds a consolidation-state file or an out-of-scope skeleton, readable or not.
+pub fn state_present() -> bool {
+    [FILE_NAME_CONSOLIDATION, FILE_NAME_SKELETON].iter().any(|name| std::fs::symlink_metadata(bay_root().join(name)).is_ok())
+}
+
 /// Remove the consolidation state file (a no-op when none exists).
 ///
 /// # Returns
 /// * `Ok(())`      - If the state file is gone.
 /// * `Err(String)` - If the file exists but could not be removed.
 pub fn clear_consolidation_state() -> Result<(), String> {
-    let path = get_consolidation_state_path();
-
-    match file_utils::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("Error while removing \"{}\": {}", path.to_string_lossy(), e)),
-    }
+    remove_record(&get_consolidation_state_path())
 }
 
 /// The name of the out-of-scope skeleton file (beside the consolidation-state file, bay-local).
@@ -245,22 +331,6 @@ impl OutOfScopeSkeleton {
         bay_root().join(FILE_NAME_SKELETON)
     }
 
-    /// Read the skeleton beside the in-progress consolidation, returning an empty skeleton when
-    /// the file is absent (a merge with no out-of-scope resolutions). Used outside a completing
-    /// stack (e.g. inspection); the completing stack itself uses [`OutOfScopeSkeleton::read_required`]
-    /// instead, since *there* an absent file is not "no resolutions" but a broken invariant.
-    pub fn read() -> Result<OutOfScopeSkeleton, String> {
-        let path = OutOfScopeSkeleton::path();
-
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OutOfScopeSkeleton::default()),
-            Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
-        };
-
-        OutOfScopeSkeleton::from_bytes(&bytes, &path)
-    }
-
     /// Read the skeleton beside an in-progress consolidation, **requiring the file to exist**.
     ///
     /// `consolidate` always writes the skeleton — even an empty one — strictly *before* it writes
@@ -277,21 +347,23 @@ impl OutOfScopeSkeleton {
     pub fn read_required() -> Result<OutOfScopeSkeleton, String> {
         let path = OutOfScopeSkeleton::path();
 
-        let bytes = std::fs::read(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-format!(
-                    "A consolidation is in progress but its out-of-scope skeleton (\"{}\") is \
-                    missing — most likely an interrupted write (a crash mid-merge). The completing \
-                    stack cannot tell what out-of-scope entries the merge resolved, so it refuses \
-                    rather than silently drop them. {}",
-                    path.to_string_lossy(), SKELETON_REMEDY
-                )
-            } else {
-                format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)
-            }
+        let damaged = |found: String| merge_state_damaged(&bay_root(), &found, SKELETON_EFFECT, ABORT_COMMAND);
+
+        let named = |reason: &str| format!("The consolidation skeleton file \"{}\" {}", path.to_string_lossy(), reason);
+
+        let bytes = read_record_bytes(&path).map_err(|e| e.map_or_else(|e| e, |reason| damaged(named(&reason))))?.ok_or_else(|| damaged(format!(
+            "A consolidation is in progress but its out-of-scope skeleton (\"{}\") is missing, most likely \
+             from an interrupted write (a crash mid-merge), so no command can tell which out-of-scope \
+             entries the merge resolved.",
+            path.to_string_lossy()
+        )))?;
+
+        let lines = record_utils::from_bytes(&bytes, SKELETON_RECORD, SKELETON_VERSION).map_err(|e| match e.is_newer(SKELETON_RECORD, SKELETON_VERSION) {
+            true => format!("{} Use the Forklift that wrote it.", named(&e.describe())),
+            false => damaged(named(&e.describe())),
         })?;
 
-        OutOfScopeSkeleton::from_bytes(&bytes, &path)
+        OutOfScopeSkeleton::from_lines(&lines, &path).map_err(damaged)
     }
 
     /// Write the skeleton (atomically) beside the consolidation-state file.
@@ -301,13 +373,7 @@ format!(
 
     /// Remove the skeleton file (a no-op when none exists), consumed alongside the consolidation.
     pub fn clear() -> Result<(), String> {
-        let path = OutOfScopeSkeleton::path();
-
-        match file_utils::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("Error while removing \"{}\": {}", path.to_string_lossy(), e)),
-        }
+        remove_record(&OutOfScopeSkeleton::path())
     }
 
     /// Serialize to the on-disk form, a [`record_utils`] file of kind [`SKELETON_RECORD`]: one
@@ -325,19 +391,25 @@ format!(
 
     /// Parse the on-disk form produced by [`OutOfScopeSkeleton::to_bytes`].
     ///
-    /// `path` is where `bytes` were read from; an error names it, and the way out in its bay.
+    /// `path` is where `bytes` were read from; an error names it and what is wrong, and no way
+    /// out: that depends on whose file it is (see [`OutOfScopeSkeleton::read_required`]).
     pub fn from_bytes(bytes: &[u8], path: &Path) -> Result<OutOfScopeSkeleton, String> {
-        let remedy = SKELETON_REMEDY;
         let lines = record_utils::from_bytes(bytes, SKELETON_RECORD, SKELETON_VERSION).map_err(|e| format!(
-            "The consolidation skeleton file \"{}\" {} {}", path.to_string_lossy(), e.describe(), remedy
+            "The consolidation skeleton file \"{}\" {}", path.to_string_lossy(), e.describe()
         ))?;
 
+        OutOfScopeSkeleton::from_lines(&lines, path)
+    }
+
+    /// Parse the entries of a skeleton record whose header and digest were already checked; see
+    /// [`OutOfScopeSkeleton::from_bytes`].
+    fn from_lines(lines: &[String], path: &Path) -> Result<OutOfScopeSkeleton, String> {
         let mut entries: BTreeMap<String, Option<(String, DirEntryType)>> = BTreeMap::new();
 
-        for line in &lines {
+        for line in lines {
             let malformed = || format!(
-                "The consolidation skeleton file \"{}\" has a malformed line \"{}\". {}",
-                path.to_string_lossy(), line.escape_debug(), remedy
+                "The consolidation skeleton file \"{}\" has a malformed line \"{}\".",
+                path.to_string_lossy(), line.escape_debug()
             );
 
             match line.split_once(' ') {
@@ -351,7 +423,7 @@ format!(
                     let path = parts.next().filter(|path| !path.is_empty()).ok_or_else(malformed)?;
 
                     let code: u64 = code.parse().map_err(|_| malformed())?;
-                    let item_type = DirEntryType::from_code(code)?;
+                    let item_type = DirEntryType::from_code(code).map_err(|_| malformed())?;
 
                     if !object_utils::is_object_hash(hash) {
                         return Err(malformed());
@@ -2058,14 +2130,155 @@ mod tests {
             assert_eq!(read_back.our_pallet, state.our_pallet);
         }
 
-        // A version-1 state (no base) is refused by its version, never read without one.
-        std::fs::write(get_consolidation_state_path(), record_utils::to_bytes(CONSOLIDATION_RECORD, 1, ["ab".repeat(32), "feature".to_string()])).unwrap();
-        let error = read_consolidation_state().err().expect("a version-1 state file must be refused");
-        assert!(error.contains("does not know") && error.contains("Abandon the consolidation"), "{}", error);
+        file_utils::remove_dir_all(&temp).ok();
+    }
 
-        std::fs::write(get_consolidation_state_path(), format!("{}\nfeature\n", "ab".repeat(32))).unwrap();
-        let error = read_consolidation_state().err().expect("a headerless state file must be refused");
-        assert!(error.contains("has no format header") && error.contains("Abandon the consolidation"), "{}", error);
+    /// The code and next step of a refusal `error` frames, or `None` for an uncoded error.
+    fn refusal_of(error: String) -> Option<(RefusalCode, String, String)> {
+        match crate::error::CoreError::from(error) {
+            crate::error::CoreError::Refusal { code, message, next_step, .. } => Some((code, message, next_step)),
+            crate::error::CoreError::Other(_) => None,
+        }
+    }
+
+    /// Every way a bay's record of its merge can be damaged — not text, no header, an older
+    /// version, a byte flipped under its digest, entries that do not parse — is refused
+    /// `merge_state_damaged`. In this bay the next step is the abort that runs: `abort
+    /// --keep-files` for a state file, which it never reads, and `abort` for a skeleton, which the
+    /// plain abort never reads. For another bay the next step is empty and the message names the
+    /// bay and the command to run there. A record a newer version wrote is not damage: it is
+    /// refused uncoded, sending the user to the Forklift that wrote it.
+    #[test]
+    fn a_damaged_merge_record_is_refused_merge_state_damaged_naming_its_abort() {
+        use crate::globals::StorageRootScope;
+
+        let temp = std::env::temp_dir().join(format!("forklift-merge-state-damaged-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&temp);
+        let root = temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let other = crate::util::bay_utils::bay_state_dir("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        crate::util::bay_utils::write_bay_path("elsewhere", &temp.join("elsewhere-folder")).unwrap();
+        let unfoldered = crate::util::bay_utils::bay_state_dir("unfoldered");
+        std::fs::create_dir_all(&unfoldered).unwrap();
+
+        let hash = "ab".repeat(32);
+        let flipped = |mut bytes: Vec<u8>| {
+            let at = bytes.iter().rposition(|byte| *byte == b'a').unwrap();
+            bytes[at] = b'c';
+            bytes
+        };
+        let state = record_utils::to_bytes(CONSOLIDATION_RECORD, CONSOLIDATION_VERSION, [hash.clone(), "feature".to_string(), hash.clone(), "main".to_string()]);
+        let pick = record_utils::to_bytes(crate::util::cherry_pick_utils::CHERRY_PICK_RECORD, crate::util::cherry_pick_utils::CHERRY_PICK_VERSION, [hash.clone(), hash.clone(), "main".to_string()]);
+        let skeleton = OutOfScopeSkeleton { entries: BTreeMap::from([("src/a".to_string(), None)]) }.to_bytes();
+
+        let damaged: Vec<(&str, &str, Vec<u8>)> = vec![
+            (FILE_NAME_CONSOLIDATION, "not text", vec![0xff, 0xfe, b'\n']),
+            (FILE_NAME_CONSOLIDATION, "no header", format!("{}\nfeature\n", hash).into_bytes()),
+            (FILE_NAME_CONSOLIDATION, "an older version", record_utils::to_bytes(CONSOLIDATION_RECORD, 1, [hash.clone(), "feature".to_string()])),
+            (FILE_NAME_CONSOLIDATION, "a flipped byte", flipped(state.clone())),
+            (FILE_NAME_CONSOLIDATION, "too few entries", record_utils::to_bytes(CONSOLIDATION_RECORD, CONSOLIDATION_VERSION, [hash.clone()])),
+            (FILE_NAME_CONSOLIDATION, "a head that is no hash", record_utils::to_bytes(CONSOLIDATION_RECORD, CONSOLIDATION_VERSION, ["nope".to_string(), "feature".to_string(), hash.clone(), "main".to_string()])),
+            (crate::util::cherry_pick_utils::FILE_NAME_CHERRY_PICK, "not text", vec![0xff, b'\n']),
+            (crate::util::cherry_pick_utils::FILE_NAME_CHERRY_PICK, "no header", b"{\"source\":\"x\"}\n".to_vec()),
+            (crate::util::cherry_pick_utils::FILE_NAME_CHERRY_PICK, "a flipped byte", flipped(pick.clone())),
+            (crate::util::cherry_pick_utils::FILE_NAME_CHERRY_PICK, "a head that is no hash", record_utils::to_bytes(crate::util::cherry_pick_utils::CHERRY_PICK_RECORD, crate::util::cherry_pick_utils::CHERRY_PICK_VERSION, [hash.clone(), "nope".to_string(), "main".to_string()])),
+        ];
+
+        let read = |dir: &Path, name: &str| -> String {
+            match name {
+                FILE_NAME_CONSOLIDATION => read_consolidation_state_in(dir).err(),
+                _ => crate::util::cherry_pick_utils::read_state_in(dir).err(),
+            }.unwrap_or_else(|| panic!("{} must be refused", name))
+        };
+
+        // Something other than a file at the record's path is damage too, and the abandon removes it.
+        let names = [FILE_NAME_CONSOLIDATION, crate::util::cherry_pick_utils::FILE_NAME_CHERRY_PICK];
+        let mut shapes: Vec<(&str, &str, Option<Vec<u8>>)> = damaged.iter().map(|(name, what, bytes)| (*name, *what, Some(bytes.clone()))).collect();
+        shapes.extend(names.iter().map(|name| (*name, "a folder", None)));
+        #[cfg(unix)]
+        shapes.extend(names.iter().map(|name| (*name, "a dangling link", Some(Vec::new()))));
+
+        for (name, what, bytes) in &shapes {
+            for dir in [&root, &other, &unfoldered] {
+                let path = dir.join(name);
+                match (what, bytes) {
+                    (&"a folder", _) => std::fs::create_dir_all(path.join("inside")).unwrap(),
+                    #[cfg(unix)]
+                    (&"a dangling link", _) => std::os::unix::fs::symlink(dir.join("nowhere"), &path).unwrap(),
+                    (_, bytes) => std::fs::write(&path, bytes.as_ref().unwrap()).unwrap(),
+                }
+                let (code, message, next_step) = refusal_of(read(dir, name)).unwrap_or_else(|| panic!("{} with {}: not coded", name, what));
+                assert_eq!(code, RefusalCode::MergeStateDamaged, "{} with {}", name, what);
+
+                if dir == &root {
+                    assert_eq!(next_step, "forklift abort --keep-files", "{} with {}: {}", name, what, message);
+                } else {
+                    assert_eq!(next_step, "", "{} with {}", name, what);
+                    let there = match dir == &other {
+                        true => format!("Run \"forklift abort --keep-files\" in bay \"elsewhere\" (\"{}\")", temp.join("elsewhere-folder").to_string_lossy()),
+                        false => "Remove it with \"forklift bay remove unfoldered\"".to_string(),
+                    };
+                    assert!(message.contains(&there), "{} with {}: {}", name, what, message);
+                }
+                remove_record(&path).unwrap();
+                assert!(std::fs::symlink_metadata(&path).is_err(), "{} with {} is removed", name, what);
+            }
+        }
+
+        // A record the filesystem fails to read may be whole: that is no damage, and it names no
+        // step that would drop it. (Skipped where permissions do not bind, as for root.)
+        #[cfg(unix)]
+        for (name, bytes) in [(FILE_NAME_CONSOLIDATION, state.clone()), (crate::util::cherry_pick_utils::FILE_NAME_CHERRY_PICK, pick.clone()), (FILE_NAME_SKELETON, skeleton.clone())] {
+            use std::os::unix::fs::PermissionsExt;
+            let path = root.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read(&path).is_err() {
+                let error = match name {
+                    FILE_NAME_SKELETON => OutOfScopeSkeleton::read_required().err(),
+                    _ => Some(read(&root, name)),
+                }.unwrap_or_else(|| panic!("an unreadable {} must be refused", name));
+                assert!(error.contains("Error while reading"), "{}", error);
+                assert!(refusal_of(error).is_none(), "an unreadable {} must not read as damage", name);
+            }
+            remove_record(&path).unwrap();
+        }
+
+        // The skeleton is read only in this bay, by the stack that completes the consolidation.
+        let skeletons: Vec<(&str, Option<Vec<u8>>)> = vec![
+            ("missing", None),
+            ("a flipped byte", Some(flipped(skeleton.clone()))),
+            ("a malformed line", Some(record_utils::to_bytes(SKELETON_RECORD, SKELETON_VERSION, ["X src/a".to_string()]))),
+            ("an unknown entry type", Some(record_utils::to_bytes(SKELETON_RECORD, SKELETON_VERSION, [format!("S 99 {} src/a", hash)]))),
+        ];
+        for (what, bytes) in skeletons {
+            let _ = file_utils::remove_file(OutOfScopeSkeleton::path());
+            if let Some(bytes) = bytes {
+                std::fs::write(OutOfScopeSkeleton::path(), bytes).unwrap();
+            }
+            let error = OutOfScopeSkeleton::read_required().err().unwrap_or_else(|| panic!("a skeleton with {} must be refused", what));
+            let (code, _, next_step) = refusal_of(error).unwrap_or_else(|| panic!("a skeleton with {}: not coded", what));
+            assert_eq!((code, next_step.as_str()), (RefusalCode::MergeStateDamaged, "forklift abort"), "a skeleton with {}", what);
+        }
+
+        // Newer records are left to the Forklift that wrote them.
+        let newer: [(&str, Vec<u8>); 3] = [
+            (FILE_NAME_CONSOLIDATION, record_utils::to_bytes(CONSOLIDATION_RECORD, CONSOLIDATION_VERSION + 1, [hash.clone()])),
+            (crate::util::cherry_pick_utils::FILE_NAME_CHERRY_PICK, record_utils::to_bytes(crate::util::cherry_pick_utils::CHERRY_PICK_RECORD, crate::util::cherry_pick_utils::CHERRY_PICK_VERSION + 1, [hash.clone()])),
+            (FILE_NAME_SKELETON, record_utils::to_bytes(SKELETON_RECORD, SKELETON_VERSION + 1, ["D src/a".to_string()])),
+        ];
+        for (name, bytes) in newer {
+            std::fs::write(root.join(name), bytes).unwrap();
+            let error = match name {
+                FILE_NAME_SKELETON => OutOfScopeSkeleton::read_required().err(),
+                _ => Some(read(&root, name)),
+            }.unwrap_or_else(|| panic!("a newer {} must be refused", name));
+            assert!(error.contains("Use the Forklift that wrote it."), "{}", error);
+            assert!(refusal_of(error).is_none(), "a newer {} must not read as damage", name);
+            file_utils::remove_file(root.join(name)).unwrap();
+        }
 
         file_utils::remove_dir_all(&temp).ok();
     }

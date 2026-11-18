@@ -19,20 +19,20 @@ use std::path::{Path, PathBuf};
 use crate::enums::parcel_action_type::ParcelActionType;
 use crate::globals::bay_root;
 use crate::model::operator::Operator;
-use crate::util::{file_utils, object_utils, record_utils};
+use crate::util::{file_utils, merge_utils, object_utils, record_utils};
 
 /// The name of the cherry-pick-state file (inside the bay root). While a pick is in
 /// progress (its merge left conflicts), it records the source parcel, the head and pallet the pick
 /// was applied to, and the intended description; the next `stack` reads it to complete the pick
 /// single-parent and remove it.
-const FILE_NAME_CHERRY_PICK: &str = "cherry-pick";
+pub(crate) const FILE_NAME_CHERRY_PICK: &str = "cherry-pick";
 
 /// The state record kind of the cherry-pick-state file. Its entries are the source, the head, the
 /// pallet, and then the description when there is one.
-const CHERRY_PICK_RECORD: &str = "cherry-pick";
+pub(crate) const CHERRY_PICK_RECORD: &str = "cherry-pick";
 
 /// The version of the cherry-pick-state record.
-const CHERRY_PICK_VERSION: u32 = 2;
+pub(crate) const CHERRY_PICK_VERSION: u32 = 2;
 
 /// A cherry-pick in progress: the source parcel being applied, and the description the
 /// completing `stack` should default to.
@@ -56,11 +56,9 @@ fn state_path() -> PathBuf {
     bay_root().join(FILE_NAME_CHERRY_PICK)
 }
 
-/// How to abandon the pick in progress in this bay without putting anything back: a phrase such as
-/// `remove "<path>"`, naming the bay's own state file. For where `abort` cannot run: an
-/// unreadable state or source parcel, or a bay no longer at the head the pick was applied on.
-pub fn state_removal_hint() -> String {
-    format!("remove \"{}\"", state_path().to_string_lossy())
+/// Whether this bay holds a cherry-pick-state file, readable or not.
+pub fn state_present() -> bool {
+    std::fs::symlink_metadata(state_path()).is_ok()
 }
 
 /// Read the cherry-pick state, if a pick is in progress.
@@ -81,21 +79,24 @@ pub fn read_state() -> Result<Option<CherryPickState>, String> {
 pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
     let path = dir.join(FILE_NAME_CHERRY_PICK);
 
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e))?;
-
-    let malformed = || format!(
-        "The pick state file \"{}\" is malformed; remove it to abort the pick.",
-        path.to_string_lossy()
+    let damaged = |reason: &str| merge_utils::merge_state_damaged(
+        dir,
+        &format!("The pick state file \"{}\" {}", path.to_string_lossy(), reason),
+        merge_utils::KEEPING_FILES_EFFECT,
+        merge_utils::ABORT_KEEPING_FILES,
     );
+    let malformed = || damaged("is malformed.");
 
-    let entries = record_utils::from_bytes(&bytes, CHERRY_PICK_RECORD, CHERRY_PICK_VERSION).map_err(|e| format!(
-        "The pick state file \"{}\" {} Remove it to abort the pick.", path.to_string_lossy(), e.describe()
-    ))?;
+    let Some(bytes) = merge_utils::read_record_bytes(&path).map_err(|e| e.map_or_else(|e| e, |reason| damaged(&reason)))? else {
+        return Ok(None);
+    };
+
+    let entries = record_utils::from_bytes(&bytes, CHERRY_PICK_RECORD, CHERRY_PICK_VERSION).map_err(|e| {
+        match e.is_newer(CHERRY_PICK_RECORD, CHERRY_PICK_VERSION) {
+            true => format!("The pick state file \"{}\" {} Use the Forklift that wrote it.", path.to_string_lossy(), e.describe()),
+            false => damaged(&e.describe()),
+        }
+    })?;
 
     let mut entries = entries.into_iter();
     let (Some(source), Some(our_head), Some(our_pallet)) = (entries.next(), entries.next(), entries.next()) else {
@@ -144,13 +145,7 @@ pub(crate) fn state_bytes(state: &CherryPickState) -> Vec<u8> {
 /// * `Ok(())`      - If the state file is gone.
 /// * `Err(String)` - If the file exists but could not be removed.
 pub fn clear_state() -> Result<(), String> {
-    let path = state_path();
-
-    match file_utils::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("Error while removing \"{}\": {}", path.to_string_lossy(), e)),
-    }
+    merge_utils::remove_record(&state_path())
 }
 
 /// The distinct authors of a source parcel, in first-seen order (by identifier) — the
@@ -234,7 +229,6 @@ mod tests {
 
         let error = read_state_in(&dir).err().unwrap();
         assert!(error.contains("has no format header"), "{}", error);
-        assert!(error.contains("Remove it to abort the pick."), "{}", error);
         let _ = file_utils::remove_dir_all(&dir);
     }
 
