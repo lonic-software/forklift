@@ -143,9 +143,12 @@ pub enum Measured {
     /// was killed; what it said is not kept.
     KilledAtLimit { limit_ms: u64 },
     /// The cache-drop program did not succeed before a cold repetition, so the repetition would
-    /// not have been cold and was not run: its exit, or none when it died of a signal, and what it
-    /// said on stderr.
-    DropFailed { exit: Option<i32>, stderr: String },
+    /// not have been cold and was not run: its exit, or the signal it died of when it had no exit,
+    /// and what it said on stderr.
+    DropFailed { exit: Option<i32>, signal: Option<i32>, stderr: String },
+    /// The cache-drop program ran past its limit before a cold repetition and was killed, so the
+    /// repetition was not run.
+    DropKilledAtLimit { limit_ms: u64 },
 }
 
 /// Microseconds over the repetitions: never the mean.
@@ -254,9 +257,16 @@ impl PerfReport {
                             Measured::KilledAtLimit { limit_ms } => {
                                 let _ = writeln!(out, "| {} | voided: killed at its {} limit | | | | | {} |", cell.subject.label(), micros(limit_ms.saturating_mul(1000)), command);
                             }
-                            Measured::DropFailed { exit, stderr } => {
-                                let ended = exit.map_or_else(|| "died of a signal".to_string(), |exit| format!("exited {}", exit));
+                            Measured::DropFailed { exit, signal, stderr } => {
+                                let ended = match (exit, signal) {
+                                    (Some(exit), _) => format!("exited {}", exit),
+                                    (None, Some(signal)) => format!("died of signal {}", signal),
+                                    (None, None) => "ended with no exit".to_string(),
+                                };
                                 let _ = writeln!(out, "| {} | voided: the cache-drop program {}: {} | | | | | {} |", cell.subject.label(), ended, stderr.trim().replace('\n', " ").replace('|', "\\|"), command);
+                            }
+                            Measured::DropKilledAtLimit { limit_ms } => {
+                                let _ = writeln!(out, "| {} | voided: the cache-drop program was killed at its {} limit | | | | | {} |", cell.subject.label(), micros(limit_ms.saturating_mul(1000)), command);
                             }
                         }
                     }
@@ -317,16 +327,24 @@ impl Subject {
     }
 }
 
-/// How the cold rows run: the cache-drop program each repetition runs first, or why they are not
-/// run at all.
-type Cold = Result<PathBuf, String>;
+/// The cache-drop program each cold repetition runs first, with no arguments, and how long it may
+/// take.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DropCaches {
+    program: PathBuf,
+    limit: Duration,
+}
+
+/// How the cold rows run: the cache drop each repetition runs first, or why they are not run at
+/// all.
+type Cold = Result<DropCaches, String>;
 
 /// The cold rows' plan on a platform that is Windows or not, given the cache-drop program the
 /// caller named, if any.
 fn cold_when(windows: bool, drop_caches: Option<PathBuf>) -> Cold {
     match drop_caches {
         _ if windows => Err(NO_COLD_ON_WINDOWS.to_string()),
-        Some(program) => Ok(program),
+        Some(program) => Ok(DropCaches { program, limit: COMMAND_LIMIT }),
         None => Err(NO_DROP.to_string()),
     }
 }
@@ -366,7 +384,7 @@ pub fn run(options: &PerfOptions, progress: &dyn Fn(&str)) -> Result<PerfReport,
     let header = Header {
         seed: shape.seed, shape: shape.name.to_string(), shape_detail: shape.describe(), reps: options.reps, tools,
         platform: Platform::current(), os: crate::run::operating_system(), filesystem: crate::run::filesystem_of(output.root()),
-        configurations, hardware: hardware(), drop_caches: cold.as_ref().ok().map(|program| program.display().to_string()),
+        configurations, hardware: hardware(), drop_caches: cold.as_ref().ok().map(|drop| drop.program.display().to_string()),
     };
     let report = PerfReport { format: PERF_FORMAT, header, rows };
     for (name, text) in [("perf.md", report.markdown()), ("perf.json", report.json())] {
@@ -502,12 +520,12 @@ fn pairs(built: &Built, reps: usize, cold: &Cold, scratch: &Scratch, environment
 /// Pushes `operation`'s warm row and then its cold one: both not comparable when `check` failed,
 /// the cold one not run when the plan says so, and otherwise each as `time` measures it, given the
 /// cache-drop program for the cold row.
-fn both(rows: &mut Vec<Row>, operation: &str, note: &str, check: Result<(), String>, cold: &Cold, mut time: impl FnMut(Option<&Path>) -> Result<Outcome, Stopped>) -> Result<(), Stopped> {
+fn both(rows: &mut Vec<Row>, operation: &str, note: &str, check: Result<(), String>, cold: &Cold, mut time: impl FnMut(Option<&DropCaches>) -> Result<Outcome, Stopped>) -> Result<(), Stopped> {
     for cache in [Cache::Warm, Cache::Cold] {
         let outcome = match (&check, cache, cold) {
             (Err(reason), _, _) => Outcome::NotComparable { reason: reason.clone() },
             (Ok(()), Cache::Warm, _) => time(None)?,
-            (Ok(()), Cache::Cold, Ok(program)) => time(Some(program))?,
+            (Ok(()), Cache::Cold, Ok(drop)) => time(Some(drop))?,
             (Ok(()), Cache::Cold, Err(reason)) => Outcome::NotRun { reason: reason.clone() },
         };
         rows.push(Row { operation: operation.to_string(), cache, note: note.to_string(), outcome });
@@ -515,7 +533,7 @@ fn both(rows: &mut Vec<Row>, operation: &str, note: &str, check: Result<(), Stri
     Ok(())
 }
 
-/// The run that warms a subject's caches after its work tree was built, edited or copied, untimed
+/// The run that warms a subject's caches after its work tree was built or edited, untimed
 /// and unjudged: Forklift's stocktake --summary or git's status.
 fn read_untimed(subject: &Subject, scratch: &Scratch, environment: &Environment) -> Result<(), Stopped> {
     let read = if subject.tool == Tool::Forklift { subject.line(&["stocktake", "--summary"]) } else { subject.line(&["status"]) };
@@ -562,75 +580,163 @@ fn write_lines(write: Write, argument: &str) -> [Vec<&str>; 2] {
 }
 
 /// The write pairs, warm and cold: commit over the edit set, staged untimed, then switch to
-/// [`SIDE_BRANCH`] and merge it, which are not comparable unless it and the current branch are at
-/// different commits in every subject. Each repetition runs on a fresh copy of the clean subject,
-/// which every write must leave clean; the subjects themselves are not changed.
+/// [`SIDE_BRANCH`] and merge it. Switch is not comparable unless the side branch is at another
+/// commit than the current branch in every subject, and merge unless neither of the two contains
+/// the other, so that it joins two lines of history. Each repetition runs on a fresh copy of the
+/// clean subject, which every write must leave clean; the subjects themselves are not changed.
 #[allow(clippy::too_many_arguments)]
 fn writes(subjects: &[Subject], edited: &[&str], reps: usize, cold: &Cold, scratch: &Scratch, environment: &Environment, progress: &dyn Fn(&str), rows: &mut Vec<Row>) -> Result<(), Stopped> {
     let copies = scratch.work().join("copies");
     std::fs::create_dir_all(&copies).map_err(|error| Stopped(format!("{}: {}", copies.display(), error)))?;
     let staged = Changes { staged: edited.iter().map(|file| file.to_string()).collect(), unstaged: BTreeSet::new() };
+    let clean = Changes::default();
 
     progress("timing commit");
     let note = format!(
         "the same {} tracked files edited and staged, untimed, on a fresh copy for each repetition; Forklift's subject is enrolled, so its stack is signed, and git's commit is not",
         edited.len(),
     );
-    let fresh = Fresh { edit: edited, before: Some(&staged), copies: &copies };
+    let fresh = Fresh { operation: "commit", edit: edited, before: &staged, copies: &copies };
     let [forklift, git] = write_lines(Write::Commit, COMMIT_MESSAGE);
     both(rows, "commit", &note, Ok(()), cold, |cold| fresh_pair(subjects, &forklift, &git, reps, cold, &fresh, scratch, environment))?;
 
-    let differ = differs(subjects, scratch, environment)?;
-    let fresh = Fresh { edit: &[], before: None, copies: &copies };
-    for (write, operation, note) in [
-        (Write::Switch, "switch", format!("from the current branch to {}, which leaves it a few commits before its tip, on a fresh copy for each repetition", SIDE_BRANCH)),
-        (Write::Merge, "merge", format!("{} into the current branch, a merge with no conflict, on a fresh copy for each repetition", SIDE_BRANCH)),
+    let (switch, merge) = sides(subjects, scratch, environment)?;
+    for (write, operation, note, check) in [
+        (Write::Switch, "switch", format!("from the current branch to {}, which leaves it a few commits before its tip, on a fresh copy for each repetition", SIDE_BRANCH), switch),
+        (Write::Merge, "merge", format!("{} into the current branch, each with commits the other lacks, a merge with no conflict, on a fresh copy for each repetition", SIDE_BRANCH), merge),
     ] {
         progress(&format!("timing {}", operation));
+        let fresh = Fresh { operation, edit: &[], before: &clean, copies: &copies };
         let [forklift, git] = write_lines(write, SIDE_BRANCH);
-        both(rows, operation, &note, differ.clone(), cold, |cold| fresh_pair(subjects, &forklift, &git, reps, cold, &fresh, scratch, environment))?;
+        both(rows, operation, &note, check, cold, |cold| fresh_pair(subjects, &forklift, &git, reps, cold, &fresh, scratch, environment))?;
     }
     Ok(())
 }
 
-/// Whether [`SIDE_BRANCH`] is at another commit than the current branch in every subject, as each
-/// tool reads its own refs, or why not.
-fn differs(subjects: &[Subject], scratch: &Scratch, environment: &Environment) -> Result<Result<(), String>, Stopped> {
-    let mut not = Vec::new();
+/// Where [`SIDE_BRANCH`] stands against the current branch in one subject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    /// At the commit the current branch is at.
+    Same,
+    /// On one line of history with it: one of the two contains the other.
+    OneLine,
+    /// Each has commits the other lacks.
+    Forked,
+}
+
+/// Whether switching to [`SIDE_BRANCH`] changes anything in every subject, and whether merging it
+/// joins two lines of history in every subject, as each tool reads its own history, or why not.
+fn sides(subjects: &[Subject], scratch: &Scratch, environment: &Environment) -> Result<(Result<(), String>, Result<(), String>), Stopped> {
+    let (mut switch, mut merge) = (Vec::new(), Vec::new());
     for subject in subjects {
-        let arguments: Vec<&str> = if subject.tool == Tool::Forklift { vec!["--json", "pallet", "list"] } else { vec!["rev-parse", "HEAD", SIDE_BRANCH] };
-        let outcome = tool::run(&subject.invocation(subject.line(&arguments)), scratch, environment)?;
-        if !outcome.succeeded() {
-            not.push(format!("{} {} exited {:?}: {}", subject.tool.label(), arguments.join(" "), outcome.exit, String::from_utf8_lossy(&outcome.stderr).trim()));
-            continue;
-        }
-        let heads: Option<(String, String)> = if subject.tool == Tool::Forklift {
-            let document = runner::document(&outcome.stdout);
-            let pallets = document["data"]["pallets"].as_array().cloned().unwrap_or_default();
-            let head = |found: &dyn Fn(&serde_json::Value) -> bool| pallets.iter().find(|pallet| found(pallet)).and_then(|pallet| pallet["head"].as_str()).map(str::to_string);
-            head(&|pallet| pallet["current"] == true).zip(head(&|pallet| pallet["name"] == SIDE_BRANCH))
-        } else {
-            let text = String::from_utf8_lossy(&outcome.stdout);
-            let mut lines = text.lines().map(str::to_string);
-            lines.next().zip(lines.next())
-        };
-        match heads {
-            None => not.push(format!("{} named no head for the current branch or for {}", subject.tool.label(), SIDE_BRANCH)),
-            Some((current, side)) if current == side => not.push(format!(
-                "{} has {} at the commit its current branch is at, so switching to it or merging it would time a change of nothing", subject.tool.label(), SIDE_BRANCH,
-            )),
-            Some(_) => {}
+        let label = subject.tool.label();
+        match side(subject, scratch, environment)? {
+            Err(reason) => {
+                switch.push(reason.clone());
+                merge.push(reason);
+            }
+            Ok(Side::Same) => {
+                let reason = format!("{} has {} at the commit its current branch is at, so switching to it or merging it would time a change of nothing", label, SIDE_BRANCH);
+                switch.push(reason.clone());
+                merge.push(reason);
+            }
+            Ok(Side::OneLine) => merge.push(format!("{} has {} and its current branch on one line of history, one containing the other, so merging it would not join two lines", label, SIDE_BRANCH)),
+            Ok(Side::Forked) => {}
         }
     }
-    Ok(if not.is_empty() { Ok(()) } else { Err(not.join("; ")) })
+    let verdict = |not: Vec<String>| if not.is_empty() { Ok(()) } else { Err(not.join("; ")) };
+    Ok((verdict(switch), verdict(merge)))
+}
+
+/// Where [`SIDE_BRANCH`] stands in `subject`: git's by `rev-list --left-right --count`, Forklift's
+/// by its pallets' heads and the history of each. Gives why when a read failed.
+fn side(subject: &Subject, scratch: &Scratch, environment: &Environment) -> Result<Result<Side, String>, Stopped> {
+    let label = subject.tool.label();
+    if subject.tool != Tool::Forklift {
+        let range = format!("HEAD...{}", SIDE_BRANCH);
+        let text = match output(subject, &["rev-list", "--left-right", "--count", &range], scratch, environment)? {
+            Ok(text) => text,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let counts: Vec<u64> = text.split_whitespace().map_while(|count| count.parse().ok()).collect();
+        return Ok(match counts[..] {
+            [0, 0] => Ok(Side::Same),
+            [ahead, behind] if ahead == 0 || behind == 0 => Ok(Side::OneLine),
+            [_, _] => Ok(Side::Forked),
+            _ => Err(format!("{} rev-list gave no two counts: {}", label, text.trim())),
+        });
+    }
+    let text = match output(subject, &["--json", "pallet", "list"], scratch, environment)? {
+        Ok(text) => text,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let document = runner::document(text.as_bytes());
+    let pallets = document["data"]["pallets"].as_array().cloned().unwrap_or_default();
+    let head = |found: &dyn Fn(&serde_json::Value) -> bool| pallets.iter().find(|pallet| found(pallet)).and_then(|pallet| pallet["head"].as_str()).map(str::to_string);
+    let Some((current, side)) = head(&|pallet| pallet["current"] == true).zip(head(&|pallet| pallet["name"] == SIDE_BRANCH)) else {
+        return Ok(Err(format!("{} named no head for the current branch or for {}", label, SIDE_BRANCH)));
+    };
+    if current == side {
+        return Ok(Ok(Side::Same));
+    }
+    let behind = match parcels(subject, &side, scratch, environment)? {
+        Ok(parcels) => parcels.contains(&current),
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let ahead = match parcels(subject, &current, scratch, environment)? {
+        Ok(parcels) => parcels.contains(&side),
+        Err(reason) => return Ok(Err(reason)),
+    };
+    Ok(Ok(if behind || ahead { Side::OneLine } else { Side::Forked }))
+}
+
+/// Every parcel in Forklift's history of `revision`, itself included, read page by page.
+fn parcels(subject: &Subject, revision: &str, scratch: &Scratch, environment: &Environment) -> Result<Result<BTreeSet<String>, String>, Stopped> {
+    let mut parcels = BTreeSet::new();
+    let mut after: Option<String> = None;
+    loop {
+        let mut arguments = vec!["--json".to_string(), "history".to_string(), revision.to_string()];
+        if let Some(cursor) = after.take() {
+            arguments.extend(["--after".to_string(), cursor]);
+        }
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        let text = match output(subject, &arguments, scratch, environment)? {
+            Ok(text) => text,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let document = runner::document(text.as_bytes());
+        let Some(entries) = document["data"]["entries"].as_array() else {
+            return Ok(Err(format!("Forklift's --json history {} gave no entries", revision)));
+        };
+        for entry in entries {
+            let Some(parcel) = entry["parcel"].as_str() else {
+                return Ok(Err(format!("Forklift's --json history {} gave an entry with no parcel", revision)));
+            };
+            parcels.insert(parcel.to_string());
+        }
+        match document["data"]["next"].as_str() {
+            Some(next) => after = Some(next.to_string()),
+            None => return Ok(Ok(parcels)),
+        }
+    }
+}
+
+/// What `subject` printed on stdout for `arguments`, after its prefix, or why it did not succeed.
+fn output(subject: &Subject, arguments: &[&str], scratch: &Scratch, environment: &Environment) -> Result<Result<String, String>, Stopped> {
+    let outcome = tool::run(&subject.invocation(subject.line(arguments)), scratch, environment)?;
+    if !outcome.succeeded() {
+        return Ok(Err(format!("{} {} exited {:?}: {}", subject.tool.label(), arguments.join(" "), outcome.exit, String::from_utf8_lossy(&outcome.stderr).trim())));
+    }
+    Ok(Ok(String::from_utf8_lossy(&outcome.stdout).into_owned()))
 }
 
 /// What each repetition of a write pair starts from: a fresh copy of the subject under `copies`,
-/// read once untimed, then `edit`'s files edited and staged, untimed, after which the subject must
-/// report exactly `before` changed.
+/// named for `operation`, refreshed once untimed, then `edit`'s files edited and staged, untimed,
+/// after which the copy must report exactly `before` changed.
 struct Fresh<'a> {
+    operation: &'a str,
     edit: &'a [&'a str],
-    before: Option<&'a Changes>,
+    before: &'a Changes,
     copies: &'a Path,
 }
 
@@ -638,7 +744,7 @@ struct Fresh<'a> {
 /// fresh copy. Not comparable when a copy did not reach the state the pair starts from, or a write
 /// left one not clean.
 #[allow(clippy::too_many_arguments)]
-fn fresh_pair(subjects: &[Subject], forklift: &[&str], git: &[&str], reps: usize, cold: Option<&Path>, fresh: &Fresh, scratch: &Scratch, environment: &Environment) -> Result<Outcome, Stopped> {
+fn fresh_pair(subjects: &[Subject], forklift: &[&str], git: &[&str], reps: usize, cold: Option<&DropCaches>, fresh: &Fresh, scratch: &Scratch, environment: &Environment) -> Result<Outcome, Stopped> {
     let mut cells = Vec::new();
     for subject in subjects {
         let command = subject.line(if subject.tool == Tool::Forklift { forklift } else { git });
@@ -650,7 +756,8 @@ fn fresh_pair(subjects: &[Subject], forklift: &[&str], git: &[&str], reps: usize
     Ok(Outcome::Timed { cells })
 }
 
-/// A folder the harness copied a subject into, removed when dropped.
+/// A folder the harness copied a subject into, removed when dropped. A copy that cannot be removed
+/// is left where it is: every copy has a name of its own, so a leftover is in no later one's way.
 struct Copied(PathBuf);
 
 impl Drop for Copied {
@@ -660,32 +767,63 @@ impl Drop for Copied {
     }
 }
 
+/// The untimed run that brings a fresh copy's caches up to date with its copied files, as git's
+/// status refreshes its index: Forklift's `load .`, since its stocktake keeps nothing it learns
+/// about a file, and git's `status`.
+fn refresh_untimed(copy: &Subject, scratch: &Scratch, environment: &Environment) -> Result<(), Stopped> {
+    let refresh = if copy.tool == Tool::Forklift { copy.line(&["load", "."]) } else { copy.line(&["status"]) };
+    tool::run(&copy.invocation(refresh), scratch, environment)?;
+    Ok(())
+}
+
+/// Writes every dirty page out, untimed, so that a timed write which syncs pays for its own writes
+/// and not for the copy's. Only on unix, which has sync(2); on Windows it does nothing.
+fn settle() {
+    #[cfg(unix)]
+    // SAFETY: sync(2) takes no arguments and has no failure to report.
+    unsafe {
+        libc::sync();
+    }
+}
+
 /// One write cell: each repetition on a fresh copy of `subject` as `fresh` describes it, watched
-/// by a daemon of its own where the subject is, and judged clean after the timed run. Gives why
-/// the pair is not comparable when a copy's check failed.
-fn fresh_cell(subject: &Subject, command: &[String], reps: usize, cold: Option<&Path>, fresh: &Fresh, scratch: &Scratch, environment: &Environment) -> Result<Result<Measured, String>, Stopped> {
+/// by a daemon of its own where the subject is, and judged clean after the timed run. A warm cell
+/// first runs the command once untimed and unjudged, on a copy of its own, as a warm read cell
+/// does. Gives why the pair is not comparable when a copy's check failed.
+fn fresh_cell(subject: &Subject, command: &[String], reps: usize, cold: Option<&DropCaches>, fresh: &Fresh, scratch: &Scratch, environment: &Environment) -> Result<Result<Measured, String>, Stopped> {
+    let cache = if cold.is_some() { Cache::Cold } else { Cache::Warm };
+    let first = if cold.is_some() { 1 } else { 0 };
     let mut runs = Vec::with_capacity(reps);
-    for rep in 1..=reps {
-        let copied = Copied(fresh.copies.join(format!("{}-{}", subject.tool.label(), rep)));
+    for rep in first..=reps {
+        let name = format!("{}-{}-{}-{}", fresh.operation.replace(' ', "-"), cache.label(), subject.tool.label(), rep);
+        let copied = Copied(fresh.copies.join(name));
         crate::scrub::copy_tree(&subject.work, &copied.0).map_err(|error| Stopped(format!("copying {} to {}: {:?}", subject.work.display(), copied.0.display(), error)))?;
         let copy = subject.at(copied.0.clone());
-        // Dropped before the copy is removed.
+        // Dropped before the copy is removed. The copy's fsmonitor setting came with it.
         let _daemon = if copy.watched {
-            Some(runner::FsmonitorDaemon::start(&copy.program, &copy.work, scratch, environment, COMMAND_LIMIT).map_err(|error| Stopped(error.to_string()))?.0)
+            Some(runner::FsmonitorDaemon::watch(&copy.program, &copy.work, scratch, environment, COMMAND_LIMIT).map_err(|error| Stopped(error.to_string()))?.0)
         } else {
             None
         };
-        read_untimed(&copy, scratch, environment)?;
+        refresh_untimed(&copy, scratch, environment)?;
         if !fresh.edit.is_empty() {
             edit(&copy.work, fresh.edit)?;
             stage(&copy, scratch, environment)?;
         }
-        if let Some(expected) = fresh.before {
-            if let Err(reason) = same(std::slice::from_ref(&copy), expected, scratch, environment)? {
-                return Ok(Err(format!("before repetition {}, {}", rep, reason)));
+        let invocation = copy.invocation(command.to_vec());
+        if rep == 0 {
+            settle();
+            match tool::run(&invocation, scratch, environment) {
+                Ok(_) => continue,
+                Err(ToolError::TimedOut { .. }) => return Ok(Ok(killed(invocation.limit))),
+                Err(error) => return Err(error.into()),
             }
         }
-        match repetition(&copy.invocation(command.to_vec()), cold, scratch, environment)? {
+        if let Err(reason) = same(std::slice::from_ref(&copy), fresh.before, scratch, environment)? {
+            return Ok(Err(format!("before repetition {}, {}", rep, reason)));
+        }
+        settle();
+        match repetition(&invocation, cold, scratch, environment)? {
             Ok(timed) => runs.push(timed),
             Err(ended) => return Ok(Ok(ended)),
         }
@@ -794,7 +932,7 @@ fn same(subjects: &[Subject], expected: &Changes, scratch: &Scratch, environment
 
 /// Times forklift's `forklift` line and both gits' `git` line, cold when given the cache-drop
 /// program.
-fn timed_pair(subjects: &[Subject], forklift: &[&str], git: &[&str], reps: usize, cold: Option<&Path>, scratch: &Scratch, environment: &Environment) -> Result<Outcome, Stopped> {
+fn timed_pair(subjects: &[Subject], forklift: &[&str], git: &[&str], reps: usize, cold: Option<&DropCaches>, scratch: &Scratch, environment: &Environment) -> Result<Outcome, Stopped> {
     let mut cells = Vec::new();
     for subject in subjects {
         let command = subject.line(if subject.tool == Tool::Forklift { forklift } else { git });
@@ -808,7 +946,7 @@ fn timed_pair(subjects: &[Subject], forklift: &[&str], git: &[&str], reps: usize
 /// judged, so the cache is warm; a cold cell drops the cache before each repetition instead. The
 /// first repetition that does not end in a timing ends the cell, and so does an untimed run
 /// killed at its limit.
-fn measure(invocation: &Invocation, reps: usize, cold: Option<&Path>, scratch: &Scratch, environment: &Environment) -> Result<Measured, Stopped> {
+fn measure(invocation: &Invocation, reps: usize, cold: Option<&DropCaches>, scratch: &Scratch, environment: &Environment) -> Result<Measured, Stopped> {
     if cold.is_none() {
         match tool::run(invocation, scratch, environment) {
             Ok(_) => {}
@@ -827,19 +965,23 @@ fn measure(invocation: &Invocation, reps: usize, cold: Option<&Path>, scratch: &
 }
 
 fn killed(limit: Duration) -> Measured {
-    Measured::KilledAtLimit { limit_ms: u64::try_from(limit.as_millis()).unwrap_or(u64::MAX) }
+    Measured::KilledAtLimit { limit_ms: millis(limit) }
+}
+
+fn millis(limit: Duration) -> u64 {
+    u64::try_from(limit.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// One timed repetition, after the cache-drop program when it is cold: its timing when it
 /// succeeded, or what its cell is instead, voided by the command's exit or signal, by the drop's
 /// failure, or killed at a limit.
-fn repetition(invocation: &Invocation, cold: Option<&Path>, scratch: &Scratch, environment: &Environment) -> Result<Result<tool::Timed, Measured>, Stopped> {
-    if let Some(program) = cold {
-        let drop = Invocation { program: program.to_path_buf(), arguments: vec![], directory: invocation.directory.clone(), limit: COMMAND_LIMIT };
-        match tool::run(&drop, scratch, environment) {
-            Ok(dropped) if dropped.succeeded() => {}
-            Ok(dropped) => return Ok(Err(Measured::DropFailed { exit: dropped.exit, stderr: String::from_utf8_lossy(&dropped.stderr).into_owned() })),
-            Err(ToolError::TimedOut { .. }) => return Ok(Err(killed(drop.limit))),
+fn repetition(invocation: &Invocation, cold: Option<&DropCaches>, scratch: &Scratch, environment: &Environment) -> Result<Result<tool::Timed, Measured>, Stopped> {
+    if let Some(caches) = cold {
+        let drop = Invocation { program: caches.program.clone(), arguments: vec![], directory: invocation.directory.clone(), limit: caches.limit };
+        match tool::timed(&drop, scratch, environment) {
+            Ok(dropped) if dropped.outcome.succeeded() => {}
+            Ok(dropped) => return Ok(Err(Measured::DropFailed { exit: dropped.outcome.exit, signal: dropped.signal, stderr: String::from_utf8_lossy(&dropped.outcome.stderr).into_owned() })),
+            Err(ToolError::TimedOut { .. }) => return Ok(Err(Measured::DropKilledAtLimit { limit_ms: millis(caches.limit) })),
             Err(error) => return Err(error.into()),
         }
     }
@@ -1104,14 +1246,14 @@ mod tests {
     #[test]
     fn cold_rows_are_not_run_without_a_cache_drop_program_or_on_windows() {
         let program = PathBuf::from("/usr/local/bin/purge-caches");
-        assert_eq!(cold_when(false, Some(program.clone())), Ok(program.clone()));
+        assert_eq!(cold_when(false, Some(program.clone())), Ok(DropCaches { program: program.clone(), limit: Duration::from_secs(600) }));
         assert_eq!(cold_when(false, None), Err("no cache-drop program given (--drop-caches)".to_string()));
         assert_eq!(cold_when(true, Some(program)), Err("cold runs are not built on Windows in this harness".to_string()));
         assert_eq!(cold_when(true, None), Err("cold runs are not built on Windows in this harness".to_string()));
 
         let mut rows = Vec::new();
         let mut timed = Vec::new();
-        both(&mut rows, "log", "n", Ok(()), &Err("why".into()), |cold| { timed.push(cold.map(Path::to_path_buf)); Ok(Outcome::Timed { cells: vec![] }) }).unwrap();
+        both(&mut rows, "log", "n", Ok(()), &Err("why".into()), |cold| { timed.push(cold.cloned()); Ok(Outcome::Timed { cells: vec![] }) }).unwrap();
         assert_eq!(timed, [None]);
         assert_eq!(rows.iter().map(|row| (row.cache, &row.outcome)).collect::<Vec<_>>(), [
             (Cache::Warm, &Outcome::Timed { cells: vec![] }), (Cache::Cold, &Outcome::NotRun { reason: "why".into() }),
@@ -1138,21 +1280,31 @@ mod tests {
         let command = |log: &Path| Invocation {
             program: PathBuf::from("/bin/sh"), arguments: vec!["-c".into(), format!("echo run >> '{}'", log.display())], directory: scratch.work(), limit: Duration::from_secs(30),
         };
+        let caches = |program: PathBuf, limit: Duration| DropCaches { program, limit };
+        let long = Duration::from_secs(30);
         let log = scratch.work().join("log");
-        let drop = script("drop", &format!("echo drop >> '{}'", log.display()));
+        let drop = caches(script("drop", &format!("echo drop >> '{}'", log.display())), long);
         assert!(matches!(measure(&command(&log), 3, Some(&drop), &scratch, &environment).unwrap(), Measured::Timed { .. }));
         assert_eq!(std::fs::read_to_string(&log).unwrap(), "drop\nrun\ndrop\nrun\ndrop\nrun\n");
         let unrun = scratch.work().join("unrun");
-        let failing = script("failing", "echo no caches here >&2; exit 3");
-        assert_eq!(measure(&command(&unrun), 3, Some(&failing), &scratch, &environment).unwrap(), Measured::DropFailed { exit: Some(3), stderr: "no caches here\n".into() });
+        let failing = caches(script("failing", "echo no caches here >&2; exit 3"), long);
+        assert_eq!(measure(&command(&unrun), 3, Some(&failing), &scratch, &environment).unwrap(), Measured::DropFailed { exit: Some(3), signal: None, stderr: "no caches here\n".into() });
+        // A drop that dies of a signal keeps it; one that hangs is killed at its own limit, and is
+        // told apart from the command being killed.
+        let signalled = caches(script("signalled", "kill -9 $$"), long);
+        assert_eq!(measure(&command(&unrun), 3, Some(&signalled), &scratch, &environment).unwrap(), Measured::DropFailed { exit: None, signal: Some(9), stderr: String::new() });
+        let hanging = caches(script("hanging", "sleep 30"), Duration::from_millis(300));
+        assert_eq!(measure(&command(&unrun), 3, Some(&hanging), &scratch, &environment).unwrap(), Measured::DropKilledAtLimit { limit_ms: 300 });
         assert!(!unrun.exists());
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Switch and merge are reported not comparable, with the reason, on a subject whose side
-    /// branch is at the commit its current branch is at, and are timed once it is not; commit is
-    /// timed on a fresh copy each time, and the subject itself is never changed.
+    /// branch is at the commit its current branch is at; merge is too while one of the two
+    /// contains the other, and both are timed once each has commits the other lacks. Every write
+    /// is timed on a fresh copy each time, after one untimed run when warm, and the subject itself
+    /// is never changed; a copy that does not start or end as it should is not comparable.
     ///
     /// Revert: skip the differ check → switch and merge are timed over a change of nothing.
     #[cfg(unix)]
@@ -1167,15 +1319,17 @@ mod tests {
             assert!(outcome.succeeded(), "{:?}: {}", arguments, String::from_utf8_lossy(&outcome.stderr));
             String::from_utf8_lossy(&outcome.stdout).trim().to_string()
         };
+        let commit_file = |name: &str| {
+            std::fs::write(work.join(name), format!("{}\n", name)).unwrap();
+            run(&["add", "-A"]);
+            run(&["commit", "-q", "-m", name]);
+        };
         std::fs::create_dir(&work).unwrap();
         run(&["init", "-q", "-b", "probe"]);
         std::fs::write(work.join("a"), "a\n").unwrap();
-        std::fs::write(work.join("b"), "b\n").unwrap();
-        run(&["add", "-A"]);
-        run(&["commit", "-q", "-m", "one"]);
+        commit_file("b");
         run(&["branch", SIDE_BRANCH]);
         let subjects = [Subject { tool: Tool::Git, program: git.clone(), prefix: vec![], work: work.clone(), watched: false }];
-        let head = run(&["rev-parse", "HEAD"]);
         let writes_now = || {
             let mut rows = Vec::new();
             writes(&subjects, &["a", "b"], 1, &Err("r".into()), &scratch, &environment, &|_| {}, &mut rows).unwrap();
@@ -1183,6 +1337,7 @@ mod tests {
         };
         let timed = |outcome: &Outcome| matches!(outcome, Outcome::Timed { cells } if cells.len() == 1 && matches!(cells[0].result, Measured::Timed { .. }));
         let not_run = Outcome::NotRun { reason: "r".into() };
+        let outcomes = |rows: &[(String, Cache, Outcome)]| rows.iter().map(|(_, _, outcome)| outcome.clone()).collect::<Vec<_>>();
 
         let rows = writes_now();
         let same = Outcome::NotComparable { reason: "git has perf-side at the commit its current branch is at, so switching to it or merging it would time a change of nothing".into() };
@@ -1191,13 +1346,20 @@ mod tests {
         ]);
         assert!(timed(&rows[0].2), "{:?}", rows[0]);
         assert_eq!(rows[1].2, not_run);
-        assert_eq!(rows[2..].iter().map(|(_, _, outcome)| outcome).collect::<Vec<_>>(), [&same, &same, &same, &same]);
+        assert_eq!(outcomes(&rows[2..]), [same.clone(), same.clone(), same.clone(), same]);
 
+        // The side branch ahead of the current one: a switch changes something, a merge would only
+        // fast-forward.
         run(&["switch", "-q", SIDE_BRANCH]);
-        std::fs::write(work.join("c"), "c\n").unwrap();
-        run(&["add", "-A"]);
-        run(&["commit", "-q", "-m", "side"]);
+        commit_file("c");
         run(&["switch", "-q", "probe"]);
+        let rows = writes_now();
+        let one_line = Outcome::NotComparable { reason: "git has perf-side and its current branch on one line of history, one containing the other, so merging it would not join two lines".into() };
+        assert!(timed(&rows[2].2), "{:?}", rows[2]);
+        assert_eq!(outcomes(&rows[3..]), [not_run.clone(), one_line.clone(), one_line]);
+
+        commit_file("d");
+        let head = run(&["rev-parse", "HEAD"]);
         let rows = writes_now();
         for (operation, cache, outcome) in &rows {
             match cache {
@@ -1209,17 +1371,29 @@ mod tests {
         assert_eq!(run(&["status", "--porcelain"]), "");
         assert_eq!(std::fs::read_dir(scratch.work().join("copies")).unwrap().count(), 0);
 
-        // A commit whose copy does not start with exactly the edit set staged, or does not end
-        // clean, is not comparable, and says which.
-        let commit = || writes_now().into_iter().next().unwrap().2;
-        std::fs::write(work.join("stray"), "s\n").unwrap();
-        assert_eq!(commit(), Outcome::NotComparable { reason: "before repetition 1, git saw 3 staged of 2 expected, 1 more (stray)".into() });
-        run(&["add", "-A"]);
-        run(&["commit", "-q", "-m", "stray"]);
+        // A warm write cell runs its command once untimed first, on a copy of its own: a
+        // post-commit hook, copied with the subject, logs two commits for one repetition.
         let hook = work.join(".git").join("hooks").join("post-commit");
-        std::fs::write(&hook, "#!/bin/sh\necho left > left-behind\n").unwrap();
-        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        assert_eq!(commit(), Outcome::NotComparable { reason: "after repetition 1, git saw 1 unstaged of 0 expected, 1 more (left-behind)".into() });
+        let ran = scratch.work().join("ran");
+        let set_hook = |body: &str| {
+            std::fs::write(&hook, format!("#!/bin/sh\n{}\n", body)).unwrap();
+            std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        };
+        set_hook(&format!("echo ran >> '{}'", ran.display()));
+        assert!(writes_now().iter().all(|(_, cache, outcome)| *cache == Cache::Cold || timed(outcome)));
+        assert_eq!(std::fs::read_to_string(&ran).unwrap(), "ran\nran\n");
+        set_hook(":");
+
+        // A write whose copy does not start exactly as the pair expects, or does not end clean, is
+        // not comparable, and says which.
+        std::fs::write(work.join("stray"), "s\n").unwrap();
+        let rows = writes_now();
+        assert_eq!(rows[0].2, Outcome::NotComparable { reason: "before repetition 1, git saw 3 staged of 2 expected, 1 more (stray)".into() });
+        let stray = Outcome::NotComparable { reason: "before repetition 1, git saw 1 unstaged of 0 expected, 1 more (stray)".into() };
+        assert_eq!([&rows[2].2, &rows[4].2], [&stray, &stray]);
+        commit_file("stray");
+        set_hook("echo left > left-behind");
+        assert_eq!(writes_now()[0].2, Outcome::NotComparable { reason: "after repetition 1, git saw 1 unstaged of 0 expected, 1 more (left-behind)".into() });
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&root);
     }

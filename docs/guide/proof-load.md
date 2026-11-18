@@ -306,9 +306,11 @@ target/release/proof-load perf --out ../perf-out \
   branch that leaves `main` a few commits before its tip. Each shape has a fixed seed, so every run
   of a shape times the same history. The report's header spells the shape out.
 - `--reps` sets how many timed repetitions each cell gets (5 unless you say otherwise). Each warm
-  cell also gets one untimed run first, so every repetition runs on a warm cache.
+  cell also gets one untimed run of its command first, so that the first repetition does not pay
+  for loading what the later ones find cached.
 - `--drop-caches` names a program, by path, that drops the operating system's file caches. The
-  harness runs it with no arguments just before each repetition of a cold row, untimed. Without it,
+  harness runs it with no arguments just before each repetition of a cold row, untimed, and gives it
+  10 minutes. Without it,
   every cold row is reported as not run, with the reason "no cache-drop program given
   (--drop-caches)". Dropping the caches usually needs root, so the program is yours to provide: on
   Linux, one that runs `sync` and writes `3` to `/proc/sys/vm/drop_caches`; on macOS, one that runs
@@ -342,14 +344,24 @@ Every row runs twice: once warm, and once cold, with the caches dropped before e
 Status, log and blame run on the clean tree, and blame names the file the history changes most.
 
 Commit, switch and merge change the subject, so each of their repetitions runs on a fresh copy of the
-clean subject, made untimed and read once untimed, as after the build. The subjects themselves are
-never changed. Before each commit, the harness appends a line to the same 20 tracked files and
-stages them untimed, with `load .` and `add -A`. Forklift's stack is signed and git's commit is
-not, and the commit row's note says so. Switch moves from the current branch to `perf-side`, and
-merge merges `perf-side` into it, a merge with no conflict. Both are reported as **not comparable**
+clean subject, made untimed. The subjects themselves are never changed. A copy's files are new to
+the file system, so before anything else the harness runs, untimed, the command that brings each
+tool's record of its files up to date: Forklift's `load .` and git's `status`. Where tuned git runs
+the fsmonitor daemon, its copy gets a daemon of its own. Before each commit, the harness appends a line to the same 20
+tracked files and stages them untimed, with `load .` and `add -A`. Forklift's stack is signed and
+git's commit is not, and the commit row's note says so. Switch moves from the current branch to
+`perf-side`, and merge merges `perf-side` into it, a merge with no conflict. On unix, the harness
+then writes the copy out to disk with `sync`, untimed, so that a command which syncs its own
+writes is not also timed writing out the copy.
+
+Each write is judged before and after it runs. Before, the copy must report exactly the 20 staged
+files for commit, and nothing at all for switch and merge. After each write, the copy must be
+clean, with nothing staged, changed or untracked. A copy that fails either check makes its row
+**not comparable**, naming the repetition and the paths. Switch and merge are also not comparable
 when `perf-side` is at the commit the current branch is at in any subject, since they would then
-time a change of nothing. After each commit and merge, the copy must be clean, with nothing staged,
-changed or untracked, or the row is not comparable.
+time a change of nothing. Merge is not comparable either when one of the two branches contains the
+other in any subject, since it would then not join two lines of history. A warm cell's untimed run
+of its command is made on a copy of its own, and is not judged.
 
 These lines are the ones the fault scenarios run for their record, switch and merge steps, less the
 `--json` the scenarios give Forklift's. A test holds the two to each other.
@@ -391,7 +403,8 @@ A repetition that exits non-zero, or dies of a signal, voids its cell, which the
 the signal and the command's stderr instead of a timing. A run killed at its limit, the untimed one
 included, voids its cell too, which then says so and shows no stderr. In a cold row, a cache-drop
 program that exits non-zero, or dies of a signal, voids the cell before the command runs, and the
-cell shows the program's exit and its stderr.
+cell shows the program's exit or signal and its stderr. A cache-drop program that runs past its 10
+minutes is killed and voids the cell too, and the cell says it was the cache-drop program.
 
 Read two medians together with their spreads. A difference where one subject's fastest run is
 slower than the other's slowest is clear. One where the ranges overlap is likely to be noise. This
