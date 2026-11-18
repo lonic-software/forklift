@@ -2761,6 +2761,7 @@ mod tests {
                 std::fs::write(&path, format!("#!/bin/sh\n{}\n", body)).unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
+            #[allow(clippy::disallowed_methods, reason = "the stand-in's own record, in a test's temporary folder")]
             let _ = std::fs::remove_file(&said);
             let path = format!("{}:{}", stand_ins.display(), std::env::var("PATH").unwrap_or_default());
             let output = std::process::Command::new(&script).args(arguments).env("PATH", path).output().unwrap();
@@ -3468,6 +3469,7 @@ esac
         assert!(audit["data"]["genesis"].as_str().is_some_and(|genesis| !genesis.is_empty()), "{}", audit);
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&out);
+        #[allow(clippy::disallowed_methods, reason = "the test's own earlier report")]
         let _ = std::fs::remove_file(&earlier);
     }
 }
