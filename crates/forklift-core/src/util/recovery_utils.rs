@@ -4334,7 +4334,7 @@ mod tests {
         let error = lost.err().expect("a pack folder that cannot be told must fail the walk");
         assert!(error.contains("kept changing while it was read"), "{}", error);
 
-        std::fs::remove_dir_all(dir).ok();
+        crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
     /// FORK-447: heal's closing check names a reachable leaf whose loose file does not decompress
