@@ -1263,7 +1263,8 @@ fn a_head_the_anchor_does_not_vouch_for_is_never_exported() {
     let office = files_under(&area.path("server-root/.forklift")).into_iter()
         .find(|entry| entry.file_name().is_some_and(|name| name == "office"))
         .unwrap();
-    let stripped: Vec<(PathBuf, Vec<u8>)> = [trust, office].into_iter()
+    let copy = area.path("server-root/.forklift/trust-copy");
+    let stripped: Vec<(PathBuf, Vec<u8>)> = [trust, copy, office].into_iter()
         .map(|path| { let bytes = std::fs::read(&path).unwrap(); forklift_core::util::file_utils::remove_file(&path).unwrap(); (path, bytes) })
         .collect();
 

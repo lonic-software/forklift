@@ -684,6 +684,16 @@ can neither sign nor write unsigned until its anchor is back.
 - With neither, run `forklift prepare` in another folder, which starts without this warehouse's
   history, and enroll there.
 
+A server's first serve of a warehouse refuses as `trust_damaged` when its trust file stands but does
+not verify its office pallet, or the copy beside it differs from it. The refusal says what to do: in
+the warehouse, run `forklift heal` when one of the two files verifies the office; when both do but
+differ, move aside the one you do not trust first. When neither does, take the ways out above. It
+refuses as `trust_damaged` too when the trust file is missing beside a born office pallet or a
+standing copy, and as `ref_damaged` when the trust file stands beside an unborn office pallet with no
+copy that matches it, or not reading as an anchor: an enrollment or a first `lower` stopped part way. To run it again, move the
+trust file aside, and its copy if one stands. Where a remote holds the warehouse's office,
+`forklift lower` takes it instead, and verifies it against the trust file.
+
 ### Lost keys: re-genesis
 
 "No active key … is present on this machine" means this machine cannot sign. You may not need a reset:

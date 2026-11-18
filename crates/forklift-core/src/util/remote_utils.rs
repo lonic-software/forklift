@@ -9332,6 +9332,9 @@ mod tests {
             office_utils::write_trust_anchor(&old).unwrap();
             pallet_utils::update_meta_pallet_head(OFFICE_PALLET_NAME, None, &local_head, &pallet_utils::RefPreconditions::NONE).unwrap();
             let old_bytes = office_utils::read_trust_anchor_bytes().unwrap().unwrap();
+            // The copy a finished install leaves beside its anchor.
+            office_utils::mend_trust_copy(&crate::util::lock_utils::RefLock::acquire().unwrap(), &old_bytes).unwrap();
+            assert_eq!(trust_copy(), Some(old_bytes.clone()));
 
             Regenesis { root, _scope: scope, old_bytes, new, local_head, remote_head: "b".repeat(64) }
         }
@@ -9354,12 +9357,54 @@ mod tests {
             }).map(|_| ())
         }
 
-        /// Assert neither the anchor nor the office moved from where the fixture put them.
+        /// Assert neither the anchor, its copy nor the office moved from where the fixture put them.
         fn assert_untouched(&self) {
             assert_eq!(office_utils::read_trust_anchor_bytes().unwrap(), Some(self.old_bytes.clone()),
                 "the previous anchor must stand, byte for byte");
+            assert_eq!(trust_copy(), Some(self.old_bytes.clone()), "the copy must still be the previous anchor");
             assert_eq!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), Some(self.local_head.clone()));
         }
+    }
+
+    /// The trust file's copy, as it stands on disk (`None`: there is none).
+    fn trust_copy() -> Option<Vec<u8>> {
+        match std::fs::read(crate::globals::forklift_root().join(office_utils::FILE_NAME_TRUST_COPY)) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("the copy must read: {}", e),
+        }
+    }
+
+    /// Mark the scratch root served, as a server's first serve leaves it.
+    fn mark_root_served() {
+        mark_root(Witnesses::Served);
+    }
+
+    /// Which of a served root's witnesses a scratch root carries.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Witnesses {
+        None,
+        /// The tombstone list alone: a first serve that stopped before its mark.
+        Unfinished,
+        Served,
+    }
+
+    /// Write `witnesses` into the scratch root.
+    fn mark_root(witnesses: Witnesses) {
+        use crate::util::tombstone_utils::{served_state, ServedState};
+        let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
+        if witnesses != Witnesses::None {
+            crate::util::tombstone_utils::write_tombstones(&lock, &Default::default()).unwrap();
+        }
+        if witnesses == Witnesses::Served {
+            crate::util::tombstone_utils::write_mark(&lock).unwrap();
+        }
+        let expected = match witnesses {
+            Witnesses::None => ServedState::Never,
+            Witnesses::Unfinished => ServedState::Unfinished,
+            Witnesses::Served => ServedState::Served,
+        };
+        assert_eq!(served_state().unwrap(), expected);
     }
 
     impl Drop for Regenesis {
@@ -9413,9 +9458,209 @@ mod tests {
 
         let error = fixture.install().expect_err("a moved anchor must refuse the re-genesis");
 
-        assert_eq!(office_utils::read_trust_anchor().unwrap(), Some(theirs), "the other bay's anchor must stand");
+        assert_eq!(office_utils::read_trust_anchor().unwrap(), Some(theirs.clone()), "the other bay's anchor must stand");
+        assert_eq!(trust_copy(), Some(office_utils::encode_trust_anchor(&theirs).into_bytes()),
+            "an install that leaves the office where it stands still writes its copy");
         assert_eq!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), Some(fixture.local_head.clone()));
         assert!(matches!(error, pallet_utils::RefUpdateError::AnchorMoved), "{}", error);
+    }
+
+    // Revert: write the copy right after the trust file → the copy is new between the writes.
+    #[test]
+    fn a_trust_install_writes_its_copy_after_the_trust_file_and_the_office() {
+        let fixture = Regenesis::new("copy-last");
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+
+        let between = seen.clone();
+        office_utils::tests::BETWEEN_TRUST_WRITES.with(|seam| seam.set(Some(Box::new(move || {
+            between.borrow_mut().push(("between", pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), trust_copy()));
+        }))));
+        let before_copy = seen.clone();
+        office_utils::tests::BEFORE_TRUST_COPY_WRITE.with(|seam| seam.set(Some(Box::new(move || {
+            before_copy.borrow_mut().push(("before copy", pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), trust_copy()));
+        }))));
+
+        fixture.install().unwrap();
+
+        let new_bytes = office_utils::encode_trust_anchor(&fixture.new).into_bytes();
+        assert_eq!(*seen.borrow(), vec![
+            ("between", Some(fixture.local_head.clone()), Some(fixture.old_bytes.clone())),
+            ("before copy", Some(fixture.remote_head.clone()), Some(fixture.old_bytes.clone())),
+        ], "the copy keeps the previous anchor until the trust file and the office both carry the new one");
+        assert_eq!(office_utils::read_trust_anchor_bytes().unwrap(), Some(new_bytes.clone()));
+        assert_eq!(trust_copy(), Some(new_bytes), "the finished install leaves its anchor's copy");
+    }
+
+    // Revert: drop `mend_trust_copy` from the retry's already-in-place answer → the copy stays the
+    // previous anchor. Revert: judge the served root before the already-in-place answer → the
+    // retry in the root served since is refused.
+    #[test]
+    fn a_trust_install_stopped_before_its_copy_write_mends_the_copy_on_retry() {
+        // A root served between the stop and the retry still takes it: the retry moves nothing.
+        for witnesses in [Witnesses::None, Witnesses::Served] {
+            let fixture = Regenesis::new(&format!("copy-mend-{:?}", witnesses));
+            office_utils::tests::BEFORE_TRUST_COPY_WRITE.with(|seam| seam.set(Some(Box::new(|| panic!("stopped before the copy write")))));
+
+            let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fixture.install()));
+
+            assert!(stopped.is_err(), "the install must stop at the seam");
+            let new_bytes = office_utils::encode_trust_anchor(&fixture.new).into_bytes();
+            assert_eq!(office_utils::read_trust_anchor_bytes().unwrap(), Some(new_bytes.clone()));
+            assert_eq!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), Some(fixture.remote_head.clone()));
+            assert_eq!(trust_copy(), Some(fixture.old_bytes.clone()), "the stopped install never wrote its copy");
+            mark_root(witnesses);
+
+            fixture.install().unwrap_or_else(|e| panic!("{:?}: the retry finds the anchor and the office in place: {:?}", witnesses, e));
+
+            assert_eq!(trust_copy(), Some(new_bytes), "{:?}: the retry brings the copy level with the trust file", witnesses);
+        }
+    }
+
+    /// What stands at the copy's path that an install never writes over.
+    #[derive(Debug, Clone, Copy)]
+    enum UnwritableCopy {
+        Newer,
+        Directory,
+    }
+
+    /// An install refuses before its first write when its last would be refused: a copy a newer
+    /// Forklift wrote, or one that is not a file. A retry's mend refuses over it too.
+    // Revert: drop `refuse_unwritable_copy` from `install_trust` → the trust file and the office
+    // move before the copy write fails. Revert: drop it from the mend → the newer copy is replaced.
+    #[test]
+    fn a_trust_install_refuses_a_copy_it_would_not_write_over_before_it_writes() {
+        for unwritable in [UnwritableCopy::Newer, UnwritableCopy::Directory] {
+            let fixture = Regenesis::new(&format!("unwritable-copy-{:?}", unwritable));
+            let copy_path = crate::globals::forklift_root().join(office_utils::FILE_NAME_TRUST_COPY);
+            let newer = String::from_utf8(fixture.old_bytes.clone()).unwrap().replace("version = 1", "version = 2").into_bytes();
+            assert_ne!(newer, fixture.old_bytes, "the fixture's anchor names its version");
+            match unwritable {
+                UnwritableCopy::Newer => file_utils::write_file_atomically(&copy_path, &newer).unwrap(),
+                UnwritableCopy::Directory => {
+                    file_utils::remove_file(&copy_path).unwrap();
+                    std::fs::create_dir(&copy_path).unwrap();
+                }
+            }
+
+            let refused = fixture.install().expect_err(&format!("{:?}: the install must refuse", unwritable));
+
+            let message = format!("{:?}", refused);
+            assert!(message.contains("The trust file's copy"), "{:?}: {}", unwritable, message);
+            assert_eq!(office_utils::read_trust_anchor_bytes().unwrap(), Some(fixture.old_bytes.clone()),
+                "{:?}: the previous anchor must stand", unwritable);
+            assert_eq!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), Some(fixture.local_head.clone()),
+                "{:?}: the office must stand", unwritable);
+
+            // The trust file already holds the anchor: only the mend would write.
+            if let UnwritableCopy::Newer = unwritable {
+                let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
+                office_utils::mend_trust_copy(&lock, &fixture.old_bytes).expect_err("the mend must refuse a newer copy");
+                assert_eq!(trust_copy(), Some(newer), "the newer copy is never written over");
+            }
+        }
+    }
+
+    /// The installs `install_trust` takes that move the office, each from the state it starts in:
+    /// a re-genesis, an enrollment and a first contact's lower.
+    #[derive(Debug, Clone, Copy)]
+    enum OfficeMovingInstall {
+        Regenesis,
+        Enroll,
+        FirstContact,
+    }
+
+    impl OfficeMovingInstall {
+        const ALL: [OfficeMovingInstall; 3] = [OfficeMovingInstall::Regenesis, OfficeMovingInstall::Enroll, OfficeMovingInstall::FirstContact];
+
+        /// Set the install's starting state up in a fresh scratch root, run it there, and assert
+        /// what it wrote: nothing when refused, its anchor and office when not.
+        fn run(self, witnesses: Witnesses) -> Result<(), pallet_utils::RefUpdateError> {
+            let name = format!("served-{:?}-{:?}", self, witnesses);
+
+            match self {
+                OfficeMovingInstall::Regenesis => {
+                    let fixture = Regenesis::new(&name);
+                    mark_root(witnesses);
+
+                    let installed = fixture.install();
+
+                    if installed.is_err() {
+                        fixture.assert_untouched();
+                    } else {
+                        assert_eq!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), Some(fixture.remote_head.clone()));
+                    }
+                    installed
+                }
+                OfficeMovingInstall::Enroll | OfficeMovingInstall::FirstContact => {
+                    let _scratch = crate::util::tombstone_utils::tests::Scratch::new(&format!("remote-utils-{}", name));
+                    crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+                    mark_root(witnesses);
+
+                    let genesis = "1".repeat(64);
+                    let anchor = office_utils::TrustAnchor {
+                        genesis: genesis.clone(), enabled_at: 1, boundary: Vec::new(), prior_genesis: None, adopts: None,
+                    };
+                    let first_contact = matches!(self, OfficeMovingInstall::FirstContact);
+
+                    let installed = office_utils::install_trust(&office_utils::TrustInstall {
+                        anchor: &anchor,
+                        replaces: None,
+                        office: None,
+                        new_office: Some(&genesis),
+                        served: first_contact.then_some(genesis.as_str()),
+                        pallets: pallet_utils::PalletsPrecondition::NotConsumed,
+                        mode: office_utils::TrustReadMode::Checked,
+                    }).map(|_| ());
+
+                    let written = installed.is_ok();
+                    assert_eq!(office_utils::read_trust_anchor_bytes().unwrap().is_some(), written, "{:?}", self);
+                    assert_eq!(trust_copy().is_some(), written, "{:?}", self);
+                    assert_eq!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().is_some(), written, "{:?}", self);
+                    installed
+                }
+            }
+        }
+    }
+
+    // Revert: drop the served-root check from `install_trust` → each install moves a served
+    // root's office. Revert: refuse only `ServedState::Served` → each moves an unfinished one's.
+    #[test]
+    fn a_served_root_refuses_every_install_that_moves_its_office() {
+        for install in OfficeMovingInstall::ALL {
+            install.run(Witnesses::None).unwrap_or_else(|e| panic!("{:?} installs on a root never served: {}", install, e));
+
+            for witnesses in [Witnesses::Unfinished, Witnesses::Served] {
+                let refused = install.run(witnesses).expect_err(&format!("{:?} must be refused on a {:?} root", install, witnesses));
+
+                let pallet_utils::RefUpdateError::Failed(message) = &refused else {
+                    panic!("{:?}, {:?}: {:?}", install, witnesses, refused);
+                };
+                assert!(message.contains("its trust changes only through its server") && message.contains("Run it in a clone of the warehouse instead"),
+                    "{:?}, {:?}: {}", install, witnesses, message);
+            }
+        }
+    }
+
+    #[test]
+    fn a_served_root_takes_an_install_that_leaves_its_office_where_it_stands() {
+        // A server's own installs: its re-genesis adopts the office without moving it.
+        let fixture = Regenesis::new("served-office-stays");
+        mark_root_served();
+
+        office_utils::install_trust(&office_utils::TrustInstall {
+            anchor: &fixture.new,
+            replaces: Some(&fixture.old_bytes),
+            office: Some(&fixture.local_head),
+            new_office: None,
+            served: None,
+            pallets: pallet_utils::PalletsPrecondition::NotConsumed,
+            mode: office_utils::TrustReadMode::Checked,
+        }).expect("an install that leaves the office where it stands is the server's own");
+
+        let new_bytes = office_utils::encode_trust_anchor(&fixture.new).into_bytes();
+        assert_eq!(office_utils::read_trust_anchor_bytes().unwrap(), Some(new_bytes.clone()));
+        assert_eq!(trust_copy(), Some(new_bytes));
+        assert_eq!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), Some(fixture.local_head.clone()));
     }
 
     // Revert: skip `restore_trust_file` → the new anchor stands beside the old office.

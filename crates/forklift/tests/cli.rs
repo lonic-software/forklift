@@ -7671,7 +7671,10 @@ fn a_lost_trust_file_refuses_every_signing_write_before_anything_is_written() {
     assert_success(&warehouse.run(&["load", "."]));
     let heads = |warehouse: &TestWarehouse| ["main", "draft"].map(|pallet| stdout(&warehouse.run(&["history", pallet, "-n", "1"])));
     let before = heads(&warehouse);
-    forklift_core::util::file_utils::remove_file(root.join(".forklift/trust")).unwrap();
+    // The copy goes with it, so the born office alone says trust was established here.
+    for lost in ["trust", "trust-copy"] {
+        forklift_core::util::file_utils::remove_file(root.join(".forklift").join(lost)).unwrap();
+    }
     fn files_under(dir: &std::path::Path) -> usize {
         std::fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().path())
             .map(|path| if path.is_dir() { files_under(&path) } else { 1 })

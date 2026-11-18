@@ -73,6 +73,11 @@ This generates your identity-root key, writes the genesis office parcel
 (self-signed), and establishes the trust anchor. **From now on every parcel in
 this warehouse must be signed** — this cannot be undone.
 
+Every change of the anchor writes the trust file, then the office pallet, then a
+copy of the trust file beside it (`.forklift/trust-copy`), so Forklift writes the
+copy only once the change has finished. A change that stopped before its copy was written
+writes the copy when it is run again.
+
 A warehouse that holds an office but has lost its trust file, or whose trust file
 does not parse, is refused as `trust_damaged` by every command that reads its trust:
 it neither signs nor writes unsigned, and a new genesis would orphan every parcel
@@ -451,6 +456,13 @@ and replaces the anchor — pinning the old office head as **attested** history
 deliberately **loud**: every clone refuses to sync until its holder consciously
 re-accepts, and a remote accepts the reset only from the server operator's static
 token.
+
+In a served warehouse, run the reset from a clone and lift it to the server, never
+in the served folder itself: there `office regenesis`, like `office enroll` and a
+`lower` that would move the office pallet, refuses with the trust file and the
+office pallet as they were, since its clients take their trust from the server.
+A change refuses before it writes anything when the copy's path holds something
+other than a file, or a copy a newer version of Forklift wrote.
 
 The new anchor and the new office genesis are written together, with nothing able
 to write a ref between them. If another bay of the warehouse moves the office, the

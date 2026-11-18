@@ -491,8 +491,10 @@ fn heal_over_damaged_tombstones_answers_with_the_repair_and_rebuilds_once_it_is_
 #[test]
 fn a_redaction_is_held_while_only_a_kept_head_holds_its_content() {
     let area = Area::new("redaction");
-    let root = area.served();
+    // Enrolled before it is served: a served root's office moves only through its server.
+    let root = area.warehouse();
     area.run_ok(&root, &["office", "enroll"]);
+    mark_served(&root);
     let side = area.deleted(&root, "side");
     forget_journals(&root);
     forklift_core::util::file_utils::remove_file(list_path(&root)).unwrap();

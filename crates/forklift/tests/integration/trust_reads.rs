@@ -26,6 +26,15 @@ const BYTE_READS: &[(&str, &str)] = &[
     // a missing file as permission to sign.
     ("crates/forklift-core/src/util/office_utils.rs", "install_trust"),
     ("crates/forklift-core/src/util/office_utils.rs", "install_trust"),
+    // The copy's mend compares the trust file to the anchor its caller holds, and the copy to it;
+    // a missing trust file writes nothing.
+    ("crates/forklift-core/src/util/office_utils.rs", "mend_trust_copy"),
+    ("crates/forklift-core/src/util/office_utils.rs", "mend_trust_copy"),
+    // The check before a copy write reads only the copy, never the trust file.
+    ("crates/forklift-core/src/util/office_utils.rs", "refuse_unwritable_copy"),
+    // The first serve's check judges a trust file that stands; a missing one it leaves to the
+    // coded read, which refuses it where trust was established.
+    ("crates/forklift-core/src/util/office_utils.rs", "refuse_unsettled_trust"),
     // A ref write's anchor precondition compares the file's bytes to the ones the caller judged;
     // a missing file meets only a caller that read none, and is then read through the witnesses.
     ("crates/forklift-core/src/util/pallet_utils.rs", "check_preconditions"),
