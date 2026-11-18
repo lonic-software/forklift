@@ -10646,7 +10646,9 @@ mod tests {
         let response = put_trust(State(state), Extension(Principal::Open), Path(PathParams::new()), Json(first_anchor(Vec::new())))
             .await.into_response();
 
-        assert_eq!(office_utils::read_trust_anchor().unwrap(), None, "no anchor may be written");
+        // The office is born now, so the checked read refuses the missing file; the bytes show
+        // that nothing was written.
+        assert!(office_utils::read_trust_anchor_bytes().unwrap().is_none(), "no anchor may be written");
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }

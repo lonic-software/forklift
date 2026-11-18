@@ -4409,27 +4409,32 @@ fn a_remote_whose_anchor_was_stripped_is_refused_before_anything_is_fetched() {
     assert!(stripped.is_file(), "the server keeps its anchor at {}", stripped.display());
     forklift_core::util::file_utils::remove_file(&stripped).unwrap();
 
-    let lowered = area.forklift("a", &["--json", "lower"]);
-    let details = trust_changed_details(&lowered);
-    assert_eq!(details["what_changed"], "removed", "{}", details);
-    assert_eq!(details["current"], serde_json::Value::Null);
-    assert!(details["previous"].is_string(), "the held genesis is reported: {}", details);
+    // The server reads its own trust as lost, so it answers every client as damaged, naming its
+    // operator: a client can neither repair it nor tell what the remote trusts.
+    let refused_as_remote_damage = |output: &Output| {
+        assert_eq!(output.status.code(), Some(69), "{}{}", stdout(output), stderr(output));
+        let value: serde_json::Value = serde_json::from_str(&stdout(output)).unwrap();
+        assert_eq!(value["error"]["code"], "trust_damaged", "{}", value);
+        assert!(value["error"]["next_step"].as_str().is_some_and(|step| step.contains("remote's operator")),
+                "{}", value);
+    };
 
-    let franchised = area.forklift(".", &["--json", "clone", &server.url, "b"]);
-    let details = trust_changed_details(&franchised);
-    assert_eq!(details["what_changed"], "removed", "{}", details);
-    assert!(details.get("previous").is_none(), "a clone holds no anchor yet: {}", details);
+    refused_as_remote_damage(&area.forklift("a", &["--json", "lower"]));
+    assert_eq!(std::fs::read_to_string(area.path("a/.forklift/trust")).unwrap(), genesis,
+               "the held anchor is kept");
+
+    refused_as_remote_damage(&area.forklift(".", &["--json", "clone", &server.url, "b"]));
     assert!(!area.path("b").exists(), "a refused clone must not create the target");
 
     // Lift refuses the same way rather than re-upload an anchor over the stripped office.
-    let lifted = area.forklift("a", &["--json", "lift"]);
-    assert_eq!(trust_changed_details(&lifted)["what_changed"], "removed");
+    refused_as_remote_damage(&area.forklift("a", &["--json", "lift"]));
 
     // And the server never stores an anchor over an office it holds without one, whoever sends
     // it: the first client to arrive would otherwise plant its own over a chain it never checked.
     let foreign = serde_json::json!({ "genesis": "cd".repeat(32), "enabled_at": 0, "boundary": [] });
     let (status, response) = http_send_json(&server.url, "PUT", "/v1/trust", &foreign.to_string());
-    assert!(status.contains("409"), "{} {}", status, response);
+    assert!(status.contains("503"), "{} {}", status, response);
+    assert!(response.contains("trust_damaged"), "{}", response);
     assert!(!stripped.exists(), "nothing was stored");
 }
 

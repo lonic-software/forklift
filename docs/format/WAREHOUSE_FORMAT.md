@@ -259,6 +259,7 @@ name in a row is a constant, and every path in every fixture matches a row.
 | `meta/`, `meta/<name>` | rewritable | `pallet_utils::FOLDER_NAME_META_ROOT` |
 | `removed-refs/`, `removed-refs/<name>`, `removed-refs/<name>.<n>` | rewritable | `ref_heal::FOLDER_NAME_REMOVED_REFS` |
 | `trust` | rewritable | `office_utils::FILE_NAME_TRUST` |
+| `trust-copy` | rewritable | `office_utils::FILE_NAME_TRUST_COPY` |
 | `served` | rewritable | `tombstone_utils::FILE_NAME_SERVED` |
 | `tombstones` | rewritable | `tombstone_utils::FILE_NAME_TOMBSTONES` |
 | `sealed` | rewritable | `sealed_utils::FILE_NAME_SEALED` |
