@@ -1698,20 +1698,18 @@ fn judge_trust_bytes(bytes: &Result<Vec<u8>, String>, office_head: &str) -> Resu
 ///                   newer version's refusal of a file it wrote; or why the store or a file could
 ///                   not be read.
 pub(crate) fn refuse_unsettled_trust(_lock: &crate::util::lock_utils::RefLock) -> Result<(), String> {
-    let read = read_trust_entry;
-
     let not_served = "So the warehouse is not served, and nothing was written.";
 
     // A missing trust file is the coded read's to judge: it refuses one lost where trust was
     // established, beside a born office or a standing copy.
-    let Some(trust) = read(FILE_NAME_TRUST)? else {
+    let Some(trust) = read_trust_entry(FILE_NAME_TRUST)? else {
         read_trust_anchor().map_err(|refused| crate::error::append_to_message(refused, "The warehouse is not served."))?;
         return Ok(());
     };
     let trust_path = forklift_root().join(FILE_NAME_TRUST).to_string_lossy().into_owned();
     let copy_path = forklift_root().join(FILE_NAME_TRUST_COPY).to_string_lossy().into_owned();
 
-    let copy = read(FILE_NAME_TRUST_COPY)?;
+    let copy = read_trust_entry(FILE_NAME_TRUST_COPY)?;
 
     // What a newer version wrote is that version's to judge.
     if let Some(refusal) = trust.as_ref().ok().and_then(|bytes| newer_refusal_in(bytes)) {
