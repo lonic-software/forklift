@@ -4536,6 +4536,25 @@ mod tests {
         assert_eq!(crate::util::tombstone_utils::served_state().unwrap(), crate::util::tombstone_utils::ServedState::Never);
     }
 
+    /// An office chain the store cannot read says nothing about the trust file: the first serve
+    /// refuses with the store's own refusal, never as damaged trust heal would be sent to repair.
+    // Revert: read every chain error as an unverified anchor → `trust_damaged`.
+    #[test]
+    fn a_first_serve_over_an_unreadable_office_refuses_as_the_store() {
+        let _fixture = PrivilegeFixture::new("first-serve-unreadable-office");
+        let head = office_head().unwrap();
+        let forklift = crate::globals::forklift_root();
+        file_utils::write_file_atomically(&forklift.join(crate::util::office_utils::FILE_NAME_TRUST_COPY), &anchor_bytes()).unwrap();
+        let (folder, file_name) = file_utils::get_path_for_object(&head).unwrap();
+        file_utils::write_file_atomically(&std::path::Path::new(&folder).join(file_name), b"not an object").unwrap();
+
+        let refused = crate::util::tombstone_utils::mark_served(true).expect_err("the first serve must refuse");
+
+        assert!(crate::error::frames_code(&refused, crate::error::RefusalCode::ObjectUnreadable), "{}", refused);
+        assert!(!crate::error::frames_code(&refused, crate::error::RefusalCode::TrustDamaged), "{}", refused);
+        assert_eq!(served_witnesses_stand(), (false, false), "nothing is written: {}", refused);
+    }
+
     /// What a first serve is refused over, by the trust file and the copy that stand.
     struct UnsettledTrust {
         name: &'static str,
