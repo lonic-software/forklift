@@ -119,7 +119,8 @@ legacy boundary (a later `audit` then tolerates the imported parcels as legacy).
 is not one path component (`..`, a name containing `/`), stops the import with an error naming it
 and its directory, rather than being imported under a different path; so does an entry at any
 depth that some file system opens as `.forklift` (`.Forklift`, `.forklift.`). For agents, this means a project can be moved onto
-forklift with one command.
+forklift with one command. [Switching from git](switching.md) walks through it end to end, with
+what the import leaves behind.
 
 Git's tags come along, unsigned like the history. An annotated tag keeps its tagger's email, its
 date and its message, and a tag of a tag is followed to its commit. Git keeps a tag's signature
@@ -3145,7 +3146,8 @@ their git names outright, and git's `cherry-pick` runs `pick`. git's `restore --
 `unload`, and git's `rm --cached` is `remove`, which takes no `--cached` flag
 because it only ever stages the removal. For the review workflow, git's "pull request" is
 [`haul`](#haul--pull-requests-reviewable-merge-proposals). The
-[glossary](glossary.md) maps the concepts behind the names.
+[glossary](glossary.md) maps the concepts behind the names, and [Switching from
+git](switching.md) lists the habits that change.
 
 ---
 

@@ -14,6 +14,7 @@ machine/agent interface).
 
 | You are… | Read |
 |----------|------|
+| Coming from git, with a repository to bring | [`switching.md`](switching.md) — import it, what the import keeps and drops, the habits that change, and moving a team |
 | New to forklift | [`tutorial.md`](tutorial.md) — one project from `prepare` to `lift` and `lower`, in 15 minutes |
 | Setting up a team on a server | [`team.md`](team.md) — tokens, an office, and a second person joining, from zero |
 | Working on a large project without its whole history on disk | [`cache.md`](cache.md) — a cache warehouse: every parcel, only the files you use |

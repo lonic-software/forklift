@@ -15,6 +15,10 @@
 //! one reuses, such as a key, is written `<name>`: in the output a page shows, it stands for one
 //! word and binds it, and in a later command it is replaced by what it bound.
 //!
+//! A `git` command runs the reader's git with none of the developer's git configuration (system,
+//! global or environment), so a setting such as `core.autocrlf` or `init.defaultBranch` cannot
+//! change what it prints or writes; the same holds for the git that forklift runs itself.
+//!
 //! A server the page starts runs in the background, as the page's second terminal. The first
 //! line under its `$` line is the line it starts with; any lines after it are everything that
 //! terminal prints later, while the rest of the page runs, checked when the run ends. A server
@@ -30,7 +34,8 @@ use common::{fence, forklift_command, repository_root, server_binary, tracked_pa
 
 /// The pages under `docs/guide/` this test runs, each from an empty folder.
 const RUN_PAGES: &[&str] =
-    &["tutorial.md", "concepts.md", "team.md", "cache.md", "leaving.md", "leaked-secret.md"];
+    &["tutorial.md", "concepts.md", "team.md", "cache.md", "leaving.md", "leaked-secret.md",
+      "switching.md"];
 
 /// The address the pages tell the reader to serve on. The test serves on a port the server picks
 /// itself, so a busy 7171 on a CI machine cannot fail it, and rewrites this address wherever a
@@ -525,6 +530,22 @@ fn machine_folders(area: &Path, machine: &Option<String>) -> (PathBuf, PathBuf) 
 }
 
 impl Reader {
+    /// A reader of `page` in the run area `area`, starting on `machine` with its folder empty.
+    fn new(page: String, area: PathBuf, machine: Option<String>) -> Reader {
+        let (home, cwd) = machine_folders(&area, &machine);
+        Reader {
+            page,
+            area,
+            machine,
+            home,
+            cwd,
+            others: HashMap::new(),
+            bound: HashMap::new(),
+            address: None,
+            servers: Vec::new(),
+        }
+    }
+
     /// Make `machine` the current one, giving it an empty folder the first time.
     fn switch_to(&mut self, machine: Option<String>) {
         if machine == self.machine {
@@ -539,14 +560,27 @@ impl Reader {
     }
 
     /// The reader's environment: none of the developer's forklift settings, debug switches or log
-    /// filters, which would change what a command prints.
+    /// filters, and none of their git configuration, which would change what a command prints.
+    /// Git reads only the machine's own global file, which starts empty, so a page shows git as it
+    /// behaves with no configuration: not as Git for Windows' own system file sets it up.
     fn environment(&self, command: &mut Command) {
-        for (key, _) in std::env::vars_os() {
+        // Git's variables go wherever they were set, on the command too; forklift's own launch
+        // settings on the command (`test_command`'s) are the test's and stay.
+        let set_on_command: Vec<std::ffi::OsString> = command
+            .get_envs()
+            .map(|(key, _)| key.to_os_string())
+            .filter(|key| key.to_string_lossy().starts_with("GIT_"))
+            .collect();
+        let inherited = std::env::vars_os().map(|(key, _)| key).filter(|key| {
             let key_text = key.to_string_lossy();
-            if key_text.starts_with("FORKLIFT_") || key_text.starts_with("RUST_LOG") {
-                command.env_remove(&key);
-            }
+            ["FORKLIFT_", "RUST_LOG", "GIT_"].iter().any(|prefix| key_text.starts_with(prefix))
+        });
+        for key in inherited.chain(set_on_command) {
+            command.env_remove(&key);
         }
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", self.home.join("gitconfig"));
 
         command
             .current_dir(&self.cwd)
@@ -594,7 +628,7 @@ impl Reader {
 
         let unsupported = || -> ! {
             fail(&"this test cannot run it; use a command it knows (forklift, forklift-server, \
-                cd, mkdir, cat, echo > file, forklift > file) or teach it")
+                git, cd, mkdir, cat, echo > file, forklift > file) or teach it")
         };
 
         match (words[0].as_str(), redirect) {
@@ -679,6 +713,11 @@ impl Reader {
                 command.args(&words[1..]);
                 self.capture(command)
             }
+            ("git", None) => {
+                let mut command = Command::new("git");
+                command.args(&words[1..]);
+                self.capture(command)
+            }
             _ => unsupported(),
         }
     }
@@ -756,18 +795,7 @@ fn run_page(name: &str) {
 
     // The run starts on the first block's machine.
     let machine = steps.first().and_then(|step| step.machine.clone());
-    let (home, cwd) = machine_folders(&area, &machine);
-    let mut reader = Reader {
-        page: label.clone(),
-        area: area.clone(),
-        machine,
-        home,
-        cwd,
-        others: HashMap::new(),
-        bound: HashMap::new(),
-        address: None,
-        servers: Vec::new(),
-    };
+    let mut reader = Reader::new(label.clone(), area.clone(), machine);
 
     for step in &steps {
         reader.switch_to(step.machine.clone());
@@ -837,6 +865,49 @@ fn leaving_runs_as_written() {
 #[test]
 fn leaked_secret_runs_as_written() {
     run_page("leaked-secret.md");
+}
+
+#[test]
+fn switching_runs_as_written() {
+    run_page("switching.md");
+}
+
+/// A page's `git` sees no configuration but what the page itself set. The test plants a global file
+/// in the home folder and configuration passed in the environment, so those two fail wherever the
+/// isolation does. Two arms cannot be planted here: the system file, since the variable naming one
+/// is itself removed, fails only on a machine that has one (Git for Windows, Homebrew's git); a
+/// git variable the test process inherits fails only when the test's environment carries one.
+#[test]
+fn git_reads_none_of_the_developers_configuration() {
+    let area = std::env::temp_dir().join(format!("forklift-git-config-{}", std::process::id()));
+    let _ = forklift_core::util::file_utils::remove_dir_all(&area);
+    std::fs::create_dir_all(&area).unwrap();
+    let mut reader = Reader::new("a page".to_string(), area.clone(), None);
+
+    let planted = area.join("planted");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(planted.join(".gitconfig"), "[planted]\n\tglobal = yes\n").unwrap();
+    let list = |reader: &Reader| {
+        let mut command = Command::new("git");
+        command
+            .args(["config", "--list"])
+            .env("HOME", &planted)
+            .env("XDG_CONFIG_HOME", &planted)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "planted.environment")
+            .env("GIT_CONFIG_VALUE_0", "yes");
+        let (status, output) = reader.capture(command);
+        (status, printed_lines(&output))
+    };
+    assert_eq!(list(&reader), (Some(0), Vec::<String>::new()));
+
+    // The positive: what the page sets is seen.
+    let step = |command: &str| Step { line: 1, machine: None, command: command.to_string(), expected: Vec::new() };
+    assert_eq!(reader.run(&step("git config --global user.name Ada")).0, Some(0));
+    assert_eq!(list(&reader), (Some(0), vec!["user.name=Ada".to_string()]));
+
+    drop(reader);
+    let _ = forklift_core::util::file_utils::remove_dir_all(&area);
 }
 
 /// A page that shows commands in a `console` block promises they run as shown, so a page with one
