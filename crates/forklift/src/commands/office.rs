@@ -131,6 +131,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
         new_office: Some(&genesis),
         served: None,
         pallets: PalletsPrecondition::WithinBoundary { boundary, scope: BoundaryScope::AllButOffice },
+        mode: office_utils::TrustReadMode::Checked,
     })?;
 
     output::message(format!(
@@ -858,6 +859,7 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
         new_office: Some(&genesis),
         served: None,
         pallets: PalletsPrecondition::WithinBoundary { boundary, scope: BoundaryScope::AllButOffice },
+        mode: office_utils::TrustReadMode::Checked,
     })?;
 
     output::message(format!(

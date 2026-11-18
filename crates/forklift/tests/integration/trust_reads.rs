@@ -14,32 +14,32 @@ use crate::source_scan::{calls, differences, production_sites};
 /// Where production code is read: the client, the core and the server.
 const DIRS: &[&str] = &["crates/forklift/src", "crates/forklift-core/src", "crates/forklift-server/src"];
 
-/// Every production call of the byte read, by file and function, once per call.
+/// Every production call of the byte reads (the coded one and the raw file read beneath it), by
+/// file and function, once per call.
 const BYTE_READS: &[(&str, &str)] = &[
-    // The read layer itself: the file before the witnesses are read, and again after one stood.
+    // The read layer itself: the file before the witnesses are read, and again after one stood;
+    // and the coded byte read over the raw one.
     ("crates/forklift-core/src/util/office_utils.rs", "read_trust_anchor_in"),
     ("crates/forklift-core/src/util/office_utils.rs", "read_trust_anchor_in"),
+    ("crates/forklift-core/src/util/office_utils.rs", "read_trust_anchor_bytes"),
     // An install compares the bytes it would write and reads its own write back; it never reads
     // a missing file as permission to sign.
     ("crates/forklift-core/src/util/office_utils.rs", "install_trust"),
     ("crates/forklift-core/src/util/office_utils.rs", "install_trust"),
     // A ref write's anchor precondition compares the file's bytes to the ones the caller judged;
-    // a missing file meets only a caller that read none, and is then read through the witnesses
-    // unless the write pins the office.
+    // a missing file meets only a caller that read none, and is then read through the witnesses.
     ("crates/forklift-core/src/util/pallet_utils.rs", "check_preconditions"),
 ];
 
 /// Every production construction of the adoption read: lower's check and its adoption, which
 /// verify the office against the remote's anchor before writing it. The mode travels from them
-/// into the adoption's read-back (`PreparedTrust::commit`), which names no mode of its own.
+/// into the adoption itself (`PreparedTrust::commit`: its install and its read-back), which names
+/// no mode of its own.
 const ADOPTS: &[(&str, &str)] = &[
     ("crates/forklift/src/commands/lower.rs", "handle_command"),
     ("crates/forklift/src/commands/lower.rs", "handle_command"),
 ];
 
-/// The production callers of the byte read and the constructions of the adoption read are
-/// exactly the listed ones. Revert: call `read_trust_anchor_bytes` from another production
-/// function, or pass `TrustReadMode::Adopt` from another caller, and this fails naming it.
 /// How often `line` names the adoption variant, however it reaches it: through the enum, or bare
 /// after an import of it. Its own declaration is not a construction.
 fn adoptions(line: &str) -> usize {
@@ -65,9 +65,14 @@ fn words(line: &str) -> impl Iterator<Item = &str> {
     line.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|word| !word.is_empty())
 }
 
+/// The production callers of the byte read and the constructions of the adoption read are
+/// exactly the listed ones. Revert: call `read_trust_anchor_bytes` from another production
+/// function, or pass `TrustReadMode::Adopt` from another caller, and this fails naming it.
 #[test]
 fn every_trust_read_that_can_skip_the_witnesses_is_listed() {
-    let byte_reads = production_sites(DIRS, |line| usize::from(calls(line, "read_trust_anchor_bytes")));
+    let byte_reads = production_sites(DIRS, |line| {
+        usize::from(calls(line, "read_trust_anchor_bytes")) + usize::from(calls(line, "read_trust_file"))
+    });
     let adopts = production_sites(DIRS, adoptions);
 
     for (what, found, expected) in [("byte read", &byte_reads, BYTE_READS), ("adoption read", &adopts, ADOPTS)] {

@@ -4512,6 +4512,7 @@ mod tests {
             new_office: None,
             served: None,
             pallets: crate::util::pallet_utils::PalletsPrecondition::NotConsumed,
+            mode: crate::util::office_utils::TrustReadMode::Checked,
         }).unwrap();
 
         let error = crate::util::stack_utils::resolve_signing_key(&fixture.admin).err()
@@ -4542,6 +4543,7 @@ mod tests {
             new_office: None,
             served: None,
             pallets: crate::util::pallet_utils::PalletsPrecondition::NotConsumed,
+            mode: crate::util::office_utils::TrustReadMode::Checked,
         }).unwrap();
 
         let refused = crate::util::office_utils::stack_office_parcel(

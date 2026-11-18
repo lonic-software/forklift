@@ -3369,6 +3369,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                         boundary: anchor.boundary.clone(),
                         scope: BoundaryScope::AllButOffice,
                     },
+                    mode: office_utils::TrustReadMode::Checked,
                 });
 
                 if !trust_install_outcome(installed, &anchor)? {
@@ -3418,6 +3419,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                         boundary: anchor.boundary.clone(),
                         scope: BoundaryScope::AllButOffice,
                     },
+                    mode: office_utils::TrustReadMode::Checked,
                 });
 
                 if !trust_install_outcome(installed, &anchor)? {
@@ -5276,6 +5278,7 @@ mod tests {
             new_office: None,
             served: None,
             pallets: PalletsPrecondition::NotConsumed,
+            mode: office_utils::TrustReadMode::Checked,
         }).map(|_| ())
     }
     /// The durable-taint machinery (module `taint_utils` in `forklift_core`) is activation-gated

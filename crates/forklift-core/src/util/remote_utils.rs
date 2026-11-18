@@ -8754,6 +8754,7 @@ impl PreparedTrust {
                         boundary: judged,
                         scope: pallet_utils::BoundaryScope::AllButOffice,
                     },
+                    mode: self.mode,
                 });
 
                 if let Err(error) = installed {
@@ -8935,6 +8936,7 @@ pub async fn accept_regenesis(client: &RemoteClient,
         new_office: Some(remote_office_head),
         served: Some(remote_office_head),
         pallets: pallet_utils::PalletsPrecondition::WithinBoundary { boundary: judgement.judged, scope: pallet_utils::BoundaryScope::UserPallets },
+        mode: office_utils::TrustReadMode::Checked,
     })?;
 
     Ok(Some((local, new_anchor, judgement.unvouched)))
@@ -9348,6 +9350,7 @@ mod tests {
                 new_office: Some(&self.remote_head),
                 served: None,
                 pallets: pallet_utils::PalletsPrecondition::NotConsumed,
+                mode: office_utils::TrustReadMode::Checked,
             }).map(|_| ())
         }
 
@@ -9405,6 +9408,7 @@ mod tests {
             new_office: None,
             served: None,
             pallets: pallet_utils::PalletsPrecondition::NotConsumed,
+            mode: office_utils::TrustReadMode::Checked,
         }).unwrap();
 
         let error = fixture.install().expect_err("a moved anchor must refuse the re-genesis");

@@ -616,9 +616,9 @@ pub fn ensure_not_metadata_root(root: &TreeItem) -> Result<(), String> {
 /// # Returns
 /// * `Ok(Some(TrustAnchor))` - The anchor.
 /// * `Ok(None)`              - If signing has not been established.
-/// * `Err(String)`           - A [`RefusalCode::TrustDamaged`] refusal if the trust file is lost
-///                             or does not parse; an uncoded error if it could not be read, or a
-///                             newer version of Forklift wrote it.
+/// * `Err(String)`           - A [`RefusalCode::TrustDamaged`] refusal if the trust file is lost,
+///                             is not a file, or does not parse; an uncoded error if it could not
+///                             be read, or a newer version of Forklift wrote it.
 pub fn read_trust_anchor() -> Result<Option<TrustAnchor>, String> {
     Ok(read_trust_anchor_with_bytes()?.map(|(anchor, _)| anchor))
 }
@@ -732,24 +732,57 @@ fn trust_copy_stands() -> Result<bool, String> {
 /// The trust file's bytes, undecoded (`None`: there is no trust file). This is the read that sees
 /// a lost trust file as absent, so its production callers are an exact set the tests pin; every
 /// other reader takes [`read_trust_anchor`].
+///
+/// # Returns
+/// * `Ok(None)` - Nothing stands at the trust file's path.
+/// * `Err`      - `trust_damaged` if something other than a file stands there (a folder, a link,
+///                one whose target is gone included); an uncoded error if it could not be read.
 pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
+    match read_trust_file() {
+        Ok(bytes) => Ok(bytes),
+        Err(TrustFileError::NotAFile(path)) => Err(CoreError::refusal(
+            RefusalCode::TrustDamaged,
+            format!(
+                "The warehouse's trust file (\"{}\") is not a file, so its anchor cannot be read. \
+                Nothing was changed. {}",
+                path, LOST_ANCHOR_WAYS_OUT
+            ),
+            "",
+        ).into()),
+        Err(TrustFileError::Unreadable(why)) => Err(why),
+    }
+}
+
+/// Why the trust file's bytes could not be read.
+enum TrustFileError {
+    /// Something other than a file stands at its path, named here: damage, like a file that does
+    /// not parse.
+    NotAFile(String),
+
+    /// The filesystem failed to read it, which is not damage.
+    Unreadable(String),
+}
+
+/// The trust file's bytes (`None`: nothing stands at its path), with an entry that is not a file
+/// told apart from a read that failed. A link counts as not a file, so a dangling one is not
+/// mistaken for a file that is gone.
+fn read_trust_file() -> Result<Option<Vec<u8>>, TrustFileError> {
     let path = forklift_root().join(FILE_NAME_TRUST);
+    let not_a_file = || TrustFileError::NotAFile(path.to_string_lossy().into_owned());
+
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(meta) if !meta.is_file() => return Err(not_a_file()),
+        _ => {}
+    }
+
     match std::fs::read(&path) {
         Ok(bytes) => Ok(Some(bytes)),
+        // Gone between the two reads: absent, as a read just after would say.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        // A folder or a link to one where the file belongs is damage, like a file that does not
-        // parse; a file the filesystem fails to read is not.
         Err(e) => match std::fs::symlink_metadata(&path) {
-            Ok(meta) if !meta.is_file() => Err(CoreError::refusal(
-                RefusalCode::TrustDamaged,
-                format!(
-                    "The warehouse's trust file (\"{}\") is not a file, so its anchor cannot be read. \
-                    Nothing was changed. {}",
-                    path.to_string_lossy(), LOST_ANCHOR_WAYS_OUT
-                ),
-                "",
-            ).into()),
-            _ => Err(format!("Error while reading the trust file: {}", e)),
+            Ok(meta) if !meta.is_file() => Err(not_a_file()),
+            _ => Err(TrustFileError::Unreadable(format!("Error while reading the trust file: {}", e))),
         },
     }
 }
@@ -1261,6 +1294,10 @@ pub struct TrustInstall<'a> {
     /// ([`PalletsPrecondition::NotConsumed`] for an anchor adopted from a remote, whose boundary
     /// is the remote's).
     pub pallets: PalletsPrecondition,
+
+    /// How an install that replaces nothing re-reads the missing anchor under the hold: `Adopt`
+    /// only for the adoption that may take a remote's anchor over a born office whose own was lost.
+    pub mode: TrustReadMode,
 }
 
 /// What a successful [`install_trust`] did: a caller announcing a trust change tells its own write
@@ -1348,10 +1385,17 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
         office: OfficePrecondition::At(install.office.map(str::to_string)),
         anchor: match install.replaces {
             Some(replaced) => AnchorPrecondition::Bytes(replaced.to_vec()),
-            None => AnchorPrecondition::Absent,
+            None => AnchorPrecondition::NotConsumed,
         },
         pallets: install.pallets.clone(),
     })?;
+
+    // An install that replaces nothing needs there to be still no anchor, read in its own mode: the
+    // checked read of `AnchorPrecondition::Absent` would refuse the adoption that is the way out of
+    // a lost one.
+    if install.replaces.is_none() && read_trust_anchor_in(install.mode)?.is_some() {
+        return Err(RefUpdateError::AnchorMoved);
+    }
 
     // The check's refusal, or a walk that failed, counts only once the trust install is known to be
     // still wanted and the office and anchor not to have moved.
@@ -1362,8 +1406,12 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
         Err(error) => error,
     };
 
-    // Read back, still inside the hold: what a failed write left decides what to put back.
-    let anchor_now = read_trust_anchor_bytes();
+    // Read back, still inside the hold: what a failed write left decides what to put back. An
+    // entry that is not a file is said plainly here, not refused: this install may have written.
+    let anchor_now = read_trust_file().map_err(|why| match why {
+        TrustFileError::NotAFile(path) => format!("the trust file (\"{}\") is not a file", path),
+        TrustFileError::Unreadable(why) => why,
+    });
     let office_now = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME);
 
     let (anchor_now, office_now) = match (anchor_now, office_now) {
