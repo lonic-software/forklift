@@ -27,6 +27,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **A lost or damaged trust file refuses as `trust_damaged` (exit 69).** A trust file missing under
+  a born office was read by `stack` and `deliver` as a warehouse that never enrolled, and one that
+  did not parse refused uncoded. Now every command that reads the trust state, stack, deliver, git
+  import, enroll, regenesis and every command that judges a remote's trust, refuses either as
+  `trust_damaged`, before writing anything, and names the ways out. `lower` alone reads a missing
+  trust file as no anchor held, so it can adopt the anchor of a remote you trust. A server answers
+  it as a `503`.
 - **Every local state record carries a digest.** The records of a bay, its pallet position and
   scope, a merge, cherry-pick or park in progress, the inventory metadata, the redaction and
   origin records, the clone-in-progress record and the taint files end in a digest of their

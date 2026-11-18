@@ -85,7 +85,19 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 55** (current): `heal` emits `data.merge_state_restored` when it wrote back or removed a
+**Schema 56** (current): the `trust_damaged` error code exists (exit 69). The trust file is
+missing while the office pallet is born or the file's copy (`trust-copy`, beside it) stands, so trust
+was established and its anchor is gone; or it does not parse (not UTF-8, not TOML, no version entry,
+or an entry the anchor needs is missing or mistyped). A trust file a newer version wrote keeps its
+uncoded refusal. Nothing was changed, and there is no `next_step`: the message names the ways out
+(restore the file from a backup; or move aside whichever of the trust file and its copy stands, then
+`forklift lower` from a remote you trust; or prepare another folder). Every command that reads the
+trust state refuses it: stack, deliver, git import, enroll, regenesis and every command that judges a
+remote's trust. `lower` alone reads a missing trust file with no copy as no anchor held, whatever the
+office holds, so it can adopt the remote's. The old uncoded "holds an office but no trust anchor"
+refusal is gone, and a server answers `trust_damaged` as a `503`.
+
+**Schema 55**: `heal` emits `data.merge_state_restored` when it wrote back or removed a
 damaged record of the merge in progress: `checkout` names the working tree, and `records` lists
 each record (`record`: "consolidation state", "consolidation skeleton" or "pick state"; `file`;
 `was`, what was wrong with it; `removed`, true when no copy could be used and an interrupted merge

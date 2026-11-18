@@ -417,6 +417,9 @@ revocation by more than about a day.
   from its pack's data file. When the data file itself is lost or damaged, `heal` refuses with
   `objects_lost`, naming what cannot be read; restore the root from a backup. An object missing
   from the store altogether, or held only in a corrupt loose file, answers the same way.
+- **Lost trust file:** a root whose trust file is missing while its office pallet is born, or
+  whose trust file does not parse, answers every request that reads its trust 503 with
+  `trust_damaged` and no `Retry-After`. Restore the file from a backup.
 - **Shutdown:** SIGINT/SIGTERM drain in-flight requests before exiting.
 
 ## Updating
