@@ -3632,7 +3632,30 @@ pub(crate) mod tests {
             Err(RefUpdateError::Failed(why)) => assert!(crate::error::frames_code(&why, crate::error::RefusalCode::TrustDamaged), "{}", why),
             other => panic!("expected the pinned write refused: {:?}", other),
         }
+    }
 
+    // Revert: check the install's pallets before its re-read of the missing anchor → a first
+    // anchor whose boundary also moved reports the pallets, not the anchor installed meanwhile.
+    #[test]
+    fn a_first_anchor_over_one_installed_meanwhile_is_refused_as_the_anchor_moving() {
+        let (_root, _scope) = scratch("first-anchor-order");
+        update_pallet_head("main", None, &hash('1'), &RefPreconditions::NONE).unwrap();
+        plant_anchor('0');
+
+        let refused = crate::util::office_utils::install_trust(&crate::util::office_utils::TrustInstall {
+            anchor: &crate::util::office_utils::TrustAnchor {
+                genesis: hash('5'), enabled_at: 1, boundary: Vec::new(), prior_genesis: None, adopts: None,
+            },
+            replaces: None,
+            office: None,
+            new_office: None,
+            served: None,
+            pallets: PalletsPrecondition::WithinBoundary { boundary: Vec::new(), scope: BoundaryScope::AllButOffice },
+            mode: crate::util::office_utils::TrustReadMode::Checked,
+        });
+
+        assert_eq!(refused, Err(RefUpdateError::AnchorMoved));
+        assert_eq!(crate::util::office_utils::read_trust_anchor().unwrap().map(|anchor| anchor.genesis), Some(hash('0')));
     }
 
     // Revert: treat `Absent` as `NotConsumed` → an unsigned write lands under an anchor.

@@ -94,9 +94,8 @@ uncoded refusal. Nothing was changed, and there is no `next_step`: the message n
 (restore the file from a backup; or move aside whichever of the trust file and its copy stands, then
 `forklift lower` from a remote you trust; or prepare another folder). Every command that reads the
 trust state refuses it: stack, deliver, git import, enroll, regenesis and every command that judges a
-remote's trust. `heal` does not refuse it as `trust_damaged` yet: where it needs the remote it refuses
-the run as `remote_refused`, and elsewhere it reports a failed handshake and goes on with its other
-repairs. A remote's own lost trust file
+remote's trust. `heal` refuses as `trust_damaged` where its repair needs the remote, and elsewhere
+reports a failed handshake and goes on with its other repairs. A remote's own lost trust file
 reaches a client as `trust_damaged` with a `next_step` naming the remote's operator; a local one has
 no `next_step`. `lower` alone reads a missing trust file with no copy as no anchor held, whatever the
 office holds, so it can adopt the remote's. The old uncoded "holds an office but no trust anchor"

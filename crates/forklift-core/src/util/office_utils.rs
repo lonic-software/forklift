@@ -735,15 +735,17 @@ fn trust_copy_stands() -> Result<bool, String> {
 ///
 /// # Returns
 /// * `Ok(None)` - Nothing stands at the trust file's path.
-/// * `Err`      - `trust_damaged` if something other than a file stands there (a folder, a link,
-///                one whose target is gone included); an uncoded error if it could not be read.
+/// * `Err`      - `trust_damaged` if something other than a file stands there (a folder, or a link
+///                that reaches no file, a dangling one included); an uncoded error if it could not
+///                be read.
 pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
     match read_trust_file() {
         Ok(bytes) => Ok(bytes),
         Err(TrustFileError::NotAFile(path)) => Err(CoreError::refusal(
             RefusalCode::TrustDamaged,
             format!(
-                "The warehouse's trust file (\"{}\") is not a file, so its anchor cannot be read. \
+                "The warehouse's trust file (\"{}\") is not a file or a link to one, so its anchor \
+                cannot be read. \
                 Nothing was changed. {}",
                 path, LOST_ANCHOR_WAYS_OUT
             ),
@@ -755,8 +757,8 @@ pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
 
 /// Why the trust file's bytes could not be read.
 enum TrustFileError {
-    /// Something other than a file stands at its path, named here: damage, like a file that does
-    /// not parse.
+    /// Something other than a file, or a link to one, stands at its path, named here: damage,
+    /// like a file that does not parse.
     NotAFile(String),
 
     /// The filesystem failed to read it, which is not damage.
@@ -764,14 +766,18 @@ enum TrustFileError {
 }
 
 /// The trust file's bytes (`None`: nothing stands at its path), with an entry that is not a file
-/// told apart from a read that failed. A link counts as not a file, so a dangling one is not
-/// mistaken for a file that is gone.
+/// told apart from a read that failed. A link is judged by what it reaches, so one to a trust file
+/// reads it, and a dangling one is not mistaken for a file that is gone.
 fn read_trust_file() -> Result<Option<Vec<u8>>, TrustFileError> {
     let path = forklift_root().join(FILE_NAME_TRUST);
     let not_a_file = || TrustFileError::NotAFile(path.to_string_lossy().into_owned());
 
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::metadata(&path) {
+            Ok(target) if target.is_file() => {}
+            _ => return Err(not_a_file()),
+        },
         Ok(meta) if !meta.is_file() => return Err(not_a_file()),
         _ => {}
     }
@@ -1381,21 +1387,27 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
         return Ok(TrustInstalled::AlreadyInPlace);
     }
 
+    // The office, then the anchor, then the pallets, as one precondition set would check them. An
+    // install that replaces nothing needs there to be still no anchor, read in its own mode: the
+    // checked read of `AnchorPrecondition::Absent` would refuse the adoption that is the way out of
+    // a lost one.
     pallet_utils::check_preconditions(&lock, &RefPreconditions {
         office: OfficePrecondition::At(install.office.map(str::to_string)),
         anchor: match install.replaces {
             Some(replaced) => AnchorPrecondition::Bytes(replaced.to_vec()),
             None => AnchorPrecondition::NotConsumed,
         },
-        pallets: install.pallets.clone(),
+        pallets: PalletsPrecondition::NotConsumed,
     })?;
 
-    // An install that replaces nothing needs there to be still no anchor, read in its own mode: the
-    // checked read of `AnchorPrecondition::Absent` would refuse the adoption that is the way out of
-    // a lost one.
     if install.replaces.is_none() && read_trust_anchor_in(install.mode)?.is_some() {
         return Err(RefUpdateError::AnchorMoved);
     }
+
+    pallet_utils::check_preconditions(&lock, &RefPreconditions {
+        pallets: install.pallets.clone(),
+        ..RefPreconditions::NONE
+    })?;
 
     // The check's refusal, or a walk that failed, counts only once the trust install is known to be
     // still wanted and the office and anchor not to have moved.
@@ -1409,7 +1421,7 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
     // Read back, still inside the hold: what a failed write left decides what to put back. An
     // entry that is not a file is said plainly here, not refused: this install may have written.
     let anchor_now = read_trust_file().map_err(|why| match why {
-        TrustFileError::NotAFile(path) => format!("the trust file (\"{}\") is not a file", path),
+        TrustFileError::NotAFile(path) => format!("the trust file (\"{}\") is not a file or a link to one", path),
         TrustFileError::Unreadable(why) => why,
     });
     let office_now = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME);
@@ -2920,6 +2932,23 @@ pub(crate) mod tests {
                 let error = read_trust_anchor_in(mode).expect_err(name);
                 assert_eq!(crate::error::frames_code(&error, RefusalCode::TrustDamaged), damaged, "{}: {}", name, error);
             }
+
+            drop(_scope);
+            file_utils::remove_dir_all(&dir).ok();
+        }
+
+        // The positive for the links: one that reaches a trust file reads it.
+        #[cfg(unix)]
+        {
+            let dir = trust_read_root("link-to-file", Some(TRUST_FILE), true, false);
+            let _scope = crate::globals::StorageRootScope::enter(&dir);
+            let trust = dir.join(".forklift").join(FILE_NAME_TRUST);
+            std::fs::write(dir.join("real-trust"), TRUST_FILE).unwrap();
+            file_utils::remove_file(&trust).unwrap();
+            std::os::unix::fs::symlink(dir.join("real-trust"), &trust).unwrap();
+
+            let read = read_trust_anchor_in(TrustReadMode::Checked).map(|read| read.map(|(anchor, _)| anchor.genesis));
+            assert_eq!(read, Ok(Some("genesis-hash".to_string())));
 
             drop(_scope);
             file_utils::remove_dir_all(&dir).ok();
