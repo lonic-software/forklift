@@ -1504,6 +1504,12 @@ fn fault_body() -> ErrorResponse {
     ErrorResponse { error: FAULT_MESSAGE.to_string(), code: None, next_step: None }
 }
 
+/// The partial bundle of `hashes` a batch or subtree answers with, its failure classified by
+/// [`bundle_refusal`].
+fn partial_bundle(hashes: &[String]) -> Result<Vec<u8>, HandlerError> {
+    bundle_utils::build_partial_bundle(hashes).map_err(bundle_refusal)
+}
+
 /// A partial bundle that could not be built: a `422` when the request asked for an object over
 /// the object ceiling, which no bundle may carry, since that refusal is the requester's and
 /// repeats on every retry; else a fault of the server's own ([`internal`]).
@@ -3075,7 +3081,7 @@ async fn post_objects_batch(State(state): State<Arc<AppState>>,
         let withheld = withheld_among(&gate, &removed, &request.hashes)?;
         let hashes: Vec<String> = request.hashes.into_iter().filter(|hash| !withheld.contains(hash)).collect();
 
-        bundle_utils::build_partial_bundle(&hashes).map_err(bundle_refusal)
+        partial_bundle(&hashes)
     }).await;
 
     match result {
@@ -3157,7 +3163,7 @@ async fn get_subtree(State(state): State<Arc<AppState>>,
             tree_utils::SubtreeClosure::Complete(closure) => closure,
         };
 
-        bundle_utils::build_partial_bundle(&closure).map_err(bundle_refusal)
+        partial_bundle(&closure)
     }).await;
 
     match result {
