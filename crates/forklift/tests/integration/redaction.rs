@@ -1918,10 +1918,8 @@ fn a_server_owing_a_deletion_serves_the_chunks_only_its_recipe_names_as_absent()
     let (own, shared): (Vec<String>, Vec<String>) = {
         let _scope = forklift_core::globals::StorageRootScope::enter(&owner.root);
         let root = object_utils::load_parcel(&owner.head("main")).unwrap().tree_hash;
-        let kept = match forklift_core::util::tree_utils::collect_subtree_closure(&root, "keep", usize::MAX).unwrap() {
-            Some(forklift_core::util::tree_utils::SubtreeClosure::Complete(closure)) => closure,
-            other => panic!("{:?}", other.is_some()),
-        };
+        let kept = forklift_core::util::tree_utils::collect_subtree_closure(&root, "keep").unwrap()
+            .expect("keep is a directory");
         let kept: std::collections::HashSet<String> = kept.iter()
             .filter_map(|hash| object_utils::recipe_chunk_hashes(hash).ok())
             .flatten()
@@ -3345,10 +3343,8 @@ fn a_served_root_withholds_a_chunked_file_and_the_chunks_only_it_names() {
     owner.run_ok(&["lift"]);
 
     // The film's recipe and its chunks, split by whether the kept file names them too.
-    let closure = |root: &str, path: &str| match forklift_core::util::tree_utils::collect_subtree_closure(root, path, usize::MAX).unwrap() {
-        Some(forklift_core::util::tree_utils::SubtreeClosure::Complete(closure)) => closure,
-        other => panic!("{:?}", other.is_some()),
-    };
+    let closure = |root: &str, path: &str| forklift_core::util::tree_utils::collect_subtree_closure(root, path).unwrap()
+        .expect("the path is a directory");
     let (recipe, own, shared): (String, Vec<String>, Vec<String>) = {
         let _scope = forklift_core::globals::StorageRootScope::enter(&owner.root);
         let root = object_utils::load_parcel(&owner.head("main")).unwrap().tree_hash;

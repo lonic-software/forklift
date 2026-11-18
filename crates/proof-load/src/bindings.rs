@@ -162,8 +162,6 @@ pub const WRITE_EXEMPTIONS: &[(&str, WriteExemption)] = &[
 pub const ROUTE_EXEMPTIONS: &[RouteExemption] = &[
     RouteExemption { method: "GET", path: "/healthz", mount: Mount::Root, reason: "no client command sends it: supervisors and load balancers probe it" },
     RouteExemption { method: "PUT", path: "/warehouses/{warehouse}", mount: Mount::Root, reason: "no client command sends it: an operator creates a warehouse over HTTP, and no scenario serves more than one" },
-    // FORK-473: delete the route or give it a caller.
-    RouteExemption { method: "GET", path: "/parcels/{parcel}/subtree/{*path}", mount: Mount::Protocol, reason: "no client command sends it: the client's method for it has no caller outside its tests" },
     // FORK-474: the scenario steps that reach these.
     RouteExemption { method: "POST", path: "/objects/missing", mount: Mount::Protocol, reason: "sent by an origin move over withheld recipes and by heal's refetch into a hosted clone, and no scenario reaches either yet" },
     RouteExemption { method: "PUT", path: "/withheld/{hash}/recipe", mount: Mount::Protocol, reason: "sent when a lift's new history reaches content the host withholds, and no scenario builds that yet" },
@@ -238,7 +236,6 @@ pub const ROUTE_WRITES: &[RouteWrites] = &[
     route("POST", "/objects/missing", Mount::Protocol, Bound::ReadOnly),
     route("POST", "/objects/upload-targets", Mount::Protocol, Bound::ReadOnly),
     route("POST", "/objects/batch", Mount::Protocol, Bound::ReadOnly),
-    route("GET", "/parcels/{parcel}/subtree/{*path}", Mount::Protocol, Bound::ReadOnly),
     route("GET", "/objects/{hash}", Mount::Protocol, Bound::ReadOnly),
     route("PUT", "/objects/{hash}", Mount::Protocol, Bound::Writes(PUT_OBJECT)),
     route("PUT", "/withheld/{hash}/recipe", Mount::Protocol, Bound::Writes(PUT_WITHHELD_RECIPE)),

@@ -1813,7 +1813,7 @@ thread_local! {
     /// concurrently on separate threads while a given `WriteBatch::finish`/`run_write_barrier`
     /// call always runs entirely on its caller's thread — one test's arming can never be observed
     /// by a concurrently running test on another thread. The exception is a fetched bundle's
-    /// import, which runs on a blocking-pool thread: a rig armed around a batch or subtree fetch
+    /// import, which runs on a blocking-pool thread: a rig armed around a batch fetch
     /// does not see that import's writes. `DirSyncFaultGuard`'s construct-and-Drop
     /// reset (see its own doc comment) is what additionally isolates tests from each other when
     /// they instead run sequentially (`--test-threads=1`) and reuse the same thread.

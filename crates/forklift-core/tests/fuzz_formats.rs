@@ -655,8 +655,8 @@ mod regressions {
         record.extend(b"only a few real bytes");
         raw.extend(zstd::encode_all(&record[..], 3).unwrap());
 
-        use forklift_core::util::bundle_utils::{import_streamed_bundle, StreamAdmission};
-        let admission = StreamAdmission::Requested(std::collections::HashSet::from(["a".repeat(64)]));
+        use forklift_core::util::bundle_utils::import_streamed_bundle;
+        let admission = std::collections::HashSet::from(["a".repeat(64)]);
         let result = import_streamed_bundle(std::io::Cursor::new(&raw), admission);
         let error = result.err().expect("a huge record length must be an error, not a panic/abort");
         assert!(error.contains("declares 18446744073709551615 bytes"), "refused on its length: {}", error);

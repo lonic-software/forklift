@@ -101,7 +101,7 @@ that send them.
 **A fault of the server's own:** a `500` from forklift-server carries a fixed `error`, and no
 `code` or `next_step`, whatever failed: its cause may name the server's directories, and a
 refusal's next step there is the operator's, so it is logged and not sent. A refusal meant for
-the requester comes at its own status instead: a batch or subtree bundle that would have to
+the requester comes at its own status instead: a batch bundle that would have to
 carry an object over the ceiling is a `422` with its code. The serverless head hides a `500`'s
 message the same way, except that it passes on a classified refusal's `code` and text (all but
 `object_unreadable`, which it hides at any status).
@@ -178,7 +178,6 @@ A `GET` route answers `HEAD` too.
 | `POST` | `/objects/missing` | `protocol` | both | authenticated |
 | `POST` | `/objects/upload-targets` | `protocol` | both | authenticated |
 | `POST` | `/objects/batch` | `protocol` | both | authenticated |
-| `GET` | `/parcels/{parcel}/subtree/{*path}` | `protocol` | both | authenticated |
 | `GET` | `/objects/{hash}` | `protocol` | both | authenticated |
 | `PUT` | `/objects/{hash}` | `protocol` | both | authenticated |
 | `PUT` | `/withheld/{hash}/recipe` | `protocol` | both | authenticated |
@@ -258,7 +257,7 @@ server's retry, applies it.
 forklift-server serves no content while an apply may be owed: from just before a ref update or
 `DELETE` it takes may land until an apply that began after it returned has decided every
 redaction, and, when it serves a warehouse anew, until its first apply has. The content routes
-(`GET` of an object, `objects/batch`, `subtree` and `bundle`) wait for that, up to 10 seconds, and
+(`GET` of an object, `objects/batch` and `bundle`) wait for that, up to 10 seconds, and
 then answer `503`; a request refused for what it asks is refused first. An apply that fails, or
 cannot tell whether a head still names a redaction, leaves it owed, and the server retries it
 after 10 seconds, then twice as long each time up to 5 minutes. Routes that move no bytes out
@@ -339,7 +338,7 @@ recipe. A client that does not know the value sends nothing, as for `"none"`.
 
 **Withheld content is refused.** `GET` and `PUT` of `/v1/objects/{hash}` for a withheld hash
 answer `451` with `code` `content_withheld`, the host's statement in the message, and
-`details.hash` and `details.statement`. `batch` and the subtree endpoint leave it out, as they do
+`details.hash` and `details.statement`. `batch` leaves it out, as it does
 an applied redaction's content. A hash both redacted and withheld is answered `410`.
 
 **Withheld content is still named.** Pallet heads may keep naming a withheld file, and a lift may
@@ -361,8 +360,8 @@ redacted recipes name as absent, as it does for an applied redaction (below).
 
 **Applied redactions are refused.** Once a head has applied a redaction, `GET` and `PUT` of
 `/v1/objects/{hash}` for its hash answer `410` with `code` `content_redacted` and the hash in
-`details.hash`, and so does `upload-targets` naming it. `batch` and the subtree endpoint leave the
-object out, as they do one the remote lacks, so the client's loose `GET` for it receives the `410`;
+`details.hash`, and so does `upload-targets` naming it. `batch` leaves the
+object out, as it does one the remote lacks, so the client's loose `GET` for it receives the `410`;
 the bundle never carries it. What is refused is the redacted hash: for a chunked file, the
 recipe. Its chunks are not refused by hash, since other content may share them; a client never
 uploads one only that recipe names. Until its deletion is done, forklift-server serves a chunk
@@ -497,34 +496,10 @@ sent, alone or after smaller ones that left room under it; the deadline stops ev
 answer once it has spent its time looking for objects it lacks. The self-hosted server answers
 every batch whole; the client's 512-hash chunks bound it.
 
-### `GET /v1/parcels/{parcel}/subtree/{path}` (additive; the path-addressed fetch)
+### Deferred endpoints
 
-The object closure of the subtree at `path` in `parcel` — the subtree root object and every
-tree and blob beneath it — as a **bundle-format stream** (`BUNDLE_FORMAT.md`), served with
-`Content-Encoding: identity`. `{path}` is a warehouse path key (`/`-separated, e.g. `src/api`);
-the empty path is the whole tree. A parcel or path that does not resolve to a subtree is `404`.
-Every record is hash-verified on import, exactly like a bundle.
-
-This is the **path-addressed** counterpart of hash-addressed fetch. A sparse client already
-fetches exactly a subtree by pruning its hash-addressed walk by path (the MVP, which needs no
-new endpoint); this endpoint moves that resolution to the **remote**, which is what lets the
-remote *authorize a fetch by path*. A hash-addressed `GET /v1/objects/{hash}` is path-blind — it
-cannot enforce a per-path grant without a hash→path index — so this endpoint is the wire surface
-**file-level path enforcement** (FORK-10) is designed to gate: the remote resolves the subtree,
-checks the operator's path grants, and `403`s an out-of-scope path. The authorizer is a distinct
-seam in the head, wired when file-level FORK-10 ships; **today the read is open to every
-authenticated principal**, exactly as an object fetch already is, so the endpoint adds no
-enforcement yet — it only positions the surface. Task-scoped sparse workspaces are not
-confidentiality (hiding content): that is a separate feature (the private-tier locker), and this
-endpoint must not be sold as it.
-
-The endpoint is **additive**: a client whose remote predates the route gets a `404` and falls
-back to the shipped hash-addressed scoped walk, so it needs no protocol bump. A storage-backed
-head may answer `307` with a presigned `GET` of the bundle under the ephemeral response prefix,
-the same medicine the batch endpoint uses for large responses.
-
-Two further additive endpoints are **designed but deferred**, both pure optimizations behind the
-same `404`-fallback discipline (a client falls back to the hash walk / to recomputing locally):
+Two additive endpoints are **designed but deferred**, both pure optimizations a client tries and,
+on a `404`, falls back from (to the hash-addressed walk / to recomputing locally):
 a **scoped-bundle** endpoint for sparse cold-start bundle speed, and **served commit-graph
 shards** so a sparse clone gets full changed-path filters without recomputing them. Neither
 changes what is fetchable, only how fast.

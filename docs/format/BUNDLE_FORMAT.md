@@ -187,22 +187,15 @@ incremental object path; changing its representation would change signed history
 
 ## Partial bundles
 
-The incremental `POST /v1/objects/batch` and subtree responses use the `2026-07-11` record stream:
+The incremental `POST /v1/objects/batch` response uses the `2026-07-11` record stream:
 a header line, then one outer zstd stream of `O` records, each `kind[1] | hash[64 ASCII hex] |
-length u64 | object bytes`. Those small responses add selected objects to an existing store and
+length u64 | object bytes`. That small response adds selected objects to an existing store and
 cannot generally be installed as a self-contained pack, because requested deltas may not have their
 bases. They are read only from a remote's response, never from a whole-bundle file.
 
 Every record is admitted before a byte of its payload is read, so a remote can make the client
-store only what it asked for:
-
-- **Batch.** A record must name a hash the request asked for, and no hash may appear twice. The
-  client sends each hash once, and the builder writes a repeated hash once.
-- **Subtree.** The client names the subtree's hash from the spine tree it already holds. The first
-  admissible record is that tree; each admitted tree makes its files and subtrees admissible,
-  loaded from the store even when the record was skipped because the client already held it. No
-  hash may appear twice, and at most 10,000 records are admitted, the server's own cap on one
-  response.
+store only what it asked for: a record must name a hash the request asked for, and no hash may
+appear twice. The client sends each hash once, and the builder writes a repeated hash once.
 
 Any other record kind, an unrequested hash, or a repeat rejects the response.
 

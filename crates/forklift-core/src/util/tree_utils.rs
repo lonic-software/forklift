@@ -1022,39 +1022,14 @@ pub fn resolve_subtree_hash(root_tree_hash: &str, key: &str) -> Result<Option<St
     Ok(Some(current))
 }
 
-/// The outcome of [`collect_subtree_closure`]: either the walk ran to completion under `cap`, or
-/// it was abandoned the moment the closure exceeded `cap` — before loading whatever the rest of
-/// the subtree contains. `Overflowed` carries nothing: a caller that only wants to refuse an
-/// oversized subtree (the one caller today) has no use for a partial, arbitrarily-truncated list,
-/// and not building one is the point — keeping it would reintroduce the unbounded work this type
-/// exists to avoid paying for.
-pub enum SubtreeClosure {
-    /// The full closure, `cap` objects or fewer.
-    Complete(Vec<String>),
-    /// The closure exceeds `cap`; the walk stopped as soon as that was known.
-    Overflowed,
-}
-
 /// The object closure of the subtree at a warehouse path key inside a parcel's tree: the subtree
 /// root object and every tree and blob beneath it, de-duplicated. `Ok(None)` when the key names
 /// nothing (or a file) in this tree.
 ///
-/// The path-addressed subtree fetch endpoint (`docs/format/REMOTE_PROTOCOL.md`) serves exactly
-/// this set, so a remote can resolve — and, when file-level path enforcement ships, authorize —
-/// a fetch by path rather than by an opaque hash a path-blind object endpoint cannot gate.
-///
-/// The walk is bounded by `cap`: as soon as the closure built so far exceeds it, the walk stops
-/// and returns [`SubtreeClosure::Overflowed`] without loading anything further. That makes an
-/// oversized-subtree request cheap to refuse — a caller enforcing a response-size limit does not
-/// pay for the rest of the walk just to learn it will discard the answer.
-///
 /// # Arguments
 /// * `root_tree_hash` - The parcel's root tree hash.
 /// * `key`            - The warehouse path key of the subtree.
-/// * `cap`            - The closure size above which the walk aborts early.
-pub fn collect_subtree_closure(
-    root_tree_hash: &str, key: &str, cap: usize
-) -> Result<Option<SubtreeClosure>, String> {
+pub fn collect_subtree_closure(root_tree_hash: &str, key: &str) -> Result<Option<Vec<String>>, String> {
     let subtree = match resolve_subtree_hash(root_tree_hash, key)? {
         Some(hash) => hash,
         None => return Ok(None),
@@ -1071,18 +1046,12 @@ pub fn collect_subtree_closure(
         }
 
         closure.push(tree_hash.clone());
-        if closure.len() > cap {
-            return Ok(Some(SubtreeClosure::Overflowed));
-        }
 
         let tree = object_utils::load_tree(&tree_hash)?;
 
         for (_, file) in tree.get_files() {
             if seen.insert(file.hash.clone()) {
                 closure.push(file.hash.clone());
-                if closure.len() > cap {
-                    return Ok(Some(SubtreeClosure::Overflowed));
-                }
             }
         }
 
@@ -1091,7 +1060,7 @@ pub fn collect_subtree_closure(
         }
     }
 
-    Ok(Some(SubtreeClosure::Complete(closure)))
+    Ok(Some(closure))
 }
 
 #[cfg(test)]
@@ -1154,70 +1123,20 @@ mod subtree_closure_tests {
         object.hash
     }
 
-    /// Six real, loadable, mutually-distinct trees named `a1..a6` (so `BTreeMap` iteration visits
-    /// them in that order) plus one entry, `zzz_poison`, whose hash was never stored — sorted
-    /// last, so nothing but a walk that runs past the cap can ever reach it. Returns the root
-    /// tree's hash.
-    ///
-    /// A walk that (bug) only checks the cap after finishing keeps going once the real cap trip
-    /// is behind it: it works through the remaining `aN` entries and eventually reaches
-    /// `zzz_poison`, calling `load_tree` on a hash that names nothing — which fails. A walk that
-    /// aborts as soon as the closure exceeds the cap never gets there. That gives a hard,
-    /// non-timing signal that separates "aborted early" from "walked fully then checked":
-    /// `Ok(Overflowed)` vs `Err(_)`.
-    fn build_fixture_with_poison() -> String {
-        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-        for name in ["a1", "a2", "a3", "a4", "a5", "a6"] {
-            root.add_child(TreeItem::new(name.to_string(), store_marked_tree(name), DirEntryType::Tree));
-        }
-        root.add_child(TreeItem::new("zzz_poison".to_string(), "f".repeat(64), DirEntryType::Tree));
-
-        let mut object = LooseObjectBuilder::build_tree(&root);
-        object.store().unwrap();
-        object.hash
-    }
-
     #[test]
-    fn the_walk_aborts_as_soon_as_the_closure_exceeds_the_cap_rather_than_completing() {
-        let _scratch = Scratch::new("aborts-early");
-        let root_hash = build_fixture_with_poison();
+    fn the_closure_is_every_tree_and_blob_beneath_the_key() {
+        let _scratch = Scratch::new("closure");
 
-        let result = collect_subtree_closure(&root_hash, "", 5);
-
-        match result {
-            Ok(Some(SubtreeClosure::Overflowed)) => {} // expected: aborted before reaching poison
-            Ok(Some(SubtreeClosure::Complete(closure))) => {
-                panic!("the walk completed with {} objects instead of aborting", closure.len())
-            }
-            Ok(None) => panic!("the root resolved to nothing"),
-            Err(error) => panic!(
-                "the walk ran past the cap and failed loading the poisoned entry \
-                (proves it did NOT abort early): {}", error
-            ),
-        }
-    }
-
-    #[test]
-    fn under_the_cap_the_full_closure_still_comes_back() {
-        let _scratch = Scratch::new("under-cap");
-
-        // A small, poison-free fixture: root + two distinct one-file subtrees, capped well above
-        // its size — a cap that never trips must still return the complete closure, not a
-        // truncated one. Closure: root, x's tree, x's blob, y's tree, y's blob = 5 objects.
+        // Root + two distinct one-file subtrees. Closure: root, x's tree, x's blob, y's tree,
+        // y's blob = 5 objects.
         let mut small = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         small.add_child(TreeItem::new("x".to_string(), store_marked_tree("x"), DirEntryType::Tree));
         small.add_child(TreeItem::new("y".to_string(), store_marked_tree("y"), DirEntryType::Tree));
         let mut object = LooseObjectBuilder::build_tree(&small);
         object.store().unwrap();
 
-        let result = collect_subtree_closure(&object.hash, "", 100).unwrap().unwrap();
-
-        match result {
-            SubtreeClosure::Complete(closure) => {
-                assert_eq!(closure.len(), 5, "root + (tree, blob) for each of x and y, none deduped away");
-            }
-            SubtreeClosure::Overflowed => panic!("a closure of 5 must not overflow a cap of 100"),
-        }
+        let closure = collect_subtree_closure(&object.hash, "").unwrap().unwrap();
+        assert_eq!(closure.len(), 5, "root + (tree, blob) for each of x and y, none deduped away");
     }
 
     /// A remedy command's path is one argument: plain paths stay as they are, anything a shell
