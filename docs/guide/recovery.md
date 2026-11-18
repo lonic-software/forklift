@@ -187,8 +187,16 @@ entry lost its statement, or whose line was cut short or is not valid UTF-8, sta
 placeholder statement; restate it with
 `forklift-server withhold add --root <warehouse> <hash> --statement "…"`. It then lists the files
 the history names that are absent and that no record holds: what a lost entry withheld, once its copy
-was deleted. Withhold each one that was again. Absent folders or chunks are listed apart: no
-takedown withholds one, so they are damage to the store, to restore from a copy of the warehouse.
+was deleted. Each is recorded as unaccounted, and the warehouse is not served while one is. Put back
+the bytes of any you hold a copy of and run the repair again, so it stops counting for good if they
+go once more, and withhold each one that was taken down, or is gone for good,
+again. Absent folders and parts of history are listed apart: nothing beneath them could be walked,
+so a takedown's file may sit there unseen, and the warehouse is not served while one is listed,
+even once it is back. Restore each from a copy of the warehouse and run the repair again to walk
+beneath it. Run the repair again too once nothing your pallets, hauls, bays or staged work keep
+names a file or reaches a folder: it drops what it no longer finds. `forklift-server withhold list`
+names everything still outstanding. Absent chunks are listed last: no takedown withholds one, so
+they are damage to the store, to restore from a copy of the warehouse.
 If the record matches its digest but its header names a newer version of Forklift, the repair
 leaves it for that version. A record that does not match its digest may hold an entry that reads
 whole but was altered, such as a digit of its hash, so the repair says so: check the kept entries

@@ -166,7 +166,10 @@ enum WithholdAction {
         statement: String,
     },
 
-    /// List each withheld hash and its statement
+    /// List each withheld hash and its statement, and what a repair of the record left unaccounted
+    /// that still is: each such file's hash after `unaccounted`, and each folder or part of
+    /// history it could not walk beneath after `undescended`. The warehouse is not served while
+    /// either is listed
     List {
         /// The warehouse root to read
         #[arg(long)]
@@ -176,7 +179,10 @@ enum WithholdAction {
     /// Rebuild a lost or damaged record of withheld content while the warehouse is not served.
     /// A copy of the damaged record is kept aside and every entry that still reads is kept; a hash
     /// whose entry lost its statement stays withheld under a placeholder to restate, and every
-    /// absent file the history names that no record holds is listed, to withhold again
+    /// absent file the history names that no record holds is listed, to withhold again. Each such
+    /// file, and each absent folder or part of history the walk could not see beneath, is recorded
+    /// as unaccounted, and the warehouse is not served until each is accounted for; run again over
+    /// a record that reads whole, it walks again for what an earlier repair left unaccounted
     Repair {
         /// The warehouse root to repair
         #[arg(long)]
@@ -864,13 +870,21 @@ fn list_withheld(root: &str) -> Result<(), String> {
     let _scope = forklift_core::globals::StorageRootScope::enter(&opened.root);
 
     let withheld = forklift_core::util::withholding::read_withheld()?;
+    let applied = forklift_core::util::applied_redactions::read_applied()?;
+    let outstanding = forklift_core::util::withholding::outstanding_unaccounted(&withheld, &applied)?;
 
-    if withheld.is_empty() {
+    if withheld.is_empty() && outstanding.is_empty() && withheld.undescended().next().is_none() {
         println!("This warehouse withholds nothing.");
     }
 
     for (hash, statement) in withheld.entries() {
         println!("{} {}", hash, statement);
+    }
+    for hash in outstanding {
+        println!("unaccounted {}", hash);
+    }
+    for hash in withheld.undescended() {
+        println!("undescended {}", hash);
     }
 
     Ok(())

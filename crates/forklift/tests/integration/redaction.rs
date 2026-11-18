@@ -3088,13 +3088,16 @@ fn http_raw(url: &str, path: &str) -> String {
 /// withheld, nor answers as if nothing were withheld: every request that reads the record, the
 /// handshake and a read of the content alike, is a `503` `withheld_damaged` naming the operator's
 /// repair, with no `Retry-After` and no path of the server's; a clone of it exits 56 and is told
-/// to ask the operator. The repair keeps a hash whose entry lost its statement
-/// withheld, and lists content a lost entry withheld whose copy the server already deleted.
+/// to ask the operator. A root whose record is damaged when it is to be served is not served. The
+/// repair keeps a hash whose entry lost its statement withheld, and lists content a lost entry
+/// withheld whose copy the server already deleted, recording it as unaccounted: the root is not
+/// served, `withhold list` naming it, until the operator withholds it again.
 ///
 /// Revert: read a missing record as nothing withheld → the content still stored is a `200`;
 /// leave the damage uncoded → a `500` naming the server's path; drop the client's arm → the next
 /// step is the operator's command alone; drop the placeholder → the content is served again after
-/// the repair; drop the walk → the deleted content is not listed.
+/// the repair; drop the walk → the deleted content is not listed; record nothing unaccounted →
+/// the root is served though a takedown may be among what the repair could not account for.
 #[test]
 fn a_served_root_whose_withheld_record_is_lost_or_damaged_refuses_until_its_operator_repairs_it() {
     let root = std::env::temp_dir().join(format!("forklift-withheld-damaged-{}", std::process::id()));
@@ -3112,11 +3115,8 @@ fn a_served_root_whose_withheld_record_is_lost_or_damaged_refuses_until_its_oper
     owner.stack("notes.txt", b"notes\n", "notes");
     owner.run_ok(&["lift"]);
     let film = hash_of(film);
-    stop(server);
 
-    // Withheld while nothing serves the root, so its copy is still stored, and then lost.
-    let added = withhold(&root, &["add", &film, "--statement", "court order 2026-90"]);
-    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    // Lost while served, so the film's copy is still stored.
     forklift_core::util::file_utils::remove_file(&record).unwrap();
 
     let refuses = |server: &Server, what: &str| {
@@ -3133,12 +3133,11 @@ fn a_served_root_whose_withheld_record_is_lost_or_damaged_refuses_until_its_oper
         }
     };
 
-    let server = Server::serve(&root);
     refuses(&server, "lost");
 
     // Damaged: the film's entry cut inside its digest column, in a record that matches its digest,
     // so the entry is what refuses.
-    let cut = format!("/forklift-withheld 3\n{} 1\n", film).into_bytes();
+    let cut = format!("/forklift-withheld 4\n{} 1\n", film).into_bytes();
     std::fs::write(&record, forklift_core::util::record_utils::with_digest(cut)).unwrap();
     refuses(&server, "damaged");
 
@@ -3159,6 +3158,9 @@ fn a_served_root_whose_withheld_record_is_lost_or_damaged_refuses_until_its_oper
     let refused = withhold(&root, &["repair"]);
     assert!(!refused.status.success(), "{:?}", refused);
     stop(server);
+    // Damaged when it is to be served, the root is not.
+    let refused = serve_refused(&root);
+    assert!(refused.contains("forklift-server withhold repair"), "{}", refused);
     let repaired = withhold(&root, &["repair"]);
     assert!(repaired.status.success(), "{}", String::from_utf8_lossy(&repaired.stderr));
     let report = String::from_utf8_lossy(&repaired.stdout).into_owned();
@@ -3191,7 +3193,43 @@ fn a_served_root_whose_withheld_record_is_lost_or_damaged_refuses_until_its_oper
     assert!(repaired.status.success(), "{}", String::from_utf8_lossy(&repaired.stderr));
     let report = String::from_utf8_lossy(&repaired.stdout).into_owned();
     assert!(report.contains(&format!("  {}", film)), "{}", report);
-    assert!(report.contains("1 file the history here names is absent") && !report.contains("damage to the store"), "only the file is listed: {}", report);
+    assert!(report.contains("1 file the history here names is absent") && !report.contains("which no takedown withholds") && !report.contains("undescended"), "only the file is listed: {}", report);
+    assert!(report.contains("It is recorded as unaccounted, and this warehouse is not served while one is."), "{}", report);
+
+    // Recorded as unaccounted, the film keeps the root from being served, until it is withheld.
+    let listed = withhold(&root, &["list"]);
+    assert_eq!(String::from_utf8_lossy(&listed.stdout), format!("unaccounted {}\n", film));
+    let refused = serve_refused(&root);
+    assert!(refused.contains("is not served: a repair of its damaged record of withheld content left 1 file, folder or part \
+        of history unaccounted.") && refused.contains("`forklift-server withhold list` names each."), "{}", refused);
+    let added = withhold(&root, &["add", &film, "--statement", "court order 2026-90"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let listed = withhold(&root, &["list"]);
+    assert_eq!(String::from_utf8_lossy(&listed.stdout), format!("{} court order 2026-90\n", film));
+    let server = Server::serve(&root);
+    let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+    assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
+}
+
+/// What `forklift-server serve` over `root` says when it refuses to serve it; a server that
+/// starts instead is a failure.
+fn serve_refused(root: &std::path::Path) -> String {
+    let mut child = std::process::Command::new(common::server_binary()).env("FORKLIFT_FSYNC", "0")
+        .args(["serve", "--root", root.to_str().unwrap(), "--addr", "127.0.0.1:0", "--open"])
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+        .spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the server started over {}", root.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "{:?}", output);
+
+    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 /// A takedown deletes the copy on a served root, though the head still names the file: the server

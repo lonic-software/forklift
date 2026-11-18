@@ -29,15 +29,27 @@
 //! is the only way left to tell whether the file repeats a redacted recipe's chunk list. It is written whole and atomically under the
 //! [`RefLock`], re-read under that lock first, so two writers never drop each other's entries. A
 //! record this build cannot read, of another version or with an entry that is not a hash and a
-//! statement, fails every read with [`RefusalCode::WithheldDamaged`] and is never written over:
+//! statement (or one of the two kinds of line below), fails every read with
+//! [`RefusalCode::WithheldDamaged`] and is never written over:
 //! withheld content must never read as served. Nor may a lost record: a root's first serve writes
 //! an empty one before the served mark ([`tombstone_utils::mark_served`]), so in a served root a
 //! missing record is damage too, and only a root never served reads none as nothing withheld. A
 //! record lost before the first serve cannot be told from none, but nothing was served yet. The
 //! operator repairs a damaged record with `forklift-server withhold repair`
 //! ([`withheld_repair`](crate::util::withheld_repair)).
+//!
+//! That repair cannot rebuild an entry lost whole, so it records, in this same record, what it
+//! could not account for, and a server does not serve the warehouse while any of it is outstanding
+//! ([`unaccounted_count`]): an `unaccounted <hash>` line for each file content the history names
+//! that the store lacks and nothing withholds, which may be a takedown whose entry was lost, and an
+//! `undescended <hash>` line for each absent tree or parcel its walk could not see beneath, where
+//! such a file may sit unseen. Neither line opens with a hash, so a later repair of a damaged record
+//! never salvages one into a takedown. An unaccounted hash stops counting once its bytes are back,
+//! or it is withheld or redacted; withholding it also takes its line off. Only a repair run again
+//! takes either kind of line off, by walking again. In a record of its own, a lost set would read
+//! as nothing unaccounted; here, losing it is losing the record, which is damage.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use crate::globals;
 use crate::util::applied_redactions::{self, AppliedSet};
@@ -51,10 +63,17 @@ use crate::util::{bundle_utils, file_utils, object_utils, record_utils, redactio
 /// The record is digested ([`record_utils::to_bytes`]), so damage that still parses, such
 /// as a flipped digit in a hash, is refused rather than read as what the host withholds. Version 3
 /// added the digest; a record of version 2, which has none, is refused under the same damage code,
-/// named as another version's.
+/// named as another version's. Version 4 added the `unaccounted` and `undescended` lines; a record
+/// of version 3 that matches its digest is named as another version's too, and one cut short is
+/// named as damage ([`record_utils::from_bytes`] judges both).
 const FILE_NAME_WITHHELD: &str = "withheld";
 const WITHHELD_RECORD: &str = "withheld";
-const WITHHELD_VERSION: u32 = 3;
+const WITHHELD_VERSION: u32 = 4;
+
+/// The keywords that open the two kinds of line a repair records, each followed by one hash: never
+/// an object hash, so a repair of a damaged record never salvages either as a takedown.
+pub(crate) const UNACCOUNTED: &str = "unaccounted";
+pub(crate) const UNDESCENDED: &str = "undescended";
 
 /// The longest statement a takedown may carry, in characters: every handshake carries it.
 pub const STATEMENT_MAX_CHARS: usize = 1000;
@@ -171,10 +190,15 @@ struct WithheldEntry {
     digest: ChunkDigest,
 }
 
-/// Every hash this head withholds, each beside the operator's statement.
+/// Every hash this head withholds, each beside the operator's statement, and what a repair of the
+/// record left unaccounted (see the module doc comment). Only [`Self::unaccounted`],
+/// [`Self::undescended`] and [`unaccounted_count`] read the second part: every other accessor is of
+/// the withheld entries alone.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WithheldSet {
     entries: BTreeMap<String, WithheldEntry>,
+    unaccounted: BTreeSet<String>,
+    undescended: BTreeSet<String>,
 }
 
 impl WithheldSet {
@@ -185,6 +209,7 @@ impl WithheldSet {
             entries: entries.into_iter()
                 .map(|(hash, statement, digest)| (hash, WithheldEntry { statement, digest }))
                 .collect(),
+            ..WithheldSet::default()
         }
     }
 
@@ -203,7 +228,7 @@ impl WithheldSet {
         self.entries.get(hash).map(|entry| &entry.digest)
     }
 
-    /// Whether nothing is withheld.
+    /// Whether nothing is withheld. What a repair left unaccounted is not withheld, and does not count.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -213,10 +238,29 @@ impl WithheldSet {
         self.entries.iter().map(|(hash, entry)| (hash, &entry.statement))
     }
 
+    /// Each file content a repair recorded as unaccounted, sorted, whether or not it is still
+    /// outstanding ([`unaccounted_count`]).
+    pub fn unaccounted(&self) -> impl Iterator<Item = &String> {
+        self.unaccounted.iter()
+    }
+
+    /// Each absent tree or parcel a repair could not see beneath, sorted, present again or not.
+    pub fn undescended(&self) -> impl Iterator<Item = &String> {
+        self.undescended.iter()
+    }
+
+    /// Replace what the set records as unaccounted and undescended: a repair's walk, done again.
+    pub(crate) fn set_unaccounted(&mut self, unaccounted: impl IntoIterator<Item = String>, undescended: impl IntoIterator<Item = String>) {
+        self.unaccounted = unaccounted.into_iter().collect();
+        self.undescended = undescended.into_iter().collect();
+    }
+
     /// Write this set whole as the record. The caller holds the ref lock and read the set under it.
     pub(crate) fn write(&self, _lock: &RefLock) -> Result<(), String> {
         let entries = self.entries.iter()
-            .map(|(hash, entry)| format!("{} {} {}", hash, entry.digest.column(), entry.statement));
+            .map(|(hash, entry)| format!("{} {} {}", hash, entry.digest.column(), entry.statement))
+            .chain(self.unaccounted.iter().map(|hash| format!("{} {}", UNACCOUNTED, hash)))
+            .chain(self.undescended.iter().map(|hash| format!("{} {}", UNDESCENDED, hash)));
         let bytes = record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, entries);
         file_utils::replace_file_atomically(&withheld_path(), &bytes)
     }
@@ -259,7 +303,7 @@ pub fn is_damage(error: &str) -> bool {
 pub(crate) enum Unparsed {
     /// The file as a whole does not read as a record of this kind and version.
     Record(record_utils::RecordError),
-    /// An entry is not a hash, a chunk-list digest and a statement.
+    /// An entry is not a hash, a chunk-list digest and a statement, nor a keyword and a hash.
     Entry(String),
 }
 
@@ -270,7 +314,7 @@ impl Unparsed {
             Unparsed::Record(e) => format!("The record of withheld content {}", e.describe()),
             Unparsed::Entry(entry) => format!(
                 "The record of withheld content holds an entry that is not an object hash, a chunk-list \
-                digest and a statement: \"{}\".",
+                digest and a statement, nor a line a repair records: \"{}\".",
                 entry.escape_debug()
             ),
         }
@@ -288,12 +332,38 @@ pub(crate) fn parse_entry(entry: &str) -> Option<(&str, &str, ChunkDigest)> {
         .then_some((hash, statement, digest))
 }
 
-/// Parse the record's bytes whole.
+/// The keyword and the hash of a line a repair records ([`UNACCOUNTED`], [`UNDESCENDED`]), or
+/// `None` when `line` is not exactly one keyword, a space and an object hash.
+pub(crate) fn parse_repair_line(line: &str) -> Option<(&str, &str)> {
+    let (keyword, hash) = line.split_once(' ')?;
+
+    ([UNACCOUNTED, UNDESCENDED].contains(&keyword) && object_utils::is_object_hash(hash)).then_some((keyword, hash))
+}
+
+/// The first version of the record that wrote a digest.
+const FIRST_DIGESTED_VERSION: u32 = 3;
+
+/// Parse the record's bytes whole. A record of an older version that wrote a digest, with none, was
+/// cut short: it is named as damage, never as that version's.
 pub(crate) fn parse(bytes: &[u8]) -> Result<WithheldSet, Unparsed> {
-    let entries = record_utils::from_bytes(bytes, WITHHELD_RECORD, WITHHELD_VERSION).map_err(Unparsed::Record)?;
+    let digestless = record_utils::without_digest_line(bytes).len() == bytes.len();
+    let entries = record_utils::from_bytes(bytes, WITHHELD_RECORD, WITHHELD_VERSION).map_err(|e| match e {
+        record_utils::RecordError::OtherVersion(found) if digestless
+            && (FIRST_DIGESTED_VERSION..WITHHELD_VERSION).any(|older| found == record_utils::header(WITHHELD_RECORD, older)) =>
+            Unparsed::Record(record_utils::RecordError::Damaged),
+        e => Unparsed::Record(e),
+    })?;
     let mut set = WithheldSet::default();
 
     for entry in entries {
+        if let Some((keyword, hash)) = parse_repair_line(&entry) {
+            match keyword {
+                UNACCOUNTED => set.unaccounted.insert(hash.to_string()),
+                _ => set.undescended.insert(hash.to_string()),
+            };
+            continue;
+        }
+
         match parse_entry(&entry) {
             Some((hash, statement, digest)) => {
                 set.entries.insert(hash.to_string(), WithheldEntry { statement: statement.to_string(), digest });
@@ -397,6 +467,42 @@ pub fn removed_from(applied: &AppliedSet, withheld: &WithheldSet) -> AppliedSet 
     AppliedSet::of(applied.hashes().chain(withheld.entries.keys()).cloned())
 }
 
+/// Each unaccounted hash of `set` still outstanding, sorted: one the store lacks and that neither
+/// `applied` nor `set`'s entries name ([`removed_from`]). Putting its bytes back, an applied
+/// redaction of it, or withholding it each stops it counting, with no command of its own.
+///
+/// # Returns
+/// * `Ok(Vec<&String>)` - The outstanding hashes.
+/// * `Err(String)`      - Whether one is in the store could not be told.
+pub fn outstanding_unaccounted<'a>(set: &'a WithheldSet, applied: &AppliedSet) -> Result<Vec<&'a String>, String> {
+    let removed = removed_from(applied, set);
+    let mut outstanding = Vec::new();
+
+    for hash in &set.unaccounted {
+        if !removed.contains(hash) && !file_utils::is_present_for_sweep(hash)? {
+            outstanding.push(hash);
+        }
+    }
+
+    Ok(outstanding)
+}
+
+/// How many things a repair of the record of withheld content left unaccounted that still are: each
+/// outstanding unaccounted hash ([`outstanding_unaccounted`]), and every undescended tree or parcel,
+/// present again or not, since nothing beneath one has been walked until a repair runs again. A
+/// server does not serve the warehouse while this is above zero.
+///
+/// # Returns
+/// * `Ok(usize)`   - How many.
+/// * `Err(String)` - The record or the applied redactions cannot be read (the record's damage is a
+///                   [`RefusalCode::WithheldDamaged`] refusal), or whether a hash is in the store
+///                   could not be told.
+pub fn unaccounted_count() -> Result<usize, String> {
+    let set = read_withheld()?;
+
+    Ok(outstanding_unaccounted(&set, &applied_redactions::read_applied()?)?.len() + set.undescended.len())
+}
+
 /// What [`withhold`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Withheld {
@@ -427,6 +533,10 @@ pub enum Withheld {
 /// A recipe the store holds has its chunk-list digest recorded with it ([`ChunkDigest`]). An entry
 /// restated keeps the digest it has, even once the recipe is deleted; one without a digest takes
 /// the held recipe's.
+///
+/// A hash a repair recorded as unaccounted is taken off that list in the same write: the operator
+/// has now accounted for it. An undescended tree or parcel is left as it is: nothing beneath it has
+/// been walked.
 ///
 /// [`redaction_deleter::withheld_chunks`]: crate::util::redaction_deleter::withheld_chunks
 ///
@@ -468,7 +578,7 @@ pub fn withhold(hash: &str, statement: &str) -> Result<Withheld, String> {
             };
 
             match held.statement == statement {
-                true if digest == held.digest => return Ok(Withheld::Unchanged),
+                true if digest == held.digest && !set.unaccounted.contains(hash) => return Ok(Withheld::Unchanged),
                 true => (Withheld::Unchanged, digest),
                 false => (Withheld::Restated, digest),
             }
@@ -483,6 +593,7 @@ pub fn withhold(hash: &str, statement: &str) -> Result<Withheld, String> {
     }
 
     set.entries.insert(hash.to_string(), WithheldEntry { statement: statement.to_string(), digest });
+    set.unaccounted.remove(hash);
     set.write(&lock)?;
 
     Ok(outcome)
@@ -582,6 +693,7 @@ mod tests {
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
     // Revert: drop the re-read under the lock → the second withhold loses the first.
     #[test]
@@ -794,5 +906,55 @@ mod tests {
         std::fs::write(&bundle, b"bundle").unwrap();
         assert_eq!(withhold(A, "restated").unwrap(), Withheld::Restated);
         assert!(bundle.exists());
+    }
+
+    // Revert: read a version-3 record that matches its digest as damage → the operator is told the
+    // record was altered when it was only written by an older Forklift; or read one cut short, with
+    // no digest line, as version 3's → the cut is named as an older version's.
+    #[test]
+    fn a_version_3_record_is_named_older_and_one_cut_short_is_named_damaged() {
+        let _scratch = Scratch::new("v3");
+        let v3 = record_utils::to_bytes(WITHHELD_RECORD, 3, [format!("{} - statement", A)]);
+        std::fs::write(withheld_path(), &v3).unwrap();
+        let refused = read_withheld().unwrap_err();
+        assert!(is_damage(&refused));
+        assert!(refused.contains("is in a format this version of Forklift does not know (\"/forklift-withheld 3\")"), "{}", refused);
+
+        for cut in [record_utils::without_digest_line(&v3).to_vec(),
+                    record_utils::without_digest_line(&record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [format!("{} - statement", A)])).to_vec()] {
+            std::fs::write(withheld_path(), &cut).unwrap();
+            let refused = read_withheld().unwrap_err();
+            assert!(is_damage(&refused));
+            assert!(refused.contains("is damaged: it does not match its digest."), "{}", refused);
+        }
+    }
+
+    // Revert: leave the unaccounted line on a withhold → the hash still counts after the operator
+    // accounted for it; or take the undescended lines off too → what the walk never saw beneath is
+    // forgotten; or skip writing either kind → it is lost on the next write.
+    #[test]
+    fn withholding_an_unaccounted_hash_takes_its_line_off_and_keeps_every_undescended_one() {
+        let _scratch = Scratch::new("accounts");
+        let mut set = WithheldSet::default();
+        set.set_unaccounted([A.to_string(), B.to_string()], [C.to_string()]);
+        set.write(&RefLock::acquire().unwrap()).unwrap();
+        let text = String::from_utf8(std::fs::read(withheld_path()).unwrap()).unwrap();
+        assert!(text.starts_with(&format!("/forklift-withheld 4\nunaccounted {}\nunaccounted {}\nundescended {}\n", A, B, C)), "{}", text);
+        assert!(read_withheld().unwrap().is_empty(), "what a repair left unaccounted is not withheld");
+
+        withhold(A, "court order").unwrap();
+        let set = read_withheld().unwrap();
+        assert_eq!(set.statement(A), Some("court order"));
+        assert_eq!(set.unaccounted().collect::<Vec<_>>(), vec![B]);
+        assert_eq!(set.undescended().collect::<Vec<_>>(), vec![C]);
+
+        // Withheld again as it was, the hash is already accounted for: nothing to write.
+        assert_eq!(withhold(A, "court order").unwrap(), Withheld::Unchanged);
+
+        // A line of either kind whose hash is not one is no line a repair wrote.
+        for line in ["unaccounted not-a-hash", "undescended", &format!("unaccounted  {}", B), &format!("unrecorded {}", B)] {
+            std::fs::write(withheld_path(), record_utils::to_bytes(WITHHELD_RECORD, WITHHELD_VERSION, [line])).unwrap();
+            assert!(is_damage(&read_withheld().unwrap_err()), "{:?}", line);
+        }
     }
 }

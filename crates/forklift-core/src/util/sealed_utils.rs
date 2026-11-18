@@ -1068,6 +1068,19 @@ pub struct Walked {
     /// The file contents (blobs and recipes) among `absent`: what a host may have withheld, where
     /// an absent tree or chunk never was.
     pub absent_files: HashSet<String>,
+    /// The trees among `absent`, and each absent hash a record holds as file content that an entry
+    /// also names as a tree: boundaries the walk could not see beneath. Not a subset of `absent`.
+    pub absent_trees: HashSet<String>,
+    /// The absent parcels a loss edge reached: a root this warehouse's own refs set (a user or meta
+    /// pallet head, a bay's parcel, a tombstone's head, the trust anchor's `adopts` pin, or a parcel
+    /// the caller named), or a parent of a present parcel. Judged over every edge that reaches one,
+    /// whatever order the walk met them in. An absent parcel only an unmerged haul's head, a mirror
+    /// root or an enrollment or revocation pin reaches is not among them: that may be history this
+    /// warehouse never held, and nothing here can tell it from history held and lost.
+    pub lost_parcels: HashSet<String>,
+    /// The absent hashes a record held as file content, which `absent` leaves out: one an entry
+    /// names as a tree too is still a boundary the walk could not see beneath.
+    held_absent: HashSet<String>,
 }
 
 impl Walked {
@@ -1079,6 +1092,11 @@ impl Walked {
             if at == At::File && self.absent.contains(hash) && tolerated.held(hash, At::File).is_none() {
                 self.absent_files.insert(hash.to_string());
             }
+            // Met first as a chunk or file of the same bytes, held or not, it is a tree too: a
+            // withholding is of file content, and holds nothing beneath a folder.
+            if at == At::Tree && (self.absent.contains(hash) || self.held_absent.contains(hash)) {
+                self.absent_trees.insert(hash.to_string());
+            }
             return Ok(Met::Again);
         }
 
@@ -1088,15 +1106,20 @@ impl Walked {
 
         match tolerated.held(hash, at) {
             // A boundary too, but never one a remote is leaned on for, so not among `absent`.
-            Some(Held::Redacted | Held::Withheld | Held::Unavailable) => return Ok(Met::Absent),
+            Some(Held::Redacted | Held::Withheld | Held::Unavailable) => {
+                self.held_absent.insert(hash.to_string());
+                return Ok(Met::Absent);
+            }
             Some(Held::Sealed) => {}
             None if unrecorded == Unrecorded::Damage => return Ok(Met::Unrecorded),
             None => {}
         }
 
         self.absent.insert(hash.to_string());
-        if at == At::File {
-            self.absent_files.insert(hash.to_string());
+        match at {
+            At::File => { self.absent_files.insert(hash.to_string()); }
+            At::Tree => { self.absent_trees.insert(hash.to_string()); }
+            At::Chunk => {}
         }
         Ok(Met::Absent)
     }
@@ -1117,6 +1140,8 @@ impl Walked {
 /// Every object a present object or a root references, walked from the roots a sweep keeps and
 /// `parcels` (see Bounding in the module doc comment). An absent parcel a root or a parent names
 /// is referenced but never judged: a haul, mirror or pin may name history this warehouse never had.
+/// It is only classed, among [`Walked::lost_parcels`] when a loss edge reaches it, for a caller
+/// that must know where the walk could not see.
 ///
 /// # Arguments
 /// * `parcels`    - Parcels to root the walk at beyond the ones a sweep keeps.
@@ -1137,15 +1162,28 @@ pub fn walk(parcels: &[String], tolerated: &Tolerated, unrecorded: Unrecorded) -
     let mut heads: Vec<String> = parcels.to_vec();
     heads.extend(sources.heads());
 
+    // The roots whose absence is loss: what this warehouse's own refs set, and what the caller named.
+    let mut loss_roots: HashSet<String> = parcels.iter().cloned().collect();
+    loss_roots.extend(sources.parcels.iter().cloned());
+    loss_roots.extend(sources.meta_heads.iter().cloned());
+    loss_roots.extend(sources.tombstone_heads.iter().cloned());
+    loss_roots.extend(sources.adopted_heads());
+
     let (present_parcels, gaps) = audit_utils::collect_reachable_noting_gaps(&heads, is_present)?;
-    let mut walked = Walked { referenced: gaps.into_iter().collect(), ..Walked::default() };
+    let mut walked = Walked { referenced: gaps.iter().cloned().collect(), ..Walked::default() };
     let damage = |hash: &str, named_by: &str| Ok(Err(WalkDamage { hash: hash.to_string(), named_by: named_by.to_string() }));
 
+    // A gap is loss when any edge reaching it is: computed over every present parcel's parents once
+    // the parcel walk is done, so the order it met the edges in cannot matter.
+    let mut parents: HashSet<String> = HashSet::new();
     let mut trees: Vec<(String, String)> = Vec::new();
     for parcel in &present_parcels {
         walked.referenced.insert(parcel.clone());
-        trees.push((object_utils::load_parcel(parcel)?.tree_hash, parcel.clone()));
+        let loaded = object_utils::load_parcel(parcel)?;
+        parents.extend(loaded.parents);
+        trees.push((loaded.tree_hash, parcel.clone()));
     }
+    walked.lost_parcels = gaps.into_iter().filter(|gap| loss_roots.contains(gap) || parents.contains(gap)).collect();
 
     for (hash, item_type) in &sources.shard_leaves {
         // A tree is met when it is popped.
