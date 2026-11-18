@@ -85,7 +85,18 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 53** (current): the `checkout_scope_damaged` error code exists (exit 67). The scope file
+**Schema 54** (current): the `merge_state_damaged` error code exists (exit 68). A bay's record
+of the consolidation or pick in progress there, its state file or a consolidation's skeleton, is
+not UTF-8, lacks its header, is in an older format, does not match its digest, or holds entries
+that do not parse, or the skeleton is missing beside a consolidation. A record in a format this
+version of Forklift does not know keeps its uncoded refusal. In the bay the command runs in,
+`next_step` is `forklift abort --keep-files` for a state file and `forklift abort` for a
+skeleton; for another bay there is no next step, and the message names the bay and the command
+to run there. `abort --keep-files` emits `data.abandoned` (the merges whose record it removed,
+`consolidation` and/or `pick`) and `data.conflicts` (how many files the inventory still holds in
+conflict).
+
+**Schema 53**: the `checkout_scope_damaged` error code exists (exit 67). The scope file
 of the checkout a command runs in, or of another checkout it reads, is missing where the mode
 requires one, does not match its digest, lacks its header, is in an older format, or is not
 UTF-8. A file in a format this version of Forklift does not know keeps its uncoded refusal. In

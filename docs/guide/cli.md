@@ -1505,8 +1505,9 @@ refused. Requires a clean warehouse. git's `cherry-pick` still runs it, unlisted
 ### `abort` — abandon a consolidation or pick in progress
 
 ```sh
-forklift abort             # abandon the merge or pick that stopped at conflicts
-forklift abort --confirm   # ...even where it would throw away what you changed since
+forklift abort               # abandon the merge or pick that stopped at conflicts
+forklift abort --confirm     # ...even where it would throw away what you changed since
+forklift abort --keep-files  # drop the record of the merge, leave every file as it is
 ```
 
 Abandons the consolidation or pick in progress in this bay, however it was started: a
@@ -1524,8 +1525,13 @@ made out of one of the head's files. Move that file aside first.
 
 `abort` cannot run when the pallet has moved since the merge started (another bay stacked on
 it), when the other side's parcel is no longer readable, or when the record of what is in
-progress is unreadable. Each of those refusals names the file to remove instead, which ends
-the merge and leaves every file as it is.
+progress is damaged (`merge_state_damaged`, exit 68). Each of those refusals names
+`forklift abort --keep-files` instead. It puts nothing back and never reads the record: it
+removes it, leaves every file as it is in the working directory and the inventory, and reports
+how many files are still in conflict. Resolve and load those, and the next `stack` records what
+the files hold as an ordinary parcel, with no second parent. A consolidation whose skeleton (its
+record of the out-of-scope entries it resolved) is damaged is refused naming the plain
+`forklift abort`, which does not read the skeleton.
 
 `undo` right after a consolidate or pick that stopped at conflicts runs the same abort, and
 refuses where it would need `--confirm`.
