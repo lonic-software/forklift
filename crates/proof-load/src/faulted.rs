@@ -2593,7 +2593,7 @@ mod tests {
     ///
     /// Revert: take every indented hash → the store damage listed after the `withhold add` line is
     /// restated as a takedown; drop the root check → a report over another warehouse restates here;
-    /// admit any `--statement` value → a command the report wrote out whole is taken as owed.
+    /// admit any `--statement` value → the line leaving `<reason>` open restates `d` over the root.
     #[test]
     fn only_a_takedown_a_report_asks_restated_is_one() {
         let (a, b, c, d) = ("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
