@@ -1,7 +1,8 @@
 # Performance backlog
 
-A per-command follow-up to [`BENCHMARK.md`](BENCHMARK.md), [`PARALLELIZATION_PLAN.md`](PARALLELIZATION_PLAN.md)
-and [`OBJECT_STORE_SCALING.md`](OBJECT_STORE_SCALING.md). Those documents cover the
+A per-command follow-up to [`PARALLELIZATION_PLAN.md`](PARALLELIZATION_PLAN.md) and
+[`OBJECT_STORE_SCALING.md`](OBJECT_STORE_SCALING.md), with new measurements taken by
+[`proof-load perf`](guide/proof-load.md#11-measuring-performance). Those two documents cover the
 structural, store-wide levers (packing, the commit-graph, parallel fan-out); this one
 is narrower — a 2026-07-15 phase-timing investigation into per-command overhead on
 git.git, and what is left to do about it after the obvious quick wins.
@@ -525,8 +526,8 @@ the cost. The second (per-version blob loads) was not.
 
 What is left: about 45% of the remaining samples rebuild trees through delta chains
 (`resolve_tree_file` → `reconstruct_record`, a chain of a dozen deltas or more). That is the
-next target if the gap matters, and it is not blame-specific. `bin/benchmark` now has a blame
-row, so the gap stays visible.
+next target if the gap matters, and it is not blame-specific. `proof-load perf` has a blame row,
+so the gap stays visible.
 
 **FORK-191.** When the newest parcel's `ensure` fails (a merge whose other parent is missing
 from a partial or damaged store), no parcel above that point can get a graph record. Each
@@ -1048,5 +1049,5 @@ git's roughly **10–11 s** — but this is an extrapolation, not a measurement:
 in this investigation ran a corpus anywhere near that size. Before quoting a
 1M-commit number anywhere (a blog post, a sales conversation, a competitive
 comparison), run it on a real ≥500k-commit corpus (e.g. `torvalds/linux`, per the
-kernel-scale disk-budget note in `BENCHMARK.md`) and replace the projection with a
-measurement.
+disk budget in [`proof-load perf`'s guide](guide/proof-load.md#before-you-quote-a-number)) and
+replace the projection with a measurement.

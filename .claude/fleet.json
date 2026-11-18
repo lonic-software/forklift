@@ -20,7 +20,7 @@
       "bound_seconds": 1800
     },
     {
-      "pattern": "bin/(check|bench\\.sh|benchmark)([[:space:]]|$)",
+      "pattern": "bin/check([[:space:]]|$)",
       "bound_seconds": 3600
     }
   ],

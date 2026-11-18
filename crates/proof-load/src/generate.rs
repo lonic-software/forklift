@@ -51,7 +51,20 @@ impl Shape {
         commits: 40, changed_per_commit: 8, side_commits: 3,
     };
 
-    pub const ALL: [Shape; 1] = [Shape::SMALL];
+    /// A few thousand files in deeper trees, and a history ten times as long.
+    pub const MEDIUM: Shape = Shape {
+        name: "medium", seed: 0x5eed_0002, files: 5_000, width: 6, depth: 4, binaries: 4, binary_bytes: 4 << 20,
+        commits: 400, changed_per_commit: 20, side_commits: 5,
+    };
+
+    /// Tens of thousands of files and a few thousand commits: a large monorepo's scale, which a
+    /// per-PR run does not take.
+    pub const HUGE: Shape = Shape {
+        name: "huge", seed: 0x5eed_0003, files: 50_000, width: 8, depth: 4, binaries: 8, binary_bytes: 8 << 20,
+        commits: 2_000, changed_per_commit: 50, side_commits: 8,
+    };
+
+    pub const ALL: [Shape; 3] = [Shape::SMALL, Shape::MEDIUM, Shape::HUGE];
 
     pub fn named(name: &str) -> Option<Shape> {
         Shape::ALL.into_iter().find(|shape| shape.name == name)
@@ -83,8 +96,8 @@ impl Shape {
     }
 }
 
-/// What a generated history holds that the pairs need: the file blamed, and the text files a
-/// diff's edit set is taken from, in path order.
+/// What a history holds that the pairs need: the file blamed, and the text files a diff's edit set
+/// is taken from, in path order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Generated {
     pub blame_file: String,
@@ -221,6 +234,77 @@ pub fn mirror(git: &Path, shape: &Shape, mirror: &Path, scratch: &Scratch, envir
     Ok(generated)
 }
 
+/// How many first-parent commits back from `HEAD` a real history's most-changed file is looked
+/// for: enough to find the file a project keeps changing, few enough that a long history's log is
+/// read in moments.
+pub const BLAME_WINDOW: usize = 1_000;
+
+/// What the pairs need from the real history mirrored at `mirror`, read at its `HEAD`: its
+/// regular files git takes for text, in path order, and the one of them changed in the most of
+/// the last [`BLAME_WINDOW`] first-parent commits, the first in path order on a tie, or the first
+/// text file when none of them changed. A history with no text file is refused, since every pair
+/// that edits needs one.
+pub fn read_history(git: &Path, mirror: &Path, scratch: &Scratch, environment: &Environment, limit: Duration) -> Result<Generated, RunError> {
+    let read = |arguments: &[&str], no_match_is_empty: bool| -> Result<Vec<u8>, RunError> {
+        let invocation = Invocation { program: git.to_path_buf(), arguments: arguments.iter().map(|argument| argument.to_string()).collect(), directory: mirror.to_path_buf(), limit };
+        let outcome = tool::run(&invocation, scratch, environment).map_err(RunError::Tool)?;
+        if no_match_is_empty && outcome.exit == Some(1) && outcome.stderr.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !outcome.succeeded() {
+            return Err(RunError::BuildFailed {
+                arguments: outcome.arguments, exit: outcome.exit,
+                stderr: String::from_utf8_lossy(&outcome.stderr).into_owned(), stdout: String::from_utf8_lossy(&outcome.stdout).into_owned(),
+            });
+        }
+        Ok(outcome.stdout)
+    };
+    let tree = read(&["ls-tree", "-r", "-z", "HEAD"], false)?;
+    let texts = read(&["grep", "-I", "-l", "-z", "-e", "", "HEAD"], true)?;
+    let window = format!("-n{}", BLAME_WINDOW);
+    let log = read(&["log", "--first-parent", "--format=", "--name-only", "-z", &window, "HEAD"], false)?;
+    let text_files = text_files(&tree, &texts);
+    if text_files.is_empty() {
+        return Err(RunError::Io(format!("{}: the history's HEAD holds no regular file git takes for text, which the pairs that edit need", mirror.display())));
+    }
+    let blame_file = most_changed(&log, &text_files);
+    Ok(Generated { blame_file, text_files })
+}
+
+/// The regular files, by mode, in `ls-tree -r -z` entries `mode type object<TAB>path` that `grep
+/// -l -z` over `HEAD` also named, as `HEAD:path`, in path order. A symbolic link or a submodule is
+/// never one, since an edit through it would change what it points at.
+fn text_files(tree: &[u8], texts: &[u8]) -> Vec<String> {
+    let named: std::collections::BTreeSet<&[u8]> = texts.split(|byte| *byte == 0).filter_map(|entry| entry.strip_prefix(b"HEAD:")).collect();
+    let mut files: Vec<String> = tree.split(|byte| *byte == 0).filter_map(|entry| {
+        let tab = entry.iter().position(|byte| *byte == b'\t')?;
+        let (meta, path) = (&entry[..tab], &entry[tab + 1..]);
+        let regular = meta.starts_with(b"100644 blob ") || meta.starts_with(b"100755 blob ");
+        (regular && named.contains(path)).then(|| String::from_utf8(path.to_vec()).ok()).flatten()
+    }).collect();
+    files.sort();
+    files
+}
+
+/// The one of `text_files` named most often in a `log --name-only -z` listing, the first in path
+/// order on a tie, or the first of them when the listing names none.
+fn most_changed(log: &[u8], text_files: &[String]) -> String {
+    let mut counts: std::collections::BTreeMap<&str, usize> = text_files.iter().map(|file| (file.as_str(), 0)).collect();
+    // -z ends every name with a NUL and leaves a newline in a name as it is, so only a NUL splits.
+    for name in log.split(|byte| *byte == 0) {
+        if let Some(count) = std::str::from_utf8(name).ok().and_then(|name| counts.get_mut(name)) {
+            *count += 1;
+        }
+    }
+    let mut best = text_files[0].as_str();
+    for (file, count) in &counts {
+        if *count > counts[best] {
+            best = file;
+        }
+    }
+    best.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +323,26 @@ mod tests {
         assert_ne!(first, other);
         assert_eq!(generated.text_files.len(), 12);
         assert_eq!(generated.blame_file, "d0/d0/f00000.txt");
+    }
+
+    /// A real history's text files are its regular files git takes for text, in path order, and
+    /// never a symbolic link, a submodule or a binary; the file blamed is the most-changed of
+    /// them, the first in path order on a tie, and the first text file when the log names none.
+    ///
+    /// Revert: take every blob `ls-tree` lists → the link is a text file; take the last of a tie
+    /// → `b.txt` is blamed; split on a newline too → `b.txt` is blamed over the newline name.
+    #[test]
+    fn a_real_historys_text_files_and_blamed_file_are_read_from_git() {
+        let tree = b"100644 blob 1111\ta.txt\x00100755 blob 2222\tb.txt\x00120000 blob 3333\tlink\x00160000 commit 4444\tsub\x00100644 blob 5555\tpic.png\x00100644 blob 6666\tc d.txt\0";
+        let texts = b"HEAD:a.txt\0HEAD:b.txt\0HEAD:link\0HEAD:c d.txt\0";
+        let files = text_files(tree, texts);
+        assert_eq!(files, ["a.txt", "b.txt", "c d.txt"]);
+        assert_eq!(most_changed(b"\0b.txt\0a.txt\0\0b.txt\0a.txt\0gone.txt\0gone.txt\0gone.txt\0", &files), "a.txt");
+        assert_eq!(most_changed(b"\0b.txt\0b.txt\0a.txt\0", &files), "b.txt");
+        assert_eq!(most_changed(b"", &files), "a.txt");
+        // A name holding a newline is one name, never two that could each count.
+        let files = ["a.txt".to_string(), "b.txt".to_string(), "b.txt\na.txt".to_string()];
+        assert_eq!(most_changed(b"b.txt\na.txt\0b.txt\na.txt\0b.txt\0", &files), "b.txt\na.txt");
     }
 
     /// The mirror git builds from the stream holds every file on main, the most-changed file
@@ -267,6 +371,12 @@ mod tests {
         assert_eq!(read(&["rev-list", "--count", "main", "--", &generated.blame_file], &path).trim(), "6");
         assert_eq!(read(&["rev-list", "--count", "main..perf-side"], &path).trim(), "2");
         assert_eq!(read(&["rev-list", "--count", "perf-side..main"], &path).trim(), "2");
+
+        // Read back as a real history is: every text file, the binary left out, and the file
+        // changed in every commit as the one blamed.
+        let read_back = read_history(&git, &path, &scratch, &environment, limit).unwrap();
+        assert_eq!(read_back.text_files, generated.text_files);
+        assert_eq!(read_back.blame_file, generated.blame_file);
 
         let work = scratch.work().join("merge");
         read(&["clone", "-q", "--", &path.display().to_string(), &work.display().to_string()], scratch.work().as_path());

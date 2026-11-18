@@ -687,6 +687,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 - **forklift-server no longer serves `GET /v1/parcels/{parcel}/subtree/{path}`.** No client
   command sent it; a sparse clone fetches its subtrees by hash through `objects/batch`, as before.
+- **The benchmark scripts `bin/bench.sh` and `bin/benchmark`, their CI job and `docs/BENCHMARK.md` are gone.**
+  `proof-load perf` replaces them: it times Forklift against git on a generated history or one you
+  name with `--history-from`, and judges the rows. The
+  [Proof Load guide](docs/guide/proof-load.md#11-measuring-performance) describes it.
 
 ### Fixed
 

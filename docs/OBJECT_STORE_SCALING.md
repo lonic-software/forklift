@@ -1,7 +1,10 @@
 # Object-store scaling — design note
 
 A design note motivated by benchmarking Forklift against git on git.git (81,348
-commits, ~402k objects). See [`BENCHMARK.md`](BENCHMARK.md) to reproduce.
+commits, ~402k objects). The `history` timing can be re-taken on a git.git clone with
+`proof-load perf --history-from` ([the guide](guide/proof-load.md#11-measuring-performance)), as its
+`log` row. perf records no store size, and its Forklift subject is an import, which arrives packed,
+so the on-disk signal and the loose baseline below are measured by hand.
 
 ## The two signals
 
@@ -456,8 +459,8 @@ outright *without* lever G.
 (Note: `gc_utils` still owns *loose*-garbage collection with its grace period; the repack only
 drops garbage that was already **packed**, and leaves loose garbage to `gc_utils`.)
 
-Each step is independently shippable and measurable with `bin/benchmark`
-(re-run and diff the size + `history` rows).
+Each step is independently shippable and measurable on git.git: its timings with
+`proof-load perf --history-from` (the `log` and `pack` rows), its store size by hand.
 
 ### Phase 3 — repack (`compact --all`), shipped
 

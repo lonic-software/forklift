@@ -1,0 +1,72 @@
+# Proof Load performance, the per-PR job: `proof-load perf` on the small shape under the self gate,
+# the checks a shared runner can hold. They compare two timings of one run: Forklift against tuned
+# git for an order-of-magnitude regression on the gross rows, Forklift against itself for the
+# repack and parallel-audit ratios, and any of those rows that could not run. Linux only, because
+# the one-core audit is pinned with taskset. It runs on every push to main, so a regression that
+# lands is caught, and on a pull request that touches what the timed binaries or the harness are
+# built from.
+#
+# The report (perf.md, perf.json) is uploaded as an artifact for reading; the gate is the exit status.
+# It is not part of the `ci passed` gate.
+name: proof load perf
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "crates/forklift-core/**"
+      - "crates/forklift/**"
+      - "crates/forklift-server/**"
+      - "crates/proof-load/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - ".github/workflows/proof-load-perf.yml"
+
+concurrency:
+  group: proof-load-perf-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # As in ci.yml: an empty RUSTFLAGS replaces the macOS split-debuginfo entry of .cargo/config.toml.
+  RUSTFLAGS: ""
+
+jobs:
+  perf:
+    name: proof load perf (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the binaries to time and the harness
+        run: cargo build --release --locked -p forklift -p forklift-server -p proof-load
+
+      # perf reports the one-core audit as not run without taskset, which never fails a run, so
+      # its ratio would go unchecked here without this step.
+      - name: Require taskset for the one-core audit
+        run: command -v taskset
+
+      - name: Time Forklift against git under the self gate
+        run: |
+          target/release/proof-load perf --out "$RUNNER_TEMP/perf-out" \
+            --forklift target/release/forklift --git "$(command -v git)" \
+            --forklift-server target/release/forklift-server \
+            --shape small --reps 3 --gate self
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-load-perf
+          path: |
+            ${{ runner.temp }}/perf-out/perf.md
+            ${{ runner.temp }}/perf-out/perf.json
+          if-no-files-found: warn
