@@ -2277,6 +2277,14 @@ esac
         assert!(shown.markdown().contains("| git | voided: did not move the head: a \\| b | | | | | `pull -q` |\n"), "{}", shown.markdown());
         assert!(shown.failed());
         assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0, "copies left behind");
+
+        // A clone that fails leaves no folder, which voids its cell rather than stopping the run.
+        let empty = scratch.work().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let hosts = [Hosts { level: empty, ahead: work.clone(), past: level.clone() }];
+        let Outcome::Timed { cells } = remote_pair(&subjects, &hosts, Transfer::Clone, 1, None, &server, &copies, &scratch, &environment).unwrap() else { panic!() };
+        assert!(matches!(cells[0].result, Measured::Voided { exit: Some(128), .. }), "{:?}", cells[0].result);
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0, "copies left behind");
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&root);
     }
