@@ -459,10 +459,6 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
                     "withhold".into(), "add".into(), "--root".into(), root.display().to_string(),
                     "--statement".into(), crate::scenario::TAKEN_BECAUSE.into(), hash.clone(),
                 ], scratch.root().to_path_buf())?);
-                // Only a takedown the server took enters the operator's record of them.
-                if let Some(host) = host.as_ref().filter(|_| outcomes.last().is_some_and(|outcome| outcome.succeeded())) {
-                    host.took_down(&hash, crate::scenario::TAKEN_BECAUSE);
-                }
                 // The server deletes its own copy within seconds of a withhold; a fault before
                 // that would grade the window, not the state a host is in from then on. Wait for
                 // the loose object to go, as the census lays it out.
@@ -473,6 +469,10 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
                         return Err(RunError::Io(format!("scenario {}: the host kept its copy of withheld {} past {:?}", scenario.id, hash, limit)));
                     }
                     std::thread::sleep(Duration::from_millis(100));
+                }
+                // The copy gone is the takedown taken: from here it is in the operator's record.
+                if let Some(host) = host.as_ref() {
+                    host.took_down(&hash, crate::scenario::TAKEN_BECAUSE);
                 }
                 let digest = crate::corpus::expected_entry(&path, &bytes, &corpus.modes);
                 taken.push(Taken { path, digest, by: TakenBy::Withheld });
