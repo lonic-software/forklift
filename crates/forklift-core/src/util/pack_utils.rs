@@ -1447,8 +1447,9 @@ fn pair_stamp(index_path: &Path) -> PairStamp {
 /// listing so a pack published during the load moves the folder past the stamp rather than
 /// slipping in under it.
 struct FolderStamp {
-    /// The sorted names of every pack index and pack data file in the folder. Temp files end in
-    /// `.tmp`, so they are not among them.
+    /// The sorted names of every pack index, pack data file and signature table in the folder
+    /// ([`is_pack_file_name`]); [`listing_went_stale`] reads them as what the listing named. Temp
+    /// files end in `.tmp`, so they are not among them.
     names: Vec<OsString>,
     /// The folder's mtime and when it was read. Both were taken before `names` was listed, and a
     /// racy check that lists the folder again and finds the same names replaces both with the
@@ -2167,7 +2168,126 @@ pub fn densify_pending() -> Result<bool, String> {
 ///
 /// The returned set carries a [`FolderStamp`] taken before the listing, and each broken entry a
 /// [`PairStamp`] taken before its load, which is what [`reloaded_if_stale`] compares against.
+///
+/// A file the listing named can be gone by the time it is opened: a compaction in another
+/// process publishes what replaces it, then deletes it. Read as damage, that would refuse a healthy
+/// store: a parcel's signature would read unreadable. So when a broken entry's
+/// listed file is gone (see [`listing_went_stale`]), the listing is stale, and the load starts over
+/// from a new one, which names the replacements, since they were published first. A folder that
+/// keeps changing under [`LISTING_ATTEMPTS`] loads in a row is an error, never a stale verdict.
 fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet, String> {
+    for _ in 0..LISTING_ATTEMPTS {
+        let set = load_listed_packs(pack_folder, check)?;
+        if !listing_went_stale(&set) {
+            return Ok(set);
+        }
+    }
+
+    Err(format!(
+        "The pack folder \"{}\" kept changing while it was read: {} times in a row, a file it listed \
+        was gone before it could be opened. Try again once the other process writing to it (a compact, \
+        most likely) has finished.",
+        pack_folder.to_string_lossy(), LISTING_ATTEMPTS
+    ))
+}
+
+/// How many listings [`load_packs_from_disk`] takes before it gives up on a pack folder that
+/// changes under every one. A compaction publishes the replacements before it deletes, so the
+/// listing after an overlap names them at once, with no pause: a reload runs under the reload
+/// lock, which every other miss on the warehouse waits on. The rest is margin for compactions
+/// back to back.
+const LISTING_ATTEMPTS: usize = 8;
+
+/// Whether a file the listing named for one of `set`'s broken entries is now gone: proof that the
+/// folder changed between the listing and the open, so the entry's failure says nothing about the
+/// store. Asked with `symlink_metadata`, so a dangling link stays what it is, a broken entry, and
+/// never makes a load start over forever. A data file the listing did not name is no evidence:
+/// an index that stands without its data is how a damaged pair looks.
+fn listing_went_stale(set: &PackSet) -> bool {
+    let listed = |path: &Path| path.file_name()
+        .is_some_and(|name| set.stamp.names.binary_search_by(|listed| listed.as_os_str().cmp(name)).is_ok());
+    let gone = |path: &Path| matches!(
+        std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    let vanished = |path: &Path| listed(path) && gone(path);
+    let pair_vanished = |index_path: &Path| {
+        vanished(index_path) || vanished(&index_path.with_extension(FILE_EXTENSION_PACK_DATA))
+    };
+
+    set.unreadable_signature_tables.iter().any(|table| vanished(&table.path))
+        || set.quarantined.iter().any(|pack| pair_vanished(&pack.index_path))
+        || set.unenumerable.iter().any(|pack| pair_vanished(&pack.index_path))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A step [`load_listed_packs`] runs once on this thread, between its listing and its opens:
+    /// where a test puts another process's compaction, which can land between the two.
+    static BETWEEN_LISTING_AND_OPENS: std::cell::RefCell<Option<(Option<IndexCheck>, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `step` once on this thread, in the next pack-set load, after it lists the pack folder and
+/// before it opens anything. Dropping the guard disarms a step that has not run.
+#[cfg(test)]
+#[must_use = "the step is disarmed when the guard drops"]
+pub(crate) fn between_next_listing_and_opens(step: impl FnOnce() + 'static) -> ListingStep {
+    arm_listing_step(None, Box::new(step))
+}
+
+/// [`between_next_listing_and_opens`], for the next load under `only` alone when it is given.
+#[cfg(test)]
+fn arm_listing_step(only: Option<IndexCheck>, step: Box<dyn FnOnce()>) -> ListingStep {
+    BETWEEN_LISTING_AND_OPENS.with(|slot| *slot.borrow_mut() = Some((only, step)));
+    ListingStep(())
+}
+
+/// The guard [`between_next_listing_and_opens`] returns.
+#[cfg(test)]
+pub(crate) struct ListingStep(());
+
+#[cfg(test)]
+impl Drop for ListingStep {
+    fn drop(&mut self) {
+        BETWEEN_LISTING_AND_OPENS.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+/// Stand a compaction in another process between each of this thread's next `times` pack-folder
+/// listings and their opens (only those of loads under `only`, when it is given): each deletes the
+/// signature table the listing just named and publishes the next. Returns how many have run.
+/// Writes the first table into the active pack folder.
+#[cfg(test)]
+pub(crate) fn churn_next_listings(times: u8, only: Option<IndexCheck>) -> std::rc::Rc<std::cell::Cell<u8>> {
+    fn table(seed: u8) -> (PathBuf, Vec<u8>) {
+        let mut parcel = [seed; HASH_LEN];
+        parcel[0] = 0xc5;
+        let entries = vec![(parcel, vec![seed; 64])];
+        let name = format!("{}.{}", signature_table::table_id(&entries), FILE_EXTENSION_SIGNATURE_TABLE);
+        (pack_folder().join(name), signature_table::build(&entries))
+    }
+    fn arm(steps: std::rc::Rc<std::cell::Cell<u8>>, times: u8, only: Option<IndexCheck>) {
+        std::mem::forget(arm_listing_step(only, Box::new(move || {
+            let seed = steps.get() + 1;
+            crate::util::file_utils::remove_file(&table(seed).0).unwrap();
+            let (next, bytes) = table(seed + 1);
+            std::fs::write(next, bytes).unwrap();
+            steps.set(seed);
+            if seed < times {
+                arm(steps, times, only);
+            }
+        })));
+    }
+
+    let (first, bytes) = table(1);
+    std::fs::write(first, bytes).unwrap();
+    let steps = std::rc::Rc::new(std::cell::Cell::new(0));
+    arm(std::rc::Rc::clone(&steps), times, only);
+    steps
+}
+
+/// One listing of the pack folder, and the opens of what it named: [`load_packs_from_disk`]
+/// without the check that the listing stayed current.
+fn load_listed_packs(pack_folder: &Path, check: IndexCheck) -> Result<PackSet, String> {
     PACK_SET_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let mut packs = Vec::new();
@@ -2196,14 +2316,28 @@ fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet
         )),
     };
 
+    // The whole listing first, then the opens, so what "the listing named" means is one moment.
+    let mut paths = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("Error while listing the pack folder: {}", e))?;
-        let path = entry.path();
-
-        if is_pack_file_name(&path) {
+        if is_pack_file_name(&entry.path()) {
             names.push(entry.file_name());
         }
+        paths.push(entry.path());
+    }
 
+    #[cfg(test)]
+    if let Some(step) = BETWEEN_LISTING_AND_OPENS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_ref() {
+            Some((Some(only), _)) if *only != check => None,
+            _ => slot.take().map(|(_, step)| step),
+        }
+    }) {
+        step();
+    }
+
+    for path in paths {
         if path.extension().and_then(|e| e.to_str()) == Some(FILE_EXTENSION_SIGNATURE_TABLE) {
             match open_signature_table(&path, check) {
                 Ok(table) => signature_tables.push(table),
@@ -2350,7 +2484,7 @@ fn folder_modified(pack_folder: &Path) -> Result<Option<SystemTime>, String> {
 
 /// How much of each index a pack load validates up front.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IndexCheck {
+pub(crate) enum IndexCheck {
     /// The header and fanout table only; each bucket is validated when a lookup first reads it.
     /// What the pack registry loads, so a command pays only for the buckets it touches.
     Lazy,
@@ -11774,6 +11908,124 @@ pub(crate) mod tests {
             assert_eq!(sign_utils::load_raw_parcel_signature(&hash).unwrap().as_ref(), Some(&bytes),
                 "racy {}: a table published after caching must be found", racy);
 
+            crate::util::file_utils::remove_dir_all(&temp).ok();
+        }
+    }
+
+    /// FORK-519: a signature table another process's compaction replaced and deleted between a
+    /// reload's listing and its open is not read as damage: the read serves the signature from
+    /// the merged table that replaced it. The reload is the one a read's miss triggers, so no
+    /// later revalidation would have caught it.
+    ///
+    /// Revert: make `listing_went_stale` answer false → the reload records the deleted table as
+    /// unreadable, holds no merged one, and the read refuses → red.
+    #[test]
+    fn a_table_deleted_between_a_reloads_listing_and_its_open_is_not_read_as_damage() {
+        let (temp, _scope) = enter_signature_root("sig-listing-race");
+
+        let hash = fake_parcel("", 1);
+        let bytes = fake_signature(1);
+        assert_eq!(tabled_signature(&hash, false).unwrap(), TabledSignature::Missing,
+            "sanity: no table yet, and the empty pack set is cached");
+
+        let table_path = |entries: &[([u8; HASH_LEN], Vec<u8>)]| pack_folder()
+            .join(format!("{}.{}", signature_table::table_id(entries), FILE_EXTENSION_SIGNATURE_TABLE));
+        let input = vec![(hash_to_bytes(&hash).unwrap(), bytes.clone())];
+        let input_path = table_path(&input);
+        std::fs::write(&input_path, signature_table::build(&input)).unwrap();
+
+        let mut merged = input.clone();
+        merged.push((hash_to_bytes(&fake_parcel("", 2)).unwrap(), fake_signature(2)));
+        merged.sort();
+        let merged_path = table_path(&merged);
+        assert_ne!(merged_path, input_path, "sanity: the merged table has a name of its own");
+
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let compacted = std::rc::Rc::clone(&ran);
+        let (step_input, step_merged) = (input_path.clone(), merged_path.clone());
+        let _step = between_next_listing_and_opens(move || {
+            // The compaction's signature merge: publish the merged table, then delete its input.
+            std::fs::write(&step_merged, signature_table::build(&merged)).unwrap();
+            crate::util::file_utils::remove_file(&step_input).unwrap();
+            compacted.set(true);
+        });
+
+        let read = sign_utils::load_raw_parcel_signature(&hash);
+        assert!(ran.get(), "the compaction ran between the reload's listing and its opens");
+        assert_eq!(read, Ok(Some(bytes)), "a healthy parcel's signature must be served from the merged table");
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-519: a pack folder that changes between every listing and its opens is an error once
+    /// the listings run out, naming the folder, never the last listing's stale verdict, which
+    /// would read a healthy table as unreadable.
+    ///
+    /// Revert: let the last attempt return its set however stale → the load succeeds, recording
+    /// the deleted table as unreadable → red.
+    #[test]
+    fn a_pack_folder_that_changes_under_every_listing_is_an_error_not_a_stale_verdict() {
+        let (temp, _scope) = enter_signature_root("sig-listing-churn");
+        let steps = churn_next_listings(8, None);
+
+        let loaded = load_packs_from_disk(&pack_folder(), IndexCheck::Lazy);
+
+        assert_eq!(steps.get(), 8, "one compaction under each of the eight listings");
+        let error = loaded.err().expect("a folder that never held still must not load");
+        assert!(error.contains("kept changing while it was read: 8 times in a row"), "{}", error);
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-519: a pack file deleted between a reload's listing and its open, with the pack that
+    /// replaced it published first, is not read as damage, whichever of the pair's files went: a
+    /// presence check, which revalidates once, finds the object in the replacement. A lone index is
+    /// still a damaged pair once a listing sees it that way.
+    ///
+    /// Reverts: drop the index arm of `listing_went_stale`'s `pair_vanished` → the index-gone case
+    /// reads the pair unenumerable and the object absent → red; drop the data arm → the data-gone
+    /// case quarantines the pair, holds no replacement, and reads the object absent → red.
+    #[test]
+    fn a_pack_file_deleted_between_a_reloads_listing_and_its_open_is_not_read_as_damage() {
+        #[derive(Debug, Clone, Copy)]
+        enum Gone { Index, Data }
+
+        for gone in [Gone::Index, Gone::Data] {
+            let temp = fresh_root(&format!("pack-listing-race-{:?}", gone));
+            let _scope = StorageRootScope::enter(&temp);
+            std::fs::create_dir_all(pack_folder()).unwrap();
+
+            let content = b"an object whose pack is replaced while a reload lists the folder".to_vec();
+            let hash = blake3::hash(&content).to_hex().to_string();
+            assert!(!is_in_packs(&hash).unwrap(), "sanity: no pack yet, and the empty pack set is cached");
+
+            let (_, artifact) = publish_external_pack(&content);
+
+            let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+            let replaced = std::rc::Rc::clone(&ran);
+            let (step_hash, step_content) = (hash.clone(), content.clone());
+            let (index, data) = (artifact.index_path.clone(), artifact.data_path.clone());
+            let _step = between_next_listing_and_opens(move || {
+                let filler = b"another object, so the replacement pack has a name of its own".to_vec();
+                let mut builder = TransportPackBuilder::new(&pack_folder()).unwrap();
+                builder.append_full(&step_hash, step_content.as_slice()).unwrap();
+                builder.append_full(&blake3::hash(&filler).to_hex().to_string(), filler.as_slice()).unwrap();
+                builder.finish().unwrap();
+                let removed = match gone { Gone::Index => &index, Gone::Data => &data };
+                crate::util::file_utils::remove_file(removed).unwrap();
+                replaced.set(true);
+            });
+
+            let present = crate::util::file_utils::does_object_exist(&hash);
+            assert!(ran.get(), "{:?}: the replacement ran between the reload's listing and its opens", gone);
+            assert_eq!(present, Ok(true), "{:?}: the object the replacement holds must read present", gone);
+
+            if let Gone::Data = gone {
+                assert_eq!(cached_pack_set().quarantined.len(), 1,
+                    "a lone index the second listing saw stays a damaged pair");
+            }
+
+            drop(_step);
             crate::util::file_utils::remove_dir_all(&temp).ok();
         }
     }
