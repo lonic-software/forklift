@@ -868,10 +868,11 @@ fn switching_runs_as_written() {
     run_page("switching.md");
 }
 
-/// A page's `git` sees no configuration but what the page itself set. The test plants one setting
-/// in each place git would otherwise read, so it fails wherever the isolation does, not only on a
-/// machine whose own git is configured: a system file, a global file in the home folder, and
-/// configuration passed in the environment.
+/// A page's `git` sees no configuration but what the page itself set. The test plants a global file
+/// in the home folder and configuration passed in the environment, so those two fail wherever the
+/// isolation does. The system file cannot be planted, since the variable naming one is itself
+/// removed: that arm fails only on a machine that has a system file, such as one with Git for
+/// Windows or Homebrew's git.
 #[test]
 fn git_reads_none_of_the_developers_configuration() {
     let area = std::env::temp_dir().join(format!("forklift-git-config-{}", std::process::id()));
@@ -881,7 +882,6 @@ fn git_reads_none_of_the_developers_configuration() {
 
     let planted = area.join("planted");
     std::fs::create_dir_all(&planted).unwrap();
-    std::fs::write(planted.join("system"), "[planted]\n\tsystem = yes\n").unwrap();
     std::fs::write(planted.join(".gitconfig"), "[planted]\n\tglobal = yes\n").unwrap();
     let list = |reader: &Reader| {
         let mut command = Command::new("git");
@@ -889,7 +889,6 @@ fn git_reads_none_of_the_developers_configuration() {
             .args(["config", "--list"])
             .env("HOME", &planted)
             .env("XDG_CONFIG_HOME", &planted)
-            .env("GIT_CONFIG_SYSTEM", planted.join("system"))
             .env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", "planted.environment")
             .env("GIT_CONFIG_VALUE_0", "yes");
