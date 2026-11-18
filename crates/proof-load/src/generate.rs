@@ -332,7 +332,7 @@ mod tests {
     /// → `b.txt` is blamed.
     #[test]
     fn a_real_historys_text_files_and_blamed_file_are_read_from_git() {
-        let tree = b"100644 blob 1111\ta.txt\0100755 blob 2222\tb.txt\0120000 blob 3333\tlink\0160000 commit 4444\tsub\0100644 blob 5555\tpic.png\0100644 blob 6666\tc d.txt\0";
+        let tree = b"100644 blob 1111\ta.txt\x00100755 blob 2222\tb.txt\x00120000 blob 3333\tlink\x00160000 commit 4444\tsub\x00100644 blob 5555\tpic.png\x00100644 blob 6666\tc d.txt\0";
         let texts = b"HEAD:a.txt\0HEAD:b.txt\0HEAD:link\0HEAD:c d.txt\0";
         let files = text_files(tree, texts);
         assert_eq!(files, ["a.txt", "b.txt", "c d.txt"]);

@@ -2467,7 +2467,7 @@ mod tests {
             }
         }
         assert_eq!(referrers, Vec::<String>::new(), "these lines name a file perf replaced; name proof-load perf or its guide instead");
-        let missing: Vec<_> = KEPT.iter().zip(found).filter(|(_, count)| *count != 1).map(|(kept, count)| (kept, count)).collect();
+        let missing: Vec<_> = KEPT.iter().zip(found).filter(|(_, count)| *count != 1).collect();
         assert_eq!(missing, [], "each kept line is found exactly once");
     }
 
