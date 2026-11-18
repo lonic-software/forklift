@@ -648,7 +648,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   absolute paths, such as a pack index that does not parse or a damaged ref. A `500` now carries a
   fixed message and no code, and the cause goes to the server's log. A bundle that would have to
   carry a chunked file or an object over the ceiling is refused with a `422` and its code, not a
-  `500`, so a client no longer retries it. A warehouse whose locks could not be taken is refused
+  `500`: a batch fetch stops on it rather than retrying, and a subtree fetch falls back to
+  fetching object by object, as it does for a subtree over the cap. A warehouse whose locks could not be taken is refused
   with a `503` that no longer names the lock file or the process holding it.
 - **A damaged record of a merge in progress is refused with a command that ends it.** A garbled,
   cut or digest-mismatched consolidation or pick state file was refused in prose that said to
