@@ -31,19 +31,23 @@ fn written_fetch_scope(area: &TestArea) -> Vec<u8> {
     std::fs::read(area.path(FETCH_SCOPE)).unwrap()
 }
 
-/// Every way the fetch-scope file is lost or damaged (deleted, emptied, zeroed, made invalid UTF-8)
-/// makes `load` refuse naming `heal`, and `heal` rebuilds it from the main tree's scope, exactly as
-/// the clone wrote it, after which `load` works.
+/// Every way the fetch-scope file is lost or damaged (deleted, emptied, zeroed, made invalid UTF-8,
+/// or a byte flipped that leaves a scope no checkout's lies within) makes `load` refuse naming
+/// `heal`, and `heal` rebuilds it from the main tree's scope, exactly as the clone wrote it, after
+/// which `load` works.
 ///
 /// Revert: keep `REMEDY_REFRANCHISE` on read_fetch_state, or drop `scope_heal::repair` from heal →
-/// the refusal names no heal, or heal exits 0 with the file still damaged → red.
+/// the refusal names no heal, or heal exits 0 with the file still damaged → red; read a record
+/// whose digest does not match as if it did → the flipped scope reads, and heal refuses
+/// `fetch_scope_damaged` with both ways out instead of rebuilding → red.
 #[test]
 fn heal_rebuilds_a_lost_or_damaged_fetch_scope_from_the_checkouts() {
     let area = TestArea::new("fetch-scope-heal-rebuild");
     let _server = sparse_with_docs(&area);
     let original = written_fetch_scope(&area);
 
-    let damages: [Damage; 4] = [
+    let damages: [Damage; 5] = [
+        ("a byte flipped", &|area| flip_a_scope_byte(area, FETCH_SCOPE)),
         ("deleted", &|area| forklift_core::util::file_utils::remove_file(area.path(FETCH_SCOPE)).unwrap()),
         ("emptied", &|area| std::fs::write(area.path(FETCH_SCOPE), b"").unwrap()),
         ("zeroed", &|area| std::fs::write(area.path(FETCH_SCOPE), vec![0u8; original.len()]).unwrap()),
@@ -167,8 +171,8 @@ fn heal_with_no_readable_checkout_offers_a_fetch_scope_that_works() {
     assert_eq!(json_of(&healed)["data"]["fetch_scope_rebuilt"]["scope"], serde_json::json!(["docs", "src"]));
 }
 
-/// A fetch scope that parses but does not hold a checkout's scope (a flipped byte kept it valid)
-/// is refused with both ways out; choosing the fetch scope as the damaged one fetches and sets it.
+/// A fetch scope that matches its digest but does not hold a checkout's scope (one of the two was
+/// written over whole, by hand or from elsewhere) is refused with both ways out; choosing the fetch scope as the damaged one fetches and sets it.
 ///
 /// Revert: skip the check of the checkouts against a readable fetch scope → heal exits 0 → red.
 #[test]

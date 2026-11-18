@@ -9244,6 +9244,29 @@ fn sparse_with_docs(area: &TestArea) -> Server {
     server
 }
 
+/// Flip one byte of the scope record at `path`, leaving its digest line as it was, so that only
+/// the digest tells the damage apart: the body, digested again, is still a scope naming a path.
+/// "docs" and "src/api" become the one prefix "docs/src/api", a narrowing that stays within a
+/// fetch scope naming "docs"; a record without "docs" has "src/api" become "src/apj".
+fn flip_a_scope_byte(area: &TestArea, path: &str) {
+    use forklift_core::util::record_utils;
+
+    let mut bytes = std::fs::read(area.path(path)).unwrap();
+    let (from, at) = match bytes.windows(12).position(|window| window == b"docs\nsrc/api") {
+        Some(index) => (b'\n', index + 4),
+        None => (b'i', bytes.windows(7).position(|window| window == b"src/api").expect("a scope naming src/api") + 6),
+    };
+    assert_eq!(bytes[at], from);
+    bytes[at] = if from == b'\n' { b'/' } else { b'j' };
+
+    let body = record_utils::without_digest_line(&bytes).to_vec();
+    assert_ne!(body.len(), bytes.len(), "the stale digest line is kept");
+    let prefixes = record_utils::from_bytes(&record_utils::with_digest(body), "scope", 5).expect("the flipped body is a scope");
+    assert!(!prefixes.is_empty() && !prefixes.iter().any(|prefix| prefix.as_str() == "src/api"), "{:?}", prefixes);
+
+    std::fs::write(area.path(path), bytes).unwrap();
+}
+
 /// FORK-458: heal's rebuild of a damaged inventory record in a sparse clone keeps to its fetch
 /// scope, as the shard builder does: a subtree outside it was never fetched, so it names no folder
 /// and holds nothing back. Revert: walk out-of-scope subtrees too → the unfetched tree reads as
