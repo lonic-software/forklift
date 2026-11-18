@@ -1523,8 +1523,8 @@ fn restatements(tool: Tool, report: &str, root: &Path) -> Vec<Restate> {
 
 /// What an operator command's report, `written` as extracted, names next, each recorded as
 /// unextractable in the order the report names it: a server command writes no failure document,
-/// so nothing in its report is run. It is the operator's own follow-up, kept so the trail says
-/// what the remedy left owed.
+/// so nothing here runs what its report names. It is the operator's own follow-up, kept so the
+/// trail says what the remedy left owed; [`operate`] takes off the takedowns it restated.
 fn follow_ups(tool: Tool, written: &str, outcome: &Outcome) -> Vec<String> {
     [&outcome.stdout, &outcome.stderr].into_iter()
         .flat_map(|text| String::from_utf8_lossy(text).lines().map(str::to_string).collect::<Vec<_>>())
@@ -2570,8 +2570,8 @@ mod tests {
         assert_eq!(unextractable, ["forklift-server tombstone repair --root <warehouse>"]);
     }
 
-    /// An operator command's report is never run from: whatever it names next, runnable or not, is
-    /// kept as unextractable, labelled with the remedy that named it.
+    /// What an operator command's report names next, runnable or not, is kept as unextractable,
+    /// labelled with the remedy that named it; nothing here runs it.
     ///
     /// Revert: run what it names → the runnable `forklift heal` leaves the list; drop the
     /// unextractable ones → the `withhold add` the operator owes is lost from the trail.
