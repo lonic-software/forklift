@@ -276,9 +276,10 @@ pub fn write_consolidation_state(state: &ConsolidationState) -> Result<(), Strin
 
 /// Write a merge record at `path` and its copy at `copy`, both atomically and the copy first: a copy
 /// write that fails fails the whole write before the record is touched. A record write that fails
-/// takes the copy it would have matched away again, so a copy never holds bytes a record write did
-/// not commit; only a stop between the two writes leaves one ahead of its record, which the next
-/// heal over a usable record writes back over.
+/// takes the copy away again, so a failed write leaves no copy ahead of its record (a write whose
+/// rename landed before a later step failed leaves its record without a copy until heal re-syncs
+/// one); only a stop between the two writes leaves one ahead, which the next heal over a usable
+/// record writes back over.
 pub(crate) fn write_record_and_copy(path: &Path, copy: &Path, bytes: &[u8]) -> Result<(), String> {
     file_utils::write_file_atomically(copy, bytes)
         .map_err(|e| format!("Error while recording the copy \"{}\": {}", copy.to_string_lossy(), e))?;

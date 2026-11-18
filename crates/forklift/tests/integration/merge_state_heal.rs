@@ -197,6 +197,28 @@ fn heal_writes_a_damaged_merge_record_back_from_its_copy() {
     assert_eq!(std::fs::read(area.state("consolidation")).unwrap(), original, "the folder is replaced by the record");
 }
 
+/// A heal stopped at any rename while it writes a record back leaves that record present, damaged
+/// or restored, never absent: an absent state reads as no merge at all.
+///
+/// Revert: remove the damaged record before its write back → a stop at the write's rename leaves
+/// no record, red.
+#[test]
+fn a_heal_stopped_while_writing_a_record_back_never_leaves_it_absent() {
+    use forklift_core::util::file_utils::CRASH_POINT_EXIT_CODE;
+
+    for at in 1..200 {
+        let area = Area::conflicted(&format!("restore-stopped-{}", at));
+        flip(&area.state("consolidation"));
+        let stopped = area.command(&["heal"]).env("FORKLIFT_DEBUG_CRASH_AT_RENAME", at.to_string()).output().unwrap();
+        let _ = forklift_core::util::file_utils::remove_file(area.state("lock"));
+        assert!(area.state("consolidation").exists(), "a heal stopped at rename {} left no consolidation state", at);
+        if stopped.status.code() != Some(CRASH_POINT_EXIT_CODE) {
+            return;
+        }
+    }
+    panic!("heal never ran past every rename");
+}
+
 /// T2. A reader of a damaged record names `forklift heal` exactly when heal can restore it: with a
 /// usable copy beside it. With the copy damaged too, it names the record's way out, which then
 /// runs: heal refuses with it only after its other repairs, so a damaged inventory, which that way

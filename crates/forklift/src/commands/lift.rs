@@ -346,13 +346,6 @@ async fn try_auto_merge(client: &RemoteClient,
                         head: &str,
                         remote_head: &str,
                         progress: &Progress) -> Result<bool, String> {
-    // A merge in progress here would be written over by this one, so a lift there makes none and
-    // falls through to the diverged error before fetching anything for it: the lower that error
-    // names says what to finish first.
-    if shift::merge_in_progress()? {
-        return Ok(false);
-    }
-
     // Their work must be local before we can compare ancestry or merge it. Path-pruned in a
     // sparse workspace (a full fetch scope makes this the whole closure, as before), so an
     // optimistic auto-merge stays as sparse as the workspace it runs in. A cache fetches only
@@ -365,6 +358,13 @@ async fn try_auto_merge(client: &RemoteClient,
         && !merge_utils::is_ancestor(head, remote_head)?;          // they do not already contain us
 
     if !diverged {
+        return Ok(false);
+    }
+
+    // A merge in progress here would be written over by this one, so a lift there makes none and
+    // falls through to the diverged error: the lower that error names says what to finish first.
+    // Read only once the remote diverged, so a lift that merges nothing never reads those records.
+    if shift::merge_in_progress()? {
         return Ok(false);
     }
 

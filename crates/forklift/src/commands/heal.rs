@@ -247,6 +247,10 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let mut merge_repair = merge_state_heal::repair(agreement.as_ref(), &mut ref_notes)
         .map_err(|error| records_said(error, &ref_notes, early_position.as_ref(), early_scope.as_ref()))?;
     let early_restored = merge_repair.restored.clone();
+    // A refusal heal ends with once every repair has run: a note until then, so a refusal that
+    // ends the run earlier still names it.
+    let mut merge_note = merge_repair.refusal.clone().map(String::from);
+    ref_notes.extend(merge_note.clone());
     let with_merge = |mut error: String| {
         for sentence in early_restored.iter().flat_map(MergeStateRestored::sentences) {
             error = forklift_core::error::append_to_message(error, &sentence);
@@ -456,9 +460,15 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     if merge_repair.deferred {
         match operation_utils::read() {
             Ok(None) => {
-                let later = merge_state_heal::repair(agreement.as_ref(), &mut ref_notes)
+                // Judged against the position that recovery left, which it may have moved.
+                let settled = merge_state_heal::agreement_in(&forklift_core::globals::bay_root());
+                let later = merge_state_heal::repair(settled.as_ref(), &mut ref_notes)
                     .map_err(|error| with_rebuilt(changed_after(String::from(error), &refs_rebuilt, &refs_removed, &ref_notes), &inventory_rebuilt))?;
                 merge_repair = merge_repair.then(later);
+                if merge_note.is_none() {
+                    merge_note = merge_repair.refusal.clone().map(String::from);
+                    ref_notes.extend(merge_note.clone());
+                }
             }
             _ => ref_notes.push(
                 "A damaged record of the merge in progress in this bay waits for the interrupted operation there to be \
@@ -503,8 +513,6 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // A damaged merge record no copy could restore is refused last, once every repair has run: its
     // way out reads what they mend. While another refusal leads, it stays a note.
     let merge_refusal = merge_repair.refusal;
-    let merge_note = merge_refusal.clone().map(String::from);
-    notes.extend(merge_note.clone());
     if let Some(kind) = waits {
         notes.push(format!(
             "The interrupted {} in this bay waits for its pallet's ref; heal finishes or undoes it once that ref is set.",

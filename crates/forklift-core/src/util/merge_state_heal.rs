@@ -359,9 +359,12 @@ pub fn repair(agreement: Option<&Agreement>, notes: &mut Vec<String>) -> Result<
             Marker::None | Marker::Other => Ok(agreement),
         };
         if let Some(bytes) = restorable_copy(&dir, record, copy_agreement, digest.as_deref()) {
-            // Whatever stands there goes first: a folder in the record's place would refuse the
-            // rename that writes it, and every heal would meet it again.
-            merge_utils::remove_record(&path)?;
+            // A folder in the record's place would refuse the rename that writes it, and every heal
+            // would meet it again, so it goes first. A file is left for the rename to replace: were
+            // it removed and the write then failed, the next heal would read no merge at all.
+            if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+                merge_utils::remove_record(&path)?;
+            }
             file_utils::write_file_atomically(&path, &bytes)
                 .map_err(|e| format!("Error while restoring the {} \"{}\": {}", record.what(), path.to_string_lossy(), e))?;
             if record == MergeRecord::State {

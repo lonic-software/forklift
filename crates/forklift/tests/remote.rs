@@ -2000,10 +2000,13 @@ fn a_lift_over_a_merge_in_progress_stops_diverged_and_leaves_it() {
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
 
+    // A lift that merges nothing never reads the merge records, so a damaged one does not stop it.
     area.write_file("a/from_a.txt", "a\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "-m", "a's file"]));
+    area.write_file("a/.forklift/cherry-pick", "/forklift-garbled\n");
     assert_success(&area.forklift("a", &["lift"]));
+    forklift_core::util::file_utils::remove_file(area.path("a/.forklift/cherry-pick")).unwrap();
 
     // B diverges with its own parcel, and has a local merge in progress, resolved to its side and
     // loaded, so its tree is clean.
