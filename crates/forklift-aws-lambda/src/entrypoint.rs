@@ -998,13 +998,13 @@ const COMMIT_NOT_READY_RETRY_AFTER_SECONDS: &str = "1";
 ///
 /// A raw `500`'s message is the one the client never sees as written. `Head`'s internal errors wrap
 /// raw storage failures (an SDK `DisplayErrorContext` can carry a request id, a bucket or table
-/// name), and this router sits behind the hosted service's public edge. `forklift-server`
-/// forwards its `500` messages verbatim, and that is fine there — a self-host head only ever
-/// runs on the operator's own infrastructure — but this head must not hand a stranger's bucket
-/// name to whoever happens to be asking. The detail is logged instead (Lambda ships stderr to
-/// CloudWatch) and the client gets a generic message. Every other status is the protocol's own
-/// diagnostic (a bad hash, a stale ref, a malformed body) and stays as-is — it is meant to be
-/// read. A classified refusal (§7.4) is decoded regardless of status — see [`error_body`].
+/// name), and this router sits behind the hosted service's public edge, which must not hand a
+/// stranger's bucket name to whoever happens to be asking. (`forklift-server` hides every `500`'s
+/// message, a classified refusal's too: they may name the server's directories.) The detail is
+/// logged instead (Lambda ships stderr to CloudWatch) and the client gets a generic message.
+/// Every other status is the protocol's own diagnostic (a bad hash, a stale ref, a malformed
+/// body) and stays as-is — it is meant to be read. A classified refusal (§7.4) is decoded
+/// regardless of status — see [`error_body`].
 fn error_response(error: HeadError) -> Response<Vec<u8>> {
     // The head's [`Status`] numeric values *are* the protocol's HTTP status codes, so this is
     // the single point its taxonomy meets `http`.
@@ -1127,8 +1127,9 @@ mod tests {
     }
 
     /// A classified refusal (§7.4) is decoded onto the wire regardless of status — its human message
-    /// is a controlled taxonomy diagnostic, safe to expose even at `500`, so both heads carry the
-    /// code consistently. The raw frame never leaks.
+    /// is a controlled taxonomy diagnostic, safe to expose even at `500` here. (`forklift-server`
+    /// hides every `500`, refusals included, and answers a requester's refusal at its own
+    /// status.) The raw frame never leaks.
     #[test]
     fn error_body_threads_a_refusal_code_at_any_status() {
         for status in [StatusCode::UNPROCESSABLE_ENTITY, StatusCode::INTERNAL_SERVER_ERROR] {

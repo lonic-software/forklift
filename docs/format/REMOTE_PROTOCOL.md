@@ -18,7 +18,8 @@ prefix: `/v1/…`. Errors use conventional status codes with a JSON body
 fields to that body: `code` — the stable refusal code string — and `next_step` — its
 machine-actionable recovery step. When a server-side operation fails with a classified refusal,
 the head sets them so a client classifies it with the same code and exit code as a local refusal;
-`error` is the human message. Both are **additive**: an older head omits them, and a client that
+`error` is the human message. A `500` is the exception: forklift-server sets neither on one (see
+*A fault of the server's own* below). Both are **additive**: an older head omits them, and a client that
 does not understand them ignores them (a plain error simply has no `code`). Example:
 `{"error":"…","code":"out_of_scope","next_step":"…"}`.
 
@@ -96,6 +97,14 @@ of the server's directory:
 
 The serverless head reads none of these records, and its `503`s are described with the endpoints
 that send them.
+
+**A fault of the server's own:** a `500` from forklift-server carries a fixed `error`, and no
+`code` or `next_step`, whatever failed: its cause may name the server's directories, and a
+refusal's next step there is the operator's, so it is logged and not sent. A refusal meant for
+the requester comes at its own status instead: a batch or subtree bundle that would have to
+carry an object over the ceiling is a `422` with its code. The serverless head hides a `500`'s
+message the same way, except that it passes on a classified refusal's `code` and text (all but
+`object_unreadable`, which it hides at any status).
 
 **Refused for now, on either head:** a `429`, and a `503` that carries `Retry-After`, are
 refusals sent before the request changed anything, so the identical request may be sent again

@@ -657,6 +657,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   makes, refuse while a consolidation or pick is in progress in the bay, and a `lift` there makes
   no merge of its own and stops as diverged; `haul consolidate` over a conflicted consolidation
   whose files were resolved used to write a second merge's record over the first one's.
+- **A server's `500` no longer names its files.** A request that failed on a fault of
+  `forklift-server`'s own answered with the failure's own message, which could carry the server's
+  absolute paths, such as a pack index that does not parse or a damaged ref. A `500` now carries a
+  fixed message and no code, and the cause goes to the server's log. A batch fetch that would have
+  to carry an object over the ceiling is refused with a `422` and its code, not a `500`, so the
+  client stops on it rather than retrying. A warehouse whose locks could not be taken is refused
+  with a `503` that no longer names the lock file or the process holding it.
 - **A damaged record of a merge in progress is refused with a command that ends it.** A garbled,
   cut or digest-mismatched consolidation or pick state file was refused in prose that said to
   remove the file by hand. Every reader now refuses it with `merge_state_damaged` (exit 68,
