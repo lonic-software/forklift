@@ -428,13 +428,18 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
                 outcomes.push(run_in(server, vec!["prepare".into(), "--root".into(), root.display().to_string()], scratch.root().to_path_buf())?);
                 // Taken out first, so a new host that fails to start leaves no old one behind to
                 // log a second time.
+                // The operator's record of takedowns is its own, kept across a restart of the host.
+                let mut takedowns = Vec::new();
                 if let Some(old) = host.take() {
+                    takedowns = old.takedowns();
                     stopped.extend(finish(old, observer, scratch)?);
                 }
-                *host = Some(match observer {
+                let started = match observer {
                     Some(observer) => observer.host(server, &root, scratch, environment, limit),
                     None => Host::start(server, &root, scratch, environment, limit),
-                }.map_err(RunError::Tool)?);
+                }.map_err(RunError::Tool)?;
+                takedowns.iter().for_each(|(hash, statement)| started.took_down(hash, statement));
+                *host = Some(started);
             }
             Op::Bundle => {
                 let server = server.filter(|_| host.is_some())
@@ -443,7 +448,7 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
                 outcomes.push(run_in(server, vec!["bundle".into(), "--root".into(), root.display().to_string()], scratch.root().to_path_buf())?);
             }
             Op::Withhold { index } => {
-                let server = server.filter(|_| host.is_some())
+                let (server, hosted) = server.zip(host.as_ref())
                     .ok_or_else(|| RunError::Io(format!("scenario {} withholds before it hosts a warehouse", scenario.id)))?;
                 let (path, bytes) = crate::scenario::taken(corpus, *index)
                     .ok_or_else(|| RunError::Io(format!("scenario {}: record {} holds nothing no later record holds", scenario.id, index)))?;
@@ -465,6 +470,8 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
+                // The copy gone is the takedown taken: from here it is in the operator's record.
+                hosted.took_down(&hash, crate::scenario::TAKEN_BECAUSE);
                 let digest = crate::corpus::expected_entry(&path, &bytes, &corpus.modes);
                 taken.push(Taken { path, digest, by: TakenBy::Withheld });
             }
