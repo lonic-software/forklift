@@ -2191,7 +2191,7 @@ mod tests {
                         assert!(message.contains("Run \"forklift abort --keep-files\" in bay \"elsewhere\""), "{} with {}: {}", name, what, message);
                     }
                 }
-                std::fs::remove_file(dir.join(name)).unwrap();
+                file_utils::remove_file(dir.join(name)).unwrap();
             }
         }
 
@@ -2203,7 +2203,7 @@ mod tests {
             ("an unknown entry type", Some(record_utils::to_bytes(SKELETON_RECORD, SKELETON_VERSION, [format!("S 99 {} src/a", hash)]))),
         ];
         for (what, bytes) in skeletons {
-            let _ = std::fs::remove_file(OutOfScopeSkeleton::path());
+            let _ = file_utils::remove_file(OutOfScopeSkeleton::path());
             if let Some(bytes) = bytes {
                 std::fs::write(OutOfScopeSkeleton::path(), bytes).unwrap();
             }
@@ -2226,7 +2226,7 @@ mod tests {
             }.unwrap_or_else(|| panic!("a newer {} must be refused", name));
             assert!(error.contains("Use the Forklift that wrote it."), "{}", error);
             assert!(refusal_of(error).is_none(), "a newer {} must not read as damage", name);
-            std::fs::remove_file(root.join(name)).unwrap();
+            file_utils::remove_file(root.join(name)).unwrap();
         }
 
         file_utils::remove_dir_all(&temp).ok();
