@@ -98,7 +98,10 @@ began) the ways out the message names leave out `forklift lower`. A server's 503
 carries `next_step` `forklift heal` on the same rule. The office pallet's ref missing beside a trust
 file refuses as `ref_damaged` (exit 53) where a command needs the verified office (stack, deliver,
 lift, audit, enroll and regenesis among them), with `next_step` `forklift lower` where a remote is
-configured, and none otherwise. Before, it was an uncoded "office pallet is unborn" message, and
+configured, and none otherwise (a remote that holds no office names none). On a served root, an
+unborn office pallet beside the trust file is the window before the enrolling client lifts it, and
+stays uncoded. `signature_damaged` joins the damage codes a server answers as a 503 naming its
+operator. Before, it was an uncoded "office pallet is unborn" message, and
 enroll said trust was already established.
 
 **Schema 57**: `heal` emits `data.trust_restored` when it wrote the trust file from its

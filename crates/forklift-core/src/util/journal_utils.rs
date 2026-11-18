@@ -698,11 +698,14 @@ pub(crate) fn trust_preconditions_saying(refused: &str, head: &str, closing: &st
     let untrusted = |e: String| format!("{} {} {}", refused, e, closing);
 
     // A trust file heal can restore is refused as that, not as an office that fails its anchor.
+    // Any other refusal, coded or not, says what was refused and what was left as it was.
     let office_state = audit_utils::verify_office_chain(&anchor, &office_head).map_err(|e| {
-        match audit_utils::office_chain_refusal(e, closing) {
-            refused if crate::error::frames_in(&refused).next().is_some() => refused,
-            refused => untrusted(refused),
-        }
+        let anchored = !matches!(e, audit_utils::OfficeChainError::Unreadable(_))
+            && crate::error::frames_in(e.message()).next().is_none();
+        let why = String::from(e);
+        anchored.then(|| office_utils::unverified_trust_refusal(&format!("{} {}", refused, why), closing))
+            .flatten()
+            .unwrap_or_else(|| untrusted(why))
     })?;
     audit_utils::verify_pallet_history(head, &anchor, &office_state, &[]).map_err(|e| untrusted(e.into()))?;
 

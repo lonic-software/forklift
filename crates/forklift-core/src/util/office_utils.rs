@@ -2198,12 +2198,12 @@ fn heal_restores_trust() -> bool {
 
 /// The refusal of the trust file's anchor, which parses but does not verify the office head,
 /// `refused` saying why: [`RefusalCode::TrustDamaged`] naming `forklift heal` when heal writes the
-/// trust file back from a copy that does verify it. Otherwise `refused` as it stands, since an
-/// office chain damaged or tampered with fails the same check, and nothing here tells which of the
-/// two changed. `closing` says what the refused command left as it was.
-pub(crate) fn unverified_trust_refusal(refused: String, closing: &str) -> String {
+/// trust file back from a copy that does verify it. Otherwise `None`, and the caller's own refusal
+/// stands, since an office chain damaged or tampered with fails the same check, and nothing here
+/// tells which of the two changed. `closing` says what the refused command left as it was.
+pub(crate) fn unverified_trust_refusal(refused: &str, closing: &str) -> Option<String> {
     match heal_restores_trust() {
-        true => CoreError::refusal(
+        true => Some(CoreError::refusal(
             RefusalCode::TrustDamaged,
             format!(
                 "The warehouse's trust file (\"{}\") does not verify the office pallet, but its copy does: {} \
@@ -2212,8 +2212,8 @@ pub(crate) fn unverified_trust_refusal(refused: String, closing: &str) -> String
                 refused.trim_end(), closing
             ),
             "forklift heal",
-        ).into(),
-        false => refused,
+        ).into()),
+        false => None,
     }
 }
 
@@ -2222,11 +2222,16 @@ pub(crate) fn unverified_trust_refusal(refused: String, closing: &str) -> String
 /// with the ways out of a lost anchor that hold on this root, a served one's or a client's.
 pub(crate) fn trust_remedy() -> (String, &'static str) {
     if heal_restores_trust() {
-        return ("forklift heal".to_string(), "The copy beside it verifies the office pallet, so the trust file can be restored from it.");
+        return ("forklift heal".to_string(), "The copy beside it holds an anchor heal can restore the trust file from.");
     }
-    let served = crate::util::tombstone_utils::served_state()
-        .is_ok_and(|state| state != crate::util::tombstone_utils::ServedState::Never);
-    (String::new(), lost_anchor_ways_out(served))
+    (String::new(), lost_anchor_ways_out(served_or_unknown()))
+}
+
+/// Whether this root is served, or its first serve began, or its served state cannot be read: a
+/// refusal that cannot tell names none of the ways out a served root refuses.
+fn served_or_unknown() -> bool {
+    crate::util::tombstone_utils::served_state()
+        .map_or(true, |state| state != crate::util::tombstone_utils::ServedState::Never)
 }
 
 /// What stands of the trust file or its copy, `file`, parsed as `anchor`, that no anchor can be
@@ -2286,7 +2291,7 @@ const SERVED_LOST_ANCHOR_WAYS_OUT: &str = "Restore the trust file or its copy fr
 fn unborn_office_note() -> String {
     format!(
         "The office pallet is unborn beside a trust file, so nothing signed here can be checked until it stands. {}",
-        unborn_office_remedy().1
+        unborn_office_remedy(crate::util::remote_utils::RemoteClient::is_configured()).1
     )
 }
 
@@ -2295,7 +2300,21 @@ fn unborn_office_note() -> String {
 /// does not say why the office is missing, since a lost ref and an enrollment or a first lower
 /// stopped between its writes look alike. `closing` says what the refused command left as it was.
 pub fn office_unborn_refusal(closing: &str) -> String {
-    let (next_step, ways_out) = match unborn_office_remedy() {
+    office_unborn_refusal_over(closing, crate::util::remote_utils::RemoteClient::is_configured())
+}
+
+/// [`office_unborn_refusal`], `lowerable` saying whether a remote stands that a lower can take
+/// the office pallet from. A served root's office is unborn while its first enrollment has lifted
+/// the anchor and not yet the office, so there it is refused uncoded, with no hand fix.
+pub fn office_unborn_refusal_over(closing: &str, lowerable: bool) -> String {
+    if served_or_unknown() {
+        return format!(
+            "The trust file holds this warehouse's anchor, but the office pallet is unborn, so nothing signed here \
+            can be checked. {} On a served warehouse the office pallet stands once the enrolling client lifts it.",
+            closing
+        );
+    }
+    let (next_step, ways_out) = match unborn_office_remedy(lowerable) {
         // The step names lower on a line of its own; the message says only what it does.
         (step, _) if !step.is_empty() =>
             (step, "Lowering takes the office pallet from the remote, and verifies it against the trust file.".to_string()),
@@ -2315,10 +2334,10 @@ pub fn office_unborn_refusal(closing: &str) -> String {
 }
 
 /// The next step and the ways out of a client's unborn office beside a trust file: `forklift
-/// lower` takes the office from a configured remote, verified against the trust file; without
-/// one, the office ref is restored or written by hand.
-fn unborn_office_remedy() -> (String, String) {
-    match crate::util::remote_utils::RemoteClient::is_configured() {
+/// lower` takes the office from a remote that holds it (`lowerable`), verified against the trust
+/// file; without one, the office ref is restored or written by hand.
+fn unborn_office_remedy(lowerable: bool) -> (String, String) {
+    match lowerable {
         true => (
             "forklift lower".to_string(),
             "\"forklift lower\" takes the office pallet from the remote, and verifies it against the trust file.".to_string(),
@@ -3693,7 +3712,8 @@ pub(crate) mod tests {
     /// restore, so the refusal names no next step; the ways out it names leave out lower once the
     /// root is served, where lower is refused.
     // Reverts: drop the @office read, or the copy read, in `read_trust_anchor_in` → the witnessed
-    // row reads `None`; `trust_remedy` passes `false` for served → the served pass names lower.
+    // row reads `None`; `trust_remedy` passes `false` for served → the served pass names lower;
+    // `served_or_unknown` reads an unreadable state as a client's → the unreadable pass names lower.
     #[test]
     fn a_missing_trust_file_with_a_witness_refuses_and_without_one_reads_as_none() {
         // (name, office born, copy stands, checked refuses, adopt refuses)
@@ -3722,10 +3742,14 @@ pub(crate) mod tests {
                 }
             }
             if checked_refuses {
-                // The mark alone: serving reads the trust, which refuses here.
+                // The mark alone, first with no list beside it, which reads as damage, then with
+                // one: serving reads the trust, which refuses here.
                 let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
-                crate::util::tombstone_utils::write_tombstones(&lock, &Default::default()).unwrap();
                 crate::util::tombstone_utils::write_mark(&lock).unwrap();
+                assert!(crate::util::tombstone_utils::served_state().is_err(), "{}", name);
+                let e = read_trust_anchor_in(TrustReadMode::Checked).expect_err(name);
+                assert!(!e.contains("forklift lower"), "{}: an unreadable served state never names lower: {}", name, e);
+                crate::util::tombstone_utils::write_tombstones(&lock, &Default::default()).unwrap();
                 drop(lock);
                 assert!(crate::util::tombstone_utils::is_served().unwrap());
                 let e = read_trust_anchor_in(TrustReadMode::Checked).expect_err(name);
@@ -3736,6 +3760,31 @@ pub(crate) mod tests {
             drop(_scope);
             file_utils::remove_dir_all(&dir).ok();
         }
+    }
+
+    /// An unborn office beside the trust file is a lost ref on a client, named `ref_damaged` with
+    /// its hand fix; on a served root it is the window before the enrolling client lifts the
+    /// office, refused uncoded with no fix to make.
+    // Revert: drop the served check in `office_unborn_refusal_over` → the served row is coded → red.
+    #[test]
+    fn an_unborn_office_is_ref_damaged_on_a_client_and_not_on_a_served_root() {
+        let dir = trust_read_root("unborn-office", Some(TRUST_FILE), false, false);
+        let _scope = crate::globals::StorageRootScope::enter(&dir);
+
+        let client = office_unborn_refusal_over("Nothing was changed.", false);
+        assert!(crate::error::frames_code(&client, RefusalCode::RefDamaged), "{}", client);
+        assert!(client.contains("by hand"), "{}", client);
+
+        let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
+        crate::util::tombstone_utils::write_tombstones(&lock, &Default::default()).unwrap();
+        crate::util::tombstone_utils::write_mark(&lock).unwrap();
+        drop(lock);
+        let served = office_unborn_refusal_over("Nothing was changed.", true);
+        assert!(crate::error::frames_in(&served).next().is_none(), "{}", served);
+        assert!(served.contains("Nothing was changed.") && !served.contains("by hand") && !served.contains("forklift lower"), "{}", served);
+
+        drop(_scope);
+        file_utils::remove_dir_all(&dir).ok();
     }
 
     /// A trust file that does not parse, or a folder or a dangling link in its place, is damage,

@@ -7825,7 +7825,7 @@ fn damaged_trust_refuses_with_its_code_and_names_heal_where_heal_mends() {
         ("trust lost beside its copy", Box::new(move |w| lose(w, "trust")),
             &["stack", "-m", "r"], 69, "trust_damaged", "forklift heal", "is missing, but its copy stands beside it"),
         ("trust lost beside its copy", Box::new(move |w| lose(w, "trust")),
-            &["audit", "--full"], 69, "trust_damaged", "forklift heal", "can be restored from it"),
+            &["audit", "--full"], 69, "trust_damaged", "forklift heal", "heal can restore the trust file from"),
         ("trust garbled beside its copy", Box::new(|w| std::fs::write(w.root.join(".forklift/trust"), b"garbage\xff").unwrap()),
             &["stack", "-m", "r"], 69, "trust_damaged", "forklift heal", "is damaged, and its anchor cannot be read"),
         ("trust and copy lost", Box::new(move |w| { lose(w, "trust"); lose(w, "trust-copy"); }),
@@ -7892,6 +7892,35 @@ fn an_anchor_and_copy_that_both_fail_the_office_keep_the_chains_refusal() {
 
     assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
     assert_ne!(json(&refused)["error"]["code"], "trust_damaged", "{}", stdout(&refused));
+}
+
+/// A coded refusal met on the office walk, restoring a deleted pallet, still says which pallet's
+/// restore was refused and that nothing was undone.
+// Revert: pass a coded office refusal through `trust_preconditions_saying` as it stands → the
+// refusal names neither the pallet nor what was left → red.
+#[test]
+fn undoing_a_delete_over_a_damaged_office_signature_names_what_was_refused() {
+    let (warehouse, _) = enrolled_warehouse("undo-delete-office-sig");
+    assert_success(&warehouse.run(&["pallet", "create", "side"]));
+    warehouse.write_file("code.txt", "side\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "on side"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_success(&warehouse.run(&["pallet", "delete", "side", "--force"]));
+    let office = std::fs::read_to_string(warehouse.root.join(".forklift/meta/office")).unwrap();
+    let office = office.trim();
+    let sidecar = warehouse.root.join(".forklift/objects").join(&office[0..2]).join(format!("{}.sig", &office[2..]));
+    assert!(sidecar.exists(), "the office head is signed in a sidecar: {}", sidecar.display());
+    std::fs::write(&sidecar, b"xx").unwrap();
+
+    let refused = warehouse.run(&["--json", "undo"]);
+
+    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
+    let value = json(&refused);
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("deleted pallet \"side\""), "{}", value);
+    assert!(message.contains("Nothing was undone."), "{}", value);
+    assert!(!warehouse.root.join(".forklift/pallets/side").exists(), "{}", value);
 }
 
 // Revert: drop deliver's target-coverage check → the delivery lands and other.txt is back to v1.

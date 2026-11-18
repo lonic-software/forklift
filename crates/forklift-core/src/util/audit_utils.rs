@@ -1049,7 +1049,10 @@ pub fn office_chain_refusal(refused: OfficeChainError, closing: &str) -> String 
     match refused {
         OfficeChainError::Unreadable(why) => why,
         refused if crate::error::frames_in(refused.message()).next().is_some() => String::from(refused),
-        refused => office_utils::unverified_trust_refusal(String::from(refused), closing),
+        refused => {
+            let refused = String::from(refused);
+            office_utils::unverified_trust_refusal(&refused, closing).unwrap_or(refused)
+        }
     }
 }
 

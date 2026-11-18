@@ -51,11 +51,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   server's `503` included; a trust file that parses but no longer verifies the office pallet while
   its copy does is refused that way too, rather than with the office's uncoded message. On a served
   warehouse the ways out no longer name `forklift lower`, which it refuses. A lost office pallet ref
-  beside a trust file refuses as `ref_damaged` (exit 53), naming `forklift lower` where a remote is
-  configured; `office enroll` no longer calls such a warehouse already enrolled. A parcel's stored
+  beside a trust file refuses as `ref_damaged` (exit 53), naming `forklift lower` where a remote
+  holds the office; `office enroll` no longer calls such a warehouse already enrolled. A parcel's stored
   signature that cannot be read refuses as the new `signature_damaged` (exit 70), and a parcel
   stacked after trust was established with no signature as `signature_missing` (exit 71), where
-  both were uncoded (`--json` schema 58).
+  both were uncoded (`--json` schema 58); a server answers damage to a signature in its own office
+  pallet as a `503` `signature_damaged` for its operator.
 - **A served warehouse's trust changes only through its server.** In a served folder,
   `office regenesis`, `office enroll` and a `lower` that would move the office pallet now refuse,
   leaving the trust file and the office pallet as they were; run them in a clone of the warehouse

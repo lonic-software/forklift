@@ -1905,7 +1905,7 @@ fn operator_remedy(code: forklift_core::error::RefusalCode, own: &str) -> String
         RefusalCode::SealedDamaged | RefusalCode::UnavailableDamaged | RefusalCode::BayPositionDamaged => own.to_string(),
         // The trust file's own next step names no path.
         RefusalCode::TrustDamaged => own.to_string(),
-        RefusalCode::FetchScopeStray | RefusalCode::OriginDamaged => String::new(),
+        RefusalCode::FetchScopeStray | RefusalCode::OriginDamaged | RefusalCode::SignatureDamaged => String::new(),
         _ => unreachable!("not a damage code"),
     }
 }
@@ -1934,6 +1934,8 @@ fn damage_message(code: forklift_core::error::RefusalCode) -> String {
             "The warehouse's record of what its head withholds is missing or does not read, so what may be served cannot be told, and the request was refused.".to_string(),
         RefusalCode::TrustDamaged =>
             "The warehouse's trust file, or the copy beside it, is lost or does not read, so what it trusts cannot be told, and the request was refused.".to_string(),
+        RefusalCode::SignatureDamaged =>
+            "A signature the warehouse holds does not read, so what signed its parcel cannot be told, and the request was refused. Its operator restores the warehouse's objects from a backup.".to_string(),
         _ => unreachable!("not a damage code"),
     }
 }
@@ -3710,8 +3712,12 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     office first.".to_string()
                 ))?;
 
+                // The office chain is the server's own: damage met on it is the operator's to repair.
                 let office_state = audit_utils::verify_office_chain_memoized(&anchor, &office_head)
-                    .map_err(|error| unprocessable(error.into()))?;
+                    .map_err(|error| match String::from(error) {
+                        damaged if forklift_core::error::frames_in(&damaged).any(|(code, _, _)| DAMAGE_CODES.iter().any(|damage| damage.as_str() == code)) => damage_refusal(damaged),
+                        refused => unprocessable(refused),
+                    })?;
 
                 // Incremental: everything reachable from old_head was verified when
                 // old_head was committed, so only the new slice is audited.

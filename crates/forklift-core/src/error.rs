@@ -517,6 +517,7 @@ pub const SERVED_DAMAGE: &[RefusalCode] = &[
     RefusalCode::OriginDamaged,
     RefusalCode::BayPositionDamaged,
     RefusalCode::TrustDamaged,
+    RefusalCode::SignatureDamaged,
 ];
 
 impl RefusalCode {

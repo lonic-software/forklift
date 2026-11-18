@@ -718,6 +718,9 @@ A parcel's stored signature cannot be read or does not parse, so what signed the
 told. The message names the parcel. Nothing was changed. A signature is never stored twice with
 different bytes, so fetching the parcel again does not replace it: restore the warehouse's objects
 (`.forklift/objects`) from a backup, or clone the warehouse again from a remote that holds the parcel.
+A signature naming a format version newer than this Forklift reads is refused the same way, since
+damage can make it read as any version; if a newer Forklift wrote it, upgrading reads it. Told it by
+a remote, the damage is in the server's store: ask its operator.
 
 ### `signature_missing` (exit 71)
 

@@ -422,6 +422,9 @@ revocation by more than about a day.
   every request that reads its trust 503 with `trust_damaged` and no `Retry-After`. Where the copy
   still verifies the office pallet, the response's `next_step` is `forklift heal`, run in the root,
   which writes the trust file back from it. Otherwise restore the file from a backup.
+- **Damaged signature:** a lift whose check meets a signature in the root's own office pallet that
+  does not read answers 503 with `signature_damaged` and no `Retry-After`; the log names the parcel,
+  the response does not. Restore the root's objects from a backup.
 - **First serve and trust:** the first serve of a root refuses as `trust_damaged`, writing no served
   mark, when its trust file stands beside a born office pallet but does not verify it, or its copy
   differs from it: a client's trust change there stopped part way, or a file was damaged. It refuses
