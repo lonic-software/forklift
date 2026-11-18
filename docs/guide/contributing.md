@@ -219,7 +219,14 @@ Notes:
   `.cargo/`. It fails on the checks a shared runner can
   hold: a gross regression against tuned git, a broken ratio of Forklift's own, or one of those rows
   that could not run ([the guide](proof-load.md#the-verdict) has each). It is outside `ci passed`.
-  `perf.md` and `perf.json` are uploaded.
+  `perf.md` and `perf.json` are uploaded. The same workflow's weekly job (also started by
+  `workflow_dispatch`) runs the small and medium shapes under `--gate all`, warm and cold, with
+  `bin/perf-drop-caches` dropping the caches through `sudo -n`. It keeps every run's reports on the
+  orphan branch `proof-load-perf`, one commit per run and one folder per shape, before its verdict
+  fails the job, and sets each run beside that shape's last kept report with `--against`. It is the
+  one job there with `contents: write`, and a run on a branch other than `main` keeps nothing. A
+  clearly slower row it fails on needs a ticket in `crates/proof-load/perf-tickets.json`, as
+  [the guide](proof-load.md#the-verdict) says.
 - The `proof load desktop` checks (`.github/workflows/proof-load-desktop.yml`, one per OS) build,
   test and Clippy `tools/proof-load-desktop`, Proof Load's egui window. It is a Cargo workspace of
   its own with its own `Cargo.lock`, so egui is in neither the root lock nor any other job's build;

@@ -278,7 +278,12 @@ on error, so for now they report grades without failing a pull request.
   forklift-server, on every push to `main` and on a pull request that touches the code the timed
   binaries or the harness are built from (the forklift, forklift-core, forklift-server and
   proof-load crates, the workspace's `Cargo.toml` and `Cargo.lock`, `.cargo/`). A verdict that fails anything fails the job, and `perf.md` and
-  `perf.json` are uploaded.
+  `perf.json` are uploaded. Weekly, and when started by hand, it runs the small and medium shapes
+  under `--gate all`, warm and cold, with `bin/perf-drop-caches` as the `--drop-caches` program. Each
+  shape's `perf.json` and `perf.md` are kept on the `proof-load-perf` branch, at
+  `<shape>/<UTC time>-<commit>.json`, whatever the run came to, and each run is set beside that
+  shape's last kept report with `--against`. A run started by hand on another branch than `main`
+  keeps nothing. A verdict that fails anything fails the job, after the reports are kept.
 - **`proof load desktop`** builds, tests and runs Clippy on the desktop window on each OS. It runs no
   faults, and a failing step fails it.
 
@@ -336,14 +341,18 @@ target/release/proof-load perf --out ../perf-out \
   10 minutes. Without it,
   every cold row is reported as not run, with the reason "no cache-drop program given
   (--drop-caches)". Dropping the caches usually needs root, so the program is yours to provide: on
-  Linux, one that runs `sync` and writes `3` to `/proc/sys/vm/drop_caches`; on macOS, one that runs
-  `purge`. On Windows the harness has no cold runs, and every cold row reads "cold runs are not built
+  Linux, one that runs `sync` and writes `3` to `/proc/sys/vm/drop_caches`, as
+  `bin/perf-drop-caches` does through `sudo -n` (so it fails, rather than waits, where sudo would
+  ask for a password); on macOS, one that runs `purge`. On Windows the harness has no cold runs, and every cold row reads "cold runs are not built
   on Windows in this harness".
 - `--forklift-server` names the forklift-server binary, by path, that serves Forklift's remotes
   for the clone, push and pull rows. Without it, those rows are reported as not run, with the reason
   "no forklift-server given (--forklift-server)". On Windows they are never run, and read "remote
   rows are not built on Windows in this harness, which stops a forklift-server gracefully only on
   unix".
+- `--against` names an earlier run's `perf.json`, by path, to set this run beside. See *Against an
+  earlier run* below. It never fails the run. A path that names no readable file stops the run
+  before anything is timed.
 
 The history is written as a `git fast-import` stream into a bare repository. Each subject is built
 from that repository the way `--history-from` builds one: git's subjects by copying it, Forklift's
@@ -491,7 +500,7 @@ built only on Linux, with `taskset` on the `PATH`; elsewhere the last row is rep
 Each of these compares two timings taken on the same machine in the same run, so a shared, noisy
 CI runner can hold them. `--gate self` stops there. CI runs it on the small shape in `proof-load-perf.yml`, on every push
 to `main` and on a pull request that touches the code the timed binaries or the harness are built
-from. `--gate all` also fails on any other row that could not run, and on a row that is **clearly slower** with
+from. The same workflow runs `--gate all` weekly (see section 9). `--gate all` also fails on any other row that could not run, and on a row that is **clearly slower** with
 no ticket tracking it. Clearly slower means Forklift's median is more than 1.25 times tuned git's,
 and its fastest run is slower than tuned git's slowest. The verdict lists every clearly slower row
 under either gate, with its ticket when one tracks it. A row not run, for any reason above, never
@@ -505,6 +514,20 @@ that never fails the run. A change that makes a row clearly slower on purpose ad
 the change that closes the ticket removes it. A test holds every entry to a row this build times
 and a shape it has, and to one entry per row. Since an entry names a generated shape, no entry can
 track a row of a real history, so `--history-from` is judged under `self` and refuses `--gate all`.
+
+### Against an earlier run
+
+With `--against`, `perf.md` has a section after the verdict, and `perf.json` a field, that set each
+row beside the same row of the earlier run, by its operation and cache. For each row, it gives
+Forklift's median as a percentage of tuned git's, rounded, in the earlier run and in this one. A
+ratio is compared rather than a time, because the two runs may have run on two machines; the
+section names the earlier run's forklift and hardware. A row where either run did not time both
+Forklift and tuned git, or that only one run has, is listed as not compared, with why.
+
+The earlier report is not compared at all when this build does not read its format, or when it
+timed another history (another shape, or the same shape with other numbers) or ran on another
+platform. The section then says why. However far a ratio moved, the comparison never fails the
+run: the verdict alone does.
 
 ### Before you quote a number
 

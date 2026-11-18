@@ -26,7 +26,7 @@ use crate::scrub::{Environment, Output, Scratch};
 use crate::tool::{self, Invocation, ToolError};
 
 /// The perf document's format. A reader refuses any other number rather than guess at it.
-pub const PERF_FORMAT: u32 = 4;
+pub const PERF_FORMAT: u32 = 5;
 
 /// How long one timed or untimed command of the loop may run.
 const COMMAND_LIMIT: Duration = Duration::from_secs(10 * 60);
@@ -83,6 +83,8 @@ pub struct PerfReport {
     pub header: Header,
     pub rows: Vec<Row>,
     pub verdict: Verdict,
+    /// This run beside the earlier one `--against` named; none when none was named.
+    pub against: Option<Drift>,
 }
 
 /// What a perf run ran on: everything the graded report's header records, plus the hardware.
@@ -313,6 +315,91 @@ pub struct Ticket {
     pub ticket: String,
 }
 
+/// This run beside an earlier one, the perf.json `--against` names: each row's Forklift median
+/// as a share of tuned git's, then and now. It never fails the run, since the two runs may have
+/// run on two machines.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Drift {
+    /// The earlier perf.json, by the path given.
+    pub path: String,
+    pub outcome: DriftOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DriftOutcome {
+    /// The earlier run timed the same history on the same platform: what it ran, and every row
+    /// of either run.
+    Compared { tools: BTreeMap<String, String>, hardware: Hardware, rows: Vec<RowDrift> },
+    /// The earlier report is not one this build reads, or it timed another history or ran on
+    /// another platform, so none of its ratios is compared: why.
+    NotCompared { reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowDrift {
+    pub operation: String,
+    pub cache: Cache,
+    pub change: Change,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Change {
+    /// Forklift's median as a percentage of tuned git's, rounded, in the earlier run and in this
+    /// one.
+    Compared { earlier_percent: u64, percent: u64 },
+    /// One run or both has no such ratio for the row: why.
+    NotCompared { reason: String },
+}
+
+/// Forklift's median as a percentage of tuned git's, where both were timed and tuned git's is
+/// above zero.
+fn percent_of_tuned(row: &Row) -> Option<u64> {
+    let Outcome::Timed { cells } = &row.outcome else { return None };
+    let (forklift, tuned) = forklift_and_tuned(cells)?;
+    (tuned.median > 0).then(|| (u128::from(forklift.median) * 100 + u128::from(tuned.median) / 2) / u128::from(tuned.median)).map(|percent| u64::try_from(percent).unwrap_or(u64::MAX))
+}
+
+/// `rows`, timed under `header`, beside the earlier report: each row of either run by its
+/// operation and cache, this run's first and then the rows only the earlier run has. A report of
+/// another shape, another shape detail (the history spelled out) or another platform is not
+/// compared at all.
+pub fn drift(rows: &[Row], header: &Header, earlier: &PerfReport) -> DriftOutcome {
+    let then = &earlier.header;
+    if (then.shape.as_str(), then.shape_detail.as_str()) != (header.shape.as_str(), header.shape_detail.as_str()) {
+        return DriftOutcome::NotCompared { reason: format!("it timed {}: {}, and this run {}: {}", then.shape, then.shape_detail, header.shape, header.shape_detail) };
+    }
+    if then.platform != header.platform {
+        return DriftOutcome::NotCompared { reason: format!("it ran on {}, and this run on {}", then.platform.label(), header.platform.label()) };
+    }
+    let key = |row: &Row| (row.operation.clone(), row.cache);
+    let mut changes = Vec::new();
+    for row in rows {
+        let change = match earlier.rows.iter().find(|candidate| key(candidate) == key(row)) {
+            None => Change::NotCompared { reason: "the earlier run has no such row".to_string() },
+            Some(before) => match (percent_of_tuned(before), percent_of_tuned(row)) {
+                (Some(earlier_percent), Some(percent)) => Change::Compared { earlier_percent, percent },
+                (before, now) => {
+                    let lacking = match (before, now) {
+                        (None, None) => "either run",
+                        (None, Some(_)) => "the earlier run",
+                        _ => "this run",
+                    };
+                    Change::NotCompared { reason: format!("Forklift and tuned git were not both timed in {}", lacking) }
+                }
+            },
+        };
+        changes.push(RowDrift { operation: row.operation.clone(), cache: row.cache, change });
+    }
+    for before in earlier.rows.iter().filter(|before| !rows.iter().any(|row| key(row) == key(before))) {
+        changes.push(RowDrift { operation: before.operation.clone(), cache: before.cache, change: Change::NotCompared { reason: "this run has no such row".to_string() } });
+    }
+    DriftOutcome::Compared { tools: then.tools.clone(), hardware: then.hardware.clone(), rows: changes }
+}
+
 /// The tickets this build was shipped with, crates/proof-load/perf-tickets.json.
 pub fn tickets() -> Result<Vec<Ticket>, String> {
     serde_json::from_str(include_str!("../perf-tickets.json")).map_err(|error| format!("perf-tickets.json: {}", error))
@@ -421,7 +508,8 @@ impl PerfReport {
         serde_json::to_string_pretty(self).unwrap_or_else(|error| format!("{{\"error\":\"{}\"}}", error))
     }
 
-    /// Whether the verdict failed the run under its gate.
+    /// Whether the verdict failed the run under its gate. What the run came to against an
+    /// earlier one never fails it.
     pub fn failed(&self) -> bool {
         !self.verdict.failures.is_empty()
     }
@@ -472,6 +560,23 @@ impl PerfReport {
         }
         for ticket in &verdict.closable {
             let _ = writeln!(out, "- possibly closable: {} names {}, {}, which this run timed and did not find clearly slower", ticket.ticket, ticket.operation, ticket.cache.label());
+        }
+        if let Some(against) = &self.against {
+            let _ = writeln!(out, "\n## Against an earlier run\n\n- earlier run: `{}`", against.path);
+            match &against.outcome {
+                DriftOutcome::NotCompared { reason } => { let _ = writeln!(out, "- not compared: {}", reason); }
+                DriftOutcome::Compared { tools, hardware, rows } => {
+                    let forklift = tools.get("forklift").map_or("not recorded", String::as_str);
+                    let _ = writeln!(out, "- its forklift: {}\n- its hardware: {}, {} logical cores", forklift, hardware.cpu, hardware.logical_cores);
+                    out.push_str("- each row: Forklift's median as a percentage of tuned git's, in the earlier run and in this one. The two runs may have run on two machines, so this never fails the run.\n");
+                    for row in rows {
+                        match &row.change {
+                            Change::Compared { earlier_percent, percent } => { let _ = writeln!(out, "- {}, {}: {}% then, {}% now", row.operation, row.cache.label(), earlier_percent, percent); }
+                            Change::NotCompared { reason } => { let _ = writeln!(out, "- {}, {}: not compared: {}", row.operation, row.cache.label(), reason); }
+                        }
+                    }
+                }
+            }
         }
         out.push_str("\n## Rows\n");
         for row in &self.rows {
@@ -563,6 +668,8 @@ pub struct PerfOptions {
     pub drop_caches: Option<PathBuf>,
     /// The forklift-server that serves Forklift's remotes; without it the remote rows are not run.
     pub forklift_server: Option<PathBuf>,
+    /// An earlier perf.json to set this run's rows beside; it never fails the run.
+    pub against: Option<PathBuf>,
 }
 
 /// One subject a pair runs on: its tool, the binary, the arguments every one of its command lines
@@ -627,6 +734,12 @@ pub fn run(options: &PerfOptions, progress: &dyn Fn(&str)) -> Result<PerfReport,
     let drop_caches = options.drop_caches.as_deref().map(|program| absolute("--drop-caches", program)).transpose()?;
     let cold = cold_when(cfg!(windows), drop_caches);
     let forklift_server = options.forklift_server.as_deref().map(|program| absolute("--forklift-server", program)).transpose()?;
+    // Read before anything is timed, so a path that names nothing stops the run at once; a report
+    // that is read but not comparable is said so in the report instead.
+    let against = options.against.as_deref().map(|path| {
+        let text = std::fs::read_to_string(path).map_err(|error| format!("--against {}: {}", path.display(), error))?;
+        Ok::<_, String>((path.display().to_string(), PerfReport::from_json(&text)))
+    }).transpose()?;
     let remote = remote_when(cfg!(windows), forklift_server);
     let mut output = Output::claim(&options.out).map_err(|error| error.to_string())?;
     let scratch = output.scratch("perf").map_err(|error| error.to_string())?;
@@ -661,7 +774,8 @@ pub fn run(options: &PerfOptions, progress: &dyn Fn(&str)) -> Result<PerfReport,
         platform, os: crate::run::operating_system(), filesystem: crate::run::filesystem_of(output.root()),
         configurations, hardware: hardware(), drop_caches: cold.as_ref().ok().map(|drop| drop.program.display().to_string()),
     };
-    let report = PerfReport { format: PERF_FORMAT, header, rows, verdict };
+    let against = against.map(|(path, earlier)| Drift { path, outcome: earlier.map_or_else(|reason| DriftOutcome::NotCompared { reason }, |earlier| drift(&rows, &header, &earlier)) });
+    let report = PerfReport { format: PERF_FORMAT, header, rows, verdict, against };
     for (name, text) in [("perf.md", report.markdown()), ("perf.json", report.json())] {
         std::fs::write(output.root().join(name), text).map_err(|error| format!("cannot write {}: {}", name, error))?;
     }
@@ -2365,7 +2479,7 @@ mod tests {
             Row { operation: "log".into(), cache: Cache::Cold, note: "n".into(), outcome: Outcome::NotRun { reason: "r".into() } },
         ];
         let verdict = judge(&rows, "small", Platform::Linux, Gate::All, &[]);
-        PerfReport { format: PERF_FORMAT, header, rows, verdict }
+        PerfReport { format: PERF_FORMAT, header, rows, verdict, against: None }
     }
 
     /// A warm row timed on Forklift and tuned git, each at its own median, fastest and slowest.
@@ -2491,7 +2605,7 @@ mod tests {
     fn perf_options_name_one_history() {
         let options = |shape: Option<&str>, history: Option<&str>, side: Option<&str>| PerfOptions {
             out: PathBuf::from("out"), forklift: PathBuf::from("f"), git: PathBuf::from("g"), shape: shape.map(str::to_string),
-            history_from: history.map(PathBuf::from), side_branch: side.map(str::to_string), reps: 1, gate: None, drop_caches: None, forklift_server: None,
+            history_from: history.map(PathBuf::from), side_branch: side.map(str::to_string), reps: 1, gate: None, drop_caches: None, forklift_server: None, against: None,
         };
         assert_eq!(source(&options(None, None, None)), Ok(Source::Generated(Shape::SMALL)));
         assert_eq!(source(&options(Some("huge"), None, None)), Ok(Source::Generated(Shape::HUGE)));
@@ -2562,13 +2676,118 @@ mod tests {
 
         let mut value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
         value["format"] = serde_json::json!(1);
-        assert_eq!(PerfReport::from_json(&value.to_string()).unwrap_err(), "perf report format 1 is not one this build reads (it reads 4)");
+        assert_eq!(PerfReport::from_json(&value.to_string()).unwrap_err(), "perf report format 1 is not one this build reads (it reads 5)");
         value.as_object_mut().unwrap().remove("format");
         assert_eq!(PerfReport::from_json(&value.to_string()).unwrap_err(), "not a perf report: it names no format");
 
         let mut value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
         value["rows"][0]["outcome"]["cells"][0]["result"]["guessed"] = serde_json::json!(true);
-        assert!(PerfReport::from_json(&value.to_string()).unwrap_err().starts_with("not a perf report of format 4: "));
+        assert!(PerfReport::from_json(&value.to_string()).unwrap_err().starts_with("not a perf report of format 5: "));
+    }
+
+    /// Against an earlier run of the same history and platform, each row of either run is set
+    /// beside the other by its operation and cache: as Forklift's median in percent of tuned git's,
+    /// rounded half up, where both runs timed both, and otherwise with why not. A report of
+    /// another history or platform is not compared at all. The comparison reads back from
+    /// perf.json, shows in perf.md, and never fails the run, however far a ratio moved.
+    #[test]
+    fn a_run_is_set_beside_an_earlier_one_and_never_failed_by_it() {
+        let earlier = PerfReport { rows: vec![
+            paired("status", [3_000, 2_900, 3_100], [1_000, 900, 1_100]),
+            paired("diff", [1_000, 900, 1_100], [1_000, 900, 1_100]),
+            paired("blame", [1_000, 900, 1_100], [1_000, 900, 1_100]),
+            alone(REPACK, 5_000),
+        ], ..report() };
+        let rows = vec![
+            paired("status", [12_000, 11_000, 13_000], [1_000, 900, 1_100]),
+            paired("log", [1_005, 1_000, 1_010], [1_000, 900, 1_100]),
+            Row { operation: "diff".into(), cache: Cache::Warm, note: "n".into(), outcome: Outcome::NotRun { reason: "r".into() } },
+            alone(REPACK, 5_000),
+        ];
+        let header = report().header;
+        let compared = |operation: &str, earlier_percent: u64, percent: u64| RowDrift { operation: operation.into(), cache: Cache::Warm, change: Change::Compared { earlier_percent, percent } };
+        let not = |operation: &str, reason: &str| RowDrift { operation: operation.into(), cache: Cache::Warm, change: Change::NotCompared { reason: reason.into() } };
+        let outcome = drift(&rows, &header, &earlier);
+        assert_eq!(outcome, DriftOutcome::Compared { tools: BTreeMap::new(), hardware: header.hardware.clone(), rows: vec![
+            compared("status", 300, 1200),
+            not("log", "the earlier run has no such row"),
+            not("diff", "Forklift and tuned git were not both timed in this run"),
+            not(REPACK, "Forklift and tuned git were not both timed in either run"),
+            not("blame", "this run has no such row"),
+        ] });
+        let log_then = PerfReport { rows: vec![Row { outcome: Outcome::NotRun { reason: "r".into() }, ..paired("log", [1, 1, 1], [1, 1, 1]) }], ..report() };
+        let DriftOutcome::Compared { rows: logged, .. } = drift(&rows[1..2], &header, &log_then) else { panic!() };
+        assert_eq!(logged, [not("log", "Forklift and tuned git were not both timed in the earlier run")]);
+
+        let elsewhere = |header: Header| drift(&rows, &report().header, &PerfReport { header, ..earlier.clone() });
+        assert_eq!(elsewhere(Header { shape: "medium".into(), shape_detail: "more".into(), ..report().header }), DriftOutcome::NotCompared { reason: "it timed medium: more, and this run small: detail".into() });
+        assert_eq!(elsewhere(Header { shape_detail: "fewer".into(), ..report().header }), DriftOutcome::NotCompared { reason: "it timed small: fewer, and this run small: detail".into() });
+        assert_eq!(elsewhere(Header { platform: Platform::Macos, ..report().header }), DriftOutcome::NotCompared { reason: "it ran on macOS, and this run on Linux".into() });
+
+        let verdict = judge(&rows, "small", Platform::Linux, Gate::SelfOnly, &[]);
+        assert_eq!(failures(&verdict), [("status", Check::Gross)]);
+        let passing = &rows[1..];
+        let shown = PerfReport { rows: passing.to_vec(), verdict: judge(passing, "small", Platform::Linux, Gate::SelfOnly, &[]), against: Some(Drift { path: "earlier/perf.json".into(), outcome: drift(&rows, &header, &earlier) }), ..report() };
+        assert!(!shown.failed(), "a ratio four times worse than the earlier run's fails nothing");
+        assert_eq!(PerfReport::from_json(&shown.json()).unwrap(), shown);
+        let markdown = shown.markdown();
+        for line in [
+            "\n## Against an earlier run\n\n- earlier run: `earlier/perf.json`\n- its forklift: not recorded\n- its hardware: a cpu, 8 logical cores\n",
+            "\n- status, warm: 300% then, 1200% now\n",
+            "\n- blame, warm: not compared: this run has no such row\n",
+        ] {
+            assert!(markdown.contains(line), "{:?} in {}", line, markdown);
+        }
+        let unread = PerfReport { against: Some(Drift { path: "old.json".into(), outcome: DriftOutcome::NotCompared { reason: "perf report format 4 is not one this build reads (it reads 5)".into() } }), ..shown };
+        assert!(unread.markdown().contains("\n- earlier run: `old.json`\n- not compared: perf report format 4 is not one this build reads (it reads 5)\n\n## Rows\n"), "{}", unread.markdown());
+        assert_eq!(PerfReport::from_json(&unread.json()).unwrap(), unread);
+    }
+
+    /// bin/perf-drop-caches, run with stand-ins for `uname` and `sudo` first on the `PATH`, writes 3
+    /// to drop_caches through `sudo -n` on Linux, fails when that write fails, so the cold cell it
+    /// ran for is voided rather than timed warm, and refuses another system or any argument.
+    #[cfg(unix)]
+    #[test]
+    fn the_drop_script_writes_drop_caches_through_sudo_and_fails_with_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (root, _scratch, _environment) = scratch("drop-script");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bin/perf-drop-caches");
+        let stand_ins = root.join("stand-ins");
+        std::fs::create_dir(&stand_ins).unwrap();
+        let said = root.join("sudo-said");
+        let ran = |system: &str, sudo_exit: i32, arguments: &[&str]| {
+            for (name, body) in [("uname", format!("echo {}", system)), ("sudo", format!("printf '%s|' \"$@\" > '{}'\nexit {}", said.display(), sudo_exit))] {
+                let path = stand_ins.join(name);
+                std::fs::write(&path, format!("#!/bin/sh\n{}\n", body)).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let _ = std::fs::remove_file(&said);
+            let path = format!("{}:{}", stand_ins.display(), std::env::var("PATH").unwrap_or_default());
+            let output = std::process::Command::new(&script).args(arguments).env("PATH", path).output().unwrap();
+            (output.status.code(), String::from_utf8_lossy(&output.stderr).into_owned(), std::fs::read_to_string(&said).ok())
+        };
+        assert_eq!(ran("Linux", 0, &[]), (Some(0), String::new(), Some("-n|sh|-c|echo 3 > /proc/sys/vm/drop_caches|".into())));
+        assert_eq!(ran("Linux", 1, &[]).0, Some(1));
+        assert_eq!(ran("Darwin", 0, &[]), (Some(2), "perf-drop-caches: drops Linux's caches only; on macOS, pass purge to --drop-caches\n".into(), None));
+        assert_eq!(ran("Linux", 0, &["now"]), (Some(2), "perf-drop-caches: takes no arguments\n".into(), None));
+        #[allow(clippy::disallowed_methods)] // a test's own temporary folder
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An `--against` that names no readable file stops the run before anything is made, its
+    /// output folder included.
+    #[test]
+    fn an_against_that_names_nothing_stops_the_run_first() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let out = std::env::temp_dir().join(format!("proof-load-perf-against-{}-{}", std::process::id(), nanos));
+        let missing = out.with_extension("json");
+        let options = PerfOptions {
+            out: out.clone(), forklift: PathBuf::from("forklift"), git: PathBuf::from("git"), shape: None, history_from: None, side_branch: None, reps: 1, gate: None,
+            drop_caches: None, forklift_server: None, against: Some(missing.clone()),
+        };
+        let error = run(&options, &|_| {}).unwrap_err();
+        assert!(error.starts_with(&format!("--against {}: ", missing.display())), "{}", error);
+        assert!(!out.exists(), "the output folder was made");
     }
 
     /// A repetition that exits non-zero voids its cell, which carries the exit and the stderr and
@@ -3188,11 +3407,18 @@ esac
         let out = std::env::temp_dir().join(format!("proof-load-perf-run-{}-{}", std::process::id(), nanos));
         let server = std::env::var_os("PROOF_LOAD_FORKLIFT_SERVER").map(PathBuf::from)
             .unwrap_or_else(|| forklift.with_file_name(format!("forklift-server{}", std::env::consts::EXE_SUFFIX)));
+        let earlier = std::env::temp_dir().join(format!("proof-load-perf-earlier-{}-{}.json", std::process::id(), nanos));
+        std::fs::write(&earlier, report().json()).unwrap();
         let options = PerfOptions {
             out: out.clone(), forklift: forklift.clone(), git: crate::scrub::path_git(), shape: None, history_from: None, side_branch: None, reps: 1, gate: Some(Gate::All),
-            drop_caches: None, forklift_server: Some(server),
+            drop_caches: None, forklift_server: Some(server), against: Some(earlier.clone()),
         };
         let report = run(&options, &|_| {}).unwrap();
+        // The earlier report is read and set beside this run's: one of another history is not
+        // compared, and says which.
+        assert_eq!(report.against, Some(Drift { path: earlier.display().to_string(), outcome: DriftOutcome::NotCompared {
+            reason: format!("it timed small: detail, and this run small: {}", report.header.shape_detail),
+        } }));
         let operations: Vec<&str> = report.rows.iter().filter(|row| row.cache == Cache::Warm).map(|row| row.operation.as_str()).collect();
         let paired = ["status", "log", "blame", "verify", "commit", "switch", "merge", "pack", "clone", "push", "pull", "diff", "diff --staged"];
         let gated = [FRESH_COMPACT, REPACK, AUDIT, AUDIT_ONE_CORE];
@@ -3242,5 +3468,6 @@ esac
         assert!(audit["data"]["genesis"].as_str().is_some_and(|genesis| !genesis.is_empty()), "{}", audit);
         #[allow(clippy::disallowed_methods)] // a test's own temporary folder
         let _ = std::fs::remove_dir_all(&out);
+        let _ = std::fs::remove_file(&earlier);
     }
 }

@@ -1,0 +1,18 @@
+#!/bin/sh
+# Drops Linux's page cache, dentries and inodes, for `proof-load perf --drop-caches`, which runs it
+# with no arguments before each cold repetition. It writes everything dirty out first, since the
+# kernel drops only clean pages, then writes 3 to /proc/sys/vm/drop_caches as root through sudo,
+# which must not ask for a password: `sudo -n` fails rather than wait for one. The weekly job of
+# proof-load-perf.yml passes it. Linux only; on macOS, pass `purge` itself.
+set -eu
+
+if [ "$#" -ne 0 ]; then
+    echo "perf-drop-caches: takes no arguments" >&2
+    exit 2
+fi
+if [ "$(uname -s)" != Linux ]; then
+    echo "perf-drop-caches: drops Linux's caches only; on macOS, pass purge to --drop-caches" >&2
+    exit 2
+fi
+sync
+sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'

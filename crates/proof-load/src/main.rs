@@ -139,6 +139,12 @@ enum Command {
         /// and pull rows. Without it those rows are reported as not run.
         #[arg(long)]
         forklift_server: Option<PathBuf>,
+        /// An earlier run's perf.json, by path. The report then sets each row's Forklift median,
+        /// as a share of tuned git's, beside the earlier run's. It never fails the run; an earlier
+        /// report this build does not read, or of another history or platform, is reported as
+        /// not compared.
+        #[arg(long)]
+        against: Option<PathBuf>,
     },
 }
 
@@ -170,9 +176,9 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Perf { out, forklift, git, shape, history_from, side_branch, gate, reps, drop_caches, forklift_server } => {
+        Command::Perf { out, forklift, git, shape, history_from, side_branch, gate, reps, drop_caches, forklift_server, against } => {
             let gate = gate.map(|gate| perf::Gate::named(&gate).expect("clap admits only the gates perf names"));
-            let options = perf::PerfOptions { out, forklift, git, shape, history_from, side_branch, reps, gate, drop_caches, forklift_server };
+            let options = perf::PerfOptions { out, forklift, git, shape, history_from, side_branch, reps, gate, drop_caches, forklift_server, against };
             match perf::run(&options, &|text| eprintln!("proof-load: {}", text)) {
                 Ok(report) if report.failed() => ExitCode::from(1),
                 Ok(_) => ExitCode::SUCCESS,
