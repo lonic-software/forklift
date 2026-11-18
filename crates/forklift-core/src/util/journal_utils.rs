@@ -692,12 +692,18 @@ pub(crate) fn trust_preconditions_saying(refused: &str, head: &str, closing: &st
     };
 
     let Some(office_head) = pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)? else {
-        return Err(format!("Trust is established but the office pallet is missing. {}", closing));
+        return Err(office_utils::office_unborn_refusal(closing));
     };
 
     let untrusted = |e: String| format!("{} {} {}", refused, e, closing);
 
-    let office_state = audit_utils::verify_office_chain(&anchor, &office_head).map_err(|e| untrusted(e.into()))?;
+    // A trust file heal can restore is refused as that, not as an office that fails its anchor.
+    let office_state = audit_utils::verify_office_chain(&anchor, &office_head).map_err(|e| {
+        match audit_utils::office_chain_refusal(e, closing) {
+            refused if crate::error::frames_in(&refused).next().is_some() => refused,
+            refused => untrusted(refused),
+        }
+    })?;
     audit_utils::verify_pallet_history(head, &anchor, &office_state, &[]).map_err(|e| untrusted(e.into()))?;
 
     Ok(RefPreconditions {

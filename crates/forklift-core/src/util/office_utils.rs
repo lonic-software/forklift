@@ -674,6 +674,7 @@ pub fn read_trust_anchor_in(mode: TrustReadMode) -> Result<Option<(TrustAnchor, 
         return decode_trust_file(&bytes).map(|anchor| Some((anchor, bytes)));
     }
 
+    let (next_step, ways_out) = trust_remedy();
     Err(CoreError::refusal(
         RefusalCode::TrustDamaged,
         format!(
@@ -684,9 +685,9 @@ pub fn read_trust_anchor_in(mode: TrustReadMode) -> Result<Option<(TrustAnchor, 
                 true => "its copy stands beside it",
                 false => "the office pallet is born",
             },
-            LOST_ANCHOR_WAYS_OUT
+            ways_out
         ),
-        "",
+        next_step,
     ).into())
 }
 
@@ -707,15 +708,18 @@ fn decode_trust_file(bytes: &[u8]) -> Result<TrustAnchor, String> {
 
     decoded.map_err(|error| match error {
         TrustDecodeError::Newer(message) => message,
-        TrustDecodeError::Damaged(why) => CoreError::refusal(
-            RefusalCode::TrustDamaged,
-            format!(
-                "{} So the warehouse's trust file (\"{}\") is damaged, and its anchor cannot be read. \
-                Nothing was changed. {}",
-                why.trim_end(), forklift_root().join(FILE_NAME_TRUST).to_string_lossy(), LOST_ANCHOR_WAYS_OUT
-            ),
-            "",
-        ).into(),
+        TrustDecodeError::Damaged(why) => {
+            let (next_step, ways_out) = trust_remedy();
+            CoreError::refusal(
+                RefusalCode::TrustDamaged,
+                format!(
+                    "{}. So the warehouse's trust file (\"{}\") is damaged, and its anchor cannot be read. \
+                    Nothing was changed. {}",
+                    why.trim_end().trim_end_matches('.'), forklift_root().join(FILE_NAME_TRUST).to_string_lossy(), ways_out
+                ),
+                next_step,
+            ).into()
+        }
     })
 }
 
@@ -741,13 +745,14 @@ fn trust_copy_stands() -> Result<bool, String> {
 pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
     match read_trust_file(FILE_NAME_TRUST) {
         Ok(bytes) => Ok(bytes),
+        // heal does not write over what stands there, so the next step is never heal's.
         Err(TrustFileError::NotAFile(path)) => Err(CoreError::refusal(
             RefusalCode::TrustDamaged,
             format!(
                 "The warehouse's trust file (\"{}\") is not a file or a link to one, so its anchor \
                 cannot be read. \
                 Nothing was changed. {}",
-                path, LOST_ANCHOR_WAYS_OUT
+                path, trust_remedy().1
             ),
             "",
         ).into()),
@@ -1914,80 +1919,149 @@ pub fn repair_trust() -> Result<TrustRepair, String> {
 
 /// [`repair_trust`], noting into `repair` as it goes.
 fn repair_trust_noting(repair: &mut TrustRepair) -> Result<(), String> {
-    let unchecked = |why: String| format!(
-        "The trust file and its copy were not checked, and nothing was written to them: {} Once that is \
-        fixed, run \"forklift heal\" again.",
-        crate::error::rendered_frames(&why).trim_end().trim_end_matches('.').to_string() + "."
-    );
     // A ref lock that cannot be taken stops nothing here: the repairs after this one that need it
     // report it themselves.
     let lock = match crate::util::lock_utils::RefLock::acquire() {
         Ok(lock) => lock,
         Err(why) => {
-            repair.notes.push(unchecked(why));
+            repair.notes.push(unchecked_trust_note(why));
             return Ok(());
         }
     };
 
+    let Some(files) = read_trust_files(&mut repair.notes)? else {
+        return Ok(());
+    };
+    let Some(write) = plan_trust_repair(&files, &mut repair.notes)? else {
+        return Ok(());
+    };
+
+    let (trust_path, copy_path) = (forklift_root().join(FILE_NAME_TRUST), forklift_root().join(FILE_NAME_TRUST_COPY));
+    match write {
+        TrustFileWritten::Trust => {
+            let Some(Ok(bytes)) = &files.copy else {
+                unreachable!("only a copy that parses is written to the trust file");
+            };
+            file_utils::write_file_atomically(&trust_path, bytes)?;
+            repair.restored = Some(TrustRestored { written: TrustFileWritten::Trust, path: trust_path, from: copy_path });
+        }
+        TrustFileWritten::Copy => {
+            let Some(Ok(bytes)) = &files.trust else {
+                unreachable!("only a trust file that parses is written to the copy");
+            };
+            write_trust_copy(&lock, bytes)?;
+            repair.restored = Some(TrustRestored { written: TrustFileWritten::Copy, path: copy_path, from: trust_path });
+        }
+    }
+
+    Ok(())
+}
+
+/// The note of a trust file and copy heal could not check, for `why`, and so did not write.
+fn unchecked_trust_note(why: String) -> String {
+    format!(
+        "The trust file and its copy were not checked, and nothing was written to them: {} Once that is \
+        fixed, run \"forklift heal\" again.",
+        crate::error::rendered_frames(&why).trim_end().trim_end_matches('.').to_string() + "."
+    )
+}
+
+/// The trust file and its copy as heal judges them, with what they are judged against.
+struct TrustFiles {
+    /// The trust file ([`read_trust_entry`]).
+    trust: Option<Result<Vec<u8>, String>>,
+    /// Its copy ([`read_trust_entry`]).
+    copy: Option<Result<Vec<u8>, String>>,
+    /// The office pallet's head.
+    office_head: Option<String>,
+    /// Whether the root is served, or its first serve began.
+    served: bool,
+}
+
+/// Read the trust file, its copy, the office head and the served state, for
+/// [`plan_trust_repair`].
+///
+/// # Returns
+/// * `Ok(Some(TrustFiles))` - What was read.
+/// * `Ok(None)`             - Neither file stands (never enrolled, or both lost, which the coded
+///                            read refuses), or something could not be read, which is noted.
+/// * `Err(String)`          - A newer version's refusal of a file it wrote.
+fn read_trust_files(notes: &mut Vec<String>) -> Result<Option<TrustFiles>, String> {
     let (trust, copy) = match (read_trust_entry(FILE_NAME_TRUST), read_trust_entry(FILE_NAME_TRUST_COPY)) {
         (Ok(trust), Ok(copy)) => (trust, copy),
         (Err(why), _) | (_, Err(why)) => {
-            repair.notes.push(unchecked(why));
-            return Ok(());
+            notes.push(unchecked_trust_note(why));
+            return Ok(None);
         }
     };
-    let trust_path = forklift_root().join(FILE_NAME_TRUST);
-    let copy_path = forklift_root().join(FILE_NAME_TRUST_COPY);
     let unchanged = "Nothing was changed.";
 
     // What a newer version wrote is that version's to judge.
     if let Some(Ok(bytes)) = &trust {
         if let Some(refusal) = newer_refusal_in(bytes) {
-            return Err(format!("{} It stands at \"{}\". {}", refusal, trust_path.to_string_lossy(), unchanged));
+            return Err(format!("{} It stands at \"{}\". {}", refusal, forklift_root().join(FILE_NAME_TRUST).to_string_lossy(), unchanged));
         }
     }
     if let Some(Ok(bytes)) = &copy {
         if let Some(refusal) = newer_refusal_in(bytes) {
-            return Err(format!("{} {}", newer_copy_refusal(&refusal, &copy_path), unchanged));
+            return Err(format!("{} {}", newer_copy_refusal(&refusal, &forklift_root().join(FILE_NAME_TRUST_COPY)), unchanged));
         }
     }
 
-    // Neither stands: never enrolled, or both lost, which the coded read refuses.
     if trust.is_none() && copy.is_none() {
-        return Ok(());
+        return Ok(None);
     }
 
     let office_head = match pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME) {
         Ok(head) => head,
         Err(why) => {
-            repair.notes.push(unchecked(why));
-            return Ok(());
+            notes.push(unchecked_trust_note(why));
+            return Ok(None);
         }
     };
     let served = match crate::util::tombstone_utils::served_state() {
         Ok(state) => state != crate::util::tombstone_utils::ServedState::Never,
         Err(why) => {
-            repair.notes.push(unchecked(why));
-            return Ok(());
+            notes.push(unchecked_trust_note(why));
+            return Ok(None);
         }
     };
+
+    Ok(Some(TrustFiles { trust, copy, office_head, served }))
+}
+
+/// Which of the trust file and its copy heal writes from the other, as [`repair_trust`] judges
+/// `files`; it writes nothing itself. Notes go into `notes`.
+///
+/// # Returns
+/// * `Ok(Some(TrustFileWritten))` - The file heal writes, and can: what stands there may be
+///                                  written over.
+/// * `Ok(None)`                   - Nothing to write: the files agree, or nothing can be
+///                                  restored, or the office chain could not be read (noted).
+/// * `Err(String)`                - [`repair_trust`]'s refusals.
+fn plan_trust_repair(files: &TrustFiles, notes: &mut Vec<String>) -> Result<Option<TrustFileWritten>, String> {
+    let TrustFiles { trust, copy, office_head, served } = files;
+    let served = *served;
+    let trust_path = forklift_root().join(FILE_NAME_TRUST);
+    let copy_path = forklift_root().join(FILE_NAME_TRUST_COPY);
+    let unchanged = "Nothing was changed.";
     let client_unborn = !served && office_head.is_none();
 
     let parsed = |file: &Option<Result<Vec<u8>, String>>| match file {
         Some(Ok(bytes)) => std::str::from_utf8(bytes).ok().and_then(|text| parse_trust_anchor_classified(text).ok()),
         _ => None,
     };
-    let (trust_anchor, copy_anchor) = (parsed(&trust), parsed(&copy));
+    let (trust_anchor, copy_anchor) = (parsed(trust), parsed(copy));
 
     // Only beside an anchor that parses, or one heal restores below, does the office note's next
     // step hold. With none, nothing here can restore the anchor.
     match client_unborn && (trust_anchor.is_some() || copy_anchor.is_some()) {
-        true => repair.notes.push(unborn_office_note()),
-        false if client_unborn => repair.notes.push(format!(
+        true => notes.push(unborn_office_note()),
+        false if client_unborn => notes.push(format!(
             "The trust file (\"{}\") {}, and its copy (\"{}\") {}, and the office pallet is unborn, so heal has \
             nothing to restore the anchor from. {}",
-            trust_path.to_string_lossy(), entry_said(&trust, &trust_anchor),
-            copy_path.to_string_lossy(), entry_said(&copy, &copy_anchor), lost_anchor_ways_out(false)
+            trust_path.to_string_lossy(), entry_said(trust, &trust_anchor),
+            copy_path.to_string_lossy(), entry_said(copy, &copy_anchor), lost_anchor_ways_out(false)
         )),
         false => {}
     }
@@ -1998,7 +2072,7 @@ fn repair_trust_noting(repair: &mut TrustRepair) -> Result<(), String> {
         let (Some(file), Some(anchor)) = (file, anchor) else {
             return Ok(false);
         };
-        match &office_head {
+        match office_head {
             None => Ok(served),
             // A server's re-genesis adopts the office head and names the genesis it succeeds; an
             // anchor that names none is no re-genesis. The named genesis is not required to root the
@@ -2009,24 +2083,24 @@ fn repair_trust_noting(repair: &mut TrustRepair) -> Result<(), String> {
         }
     };
 
-    if matches!((&trust, &copy), (Some(Ok(trust)), Some(Ok(copy))) if trust == copy) {
+    if matches!((trust, copy), (Some(Ok(trust)), Some(Ok(copy))) if trust == copy) {
         if trust_anchor.is_none() && !client_unborn {
             return Err(neither_usable_refusal(&trust_path, "does not read as an anchor", &copy_path, "is the same", served));
         }
         // Nothing to restore either from. An anchor that does not serve is said, so a run that
         // writes nothing does not read as one that found nothing; the readers after heal refuse it.
         if !client_unborn {
-            match usable(&trust, &trust_anchor) {
+            match usable(trust, &trust_anchor) {
                 Ok(true) => {}
-                Ok(false) => repair.notes.push(format!(
+                Ok(false) => notes.push(format!(
                     "The trust file (\"{}\") and its copy hold the same anchor, but it does not verify the office \
                     pallet, so heal has nothing to restore it from. {}",
                     trust_path.to_string_lossy(), lost_anchor_ways_out(served)
                 )),
-                Err(why) => repair.notes.push(unchecked(why)),
+                Err(why) => notes.push(unchecked_trust_note(why)),
             }
         }
-        return Ok(());
+        return Ok(None);
     }
 
     let differ = || -> String { CoreError::refusal(
@@ -2049,21 +2123,21 @@ fn repair_trust_noting(repair: &mut TrustRepair) -> Result<(), String> {
             (Some(_), Some(_)) => return Err(differ()),
             (None, Some(_)) => TrustFileWritten::Trust,
             // Nothing that parses to restore the trust file from: the note says what stands.
-            _ => return Ok(()),
+            _ => return Ok(None),
         },
         false => {
-            let judged = usable(&trust, &trust_anchor).and_then(|trust| Ok((trust, usable(&copy, &copy_anchor)?)));
+            let judged = usable(trust, &trust_anchor).and_then(|trust_usable| Ok((trust_usable, usable(copy, &copy_anchor)?)));
             let (trust_usable, copy_usable) = match judged {
                 Ok(judged) => judged,
                 Err(why) => {
-                    repair.notes.push(unchecked(why));
-                    return Ok(());
+                    notes.push(unchecked_trust_note(why));
+                    return Ok(None);
                 }
             };
 
             match (trust_usable, copy_usable) {
                 (true, true) => {
-                    let successor = match (&trust_anchor, &copy_anchor, &office_head) {
+                    let successor = match (&trust_anchor, &copy_anchor, office_head) {
                         (Some(trust), Some(copy), Some(head)) => served
                             && trust.prior_genesis.as_deref() == Some(copy.genesis.as_str())
                             && trust.adopts.as_deref() == Some(head.as_str()),
@@ -2078,19 +2152,17 @@ fn repair_trust_noting(repair: &mut TrustRepair) -> Result<(), String> {
                 (true, false) => TrustFileWritten::Copy,
                 (false, false) => {
                     return Err(neither_usable_refusal(
-                        &trust_path, entry_said(&trust, &trust_anchor), &copy_path, entry_said(&copy, &copy_anchor), served,
+                        &trust_path, entry_said(trust, &trust_anchor), &copy_path, entry_said(copy, &copy_anchor), served,
                     ));
                 }
             }
         }
     };
 
+    // What stands where heal writes must be one it may write over.
     match write {
         TrustFileWritten::Trust => {
-            let Some(Ok(bytes)) = &copy else {
-                unreachable!("only a copy that parses is written to the trust file");
-            };
-            if let Some(Err(_)) = &trust {
+            if let Some(Err(_)) = trust {
                 return Err(CoreError::refusal(
                     RefusalCode::TrustDamaged,
                     format!(
@@ -2101,24 +2173,60 @@ fn repair_trust_noting(repair: &mut TrustRepair) -> Result<(), String> {
                     String::new(),
                 ).into());
             }
-            file_utils::write_file_atomically(&trust_path, bytes)?;
-            repair.restored = Some(TrustRestored { written: TrustFileWritten::Trust, path: trust_path, from: copy_path });
         }
-        TrustFileWritten::Copy => {
-            let Some(Ok(bytes)) = &trust else {
-                unreachable!("only a trust file that parses is written to the copy");
-            };
-            refuse_unwritable_copy_in(match &copy {
-                None => Ok(None),
-                Some(Ok(copy)) => Ok(Some(copy.clone())),
-                Some(Err(path)) => Err(TrustFileError::NotAFile(path.clone())),
-            })?;
-            write_trust_copy(&lock, bytes)?;
-            repair.restored = Some(TrustRestored { written: TrustFileWritten::Copy, path: copy_path, from: trust_path });
-        }
+        TrustFileWritten::Copy => refuse_unwritable_copy_in(match copy {
+            None => Ok(None),
+            Some(Ok(copy)) => Ok(Some(copy.clone())),
+            Some(Err(path)) => Err(TrustFileError::NotAFile(path.clone())),
+        })?,
     }
 
-    Ok(())
+    Ok(Some(write))
+}
+
+/// Whether `forklift heal` writes the trust file back from its copy, as the two stand now: the
+/// next step a coded refusal of a lost or damaged trust file names exactly when it holds. The same
+/// judgement as [`repair_trust`]'s, read without the ref lock and writing nothing, so it only
+/// chooses the next step a refusal names.
+fn heal_restores_trust() -> bool {
+    let mut notes = Vec::new();
+    match read_trust_files(&mut notes) {
+        Ok(Some(files)) => matches!(plan_trust_repair(&files, &mut notes), Ok(Some(TrustFileWritten::Trust))),
+        _ => false,
+    }
+}
+
+/// The refusal of the trust file's anchor, which parses but does not verify the office head,
+/// `refused` saying why: [`RefusalCode::TrustDamaged`] naming `forklift heal` when heal writes the
+/// trust file back from a copy that does verify it. Otherwise `refused` as it stands, since an
+/// office chain damaged or tampered with fails the same check, and nothing here tells which of the
+/// two changed. `closing` says what the refused command left as it was.
+pub(crate) fn unverified_trust_refusal(refused: String, closing: &str) -> String {
+    match heal_restores_trust() {
+        true => CoreError::refusal(
+            RefusalCode::TrustDamaged,
+            format!(
+                "The warehouse's trust file (\"{}\") does not verify the office pallet, but its copy does: {} \
+                {} The trust file can be restored from its copy.",
+                forklift_root().join(FILE_NAME_TRUST).to_string_lossy(),
+                refused.trim_end(), closing
+            ),
+            "forklift heal",
+        ).into(),
+        false => refused,
+    }
+}
+
+/// The next step and the ways out a refusal of the trust file names: `forklift heal` when heal
+/// writes the trust file back from its copy ([`heal_restores_trust`]), and otherwise no step,
+/// with the ways out of a lost anchor that hold on this root, a served one's or a client's.
+pub(crate) fn trust_remedy() -> (String, &'static str) {
+    if heal_restores_trust() {
+        return ("forklift heal".to_string(), "The copy beside it verifies the office pallet, so the trust file can be restored from it.");
+    }
+    let served = crate::util::tombstone_utils::served_state()
+        .is_ok_and(|state| state != crate::util::tombstone_utils::ServedState::Never);
+    (String::new(), lost_anchor_ways_out(served))
 }
 
 /// What stands of the trust file or its copy, `file`, parsed as `anchor`, that no anchor can be
@@ -2176,18 +2284,48 @@ const SERVED_LOST_ANCHOR_WAYS_OUT: &str = "Restore the trust file or its copy fr
 /// enrollment or a first lower stopped between its writes leaves, and the one a lost office ref
 /// leaves, which nothing here tells apart.
 fn unborn_office_note() -> String {
-    let said = "The office pallet is unborn beside a trust file, so nothing signed here can be checked until it stands.";
-    match crate::util::remote_utils::RemoteClient::is_configured() {
-        true => format!(
-            "{} \"forklift lower\" takes the office pallet from the remote, and verifies it against the trust file.",
-            said
+    format!(
+        "The office pallet is unborn beside a trust file, so nothing signed here can be checked until it stands. {}",
+        unborn_office_remedy().1
+    )
+}
+
+/// The refusal of a client whose office pallet is unborn beside the trust file that holds its
+/// anchor: what every reader that checks the office against the anchor says, and enroll too. It
+/// does not say why the office is missing, since a lost ref and an enrollment or a first lower
+/// stopped between its writes look alike. `closing` says what the refused command left as it was.
+pub fn office_unborn_refusal(closing: &str) -> String {
+    let (next_step, ways_out) = unborn_office_remedy();
+    CoreError::refusal(
+        RefusalCode::RefDamaged,
+        format!(
+            "The trust file (\"{}\") holds this warehouse's anchor, but the office pallet is unborn: its ref \
+            (\"{}\") is missing, so nothing signed here can be checked. {} {}",
+            forklift_root().join(FILE_NAME_TRUST).to_string_lossy(),
+            pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME).to_string_lossy(),
+            closing, ways_out
         ),
-        false => format!(
-            "{} With no remote to take it from, restore its ref (\"{}\") from a backup, or write the office \
-            pallet's head parcel hash into it by hand; an older head than the last re-admits any key revoked \
-            since.",
-            said,
-            pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME).to_string_lossy()
+        next_step,
+    ).into()
+}
+
+/// The next step and the ways out of a client's unborn office beside a trust file: `forklift
+/// lower` takes the office from a configured remote, verified against the trust file; without
+/// one, the office ref is restored or written by hand.
+fn unborn_office_remedy() -> (String, String) {
+    match crate::util::remote_utils::RemoteClient::is_configured() {
+        true => (
+            "forklift lower".to_string(),
+            "\"forklift lower\" takes the office pallet from the remote, and verifies it against the trust file.".to_string(),
+        ),
+        false => (
+            String::new(),
+            format!(
+                "With no remote to take it from, restore its ref (\"{}\") from a backup, or write the office \
+                pallet's head parcel hash into it by hand; an older head than the last re-admits any key revoked \
+                since.",
+                pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME).to_string_lossy()
+            ),
         ),
     }
 }

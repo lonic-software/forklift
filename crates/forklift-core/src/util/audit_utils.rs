@@ -615,11 +615,16 @@ pub fn verify_pallet_history(head: &str,
                     )));
                 } else {
                     return Err(HistoryRefusal::verdict(match reason {
-                        TrustBoundaryReason::Unsigned => format!(
-                            "Parcel {} was stacked after trust was established but carries no \
-                            signature. The warehouse may have been tampered with.",
-                            hash
-                        ),
+                        // A lost signature and a stripped one look alike, so the wording keeps both.
+                        TrustBoundaryReason::Unsigned => crate::error::CoreError::refusal(
+                            crate::error::RefusalCode::SignatureMissing,
+                            format!(
+                                "Parcel {} was stacked after trust was established but carries no \
+                                signature. The warehouse may have been tampered with.",
+                                hash
+                            ),
+                            "",
+                        ).into(),
                         TrustBoundaryReason::UnknownKey(key_id) => format!(
                             "Parcel {} is signed with key {}, which is not tracked in the \
                             office. The warehouse may have been tampered with.",
@@ -1035,6 +1040,19 @@ pub fn verified_local_office() -> Result<VerifiedOffice, String> {
         .1)
 }
 
+/// The refusal of an office chain that did not verify against this warehouse's trust anchor. One
+/// the store cannot give, or a coded refusal met on the walk, says nothing of the anchor and stands
+/// as it is. Any other is the anchor's to answer for only when heal can restore a trust file that
+/// does verify ([`office_utils::unverified_trust_refusal`]), `closing` saying what the refused
+/// command left as it was.
+pub fn office_chain_refusal(refused: OfficeChainError, closing: &str) -> String {
+    match refused {
+        OfficeChainError::Unreadable(why) => why,
+        refused if crate::error::frames_in(refused.message()).next().is_some() => String::from(refused),
+        refused => office_utils::unverified_trust_refusal(String::from(refused), closing),
+    }
+}
+
 /// This warehouse's trust anchor and its office verified against it, read together so the office
 /// is judged against exactly the anchor returned — or `None` when the warehouse never enrolled. A
 /// lost anchor refuses ([`office_utils::read_trust_anchor`]).
@@ -1043,9 +1061,9 @@ pub fn verified_local_trust() -> Result<Option<(TrustAnchor, VerifiedOffice)>, S
         return Ok(None);
     };
     let head = pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)?
-        .ok_or("The office pallet is unborn; use \"forklift office enroll\" first.".to_string())?;
+        .ok_or_else(|| office_utils::office_unborn_refusal("Nothing was changed."))?;
 
-    let state = verify_office_chain_memoized(&anchor, &head)?;
+    let state = verify_office_chain_memoized(&anchor, &head).map_err(|refused| office_chain_refusal(refused, "Nothing was changed."))?;
 
     let office = VerifiedOffice {
         state,

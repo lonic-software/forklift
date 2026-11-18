@@ -363,7 +363,9 @@ refusal_codes! {
     /// while a checkout still stands on a parcel of that pallet. Nothing was changed. `heal`
     /// rebuilds it from what the bays, their journals and the ref's own bytes still name, or, when
     /// that evidence does not settle one head, refuses with this code, listing what it found, so
-    /// `heal --ref <pallet>=<parcel>` can set it.
+    /// `heal --ref <pallet>=<parcel>` can set it. On a client it also covers the office pallet's
+    /// ref missing beside a held trust file, which heal reports and does not mend: the next step is
+    /// `lower` where a remote is configured, and otherwise empty, the message naming the hand fix.
     RefDamaged => "ref_damaged",
 
     /// A sparse warehouse's fetch scope is lost or damaged and `heal` could not rebuild it from
@@ -480,12 +482,26 @@ refusal_codes! {
     MergeStateDamaged => "merge_state_damaged",
 
     /// The warehouse's trust file is lost or damaged: it is missing while the office pallet is
-    /// born or its copy stands, so trust was established and its anchor is gone, or it does not
-    /// parse. A trust file a newer version wrote is not this. Nothing was changed. The message names
-    /// the ways out (a backup, or, after moving the trust file and its copy aside, `forklift
-    /// lower` from a remote the operator trusts), and the next step is empty. A server answers it
-    /// as a `503` naming its operator.
+    /// born or its copy stands, so trust was established and its anchor is gone, it does not
+    /// parse, or it does not verify the office pallet while its copy does. A trust file a newer
+    /// version wrote is not this. Nothing was changed. The next step is `heal` when heal restores
+    /// the trust file from its copy; otherwise it is empty, and the message names the ways out (a
+    /// backup, or, after moving the trust file and its copy aside, `forklift lower` from a remote
+    /// the operator trusts, or, on a served root, its operator's). A server answers it as a `503`
+    /// naming its operator.
     TrustDamaged => "trust_damaged",
+
+    /// A parcel's stored signature, in its sidecar or a signature table, cannot be read, does not
+    /// parse, or names a format version this Forklift does not read, so what signed the parcel
+    /// cannot be told. A signature is never stored twice with different bytes, so the message names
+    /// restoring the warehouse's objects from a backup, or cloning it again from a remote that
+    /// holds the parcel; the next step is empty.
+    SignatureDamaged => "signature_damaged",
+
+    /// A parcel stacked after trust was established carries no signature. A lost signature and a
+    /// stripped one look alike, so the warehouse may have been tampered with; the next step is
+    /// empty.
+    SignatureMissing => "signature_missing",
 }
 
 /// The codes of a host record that is lost or damaged, or of an object its store cannot read,

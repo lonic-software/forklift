@@ -547,12 +547,29 @@ fn encode_parcel_signature(signature: &ParcelSignature) -> Vec<u8> {
 /// # Returns
 /// * `Ok(Some(ParcelSignature))` - The stored signature.
 /// * `Ok(None)`                  - If the parcel has no signature.
-/// * `Err(String)`               - If the sidecar exists but is malformed.
+/// * `Err(String)`               - A [`RefusalCode::SignatureDamaged`] refusal when the stored
+///                                   signature cannot be read, does not parse, or names a format
+///                                   version this Forklift does not read.
 pub fn load_parcel_signature(parcel_hash: &str) -> Result<Option<ParcelSignature>, String> {
     match load_raw_parcel_signature(parcel_hash)? {
-        Some(bytes) => parse_parcel_signature(&bytes, parcel_hash).map(Some),
+        Some(bytes) => parse_parcel_signature(&bytes, parcel_hash).map(Some).map_err(|why| signature_damaged(parcel_hash, why)),
         None => Ok(None),
     }
+}
+
+/// The refusal of parcel `parcel_hash`'s stored signature, which cannot be read or does not parse,
+/// for `why`, which names the parcel. A signature is never stored twice with different bytes, so taking the parcel's again
+/// from a remote does not replace it: the store, or the warehouse, is taken again instead.
+fn signature_damaged(parcel_hash: &str, why: String) -> String {
+    crate::error::CoreError::refusal(
+        crate::error::RefusalCode::SignatureDamaged,
+        format!(
+            "{}. So that stored signature is damaged, and what signed the parcel cannot be told. Restore the \
+            warehouse's objects from a backup, or clone the warehouse again from a remote that holds the parcel.",
+            why.trim_end().trim_end_matches('.')
+        ),
+        "",
+    ).into()
 }
 
 /// Read the raw bytes of a parcel's signature (the transfer form — see
@@ -571,8 +588,8 @@ pub fn load_parcel_signature(parcel_hash: &str) -> Result<Option<ParcelSignature
 /// # Returns
 /// * `Ok(Some(Vec<u8>))` - The signature bytes.
 /// * `Ok(None)`          - If the parcel has no signature.
-/// * `Err(String)`       - If the sidecar could not be read, or an unreadable table might hold
-///                         the signature.
+/// * `Err(String)`       - A [`RefusalCode::SignatureDamaged`] refusal when the sidecar could not
+///                         be read, or an unreadable table might hold the signature.
 pub fn load_raw_parcel_signature(parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
     if let pack_utils::TabledSignature::Found(bytes) = pack_utils::tabled_signature(parcel_hash, false)? {
         return Ok(Some(bytes));
@@ -585,9 +602,9 @@ pub fn load_raw_parcel_signature(parcel_hash: &str) -> Result<Option<Vec<u8>>, S
     match pack_utils::tabled_signature(parcel_hash, true)? {
         pack_utils::TabledSignature::Found(bytes) => Ok(Some(bytes)),
         pack_utils::TabledSignature::Missing => Ok(None),
-        pack_utils::TabledSignature::Unreadable(message) => Err(format!(
+        pack_utils::TabledSignature::Unreadable(message) => Err(signature_damaged(parcel_hash, format!(
             "The signature of parcel {} cannot be read: {}", parcel_hash, message
-        )),
+        ))),
     }
 }
 
@@ -598,9 +615,9 @@ fn load_loose_signature(parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
     match std::fs::read(&path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!(
+        Err(e) => Err(signature_damaged(parcel_hash, format!(
             "Error while reading the signature of parcel {}: {}", parcel_hash, e
-        )),
+        ))),
     }
 }
 
