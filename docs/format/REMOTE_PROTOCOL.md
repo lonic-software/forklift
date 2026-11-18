@@ -97,10 +97,13 @@ of the server's directory:
 The serverless head reads none of these records, and its `503`s are described with the endpoints
 that send them.
 
-**A fault of the server's own:** a `500` that is not a classified refusal carries a fixed
-`error`, and no `code` or `next_step`, in both heads: its cause may name the server's directories
-or storage, so it is logged and not sent. A classified refusal keeps its `code` and text at any
-status, `500` included.
+**A fault of the server's own:** a `500` from forklift-server carries a fixed `error`, and no
+`code` or `next_step`, whatever failed: its cause may name the server's directories, and a
+refusal's next step there is the operator's, so it is logged and not sent. A refusal meant for
+the requester comes at its own status instead: a bundle that would have to carry a chunked file,
+or an object over the ceiling, is a `422` with its code. The serverless head hides a `500`'s
+message the same way, except that it passes on a classified refusal's `code` and text (all but
+`object_unreadable`, which it hides at any status).
 
 **Refused for now, on either head:** a `429`, and a `503` that carries `Retry-After`, are
 refusals sent before the request changed anything, so the identical request may be sent again

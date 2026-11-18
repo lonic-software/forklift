@@ -1475,20 +1475,19 @@ fn parse_operator_tokens(path: &str) -> Result<HashMap<String, String>, String> 
 /// yet servable), never for good. A [`damage_refusal`] is the exception: no retry mends it, so it
 /// says no time, and a client takes it as an answer.
 ///
-/// A `500` whose message is no classified refusal is the server's own fault, and its message is
-/// the reader's: it may name this host's directories, a pack index among them. So the client is
-/// told only that the server failed, and the message is logged. A classified refusal keeps its
-/// code and text at any status: a client takes its exit code from it, and its text is written for
-/// the requester.
+/// A `500` is the server's own fault, and its message is the reader's: it may name this host's
+/// directories, a pack index among them, and a classified refusal's next step there is the
+/// operator's, not the client's (a damaged ref's is `forklift heal`). So the client is told only
+/// that the server failed, with no code, and the message is logged. A refusal meant for the
+/// requester is answered at its own status by its handler ([`bundle_refusal`]).
 fn error_response(error: HandlerError) -> Response {
     let status = error.0;
     let damaged = is_damage(&error.1);
-    let body = match status == StatusCode::INTERNAL_SERVER_ERROR && forklift_core::error::deframe(&error.1).is_none() {
-        true => {
-            tracing::error!(message = %error.1, "a request failed on a fault of the server's own");
-            fault_body()
-        }
-        false => error_body(error.1),
+    let body = if status == StatusCode::INTERNAL_SERVER_ERROR {
+        tracing::error!(message = %error.1, "a request failed on a fault of the server's own");
+        fault_body()
+    } else {
+        error_body(error.1)
     };
     let mut response = (status, Json(body)).into_response();
 
@@ -1503,6 +1502,17 @@ fn error_response(error: HandlerError) -> Response {
 /// no code.
 fn fault_body() -> ErrorResponse {
     ErrorResponse { error: FAULT_MESSAGE.to_string(), code: None, next_step: None }
+}
+
+/// A bundle that could not be built: a `422` when the request asked for an object no bundle can
+/// carry (a chunked file, or one over the object ceiling), since that refusal is the requester's
+/// and repeats on every retry; else a fault of the server's own ([`internal`]).
+fn bundle_refusal(error: String) -> HandlerError {
+    let requester = [scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED, scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED];
+    match forklift_core::error::deframe(&error) {
+        Some((code, _, _)) if requester.contains(&code) => (StatusCode::UNPROCESSABLE_ENTITY, error),
+        _ => internal(error),
+    }
 }
 
 /// What a client is told of a fault of the server's own ([`fault_body`]).
@@ -2513,14 +2523,17 @@ fn resolve_handle(state: &AppState,
     let handle = Arc::new(
         WarehouseHandle::serving(root, false).map_err(|refusal| match refusal {
             // Not the reader's words: a lock's names its file on this server, the process holding
-            // it, and a removal only the operator can run. They go to the log.
+            // it, and a removal only the operator can run. They go to the log. The cause may be one
+            // that does not clear by itself (a lock left by a process that died, an I/O error), so
+            // the text promises nothing.
             ServingRefusal::Busy(reason) => {
-                tracing::warn!(warehouse = %id, %reason, "the warehouse is not served for now");
+                tracing::error!(warehouse = %id, %reason, "the warehouse's locks could not be taken");
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!(
-                        "Warehouse \"{}\" is temporarily unavailable: another process on the server is \
-                        working on it. Try again once it finishes.",
+                        "Warehouse \"{}\" is temporarily unavailable: the server could not take its \
+                        locks, which another process may hold. Its operator can find the cause in the \
+                        server's log.",
                         id
                     ),
                 )
@@ -3063,7 +3076,7 @@ async fn post_objects_batch(State(state): State<Arc<AppState>>,
         let withheld = withheld_among(&gate, &removed, &request.hashes)?;
         let hashes: Vec<String> = request.hashes.into_iter().filter(|hash| !withheld.contains(hash)).collect();
 
-        bundle_utils::build_partial_bundle(&hashes).map_err(internal)
+        bundle_utils::build_partial_bundle(&hashes).map_err(bundle_refusal)
     }).await;
 
     match result {
@@ -3145,7 +3158,7 @@ async fn get_subtree(State(state): State<Arc<AppState>>,
             tree_utils::SubtreeClosure::Complete(closure) => closure,
         };
 
-        bundle_utils::build_partial_bundle(&closure).map_err(internal)
+        bundle_utils::build_partial_bundle(&closure).map_err(bundle_refusal)
     }).await;
 
     match result {
@@ -5438,11 +5451,12 @@ mod tests {
         assert!(!body.error.contains('\u{1f}'), "the raw frame never leaks: {:?}", body.error);
     }
 
-    /// A `500` whose message is no classified refusal carries a fixed text and no code, so its words
-    /// never reach the client; a classified refusal at `500`, and any other status, keeps its own.
+    /// A `500` carries a fixed text and no code, whether its message is plain or a classified
+    /// refusal, so neither's words nor an operator's next step reach the client; any other status
+    /// keeps the handler's own.
     ///
-    /// Revert: answer a `500` with `error_body` → the path reaches the client → red. Hide every
-    /// `500` → the refusal's code is lost → red.
+    /// Revert: answer a `500` with `error_body` → the path reaches the client → red. Pass a
+    /// classified refusal through at `500` → its path and `forklift heal` reach the client → red.
     #[tokio::test]
     async fn a_500_answers_a_fixed_text_and_no_code() {
         let plain = "Error while reading \"/srv/wh/.forklift/objects/pack/x.idx\": denied".to_string();
@@ -5453,14 +5467,40 @@ mod tests {
         assert!(error.get("code").is_none() && error.get("next_step").is_none(), "{}", body);
         assert!(!body.contains("/srv/wh"), "{}", body);
 
-        let framed: String = scope_utils::chunked_transport_refusal("big.bin").into();
+        let framed: String = forklift_core::error::CoreError::refusal(
+            forklift_core::error::RefusalCode::RefDamaged,
+            "The ref of pallet \"main\" (\"/srv/wh/.forklift/pallets/main\") is damaged.",
+            "forklift heal",
+        ).into();
         let body = body_text(error_response(server_fault(framed))).await;
         let error: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(error["code"], "chunked_transport_unsupported", "a classified refusal keeps its code: {}", body);
-        assert!(error["error"].as_str().unwrap().contains("big.bin"), "{}", body);
+        assert_eq!(error["error"], "The server failed to answer the request. Its operator can find the cause in the server's log.", "{}", body);
+        assert!(error.get("code").is_none() && error.get("next_step").is_none(), "{}", body);
+        assert!(!body.contains("/srv/wh") && !body.contains("heal"), "{}", body);
 
         let body = body_text(error_response((StatusCode::UNPROCESSABLE_ENTITY, plain))).await;
         assert!(body.contains("/srv/wh/.forklift/objects/pack/x.idx"), "another status keeps its message: {}", body);
+    }
+
+    /// A bundle refused for an object no bundle can carry is the requester's: a `422` with its code,
+    /// which no retry changes. Any other bundle failure is the server's own.
+    ///
+    /// Revert: map a bundle's error with `internal` → the chunked refusal is a `500` → red.
+    #[test]
+    fn a_bundle_no_transport_can_carry_is_a_422_with_its_code() {
+        let chunked: String = scope_utils::chunked_transport_refusal("big.bin").into();
+        let oversized: String = scope_utils::oversized_transport_refusal("object x", 1 << 40).into();
+        for refusal in [chunked, oversized] {
+            let (status, message) = bundle_refusal(refusal.clone());
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", refusal);
+            assert_eq!(message, refusal);
+        }
+
+        let damaged: String = forklift_core::error::CoreError::refusal(
+            forklift_core::error::RefusalCode::RefDamaged, "damaged", "forklift heal",
+        ).into();
+        assert_eq!(bundle_refusal(damaged).0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(bundle_refusal("Error while reading x".to_string()).0, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// A plain (unframed) error passes through with no code — an older client ignores the absent
@@ -7836,7 +7876,7 @@ mod tests {
         let refused = resolve_handle(&state, &warehouse_params("w")).map(|_| ()).unwrap_err();
 
         assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(refused.1.starts_with("Warehouse \"w\" is temporarily unavailable"), "{}", refused.1);
+        assert!(refused.1.starts_with("Warehouse \"w\" is temporarily unavailable: the server could not take its locks"), "{}", refused.1);
         assert!(!refused.1.contains(base.to_string_lossy().as_ref()), "{}", refused.1);
 
         let _ = ServeLock::release(held);
