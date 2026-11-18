@@ -336,13 +336,9 @@ fn is_newer_header(header: &str) -> bool {
     header_version(header).is_some_and(|version| version > SCOPE_VERSION)
 }
 
-/// The version a scope file's header names, when it is written as Forklift writes one: the tag, one
-/// space, and a number without a leading zero. Any other header is damaged, whatever number it holds.
+/// The version a scope file's header names (see [`record_utils::header_version`]).
 fn header_version(header: &str) -> Option<u32> {
-    let digits = header.strip_prefix(&format!("/forklift-{} ", SCOPE_RECORD))?;
-    let plain = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) && (digits == "0" || !digits.starts_with('0'));
-
-    if plain { digits.parse().ok() } else { None }
+    record_utils::header_version(header, SCOPE_RECORD)
 }
 
 /// A scope file as `heal` reads it: on its own, never against the warehouse's mode or another

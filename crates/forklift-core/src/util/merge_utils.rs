@@ -123,14 +123,8 @@ const SKELETON_EFFECT: &str = "The abort puts back what the merge changed withou
 /// Whether a record's header names a version of `kind` newer than `version`: a record a newer
 /// Forklift wrote, which is not damage and is left as it is.
 pub(crate) fn is_newer_record(error: &record_utils::RecordError, kind: &str, version: u32) -> bool {
-    let record_utils::RecordError::OtherVersion(header) = error else {
-        return false;
-    };
-    let Some(digits) = header.strip_prefix(&format!("/forklift-{} ", kind)) else {
-        return false;
-    };
-    let plain = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) && !digits.starts_with('0');
-    plain && digits.parse::<u32>().is_ok_and(|found| found > version)
+    matches!(error, record_utils::RecordError::OtherVersion(header)
+        if record_utils::header_version(header, kind).is_some_and(|found| found > version))
 }
 
 /// Get the path of the consolidation-state file (bay-local: a merge in progress belongs

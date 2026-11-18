@@ -58,6 +58,16 @@ pub enum RecordError {
     Damaged,
 }
 
+/// The version a record's header names, when it is written as Forklift writes one for `kind`: the
+/// tag, one space, and a number without a leading zero. Any other header is damaged, whatever number
+/// it holds, so only a header this returns a higher version for was written by a newer Forklift.
+pub fn header_version(header: &str, kind: &str) -> Option<u32> {
+    let digits = header.strip_prefix(&format!("/forklift-{} ", kind))?;
+    let plain = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) && (digits == "0" || !digits.starts_with('0'));
+
+    if plain { digits.parse().ok() } else { None }
+}
+
 impl RecordError {
     /// The reason as a phrase that follows "The <file> ".
     pub fn describe(&self) -> String {
