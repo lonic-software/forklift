@@ -4768,8 +4768,9 @@ mod tests {
         /// An anchor of another chain that adopts the office head but succeeds no genesis: no
         /// server's re-genesis.
         stranger: Vec<u8>,
-        /// The same, naming as its prior a genesis that does not root the office.
-        stray: Vec<u8>,
+        /// A server's second re-genesis before the office moved: it succeeds `regenesis`, whose
+        /// genesis roots nothing.
+        second: Vec<u8>,
         /// The settled anchor, at a version this Forklift does not read.
         newer: Vec<u8>,
         /// Bytes that do not parse.
@@ -4796,8 +4797,8 @@ mod tests {
                     genesis: "d".repeat(64), enabled_at: 1_700_000_004, boundary: Vec::new(), prior_genesis: None,
                     adopts: Some(office_head().unwrap()),
                 }),
-                stray: encode(&TrustAnchor {
-                    genesis: "d".repeat(64), enabled_at: 1_700_000_004, boundary: Vec::new(), prior_genesis: Some("c".repeat(64)),
+                second: encode(&TrustAnchor {
+                    genesis: "c".repeat(64), enabled_at: 1_700_000_004, boundary: Vec::new(), prior_genesis: Some("f".repeat(64)),
                     adopts: Some(office_head().unwrap()),
                 }),
                 newer,
@@ -4837,7 +4838,7 @@ mod tests {
     fn heal_restores_the_trust_file_or_its_copy_from_the_other() {
         use crate::util::office_utils::TrustFileWritten::{Copy, Trust};
 
-        for case in 0..11 {
+        for case in 0..14 {
             let fixture = PrivilegeFixture::new(&format!("heal-trust-restores-{}", case));
             let b = TrustBytes::of(&fixture);
             let (state, written, after) = [
@@ -4854,6 +4855,14 @@ mod tests {
                 // A server's re-genesis stopped before its copy write is rolled forward.
                 (TrustState { name: "server re-genesis", trust: Some(b.regenesis.clone()), copy: Some(b.settled.clone()), served: true, unborn: false },
                     Some(Copy), b.regenesis.clone()),
+                // A server's second re-genesis before its office moved names a genesis that roots
+                // nothing; it is a re-genesis all the same.
+                (TrustState { name: "server's second re-genesis, copy stopped", trust: Some(b.second.clone()), copy: Some(b.regenesis.clone()), served: true, unborn: false },
+                    Some(Copy), b.second.clone()),
+                (TrustState { name: "server's second re-genesis, copy missing", trust: Some(b.second.clone()), copy: None, served: true, unborn: false },
+                    Some(Copy), b.second.clone()),
+                (TrustState { name: "server's second re-genesis, settled", trust: Some(b.second.clone()), copy: Some(b.second.clone()), served: true, unborn: false },
+                    None, b.second.clone()),
                 // A server's bootstrap: an anchor put, and the office not yet lifted.
                 (TrustState { name: "server bootstrap, copy missing", trust: Some(b.settled.clone()), copy: None, served: true, unborn: true },
                     Some(Copy), b.settled.clone()),
@@ -4887,7 +4896,7 @@ mod tests {
                 "{}: {:?}", state.name, repaired.notes);
             let unserving = repaired.notes.iter().any(|note| note.contains("hold the same anchor, but it does not verify the office pallet"));
             assert_eq!(unserving, state.name == "equal, verifying nothing", "{}: {:?}", state.name, repaired.notes);
-            let unanchored = repaired.notes.iter().any(|note| note.contains("Neither the trust file") && note.contains("forklift lower"));
+            let unanchored = repaired.notes.iter().any(|note| note.contains("does not read as an anchor, and its copy (") && note.contains(") is missing, and the office pallet is unborn") && note.contains("forklift lower"));
             assert_eq!(unanchored, state.name == "client, office unborn, nothing parses", "{}: {:?}", state.name, repaired.notes);
             // What a server's ref update reads stands.
             if state.served {
@@ -4915,7 +4924,7 @@ mod tests {
     fn heal_refuses_trust_it_cannot_restore_and_writes_nothing() {
         use crate::error::RefusalCode;
 
-        for case in 0..13 {
+        for case in 0..12 {
             let fixture = PrivilegeFixture::new(&format!("heal-trust-refuses-{}", case));
             let b = TrustBytes::of(&fixture);
             let (state, code, says) = [
@@ -4930,8 +4939,6 @@ mod tests {
                     Some(RefusalCode::TrustDamaged), "both read as an anchor"),
                 // Adopting the office head makes no anchor a server's re-genesis.
                 (TrustState { name: "stranger adopting, served", trust: Some(b.stranger.clone()), copy: None, served: true, unborn: false },
-                    Some(RefusalCode::TrustDamaged), "does not verify the office pallet, and its copy"),
-                (TrustState { name: "stray prior adopting, served", trust: Some(b.stray.clone()), copy: None, served: true, unborn: false },
                     Some(RefusalCode::TrustDamaged), "does not verify the office pallet, and its copy"),
                 // A served root's ways out name no lower, which its trust never moves by.
                 (TrustState { name: "garbled twins, served", trust: Some(b.garbled.clone()), copy: Some(b.garbled.clone()), served: true, unborn: false },

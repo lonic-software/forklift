@@ -1668,25 +1668,13 @@ fn judge_trust_bytes(bytes: &Result<Vec<u8>, String>, office_head: &str) -> Resu
         Ok(Err(TrustDecodeError::Damaged(_))) | Err(_) => return Ok(TrustJudged::Unusable),
     };
 
-    match anchor_verifies(&anchor, office_head)? {
-        true => Ok(TrustJudged::Usable),
-        false => Ok(TrustJudged::Unverified(anchor)),
-    }
-}
-
-/// Whether `anchor` verifies `office_head`.
-///
-/// # Returns
-/// * `Ok(bool)`    - Whether the office chain verifies against it.
-/// * `Err(String)` - The office chain could not be read, which says nothing about the anchor.
-fn anchor_verifies(anchor: &TrustAnchor, office_head: &str) -> Result<bool, String> {
-    match crate::util::audit_utils::verify_office_chain_memoized(anchor, office_head) {
-        Ok(_) => Ok(true),
+    match crate::util::audit_utils::verify_office_chain_memoized(&anchor, office_head) {
+        Ok(_) => Ok(TrustJudged::Usable),
         // A parcel the store cannot give says nothing of the anchor; nor does a coded refusal met
         // past the walk, such as a key object that does not read.
         Err(crate::util::audit_utils::OfficeChainError::Unreadable(why)) => Err(why),
         Err(refused) if crate::error::frames_in(refused.message()).next().is_some() => Err(refused.message().to_string()),
-        Err(_) => Ok(false),
+        Err(_) => Ok(TrustJudged::Unverified(anchor)),
     }
 }
 
@@ -1995,9 +1983,10 @@ fn repair_trust_noting(repair: &mut TrustRepair) -> Result<(), String> {
     match client_unborn && (trust_anchor.is_some() || copy_anchor.is_some()) {
         true => repair.notes.push(unborn_office_note()),
         false if client_unborn => repair.notes.push(format!(
-            "Neither the trust file (\"{}\") nor its copy reads as an anchor, and the office pallet is unborn, \
-            so heal has nothing to restore the anchor from. {}",
-            trust_path.to_string_lossy(), lost_anchor_ways_out(false)
+            "The trust file (\"{}\") {}, and its copy (\"{}\") {}, and the office pallet is unborn, so heal has \
+            nothing to restore the anchor from. {}",
+            trust_path.to_string_lossy(), entry_said(&trust, &trust_anchor),
+            copy_path.to_string_lossy(), entry_said(&copy, &copy_anchor), lost_anchor_ways_out(false)
         )),
         false => {}
     }
@@ -2010,12 +1999,11 @@ fn repair_trust_noting(repair: &mut TrustRepair) -> Result<(), String> {
         };
         match &office_head {
             None => Ok(served),
-            // A server's re-genesis adopts the office head and names the genesis it succeeds, which
-            // roots that head: whatever else adopts it is no re-genesis.
-            Some(head) if served && anchor.adopts.as_deref() == Some(head.as_str()) && match &anchor.prior_genesis {
-                Some(prior) => anchor_verifies(&TrustAnchor { genesis: prior.clone(), prior_genesis: None, adopts: None, ..anchor.clone() }, head)?,
-                None => false,
-            } => Ok(true),
+            // A server's re-genesis adopts the office head and names the genesis it succeeds; an
+            // anchor that names none is no re-genesis. The named genesis is not required to root the
+            // head: a second re-genesis before the office moves names the first one's, which roots
+            // nothing, and the server reads its trust file through this same window.
+            Some(head) if served && anchor.prior_genesis.is_some() && anchor.adopts.as_deref() == Some(head.as_str()) => Ok(true),
             Some(head) => Ok(judge_trust_bytes(file, head)? == TrustJudged::Usable),
         }
     };
@@ -2088,14 +2076,8 @@ fn repair_trust_noting(repair: &mut TrustRepair) -> Result<(), String> {
                 (false, true) => TrustFileWritten::Trust,
                 (true, false) => TrustFileWritten::Copy,
                 (false, false) => {
-                    let said = |file: &Option<Result<Vec<u8>, String>>, anchor: &Option<TrustAnchor>| match (file, anchor) {
-                        (None, _) => "is missing",
-                        (Some(Err(_)), _) => "is not a file or a link to one",
-                        (Some(Ok(_)), None) => "does not read as an anchor",
-                        (Some(Ok(_)), Some(_)) => "does not verify the office pallet",
-                    };
                     return Err(neither_usable_refusal(
-                        &trust_path, said(&trust, &trust_anchor), &copy_path, said(&copy, &copy_anchor), served,
+                        &trust_path, entry_said(&trust, &trust_anchor), &copy_path, entry_said(&copy, &copy_anchor), served,
                     ));
                 }
             }
@@ -2136,6 +2118,17 @@ fn repair_trust_noting(repair: &mut TrustRepair) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// What stands of the trust file or its copy, `file`, parsed as `anchor`, that no anchor can be
+/// restored from it.
+fn entry_said(file: &Option<Result<Vec<u8>, String>>, anchor: &Option<TrustAnchor>) -> &'static str {
+    match (file, anchor) {
+        (None, _) => "is missing",
+        (Some(Err(_)), _) => "is not a file or a link to one",
+        (Some(Ok(_)), None) => "does not read as an anchor",
+        (Some(Ok(_)), Some(_)) => "does not verify the office pallet",
+    }
 }
 
 /// The trust file or its copy, `name`, as heal and the first serve judge it: `None` when nothing
