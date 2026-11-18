@@ -283,7 +283,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let store_access = match store_access {
         Some(store_access) => store_access,
         None => {
-            shared = StoreAccessLock::shared(crate::announce_store_access_wait)?;
+            shared = StoreAccessLock::shared(crate::announce_store_access_wait)
+                .map_err(|error| with_merge(records_said(CoreError::from(error), &ref_notes, early_position.as_ref(), early_scope.as_ref())))?;
             &shared
         }
     };
