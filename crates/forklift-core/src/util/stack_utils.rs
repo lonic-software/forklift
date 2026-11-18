@@ -397,7 +397,7 @@ pub async fn stack_parcel(description: Option<String>,
         // skeleton file is a broken invariant (an interrupted write), not "no resolutions" — see
         // its doc comment.
         let skeleton = match &consolidation {
-            Some(_) => merge_utils::OutOfScopeSkeleton::read_required()?,
+            Some(state) => merge_utils::OutOfScopeSkeleton::read_required(state)?,
             None => merge_utils::OutOfScopeSkeleton::default(),
         };
 

@@ -159,7 +159,7 @@ fn read_consolidation(with_skeleton: bool) -> Result<Option<ConsolidationInProgr
     };
 
     let skeleton = match with_skeleton {
-        true => String::from_utf8(OutOfScopeSkeleton::read_required()?.to_bytes())
+        true => String::from_utf8(OutOfScopeSkeleton::read_required(&state)?.to_bytes())
             .map_err(|_| "The out-of-scope skeleton does not serialize as text.".to_string())?,
         false => String::new(),
     };
@@ -1048,13 +1048,15 @@ pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
     // `stack` order them, so no window shows a consolidation without its skeleton.
     match &entry.before.consolidation {
         Some(consolidation) => {
-            // Validated when the journal was read; written back as recorded.
-            file_utils::write_file_atomically(&OutOfScopeSkeleton::path(), consolidation.skeleton.as_bytes())?;
+            // Validated when the journal was read; written back as recorded, with its copy, and
+            // the state records the digest of exactly those bytes.
+            let skeleton_digest = OutOfScopeSkeleton::write_bytes(consolidation.skeleton.as_bytes())?;
             merge_utils::write_consolidation_state(&ConsolidationState {
                 their_head: consolidation.their_head.clone(),
                 their_pallet: consolidation.their_pallet.clone(),
                 our_head: consolidation.our_head.clone(),
                 our_pallet: consolidation.our_pallet.clone(),
+                skeleton_digest,
             })?;
         },
         None => {
@@ -1366,11 +1368,12 @@ mod tests {
 
     /// Start a consolidation in the bay as `consolidate` does: the skeleton, then the state.
     fn start_consolidation(head: &str, pallet: &str) {
-        OutOfScopeSkeleton::default().write().unwrap();
+        let skeleton_digest = OutOfScopeSkeleton::default().write().unwrap();
         merge_utils::write_consolidation_state(&ConsolidationState {
             their_head: head.to_string(),
             their_pallet: pallet.to_string(),
             our_head: hash('e'), our_pallet: "main".to_string(),
+            skeleton_digest,
         }).unwrap();
     }
 
@@ -2342,7 +2345,7 @@ mod tests {
         assert_eq!(consolidation.their_head, hash('c'));
         assert_eq!(consolidation.their_pallet, "their-pallet");
         assert_eq!(consolidation.our_pallet, "feature", "the pallet the merge started on must come back");
-        assert!(OutOfScopeSkeleton::read_required().is_ok(), "the skeleton must come back with the state");
+        assert!(OutOfScopeSkeleton::read_required(&consolidation).is_ok(), "the skeleton must come back with the state");
     }
 
     #[test]
@@ -2368,7 +2371,8 @@ mod tests {
 
         restore_refs(&completed).unwrap();
 
-        assert!(OutOfScopeSkeleton::read_required().unwrap() == skeleton, "the recorded skeleton must be restored");
+        let state = merge_utils::read_consolidation_state().unwrap().unwrap();
+        assert!(OutOfScopeSkeleton::read_required(&state).unwrap() == skeleton, "the recorded skeleton must be restored");
 
         // And an entry with no consolidation before it clears both.
         advance(
@@ -2444,6 +2448,7 @@ mod tests {
             their_head: hash('d'),
             their_pallet: "side".to_string(),
             our_head: hash('e'), our_pallet: "main".to_string(),
+            skeleton_digest: "0".repeat(64),
         }).unwrap();
 
         assert!(capture().is_err(), "a broken merge must not be journaled with an empty skeleton");
@@ -2535,6 +2540,7 @@ mod tests {
             their_head: hash('d'),
             their_pallet: "stray".to_string(),
             our_head: hash('e'), our_pallet: "main".to_string(),
+            skeleton_digest: "0".repeat(64),
         }).unwrap();
         advance("main", None, &hash('b')).unwrap();
 

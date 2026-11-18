@@ -284,6 +284,10 @@ pub(crate) async fn merge_head_into_current(current: &str,
     load_guard_utils::check_no_incomplete_load()?;
     operation_utils::check_none_standing()?;
 
+    // Every caller merges into a bay that has no merge in progress: one standing would be written
+    // over by this merge's records and lost with them.
+    shift::refuse_mid_merge("starting another merge")?;
+
     let our_tree_hash = object_utils::load_parcel(our_head)?.tree_hash;
     let their_tree_hash = object_utils::load_parcel(their_head)?.tree_hash;
 
@@ -355,13 +359,14 @@ pub(crate) async fn merge_head_into_current(current: &str,
     // Clearing first guards against a stale skeleton left behind by an aborted earlier merge in
     // this bay.
     merge_utils::OutOfScopeSkeleton::clear()?;
-    merge_utils::OutOfScopeSkeleton::from_actions(&actions).write()?;
+    let skeleton_digest = merge_utils::OutOfScopeSkeleton::from_actions(&actions).write()?;
 
     merge_utils::write_consolidation_state(&ConsolidationState {
         their_head: their_head.to_string(),
         their_pallet: their_label.to_string(),
         our_head: our_head.to_string(),
         our_pallet: current.to_string(),
+        skeleton_digest,
     })?;
 
     if conflict_paths.is_empty() {
@@ -1069,7 +1074,7 @@ mod tests {
             staged.len(), unstaged.len());
 
         assert!(merge_utils::read_consolidation_state().unwrap().is_none(), "no consolidation may stay in progress");
-        assert!(merge_utils::OutOfScopeSkeleton::read_required().is_err(), "no skeleton may stay behind");
+        assert!(!forklift_core::globals::bay_root().join("consolidation-skeleton").exists(), "no skeleton may stay behind");
     }
 
     use forklift_core::util::operation_utils::RecoveryOutcome;

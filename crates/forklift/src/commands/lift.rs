@@ -12,6 +12,7 @@ use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use crate::commands::consolidate::{self, MergeStatus};
 use crate::commands::lower::{self, MetaPalletFailure};
 use crate::commands::mirror::{self, LiftMirror};
+use crate::commands::shift;
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -357,6 +358,13 @@ async fn try_auto_merge(client: &RemoteClient,
         && !merge_utils::is_ancestor(head, remote_head)?;          // they do not already contain us
 
     if !diverged {
+        return Ok(false);
+    }
+
+    // A merge in progress here would be written over by this one, so a lift there makes none and
+    // falls through to the diverged error: the lower that error names says what to finish first.
+    // Read only once the remote diverged, so a lift that merges nothing never reads those records.
+    if shift::merge_in_progress()? {
         return Ok(false);
     }
 

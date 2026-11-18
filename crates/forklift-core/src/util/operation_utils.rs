@@ -491,6 +491,12 @@ pub fn read() -> Result<Option<Operation>, String> {
     read_at(&marker_path())
 }
 
+/// Whether anything stands at the marker path of the bay whose bay-local state dir is `dir`: a
+/// marker, readable or not.
+pub(crate) fn marker_stands_in(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(FILE_NAME_OPERATION)).is_ok()
+}
+
 /// Read the marker of the bay whose bay-local state dir is `dir` (see [`read`]).
 pub(crate) fn read_in(dir: &Path) -> Result<Option<Operation>, String> {
     read_at(&dir.join(FILE_NAME_OPERATION))

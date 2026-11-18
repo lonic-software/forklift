@@ -155,6 +155,11 @@ pub async fn catch_up(position: pallet_utils::BayPosition) -> Result<CaughtUp, S
     ))
 }
 
+/// Whether a consolidation or a pick is in progress in this bay.
+pub(crate) fn merge_in_progress() -> Result<bool, String> {
+    Ok(merge_utils::read_consolidation_state()?.is_some() || cherry_pick_utils::read_state()?.is_some())
+}
+
 /// Refuse a switch of the current pallet while a consolidation or cherry-pick is in progress: it
 /// is completed on the pallet it started on (`stack` refuses it anywhere else).
 ///

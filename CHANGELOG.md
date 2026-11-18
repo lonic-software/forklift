@@ -648,6 +648,20 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **`heal` restores a damaged record of a merge in progress from a copy kept beside it.** Every
+  write of a consolidation's state, its out-of-scope skeleton or a pick's state now leaves a copy
+  (`consolidation-copy`, `consolidation-skeleton-copy`, `cherry-pick-copy`), and `forklift heal`
+  writes a damaged record back from it when the copy reads and agrees with where the bay stands,
+  reporting it in `merge_state_restored` (`--json` schema 55). The refusal of a damaged record
+  names `forklift heal` while that can run, and `abort --keep-files` (or `abort` for the skeleton)
+  once no copy can be used. Under an interrupted merge or pick, heal removes a record no copy can
+  restore, since finishing that operation drops it anyway. A consolidation records its skeleton's
+  digest, so a skeleton left by another merge is refused as damaged. The consolidation state's
+  format changes: a merge in progress written by an older Forklift is refused.
+- **A merge no longer starts over one in progress.** `haul consolidate`, and the merge a `lower`
+  makes, refuse while a consolidation or pick is in progress in the bay, and a `lift` there makes
+  no merge of its own and stops as diverged; `haul consolidate` over a conflicted consolidation
+  whose files were resolved used to write a second merge's record over the first one's.
 - **A server's `500` no longer names its files.** A request that failed on a fault of
   `forklift-server`'s own answered with the failure's own message, which could carry the server's
   absolute paths, such as a pack index that does not parse or a damaged ref. A `500` now carries a

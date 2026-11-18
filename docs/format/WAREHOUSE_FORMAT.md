@@ -294,8 +294,11 @@ name in a row is a constant, and every path in every fixture matches a row.
 | `{bay}scope` | rewritable | `scope_utils::FILE_NAME_BAY_SCOPE` |
 | `{bay}scope-copy` | rewritable | `scope_utils::FILE_NAME_SCOPE_COPY` |
 | `{bay}cherry-pick` | rewritable | `cherry_pick_utils::FILE_NAME_CHERRY_PICK` |
+| `{bay}cherry-pick-copy` | rewritable | `cherry_pick_utils::FILE_NAME_CHERRY_PICK_COPY` |
 | `{bay}consolidation` | rewritable | `merge_utils::FILE_NAME_CONSOLIDATION` |
+| `{bay}consolidation-copy` | rewritable | `merge_utils::FILE_NAME_CONSOLIDATION_COPY` |
 | `{bay}consolidation-skeleton` | rewritable | `merge_utils::FILE_NAME_SKELETON` |
+| `{bay}consolidation-skeleton-copy` | rewritable | `merge_utils::FILE_NAME_SKELETON_COPY` |
 | `{bay}operation` | rewritable | `operation_utils::FILE_NAME_OPERATION` |
 | `{bay}journal.json` | rewritable | `journal_utils::FILE_NAME_JOURNAL` |
 | `{bay}lock` | lock | `lock_utils::FILE_NAME_LOCK`, `franchise_utils::FILE_NAME_LOCK` |

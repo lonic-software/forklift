@@ -2383,6 +2383,55 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "MergeRecordRestored": {
+      "description": "A merge record `heal` wrote back from its copy, or removed with it.",
+      "properties": {
+        "file": {
+          "description": "Its file.",
+          "type": "string"
+        },
+        "record": {
+          "description": "The record: \"consolidation state\", \"consolidation skeleton\" or \"pick state\".",
+          "type": "string"
+        },
+        "removed": {
+          "description": "Whether it was removed with its copy rather than written back: under an interrupted merge or\npick, whose recovery clears it whatever its outcome, when no copy could be used.",
+          "type": "boolean"
+        },
+        "was": {
+          "description": "What the file held that could not be used.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "record",
+        "file",
+        "removed",
+        "was"
+      ],
+      "type": "object"
+    },
+    "MergeStateRestored": {
+      "description": "The merge records of the checkout `heal` runs in that it wrote back or removed.",
+      "properties": {
+        "checkout": {
+          "description": "The checkout: the warehouse's own working tree, or a bay.",
+          "type": "string"
+        },
+        "records": {
+          "description": "Each record, in the order heal judged them.",
+          "items": {
+            "$ref": "#/$defs/MergeRecordRestored"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "checkout",
+        "records"
+      ],
+      "type": "object"
+    },
     "ObjectsLost": {
       "description": "What a `heal` run found lost: reachable objects the store cannot give back.",
       "properties": {
@@ -2941,6 +2990,17 @@ A command not listed here either reports only the generic human-message shape `{
         }
       ],
       "description": "The inventory's registered set of folders, which did not read and this run rebuilt from the\nfolders it could find whose staging the shard store holds."
+    },
+    "merge_state_restored": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MergeStateRestored"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The records of the merge in progress in the checkout this run healed that were damaged or\nmissing and this run wrote back from the copy beside each, or removed with it under an\ninterrupted merge or pick whose recovery clears them."
     },
     "newly_held_by_hash": {
       "description": "Absent objects beneath those in `unsealed` that the record now holds by hash alone, so that\nremoving those records left nothing beneath them unaccounted for.",

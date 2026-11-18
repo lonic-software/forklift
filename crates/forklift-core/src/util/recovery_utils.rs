@@ -5519,6 +5519,7 @@ mod tests {
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         let state = crate::util::merge_utils::ConsolidationState {
             their_head: target_hash.clone(), their_pallet: "their-pallet".to_string(), our_head: "e".repeat(64), our_pallet: "main".to_string(),
+            skeleton_digest: "0".repeat(64),
         };
         std::fs::write(bay_b_dir.join("consolidation"), crate::util::merge_utils::consolidation_state_bytes(&state)).unwrap();
 

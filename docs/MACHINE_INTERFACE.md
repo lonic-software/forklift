@@ -85,7 +85,17 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 54** (current): the `merge_state_damaged` error code exists (exit 68). A bay's record
+**Schema 55** (current): `heal` emits `data.merge_state_restored` when it wrote back or removed a
+damaged record of the merge in progress: `checkout` names the working tree, and `records` lists
+each record (`record`: "consolidation state", "consolidation skeleton" or "pick state"; `file`;
+`was`, what was wrong with it; `removed`, true when no copy could be used and an interrupted merge
+or pick that heal then settles made the record unneeded). Every write of those records leaves a copy
+beside it, and `merge_state_damaged` now names `forklift heal` as its `next_step` whenever heal can
+run: an interrupted operation stands in that bay, or the copy reads and agrees with the pallet and
+parcel the bay stands on (for a skeleton, matches the digest its state records). Otherwise the next
+step is as in schema 54. A skeleton whose bytes do not match that digest is refused as damaged.
+
+**Schema 54**: the `merge_state_damaged` error code exists (exit 68). A bay's record
 of the consolidation or pick in progress there, its state file or a consolidation's skeleton, is
 not a file, is not UTF-8, lacks its header, is in an older format, does not
 match its digest, or holds entries that do not parse, or the skeleton is missing beside a

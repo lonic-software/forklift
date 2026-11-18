@@ -171,6 +171,31 @@ fn heal_with_no_readable_checkout_offers_a_fetch_scope_that_works() {
     assert_eq!(json_of(&healed)["data"]["fetch_scope_rebuilt"]["scope"], serde_json::json!(["docs", "src"]));
 }
 
+/// A damaged merge record heal leaves for last is named in a refusal that ends the run earlier, as
+/// a plain sentence: never its code or its frame's separators.
+///
+/// Revert: note the refusal's raw frame → the note reads its code and the frame's separators, red.
+#[test]
+fn an_earlier_refusal_names_a_damaged_merge_record_as_plain_text() {
+    let area = TestArea::new("fetch-scope-heal-merge-note");
+    let _server = sparse_with_docs(&area);
+
+    forklift_core::util::file_utils::remove_file(area.path(FETCH_SCOPE)).unwrap();
+    std::fs::write(area.path(MAIN_SCOPE), forklift_core::util::record_utils::to_bytes("scope", 99, ["docs", "src/api"])).unwrap();
+    std::fs::write(area.path("sparse/.forklift/cherry-pick"), "/forklift-garbled\n").unwrap();
+
+    let human = area.forklift("sparse", &["heal"]);
+    assert_eq!(human.status.code(), Some(FETCH_SCOPE_DAMAGED_EXIT), "{}{}", stdout(&human), stderr(&human));
+    let text = stderr(&human);
+    let note = text.lines().find(|line| line.contains("Note: ") && line.contains("cherry-pick"))
+        .unwrap_or_else(|| panic!("no note names the pick state: {}", text));
+    assert!(!note.contains("merge_state_damaged") && !note.contains('\u{1f}'), "the note is not plain text: {:?}", note);
+
+    let error = fetch_scope_damaged(&area.forklift("sparse", &["--json", "heal"]));
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("cherry-pick") && !message.contains("merge_state_damaged") && !message.contains('\u{1f}'), "{:?}", message);
+}
+
 /// A fetch scope that matches its digest but does not hold a checkout's scope (one of the two holds
 /// the wrong scope whole, as a file put back from elsewhere would) is refused with both ways out;
 /// choosing the fetch scope as the damaged one fetches and sets it.

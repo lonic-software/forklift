@@ -1981,6 +1981,58 @@ fn optimistic_lift_refuses_on_an_incomplete_load_before_writing_consolidation_st
     assert!(stdout(&healed).contains("auto-merged"), "{}", stdout(&healed));
 }
 
+/// A lift over a merge in progress makes no merge of its own, which would write over the one
+/// standing: it stops with the diverged error, whose lower then says what to finish first, and the
+/// merge in progress is left byte for byte.
+///
+/// Revert: drop the lift's mid-merge check → the merge primitive's own guard refuses instead,
+/// naming no lower, red. Read the merge records before the diverged test → the lift of a pallet
+/// that is only ahead is refused over a damaged pick state, red.
+#[test]
+fn a_lift_over_a_merge_in_progress_stops_diverged_and_leaves_it() {
+    let area = TestArea::new("lift-mid-merge");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/shared.txt", "base\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "initial"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+
+    // A lift that merges nothing never reads the merge records, so a damaged one does not stop it.
+    area.write_file("a/from_a.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a's file"]));
+    area.write_file("a/.forklift/cherry-pick", "/forklift-garbled\n");
+    assert_success(&area.forklift("a", &["lift"]));
+    forklift_core::util::file_utils::remove_file(area.path("a/.forklift/cherry-pick")).unwrap();
+
+    // B diverges with its own parcel, and has a local merge in progress, resolved to its side and
+    // loaded, so its tree is clean.
+    assert_success(&area.forklift("b", &["pallet", "create", "side"]));
+    area.write_file("b/shared.txt", "side\n");
+    assert_success(&area.forklift("b", &["load", "."]));
+    assert_success(&area.forklift("b", &["stack", "-m", "side"]));
+    assert_success(&area.forklift("b", &["shift", "main"]));
+    area.write_file("b/shared.txt", "b\n");
+    assert_success(&area.forklift("b", &["load", "."]));
+    assert_success(&area.forklift("b", &["stack", "-m", "b's change"]));
+    let _ = area.forklift("b", &["consolidate", "side"]);
+    assert!(area.path("b/.forklift/consolidation").exists(), "the consolidate stopped on its conflict");
+    area.write_file("b/shared.txt", "b\n");
+    assert_success(&area.forklift("b", &["load", "shared.txt"]));
+    let state = std::fs::read(area.path("b/.forklift/consolidation")).unwrap();
+
+    let refused = area.forklift("b", &["lift"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("diverged") && stderr(&refused).contains("Next step: forklift lower; then forklift lift"),
+        "{}", stderr(&refused));
+    assert_eq!(std::fs::read(area.path("b/.forklift/consolidation")).unwrap(), state, "the merge in progress is untouched");
+    assert!(!area.path("b/from_a.txt").exists(), "nothing of theirs was merged in");
+}
+
 #[test]
 fn manifest_syncs_across_remotes_and_replays_when_diverged() {
     let area = TestArea::new("manifest-remote");
@@ -13712,7 +13764,8 @@ fn heal_reseals_nothing_over_a_check_that_could_not_read_every_source() {
     assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let older = sealed_older_roots(&area, "cached", &head);
     lose_sealed_record(&area, "cached");
-    std::fs::write(area.path("cached/.forklift/consolidation"), "not a record\n").unwrap();
+    // A record the walk reads its roots from and heal does not repair: the walk reads past it.
+    std::fs::write(area.path(&format!("cached/.forklift/{}", forklift_core::util::mirror_utils::FILE_NAME_MIRROR_ROOTS)), "not a record\n").unwrap();
 
     let output = area.forklift("cached", &["--json", "heal"]);
     assert!(!output.status.success(), "{}", stdout(&output));
