@@ -2223,7 +2223,7 @@ fn listing_went_stale(set: &PackSet) -> bool {
 thread_local! {
     /// A step [`load_listed_packs`] runs once on this thread, between its listing and its opens:
     /// where a test puts another process's compaction, which can land between the two.
-    static BETWEEN_LISTING_AND_OPENS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BETWEEN_LISTING_AND_OPENS: std::cell::RefCell<Option<(Option<IndexCheck>, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Run `step` once on this thread, in the next pack-set load, after it lists the pack folder and
@@ -2231,7 +2231,13 @@ thread_local! {
 #[cfg(test)]
 #[must_use = "the step is disarmed when the guard drops"]
 pub(crate) fn between_next_listing_and_opens(step: impl FnOnce() + 'static) -> ListingStep {
-    BETWEEN_LISTING_AND_OPENS.with(|slot| *slot.borrow_mut() = Some(Box::new(step)));
+    arm_listing_step(None, Box::new(step))
+}
+
+/// [`between_next_listing_and_opens`], for the next load under `only` alone when it is given.
+#[cfg(test)]
+fn arm_listing_step(only: Option<IndexCheck>, step: Box<dyn FnOnce()>) -> ListingStep {
+    BETWEEN_LISTING_AND_OPENS.with(|slot| *slot.borrow_mut() = Some((only, step)));
     ListingStep(())
 }
 
@@ -2247,10 +2253,11 @@ impl Drop for ListingStep {
 }
 
 /// Stand a compaction in another process between each of this thread's next `times` pack-folder
-/// listings and their opens: each deletes the signature table the listing just named and publishes
-/// the next. Returns how many have run. Writes the first table into the active pack folder.
+/// listings and their opens (only those of loads under `only`, when it is given): each deletes the
+/// signature table the listing just named and publishes the next. Returns how many have run.
+/// Writes the first table into the active pack folder.
 #[cfg(test)]
-pub(crate) fn churn_next_listings(times: u8) -> std::rc::Rc<std::cell::Cell<u8>> {
+pub(crate) fn churn_next_listings(times: u8, only: Option<IndexCheck>) -> std::rc::Rc<std::cell::Cell<u8>> {
     fn table(seed: u8) -> (PathBuf, Vec<u8>) {
         let mut parcel = [seed; HASH_LEN];
         parcel[0] = 0xc5;
@@ -2258,23 +2265,23 @@ pub(crate) fn churn_next_listings(times: u8) -> std::rc::Rc<std::cell::Cell<u8>>
         let name = format!("{}.{}", signature_table::table_id(&entries), FILE_EXTENSION_SIGNATURE_TABLE);
         (pack_folder().join(name), signature_table::build(&entries))
     }
-    fn arm(steps: std::rc::Rc<std::cell::Cell<u8>>, times: u8) {
-        std::mem::forget(between_next_listing_and_opens(move || {
+    fn arm(steps: std::rc::Rc<std::cell::Cell<u8>>, times: u8, only: Option<IndexCheck>) {
+        std::mem::forget(arm_listing_step(only, Box::new(move || {
             let seed = steps.get() + 1;
             crate::util::file_utils::remove_file(&table(seed).0).unwrap();
             let (next, bytes) = table(seed + 1);
             std::fs::write(next, bytes).unwrap();
             steps.set(seed);
             if seed < times {
-                arm(steps, times);
+                arm(steps, times, only);
             }
-        }));
+        })));
     }
 
     let (first, bytes) = table(1);
     std::fs::write(first, bytes).unwrap();
     let steps = std::rc::Rc::new(std::cell::Cell::new(0));
-    arm(std::rc::Rc::clone(&steps), times);
+    arm(std::rc::Rc::clone(&steps), times, only);
     steps
 }
 
@@ -2320,7 +2327,13 @@ fn load_listed_packs(pack_folder: &Path, check: IndexCheck) -> Result<PackSet, S
     }
 
     #[cfg(test)]
-    if let Some(step) = BETWEEN_LISTING_AND_OPENS.with(|slot| slot.borrow_mut().take()) {
+    if let Some(step) = BETWEEN_LISTING_AND_OPENS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_ref() {
+            Some((Some(only), _)) if *only != check => None,
+            _ => slot.take().map(|(_, step)| step),
+        }
+    }) {
         step();
     }
 
@@ -2471,7 +2484,7 @@ fn folder_modified(pack_folder: &Path) -> Result<Option<SystemTime>, String> {
 
 /// How much of each index a pack load validates up front.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IndexCheck {
+pub(crate) enum IndexCheck {
     /// The header and fanout table only; each bucket is validated when a lookup first reads it.
     /// What the pack registry loads, so a command pays only for the buckets it touches.
     Lazy,
@@ -11953,7 +11966,7 @@ pub(crate) mod tests {
     #[test]
     fn a_pack_folder_that_changes_under_every_listing_is_an_error_not_a_stale_verdict() {
         let (temp, _scope) = enter_signature_root("sig-listing-churn");
-        let steps = churn_next_listings(8);
+        let steps = churn_next_listings(8, None);
 
         let loaded = load_packs_from_disk(&pack_folder(), IndexCheck::Lazy);
 

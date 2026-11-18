@@ -4316,23 +4316,18 @@ mod tests {
         tree_object.hash.clone()
     }
 
-    /// FORK-447: heal's closing check names a reachable leaf whose loose file does not decompress
-    /// and a reachable tree whose loose file decompresses to other bytes as corrupt, without
-    /// descending the tree or failing the walk on it, and leaves a corrupt file history does not
-    /// reach unlisted. Every corrupt file is kept. Mutation: skip the scan (the walk fails on the
-    /// tree), drop the leaf's corrupt check (the leaf goes unnamed), or list every corrupt file →
-    /// red.
     /// FORK-519: a pack folder that cannot be told — here one that changed under every listing the
-    /// snapshot took — fails the walk, rather than reading as "no foreign index" and reporting a
-    /// loss with no qualification.
+    /// health snapshot took — fails the walk, rather than reading as "no foreign index" and
+    /// reporting a loss with no qualification. Only full-check loads are churned, which in this
+    /// walk is the snapshot alone, wherever the walk takes it.
     ///
-    /// Revert: swallow the snapshot's error (`is_ok_and`) → the churn is spent on the snapshot, the
-    /// rest of the walk sees a quiet folder and returns a report → red.
+    /// Revert: swallow the snapshot's error (`is_ok_and`), in either position → the churn is spent
+    /// on the snapshot, the rest of the walk sees a quiet folder and returns a report → red.
     #[test]
     fn find_lost_objects_fails_on_a_pack_folder_it_cannot_tell() {
         let (dir, _scope) = enter_temp_root("fork519-lost-churn");
         std::fs::create_dir_all(pack_utils::pack_folder()).unwrap();
-        let steps = pack_utils::churn_next_listings(8);
+        let steps = pack_utils::churn_next_listings(8, Some(pack_utils::IndexCheck::Full));
 
         let lost = find_lost_objects();
         assert_eq!(steps.get(), 8, "sanity: the snapshot's eight listings each met a compaction");
@@ -4342,6 +4337,12 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// FORK-447: heal's closing check names a reachable leaf whose loose file does not decompress
+    /// and a reachable tree whose loose file decompresses to other bytes as corrupt, without
+    /// descending the tree or failing the walk on it, and leaves a corrupt file history does not
+    /// reach unlisted. Every corrupt file is kept. Mutation: skip the scan (the walk fails on the
+    /// tree), drop the leaf's corrupt check (the leaf goes unnamed), or list every corrupt file →
+    /// red.
     #[test]
     fn find_lost_objects_names_reachable_corrupt_loose_objects_only() {
         use crate::model::tree_item::TreeItem;
