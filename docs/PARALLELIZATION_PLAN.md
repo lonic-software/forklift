@@ -425,13 +425,16 @@ re-run a benchmark by hand.
   crosses `audit_utils::PARALLEL_THRESHOLD` at that size. Linux only for the pinned row, since there
   is no worker-count env/flag to pass instead and macOS has no affinity equivalent `num_cpus` honors.
 - **CI job:** `.github/workflows/proof-load-perf.yml`: one `ubuntu-latest` job, on every push to
-  `main` and on pull requests that touch a perf-sensitive path (`crates/forklift-core/src/**`,
-  `crates/forklift/src/commands/**`, `crates/forklift/src/cli.rs`, `crates/proof-load/**`). It
+  `main` and on pull requests that touch what the timed binaries are built from (`crates/forklift-core/`,
+  `crates/forklift/`, `crates/forklift-server/`, the workspace's `Cargo.toml` and `Cargo.lock`,
+  `.cargo/`) or the harness (`crates/proof-load/`). It
   uploads `perf.json`/`perf.md` as a build artifact; the numbers are not committed to the repo.
 - **Gating philosophy, deliberately narrow.** A CI runner is noisy and shared, and an absolute-ms
   baseline gate on it is flake theater. The job runs `--gate self`, which fails only on same-run
   ratios: repack ≤ 1.5× a fresh `compact` (per D/P3 above), unrestricted `audit` ≤ 2× `audit`
   pinned to one core, and Forklift's median at most 10× tuned git's on the status, diff, switch,
-  commit, verify and pack rows and both diffs, sized to catch an order-of-magnitude regression (an accidental
-  O(n²), a broken fan-out) and nothing tighter. The 10× ratio replaced the first harness's absolute
+  commit, verify and pack rows and both diffs, sized to catch an order-of-magnitude regression (an
+  accidental O(n²)) and nothing tighter. The audit ratio catches a parallel path that runs much
+  slower than one core, such as one fighting over a lock; an audit that lost its parallelism, and
+  runs as fast as one core, passes it. The 10× ratio replaced the first harness's absolute
   ceilings. Absolute-time trend-watching is left to a human reading the uploaded report.

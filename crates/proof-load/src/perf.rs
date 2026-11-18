@@ -61,8 +61,9 @@ const NO_ONE_CORE: &str = "pinning a command to one core is built only on Linux,
 const GATE_FILES: usize = 240;
 const GATE_TOUCHED: usize = 5;
 /// The gate subject's parcels: more than the count at which Forklift's audit verifies signatures
-/// in parallel (audit_utils's PARALLEL_THRESHOLD, 256 when this was written), so the one-core
-/// ratio judges that fan-out.
+/// in parallel (audit_utils's PARALLEL_THRESHOLD, 256 when this was written), so the unrestricted
+/// audit takes the parallel path. Its ratio to the one-core audit catches that path running much
+/// slower than one core; an audit that lost its parallelism, and runs as fast as one core, passes.
 const GATE_PARCELS: usize = 300;
 /// The gate subject's rows, Forklift's alone, warm only.
 pub const FRESH_COMPACT: &str = "fresh compact";
@@ -358,10 +359,19 @@ pub fn judge(rows: &[Row], shape: &str, platform: Platform, gate: Gate, tickets:
             Outcome::NotComparable { reason } => Some(format!("not comparable: {}", reason)),
             Outcome::Timed { cells } => cells.iter().find(|cell| !matches!(cell.result, Measured::Timed { .. })).map(|cell| format!("{}'s cell has no timing", cell.subject.label())),
         };
-        if let Some(detail) = unrun.filter(|_| gated) {
+        let Outcome::Timed { cells } = &row.outcome else {
+            if let Some(detail) = unrun.filter(|_| gated) {
+                fail(row, Check::CouldNotRun, detail);
+            }
+            continue;
+        };
+        // A timed row compares Forklift with tuned git, and a gate-subject row is Forklift's alone:
+        // a row missing a subject it needs was never compared, which is not a pass.
+        let needs: &[Tool] = if gate_row(&row.operation) { &[Tool::Forklift] } else { &[Tool::Forklift, Tool::GitTuned] };
+        let missing = needs.iter().find(|tool| !cells.iter().any(|cell| cell.subject == **tool)).map(|tool| format!("it has no {} cell", tool.label()));
+        if let Some(detail) = unrun.or(missing).filter(|_| gated) {
             fail(row, Check::CouldNotRun, detail);
         }
-        let Outcome::Timed { cells } = &row.outcome else { continue };
         let Some((forklift, tuned)) = forklift_and_tuned(cells) else { continue };
         if GROSS.contains(&row.operation.as_str()) && forklift.median > tuned.median.saturating_mul(GROSS_TIMES) {
             fail(row, Check::Gross, format!("Forklift's median {} is more than {} times tuned git's {}", micros(forklift.median), GROSS_TIMES, micros(tuned.median)));
@@ -545,8 +555,9 @@ pub struct PerfOptions {
     /// they are not run on a real history.
     pub side_branch: Option<String>,
     pub reps: usize,
-    /// Which checks fail the run.
-    pub gate: Gate,
+    /// Which checks fail the run: all on a generated shape and self on a real history when none
+    /// is given.
+    pub gate: Option<Gate>,
     /// The program each cold repetition runs first to drop the operating system's caches; without
     /// it the cold rows are not run.
     pub drop_caches: Option<PathBuf>,
@@ -644,7 +655,7 @@ pub fn run(options: &PerfOptions, progress: &dyn Fn(&str)) -> Result<PerfReport,
         Source::History(_) => (None, "history".to_string()),
     };
     let platform = Platform::current();
-    let verdict = judge(&rows, &shape, platform, options.gate, &tickets);
+    let verdict = judge(&rows, &shape, platform, gate_of(options), &tickets);
     let header = Header {
         seed, shape, shape_detail, side_branch, reps: options.reps, tools,
         platform, os: crate::run::operating_system(), filesystem: crate::run::filesystem_of(output.root()),
@@ -690,6 +701,9 @@ fn source(options: &PerfOptions) -> Result<Source, String> {
             let from = std::path::absolute(from).map_err(|error| format!("--history-from {}: {}", from.display(), error))?;
             if !from.is_dir() {
                 return Err(format!("--history-from {}: not a folder", from.display()));
+            }
+            if options.gate == Some(Gate::All) {
+                return Err("--gate all fails a clearly slower row no ticket tracks, and a ticket names a generated shape, so none can track a row of --history-from's history; judge it with --gate self".to_string());
             }
             Ok(Source::History(History { from, side: options.side_branch.clone() }))
         }
@@ -1066,8 +1080,8 @@ fn gate_signed(forklift: &Path, at: &Path, scratch: &Scratch, environment: &Envi
     })
 }
 
-/// The gate subject's rows, Forklift's alone and warm only: the fresh compact, once, of the loose
-/// objects its build left; the repack of its whole store; its audit of main; and that audit pinned
+/// The gate subject's rows, Forklift's alone and warm only: the fresh compact of the loose objects
+/// its build left, on a fresh copy each repetition; the repack of its whole store; its audit of main; and that audit pinned
 /// to one core, when `one_core` allows. Every row is not comparable when the subject could not be
 /// built or its audit verified other than every signed parcel, and the fresh compact when it
 /// packed nothing.
@@ -1080,7 +1094,7 @@ fn gate_rows(forklift: &Path, reps: usize, one_core: &OneCore, scratch: &Scratch
         Err(reason) => Err(format!("the gate subject could not be built: {}", reason)),
     };
     let notes = [
-        (FRESH_COMPACT, format!("Forklift's store compact over the loose objects of a warehouse of {} signed parcels, once, since it leaves nothing loose", GATE_PARCELS)),
+        (FRESH_COMPACT, format!("Forklift's store compact over the loose objects of a warehouse of {} signed parcels, each repetition on a fresh copy, since it leaves nothing loose", GATE_PARCELS)),
         (REPACK, "Forklift's store compact --all over the same store, packed by the fresh compact".to_string()),
         (AUDIT, "Forklift's audit of main, which checks every parcel's signature".to_string()),
         (AUDIT_ONE_CORE, "the same audit pinned to one core with taskset -c 0".to_string()),
@@ -1097,13 +1111,10 @@ fn gate_rows(forklift: &Path, reps: usize, one_core: &OneCore, scratch: &Scratch
         let outcome = match operation {
             FRESH_COMPACT => {
                 let command = subject.line(&["--json", "store", "compact"]);
-                settle(&at)?;
-                match repetition(&subject.invocation(command.clone()), None, scratch, environment)? {
-                    Err(ended) => cell(command, ended),
-                    Ok(timed) => match runner::document(&timed.outcome.stdout)["data"]["objects_packed"].as_u64() {
-                        Some(packed) if packed > 0 => cell(command, summarise(&[timed])),
-                        packed => Outcome::NotComparable { reason: format!("the fresh compact packed {:?} objects, so it timed no packing", packed) },
-                    },
+                match fresh_compact(&subject, &command, reps, scratch, environment)? {
+                    Ok(Ok(runs)) => cell(command, summarise(&runs)),
+                    Ok(Err(ended)) => cell(command, ended),
+                    Err(reason) => Outcome::NotComparable { reason },
                 }
             }
             REPACK => {
@@ -1127,6 +1138,54 @@ fn gate_rows(forklift: &Path, reps: usize, one_core: &OneCore, scratch: &Scratch
         rows.push(row(outcome));
     }
     Ok(())
+}
+
+/// The gate `options` judges by: the one it names, else all on a generated shape and self on a
+/// real history, which no ticket can track.
+fn gate_of(options: &PerfOptions) -> Gate {
+    options.gate.unwrap_or(if options.history_from.is_some() { Gate::SelfOnly } else { Gate::All })
+}
+
+/// The fresh compact's `reps` timed runs, each on a fresh copy of the gate subject's loose store
+/// after one untimed run on another, and then the subject's own compact, untimed, so the repack
+/// after it runs over a packed store. Every run must pack something, since the subject is built
+/// loose: gives why the row is not comparable when one packed nothing, and the cell's ending when
+/// a run ended without a timing.
+fn fresh_compact(subject: &Subject, command: &[String], reps: usize, scratch: &Scratch, environment: &Environment) -> Result<Result<Result<Vec<tool::Timed>, Measured>, String>, Stopped> {
+    let copies = scratch.work().join("gate-copies");
+    std::fs::create_dir_all(&copies).map_err(|error| Stopped(format!("{}: {}", copies.display(), error)))?;
+    let mut runs = Vec::with_capacity(reps);
+    for rep in 0..=reps {
+        let copied = Copied(Some(copies.join(format!("fresh-compact-{}", rep))));
+        let compacted = crate::scrub::copy_tree(&subject.work, copied.path())
+            .map_err(|error| Stopped(format!("copying {} to {}: {:?}", subject.work.display(), copied.path().display(), error)))
+            .and_then(|()| compact_once(&subject.at(copied.path().to_path_buf()), command, scratch, environment));
+        let removed = copied.remove();
+        let compacted = compacted?;
+        removed?;
+        match compacted {
+            Ok(Ok(timed)) => if rep > 0 { runs.push(timed) },
+            ended => return Ok(ended.map(|ended| ended.map(|_| Vec::new()))),
+        }
+    }
+    Ok(match compact_once(subject, command, scratch, environment)? {
+        Ok(Ok(_)) => Ok(Ok(runs)),
+        Ok(Err(ended)) => Err(format!("the gate subject's own compact, untimed, ended without packing: {:?}", ended)),
+        Err(reason) => Err(reason),
+    })
+}
+
+/// One `store compact` of `subject`'s store, after its writes are settled, which must pack at least
+/// one object.
+fn compact_once(subject: &Subject, command: &[String], scratch: &Scratch, environment: &Environment) -> Result<Result<Result<tool::Timed, Measured>, String>, Stopped> {
+    settle(&subject.work)?;
+    Ok(match repetition(&subject.invocation(command.to_vec()), None, scratch, environment)? {
+        Err(ended) => Ok(Err(ended)),
+        Ok(timed) => match runner::document(&timed.outcome.stdout)["data"]["objects_packed"].as_u64() {
+            Some(packed) if packed > 0 => Ok(Ok(timed)),
+            packed => Err(format!("the fresh compact packed {:?} objects, so it timed no packing", packed)),
+        },
+    })
 }
 
 /// The forklift-server the remote rows serve Forklift's remotes with, or why they are not run.
@@ -2350,6 +2409,14 @@ mod tests {
         let verdict = judged(&[unrun("diff", not_comparable.clone()), unrun(AUDIT, not_comparable.clone()), unrun("log", not_comparable), unrun("switch", Outcome::NotRun { reason: "r".into() })]);
         assert_eq!(failures(&verdict), [("diff", Check::CouldNotRun), (AUDIT, Check::CouldNotRun)]);
         assert_eq!(verdict.failures[0].detail, "not comparable: why");
+
+        // A timed row missing a subject it needs was never compared: a gross row with no tuned git
+        // cell, and a gate-subject row with no cell at all, fail; log, ungated under self, does not.
+        let Outcome::Timed { cells } = paired("status", fast, fast).outcome else { unreachable!() };
+        let forklift_only = Outcome::Timed { cells: cells[..1].to_vec() };
+        let verdict = judged(&[unrun("status", forklift_only.clone()), unrun(REPACK, Outcome::Timed { cells: vec![] }), unrun("log", forklift_only)]);
+        assert_eq!(failures(&verdict), [("status", Check::CouldNotRun), (REPACK, Check::CouldNotRun)]);
+        assert_eq!((verdict.failures[0].detail.as_str(), verdict.failures[1].detail.as_str()), ("it has no git-tuned cell", "it has no forklift cell"));
     }
 
     /// Under all, a clearly slower row with no ticket fails and one with a ticket for its
@@ -2415,7 +2482,7 @@ mod tests {
     fn perf_options_name_one_history() {
         let options = |shape: Option<&str>, history: Option<&str>, side: Option<&str>| PerfOptions {
             out: PathBuf::from("out"), forklift: PathBuf::from("f"), git: PathBuf::from("g"), shape: shape.map(str::to_string),
-            history_from: history.map(PathBuf::from), side_branch: side.map(str::to_string), reps: 1, gate: Gate::All, drop_caches: None, forklift_server: None,
+            history_from: history.map(PathBuf::from), side_branch: side.map(str::to_string), reps: 1, gate: None, drop_caches: None, forklift_server: None,
         };
         assert_eq!(source(&options(None, None, None)), Ok(Source::Generated(Shape::SMALL)));
         assert_eq!(source(&options(Some("huge"), None, None)), Ok(Source::Generated(Shape::HUGE)));
@@ -2425,6 +2492,11 @@ mod tests {
         let here = std::env::current_dir().unwrap();
         let Ok(Source::History(history)) = source(&options(None, Some("."), Some("s"))) else { panic!("a real history") };
         assert_eq!((std::fs::canonicalize(&history.from).unwrap(), history.side.as_deref()), (std::fs::canonicalize(&here).unwrap(), Some("s")));
+        let judged = |gate: Option<Gate>| source(&PerfOptions { gate, ..options(None, Some("."), None) }).map(|_| ());
+        assert_eq!((judged(None), judged(Some(Gate::SelfOnly))), (Ok(()), Ok(())));
+        assert_eq!((gate_of(&options(None, Some("."), None)), gate_of(&options(Some("small"), None, None)), gate_of(&options(None, None, None))), (Gate::SelfOnly, Gate::All, Gate::All));
+        assert_eq!(gate_of(&PerfOptions { gate: Some(Gate::SelfOnly), ..options(None, None, None) }), Gate::SelfOnly);
+        assert_eq!(judged(Some(Gate::All)), Err("--gate all fails a clearly slower row no ticket tracks, and a ticket names a generated shape, so none can track a row of --history-from's history; judge it with --gate self".into()));
         let missing = here.join("no-such-folder-here");
         assert_eq!(source(&options(None, Some(&missing.display().to_string()), None)), Err(format!("--history-from {}: not a folder", missing.display())));
     }
@@ -2432,7 +2504,8 @@ mod tests {
     /// The four files `perf` replaced are named, outside this file, only on the lines kept as
     /// dated records of them: every tracked line the sweep finds is one kept line, and every kept
     /// line is found once. Kept lines are keyed by their file and a fragment of their text, never
-    /// by number, since DESIGN.html's changelog moves down with each new row.
+    /// by number, since DESIGN.html's changelog moves down with each new row. The sweep matches the
+    /// names as they are spelled, so a pattern that escapes one, as a regex does, passes it.
     ///
     /// Revert: drop a kept entry → its line is named as a referrer; name a retired file on a new
     /// line → that line is.
@@ -2618,10 +2691,11 @@ mod tests {
 
         let mut rows = Vec::new();
         let mut timed = Vec::new();
-        both(&mut rows, "log", "n", Ok(()), &Err("why".into()), |cold| { timed.push(cold.cloned()); Ok(Outcome::Timed { cells: vec![] }) }).unwrap();
+        let warm = paired("log", [1_000, 900, 1_100], [1_000, 900, 1_100]).outcome;
+        both(&mut rows, "log", "n", Ok(()), &Err("why".into()), |cold| { timed.push(cold.cloned()); Ok(warm.clone()) }).unwrap();
         assert_eq!(timed, [None]);
         assert_eq!(rows.iter().map(|row| (row.cache, &row.outcome)).collect::<Vec<_>>(), [
-            (Cache::Warm, &Outcome::Timed { cells: vec![] }), (Cache::Cold, &Outcome::NotRun { reason: "why".into() }),
+            (Cache::Warm, &warm), (Cache::Cold, &Outcome::NotRun { reason: "why".into() }),
         ]);
         let mut report = report();
         report.verdict = judge(&rows, "small", Platform::Linux, Gate::All, &[]);
@@ -3106,7 +3180,7 @@ esac
         let server = std::env::var_os("PROOF_LOAD_FORKLIFT_SERVER").map(PathBuf::from)
             .unwrap_or_else(|| forklift.with_file_name(format!("forklift-server{}", std::env::consts::EXE_SUFFIX)));
         let options = PerfOptions {
-            out: out.clone(), forklift: forklift.clone(), git: crate::scrub::path_git(), shape: None, history_from: None, side_branch: None, reps: 1, gate: Gate::All,
+            out: out.clone(), forklift: forklift.clone(), git: crate::scrub::path_git(), shape: None, history_from: None, side_branch: None, reps: 1, gate: Some(Gate::All),
             drop_caches: None, forklift_server: Some(server),
         };
         let report = run(&options, &|_| {}).unwrap();

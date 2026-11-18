@@ -290,7 +290,8 @@ fn text_files(tree: &[u8], texts: &[u8]) -> Vec<String> {
 /// order on a tie, or the first of them when the listing names none.
 fn most_changed(log: &[u8], text_files: &[String]) -> String {
     let mut counts: std::collections::BTreeMap<&str, usize> = text_files.iter().map(|file| (file.as_str(), 0)).collect();
-    for name in log.split(|byte| *byte == 0 || *byte == b'\n') {
+    // -z ends every name with a NUL and leaves a newline in a name as it is, so only a NUL splits.
+    for name in log.split(|byte| *byte == 0) {
         if let Some(count) = std::str::from_utf8(name).ok().and_then(|name| counts.get_mut(name)) {
             *count += 1;
         }
@@ -329,7 +330,7 @@ mod tests {
     /// them, the first in path order on a tie, and the first text file when the log names none.
     ///
     /// Revert: take every blob `ls-tree` lists → the link is a text file; take the last of a tie
-    /// → `b.txt` is blamed.
+    /// → `b.txt` is blamed; split on a newline too → `b.txt` is blamed over the newline name.
     #[test]
     fn a_real_historys_text_files_and_blamed_file_are_read_from_git() {
         let tree = b"100644 blob 1111\ta.txt\x00100755 blob 2222\tb.txt\x00120000 blob 3333\tlink\x00160000 commit 4444\tsub\x00100644 blob 5555\tpic.png\x00100644 blob 6666\tc d.txt\0";
@@ -339,6 +340,9 @@ mod tests {
         assert_eq!(most_changed(b"\0b.txt\0a.txt\0\0b.txt\0a.txt\0gone.txt\0gone.txt\0gone.txt\0", &files), "a.txt");
         assert_eq!(most_changed(b"\0b.txt\0b.txt\0a.txt\0", &files), "b.txt");
         assert_eq!(most_changed(b"", &files), "a.txt");
+        // A name holding a newline is one name, never two that could each count.
+        let files = ["a.txt".to_string(), "b.txt".to_string(), "b.txt\na.txt".to_string()];
+        assert_eq!(most_changed(b"b.txt\na.txt\0b.txt\na.txt\0b.txt\0", &files), "b.txt\na.txt");
     }
 
     /// The mirror git builds from the stream holds every file on main, the most-changed file

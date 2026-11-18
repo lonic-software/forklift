@@ -124,8 +124,10 @@ enum Command {
         /// Which checks fail the run: self, the ones a shared machine can hold (Forklift against
         /// its own ratios, a gross regression against tuned git, a gated row that could not run),
         /// or all, which adds any row that could not run and a clearly slower row no ticket tracks.
-        #[arg(long, default_value = "all", value_parser = ["self", "all"])]
-        gate: String,
+        /// All on a generated shape and self on --history-from, which all is refused with: tickets
+        /// name a generated shape, so none can track a real history's row.
+        #[arg(long, value_parser = ["self", "all"])]
+        gate: Option<String>,
         /// Timed repetitions per cell, after one untimed run on a warm cache.
         #[arg(long, default_value_t = 5)]
         reps: usize,
@@ -169,7 +171,7 @@ fn main() -> ExitCode {
             }
         }
         Command::Perf { out, forklift, git, shape, history_from, side_branch, gate, reps, drop_caches, forklift_server } => {
-            let gate = perf::Gate::named(&gate).expect("clap admits only the gates perf names");
+            let gate = gate.map(|gate| perf::Gate::named(&gate).expect("clap admits only the gates perf names"));
             let options = perf::PerfOptions { out, forklift, git, shape, history_from, side_branch, reps, gate, drop_caches, forklift_server };
             match perf::run(&options, &|text| eprintln!("proof-load: {}", text)) {
                 Ok(report) if report.failed() => ExitCode::from(1),

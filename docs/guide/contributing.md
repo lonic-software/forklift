@@ -214,8 +214,9 @@ Notes:
   its run step continues on error.
 - The `proof load perf` check (`.github/workflows/proof-load-perf.yml`, Linux) times Forklift
   against git with `proof-load perf --shape small --reps 3 --gate self`, on every push to `main`
-  and on a pull request that touches `crates/forklift-core/src/`, `crates/forklift/src/commands/`,
-  `crates/forklift/src/cli.rs` or `crates/proof-load/`. It fails on the checks a shared runner can
+  and on a pull request that touches `crates/forklift-core/`, `crates/forklift/`,
+  `crates/forklift-server/`, `crates/proof-load/`, the workspace's `Cargo.toml` or `Cargo.lock`, or
+  `.cargo/`. It fails on the checks a shared runner can
   hold: a gross regression against tuned git, a broken ratio of Forklift's own, or one of those rows
   that could not run ([the guide](proof-load.md#the-verdict) has each). It is outside `ci passed`.
   `perf.md` and `perf.json` are uploaded.

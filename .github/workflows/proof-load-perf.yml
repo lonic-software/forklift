@@ -3,7 +3,8 @@
 # git for an order-of-magnitude regression on the gross rows, Forklift against itself for the
 # repack and parallel-audit ratios, and any of those rows that could not run. Linux only, because
 # the one-core audit is pinned with taskset. It runs on every push to main, so a regression that
-# lands is caught, and on a pull request that touches a perf-sensitive path.
+# lands is caught, and on a pull request that touches what the timed binaries or the harness are
+# built from.
 #
 # The report (perf.md, perf.json) is uploaded as an artifact for reading; the gate is the exit status.
 # It is not part of the `ci passed` gate.
@@ -14,10 +15,13 @@ on:
     branches: [main]
   pull_request:
     paths:
-      - "crates/forklift-core/src/**"
-      - "crates/forklift/src/commands/**"
-      - "crates/forklift/src/cli.rs"
+      - "crates/forklift-core/**"
+      - "crates/forklift/**"
+      - "crates/forklift-server/**"
       - "crates/proof-load/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
       - ".github/workflows/proof-load-perf.yml"
 
 concurrency:
@@ -44,6 +48,11 @@ jobs:
 
       - name: Build the binaries to time and the harness
         run: cargo build --release --locked -p forklift -p forklift-server -p proof-load
+
+      # perf reports the one-core audit as not run without taskset, which never fails a run, so
+      # its ratio would go unchecked here without this step.
+      - name: Require taskset for the one-core audit
+        run: command -v taskset
 
       - name: Time Forklift against git under the self gate
         run: |

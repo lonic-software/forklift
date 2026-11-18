@@ -325,7 +325,8 @@ target/release/proof-load perf --out ../perf-out \
   `--history-from`, since a generated shape has `perf-side`, and the history must have a branch of
   that name. Without it, switch and merge are reported as not run, with the reason "no side branch
   given (--side-branch)".
-- `--gate` says which checks fail the run: `self` or `all` (the default). See *The verdict* below.
+- `--gate` says which checks fail the run: `self` or `all`. It defaults to `all` on a generated
+  shape and to `self` with `--history-from`, which refuses `all`. See *The verdict* below.
 - `--reps` sets how many timed repetitions each cell gets (5 unless you say otherwise). Each warm
   cell also gets one untimed run of its command first, so that the first repetition does not pay
   for loading what the later ones find cached.
@@ -465,12 +466,13 @@ anything. Its rows have one cell, Forklift's, and run warm:
 
 | Row | Forklift |
 |---|---|
-| fresh compact | `store compact`, once, on the loose store |
+| fresh compact | `store compact` on a fresh copy of the loose store, each repetition |
 | repack | `store compact --all` |
 | audit main | `audit main` |
 | audit main, one core | `audit main` pinned to one core with `taskset -c 0` |
 
-A fresh compact that packs nothing makes its row not comparable. Pinning a command to one core is
+One more compact, untimed, packs the subject itself, so the repack runs over a packed store. A
+compact that packs nothing makes the fresh compact's row not comparable. Pinning a command to one core is
 built only on Linux, with `taskset` on the `PATH`; elsewhere the last row is reported as not run.
 
 ### The verdict
@@ -482,13 +484,13 @@ built only on Linux, with `taskset` on the `PATH`; elsewhere the last row is rep
   magnitude, such as an accidental quadratic loop, not a benchmark;
 - a **broken ratio of Forklift's own**: the repack's median above 1.5 times the fresh compact's, or
   the audit's above twice the one-core audit's;
-- any of those rows, or of the gate subject's, that **could not run**: not comparable, or with a
-  voided cell.
+- any of those rows, or of the gate subject's, that **could not run**: not comparable, with a
+  voided cell, or missing a cell it is judged by (Forklift's, and on the gross rows tuned git's).
 
 Each of these compares two timings taken on the same machine in the same run, so a shared, noisy
 CI runner can hold them. `--gate self` stops there. CI runs it on the small shape in `proof-load-perf.yml`, on every push
-to `main` and on a pull request that touches a perf-sensitive path. `--gate
-all` also fails on any other row that could not run, and on a row that is **clearly slower** with
+to `main` and on a pull request that touches the code the timed binaries or the harness are built
+from. `--gate all` also fails on any other row that could not run, and on a row that is **clearly slower** with
 no ticket tracking it. Clearly slower means Forklift's median is more than 1.25 times tuned git's,
 and its fastest run is slower than tuned git's slowest. The verdict lists every clearly slower row
 under either gate, with its ticket when one tracks it. A row not run, for any reason above, never
@@ -500,7 +502,8 @@ operation, a shape, a cache (`warm` or `cold`), a platform (`linux`, `macos` or 
 entry tracks was timed and is not clearly slower, the verdict lists the entry as possibly closable;
 that never fails the run. A change that makes a row clearly slower on purpose adds its entry, and
 the change that closes the ticket removes it. A test holds every entry to a row this build times
-and a shape it has, and to one entry per row.
+and a shape it has, and to one entry per row. Since an entry names a generated shape, no entry can
+track a row of a real history, so `--history-from` is judged under `self` and refuses `--gate all`.
 
 ### Before you quote a number
 
