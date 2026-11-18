@@ -1068,7 +1068,8 @@ pub struct Walked {
     /// The file contents (blobs and recipes) among `absent`: what a host may have withheld, where
     /// an absent tree or chunk never was.
     pub absent_files: HashSet<String>,
-    /// The trees among `absent`: boundaries the walk could not see beneath.
+    /// The trees among `absent`, and each absent hash a record holds as file content that an entry
+    /// also names as a tree: boundaries the walk could not see beneath. Not a subset of `absent`.
     pub absent_trees: HashSet<String>,
     /// The absent parcels a loss edge reached: a root this warehouse's own refs set (a user or meta
     /// pallet head, a bay's parcel, a tombstone's head, the trust anchor's `adopts` pin, or a parcel
