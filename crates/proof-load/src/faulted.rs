@@ -1392,6 +1392,13 @@ fn bound<'a>(host: Option<&'a Host>, arguments: &[String]) -> Option<(&'a Host, 
 /// part of it, none of which the subject's user can take, is outside knowledge, in the order it
 /// was taken, what starting again took included. [`named_remedies`] has already set aside any remedy
 /// the harness cannot carry out; one reaching here regardless is recorded as unextractable.
+///
+/// What the command's report names next is recorded, never run ([`follow_ups`]), but for one
+/// thing only the operator can supply: a takedown it asks to be restated ([`restatements`]) is
+/// restated from the operator's own record of takedowns ([`Host::takedowns`]), and only for a hash
+/// both name. A hash the report names that the record lacks stays owed, so content the store lost
+/// is never restated into a takedown; a takedown the report does not name is left to the
+/// readback, which grades what the repair made of it.
 fn operate(context: &Context, arguments: &[String], trail: &mut Trail, unextractable: &mut Vec<String>) -> Result<(), RunError> {
     let written = format!("forklift-server {}", arguments.join(" "));
     let Some((host, bound)) = bound(context.host, arguments) else {
@@ -1400,10 +1407,53 @@ fn operate(context: &Context, arguments: &[String], trail: &mut Trail, unextract
         }
         return Ok(());
     };
-    let operated = host.operate(bound.clone(), context.scratch, context.environment, context.limit).map_err(RunError::Tool)?;
+    let outcome = as_operator(context, host, bound.clone(), format!("forklift-server {}", bound.join(" ")), trail, unextractable)?;
+    let report = [&outcome.stdout, &outcome.stderr].into_iter().map(|text| String::from_utf8_lossy(text).into_owned()).collect::<Vec<_>>().join("\n");
+    let mut owed = follow_ups(context.tool, &written, &outcome);
+    trail.steps.push(outcome);
+
+    let takedowns = host.takedowns();
+    let mut restated: Vec<String> = Vec::new();
+    for restate in restatements(context.tool, &report, host.root()) {
+        for hash in &restate.hashes {
+            let Some((_, statement)) = takedowns.iter().find(|(taken, _)| taken == hash) else { continue };
+            if restated.contains(hash) {
+                continue;
+            }
+            let root = host.root().display().to_string();
+            let restating = vec!["withhold".to_string(), "add".into(), "--root".into(), root.clone(), "--statement".into(), statement.clone(), hash.clone()];
+            let known = format!("forklift-server withhold add --root {} --statement {:?} {}, from its own record of takedowns", root, statement, hash);
+            let outcome = as_operator(context, host, restating, known, trail, unextractable)?;
+            owed.extend(follow_ups(context.tool, "forklift-server withhold add", &outcome));
+            let took = outcome.succeeded();
+            trail.steps.push(outcome);
+            if took {
+                restated.push(hash.clone());
+            }
+        }
+        // Discharged only once every hash it named is restated.
+        if restate.hashes.iter().all(|hash| restated.contains(hash)) {
+            let named = format!("named by {}: {}", written, restate.named);
+            owed.retain(|text| *text != named);
+        }
+    }
+    for text in owed {
+        if !unextractable.contains(&text) {
+            unextractable.push(text);
+        }
+    }
+    Ok(())
+}
+
+/// Runs `arguments` on `host` as its operator ([`Host::operate`]), `known` naming the command as
+/// outside knowledge between the server's stop and its start again, with what starting again took;
+/// what the restart could not do is recorded as unextractable. The command's outcome is returned,
+/// for the caller to make a step.
+fn as_operator(context: &Context, host: &Host, arguments: Vec<String>, known: String, trail: &mut Trail, unextractable: &mut Vec<String>) -> Result<Outcome, RunError> {
+    let operated = host.operate(arguments, context.scratch, context.environment, context.limit).map_err(RunError::Tool)?;
     let knowledge = &mut trail.recoverability.outside_knowledge;
     knowledge.push("as the remote's operator, on the host: stop the server".to_string());
-    knowledge.push(format!("as the remote's operator, on the host: forklift-server {}", bound.join(" ")));
+    knowledge.push(format!("as the remote's operator, on the host: {}", known));
     knowledge.extend(operated.restarted.outside_knowledge);
     knowledge.push("as the remote's operator, on the host: start the server again".to_string());
     for text in operated.restarted.unextractable.into_iter().chain(operated.restarted.refused.map(|said| format!("the restarted server refused: {}", said))) {
@@ -1411,13 +1461,44 @@ fn operate(context: &Context, arguments: &[String], trail: &mut Trail, unextract
             unextractable.push(text);
         }
     }
-    for text in follow_ups(context.tool, &written, &operated.outcome) {
-        if !unextractable.contains(&text) {
-            unextractable.push(text);
+    Ok(operated.outcome)
+}
+
+/// A takedown an operator command's report asks its operator to restate: the command as the report
+/// quotes it, and each hash it names for it.
+#[derive(Debug, PartialEq, Eq)]
+struct Restate {
+    named: String,
+    hashes: Vec<String>,
+}
+
+/// Each takedown `report`, an operator command's output over the warehouse at `root`, asks its
+/// operator to restate: a quoted `forklift-server withhold add --root <root> <hash> --statement
+/// <statement>`, exactly that shape and over exactly `root`, its hash either written in place or
+/// left as `<hash>` and listed one per indented line right after the line quoting it. Nothing else
+/// is one: any other placeholder or argument, another root, or a hash that is not one.
+fn restatements(tool: Tool, report: &str, root: &Path) -> Vec<Restate> {
+    let is_hash = |text: &str| text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    let prefix = format!("forklift-server withhold add --root {} ", root.display());
+    let lines: Vec<&str> = report.lines().collect();
+    let mut found = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        for named in remedy::extract(tool, &[line]).unextractable {
+            let Some(hash) = named.strip_prefix(&prefix).and_then(|rest| rest.strip_suffix(" --statement <statement>")) else { continue };
+            let hashes = if hash == "<hash>" {
+                lines[at + 1..].iter().take_while(|listed| listed.starts_with(char::is_whitespace) && is_hash(listed.trim()))
+                    .map(|listed| listed.trim().to_string()).collect()
+            } else if is_hash(hash) {
+                vec![hash.to_string()]
+            } else {
+                continue;
+            };
+            if !hashes.is_empty() {
+                found.push(Restate { named, hashes });
+            }
         }
     }
-    trail.steps.push(operated.outcome);
-    Ok(())
+    found
 }
 
 /// What an operator command's report, `written` as extracted, names next, each recorded as
@@ -2483,6 +2564,35 @@ mod tests {
             "named by forklift-server withhold repair --root <warehouse>: forklift heal",
         ], "in the order the report names them");
         assert!(follow_ups(Tool::Forklift, "x", &Outcome { stdout: b"Repaired.\n".to_vec(), ..outcome }).is_empty());
+    }
+
+    /// A takedown is restated only where an operator report asks for exactly that: `withhold add`
+    /// over the served root with only its statement left open, its hash written in place or listed
+    /// on the indented lines right after a `<hash>`. The folders and chunks listed as store damage
+    /// after another line, another root, and any other placeholder are not restatements.
+    ///
+    /// Revert: take every indented hash → the store damage listed after the `withhold add` line is
+    /// restated as a takedown; drop the root check → a report over another warehouse restates here;
+    /// admit any `--statement` value → a command the report wrote out whole is taken as owed.
+    #[test]
+    fn only_a_takedown_a_report_asks_restated_is_one() {
+        let (a, b, c, d) = ("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
+        let report = format!(
+            "Kept 1 entry of the old record.\n\
+            Kept {a} withheld, though its entry did not read whole; restate its statement with \"forklift-server withhold add --root /s/host {a} --statement <statement>\".\n\
+            2 files the history here names are absent, and no record holds them: content a lost entry may have withheld. Withhold each one that was with \"forklift-server withhold add --root /s/host <hash> --statement <statement>\":\n  {b}\n  {c}\n\
+            1 folder or chunk the history here names is absent too, which no takedown withholds. Restore it from a copy of this warehouse:\n  {d}\n\
+            Elsewhere \"forklift-server withhold add --root /s/other {d} --statement <statement>\", \"forklift-server withhold add --root /s/host {d} --statement <reason>\", \"forklift-server withhold add --root /s/host {d} --statement because\" and \"forklift-server withhold add --root /s/host <hash> --statement <statement>\" over nothing.\n"
+        );
+        let template = "forklift-server withhold add --root /s/host <hash> --statement <statement>".to_string();
+        assert_eq!(restatements(Tool::Forklift, &report, Path::new("/s/host")), [
+            Restate { named: format!("forklift-server withhold add --root /s/host {} --statement <statement>", a), hashes: vec![a.clone()] },
+            Restate { named: template, hashes: vec![b.clone(), c.clone()] },
+        ]);
+        assert_eq!(restatements(Tool::Forklift, &report, Path::new("/s/other")), [
+            Restate { named: format!("forklift-server withhold add --root /s/other {} --statement <statement>", d), hashes: vec![d.clone()] },
+        ], "the root decides which lines ask");
+        assert!(restatements(Tool::Forklift, &report, Path::new("/s/third")).is_empty());
     }
 
     /// A served record counts as acknowledged only after an answer that asks nothing further: success, or

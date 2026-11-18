@@ -38,6 +38,11 @@ pub struct Host {
     program: PathBuf,
     root: PathBuf,
     tracing: Mutex<Option<Tracing>>,
+    /// The operator's own record of its takedowns: each hash the harness withheld here and the
+    /// statement it gave, in order.
+    /// A real host keeps one apart from the warehouse (the notice it acted on), so restating a
+    /// takedown the warehouse lost is the operator's knowledge, never the product's.
+    takedowns: Mutex<Vec<(String, String)>>,
 }
 
 /// strace attached to one running server.
@@ -163,7 +168,7 @@ impl Host {
         // Weak: a proxy connection thread outliving the host must not keep its server alive.
         let killed: Weak<Mutex<Option<Served>>> = Arc::downgrade(&server);
         proxy.set_killer(move || if let Some(server) = killed.upgrade() { drop(lock(&server).take()) });
-        Ok(Host { url: proxy.url.clone(), proxy, server, program: program.to_path_buf(), root: root.to_path_buf(), tracing: Mutex::new(None) })
+        Ok(Host { url: proxy.url.clone(), proxy, server, program: program.to_path_buf(), root: root.to_path_buf(), tracing: Mutex::new(None), takedowns: Mutex::new(Vec::new()) })
     }
 
     /// [`Host::start`], with `strace` attached to the server once it is listening, its trace
@@ -260,6 +265,20 @@ impl Host {
     /// The host warehouse's folder.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Records `hash`, withheld here with `statement`, in the operator's record of takedowns; a
+    /// hash withheld again keeps its latest statement.
+    pub fn took_down(&self, hash: &str, statement: &str) {
+        let mut takedowns = lock(&self.takedowns);
+        takedowns.retain(|(taken, _)| taken != hash);
+        takedowns.push((hash.to_string(), statement.to_string()));
+    }
+
+    /// The operator's record of takedowns over this warehouse, hash and statement, in the order
+    /// they were made.
+    pub fn takedowns(&self) -> Vec<(String, String)> {
+        lock(&self.takedowns).clone()
     }
 
     /// Kills the server, as a crash would: no shutdown, whatever it holds left behind.

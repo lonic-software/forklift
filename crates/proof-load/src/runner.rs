@@ -428,13 +428,18 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
                 outcomes.push(run_in(server, vec!["prepare".into(), "--root".into(), root.display().to_string()], scratch.root().to_path_buf())?);
                 // Taken out first, so a new host that fails to start leaves no old one behind to
                 // log a second time.
+                // The operator's record of takedowns is its own, kept across a restart of the host.
+                let mut takedowns = Vec::new();
                 if let Some(old) = host.take() {
+                    takedowns = old.takedowns();
                     stopped.extend(finish(old, observer, scratch)?);
                 }
-                *host = Some(match observer {
+                let started = match observer {
                     Some(observer) => observer.host(server, &root, scratch, environment, limit),
                     None => Host::start(server, &root, scratch, environment, limit),
-                }.map_err(RunError::Tool)?);
+                }.map_err(RunError::Tool)?;
+                takedowns.iter().for_each(|(hash, statement)| started.took_down(hash, statement));
+                *host = Some(started);
             }
             Op::Bundle => {
                 let server = server.filter(|_| host.is_some())
@@ -454,6 +459,10 @@ fn build_in(scenario: &Scenario, corpus: &Corpus, tool: Tool, program: &Path, se
                     "withhold".into(), "add".into(), "--root".into(), root.display().to_string(),
                     "--statement".into(), crate::scenario::TAKEN_BECAUSE.into(), hash.clone(),
                 ], scratch.root().to_path_buf())?);
+                // Only a takedown the server took enters the operator's record of them.
+                if let Some(host) = host.as_ref().filter(|_| outcomes.last().is_some_and(|outcome| outcome.succeeded())) {
+                    host.took_down(&hash, crate::scenario::TAKEN_BECAUSE);
+                }
                 // The server deletes its own copy within seconds of a withhold; a fault before
                 // that would grade the window, not the state a host is in from then on. Wait for
                 // the loose object to go, as the census lays it out.
