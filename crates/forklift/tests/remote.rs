@@ -3575,6 +3575,9 @@ fn enroll_refuses_an_office_with_no_anchor_and_its_ways_out_work() {
         forklift_core::util::pallet_utils::get_meta_pallet_head("office").unwrap().unwrap()
     };
     let office_before = office_head(&area);
+    // Without the copy enroll wrote, the born office alone witnesses the anchor; the copy's own
+    // case is below.
+    forklift_core::util::file_utils::remove_file(area.path("a/.forklift/trust-copy")).unwrap();
 
     // Way out one: restore the file from a backup.
     forklift_core::util::file_utils::remove_file(&trust).unwrap();
@@ -3604,6 +3607,7 @@ fn enroll_refuses_an_office_with_no_anchor_and_its_ways_out_work() {
     assert_success(&area.forklift("a", &["lower"]));
     assert_eq!(std::fs::read(&trust).unwrap(), held, "lower restores the anchor");
     assert_success(&area.forklift("a", &["audit", "@office"]));
+    assert_eq!(std::fs::read(area.path("a/.forklift/trust-copy")).unwrap(), held, "and writes its copy");
 
     // A copy standing beside the missing file witnesses this warehouse's own anchor, so not even
     // lower writes the remote's over it; the refusal names moving the copy aside, and it stays.
@@ -12874,7 +12878,7 @@ impl StrippedRemote {
         assert_eq!(office.len(), 1, "{:?}", office);
 
         let mut stripped = Vec::new();
-        for path in [trust, office[0].clone()] {
+        for path in [trust, area.path("server-root/.forklift/trust-copy"), office[0].clone()] {
             stripped.push((path.clone(), std::fs::read(&path).unwrap()));
             forklift_core::util::file_utils::remove_file(&path).unwrap();
         }

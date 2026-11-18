@@ -50,7 +50,7 @@ const WRITERS: &[(&str, &str, Class)] = &[
     ("crates/forklift-core/src/util/journal_utils.rs", "create_deleted", Class::Verifies),
     ("crates/forklift-core/src/util/journal_utils.rs", "put_back_refs", Class::CopiesLocal),
     ("crates/forklift-core/src/util/journal_utils.rs", "un_restore_current", Class::CopiesLocal),
-    ("crates/forklift-core/src/util/office_utils.rs", "write_trust_install", Class::Meta),
+    ("crates/forklift-core/src/util/office_utils.rs", "write_trust_office", Class::Meta),
     // A lower rolled forward under the preconditions its take was verified against, or a
     // consolidation's fast-forward to a local head.
     ("crates/forklift-core/src/util/operation_utils.rs", "recover_operation", Class::Verifies),

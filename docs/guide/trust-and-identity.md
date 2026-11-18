@@ -74,8 +74,8 @@ This generates your identity-root key, writes the genesis office parcel
 this warehouse must be signed** — this cannot be undone.
 
 Every change of the anchor writes the trust file, then the office pallet, then a
-copy of the trust file beside it (`.forklift/trust-copy`), so a copy is only ever an
-anchor whose change finished. A change that stopped before its copy was written
+copy of the trust file beside it (`.forklift/trust-copy`), so Forklift writes the
+copy only once the change has finished. A change that stopped before its copy was written
 writes the copy when it is run again.
 
 A warehouse that holds an office but has lost its trust file, or whose trust file
