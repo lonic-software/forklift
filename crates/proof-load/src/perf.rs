@@ -160,8 +160,9 @@ pub enum Measured {
     /// The cache-drop program ran past its limit before a cold repetition and was killed, so the
     /// repetition was not run.
     DropKilledAtLimit { limit_ms: u64 },
-    /// A push or a pull succeeded but did not carry the head across, as the refs read before and
-    /// after it show, so its time would be of no transfer: what the refs said.
+    /// A transfer succeeded but did not carry the head across, so its time would be of no
+    /// transfer: a push or a pull by the refs read before and after it, a clone by the head its new
+    /// work tree landed on. What the reads said.
     NothingMoved { reason: String },
 }
 
@@ -893,9 +894,12 @@ fn remote_pair(subjects: &[Subject], hosts: &[Hosts], transfer: Transfer, branch
     let mut cells = Vec::new();
     for (subject, hosts) in subjects.iter().zip(hosts) {
         let command = subject.line(if subject.tool == Tool::Forklift { &forklift } else { &git });
-        let cloned = match head(subject, scratch, environment)? {
-            Ok(at) => Head { branch: branch.to_string(), commit: at.commit },
-            Err(reason) => return Ok(Outcome::NotComparable { reason }),
+        let cloned = match transfer {
+            Transfer::Clone => match head(subject, scratch, environment)? {
+                Ok(at) => Some(Head { branch: branch.to_string(), commit: at.commit }),
+                Err(reason) => return Ok(Outcome::NotComparable { reason }),
+            },
+            Transfer::Push | Transfer::Pull => None,
         };
         let remote = Against { transfer, template: hosts.remote(transfer), work: hosts.work(subject, transfer), cloned, server, copies };
         match remote_cell(subject, &command, reps, cold, &remote, scratch, environment)? {
@@ -908,12 +912,12 @@ fn remote_pair(subjects: &[Subject], hosts: &[Hosts], transfer: Transfer, branch
 
 /// What each repetition of a remote cell runs against: a fresh copy of `template`, served by
 /// `server` for Forklift's, from a fresh copy of `work` for a push or a pull, each copy and a
-/// clone's folder under `copies`. A clone must land on `cloned`.
+/// clone's folder under `copies`. A clone must land on `cloned`, which only a clone has.
 struct Against<'a> {
     transfer: Transfer,
     template: &'a Path,
     work: &'a Path,
-    cloned: Head,
+    cloned: Option<Head>,
     server: &'a Path,
     copies: &'a Path,
 }
@@ -966,11 +970,21 @@ fn remote_rep(subject: &Subject, command: &[String], rep: usize, cold: Option<&D
         None => served.stop(SERVE_LIMIT).map_err(|reason| format!("forklift-server over the remote did not stop: {}", reason)),
     };
     let step = step?;
-    match stopped {
-        Ok(()) => Ok(step),
-        Err(reason) if rep == 0 => Ok(Step::Ended(Err(format!("after the untimed run, {}", reason)))),
-        Err(reason) => Ok(Step::Ended(Err(format!("after repetition {}, {}", rep, reason)))),
-    }
+    let Err(reason) = stopped else {
+        return Ok(step);
+    };
+    let at = if rep == 0 { "after the untimed run".to_string() } else { format!("after repetition {}", rep) };
+    // What the command itself gave is kept beside the server's failure, which may be its cause.
+    let own = match step {
+        Step::Ended(Ok(Measured::Voided { exit, signal, stderr })) => {
+            let ended = exit.map(|code| format!("exited {}", code)).or_else(|| signal.map(|signal| format!("died of signal {}", signal))).unwrap_or_else(|| "ended".to_string());
+            format!("; the command had {}: {}", ended, stderr.trim())
+        }
+        Step::Ended(Ok(Measured::NothingMoved { reason })) => format!("; the command had moved nothing: {}", reason),
+        Step::Ended(Err(reason)) => format!("; the repetition was already not comparable: {}", reason),
+        Step::Ended(Ok(_)) | Step::Ran(_) => String::new(),
+    };
+    Ok(Step::Ended(Err(format!("{}, {}{}", at, reason, own))))
 }
 
 /// The repetition itself, against the copy of the remote at `host`, reached at `url`.
@@ -997,7 +1011,8 @@ fn transfer_rep(subject: &Subject, command: &[String], rep: usize, cold: Option<
         match head(&clone, scratch, environment)? {
             Err(reason) => return Ok(Step::Ended(Err(format!("after repetition {}, the clone: {}", rep, reason)))),
             Ok(landed) => {
-                if let Err(reason) = landed_on(clone.tool, &remote.cloned, &landed) {
+                let expected = remote.cloned.as_ref().expect("a clone's cell knows where it must land");
+                if let Err(reason) = landed_on(clone.tool, expected, &landed) {
                     return Ok(Step::Ended(Ok(Measured::NothingMoved { reason: format!("repetition {}: {}", rep, reason) })));
                 }
             }
