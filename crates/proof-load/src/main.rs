@@ -129,13 +129,26 @@ fn main() -> ExitCode {
 mod tests {
     use clap::CommandFactory;
 
-    /// The guide page names every flag `proof-load run` takes, so a new flag fails until the page
-    /// says what it does.
+    /// The guide page names every flag `proof-load run` takes in its prose or tables, outside its
+    /// code blocks, so a new flag fails until the page mentions it where it explains things; an
+    /// example command line alone does not count.
     ///
-    /// Revert: drop `--jobs` from the guide → it is named missing.
+    /// Revert: drop `--jobs` from the guide → it is named missing; count the code blocks → a flag
+    /// only the example shows passes.
     #[test]
     fn the_guide_names_every_run_flag() {
-        let guide = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/guide/proof-load.md")).unwrap();
+        let prose = |page: &str| -> String {
+            let mut fenced = false;
+            page.lines().filter(|line| {
+                if line.trim_start().starts_with("```") {
+                    fenced = !fenced;
+                    return false;
+                }
+                !fenced
+            }).collect::<Vec<_>>().join("\n")
+        };
+        assert_eq!(prose("one `--seed`\n```sh\nproof-load run --jobs 2\n```\ntwo"), "one `--seed`\ntwo");
+        let guide = prose(&std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/guide/proof-load.md")).unwrap());
         let cli = super::Cli::command();
         let run = cli.find_subcommand("run").expect("the run subcommand");
         let flags: Vec<String> = run.get_arguments().filter_map(|argument| argument.get_long()).map(|long| format!("--{}", long)).collect();

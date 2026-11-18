@@ -1087,9 +1087,10 @@ mod tests {
     }
 
     /// The guide page that publishes the method names every fault class as a row of its table and
-    /// every grade by the name the report prints, so a class or grade added here fails until the
-    /// page explains it. The matches make both lists exhaustive: a new variant does not compile
-    /// until it is added to them.
+    /// every grade by the name the report prints, so a listed class or grade fails until the page
+    /// explains it. The classes are `Category::ALL`, the list the coverage table itself walks, so a
+    /// class it leaves out is missing from the report too. A new variant of either enum does not
+    /// compile until the match beside its list names it, which is where that list is kept.
     ///
     /// Revert: drop the guide's `AWS head` row → it is named missing.
     #[test]

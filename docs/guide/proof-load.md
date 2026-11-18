@@ -38,15 +38,18 @@ target/debug/proof-load run --source . --out ../proof-load-out \
 ```
 
 - `--source` is the source tree of the version under test, read only. The harness reads its census
-  of on-disk names, its command schema and its server route table from it, so a check can fail when
-  something new has no test.
+  of on-disk names and its server route table from it, so a check can fail when something new has
+  no test.
+- `--forklift`, `--forklift-server` and `--git` name the binaries under test, by path. The list of
+  commands the write-op check covers comes from the `--forklift` binary (`forklift self schema`),
+  so it follows that binary, not the source tree.
 - `--out` receives the scratch areas, the report and the details files.
 - `--only <scenario>` runs one scenario. Without it, every scenario runs, which takes much longer.
 - Leave out a binary and the lanes that need it are reported as *not run*, with the reason, rather
   than skipped silently.
 
-It exits 0 when the report passes, 1 when it fails, and 2 when the run itself could not go ahead
-(a non-empty output folder, an unknown scenario, a missing route table). Its progress goes to
+It exits 0 when the report passes, 1 when it fails, and 2 when the run itself could not go ahead,
+such as over a non-empty output folder or an unknown scenario. Its progress goes to
 stderr. The results are the files it writes.
 
 The other flags add lanes; section 6 lists them.
@@ -98,7 +101,8 @@ goes no further once they read back as expected:
 1. The faulted command itself, then a readback of every record.
 2. One plain retry.
 3. Each remedy the tool names, run in turn. Remedies are bounded, and none is run twice.
-4. The tool's own remedy set:
+4. Only when a record the tool had acknowledged still does not read back, the tool's own remedy
+   set:
    - for Forklift, `forklift heal`, then `forklift audit` (which only reports), then a fresh clone;
    - for git, `git fsck --full` (which only reports), then each ref restored from its reflog, then a
      fresh clone.
@@ -137,8 +141,9 @@ To replay a row:
 
 1. Take the seed from the header and the scenario from the row.
 2. Build the same binaries.
-3. Run `proof-load run` with `--seed <seed> --only <scenario>` and the same lane flags, into a new
-   output folder.
+3. Run `proof-load run` with `--seed <seed> --only <scenario>` and the same lane flags as the
+   original run, into a new output folder. The report does not record the lane flags; for a CI
+   run, they are in the workflow file (section 9).
 
 A row over a real history cannot be replayed with `--only`, because `--history-from` refuses it.
 That lane replays as a whole.
@@ -177,7 +182,8 @@ The exemptions live in `crates/proof-load/src/bindings.rs`.
 
 ## 7. Comparing with git
 
-Each fault Forklift gets, git gets too, as two subjects: `git` at its defaults, and `git-tuned`:
+The damaged-file faults, and the client's kill points and power loss, run for git too, as two
+subjects: `git` at its defaults, and `git-tuned`:
 
 - every fsync on;
 - fsck on transfer;
@@ -185,8 +191,11 @@ Each fault Forklift gets, git gets too, as two subjects: `git` at its defaults, 
 - an untracked cache;
 - the fsmonitor daemon.
 
-Git's rows are reported beside Forklift's. They never fail the run. Where a git lane could not run,
-the report says `git: not fully measured`.
+The other lanes (disk full, read-only, the two volumes, the network, and the server's kill points
+and power loss) run for Forklift only. Git's rows are reported beside Forklift's, and they never
+fail the run. Where a git lane could not run, the report says `git: not fully measured`. The
+network lane is always one of these, because git's host is a bare repository reached by its path,
+with no server for the proxy to fault.
 
 ### The data plate
 
@@ -217,9 +226,10 @@ back a sample of up to eight positions, chosen by the seed among the refs both s
 **Damage not reached by the sample.** Damage can land where no sampled position reads, for example
 a commit that only an unsampled branch holds. When every sampled position read back as expected,
 the harness runs the subject's whole-store check: `git fsck --full`, or `forklift heal`. If that
-check finds damage, the row is not graded `healed`. Instead, it is listed under the
-`damage not reached by the sample` completeness check, and that entry fails the run. Such a row
-has no grade and no place on the plate, so it never counts toward "git does better".
+check finds damage, the row is not graded `healed`. Instead, it is listed under that subject's
+`damage not reached by the sample` completeness check. Under Forklift, the entry fails the run;
+under git, it is one of the gaps behind `git: not fully measured`. Such a row has no grade and no
+place on the plate, so it never counts toward "git does better".
 
 ### Fidelity
 
@@ -235,17 +245,16 @@ record, never by id. Findings never fail the run. Each class of loss gets a tick
 2. **Coverage**: the class × platform table from section 3.
 3. **Completeness**: each check, with what it found missing.
 4. **Data plate** and **Git does better**: section 7.
-5. **Grades**: one row per faulted run, with these columns:
-   - subject, scenario, fault class and binding;
-   - grade and the recoverability record;
-   - a note where one applies.
-6. **Forklift-only grades**: rows git has no counterpart for. For example, an operation with no git
-   equivalent.
+5. **Grades**: one row per faulted run, with its subject, scenario, fault class, binding, grade
+   and recoverability record. Rows of scenarios git has no counterpart for are listed here too.
+6. **Forklift-only grades**: a section the report keeps, which a run currently leaves empty.
 7. **Fidelity**: the findings from the fixtures. Over a real history the findings are counted by
    field, and `report.json` lists each one.
 
-Each row points at its details file (`<name>.json`, sometimes with a JSON pointer after `#`) in the
-output folder. Use the details file to find out *why* a row has its grade. It holds:
+Each row in `report.json` names its details file (`detail`: `<name>.json`, sometimes with a JSON
+pointer after `#`) in the output folder, and carries a `note` where one applies. In `report.md`,
+the data plate's cells link to them. Use the details file to find out *why* a row has its grade.
+It holds:
 
 - every command run after the fault, in order, with its arguments, exit status, stdout and stderr;
 - the readbacks.
@@ -255,8 +264,8 @@ HTTP exchange) and `server-writes.json`, and on Linux the strace traces.
 
 ## 9. How CI runs it
 
-Three workflows run Proof Load. All of them sit outside `ci passed` and continue on error, so for
-now they report grades without failing a pull request.
+Three workflows run Proof Load, all outside `ci passed`. The two that run the harness continue on
+error, so for now they report grades without failing a pull request.
 
 - **`proof load`** runs on every pull request, once per OS, against forklift and forklift-server
   built for that OS's release target. It sets `--budget 2700`, the read-only and network lanes, and
@@ -265,7 +274,8 @@ now they report grades without failing a pull request.
   volume (vfat on Linux, exFAT on macOS). `report.md` is added to the job summary, and the JSON
   files, `report.md` and the traces are uploaded.
 - **`proof load history`** runs weekly on Linux with `--history-from .`, over Forklift's own history.
-- **`proof load desktop`** builds and tests the desktop window on each OS.
+- **`proof load desktop`** builds, tests and runs Clippy on the desktop window on each OS. It runs no
+  faults, and a failing step fails it.
 
 [`contributing.md`](contributing.md) has the full detail of each lane as CI runs it.
 
