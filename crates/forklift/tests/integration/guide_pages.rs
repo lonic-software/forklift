@@ -858,8 +858,9 @@ fn switching_runs_as_written() {
     run_page("switching.md");
 }
 
-/// A page's `git` sees no configuration but what the page itself set: not the developer's global
-/// or system files, nor configuration passed in the environment (`GIT_CONFIG_COUNT`).
+/// A page's `git` sees no configuration but what the page itself set, whatever the developer's
+/// global and system files hold. Configuration passed in the environment (`GIT_CONFIG_COUNT` and
+/// its keys) is removed too, but this checks that only when the test's own environment carries it.
 #[test]
 fn git_reads_none_of_the_developers_configuration() {
     let area = std::env::temp_dir().join(format!("forklift-git-config-{}", std::process::id()));
