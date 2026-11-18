@@ -5264,33 +5264,6 @@ fn import_git_records_the_git_tags_unsigned() {
     assert!(stdout(&warehouse.run(&["tag", "show", "v1.0"])).contains("bob@example.com (unsigned)"));
 }
 
-/// An office standing without its anchor refuses every unsigned write, so git import refuses it
-/// up front, saying the anchor was lost, and no branch lands.
-// Revert: drop the up-front `verified_local_trust` check → the head precondition still refuses after
-// the conversion, but as a changed office, without the lost-anchor message.
-#[test]
-fn import_git_refuses_an_office_without_its_anchor_before_any_branch_lands() {
-    let warehouse = TestWarehouse::new("import-git-lost-anchor");
-    let root = warehouse.root.clone();
-
-    assert_success(&warehouse.run(&["prepare"]));
-    configure_operator(&warehouse);
-    assert_success(&warehouse.run(&["office", "enroll"]));
-    forklift_core::util::file_utils::remove_file(root.join(".forklift/trust")).unwrap();
-
-    git_in(&root, &["init", "-q", "-b", "trunk"]);
-    warehouse.write_file("x.txt", "here\n");
-    git_in(&root, &["add", "-A"]);
-    git_in(&root, &["commit", "-qm", "git work"]);
-    git_in(&root, &["tag", "v1.0"]);
-
-    let refused = warehouse.run(&["git", "import", "."]);
-    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
-    assert!(stderr(&refused).contains("holds an office but no trust anchor"), "{}", stderr(&refused));
-    let pallets = stdout(&warehouse.run(&["pallet", "list"]));
-    assert!(!pallets.contains("trunk"), "no branch lands: {}", pallets);
-}
-
 /// Git import leaves out a git tag whose name a tag already here holds, since a tag name is
 /// immutable, and records the rest.
 // Revert: drop the `taken` check in `plan_tags` → the import fails on the immutable name.
@@ -7675,13 +7648,15 @@ fn deliver_works_unsigned_in_a_warehouse_that_never_enrolled() {
     }
 }
 
-/// An office standing without its anchor is neither trusted nor never enrolled, so deliver
-/// refuses it up front, saying the anchor was lost, and records nothing.
-// Revert: drop the `verified_local_trust` check in `deliver` → the parcel object is stored and the
-// delivery record refuses as a changed office, without the lost-anchor message.
+/// A trust file lost under a born office is neither trusted nor never enrolled: stack, deliver and
+/// git import each refuse it as trust_damaged, before writing anything, rather than writing
+/// unsigned under an office that requires signatures.
+// Revert: `resolve_signing_key` reads a missing trust file as unsigned (the byte read) → stack
+// stacks unsigned and exits 0.
 #[test]
-fn deliver_refuses_an_office_without_its_anchor_before_anything_is_written() {
-    let warehouse = TestWarehouse::new("deliver-lost-anchor");
+fn a_lost_trust_file_refuses_every_signing_write_before_anything_is_written() {
+    let warehouse = TestWarehouse::new("lost-anchor-writes");
+    let root = warehouse.root.clone();
     warehouse.write_file("code.txt", "v1\n");
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
@@ -7692,21 +7667,42 @@ fn deliver_refuses_an_office_without_its_anchor_before_anything_is_written() {
     warehouse.write_file("code.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "draft work"]));
-    let main_head = stdout(&warehouse.run(&["history", "main", "-n", "1"]));
-    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/trust")).unwrap();
+    warehouse.write_file("code.txt", "v3\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let heads = |warehouse: &TestWarehouse| ["main", "draft"].map(|pallet| stdout(&warehouse.run(&["history", pallet, "-n", "1"])));
+    let before = heads(&warehouse);
+    forklift_core::util::file_utils::remove_file(root.join(".forklift/trust")).unwrap();
     fn files_under(dir: &std::path::Path) -> usize {
         std::fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().path())
             .map(|path| if path.is_dir() { files_under(&path) } else { 1 })
             .sum()
     }
-    let objects = || files_under(&warehouse.root.join(".forklift/objects"));
+    let objects = || files_under(&root.join(".forklift/objects"));
     let stored = objects();
 
-    let refused = warehouse.run(&["deliver", "main", "-m", "over a lost anchor"]);
-    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
-    assert!(stderr(&refused).contains("holds an office but no trust anchor"), "{}", stderr(&refused));
-    assert_eq!(stdout(&warehouse.run(&["history", "main", "-n", "1"])), main_head, "the target must not move");
-    assert_eq!(objects(), stored, "no object is stored");
+    let writes: [&[&str]; 3] = [
+        &["--json", "stack", "-m", "over a lost anchor"],
+        &["--json", "deliver", "main", "-m", "over a lost anchor"],
+        &["--json", "git", "import", "."],
+    ];
+    for (index, args) in writes.into_iter().enumerate() {
+        if index == 2 {
+            git_in(&root, &["init", "-q", "-b", "trunk"]);
+            git_in(&root, &["add", "-A"]);
+            git_in(&root, &["commit", "-qm", "git work"]);
+        }
+
+        let refused = warehouse.run(args);
+        assert_eq!(refused.status.code(), Some(69), "{:?}: {}{}", args, stdout(&refused), stderr(&refused));
+        let value = json(&refused);
+        assert_eq!(value["error"]["code"], "trust_damaged", "{:?}: {}", args, value);
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("trust file") && message.contains("is missing, but the office pallet is born"), "{:?}: {}", args, value);
+        assert!(message.contains("forklift lower"), "{:?}: {}", args, value);
+        assert_eq!(heads(&warehouse), before, "{:?}: no pallet moves", args);
+        assert_eq!(objects(), stored, "{:?}: no object is stored", args);
+    }
+    assert!(!stdout(&warehouse.run(&["pallet", "list"])).contains("trunk"), "no branch lands");
 }
 
 // Revert: drop deliver's target-coverage check → the delivery lands and other.txt is back to v1.

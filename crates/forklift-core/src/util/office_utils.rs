@@ -2765,6 +2765,112 @@ pub(crate) mod tests {
         assert!(error.contains("version 2"), "{}", error);
     }
 
+    /// A warehouse root for the accessor tests: `office` gives @office a head, `copy` plants the
+    /// trust file's copy, and `trust` writes the trust file.
+    fn trust_read_root(name: &str, trust: Option<&str>, office: bool, copy: bool) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("forklift-trust-read-{}-{}", name, std::process::id()));
+        let _ = file_utils::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = crate::globals::StorageRootScope::enter(&dir);
+
+        if let Some(trust) = trust {
+            std::fs::write(forklift_root().join(FILE_NAME_TRUST), trust).unwrap();
+        }
+
+        if office {
+            let path = pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("{}\n", "ab".repeat(32))).unwrap();
+        }
+
+        if copy {
+            std::fs::write(forklift_root().join(FILE_NAME_TRUST_COPY), "planted").unwrap();
+        }
+
+        dir
+    }
+
+    const TRUST_FILE: &str = "version = 1\ngenesis = \"genesis-hash\"\nenabled_at = 1\nboundary = []\n";
+
+    /// A missing trust file is "never enrolled" only with no witness that trust was established:
+    /// a born office or a standing copy refuses it as lost, under both reads where they apply,
+    /// and with neither it reads as no anchor.
+    // Revert: drop the @office read, or the copy read, in `read_trust_anchor_in` → the witnessed
+    // row reads `None`.
+    #[test]
+    fn a_missing_trust_file_with_a_witness_refuses_and_without_one_reads_as_none() {
+        // (name, office born, copy stands, checked refuses, adopt refuses)
+        let rows = [
+            ("neither", false, false, false, false),
+            ("office", true, false, true, false),
+            ("copy", false, true, true, true),
+            ("both", true, true, true, true),
+        ];
+
+        for (name, office, copy, checked_refuses, adopt_refuses) in rows {
+            let dir = trust_read_root(name, None, office, copy);
+            let _scope = crate::globals::StorageRootScope::enter(&dir);
+
+            for (mode, refuses) in [(TrustReadMode::Checked, checked_refuses), (TrustReadMode::Adopt, adopt_refuses)] {
+                match read_trust_anchor_in(mode) {
+                    Ok(None) => assert!(!refuses, "{}, {:?}: a lost anchor read as never enrolled", name, mode),
+                    Ok(Some(_)) => panic!("{}, {:?}: no trust file was written", name, mode),
+                    Err(e) => {
+                        assert!(refuses, "{}, {:?}: refused with no witness: {}", name, mode, e);
+                        assert!(crate::error::frames_code(&e, RefusalCode::TrustDamaged), "{}, {:?}: {}", name, mode, e);
+                    }
+                }
+            }
+
+            drop(_scope);
+            file_utils::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// A trust file that does not parse is damage, whatever stands beside it; one a newer version
+    /// wrote is not, and is refused uncoded.
+    // Revert: map `TrustDecodeError::Damaged` to the plain message → no code on the garbled file.
+    #[test]
+    fn a_garbled_trust_file_is_trust_damaged_and_a_newer_one_is_not() {
+        for (name, content, damaged) in [
+            ("garbled", "version = 1\ngenesis = \"g", true),
+            ("unversioned", "genesis = \"g\"\nenabled_at = 1\nboundary = []\n", true),
+            ("newer", "version = 2\ngenesis = \"g\"\n", false),
+        ] {
+            let dir = trust_read_root(name, Some(content), false, false);
+            let _scope = crate::globals::StorageRootScope::enter(&dir);
+
+            for mode in [TrustReadMode::Checked, TrustReadMode::Adopt] {
+                let error = read_trust_anchor_in(mode).expect_err(name);
+                assert_eq!(crate::error::frames_code(&error, RefusalCode::TrustDamaged), damaged, "{}: {}", name, error);
+            }
+
+            drop(_scope);
+            file_utils::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// An install writes the trust file before its witnesses, so a witness seen after the file
+    /// read absent can be an install that landed in between: the accessor reads the file again
+    /// before calling the anchor lost, on either witness.
+    // Revert: re-read only on the @office witness → the copy row refuses trust_damaged.
+    #[test]
+    fn a_trust_file_written_between_the_reads_is_returned_not_refused() {
+        for (name, office, copy) in [("reread-office", true, false), ("reread-copy", false, true)] {
+            let dir = trust_read_root(name, None, office, copy);
+            let _scope = crate::globals::StorageRootScope::enter(&dir);
+
+            let path = forklift_root().join(FILE_NAME_TRUST);
+            BEFORE_TRUST_REREAD.with(|seam| seam.set(Some(Box::new(move || std::fs::write(path, TRUST_FILE).unwrap()))));
+
+            let read = read_trust_anchor_in(TrustReadMode::Checked);
+            assert_eq!(read.map(|read| read.map(|(anchor, _)| anchor.genesis)), Ok(Some("genesis-hash".to_string())), "{}", name);
+
+            drop(_scope);
+            file_utils::remove_dir_all(&dir).ok();
+        }
+    }
+
     /// Finding F7 (round 3): the trust file's `genesis`/`enabled_at` used to be hand-rolled
     /// required reads with the same `and_then(...).ok_or(...)` shape the four retired sites
     /// used, directly under a comment insisting the parse must be strict. They now route

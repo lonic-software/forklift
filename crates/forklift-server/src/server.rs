@@ -10193,6 +10193,39 @@ mod tests {
             let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
+        /// A trust file that does not parse, or one missing beside its standing copy, is a 503
+        /// trust_damaged with the fixed message, naming no file of the server's.
+        /// Revert: drop TrustDamaged from SERVED_DAMAGE → a 500 with no code → red.
+        #[tokio::test]
+        async fn a_handshake_over_a_damaged_trust_file_refuses_with_its_code() {
+            let (root, _scope, _side) = served_with_side("handshake-trust");
+            let trust = forklift_core::globals::forklift_root().join("trust");
+            let copy = forklift_core::globals::forklift_root().join("trust-copy");
+
+            for (what, trust_bytes, copy_bytes) in [
+                ("garbled", Some(&b"version = 1\ngenesis = \""[..]), None),
+                ("missing beside its copy", None, Some(&b"a copy"[..])),
+            ] {
+                for (path, bytes) in [(&trust, trust_bytes), (&copy, copy_bytes)] {
+                    match bytes {
+                        Some(bytes) => std::fs::write(path, bytes).unwrap(),
+                        None => { let _ = forklift_core::util::file_utils::remove_file(path); }
+                    }
+                }
+
+                let response = get_warehouse(State(Arc::new(single_mode_state(root.clone()))), Path(PathParams::new()))
+                    .await.into_response();
+
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{}", what);
+                let body = body_text(response).await;
+                assert!(body.contains(r#""code":"trust_damaged""#), "{}: {}", what, body);
+                assert!(body.contains("The warehouse's trust anchor is lost or does not read"), "{}: {}", what, body);
+                let absolute = std::path::absolute(&root).unwrap();
+                assert!(!body.contains(&*absolute.to_string_lossy()) && !body.contains(".forklift"), "{}: no server path: {}", what, body);
+            }
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+        }
+
         /// The served root's own position is what a new clone checks out: lost or damaged, the
         /// handshake refuses with its code and names heal, and never the position file's path.
         /// Revert: drop BayPositionDamaged from SERVED_DAMAGE → a 500 with no code → red.

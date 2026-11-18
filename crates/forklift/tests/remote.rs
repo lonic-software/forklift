@@ -3550,8 +3550,11 @@ fn accepting_a_regenesis_refuses_an_anchor_adopting_anything_but_office_history(
 }
 
 /// A warehouse that lost its anchor but holds an office is refused a new one, unchanged, and each
-/// way out the refusal names works from that state.
-// Revert: let `office enroll` proceed over an office with no anchor → it writes a new anchor.
+/// way out the refusal names works from that state. Only lower reads past the office: another
+/// command judging the remote refuses the lost anchor rather than meeting the remote as a first
+/// contact.
+// Revert: let `office enroll` proceed over an office with no anchor → it writes a new anchor. Or
+// pass `TrustReadMode::Adopt` from `pallet restore --remote` → it judges the remote as first contact.
 #[test]
 fn enroll_refuses_an_office_with_no_anchor_and_its_ways_out_work() {
     let area = TestArea::new("enroll-lost-anchor");
@@ -3575,28 +3578,46 @@ fn enroll_refuses_an_office_with_no_anchor_and_its_ways_out_work() {
 
     // Way out one: restore the file from a backup.
     forklift_core::util::file_utils::remove_file(&trust).unwrap();
-    let refused = area.forklift("a", &["office", "enroll"]);
-    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
-    let message = stderr(&refused);
-    assert!(message.contains("holds an office but no trust anchor"), "{}", message);
+    let refused = area.forklift("a", &["--json", "office", "enroll"]);
+    assert_eq!(refused.status.code(), Some(69), "{}{}", stdout(&refused), stderr(&refused));
+    let value = json_of(&refused);
+    assert_eq!(value["error"]["code"], "trust_damaged", "{}", value);
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("is missing, but the office pallet is born"), "{}", message);
     assert!(message.contains("forklift lower"), "{}", message);
     assert!(!trust.exists(), "no anchor is written");
     assert_eq!(office_head(&area), office_before, "the office is not moved");
 
     // A reset has no anchor to replace, and must not send this state back to enroll.
-    let reset = area.forklift("a", &["office", "regenesis", "--confirm"]);
-    assert!(!reset.status.success(), "{}{}", stdout(&reset), stderr(&reset));
-    assert!(stderr(&reset).contains("holds an office but no trust anchor"), "{}", stderr(&reset));
+    let reset = area.forklift("a", &["--json", "office", "regenesis", "--confirm"]);
+    assert_eq!(json_of(&reset)["error"]["code"], "trust_damaged", "{}{}", stdout(&reset), stderr(&reset));
 
     std::fs::write(&trust, &held).unwrap();
     assert_success(&area.forklift("a", &["audit", "@office"]));
 
-    // Way out two: a remote that holds the trust.
+    // Way out two: a remote that holds the trust. Only lower reads past the office.
     forklift_core::util::file_utils::remove_file(&trust).unwrap();
     assert!(!area.forklift("a", &["office", "enroll"]).status.success());
+    let judged = area.forklift("a", &["--json", "pallet", "restore", "nothing", "--remote"]);
+    assert_eq!(json_of(&judged)["error"]["code"], "trust_damaged", "{}{}", stdout(&judged), stderr(&judged));
+    assert!(!trust.exists(), "no anchor is written");
     assert_success(&area.forklift("a", &["lower"]));
     assert_eq!(std::fs::read(&trust).unwrap(), held, "lower restores the anchor");
     assert_success(&area.forklift("a", &["audit", "@office"]));
+
+    // A copy standing beside the missing file witnesses this warehouse's own anchor, so not even
+    // lower writes the remote's over it; the refusal names moving the copy aside, and it stays.
+    let copy = area.path("a/.forklift/trust-copy");
+    forklift_core::util::file_utils::remove_file(&trust).unwrap();
+    std::fs::write(&copy, "not a trust file").unwrap();
+    let lowered = area.forklift("a", &["--json", "lower"]);
+    let value = json_of(&lowered);
+    assert_eq!(value["error"]["code"], "trust_damaged", "{}", value);
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("its copy stands beside it") && message.contains("move aside"), "{}", message);
+    assert_eq!(std::fs::read(&copy).unwrap(), b"not a trust file", "the copy is unchanged");
+    assert!(!trust.exists(), "no anchor is written");
+    forklift_core::util::file_utils::remove_file(&copy).unwrap();
 
     // The last resort: another folder, on its own.
     std::fs::create_dir_all(area.path("elsewhere")).unwrap();
