@@ -7708,6 +7708,87 @@ fn a_lost_trust_file_refuses_every_signing_write_before_anything_is_written() {
     assert!(!stdout(&warehouse.run(&["pallet", "list"])).contains("trunk"), "no branch lands");
 }
 
+/// An enrolled warehouse, stacked once, with its trust file and the copy enroll wrote beside it.
+fn enrolled_warehouse(name: &str) -> (TestWarehouse, Vec<u8>) {
+    let warehouse = TestWarehouse::new(name);
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+    let forklift = warehouse.root.join(".forklift");
+    let anchor = std::fs::read(forklift.join("trust")).unwrap();
+    assert_eq!(std::fs::read(forklift.join("trust-copy")).unwrap(), anchor, "enroll writes the copy");
+    (warehouse, anchor)
+}
+
+/// A trust file lost beside its copy is put back by heal before anything reads the anchor, with no
+/// taint standing, and the next stack is signed.
+// Revert: run the trust repair only where a taint stands (none does here) → heal refuses
+// trust_damaged at the first pass that reads the anchor.
+#[test]
+fn heal_restores_a_lost_trust_file_from_its_copy_and_signing_resumes() {
+    let (warehouse, anchor) = enrolled_warehouse("heal-lost-anchor");
+    let forklift = warehouse.root.join(".forklift");
+    forklift_core::util::file_utils::remove_file(forklift.join("trust")).unwrap();
+
+    let healed = warehouse.run(&["--json", "heal"]);
+
+    assert_eq!(healed.status.code(), Some(0), "{}{}", stdout(&healed), stderr(&healed));
+    let restored = json(&healed)["data"]["trust_restored"].clone();
+    assert_eq!(restored["written"], "trust", "{}", restored);
+    assert_eq!(restored["path"].as_str().map(std::path::PathBuf::from), Some(std::path::Path::new(".forklift").join("trust")), "{}", restored);
+    assert_eq!(restored["from"].as_str().map(std::path::PathBuf::from), Some(std::path::Path::new(".forklift").join("trust-copy")), "{}", restored);
+    assert_eq!(std::fs::read(forklift.join("trust")).unwrap(), anchor);
+    assert_eq!(std::fs::read(forklift.join("trust-copy")).unwrap(), anchor);
+
+    // Said to a person, too.
+    forklift_core::util::file_utils::remove_file(forklift.join("trust")).unwrap();
+    let healed = warehouse.run(&["heal"]);
+    assert_eq!(healed.status.code(), Some(0), "{}{}", stdout(&healed), stderr(&healed));
+    assert!(stdout(&healed).contains("was missing or did not hold the anchor, and is restored from its copy"), "{}", stdout(&healed));
+
+    warehouse.write_file("code.txt", "v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let stacked = warehouse.run(&["--json", "stack", "-m", "after heal"]);
+    assert_eq!(stacked.status.code(), Some(0), "{}{}", stdout(&stacked), stderr(&stacked));
+    let parcel = json(&stacked)["data"]["parcel"].as_str().unwrap().to_string();
+    let sidecar = forklift.join("objects").join(&parcel[0..2]).join(format!("{}.sig", &parcel[2..]));
+    assert!(sidecar.exists(), "the stack after heal is signed");
+}
+
+/// A client whose trust file and office ref are both lost, with the copy standing, gets its trust
+/// file back from the copy, which is left as it was; what refuses next is the missing office,
+/// never the trust.
+// Revert: require a copy that verifies beside an unborn office → heal writes nothing, and stack
+// refuses trust_damaged.
+#[test]
+fn heal_restores_the_trust_file_beside_a_lost_office_from_its_copy() {
+    let (warehouse, anchor) = enrolled_warehouse("heal-lost-anchor-and-office");
+    let forklift = warehouse.root.join(".forklift");
+    for lost in ["trust", "meta/office"] {
+        forklift_core::util::file_utils::remove_file(forklift.join(lost)).unwrap();
+    }
+
+    let healed = warehouse.run(&["--json", "heal"]);
+
+    assert_eq!(healed.status.code(), Some(0), "{}{}", stdout(&healed), stderr(&healed));
+    let value = json(&healed);
+    assert_eq!(value["data"]["trust_restored"]["written"], "trust", "{}", value);
+    let notes = value["data"]["notes"].to_string();
+    assert!(notes.contains("The office pallet is unborn beside a trust file"), "{}", notes);
+    assert!(notes.contains("by hand") && notes.contains("re-admits any key revoked"), "no remote: the hand fix: {}", notes);
+    assert_eq!(std::fs::read(forklift.join("trust")).unwrap(), anchor);
+    assert_eq!(std::fs::read(forklift.join("trust-copy")).unwrap(), anchor, "the copy is left as it was");
+
+    warehouse.write_file("code.txt", "v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let refused = warehouse.run(&["--json", "stack", "-m", "over a lost office"]);
+    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
+    assert_ne!(json(&refused)["error"]["code"], "trust_damaged", "{}", stdout(&refused));
+}
+
 // Revert: drop deliver's target-coverage check → the delivery lands and other.txt is back to v1.
 #[test]
 fn deliver_onto_a_target_that_moved_after_the_draft_forked_is_refused() {
@@ -8629,7 +8710,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 56);
+    assert_eq!(value["schema"], 57);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -8671,7 +8752,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 56);
+    assert_eq!(value["schema"], 57);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -8730,7 +8811,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 56);
+    assert_eq!(value["schema"], 57);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -8938,7 +9019,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 56,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 57,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);

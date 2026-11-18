@@ -12,7 +12,7 @@ use forklift_core::util::reseal_utils::{self, ResealError};
 use forklift_core::util::warehouse_utils::{self, WarehouseMode};
 use forklift_core::util::applied_redactions::{self, RedactionState};
 use forklift_core::util::unavailable_heal::{self, RemoteError};
-use forklift_core::util::{config_utils, origin_utils, pallet_utils, park_utils, recovery_utils, redaction_utils, sealed_utils, tree_utils, unavailable};
+use forklift_core::util::{config_utils, office_utils, origin_utils, pallet_utils, park_utils, recovery_utils, redaction_utils, sealed_utils, tree_utils, unavailable};
 use crate::output::{self, CommandOutput};
 
 /// The note of a re-apply of redactions that could not run, followed by why.
@@ -134,6 +134,13 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             .fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence.trim_start())),
         None => error,
     };
+
+    // Before anything reads the trust anchor, whether or not a taint stands: a lost or damaged
+    // trust file stops every such reader, and its copy can put it back. A refusal stops the run
+    // with nothing here written.
+    let trust_repair = office_utils::repair_trust().map_err(config_said)?;
+    ref_notes.extend(trust_repair.notes);
+
     let record_rebuilt = sealed_utils::rebuild()
         .map_err(|error| config_said(format!(
             "{}{} Nothing else was healed: once that is fixed, run \"forklift heal\" again.",
@@ -842,6 +849,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         parked_rebuilt,
         position_rebuilt: early_position.or(late_position),
         config_repaired,
+        trust_restored: trust_repair.restored,
         inventory_rebuilt,
         inventory_held,
         was_tainted: outcome.was_tainted,
@@ -1518,6 +1526,11 @@ pub(crate) struct HealReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     config_repaired: Option<config_utils::ConfigRepaired>,
 
+    /// The trust file or its copy, which was missing or did not hold the anchor and this run wrote
+    /// from the other, before anything read the anchor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust_restored: Option<office_utils::TrustRestored>,
+
     /// The inventory's registered set of folders, which did not read and this run rebuilt from the
     /// folders it could find whose staging the shard store holds.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1854,7 +1867,7 @@ impl HealReport {
             && self.restored_from_working_tree.is_empty()
             && self.checkout_scope_restored.is_none() && self.merge_state_restored.is_none()
             && self.fetch_scope_rebuilt.is_none() && self.parked_rebuilt.is_none() && self.position_rebuilt.is_none()
-            && self.config_repaired.is_none()
+            && self.config_repaired.is_none() && self.trust_restored.is_none()
             && self.inventory_rebuilt.is_none() && self.inventory_held.is_none()
             && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
             && self.objects_lost.is_none()
@@ -1899,6 +1912,10 @@ impl CommandOutput for HealReport {
             for sentence in repaired.sentences() {
                 println!("{}", sentence);
             }
+        }
+
+        if let Some(restored) = &self.trust_restored {
+            println!("{}", restored.sentence());
         }
 
         if let Some(rebuilt) = &self.inventory_rebuilt {

@@ -37,6 +37,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   operator as the next step. `lower` alone reads a missing
   trust file as no anchor held, so it can adopt the anchor of a remote you trust. A server answers
   it as a `503`.
+- **`heal` restores a lost or damaged trust file from its copy.** Before anything reads the trust
+  anchor, and whether or not a taint stands, `heal` writes the trust file back from its copy when
+  the trust file is missing, does not parse or no longer verifies the office pallet and the copy
+  does; and it writes the copy from the trust file the other way round. Such a warehouse used to
+  refuse every signing write, and `heal` itself, as `trust_damaged`. A served warehouse's trust
+  change that stopped before its copy was written is finished, as is its first anchor written before
+  its office pallet was lifted. Where the two differ and both would serve, `heal` refuses as
+  `trust_damaged` and changes nothing: move aside the one you do not trust, then run it again. It
+  reports what it wrote as `trust_restored` (`--json` schema 57).
 - **A served warehouse's trust changes only through its server.** In a served folder,
   `office regenesis`, `office enroll` and a `lower` that would move the office pallet now refuse,
   leaving the trust file and the office pallet as they were; run them in a clone of the warehouse

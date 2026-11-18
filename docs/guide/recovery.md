@@ -671,6 +671,11 @@ established (the office pallet is born, or the file's copy `.forklift/trust-copy
 not parse, or something other than a file stands in its place. Nothing was changed: the warehouse
 can neither sign nor write unsigned until its anchor is back.
 
+- Run `forklift heal` first. Where the copy `.forklift/trust-copy` still holds the anchor, heal
+  writes the trust file back from it (and a missing or stale copy from the trust file), and reports
+  it as restored. Where the two differ and both would serve, it refuses and changes nothing: move
+  aside the one you do not trust, then run heal again. Where neither holds the anchor, it says so
+  and changes nothing; go on below.
 - Restore `.forklift/trust` from a backup, if you have one.
 - Otherwise move aside whichever of `trust` and `trust-copy` stands, then take the configured
   remote's anchor:
