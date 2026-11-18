@@ -15586,6 +15586,7 @@ fn a_damaged_merge_record_is_refused_and_abort_keep_files_drops_it_keeping_every
         assert_success(&abandoned);
         assert_eq!(json(&abandoned)["data"], serde_json::json!({"abandoned": [kind], "conflicts": 0}), "{}", stdout(&abandoned));
         assert!(!warehouse.root.join(state).exists(), "{}: the record is gone", kind);
+        assert!(!warehouse.root.join(".forklift/consolidation-skeleton").exists(), "{}: no skeleton stays behind", kind);
         assert_eq!(read(&warehouse, "f.txt"), "resolved\n", "{}: the file is left as it is", kind);
         assert_eq!(staged_and_unstaged(&warehouse), (vec!["f.txt".to_string()], vec![]), "{}: the inventory is left as it is", kind);
 

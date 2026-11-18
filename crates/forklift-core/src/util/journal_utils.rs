@@ -1685,6 +1685,32 @@ mod tests {
         assert_eq!(popped.after.cherry_pick, Some(PickInProgress { source: hash('c'), our_head: hash('e'), our_pallet: "main".to_string(), description: None }));
     }
 
+    /// The pop for an abort that does not read the merge's record removes the latest entry when it
+    /// left a merge in progress and the bay stands where it left it, on the same pallet and base,
+    /// and leaves it in place when the bay stands anywhere else, or the entry left none.
+    #[test]
+    fn the_unread_pop_takes_the_entry_that_left_the_merge_only_while_the_bay_stands_where_it_left_it() {
+        let _scratch = Scratch::new("pop-unread");
+
+        let mut started = entry("pick", "main", &hash('a'), &hash('a'));
+        started.after.cherry_pick = Some(PickInProgress { source: hash('c'), our_head: hash('a'), our_pallet: "main".to_string(), description: None });
+        let plain = entry("stack", "main", &hash('1'), &hash('a'));
+
+        let cases = [
+            ("where it left it", &started, "main", hash('a'), true),
+            ("on another base", &started, "main", hash('b'), false),
+            ("on another pallet", &started, "feature", hash('a'), false),
+            ("after an entry that left none", &plain, "main", hash('a'), false),
+        ];
+        for (what, latest, pallet, base, popped) in cases {
+            write(std::slice::from_ref(latest)).unwrap();
+            pallet_utils::write_position(&pallet_utils::BayPosition::new(pallet, Some(base))).unwrap();
+
+            assert_eq!(pop_if_it_left_in_progress_unread().unwrap(), popped, "{}", what);
+            assert_eq!(read().unwrap().len(), usize::from(!popped), "{}", what);
+        }
+    }
+
     #[test]
     fn push_if_changed_records_a_switch_of_the_current_pallet() {
         let _scratch = Scratch::new("push-switch");
