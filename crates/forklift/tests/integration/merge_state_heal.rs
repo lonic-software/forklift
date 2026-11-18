@@ -167,7 +167,7 @@ fn heal_writes_a_damaged_merge_record_back_from_its_copy() {
         std::fs::write(area.root.join("f.txt"), "resolved\n").unwrap();
         area.ok(&["load", "f.txt"]);
         let stacked = parsed(&area.ok(&["--json", "stack", "-m", "merged"]));
-        let merge = stacked["data"]["hash"].as_str().unwrap_or_else(|| panic!("{}", stacked)).to_string();
+        let merge = stacked["data"]["parcel"].as_str().unwrap_or_else(|| panic!("{}", stacked)).to_string();
         let peek = text(&area.ok(&["store", "peek", &merge]).stdout);
         for pallet in ["other"] {
             assert!(peek.contains(&format!("parent {}", area.head(pallet))), "{}: the merge records {}: {}", file, pallet, peek);
@@ -180,6 +180,7 @@ fn heal_writes_a_damaged_merge_record_back_from_its_copy() {
 
     let area = Area::picking("restore-pick");
     let original = std::fs::read(area.state("cherry-pick")).unwrap();
+    assert_eq!(std::fs::read(area.state("cherry-pick-copy")).unwrap(), original, "the copy holds the pick state's bytes");
     flip(&area.state("cherry-pick"));
     let data = area.healed();
     assert_eq!(names(&data["merge_state_restored"]), vec![("pick state".to_string(), false)], "{}", data);
@@ -281,7 +282,10 @@ fn a_copy_that_disagrees_with_the_bay_is_not_written_back() {
 }
 
 /// Crash `args` at each rename in turn until one stops it with its marker standing beside a
-/// consolidation state; `prepare` sets the bay up before each attempt.
+/// consolidation state; `prepare` sets the bay up before each attempt. A consolidate lowers its
+/// marker with no rename between its state's write and the lowering, so a crash that stops the
+/// state's own rename is completed by hand: the rename is atomic, and the bay is then exactly as a
+/// stop right after it leaves it.
 fn crashed_with_a_marker(name: &str, prepare: &dyn Fn(&str) -> Area, args: &[&str], kind: &str) -> Area {
     use forklift_core::util::file_utils::CRASH_POINT_EXIT_CODE;
 
@@ -293,6 +297,11 @@ fn crashed_with_a_marker(name: &str, prepare: &dyn Fn(&str) -> Area, args: &[&st
         }
         // A stopped process leaves its lock behind, as a power loss would; the operator clears it.
         let _ = forklift_core::util::file_utils::remove_file(area.state("lock"));
+        let pending = std::fs::read_dir(area.state("")).unwrap().map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap().to_string_lossy().starts_with("consolidation.tmp~"));
+        if let Some(pending) = pending {
+            std::fs::rename(pending, area.state("consolidation")).unwrap();
+        }
         let marker = std::fs::read_to_string(area.state("operation")).unwrap_or_default();
         if marker.contains(kind) && area.state("consolidation").exists() {
             return area;
@@ -352,7 +361,8 @@ fn a_merge_an_undo_put_back_is_restored_from_its_copy() {
 }
 
 /// T8. A merge is never started over one in progress: `haul consolidate` refuses with the
-/// consolidation left byte for byte as it was.
+/// consolidation left byte for byte as it was. Every merge — consolidate, haul, lift, lower — goes
+/// through the one primitive the guard sits in.
 ///
 /// Revert: drop the mid-merge guard from the merge primitive → haul consolidate writes a second
 /// consolidation over the first, red.
@@ -367,6 +377,10 @@ fn haul_consolidate_refuses_over_a_merge_in_progress() {
 
     let merge = area.ok(&["consolidate", "other"]);
     assert!(text(&merge.stdout).contains("conflict: f.txt"), "{}", text(&merge.stdout));
+    // Resolved to our side and loaded, the tree holds no change a merge would overwrite: only the
+    // merge in progress stands in the way.
+    std::fs::write(area.root.join("f.txt"), "ours\n").unwrap();
+    area.ok(&["load", "f.txt"]);
     let state = std::fs::read(area.state("consolidation")).unwrap();
 
     let refused = area.run(&["haul", "consolidate", &id]);
@@ -396,7 +410,7 @@ fn git(root: &Path, args: &[&str]) {
 fn under_another_interrupted_operation_heal_refuses_after_its_recovery() {
     let prepare = |name: &str| {
         let area = Area::conflicted(name);
-        git(&area.root, &["init", "-q", "-b", "main"]);
+        git(&area.root, &["init", "-q", "-b", "imported"]);
         std::fs::write(area.root.join("g.txt"), "from git\n").unwrap();
         git(&area.root, &["add", "g.txt"]);
         git(&area.root, &["commit", "-qm", "first commit"]);
