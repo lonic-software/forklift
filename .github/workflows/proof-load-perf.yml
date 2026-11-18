@@ -1,18 +1,30 @@
-# Proof Load performance, the per-PR job: `proof-load perf` on the small shape under the self gate,
-# the checks a shared runner can hold. They compare two timings of one run: Forklift against tuned
-# git for an order-of-magnitude regression on the gross rows, Forklift against itself for the
-# repack and parallel-audit ratios, and any of those rows that could not run. Linux only, because
-# the one-core audit is pinned with taskset. It runs on every push to main, so a regression that
+# Proof Load performance: `proof-load perf`, in two jobs.
+#
+# The per-PR job runs the small shape under the self gate, the checks a shared runner can hold.
+# They compare two timings of one run: Forklift against tuned git for an order-of-magnitude
+# regression on the gross rows, Forklift against itself for the repack and parallel-audit ratios,
+# and any of those rows that could not run. It runs on every push to main, so a regression that
 # lands is caught, and on a pull request that touches what the timed binaries or the harness are
 # built from.
 #
-# The report (perf.md, perf.json) is uploaded as an artifact for reading; the gate is the exit status.
-# It is not part of the `ci passed` gate.
+# The weekly job runs the small and medium shapes, warm and cold, under the full gate, which also
+# fails a clearly slower row that perf-tickets.json names no ticket for. Its cold rows drop the
+# caches before each repetition with bin/perf-drop-caches. Each shape's perf.json and perf.md are
+# kept on the orphan branch proof-load-perf, whatever perf's exit was, and each shape's run is set
+# beside that shape's last kept report with --against, which never fails it. A run on another
+# branch than main, by workflow_dispatch, keeps nothing.
+#
+# Both jobs are Linux only, because the one-core audit is pinned with taskset, and the per-PR job
+# uploads its report as an artifact for reading; each job's gate is perf's exit status. Neither is
+# part of the `ci passed` gate.
 name: proof load perf
 
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: "23 5 * * 3"
+  workflow_dispatch:
   pull_request:
     paths:
       - "crates/forklift-core/**"
@@ -24,9 +36,15 @@ on:
       - ".cargo/**"
       - ".github/workflows/proof-load-perf.yml"
 
+# Two weekly runs of one ref never overlap: the second waits for the first, so it reads what the
+# first kept. GitHub keeps at most one run waiting in a group, so a third cancels the waiting one,
+# which then times and keeps nothing.
 concurrency:
-  group: proof-load-perf-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: true
+  group: proof-load-perf-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('weekly-{0}', github.ref) || github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,6 +54,7 @@ env:
 jobs:
   perf:
     name: proof load perf (ubuntu-latest)
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -70,3 +89,124 @@ jobs:
             ${{ runner.temp }}/perf-out/perf.md
             ${{ runner.temp }}/perf-out/perf.json
           if-no-files-found: warn
+
+  weekly:
+    name: proof load perf weekly (ubuntu-latest)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # The one job that writes: it pushes the proof-load-perf branch.
+    permissions:
+      contents: write
+    # The hang guard, well past a normal run of both shapes, warm and cold.
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the binaries to time and the harness
+        run: cargo build --release --locked -p forklift -p forklift-server -p proof-load
+
+      - name: Require taskset for the one-core audit, and sudo without a password for the cache drop
+        run: command -v taskset && sudo -n true
+
+      # Each shape's last kept report, if the branch has one, for --against. A branch that cannot be
+      # listed stops the job, rather than run as if there were nothing kept.
+      - name: Read the last kept reports
+        run: |
+          if git ls-remote --exit-code --heads origin proof-load-perf > /dev/null; then
+            git fetch --no-tags --depth=1 origin +refs/heads/proof-load-perf:refs/remotes/origin/proof-load-perf
+          else
+            status=$?
+            [ "$status" -eq 2 ] || exit "$status"
+            echo "proof-load-perf has no reports yet"
+            exit 0
+          fi
+          for shape in small medium; do
+            # grep's exit 1 is a folder with no report yet; any other failure stops the step.
+            last=$(git ls-tree --name-only origin/proof-load-perf "$shape/" | { grep '\.json$' || [ "$?" -eq 1 ]; } | sort | tail -n 1)
+            if [ -n "$last" ]; then
+              git show "origin/proof-load-perf:$last" > "$RUNNER_TEMP/earlier-$shape.json"
+              echo "$shape: against $last"
+            fi
+          done
+
+      # Every shape runs whatever the one before it came to, and this step records each one's exit
+      # rather than fail, so the reports are kept before the verdict fails the job.
+      - name: Time Forklift against git under the full gate, warm and cold
+        id: perf
+        run: |
+          for shape in small medium; do
+            against=()
+            if [ -f "$RUNNER_TEMP/earlier-$shape.json" ]; then against=(--against "$RUNNER_TEMP/earlier-$shape.json"); fi
+            exit_status=0
+            target/release/proof-load perf --out "$RUNNER_TEMP/perf-$shape" \
+              --forklift target/release/forklift --git "$(command -v git)" \
+              --forklift-server target/release/forklift-server \
+              --shape "$shape" --gate all --drop-caches "$PWD/bin/perf-drop-caches" "${against[@]}" || exit_status=$?
+            echo "$shape=$exit_status" >> "$GITHUB_OUTPUT"
+            echo "$shape: perf exited $exit_status"
+          done
+
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          for shape in small medium; do
+            report="$RUNNER_TEMP/perf-$shape/perf.md"
+            if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; else echo "$shape wrote no perf.md" >> "$GITHUB_STEP_SUMMARY"; fi
+          done
+
+      # One commit per run on proof-load-perf, built without touching the work tree: each shape's
+      # report at <shape>/<UTC time>-<main's sha>.json and .md, beside every earlier one. It runs
+      # only after the timing step ran to its end, and commits nothing when no shape wrote a report.
+      # The push moves the branch only forward, so a run that raced another fails here rather than
+      # drop it.
+      - name: Keep the reports on proof-load-perf
+        if: ${{ !cancelled() && steps.perf.outcome == 'success' && github.ref == 'refs/heads/main' }}
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          SMALL: ${{ steps.perf.outputs.small }}
+          MEDIUM: ${{ steps.perf.outputs.medium }}
+        run: |
+          stamp="$(date -u +%Y-%m-%dT%H%M%SZ)-$(git rev-parse HEAD)"
+          export GIT_INDEX_FILE="$RUNNER_TEMP/proof-load-perf.index"
+          parent=()
+          if git rev-parse -q --verify refs/remotes/origin/proof-load-perf > /dev/null; then
+            git read-tree refs/remotes/origin/proof-load-perf
+            parent=(-p "$(git rev-parse refs/remotes/origin/proof-load-perf)")
+          else
+            git read-tree --empty
+          fi
+          kept=0
+          for shape in small medium; do
+            for kind in json md; do
+              report="$RUNNER_TEMP/perf-$shape/perf.$kind"
+              [ -f "$report" ] || continue
+              git update-index --add --cacheinfo "100644,$(git hash-object -w "$report"),$shape/$stamp.$kind"
+              kept=$((kept + 1))
+            done
+          done
+          if [ "$kept" -eq 0 ]; then
+            echo "no shape wrote a report; nothing is kept"
+            exit 0
+          fi
+          commit=$(git commit-tree "$(git write-tree)" "${parent[@]}" -m "perf $stamp: small exited ${SMALL:-none}, medium ${MEDIUM:-none}")
+          git push origin "$commit:refs/heads/proof-load-perf"
+
+      - name: Fail on the verdict
+        if: ${{ !cancelled() }}
+        env:
+          SMALL: ${{ steps.perf.outputs.small }}
+          MEDIUM: ${{ steps.perf.outputs.medium }}
+        run: |
+          echo "small exited ${SMALL:-none}, medium ${MEDIUM:-none}"
+          [ "$SMALL" = 0 ] && [ "$MEDIUM" = 0 ]
