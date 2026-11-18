@@ -47,6 +47,14 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   failed its digest, each repair says that an entry it kept may still have been altered. `withhold
   repair --header-damaged` is gone: a header damaged into a newer version's no longer matches its
   digest, so it is repaired like any other damage.
+- **A repaired withheld record no longer lets a lost takedown be served.** `forklift-server withhold
+  repair` records each absent file it cannot account for, and each absent folder or part of history
+  it cannot walk beneath, and the warehouse is not served while one is outstanding: `serve --root`
+  will not start, and a `--warehouses` server answers `409`. Before, a takedown whose entry was lost
+  was served again unless its operator withheld it again by hand. Put the bytes back, withhold it
+  with `withhold add`, or, once nothing kept names it, run the repair again; `withhold list` names
+  each. **Breaking:** the withheld record moves to version 4, so a record written before this change
+  refuses as an older version's; run `forklift-server withhold repair` on it.
 - **A served warehouse whose host records do not parse refuses with a code, and is not retried.**
   A `--warehouses` server answered an uncoded `500` for a root whose sealed-object, unavailable or
   origin record did not read, or whose fetch scope stood in a full warehouse. Each now answers

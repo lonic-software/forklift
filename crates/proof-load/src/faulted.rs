@@ -1399,7 +1399,9 @@ fn bound<'a>(host: Option<&'a Host>, arguments: &[String]) -> Option<(&'a Host, 
 /// both name, inside the same stop, before the server serves again, as the report asks. A hash the
 /// report names that the record lacks stays owed, so content the store lost is never restated into
 /// a takedown; a takedown the report does not name is left to the readback, which grades what the
-/// repair made of it.
+/// repair made of it. The repair leaves such a hash unaccounted, and the server refuses to start
+/// while one is: that refusal is kept as owed (`the restarted server refused: …`), the server left
+/// down, since only an operator holding the lost bytes, or knowing why they are gone, can answer it.
 fn operate(context: &Context, arguments: &[String], trail: &mut Trail, unextractable: &mut Vec<String>) -> Result<(), RunError> {
     let written = format!("forklift-server {}", arguments.join(" "));
     let Some((host, bound)) = bound(context.host, arguments) else {
@@ -2603,7 +2605,7 @@ mod tests {
 
     /// A takedown is restated only where an operator report asks for exactly that: `withhold add`
     /// over the served root with only its statement left open, its hash written in place or listed
-    /// on the indented lines right after a `<hash>`. The folders and chunks listed as store damage
+    /// on the indented lines right after a `<hash>`. The folders, history and chunks a repair lists
     /// after another line, another root, and any other placeholder are not restatements.
     ///
     /// Revert: take every indented hash → the store damage listed after the `withhold add` line is
@@ -2615,8 +2617,9 @@ mod tests {
         let report = format!(
             "Kept 1 entry of the old record.\n\
             Kept {a} withheld, though its entry did not read whole; restate its statement with \"forklift-server withhold add --root /s/host {a} --statement <statement>\".\n\
-            2 files the history here names are absent, and no record holds them: content a lost entry may have withheld. Withhold each one that was with \"forklift-server withhold add --root /s/host <hash> --statement <statement>\":\n  {b}\n  {c}\n\
-            1 folder or chunk the history here names is absent too, which no takedown withholds. Restore it from a copy of this warehouse:\n  {d}\n\
+            2 files the history here names are absent, and no record holds them: content a lost entry may have withheld, once its copy was deleted, or damage to the store. Each is recorded as unaccounted, and this warehouse is not served while one is. Put back the bytes of any you hold a copy of. Withhold each one that was taken down, or is gone for good, with \"forklift-server withhold add --root /s/host <hash> --statement <statement>\", stating honestly why; a withholding is never lifted. Once nothing a sweep keeps (pallets, hauls, bays, staged work) names one any more, running this repair again drops it:\n  {b}\n  {c}\n\
+            1 folder or part of history the history here names is absent, and nothing beneath it could be walked, so a file a lost entry withheld may sit there unseen. It is recorded as undescended, and this warehouse is not served while one is, even once it is back. Restore it from a copy of this warehouse, then run this repair again to walk beneath it; or, once nothing a sweep keeps reaches one any more, run this repair again to drop it:\n  {d}\n\
+            1 chunk the history here names is absent too, which no takedown withholds: that is damage to the store, not a lost entry. Restore it from a copy of this warehouse:\n  {d}\n\
             Elsewhere \"forklift-server withhold add --root /s/other {d} --statement <statement>\", \"forklift-server withhold add --root /s/host {d} --statement <reason>\", \"forklift-server withhold add --root /s/host {d} --statement because\" and \"forklift-server withhold add --root /s/host <hash> --statement <statement>\" over nothing.\n"
         );
         let template = "forklift-server withhold add --root /s/host <hash> --statement <statement>".to_string();

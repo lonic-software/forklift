@@ -55,7 +55,9 @@ A served root must hold the full tree. A partial warehouse (one cloned with `--o
 it holds that object by hash alone, without its content, whatever its marker says, and any root
 that records an origin (`.forklift/origin`), which only a partial warehouse has, and any root
 lacking content its unavailable record (`.forklift/unavailable`) lists, which a fetch left out
-because its remote's host withholds it, until those files' bytes are loaded again. A record that
+because its remote's host withholds it, until those files' bytes are loaded again, and any root
+whose withheld record a repair left with a file or part of history unaccounted (below), until each is
+accounted for. A record that
 does not parse is refused as damage, and so is a fetch scope (`.forklift/config/fetch-scope`) in a
 root that is not partial: a `--warehouses` server answers `503` with no `Retry-After` and the
 record's code (`fetch_scope_stray`, `sealed_damaged`, `unavailable_damaged` or `origin_damaged`),
@@ -365,8 +367,14 @@ revocation by more than about a day.
   served. It keeps a copy of the damaged record beside it, keeps every entry that still reads (a
   line cut short or not valid UTF-8 does not), keeps a hash whose entry lost its statement withheld
   under a placeholder (restate it with `withhold add`), and lists the absent files the history names
-  that no record holds, to withhold again. A record that matches its digest but whose header names
-  a newer version is left for that Forklift. A lost entry whose copy is still
+  that no record holds, to withhold again. It records each such file as unaccounted, and each absent
+  folder or part of history it could not walk beneath as undescended, and the root is not served
+  while one is (`serve --root` will not start; a `--warehouses` server answers `409`):
+  a takedown whose entry was lost may be among them. A file stops counting once its bytes are back,
+  once it is withheld again with `withhold add`, or once nothing a sweep keeps names it and the
+  repair is run again; a folder or part of history only once the repair, run again, walks beneath
+  it or finds nothing reaches it. `withhold list` names each. A record that matches its digest but
+  whose header names a newer version is left for that Forklift. A lost entry whose copy is still
   stored cannot be found: withhold it again before serving. Not yet: if a hash withheld before it arrived turns out to be a chunked
   file's, its chunks are still taken and served; and there is no command to lift a takedown.
 - **Redactions:** after every pallet update or deletion, the server applies each redaction
