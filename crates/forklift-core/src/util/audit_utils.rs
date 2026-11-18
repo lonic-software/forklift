@@ -4539,10 +4539,14 @@ mod tests {
     /// What a first serve is refused over, by the trust file and the copy that stand.
     struct UnsettledTrust {
         name: &'static str,
-        trust: Vec<u8>,
+        trust: Option<Vec<u8>>,
         copy: Option<Vec<u8>>,
+        /// The office pallet's ref is removed: its head reads unborn.
+        unborn: bool,
         code: Option<crate::error::RefusalCode>,
         says: &'static str,
+        /// What the refusal must not name.
+        not: Option<&'static str>,
     }
 
     // Revert: name `forklift heal` for every unsettled trust → the cases whose way out is another
@@ -4552,7 +4556,7 @@ mod tests {
         use crate::error::RefusalCode;
         let garbled = b"not a trust file".to_vec();
 
-        for case in 0..6 {
+        for case in 0..9 {
             let fixture = PrivilegeFixture::new(&format!("first-serve-way-out-{}", case));
             let settled = anchor_bytes();
             let head = office_head().unwrap();
@@ -4566,24 +4570,44 @@ mod tests {
             assert_ne!(newer, settled, "the fixture's anchor names its version");
 
             let case = [
-                UnsettledTrust { name: "copy garbled", trust: settled.clone(), copy: Some(garbled.clone()),
-                    code: Some(RefusalCode::TrustDamaged), says: "forklift heal" },
-                UnsettledTrust { name: "trust garbled", trust: garbled.clone(), copy: Some(settled.clone()),
-                    code: Some(RefusalCode::TrustDamaged), says: "forklift heal" },
-                UnsettledTrust { name: "both verify", trust: settled.clone(), copy: Some(resettled),
-                    code: Some(RefusalCode::TrustDamaged), says: "Move aside whichever of the two you do not trust" },
-                UnsettledTrust { name: "server re-genesis", trust: regenesis.clone(), copy: Some(regenesis),
-                    code: Some(RefusalCode::TombstonesDamaged), says: "forklift-server tombstone repair --root" },
-                UnsettledTrust { name: "nothing verifies", trust: garbled.clone(), copy: None,
-                    code: Some(RefusalCode::TrustDamaged), says: "forklift lower" },
-                UnsettledTrust { name: "newer copy", trust: settled.clone(), copy: Some(newer),
-                    code: None, says: "version 2, which this version of Forklift does not read" },
+                UnsettledTrust { name: "copy garbled", trust: Some(settled.clone()), copy: Some(garbled.clone()), unborn: false,
+                    code: Some(RefusalCode::TrustDamaged), says: "forklift heal", not: None },
+                UnsettledTrust { name: "trust garbled", trust: Some(garbled.clone()), copy: Some(settled.clone()), unborn: false,
+                    code: Some(RefusalCode::TrustDamaged), says: "forklift heal", not: None },
+                UnsettledTrust { name: "both verify", trust: Some(settled.clone()), copy: Some(resettled), unborn: false,
+                    code: Some(RefusalCode::TrustDamaged), says: "Move aside whichever of the two you do not trust",
+                    not: None },
+                UnsettledTrust { name: "server re-genesis", trust: Some(regenesis.clone()), copy: Some(regenesis.clone()),
+                    unborn: false, code: Some(RefusalCode::TombstonesDamaged), says: "forklift-server tombstone repair --root",
+                    not: None },
+                // Adopting the same head, a client's re-genesis stopped before its office move is
+                // never told its served witnesses were lost.
+                UnsettledTrust { name: "client re-genesis, no copy", trust: Some(regenesis), copy: None, unborn: false,
+                    code: Some(RefusalCode::TrustDamaged), says: "forklift lower", not: Some("tombstone repair") },
+                UnsettledTrust { name: "nothing verifies", trust: Some(garbled.clone()), copy: None, unborn: false,
+                    code: Some(RefusalCode::TrustDamaged), says: "forklift lower", not: None },
+                UnsettledTrust { name: "newer copy", trust: Some(settled.clone()), copy: Some(newer), unborn: false,
+                    code: None, says: "The trust file's copy has version 2, which this version of Forklift does not read",
+                    not: None },
+                UnsettledTrust { name: "trust missing", trust: None, copy: None, unborn: false,
+                    code: Some(RefusalCode::TrustDamaged), says: "is missing, but the office pallet is born", not: None },
+                UnsettledTrust { name: "office unborn", trust: Some(settled.clone()), copy: Some(settled.clone()), unborn: true,
+                    code: Some(RefusalCode::RefDamaged), says: "stopped between its two writes", not: None },
             ].into_iter().nth(case).unwrap();
 
             let forklift = crate::globals::forklift_root();
-            file_utils::write_file_atomically(&forklift.join(crate::util::office_utils::FILE_NAME_TRUST), &case.trust).unwrap();
-            if let Some(copy) = &case.copy {
-                file_utils::write_file_atomically(&forklift.join(crate::util::office_utils::FILE_NAME_TRUST_COPY), copy).unwrap();
+            for (name, bytes) in [(crate::util::office_utils::FILE_NAME_TRUST, &case.trust), (crate::util::office_utils::FILE_NAME_TRUST_COPY, &case.copy)] {
+                let path = forklift.join(name);
+                match bytes {
+                    Some(bytes) => file_utils::write_file_atomically(&path, bytes).unwrap(),
+                    None if path.exists() => file_utils::remove_file(&path).unwrap(),
+                    None => {}
+                }
+            }
+            if case.unborn {
+                file_utils::remove_file(crate::util::pallet_utils::get_pallet_ref_path(
+                    crate::util::pallet_utils::PalletNamespace::Meta, crate::util::office_utils::OFFICE_PALLET_NAME,
+                )).unwrap();
             }
 
             let refused = crate::util::tombstone_utils::mark_served(true).expect_err(case.name);
@@ -4593,6 +4617,9 @@ mod tests {
                 None => assert!(crate::error::frames_in(&refused).next().is_none(), "{}: {}", case.name, refused),
             }
             assert!(refused.contains(case.says), "{}: {}", case.name, refused);
+            if let Some(not) = case.not {
+                assert!(!refused.contains(not), "{}: {}", case.name, refused);
+            }
             assert_eq!(served_witnesses_stand(), (false, false), "{}: nothing is written", case.name);
         }
     }

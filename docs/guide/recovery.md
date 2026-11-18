@@ -685,9 +685,13 @@ can neither sign nor write unsigned until its anchor is back.
   history, and enroll there.
 
 A server's first serve of a warehouse refuses as `trust_damaged` when its trust file stands but does
-not verify its office pallet, or the copy beside it differs from it. The refusal names the step: in
+not verify its office pallet, or the copy beside it differs from it. The refusal says what to do: in
 the warehouse, run `forklift heal` when one of the two files verifies the office; when both do but
-differ, move aside the one you do not trust first. When neither does, take the ways out above.
+differ, move aside the one you do not trust first. When neither does, take the ways out above. It
+refuses as `trust_damaged` too when the trust file is missing beside a born office pallet, and as
+`ref_damaged` when the trust file stands beside an unborn one: an enrollment or a first `lower`
+stopped part way. Where a remote holds the warehouse's office, `forklift lower` takes it and verifies
+it against the trust file.
 
 ### Lost keys: re-genesis
 

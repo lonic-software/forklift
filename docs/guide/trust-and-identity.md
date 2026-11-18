@@ -461,6 +461,8 @@ In a served warehouse, run the reset from a clone and lift it to the server, nev
 in the served folder itself: there `office regenesis`, like `office enroll` and a
 `lower` that would move the office pallet, refuses with the trust file and the
 office pallet as they were, since its clients take their trust from the server.
+A change refuses before it writes anything when the copy's path holds something
+other than a file, or a copy a newer version of Forklift wrote.
 
 The new anchor and the new office genesis are written together, with nothing able
 to write a ref between them. If another bay of the warehouse moves the office, the

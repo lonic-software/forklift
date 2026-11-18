@@ -30,6 +30,8 @@ const BYTE_READS: &[(&str, &str)] = &[
     // a missing trust file writes nothing.
     ("crates/forklift-core/src/util/office_utils.rs", "mend_trust_copy"),
     ("crates/forklift-core/src/util/office_utils.rs", "mend_trust_copy"),
+    // The check before a copy write reads only the copy, never the trust file.
+    ("crates/forklift-core/src/util/office_utils.rs", "refuse_unwritable_copy"),
     // The first serve's check judges a trust file that stands; a missing one it leaves to the
     // coded read, which refuses it where trust was established.
     ("crates/forklift-core/src/util/office_utils.rs", "refuse_unsettled_trust"),

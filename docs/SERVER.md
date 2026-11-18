@@ -423,13 +423,14 @@ revocation by more than about a day.
   from a backup.
 - **First serve and trust:** the first serve of a root refuses as `trust_damaged`, writing no served
   mark, when its trust file stands beside a born office pallet but does not verify it, or its copy
-  differs from it: a client's trust change there stopped part way, or a file was damaged. The log
-  names the way out. A re-genesis a server installed, standing in a root that has lost both its
+  differs from it: a client's trust change there stopped part way, or a file was damaged. It refuses
+  as `trust_damaged` too when the trust file is missing beside a born office pallet, and as
+  `ref_damaged` when the trust file stands beside an unborn one. The log says what to do. A re-genesis a server installed, standing in a root that has lost both its
   served mark and its tombstone list, refuses as `tombstones_damaged` instead: run
   `forklift-server tombstone repair --root <warehouse>`.
 - **Trust changes in a served root:** once a root is served, `forklift office regenesis`,
   `office enroll` and a `lower` that would move the office pallet refuse in it, leaving its trust
-  file and office pallet as they were, since its clients take their trust from the server. Run them from a clone, against the server.
+  file and office pallet as they were, since its clients take their trust from the server. Make the change in a clone and lift it to the server.
 - **Shutdown:** SIGINT/SIGTERM drain in-flight requests before exiting.
 
 ## Updating
