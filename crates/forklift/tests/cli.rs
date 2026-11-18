@@ -15582,6 +15582,16 @@ fn a_damaged_merge_record_is_refused_and_abort_keep_files_drops_it_keeping_every
                 "{} {:?}: {}", kind, command, error);
         }
 
+        // An inventory it cannot count conflicts in refuses the abandon, changing nothing, rather
+        // than report none.
+        let metadata = warehouse.root.join(".forklift/inventory/metadata");
+        let intact = std::fs::read(&metadata).unwrap();
+        std::fs::write(&metadata, b"/forklift-garbled\n").unwrap();
+        let uncounted = warehouse.run(&["--json", "abort", "--keep-files"]);
+        assert_eq!(json(&uncounted)["error"]["code"].as_str(), Some("inventory_damaged"), "{}", stdout(&uncounted));
+        assert!(warehouse.root.join(state).exists(), "a refused abandon leaves the record");
+        std::fs::write(&metadata, intact).unwrap();
+
         let abandoned = warehouse.run(&["--json", "abort", "--keep-files"]);
         assert_success(&abandoned);
         assert_eq!(json(&abandoned)["data"], serde_json::json!({"abandoned": [kind], "conflicts": 0}), "{}", stdout(&abandoned));
