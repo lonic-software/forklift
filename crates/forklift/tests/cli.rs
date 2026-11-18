@@ -7796,6 +7796,158 @@ fn heal_restores_the_trust_file_beside_a_lost_office_from_its_copy() {
     assert_ne!(json(&refused)["error"]["code"], "trust_damaged", "{}", stdout(&refused));
 }
 
+/// Each damage to an enrolled warehouse's trust, office ref or signatures refuses with its own code
+/// and exit, and with `forklift heal` as its next step exactly where heal mends it: a trust file
+/// lost or damaged beside a copy that verifies, or one that parses but verifies nothing while its
+/// copy does. Where heal cannot mend, the step is empty and the message names the ways out. A lost
+/// office ref refuses as ref_damaged in stack, audit and enroll alike (enroll never says trust is
+/// already established over it), naming lower once a remote is configured.
+// Reverts: trust_remedy never names heal → the heal rows see no step; verified_local_trust's
+// unborn office back to the plain "use enroll" error → stack's office row exits 1; enroll's
+// unborn-office check dropped → "already established"; the history verdict uncoded → audit's
+// missing-signature row exits 1; load_parcel_signature's parse error uncoded → exit 1.
+#[test]
+fn damaged_trust_refuses_with_its_code_and_names_heal_where_heal_mends() {
+    fn sidecar_of_head(warehouse: &TestWarehouse) -> std::path::PathBuf {
+        let head = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+        let head = head.trim();
+        warehouse.root.join(".forklift/objects").join(&head[0..2]).join(format!("{}.sig", &head[2..]))
+    }
+    let (foreign, _) = enrolled_warehouse("coded-refusals-foreign");
+    let foreign_anchor = std::fs::read(foreign.root.join(".forklift/trust")).unwrap();
+    let lose = |warehouse: &TestWarehouse, path: &str| {
+        forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift").join(path)).unwrap();
+    };
+
+    // (case, damage, command, exit, code, next step, a phrase the message holds)
+    type Damage = Box<dyn Fn(&TestWarehouse)>;
+    let cases: Vec<(&str, Damage, &[&str], i32, &str, &str, &str)> = vec![
+        ("trust lost beside its copy", Box::new(move |w| lose(w, "trust")),
+            &["stack", "-m", "r"], 69, "trust_damaged", "forklift heal", "is missing, but its copy stands beside it"),
+        ("trust lost beside its copy", Box::new(move |w| lose(w, "trust")),
+            &["audit", "--full"], 69, "trust_damaged", "forklift heal", "heal can restore the trust file from"),
+        ("trust garbled beside its copy", Box::new(|w| std::fs::write(w.root.join(".forklift/trust"), b"garbage\xff").unwrap()),
+            &["stack", "-m", "r"], 69, "trust_damaged", "forklift heal", "is damaged, and its anchor cannot be read"),
+        ("trust and copy lost", Box::new(move |w| { lose(w, "trust"); lose(w, "trust-copy"); }),
+            &["stack", "-m", "r"], 69, "trust_damaged", "", "forklift lower"),
+        ("trust another warehouse's, beside its copy", {
+            let anchor = foreign_anchor.clone();
+            Box::new(move |w| std::fs::write(w.root.join(".forklift/trust"), &anchor).unwrap())
+        }, &["stack", "-m", "r"], 69, "trust_damaged", "forklift heal", "does not verify the office pallet, but its copy does"),
+        ("office ref lost", Box::new(move |w| lose(w, "meta/office")),
+            &["stack", "-m", "r"], 53, "ref_damaged", "", "by hand"),
+        ("office ref lost", Box::new(move |w| lose(w, "meta/office")),
+            &["audit"], 53, "ref_damaged", "", "the office pallet is unborn"),
+        ("office ref lost", Box::new(move |w| lose(w, "meta/office")),
+            &["office", "enroll"], 53, "ref_damaged", "", "the office pallet is unborn"),
+        ("office ref lost, a remote configured", Box::new(move |w| {
+            lose(w, "meta/office");
+            assert_success(&w.run(&["config", "set", "remote.url", "http://127.0.0.1:9"]));
+        }), &["stack", "-m", "r"], 53, "ref_damaged", "", "If the configured remote holds this warehouse's office pallet"),
+        ("head signature garbled", Box::new(|w| std::fs::write(sidecar_of_head(w), b"xx").unwrap()),
+            &["audit", "--full"], 70, "signature_damaged", "", "clone the warehouse again from a remote that holds the parcel"),
+        ("head signature lost", Box::new(|w| forklift_core::util::file_utils::remove_file(sidecar_of_head(w)).unwrap()),
+            &["audit", "--full"], 71, "signature_missing", "", "may have been tampered with"),
+    ];
+
+    for (index, (case, damage, command, exit, code, step, phrase)) in cases.into_iter().enumerate() {
+        let (warehouse, _) = enrolled_warehouse(&format!("coded-refusals-{}", index));
+        warehouse.write_file("code.txt", "v2\n");
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["stack", "-m", "signed"]));
+        warehouse.write_file("code.txt", "v3\n");
+        assert_success(&warehouse.run(&["load", "."]));
+        damage(&warehouse);
+
+        let args: Vec<&str> = std::iter::once("--json").chain(command.iter().copied()).collect();
+        let refused = warehouse.run(&args);
+
+        let what = format!("{} / {:?}", case, command);
+        assert_eq!(refused.status.code(), Some(exit), "{}: {}{}", what, stdout(&refused), stderr(&refused));
+        let value = json(&refused);
+        assert_eq!(value["error"]["code"], code, "{}: {}", what, value);
+        assert_eq!(value["error"]["next_step"].as_str().unwrap_or(""), step, "{}: {}", what, value);
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains(phrase), "{}: {}", what, message);
+        assert!(!message.contains("already established"), "{}: {}", what, message);
+    }
+}
+
+/// An office chain that fails its anchor while the copy fails it too is not the trust file's to
+/// answer for: the refusal is the chain's own, never trust_damaged, since a tampered office and a
+/// damaged anchor fail the same check.
+// Revert: unverified_trust_refusal raises trust_damaged whether or not heal mends → red.
+#[test]
+fn an_anchor_and_copy_that_both_fail_the_office_keep_the_chains_refusal() {
+    let (foreign, _) = enrolled_warehouse("chain-refusal-foreign");
+    let foreign_anchor = std::fs::read(foreign.root.join(".forklift/trust")).unwrap();
+    let (warehouse, _) = enrolled_warehouse("chain-refusal");
+    for file in ["trust", "trust-copy"] {
+        std::fs::write(warehouse.root.join(".forklift").join(file), &foreign_anchor).unwrap();
+    }
+    warehouse.write_file("code.txt", "v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+
+    let refused = warehouse.run(&["--json", "stack", "-m", "over a foreign anchor"]);
+
+    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
+    assert_ne!(json(&refused)["error"]["code"], "trust_damaged", "{}", stdout(&refused));
+}
+
+/// A coded refusal met on the office walk, restoring a deleted pallet, still says which pallet's
+/// restore was refused and that nothing was undone.
+// Revert: pass a coded office refusal through `trust_preconditions_saying` as it stands → the
+// refusal names neither the pallet nor what was left → red.
+#[test]
+fn undoing_a_delete_over_a_damaged_office_signature_names_what_was_refused() {
+    let (warehouse, _) = enrolled_warehouse("undo-delete-office-sig");
+    assert_success(&warehouse.run(&["pallet", "create", "side"]));
+    warehouse.write_file("code.txt", "side\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "on side"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_success(&warehouse.run(&["pallet", "delete", "side", "--force"]));
+    let office = std::fs::read_to_string(warehouse.root.join(".forklift/meta/office")).unwrap();
+    let office = office.trim();
+    let sidecar = warehouse.root.join(".forklift/objects").join(&office[0..2]).join(format!("{}.sig", &office[2..]));
+    assert!(sidecar.exists(), "the office head is signed in a sidecar: {}", sidecar.display());
+    std::fs::write(&sidecar, b"xx").unwrap();
+
+    let refused = warehouse.run(&["--json", "undo"]);
+
+    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
+    let value = json(&refused);
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("deleted pallet \"side\""), "{}", value);
+    assert!(message.contains("Nothing was undone."), "{}", value);
+    assert!(!warehouse.root.join(".forklift/pallets/side").exists(), "{}", value);
+}
+
+/// An enrollment stopped before it wrote the office pallet leaves an anchor with no office ref to
+/// restore. The refusal names moving the trust files aside and enrolling again, and that way out
+/// is taken here, to an enrolled warehouse that audits clean.
+#[test]
+fn an_enrollment_stopped_before_the_office_names_a_way_out_that_works() {
+    let (warehouse, _) = enrolled_warehouse("enroll-stopped");
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/meta/office")).unwrap();
+
+    let refused = warehouse.run(&["--json", "office", "enroll"]);
+
+    assert_eq!(refused.status.code(), Some(53), "{}{}", stdout(&refused), stderr(&refused));
+    let value = json(&refused);
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("move the trust file") && message.contains("run \"forklift office enroll\" again"), "{}", value);
+
+    for name in ["trust", "trust-copy"] {
+        let path = warehouse.root.join(".forklift").join(name);
+        if path.exists() {
+            forklift_core::util::file_utils::remove_file(&path).unwrap();
+        }
+    }
+    assert_success(&warehouse.run(&["office", "enroll"]));
+    assert_success(&warehouse.run(&["audit"]));
+}
+
 // Revert: drop deliver's target-coverage check → the delivery lands and other.txt is back to v1.
 #[test]
 fn deliver_onto_a_target_that_moved_after_the_draft_forked_is_refused() {
@@ -8717,7 +8869,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 57);
+    assert_eq!(value["schema"], 58);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -8759,7 +8911,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 57);
+    assert_eq!(value["schema"], 58);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -8818,7 +8970,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 57);
+    assert_eq!(value["schema"], 58);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -9026,7 +9178,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 57,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 58,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);

@@ -1905,7 +1905,7 @@ fn operator_remedy(code: forklift_core::error::RefusalCode, own: &str) -> String
         RefusalCode::SealedDamaged | RefusalCode::UnavailableDamaged | RefusalCode::BayPositionDamaged => own.to_string(),
         // The trust file's own next step names no path.
         RefusalCode::TrustDamaged => own.to_string(),
-        RefusalCode::FetchScopeStray | RefusalCode::OriginDamaged => String::new(),
+        RefusalCode::FetchScopeStray | RefusalCode::OriginDamaged | RefusalCode::SignatureDamaged => String::new(),
         _ => unreachable!("not a damage code"),
     }
 }
@@ -1934,6 +1934,8 @@ fn damage_message(code: forklift_core::error::RefusalCode) -> String {
             "The warehouse's record of what its head withholds is missing or does not read, so what may be served cannot be told, and the request was refused.".to_string(),
         RefusalCode::TrustDamaged =>
             "The warehouse's trust file, or the copy beside it, is lost or does not read, so what it trusts cannot be told, and the request was refused.".to_string(),
+        RefusalCode::SignatureDamaged =>
+            "A signature the warehouse holds does not read, so what signed its parcel cannot be told, and the request was refused. Its operator restores the warehouse's objects from a backup.".to_string(),
         _ => unreachable!("not a damage code"),
     }
 }
@@ -1944,12 +1946,7 @@ fn damage_message(code: forklift_core::error::RefusalCode) -> String {
 /// ([`error_response`]), since only the operator's repair mends it; any other error is a 500
 /// ([`server_fault`]). The damage itself is logged, with the local next step.
 fn damage_refusal(message: String) -> HandlerError {
-    // A caller may have wrapped the damage in its own words; the frame inside still names it.
-    let damage = forklift_core::error::frames_in(&message).find_map(|(code, _, step)| {
-        DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, step.to_string()))
-    });
-
-    match damage {
+    match damage_in(&message) {
         Some((code, step)) => {
             tracing::error!(%message, "a host record or the store is damaged");
             (StatusCode::SERVICE_UNAVAILABLE, forklift_core::error::CoreError::refusal(code, damage_message(code), operator_remedy(code, &step)).into())
@@ -1963,13 +1960,31 @@ fn unprocessable(message: String) -> HandlerError {
     (StatusCode::UNPROCESSABLE_ENTITY, message)
 }
 
+/// The first of the [`DAMAGE_CODES`] framed anywhere in `message`, with its step: a caller may have
+/// wrapped the damage in its own words, and the frame inside still names it.
+fn damage_in(message: &str) -> Option<(forklift_core::error::RefusalCode, String)> {
+    forklift_core::error::frames_in(message).find_map(|(code, _, step)| {
+        DAMAGE_CODES.iter().find(|damage| damage.as_str() == code).map(|code| (*code, step.to_string()))
+    })
+}
+
+/// A verification of what the warehouse holds that refused: the operator's 503
+/// ([`damage_refusal`]) when the refusal carries a damage frame anywhere in it, a 422 otherwise.
+/// A read failure the reader did not frame as damage still goes out as the 422.
+fn refused_or_damaged(message: String) -> HandlerError {
+    match damage_in(&message) {
+        Some(_) => damage_refusal(message),
+        None => unprocessable(message),
+    }
+}
+
 /// Map a lifted office chain that did not verify: a 403 when a parcel the lift brings
 /// oversteps its signer's privileges, a 422 otherwise (see
 /// `audit_utils::classify_office_lift_refusal`).
 fn office_lift_refusal(error: audit_utils::OfficeChainError, held_head: Option<&str>) -> HandlerError {
     match audit_utils::classify_office_lift_refusal(error, held_head) {
         audit_utils::OfficeLiftRefusal::Overstep(message) => (StatusCode::FORBIDDEN, message),
-        audit_utils::OfficeLiftRefusal::Unprocessable(message) => unprocessable(message),
+        audit_utils::OfficeLiftRefusal::Unprocessable(message) => refused_or_damaged(message),
     }
 }
 
@@ -3700,7 +3715,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     office_head.as_deref(),
                     request.old_head.as_deref(),
                     &request.new_head
-                ).map_err(unprocessable)?;
+                ).map_err(refused_or_damaged)?;
             } else if let Some(anchor) = anchor {
                 // A trusted warehouse accepts nothing a local audit would reject. This is the
                 // user-pallet path (the office and the meta-tree pallets took the branches above). The office head is the one
@@ -3711,7 +3726,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 ))?;
 
                 let office_state = audit_utils::verify_office_chain_memoized(&anchor, &office_head)
-                    .map_err(|error| unprocessable(error.into()))?;
+                    .map_err(|error| refused_or_damaged(error.into()))?;
 
                 // Incremental: everything reachable from old_head was verified when
                 // old_head was committed, so only the new slice is audited.
@@ -3720,7 +3735,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     &anchor,
                     &office_state,
                     request.old_head.as_deref().as_slice()
-                ).map_err(|refusal| unprocessable(refusal.into()))?;
+                ).map_err(|refusal| refused_or_damaged(refusal.into()))?;
             }
 
             ref_write_test_checkpoint(&name);
@@ -10205,17 +10220,27 @@ mod tests {
         }
 
         /// A trust file that does not parse, or one missing beside its standing copy, is a 503
-        /// trust_damaged with the fixed message, naming no file of the server's.
+        /// trust_damaged with the fixed message, naming no file of the server's. Its operator is
+        /// told `forklift heal` exactly where heal restores the trust file from a usable copy (a
+        /// served root's office still unborn makes any copy that parses usable).
         /// Revert: drop TrustDamaged from SERVED_DAMAGE → a 500 with no code → red.
         #[tokio::test]
         async fn a_handshake_over_a_damaged_trust_file_refuses_with_its_code() {
             let (root, _scope, _side) = served_with_side("handshake-trust");
             let trust = forklift_core::globals::forklift_root().join("trust");
             let copy = forklift_core::globals::forklift_root().join("trust-copy");
+            let usable = office_utils::encode_trust_anchor(&TrustAnchor {
+                genesis: "0".repeat(64),
+                enabled_at: 0,
+                boundary: Vec::new(),
+                prior_genesis: None,
+                adopts: None,
+            });
 
-            for (what, trust_bytes, copy_bytes) in [
-                ("garbled", Some(&b"version = 1\ngenesis = \""[..]), None),
-                ("missing beside its copy", None, Some(&b"a copy"[..])),
+            for (what, trust_bytes, copy_bytes, step) in [
+                ("garbled", Some(&b"version = 1\ngenesis = \""[..]), None, ""),
+                ("missing beside its copy", None, Some(&b"a copy"[..]), ""),
+                ("missing beside a usable copy", None, Some(usable.as_bytes()), "forklift heal"),
             ] {
                 for (path, bytes) in [(&trust, trust_bytes), (&copy, copy_bytes)] {
                     match bytes {
@@ -10231,6 +10256,8 @@ mod tests {
                 let body = body_text(response).await;
                 assert!(body.contains(r#""code":"trust_damaged""#), "{}: {}", what, body);
                 assert!(body.contains("The warehouse's trust file, or the copy beside it, is lost or does not read"), "{}: {}", what, body);
+                let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(value["next_step"].as_str().unwrap_or(""), step, "{}: {}", what, body);
                 let absolute = std::path::absolute(&root).unwrap();
                 assert!(!body.contains(&*absolute.to_string_lossy()) && !body.contains(".forklift"), "{}: no server path: {}", what, body);
             }

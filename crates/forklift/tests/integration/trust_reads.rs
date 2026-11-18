@@ -38,10 +38,11 @@ const BYTE_READS: &[(&str, &str)] = &[
     // coded read, which refuses it where trust was established.
     ("crates/forklift-core/src/util/office_utils.rs", "refuse_unsettled_trust"),
     ("crates/forklift-core/src/util/office_utils.rs", "refuse_unsettled_trust"),
-    // heal's repair reads both files under the ref lock and writes one from the other; a missing
+    // heal's repair reads both files (under the ref lock) and writes one from the other; a missing
     // trust file it restores only from a copy that stands, and with neither it writes nothing,
-    // leaving the coded read to refuse a lost anchor.
-    ("crates/forklift-core/src/util/office_utils.rs", "repair_trust_noting"),
+    // leaving the coded read to refuse a lost anchor. A refusal reads them the same way, without
+    // the lock and writing nothing, only to say whether heal would restore the trust file.
+    ("crates/forklift-core/src/util/office_utils.rs", "read_trust_files"),
     // A ref write's anchor precondition compares the file's bytes to the ones the caller judged;
     // a missing file meets only a caller that read none, and is then read through the witnesses.
     ("crates/forklift-core/src/util/pallet_utils.rs", "check_preconditions"),

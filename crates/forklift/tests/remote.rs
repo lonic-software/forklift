@@ -3637,7 +3637,10 @@ fn a_lost_anchor_over_a_remote_that_reset_its_trust_clones_again() {
     let server = regenesis_on_remote(&area, |server| {
         assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "root"]));
     });
-    forklift_core::util::file_utils::remove_file(area.path("b/.forklift/trust")).unwrap();
+    // The copy goes too: beside a copy that verifies, the way out is heal, not a new clone.
+    for lost in ["trust", "trust-copy"] {
+        forklift_core::util::file_utils::remove_file(area.path("b/.forklift").join(lost)).unwrap();
+    }
 
     let refused = area.forklift("b", &["office", "enroll"]);
     assert!(stderr(&refused).contains("clone it again"), "{}", stderr(&refused));
@@ -5793,6 +5796,105 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_and_reads_the
             "signer.boundary eq {}: expected match = {}: {}",
             value, must_match, report
         );
+    }
+}
+
+/// A damaged signature in the server's own office chain is the operator's to repair: a lift
+/// over it is refused as `signature_damaged`, naming the remote's operator and no server path.
+// Revert: map the user-pallet lift's office-chain refusal through `unprocessable` as it stands →
+// the client is told the remedy for its own store → red.
+#[test]
+fn a_lift_over_a_damaged_office_signature_on_the_server_names_its_operator() {
+    let area = TestArea::new("lift-server-office-sig");
+    let server = Server::start(&area, None);
+    std::fs::create_dir_all(area.path("w")).unwrap();
+    assert_success(&area.forklift("w", &["prepare"]));
+    assert_success(&area.forklift("w", &["config", "set", "--global", "operator.identifier", "tester@forklift"]));
+    area.write_file("w/app.txt", "v1\n");
+    assert_success(&area.forklift("w", &["load", "."]));
+    assert_success(&area.forklift("w", &["stack", "-m", "first"]));
+    assert_success(&area.forklift("w", &["office", "enroll"]));
+    assert_success(&area.forklift("w", &["config", "set", "remote.url", &server.url]));
+    assert_success(&area.forklift("w", &["lift"]));
+    drop(server);
+    // A killed server leaves its lock behind.
+    let _ = forklift_core::util::file_utils::remove_file(area.path("server-root/.forklift/serve.lock"));
+
+    let office = std::fs::read_to_string(area.path("server-root/.forklift/meta/office")).unwrap();
+    let office = office.trim();
+    let sidecar = area.path("server-root/.forklift/objects").join(&office[0..2]).join(format!("{}.sig", &office[2..]));
+    assert!(sidecar.exists(), "the server holds the office head's sidecar: {}", sidecar.display());
+    std::fs::write(&sidecar, b"xx").unwrap();
+    let root = area.path("server-root");
+    let server = Server::spawn(vec![
+        "serve".to_string(), "--root".to_string(), root.to_str().unwrap().to_string(),
+        "--addr".to_string(), "127.0.0.1:0".to_string(),
+    ], None);
+    assert_success(&area.forklift("w", &["config", "set", "remote.url", &server.url]));
+    area.write_file("w/app.txt", "v2\n");
+    assert_success(&area.forklift("w", &["load", "."]));
+    assert_success(&area.forklift("w", &["stack", "-m", "second"]));
+
+    let lifted = area.forklift("w", &["--json", "lift"]);
+
+    assert!(!lifted.status.success(), "{}{}", stdout(&lifted), stderr(&lifted));
+    let value = json_of(&lifted);
+    assert_eq!(value["error"]["code"], "signature_damaged", "{}", value);
+    let said = value.to_string();
+    assert!(said.contains("operator"), "{}", value);
+    assert!(said.contains("(503)"), "the server answers its own damage as a 503: {}", value);
+    assert!(!said.contains("server-root") && !said.contains("Restore the warehouse's objects"), "the server's fixed text, not its reader's: {}", value);
+}
+
+/// A lift from a warehouse whose office ref is lost beside its trust file refuses as ref_damaged
+/// before it uploads anything: a fresh remote is left with no trust anchor, rather than one with
+/// no office behind it. Lower is the way out it names only where the remote holds the office.
+// Revert: read the office head after the anchor's upload in `push_local_trust` → the server root
+// holds a trust file. Revert: pass `true` for `lowerable` → the fresh remote's row names lower.
+#[test]
+fn a_lift_over_a_lost_office_ref_refuses_before_uploading_the_anchor() {
+    // (name, who lifted an office to the remote first, the step named)
+    for (name, lifted_first, step) in [
+        ("fresh remote", "", ""),
+        ("remote holds the office", "w", "forklift lower"),
+        ("remote holds another warehouse's office", "x", ""),
+    ] {
+        let area = TestArea::new(&format!("lift-lost-office-{}", lifted_first));
+        let server = Server::start(&area, None);
+        if lifted_first == "x" {
+            std::fs::create_dir_all(area.path("x")).unwrap();
+            assert_success(&area.forklift("x", &["prepare"]));
+            assert_success(&area.forklift("x", &["config", "set", "--global", "operator.identifier", "tester@forklift"]));
+            area.write_file("x/other.txt", "x\n");
+            assert_success(&area.forklift("x", &["load", "."]));
+            assert_success(&area.forklift("x", &["stack", "-m", "other"]));
+            assert_success(&area.forklift("x", &["office", "enroll"]));
+            assert_success(&area.forklift("x", &["config", "set", "remote.url", &server.url]));
+            assert_success(&area.forklift("x", &["lift"]));
+        }
+        std::fs::create_dir_all(area.path("w")).unwrap();
+        assert_success(&area.forklift("w", &["prepare"]));
+        assert_success(&area.forklift("w", &["config", "set", "--global", "operator.identifier", "tester@forklift"]));
+        area.write_file("w/app.txt", "v1\n");
+        assert_success(&area.forklift("w", &["load", "."]));
+        assert_success(&area.forklift("w", &["stack", "-m", "first"]));
+        assert_success(&area.forklift("w", &["office", "enroll"]));
+        assert_success(&area.forklift("w", &["config", "set", "remote.url", &server.url]));
+        if lifted_first == "w" {
+            assert_success(&area.forklift("w", &["lift"]));
+        }
+        forklift_core::util::file_utils::remove_file(area.path("w/.forklift/meta/office")).unwrap();
+
+        let lifted = area.forklift("w", &["--json", "lift"]);
+
+        assert_eq!(lifted.status.code(), Some(53), "{}: {}{}", name, stdout(&lifted), stderr(&lifted));
+        let value = json_of(&lifted);
+        assert_eq!(value["error"]["code"], "ref_damaged", "{}: {}", name, value);
+        assert_eq!(value["error"]["next_step"].as_str().unwrap_or(""), step, "{}: {}", name, value);
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("Nothing was lifted."), "{}: {}", name, value);
+        assert_eq!(message.contains("by hand"), step.is_empty(), "{}: {}", name, value);
+        assert_eq!(area.path("server-root/.forklift/trust").exists(), !lifted_first.is_empty(), "{}: no anchor reaches a fresh remote", name);
     }
 }
 

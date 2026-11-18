@@ -85,7 +85,27 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 57** (current): `heal` emits `data.trust_restored` when it wrote the trust file from its
+**Schema 58** (current): two new error codes. `signature_damaged` (exit 70): a parcel's stored
+signature cannot be read or does not parse, so what signed it cannot be told; the message names the
+parcel and the ways out (restore the objects from a backup, or clone again from a remote that holds
+the parcel), with no `next_step`. `signature_missing` (exit 71): a parcel stacked after trust was
+established carries no signature, so the warehouse may have been tampered with; no `next_step`.
+Both were uncoded messages before. `trust_damaged` now has `next_step` `forklift heal` wherever heal
+can mend it: the trust file missing, not parsing, or parsing but verifying nothing while its copy
+verifies the office pallet. That last case refused with the office chain's uncoded message before.
+Where heal cannot mend, there is still no `next_step`, and on a served root (or one whose first serve
+began) the ways out the message names leave out `forklift lower`. A server's 503 `trust_damaged`
+carries `next_step` `forklift heal` on the same rule. The office pallet's ref missing beside a trust
+file refuses as `ref_damaged` (exit 53) where a command needs the verified office (stack, deliver,
+lift, audit, enroll and regenesis among them), with `next_step` `forklift lower` only where `lift` has found
+that the remote holds this warehouse's office, and none otherwise; the other commands do not ask the
+remote, so they name lower in the message where one is configured. On a served root, an unborn office
+pallet beside the trust file is the window before the enrolling client lifts it or a lost ref, which
+nothing there tells apart, so it stays uncoded and names both. `signature_damaged` joins the damage codes a server answers as a 503 naming its
+operator. Before, it was an uncoded "office pallet is unborn" message, and
+enroll said trust was already established.
+
+**Schema 57**: `heal` emits `data.trust_restored` when it wrote the trust file from its
 copy, or the copy from the trust file, before anything read the anchor: `written` (`trust` or
 `copy`) names the file written, `path` its path and `from` the file it was written from. It does so
 whether or not a taint stands. Where the trust file and its copy differ and both would serve, it

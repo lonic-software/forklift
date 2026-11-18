@@ -8976,6 +8976,14 @@ pub async fn push_local_trust(client: &RemoteClient,
         return Ok(None);
     };
 
+    // Read before anything is uploaded, so a missing office refuses with the remote untouched.
+    let Some(office_head) = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)? else {
+        // Lower is the way out only where this remote holds this warehouse's office to take.
+        let lowerable = info.trust.as_ref().is_some_and(|trust| trust.genesis == local.genesis)
+            && info.pallets.contains_key(&office_utils::office_wire_key());
+        return Err(office_utils::office_unborn_refusal_over("Nothing was lifted.", Some(lowerable)));
+    };
+
     if let Some(remote_trust) = &info.trust {
         if remote_trust.genesis != local.genesis {
             // This warehouse re-genesised and the remote still holds the prior
@@ -9001,9 +9009,6 @@ pub async fn push_local_trust(client: &RemoteClient,
         client.put_trust(&TrustAnchorDto::from(&local)).await?;
     }
 
-    let Some(office_head) = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)? else {
-        return Err("Trust is established but the office pallet is missing.".to_string());
-    };
 
     // Right after a re-genesis the office lift replaces the remote's chain instead of
     // extending it — allowed exactly when the local anchor adopts the remote's head.
