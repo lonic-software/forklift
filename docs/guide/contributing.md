@@ -683,10 +683,10 @@ it touched, or that none applied. When a change alters:
   and the lines under a server's startup line are everything its terminal prints later; a `git`
   step runs with none of the developer's git configuration. The module comment of `guide_pages.rs`
   says how each of these runs;
-- **Proof Load's fault classes, grades, `run` flags, lanes or report** → update
+- **Proof Load's fault classes, grades, flags, lanes, report or perf report** → update
   [`proof-load.md`](proof-load.md), and the READMEs of `crates/proof-load` and
   `tools/proof-load-desktop` where they show it. Two tests in `cargo test -p proof-load` fail when
-  the page leaves out a fault class, a grade or a flag of `proof-load run`;
+  the page leaves out a fault class, a grade or a flag of any `proof-load` subcommand;
 - **a heading another page links to** → fix the links. The `doc_links` test reads every `.md` page
   in the repository and fails on a relative link to a missing file or a missing heading;
 - **trust / office / key behavior** → update [`trust-and-identity.md`](trust-and-identity.md);

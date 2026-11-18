@@ -377,8 +377,8 @@ fn pairs(built: &Built, reps: usize, scratch: &Scratch, environment: &Environmen
     let baseline = clean.as_ref().map_or(0, |counts| counts.unstaged);
     let clean = clean.map(|_| ());
     let reads: [(&str, String, [&[&str]; 2]); 3] = [
-        ("status", "forklift stocktake --summary against git status, on the clean tree".to_string(), [&["stocktake", "--summary"], &["status"]]),
-        ("log", "forklift history against git log, the whole history".to_string(), [&["history"], &["log"]]),
+        ("status", "Forklift's stocktake --summary against git's status, on the clean tree".to_string(), [&["stocktake", "--summary"], &["status"]]),
+        ("log", "Forklift's history against git's log, the whole history".to_string(), [&["history"], &["log"]]),
         ("blame", format!("{}, the file the history changes most, first-parent on both", blame), [&["blame", blame], &["blame", "--first-parent", blame]]),
     ];
     for (operation, note, [forklift, git]) in reads {
@@ -414,7 +414,7 @@ fn pairs(built: &Built, reps: usize, scratch: &Scratch, environment: &Environmen
         let stage = if subject.tool == Tool::Forklift { subject.line(&["load", "."]) } else { subject.line(&["add", "-A"]) };
         tool::run(&subject.invocation(stage), scratch, environment)?;
     }
-    let note = format!("the same {} files staged, untimed, by forklift load . and git add -A", count);
+    let note = format!("the same {} files staged, untimed, by Forklift's load . and git's add -A", count);
     progress("timing diff --staged");
     let outcome = match changed(subjects, &["diff", "--cached", "--name-only"], |counts| counts.staged, count, scratch, environment)? {
         Ok(()) => timed_pair(subjects, &["diff", "--staged"], &["diff", "--staged"], reps, scratch, environment)?,
@@ -437,7 +437,7 @@ fn forklift_counts(subject: &Subject, scratch: &Scratch, environment: &Environme
     let count = |field: &str| document["data"][field].as_u64().and_then(|count| usize::try_from(count).ok());
     Ok(match (outcome.succeeded(), count("staged_count"), count("unstaged_count")) {
         (true, Some(staged), Some(unstaged)) => Ok(Counts { staged, unstaged }),
-        _ => Err(format!("forklift --json stocktake --summary gave no counts (exit {:?}): {}", outcome.exit, String::from_utf8_lossy(&outcome.stderr).trim())),
+        _ => Err(format!("Forklift's --json stocktake --summary gave no counts (exit {:?}): {}", outcome.exit, String::from_utf8_lossy(&outcome.stderr).trim())),
     })
 }
 
@@ -461,7 +461,7 @@ fn clean(subjects: &[Subject], scratch: &Scratch, environment: &Environment) -> 
         if subject.tool == Tool::Forklift {
             match forklift_counts(subject, scratch, environment)? {
                 Ok(read) if read.staged == 0 => counts = Some(read),
-                Ok(read) => dirty.push(format!("forklift has {} staged", read.staged)),
+                Ok(read) => dirty.push(format!("Forklift's subject has {} staged", read.staged)),
                 Err(reason) => dirty.push(reason),
             }
         } else {
