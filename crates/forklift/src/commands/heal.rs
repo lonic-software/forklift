@@ -140,12 +140,17 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // with nothing here written.
     let trust_repair = office_utils::repair_trust().map_err(config_said)?;
     ref_notes.extend(trust_repair.notes);
+    // Every refusal from here on says what this run already wrote, the trust file among it.
+    let config_said = |error: String| match &trust_repair.restored {
+        Some(restored) => forklift_core::error::append_to_message(config_said(error), &restored.sentence()),
+        None => config_said(error),
+    };
 
     let record_rebuilt = sealed_utils::rebuild()
-        .map_err(|error| config_said(format!(
+        .map_err(|error| config_said(ref_notes.iter().fold(format!(
             "{}{} Nothing else was healed: once that is fixed, run \"forklift heal\" again.",
             error, if error.ends_with('.') { "" } else { "." },
-        )))?
+        ), |error, note| forklift_core::error::append_to_message(error, &format!("Note: {}", note)))))?
         .map(RecordRebuilt::from);
 
     // Before the taint recovery too, whose walks read the record of content this warehouse cannot
@@ -849,7 +854,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         parked_rebuilt,
         position_rebuilt: early_position.or(late_position),
         config_repaired,
-        trust_restored: trust_repair.restored,
+        trust_restored: trust_repair.restored.clone(),
         inventory_rebuilt,
         inventory_held,
         was_tainted: outcome.was_tainted,

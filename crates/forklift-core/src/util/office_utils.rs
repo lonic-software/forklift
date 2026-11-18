@@ -1698,11 +1698,7 @@ fn judge_trust_bytes(bytes: &Result<Vec<u8>, String>, office_head: &str) -> Resu
 ///                   newer version's refusal of a file it wrote; or why the store or a file could
 ///                   not be read.
 pub(crate) fn refuse_unsettled_trust(_lock: &crate::util::lock_utils::RefLock) -> Result<(), String> {
-    let read = |name: &str| match read_trust_file(name) {
-        Ok(bytes) => Ok(bytes.map(Ok)),
-        Err(TrustFileError::NotAFile(path)) => Ok(Some(Err(path))),
-        Err(TrustFileError::Unreadable(why)) => Err(why),
-    };
+    let read = read_trust_entry;
 
     let not_served = "So the warehouse is not served, and nothing was written.";
 
@@ -1894,20 +1890,35 @@ pub struct TrustRepair {
 /// parsing), are refused: nothing here tells which to keep. So are two neither of which is usable
 /// beside a born office, and a file a newer Forklift wrote, which is never used or written over.
 /// Two equal files are left as they are, whatever they verify: there is nothing to restore either
-/// from, and the readers after heal judge the anchor they hold.
+/// from, and the readers after heal judge the anchor they hold. One that does not verify a born
+/// office is noted.
 ///
 /// # Returns
 /// * `Ok(TrustRepair)` - What was written, and notes for what was left: the ref lock, a file or
-///                       the store that could not be read (nothing is written then), and an unborn office beside
-///                       a trust file on a client.
+///                       the store that could not be read (nothing is written then), an unborn
+///                       office beside an anchor on a client, and two equal files that do not
+///                       verify the office.
 /// * `Err(String)`     - A [`RefusalCode::TrustDamaged`] refusal of two files heal cannot choose
 ///                       between or restore from, or of a file it will not write over; a newer
-///                       version's refusal; or why a file could not be written.
+///                       version's refusal; or why a file could not be written. Each carries the
+///                       notes made before it.
 pub fn repair_trust() -> Result<TrustRepair, String> {
     let mut repair = TrustRepair::default();
+    match repair_trust_noting(&mut repair) {
+        Ok(()) => Ok(repair),
+        // What it noted before refusing goes along.
+        Err(refused) => Err(repair.notes.iter().fold(refused, |refused, note| {
+            crate::error::append_to_message(refused, &format!("Note: {}", note))
+        })),
+    }
+}
+
+/// [`repair_trust`], noting into `repair` as it goes.
+fn repair_trust_noting(repair: &mut TrustRepair) -> Result<(), String> {
     let unchecked = |why: String| format!(
-        "The trust file and its copy were not checked, and nothing was written to them: {}",
-        why.trim_end()
+        "The trust file and its copy were not checked, and nothing was written to them: {} Once that is \
+        fixed, run \"forklift heal\" again.",
+        why.trim_end().trim_end_matches('.').to_string() + "."
     );
     // A ref lock that cannot be taken stops nothing here: the repairs after this one that need it
     // report it themselves.
@@ -1915,20 +1926,15 @@ pub fn repair_trust() -> Result<TrustRepair, String> {
         Ok(lock) => lock,
         Err(why) => {
             repair.notes.push(unchecked(why));
-            return Ok(repair);
+            return Ok(());
         }
     };
 
-    let read = |name: &str| match read_trust_file(name) {
-        Ok(bytes) => Ok(bytes.map(Ok)),
-        Err(TrustFileError::NotAFile(path)) => Ok(Some(Err(path))),
-        Err(TrustFileError::Unreadable(why)) => Err(why),
-    };
-    let (trust, copy) = match (read(FILE_NAME_TRUST), read(FILE_NAME_TRUST_COPY)) {
+    let (trust, copy) = match (read_trust_entry(FILE_NAME_TRUST), read_trust_entry(FILE_NAME_TRUST_COPY)) {
         (Ok(trust), Ok(copy)) => (trust, copy),
         (Err(why), _) | (_, Err(why)) => {
             repair.notes.push(unchecked(why));
-            return Ok(repair);
+            return Ok(());
         }
     };
     let trust_path = forklift_root().join(FILE_NAME_TRUST);
@@ -1949,21 +1955,21 @@ pub fn repair_trust() -> Result<TrustRepair, String> {
 
     // Neither stands: never enrolled, or both lost, which the coded read refuses.
     if trust.is_none() && copy.is_none() {
-        return Ok(repair);
+        return Ok(());
     }
 
     let office_head = match pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME) {
         Ok(head) => head,
         Err(why) => {
             repair.notes.push(unchecked(why));
-            return Ok(repair);
+            return Ok(());
         }
     };
     let served = match crate::util::tombstone_utils::served_state() {
         Ok(state) => state != crate::util::tombstone_utils::ServedState::Never,
         Err(why) => {
             repair.notes.push(unchecked(why));
-            return Ok(repair);
+            return Ok(());
         }
     };
     let client_unborn = !served && office_head.is_none();
@@ -1974,15 +1980,9 @@ pub fn repair_trust() -> Result<TrustRepair, String> {
     };
     let (trust_anchor, copy_anchor) = (parsed(&trust), parsed(&copy));
 
-    if client_unborn && (trust.is_some() || copy_anchor.is_some()) {
+    // Only beside an anchor that parses, or one heal restores below, does the note's next step hold.
+    if client_unborn && (trust_anchor.is_some() || copy_anchor.is_some()) {
         repair.notes.push(unborn_office_note());
-    }
-
-    if matches!((&trust, &copy), (Some(Ok(trust)), Some(Ok(copy))) if trust == copy) {
-        return match trust_anchor.is_some() || client_unborn {
-            true => Ok(repair),
-            false => Err(neither_usable_refusal(&trust_path, "does not read as an anchor", &copy_path, "is the same")),
-        };
     }
 
     // Whether `file`, parsed as `anchor`, is usable. A chain the store cannot read says nothing of
@@ -1993,10 +1993,28 @@ pub fn repair_trust() -> Result<TrustRepair, String> {
         };
         match &office_head {
             None => Ok(served),
-            Some(head) if served && anchor.adopts.as_deref() == Some(head.as_str()) => Ok(true),
+            // A server's re-genesis names the genesis it succeeds; an anchor that names none is no
+            // re-genesis, whatever it adopts.
+            Some(head) if served && anchor.prior_genesis.is_some() && anchor.adopts.as_deref() == Some(head.as_str()) => Ok(true),
             Some(head) => Ok(judge_trust_bytes(file, head)? == TrustJudged::Usable),
         }
     };
+
+    if matches!((&trust, &copy), (Some(Ok(trust)), Some(Ok(copy))) if trust == copy) {
+        if trust_anchor.is_none() && !client_unborn {
+            return Err(neither_usable_refusal(&trust_path, "does not read as an anchor", &copy_path, "is the same"));
+        }
+        // Nothing to restore either from. An anchor that does not serve is said, so a run that
+        // writes nothing does not read as one that found nothing; the readers after heal refuse it.
+        if !client_unborn && usable(&trust, &trust_anchor) == Ok(false) {
+            repair.notes.push(format!(
+                "The trust file (\"{}\") and its copy hold the same anchor, but it does not verify the office \
+                pallet, so heal has nothing to restore it from. {}",
+                trust_path.to_string_lossy(), LOST_ANCHOR_WAYS_OUT
+            ));
+        }
+        return Ok(());
+    }
 
     let differ = || -> String { CoreError::refusal(
         RefusalCode::TrustDamaged,
@@ -2004,7 +2022,7 @@ pub fn repair_trust() -> Result<TrustRepair, String> {
             "The trust file (\"{}\") and its copy (\"{}\") differ, and both {}, so heal cannot tell which \
             to keep. {} Move aside whichever of the two you do not trust, then run \"forklift heal\" again.",
             trust_path.to_string_lossy(), copy_path.to_string_lossy(),
-            match client_unborn {
+            match office_head.is_none() {
                 true => "read as an anchor",
                 false => "verify the office pallet",
             },
@@ -2018,7 +2036,7 @@ pub fn repair_trust() -> Result<TrustRepair, String> {
             (Some(_), Some(_)) => return Err(differ()),
             (None, Some(_)) => TrustFileWritten::Trust,
             // Nothing that parses to restore the trust file from: the note says what stands.
-            _ => return Ok(repair),
+            _ => return Ok(()),
         },
         false => {
             let judged = usable(&trust, &trust_anchor).and_then(|trust| Ok((trust, usable(&copy, &copy_anchor)?)));
@@ -2026,7 +2044,7 @@ pub fn repair_trust() -> Result<TrustRepair, String> {
                 Ok(judged) => judged,
                 Err(why) => {
                     repair.notes.push(unchecked(why));
-                    return Ok(repair);
+                    return Ok(());
                 }
             };
 
@@ -2083,17 +2101,31 @@ pub fn repair_trust() -> Result<TrustRepair, String> {
             let Some(Ok(bytes)) = &trust else {
                 unreachable!("only a trust file that parses is written to the copy");
             };
-            refuse_unwritable_copy()?;
+            refuse_unwritable_copy_in(match &copy {
+                None => Ok(None),
+                Some(Ok(copy)) => Ok(Some(copy.clone())),
+                Some(Err(path)) => Err(TrustFileError::NotAFile(path.clone())),
+            })?;
             write_trust_copy(&lock, bytes)?;
             repair.restored = Some(TrustRestored { written: TrustFileWritten::Copy, path: copy_path, from: trust_path });
         }
     }
 
-    Ok(repair)
+    Ok(())
 }
 
-/// The refusal of a trust file and a copy beside a born office neither of which heal can restore
-/// the anchor from, saying of each why (`trust_said`, `copy_said`).
+/// The trust file or its copy, `name`, as heal and the first serve judge it: `None` when nothing
+/// stands there, `Some(Err(path))` when what stands is not a file or a link to one.
+fn read_trust_entry(name: &str) -> Result<Option<Result<Vec<u8>, String>>, String> {
+    match read_trust_file(name) {
+        Ok(bytes) => Ok(bytes.map(Ok)),
+        Err(TrustFileError::NotAFile(path)) => Ok(Some(Err(path))),
+        Err(TrustFileError::Unreadable(why)) => Err(why),
+    }
+}
+
+/// The refusal of a trust file and a copy neither of which heal can restore the anchor from,
+/// saying of each why (`trust_said`, `copy_said`).
 fn neither_usable_refusal(trust_path: &std::path::Path, trust_said: &str, copy_path: &std::path::Path, copy_said: &str) -> String {
     CoreError::refusal(
         RefusalCode::TrustDamaged,

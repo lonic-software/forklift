@@ -7733,6 +7733,13 @@ fn heal_restores_a_lost_trust_file_from_its_copy_and_signing_resumes() {
     let forklift = warehouse.root.join(".forklift");
     forklift_core::util::file_utils::remove_file(forklift.join("trust")).unwrap();
 
+    // A refusal later in the run says the trust file was written.
+    let refused = warehouse.run(&["heal", "--position", "main", "--remove-ref", "main"]);
+    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
+    assert!(stderr(&refused).contains("was missing or did not hold the anchor, and is restored from its copy"), "{}", stderr(&refused));
+    assert_eq!(std::fs::read(forklift.join("trust")).unwrap(), anchor);
+    forklift_core::util::file_utils::remove_file(forklift.join("trust")).unwrap();
+
     let healed = warehouse.run(&["--json", "heal"]);
 
     assert_eq!(healed.status.code(), Some(0), "{}{}", stdout(&healed), stderr(&healed));

@@ -4765,6 +4765,9 @@ mod tests {
         regenesis: Vec<u8>,
         /// An anchor of another chain, which neither verifies nor adopts the office.
         foreign: Vec<u8>,
+        /// An anchor of another chain that adopts the office head but succeeds no genesis: no
+        /// server's re-genesis.
+        stranger: Vec<u8>,
         /// The settled anchor, at a version this Forklift does not read.
         newer: Vec<u8>,
         /// Bytes that do not parse.
@@ -4786,6 +4789,10 @@ mod tests {
                 }),
                 foreign: encode(&TrustAnchor {
                     genesis: "e".repeat(64), enabled_at: 1_700_000_003, boundary: Vec::new(), prior_genesis: None, adopts: None,
+                }),
+                stranger: encode(&TrustAnchor {
+                    genesis: "d".repeat(64), enabled_at: 1_700_000_004, boundary: Vec::new(), prior_genesis: None,
+                    adopts: Some(office_head().unwrap()),
                 }),
                 newer,
                 garbled: b"not a trust file".to_vec(),
@@ -4824,7 +4831,7 @@ mod tests {
     fn heal_restores_the_trust_file_or_its_copy_from_the_other() {
         use crate::util::office_utils::TrustFileWritten::{Copy, Trust};
 
-        for case in 0..10 {
+        for case in 0..11 {
             let fixture = PrivilegeFixture::new(&format!("heal-trust-restores-{}", case));
             let b = TrustBytes::of(&fixture);
             let (state, written, after) = [
@@ -4852,6 +4859,9 @@ mod tests {
                 // could be restored from, and nothing verifies the copy could be written from.
                 (TrustState { name: "client, office unborn, copy missing", trust: Some(b.settled.clone()), copy: None, served: false, unborn: true },
                     None, b.settled.clone()),
+                // Nothing parses: no write, and no note naming a lower that verifies against it.
+                (TrustState { name: "client, office unborn, nothing parses", trust: Some(b.garbled.clone()), copy: None, served: false, unborn: true },
+                    None, b.garbled.clone()),
                 // Equal files hold nothing to restore either from.
                 (TrustState { name: "equal, verifying nothing", trust: Some(b.foreign.clone()), copy: Some(b.foreign.clone()), served: false, unborn: false },
                     None, b.foreign.clone()),
@@ -4867,7 +4877,10 @@ mod tests {
                 None => assert_eq!(trust_files(), before, "{}: nothing is written", state.name),
             }
             let noted = repaired.notes.iter().any(|note| note.contains("The office pallet is unborn beside a trust file"));
-            assert_eq!(noted, state.unborn && !state.served, "{}: {:?}", state.name, repaired.notes);
+            assert_eq!(noted, state.unborn && !state.served && state.name != "client, office unborn, nothing parses",
+                "{}: {:?}", state.name, repaired.notes);
+            let unserving = repaired.notes.iter().any(|note| note.contains("hold the same anchor, but it does not verify the office pallet"));
+            assert_eq!(unserving, state.name == "equal, verifying nothing", "{}: {:?}", state.name, repaired.notes);
             // What a server's ref update reads stands.
             if state.served {
                 assert!(crate::util::office_utils::read_trust_anchor_with_bytes().unwrap().is_some(), "{}", state.name);
@@ -4882,7 +4895,7 @@ mod tests {
     fn heal_refuses_trust_it_cannot_restore_and_writes_nothing() {
         use crate::error::RefusalCode;
 
-        for case in 0..9 {
+        for case in 0..11 {
             let fixture = PrivilegeFixture::new(&format!("heal-trust-refuses-{}", case));
             let b = TrustBytes::of(&fixture);
             let (state, code, says) = [
@@ -4894,6 +4907,12 @@ mod tests {
                 (TrustState { name: "re-genesis in the copy, served", trust: Some(b.settled.clone()), copy: Some(b.regenesis.clone()), served: true, unborn: false },
                     Some(RefusalCode::TrustDamaged), "Move aside whichever of the two you do not trust"),
                 (TrustState { name: "both parse, office unborn", trust: Some(b.settled.clone()), copy: Some(b.foreign.clone()), served: false, unborn: true },
+                    Some(RefusalCode::TrustDamaged), "both read as an anchor"),
+                // Adopting the office head makes no anchor a server's re-genesis.
+                (TrustState { name: "stranger adopting, served", trust: Some(b.stranger.clone()), copy: None, served: true, unborn: false },
+                    Some(RefusalCode::TrustDamaged), "does not verify the office pallet, and its copy"),
+                // A server's bootstrap holds no office both could verify.
+                (TrustState { name: "both read, served bootstrap", trust: Some(b.settled.clone()), copy: Some(b.resettled.clone()), served: true, unborn: true },
                     Some(RefusalCode::TrustDamaged), "both read as an anchor"),
                 (TrustState { name: "copy verifies nothing", trust: None, copy: Some(b.foreign.clone()), served: false, unborn: false },
                     Some(RefusalCode::TrustDamaged), "is missing, and its copy"),
@@ -4923,6 +4942,9 @@ mod tests {
             assert!(refused.contains("Nothing was changed."), "{}: {}", state.name, refused);
             assert_eq!(trust_files(), before, "{}: nothing is written", state.name);
             assert_eq!(folder.is_dir(), state.name == "trust is a folder", "{}", state.name);
+            // What heal noted before refusing goes along.
+            assert_eq!(refused.contains("Note: The office pallet is unborn beside a trust file"), state.name == "both parse, office unborn",
+                "{}: {}", state.name, refused);
         }
     }
 
