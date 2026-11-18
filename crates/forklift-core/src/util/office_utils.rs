@@ -1874,7 +1874,8 @@ pub struct TrustRepair {
 ///
 /// A file is usable when it parses at a version this Forklift reads and its anchor verifies the
 /// office head. On a served root (its first serve begun or finished), an anchor that adopts the
-/// office head (a server's re-genesis, which leaves the office where it stands) is usable too, and
+/// office head and names the genesis it succeeds (a server's re-genesis, which leaves the office
+/// where it stands) is usable too, and
 /// so is any anchor while the office is unborn (a server's bootstrap). Then:
 /// - the trust file not usable and the copy usable: the trust file is written from the copy;
 /// - on a client with the office unborn, the trust file missing or not parsing and the copy
