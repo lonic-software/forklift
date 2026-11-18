@@ -79,13 +79,6 @@ pub fn read_state() -> Result<Option<CherryPickState>, String> {
 pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
     let path = dir.join(FILE_NAME_CHERRY_PICK);
 
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e))?;
-
     let damaged = |reason: &str| merge_utils::merge_state_damaged(
         dir,
         &format!("The pick state file \"{}\" {}", path.to_string_lossy(), reason),
@@ -94,8 +87,12 @@ pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
     );
     let malformed = || damaged("is malformed.");
 
+    let Some(bytes) = merge_utils::read_record_bytes(&path).map_err(|reason| damaged(&reason))? else {
+        return Ok(None);
+    };
+
     let entries = record_utils::from_bytes(&bytes, CHERRY_PICK_RECORD, CHERRY_PICK_VERSION).map_err(|e| {
-        match merge_utils::is_newer_record(&e, CHERRY_PICK_RECORD, CHERRY_PICK_VERSION) {
+        match e.is_newer(CHERRY_PICK_RECORD, CHERRY_PICK_VERSION) {
             true => format!("The pick state file \"{}\" {} Use the Forklift that wrote it.", path.to_string_lossy(), e.describe()),
             false => damaged(&e.describe()),
         }
@@ -148,13 +145,7 @@ pub(crate) fn state_bytes(state: &CherryPickState) -> Vec<u8> {
 /// * `Ok(())`      - If the state file is gone.
 /// * `Err(String)` - If the file exists but could not be removed.
 pub fn clear_state() -> Result<(), String> {
-    let path = state_path();
-
-    match file_utils::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("Error while removing \"{}\": {}", path.to_string_lossy(), e)),
-    }
+    merge_utils::remove_record(&state_path())
 }
 
 /// The distinct authors of a source parcel, in first-seen order (by identifier) — the

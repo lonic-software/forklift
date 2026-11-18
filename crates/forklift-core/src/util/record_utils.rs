@@ -69,6 +69,12 @@ pub fn header_version(header: &str, kind: &str) -> Option<u32> {
 }
 
 impl RecordError {
+    /// Whether this is a record of `kind` that a newer Forklift wrote: its header names a version
+    /// above `version`, written as Forklift writes one (see [`header_version`]). That is not damage.
+    pub fn is_newer(&self, kind: &str, version: u32) -> bool {
+        matches!(self, RecordError::OtherVersion(header) if header_version(header, kind).is_some_and(|found| found > version))
+    }
+
     /// The reason as a phrase that follows "The <file> ".
     pub fn describe(&self) -> String {
         match self {

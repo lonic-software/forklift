@@ -2378,7 +2378,7 @@ mod tests {
         ).unwrap();
         restore_refs(&entry("stack", "main", &hash('1'), &hash('2'))).unwrap();
         assert!(merge_utils::read_consolidation_state().unwrap().is_none());
-        assert!(OutOfScopeSkeleton::read().unwrap().is_empty());
+        assert!(std::fs::symlink_metadata(OutOfScopeSkeleton::path()).is_err(), "no skeleton stays behind");
     }
 
     #[test]

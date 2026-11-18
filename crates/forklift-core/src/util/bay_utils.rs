@@ -796,6 +796,8 @@ pub fn read_bay_state_roots_in(dir: &Path) -> Result<BayStateRoots, String> {
 /// [`BayReadPolicy::Tolerate`] — names the bay and the in-tool cleanup route (`forklift bay
 /// remove`) a user can actually run, never a Rust path or internal identifier.
 fn degraded_bay_note(dir: &Path, error: &str) -> String {
+    // A refusal read there carries its frame; the note is plain prose.
+    let error = crate::error::CoreError::from(error.to_string()).to_string();
     if dir == forklift_root() {
         format!(
             "the current tree's own saved state could not be read this run ({}); it was treated \

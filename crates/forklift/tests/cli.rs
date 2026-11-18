@@ -15615,6 +15615,12 @@ fn a_damaged_skeleton_is_refused_naming_the_abort() {
     let error = json(&refused)["error"].clone();
     assert_eq!((error["code"].as_str(), error["next_step"].as_str()), (Some("merge_state_damaged"), Some("forklift abort")), "{}", error);
 
+    // The named step runs as it always does: the resolution is a change since the merge, so it asks
+    // first, naming its own next step, and never reads the skeleton.
+    let asked = warehouse.run(&["--json", "abort"]);
+    assert_eq!(asked.status.code(), Some(39), "{}{}", stdout(&asked), stderr(&asked));
+    assert_eq!(json(&asked)["error"]["next_step"].as_str(), Some("forklift abort --confirm"), "{}", stdout(&asked));
+
     assert_success(&warehouse.run(&["abort", "--confirm"]));
     assert_eq!(read(&warehouse, "f.txt"), "ours\n");
 }

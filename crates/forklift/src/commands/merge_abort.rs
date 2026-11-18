@@ -433,7 +433,8 @@ fn emptied_directories(removed: &[String], our_tree: &str) -> Result<Vec<String>
 ///
 /// # Returns
 /// * `Ok(Abandoned)` - The records removed.
-/// * `Err(String)`   - If no merge is recorded in this bay, or a file could not be removed.
+/// * `Err(String)`   - If no merge is recorded in this bay, the inventory cannot be read, or a
+///                     file could not be removed.
 fn abandon() -> Result<Abandoned, String> {
     let consolidation = merge_utils::state_present();
     let pick = cherry_pick_utils::state_present();
@@ -441,6 +442,10 @@ fn abandon() -> Result<Abandoned, String> {
     if !consolidation && !pick {
         return Err("No consolidation or pick is in progress; there is nothing to abort.".to_string());
     }
+
+    // Counted before anything changes, so an inventory that cannot be read refuses the abandon
+    // rather than report no conflicts.
+    let conflicts = inventory_utils::list_conflict_paths()?.len();
 
     journal_utils::pop_if_it_left_in_progress_unread()?;
 
@@ -457,7 +462,7 @@ fn abandon() -> Result<Abandoned, String> {
         kinds.push(MergeKind::Pick.noun().to_string());
     }
 
-    Ok(Abandoned { abandoned: kinds, conflicts: inventory_utils::list_conflict_paths().unwrap_or_default().len() })
+    Ok(Abandoned { abandoned: kinds, conflicts })
 }
 
 /// The result of `abort --keep-files`.

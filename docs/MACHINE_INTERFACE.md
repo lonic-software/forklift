@@ -87,8 +87,9 @@ exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a deat
 
 **Schema 54** (current): the `merge_state_damaged` error code exists (exit 68). A bay's record
 of the consolidation or pick in progress there, its state file or a consolidation's skeleton, is
-not UTF-8, lacks its header, is in an older format, does not match its digest, or holds entries
-that do not parse, or the skeleton is missing beside a consolidation. A record in a format this
+not a file or cannot be read, is not UTF-8, lacks its header, is in an older format, does not
+match its digest, or holds entries that do not parse, or the skeleton is missing beside a
+consolidation. A record in a format this
 version of Forklift does not know keeps its uncoded refusal. In the bay the command runs in,
 `next_step` is `forklift abort --keep-files` for a state file and `forklift abort` for a
 skeleton; for another bay there is no next step, and the message names the bay and the command

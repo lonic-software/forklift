@@ -296,7 +296,7 @@ impl PathScope {
                 sparse checkouts left out the ignore files, so it cannot be read safely. {}",
                 remedy
             ),
-            RecordError::OtherVersion(ref header) => match header_version(header) {
+            RecordError::OtherVersion(ref header) => match record_utils::header_version(header, SCOPE_RECORD) {
                 Some(version) if version > SCOPE_VERSION => format!("{} Use the Forklift that wrote it.", e.describe()),
                 Some(4) => format!(
                     "{} An older version of Forklift wrote it, before scope files carried a digest. {}",
@@ -330,16 +330,6 @@ impl PathScope {
     }
 }
 
-/// Whether a scope header names a version newer than this build's. A header whose version cannot
-/// be read is not newer: no Forklift wrote it.
-fn is_newer_header(header: &str) -> bool {
-    header_version(header).is_some_and(|version| version > SCOPE_VERSION)
-}
-
-/// The version a scope file's header names (see [`record_utils::header_version`]).
-fn header_version(header: &str) -> Option<u32> {
-    record_utils::header_version(header, SCOPE_RECORD)
-}
 
 /// A scope file as `heal` reads it: on its own, never against the warehouse's mode or another
 /// scope, so that each one can be judged whatever the others hold.
@@ -371,7 +361,7 @@ pub(crate) fn read_scope_raw(path: &Path) -> Result<RawScope, String> {
     };
 
     if let Err(error @ RecordError::OtherVersion(_)) = record_utils::from_bytes(&bytes, SCOPE_RECORD, SCOPE_VERSION) {
-        if matches!(&error, RecordError::OtherVersion(header) if is_newer_header(header)) {
+        if error.is_newer(SCOPE_RECORD, SCOPE_VERSION) {
             return Ok(RawScope::Newer(error.describe()));
         }
     }
