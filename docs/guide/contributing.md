@@ -114,7 +114,10 @@ Notes:
   shares, and `--partition count:3/4` there runs a different set.
 - The `proof load` checks (`.github/workflows/proof-load.yml`, one per OS) run the fault-injection
   harness in `crates/proof-load` against forklift and forklift-server built for each OS's release
-  target: damaged files over every census name, graded by reading every record back; the same
+  target: damaged files over every census name, graded by reading every record back (a hosted
+  warehouse's refusal whose remedy is its operator's, `forklift-server … --root <warehouse>`, is
+  carried out by the harness as that operator: the server asked to stop, the command run over the
+  warehouse it serves, the server started again, each step graded as outside knowledge); the same
   faults over git's own layout for git at its defaults and tuned, whose rows are reported beside
   forklift's but fail nothing (a git layout path no row classifies fails the check, by name); and
   on Linux process kills at each of forklift's traced write calls of the `history` scenario, and
