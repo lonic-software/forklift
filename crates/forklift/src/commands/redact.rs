@@ -202,19 +202,14 @@ pub(crate) fn delete_applied() -> Result<Option<DeletionView>, String> {
     // The store lock keeps out other maintenance, the serve lock a server answering for an object
     // about to go, and exclusive store access every writer that could publish a new reference to
     // one. None waits. `main` takes no shared hold for this command, which would refuse the last.
+    // A refusal's own text names the holder and the way out; the deletion stays owed meanwhile.
     let store_lock = match StoreLock::acquire() {
         Ok(lock) => lock,
-        Err(e) => return Ok(owed(format!(
-            "Other object-store maintenance is running on this warehouse; let it finish. If none is, the \
-            lock below was left by a compaction, gc or eviction that was killed and can be removed. {}", e
-        ))),
+        Err(e) => return Ok(owed(e.to_string())),
     };
     let serve_lock = match ServeLock::acquire() {
         Ok(lock) => lock,
-        Err(e) => return Ok(owed(format!(
-            "This warehouse root is being served; stop the server first. If no server is running, the \
-            lock below was left by a server, gc or full repack that was killed and can be removed. {}", e
-        ))),
+        Err(e) => return Ok(owed(e.to_string())),
     };
     let store_access = match StoreAccessLock::try_exclusive() {
         Ok(hold) => hold,

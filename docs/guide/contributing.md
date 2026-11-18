@@ -143,8 +143,9 @@ Notes:
   a replay whose tree differs from the traced run's at any line's start or at its end, refuses
   the scenario's power loss. The environment faults run under the faulted command of the
   scenarios named for them and are lifted before the readback and retry that grade them: a lock
-  left by a holder that no longer runs is planted as a damage binding (`{bay}lock`, `store.lock`,
-  `serve.lock`); `--read-only` clears the write bits of the work folder, warehouse included, and
+  left by a holder that no longer runs is planted as a damage binding for git's lock files
+  (`index.lock`, `HEAD.lock`, `refs/heads/main.lock`), while Forklift's locks are kernel locks a
+  dead holder leaves nothing of; `--read-only` clears the write bits of the work folder, warehouse included, and
   is not run where that still admits a write (root, Windows); `--disk-full` fills a volume given
   as `--capped-volume` (an empty or new directory on a small volume of its own, which CI makes as
   a 128 MiB tmpfs on Linux and a RAM disk on macOS) with a ballast file, leaving none, a quarter,
@@ -509,7 +510,8 @@ forklift behaves predictably. From `DESIGN.html` §2:
   each waits up to a second for another process (an editor, indexer or antivirus
   scanner) to release a Windows handle that blocks it, and `clippy.toml` bans the
   bare `std::fs` and `tokio::fs` versions. Mutating commands hold the **warehouse lock**
-  (`.forklift/lock`, `create_new`, held for the whole command) so a reader can
+  (a kernel lock on `.forklift/lock`, a file that is never deleted, held for the whole
+  command) so a reader can
   never see a half-updated staging area. Read-only commands don't take it. Add a
   new mutating command to the lock list in `cli.rs`
   (`requires_warehouse_lock`). Every command on that list also holds the

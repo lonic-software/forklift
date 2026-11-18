@@ -170,7 +170,7 @@ impl Repaired {
 /// A header damaged into a newer version's no longer matches the digest, so it is repaired as
 /// damage: only a record whose digest verifies is taken as a newer version's.
 pub fn repair_withheld() -> Result<Repaired, String> {
-    let _serve_lock = ServeLock::acquire().map_err(|e| format!("Refusing to repair the record of withheld content: {}", e))?;
+    let _serve_lock = ServeLock::acquire().map_err(|e| crate::util::lock_utils::refusing_to("repair the record of withheld content", e))?;
     let lock = RefLock::acquire()?;
 
     let path = withholding::withheld_path();

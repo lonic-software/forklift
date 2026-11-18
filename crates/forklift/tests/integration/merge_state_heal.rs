@@ -210,7 +210,6 @@ fn a_heal_stopped_while_writing_a_record_back_never_leaves_it_absent() {
         let area = Area::conflicted(&format!("restore-stopped-{}", at));
         flip(&area.state("consolidation"));
         let stopped = area.command(&["heal"]).env("FORKLIFT_DEBUG_CRASH_AT_RENAME", at.to_string()).output().unwrap();
-        let _ = forklift_core::util::file_utils::remove_file(area.state("lock"));
         assert!(area.state("consolidation").exists(), "a heal stopped at rename {} left no consolidation state", at);
         if stopped.status.code() != Some(CRASH_POINT_EXIT_CODE) {
             return;
@@ -333,8 +332,6 @@ fn crashed_with_a_marker(name: &str, prepare: &dyn Fn(&str) -> Area, args: &[&st
         if stopped.status.code() != Some(CRASH_POINT_EXIT_CODE) {
             break;
         }
-        // A stopped process leaves its lock behind, as a power loss would; the operator clears it.
-        let _ = forklift_core::util::file_utils::remove_file(area.state("lock"));
         let pending = std::fs::read_dir(area.state("")).unwrap().map(|entry| entry.unwrap().path())
             .find(|path| path.file_name().unwrap().to_string_lossy().starts_with("consolidation.tmp~"));
         if let Some(pending) = pending {

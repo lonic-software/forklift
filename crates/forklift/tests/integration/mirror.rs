@@ -921,7 +921,11 @@ fn a_scoped_bay_skips_the_lift_mirror_and_refuses_mirror() {
 /// the other runs start in a second bay, since each bay has its own warehouse lock and the mirror
 /// lock is the one they share.
 ///
-/// Revert: a create-new lock file → the run after the kill still reports busy.
+/// The holder held bay `a`'s warehouse lock too, and that is released with it: a mutating command
+/// in `a` runs after the kill with nothing removed.
+///
+/// Revert: a create-new lock file → the run after the kill still reports busy; a create-new
+/// warehouse lock → the command in `a` is refused.
 #[cfg(unix)]
 #[test]
 fn a_busy_mirror_is_reported_and_a_killed_holder_releases_it() {
@@ -960,6 +964,8 @@ fn a_busy_mirror_is_reported_and_a_killed_holder_releases_it() {
 
     let report = area.json("bay", &["git", "mirror"]);
     assert_eq!(outcome(&report, "main")["status"], "pushed", "{}", report);
+
+    area.stack("a", "code.txt", "v3\n", "after the holder was killed");
 }
 
 /// Memo test 24: a configured pallet the remote lacks, and one git refuses as a branch name, are

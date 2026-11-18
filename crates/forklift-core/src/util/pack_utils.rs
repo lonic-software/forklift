@@ -4038,7 +4038,7 @@ fn compact_bounded(all: bool,
     // enumerate the same loose set and race each other's deletions. Held for the whole run;
     // errors immediately if another compaction holds it — an explicit `compact` surfaces that,
     // auto-maintenance (which ignores compaction errors) simply skips the now-redundant work.
-    // Taken after the folder exists so its parent (`forklift_root`) is present for `create_new`.
+    // Taken after the folder exists so its parent (`forklift_root`) is present for its sidecar.
     let _store_lock = lock_utils::StoreLock::acquire()?;
 
     // A repack is serve-exclusive, like gc (FORK-149). It keeps only the live set, with no grace
@@ -4049,11 +4049,7 @@ fn compact_bounded(all: bool,
     // allowed. Auto-maintenance ignores a compaction error, so it simply skips the repack while
     // the root is served.
     let _serve_lock = if all {
-        Some(lock_utils::ServeLock::acquire().map_err(|e| format!(
-            "A full repack cannot run while this warehouse root is being served, or while a gc runs \
-             against it; stop the server first. If neither is running, the lock below was left by \
-             one that was killed and can be removed. {}", e
-        ))?)
+        Some(lock_utils::ServeLock::acquire()?)
     } else {
         None
     };
@@ -5537,7 +5533,8 @@ pub(crate) fn rebuild_pack_indexes() -> Result<IndexRebuild, String> {
 
     let _store = match lock_utils::StoreLock::acquire() {
         Ok(lock) => lock,
-        Err(error) => return Ok(IndexRebuild { skipped: Some(error), ..IndexRebuild::default() }),
+        // Readable text, not a frame: heal prints it as a note.
+        Err(error) => return Ok(IndexRebuild { skipped: Some(error.to_string()), ..IndexRebuild::default() }),
     };
 
     let mut report = IndexRebuild::default();
@@ -13207,8 +13204,10 @@ pub(crate) mod tests {
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
-    /// While another process holds the object-store lock the rebuild does not run and says why.
-    /// Mutation: rebuild without the lock → the index is published → red.
+    /// While another process holds the object-store lock the rebuild does not run and says why, in
+    /// readable text.
+    /// Mutation: rebuild without the lock → the index is published → red; pass the refusal on as a
+    /// frame → the separator assertion is red.
     #[test]
     fn the_rebuild_is_skipped_while_the_store_lock_is_held() {
         let (temp, _scope) = salvage_root("fork449-rebuild-busy");
@@ -13221,6 +13220,10 @@ pub(crate) mod tests {
         let held = lock_utils::StoreLock::acquire().unwrap();
         let report = rebuild_pack_indexes().unwrap();
         assert!(report.skipped.is_some() && report.rebuilt.is_empty(), "{:?}", report);
+        // Heal prints the reason as a note: readable text with its way out, never a frame.
+        let skipped = report.skipped.as_deref().unwrap();
+        assert!(!skipped.contains('\u{1f}'), "{:?}", skipped);
+        assert!(skipped.contains("is maintaining the object store") && skipped.contains("run the command again"), "{:?}", skipped);
         assert!(!index.exists());
         drop(held);
 

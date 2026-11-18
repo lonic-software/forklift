@@ -84,8 +84,7 @@ long as it is served.
 
 `forklift-server upgrade --root <root>` upgrades a warehouse to the format this build reads, with
 the same steps as `forklift upgrade`, and resumes one that was interrupted. It needs the warehouse to
-itself: stop every server serving it and let any `bundle` or `gc` finish first, or it refuses. It
-takes no serve lock, so a lock left by a server that was killed does not stand in its way. On a
+itself: stop every server serving it and let any `bundle` or `gc` finish first, or it refuses. On a
 `--warehouses` server, stop the server, upgrade each warehouse it answers `503` for, and start it
 again.
 
@@ -114,8 +113,9 @@ One server serves a base folder at a time. A second server on the same folder is
 startup; the lock is a kernel lock on `<base>/.forklift-server.lock`, so a crashed server leaves
 nothing stale behind.
 
-A live warehouse holds its serve lock and one open file. The server keeps at most half its
-open-file limit (and never more than 1024) live. When it needs to serve one more, it first lets go
+A live warehouse holds three files open: its serve lock, its store-access hold and its format
+lease. The server keeps half its open-file limit for those files, so at most a sixth of the limit
+in warehouses (and never more than 1024) is live. When it needs to serve one more, it first lets go
 of the least recently used warehouse that no request is using. It never refuses a request
 because of that cap: when every live warehouse is busy, it serves the new one over the cap. A
 warehouse that was let go is served again on its next request. Below the cap nothing is let go.
@@ -307,19 +307,18 @@ revocation by more than about a day.
   if it holds nothing this root needs, and do not bring it back after a sweep has run. It is **refused
   while a server is serving that root** — it would sweep the server's in-flight objects and
   make a concurrent lift fail its ref update — so stop the server, gc, then restart (run it
-  in a maintenance window, not against a live server). A hard-killed server leaves a
-  `serve.lock` behind (a graceful SIGINT/SIGTERM removes it automatically); if `gc` reports
-  the root locked by a process that is no longer running, remove
-  `<root>/.forklift/serve.lock` and retry. It is also refused while a `forklift` command
-  that writes objects runs against the root, which could reuse an unreachable object the
-  sweep is about to delete; that lock is a kernel lock, so it never outlives its process.
+  in a maintenance window, not against a live server). The server's lock on the root is a
+  kernel lock, released when its process ends however it ends, so a server that was killed
+  holds nothing: `gc` and a restart both go ahead with no file to remove. It is also refused
+  while a `forklift` command that writes objects runs against the root, which could reuse an
+  unreachable object the sweep is about to delete; that lock is a kernel lock too.
   It refuses, deleting nothing, when an object it must read to find what is still live is
   missing but a damaged, orphaned or unreadable pack might hold it: it names the object
   rather than treating it as absent and sweeping what that object references.
   A server keeps that lock's file open for every live warehouse, so it raises its own soft
   limit on open files at startup, as far toward the hard limit as the kernel allows. In
-  multi-warehouse mode that limit also sets how many warehouses stay live (half of it, at most
-  1024; see "Serving many warehouses"). A warehouse no request is using may then be let go, and
+  multi-warehouse mode that limit also sets how many warehouses stay live (a sixth of it, since
+  each holds three files open and half the limit is kept for requests; at most 1024; see "Serving many warehouses"). A warehouse no request is using may then be let go, and
   `gc` runs on it while it is not live. Raise the hard limit (`ulimit -Hn`, systemd
   `LimitNOFILE`) if many warehouses are busy at once.
 - **Deleted pallets:** a root the server has served carries a durable mark, written before the

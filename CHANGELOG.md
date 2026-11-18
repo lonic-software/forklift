@@ -27,6 +27,14 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **A killed process no longer leaves a lock to remove by hand.** The bay's lock, the object
+  store's lock and a served warehouse's `serve.lock` are now kernel locks, released when the
+  process holding them ends, however it ends. A `forklift-server` that crashed or was killed
+  restarts under a supervisor with no manual step, and `gc` runs after it; a `forklift` command
+  killed mid-way leaves the next one free to run. A lock another process still holds is refused at
+  once, coded `warehouse_locked`, `store_locked` (new) or `serve_locked` (new), all exit 6, with a
+  next step that says to wait for it or stop the server. JSON schema 59.
+
 - **A lost or damaged trust file refuses as `trust_damaged` (exit 69).** A trust file missing under
   a born office was read by `stack` and `deliver` as a warehouse that never enrolled, and one that
   did not parse refused uncoded. Now every command that reads the trust state, stack, deliver, git

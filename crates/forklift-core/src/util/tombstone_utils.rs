@@ -332,7 +332,7 @@ pub(crate) fn write_tombstones(_lock: &RefLock, tombstones: &Tombstones) -> Resu
 /// The serve lock is the one gc takes, so the rewrite refuses while a server serves the root; the
 /// ref lock keeps a removal in a bay meanwhile from losing its own tombstone.
 fn rewrite_locks(what: &str) -> Result<(ServeLock, RefLock), String> {
-    let serve_lock = ServeLock::acquire().map_err(|e| format!("Refusing to {}: {}", what, e))?;
+    let serve_lock = ServeLock::acquire().map_err(|e| crate::util::lock_utils::refusing_to(what, e))?;
 
     Ok((serve_lock, RefLock::acquire()?))
 }

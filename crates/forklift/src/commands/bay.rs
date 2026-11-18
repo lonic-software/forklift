@@ -119,16 +119,16 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     bay_utils::write_bay_redirect(&bay_dir, &warehouse_root, name)?;
 
     // Enter the bay to check out its pallet and materialize its working tree. The current
-    // warehouse lock stored its path at acquire time, so switching context here does not
-    // affect its release.
+    // warehouse lock holds its sidecar open, so switching context here does not affect its
+    // release.
     globals::set_bay_context(
         warehouse_root.join(globals::FOLDER_NAME_FORKLIFT_ROOT), bay_dir.join(globals::FOLDER_NAME_FORKLIFT_ROOT), name.to_string()
     );
     std::env::set_current_dir(&bay_dir)
         .map_err(|e| format!("Error while entering the bay \"{}\": {}", bay_dir.to_string_lossy(), e))?;
 
-    // The new bay's own lock, held until it is filled: a command run in the bay meanwhile waits
-    // for it rather than staging against a half-made tree or clearing an assembly in flight.
+    // The new bay's own lock, held until it is filled: a command run in the bay meanwhile is
+    // refused rather than staging against a half-made tree or clearing an assembly in flight.
     let _bay_lock = lock_utils::WarehouseLock::acquire()?;
 
     shift_utils::materialize_tree(None, &tree, "Creating the bay", file_utils::take_stat_anchor()?, &Progress::NONE, &[])?;

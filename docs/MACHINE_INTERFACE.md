@@ -85,7 +85,16 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 58** (current): two new error codes. `signature_damaged` (exit 70): a parcel's stored
+**Schema 59** (current): a lock another forklift process holds is refused with a code of its own,
+all exit 6: `warehouse_locked` for the bay's lock, `store_locked` (new) for the object store's lock
+a compaction holds, and `serve_locked` (new) for the warehouse root's lock a server, `gc`,
+`store compact --all` or `store evict` holds. Each lock is a kernel lock released when its holder
+ends, however it ends, so the refusal means the holder still runs: the `next_step` names waiting
+for it, or stopping the server, and never removing a file. `warehouse_locked` no longer names a
+lock file or a process id. A `forklift-server` that will not start beside another holder of the
+root says the same in its text.
+
+**Schema 58**: two new error codes. `signature_damaged` (exit 70): a parcel's stored
 signature cannot be read or does not parse, so what signed it cannot be told; the message names the
 parcel and the ways out (restore the objects from a backup, or clone again from a remote that holds
 the parcel), with no `next_step`. `signature_missing` (exit 71): a parcel stacked after trust was
