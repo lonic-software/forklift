@@ -87,7 +87,7 @@ pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
     );
     let malformed = || damaged("is malformed.");
 
-    let Some(bytes) = merge_utils::read_record_bytes(&path).map_err(|reason| damaged(&reason))? else {
+    let Some(bytes) = merge_utils::read_record_bytes(&path).map_err(|e| e.map_or_else(|e| e, |reason| damaged(&reason)))? else {
         return Ok(None);
     };
 

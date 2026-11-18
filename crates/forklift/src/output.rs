@@ -945,7 +945,7 @@ impl ErrorCode {
             ErrorCode::CheckoutScopeDamaged =>
                 "A checkout's scope, the paths it holds, is missing, does not parse, or names no path where one is required. Nothing was changed; heal restores it from the copy beside it when run in that checkout, and otherwise names heal --scope for the paths the checkout held",
             ErrorCode::MergeStateDamaged =>
-                "A bay's record of the consolidation or pick in progress there, its state file or a consolidation's out-of-scope skeleton, is not text, is cut short or garbled, or does not match its digest. Nothing was changed; abort --keep-files run in that bay drops a damaged state file and leaves every file as it is, and abort abandons a merge whose skeleton is damaged"
+                "A bay's record of the consolidation or pick in progress there, its state file or a consolidation's out-of-scope skeleton, is not a file, is not text, is cut short or garbled, does not match its digest, or is missing beside a consolidation. Nothing was changed; abort --keep-files run in that bay drops a damaged state file and leaves every file as it is, and abort abandons a merge whose skeleton is damaged"
         }
     }
 

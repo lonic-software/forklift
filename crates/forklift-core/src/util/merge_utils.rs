@@ -134,17 +134,21 @@ const SKELETON_EFFECT: &str = "The abort puts back what the merge changed withou
 /// # Returns
 /// * `Ok(Some(bytes))` - The file's bytes.
 /// * `Ok(None)`        - Nothing is at `path`.
-/// * `Err(String)`     - Something other than a file is there, or it could not be read: why, as a
-///                       phrase that follows "The <file> ", for the caller to refuse as damage.
-pub(crate) fn read_record_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+/// * `Err(Ok(String))`  - Something other than a file is there: why, as a phrase that follows
+///                       "The <file> ", for the caller to refuse as damage.
+/// * `Err(Err(String))` - The file could not be read. That says nothing about its bytes, which may
+///                       be whole, so it is no damage and names no way out that drops the record.
+pub(crate) fn read_record_bytes(path: &Path) -> Result<Option<Vec<u8>>, Result<String, String>> {
+    let unreadable = |e: std::io::Error| Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e));
+
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("could not be read: {}.", e)),
-        Ok(metadata) if !metadata.file_type().is_file() => return Err("is not a file.".to_string()),
+        Err(e) => return Err(unreadable(e)),
+        Ok(metadata) if !metadata.file_type().is_file() => return Err(Ok("is not a file.".to_string())),
         Ok(_) => {}
     }
 
-    std::fs::read(path).map(Some).map_err(|e| format!("could not be read: {}.", e))
+    std::fs::read(path).map(Some).map_err(unreadable)
 }
 
 /// Remove the bay-local record at `path`, whatever is there: a file, a link (never followed) or a
@@ -152,8 +156,8 @@ pub(crate) fn read_record_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> 
 pub(crate) fn remove_record(path: &Path) -> Result<(), String> {
     let removed = match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Ok(metadata) if metadata.file_type().is_dir() => file_utils::remove_dir_all(path),
-        _ => file_utils::remove_file(path),
+        Ok(metadata) => file_utils::remove_entry_unfollowed(path, metadata.file_type()),
+        Err(_) => file_utils::remove_file(path),
     };
 
     match removed {
@@ -191,7 +195,7 @@ pub fn read_consolidation_state_in(dir: &Path) -> Result<Option<ConsolidationSta
         ABORT_KEEPING_FILES,
     );
 
-    let Some(bytes) = read_record_bytes(&path).map_err(&malformed)? else {
+    let Some(bytes) = read_record_bytes(&path).map_err(|e| e.map_or_else(|e| e, &malformed))? else {
         return Ok(None);
     };
 
@@ -347,7 +351,7 @@ impl OutOfScopeSkeleton {
 
         let named = |reason: &str| format!("The consolidation skeleton file \"{}\" {}", path.to_string_lossy(), reason);
 
-        let bytes = read_record_bytes(&path).map_err(|reason| damaged(named(&reason)))?.ok_or_else(|| damaged(format!(
+        let bytes = read_record_bytes(&path).map_err(|e| e.map_or_else(|e| e, |reason| damaged(named(&reason))))?.ok_or_else(|| damaged(format!(
             "A consolidation is in progress but its out-of-scope skeleton (\"{}\") is missing, most likely \
              from an interrupted write (a crash mid-merge), so no command can tell which out-of-scope \
              entries the merge resolved.",
@@ -2221,6 +2225,25 @@ mod tests {
                 remove_record(&path).unwrap();
                 assert!(std::fs::symlink_metadata(&path).is_err(), "{} with {} is removed", name, what);
             }
+        }
+
+        // A record the filesystem fails to read may be whole: that is no damage, and it names no
+        // step that would drop it. (Skipped where permissions do not bind, as for root.)
+        #[cfg(unix)]
+        for (name, bytes) in [(FILE_NAME_CONSOLIDATION, state.clone()), (FILE_NAME_SKELETON, skeleton.clone())] {
+            use std::os::unix::fs::PermissionsExt;
+            let path = root.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read(&path).is_err() {
+                let error = match name {
+                    FILE_NAME_SKELETON => OutOfScopeSkeleton::read_required().err(),
+                    _ => Some(read(&root, name)),
+                }.unwrap_or_else(|| panic!("an unreadable {} must be refused", name));
+                assert!(error.contains("Error while reading"), "{}", error);
+                assert!(refusal_of(error).is_none(), "an unreadable {} must not read as damage", name);
+            }
+            remove_record(&path).unwrap();
         }
 
         // The skeleton is read only in this bay, by the stack that completes the consolidation.

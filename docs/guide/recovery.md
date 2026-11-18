@@ -498,8 +498,9 @@ Forklift is not this refusal, and no heal writes over it.
 
 ### `merge_state_damaged` (exit 68)
 
-The record a bay keeps of the consolidation or pick in progress there is not text, is cut short or
-garbled, or does not match its digest, so no command can tell what the merge was. Nothing was
+The record a bay keeps of the consolidation or pick in progress there is not a file, is not text,
+is cut short or garbled, or does not match its digest, or a consolidation's skeleton is missing,
+so no command can tell what the merge was. Nothing was
 changed. Run the next step it names in that bay:
 
 - For the consolidation or pick state, `forklift abort --keep-files` abandons the merge without
