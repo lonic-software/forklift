@@ -644,9 +644,9 @@ mod tests {
             let (repaired, count) = lose_and_repair();
             assert_eq!((repaired.absent.clone(), repaired.undescended.clone(), count), (Vec::new(), vec![folder.clone()], 1));
             let report = repaired.report().join("\n");
-            assert!(report.contains(&format!("1 folder or part of history the history here names is absent, and nothing beneath it \
+            assert!(report.contains("1 folder or part of history the history here names is absent, and nothing beneath it \
                 could be walked, so a file a lost entry withheld may sit there unseen. It is recorded as undescended, and this warehouse \
-                is not served while one is, even once it is back.")) && report.contains(&format!("  {}", folder)), "{}", report);
+                is not served while one is, even once it is back.") && report.contains(&format!("  {}", folder)), "{}", report);
             assert!(!report.contains("damage to the store"), "{}", report);
 
             // Back, the folder still counts: nothing beneath it has been walked. Revert: count an
