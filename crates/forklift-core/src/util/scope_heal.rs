@@ -18,9 +18,11 @@
 //! file is still unreadable then. While it is, every sparse ref write refuses on reading it, so no
 //! ref moves between the check and the write.
 //!
-//! A fetch scope that parses can still be wrong, since the record carries no digest. When a
-//! checkout's scope lies outside it, one of the two files is damaged, and heal cannot tell which.
-//! It refuses with `fetch_scope_damaged`, offering both ways out.
+//! Every scope record ends in its digest, so a damaged byte makes the file unreadable and the
+//! rebuild above, or the checkout's own heal, takes it. When both match their digests and a
+//! checkout's scope still lies outside the fetch scope, one of them holds the wrong scope whole (a
+//! file put back from elsewhere, say), and no digest says which. Heal refuses with
+//! `fetch_scope_damaged`, offering both ways out.
 //!
 //! ## The chosen scope
 //!

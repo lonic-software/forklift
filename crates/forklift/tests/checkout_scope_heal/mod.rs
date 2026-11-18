@@ -64,18 +64,23 @@ fn refused_scope(area: &TestArea, dir: &str, scope: &str, args: &[&str]) -> Stri
 
 /// Every way a scope file is lost or damaged, in the main tree and in a bay, makes a read refuse
 /// `checkout_scope_damaged` naming `forklift heal`, and heal writes it back byte for byte from its
-/// copy, after which the read works.
+/// copy, after which the read works. That includes a byte flipped that leaves a valid scope: the
+/// main tree's narrowed to "docs/src/api", inside the fetch scope, which only the digest catches,
+/// and the bay's turned to "src/apj", outside it.
 ///
 /// Revert: return the old untyped refusal from the scope readers → no code, no next step → red;
 /// skip the restore in heal → the scope stays damaged → red; skip the copy's re-sync → the lost
-/// copy stays lost → red.
+/// copy stays lost → red; read a record whose digest does not match as if it did → the main tree's
+/// flipped scope reads, and `stocktake` runs narrowed → red (the bay's row, outside the fetch
+/// scope, would be refused without the digest too).
 #[test]
 fn heal_restores_a_lost_or_damaged_scope_from_its_copy() {
     let area = TestArea::new("checkout-scope-heal-restore");
     let _server = with_bay(&area);
 
     type Damage<'a> = (&'a str, &'a dyn Fn(&TestArea, &str));
-    let damages: [Damage; 4] = [
+    let damages: [Damage; 5] = [
+        ("a byte flipped", &|area, path| flip_a_scope_byte(area, path)),
         ("deleted", &|area, path| remove(area, path)),
         ("emptied", &|area, path| std::fs::write(area.path(path), b"").unwrap()),
         ("zeroed", &|area, path| {
