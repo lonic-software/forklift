@@ -127,7 +127,9 @@ impl Signing {
 /// * `Err(String)` - Trust is established but the office does not verify, or the operator cannot
 ///                   sign.
 pub fn resolve_signing_key(operator: &Operator) -> Result<Signing, String> {
-    if office_utils::read_trust_anchor_bytes()?.is_none() {
+    // A lost trust file refuses here rather than reading as "never enrolled", which would stack
+    // unsigned under an office that requires signatures.
+    if office_utils::read_trust_anchor()?.is_none() {
         return Ok(Signing::Unsigned);
     }
 

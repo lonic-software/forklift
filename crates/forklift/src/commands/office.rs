@@ -6,7 +6,7 @@ use forklift_core::util::office_utils::{IdentityClass, OfficeState, RevocationRe
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{AnchorPrecondition, BoundaryScope, PalletsPrecondition, RefPreconditions};
 use forklift_core::util::remote_utils::{self, RemoteClient};
-use forklift_core::util::{audit_utils, config_utils, office_utils, pallet_utils, sign_utils, trust_utils};
+use forklift_core::util::{config_utils, office_utils, pallet_utils, sign_utils, trust_utils};
 use crate::output::{self, CommandOutput};
 
 // The office command — the warehouse office manages the personnel records: users and
@@ -31,12 +31,6 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
             to admit you: generate a keypair with \"forklift profile keygen\" and hand them the \
             public key.".to_string()
         );
-    }
-
-    // An office with no anchor lost its anchor: a new genesis would orphan every parcel that
-    // office vouches for, and no head accepts an anchor over one.
-    if pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.is_some() {
-        return Err(audit_utils::LOST_ANCHOR.to_string());
     }
 
     // Everything reachable from the current pallet heads is the pre-trust history:
@@ -761,10 +755,6 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
     let operator = config_utils::get_operator()?;
 
     let Some((old_anchor, old_anchor_bytes)) = office_utils::read_trust_anchor_with_bytes()? else {
-        if pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.is_some() {
-            return Err(audit_utils::LOST_ANCHOR.to_string());
-        }
-
         return Err(
             "Trust is not established for this warehouse; there is nothing to reset. \
             Use \"forklift office enroll\".".to_string()

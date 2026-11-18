@@ -3,6 +3,7 @@ use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::model::operator::Operator;
 use forklift_core::util::meta_tree::{self, CellRead, Entry, KeepSide, MetaConflict, MetaSigner, MetaWriter, PalletRules, ReplayError, Stamp};
+use forklift_core::util::office_utils::TrustReadMode;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{BatchLaneClosure, RemoteClient};
 use forklift_core::util::{
@@ -106,7 +107,7 @@ pub async fn handle_command(pallet: Option<String>,
     // refuses as such rather than as another remote's pallet list.
     if let Some(name) = &named {
         if !info.pallets.contains_key(name) {
-            remote_utils::check_remote_trust(&client, &info, expect.as_deref())?;
+            remote_utils::check_remote_trust(&client, &info, expect.as_deref(), TrustReadMode::Adopt)?;
 
             return Err(remote_lacks_pallet(&info, name, &missing_named_step(name, repair)?).into());
         }
@@ -114,7 +115,7 @@ pub async fn handle_command(pallet: Option<String>,
 
     // Checks the pin (and a stripped anchor) against the handshake before anything is fetched,
     // and verifies the remote's office against the anchor it will stand under.
-    let mut trust = remote_utils::prepare_remote_trust(&client, &info, expect.as_deref()).await?;
+    let mut trust = remote_utils::prepare_remote_trust(&client, &info, expect.as_deref(), TrustReadMode::Adopt).await?;
 
     // First contact: the pallet this lower takes is verified against the anchor the remote serves
     // before that anchor is installed, so a refusal leaves this warehouse holding none. Where it is

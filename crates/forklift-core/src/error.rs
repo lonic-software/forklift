@@ -478,6 +478,14 @@ refusal_codes! {
     /// `abort` for a damaged skeleton, which the abort never reads. For another bay the next step
     /// is empty, and the message names the bay to run it in.
     MergeStateDamaged => "merge_state_damaged",
+
+    /// The warehouse's trust file is lost or damaged: it is missing while the office pallet is
+    /// born or its copy stands, so trust was established and its anchor is gone, or it does not
+    /// parse. A trust file a newer version wrote is not this. Nothing was changed. The message names
+    /// the ways out (a backup, or, after moving the trust file and its copy aside, `forklift
+    /// lower` from a remote the operator trusts), and the next step is empty. A server answers it
+    /// as a `503` naming its operator.
+    TrustDamaged => "trust_damaged",
 }
 
 /// The codes of a host record that is lost or damaged, or of an object its store cannot read,
@@ -492,6 +500,7 @@ pub const SERVED_DAMAGE: &[RefusalCode] = &[
     RefusalCode::UnavailableDamaged,
     RefusalCode::OriginDamaged,
     RefusalCode::BayPositionDamaged,
+    RefusalCode::TrustDamaged,
 ];
 
 impl RefusalCode {

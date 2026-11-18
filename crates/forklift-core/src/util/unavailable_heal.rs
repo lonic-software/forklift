@@ -61,7 +61,7 @@ pub async fn handshake() -> Result<Option<Answered>, RemoteError> {
         HandshakeError::NoResponse(why) => RemoteError::NoResponse(why),
         HandshakeError::Answered(why) => RemoteError::Refused(why),
     })?;
-    remote_utils::check_remote_trust(&client, &info, None).map_err(refused)?;
+    remote_utils::check_remote_trust(&client, &info, None, crate::util::office_utils::TrustReadMode::Checked).map_err(refused)?;
 
     Ok(Some(Answered { client, info }))
 }

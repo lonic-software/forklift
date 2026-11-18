@@ -1903,6 +1903,8 @@ fn operator_remedy(code: forklift_core::error::RefusalCode, own: &str) -> String
         // The served root's own position names heal; another bay's names nothing, since a heal in
         // the warehouse's root does not reach it.
         RefusalCode::SealedDamaged | RefusalCode::UnavailableDamaged | RefusalCode::BayPositionDamaged => own.to_string(),
+        // The trust file's own next step names no path.
+        RefusalCode::TrustDamaged => own.to_string(),
         RefusalCode::FetchScopeStray | RefusalCode::OriginDamaged => String::new(),
         _ => unreachable!("not a damage code"),
     }
@@ -1930,6 +1932,8 @@ fn damage_message(code: forklift_core::error::RefusalCode) -> String {
             "The warehouse's list of deleted pallets, or the mark beside it that records the warehouse as served, is missing or does not read, so which history it keeps for them cannot be told, and the request was refused.".to_string(),
         RefusalCode::WithheldDamaged =>
             "The warehouse's record of what its head withholds is missing or does not read, so what may be served cannot be told, and the request was refused.".to_string(),
+        RefusalCode::TrustDamaged =>
+            "The warehouse's trust anchor is lost or does not read, so what it trusts cannot be told, and the request was refused.".to_string(),
         _ => unreachable!("not a damage code"),
     }
 }
@@ -3383,21 +3387,9 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                 Ok(Some(event))
             }
             None => {
-                // No anchor but an office: the anchor was lost, and whichever client lifts first
-                // would otherwise plant its own over a chain it never verified. The install below
-                // conditions on the office still being unborn, so a bay of this warehouse enrolling
-                // meanwhile refuses it.
-                if pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)
-                    .map_err(internal)?
-                    .is_some() {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        "This warehouse holds an office but no trust anchor: its anchor was \
-                        lost. The server operator must restore it; a client cannot \
-                        re-establish it.".to_string()
-                    ));
-                }
-
+                // No anchor is held and nothing says one was ([`office_utils::read_trust_anchor`]
+                // refuses a lost one). The install below conditions on the office still being
+                // unborn, so a bay of this warehouse enrolling meanwhile refuses it.
                 // A first anchor arrives over an unborn office, so nothing above ties its
                 // `adopts` to held history — but every warehouse that adopts this anchor later
                 // fetches that history from here. The client uploads it before the anchor.

@@ -1007,34 +1007,12 @@ impl std::ops::Deref for VerifiedOffice {
     }
 }
 
-/// The refusal of anything that needs the trust state — `enroll`, `regenesis`, a metadata write —
-/// over an office whose anchor is gone.
-pub const LOST_ANCHOR: &str = "This warehouse holds an office but no trust anchor: its anchor was lost. Nothing was \
-    changed. Restore the warehouse's trust file from a backup if you have one. Otherwise \"forklift lower\" \
-    takes the anchor of the configured remote, with nothing here to compare it against, so use it only with a \
-    remote you trust; if that remote has reset its trust, clone it again instead. With neither, trust cannot be \
-    re-established here: run \"forklift prepare\" in another folder, which starts without this warehouse's \
-    history, and enroll there.";
-
 /// The office this warehouse's meta pallets are written and checked against, by its trust state:
-/// the verified office when trust is held, `None` when the warehouse never enrolled (no anchor,
-/// an unborn office). An office whose anchor is gone refuses: it can neither be verified nor
-/// treated as never enrolled.
+/// the verified office when trust is held, `None` when the warehouse never enrolled. A lost anchor
+/// refuses ([`office_utils::read_trust_anchor`]): it can neither be verified nor treated as never
+/// enrolled.
 pub fn local_meta_office() -> Result<Option<VerifiedOffice>, String> {
-    Ok(local_meta_trust()?.map(|(_, office)| office))
-}
-
-/// [`local_meta_office`] with the anchor it was verified against, whose boundary admits the
-/// unsigned meta history from before trust.
-pub fn local_meta_trust() -> Result<Option<(TrustAnchor, VerifiedOffice)>, String> {
-    if let Some(trust) = verified_local_trust()? {
-        return Ok(Some(trust));
-    }
-
-    match pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)? {
-        Some(_) => Err(LOST_ANCHOR.to_string()),
-        None => Ok(None),
-    }
+    Ok(verified_local_trust()?.map(|(_, office)| office))
 }
 
 /// This warehouse's office, verified against its trust anchor. A meta pallet's writes
@@ -1046,7 +1024,8 @@ pub fn verified_local_office() -> Result<VerifiedOffice, String> {
 }
 
 /// This warehouse's trust anchor and its office verified against it, read together so the office
-/// is judged against exactly the anchor returned — or `None` when no anchor is held.
+/// is judged against exactly the anchor returned — or `None` when the warehouse never enrolled. A
+/// lost anchor refuses ([`office_utils::read_trust_anchor`]).
 pub fn verified_local_trust() -> Result<Option<(TrustAnchor, VerifiedOffice)>, String> {
     let Some((anchor, anchor_bytes)) = office_utils::read_trust_anchor_with_bytes()? else {
         return Ok(None);

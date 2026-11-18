@@ -2,6 +2,7 @@ use serde::Serialize;
 use forklift_core::enums::config_scope::ConfigScope;
 use forklift_core::error::{self, CoreError, RefusalCode};
 use forklift_core::util::lock_utils::{MoveLock, RefLock, StoreAccessLock};
+use forklift_core::util::office_utils::TrustReadMode;
 use forklift_core::util::origin_move::{self, Phase};
 use forklift_core::util::remote_utils::{self, RemoteClient};
 use forklift_core::util::{config_utils, origin_check, origin_utils, scope_utils};
@@ -123,7 +124,7 @@ async fn check_and_rewrite(target: &str,
     let client = RemoteClient::new(target, dial_token)?;
     let info = client.fetch_info().await?;
 
-    remote_utils::check_remote_trust(&client, &info, None)?;
+    remote_utils::check_remote_trust(&client, &info, None, TrustReadMode::Checked)?;
 
     let checked = origin_check::check_new_origin(&client, &info, store_access, &events::progress()).await?;
 

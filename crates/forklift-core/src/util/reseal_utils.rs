@@ -76,7 +76,7 @@ pub async fn reseal_held(lost: &BTreeSet<String>, _store_access: &StoreAccessLoc
         HandshakeError::NoResponse(why) => ResealError::NoResponse(why),
         HandshakeError::Answered(why) => ResealError::Refused(why),
     })?;
-    remote_utils::check_remote_trust(&client, &info, None).map_err(refused)?;
+    remote_utils::check_remote_trust(&client, &info, None, office_utils::TrustReadMode::Checked).map_err(refused)?;
 
     // Meta history is fetched and kept in full, never sealed, so its heads seal nothing here.
     let held: BTreeMap<String, String> = info.held_pallet_heads().into_iter()

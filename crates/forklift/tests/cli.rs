@@ -5266,7 +5266,7 @@ fn import_git_records_the_git_tags_unsigned() {
 
 /// An office standing without its anchor refuses every unsigned write, so git import refuses it
 /// up front, saying the anchor was lost, and no branch lands.
-// Revert: drop the up-front `local_meta_trust` check → the head precondition still refuses after
+// Revert: drop the up-front `verified_local_trust` check → the head precondition still refuses after
 // the conversion, but as a changed office, without the lost-anchor message.
 #[test]
 fn import_git_refuses_an_office_without_its_anchor_before_any_branch_lands() {
@@ -7677,7 +7677,7 @@ fn deliver_works_unsigned_in_a_warehouse_that_never_enrolled() {
 
 /// An office standing without its anchor is neither trusted nor never enrolled, so deliver
 /// refuses it up front, saying the anchor was lost, and records nothing.
-// Revert: drop the `local_meta_trust` check in `deliver` → the parcel object is stored and the
+// Revert: drop the `verified_local_trust` check in `deliver` → the parcel object is stored and the
 // delivery record refuses as a changed office, without the lost-anchor message.
 #[test]
 fn deliver_refuses_an_office_without_its_anchor_before_anything_is_written() {

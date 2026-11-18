@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use forklift_core::error::{sanitize, CoreError, RefusalCode};
 use forklift_core::util::lock_utils::MirrorLock;
+use forklift_core::util::office_utils::TrustReadMode;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{self, RemoteClient};
 use forklift_core::util::{
@@ -216,7 +217,7 @@ fn tags_pallet_key() -> String {
 /// none held, the remote's own anchor and office — verified, never installed: a mirror adopts no
 /// trust.
 async fn mirror_trust(client: &RemoteClient, info: &forklift_core::model::remote::WarehouseInfo) -> Result<TakeTrust, String> {
-    let prepared = remote_utils::prepare_remote_trust(client, info, None).await?;
+    let prepared = remote_utils::prepare_remote_trust(client, info, None, TrustReadMode::Checked).await?;
 
     if let Some(first_contact) = prepared.take_trust() {
         return Ok(first_contact);
