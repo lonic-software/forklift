@@ -3,6 +3,7 @@ use crate::commands::{consolidate, shift};
 use crate::output::{self, CommandOutput};
 use forklift_core::error;
 use forklift_core::util::{bay_utils, file_utils, haul_utils, journal_utils, merge_utils, object_utils, take_utils, tombstone_utils};
+use forklift_core::util::office_utils::TrustReadMode;
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use forklift_core::util::pallet_utils::{self, PalletNamespace, PalletRef, PalletsPrecondition, RefPreconditions, RefUpdateError};
 use forklift_core::util::remote_utils::{self, RemoteClient};
@@ -266,7 +267,7 @@ async fn containment(pallet: &str, head: &str) -> Result<(Option<String>, RefPre
     let note = "The delete asks the remote whether it holds the pallet's work; nothing was deleted.";
     let client = RemoteClient::for_warehouse().map_err(|e| error::append_to_message(e.into(), note))?;
     let info = client.fetch_info().await.map_err(|e| error::append_to_message(e, note))?;
-    remote_utils::check_remote_trust(&client, &info, None).map_err(|e| error::append_to_message(e, note))?;
+    remote_utils::check_remote_trust(&client, &info, None, TrustReadMode::Checked).map_err(|e| error::append_to_message(e, note))?;
 
     // A pallet deleted on the remote counts at the head its tombstone keeps there.
     let mut held = false;
@@ -321,7 +322,7 @@ async fn remote_for_deletes(name: &str, verb: &str) -> Result<(RemoteClient, for
 
     let client = RemoteClient::for_warehouse()?;
     let info = client.fetch_info().await?;
-    remote_utils::check_remote_trust(&client, &info, None)?;
+    remote_utils::check_remote_trust(&client, &info, None, TrustReadMode::Checked)?;
 
     if info.tombstones.is_none() {
         return Err(format!(

@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 55;
+pub const SCHEMA_VERSION: u32 = 56;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -630,6 +630,9 @@ error_codes! {
 
     /// A bay's record of the merge in progress there cannot be read; nothing was changed.
     MergeStateDamaged,
+
+    /// The trust file is lost or damaged; nothing was changed.
+    TrustDamaged,
 }
 
 impl ErrorCode {
@@ -703,6 +706,7 @@ impl ErrorCode {
             ErrorCode::InventoryDamaged => RefusalCode::InventoryDamaged.as_str(),
             ErrorCode::CheckoutScopeDamaged => RefusalCode::CheckoutScopeDamaged.as_str(),
             ErrorCode::MergeStateDamaged => RefusalCode::MergeStateDamaged.as_str(),
+            ErrorCode::TrustDamaged => RefusalCode::TrustDamaged.as_str(),
         }
     }
 
@@ -779,6 +783,7 @@ impl ErrorCode {
             ErrorCode::InventoryDamaged => 66,
             ErrorCode::CheckoutScopeDamaged => 67,
             ErrorCode::MergeStateDamaged => 68,
+            ErrorCode::TrustDamaged => 69,
         }
     }
 
@@ -945,7 +950,9 @@ impl ErrorCode {
             ErrorCode::CheckoutScopeDamaged =>
                 "A checkout's scope, the paths it holds, is missing, does not parse, or names no path where one is required. Nothing was changed; heal restores it from the copy beside it when run in that checkout, and otherwise names heal --scope for the paths the checkout held",
             ErrorCode::MergeStateDamaged =>
-                "A bay's record of the consolidation or pick in progress there, its state file or a consolidation's out-of-scope skeleton, is not a file, is not text, is cut short or garbled, does not match its digest, or is missing beside a consolidation. Nothing was changed; abort --keep-files run in that bay drops a damaged state file and leaves every file as it is, and abort abandons a merge whose skeleton is damaged"
+                "A bay's record of the consolidation or pick in progress there, its state file or a consolidation's out-of-scope skeleton, is not a file, is not text, is cut short or garbled, does not match its digest, or is missing beside a consolidation. Nothing was changed; abort --keep-files run in that bay drops a damaged state file and leaves every file as it is, and abort abandons a merge whose skeleton is damaged",
+            ErrorCode::TrustDamaged =>
+                "The warehouse's trust file is missing while the office pallet is born or its copy stands, so trust was established and its anchor is gone, or it does not parse. Nothing was changed; restore it from a backup, or move the trust file and its copy aside and lower from a remote you trust"
         }
     }
 
@@ -1020,6 +1027,7 @@ impl ErrorCode {
             RefusalCode::InventoryDamaged => ErrorCode::InventoryDamaged,
             RefusalCode::CheckoutScopeDamaged => ErrorCode::CheckoutScopeDamaged,
             RefusalCode::MergeStateDamaged => ErrorCode::MergeStateDamaged,
+            RefusalCode::TrustDamaged => ErrorCode::TrustDamaged,
         }
     }
 }
@@ -1681,6 +1689,7 @@ mod tests {
             (RefusalCode::InventoryDamaged, "inventory_damaged", 66),
             (RefusalCode::CheckoutScopeDamaged, "checkout_scope_damaged", 67),
             (RefusalCode::MergeStateDamaged, "merge_state_damaged", 68),
+            (RefusalCode::TrustDamaged, "trust_damaged", 69),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

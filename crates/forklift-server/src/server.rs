@@ -1903,6 +1903,8 @@ fn operator_remedy(code: forklift_core::error::RefusalCode, own: &str) -> String
         // The served root's own position names heal; another bay's names nothing, since a heal in
         // the warehouse's root does not reach it.
         RefusalCode::SealedDamaged | RefusalCode::UnavailableDamaged | RefusalCode::BayPositionDamaged => own.to_string(),
+        // The trust file's own next step names no path.
+        RefusalCode::TrustDamaged => own.to_string(),
         RefusalCode::FetchScopeStray | RefusalCode::OriginDamaged => String::new(),
         _ => unreachable!("not a damage code"),
     }
@@ -1930,6 +1932,8 @@ fn damage_message(code: forklift_core::error::RefusalCode) -> String {
             "The warehouse's list of deleted pallets, or the mark beside it that records the warehouse as served, is missing or does not read, so which history it keeps for them cannot be told, and the request was refused.".to_string(),
         RefusalCode::WithheldDamaged =>
             "The warehouse's record of what its head withholds is missing or does not read, so what may be served cannot be told, and the request was refused.".to_string(),
+        RefusalCode::TrustDamaged =>
+            "The warehouse's trust anchor is lost or does not read, so what it trusts cannot be told, and the request was refused.".to_string(),
         _ => unreachable!("not a damage code"),
     }
 }
@@ -3365,6 +3369,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                         boundary: anchor.boundary.clone(),
                         scope: BoundaryScope::AllButOffice,
                     },
+                    mode: office_utils::TrustReadMode::Checked,
                 });
 
                 if !trust_install_outcome(installed, &anchor)? {
@@ -3383,21 +3388,9 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                 Ok(Some(event))
             }
             None => {
-                // No anchor but an office: the anchor was lost, and whichever client lifts first
-                // would otherwise plant its own over a chain it never verified. The install below
-                // conditions on the office still being unborn, so a bay of this warehouse enrolling
-                // meanwhile refuses it.
-                if pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)
-                    .map_err(internal)?
-                    .is_some() {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        "This warehouse holds an office but no trust anchor: its anchor was \
-                        lost. The server operator must restore it; a client cannot \
-                        re-establish it.".to_string()
-                    ));
-                }
-
+                // No anchor is held and nothing says one was ([`office_utils::read_trust_anchor`]
+                // refuses a lost one). The install below conditions on the office still being
+                // unborn, so a bay of this warehouse enrolling meanwhile refuses it.
                 // A first anchor arrives over an unborn office, so nothing above ties its
                 // `adopts` to held history — but every warehouse that adopts this anchor later
                 // fetches that history from here. The client uploads it before the anchor.
@@ -3426,6 +3419,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                         boundary: anchor.boundary.clone(),
                         scope: BoundaryScope::AllButOffice,
                     },
+                    mode: office_utils::TrustReadMode::Checked,
                 });
 
                 if !trust_install_outcome(installed, &anchor)? {
@@ -5284,6 +5278,10 @@ mod tests {
             new_office: None,
             served: None,
             pallets: PalletsPrecondition::NotConsumed,
+            // The fixtures move the office to its genesis before planting its anchor, where enroll
+            // moves both in the install: the checked read would take that born office for a lost
+            // anchor.
+            mode: office_utils::TrustReadMode::Adopt,
         }).map(|_| ())
     }
     /// The durable-taint machinery (module `taint_utils` in `forklift_core`) is activation-gated
@@ -10201,6 +10199,39 @@ mod tests {
             let _ = forklift_core::util::file_utils::remove_dir_all(&root);
         }
 
+        /// A trust file that does not parse, or one missing beside its standing copy, is a 503
+        /// trust_damaged with the fixed message, naming no file of the server's.
+        /// Revert: drop TrustDamaged from SERVED_DAMAGE → a 500 with no code → red.
+        #[tokio::test]
+        async fn a_handshake_over_a_damaged_trust_file_refuses_with_its_code() {
+            let (root, _scope, _side) = served_with_side("handshake-trust");
+            let trust = forklift_core::globals::forklift_root().join("trust");
+            let copy = forklift_core::globals::forklift_root().join("trust-copy");
+
+            for (what, trust_bytes, copy_bytes) in [
+                ("garbled", Some(&b"version = 1\ngenesis = \""[..]), None),
+                ("missing beside its copy", None, Some(&b"a copy"[..])),
+            ] {
+                for (path, bytes) in [(&trust, trust_bytes), (&copy, copy_bytes)] {
+                    match bytes {
+                        Some(bytes) => std::fs::write(path, bytes).unwrap(),
+                        None => { let _ = forklift_core::util::file_utils::remove_file(path); }
+                    }
+                }
+
+                let response = get_warehouse(State(Arc::new(single_mode_state(root.clone()))), Path(PathParams::new()))
+                    .await.into_response();
+
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{}", what);
+                let body = body_text(response).await;
+                assert!(body.contains(r#""code":"trust_damaged""#), "{}: {}", what, body);
+                assert!(body.contains("The warehouse's trust anchor is lost or does not read"), "{}: {}", what, body);
+                let absolute = std::path::absolute(&root).unwrap();
+                assert!(!body.contains(&*absolute.to_string_lossy()) && !body.contains(".forklift"), "{}: no server path: {}", what, body);
+            }
+            let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+        }
+
         /// The served root's own position is what a new clone checks out: lost or damaged, the
         /// handshake refuses with its code and names heal, and never the position file's path.
         /// Revert: drop BayPositionDamaged from SERVED_DAMAGE → a 500 with no code → red.
@@ -10621,7 +10652,8 @@ mod tests {
         let response = put_trust(State(state), Extension(Principal::Open), Path(PathParams::new()), Json(first_anchor(Vec::new())))
             .await.into_response();
 
-        assert_eq!(office_utils::read_trust_anchor().unwrap(), None, "no anchor may be written");
+        // The office is born now, so the checked read refuses the missing file: look for the file.
+        assert!(!root.join(".forklift").join("trust").exists(), "no anchor may be written");
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }

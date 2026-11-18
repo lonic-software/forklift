@@ -116,8 +116,9 @@ Which parcels a pallet accepts depends on the warehouse's trust state:
    lives under its writer's directory) apply to the declared operator. Nothing binds that
    operator to whoever lifts the parcel, so these rules keep a parcel consistent with the name
    it declares; they do not establish that the name is true.
-2. **Anchor lost** — no trust anchor while an office exists. Every write and every content
-   check refuses until trust is restored.
+2. **Anchor lost** — no trust anchor while an office exists, or a trust file that does not
+   parse. Every write and every content check refuses as `trust_damaged` until trust is
+   restored.
 3. **Trusted** — an anchor and an office. Every parcel stacked after trust was established must
    be signed, and its signature must verify, inside the distrust boundary if its key is revoked.
    Every cell it adds or changes is stamped `signer` with its own signing key, and the pallet

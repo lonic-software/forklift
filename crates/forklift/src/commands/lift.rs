@@ -304,7 +304,7 @@ fn needs_re_signing(name: &str, remote_head: Option<&str>) -> Result<Option<&'st
         return Ok(None);
     };
 
-    let Some((anchor, _)) = audit_utils::local_meta_trust()? else { return Ok(None) };
+    let Some((anchor, _)) = audit_utils::verified_local_trust()? else { return Ok(None) };
 
     if let Some(remote_head) = remote_head {
         if !remote_utils::is_local_ahead(remote_head, &local)? {

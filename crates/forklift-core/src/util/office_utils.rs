@@ -13,6 +13,7 @@ use toml_edit::{value, DocumentMut};
 use crate::builder::object::loose_object_builder::LooseObjectBuilder;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::parcel_action_type::ParcelActionType;
+use crate::error::{CoreError, RefusalCode};
 use crate::globals::forklift_root;
 use crate::model::blob::Blob;
 use crate::model::operator::Operator;
@@ -45,6 +46,10 @@ const RECORD_SUFFIX: &str = ".toml";
 /// The trust anchor file inside the forklift root. Its presence means signing is
 /// required — a one-way door (nothing ever removes it).
 pub(crate) const FILE_NAME_TRUST: &str = "trust";
+
+/// The copy of the trust file, beside it. Its presence is a witness that trust was established,
+/// so a lost trust file is refused, not read as "never enrolled" ([`read_trust_anchor`]).
+pub(crate) const FILE_NAME_TRUST_COPY: &str = "trust-copy";
 
 /// The version of the trust file's shape, its required `version` entry. TOML lets a reader pass
 /// over a key it does not know, so without it a later shape would be read as this one.
@@ -603,10 +608,17 @@ pub fn ensure_not_metadata_root(root: &TreeItem) -> Result<(), String> {
 
 /// Read the trust anchor, if signing has been established.
 ///
+/// A missing trust file reads as "never enrolled" only when nothing says trust was established:
+/// no copy of the file stands ([`FILE_NAME_TRUST_COPY`]) and the office pallet is unborn. With
+/// either witness, the file was lost, and that is refused rather than read as no trust, since a
+/// reader that took it for "never enrolled" would stack unsigned or accept unsigned heads.
+///
 /// # Returns
 /// * `Ok(Some(TrustAnchor))` - The anchor.
 /// * `Ok(None)`              - If signing has not been established.
-/// * `Err(String)`           - If the trust file exists but is invalid.
+/// * `Err(String)`           - A [`RefusalCode::TrustDamaged`] refusal if the trust file is lost,
+///                             is not a file, or does not parse; an uncoded error if it could not
+///                             be read, or a newer version of Forklift wrote it.
 pub fn read_trust_anchor() -> Result<Option<TrustAnchor>, String> {
     Ok(read_trust_anchor_with_bytes()?.map(|(anchor, _)| anchor))
 }
@@ -618,25 +630,192 @@ pub fn read_trust_anchor() -> Result<Option<TrustAnchor>, String> {
 /// # Returns
 /// * `Ok(Some((TrustAnchor, Vec<u8>)))` - The anchor, and the file's bytes.
 /// * `Ok(None)`                         - If signing has not been established.
-/// * `Err(String)`                      - If the trust file exists but is invalid.
+/// * `Err(String)`                      - As [`read_trust_anchor`].
 pub fn read_trust_anchor_with_bytes() -> Result<Option<(TrustAnchor, Vec<u8>)>, String> {
-    let Some(bytes) = read_trust_anchor_bytes()? else {
-        return Ok(None);
-    };
-
-    let content = std::str::from_utf8(&bytes)
-        .map_err(|e| format!("The trust file is not valid UTF-8: {}", e))?;
-
-    Ok(Some((parse_trust_anchor(content)?, bytes)))
+    read_trust_anchor_in(TrustReadMode::Checked)
 }
 
-/// The trust file's bytes, undecoded (`None`: there is no trust file).
-pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
-    match std::fs::read(forklift_root().join(FILE_NAME_TRUST)) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("Error while reading the trust file: {}", e)),
+/// How a trust read treats a missing trust file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrustReadMode {
+    /// [`read_trust_anchor`]'s: a missing file is "never enrolled" only with no witness that trust
+    /// was established.
+    Checked,
+
+    /// A missing file with no copy beside it is "no anchor held", however the office stands: what
+    /// `forklift lower` reads, since adopting the remote's anchor, after verifying the office
+    /// against it, is the way out of a lost one. A copy standing still refuses, so the adoption
+    /// never writes a remote's anchor over the one local witness of this warehouse's own.
+    Adopt,
+}
+
+/// The trust anchor and its bytes, read as `mode` says ([`TrustReadMode`]).
+pub fn read_trust_anchor_in(mode: TrustReadMode) -> Result<Option<(TrustAnchor, Vec<u8>)>, String> {
+    if let Some(bytes) = read_trust_anchor_bytes()? {
+        return decode_trust_file(&bytes).map(|anchor| Some((anchor, bytes)));
     }
+
+    let copy = trust_copy_stands()?;
+    let office = match mode {
+        TrustReadMode::Checked if !copy => pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.is_some(),
+        _ => false,
+    };
+
+    if !copy && !office {
+        return Ok(None);
+    }
+
+    // An install writes the trust file before either witness, and this read takes no lock: a
+    // witness seen after the file read absent may be an install that landed in between.
+    #[cfg(test)]
+    tests::BEFORE_TRUST_REREAD.with(|seam| seam.take().map(|seam| seam()));
+
+    if let Some(bytes) = read_trust_anchor_bytes()? {
+        return decode_trust_file(&bytes).map(|anchor| Some((anchor, bytes)));
+    }
+
+    Err(CoreError::refusal(
+        RefusalCode::TrustDamaged,
+        format!(
+            "The warehouse's trust file (\"{}\") is missing, but {}: trust was established here and \
+            its anchor was lost. Nothing was changed. {}",
+            forklift_root().join(FILE_NAME_TRUST).to_string_lossy(),
+            match copy {
+                true => "its copy stands beside it",
+                false => "the office pallet is born",
+            },
+            LOST_ANCHOR_WAYS_OUT
+        ),
+        "",
+    ).into())
+}
+
+/// The ways out of a trust anchor no repair restores.
+pub const LOST_ANCHOR_WAYS_OUT: &str = "Restore the trust file from a backup if you have one. Otherwise \
+    move aside whichever of the trust file and its copy stands, then \"forklift lower\" takes the anchor of \
+    the configured remote, with nothing here to compare it against, so use it only with a remote you trust; \
+    if that remote has reset its trust, clone it again instead. With neither, trust cannot be re-established \
+    here: run \"forklift prepare\" in another folder, which starts without this warehouse's history, and \
+    enroll there.";
+
+/// Decode the trust file's `bytes`, refusing a file that does not parse as damaged. A file a newer
+/// version wrote is not damage, and is refused uncoded.
+fn decode_trust_file(bytes: &[u8]) -> Result<TrustAnchor, String> {
+    let decoded = std::str::from_utf8(bytes)
+        .map_err(|e| TrustDecodeError::Damaged(format!("The trust file is not valid UTF-8: {}", e)))
+        .and_then(parse_trust_anchor_classified);
+
+    decoded.map_err(|error| match error {
+        TrustDecodeError::Newer(message) => message,
+        TrustDecodeError::Damaged(why) => CoreError::refusal(
+            RefusalCode::TrustDamaged,
+            format!(
+                "{} So the warehouse's trust file (\"{}\") is damaged, and its anchor cannot be read. \
+                Nothing was changed. {}",
+                why.trim_end(), forklift_root().join(FILE_NAME_TRUST).to_string_lossy(), LOST_ANCHOR_WAYS_OUT
+            ),
+            "",
+        ).into(),
+    })
+}
+
+/// Whether the trust file's copy stands, by its path alone: anything there, a file or not, is the
+/// witness, since only an install that finished leaves one.
+fn trust_copy_stands() -> Result<bool, String> {
+    match std::fs::symlink_metadata(forklift_root().join(FILE_NAME_TRUST_COPY)) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("Error while reading the trust file's copy: {}", e)),
+    }
+}
+
+/// The trust file's bytes, undecoded (`None`: there is no trust file). This is the read that sees
+/// a lost trust file as absent, so its production callers are an exact set the tests pin; every
+/// other reader takes [`read_trust_anchor`].
+///
+/// # Returns
+/// * `Ok(None)` - Nothing stands at the trust file's path.
+/// * `Err`      - `trust_damaged` if something other than a file stands there (a folder, or a link
+///                that reaches no file, a dangling one included); an uncoded error if it could not
+///                be read.
+pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
+    match read_trust_file() {
+        Ok(bytes) => Ok(bytes),
+        Err(TrustFileError::NotAFile(path)) => Err(CoreError::refusal(
+            RefusalCode::TrustDamaged,
+            format!(
+                "The warehouse's trust file (\"{}\") is not a file or a link to one, so its anchor \
+                cannot be read. \
+                Nothing was changed. {}",
+                path, LOST_ANCHOR_WAYS_OUT
+            ),
+            "",
+        ).into()),
+        Err(TrustFileError::Unreadable(why)) => Err(why),
+    }
+}
+
+/// Why the trust file's bytes could not be read.
+enum TrustFileError {
+    /// Something other than a file, or a link to one, stands at its path, named here: damage,
+    /// like a file that does not parse.
+    NotAFile(String),
+
+    /// The filesystem failed to read it, which is not damage.
+    Unreadable(String),
+}
+
+/// The trust file's bytes (`None`: nothing stands at its path), with an entry that is not a file
+/// told apart from a read that failed. A link is judged by what it reaches, so one to a trust file
+/// reads it, and a dangling one is not mistaken for a file that is gone.
+fn read_trust_file() -> Result<Option<Vec<u8>>, TrustFileError> {
+    let path = forklift_root().join(FILE_NAME_TRUST);
+    let not_a_file = || TrustFileError::NotAFile(path.to_string_lossy().into_owned());
+
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::metadata(&path) {
+            Ok(target) if target.is_file() => {}
+            _ => return Err(not_a_file()),
+        },
+        Ok(meta) if !meta.is_file() => return Err(not_a_file()),
+        _ => {}
+    }
+
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        // Gone between the two reads: absent, as a read just after would say.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => match std::fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.is_file() => Err(not_a_file()),
+            _ => Err(TrustFileError::Unreadable(format!("Error while reading the trust file: {}", e))),
+        },
+    }
+}
+
+/// Why the trust file did not decode.
+enum TrustDecodeError {
+    /// A newer version of Forklift wrote it.
+    Newer(String),
+
+    /// It does not parse.
+    Damaged(String),
+}
+
+/// [`parse_trust_anchor`], telling a file a newer version wrote from a damaged one.
+fn parse_trust_anchor_classified(content: &str) -> Result<TrustAnchor, TrustDecodeError> {
+    let doc: DocumentMut = content.parse()
+        .map_err(|e| TrustDecodeError::Damaged(format!("The trust file is not valid TOML: {}", e)))?;
+
+    if let Some(Some(version)) = doc.get("version").map(|item| item.as_integer()) {
+        if version > TRUST_VERSION {
+            return Err(TrustDecodeError::Newer(format!(
+                "The trust file has version {}, which this version of Forklift does not read.", version
+            )));
+        }
+    }
+
+    parse_trust_anchor(content).map_err(TrustDecodeError::Damaged)
 }
 
 fn parse_trust_anchor(content: &str) -> Result<TrustAnchor, String> {
@@ -645,7 +824,7 @@ fn parse_trust_anchor(content: &str) -> Result<TrustAnchor, String> {
 
     match doc.get("version").map(|item| item.as_integer()) {
         Some(Some(TRUST_VERSION)) => {}
-        None => return Err("The trust file has no version entry; an older version of Forklift wrote it.".to_string()),
+        None => return Err("The trust file has no version entry.".to_string()),
         Some(Some(version)) => return Err(format!(
             "The trust file has version {}, which this version of Forklift does not read.", version
         )),
@@ -1121,6 +1300,10 @@ pub struct TrustInstall<'a> {
     /// ([`PalletsPrecondition::NotConsumed`] for an anchor adopted from a remote, whose boundary
     /// is the remote's).
     pub pallets: PalletsPrecondition,
+
+    /// How an install that replaces nothing re-reads the missing anchor under the hold: `Adopt`
+    /// only for the adoption that may take a remote's anchor over a born office whose own was lost.
+    pub mode: TrustReadMode,
 }
 
 /// What a successful [`install_trust`] did: a caller announcing a trust change tells its own write
@@ -1204,13 +1387,26 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
         return Ok(TrustInstalled::AlreadyInPlace);
     }
 
+    // The office, then the anchor, then the pallets, as one precondition set would check them. An
+    // install that replaces nothing needs there to be still no anchor, read in its own mode: the
+    // checked read of `AnchorPrecondition::Absent` would refuse the adoption that is the way out of
+    // a lost one.
     pallet_utils::check_preconditions(&lock, &RefPreconditions {
         office: OfficePrecondition::At(install.office.map(str::to_string)),
         anchor: match install.replaces {
             Some(replaced) => AnchorPrecondition::Bytes(replaced.to_vec()),
-            None => AnchorPrecondition::Absent,
+            None => AnchorPrecondition::NotConsumed,
         },
+        pallets: PalletsPrecondition::NotConsumed,
+    })?;
+
+    if install.replaces.is_none() && read_trust_anchor_in(install.mode)?.is_some() {
+        return Err(RefUpdateError::AnchorMoved);
+    }
+
+    pallet_utils::check_preconditions(&lock, &RefPreconditions {
         pallets: install.pallets.clone(),
+        ..RefPreconditions::NONE
     })?;
 
     // The check's refusal, or a walk that failed, counts only once the trust install is known to be
@@ -1222,8 +1418,12 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
         Err(error) => error,
     };
 
-    // Read back, still inside the hold: what a failed write left decides what to put back.
-    let anchor_now = read_trust_anchor_bytes();
+    // Read back, still inside the hold: what a failed write left decides what to put back. An
+    // entry that is not a file is said plainly here, not refused: this install may have written.
+    let anchor_now = read_trust_file().map_err(|why| match why {
+        TrustFileError::NotAFile(path) => format!("the trust file (\"{}\") is not a file or a link to one", path),
+        TrustFileError::Unreadable(why) => why,
+    });
     let office_now = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME);
 
     let (anchor_now, office_now) = match (anchor_now, office_now) {
@@ -2063,6 +2263,9 @@ pub(crate) mod tests {
     use std::cell::Cell;
 
     thread_local! {
+        /// Run before [`read_trust_anchor_in`] reads the trust file again, once a witness stood.
+        pub(crate) static BEFORE_TRUST_REREAD: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+
         /// Run between [`install_trust`]'s anchor write and its office write.
         pub(crate) static BETWEEN_TRUST_WRITES: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
 
@@ -2634,6 +2837,143 @@ pub(crate) mod tests {
         let newer = encoded.replacen("version = 1\n", "version = 2\n", 1);
         let error = parse_trust_anchor(&newer).expect_err("a trust file at another version must be refused");
         assert!(error.contains("version 2"), "{}", error);
+    }
+
+    /// A warehouse root for the accessor tests: `office` gives @office a head, `copy` plants the
+    /// trust file's copy, and `trust` writes the trust file.
+    fn trust_read_root(name: &str, trust: Option<&str>, office: bool, copy: bool) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("forklift-trust-read-{}-{}", name, std::process::id()));
+        let _ = file_utils::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = crate::globals::StorageRootScope::enter(&dir);
+
+        if let Some(trust) = trust {
+            std::fs::write(forklift_root().join(FILE_NAME_TRUST), trust).unwrap();
+        }
+
+        if office {
+            let path = pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("{}\n", "ab".repeat(32))).unwrap();
+        }
+
+        if copy {
+            std::fs::write(forklift_root().join(FILE_NAME_TRUST_COPY), "planted").unwrap();
+        }
+
+        dir
+    }
+
+    const TRUST_FILE: &str = "version = 1\ngenesis = \"genesis-hash\"\nenabled_at = 1\nboundary = []\n";
+
+    /// A missing trust file is "never enrolled" only with no witness that trust was established:
+    /// a born office or a standing copy refuses it as lost, under both reads where they apply,
+    /// and with neither it reads as no anchor.
+    // Revert: drop the @office read, or the copy read, in `read_trust_anchor_in` → the witnessed
+    // row reads `None`.
+    #[test]
+    fn a_missing_trust_file_with_a_witness_refuses_and_without_one_reads_as_none() {
+        // (name, office born, copy stands, checked refuses, adopt refuses)
+        let rows = [
+            ("neither", false, false, false, false),
+            ("office", true, false, true, false),
+            ("copy", false, true, true, true),
+            ("both", true, true, true, true),
+        ];
+
+        for (name, office, copy, checked_refuses, adopt_refuses) in rows {
+            let dir = trust_read_root(name, None, office, copy);
+            let _scope = crate::globals::StorageRootScope::enter(&dir);
+
+            for (mode, refuses) in [(TrustReadMode::Checked, checked_refuses), (TrustReadMode::Adopt, adopt_refuses)] {
+                match read_trust_anchor_in(mode) {
+                    Ok(None) => assert!(!refuses, "{}, {:?}: a lost anchor read as never enrolled", name, mode),
+                    Ok(Some(_)) => panic!("{}, {:?}: no trust file was written", name, mode),
+                    Err(e) => {
+                        assert!(refuses, "{}, {:?}: refused with no witness: {}", name, mode, e);
+                        assert!(crate::error::frames_code(&e, RefusalCode::TrustDamaged), "{}, {:?}: {}", name, mode, e);
+                    }
+                }
+            }
+
+            drop(_scope);
+            file_utils::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// A trust file that does not parse, or a folder or a dangling link in its place, is damage,
+    /// whatever stands beside it; one a newer version wrote is not, and is refused uncoded.
+    // Revert: map `TrustDecodeError::Damaged` to the plain message → no code on the garbled file.
+    #[test]
+    fn a_garbled_trust_file_is_trust_damaged_and_a_newer_one_is_not() {
+        for (name, content, damaged) in [
+            ("garbled", "version = 1\ngenesis = \"g", true),
+            ("unversioned", "genesis = \"g\"\nenabled_at = 1\nboundary = []\n", true),
+            ("newer", "version = 2\ngenesis = \"g\"\n", false),
+            // Its content is replaced by a folder below, or by a link whose target is gone.
+            ("folder", "", true),
+            #[cfg(unix)]
+            ("dangling-link", "", true),
+        ] {
+            let dir = trust_read_root(name, Some(content), false, false);
+            let _scope = crate::globals::StorageRootScope::enter(&dir);
+            let trust = dir.join(".forklift").join(FILE_NAME_TRUST);
+            if name == "folder" {
+                file_utils::remove_file(&trust).unwrap();
+                std::fs::create_dir(&trust).unwrap();
+            }
+            #[cfg(unix)]
+            if name == "dangling-link" {
+                file_utils::remove_file(&trust).unwrap();
+                std::os::unix::fs::symlink(dir.join("gone"), &trust).unwrap();
+            }
+
+            for mode in [TrustReadMode::Checked, TrustReadMode::Adopt] {
+                let error = read_trust_anchor_in(mode).expect_err(name);
+                assert_eq!(crate::error::frames_code(&error, RefusalCode::TrustDamaged), damaged, "{}: {}", name, error);
+            }
+
+            drop(_scope);
+            file_utils::remove_dir_all(&dir).ok();
+        }
+
+        // The positive for the links: one that reaches a trust file reads it.
+        #[cfg(unix)]
+        {
+            let dir = trust_read_root("link-to-file", Some(TRUST_FILE), true, false);
+            let _scope = crate::globals::StorageRootScope::enter(&dir);
+            let trust = dir.join(".forklift").join(FILE_NAME_TRUST);
+            std::fs::write(dir.join("real-trust"), TRUST_FILE).unwrap();
+            file_utils::remove_file(&trust).unwrap();
+            std::os::unix::fs::symlink(dir.join("real-trust"), &trust).unwrap();
+
+            let read = read_trust_anchor_in(TrustReadMode::Checked).map(|read| read.map(|(anchor, _)| anchor.genesis));
+            assert_eq!(read, Ok(Some("genesis-hash".to_string())));
+
+            drop(_scope);
+            file_utils::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// An install writes the trust file before its witnesses, so a witness seen after the file
+    /// read absent can be an install that landed in between: the accessor reads the file again
+    /// before calling the anchor lost, on either witness.
+    // Revert: re-read only on the @office witness → the copy row refuses trust_damaged.
+    #[test]
+    fn a_trust_file_written_between_the_reads_is_returned_not_refused() {
+        for (name, office, copy) in [("reread-office", true, false), ("reread-copy", false, true)] {
+            let dir = trust_read_root(name, None, office, copy);
+            let _scope = crate::globals::StorageRootScope::enter(&dir);
+
+            let path = forklift_root().join(FILE_NAME_TRUST);
+            BEFORE_TRUST_REREAD.with(|seam| seam.set(Some(Box::new(move || std::fs::write(path, TRUST_FILE).unwrap()))));
+
+            let read = read_trust_anchor_in(TrustReadMode::Checked);
+            assert_eq!(read.map(|read| read.map(|(anchor, _)| anchor.genesis)), Ok(Some("genesis-hash".to_string())), "{}", name);
+
+            drop(_scope);
+            file_utils::remove_dir_all(&dir).ok();
+        }
     }
 
     /// Finding F7 (round 3): the trust file's `genesis`/`enabled_at` used to be hand-rolled

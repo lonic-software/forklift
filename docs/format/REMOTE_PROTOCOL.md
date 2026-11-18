@@ -583,8 +583,10 @@ can never both plant their anchor — exactly one wins, the other gets the `409`
 anchor comes first and the office pallet ref (with its objects) follows in the same sync:
 no head lifts `@office` while it holds no anchor (`422`), and the anchor without the chain
 verifies nothing. A remote that holds `@office` but no anchor has lost its anchor, and
-`PUT /v1/trust` there is `409` — a client cannot plant an anchor over a chain it never
-verified; the operator must restore the lost one. A first anchor that carries `adopts` is
+`PUT /v1/trust` there is refused — a client cannot plant an anchor over a chain it never
+verified; the operator must restore the lost one. `forklift-server` answers it, and every other
+request that reads the trust state, `503` `trust_damaged`; the AWS head answers `PUT /v1/trust`
+`409`. A first anchor that carries `adopts` is
 `422` unless the remote holds that history completely and every parcel of it, followed by
 first parent to its root, has the tree and parents Forklift writes for an office parcel.
 Its signatures are not checked: adopted history is frozen and may predate the keys. Clients

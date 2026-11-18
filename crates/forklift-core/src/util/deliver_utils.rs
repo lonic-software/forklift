@@ -80,7 +80,7 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
     // established since the signing choice was read.
     let (signing_key_id, writer) = match stack_utils::resolve_signing_key(&operator)? {
         stack_utils::Signing::Unsigned => {
-            if audit_utils::local_meta_trust()?.is_some() {
+            if audit_utils::verified_local_trust()?.is_some() {
                 return Err(
                     "Trust was established for this warehouse while deliver ran; nothing was \
                     changed. Run it again.".to_string()

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use forklift_core::error;
 use forklift_core::util::held_heads;
+use forklift_core::util::office_utils::TrustReadMode;
 use forklift_core::util::remote_utils::{self, RemoteClient};
 use crate::output;
 
@@ -42,7 +43,7 @@ pub(crate) struct RemoteHeld {
 pub(crate) async fn held_by_remote(note: &str) -> Result<RemoteHeld, String> {
     let client = RemoteClient::for_warehouse().map_err(|e| error::append_to_message(e.into(), note))?;
     let info = client.fetch_info().await.map_err(|e| error::append_to_message(e, note))?;
-    remote_utils::check_remote_trust(&client, &info, None).map_err(|e| error::append_to_message(e, note))?;
+    remote_utils::check_remote_trust(&client, &info, None, TrustReadMode::Checked).map_err(|e| error::append_to_message(e, note))?;
 
     // A deleted pallet's tombstone keeps its history on the remote as a live ref would.
     let held = info.held_pallet_heads();

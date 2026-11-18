@@ -22,7 +22,7 @@ use crate::model::remote::{
 use crate::enums::config_scope::ConfigScope;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{self, StorageRootScope};
-use crate::util::office_utils::OFFICE_PALLET_NAME;
+use crate::util::office_utils::{TrustReadMode, OFFICE_PALLET_NAME};
 use crate::util::lock_utils::RefLock;
 use crate::util::pallet_utils::RefPreconditions;
 use crate::util::progress_utils::Progress;
@@ -8469,12 +8469,17 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// * `client` - The remote.
 /// * `info`   - The remote's handshake.
 /// * `expect` - The pinned genesis (`--expect`), if any.
+/// * `mode`   - How the local anchor is read: [`TrustReadMode::Adopt`] for `lower` alone, which
+///              may adopt the remote's anchor over a lost one.
 ///
 /// # Returns
 /// * `Ok(())`      - The remote's trust would be adopted or already matches.
 /// * `Err(String)` - The refusal `prepare_remote_trust` would raise.
-pub fn check_remote_trust(client: &RemoteClient, info: &WarehouseInfo, expect: Option<&str>) -> Result<(), String> {
-    let local = office_utils::read_trust_anchor()?;
+pub fn check_remote_trust(client: &RemoteClient,
+                          info: &WarehouseInfo,
+                          expect: Option<&str>,
+                          mode: TrustReadMode) -> Result<(), String> {
+    let local = office_utils::read_trust_anchor_in(mode)?.map(|(anchor, _)| anchor);
     judge_remote_trust(client.url(), info, local.as_ref(), expect).map(|_| ())
 }
 
@@ -8552,6 +8557,9 @@ pub struct PreparedTrust {
     /// ([`PreparedTrust::judge_local_heads`]); the install stands only while those pallets hold no
     /// other.
     judged_heads: Option<Vec<String>>,
+
+    /// How the local anchor was read, which the commit's read-back repeats.
+    mode: TrustReadMode,
 }
 
 /// Judge, fetch and verify the remote's trust state for a lower or clone, writing nothing.
@@ -8564,6 +8572,7 @@ pub struct PreparedTrust {
 /// * `client` - The remote.
 /// * `info`   - The remote's handshake.
 /// * `expect` - The pinned genesis (`--expect`), if any.
+/// * `mode`   - How the local anchor is read ([`check_remote_trust`]).
 ///
 /// # Returns
 /// * `Ok(PreparedTrust)` - What to adopt; [`PreparedTrust::commit`] writes it.
@@ -8572,10 +8581,11 @@ pub struct PreparedTrust {
 ///                         failed transfer.
 pub async fn prepare_remote_trust(client: &RemoteClient,
                                   info: &WarehouseInfo,
-                                  expect: Option<&str>) -> Result<PreparedTrust, String> {
+                                  expect: Option<&str>,
+                                  mode: TrustReadMode) -> Result<PreparedTrust, String> {
     // Read once: the pin, the stripped-anchor check and the mismatch check below all judge the
     // same held anchor, and the office write is conditioned on its bytes.
-    let local_read = office_utils::read_trust_anchor_with_bytes()?;
+    let local_read = office_utils::read_trust_anchor_in(mode)?;
     let local = local_read.as_ref().map(|(anchor, _)| anchor);
 
     let mut prepared = PreparedTrust {
@@ -8587,6 +8597,7 @@ pub async fn prepare_remote_trust(client: &RemoteClient,
         new_office: None,
         fetch: FetchStats::default(),
         judged_heads: None,
+        mode,
     };
 
     let Some(remote_office_head) = judge_remote_trust(client.url(), info, local, expect)? else {
@@ -8743,11 +8754,12 @@ impl PreparedTrust {
                         boundary: judged,
                         scope: pallet_utils::BoundaryScope::AllButOffice,
                     },
+                    mode: self.mode,
                 });
 
                 if let Err(error) = installed {
-                    let held = office_utils::read_trust_anchor().ok().flatten()
-                        .is_some_and(|anchor| anchor.genesis == remote_trust.genesis);
+                    let held = office_utils::read_trust_anchor_in(self.mode).ok().flatten()
+                        .is_some_and(|(anchor, _)| anchor.genesis == remote_trust.genesis);
 
                     return Err(match held {
                         true => crate::error::append_to_message(error.into(), &format!(
@@ -8924,6 +8936,7 @@ pub async fn accept_regenesis(client: &RemoteClient,
         new_office: Some(remote_office_head),
         served: Some(remote_office_head),
         pallets: pallet_utils::PalletsPrecondition::WithinBoundary { boundary: judgement.judged, scope: pallet_utils::BoundaryScope::UserPallets },
+        mode: office_utils::TrustReadMode::Checked,
     })?;
 
     Ok(Some((local, new_anchor, judgement.unvouched)))
@@ -9085,7 +9098,7 @@ pub fn lift_refused_by_content(name: &str, remote_head: Option<&str>) -> bool {
             }
         }
 
-        let trust = crate::util::audit_utils::local_meta_trust()?;
+        let trust = crate::util::audit_utils::verified_local_trust()?;
         let office = trust.as_ref().map(|(_, office)| &office.state);
         let boundary = trust.as_ref().map(|(anchor, _)| anchor.boundary.as_slice()).unwrap_or(&[]);
 
@@ -9337,6 +9350,7 @@ mod tests {
                 new_office: Some(&self.remote_head),
                 served: None,
                 pallets: pallet_utils::PalletsPrecondition::NotConsumed,
+                mode: office_utils::TrustReadMode::Checked,
             }).map(|_| ())
         }
 
@@ -9394,6 +9408,7 @@ mod tests {
             new_office: None,
             served: None,
             pallets: pallet_utils::PalletsPrecondition::NotConsumed,
+            mode: office_utils::TrustReadMode::Checked,
         }).unwrap();
 
         let error = fixture.install().expect_err("a moved anchor must refuse the re-genesis");

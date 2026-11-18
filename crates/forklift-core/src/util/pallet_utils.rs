@@ -1109,7 +1109,8 @@ pub enum AnchorPrecondition {
     /// The decision did not read the anchor.
     NotConsumed,
 
-    /// The decision read no anchor: there must still be none.
+    /// The decision read no anchor: there must still be none, read through the witnesses, so a
+    /// trust file lost since trust was established refuses the write (`Failed`, `trust_damaged`).
     Absent,
 
     /// The anchor file must still hold exactly these bytes. Compared as bytes, not as a decoded
@@ -1156,7 +1157,8 @@ pub enum BoundaryScope {
 /// * `Ok(())`              - Every precondition holds.
 /// * `Err(RefUpdateError)` - `OfficeMoved`, `AnchorMoved`, then `PalletsMoved` or `WitnessMoved`
 ///                           for the first one that does not hold (checked in that order), or
-///                           `Failed` if one could not be read.
+///                           `Failed` if one could not be read, or for an `Absent` anchor whose
+///                           trust file was lost (a `trust_damaged` refusal).
 pub(crate) fn check_preconditions(_lock: &crate::util::lock_utils::RefLock,
                                   preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
     if let OfficePrecondition::At(expected) = &preconditions.office {
@@ -1177,6 +1179,13 @@ pub(crate) fn check_preconditions(_lock: &crate::util::lock_utils::RefLock,
         if crate::util::office_utils::read_trust_anchor_bytes()?.as_deref() != expected {
             return Err(RefUpdateError::AnchorMoved);
         }
+    }
+
+    // No trust file is no anchor only where nothing says trust was established: an enrollment
+    // whose file was lost since the decision read none must not take an unsigned write, whatever
+    // office head the decision read after its anchor.
+    if preconditions.anchor == AnchorPrecondition::Absent {
+        crate::util::office_utils::read_trust_anchor()?;
     }
 
     match &preconditions.pallets {
@@ -3595,6 +3604,58 @@ pub(crate) mod tests {
 
         assert_eq!(get_pallet_head("main").unwrap(), Some(hash('1')), "the target must be unchanged");
         assert_eq!(refused, Err(RefUpdateError::AnchorMoved));
+    }
+
+    // Revert: drop the witness read from `Absent` → the unsigned write lands under a born office
+    // whose trust file was lost, pinned or not.
+    #[test]
+    fn a_write_judged_without_an_anchor_is_refused_once_trust_was_established_and_lost() {
+        let (_root, _scope) = scratch("anchor-established-lost");
+        // The positive: with no witness, an unsigned write judged without an anchor lands.
+        update_pallet_head("main", None, &hash('0'), &anchor_is(AnchorPrecondition::Absent)).unwrap();
+        update_pallet_head("main", Some(&hash('0')), &hash('1'), &RefPreconditions::NONE).unwrap();
+        update_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME, None, &hash('9'), &RefPreconditions::NONE).unwrap();
+
+        let refused = update_pallet_head("main", Some(&hash('1')), &hash('2'), &anchor_is(AnchorPrecondition::Absent));
+
+        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('1')), "the target must be unchanged");
+        match refused {
+            Err(RefUpdateError::Failed(why)) => assert!(crate::error::frames_code(&why, crate::error::RefusalCode::TrustDamaged), "{}", why),
+            other => panic!("expected the lost anchor refused: {:?}", other),
+        }
+
+        // Pinning the office it read after the anchor does not let it through.
+        let pinned = RefPreconditions { office: OfficePrecondition::At(Some(hash('9'))), anchor: AnchorPrecondition::Absent, ..RefPreconditions::NONE };
+        let refused = update_pallet_head("main", Some(&hash('1')), &hash('2'), &pinned);
+        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('1')), "the pinned write must not land");
+        match refused {
+            Err(RefUpdateError::Failed(why)) => assert!(crate::error::frames_code(&why, crate::error::RefusalCode::TrustDamaged), "{}", why),
+            other => panic!("expected the pinned write refused: {:?}", other),
+        }
+    }
+
+    // Revert: check the install's pallets before its re-read of the missing anchor → a first
+    // anchor whose boundary also moved reports the pallets, not the anchor installed meanwhile.
+    #[test]
+    fn a_first_anchor_over_one_installed_meanwhile_is_refused_as_the_anchor_moving() {
+        let (_root, _scope) = scratch("first-anchor-order");
+        update_pallet_head("main", None, &hash('1'), &RefPreconditions::NONE).unwrap();
+        plant_anchor('0');
+
+        let refused = crate::util::office_utils::install_trust(&crate::util::office_utils::TrustInstall {
+            anchor: &crate::util::office_utils::TrustAnchor {
+                genesis: hash('5'), enabled_at: 1, boundary: Vec::new(), prior_genesis: None, adopts: None,
+            },
+            replaces: None,
+            office: None,
+            new_office: None,
+            served: None,
+            pallets: PalletsPrecondition::WithinBoundary { boundary: Vec::new(), scope: BoundaryScope::AllButOffice },
+            mode: crate::util::office_utils::TrustReadMode::Checked,
+        });
+
+        assert_eq!(refused, Err(RefUpdateError::AnchorMoved));
+        assert_eq!(crate::util::office_utils::read_trust_anchor().unwrap().map(|anchor| anchor.genesis), Some(hash('0')));
     }
 
     // Revert: treat `Absent` as `NotConsumed` → an unsigned write lands under an anchor.

@@ -5,6 +5,7 @@ use forklift_core::error::{self, CoreError, RefusalCode};
 use forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT;
 use forklift_core::model::remote::WarehouseInfo;
 use forklift_core::util::franchise_utils::{self, Admission, Attempt, BundleState, Failure, FranchiseRecord, Phase, Request};
+use forklift_core::util::office_utils::TrustReadMode;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{self as remote, BatchLaneClosure, BundleDownload, PartialBundle, RemoteClient, TorSettings};
@@ -588,7 +589,7 @@ async fn franchise_into_prepared_target(
 
     // `None` because the pin was already checked against this same handshake by
     // `check_handshake_trust` in `handle_command`, before the download — not because there is none.
-    let mut trust = remote_utils::prepare_remote_trust(client, &info, None).await?;
+    let mut trust = remote_utils::prepare_remote_trust(client, &info, None, TrustReadMode::Checked).await?;
     let take_trust = trust.take_trust().unwrap_or(TakeTrust::Untrusted);
 
     let PalletResolution { pallet_name, remote_head } = resolution;

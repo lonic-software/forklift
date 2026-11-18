@@ -19,7 +19,7 @@ use forklift_core::util::file_utils::BulkStoreSession;
 use forklift_core::util::pack_utils::{IngestBase, IngestStored, StoreIngest};
 use forklift_core::util::meta_tree::MetaWriter;
 use forklift_core::util::tag_utils::{self, Tag};
-use forklift_core::util::{audit_utils, config_utils, inventory_utils, object_utils, office_utils, operation_utils, pallet_utils, shift_utils};
+use forklift_core::util::{config_utils, inventory_utils, object_utils, office_utils, operation_utils, pallet_utils, shift_utils};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::commands::export_git::SkippedTag;
 use crate::events;
@@ -72,10 +72,6 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
             Import into a fresh warehouse, then \"forklift office enroll\".".to_string()
         );
     }
-
-    // With no anchor, an office standing refuses every unsigned write: refused here, with what
-    // happened to the anchor, rather than after the conversion as a changed office.
-    audit_utils::local_meta_trust()?;
 
     // Validate it is a git repository up front (a clear error beats a cryptic one later).
     git(path, &["rev-parse", "--git-dir"])?;
