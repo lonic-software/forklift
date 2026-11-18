@@ -1085,5 +1085,29 @@ mod tests {
         assert!(refusal(Some("bare.json#/graded")).ends_with("holds no steps at `/graded`"), "an object without steps");
         assert!(refusal(Some("odd.json#")).contains("unknown field `weight`"), "a step with a field this build does not know");
     }
-}
 
+    /// The guide page that publishes the method names every fault class as a row of its table and
+    /// every grade by the name the report prints, so a listed class or grade fails until the page
+    /// explains it. The classes are `Category::ALL`, the list the coverage table itself walks, so a
+    /// class it leaves out is missing from the report too. A new variant of either enum does not
+    /// compile until the match beside its list names it, which is where that list is kept.
+    ///
+    /// Revert: drop the guide's `AWS head` row → it is named missing.
+    #[test]
+    fn the_guide_names_every_class_and_grade() {
+        let guide = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/guide/proof-load.md")).unwrap();
+        let classes = Category::ALL.map(|category| match category {
+            Category::DamagedFiles | Category::KillPointsClient | Category::KillPointsServer | Category::PowerLossClient
+            | Category::PowerLossServer | Category::DiskFull | Category::ReadOnly | Category::CaseFolding | Category::NoExec
+            | Category::DeadPidLock | Category::Network | Category::ClockSkew | Category::AwsHead | Category::Fidelity => category,
+        });
+        assert_eq!(classes.iter().collect::<std::collections::BTreeSet<_>>().len(), classes.len(), "Category::ALL repeats a class");
+        let grades = [Grade::Healed, Grade::RefusedWorkingRemedy, Grade::RefusedNoRemedy, Grade::DataLost, Grade::Silent].map(|grade| match grade {
+            Grade::Healed | Grade::RefusedWorkingRemedy | Grade::RefusedNoRemedy | Grade::DataLost | Grade::Silent => grade,
+        });
+        let missing: Vec<String> = classes.iter().map(|category| format!("| {} |", category.label()))
+            .chain(grades.iter().map(|grade| format!("| `{}` |", kebab(grade))))
+            .filter(|needle| !guide.contains(needle.as_str())).collect();
+        assert_eq!(missing, Vec::<String>::new(), "docs/guide/proof-load.md does not name these");
+    }
+}
