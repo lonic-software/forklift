@@ -49,7 +49,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   and for a ref that waits on the office's or `@redactions`' refusal, or on an unborn office, it
   names that step instead. Where `heal` could not read what it needs to judge the ref (a file it
   may not read, pack damage it rebuilds, a pack it cannot list in full), the refusal names settling
-  that read and running `heal` again, and the removal is refused. A removal stopped after the ref went still reports it, and a rerun
+  that read and running `heal` again, and the removal is refused. Where it reads in a format this
+  Forklift does not know (a newer version wrote it), the step is to upgrade Forklift, and where the
+  trust file's anchor or the office's history refuses, the step is that refusal's way out; the
+  removal is refused for both. A removal stopped after the ref went still reports it, and a rerun
   keeps the bytes in the same file. `--json`: each `refs_removed` entry's `kept` is replaced by
   `kept_ref` and `kept_copy`, each the file one role's bytes were kept in, or null (schema 61).
 

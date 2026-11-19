@@ -125,7 +125,10 @@ stands, and not for a ref `heal` refused only because the office's or `@redactio
 or because the office is unborn beside the trust file: it names what to settle first. Nor does it run for a ref
 `heal` could not judge because it could not read what it needs (a file it may not read, a pack it cannot
 open or list in full): that is no verdict on the ref, so the step is to settle what the refusal names and
-run `forklift heal` again, which then judges the ref. A copy that cannot be read, a link at the
+run `forklift heal` again, which then judges the ref. It is refused too where what `heal` needs
+reads in a format this Forklift does not know, as one a newer version wrote (the step is to upgrade
+Forklift), and where the trust file's anchor is lost or the office's history does not verify against
+it beside an intact office ref (the step is that refusal's way out). A copy that cannot be read, a link at the
 copy's path, or something other than a file at the ref's path is refused too, naming it: make the copy
 and the folders on the way to it readable, replace the link with the copy's file (moving it aside would
 leave the pallet reading as never written), or move aside what stands at the ref's path, and run the

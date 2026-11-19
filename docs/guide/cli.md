@@ -2890,7 +2890,9 @@ are in `details` under `--json`). Choose one yourself:
   a ref `heal` refused only because the office's or `@redactions`' ref was refused, or because the
   office is unborn beside the trust file, naming what to settle first. A ref `heal` could not
   judge because it could not read what it needs is no verdict on it: the removal is refused, and
-  the step is to settle that read and run `forklift heal` again.
+  the step is to settle that read and run `forklift heal` again. So is one that reads in a format
+  this Forklift does not know (the step is to upgrade Forklift), and one the trust state refuses
+  (the step is that refusal's way out).
 
 Both refuse a ref that is readable. A refusal also lists any ref the same run already set or
 removed. The report lists `refs_rebuilt`, `refs_removed` and
