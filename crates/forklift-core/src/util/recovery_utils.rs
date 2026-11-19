@@ -6255,8 +6255,11 @@ mod tests {
         assert_eq!(sources.meta_heads, vec![h1.clone()]);
 
         // A copy that cannot be read (here the copy folder is a file, so reading under it fails)
-        // fails GC closed, and is a note under heal's tolerant read.
+        // fails GC closed, and is a note under heal's tolerant read. Unix only: Windows reports a
+        // path under a file as not found, so there the copy reads as absent and adds nothing.
         // Revert: read an unreadable copy as absent → GC's read succeeds → red.
+        #[cfg(unix)]
+        {
         let copies = crate::globals::forklift_root().join(pallet_utils::FOLDER_NAME_META_COPY_ROOT);
         crate::util::file_utils::remove_dir_all(&copies).unwrap();
         std::fs::write(&copies, "not a folder\n").unwrap();
@@ -6269,6 +6272,7 @@ mod tests {
         ).unwrap();
         assert_eq!(tolerated.meta_heads, vec![h1]);
         assert!(tolerated.degraded.iter().any(|note| note.contains("the copy of pallet \"@tags\"")), "{:?}", tolerated.degraded);
+        }
     }
 
     // ---- §8.3 torn rescan (I5) ----
