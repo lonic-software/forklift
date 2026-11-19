@@ -1596,6 +1596,61 @@ fn a_meta_head_failing_verification_is_the_refs_own_only_on_what_the_store_holds
     }
 }
 
+/// The one pack `store compact --all` left in `root`, without its extension.
+fn only_pack(root: &Path) -> PathBuf {
+    let packs: Vec<PathBuf> = std::fs::read_dir(root.join(".forklift").join("objects").join("pack")).unwrap().flatten()
+        .map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|ext| ext == "pack"))
+        .collect();
+    assert_eq!(packs.len(), 1, "{:?}", packs);
+    packs[0].with_extension("")
+}
+
+// A lost meta ref whose copy's head sits only in a pack whose data file is lost beside its index
+// is no verdict on the ref: the head is unread, never decided absent. The refusal's reason carries
+// no frame of the read error's own step, the removal is refused, and once the data file is back
+// heal rebuilds the ref. An index lost beside its data file is heal's own to settle: it rebuilds the index, then
+// the ref, in one run.
+// Mutations: read pack damage as the store's verdict → next_step is the removal, red; keep the read
+// error's frame in the reason → the reason names a step of its own, red.
+#[test]
+fn a_meta_head_in_a_pack_the_store_cannot_read_in_full_is_unread() {
+    for case in ["index lost", "data lost"] {
+        let area = Area::new(&format!("meta-pack-{}", case.replace(' ', "-")));
+        let (root, _, second) = tagged(&area);
+        area.run_ok(&root, &["store", "compact", "--all"]);
+        assert!(!loose_object(&root, &second).exists(), "the head is packed");
+        let pack = only_pack(&root);
+        let moved = match case {
+            "index lost" => pack.with_extension("idx"),
+            _ => pack.with_extension("pack"),
+        };
+        let saved = area.base.join("saved");
+        forklift_core::util::file_utils::rename(&moved, &saved).unwrap();
+        forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+
+        if case == "data lost" {
+            // The lost pack holds the warehouse's history too, so heal refuses on the lost
+            // objects first; the ref's refusal stands beside it.
+            let output = area.run(&root, &["--json", "heal"]);
+            assert_eq!(output.status.code(), Some(58), "{}{}", text(&output.stdout), text(&output.stderr));
+            let refused: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let refs = refused["error"]["details"]["refs_refused"].as_array().unwrap();
+            assert_eq!(refs.len(), 1, "{}", refused);
+            assert_eq!(refs[0]["pallet"], "@tags", "{}", refused);
+            let reason = refs[0]["reason"].as_str().unwrap();
+            assert!(reason.contains(&format!("Object {} cannot be read", second)), "{}", refused);
+            assert!(!reason.contains("Next step"), "{}", refused);
+            let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+            assert!(!removal.status.success(), "{}", text(&removal.stdout));
+            assert!(text(&removal.stderr).contains("heal could not read what it needs to judge it"), "{}", text(&removal.stderr));
+            assert!(!root.join(".forklift").join("removed-refs").exists(), "nothing is kept");
+            forklift_core::util::file_utils::rename(&saved, &moved).unwrap();
+        }
+        assert_eq!(rebuilt_meta(&healed(&area, &root)), vec![("@tags".to_string(), second.clone(), "the ref's copy".to_string())], "{}", case);
+        assert_eq!(tag_names(&tag_list(&area, &root)).len(), 2, "{}", case);
+    }
+}
+
 // A meta ref heal chose no head for is still the office's refusal while the office is refused,
 // since its removal would be judged against no office. Mutation: keep the choice's own owner
 // beside a refused office → @tags is removed, red.
