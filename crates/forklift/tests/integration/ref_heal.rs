@@ -1386,6 +1386,27 @@ fn a_meta_ref_heal_refuses_as_its_own_is_removed_with_no_taint_standing() {
     }
 }
 
+// A meta ref heal chose no head for is still the office's refusal while the office is refused,
+// since its removal would be judged against no office. Mutation: keep the choice's own owner
+// beside a refused office → @tags is removed, red.
+#[test]
+fn a_meta_ref_with_no_head_beside_a_refused_office_waits_on_the_office() {
+    let area = Area::new("meta-remove-no-head");
+    let (root, _, _) = tagged(&area);
+    area.run_ok(&root, &["office", "enroll"]);
+
+    forklift_core::util::file_utils::remove_file(&meta_path(&root, "office")).unwrap();
+    std::fs::write(meta_copy_path(&root, "office"), b"not a hash").unwrap();
+    forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+    std::fs::write(meta_copy_path(&root, "tags"), b"not a hash either").unwrap();
+
+    let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+    let said = text(&removal.stderr);
+    assert!(!removal.status.success(), "{}", text(&removal.stdout));
+    assert!(said.contains("heal refused it only because it refused the ref of pallet \"@office\""), "{}", said);
+    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), b"not a hash either", "the copy stands");
+}
+
 // A meta ref refused only because the office was is not removed: the removal names the office's
 // refusal and its step, and once the office is removed, the office's way back, never the
 // verifier's "lift the office". Mutations: admit a cascaded refusal → @tags and its sound copy
