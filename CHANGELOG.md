@@ -25,8 +25,21 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   file's change). Two bays popping one park no longer both apply it: the second applies nothing
   and says the park was taken.
 
+- **`heal` rebuilds a lost or damaged metadata pallet ref.** A ref under `.forklift/meta/` (such
+  as `@tags`'s) that is gone or no longer holds a parcel hash is rebuilt from its copy, or from the
+  parcel its remaining bytes still name, once the head verifies as that pallet's history against
+  the office. A copy that disagrees with those bytes is taken only when it descends from what
+  they name; otherwise `heal` refuses with both heads (`ref_damaged`, exit 53). A copy lost or out
+  of step beside a ref that reads is set back to the ref. The office's and the redactions' own
+  refs are not rebuilt: while either is damaged, every damaged metadata ref is refused, to be set
+  by hand.
+
 ### Changed
 
+- **Each metadata pallet's ref now has a copy.** Every change to a ref under `.forklift/meta/` also
+  writes the same bytes to `.forklift/meta-copy/<name>`, under the same lock, in the order that
+  leaves the copy at the newer head if the write is interrupted. Beside a ref that reads, garbage
+  collection keeps the head the copy names as well as the ref's own.
 - **A killed process no longer leaves a lock to remove by hand.** The bay's lock, the object
   store's lock and a served warehouse's `serve.lock` are now kernel locks, released when the
   process holding them ends, however it ends. A `forklift-server` that crashed or was killed

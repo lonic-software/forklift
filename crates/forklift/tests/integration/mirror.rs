@@ -1266,11 +1266,13 @@ fn a_head_the_anchor_does_not_vouch_for_is_never_exported() {
     let mirrored = tip(&fixture.git, "main").unwrap();
 
     let trust = area.path("server-root/.forklift/trust");
-    let office = files_under(&area.path("server-root/.forklift")).into_iter()
-        .find(|entry| entry.file_name().is_some_and(|name| name == "office"))
-        .unwrap();
+    // The office's ref and its copy, both: which of the two a walk meets first is its order.
+    let office: Vec<PathBuf> = files_under(&area.path("server-root/.forklift")).into_iter()
+        .filter(|entry| entry.file_name().is_some_and(|name| name == "office"))
+        .collect();
+    assert_eq!(office.len(), 2, "{:?}", office);
     let copy = area.path("server-root/.forklift/trust-copy");
-    let stripped: Vec<(PathBuf, Vec<u8>)> = [trust, copy, office].into_iter()
+    let stripped: Vec<(PathBuf, Vec<u8>)> = [trust, copy].into_iter().chain(office)
         .map(|path| { let bytes = std::fs::read(&path).unwrap(); forklift_core::util::file_utils::remove_file(&path).unwrap(); (path, bytes) })
         .collect();
 

@@ -163,6 +163,8 @@ pub const CENSUS_ROLES: &[(&str, Role)] = &[
     ("pallets/<name>", Role::BranchRef),
     ("meta/", Role::Metadata),
     ("meta/<name>", Role::Metadata),
+    ("meta-copy/", Role::Metadata),
+    ("meta-copy/<name>", Role::Metadata),
     ("removed-refs/", Role::Log),
     ("removed-refs/<name>", Role::Log),
     ("removed-refs/<name>.<n>", Role::Log),

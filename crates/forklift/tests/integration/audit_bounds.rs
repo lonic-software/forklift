@@ -1480,7 +1480,7 @@ fn a_failed_rebuild_stops_heal() {
     let stderr = String::from_utf8_lossy(&failed.stderr);
 
     assert!(!failed.status.success(), "{}", stderr);
-    assert!(stderr.contains("Nothing else was healed"), "{}", stderr);
+    assert!(stderr.contains("Heal went no further"), "{}", stderr);
     assert_eq!(stderr.matches("sealed-object record").count(), 1, "{}", stderr);
     assert_eq!(std::fs::read(warehouse.root.join(".forklift").join("sealed")).unwrap(), bytes);
 }

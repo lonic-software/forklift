@@ -1115,7 +1115,9 @@ fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
 
         let reference = PalletRef::parse(wire)?;
 
-        match pallet_utils::update_pallet_head_in(reference.namespace, &reference.name, Some(post_head), pre_head, &pallet_utils::RefPreconditions::NONE) {
+        // A backward write: a meta ref's copy is written only after the ref write returned Ok, so
+        // an interrupted put-back leaves the copy at the head it moved off, never an older one.
+        match pallet_utils::put_back_pallet_head_in(reference.namespace, &reference.name, post_head, pre_head) {
             Ok(()) => {}
             Err(RefUpdateError::Moved(_)) if wire == current => {
                 return Err(current_pallet_moved(current, &entry.op));
@@ -2355,6 +2357,44 @@ mod tests {
         assert_eq!(consolidation.their_pallet, "their-pallet");
         assert_eq!(consolidation.our_pallet, "feature", "the pallet the merge started on must come back");
         assert!(OutOfScopeSkeleton::read_required(&consolidation).is_ok(), "the skeleton must come back with the state");
+    }
+
+    /// Undo's put-back is a backward write: a meta ref goes back before its copy is written, so a
+    /// copy that cannot be written leaves the ref at undo's target, never at the head the
+    /// operation left, and the undo stands (the copy is left at the newer head, for the copy mend).
+    /// Revert: put the refs back in the forward order → the copy write fails first and @office
+    /// stays at the operation's head → red. Revert: fail the put-back on the copy's error → undo
+    /// rolls back and errs → red.
+    #[test]
+    fn restore_refs_puts_a_meta_ref_back_before_its_copy() {
+        let _scratch = Scratch::new("restore-meta-copy-order");
+
+        advance(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &hash('2'),
+        ).unwrap();
+        pallet_utils::update_meta_pallet_head(
+            "office",
+            pallet_utils::get_meta_pallet_head("office").unwrap().as_deref(),
+            &hash('4'),
+            &pallet_utils::RefPreconditions::NONE,
+        ).unwrap();
+
+        let copy = pallet_utils::get_meta_copy_path("office");
+        crate::util::file_utils::remove_file(&copy).unwrap();
+        std::fs::create_dir_all(copy.join("in-the-way")).unwrap();
+
+        let mut restored = entry("stack", "main", &hash('a'), &hash('2'));
+        restored.before.heads.insert("@office".to_string(), Some(hash('b')));
+        restored.after.heads.insert("@office".to_string(), Some(hash('4')));
+
+        let restored = restore_refs(&restored);
+
+        assert_eq!(pallet_utils::get_meta_pallet_head("office").unwrap(), Some(hash('b')), "{:?}", restored);
+        assert!(restored.is_ok(), "the put-back happened, so the undo stands: {:?}", restored);
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('a')), "the undo is not rolled back");
+        assert_eq!(pallet_utils::read_meta_copy_state("office").unwrap(), pallet_utils::MetaCopyState::Other);
     }
 
     #[test]
