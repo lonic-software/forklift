@@ -1747,12 +1747,13 @@ mod tests {
 
     /// git's references merge without attributes, as Forklift does: a mirror whose HEAD has a
     /// `.gitattributes` setting the conflicted file's marker size to 32 still gets seven-character
-    /// markers from G.
+    /// markers from G. git 2.55 reads no attributes in a bare mirror unless configured to, so the
+    /// fixture configures `attr.tree=HEAD`, the setting a runner's git could carry.
     ///
     /// Revert: drop --attr-source from the mirror's git → G's markers are 32 characters.
     #[test]
     fn git_merges_without_attributes() {
-        let (scratch, environment) = crate::history::tests::scratch("replay-merge-attributes");
+        let (scratch, mut environment) = crate::history::tests::scratch("replay-merge-attributes");
         let source = scratch.root().join("source");
         std::fs::create_dir(&source).unwrap();
         let git = |arguments: &[&str]| git_in(&source, arguments, &scratch, &environment);
@@ -1770,6 +1771,9 @@ mod tests {
         commit(&source, "attributes", &scratch, &environment);
         let mirror = scratch.root().join("mirror.git");
         git(&["clone", "-q", "--mirror", &source.display().to_string(), &mirror.display().to_string()]);
+        environment.variables.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
+        environment.variables.insert("GIT_CONFIG_KEY_0".to_string(), "attr.tree".to_string());
+        environment.variables.insert("GIT_CONFIG_VALUE_0".to_string(), "HEAD".to_string());
         let tools = Tools { forklift: path_git(), git: path_git(), mirror: mirror.clone(), warehouse: scratch.work().to_path_buf(), index: scratch.tmp().join("replay.index"), scratch: &scratch, environment: &environment };
         let merged = tools.merge_tree("o", "t", &[]).unwrap().unwrap();
         assert_eq!(merged.conflicted, BTreeSet::from(["f".to_string()]));
