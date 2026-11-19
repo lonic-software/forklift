@@ -881,9 +881,13 @@ pub struct Removed {
     /// The pallet.
     pub pallet: String,
 
-    /// The files the removed bytes were kept in: the ref's, then, for a meta pallet, its copy's.
-    /// A meta ref that was lost keeps only its copy's.
-    pub kept: Vec<String>,
+    /// The file the removed ref's bytes were kept in; `None` for a meta ref that was lost, which
+    /// held none.
+    pub kept_ref: Option<String>,
+
+    /// For a meta pallet, the file its removed copy's bytes were kept in; `None` when it had no
+    /// copy, or the copy was not removed. Always `None` for a user pallet, which has no copy.
+    pub kept_copy: Option<String>,
 }
 
 /// The folder unreadable refs that `--remove-ref` removed are kept in.
@@ -898,19 +902,20 @@ pub fn remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<Remov
         unreachable!("admit_remove admits only an unreadable ref");
     };
 
-    let kept = kept_path(pallet, &[]);
+    let kept = kept_path(pallet, bytes);
 
     pallet_utils::remove_damaged_ref(pallet, bytes, &kept).map_err(|error| error.to_string())?;
 
-    Ok(Removed { pallet: pallet.to_string(), kept: vec![kept.to_string_lossy().into_owned()] })
+    Ok(Removed { pallet: pallet.to_string(), kept_ref: Some(kept.to_string_lossy().into_owned()), kept_copy: None })
 }
 
-/// A free path under the removed-refs folder for the bytes of `pallet`'s ref, and none of `taken`.
-fn kept_path(pallet: &str, taken: &[&std::path::Path]) -> std::path::PathBuf {
+/// The path under the removed-refs folder for `bytes` removed from `stem`'s file: the first that
+/// is free, or that holds those bytes already, as a removal stopped before it finished leaves it.
+fn kept_path(stem: &str, bytes: &[u8]) -> std::path::PathBuf {
     let folder = forklift_root().join(FOLDER_NAME_REMOVED_REFS);
-    let stem = pallet.replace('/', "%2F");
+    let stem = stem.replace('/', "%2F");
     (0..).map(|n| folder.join(match n { 0 => stem.clone(), n => format!("{}.{}", stem, n) }))
-        .find(|path| !path.exists() && !taken.contains(&path.as_path()))
+        .find(|path| !path.exists() || std::fs::read(path).is_ok_and(|held| held == bytes))
         .expect("an unbounded range always yields a free name")
 }
 
@@ -923,7 +928,11 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
     // A cascade names the office or @redactions, whose own refusals do not cascade back.
     for _ in 0..3 {
         match at.meta.as_ref().map(|meta| &meta.owner) {
-            Some(Owner::Own) => return format!("forklift heal --remove-ref {}", at.pallet),
+            // A copy path nothing can be kept from blocks the removal, so it is no step.
+            Some(Owner::Own) => return match at.meta.as_ref().is_some_and(|meta| pallet_utils::copy_blocks(&at.pallet[1..], &meta.copy)) {
+                true => pallet_utils::blocked_copy_step(&at.pallet[1..], "run \"forklift heal\" again"),
+                false => removal_step(&at.pallet),
+            },
             Some(Owner::Cascade(cause)) => match all.iter().find(|other| other.pallet == *cause) {
                 Some(cause) => at = cause,
                 None => break,
@@ -933,6 +942,11 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
         }
     }
     "forklift heal".to_string()
+}
+
+/// The removal of meta ref `wire`: the step of a refusal of its own, where nothing blocks it.
+pub fn removal_step(wire: &str) -> String {
+    pallet_utils::meta_removal_step(&wire[1..])
 }
 
 /// `step`, a command or sentences from [`meta_step`], as a sentence of its own.
@@ -948,7 +962,17 @@ pub fn step_sentence(step: &str) -> String {
 /// own. `judged` is what this run's meta pass before the taint recovery left unrebuilt, and
 /// `unjudged` what it never judged. Admitted only with no taint record standing, and only while
 /// the ref and its copy still stand as that pass judged them; afterwards the pallet reads unborn.
-pub fn remove_damaged_meta_ref(wire: &str, judged: &[Refused], unjudged: &[String], notes: &mut Vec<String>) -> Result<Removed, String> {
+///
+/// # Returns
+/// * `Err((String, Option<Removed>))` - Why not, and what was removed before it stopped, if
+///                                      anything: the ref, with its copy or not.
+pub fn remove_damaged_meta_ref(wire: &str, judged: &[Refused], unjudged: &[String], notes: &mut Vec<String>) -> Result<Removed, (String, Option<Removed>)> {
+    let mut partial = None;
+    remove_meta_ref(wire, judged, unjudged, notes, &mut partial).map_err(|error| (error, partial))
+}
+
+/// [`remove_damaged_meta_ref`], what a removal that stopped had removed left in `partial`.
+fn remove_meta_ref(wire: &str, judged: &[Refused], unjudged: &[String], notes: &mut Vec<String>, partial: &mut Option<Removed>) -> Result<Removed, String> {
     let name = wire.strip_prefix('@')
         .filter(|name| crate::util::meta_tree::META_PALLET_NAMES.contains(name))
         .ok_or_else(|| format!("\"{}\" is not a meta pallet this version of Forklift knows, so there is no ref of it to remove.", wire))?;
@@ -999,29 +1023,41 @@ pub fn remove_damaged_meta_ref(wire: &str, judged: &[Refused], unjudged: &[Strin
         )),
     }
 
-    // A folder at the copy's path holds other names' copies and is read as no copy; anything
-    // else that is not a file cannot be kept.
     let copy_path = pallet_utils::get_meta_copy_path(name);
-    let copy_is_folder = std::fs::symlink_metadata(&copy_path).is_ok_and(|metadata| metadata.is_dir());
-    if meta.copy == pallet_utils::MetaCopyState::Other && !copy_is_folder {
+    if pallet_utils::copy_blocks(name, &meta.copy) {
         return Err(format!(
-            "Something that is not a file stands at the copy's path of pallet \"{}\" (\"{}\"), so it cannot be kept and the ref was not removed: \
-            move it aside, then run the command again.",
-            wire, copy_path.to_string_lossy()
+            "Something that is not a file stands at the copy's path of pallet \"{}\", so it cannot be kept and the ref was not removed. {}",
+            wire, pallet_utils::blocked_copy_step(name, "run \"forklift heal\" again")
         ));
     }
 
-    let kept_ref = matches!(meta.damage, RefDamage::Unreadable(_)).then(|| kept_path(wire, &[]));
-    let kept_copy = matches!(meta.copy, pallet_utils::MetaCopyState::Bytes(_))
-        .then(|| kept_path(&format!("{}.copy", wire), &kept_ref.iter().map(|path| path.as_path()).collect::<Vec<_>>()));
+    // The ref's stem and the copy's never collide: neither is a prefix of the other's names.
+    let kept_ref = match &meta.damage {
+        RefDamage::Unreadable(bytes) => Some(kept_path(wire, bytes)),
+        _ => None,
+    };
+    let kept_copy = match &meta.copy {
+        pallet_utils::MetaCopyState::Bytes(bytes) => Some(kept_path(&format!("{}.copy", wire), bytes)),
+        _ => None,
+    };
+    let said = |path: &Option<std::path::PathBuf>| path.as_ref().map(|path| path.to_string_lossy().into_owned());
+    let removed = |kept_copy: Option<String>| Removed { pallet: wire.to_string(), kept_ref: said(&kept_ref), kept_copy };
 
-    pallet_utils::remove_damaged_meta_ref(name, &meta.damage, &meta.copy, kept_ref.as_deref(), kept_copy.as_deref())
-        .map_err(|error| error.to_string())?;
-
-    Ok(Removed {
-        pallet: wire.to_string(),
-        kept: kept_ref.iter().chain(&kept_copy).map(|path| path.to_string_lossy().into_owned()).collect(),
-    })
+    match pallet_utils::remove_damaged_meta_ref(name, &meta.damage, &meta.copy, kept_ref.as_deref(), kept_copy.as_deref()) {
+        Ok(()) => Ok(removed(said(&kept_copy))),
+        Err((error, pallet_utils::MetaRemoved::Nothing)) => Err(error.to_string()),
+        Err((error, pallet_utils::MetaRemoved::Ref)) => {
+            *partial = Some(removed(None));
+            Err(crate::error::append_to_message(error.to_string(), &format!(
+                "The ref of pallet \"{}\" was removed, but its copy (\"{}\") still stands: run \"forklift heal\" again, which judges it.",
+                wire, copy_path.to_string_lossy()
+            )))
+        }
+        Err((error, pallet_utils::MetaRemoved::Both)) => {
+            *partial = Some(removed(said(&kept_copy)));
+            Err(error.to_string())
+        }
+    }
 }
 
 /// Why meta ref `wire` (`name`) is not removed when heal's pass before the taint recovery left

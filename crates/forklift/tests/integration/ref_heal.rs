@@ -376,8 +376,10 @@ fn remove_ref_drops_only_an_unreadable_ref_nothing_names() {
     std::fs::write(ref_path(&root, "side"), &zeros).unwrap();
     let output = area.run_ok(&root, &["--json", "heal", "--remove-ref", "side"]);
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let kept = root.join(value["data"]["refs_removed"][0]["kept"][0].as_str().unwrap());
+    let removed = &value["data"]["refs_removed"][0];
+    let kept = root.join(removed["kept_ref"].as_str().unwrap());
     assert_eq!(std::fs::read(&kept).unwrap(), zeros);
+    assert!(removed["kept_copy"].is_null(), "a user pallet has no copy: {}", value);
     assert!(!ref_path(&root, "side").exists());
 
     // Nothing is left to heal.
@@ -1208,6 +1210,9 @@ fn a_lost_meta_ref_is_refused_where_it_is_read_while_its_copy_stands() {
     let removed = area.run_ok(&root, &["--json", "heal", "--remove-ref", "@tags"]);
     let removed: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
     assert_eq!(removed["data"]["refs_removed"][0]["pallet"], "@tags", "{}", removed);
+    assert!(removed["data"]["refs_removed"][0]["kept_ref"].is_null(), "a lost ref keeps nothing: {}", removed);
+    let kept_copy = Path::new(removed["data"]["refs_removed"][0]["kept_copy"].as_str().unwrap());
+    assert_eq!(kept_copy.file_name().unwrap(), "@tags.copy", "{}", removed);
     assert_eq!(kept_meta(&root, "tags"), (None, Some(b"not a hash".to_vec())), "the copy's bytes are kept; the ref had none");
     assert!(!meta_path(&root, "tags").exists() && !meta_copy_path(&root, "tags").exists());
     let listed = area.run_ok(&root, &["tag", "list"]);
@@ -1335,6 +1340,77 @@ fn a_copy_naming_a_parcel_that_fails_verification_is_refused_not_written() {
     area.run_ok(&root, &["heal", "--remove-ref", "@tags"]);
     assert_eq!(kept_meta(&root, "tags"), (None, Some(format!("{}\n", head(&root, "main")).into_bytes())));
     assert!(tag_names(&tag_list(&area, &root)).is_empty());
+}
+
+// A removal stopped after the ref went says so, with where its bytes are kept, and a rerun keeps
+// the copy's bytes in the file the first run kept them in. Mutations: report the stop as removing
+// nothing → no "Removed the damaged ref" sentence, red; drop the stopped removal's entry → same,
+// red; keep in a fresh file whatever stands → @tags.copy.1, red.
+#[cfg(unix)]
+#[test]
+fn a_meta_removal_stopped_after_the_ref_says_what_it_removed_and_a_rerun_keeps_the_same_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let area = Area::new("meta-remove-partial");
+    let (root, _, _) = tagged(&area);
+    let copy = format!("{}\n", head(&root, "main")).into_bytes();
+    std::fs::write(meta_path(&root, "tags"), b"not a hash").unwrap();
+    std::fs::write(meta_copy_path(&root, "tags"), &copy).unwrap();
+    let folder = meta_copy_path(&root, "tags").parent().unwrap().to_path_buf();
+
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let said = text(&removal.stderr);
+    assert!(!removal.status.success(), "{}", text(&removal.stdout));
+    assert!(said.contains("Removed the damaged ref of pallet \"@tags\", keeping its bytes in"), "{}", said);
+    assert!(said.contains("was removed, but its copy (") && said.contains("still stands: run \"forklift heal\" again"), "{}", said);
+    assert!(!meta_path(&root, "tags").exists());
+    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), copy, "the copy stands");
+    assert_eq!(kept_meta(&root, "tags"), (Some(b"not a hash".to_vec()), Some(copy.clone())));
+
+    // The named step: heal judges the copy alone, refuses it as its own, and its removal keeps
+    // the copy's bytes in the same file.
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    assert_eq!(refused["error"]["next_step"], "forklift heal --remove-ref @tags", "{}", refused);
+    let removal = area.run_ok(&root, &["heal", "--remove-ref", "@tags"]);
+    assert!(text(&removal.stdout).contains("Removed the lost ref of pallet \"@tags\", and its copy, keeping the copy's bytes in \""), "{}", text(&removal.stdout));
+    assert!(!meta_copy_path(&root, "tags").exists());
+    assert!(!root.join(".forklift").join("removed-refs").join("@tags.copy.1").exists(), "kept once");
+    assert_eq!(kept_meta(&root, "tags"), (Some(b"not a hash".to_vec()), Some(copy)));
+}
+
+// A damaged ref beside a copy path nothing can be kept from has one way out, said alike by heal, its
+// removal and a read of the pallet: the removal is no step there, and its cost is not said.
+// Mutation: name the removal whatever stands at the copy's path → next_step is the removal, red.
+#[cfg(unix)]
+#[test]
+fn a_lost_meta_ref_beside_a_blocked_copy_path_has_one_way_out() {
+    let area = Area::new("meta-copy-blocked");
+    let (root, _, _) = tagged(&area);
+    let copy = meta_copy_path(&root, "tags");
+    std::fs::write(meta_path(&root, "tags"), b"not a hash").unwrap();
+    forklift_core::util::file_utils::remove_file(&copy).unwrap();
+    std::os::unix::fs::symlink(root.join("nowhere"), &copy).unwrap();
+
+    let way_out = format!(
+        "Replace what stands at the copy's path (\"{}\") with the copy's file, or restore the ref's file from a backup, then run \"forklift heal\" again. \
+        With neither, moving it aside leaves the pallet empty, as the ref's removal would.",
+        Path::new(".forklift").join("meta-copy").join("tags").to_string_lossy()
+    );
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    let next_step = refused["error"]["next_step"].as_str().unwrap();
+    assert!(next_step.ends_with(&way_out[way_out.find("meta-copy").unwrap()..]) && next_step.starts_with("Replace what stands"), "{}", refused);
+    assert!(!refused["error"]["message"].as_str().unwrap().contains("Its removal leaves the pallet empty"), "{}", refused);
+
+    let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+    assert!(!removal.status.success(), "{}", text(&removal.stdout));
+    assert!(text(&removal.stderr).contains(next_step), "{}", text(&removal.stderr));
+
+    let read = tag_list(&area, &root);
+    assert!(!read.status.success());
+    let read: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
+    assert_eq!(read["error"]["next_step"], next_step.replace("run \"forklift heal\" again", "run the command again"), "{}", read);
 }
 
 // The removal of a meta ref heal refuses as its own, with no taint standing; and refused, writing

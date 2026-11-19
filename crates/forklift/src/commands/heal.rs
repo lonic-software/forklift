@@ -382,11 +382,15 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     for pallet in remove_ref {
         let removed = match pallet.starts_with('@') {
             true => ref_heal::remove_damaged_meta_ref(pallet, &meta_deferred, &refs_left.borrow().unjudged, &mut ref_notes),
-            false => ref_heal::remove_damaged_ref(pallet, &mut ref_notes),
+            false => ref_heal::remove_damaged_ref(pallet, &mut ref_notes).map_err(|error| (error, None)),
         };
         match removed {
             Ok(removed) => refs_removed.push(removed),
-            Err(error) => return Err(changed(error, &refs_rebuilt, &refs_removed, &ref_notes)),
+            // What a removal that stopped had removed is said with its error.
+            Err((error, partial)) => {
+                refs_removed.extend(partial);
+                return Err(changed(error, &refs_rebuilt, &refs_removed, &ref_notes));
+            }
         }
     }
 
@@ -1491,10 +1495,10 @@ fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
 }
 
 /// Each refused ref's line, then its candidate heads, which the hand step writes.
-fn refusal_lines(refused: &[ref_heal::Refused]) -> Vec<String> {
+fn refusal_lines(all: &[ref_heal::Refused]) -> Vec<String> {
     let mut lines = Vec::new();
 
-    for refused in refused {
+    for refused in all {
         lines.push(format!("The ref of pallet \"{}\" was not rebuilt: {}.", refused.pallet, refused.reason));
 
         if refused.candidates.is_empty() {
@@ -1505,7 +1509,7 @@ fn refusal_lines(refused: &[ref_heal::Refused]) -> Vec<String> {
         }
 
         // What its removal costs, where that is its way out.
-        if refused.meta.as_ref().is_some_and(|meta| meta.owner == ref_heal::Owner::Own) {
+        if refused.meta.is_some() && ref_heal::meta_step(refused, all) == ref_heal::removal_step(&refused.pallet) {
             lines.push(
                 "  Its removal leaves the pallet empty: what only its history reached may then be freed, and the removed files' bytes \
                 are kept under removed-refs.".to_string()
@@ -1649,15 +1653,22 @@ fn rebuilt_sentence(rebuilt: &ref_heal::Rebuilt) -> String {
 }
 
 fn removed_sentence(removed: &ref_heal::Removed) -> String {
-    let kept = removed.kept.iter().map(|kept| format!("\"{}\"", kept)).collect::<Vec<_>>().join(" and ");
+    let ref_said = match &removed.kept_ref {
+        Some(kept) => format!("the damaged ref of pallet \"{}\", keeping its bytes in \"{}\"", removed.pallet, kept),
+        None => format!("the lost ref of pallet \"{}\"", removed.pallet),
+    };
     match removed.pallet.starts_with('@') {
         true => format!(
-            "Removed the lost or damaged ref of pallet \"{}\" and its copy, keeping their bytes in {}; the pallet now reads empty, and what only it reached is no longer held by any pallet.",
-            removed.pallet, kept
+            "Removed {}{}; the pallet now reads empty, and what only it reached is no longer held by any pallet.",
+            ref_said,
+            match &removed.kept_copy {
+                Some(kept) => format!(", and its copy, keeping the copy's bytes in \"{}\"", kept),
+                None => String::new(),
+            }
         ),
         false => format!(
-            "Removed the unreadable ref of pallet \"{}\", keeping its bytes in {}; what only it reached is no longer held by any pallet.",
-            removed.pallet, kept
+            "Removed the unreadable ref of pallet \"{}\", keeping its bytes in \"{}\"; what only it reached is no longer held by any pallet.",
+            removed.pallet, removed.kept_ref.as_deref().unwrap_or_default()
         ),
     }
 }
