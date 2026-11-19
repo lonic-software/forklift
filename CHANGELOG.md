@@ -38,7 +38,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   While either ref is damaged and was not rebuilt, every damaged metadata ref is refused, to be set
   by hand. A metadata ref that cannot be settled before the taint recovery is judged again after
   it; a refusal that stops the run before then, such as one for a durability taint that still
-  stands, names each ref left that way with the heads found for it.
+  stands, names each ref left that way with the heads found for it, and each damaged metadata
+  ref a pass that stopped never judged.
 
 ### Changed
 

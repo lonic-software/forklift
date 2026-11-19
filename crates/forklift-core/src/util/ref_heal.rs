@@ -1196,37 +1196,39 @@ pub fn repair_meta(pass: Pass) -> Result<MetaRepair, TrustStopped> {
         judged = rebuild_office(state, redactions, tainted, pass, &mut report);
     }
 
-    let trust = match crate::util::office_utils::repair_trust() {
-        Ok(trust) => trust,
+    let trust = crate::util::office_utils::repair_trust();
+    if trust.is_ok() && report.stopped.is_none() {
+        repair_other_meta(pass, office.is_some(), judged, &mut tainted, &mut report);
+    }
+    // A pass that stopped, at the trust repair or inside step 3, names what it never judged.
+    if trust.is_err() || report.stopped.is_some() {
+        report.unjudged = unjudged_in(&states, &report);
+    }
+
+    match trust {
+        Ok(trust) => Ok(MetaRepair { repair: report, trust }),
         Err(error) => {
             let mut notes = std::mem::take(&mut report.notes);
             if let Some(stopped) = report.stopped.take() {
                 notes.push(format!("The office pallet's ref was not rebuilt: {}", stopped.trim_end_matches('.')));
             }
-            let unjudged = unjudged_in(&states, &report);
-            return Err(TrustStopped {
+            Err(TrustStopped {
                 error, rebuilt: std::mem::take(&mut report.rebuilt), deferred: std::mem::take(&mut report.deferred),
-                refused: std::mem::take(&mut report.refused), unjudged, notes,
-            });
+                refused: std::mem::take(&mut report.refused), unjudged: std::mem::take(&mut report.unjudged), notes,
+            })
         }
-    };
-
-    if report.stopped.is_none() {
-        repair_other_meta(pass, office.is_some(), judged, &mut tainted, &mut report);
     }
-    if report.stopped.is_some() {
-        report.unjudged = unjudged_in(&states, &report);
-    }
-
-    Ok(MetaRepair { repair: report, trust })
 }
 
-/// The lost or damaged meta refs among `states`, as `@<name>`, that `report` neither rebuilt,
-/// refused nor deferred: what a pass that stopped never judged.
+/// The lost or damaged meta refs, as `@<name>`, that `report` neither rebuilt, refused nor
+/// deferred: what a pass that stopped never judged. Read again, since step 3 judges from its own
+/// read; `states`, the pass's first read, stands in when that fails.
 fn unjudged_in(states: &[MetaState], report: &Repair) -> Vec<String> {
+    let now = meta_states(&mut Vec::new()).ok();
     let judged = |wire: &str| report.rebuilt.iter().any(|rebuilt| rebuilt.pallet == wire)
         || report.refused.iter().chain(&report.deferred).any(|refused| refused.pallet == wire);
-    states.iter().filter(|state| state.damage().is_some()).map(MetaState::wire).filter(|wire| !judged(wire)).collect()
+    now.as_deref().unwrap_or(states).iter()
+        .filter(|state| state.damage().is_some()).map(MetaState::wire).filter(|wire| !judged(wire)).collect()
 }
 
 /// What step 1 of [`repair_meta`] judged of a damaged `@redactions` beside a damaged office, for

@@ -156,7 +156,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let meta_rebuilt = meta_first.repair.rebuilt;
     // The damaged refs a refusal from here on names beside what was written: those the pass before
     // the taint left for the pass after it, until that pass has judged them; then those it refused.
-    let refs_left = std::cell::RefCell::new(RefsLeft::Deferred(meta_first.repair.deferred, meta_first.repair.unjudged));
+    let meta_deferred = meta_first.repair.deferred;
+    let refs_left = std::cell::RefCell::new(RefsLeft { deferred: meta_deferred.clone(), refused: Vec::new(), unjudged: meta_first.repair.unjudged });
 
     // Every refusal from here on says what this run already wrote, the trust file and the meta
     // refs among it, and the refs it left damaged.
@@ -166,12 +167,10 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             None => config_said(error),
         };
         let error = meta_rebuilt.iter().fold(error, |error, rebuilt| forklift_core::error::append_to_message(error, &rebuilt_sentence(rebuilt)));
-        let (error, unjudged) = match &*refs_left.borrow() {
-            RefsLeft::Deferred(deferred, unjudged) => (deferred_sentences(deferred).iter()
-                .fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence)), unjudged_sentences(unjudged)),
-            RefsLeft::Refused(refused, unjudged) => (refused_too(error, refused), unjudged_sentences(unjudged)),
-        };
-        unjudged.iter().fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence))
+        let left = refs_left.borrow();
+        let error = refused_too(error, &left.refused);
+        deferred_sentences(&left.deferred).iter().chain(&unjudged_sentences(&left.unjudged))
+            .fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence))
     };
 
     let record_rebuilt = sealed_utils::rebuild()
@@ -437,11 +436,11 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // The meta refs first, as before the taint: a user ref's rebuild reads the office.
     let meta_second = match ref_heal::repair_meta(Pass::AfterTaint) {
         Ok(meta) => {
-            refs_left.replace(RefsLeft::Refused(meta.repair.refused.clone(), meta.repair.unjudged.clone()));
+            refs_left.replace(RefsLeft::after_second(&meta_deferred, meta.repair.refused.clone(), meta.repair.unjudged.clone()));
             meta
         }
         Err(stopped) => {
-            refs_left.replace(RefsLeft::Refused(stopped.refused, stopped.unjudged));
+            refs_left.replace(RefsLeft::after_second(&meta_deferred, stopped.refused, stopped.unjudged));
             refs_rebuilt.extend(stopped.rebuilt);
             ref_notes.extend(stopped.notes);
             return Err(changed_after(stopped.error, &refs_rebuilt, &refs_removed, &ref_notes));
@@ -471,7 +470,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     ref_notes.extend(second.notes);
     let mut refs_refused = second.refused;
     refs_refused.extend(meta_second.refused);
-    refs_left.replace(RefsLeft::Refused(refs_refused.clone(), Vec::new()));
+    refs_left.replace(RefsLeft { deferred: Vec::new(), refused: refs_refused.clone(), unjudged: Vec::new() });
     if let Some(error) = second.stopped {
         return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
     }
@@ -1486,10 +1485,26 @@ fn candidates_clause(candidates: &[ref_heal::Candidate]) -> String {
 }
 
 /// The damaged refs a refusal names: those left for the meta pass after the taint recovery, until
-/// it has run, then those refused; each beside the meta refs a pass that stopped never judged.
-enum RefsLeft {
-    Deferred(Vec<ref_heal::Refused>, Vec<String>),
-    Refused(Vec<ref_heal::Refused>, Vec<String>),
+/// it has run, then those refused; and the meta refs a pass that stopped never judged.
+struct RefsLeft {
+    deferred: Vec<ref_heal::Refused>,
+    refused: Vec<ref_heal::Refused>,
+    unjudged: Vec<String>,
+}
+
+impl RefsLeft {
+    /// After the meta pass after the taint, which refused `refused` and, stopping, never judged
+    /// `unjudged`: one of those the pass before it deferred keeps that pass's reason and heads.
+    fn after_second(deferred: &[ref_heal::Refused], refused: Vec<ref_heal::Refused>, unjudged: Vec<String>) -> RefsLeft {
+        let (deferred, unjudged) = unjudged.into_iter().fold((Vec::new(), Vec::new()), |(mut kept, mut rest), wire| {
+            match deferred.iter().find(|refused| refused.pallet == wire) {
+                Some(first) => kept.push(first.clone()),
+                None => rest.push(wire),
+            }
+            (kept, rest)
+        });
+        RefsLeft { deferred, refused, unjudged }
+    }
 }
 
 /// Restore the checkout's scope from its copy, or set it to the paths `--scope` named.
