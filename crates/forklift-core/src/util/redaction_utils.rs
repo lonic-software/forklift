@@ -1205,6 +1205,27 @@ pub struct RedactionCheck {
     /// The redactions an exemption passed while this warehouse had not applied them. One applied
     /// since is never exempt, so the hold checks again.
     exempted: HashSet<String>,
+
+    /// The `@redactions` state heal judged, when the check ran against the head heal chose for a
+    /// lost or damaged `@redactions` ref rather than one read from it (see
+    /// [`check_head_write_judged`]).
+    judged: Option<JudgedRedactions>,
+}
+
+/// A lost or damaged `@redactions` ref as heal judged it before rebuilding it: the head it chose,
+/// which the writes judged beside it are checked against, and the ref and its copy as heal read
+/// them. A ref that reads as damaged holds no head to check against, and one lost reads as no
+/// redactions at all, so neither is read in its place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JudgedRedactions {
+    /// The head heal rebuilds `@redactions` at.
+    pub head: String,
+
+    /// How the ref was damaged when heal judged it.
+    pub damage: pallet_utils::RefDamage,
+
+    /// Its copy, as heal judged it.
+    pub copy: pallet_utils::MetaCopyState,
 }
 
 impl RedactionCheck {
@@ -1227,8 +1248,16 @@ impl RedactionCheck {
     /// object takes no ref lock, so a skipped object stored after this read can still land beside
     /// the written head, as one fetched after the write can; the receiving side of a lift, not this
     /// check, is what judges bytes handed on.
+    /// A judged check holds while `@redactions`' ref and copy are still as heal judged them, in
+    /// place of the head read.
     pub(crate) fn holds(&self, _lock: &crate::util::lock_utils::RefLock) -> Result<bool, String> {
-        if pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)? != self.redactions {
+        let stands = match &self.judged {
+            Some(judged) => pallet_utils::meta_ref_stands_as(REDACTIONS_PALLET_NAME, &judged.damage, &judged.copy)
+                .map_err(|error| error.to_string())?,
+            None => pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)? == self.redactions,
+        };
+
+        if !stands {
             return Ok(false);
         }
 
@@ -1264,6 +1293,10 @@ pub struct HeadWriteCheck {
     /// The `@redactions` head read before the check, or `None` when it could not be read.
     redactions: Option<Option<String>>,
     outcome: Result<RedactionCheck, pallet_utils::RefUpdateError>,
+
+    /// The `@redactions` state heal judged, for a check against the head it chose (see
+    /// [`check_head_write_judged`]).
+    judged: Option<JudgedRedactions>,
 }
 
 impl HeadWriteCheck {
@@ -1273,9 +1306,18 @@ impl HeadWriteCheck {
     /// check that failed stands until `@redactions` moves, so it is retried once a redaction
     /// lands rather than reporting a failure about a head that no longer holds; one that could
     /// not read `@redactions` at all stands, and its failure is reported.
+    ///
+    /// A judged check's failure stands too: its head was chosen, not read, so moving the ref
+    /// cannot correct it.
     pub(crate) fn stands(&self, lock: &crate::util::lock_utils::RefLock) -> Result<bool, String> {
         match &self.outcome {
             Ok(check) => check.holds(lock),
+            // A refusal or failure judged against a chosen head is reported only while the
+            // @redactions ref and copy still read as judged; otherwise the move is the answer.
+            Err(_) if self.judged.is_some() => {
+                let judged = self.judged.as_ref().expect("matched as judged");
+                pallet_utils::meta_ref_stands_as(REDACTIONS_PALLET_NAME, &judged.damage, &judged.copy).map_err(|e| e.to_string())
+            }
             Err(pallet_utils::RefUpdateError::Redacted { .. }) => Ok(true),
             Err(_) => match &self.redactions {
                 Some(read) => Ok(*read == pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)?),
@@ -1287,6 +1329,11 @@ impl HeadWriteCheck {
     /// The decision: the proof the compare-and-set takes, or the refusal or failure.
     pub(crate) fn outcome(&self) -> Result<&RedactionCheck, pallet_utils::RefUpdateError> {
         self.outcome.as_ref().map_err(Clone::clone)
+    }
+
+    /// The `@redactions` state a judged check rests on, `None` for one read from the ref.
+    pub(crate) fn judged(&self) -> Option<&JudgedRedactions> {
+        self.judged.as_ref()
     }
 }
 
@@ -1385,7 +1432,24 @@ pub fn check_head_write(namespace: pallet_utils::PalletNamespace,
         Err(error) => Err(error.clone().into()),
     };
 
-    HeadWriteCheck { redactions: redactions.ok(), outcome }
+    HeadWriteCheck { redactions: redactions.ok(), outcome, judged: None }
+}
+
+/// [`check_head_write`] against the redactions at `judged.head`, the head heal chose for a lost or
+/// damaged `@redactions` ref, which is not read: a damaged one names no head, and a lost one would
+/// read as no redactions at all. The write's hold then re-reads `@redactions`' ref and copy in
+/// place of its head, and the write is refused as moved when either is no longer as heal judged
+/// it ([`HeadWriteCheck::judged`]).
+pub(crate) fn check_head_write_judged(namespace: pallet_utils::PalletNamespace,
+                                      name: &str,
+                                      expected: Option<&str>,
+                                      new: &str,
+                                      judged: &JudgedRedactions) -> HeadWriteCheck {
+    let outcome = check_head_write_at(namespace, name, expected, new, None, Some(judged.head.clone()), &LocalObjects::default(),
+                                      crate::util::scope_utils::content_may_be_absent)
+        .map(|check| RedactionCheck { judged: Some(judged.clone()), ..check });
+
+    HeadWriteCheck { redactions: Some(Some(judged.head.clone())), outcome, judged: Some(judged.clone()) }
 }
 
 /// Check a ref write of `new` over `expected` that a head received, against the redactions at
@@ -1430,6 +1494,7 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
         skipped: HashSet::new(),
         adopted: false,
         exempted: HashSet::new(),
+        judged: None,
     };
 
     let Some(redactions) = redactions.filter(|_| expected != Some(new)) else {
@@ -1749,6 +1814,7 @@ mod tests {
             skipped: HashSet::new(),
             adopted: false,
             exempted: HashSet::from([exempted.clone()]),
+            judged: None,
         };
 
         let lock = crate::util::lock_utils::RefLock::acquire().unwrap();

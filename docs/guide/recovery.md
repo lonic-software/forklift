@@ -110,8 +110,8 @@ what only that ref reached is then no longer kept by any pallet.
 **Do not** write the ref file by hand: `heal --ref` checks that the parcel's history is complete.
 
 A meta pallet's ref (a name starting with `@`, such as `@tags`) is rebuilt from its copy
-(`.forklift/meta-copy/<name>`), the office's among them. `@redactions`' is not rebuilt, and neither
-is one `heal` refuses: restore its file from a backup, or write the head parcel's hash into it.
+(`.forklift/meta-copy/<name>`), the office's and `@redactions`' among them. One `heal` refuses is not
+rebuilt: restore its file from a backup, or write the head parcel's hash into it.
 
 The office pallet's ref (`.forklift/meta/office`) missing beside a trust file refuses as `ref_damaged`
 too, in the commands that need the verified office, such as `stack`, `audit` and `office enroll`: the anchor stands, but there is no office to check

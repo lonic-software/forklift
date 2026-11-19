@@ -1373,7 +1373,7 @@ pub fn update_meta_pallet_head_served(name: &str,
                                       preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
     let served = crate::util::redaction_utils::Served::chain(served);
 
-    update_pallet_head_checked(PalletNamespace::Meta, name, expected, new, preconditions, None, None, Some(served), None, None, WriteOrder::Forward)
+    update_pallet_head_checked(PalletNamespace::Meta, name, expected, new, preconditions, None, None, Some(served), None, None, None, WriteOrder::Forward)
 }
 
 /// [`update_pallet_head`] for a client adopting `served`, what the remote served for this user
@@ -1388,7 +1388,7 @@ pub fn adopt_pallet_head(name: &str,
                          new: &str,
                          served: crate::util::redaction_utils::Served,
                          preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(PalletNamespace::User, name, expected, new, preconditions, None, None, Some(served), None, None, WriteOrder::Forward)
+    update_pallet_head_checked(PalletNamespace::User, name, expected, new, preconditions, None, None, Some(served), None, None, None, WriteOrder::Forward)
 }
 
 /// Move the head of a pallet from `expected` to `new`: a compare-and-set, and the only way a
@@ -1446,7 +1446,7 @@ pub fn update_pallet_head_in(
     new: &str,
     preconditions: &RefPreconditions,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, expected, new, preconditions, None, None, None, None, None, WriteOrder::Forward)
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, None, None, None, None, None, None, WriteOrder::Forward)
 }
 
 /// [`update_pallet_head_in`] for undo's put-back, which moves a ref back from the head its
@@ -1458,7 +1458,7 @@ pub(crate) fn put_back_pallet_head_in(
     expected: &str,
     new: &str,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, Some(expected), new, &RefPreconditions::NONE, None, None, None, None, None, WriteOrder::Backward)
+    update_pallet_head_checked(namespace, name, Some(expected), new, &RefPreconditions::NONE, None, None, None, None, None, None, WriteOrder::Backward)
 }
 
 /// Which way a head write moves its ref, which orders a meta ref's copy write against the ref
@@ -1477,7 +1477,7 @@ pub fn recreate_pallet_head(name: &str,
                             new: &str,
                             preconditions: &RefPreconditions,
                             tombstone: &str) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, Some(tombstone), None, None, None, WriteOrder::Forward)
+    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, Some(tombstone), None, None, None, None, WriteOrder::Forward)
 }
 
 /// [`update_pallet_head_in`] for a caller that has just verified `new`'s closure itself (a
@@ -1494,7 +1494,7 @@ pub fn update_pallet_head_verified(
     verified: &VerifiedClosure,
     tombstone: Option<&str>,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified), tombstone, None, None, None, WriteOrder::Forward)
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified), tombstone, None, None, None, None, WriteOrder::Forward)
 }
 
 /// How a user pallet's ref is damaged, as [`repair_pallet_head`] expects to find it.
@@ -1514,7 +1514,7 @@ pub enum RefDamage {
 /// redaction checks apply. `preconditions` pins the trust state `new` was verified against (a
 /// rebuilt head becomes a local head, which a take does not verify again).
 pub fn repair_pallet_head(name: &str, damage: &RefDamage, new: &str, preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, None, None, Some(damage), None, WriteOrder::Forward)
+    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, None, None, Some(damage), None, None, WriteOrder::Forward)
 }
 
 /// Set damaged meta pallet `name` to `new`: heal's rebuild of a meta ref that is missing or does
@@ -1526,23 +1526,41 @@ pub fn repair_pallet_head(name: &str, damage: &RefDamage, new: &str, preconditio
 /// verified against in `preconditions`. The ref is written first and the copy only once the ref
 /// reads back at `new`, and a copy already holding those bytes is not written again, so a rebuild
 /// from the copy leaves it as it was.
+///
+/// `judged` is the head heal chose for a lost or damaged `@redactions` ref, when heal rebuilds
+/// that ref, or one beside it, before `@redactions` reads: the redaction check runs against it
+/// ([`check_head_write_judged`]), and the write is refused as moved, never checked again, when
+/// `@redactions`' ref or copy no longer stands as heal judged it.
+///
+/// [`check_head_write_judged`]: crate::util::redaction_utils::check_head_write_judged
 pub fn repair_meta_pallet_head(name: &str,
                                damage: &RefDamage,
                                copy: &MetaCopyState,
                                new: &str,
-                               preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(PalletNamespace::Meta, name, None, new, preconditions, None, None, None, Some(damage), Some(copy), WriteOrder::Forward)
+                               preconditions: &RefPreconditions,
+                               judged: Option<&crate::util::redaction_utils::JudgedRedactions>) -> Result<(), RefUpdateError> {
+    update_pallet_head_checked(PalletNamespace::Meta, name, None, new, preconditions, None, None, None, Some(damage), Some(copy), judged, WriteOrder::Forward)
+}
+
+/// Whether the ref of meta pallet `name` is still damaged as `damage` says and its copy still
+/// stands as `copy`.
+///
+/// # Returns
+/// * `Ok(false)` - Either moved.
+/// * `Err`       - Either could not be read.
+pub(crate) fn meta_ref_stands_as(name: &str, damage: &RefDamage, copy: &MetaCopyState) -> Result<bool, RefUpdateError> {
+    match require_damage(PalletNamespace::Meta, name, damage).and_then(|()| require_copy(name, copy)) {
+        Ok(()) => Ok(true),
+        Err(RefUpdateError::Moved(_)) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Refuse with [`RefUpdateError::Moved`] unless the copy of meta pallet `name` still stands as
 /// `judged`.
 fn require_copy(name: &str, judged: &MetaCopyState) -> Result<(), RefUpdateError> {
     if read_file_state(&get_meta_copy_path(name))? != *judged {
-        return Err(RefUpdateError::Moved(RefMoved {
-            reference: PalletRef { namespace: PalletNamespace::Meta, name: name.to_string() },
-            expected: None,
-            found: get_pallet_head_in(PalletNamespace::Meta, name).ok().flatten(),
-        }));
+        return Err(moved(PalletNamespace::Meta, name));
     }
 
     Ok(())
@@ -1589,14 +1607,20 @@ fn require_damage(namespace: PalletNamespace, name: &str, damage: &RefDamage) ->
     };
 
     if !holds {
-        return Err(RefUpdateError::Moved(RefMoved {
-            reference: PalletRef { namespace, name: name.to_string() },
-            expected: None,
-            found: get_pallet_head_in(namespace, name).ok().flatten(),
-        }));
+        return Err(moved(namespace, name));
     }
 
     Ok(())
+}
+
+/// [`RefUpdateError::Moved`] for a damaged ref of `name` in `namespace` that no longer stands as
+/// judged, naming the head it reads at now, if any.
+fn moved(namespace: PalletNamespace, name: &str) -> RefUpdateError {
+    RefUpdateError::Moved(RefMoved {
+        reference: PalletRef { namespace, name: name.to_string() },
+        expected: None,
+        found: get_pallet_head_in(namespace, name).ok().flatten(),
+    })
 }
 
 /// The heads of every user pallet whose ref can be read; a damaged ref is skipped. The bound of a
@@ -1663,11 +1687,13 @@ fn update_pallet_head_checked(
     served: Option<crate::util::redaction_utils::Served>,
     damaged: Option<&RefDamage>,
     copy: Option<&MetaCopyState>,
+    judged: Option<&crate::util::redaction_utils::JudgedRedactions>,
     order: WriteOrder,
 ) -> Result<(), RefUpdateError> {
     // A repair judges the write as a creation: nothing it replaces is a head.
     debug_assert!(damaged.is_none() || expected.is_none(), "a repair expects no head");
     debug_assert!(copy.is_none() || (damaged.is_some() && namespace == PalletNamespace::Meta), "only a meta repair expects a copy");
+    debug_assert!(judged.is_none() || copy.is_some(), "only a meta repair is judged against a chosen @redactions head");
 
     // Checked before the lock too, so an invalid write never waits for it.
     validate_head_write(name, new)?;
@@ -1701,7 +1727,11 @@ fn update_pallet_head_checked(
     let mut backward = served_backward(namespace, expected, new)?;
     // Its refusal, or a walk that failed, is reported only inside the hold and after the compares,
     // so a ref or precondition that moved meanwhile is what the caller hears.
-    let mut redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new, served);
+    let check_redactions = || match judged {
+        Some(judged) => crate::util::redaction_utils::check_head_write_judged(namespace, name, expected, new, judged),
+        None => crate::util::redaction_utils::check_head_write(namespace, name, expected, new, served),
+    };
+    let mut redaction = check_redactions();
 
     loop {
         #[cfg(test)]
@@ -1775,7 +1805,7 @@ fn update_pallet_head_checked(
                 let leaned_on = verify_new_head(name, expected, new, &current)?;
                 verified_at = Some((current, leaned_on));
                 // What a partial warehouse holds decided what the redaction walk skipped.
-                redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new, served);
+                redaction = check_redactions();
                 continue;
             }
         }
@@ -1783,8 +1813,14 @@ fn update_pallet_head_checked(
         // `@redactions` is written under this lock too, so a redaction either lands before this
         // hold, and the head is checked against it, or after the write.
         if !redaction.stands(&lock)? {
+            // A judged head was chosen from `@redactions` as heal found it, so once that moved,
+            // checking again would only choose the same head: the write is refused as moved.
+            if redaction.judged().is_some() {
+                return Err(moved(PalletNamespace::Meta, crate::util::redaction_utils::REDACTIONS_PALLET_NAME));
+            }
+
             drop(lock);
-            redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new, served);
+            redaction = check_redactions();
             continue;
         }
 
@@ -2839,12 +2875,12 @@ pub(crate) mod tests {
             assert_eq!(judged, ref_bytes(&h1));
 
             set_copy("tags", &h2);
-            let moved = repair_meta_pallet_head("tags", &RefDamage::Missing, &judged, &h1, &RefPreconditions::NONE);
+            let moved = repair_meta_pallet_head("tags", &RefDamage::Missing, &judged, &h1, &RefPreconditions::NONE, None);
             assert!(matches!(moved, Err(RefUpdateError::Moved(_))), "{:?}", moved);
             assert_eq!(head("tags"), None, "the ref must stay lost");
 
             set_copy("tags", &h1);
-            repair_meta_pallet_head("tags", &RefDamage::Missing, &judged, &h1, &RefPreconditions::NONE).unwrap();
+            repair_meta_pallet_head("tags", &RefDamage::Missing, &judged, &h1, &RefPreconditions::NONE, None).unwrap();
             assert_eq!(head("tags").as_deref(), Some(h1.as_str()));
         }
 
@@ -3622,6 +3658,77 @@ pub(crate) mod tests {
                 }
                 other => panic!("expected a redacted refusal, got {:?}", other),
             }
+        }
+
+        /// A meta rebuild judged against the head heal chose for a damaged `@redactions` is checked
+        /// against that head, not the ref, and is refused as moved, not checked again, once that
+        /// ref's copy or the ref itself changed before the hold, a refusal included; with both as
+        /// judged, it lands. Revert: have the hold read the `@redactions` head for a judged check
+        /// too → the damaged ref fails it, red; judge the copy alone → the ref set by hand is
+        /// written past, red; report a judged refusal without the re-read → redacted, not moved, red.
+        #[test]
+        fn a_rebuild_judged_against_a_chosen_redactions_head_is_refused_once_that_ref_moves() {
+            use crate::util::redaction_utils::{JudgedRedactions, REDACTIONS_PALLET_NAME};
+
+            let (_root, _scope) = scratch("redacted-judged");
+            redact(&blob("unrelated"));
+            let chosen = get_meta_pallet_head(REDACTIONS_PALLET_NAME).unwrap().unwrap();
+            let copy = read_meta_copy_state(REDACTIONS_PALLET_NAME).unwrap();
+            let damaged = b"not a head\n".to_vec();
+            std::fs::write(get_pallet_ref_path(PalletNamespace::Meta, REDACTIONS_PALLET_NAME), &damaged).unwrap();
+            let judged = JudgedRedactions { head: chosen.clone(), damage: RefDamage::Unreadable(damaged.clone()), copy: copy.clone() };
+
+            let h1 = super::stub_parcel("h1");
+            let tags = read_meta_copy_state("tags").unwrap();
+            let copy_path = get_meta_copy_path(REDACTIONS_PALLET_NAME);
+
+            let moved_path = copy_path.clone();
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&moved_path, format!("{}\n", super::stub_parcel("other"))).unwrap();
+            })));
+
+            match repair_meta_pallet_head("tags", &RefDamage::Missing, &tags, &h1, &RefPreconditions::NONE, Some(&judged)) {
+                Err(RefUpdateError::Moved(moved)) => assert_eq!(moved.reference, PalletRef::meta(REDACTIONS_PALLET_NAME)),
+                other => panic!("expected @redactions moved, got {:?}", other),
+            }
+            assert_eq!(get_meta_pallet_head("tags").unwrap(), None, "nothing was written");
+
+            let MetaCopyState::Bytes(bytes) = &copy else { panic!("the redaction wrote a copy") };
+            std::fs::write(&copy_path, bytes).unwrap();
+
+            // The ref set by hand to another head before the hold, its copy as judged.
+            let ref_path = get_pallet_ref_path(PalletNamespace::Meta, REDACTIONS_PALLET_NAME);
+            let moved_ref = ref_path.clone();
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&moved_ref, format!("{}\n", super::stub_parcel("other"))).unwrap();
+            })));
+            match repair_meta_pallet_head("tags", &RefDamage::Missing, &tags, &h1, &RefPreconditions::NONE, Some(&judged)) {
+                Err(RefUpdateError::Moved(moved)) => assert_eq!(moved.reference, PalletRef::meta(REDACTIONS_PALLET_NAME)),
+                other => panic!("expected @redactions moved by its ref, got {:?}", other),
+            }
+            assert_eq!(get_meta_pallet_head("tags").unwrap(), None, "nothing was written");
+
+            std::fs::write(&ref_path, &damaged).unwrap();
+
+            // A head naming the redacted blob, judged against the chosen head, while the copy
+            // moves before the hold: the move is the answer, not the redaction.
+            let named = parcel(&tree(&[("a", &blob("unrelated"), DirEntryType::Normal)]), &[]);
+            let moved_copy = copy_path.clone();
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&moved_copy, format!("{}\n", super::stub_parcel("other"))).unwrap();
+            })));
+            match repair_meta_pallet_head("tags", &RefDamage::Missing, &tags, &named, &RefPreconditions::NONE, Some(&judged)) {
+                Err(RefUpdateError::Moved(moved)) => assert_eq!(moved.reference, PalletRef::meta(REDACTIONS_PALLET_NAME)),
+                other => panic!("expected @redactions moved over the redaction, got {:?}", other),
+            }
+            std::fs::write(&copy_path, bytes).unwrap();
+            assert_redacted(
+                repair_meta_pallet_head("tags", &RefDamage::Missing, &tags, &named, &RefPreconditions::NONE, Some(&judged)),
+                "a", &blob("unrelated"),
+            );
+
+            repair_meta_pallet_head("tags", &RefDamage::Missing, &tags, &h1, &RefPreconditions::NONE, Some(&judged)).unwrap();
+            assert_eq!(get_meta_pallet_head("tags").unwrap().as_deref(), Some(h1.as_str()));
         }
 
         // Revert: skip the check → the head naming the redacted blob lands; or refuse every head

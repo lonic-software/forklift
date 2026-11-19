@@ -32,8 +32,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   they name; otherwise `heal` refuses with both heads (`ref_damaged`, exit 53). A copy lost or out
   of step beside a ref that reads is set back to the ref. The office's ref is rebuilt first, at a
   head that verifies against the anchor of the trust file or of its copy, and a trust file lost
-  beside it is then restored from its copy. The redactions' own ref is not rebuilt: while it, or an
-  office ref heal could not rebuild, is damaged, every damaged metadata ref is refused, to be set
+  beside it is then restored from its copy. The redactions' own ref (`@redactions`) is rebuilt
+  next, ahead of every other metadata ref, which is checked against it; beside a damaged office
+  the head it is to be rebuilt at is verified first, and the office is checked against that head.
+  While either ref is damaged and was not rebuilt, every damaged metadata ref is refused, to be set
   by hand.
 
 ### Changed

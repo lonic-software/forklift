@@ -2907,10 +2907,15 @@ trust file or, when that file is lost, is not a file, does not read as an anchor
 verify it, of the trust file's copy. `heal` does not rebuild it while either file was written by a
 newer version of Forklift, or while the office's history cannot be read from the store. Then `heal`
 restores a lost trust file from its copy, as it does beside an intact office, and only then
-rebuilds the other metadata refs, which are verified against both. `heal` does not rebuild the
-redactions' ref (`@redactions`). Every other metadata pallet is checked against it, so while it is
-damaged, or while the office's ref is damaged and was not rebuilt, `heal` refuses every damaged
-metadata ref, listing the head each copy names. Write the head into the file by hand.
+rebuilds the other metadata refs, which are verified against both. The redactions' ref
+(`@redactions`) comes first among them, since every other metadata pallet is checked against it.
+Its ref holds no head to check against while it is damaged, so a rebuild beside it is checked
+against the head `heal` chose for it instead. That covers `@redactions`' own rebuild, and the
+office's when both are damaged: the head chosen for `@redactions` must then verify against the
+office's rebuilt head before the office is written. If `@redactions`' ref or its copy changes while
+`heal` runs, the write is refused, not checked again. While either ref is damaged and was not
+rebuilt, `heal` refuses every damaged metadata ref, listing the head each copy names. Write the
+head into the file by hand.
 
 #### A damaged fetch scope
 

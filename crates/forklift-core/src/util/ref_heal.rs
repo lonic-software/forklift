@@ -1047,17 +1047,10 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
 /// Verify `head` as the whole history of meta pallet `name`, against the trust anchor and the
 /// office as they are now, and return the preconditions that pin both for the write.
 fn verify_meta_head(name: &str, head: &str) -> Result<pallet_utils::RefPreconditions, String> {
-    let Some(rules) = crate::util::meta_tree::meta_rules(name) else {
-        return Err("it is not a meta pallet heal has rules to verify against".to_string());
-    };
-
     let anchor = crate::util::office_utils::read_trust_anchor_with_bytes()?;
     let office_head = pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME)?;
 
-    crate::util::meta_tree::verify_meta_update(
-        name, rules, crate::util::meta_tree::Admission::Audit, anchor.as_ref().map(|(anchor, _)| anchor),
-        office_head.as_deref(), None, head,
-    ).map_err(|why| format!("parcel {} does not pass verification: {}", head, why.trim_end_matches('.')))?;
+    verify_meta_against(name, head, anchor.as_ref().map(|(anchor, _)| anchor), office_head.as_deref())?;
 
     Ok(pallet_utils::RefPreconditions {
         office: pallet_utils::OfficePrecondition::At(office_head),
@@ -1067,6 +1060,18 @@ fn verify_meta_head(name: &str, head: &str) -> Result<pallet_utils::RefPrecondit
         },
         pallets: pallet_utils::PalletsPrecondition::NotConsumed,
     })
+}
+
+/// Verify `head` as the whole history of meta pallet `name`, against `anchor` and the office at
+/// `office_head` (`None`: no anchor, or an unborn office).
+fn verify_meta_against(name: &str, head: &str, anchor: Option<&crate::util::office_utils::TrustAnchor>, office_head: Option<&str>) -> Result<(), String> {
+    let Some(rules) = crate::util::meta_tree::meta_rules(name) else {
+        return Err("it is not a meta pallet heal has rules to verify against".to_string());
+    };
+
+    crate::util::meta_tree::verify_meta_update(name, rules, crate::util::meta_tree::Admission::Audit, anchor, office_head, None, head)
+        .map(|_| ())
+        .map_err(|why| format!("parcel {} does not pass verification: {}", head, why.trim_end_matches('.')))
 }
 
 /// Set an intact meta ref's copy to the ref's bytes, when the copy is lost or differs.
@@ -1132,17 +1137,25 @@ fn is_redactions(state: &MetaState) -> bool {
 
 /// Run one repair pass over every meta ref, in three steps:
 /// 1. A lost or damaged office ref is rebuilt from its copy or its own bytes, at a head whose
-///    chain verifies against the anchor of the trust file or, failing that, of its copy, while
-///    `@redactions` reads. The write is pinned to the bytes of the file that anchor came from,
-///    not to the office, whose ref is what is being rebuilt.
+///    chain verifies against the anchor of the trust file or, failing that, of its copy. The
+///    write is pinned to both files as they were judged, not to the office, whose ref is what is
+///    being rebuilt. Beside a lost or damaged `@redactions` ref, the head that ref is to be
+///    rebuilt at is chosen and verified first, against that anchor and the office head chosen,
+///    and the office's write is checked against it; with no such head the office is refused.
 /// 2. The trust file and its copy are repaired ([`repair_trust`]), reading the office as step 1
 ///    left it, so a trust file lost beside a lost office is restored once the office stands.
-/// 3. Every meta ref that reads has a lost or differing copy set to it, and a lost or damaged
-///    ref other than the office's and `@redactions'` is rebuilt from its copy or its own bytes,
-///    verified against the anchor and the office as step 2 left them, while both of those read.
-///    A lost or damaged `@redactions` ref is refused, and so is every other damaged meta ref
-///    beside it or beside an office step 1 did not rebuild, since each is verified against the
-///    office and checked against the redactions.
+/// 3. A lost or damaged `@redactions` ref is rebuilt first, while the office reads, verified
+///    against the anchor and the office as step 2 left them, and checked against the head it is
+///    rebuilt at. Then every meta ref that reads has a lost or differing copy set to it, and
+///    every other lost or damaged one is rebuilt the same way, checked against the redactions
+///    as `@redactions` then reads. One beside an office or a `@redactions` still damaged is
+///    refused, since each is verified against the office and checked against the redactions.
+///
+/// A head chosen for `@redactions` stands in for what its ref would hold: a write checked
+/// against it is refused as moved once that ref or its copy no longer stands as heal judged it
+/// ([`JudgedRedactions`]).
+///
+/// [`JudgedRedactions`]: crate::util::redaction_utils::JudgedRedactions
 ///
 /// [`Pass::BeforeTaint`] refuses nothing and drops a write that failed, leaving both to
 /// [`Pass::AfterTaint`], which judges again.
@@ -1160,13 +1173,13 @@ pub fn repair_meta(pass: Pass) -> Result<MetaRepair, TrustStopped> {
 
     // Never fails today (what cannot be read is noted), so the trust repair below always runs.
     let states = meta_states(&mut report.notes).unwrap_or_default();
-    let redactions_damaged = states.iter().any(|state| is_redactions(state) && state.damage().is_some());
+    let redactions = states.iter().find(|state| is_redactions(state) && state.damage().is_some());
     let office = states.iter().find(|state| is_office(state) && state.damage().is_some());
-    let office_judged = office.is_some() && !redactions_damaged;
+    let mut judged = None;
 
-    if let (Some(state), false) = (office, redactions_damaged) {
+    if let Some(state) = office {
         let tainted = tainted.get_or_insert_with(|| Tainted::read(&mut report.notes));
-        rebuild_office(state, tainted, pass, &mut report);
+        judged = rebuild_office(state, redactions, tainted, pass, &mut report);
     }
 
     let trust = match crate::util::office_utils::repair_trust() {
@@ -1181,24 +1194,79 @@ pub fn repair_meta(pass: Pass) -> Result<MetaRepair, TrustStopped> {
     };
 
     if report.stopped.is_none() {
-        repair_other_meta(pass, office_judged, &mut tainted, &mut report);
+        repair_other_meta(pass, office.is_some(), judged, &mut tainted, &mut report);
     }
 
     Ok(MetaRepair { repair: report, trust })
 }
 
-/// Step 1 of [`repair_meta`]: judge the damaged office ref `state` and write it.
-fn rebuild_office(state: &MetaState, tainted: &Tainted, pass: Pass, report: &mut Repair) {
+/// What step 1 of [`repair_meta`] judged of a damaged `@redactions` beside a damaged office, for
+/// step 3, which writes it.
+enum RedactionsJudged {
+    /// The head chosen and verified, found at the source named, which the office's write was
+    /// checked against: step 3 writes this head, or none.
+    Verified(crate::util::redaction_utils::JudgedRedactions, &'static str),
+
+    /// Why no head was chosen and verified, which refused the office, and what names a head.
+    Refused(String, Vec<Candidate>),
+}
+
+/// Step 1 of [`repair_meta`]: judge the damaged office ref `state` and write it, checked against
+/// the head chosen for `redactions`, a damaged `@redactions` ref beside it.
+///
+/// # Returns
+/// * `Some(RedactionsJudged)` - What was judged of `redactions`, when the office's own judgment
+///                              got that far.
+fn rebuild_office(state: &MetaState, redactions: Option<&MetaState>, tainted: &Tainted, pass: Pass, report: &mut Repair) -> Option<RedactionsJudged> {
     let (head, source) = match choose_meta(state, tainted) {
         Ok(chosen) => chosen,
-        Err((reason, candidates)) => return refuse_in(report, state, pass, reason, candidates),
+        Err((reason, candidates)) => {
+            refuse_in(report, state, pass, reason, candidates);
+            return None;
+        }
     };
+    let candidates = || vec![Candidate { head: head.clone(), source: source.to_string() }];
 
     // The trust file's anchor first, so a copy's is used only where the trust file's does not
     // serve; the write is pinned to both files as they were judged.
-    let anchor = match crate::util::office_utils::office_rebuild_anchor(&head) {
+    let (anchor, judged_anchor) = match crate::util::office_utils::office_rebuild_anchor(&head) {
         Ok(anchor) => anchor,
-        Err(reason) => return refuse_in(report, state, pass, reason, vec![Candidate { head, source: source.to_string() }]),
+        Err(reason) => {
+            refuse_in(report, state, pass, reason, candidates());
+            return None;
+        }
+    };
+
+    // Against the anchor and the office head judged here: the office's ref reads as damaged.
+    let judged = match redactions {
+        None => None,
+        Some(redactions) => {
+            let refused = |why: &str, unjudged: (String, Vec<Candidate>)| {
+                (format!(
+                    "it is checked against the redactions, and the ref of pallet \"{}\" is damaged too, {}: set that first",
+                    redactions.wire(), why
+                ), RedactionsJudged::Refused(unjudged.0, unjudged.1))
+            };
+            let outcome = match choose_meta(redactions, tainted) {
+                Err(unjudged) => Err(refused("and heal chose no head for it", unjudged)),
+                Ok((chosen, chosen_source)) => {
+                    match verify_meta_against(crate::util::redaction_utils::REDACTIONS_PALLET_NAME, &chosen, Some(&judged_anchor), Some(&head)) {
+                        Ok(()) => Ok((judged_redactions(redactions, chosen), chosen_source)),
+                        Err(reason) => Err(refused(
+                            "with no head heal can verify",
+                            (reason, vec![Candidate { head: chosen, source: chosen_source.to_string() }]),
+                        )),
+                    }
+                }
+            };
+            match outcome {
+                Ok(judged) => Some(judged),
+                Err((reason, unjudged)) => {
+                    refuse_in(report, state, pass, reason, candidates());
+                    return Some(unjudged);
+                }
+            }
+        }
     };
 
     let preconditions = pallet_utils::RefPreconditions {
@@ -1207,7 +1275,17 @@ fn rebuild_office(state: &MetaState, tainted: &Tainted, pass: Pass, report: &mut
         pallets: pallet_utils::PalletsPrecondition::NotConsumed,
     };
 
-    write_meta_rebuild(state, head, source, &preconditions, pass, report);
+    write_meta_rebuild(state, head, source, &preconditions, judged.as_ref().map(|(judged, _)| judged), pass, report);
+    judged.map(|(judged, source)| RedactionsJudged::Verified(judged, source))
+}
+
+/// Damaged `@redactions` ref `state` as heal judged it, to be rebuilt at `head`.
+fn judged_redactions(state: &MetaState, head: String) -> crate::util::redaction_utils::JudgedRedactions {
+    crate::util::redaction_utils::JudgedRedactions {
+        head,
+        damage: state.damage().expect("only a damaged @redactions is judged"),
+        copy: state.copy.clone(),
+    }
 }
 
 /// Refuse meta ref `state` for `reason`, listing `candidates`: in [`Pass::AfterTaint`] only,
@@ -1218,13 +1296,20 @@ fn refuse_in(report: &mut Repair, state: &MetaState, pass: Pass, reason: String,
     }
 }
 
-/// Write the rebuild of damaged meta ref `state` at `head`, found at `source`, and report it.
+/// Write the rebuild of damaged meta ref `state` at `head`, found at `source`, and report it,
+/// checked against the head `judged` chose for a damaged `@redactions` when there is one.
 ///
 /// # Returns
 /// * `true` - If the pass stops here (`report.stopped` says why).
-fn write_meta_rebuild(state: &MetaState, head: String, source: &str, preconditions: &pallet_utils::RefPreconditions, pass: Pass, report: &mut Repair) -> bool {
+fn write_meta_rebuild(state: &MetaState,
+                      head: String,
+                      source: &str,
+                      preconditions: &pallet_utils::RefPreconditions,
+                      judged: Option<&crate::util::redaction_utils::JudgedRedactions>,
+                      pass: Pass,
+                      report: &mut Repair) -> bool {
     let damage = state.damage().expect("only a damaged ref is rebuilt");
-    let written = pallet_utils::repair_meta_pallet_head(&state.name, &damage, &state.copy, &head, preconditions);
+    let written = pallet_utils::repair_meta_pallet_head(&state.name, &damage, &state.copy, &head, preconditions, judged);
 
     // A write can land and still report a failure (under a standing taint, its rename goes
     // through and the taint is reported), so the ref read back decides.
@@ -1251,17 +1336,31 @@ fn write_meta_rebuild(state: &MetaState, head: String, source: &str, preconditio
 }
 
 /// Step 3 of [`repair_meta`], over the meta refs as the steps before it left them. The office is
-/// skipped when step 1 judged it (`office_judged`), which reported it.
-fn repair_other_meta(pass: Pass, office_judged: bool, tainted: &mut Option<Tainted>, report: &mut Repair) {
+/// skipped when step 1 judged it (`office_judged`), which reported it; `judged` is what step 1
+/// judged of a damaged `@redactions` beside it.
+fn repair_other_meta(pass: Pass, office_judged: bool, judged: Option<RedactionsJudged>, tainted: &mut Option<Tainted>, report: &mut Repair) {
     let states = meta_states(&mut report.notes).unwrap_or_default();
-
-    let blocking: Vec<String> = states.iter()
-        .filter(|state| state.damage().is_some() && (is_office(state) || is_redactions(state)))
-        .map(MetaState::wire)
-        .collect();
 
     if states.iter().any(|state| state.damage().is_some()) && tainted.is_none() {
         *tainted = Some(Tainted::read(&mut report.notes));
+    }
+
+    let mut blocking: Vec<String> = states.iter()
+        .filter(|state| state.damage().is_some() && is_office(state))
+        .map(MetaState::wire)
+        .collect();
+
+    // Every other meta ref's rebuild is checked against the redactions, so @redactions goes first.
+    if let Some(state) = states.iter().find(|state| state.damage().is_some() && is_redactions(state)) {
+        let tainted = tainted.as_ref().expect("read when a ref is damaged");
+
+        if !rebuild_redactions(state, &blocking, judged, tainted, pass, report) {
+            blocking.push(state.wire());
+        }
+
+        if report.stopped.is_some() {
+            return;
+        }
     }
 
     for state in &states {
@@ -1274,7 +1373,8 @@ fn repair_other_meta(pass: Pass, office_judged: bool, tainted: &mut Option<Taint
             continue;
         }
 
-        if office_judged && is_office(state) {
+        // Rebuilt above, or refused there.
+        if is_redactions(state) || (office_judged && is_office(state)) {
             continue;
         }
 
@@ -1282,19 +1382,14 @@ fn repair_other_meta(pass: Pass, office_judged: bool, tainted: &mut Option<Taint
 
         let choice = choose_meta(state, tainted.as_ref().expect("read when a ref is damaged"));
 
-        // Step 1 judges a damaged office only beside a @redactions that reads, so one met here
-        // waits on it, or was damaged after step 1 read it.
-        if is_redactions(state) || is_office(state) {
+        // Step 1 judges every office damaged when it read them, so one met here was damaged
+        // after.
+        if is_office(state) {
             let candidates = match choice {
                 Ok((head, source)) => vec![Candidate { head, source: source.to_string() }],
                 Err((_, candidates)) => candidates,
             };
-            let redactions = format!("@{}", crate::util::redaction_utils::REDACTIONS_PALLET_NAME);
-            refuse(match (is_office(state), blocking.contains(&redactions)) {
-                (true, true) => format!("heal rebuilds it only while the ref of pallet \"{}\" reads, and that is damaged too: set that first", redactions),
-                (true, false) => "it was damaged while heal ran; run \"forklift heal\" again".to_string(),
-                (false, _) => "heal does not rebuild this ref; write the head it is to hold into the ref file by hand".to_string(),
-            }, candidates);
+            refuse("it was damaged while heal ran; run \"forklift heal\" again".to_string(), candidates);
             continue;
         }
 
@@ -1323,10 +1418,81 @@ fn repair_other_meta(pass: Pass, office_judged: bool, tainted: &mut Option<Taint
             }
         };
 
-        if write_meta_rebuild(state, head, source, &preconditions, pass, report) {
+        if write_meta_rebuild(state, head, source, &preconditions, None, pass, report) {
             break;
         }
     }
+}
+
+/// Step 3's rebuild of damaged `@redactions` ref `state`: verified against the anchor and the
+/// office as step 2 left them, and checked against the head it is rebuilt at, since its ref holds
+/// none to check against. Refused while a ref in `blocking` (the office) is damaged, for the
+/// reason step 1 gave when it gave one. Where step 1 verified a head (`judged`), the office was
+/// checked against that head, so only that head is written, and only while the ref and its copy
+/// read as step 1 judged them.
+///
+/// # Returns
+/// * `true` - If the ref was rebuilt.
+fn rebuild_redactions(state: &MetaState, blocking: &[String], judged: Option<RedactionsJudged>, tainted: &Tainted, pass: Pass, report: &mut Repair) -> bool {
+    let judged = match judged {
+        Some(RedactionsJudged::Refused(reason, candidates)) => {
+            refuse_in(report, state, pass, reason, candidates);
+            return false;
+        }
+        Some(RedactionsJudged::Verified(judged, source)) => Some((judged, source)),
+        None => None,
+    };
+
+    if !blocking.is_empty() {
+        let candidates = match &judged {
+            Some((judged, source)) => vec![Candidate { head: judged.head.clone(), source: source.to_string() }],
+            None => match choose_meta(state, tainted) {
+                Ok((head, source)) => vec![Candidate { head, source: source.to_string() }],
+                Err((_, candidates)) => candidates,
+            },
+        };
+        refuse_in(report, state, pass, format!(
+            "it is verified against the office, and the ref of {} is damaged too: set that first",
+            blocking.iter().map(|wire| format!("pallet \"{}\"", wire)).collect::<Vec<_>>().join(" and ")
+        ), candidates);
+        return false;
+    }
+
+    let (judged, source) = match judged {
+        Some((judged, source)) => {
+            // What the ref and its copy name now is listed, not what step 1 judged: a head judged
+            // before they moved could set the ref back past them.
+            if state.damage().as_ref() != Some(&judged.damage) || state.copy != judged.copy {
+                let candidates = match choose_meta(state, tainted) {
+                    Ok((head, source)) => vec![Candidate { head, source: source.to_string() }],
+                    Err((_, candidates)) => candidates,
+                };
+                refuse_in(report, state, pass, "it changed while heal ran".to_string(), candidates);
+                return false;
+            }
+            (judged, source)
+        }
+        None => match choose_meta(state, tainted) {
+            Ok((head, source)) => (judged_redactions(state, head), source),
+            Err((reason, candidates)) => {
+                refuse_in(report, state, pass, reason, candidates);
+                return false;
+            }
+        },
+    };
+
+    let preconditions = match verify_meta_head(&state.name, &judged.head) {
+        Ok(preconditions) => preconditions,
+        Err(reason) => {
+            refuse_in(report, state, pass, reason, vec![Candidate { head: judged.head.clone(), source: source.to_string() }]);
+            return false;
+        }
+    };
+
+    let before = report.rebuilt.len();
+    write_meta_rebuild(state, judged.head.clone(), source, &preconditions, Some(&judged), pass, report);
+
+    report.rebuilt.len() > before
 }
 
 #[cfg(test)]
@@ -1347,5 +1513,51 @@ mod tests {
 
         let tainted = Tainted { hashes: BTreeSet::from(["f".repeat(HASH_LENGTH)]), torn: false };
         assert_eq!(judge(vec![one.clone(), two.clone(), "f".repeat(HASH_LENGTH)], &tainted), Salvage::Ambiguous(vec![one, two], true));
+    }
+
+    /// Record an unsigned redaction of a blob of `content`, and return the `@redactions` head.
+    fn redact(content: &str) -> String {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::util::redaction_utils::{record_redaction, Redaction, REDACTIONS_PALLET_NAME};
+
+        let mut blob = LooseObjectBuilder::build_blob(&crate::model::blob::Blob { content: content.as_bytes().to_vec() });
+        blob.store().unwrap();
+        let redaction = Redaction { hash: blob.hash.clone(), reason: "leaked".to_string(), redacted_at: 0, chunks: None };
+        let operator = crate::model::operator::Operator { identifier: "test".to_string() };
+        record_redaction(&redaction, &crate::util::meta_tree::MetaWriter::Unsigned, &operator).unwrap();
+        pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME).unwrap().unwrap()
+    }
+
+    // The office was checked against the @redactions head step 1 chose, so step 3 writes that
+    // head or none. Mutation: have step 3 choose again from the ref as it then reads → the copy
+    // moved back to an older head that verifies is written, red.
+    #[test]
+    fn redactions_is_written_at_the_head_the_office_was_checked_against_or_not_at_all() {
+        use crate::util::redaction_utils::REDACTIONS_PALLET_NAME;
+
+        let (_root, _scope) = scratch("ref-heal-redactions-pinned");
+        let older = redact("one");
+        let chosen = redact("two");
+        let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, REDACTIONS_PALLET_NAME);
+        std::fs::write(&ref_path, b"not a head\n").unwrap();
+
+        let state_named = |notes: &mut Vec<String>| meta_states(notes).unwrap().into_iter()
+            .find(|state| is_redactions(state)).unwrap();
+        let mut notes = Vec::new();
+        let judged = judged_redactions(&state_named(&mut notes), chosen.clone());
+
+        // Between step 1 and step 3, the copy moves back to the older head.
+        std::fs::write(pallet_utils::get_meta_copy_path(REDACTIONS_PALLET_NAME), format!("{}\n", older)).unwrap();
+        let state = state_named(&mut notes);
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false };
+        let mut report = Repair::default();
+
+        let rebuilt = rebuild_redactions(&state, &[], Some(RedactionsJudged::Verified(judged, FROM_COPY)), &clean, Pass::AfterTaint, &mut report);
+        assert!(!rebuilt && report.rebuilt.is_empty(), "{:?}", report.rebuilt);
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(report.refused[0].reason, "it changed while heal ran");
+        assert_eq!(report.refused[0].candidates.iter().map(|c| c.head.as_str()).collect::<Vec<_>>(), vec![older.as_str()],
+            "what the copy names now, not what step 1 judged");
+        assert_eq!(std::fs::read(&ref_path).unwrap(), b"not a head\n", "nothing was written");
     }
 }
