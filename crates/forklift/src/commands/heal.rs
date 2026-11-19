@@ -429,14 +429,14 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     refs_rebuilt.extend(meta_second.rebuilt);
     ref_notes.extend(meta_second.notes);
     if let Some(error) = meta_second.stopped {
-        return Err(refused_too(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), &meta_second.refused));
+        return Err(refused_too(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), meta_second.refused.iter()));
     }
 
     let second = ref_heal::repair(Pass::AfterTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(second.rebuilt);
     ref_notes.extend(second.notes);
     if let Some(error) = second.stopped {
-        return Err(refused_too(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), &second.refused));
+        return Err(refused_too(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), meta_second.refused.iter().chain(&second.refused)));
     }
     let mut refs_refused = second.refused;
     refs_refused.extend(meta_second.refused);
@@ -1387,18 +1387,7 @@ fn with_report(report: &HealReport, refused: CoreError, also: Vec<String>) -> Co
 
 /// The `ref_damaged` refusal of a run that left a damaged ref standing, carrying the whole report.
 fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
-    let mut lines = Vec::new();
-
-    for refused in &report.refs_refused {
-        lines.push(format!("The ref of pallet \"{}\" was not rebuilt: {}.", refused.pallet, refused.reason));
-
-        if refused.candidates.is_empty() {
-            lines.push("  Nothing names a head for it.".to_string());
-        }
-        for candidate in &refused.candidates {
-            lines.push(format!("  {} ({})", candidate.head, candidate.source));
-        }
-    }
+    let mut lines = refusal_lines(&report.refs_refused);
 
     if let Some(unfinished) = unfinished {
         lines.push(format!("{}.", unfinished.trim_end_matches('.')));
@@ -1424,11 +1413,27 @@ fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
     )
 }
 
-/// `error`, with a line for each ref the pass refused before it stopped.
-fn refused_too(error: String, refused: &[ref_heal::Refused]) -> String {
-    refused.iter().fold(error, |error, refused| forklift_core::error::append_to_message(
-        error, &format!("The ref of pallet \"{}\" was not rebuilt either: {}.", refused.pallet, refused.reason)
-    ))
+/// Each refused ref's line, then its candidate heads, which the hand step writes.
+fn refusal_lines<'a>(refused: impl IntoIterator<Item = &'a ref_heal::Refused>) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for refused in refused {
+        lines.push(format!("The ref of pallet \"{}\" was not rebuilt: {}.", refused.pallet, refused.reason));
+
+        if refused.candidates.is_empty() {
+            lines.push("  Nothing names a head for it.".to_string());
+        }
+        for candidate in &refused.candidates {
+            lines.push(format!("  {} ({})", candidate.head, candidate.source));
+        }
+    }
+
+    lines
+}
+
+/// `error`, with the refusal lines of every ref refused before the pass stopped.
+fn refused_too<'a>(error: String, refused: impl IntoIterator<Item = &'a ref_heal::Refused>) -> String {
+    refusal_lines(refused).iter().fold(error, |error, line| forklift_core::error::append_to_message(error, line))
 }
 
 /// Restore the checkout's scope from its copy, or set it to the paths `--scope` named.

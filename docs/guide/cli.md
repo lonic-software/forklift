@@ -2899,8 +2899,8 @@ from the parcel the damaged file's remaining bytes still name, as for a pallet's
 name a head and they differ, the copy is taken only when it descends from the other along first
 parents, which is where a write interrupted moving the pallet forward leaves it; otherwise `heal`
 changes nothing and refuses with `ref_damaged`, naming both. The head chosen must verify as that
-pallet's history, against the office, before it is written. A copy that is lost or names another head beside a ref that reads is set
-to the ref's head, with a `Note:`.
+pallet's history, against the office, before it is written. A copy that is lost or names another
+head beside a ref that reads is set to the ref's head, with a `Note:`.
 
 `heal` does not rebuild the office's ref (`@office`) or the redactions' (`@redactions`). Every
 other metadata pallet is checked against both, so while either is damaged, `heal` refuses every

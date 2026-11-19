@@ -953,7 +953,7 @@ fn meta_states(notes: &mut Vec<String>) -> Result<Vec<MetaState>, String> {
 
         match pallet_utils::read_meta_copy_state(&name) {
             Ok(pallet_utils::MetaCopyState::Other) if reference.is_none() => push_note(notes, format!(
-                "Something that is not a file stands at the copy of pallet \"{}\"'s ref (\"{}\"), which has no ref, so heal took the pallet as never written.",
+                "Something that is not a file stands at the copy of pallet \"{}\"'s ref (\"{}\"), which has no ref: it names no head, so heal did not judge that ref.",
                 meta_wire(&name), pallet_utils::get_meta_copy_path(&name).to_string_lossy()
             )),
             Ok(copy) => states.push(MetaState { name, reference, copy }),
