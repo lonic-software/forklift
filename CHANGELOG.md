@@ -55,7 +55,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   a newer version wrote), upgrading; and where the trust state refuses, `heal` again when it restores
   the trust file from its copy, else a way out of that refusal (a lost anchor's, or one the trust
   file's own refusal names) or settling why the office does not verify. A command that reads a damaged metadata
-  ref names `forklift heal`, never the removal. A removal stopped after the ref went still reports it, and a rerun
+  ref never names the removal: it names `forklift heal`, or, where `heal` would not judge the ref
+  (its copy cannot be read, or something that is not a file stands at the ref's or the copy's path),
+  the step that lets it. A removal stopped after the ref went still reports it, and a rerun
   keeps the bytes in the same file. `--json`: each `refs_removed` entry's `kept` is replaced by
   `kept_ref` and `kept_copy`, each the file one role's bytes were kept in, or null (schema 61).
 
@@ -71,7 +73,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   written: `tag list` printed no tags, `lower` took the remote's head as a first adoption, and
   garbage collection held nothing for it. The next step names `forklift heal` when the copy holds a
   parcel hash, or a damaged ref's own bytes name one parcel, and the hand fix otherwise; a copy
-  that cannot be read, or a link at its path, is refused, naming what to make readable or replace. A ref lost together with its copy still reads as empty. `heal`'s `objects_lost`
+  that cannot be read, or a link at its path, is refused, naming what to make readable or replace.
+  A link at any pallet's ref path is never followed: it refuses as blocked, naming moving it aside,
+  and `heal` leaves it with the same step. A ref lost together with its copy still reads as empty. `heal`'s `objects_lost`
   report names each pallet whose ref could not be read (`pallets_unread` in `--json`) instead of
   leaving it out, and no longer says no pallet's history reaches the objects while one is named (`--json`
   schema 60).

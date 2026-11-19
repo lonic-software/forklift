@@ -878,7 +878,7 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
         match anchor_serves(&Ok(bytes.clone()), &anchor, Some(head), served) {
             Ok(true) => return Ok((pallet_utils::AnchorPrecondition::Files { trust: trust.clone(), copy: copy.clone() }, anchor)),
             Ok(false) => said.push((UNVERIFIED_ANCHOR.to_string(), AnchorRefusal::Own(Verdict::AnchorRefused))),
-            Err(ChainUnjudged::Unread(why, crate::util::file_utils::ReadFault::Decided(decided))) => said.push((format!(
+            Err(ChainUnjudged::Unread(why, crate::util::audit_utils::ChainFault::Decided(decided))) => said.push((format!(
                 "holds an anchor whose chain to the head the store holds damaged or absent ({})",
                 crate::error::frames_without_steps(&why).trim_end_matches('.')
             ), AnchorRefusal::Own(Verdict::Object(decided)))),
@@ -886,11 +886,11 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
                 "holds an anchor whose chain to the head crosses a damaged signature ({})",
                 crate::error::frames_without_steps(&why).trim_end_matches('.')
             ), AnchorRefusal::Unread)),
-            Err(ChainUnjudged::Unread(why, crate::util::file_utils::ReadFault::Untold)) => said.push((format!(
+            Err(ChainUnjudged::Unread(why, crate::util::audit_utils::ChainFault::Untold)) => said.push((format!(
                 "holds an anchor whose chain to the head could not be read ({})",
                 crate::error::frames_without_steps(&why).trim_end_matches('.')
             ), AnchorRefusal::Unread)),
-            Err(ChainUnjudged::Newer(why) | ChainUnjudged::Unread(why, crate::util::file_utils::ReadFault::Newer)) => said.push((format!(
+            Err(ChainUnjudged::Newer(why)) => said.push((format!(
                 "holds an anchor whose chain to the head is in a version this Forklift does not read ({})",
                 crate::error::frames_without_steps(&why).trim_end_matches('.')
             ), AnchorRefusal::Newer)),
@@ -1896,7 +1896,7 @@ enum TrustJudged {
 enum ChainUnjudged {
     /// The store could not give a part of it; the fault says whether the store decided about that
     /// part ([`OfficeChainError::Unreadable`](crate::util::audit_utils::OfficeChainError::Unreadable)).
-    Unread(String, crate::util::file_utils::ReadFault),
+    Unread(String, crate::util::audit_utils::ChainFault),
 
     /// A signature of it reads but is damaged: no verdict on the history it signs.
     SignatureDamaged(String),

@@ -1698,12 +1698,11 @@ pub fn verify_meta_update(pallet: &str,
     // nothing of its parcels.
     let office = match (anchor, office_head) {
         (Some(anchor), Some(office_head)) => Some(audit_utils::verify_office_chain_memoized(anchor, office_head).map_err(|error| match error {
-            audit_utils::OfficeChainError::Newer(message)
-            | audit_utils::OfficeChainError::Unreadable(message, file_utils::ReadFault::Newer) => MetaCheckError::Newer(message),
-            audit_utils::OfficeChainError::Unreadable(message, file_utils::ReadFault::Untold) => MetaCheckError::Untold(message),
+            audit_utils::OfficeChainError::Newer(message) => MetaCheckError::Newer(message),
+            audit_utils::OfficeChainError::Unreadable(message, audit_utils::ChainFault::Untold) => MetaCheckError::Untold(message),
             // The store decided about part of the office chain, or holds a signature of it
             // damaged: nothing of the pallet is unread, and the office's history does not verify.
-            audit_utils::OfficeChainError::Unreadable(message, file_utils::ReadFault::Decided(_))
+            audit_utils::OfficeChainError::Unreadable(message, audit_utils::ChainFault::Decided(_))
             | audit_utils::OfficeChainError::SignatureDamaged(message)
             | audit_utils::OfficeChainError::Inauthentic(message)
             | audit_utils::OfficeChainError::Unauthorized { message, .. } => MetaCheckError::Trust(message, TrustGap::ChainRefused),

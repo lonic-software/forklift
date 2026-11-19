@@ -2894,8 +2894,10 @@ are in `details` under `--json`). Choose one yourself:
   own step, else settling why; for a format this Forklift does not know, upgrading; and for a trust
   state that refuses, `forklift heal` where heal restores the trust file from its copy, else a
   way out of that refusal (a lost anchor's, or one the trust file's own refusal names) or settling
-  why the office does not verify against the anchor. A command that reads a damaged metadata ref names
-  `forklift heal`, never the removal: only `heal` judges whose a refusal is.
+  why the office does not verify against the anchor. A command that reads a damaged metadata ref never
+  names the removal, since only `heal` judges whose a refusal is: it names `forklift heal`, or, where
+  `heal` would not judge the ref (its copy cannot be read, or something that is not a file stands at
+  the ref's or the copy's path), the step that lets it.
 
 Both refuse a ref that is readable. A refusal also lists any ref the same run already set or
 removed. The report lists `refs_rebuilt`, `refs_removed` and
@@ -2920,7 +2922,9 @@ head beside a ref that reads is set to the ref's head, with a `Note:`.
 Until then, every other command that reads such a ref refuses with `ref_damaged` (exit 53) rather
 than read it as a pallet never written, and names `forklift heal` when the copy holds a parcel hash,
 or the damaged file names one parcel. A ref lost together with its copy leaves
-nothing to tell it from one never written, and reads as empty.
+nothing to tell it from one never written, and reads as empty. A link at any pallet's ref path is
+never followed: the read refuses it as blocked, naming moving it aside, and `heal` leaves it with
+a `Note:` naming the same.
 
 The office's ref (`@office`) is rebuilt first, and its head must verify against the anchor of the
 trust file or, when that file is lost, is not a file, does not read as an anchor or does not

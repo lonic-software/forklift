@@ -2547,9 +2547,10 @@ pub enum ReadFault {
     /// The store gave the object whole, its bytes matching its address, but this build cannot
     /// parse them. The store verifies every object it gives, so this is never damage: a newer
     /// Forklift may have written it, and only a build that reads it can judge it. No verdict on
-    /// the object. A loose-object parse of verified bytes gives this, never a
-    /// [`ReadFault::Decided`]; only a whole object of a kind this build knows, which is not the
-    /// kind asked for, is a verdict ([`Decided::OtherKind`]).
+    /// the object. The store's own parse of an object's verified bytes (its envelope and kind)
+    /// gives this, never a [`ReadFault::Decided`]; only a whole object of a kind this build knows,
+    /// which is not the kind asked for, is a verdict ([`Decided::OtherKind`]). What an object
+    /// holds (a meta cell, a spine, an office record) is judged by its own reader, not as this.
     Newer,
 }
 

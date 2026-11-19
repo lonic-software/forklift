@@ -28,8 +28,9 @@ pub enum OfficeChainError {
     /// A parcel of the chain, or its signature, could not be read from the store. That says
     /// nothing of whether the chain is authentic, only that it cannot be told. The fault says
     /// whether the store decided about the parcel (absent, damaged, another kind of object), or
-    /// said nothing of it; a signature the store cannot give is told as saying nothing.
-    Unreadable(String, crate::util::file_utils::ReadFault),
+    /// said nothing of it; a signature the store cannot give is told as saying nothing. Bytes the
+    /// store gave whole that this build cannot parse are [`OfficeChainError::Newer`], never this.
+    Unreadable(String, ChainFault),
     /// A parcel's signature reads but does not decode in the version it names, or decodes in a form
     /// no check can run on (not 64 bytes): the store holds that signature damaged, while the parcel
     /// it signs may be whole. No verdict on the chain's history (a damaged version byte reads as
@@ -47,6 +48,16 @@ pub enum OfficeChainError {
         /// The refusal, phrased for the user.
         message: String,
     },
+}
+
+/// What a store read of the office chain that failed says of the part it asked for: the
+/// [`ReadFault`](crate::util::file_utils::ReadFault)s that are no parse of whole bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainFault {
+    /// The store decided about it: absent, damaged, or another kind of object.
+    Decided(crate::util::file_utils::Decided),
+    /// The read says nothing of it.
+    Untold,
 }
 
 impl OfficeChainError {
@@ -81,8 +92,9 @@ impl From<OfficeChainError> for String {
 /// Office history is linear: the chain is walked head → genesis, then verified forward.
 /// Each parcel is checked for two things:
 ///
-/// * **Authentic**: signed by a key that was active in the *previous* office state, with
-///   every key it adds carrying valid proofs (proof-of-possession, endorsement, chain to the
+/// * **Authentic**: signed by a key that was active in the *previous* office state, checked
+///   before its records are parsed (a record this build cannot parse is a newer build's only in
+///   a parcel the office signed), with every key it adds carrying valid proofs (proof-of-possession, endorsement, chain to the
 ///   identity root). Introducing a key and signing with it in the same
 ///   parcel is only valid at the genesis (that self-signature is the trust-on-first-use
 ///   anchor).
@@ -124,16 +136,6 @@ impl From<OfficeChainError> for String {
 ///                                              breaks key permanence, exceeds its signer's
 ///                                              privileges, or adds a key endorsed beyond
 ///                                              its authorizer's authority.
-/// A store read of the office chain that failed, as [`OfficeChainError`] tells it: bytes this
-/// build cannot parse are [`OfficeChainError::Newer`], so [`OfficeChainError::Unreadable`] never
-/// carries [`ReadFault::Newer`](crate::util::file_utils::ReadFault::Newer).
-fn chain_unreadable((message, fault): (String, crate::util::file_utils::ReadFault)) -> OfficeChainError {
-    match fault {
-        crate::util::file_utils::ReadFault::Newer => OfficeChainError::Newer(message),
-        fault => OfficeChainError::Unreadable(message, fault),
-    }
-}
-
 pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<OfficeState, OfficeChainError> {
     use OfficeChainError::{Inauthentic, Newer, Unauthorized};
 
@@ -221,6 +223,16 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
     Ok(previous_state.expect("the chain contains at least the genesis"))
 }
 
+/// A store read of the office chain that failed, as [`OfficeChainError`] tells it: bytes this
+/// build cannot parse are [`OfficeChainError::Newer`].
+fn chain_unreadable((message, fault): (String, crate::util::file_utils::ReadFault)) -> OfficeChainError {
+    match fault {
+        crate::util::file_utils::ReadFault::Newer => OfficeChainError::Newer(message),
+        crate::util::file_utils::ReadFault::Decided(decided) => OfficeChainError::Unreadable(message, ChainFault::Decided(decided)),
+        crate::util::file_utils::ReadFault::Untold => OfficeChainError::Unreadable(message, ChainFault::Untold),
+    }
+}
+
 /// The operator whose key, active in `state`, signed office parcel `hash`: the refusal when its
 /// signature cannot be read, is damaged or no check can run on it says nothing of the chain; one
 /// that is missing, by a key `state` does not track or revoked in it, or that does not verify is
@@ -230,7 +242,7 @@ fn office_parcel_signer(hash: &str, state: &OfficeState) -> Result<String, Offic
 
     // A signature the store cannot give is unreadable, not a verdict: only what reads is judged
     // below.
-    let raw = sign_utils::load_raw_parcel_signature(hash).map_err(|message| Unreadable(message, crate::util::file_utils::ReadFault::Untold))?;
+    let raw = sign_utils::load_raw_parcel_signature(hash).map_err(|message| Unreadable(message, ChainFault::Untold))?;
     let signature = raw.map(|bytes| sign_utils::decode_stored_parcel_signature_classified(&bytes, hash)).transpose().map_err(|refused| match refused {
         sign_utils::SignatureDecode::Newer(message) => Newer(message),
         sign_utils::SignatureDecode::Damaged(message) => SignatureDamaged(message),
