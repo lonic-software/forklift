@@ -551,10 +551,13 @@ fn encode_parcel_signature(signature: &ParcelSignature) -> Vec<u8> {
 ///                                   signature cannot be read or does not parse, which for a newer
 ///                                   format version also says an upgrade may read it.
 pub fn load_parcel_signature(parcel_hash: &str) -> Result<Option<ParcelSignature>, String> {
-    match load_raw_parcel_signature(parcel_hash)? {
-        Some(bytes) => parse_parcel_signature(&bytes, parcel_hash).map(Some).map_err(|why| stored_signature_refusal(&bytes, why)),
-        None => Ok(None),
-    }
+    load_raw_parcel_signature(parcel_hash)?.map(|bytes| decode_stored_parcel_signature(&bytes, parcel_hash)).transpose()
+}
+
+/// Parse the stored signature `bytes` of parcel `parcel_hash`, which
+/// [`load_raw_parcel_signature`] read, refusing as [`load_parcel_signature`] does.
+pub(crate) fn decode_stored_parcel_signature(bytes: &[u8], parcel_hash: &str) -> Result<ParcelSignature, String> {
+    parse_parcel_signature(bytes, parcel_hash).map_err(|why| stored_signature_refusal(bytes, why))
 }
 
 /// The refusal of a parcel's stored signature, `bytes`, that does not parse, for `why`: always

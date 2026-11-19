@@ -155,13 +155,13 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
 
         // A signature the store cannot give is unreadable, not a verdict: only what reads is
         // judged below.
-        sign_utils::load_raw_parcel_signature(hash).map_err(|message| Unreadable(message, crate::util::file_utils::ReadFault::Untold))?;
-        verify_one_signature(hash, lookup_state, "office parcel").map_err(Inauthentic)?;
+        let raw = sign_utils::load_raw_parcel_signature(hash).map_err(|message| Unreadable(message, crate::util::file_utils::ReadFault::Untold))?;
+        let signature = raw.map(|bytes| sign_utils::decode_stored_parcel_signature(&bytes, hash)).transpose().map_err(Inauthentic)?;
+        verify_signature_of(hash, signature.as_ref(), lookup_state, "office parcel").map_err(Inauthentic)?;
 
         // A revoked key must not extend the office chain: the signer has to be
         // active in the state the signature is checked against.
-        let signature = sign_utils::load_parcel_signature(hash).map_err(Inauthentic)?
-            .expect("verify_one_signature loaded this signature");
+        let signature = signature.expect("verify_signature_of refuses a parcel with no signature");
 
         let signer = lookup_state.find_key(&signature.key_id)
             .filter(|key| key.is_active())
@@ -853,7 +853,13 @@ pub fn classify_parcel_trust(hash: &str, office_state: &OfficeState) -> Result<S
 /// re-reading the parcel body. For callers that already hold (and so already proved) the
 /// body — the presence guarantee is theirs to keep.
 pub fn classify_signature_trust(hash: &str, office_state: &OfficeState) -> Result<SignatureTrust, String> {
-    let trust = match sign_utils::load_parcel_signature(hash)? {
+    classify_signature_of(hash, sign_utils::load_parcel_signature(hash)?, office_state)
+}
+
+/// [`classify_signature_trust`] of the signature `signature` already read for parcel `hash`
+/// (`None`: it has none).
+pub(crate) fn classify_signature_of(hash: &str, signature: Option<sign_utils::ParcelSignature>, office_state: &OfficeState) -> Result<SignatureTrust, String> {
+    let trust = match signature {
         None => SignatureTrust::Unsigned,
 
         Some(signature) if office_state.find_key(&signature.key_id).is_none() => {
@@ -861,7 +867,7 @@ pub fn classify_signature_trust(hash: &str, office_state: &OfficeState) -> Resul
         }
 
         Some(signature) => {
-            verify_one_signature(hash, office_state, "parcel")?;
+            verify_signature_of(hash, Some(&signature), office_state, "parcel")?;
 
             let key = office_state.find_key(&signature.key_id)
                 .expect("verify_one_signature found this key");
@@ -1735,8 +1741,16 @@ fn verify_self_service_change(previous: &OfficeState,
 pub fn verify_one_signature(parcel_hash: &str,
                             state: &OfficeState,
                             kind: &str) -> Result<(), String> {
-    let signature = sign_utils::load_parcel_signature(parcel_hash)?
-        .ok_or(format!("The {} {} carries no signature.", kind, parcel_hash))?;
+    verify_signature_of(parcel_hash, sign_utils::load_parcel_signature(parcel_hash)?.as_ref(), state, kind)
+}
+
+/// [`verify_one_signature`] of the signature `signature` already read for `parcel_hash` (`None`:
+/// it has none).
+pub(crate) fn verify_signature_of(parcel_hash: &str,
+                                  signature: Option<&sign_utils::ParcelSignature>,
+                                  state: &OfficeState,
+                                  kind: &str) -> Result<(), String> {
+    let signature = signature.ok_or(format!("The {} {} carries no signature.", kind, parcel_hash))?;
 
     let key = state.find_key(&signature.key_id)
         .ok_or(format!(

@@ -382,6 +382,19 @@ fn remove_ref_drops_only_an_unreadable_ref_nothing_names() {
     assert!(removed["kept_copy"].is_null(), "a user pallet has no copy: {}", value);
     assert!(!ref_path(&root, "side").exists());
 
+    // A numbered slot holding the same bytes may be another pallet's (here a pallet "side.1"'s
+    // removal), so a second removal of "side" keeps its bytes in a free one.
+    // Mutation: reuse a slot holding the same bytes for a user ref → kept in side.1 → red.
+    let removed_refs = root.join(".forklift").join("removed-refs");
+    std::fs::write(removed_refs.join("side"), b"other").unwrap();
+    std::fs::write(removed_refs.join("side.1"), &zeros).unwrap();
+    std::fs::write(ref_path(&root, "side"), &zeros).unwrap();
+    let output = area.run_ok(&root, &["--json", "heal", "--remove-ref", "side"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let kept = value["data"]["refs_removed"][0]["kept_ref"].as_str().unwrap().to_string();
+    assert!(kept.ends_with("side.2"), "{}", value);
+    assert_eq!(std::fs::read(removed_refs.join("side.2")).unwrap(), zeros);
+
     // Nothing is left to heal.
     healed(&area, &root);
 }

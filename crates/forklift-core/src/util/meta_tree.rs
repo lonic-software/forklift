@@ -1782,8 +1782,9 @@ fn verify_meta_signature<'o>(pallet: &str,
                              distrust_boundaries: &mut DistrustBoundaryMemo) -> Result<Option<&'o KeyRecord>, MetaCheckError> {
     // A signature or a boundary the store cannot give says nothing of the parcel; only what
     // reads is judged, as the office chain's walk judges its own.
-    sign_utils::load_raw_parcel_signature(hash)?;
-    match audit_utils::classify_signature_trust(hash, office).map_err(MetaCheckError::Content)? {
+    let signature = sign_utils::load_raw_parcel_signature(hash)?
+        .map(|bytes| sign_utils::decode_stored_parcel_signature(&bytes, hash)).transpose().map_err(MetaCheckError::Content)?;
+    match audit_utils::classify_signature_of(hash, signature, office).map_err(MetaCheckError::Content)? {
         SignatureTrust::Verified { key_id } => {
             Ok(Some(office.find_key(&key_id).expect("classify_signature_trust found this key")))
         }

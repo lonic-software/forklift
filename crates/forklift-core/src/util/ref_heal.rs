@@ -902,20 +902,25 @@ pub fn remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<Remov
         unreachable!("admit_remove admits only an unreadable ref");
     };
 
-    let kept = kept_path(pallet, bytes);
+    let kept = kept_path(pallet, None);
 
     pallet_utils::remove_damaged_ref(pallet, bytes, &kept).map_err(|error| error.to_string())?;
 
     Ok(Removed { pallet: pallet.to_string(), kept_ref: Some(kept.to_string_lossy().into_owned()), kept_copy: None })
 }
 
-/// The path under the removed-refs folder for `bytes` removed from `stem`'s file: the first that
-/// is free, or that holds those bytes already, as a removal stopped before it finished leaves it.
-fn kept_path(stem: &str, bytes: &[u8]) -> std::path::PathBuf {
+/// The path under the removed-refs folder for bytes removed from `stem`'s file: the first that is
+/// free, or, given `held`, that holds those bytes already, as a meta removal stopped before it
+/// finished leaves it. A user pallet's numbered slot can be another pallet's own (`a.1` is
+/// pallet `a`'s second and pallet `a.1`'s first), so a user removal takes a free one only. A meta
+/// stem is `@` and a meta pallet's name, which no user pallet name can spell and which holds no
+/// dot, so its slots and its copy's are its own (pinned by
+/// `meta_kept_slots_are_no_other_pallets`).
+fn kept_path(stem: &str, held: Option<&[u8]>) -> std::path::PathBuf {
     let folder = forklift_root().join(FOLDER_NAME_REMOVED_REFS);
     let stem = stem.replace('/', "%2F");
     (0..).map(|n| folder.join(match n { 0 => stem.clone(), n => format!("{}.{}", stem, n) }))
-        .find(|path| !path.exists() || std::fs::read(path).is_ok_and(|held| held == bytes))
+        .find(|path| !path.exists() || held.is_some_and(|bytes| std::fs::read(path).is_ok_and(|kept| kept == bytes)))
         .expect("an unbounded range always yields a free name")
 }
 
@@ -1033,11 +1038,11 @@ fn remove_meta_ref(wire: &str, judged: &[Refused], unjudged: &[String], notes: &
 
     // The ref's stem and the copy's never collide: neither is a prefix of the other's names.
     let kept_ref = match &meta.damage {
-        RefDamage::Unreadable(bytes) => Some(kept_path(wire, bytes)),
+        RefDamage::Unreadable(bytes) => Some(kept_path(wire, Some(bytes))),
         _ => None,
     };
     let kept_copy = match &meta.copy {
-        pallet_utils::MetaCopyState::Bytes(bytes) => Some(kept_path(&format!("{}.copy", wire), bytes)),
+        pallet_utils::MetaCopyState::Bytes(bytes) => Some(kept_path(&format!("{}.copy", wire), Some(bytes))),
         _ => None,
     };
     let said = |path: &Option<std::path::PathBuf>| path.as_ref().map(|path| path.to_string_lossy().into_owned());
@@ -1880,6 +1885,16 @@ fn rebuild_redactions(state: &MetaState, blocking: &[String], judged: Option<Red
 mod tests {
     use super::*;
     use crate::util::pallet_utils::tests::{scratch, stub_parcel};
+
+    // What lets a meta removal reuse a kept slot holding its bytes: no user pallet can be named
+    // `@…`, and no meta name has a dot, so `@<name>.<n>` and `@<name>.copy` are that pallet's own.
+    #[test]
+    fn meta_kept_slots_are_no_other_pallets() {
+        for name in crate::util::meta_tree::META_PALLET_NAMES {
+            assert!(!name.contains('.'), "{}", name);
+            assert!(pallet_utils::validate_pallet_name(&format!("@{}", name)).is_err(), "{}", name);
+        }
+    }
 
     // Mutation: judge two matching parcels as Nothing → the ref's bytes stop being a floor and
     // `--remove-ref` may drop a ref they name → red.
