@@ -213,6 +213,17 @@ Notes:
   It checks out the full history, since a shallow repository is refused, and runs on a pull request
   only when the workflow file itself changes. Like the per-OS checks it is outside `ci passed` and
   its run step continues on error.
+- The `proof load replay` check (the `replay` job of `.github/workflows/proof-load.yml`, Linux)
+  replays every two-parent merge of this repository's history on every pull request, the merge
+  the pull request would land included, with `proof-load replay --ref ${{ github.sha }}`, and
+  compares each with git's. It is outside `ci passed`, but its run step does not continue on error:
+  a divergence, a gap, or a refused or error row with no entry in
+  `crates/proof-load/replay-tickets.json` fails it
+  ([the guide](proof-load.md#tickets-and-the-verdict) has the rules).
+- The `proof load replay git` check (the `replay-git` job of
+  `.github/workflows/proof-load-history.yml`, Linux) runs on the history job's triggers. It
+  replays a seeded sample of 200 merges of git.git at a pinned commit, with the same verdict. It
+  is outside `ci passed`, and its run step does not continue on error.
 - The `proof load perf` check (`.github/workflows/proof-load-perf.yml`, Linux) times Forklift
   against git with `proof-load perf --shape small --reps 3 --gate self`, on every push to `main`
   and on a pull request that touches `crates/forklift-core/`, `crates/forklift/`,
@@ -700,7 +711,7 @@ it touched, or that none applied. When a change alters:
   and the lines under a server's startup line are everything its terminal prints later; a `git`
   step runs with none of the developer's git configuration. The module comment of `guide_pages.rs`
   says how each of these runs;
-- **Proof Load's fault classes, grades, flags, lanes, report or perf report** → update
+- **Proof Load's fault classes, grades, flags, lanes, report, perf report or replay report** → update
   [`proof-load.md`](proof-load.md), and the READMEs of `crates/proof-load` and
   `tools/proof-load-desktop` where they show it. Two tests in `cargo test -p proof-load` fail when
   the page leaves out a fault class, a grade or a flag of any `proof-load` subcommand;
@@ -720,7 +731,10 @@ it touched, or that none applied. When a change alters:
   the entry, with the measurement;
 - **a row `proof-load perf` judges clearly slower, or one it no longer does** → add or remove its
   entry in `crates/proof-load/perf-tickets.json`, as
-  [the guide's performance section](proof-load.md#the-verdict) says.
+  [the guide's performance section](proof-load.md#the-verdict) says;
+- **a merge `proof-load replay` fails on, or one a change fixes** → add its entry in
+  `crates/proof-load/replay-tickets.json`, or remove it with the fix, as
+  [the guide's replay section](proof-load.md#tickets-and-the-verdict) says.
 
 The guides intentionally *reference* rather than duplicate `SERVER.md`,
 `MACHINE_INTERFACE.md`, `DESIGN.html`, and `format/`, so there's a single place to

@@ -10,7 +10,8 @@
 //! through a proxy every host is served behind (with a killed server restarted), a check that every
 //! server route the version's route table lists was answered through that proxy, a check that
 //! every write a traced server made falls in its route's declared write set, server kill points
-//! and server power loss (Linux), and the report.
+//! and server power loss (Linux), the report, and, beside the fault runs, timing against git and the
+//! replay of a real history's merges against git's.
 
 pub mod bindings;
 pub mod census;
@@ -30,6 +31,7 @@ pub mod perf;
 pub mod power;
 pub mod proxy;
 pub mod remedy;
+pub mod replay;
 pub mod report;
 pub mod routes;
 pub mod routewrites;
