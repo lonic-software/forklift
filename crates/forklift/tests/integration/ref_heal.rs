@@ -1491,7 +1491,7 @@ fn a_meta_ref_heal_refuses_as_its_own_is_removed_with_no_taint_standing() {
                 plant_taint(&root, &[&"ab".repeat(32)]);
             }
             // No copy, and the ref's bytes a prefix of a head whose loose file cannot be read:
-            // that says nothing of the object, so heal names itself again.
+            // that says nothing of the object, so the step is to settle the read.
             "untold" => {
                 forklift_core::util::file_utils::remove_file(&meta_copy_path(&root, "tags")).unwrap();
                 std::fs::write(meta_path(&root, "tags"), &tags.as_bytes()[..12]).unwrap();
@@ -1528,10 +1528,14 @@ fn a_meta_ref_heal_refuses_as_its_own_is_removed_with_no_taint_standing() {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(loose_object(&root, &tags), std::fs::Permissions::from_mode(0o644)).unwrap();
                 }
-                assert_eq!(refused["error"]["next_step"], "forklift heal", "{}", refused);
+                let step = forklift_core::util::ref_heal::unread_step("@tags");
+                assert_eq!(refused["error"]["next_step"], step.as_str(), "{}", refused);
                 assert!(!removal.status.success(), "{}", text(&removal.stdout));
-                assert!(text(&removal.stderr).contains("heal did not refuse it for a reason of its own"), "{}", text(&removal.stderr));
+                assert!(text(&removal.stderr).contains("heal could not read what it needs to judge it"), "{}", text(&removal.stderr));
+                assert!(text(&removal.stderr).contains(&step), "{}", text(&removal.stderr));
                 assert!(!root.join(".forklift").join("removed-refs").exists(), "nothing is kept");
+                // The step leads somewhere: with the file readable again, heal rebuilds the ref.
+                assert_eq!(rebuilt_meta(&healed(&area, &root)), vec![("@tags".to_string(), tags.clone(), "what the ref's own bytes still name".to_string())]);
             }
             _ => {
                 let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
@@ -1547,9 +1551,10 @@ fn a_meta_ref_heal_refuses_as_its_own_is_removed_with_no_taint_standing() {
 
 // A lost meta ref whose copy's head fails verification on a parcel the store holds damaged is the
 // ref's own refusal, and its removal is the step; on a parcel that cannot be read, the verdict says
-// nothing of the ref, so heal names itself again and the removal is refused. Mutations: read an
+// nothing of the ref, so the step is to settle the read, the removal is refused, and once the file
+// reads again heal rebuilds the ref. Mutations: read an
 // untold failure as the ref's own → "unreadable" next_step is the removal, red; read a content
-// failure as untold → "corrupt" next_step is "forklift heal", red.
+// failure as untold → "corrupt" next_step is the settle step, red.
 #[cfg(unix)]
 #[test]
 fn a_meta_head_failing_verification_is_the_refs_own_only_on_what_the_store_holds() {
@@ -1578,10 +1583,14 @@ fn a_meta_head_failing_verification_is_the_refs_own_only_on_what_the_store_holds
                 assert!(removal.status.success(), "{}{}", text(&removal.stdout), said);
             }
             _ => {
-                assert_eq!(refused["error"]["next_step"], "forklift heal", "{}", refused);
+                let step = forklift_core::util::ref_heal::unread_step("@tags");
+                assert_eq!(refused["error"]["next_step"], step.as_str(), "{}", refused);
                 assert!(!removal.status.success(), "{}", text(&removal.stdout));
-                assert!(said.contains("heal did not refuse it for a reason of its own"), "{}", said);
+                assert!(said.contains("heal could not read what it needs to judge it"), "{}", said);
+                assert!(said.contains(&step), "{}", said);
                 assert!(!root.join(".forklift").join("removed-refs").exists(), "nothing is kept");
+                // The step leads somewhere: with the file readable again, heal rebuilds the ref.
+                assert_eq!(rebuilt_meta(&healed(&area, &root)), vec![("@tags".to_string(), second.clone(), "the ref's copy".to_string())]);
             }
         }
     }
