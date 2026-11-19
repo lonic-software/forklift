@@ -116,8 +116,13 @@ and so does one whose file does not hold a parcel hash. `heal` rebuilds it from 
 the damaged file still names, the office's and `@redactions`' among them, so the refusal names
 `forklift heal` when the copy holds a parcel hash, or the damaged file names one parcel. Where neither
 does (the copy does not hold a parcel hash, and the damaged file names nothing, several parcels or one
-that cannot be read, or is missing), and for a ref `heal` refuses, the next step is to restore the
-file from a backup, or write the head parcel's hash into it. A copy that cannot be read, a link at the
+that cannot be read, or is missing), and for a ref `heal` refuses for a reason of its own, the next
+step is `forklift heal --remove-ref @<name>`. It removes the ref and its copy, keeping the bytes of
+each under `.forklift/removed-refs`, and the pallet then reads as empty: what it recorded (tags,
+redactions, the office's keys) is gone from it, and what only its history reached may be freed.
+Restore the files from a backup instead if you have one. It runs only once no durability taint
+stands, and not for a ref `heal` refused only because the office's or `@redactions`' ref was refused,
+or because the office is unborn beside the trust file: it names what to settle first. A copy that cannot be read, a link at the
 copy's path, or something other than a file at the ref's path is refused too, naming it: make the copy
 and the folders on the way to it readable, replace the link with the copy's file (moving it aside would
 leave the pallet reading as never written), or move aside what stands at the ref's path, and run the

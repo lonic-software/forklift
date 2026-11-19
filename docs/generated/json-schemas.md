@@ -2773,8 +2773,11 @@ A command not listed here either reports only the generic human-message shape `{
       "description": "A ref `--remove-ref` removed, and where its bytes were kept.",
       "properties": {
         "kept": {
-          "description": "The file its unreadable bytes were moved to.",
-          "type": "string"
+          "description": "The files the removed bytes were kept in: the ref's, then, for a meta pallet, its copy's.\nA meta ref that was lost keeps only its copy's.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "pallet": {
           "description": "The pallet.",

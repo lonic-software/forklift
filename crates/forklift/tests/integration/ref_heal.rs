@@ -376,7 +376,7 @@ fn remove_ref_drops_only_an_unreadable_ref_nothing_names() {
     std::fs::write(ref_path(&root, "side"), &zeros).unwrap();
     let output = area.run_ok(&root, &["--json", "heal", "--remove-ref", "side"]);
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let kept = root.join(value["data"]["refs_removed"][0]["kept"].as_str().unwrap());
+    let kept = root.join(value["data"]["refs_removed"][0]["kept"][0].as_str().unwrap());
     assert_eq!(std::fs::read(&kept).unwrap(), zeros);
     assert!(!ref_path(&root, "side").exists());
 
@@ -1160,7 +1160,11 @@ fn a_lost_meta_ref_is_rebuilt_from_its_copy() {
     assert!(rebuilt_meta(&healed(&area, &root)).is_empty());
 }
 
-const META_REF_HAND_STEP: &str = "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.";
+/// What `--remove-ref` kept of meta pallet `pallet`'s files: the ref's bytes, then the copy's.
+fn kept_meta(root: &Path, pallet: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let kept = root.join(".forklift").join("removed-refs");
+    (std::fs::read(kept.join(format!("@{}", pallet))).ok(), std::fs::read(kept.join(format!("@{}.copy", pallet))).ok())
+}
 
 /// `forklift tag list` in `root`, as JSON.
 fn tag_list(area: &Area, root: &Path) -> Output {
@@ -1174,9 +1178,10 @@ fn tag_names(output: &Output) -> Vec<String> {
 }
 
 // A lost meta ref is refused where it is read, never read as unborn, while its copy stands. The
-// step names heal only when heal has a head to judge: a copy that parses. Mutations: read a
-// missing ref as unborn whatever its copy → `tag list` prints no tags, red; name heal for any
-// copy → the second case red; refuse with no copy → the third case red.
+// step names heal only when heal has a head to judge: a copy that parses; otherwise it names the
+// removal, which keeps the copy's bytes and leaves the pallet unborn. Mutations: read a missing
+// ref as unborn whatever its copy → `tag list` prints no tags, red; name heal for any copy → the
+// second case red; refuse with no copy → the third case red.
 #[test]
 fn a_lost_meta_ref_is_refused_where_it_is_read_while_its_copy_stands() {
     let area = Area::new("meta-loud");
@@ -1193,17 +1198,20 @@ fn a_lost_meta_ref_is_refused_where_it_is_read_while_its_copy_stands() {
     healed(&area, &root);
     assert_eq!(tag_names(&tag_list(&area, &root)), vec!["v1".to_string()]);
 
-    // The copy does not parse: heal has nothing to rebuild from, so the step is the hand fix.
+    // The copy does not parse: heal has nothing to rebuild from, so the step is the removal,
+    // which keeps the copy's bytes and leaves the pallet unborn, as a ref lost with its copy reads.
     forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
     std::fs::write(meta_copy_path(&root, "tags"), b"not a hash").unwrap();
     let refused = ref_damaged(&tag_list(&area, &root));
     assert!(refused["error"]["message"].as_str().unwrap().contains(") stands but does not hold a parcel hash. Nothing was changed."), "{}", refused);
-    assert_eq!(refused["error"]["next_step"], META_REF_HAND_STEP, "{}", refused);
-
-    // The ref and its copy lost together: nothing is left to tell the pallet was born, so it
-    // reads as unborn. That residual is the guide's.
-    forklift_core::util::file_utils::remove_file(&meta_copy_path(&root, "tags")).unwrap();
-    assert!(tag_names(&tag_list(&area, &root)).is_empty());
+    assert_eq!(refused["error"]["next_step"], "forklift heal --remove-ref @tags", "{}", refused);
+    let removed = area.run_ok(&root, &["--json", "heal", "--remove-ref", "@tags"]);
+    let removed: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(removed["data"]["refs_removed"][0]["pallet"], "@tags", "{}", removed);
+    assert_eq!(kept_meta(&root, "tags"), (None, Some(b"not a hash".to_vec())), "the copy's bytes are kept; the ref had none");
+    assert!(!meta_path(&root, "tags").exists() && !meta_copy_path(&root, "tags").exists());
+    let listed = area.run_ok(&root, &["tag", "list"]);
+    assert!(text(&listed.stdout).contains("No tags yet"), "{}", text(&listed.stdout));
 
     // The ref put back by hand reads again.
     std::fs::write(meta_path(&root, "tags"), format!("{}\n", head)).unwrap();
@@ -1211,7 +1219,7 @@ fn a_lost_meta_ref_is_refused_where_it_is_read_while_its_copy_stands() {
 }
 
 // A damaged meta ref with no copy whose own bytes still name its head names heal, which rebuilds
-// it from them. Mutation: name heal only beside a copy that parses → the hand step, red.
+// it from them. Mutation: name heal only beside a copy that parses → the removal, red.
 #[test]
 fn a_damaged_meta_ref_whose_bytes_salvage_names_heal_with_no_copy() {
     let area = Area::new("meta-salvage-step");
@@ -1230,10 +1238,10 @@ fn a_damaged_meta_ref_whose_bytes_salvage_names_heal_with_no_copy() {
     assert_eq!(meta_head(&root, "tags").as_deref(), Some(head.as_str()));
     assert_eq!(tag_names(&tag_list(&area, &root)), vec!["v1".to_string()]);
 
-    // Bytes that name nothing, with no copy, leave heal nothing: the hand step.
+    // Bytes that name nothing, with no copy, leave heal nothing: the removal.
     forklift_core::util::file_utils::remove_file(&meta_copy_path(&root, "tags")).unwrap();
     std::fs::write(meta_path(&root, "tags"), b"not a hash").unwrap();
-    assert_eq!(ref_damaged(&tag_list(&area, &root))["error"]["next_step"], META_REF_HAND_STEP);
+    assert_eq!(ref_damaged(&tag_list(&area, &root))["error"]["next_step"], "forklift heal --remove-ref @tags");
 }
 
 // A store sweep after a meta ref is lost refuses rather than delete the parcels only that ref
@@ -1288,11 +1296,11 @@ fn a_copy_that_does_not_descend_from_what_the_ref_names_is_refused_with_both() {
     let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
     let message = refused["error"]["message"].as_str().unwrap();
     assert!(message.contains("The ref of pallet \"@tags\" was not rebuilt: its copy names") && message.contains(&first) && message.contains(&second), "{}", refused);
-    assert_eq!(refused["error"]["next_step"], "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.", "{}", refused);
+    assert_eq!(refused["error"]["next_step"], "forklift heal --remove-ref @tags", "{}", refused);
     assert_eq!(std::fs::read(meta_path(&root, "tags")).unwrap(), second.as_bytes()[..16].to_vec(), "the ref is left as it was");
 
     // Beside a refused user ref, which nothing about @tags blocks, --ref is the step. Mutation:
-    // name the hand step for any refused meta ref → red.
+    // name the removal for any refused meta ref → red.
     area.run_ok(&root, &["pallet", "create", "side"]);
     area.run_ok(&root, &["shift", "side"]);
     area.stack(&root, "s.txt", "side");
@@ -1320,6 +1328,107 @@ fn a_copy_naming_a_parcel_that_fails_verification_is_refused_not_written() {
     let message = refused["error"]["message"].as_str().unwrap();
     assert!(message.contains("The ref of pallet \"@tags\" was not rebuilt: parcel") && message.contains("does not pass verification"), "{}", refused);
     assert!(!meta_path(&root, "tags").exists(), "nothing was written");
+
+    // The refusal is the ref's own, so it names the removal and what that costs, which then runs.
+    assert_eq!(refused["error"]["next_step"], "forklift heal --remove-ref @tags", "{}", refused);
+    assert!(message.contains("Its removal leaves the pallet empty"), "{}", refused);
+    area.run_ok(&root, &["heal", "--remove-ref", "@tags"]);
+    assert_eq!(kept_meta(&root, "tags"), (None, Some(format!("{}\n", head(&root, "main")).into_bytes())));
+    assert!(tag_names(&tag_list(&area, &root)).is_empty());
+}
+
+// The removal of a meta ref heal refuses as its own, with no taint standing; and refused, writing
+// nothing, while a taint stands. Mutations: drop the taint condition from the meta admission →
+// "tainted" red (the kept bytes land, and the write reports the taint); refuse a meta ref whose
+// salvage is unknown, as a user ref's removal does → "unknown" red.
+#[test]
+fn a_meta_ref_heal_refuses_as_its_own_is_removed_with_no_taint_standing() {
+    for case in ["tainted", "unknown"] {
+        let area = Area::new(&format!("meta-remove-{}", case));
+        let (root, _, _) = tagged(&area);
+        let tags = meta_head(&root, "tags").unwrap();
+
+        match case {
+            // The ref lost beside a copy that does not parse, and a taint naming an object that
+            // is absent, which no remote gives back.
+            "tainted" => {
+                forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+                std::fs::write(meta_copy_path(&root, "tags"), b"not a hash").unwrap();
+                plant_taint(&root, &[&"ab".repeat(32)]);
+            }
+            // No copy, and the ref's bytes a prefix of a head whose object loads as none.
+            _ => {
+                forklift_core::util::file_utils::remove_file(&meta_copy_path(&root, "tags")).unwrap();
+                std::fs::write(meta_path(&root, "tags"), &tags.as_bytes()[..12]).unwrap();
+                let object = loose_object(&root, &tags);
+                forklift_core::util::file_utils::remove_file(&object).unwrap();
+                std::fs::write(&object, b"no object").unwrap();
+            }
+        }
+
+        match case {
+            "tainted" => {
+                let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+                assert!(!removal.status.success(), "{}", text(&removal.stdout));
+                assert!(text(&removal.stderr).contains("run \"forklift heal\" first, without --remove-ref"), "{}", text(&removal.stderr));
+                assert!(!root.join(".forklift").join("removed-refs").exists(), "nothing is kept");
+                assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), b"not a hash");
+            }
+            _ => {
+                let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+                assert_eq!(refused["error"]["next_step"], "forklift heal --remove-ref @tags", "{}", refused);
+                let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+                assert!(removal.status.success(), "{}{}", text(&removal.stdout), text(&removal.stderr));
+                assert_eq!(kept_meta(&root, "tags"), (Some(tags.as_bytes()[..12].to_vec()), None));
+                assert!(tag_names(&tag_list(&area, &root)).is_empty());
+            }
+        }
+    }
+}
+
+// A meta ref refused only because the office was is not removed: the removal names the office's
+// refusal and its step, and once the office is removed, the office's way back, never the
+// verifier's "lift the office". Mutations: admit a cascaded refusal → @tags and its sound copy
+// removed, red; admit one beside an unborn office → the second removal succeeds, red; name the
+// verifier's step there → "Lift the office" red.
+#[test]
+fn a_meta_ref_refused_only_because_the_office_was_names_the_office_and_is_not_removed() {
+    let area = Area::new("meta-remove-cascade");
+    let (root, _, _) = tagged(&area);
+    area.run_ok(&root, &["office", "enroll"]);
+    let tags_copy = std::fs::read(meta_copy_path(&root, "tags")).unwrap();
+
+    forklift_core::util::file_utils::remove_file(&meta_path(&root, "office")).unwrap();
+    std::fs::write(meta_copy_path(&root, "office"), b"not a hash").unwrap();
+    forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert_eq!(refused["error"]["next_step"], "forklift heal --remove-ref @office", "{}", refused);
+    assert!(message.contains("The ref of pallet \"@office\" was not rebuilt: neither its copy nor its own bytes name a head"), "{}", refused);
+    assert!(message.contains("The ref of pallet \"@tags\" was not rebuilt: it is verified against the office and checked against the redactions, and the ref of pallet \"@office\" is damaged too"), "{}", refused);
+
+    let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+    let said = text(&removal.stderr);
+    assert!(!removal.status.success(), "{}", text(&removal.stdout));
+    assert!(said.contains("heal refused it only because it refused the ref of pallet \"@office\": neither its copy nor its own bytes name a head"), "{}", said);
+    assert!(said.contains("Run \"forklift heal --remove-ref @office\"."), "{}", said);
+    assert!(!root.join(".forklift").join("removed-refs").exists(), "nothing is kept");
+    assert!(!meta_path(&root, "tags").exists());
+    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), tags_copy, "the sound copy stands");
+
+    // The office removed, it is unborn beside the anchor: @tags waits on the office coming back,
+    // so the same run still refuses it.
+    ref_damaged(&area.run(&root, &["--json", "heal", "--remove-ref", "@office"]));
+    assert_eq!(kept_meta(&root, "office"), (None, Some(b"not a hash".to_vec())));
+    assert!(!meta_path(&root, "office").exists() && !meta_copy_path(&root, "office").exists());
+    let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+    let said = text(&removal.stderr);
+    assert!(!removal.status.success(), "{}", text(&removal.stdout));
+    assert!(said.contains("only because the trust file holds this warehouse's anchor while the office pallet is unborn"), "{}", said);
+    assert!(said.contains("With no remote that holds it to take it from, restore its ref") && said.contains("\"forklift office enroll\" again"), "{}", said);
+    assert!(!said.contains("Lift the office"), "{}", said);
+    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), tags_copy, "the sound copy stands");
 }
 
 /// Remove `a.txt` from `main`, record a redaction of it as `main` held it, and return the
@@ -1450,10 +1559,10 @@ fn a_meta_ref_beside_a_lost_redactions_ref_is_refused_naming_it() {
     assert!(message.contains(&format!("The ref of pallet \"@redactions\" was not rebuilt: parcel {} does not pass verification", second)), "{}", refused);
     assert!(message.contains("The ref of pallet \"@tags\" was not rebuilt: it is verified against the office and checked against the redactions, and the ref of pallet \"@redactions\" is damaged too"), "{}", refused);
     assert!(meta_head(&root, "tags").is_none() && meta_head(&root, "redactions").is_none(), "nothing was written");
-    assert_eq!(refused["error"]["next_step"], "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.", "{}", refused);
+    assert_eq!(refused["error"]["next_step"], "forklift heal --remove-ref @redactions", "{}", refused);
 
-    // Beside a user ref refused too, the meta refs' hand step still comes first: a user ref's
-    // rebuild is checked against the redactions. Mutation: name the hand step only when every
+    // Beside a user ref refused too, @redactions' step still comes first: a user ref's rebuild
+    // is checked against the redactions. Mutation: name a meta ref's step only when every
     // refused ref is a meta ref → the step is --ref main, red.
     forklift_core::util::file_utils::remove_file(root.join(".forklift").join("journal.json")).unwrap();
     std::fs::write(ref_path(&root, "main"), &side.as_bytes()[..20]).unwrap();
@@ -1461,7 +1570,7 @@ fn a_meta_ref_beside_a_lost_redactions_ref_is_refused_naming_it() {
     let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
     let pallets: Vec<&str> = refused["error"]["details"]["refs_refused"].as_array().unwrap().iter().map(|refused| refused["pallet"].as_str().unwrap()).collect();
     assert!(pallets.contains(&"main") && pallets.contains(&"@tags"), "{}", refused);
-    assert_eq!(refused["error"]["next_step"], "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.", "{}", refused);
+    assert_eq!(refused["error"]["next_step"], "forklift heal --remove-ref @redactions", "{}", refused);
 }
 
 // Mutation: skip the copy mend → the copy stays lost / at H1, red.

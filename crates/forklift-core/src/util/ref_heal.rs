@@ -113,6 +113,38 @@ pub struct Refused {
 
     /// Every head the evidence named.
     pub candidates: Vec<Candidate>,
+
+    /// For a meta ref, whose refusal it is and the files it was judged by; `None` for a user ref.
+    #[serde(skip)]
+    #[cfg_attr(feature = "docgen", schemars(skip))]
+    pub meta: Option<MetaVerdict>,
+}
+
+/// Whose refusal a meta ref's is, which decides the step that lets a later heal judge it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Owner {
+    /// The ref's own: nothing heal can verify names a head for it, so its removal is the way out.
+    Own,
+
+    /// It waits on the refusal of this meta ref (`@office` or `@redactions`), which it is
+    /// verified against or checked against.
+    Cascade(String),
+
+    /// The office is unborn while the trust file holds an anchor, so nothing a meta ref holds can
+    /// be verified until the office stands.
+    OfficeUnborn,
+
+    /// Its files moved while heal ran, a write failed, or what it needs could not be read: a later
+    /// heal judges it again.
+    Again,
+}
+
+/// A meta ref's refusal as heal judged it: whose it is, and the ref and copy it read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetaVerdict {
+    pub owner: Owner,
+    damage: RefDamage,
+    copy: pallet_utils::MetaCopyState,
 }
 
 /// What one pass did.
@@ -627,6 +659,7 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
                 pallet: damaged.pallet.clone(),
                 reason,
                 candidates: listed(&evidence.candidates),
+                meta: None,
             }),
             Choice::Rebuild(head, source) => match trusted(&damaged.pallet, &head)
                 .map_err(RefUpdateError::Failed)
@@ -646,6 +679,7 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
                     pallet: damaged.pallet.clone(),
                     reason: format!("the rebuild at {} was not written: {}", head, error),
                     candidates: listed(&evidence.candidates),
+                    meta: None,
                 }),
             },
         }
@@ -829,8 +863,9 @@ pub struct Removed {
     /// The pallet.
     pub pallet: String,
 
-    /// The file its unreadable bytes were moved to.
-    pub kept: String,
+    /// The files the removed bytes were kept in: the ref's, then, for a meta pallet, its copy's.
+    /// A meta ref that was lost keeps only its copy's.
+    pub kept: Vec<String>,
 }
 
 /// The folder unreadable refs that `--remove-ref` removed are kept in.
@@ -845,15 +880,159 @@ pub fn remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<Remov
         unreachable!("admit_remove admits only an unreadable ref");
     };
 
-    let folder = forklift_root().join(FOLDER_NAME_REMOVED_REFS);
-    let stem = pallet.replace('/', "%2F");
-    let kept = (0..).map(|n| folder.join(match n { 0 => stem.clone(), n => format!("{}.{}", stem, n) }))
-        .find(|path| !path.exists())
-        .expect("an unbounded range always yields a free name");
+    let kept = kept_path(pallet, &[]);
 
     pallet_utils::remove_damaged_ref(pallet, bytes, &kept).map_err(|error| error.to_string())?;
 
-    Ok(Removed { pallet: pallet.to_string(), kept: kept.to_string_lossy().into_owned() })
+    Ok(Removed { pallet: pallet.to_string(), kept: vec![kept.to_string_lossy().into_owned()] })
+}
+
+/// A free path under the removed-refs folder for the bytes of `pallet`'s ref, and none of `taken`.
+fn kept_path(pallet: &str, taken: &[&std::path::Path]) -> std::path::PathBuf {
+    let folder = forklift_root().join(FOLDER_NAME_REMOVED_REFS);
+    let stem = pallet.replace('/', "%2F");
+    (0..).map(|n| folder.join(match n { 0 => stem.clone(), n => format!("{}.{}", stem, n) }))
+        .find(|path| !path.exists() && !taken.contains(&path.as_path()))
+        .expect("an unbounded range always yields a free name")
+}
+
+/// The step that lets a later heal judge meta ref `refused` again, among the refusals `all` of
+/// the same pass: its removal, for a refusal of its own; for one that waits on another meta ref's
+/// refusal, that ref's step; for one beside an unborn office, what brings the office back; and
+/// otherwise heal again. A command, or sentences when the way out is by hand.
+pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
+    let mut at = refused;
+    // A cascade names the office or @redactions, whose own refusals do not cascade back.
+    for _ in 0..3 {
+        match at.meta.as_ref().map(|meta| &meta.owner) {
+            Some(Owner::Own) => return format!("forklift heal --remove-ref {}", at.pallet),
+            Some(Owner::Cascade(cause)) => match all.iter().find(|other| other.pallet == *cause) {
+                Some(cause) => at = cause,
+                None => break,
+            },
+            Some(Owner::OfficeUnborn) => return crate::util::office_utils::office_unborn_step(),
+            Some(Owner::Again) | None => break,
+        }
+    }
+    "forklift heal".to_string()
+}
+
+/// `step`, a command or sentences from [`meta_step`], as a sentence of its own.
+pub fn step_sentence(step: &str) -> String {
+    match step.starts_with("forklift ") {
+        true => format!("Run \"{}\".", step),
+        false => step.to_string(),
+    }
+}
+
+/// `forklift heal --remove-ref @<name>`: remove a meta pallet's lost or damaged ref and its copy,
+/// keeping the bytes of each in a file of its own, when heal refused that ref for a reason of its
+/// own. `judged` is what this run's meta pass before the taint recovery left unrebuilt, and
+/// `unjudged` what it never judged. Admitted only with no taint record standing, and only while
+/// the ref and its copy still stand as that pass judged them; afterwards the pallet reads unborn.
+pub fn remove_damaged_meta_ref(wire: &str, judged: &[Refused], unjudged: &[String], notes: &mut Vec<String>) -> Result<Removed, String> {
+    let name = wire.strip_prefix('@')
+        .filter(|name| crate::util::meta_tree::META_PALLET_NAMES.contains(name))
+        .ok_or_else(|| format!("\"{}\" is not a meta pallet this version of Forklift knows, so there is no ref of it to remove.", wire))?;
+
+    // Under a taint, heal's verdict may rest on a parcel the recovery brings back, since meta
+    // verification fails alike on a parcel it cannot load and on a rule; and the kept bytes'
+    // write would return the taint's error after landing.
+    let first = "run \"forklift heal\" first, without --remove-ref, and remove it only if that refuses it naming the removal";
+    match crate::util::taint_utils::read_taints(&forklift_root()) {
+        Ok(taints) if taints.recorded.is_empty() && !taints.torn => {}
+        Ok(_) => return Err(format!(
+            "A durability taint stands, so heal's judgement of the ref of pallet \"{}\" may rest on a parcel its recovery brings back, and the ref was not removed: {}.",
+            wire, first
+        )),
+        Err(error) => return Err(format!(
+            "The durability taint could not be read ({}), so the ref of pallet \"{}\" was not removed: {}.",
+            error.trim_end_matches('.'), wire, first
+        )),
+    }
+
+    let Some(refused) = judged.iter().find(|refused| refused.pallet == wire) else {
+        return Err(not_judged(name, wire, unjudged, notes));
+    };
+    let meta = refused.meta.as_ref().expect("a meta ref's refusal carries its verdict");
+
+    match &meta.owner {
+        Owner::Own => {}
+        Owner::Cascade(cause) => {
+            let (said, step) = match judged.iter().find(|other| other.pallet == *cause) {
+                Some(other) => (format!(": {}", other.reason.trim_end_matches('.')), meta_step(other, judged)),
+                None => (String::new(), "forklift heal".to_string()),
+            };
+            return Err(format!(
+                "The ref of pallet \"{}\" was not removed: heal refused it only because it refused the ref of pallet \"{}\"{}. \
+                Once that is settled, a later heal judges this ref again. {}",
+                wire, cause, said, step_sentence(&step)
+            ));
+        }
+        Owner::OfficeUnborn => return Err(format!(
+            "The ref of pallet \"{}\" was not removed: heal refused it only because the trust file holds this warehouse's anchor \
+            while the office pallet is unborn, so nothing a meta pallet holds can be verified. Once the office stands, a later heal \
+            judges this ref again. {}",
+            wire, crate::util::office_utils::office_unborn_step()
+        )),
+        Owner::Again => return Err(format!(
+            "The ref of pallet \"{}\" was not removed: heal did not refuse it for a reason of its own ({}). Run \"forklift heal\" again.",
+            wire, refused.reason.trim_end_matches('.')
+        )),
+    }
+
+    // A folder at the copy's path holds other names' copies and is read as no copy; anything
+    // else that is not a file cannot be kept.
+    let copy_path = pallet_utils::get_meta_copy_path(name);
+    let copy_is_folder = std::fs::symlink_metadata(&copy_path).is_ok_and(|metadata| metadata.is_dir());
+    if meta.copy == pallet_utils::MetaCopyState::Other && !copy_is_folder {
+        return Err(format!(
+            "Something that is not a file stands at the copy's path of pallet \"{}\" (\"{}\"), so it cannot be kept and the ref was not removed: \
+            move it aside, then run the command again.",
+            wire, copy_path.to_string_lossy()
+        ));
+    }
+
+    let kept_ref = matches!(meta.damage, RefDamage::Unreadable(_)).then(|| kept_path(wire, &[]));
+    let kept_copy = matches!(meta.copy, pallet_utils::MetaCopyState::Bytes(_))
+        .then(|| kept_path(&format!("{}.copy", wire), &kept_ref.iter().map(|path| path.as_path()).collect::<Vec<_>>()));
+
+    pallet_utils::remove_damaged_meta_ref(name, &meta.damage, &meta.copy, kept_ref.as_deref(), kept_copy.as_deref())
+        .map_err(|error| error.to_string())?;
+
+    Ok(Removed {
+        pallet: wire.to_string(),
+        kept: kept_ref.iter().chain(&kept_copy).map(|path| path.to_string_lossy().into_owned()).collect(),
+    })
+}
+
+/// Why meta ref `wire` (`name`) is not removed when heal's pass before the taint recovery left
+/// no refusal of it: it reads, heal never judged it, or heal could not read it.
+fn not_judged(name: &str, wire: &str, unjudged: &[String], notes: &mut Vec<String>) -> String {
+    if unjudged.iter().any(|other| other == wire) {
+        return format!(
+            "Heal stopped before judging the ref of pallet \"{}\", so it was not removed: once what stopped it is fixed, run \"forklift heal\" again.",
+            wire
+        );
+    }
+    let mut said = Vec::new();
+    let state = meta_states(&mut said).unwrap_or_default().into_iter().find(|state| state.name == name);
+    match state {
+        Some(state) if state.damage().is_none() => format!("The ref of pallet \"{}\" reads, so there is nothing to remove.", wire),
+        Some(_) => format!(
+            "The ref of pallet \"{}\" was damaged after heal judged it, so it was not removed: run \"forklift heal\" again.",
+            wire
+        ),
+        None if said.is_empty() => format!("Pallet \"{}\" has neither a ref nor a copy, so it reads as unborn and there is nothing to remove.", wire),
+        None => {
+            notes.extend(said);
+            format!(
+                "Heal could not read the ref of pallet \"{}\" or its copy, as the note says, so it did not judge that ref, and what cannot be read \
+                cannot be kept: the ref was not removed. Settle what the note names, then run the command again.",
+                wire
+            )
+        }
+    }
 }
 
 /// Whether [`remove_damaged_ref`] would refuse to remove `pallet`'s ref, judged as it judges and
@@ -1019,7 +1198,10 @@ const FROM_COPY: &str = "the ref's copy";
 /// journaled command's refs are put back, and none of `journal_op`'s commands (stack, consolidate,
 /// pick, shift) writes a meta ref: `git grep -l -E 'update_meta_pallet_head|PalletNamespace::Meta'`
 /// over their command and util modules finds none.
-fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static str), (String, Vec<Candidate>)> {
+/// A meta ref's refusal before any write: why, the heads found, and whose refusal it is.
+type MetaRefusal = (String, Vec<Candidate>, Owner);
+
+fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static str), MetaRefusal> {
     let copy = state.copy_head();
     let mut candidates: Vec<Candidate> = copy.iter()
         .map(|head| Candidate { head: head.clone(), source: FROM_COPY.to_string() })
@@ -1027,7 +1209,7 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
 
     let salvaged = match &state.reference {
         Some(bytes) => salvage(bytes, tainted).map_err(|error| (
-            format!("what its own bytes name could not be looked up: {}", error.trim_end_matches('.')), candidates.clone()
+            format!("what its own bytes name could not be looked up: {}", error.trim_end_matches('.')), candidates.clone(), Owner::Again
         ))?,
         None => Salvage::Nothing,
     };
@@ -1035,7 +1217,7 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
     match salvaged {
         Salvage::Nothing => match copy {
             Some(head) => Ok((head, FROM_COPY)),
-            None => Err(("neither its copy nor its own bytes name a head".to_string(), candidates)),
+            None => Err(("neither its copy nor its own bytes name a head".to_string(), candidates, Owner::Own)),
         },
         Salvage::Found(salvaged) => {
             candidates.push(Candidate { head: salvaged.clone(), source: Source::Salvage.describe() });
@@ -1050,29 +1232,41 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
                     Ok(false) => Err((format!(
                         "its copy names {}, which does not descend along first parents from {}, what its own bytes name, so nothing proves either the newer",
                         copy, salvaged
-                    ), candidates)),
+                    ), candidates, Owner::Own)),
                     Err(error) => Err((format!(
                         "whether its copy's head {} descends from {}, what its own bytes name, could not be told: {}",
                         copy, salvaged, error.trim_end_matches('.')
-                    ), candidates)),
+                    ), candidates, Owner::Again)),
                 },
             }
         }
         Salvage::Ambiguous(parcels, _) => {
             candidates.extend(parcels.into_iter().map(|head| Candidate { head, source: Source::Salvage.describe() }));
-            Err(("its own bytes name one of several parcels, not which".to_string(), candidates))
+            Err(("its own bytes name one of several parcels, not which".to_string(), candidates, Owner::Own))
         }
-        Salvage::Unknown(why) => Err((why, candidates)),
+        Salvage::Unknown(why) => Err((why, candidates, Owner::Own)),
     }
 }
 
 /// Verify `head` as the whole history of meta pallet `name`, against the trust anchor and the
 /// office as they are now, and return the preconditions that pin both for the write.
-fn verify_meta_head(name: &str, head: &str) -> Result<pallet_utils::RefPreconditions, String> {
-    let anchor = crate::util::office_utils::read_trust_anchor_with_bytes()?;
-    let office_head = pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME)?;
+///
+/// # Returns
+/// * `Err((reason, owner))` - Why not, and whose refusal that is: the ref's own when `head` fails
+///                            verification, [`Owner::OfficeUnborn`] when the office is unborn
+///                            beside an anchor, which refuses before `head` is read, and
+///                            [`Owner::Again`] when the anchor or the office could not be read.
+fn verify_meta_head(name: &str, head: &str) -> Result<pallet_utils::RefPreconditions, (String, Owner)> {
+    let anchor = crate::util::office_utils::read_trust_anchor_with_bytes().map_err(|error| (error, Owner::Again))?;
+    let office_head = pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME).map_err(|error| (error, Owner::Again))?;
 
-    verify_meta_against(name, head, anchor.as_ref().map(|(anchor, _)| anchor), office_head.as_deref())?;
+    // Said here rather than by the verifier, whose step (lift the office) is no step in a store
+    // that lacks its office.
+    if anchor.is_some() && office_head.is_none() {
+        return Err(("the trust file holds this warehouse's anchor, but the office pallet is unborn, so nothing a meta pallet holds can be verified".to_string(), Owner::OfficeUnborn));
+    }
+
+    verify_meta_against(name, head, anchor.as_ref().map(|(anchor, _)| anchor), office_head.as_deref()).map_err(|reason| (reason, Owner::Own))?;
 
     Ok(pallet_utils::RefPreconditions {
         office: pallet_utils::OfficePrecondition::At(office_head),
@@ -1082,6 +1276,26 @@ fn verify_meta_head(name: &str, head: &str) -> Result<pallet_utils::RefPrecondit
         },
         pallets: pallet_utils::PalletsPrecondition::NotConsumed,
     })
+}
+
+/// Whose a refusal of a meta ref other than the office is, when heal chose no head for it for a
+/// reason `owner` says: a reason of its own is still the office's while the office is refused
+/// (`blocking`) or unborn beside the trust file's anchor, since its removal would then be judged
+/// against no office.
+fn choice_owner(owner: Owner, blocking: &[String]) -> Owner {
+    if owner != Owner::Own {
+        return owner;
+    }
+    if let Some(cause) = blocking.first() {
+        return Owner::Cascade(cause.clone());
+    }
+    let anchor = crate::util::office_utils::read_trust_anchor_with_bytes();
+    let office = pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME);
+    match (anchor, office) {
+        (Ok(Some(_)), Ok(None)) => Owner::OfficeUnborn,
+        (Ok(_), Ok(_)) => Owner::Own,
+        _ => Owner::Again,
+    }
 }
 
 /// Verify `head` as the whole history of meta pallet `name`, against `anchor` and the office at
@@ -1286,8 +1500,9 @@ enum RedactionsJudged {
     /// checked against: step 3 writes this head, or none.
     Verified(crate::util::redaction_utils::JudgedRedactions, &'static str),
 
-    /// Why no head was chosen and verified, which refused the office, and what names a head.
-    Refused(String, Vec<Candidate>),
+    /// Why no head was chosen and verified, which refused the office, what names a head, and
+    /// whose refusal that is.
+    Refused(String, Vec<Candidate>, Owner),
 }
 
 /// Step 1 of [`repair_meta`]: judge the damaged office ref `state` and write it, checked against
@@ -1299,8 +1514,8 @@ enum RedactionsJudged {
 fn rebuild_office(state: &MetaState, redactions: Option<&MetaState>, tainted: &Tainted, pass: Pass, report: &mut Repair) -> Option<RedactionsJudged> {
     let (head, source) = match choose_meta(state, tainted) {
         Ok(chosen) => chosen,
-        Err((reason, candidates)) => {
-            refuse_in(report, state, pass, reason, candidates);
+        Err((reason, candidates, owner)) => {
+            refuse_in(report, state, pass, reason, candidates, owner);
             return None;
         }
     };
@@ -1310,8 +1525,9 @@ fn rebuild_office(state: &MetaState, redactions: Option<&MetaState>, tainted: &T
     // serve; the write is pinned to both files as they were judged.
     let (anchor, judged_anchor) = match crate::util::office_utils::office_rebuild_anchor(&head) {
         Ok(anchor) => anchor,
-        Err(reason) => {
-            refuse_in(report, state, pass, reason, candidates());
+        // No anchor verifies the office's own candidate, or what would tell could not be read.
+        Err((reason, own)) => {
+            refuse_in(report, state, pass, reason, candidates(), if own { Owner::Own } else { Owner::Again });
             return None;
         }
     };
@@ -1320,11 +1536,11 @@ fn rebuild_office(state: &MetaState, redactions: Option<&MetaState>, tainted: &T
     let judged = match redactions {
         None => None,
         Some(redactions) => {
-            let refused = |why: &str, unjudged: (String, Vec<Candidate>)| {
+            let refused = |why: &str, unjudged: MetaRefusal| {
                 (format!(
                     "it is checked against the redactions, and the ref of pallet \"{}\" is damaged too, {}: set that first",
                     redactions.wire(), why
-                ), RedactionsJudged::Refused(unjudged.0, unjudged.1))
+                ), RedactionsJudged::Refused(unjudged.0, unjudged.1, unjudged.2))
             };
             let outcome = match choose_meta(redactions, tainted) {
                 Err(unjudged) => Err(refused("and heal chose no head for it", unjudged)),
@@ -1333,7 +1549,7 @@ fn rebuild_office(state: &MetaState, redactions: Option<&MetaState>, tainted: &T
                         Ok(()) => Ok((judged_redactions(redactions, chosen), chosen_source)),
                         Err(reason) => Err(refused(
                             "with no head heal can verify",
-                            (reason, vec![Candidate { head: chosen, source: chosen_source.to_string() }]),
+                            (reason, vec![Candidate { head: chosen, source: chosen_source.to_string() }], Owner::Own),
                         )),
                     }
                 }
@@ -1341,7 +1557,7 @@ fn rebuild_office(state: &MetaState, redactions: Option<&MetaState>, tainted: &T
             match outcome {
                 Ok(judged) => Some(judged),
                 Err((reason, unjudged)) => {
-                    refuse_in(report, state, pass, reason, candidates());
+                    refuse_in(report, state, pass, reason, candidates(), Owner::Cascade(redactions.wire()));
                     return Some(unjudged);
                 }
             }
@@ -1369,8 +1585,9 @@ fn judged_redactions(state: &MetaState, head: String) -> crate::util::redaction_
 
 /// Refuse meta ref `state` for `reason`, listing `candidates`: in [`Pass::AfterTaint`]; the pass
 /// before the taint recovery defers it to that pass instead.
-fn refuse_in(report: &mut Repair, state: &MetaState, pass: Pass, reason: String, candidates: Vec<Candidate>) {
-    let refused = Refused { pallet: state.wire(), reason, candidates };
+fn refuse_in(report: &mut Repair, state: &MetaState, pass: Pass, reason: String, candidates: Vec<Candidate>, owner: Owner) {
+    let meta = MetaVerdict { owner, damage: state.damage().expect("only a damaged meta ref is refused"), copy: state.copy.clone() };
+    let refused = Refused { pallet: state.wire(), reason, candidates, meta: Some(meta) };
     match pass {
         Pass::AfterTaint => report.refused.push(refused),
         Pass::BeforeTaint => report.deferred.push(refused),
@@ -1411,7 +1628,7 @@ fn write_meta_rebuild(state: &MetaState,
         Ok(()) => format!("the rebuild at {} did not read back", head),
     };
 
-    refuse_in(report, state, pass, reason, vec![Candidate { head, source: source.to_string() }]);
+    refuse_in(report, state, pass, reason, vec![Candidate { head, source: source.to_string() }], Owner::Again);
     false
 }
 
@@ -1458,7 +1675,7 @@ fn repair_other_meta(pass: Pass, office_judged: bool, judged: Option<RedactionsJ
             continue;
         }
 
-        let mut refuse = |reason: String, candidates: Vec<Candidate>| refuse_in(report, state, pass, reason, candidates);
+        let mut refuse = |reason: String, candidates: Vec<Candidate>, owner: Owner| refuse_in(report, state, pass, reason, candidates, owner);
 
         let choice = choose_meta(state, tainted.as_ref().expect("read when a ref is damaged"));
 
@@ -1467,16 +1684,16 @@ fn repair_other_meta(pass: Pass, office_judged: bool, judged: Option<RedactionsJ
         if is_office(state) {
             let candidates = match choice {
                 Ok((head, source)) => vec![Candidate { head, source: source.to_string() }],
-                Err((_, candidates)) => candidates,
+                Err((_, candidates, _)) => candidates,
             };
-            refuse("it was damaged while heal ran; run \"forklift heal\" again".to_string(), candidates);
+            refuse("it was damaged while heal ran".to_string(), candidates, Owner::Again);
             continue;
         }
 
         let (head, source) = match choice {
             Ok(chosen) => chosen,
-            Err((reason, candidates)) => {
-                refuse(reason, candidates);
+            Err((reason, candidates, owner)) => {
+                refuse(reason, candidates, choice_owner(owner, &blocking));
                 continue;
             }
         };
@@ -1486,14 +1703,14 @@ fn repair_other_meta(pass: Pass, office_judged: bool, judged: Option<RedactionsJ
             refuse(format!(
                 "it is verified against the office and checked against the redactions, and the ref of {} is damaged too: set that first",
                 blocking.iter().map(|wire| format!("pallet \"{}\"", wire)).collect::<Vec<_>>().join(" and ")
-            ), candidates);
+            ), candidates, Owner::Cascade(blocking[0].clone()));
             continue;
         }
 
         let preconditions = match verify_meta_head(&state.name, &head) {
             Ok(preconditions) => preconditions,
-            Err(reason) => {
-                refuse(reason, candidates);
+            Err((reason, owner)) => {
+                refuse(reason, candidates, owner);
                 continue;
             }
         };
@@ -1515,8 +1732,8 @@ fn repair_other_meta(pass: Pass, office_judged: bool, judged: Option<RedactionsJ
 /// * `true` - If the ref was rebuilt.
 fn rebuild_redactions(state: &MetaState, blocking: &[String], judged: Option<RedactionsJudged>, tainted: &Tainted, pass: Pass, report: &mut Repair) -> bool {
     let judged = match judged {
-        Some(RedactionsJudged::Refused(reason, candidates)) => {
-            refuse_in(report, state, pass, reason, candidates);
+        Some(RedactionsJudged::Refused(reason, candidates, owner)) => {
+            refuse_in(report, state, pass, reason, candidates, owner);
             return false;
         }
         Some(RedactionsJudged::Verified(judged, source)) => Some((judged, source)),
@@ -1528,13 +1745,13 @@ fn rebuild_redactions(state: &MetaState, blocking: &[String], judged: Option<Red
             Some((judged, source)) => vec![Candidate { head: judged.head.clone(), source: source.to_string() }],
             None => match choose_meta(state, tainted) {
                 Ok((head, source)) => vec![Candidate { head, source: source.to_string() }],
-                Err((_, candidates)) => candidates,
+                Err((_, candidates, _)) => candidates,
             },
         };
         refuse_in(report, state, pass, format!(
             "it is verified against the office, and the ref of {} is damaged too: set that first",
             blocking.iter().map(|wire| format!("pallet \"{}\"", wire)).collect::<Vec<_>>().join(" and ")
-        ), candidates);
+        ), candidates, Owner::Cascade(blocking[0].clone()));
         return false;
     }
 
@@ -1545,17 +1762,17 @@ fn rebuild_redactions(state: &MetaState, blocking: &[String], judged: Option<Red
             if state.damage().as_ref() != Some(&judged.damage) || state.copy != judged.copy {
                 let candidates = match choose_meta(state, tainted) {
                     Ok((head, source)) => vec![Candidate { head, source: source.to_string() }],
-                    Err((_, candidates)) => candidates,
+                    Err((_, candidates, _)) => candidates,
                 };
-                refuse_in(report, state, pass, "it changed while heal ran".to_string(), candidates);
+                refuse_in(report, state, pass, "it changed while heal ran".to_string(), candidates, Owner::Again);
                 return false;
             }
             (judged, source)
         }
         None => match choose_meta(state, tainted) {
             Ok((head, source)) => (judged_redactions(state, head), source),
-            Err((reason, candidates)) => {
-                refuse_in(report, state, pass, reason, candidates);
+            Err((reason, candidates, owner)) => {
+                refuse_in(report, state, pass, reason, candidates, choice_owner(owner, blocking));
                 return false;
             }
         },
@@ -1563,8 +1780,8 @@ fn rebuild_redactions(state: &MetaState, blocking: &[String], judged: Option<Red
 
     let preconditions = match verify_meta_head(&state.name, &judged.head) {
         Ok(preconditions) => preconditions,
-        Err(reason) => {
-            refuse_in(report, state, pass, reason, vec![Candidate { head: judged.head.clone(), source: source.to_string() }]);
+        Err((reason, owner)) => {
+            refuse_in(report, state, pass, reason, vec![Candidate { head: judged.head.clone(), source: source.to_string() }], owner);
             return false;
         }
     };

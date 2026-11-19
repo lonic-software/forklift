@@ -377,8 +377,14 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
     }
 
+    // A meta ref is removed on the judgement the meta pass above made of it in this run, which
+    // its removal pins the ref and the copy to.
     for pallet in remove_ref {
-        match ref_heal::remove_damaged_ref(pallet, &mut ref_notes) {
+        let removed = match pallet.starts_with('@') {
+            true => ref_heal::remove_damaged_meta_ref(pallet, &meta_deferred, &refs_left.borrow().unjudged, &mut ref_notes),
+            false => ref_heal::remove_damaged_ref(pallet, &mut ref_notes),
+        };
+        match removed {
             Ok(removed) => refs_removed.push(removed),
             Err(error) => return Err(changed(error, &refs_rebuilt, &refs_removed, &ref_notes)),
         }
@@ -1462,16 +1468,18 @@ fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
         lines.push(format!("{}.", unfinished.trim_end_matches('.')));
     }
 
-    // A meta ref, which --ref does not set, is set only by hand. The office's and @redactions' come
-    // first, since a user ref's rebuild, --ref's among them, is verified against the one and
-    // checked against the other; any other meta ref's waits behind a user ref's --ref.
-    let hand = "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.".to_string();
+    // A meta ref, which --ref does not set, has its own step (ref_heal::meta_step). The office's
+    // and @redactions' come first, since a user ref's rebuild, --ref's among them, is verified
+    // against the one and checked against the other; any other meta ref's waits behind a user
+    // ref's --ref.
     let gating = [forklift_core::util::office_utils::OFFICE_PALLET_NAME, forklift_core::util::redaction_utils::REDACTIONS_PALLET_NAME]
         .map(|name| format!("@{}", name));
-    let next_step = match report.refs_refused.iter().find(|refused| !refused.pallet.starts_with('@')) {
-        _ if report.refs_refused.iter().any(|refused| gating.contains(&refused.pallet)) => hand,
-        Some(user) => format!("forklift heal --ref {}=<parcel>", user.pallet),
-        None => hand,
+    let meta_step = |refused: &ref_heal::Refused| ref_heal::meta_step(refused, &report.refs_refused);
+    let gate = gating.iter().find_map(|wire| report.refs_refused.iter().find(|refused| refused.pallet == *wire));
+    let next_step = match (gate, report.refs_refused.iter().find(|refused| !refused.pallet.starts_with('@'))) {
+        (Some(gate), _) => meta_step(gate),
+        (None, Some(user)) => format!("forklift heal --ref {}=<parcel>", user.pallet),
+        (None, None) => report.refs_refused.first().map(meta_step).unwrap_or_else(|| "forklift heal".to_string()),
     };
 
     CoreError::refusal_with_details(
@@ -1494,6 +1502,14 @@ fn refusal_lines(refused: &[ref_heal::Refused]) -> Vec<String> {
         }
         for candidate in &refused.candidates {
             lines.push(format!("  {} ({})", candidate.head, candidate.source));
+        }
+
+        // What its removal costs, where that is its way out.
+        if refused.meta.as_ref().is_some_and(|meta| meta.owner == ref_heal::Owner::Own) {
+            lines.push(
+                "  Its removal leaves the pallet empty: what only its history reached may then be freed, and the removed files' bytes \
+                are kept under removed-refs.".to_string()
+            );
         }
     }
 
@@ -1633,10 +1649,17 @@ fn rebuilt_sentence(rebuilt: &ref_heal::Rebuilt) -> String {
 }
 
 fn removed_sentence(removed: &ref_heal::Removed) -> String {
-    format!(
-        "Removed the unreadable ref of pallet \"{}\", keeping its bytes in \"{}\"; what only it reached is no longer held by any pallet.",
-        removed.pallet, removed.kept
-    )
+    let kept = removed.kept.iter().map(|kept| format!("\"{}\"", kept)).collect::<Vec<_>>().join(" and ");
+    match removed.pallet.starts_with('@') {
+        true => format!(
+            "Removed the lost or damaged ref of pallet \"{}\" and its copy, keeping their bytes in {}; the pallet now reads empty, and what only it reached is no longer held by any pallet.",
+            removed.pallet, kept
+        ),
+        false => format!(
+            "Removed the unreadable ref of pallet \"{}\", keeping its bytes in {}; what only it reached is no longer held by any pallet.",
+            removed.pallet, kept
+        ),
+    }
 }
 
 /// Drop the unavailable record's entry of every object the store holds, whose content came back,
@@ -2325,6 +2348,7 @@ mod tests {
             pallet: pallet.to_string(),
             reason: "it waits.".to_string(),
             candidates: candidates.iter().map(|(head, source)| ref_heal::Candidate { head: head.to_string(), source: source.to_string() }).collect(),
+            meta: None,
         };
         let held = |unread: bool| ref_heal::TaintHold { unread, refs: vec!["@tags".to_string()] };
         assert!(deferred_sentences(&[], None).is_empty());

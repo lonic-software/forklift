@@ -790,13 +790,14 @@ pub(crate) fn observe_trust_files() -> Result<(pallet_utils::TrustEntryState, pa
 ///                                   - Both files, as judged, and the anchor that verified
 ///                                     `head`, which what is judged beside the office is
 ///                                     verified against.
-/// * `Err(String)`                   - Why the head is not written, as a refusal's reason:
-///                                     neither file holds an anchor that verifies it; a newer
-///                                     version wrote one; or a file, the served state or the
-///                                     office chain could not be read, which says nothing of the
-///                                     head.
-pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorPrecondition, TrustAnchor), String> {
-    let unjudged = |why: String| format!("parcel {} could not be verified against the anchor: {}", head, why.trim_end_matches('.'));
+/// * `Err((String, bool))`           - Why the head is not written, as a refusal's reason, and
+///                                     whether that is the head's own: `true` when neither file
+///                                     holds an anchor that verifies it, or the head's chain
+///                                     could not be read to verify it; `false` when a newer
+///                                     version wrote one, or a file or the served state could not
+///                                     be read, which says nothing of the head.
+pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorPrecondition, TrustAnchor), (String, bool)> {
+    let unjudged = |why: String| (format!("parcel {} could not be verified against the anchor: {}", head, why.trim_end_matches('.')), false);
     let (trust, copy) = observe_trust_files().map_err(unjudged)?;
     let served = crate::util::tombstone_utils::served_state().map_err(unjudged)? != crate::util::tombstone_utils::ServedState::Never;
     let mut said = Vec::new();
@@ -806,10 +807,10 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
     for (entry, name) in [(&trust, FILE_NAME_TRUST), (&copy, FILE_NAME_TRUST_COPY)] {
         if let pallet_utils::TrustEntryState::Bytes(bytes) = entry {
             if newer_refusal_in(bytes).is_some() {
-                return Err(format!(
+                return Err((format!(
                     "\"{}\" was written by a newer version of Forklift, so heal does not verify the office against it",
                     forklift_root().join(name).to_string_lossy()
-                ));
+                ), false));
             }
         }
     }
@@ -836,17 +837,19 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
             }
         };
 
-        match anchor_serves(&Ok(bytes.clone()), &anchor, Some(head), served).map_err(unjudged)? {
+        // A chain that cannot be read is the head's: no anchor can verify it.
+        let chain = |why: String| (unjudged(why).0, true);
+        match anchor_serves(&Ok(bytes.clone()), &anchor, Some(head), served).map_err(chain)? {
             true => return Ok((pallet_utils::AnchorPrecondition::Files { trust: trust.clone(), copy: copy.clone() }, anchor)),
             false => said.push("holds an anchor it does not verify against"),
         }
     }
 
-    Err(format!(
+    Err((format!(
         "parcel {} does not verify as the office's history against an anchor heal can read: the trust file (\"{}\") {}, and its copy (\"{}\") {}",
         head, forklift_root().join(FILE_NAME_TRUST).to_string_lossy(), said[0],
         forklift_root().join(FILE_NAME_TRUST_COPY).to_string_lossy(), said[1]
-    ))
+    ), true))
 }
 
 /// Whether the anchor `anchor`, parsed from the trust-file `bytes` (`Err`: the entry is not a
@@ -2402,6 +2405,24 @@ fn unborn_office_note() -> String {
 /// stopped between its writes look alike. `closing` says what the refused command left as it was.
 pub fn office_unborn_refusal(closing: &str) -> String {
     office_unborn_refusal_over(closing, unchecked_remote())
+}
+
+/// The way out [`office_unborn_refusal`] names for an office pallet unborn beside the trust
+/// file's anchor, as a command or as sentences: what a refusal that waits on the office names.
+pub fn office_unborn_step() -> String {
+    let served = crate::util::tombstone_utils::served_state()
+        .is_ok_and(|state| state != crate::util::tombstone_utils::ServedState::Never);
+    if served {
+        return format!(
+            "On a served warehouse that is the state before the enrolling client lifts the office pallet; if it was lifted here \
+            before, restore its ref (\"{}\") from a backup.",
+            pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME).to_string_lossy()
+        );
+    }
+    match unborn_office_remedy(unchecked_remote()) {
+        (step, _) if !step.is_empty() => step,
+        (_, ways_out) => ways_out,
+    }
 }
 
 /// What is known, without asking it, of a remote a lower could take the office pallet from:

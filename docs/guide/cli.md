@@ -2881,6 +2881,14 @@ are in `details` under `--json`). Choose one yourself:
 - `forklift heal --remove-ref <pallet>` drops a damaged ref that nothing names a head for and no
   checkout stands on, once every checkout's saved state could be read. Its bytes are kept under `.forklift/removed-refs`, and whatever only that
   ref reached is no longer kept by any pallet. Repeatable.
+- `forklift heal --remove-ref @<name>` removes a metadata pallet's lost or damaged ref and its copy,
+  when `heal` refused that ref for a reason of its own: nothing names a head for it, the head
+  named does not verify as the pallet's history, or two heads disagree. The bytes of each are kept
+  in a file of their own under `.forklift/removed-refs`, and the pallet then reads as empty: its
+  tags, redactions or other records are gone from it, and what only its history reached may be
+  freed. It runs only with no durability taint standing (run `forklift heal` first), and refuses
+  a ref `heal` refused only because the office's or `@redactions`' ref was refused, or because the
+  office is unborn beside the trust file, naming what to settle first.
 
 Both refuse a ref that is readable. A refusal also lists any ref the same run already set or
 removed. The report lists `refs_rebuilt`, `refs_removed` and

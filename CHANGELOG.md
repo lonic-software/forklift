@@ -35,11 +35,20 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   beside it is then restored from its copy. The redactions' own ref (`@redactions`) is rebuilt
   next, ahead of every other metadata ref, which is checked against it; beside a damaged office
   the head it is to be rebuilt at is verified first, and the office is checked against that head.
-  While either ref is damaged and was not rebuilt, every damaged metadata ref is refused, to be set
-  by hand. A metadata ref that cannot be settled before the taint recovery is judged again after
+  While either ref is damaged and was not rebuilt, every damaged metadata ref is refused, naming
+  that ref's step. A metadata ref that cannot be settled before the taint recovery is judged again after
   it; a refusal that stops the run before then, such as one for a durability taint that still
   stands, names each ref left that way with the heads found for it, and each damaged metadata
   ref a pass that stopped never judged.
+
+- **`heal --remove-ref @<name>` removes a metadata pallet's ref that `heal` cannot rebuild.**
+  When `heal` refuses a metadata ref for a reason of its own (nothing names a head, the head named
+  does not verify, or two heads disagree), the refusal names `forklift heal --remove-ref @<name>`
+  and says what it costs. The removal keeps the ref's and the copy's bytes under
+  `.forklift/removed-refs` and leaves the pallet empty. It refuses while a durability taint stands,
+  and for a ref that waits on the office's or `@redactions`' refusal, or on an unborn office, it
+  names that step instead. `--json`: each `refs_removed` entry's `kept` is now a list of files
+  (schema 61).
 
 ### Changed
 

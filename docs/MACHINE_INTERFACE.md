@@ -85,7 +85,14 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 60** (current): a metadata pallet's ref whose file is missing while its copy
+**Schema 61** (current): `heal --remove-ref` takes a metadata pallet (`@<name>`) that `heal`
+refused for a reason of its own, and removes its ref and its copy. Each `refs_removed` entry's
+`kept` is now a list of the files the removed bytes were kept in: the ref's, then, for a metadata
+pallet, its copy's (a lost ref keeps only its copy's). A metadata ref `heal` has nothing to
+rebuild from names `forklift heal --remove-ref @<name>` as its `next_step`, where it used to name
+restoring the file by hand.
+
+**Schema 60**: a metadata pallet's ref whose file is missing while its copy
 (`.forklift/meta-copy/<name>`) stands is refused as `ref_damaged` (exit 53) wherever it is read,
 where it used to read as a pallet never written, and the `next_step` names `forklift heal` when the
 copy holds a parcel hash, or a damaged ref's file names one parcel. `heal`'s
