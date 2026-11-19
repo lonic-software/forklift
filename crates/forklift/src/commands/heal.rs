@@ -1190,6 +1190,11 @@ pub(crate) struct ObjectsLost {
     #[serde(skip_serializing_if = "Option::is_none")]
     pallets_unknown: Option<String>,
 
+    /// The pallets whose ref could not be read, so whether their history reaches any of them
+    /// could not be told.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pallets_unread: Vec<UnreadPallet>,
+
     /// Whether only staged content reaches every one of them: loads never stacked, each in a
     /// checkout `staged` or `staged_elsewhere` names, which no backup is needed to mend.
     staged_only: bool,
@@ -1210,6 +1215,17 @@ pub(crate) struct ObjectsLost {
     /// Whether the pack folder holds an index of another pack format.
     #[serde(skip)]
     foreign_index: bool,
+}
+
+/// A pallet whose ref could not be read.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct UnreadPallet {
+    /// The pallet's wire name (`@<name>` for a metadata pallet).
+    pallet: String,
+
+    /// Why its ref could not be read.
+    reason: String,
 }
 
 /// One lost object and why it is lost.
@@ -1234,10 +1250,18 @@ impl ObjectsLost {
 
         let all: std::collections::BTreeSet<String> =
             lost.absent.iter().chain(lost.unreadable.keys()).chain(lost.corrupt.keys()).cloned().collect();
-        let (pallets, pallets_unknown) = match recovery_utils::pallets_reaching(&all) {
-            Ok(pallets) => (pallets, None),
-            Err(error) => (Vec::new(), Some(error)),
+        let (pallets, pallets_unread, pallets_unknown) = match recovery_utils::pallets_reaching(&all) {
+            Ok(found) => (found.reaching, found.unread, None),
+            Err(error) => (Vec::new(), Vec::new(), Some(error)),
         };
+        // The read's own next step is left out: heal's line for that ref says what to do.
+        let pallets_unread = pallets_unread.into_iter()
+            .map(|(pallet, error)| UnreadPallet {
+                pallet,
+                reason: forklift_core::error::deframe(&error)
+                    .map_or_else(|| error.clone(), |(_, message, _)| message.into_owned()),
+            })
+            .collect();
         // Where staged content is all that reaches them cannot be told, they read as history's.
         let corrupt: std::collections::BTreeSet<String> = lost.corrupt.keys().cloned().collect();
         let staged = recovery_utils::staged_only_losses(&all, &corrupt).unwrap_or_default();
@@ -1249,6 +1273,7 @@ impl ObjectsLost {
             hashes,
             pallets,
             pallets_unknown,
+            pallets_unread,
             staged_only: staged.all,
             staged: staged.here,
             staged_elsewhere: staged.elsewhere,
@@ -1279,10 +1304,18 @@ impl ObjectsLost {
             (Some(error), _) => lines.push(format!("Which pallets reach them could not be told: {}", error)),
             (None, false) => lines.push(format!("History that reaches them: {}.", self.pallets.join(", "))),
             (None, true) if self.staged_only => {}
+            // A pallet whose ref could not be read may be the one that reaches them.
+            (None, true) if !self.pallets_unread.is_empty() => {}
             (None, true) => lines.push(
                 "No pallet's history reaches them; other refs (staged content, parked work, a bay's operation, a tombstone) do."
                     .to_string(),
             ),
+        }
+        for unread in &self.pallets_unread {
+            lines.push(format!(
+                "Whether the history of pallet \"{}\" reaches them could not be told: {}",
+                unread.pallet, unread.reason
+            ));
         }
         if !self.staged.is_empty() {
             let listed: Vec<&str> = self.staged.iter().take(LOST_HASHES_LISTED).map(String::as_str).collect();
@@ -2255,7 +2288,36 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 
 #[cfg(test)]
 mod tests {
-    use super::{deferred_sentences, ref_heal, unjudged_sentences, unload_step_when};
+    use super::{deferred_sentences, ref_heal, unjudged_sentences, unload_step_when, LostObject, ObjectsLost, UnreadPallet};
+
+    // A pallet whose ref could not be read may be the one whose history reaches the lost
+    // objects, so the report names it and never says no pallet's history reaches them.
+    // Mutation: print "No pallet's history reaches them" whenever no pallet reaches them → red.
+    #[test]
+    fn a_lost_objects_report_names_a_ref_it_could_not_read_and_never_says_nothing_reaches_them() {
+        let report = |unread: Vec<UnreadPallet>| ObjectsLost {
+            absent: 1,
+            unreadable: 0,
+            corrupt: 0,
+            hashes: vec![LostObject { hash: "a".repeat(64), reason: "absent".to_string() }],
+            pallets: Vec::new(),
+            pallets_unknown: None,
+            pallets_unread: unread,
+            staged_only: false,
+            staged: Vec::new(),
+            staged_elsewhere: Vec::new(),
+            degraded_sources: Vec::new(),
+            foreign_index: false,
+        }.lines();
+        let nothing = "No pallet's history reaches them; other refs (staged content, parked work, a bay's operation, a tombstone) do.";
+
+        let lines = report(vec![UnreadPallet { pallet: "@tags".to_string(), reason: "its ref is lost.".to_string() }]);
+        assert!(lines.contains(&"Whether the history of pallet \"@tags\" reaches them could not be told: its ref is lost.".to_string()), "{:?}", lines);
+        assert!(!lines.iter().any(|line| line.contains("No pallet's history reaches them")), "{:?}", lines);
+
+        // With every ref read, the line stands.
+        assert!(report(Vec::new()).contains(&nothing.to_string()));
+    }
 
     #[test]
     fn a_refusal_names_each_meta_ref_left_for_after_the_taint_with_its_heads() {

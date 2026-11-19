@@ -316,18 +316,6 @@ pub fn does_pallet_exist(name: &str) -> bool {
     get_pallet_ref_path(PalletNamespace::User, name).is_file()
 }
 
-/// Check whether a meta pallet exists.
-///
-/// # Arguments
-/// * `name` - The name of the meta pallet.
-///
-/// # Returns
-/// * `true`  - If the meta pallet has a ref file.
-/// * `false` - If it does not.
-pub fn does_meta_pallet_exist(name: &str) -> bool {
-    get_pallet_ref_path(PalletNamespace::Meta, name).is_file()
-}
-
 /// Where a bay stands: its current pallet, and the base — the parcel its inventory and working
 /// directory were last materialized from or stacked as (`None` while the pallet is unborn). The
 /// pallet's ref is shared by every bay on it and can move under this bay; the base cannot, so
@@ -796,38 +784,103 @@ pub fn get_meta_pallet_head(name: &str) -> Result<Option<String>, String> {
 ///
 /// # Returns
 /// * `Ok(Some(String))` - The hash of the pallet's head parcel.
-/// * `Ok(None)`         - If the pallet is unborn (it has no ref file yet).
+/// * `Ok(None)`         - If the pallet is unborn: it has no ref file, and, for a meta pallet,
+///   no copy either.
 /// * `Err(String)`      - If the name is invalid, or the ref file could not be read, or it
-///   does not contain a valid hash (a [`RefusalCode::RefDamaged`] refusal).
+///   does not contain a valid hash, or a meta pallet's ref file is missing while its copy stands
+///   (each a [`RefusalCode::RefDamaged`] refusal but the first two).
 pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Option<String>, String> {
     validate_pallet_name(name)?;
 
     let path = get_pallet_ref_path(namespace, name);
 
-    if !path.is_file() {
+    if path.is_file() {
+        return read_ref_file(namespace, name, &path);
+    }
+
+    if namespace == PalletNamespace::User {
         return Ok(None);
     }
 
-    let bytes = std::fs::read(&path)
+    // A meta ref's copy is written before a forward move and after a birth, so a copy standing
+    // without its ref is a loss, or a birth whose ref landed after the first check: the second
+    // check below tells the two apart, since nothing but a removal takes a born meta ref away.
+    let copy_path = get_meta_copy_path(name);
+
+    // A folder at the copy path is no copy: it holds the copies of names below this one, as the
+    // meta folder holds their refs.
+    if std::fs::symlink_metadata(&copy_path).is_ok_and(|metadata| metadata.is_dir()) {
+        return Ok(None);
+    }
+
+    let (copy_said, step) = match read_file_state(&copy_path) {
+        Ok(MetaCopyState::Absent) => return Ok(None),
+        Ok(MetaCopyState::Bytes(bytes)) if parse_ref_bytes(&bytes).is_some() => ("still stands".to_string(), HEAL_STEP),
+        Ok(_) => ("stands but does not hold a parcel hash".to_string(), META_REF_HAND_STEP),
+        // `heal` reads the copy again, and says why if it still cannot.
+        Err(error) => (format!("could not be read: {}", error.trim_end_matches('.')), HEAL_STEP),
+    };
+
+    if path.is_file() {
+        return read_ref_file(namespace, name, &path);
+    }
+
+    Err(CoreError::refusal(
+        RefusalCode::RefDamaged,
+        format!(
+            "The ref of pallet \"{}\" (\"{}\") is lost: its file is missing, and its copy (\"{}\") {}. \
+            Nothing was changed.",
+            PalletRef { namespace, name: name.to_string() }.to_wire(),
+            path.to_string_lossy(),
+            copy_path.to_string_lossy(),
+            copy_said
+        ),
+        step,
+    ).into())
+}
+
+const HEAL_STEP: &str = "forklift heal";
+
+/// The step for a meta ref `heal` has nothing to rebuild from.
+const META_REF_HAND_STEP: &str =
+    "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.";
+
+/// Read the ref file at `path`, which stands, as [`get_pallet_head_in`] does.
+fn read_ref_file(namespace: PalletNamespace, name: &str, path: &Path) -> Result<Option<String>, String> {
+    let bytes = std::fs::read(path)
         .map_err(|e| format!("Error while reading the ref of pallet \"{}\": {}", name, e))?;
 
-    match parse_ref_bytes(&bytes) {
-        Some(hash) => Ok(Some(hash)),
-        None => Err(CoreError::refusal(
-            RefusalCode::RefDamaged,
-            format!(
-                "The ref of pallet \"{}\" (\"{}\") is damaged: it does not hold a parcel hash. Nothing \
-                was changed.",
-                PalletRef { namespace, name: name.to_string() }.to_wire(),
-                path.to_string_lossy()
-            ),
-            // `heal` rebuilds user refs only; a meta ref has no checkout or journal to rebuild from.
-            match namespace {
-                PalletNamespace::User => "forklift heal",
-                PalletNamespace::Meta => "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.",
-            },
-        ).into()),
+    if let Some(hash) = parse_ref_bytes(&bytes) {
+        return Ok(Some(hash));
     }
+
+    // `heal` rebuilds a meta ref only from its copy or from what its own bytes still name.
+    let step = match namespace {
+        PalletNamespace::User => HEAL_STEP,
+        PalletNamespace::Meta => {
+            let copy_parses = matches!(
+                read_file_state(&get_meta_copy_path(name)),
+                Ok(MetaCopyState::Bytes(copy)) if parse_ref_bytes(&copy).is_some()
+            );
+
+            if copy_parses || crate::util::ref_heal::salvage_names_a_head(&bytes) {
+                HEAL_STEP
+            } else {
+                META_REF_HAND_STEP
+            }
+        }
+    };
+
+    Err(CoreError::refusal(
+        RefusalCode::RefDamaged,
+        format!(
+            "The ref of pallet \"{}\" (\"{}\") is damaged: it does not hold a parcel hash. Nothing \
+            was changed.",
+            PalletRef { namespace, name: name.to_string() }.to_wire(),
+            path.to_string_lossy()
+        ),
+        step,
+    ).into())
 }
 
 /// The head a ref file's `bytes` hold: one object hash, followed by any number of newlines.
@@ -2563,7 +2616,11 @@ pub fn list_meta_pallets() -> Result<Vec<String>, String> {
     list_pallets_in(PalletNamespace::Meta)
 }
 
-/// List the names of all pallets with a ref file in the given namespace, sorted.
+/// List the names of all pallets with a ref file in the given namespace, sorted, and for the meta
+/// namespace every meta pallet this forklift knows with something other than a folder at its copy
+/// too: a meta ref lost beside its copy is listed, so a reader of the whole namespace meets the
+/// refusal its head read gives rather than leaving it out. The copies are looked up by name, never
+/// their folder listed, as `heal` finds them, so a stray file there names no pallet.
 ///
 /// # Arguments
 /// * `namespace` - The pallet namespace.
@@ -2579,7 +2636,20 @@ pub fn list_pallets_in(namespace: PalletNamespace) -> Result<Vec<String>, String
         collect_pallet_names(&folder, "", &mut names)?;
     }
 
+    if namespace == PalletNamespace::Meta {
+        for name in crate::util::meta_tree::META_PALLET_NAMES {
+            match std::fs::symlink_metadata(get_meta_copy_path(name)) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => names.push(name.to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Listed, so its head read says why the copy could not be read, or reads the ref.
+                Err(_) => names.push(name.to_string()),
+            }
+        }
+    }
+
     names.sort();
+    names.dedup();
 
     Ok(names)
 }
@@ -2877,7 +2947,7 @@ pub(crate) mod tests {
             set_copy("tags", &h2);
             let moved = repair_meta_pallet_head("tags", &RefDamage::Missing, &judged, &h1, &RefPreconditions::NONE, None);
             assert!(matches!(moved, Err(RefUpdateError::Moved(_))), "{:?}", moved);
-            assert_eq!(head("tags"), None, "the ref must stay lost");
+            assert!(get_meta_pallet_head("tags").unwrap_err().contains("is lost"), "the ref must stay lost");
 
             set_copy("tags", &h1);
             repair_meta_pallet_head("tags", &RefDamage::Missing, &judged, &h1, &RefPreconditions::NONE, None).unwrap();
@@ -3892,8 +3962,8 @@ pub(crate) mod tests {
             match &written {
                 Err(RefUpdateError::Failed(why)) => {
                     assert!(why.contains("pallet \"@redactions\""), "{}", why);
-                    // `heal` does not rebuild a meta ref, so it is not the way out.
-                    assert!(why.contains("by hand") && !why.contains("forklift heal"), "{}", why);
+                    // Its copy still names a head, so `heal` rebuilds it: that is the way out.
+                    assert!(why.contains("forklift heal") && !why.contains("by hand"), "{}", why);
                 }
                 other => panic!("expected the @redactions read's failure, got {:?}", other),
             }

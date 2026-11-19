@@ -436,6 +436,13 @@ fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
     Ok(judge(matches, tainted))
 }
 
+/// Whether a damaged ref's `bytes` give `heal` a head to judge: they name a parcel, one of
+/// several, or one that may be lost, or what they name could not be looked up, which heal looks
+/// up again. Only bytes that name nothing at all leave heal nothing.
+pub(crate) fn salvage_names_a_head(bytes: &[u8]) -> bool {
+    !matches!(salvage(bytes, &Tainted::read(&mut Vec::new())), Ok(Salvage::Nothing))
+}
+
 /// The salvage among `matches`: the one readable parcel, unless another parcel also matches, or
 /// a match is tainted or cannot be read as any kind of object, which leaves the answer unknown
 /// (the bytes then still name a head, only not which). A

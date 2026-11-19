@@ -6233,13 +6233,16 @@ fn export_git_leaves_tags_out_when_the_office_cannot_name_their_tagger() {
     assert_eq!(damaged["skipped_tags"].as_array().unwrap().len(), 1, "{}", damaged);
     let skipped = &damaged["skipped_tags"][0];
     assert_eq!(skipped["name"], "v1");
-    assert!(skipped["reason"].as_str().unwrap().contains("the office that names its tagger could not be read"),
-        "{}", damaged);
+    let reason = skipped["reason"].as_str().unwrap();
+    assert!(reason.contains("the office that names its tagger could not be read: The ref of pallet \"@office\""), "{}", damaged);
+    assert!(!reason.contains('\u{1f}'), "the reason must not carry the refusal's frame: {}", damaged);
     assert!(damaged.get("unreadable_tags").is_none(), "{}", damaged);
     let human = stdout(&warehouse.run(&["git", "export", warehouse.root.join("damaged-human").to_str().unwrap()]));
     assert!(human.contains("warning: tag \"v1\" was not exported: the office"), "{}", human);
 
+    // An office never written: neither the ref nor its copy stands.
     forklift_core::util::file_utils::remove_file(&office_head).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift").join("meta-copy").join("office")).unwrap();
     let unborn = export("unborn");
     assert_eq!(unborn["tags"], serde_json::json!(["pre"]));
     assert_eq!(unborn["skipped_tags"].as_array().unwrap().len(), 1, "{}", unborn);
@@ -8037,14 +8040,18 @@ fn damaged_trust_refuses_with_its_code_and_names_heal_where_heal_mends() {
             let anchor = foreign_anchor.clone();
             Box::new(move |w| std::fs::write(w.root.join(".forklift/trust"), &anchor).unwrap())
         }, &["stack", "-m", "r"], 69, "trust_damaged", "forklift heal", "does not verify the office pallet, but its copy does"),
-        ("office ref lost", Box::new(move |w| lose(w, "meta/office")),
+        // Its copy stands, so heal rebuilds it, verified against the trust file.
+        ("office ref lost beside its copy", Box::new(move |w| lose(w, "meta/office")),
+            &["stack", "-m", "r"], 53, "ref_damaged", "forklift heal", "is lost: its file is missing, and its copy"),
+        ("office ref and copy lost", Box::new(move |w| { lose(w, "meta/office"); lose(w, "meta-copy/office"); }),
             &["stack", "-m", "r"], 53, "ref_damaged", "", "by hand"),
-        ("office ref lost", Box::new(move |w| lose(w, "meta/office")),
+        ("office ref and copy lost", Box::new(move |w| { lose(w, "meta/office"); lose(w, "meta-copy/office"); }),
             &["audit"], 53, "ref_damaged", "", "the office pallet is unborn"),
-        ("office ref lost", Box::new(move |w| lose(w, "meta/office")),
+        ("office ref and copy lost", Box::new(move |w| { lose(w, "meta/office"); lose(w, "meta-copy/office"); }),
             &["office", "enroll"], 53, "ref_damaged", "", "the office pallet is unborn"),
-        ("office ref lost, a remote configured", Box::new(move |w| {
+        ("office ref and copy lost, a remote configured", Box::new(move |w| {
             lose(w, "meta/office");
+            lose(w, "meta-copy/office");
             assert_success(&w.run(&["config", "set", "remote.url", "http://127.0.0.1:9"]));
         }), &["stack", "-m", "r"], 53, "ref_damaged", "", "If the configured remote holds this warehouse's office pallet"),
         ("head signature garbled", Box::new(|w| std::fs::write(sidecar_of_head(w), b"xx").unwrap()),
@@ -8132,7 +8139,9 @@ fn undoing_a_delete_over_a_damaged_office_signature_names_what_was_refused() {
 #[test]
 fn an_enrollment_stopped_before_the_office_names_a_way_out_that_works() {
     let (warehouse, _) = enrolled_warehouse("enroll-stopped");
+    // The ref's copy is written with the ref, so neither stands.
     forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/meta/office")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/meta-copy/office")).unwrap();
 
     let refused = warehouse.run(&["--json", "office", "enroll"]);
 

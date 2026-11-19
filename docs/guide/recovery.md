@@ -93,8 +93,8 @@ stands, but says nothing about this damage; see
 
 ### `ref_damaged` (exit 53)
 
-A pallet's ref is missing although a checkout stands on it, or its file does not hold a parcel hash:
-a crash, a disk fault or a hand edit damaged it. Run:
+A pallet's ref is missing although a checkout stands on it, or, for a meta pallet, although its copy
+stands, or its file does not hold a parcel hash: a crash, a disk fault or a hand edit damaged it. Run:
 
 ```sh
 forklift heal
@@ -109,22 +109,35 @@ what only that ref reached is then no longer kept by any pallet.
 
 **Do not** write the ref file by hand: `heal --ref` checks that the parcel's history is complete.
 
-A meta pallet's ref (a name starting with `@`, such as `@tags`) is rebuilt from its copy
-(`.forklift/meta-copy/<name>`), the office's and `@redactions`' among them. One `heal` refuses is not
-rebuilt: restore its file from a backup, or write the head parcel's hash into it.
+A meta pallet's ref (a name starting with `@`, such as `@tags`) keeps a copy beside it
+(`.forklift/meta-copy/<name>`), written with every change of the ref. A meta ref whose file is missing
+while its copy stands refuses as `ref_damaged` wherever it is read, in place of reading as an empty pallet,
+and so does one whose file does not hold a parcel hash. `heal` rebuilds it from its copy, or from what
+the damaged file still names, the office's and `@redactions`' among them, so the refusal names
+`forklift heal` whenever one of those names a head. Where neither does (the copy does not hold a parcel
+hash, and the damaged file names nothing or is missing), and for a ref `heal` refuses, the next step is
+to restore the file from a backup, or write the head parcel's hash into it.
 
-The office pallet's ref (`.forklift/meta/office`) missing beside a trust file refuses as `ref_damaged`
-too, in the commands that need the verified office, such as `stack`, `audit` and `office enroll`: the anchor stands, but there is no office to check
-anything against. `forklift lower` takes the office pallet from a remote that holds it and verifies it against the
+A meta ref lost together with its copy leaves nothing that says the pallet was ever written, so it
+reads as empty, as one never written does: `tag list` then lists no tags, for example, and refuses
+nothing. Restore both files from a backup.
+
+`heal` rebuilds the office pallet's ref (`.forklift/meta/office`) from its copy
+(`.forklift/meta-copy/office`) only once the copy's head verifies against the trust file's anchor, and
+not at all where a newer version of Forklift wrote the trust file or its copy, or the office's history
+cannot be read from the store.
+
+The office pallet's ref missing beside a trust file, with its copy missing too, refuses as
+`ref_damaged` in the commands that need the verified office, such as `stack`, `audit` and
+`office enroll`: the anchor stands, but there is no office to check anything against.
+`forklift lower` takes the office pallet from a remote that holds it and verifies it against the
 trust file. `forklift lift` asks the remote, so it names lower as the next step only where the remote
 holds this warehouse's office; other commands name it as a way out where a remote is configured.
-`forklift heal` rebuilds the ref from its copy (`.forklift/meta-copy/office`) where that stands and
-verifies against the anchor, unless a newer version of Forklift wrote the trust file or its copy, or
-the office's history cannot be read from the store. With neither a remote nor a copy to rebuild from, restore the ref from a
-backup, or write the office pallet's head parcel hash into it by hand. Write the latest head you know
-of: an older one re-admits any key revoked since. If `office enroll` stopped before it wrote the office
-pallet, there is no ref to restore. Where no remote holds this anchor, move the trust file (`.forklift/trust`) and
-its copy (`.forklift/trust-copy`) aside and run `forklift office enroll` again.
+With neither a remote nor a copy to rebuild from, restore the ref from a backup, or write the office
+pallet's head parcel hash into it by hand. Write the latest head you know of: an older one re-admits
+any key revoked since. If `office enroll` stopped before it wrote the office pallet, there is no ref to
+restore. Where no remote holds this anchor, move the trust file (`.forklift/trust`) and its copy
+(`.forklift/trust-copy`) aside and run `forklift office enroll` again.
 
 ### `fetch_scope_damaged` (exit 54)
 
@@ -303,7 +316,9 @@ counted lost; it says its check may be short instead.
 `heal` ran every repair it could, and objects that history still reaches cannot be read from this
 store. The message counts them (absent, unreadable, and corrupt: held only in loose files or pack
 records whose bytes are not the object's), lists up to 20 hashes with the reason for each, and names the pallets
-whose history reaches them. `--json` carries the same in `details.objects_lost`. Do what the next
+whose history reaches them, and every pallet whose ref could not be read, whose history may reach them
+too. `--json` carries the same in
+`details.objects_lost`. Do what the next
 step names:
 
 - **Restore the warehouse from a backup, or clone it afresh** from a remote that holds these objects.

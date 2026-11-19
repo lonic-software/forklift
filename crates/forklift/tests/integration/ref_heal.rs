@@ -1160,6 +1160,107 @@ fn a_lost_meta_ref_is_rebuilt_from_its_copy() {
     assert!(rebuilt_meta(&healed(&area, &root)).is_empty());
 }
 
+const META_REF_HAND_STEP: &str = "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.";
+
+/// `forklift tag list` in `root`, as JSON.
+fn tag_list(area: &Area, root: &Path) -> Output {
+    area.run(root, &["--json", "tag", "list"])
+}
+
+fn tag_names(output: &Output) -> Vec<String> {
+    assert!(output.status.success(), "tag list failed: {}{}", text(&output.stdout), text(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    value["data"]["tags"].as_array().unwrap().iter().map(|tag| tag["name"].as_str().unwrap().to_string()).collect()
+}
+
+// A lost meta ref is refused where it is read, never read as unborn, while its copy stands. The
+// step names heal only when heal has a head to judge: a copy that parses. Mutations: read a
+// missing ref as unborn whatever its copy → `tag list` prints no tags, red; name heal for any
+// copy → the second case red; refuse with no copy → the third case red.
+#[test]
+fn a_lost_meta_ref_is_refused_where_it_is_read_while_its_copy_stands() {
+    let area = Area::new("meta-loud");
+    let root = area.warehouse();
+    area.run_ok(&root, &["tag", "create", "v1"]);
+    let head = meta_head(&root, "tags").unwrap();
+
+    // The copy parses: the step is heal, and heal rebuilds the ref so the tag reads again.
+    forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+    let refused = ref_damaged(&tag_list(&area, &root));
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with("The ref of pallet \"@tags\" (") && message.contains("is lost: its file is missing, and its copy (") && message.ends_with(") still stands. Nothing was changed."), "{}", refused);
+    assert_eq!(refused["error"]["next_step"], "forklift heal", "{}", refused);
+    healed(&area, &root);
+    assert_eq!(tag_names(&tag_list(&area, &root)), vec!["v1".to_string()]);
+
+    // The copy does not parse: heal has nothing to rebuild from, so the step is the hand fix.
+    forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+    std::fs::write(meta_copy_path(&root, "tags"), b"not a hash").unwrap();
+    let refused = ref_damaged(&tag_list(&area, &root));
+    assert!(refused["error"]["message"].as_str().unwrap().contains(") stands but does not hold a parcel hash. Nothing was changed."), "{}", refused);
+    assert_eq!(refused["error"]["next_step"], META_REF_HAND_STEP, "{}", refused);
+
+    // The ref and its copy lost together: nothing is left to tell the pallet was born, so it
+    // reads as unborn. That residual is the guide's.
+    forklift_core::util::file_utils::remove_file(&meta_copy_path(&root, "tags")).unwrap();
+    assert!(tag_names(&tag_list(&area, &root)).is_empty());
+
+    // The ref put back by hand reads again.
+    std::fs::write(meta_path(&root, "tags"), format!("{}\n", head)).unwrap();
+    assert_eq!(tag_names(&tag_list(&area, &root)), vec!["v1".to_string()]);
+}
+
+// A damaged meta ref with no copy whose own bytes still name its head names heal, which rebuilds
+// it from them. Mutation: name heal only beside a copy that parses → the hand step, red.
+#[test]
+fn a_damaged_meta_ref_whose_bytes_salvage_names_heal_with_no_copy() {
+    let area = Area::new("meta-salvage-step");
+    let root = area.warehouse();
+    area.run_ok(&root, &["tag", "create", "v1"]);
+    let head = meta_head(&root, "tags").unwrap();
+
+    forklift_core::util::file_utils::remove_file(&meta_copy_path(&root, "tags")).unwrap();
+    std::fs::write(meta_path(&root, "tags"), &head.as_bytes()[..12]).unwrap();
+
+    let refused = ref_damaged(&tag_list(&area, &root));
+    assert!(refused["error"]["message"].as_str().unwrap().contains("is damaged: it does not hold a parcel hash."), "{}", refused);
+    assert_eq!(refused["error"]["next_step"], "forklift heal", "{}", refused);
+
+    healed(&area, &root);
+    assert_eq!(meta_head(&root, "tags").as_deref(), Some(head.as_str()));
+    assert_eq!(tag_names(&tag_list(&area, &root)), vec!["v1".to_string()]);
+
+    // Bytes that name nothing, with no copy, leave heal nothing: the hand step.
+    forklift_core::util::file_utils::remove_file(&meta_copy_path(&root, "tags")).unwrap();
+    std::fs::write(meta_path(&root, "tags"), b"not a hash").unwrap();
+    assert_eq!(ref_damaged(&tag_list(&area, &root))["error"]["next_step"], META_REF_HAND_STEP);
+}
+
+// A store sweep after a meta ref is lost refuses rather than delete the parcels only that ref
+// held: the listing names the pallet by its copy, so the sweep's fail-closed read meets the
+// refusal. Mutation: list meta pallets by their ref files alone → the sweep runs and deletes the
+// @tags parcel, red.
+#[test]
+fn a_sweep_after_a_meta_ref_is_lost_refuses_and_keeps_what_it_held() {
+    let area = Area::new("meta-lost-gc");
+    let root = area.warehouse();
+    area.run_ok(&root, &["tag", "create", "v1"]);
+    let head = meta_head(&root, "tags").unwrap();
+    let (folder, file) = forklift_core::util::file_utils::get_path_for_object(&head).unwrap();
+    let parcel = root.join(folder).join(file);
+    assert!(parcel.is_file(), "the fixture must find the @tags parcel loose");
+
+    forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+
+    let swept = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+        forklift_core::util::gc_utils::collect_garbage(0)
+    };
+    let error = swept.err().expect("the sweep must refuse over a lost meta ref");
+    assert!(forklift_core::error::rendered_frames(&error).contains("is lost"), "{}", error);
+    assert!(parcel.is_file(), "the @tags parcel must be kept");
+}
+
 // Mutation: prefer what the ref's bytes name over a copy descending from it → rebuilt at H1, red.
 #[test]
 fn a_damaged_meta_ref_takes_its_copy_when_the_copy_descends_from_what_its_bytes_name() {
@@ -1329,6 +1430,14 @@ fn a_lost_office_beside_a_redactions_ref_heal_cannot_verify_waits_on_it() {
 fn a_meta_ref_beside_a_lost_redactions_ref_is_refused_naming_it() {
     let area = Area::new("meta-blocked");
     let (root, _, second) = tagged(&area);
+    // A second pallet, for the second half, made before the damage: a write reads @redactions,
+    // and a lost one refuses it.
+    area.run_ok(&root, &["pallet", "create", "side"]);
+    area.run_ok(&root, &["shift", "side"]);
+    area.stack(&root, "s.txt", "side");
+    area.run_ok(&root, &["shift", "main"]);
+    area.stack(&root, "m.txt", "main");
+    let side = head(&root, "side");
 
     // A lost @redactions: its copy stands, its ref does not, and it names a @tags parcel, which
     // heal refuses as @redactions history.
@@ -1346,12 +1455,6 @@ fn a_meta_ref_beside_a_lost_redactions_ref_is_refused_naming_it() {
     // Beside a user ref refused too, the meta refs' hand step still comes first: a user ref's
     // rebuild is checked against the redactions. Mutation: name the hand step only when every
     // refused ref is a meta ref → the step is --ref main, red.
-    area.run_ok(&root, &["pallet", "create", "side"]);
-    area.run_ok(&root, &["shift", "side"]);
-    area.stack(&root, "s.txt", "side");
-    area.run_ok(&root, &["shift", "main"]);
-    area.stack(&root, "m.txt", "main");
-    let side = head(&root, "side");
     forklift_core::util::file_utils::remove_file(root.join(".forklift").join("journal.json")).unwrap();
     std::fs::write(ref_path(&root, "main"), &side.as_bytes()[..20]).unwrap();
 

@@ -5846,17 +5846,19 @@ fn a_lift_over_a_damaged_office_signature_on_the_server_names_its_operator() {
 }
 
 /// A lift from a warehouse whose office ref is lost beside its trust file refuses as ref_damaged
-/// before it uploads anything: a fresh remote is left with no trust anchor, rather than one with
+/// before it uploads anything, its copy lost or not: a fresh remote is left with no trust anchor, rather than one with
 /// no office behind it. Lower is the way out it names only where the remote holds the office.
 // Revert: read the office head after the anchor's upload in `push_local_trust` → the server root
 // holds a trust file. Revert: pass `true` for `lowerable` → the fresh remote's row names lower.
 #[test]
 fn a_lift_over_a_lost_office_ref_refuses_before_uploading_the_anchor() {
-    // (name, who lifted an office to the remote first, the step named)
-    for (name, lifted_first, step) in [
-        ("fresh remote", "", ""),
-        ("remote holds the office", "w", "forklift lower"),
-        ("remote holds another warehouse's office", "x", ""),
+    // (name, who lifted an office to the remote first, whether the ref's copy stands, the step
+    // named). A copy that stands is what heal rebuilds the ref from, so that row names heal.
+    for (name, lifted_first, copy_stands, step) in [
+        ("fresh remote", "", false, ""),
+        ("remote holds the office", "w", false, "forklift lower"),
+        ("remote holds another warehouse's office", "x", false, ""),
+        ("fresh remote, the copy standing", "", true, "forklift heal"),
     ] {
         let area = TestArea::new(&format!("lift-lost-office-{}", lifted_first));
         let server = Server::start(&area, None);
@@ -5883,6 +5885,9 @@ fn a_lift_over_a_lost_office_ref_refuses_before_uploading_the_anchor() {
             assert_success(&area.forklift("w", &["lift"]));
         }
         forklift_core::util::file_utils::remove_file(area.path("w/.forklift/meta/office")).unwrap();
+        if !copy_stands {
+            forklift_core::util::file_utils::remove_file(area.path("w/.forklift/meta-copy/office")).unwrap();
+        }
 
         let lifted = area.forklift("w", &["--json", "lift"]);
 
@@ -5891,7 +5896,10 @@ fn a_lift_over_a_lost_office_ref_refuses_before_uploading_the_anchor() {
         assert_eq!(value["error"]["code"], "ref_damaged", "{}: {}", name, value);
         assert_eq!(value["error"]["next_step"].as_str().unwrap_or(""), step, "{}: {}", name, value);
         let message = value["error"]["message"].as_str().unwrap();
-        assert!(message.contains("Nothing was lifted."), "{}: {}", name, value);
+        match copy_stands {
+            true => assert!(message.contains("is lost: its file is missing, and its copy"), "{}: {}", name, value),
+            false => assert!(message.contains("Nothing was lifted."), "{}: {}", name, value),
+        }
         assert_eq!(message.contains("by hand"), step.is_empty(), "{}: {}", name, value);
         assert_eq!(area.path("server-root/.forklift/trust").exists(), !lifted_first.is_empty(), "{}: no anchor reaches a fresh remote", name);
     }

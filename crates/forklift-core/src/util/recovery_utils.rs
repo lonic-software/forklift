@@ -2569,21 +2569,40 @@ pub(crate) fn corrupt_packed_objects() -> Result<StoreScan, String> {
     Ok(scan)
 }
 
-/// The pallets (user then meta, as wire names) whose history reaches any of `hashes`, for a
-/// report of lost objects. One targeted walk per pallet, so it is run only when something is lost.
+/// What [`pallets_reaching`] found.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PalletsReaching {
+    /// The pallets (user then meta, as wire names) whose history reaches any of the hashes, in
+    /// name order within each namespace.
+    pub reaching: Vec<String>,
+
+    /// The listed pallets whose head could not be read, each with why, in the same order: whether
+    /// their history reaches the hashes could not be told.
+    pub unread: Vec<(String, String)>,
+}
+
+/// The pallets whose history reaches any of `hashes`, for a report of lost objects, and the ones
+/// whose head could not be read, so the report never reads a lost or damaged ref as a pallet that
+/// does not reach them. An unborn pallet is neither. One targeted walk per pallet, so it is run
+/// only when something is lost.
 ///
 /// # Returns
-/// * `Ok(Vec<String>)` - The pallets, in name order within each namespace.
-/// * `Err(String)`     - The pallets could not be listed, or a walk could not finish.
-pub fn pallets_reaching(hashes: &BTreeSet<String>) -> Result<Vec<String>, String> {
+/// * `Ok(PalletsReaching)` - The reaching and the unread pallets.
+/// * `Err(String)`         - The pallets could not be listed, or a walk could not finish.
+pub fn pallets_reaching(hashes: &BTreeSet<String>) -> Result<PalletsReaching, String> {
     let scope = scope_utils::read_fetch_scope().unwrap_or_else(|_| PathScope::full());
     let sealed = sealed_utils::read_tolerated().unwrap_or_default();
-    let mut reaching = Vec::new();
+    let mut found = PalletsReaching::default();
 
     for namespace in [pallet_utils::PalletNamespace::User, pallet_utils::PalletNamespace::Meta] {
         for name in pallet_utils::list_pallets_in(namespace)? {
-            let Ok(Some(head)) = pallet_utils::get_pallet_head_in(namespace, &name) else {
-                continue;
+            let head = match pallet_utils::get_pallet_head_in(namespace, &name) {
+                Ok(Some(head)) => head,
+                Ok(None) => continue,
+                Err(error) => {
+                    found.unread.push((pallet_utils::PalletRef { namespace, name }.to_wire(), error));
+                    continue;
+                }
             };
             let (parcels, meta_heads) = match namespace {
                 pallet_utils::PalletNamespace::User => (vec![head], Vec::new()),
@@ -2596,12 +2615,12 @@ pub fn pallets_reaching(hashes: &BTreeSet<String>) -> Result<Vec<String>, String
             };
             let outcome = walk_closure_for(hashes, &roots, &BTreeSet::new(), &scope, Some(&sealed), None)?;
             if !outcome.referenced.is_empty() {
-                reaching.push(pallet_utils::PalletRef { namespace, name }.to_wire());
+                found.reaching.push(pallet_utils::PalletRef { namespace, name }.to_wire());
             }
         }
     }
 
-    Ok(reaching)
+    Ok(found)
 }
 
 /// What [`restore_from_working_tree`] stored again.
@@ -6225,6 +6244,40 @@ mod tests {
             "a shard-only reference (absent from the ledger) must still be found by the walk");
     }
 
+    /// The lost-objects report's source names every listed ref whose head could not be read, user
+    /// and meta, damaged and lost, beside the pallets that reach the objects, and skips an unborn
+    /// one. Revert: skip a ref whose read errors → the unread list is empty → red.
+    #[test]
+    fn pallets_reaching_names_every_ref_it_could_not_read() {
+        use crate::util::pallet_utils::{self, PalletNamespace, tests::{scratch, stub_parcel, update_pallet_head_unverified}};
+
+        let (root, _scope) = scratch("recovery-reaching-unread");
+        pallet_utils::write_position_in(&crate::globals::forklift_root(), &pallet_utils::BayPosition::new("main", None)).unwrap();
+        let p = stub_parcel("p");
+        update_pallet_head_unverified("p", None, &p, &pallet_utils::RefPreconditions::NONE).unwrap();
+        // X: the tree p's head names, gone from the store.
+        let x = object_utils::load_parcel(&p).unwrap().tree_hash;
+        let (folder, file) = file_utils::get_path_for_object(&x).unwrap();
+        file_utils::remove_file(&root.join(folder).join(file)).unwrap();
+
+        // q: a user ref that does not parse; @tags: a meta ref that does not parse; @kv: a meta ref
+        // lost beside its copy; @haul: unborn.
+        std::fs::write(pallet_utils::get_pallet_ref_path(PalletNamespace::User, "q"), "not a hash\n").unwrap();
+        let tags = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, "tags");
+        std::fs::create_dir_all(tags.parent().unwrap()).unwrap();
+        std::fs::write(&tags, "not a hash\n").unwrap();
+        let kv = pallet_utils::get_meta_copy_path("kv");
+        std::fs::create_dir_all(kv.parent().unwrap()).unwrap();
+        std::fs::write(&kv, format!("{}\n", p)).unwrap();
+
+        let found = pallets_reaching(&[x].into_iter().collect()).unwrap();
+
+        assert_eq!(found.reaching, vec!["p".to_string()]);
+        let unread: Vec<&str> = found.unread.iter().map(|(pallet, _)| pallet.as_str()).collect();
+        assert_eq!(unread, vec!["q", "@kv", "@tags"], "{:?}", found.unread);
+        assert!(found.unread[1].1.contains("is lost"), "{:?}", found.unread);
+    }
+
     /// A meta ref's copy left ahead of its intact ref (a crash or a failed restore between the
     /// two writes) has its head rooted beside the ref's, in GC's fail-closed read too, so the
     /// head outlives the grace period until the copy is mended.
@@ -6267,8 +6320,10 @@ mod tests {
             &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
         );
         assert!(closed.is_err(), "an unreadable copy must fail GC closed: {:?}", closed.map(|s| s.meta_heads));
+        // Heal's read, which tolerates the office it cannot read as well (every meta ref's copy
+        // stands in the folder that is now a file).
         let tolerated = gc_root_sources(
-            &bay_dirs, bay_utils::BayReadPolicy::Tolerate, office_utils::TrustPinReadPolicy::FailClosed,
+            &bay_dirs, bay_utils::BayReadPolicy::Tolerate, office_utils::TrustPinReadPolicy::Tolerate,
         ).unwrap();
         assert_eq!(tolerated.meta_heads, vec![h1]);
         assert!(tolerated.degraded.iter().any(|note| note.contains("the copy of pallet \"@tags\"")), "{:?}", tolerated.degraded);
