@@ -23,7 +23,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::object_type::ObjectType;
 use crate::model::operator::Operator;
 use crate::util::meta_tree::{
-    MetaCheckError, MetaCheckError::Content,
+    MetaCheckError, broken,
     self, CellEnvelope, CellRead, MetaKind, MetaWriter, PalletRules, ParcelChange,
 };
 use crate::util::office_utils::{self, OfficeState, Role};
@@ -186,10 +186,10 @@ impl PalletRules for RedactionsRules {
 
     fn check(&self, change: &ParcelChange<'_>) -> Result<(), MetaCheckError> {
         for cell in change.changes {
-            validate_redacted_hash(&cell.path).map_err(Content)?;
+            validate_redacted_hash(&cell.path).map_err(broken)?;
 
             if cell.before.is_some() {
-                return Err(Content(format!(
+                return Err(broken(format!(
                     "the redaction of {} already exists, and a redaction is never changed or \
                     removed",
                     cell.path
@@ -203,7 +203,7 @@ impl PalletRules for RedactionsRules {
                     .is_some_and(|user| matches!(user.role, Role::Admin));
 
                 if !is_admin {
-                    return Err(Content(format!(
+                    return Err(broken(format!(
                         "the redaction of {} is signed by {}, who is not an admin",
                         cell.path, operator
                     )));
@@ -214,7 +214,7 @@ impl PalletRules for RedactionsRules {
 
             if envelope.schema == REDACTION_SCHEMA {
                 parse_value(&cell.path, &envelope.value)
-                    .map_err(|why| Content(format!("the redaction of {} {}", cell.path, why)))?;
+                    .map_err(|why| broken(format!("the redaction of {} {}", cell.path, why)))?;
             }
         }
 

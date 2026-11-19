@@ -27,10 +27,13 @@ pub enum OfficeChainError {
     Inauthentic(String),
     /// A parcel of the chain, or its signature, could not be read from the store. That says
     /// nothing of whether the chain is authentic, only that it cannot be told. The fault says
-    /// whether the store decided the parcel is absent or damaged, or said nothing of it; a
-    /// signature the store cannot give is told as saying nothing, and one that reads but does not
-    /// parse as damaged.
+    /// whether the store decided about the parcel (absent, damaged, another kind of object), or
+    /// said nothing of it; a signature the store cannot give is told as saying nothing.
     Unreadable(String, crate::util::file_utils::ReadFault),
+    /// A parcel's signature reads but does not decode in the version it names: the store holds
+    /// that signature damaged, while the parcel it signs may be whole. No verdict on the chain's
+    /// history (a damaged version byte reads as any version), and one a restored signature mends.
+    SignatureDamaged(String),
     /// A signature of the chain, a parcel of it or an object a parcel holds, reads whole but in a
     /// version or form this build does not know, so a newer Forklift may have written it: no
     /// verdict on the chain, which an upgrade can judge.
@@ -51,6 +54,7 @@ impl OfficeChainError {
         match self {
             OfficeChainError::Inauthentic(message)
             | OfficeChainError::Unreadable(message, _)
+            | OfficeChainError::SignatureDamaged(message)
             | OfficeChainError::Newer(message)
             | OfficeChainError::Unauthorized { message, .. } => message,
         }
@@ -108,8 +112,8 @@ impl From<OfficeChainError> for String {
 ///                                              a parcel fails its shape, signature or
 ///                                              endorsement checks.
 /// * `Err(OfficeChainError::Unreadable(..))`  - If a parcel or its signature cannot be read
-///                                              from the store, or a signature reads but is
-///                                              damaged.
+///                                              from the store.
+/// * `Err(OfficeChainError::SignatureDamaged(_))` - If a signature reads but is damaged.
 /// * `Err(OfficeChainError::Newer(_))`        - If a signature names a version this build does
 ///                                              not know, or a parcel of the chain, or an object
 ///                                              it holds, reads whole but this build cannot
@@ -129,7 +133,7 @@ fn chain_unreadable((message, fault): (String, crate::util::file_utils::ReadFaul
 }
 
 pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<OfficeState, OfficeChainError> {
-    use OfficeChainError::{Inauthentic, Newer, Unauthorized, Unreadable};
+    use OfficeChainError::{Inauthentic, Newer, SignatureDamaged, Unauthorized, Unreadable};
 
     let mut chain: Vec<String> = Vec::new();
     let mut cursor = office_head.to_string();
@@ -186,7 +190,7 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
         let raw = sign_utils::load_raw_parcel_signature(hash).map_err(|message| Unreadable(message, crate::util::file_utils::ReadFault::Untold))?;
         let signature = raw.map(|bytes| sign_utils::decode_stored_parcel_signature_classified(&bytes, hash)).transpose().map_err(|refused| match refused {
             sign_utils::SignatureDecode::Newer(message) => Newer(message),
-            sign_utils::SignatureDecode::Damaged(message) => Unreadable(message, crate::util::file_utils::ReadFault::Content),
+            sign_utils::SignatureDecode::Damaged(message) => SignatureDamaged(message),
         })?;
         verify_signature_of(hash, signature.as_ref(), lookup_state, "office parcel").map_err(Inauthentic)?;
 
@@ -1088,7 +1092,7 @@ pub fn verified_local_office() -> Result<VerifiedOffice, String> {
 /// command left as it was.
 pub fn office_chain_refusal(refused: OfficeChainError, closing: &str) -> String {
     match refused {
-        OfficeChainError::Unreadable(why, _) | OfficeChainError::Newer(why) => why,
+        OfficeChainError::Unreadable(why, _) | OfficeChainError::SignatureDamaged(why) | OfficeChainError::Newer(why) => why,
         refused @ (OfficeChainError::Inauthentic(_) | OfficeChainError::Unauthorized { .. }) => {
             let refused = String::from(refused);
             office_utils::unverified_trust_refusal(&refused, closing).unwrap_or(refused)
@@ -1186,6 +1190,7 @@ pub fn classify_office_lift_refusal(error: OfficeChainError, held_head: Option<&
         // inauthentic chain.
         OfficeChainError::Inauthentic(message)
         | OfficeChainError::Unreadable(message, _)
+        | OfficeChainError::SignatureDamaged(message)
         | OfficeChainError::Newer(message) => OfficeLiftRefusal::Unprocessable(message),
         OfficeChainError::Unauthorized { parcel, message } => {
             if held_head.map_or(false, |head| office_history_holds(head, &parcel)) {
@@ -4432,6 +4437,7 @@ mod tests {
             Err(OfficeChainError::Inauthentic(message)) => message,
             Err(OfficeChainError::Unauthorized { message, .. }) => panic!("refused as unauthorized: {}", message),
             Err(OfficeChainError::Unreadable(message, _)) => panic!("refused as unreadable: {}", message),
+            Err(OfficeChainError::SignatureDamaged(message)) => panic!("refused as a damaged signature: {}", message),
             Err(OfficeChainError::Newer(message)) => panic!("refused as newer: {}", message),
             Ok(_) => panic!("the chain at {} must be refused", head),
         }

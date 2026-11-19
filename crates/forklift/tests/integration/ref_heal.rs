@@ -1754,6 +1754,57 @@ fn a_meta_ref_refused_only_because_the_office_was_names_the_office_and_is_not_re
     assert!(!said.contains("With no remote that holds it"), "{}", said);
 }
 
+// A damaged signature beside a parcel of a lost meta ref's history is no verdict on the ref, on
+// the office or beside it: the store holds the parcel whole, and the signature over it is what
+// cannot be read. So is a signature that decodes but cannot be checked (it is not 64 bytes). Heal
+// refuses the ref as unread, never as its own, and the removal is refused and keeps it. A forged
+// signature, one that is checked against its key and refused, is a verdict: the removal is the
+// step, and it removes the ref. Mutations: read the damaged sidecar of a non-office parcel as a
+// refused signature → "tags damaged" next_step is the removal, red; read a damaged signature on
+// the office's chain as the anchor's own refusal → "office damaged" next_step is the removal,
+// red; read a signature that cannot be checked as refused → "tags short" next_step is the
+// removal, red.
+#[test]
+fn a_damaged_signature_beside_a_meta_parcel_is_never_the_refs_own() {
+    for (pallet, damage) in [("tags", "damaged"), ("office", "damaged"), ("tags", "short"), ("tags", "forged")] {
+        let case = format!("{} {}", pallet, damage);
+        let area = Area::new(&format!("meta-signature-{}-{}", pallet, damage));
+        let (root, _, _) = tagged(&area);
+        area.run_ok(&root, &["office", "enroll"]);
+        area.run_ok(&root, &["tag", "create", "v3", "main"]);
+        let head = meta_head(&root, pallet).unwrap();
+        let sidecar = PathBuf::from(format!("{}.sig", loose_object(&root, &head).display()));
+        let signed = std::fs::read(&sidecar).unwrap_or_else(|e| panic!("{}: the head is signed: {}", case, e));
+        // Version 1, the key id, then a one-byte length and the 64-byte signature.
+        assert_eq!(signed[signed.len() - 65], 64, "{}: {:?}", case, signed);
+        let key = signed[..signed.len() - 65].to_vec();
+        let bytes = match damage {
+            "damaged" => vec![1u8, 0xff],
+            "short" => [key, vec![63], vec![7; 63]].concat(),
+            _ => [key, vec![64], vec![0; 64]].concat(),
+        };
+        std::fs::write(&sidecar, bytes).unwrap();
+        forklift_core::util::file_utils::remove_file(&meta_path(&root, pallet)).unwrap();
+
+        let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+        let removal = area.run(&root, &["heal", "--remove-ref", &format!("@{}", pallet)]);
+        let said = text(&removal.stderr);
+        if damage == "forged" {
+            assert_eq!(refused["error"]["next_step"], format!("forklift heal --remove-ref @{}", pallet).as_str(), "{}: {}", case, refused);
+            assert!(removal.status.success(), "{}: {}{}", case, text(&removal.stdout), said);
+            assert!(text(&removal.stdout).contains("which heal refused as its own: a parcel of its history is not signed as trust requires"), "{}: {}", case, text(&removal.stdout));
+            assert!(!meta_copy_path(&root, pallet).exists(), "{}: the copy is removed", case);
+            continue;
+        }
+        let step = forklift_core::util::ref_heal::unread_step(&format!("@{}", pallet));
+        assert_eq!(refused["error"]["next_step"], step.as_str(), "{}: {}", case, refused);
+        assert!(!removal.status.success(), "{}: {}", case, text(&removal.stdout));
+        assert!(said.contains("was not removed: heal could not read what it needs to judge it"), "{}: {}", case, said);
+        assert!(!root.join(".forklift").join("removed-refs").exists(), "{}: nothing is kept", case);
+        assert_eq!(std::fs::read_to_string(meta_copy_path(&root, pallet)).unwrap().trim_end(), head, "{}: the copy stands", case);
+    }
+}
+
 // A meta ref heal cannot verify because the office stands while no trust file holds its anchor
 // is refused as the trust state's, never as unread or its own: the removal names the lost
 // anchor's ways out, and taking the first of them (the trust file restored from a backup) lets a

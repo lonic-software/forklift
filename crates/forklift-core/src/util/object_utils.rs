@@ -291,7 +291,7 @@ pub(crate) fn load_parcel_judged(hash: &str) -> Result<Result<Parcel, NotAParcel
 }
 
 /// [`load_parcel`], whose error says what it tells of the parcel: a whole object of another kind
-/// is a verdict, [`file_utils::ReadFault::Content`], and bytes this build cannot parse are
+/// is a verdict, [`file_utils::Decided::OtherKind`], and bytes this build cannot parse are
 /// [`file_utils::ReadFault::Newer`].
 pub(crate) fn load_parcel_faulted(hash: &str) -> Result<Parcel, (String, file_utils::ReadFault)> {
     load_parcel_judged(hash)?.map_err(|error| match error {
@@ -310,7 +310,7 @@ fn parse_verified(bytes: &[u8]) -> Result<ParsedObject, (String, file_utils::Rea
 /// The refusal of a whole object of a kind this build knows that is not the kind asked for: the
 /// one verdict a parse of verified bytes gives.
 fn other_kind(message: String) -> (String, file_utils::ReadFault) {
-    (message, file_utils::ReadFault::Content)
+    (message, file_utils::ReadFault::Decided(file_utils::Decided::OtherKind))
 }
 
 /// Why object bytes that read whole are not a parcel ([`decode_parcel_judged`]): told from the
@@ -410,7 +410,7 @@ fn parse_tree_uncached(hash: &str) -> Result<(TreeItem, usize), String> {
 }
 
 /// [`parse_tree_uncached`], whose error says what it tells of the tree: a whole object of another
-/// kind is [`file_utils::ReadFault::Content`], and bytes this build cannot parse
+/// kind is [`file_utils::Decided::OtherKind`], and bytes this build cannot parse
 /// [`file_utils::ReadFault::Newer`] ([`parse_verified`]).
 fn parse_tree_uncached_faulted(hash: &str) -> Result<(TreeItem, usize), (String, file_utils::ReadFault)> {
     // Only the parse borrows the bytes, so take the shared `Arc` — a byte-cache hit is a pointer

@@ -28,7 +28,7 @@ use toml_edit::{value, Table};
 use crate::model::operator::Operator;
 use crate::util::manifest_utils::operator_leaf;
 use crate::util::meta_tree::{
-    MetaCheckError, MetaCheckError::Content,
+    MetaCheckError, broken,
     self, CellChange, CellEdit, CellEnvelope, CellRead, MetaKind, MetaState, MetaWriter, PalletRules,
     ParcelChange, Stamp,
 };
@@ -453,7 +453,7 @@ fn state_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option<
     match meta_tree::read_checked_cell_in(cells, &path, rules)? {
         None => Ok(None),
         Some(CellRead::Readable(envelope)) if envelope.schema == SCHEMA_STATE =>
-            parse_state(&envelope.value).map(Some).map_err(|why| Content(format!("the state at {} {}", path, why))),
+            parse_state(&envelope.value).map(Some).map_err(|why| broken(format!("the state at {} {}", path, why))),
         Some(read) => Err(newer_or_content(&read, format!(
             "the state at {} cannot be read by this forklift, so it cannot tell whether the haul \
             was merged",
@@ -469,7 +469,7 @@ fn opened_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option
     match meta_tree::read_checked_cell_in(cells, &path, rules)? {
         None => Ok(None),
         Some(CellRead::Readable(envelope)) if envelope.schema == SCHEMA_OPENED =>
-            parse_opened(&envelope.value).map(Some).map_err(|why| Content(format!("the proposal at {} {}", path, why))),
+            parse_opened(&envelope.value).map(Some).map_err(|why| broken(format!("the proposal at {} {}", path, why))),
         Some(read) => Err(newer_or_content(&read, format!("the proposal at {} cannot be read by this forklift", path))),
     }
 }
@@ -479,7 +479,7 @@ fn opened_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option
 fn newer_or_content(read: &CellRead, why: String) -> MetaCheckError {
     match read {
         CellRead::Unknown { .. } => MetaCheckError::Newer(why),
-        CellRead::Readable(_) | CellRead::Malformed(_) => Content(why),
+        CellRead::Readable(_) | CellRead::Malformed(_) => broken(why),
     }
 }
 
@@ -517,18 +517,18 @@ impl PalletRules for HaulRules {
         let mut proposals: BTreeMap<String, Option<Opened>> = BTreeMap::new();
 
         for cell in change.changes {
-            let path = parse_cell_path(&cell.path).map_err(Content)?;
+            let path = parse_cell_path(&cell.path).map_err(broken)?;
             let dir = haul_dir(path.haul);
 
             match &path.name {
-                CellName::Opened if cell.before.is_some() => return Err(Content(format!(
+                CellName::Opened if cell.before.is_some() => return Err(broken(format!(
                     "{} is the proposal of a haul, which is never changed or removed", cell.path
                 ))),
-                CellName::State if cell.after.is_none() => return Err(Content(format!(
+                CellName::State if cell.after.is_none() => return Err(broken(format!(
                     "{} is the state of a haul, which is never removed", cell.path
                 ))),
                 CellName::Review { owner: written } | CellName::Comment { owner: written, .. }
-                    if *written != owner => return Err(Content(format!(
+                    if *written != owner => return Err(broken(format!(
                         "the cell at {} sits under another operator's directory, so only they may \
                         write or remove it",
                         cell.path
@@ -548,7 +548,7 @@ impl PalletRules for HaulRules {
             };
 
             if let Some((HaulStatus::Merged(_), _)) = before {
-                return Err(Content(format!("the haul {} is merged, and a merge is final", path.haul)));
+                return Err(broken(format!("the haul {} is merged, and a merge is final", path.haul)));
             }
 
             let Some(after) = &cell.after else { continue };
@@ -563,7 +563,7 @@ impl PalletRules for HaulRules {
             };
 
             let Some(opened) = opened else {
-                return Err(Content(format!(
+                return Err(broken(format!(
                     "the cell at {} belongs to a haul with no proposal; resolve the whole haul \
                     (its id) rather than its proposal alone",
                     cell.path
@@ -579,7 +579,7 @@ impl PalletRules for HaulRules {
                 let carried = matches!(path.name, CellName::Review { .. } | CellName::Comment { .. });
 
                 if self.knows_schema(&envelope.schema) {
-                    return Err(Content(format!("the cell at {} holds a {} value", cell.path, envelope.schema)));
+                    return Err(broken(format!("the cell at {} holds a {} value", cell.path, envelope.schema)));
                 }
 
                 // A schema this build does not know, where the rules read the cell: a newer
@@ -591,16 +591,16 @@ impl PalletRules for HaulRules {
                 continue;
             }
 
-            check_value(&path.name, &envelope.value).map_err(|why| Content(format!("the value at {} {}", cell.path, why)))?;
+            check_value(&path.name, &envelope.value).map_err(|why| broken(format!("the value at {} {}", cell.path, why)))?;
 
             match &path.name {
                 CellName::Opened => {
                     if opened.id() != path.haul {
-                        return Err(Content(format!("the proposal at {} is not at the id its content derives", cell.path)));
+                        return Err(broken(format!("the proposal at {} is not at the id its content derives", cell.path)));
                     }
 
                     if &opened.opener != operator {
-                        return Err(Content(format!(
+                        return Err(broken(format!(
                             "the proposal at {} names {} as its opener, but is signed by {}",
                             cell.path, opened.opener, operator
                         )));
@@ -608,20 +608,20 @@ impl PalletRules for HaulRules {
 
                     // A haul is opened open: never born closed, or merged without a merge.
                     match state_in(change.cells, &dir, self)? {
-                        None => return Err(Content(format!("the haul {} is opened without a state", path.haul))),
+                        None => return Err(broken(format!("the haul {} is opened without a state", path.haul))),
                         Some((HaulStatus::Open, _)) => {}
-                        Some((status, _)) => return Err(Content(format!(
+                        Some((status, _)) => return Err(broken(format!(
                             "the haul {} is opened {}, but a haul is opened open", path.haul, status.as_str()
                         ))),
                     }
                 }
                 CellName::State => {
-                    let (status, moved) = parse_state(&envelope.value).map_err(Content)?;
+                    let (status, moved) = parse_state(&envelope.value).map_err(broken)?;
 
                     // A state written with its proposal is the opener's by the proposal's own rule.
                     if let Some((_, head)) = &before {
                         if &moved != head && opened.opener != operator {
-                            return Err(Content(format!(
+                            return Err(broken(format!(
                                 "the state at {} moves the head, but is written by {}; only the haul's \
                                 opener, {}, moves it. A merge or close that raced the opener's update \
                                 keeps theirs at {} and runs again",
@@ -638,14 +638,14 @@ impl PalletRules for HaulRules {
                     };
 
                     if let Some(refusal) = refusal {
-                        return Err(Content(format!(
+                        return Err(broken(format!(
                             "the state at {} records a merge into {}, but is signed by {}, who {} it",
                             cell.path, opened.target, operator, refusal.why()
                         )));
                     }
                 }
                 CellName::Comment { id, .. } if comment_id(&envelope.value) != *id => {
-                    return Err(Content(format!("the comment at {} is not at the id its content derives", cell.path)));
+                    return Err(broken(format!("the comment at {} is not at the id its content derives", cell.path)));
                 }
                 _ => {}
             }

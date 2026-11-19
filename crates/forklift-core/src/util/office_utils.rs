@@ -21,6 +21,7 @@ use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::model::tree_item::TreeItem;
 use crate::util::{alias_utils, file_utils, object_utils, pallet_utils, sign_utils, toml_spelling};
+use crate::util::ref_heal::Verdict;
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions, RefUpdateError};
 
 /// The name of the office meta pallet — the tracked-metadata pallet holding users and
@@ -869,17 +870,22 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
             }
         };
 
-        // A chain the store holds damaged or decided is absent is this anchor's verdict on the
-        // head: it cannot verify it. One the store could not give, or one crossing a signature a
-        // newer version may have written, says nothing of it. Either way the other file's anchor
-        // is still tried: it may verify the head.
+        // A chain that reads and does not verify, or one with a parcel the store decided about, is
+        // this anchor's verdict on the head: it cannot verify it. One the store could not give,
+        // one crossing a damaged signature, or one crossing a signature a newer version may have
+        // written, says nothing of it. Either way the other file's anchor is still tried: it may
+        // verify the head.
         match anchor_serves(&Ok(bytes.clone()), &anchor, Some(head), served) {
             Ok(true) => return Ok((pallet_utils::AnchorPrecondition::Files { trust: trust.clone(), copy: copy.clone() }, anchor)),
-            Ok(false) => said.push((UNVERIFIED_ANCHOR.to_string(), AnchorRefusal::Own)),
-            Err(ChainUnjudged::Unread(why, crate::util::file_utils::ReadFault::Content)) => said.push((format!(
+            Ok(false) => said.push((UNVERIFIED_ANCHOR.to_string(), AnchorRefusal::Own(Verdict::AnchorRefused))),
+            Err(ChainUnjudged::Unread(why, crate::util::file_utils::ReadFault::Decided(decided))) => said.push((format!(
                 "holds an anchor whose chain to the head the store holds damaged or absent ({})",
                 crate::error::frames_without_steps(&why).trim_end_matches('.')
-            ), AnchorRefusal::Own)),
+            ), AnchorRefusal::Own(Verdict::Object(decided)))),
+            Err(ChainUnjudged::SignatureDamaged(why)) => said.push((format!(
+                "holds an anchor whose chain to the head crosses a damaged signature ({})",
+                crate::error::frames_without_steps(&why).trim_end_matches('.')
+            ), AnchorRefusal::Unread)),
             Err(ChainUnjudged::Unread(why, crate::util::file_utils::ReadFault::Untold)) => said.push((format!(
                 "holds an anchor whose chain to the head could not be read ({})",
                 crate::error::frames_without_steps(&why).trim_end_matches('.')
@@ -891,17 +897,18 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
         }
     }
 
-    // Only two anchors that both read and both refuse the head judge it; a file that does not
-    // hold one, or whose chain could not be read, may be the one that would have verified it. One
-    // a newer version may read is that version's to judge, before what could not be read.
-    let refusal = match said.iter().all(|(_, whose)| *whose == AnchorRefusal::Own) {
-        true => AnchorRefusal::Own,
-        false if said.iter().any(|(_, whose)| *whose == AnchorRefusal::Newer) => AnchorRefusal::Newer,
-        false => AnchorRefusal::Unread,
+    // Only two anchors that both read and both refuse the head judge it, the trust file's verdict
+    // standing for both; a file that does not hold one, or whose chain could not be read, may be
+    // the one that would have verified it. One a newer version may read is that version's to
+    // judge, before what could not be read.
+    let refusal = match said.as_slice() {
+        [(_, AnchorRefusal::Own(verdict)), (_, AnchorRefusal::Own(_))] => AnchorRefusal::Own(*verdict),
+        _ if said.iter().any(|(_, whose)| *whose == AnchorRefusal::Newer) => AnchorRefusal::Newer,
+        _ => AnchorRefusal::Unread,
     };
     let trust_path = forklift_root().join(FILE_NAME_TRUST);
     let copy_path = forklift_root().join(FILE_NAME_TRUST_COPY);
-    Err((match refusal == AnchorRefusal::Own {
+    Err((match matches!(refusal, AnchorRefusal::Own(_)) {
         true => format!(
             "parcel {} does not verify as the office's history against an anchor heal can read: the trust file (\"{}\") {}, and its copy (\"{}\") {}",
             head, trust_path.to_string_lossy(), said[0].0, copy_path.to_string_lossy(), said[1].0
@@ -916,9 +923,9 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
 /// Whose an [`office_rebuild_anchor`] refusal is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AnchorRefusal {
-    /// The head's own: both files hold an anchor and neither verifies it (its chain reads and does
-    /// not reach the head, or the store decided a parcel of that chain is absent or damaged).
-    Own,
+    /// The head's own, as the verdict says: both files hold an anchor and neither verifies it (its
+    /// chain reads and does not reach the head, or the store decided about a parcel of that chain).
+    Own(Verdict),
 
     /// A newer version may judge it: it wrote a file, or a signature of a file's chain to the
     /// head, in a version this build does not know.
@@ -1887,9 +1894,12 @@ enum TrustJudged {
 /// Why an office chain could not be judged against an anchor: nothing of the anchor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChainUnjudged {
-    /// The store could not give a part of it, or holds a signature of it damaged; the fault says
-    /// whether the store decided that ([`OfficeChainError::Unreadable`](crate::util::audit_utils::OfficeChainError::Unreadable)).
+    /// The store could not give a part of it; the fault says whether the store decided about that
+    /// part ([`OfficeChainError::Unreadable`](crate::util::audit_utils::OfficeChainError::Unreadable)).
     Unread(String, crate::util::file_utils::ReadFault),
+
+    /// A signature of it reads but is damaged: no verdict on the history it signs.
+    SignatureDamaged(String),
 
     /// A signature of it names a version this build does not know: the refusal, which says so.
     Newer(String),
@@ -1899,7 +1909,7 @@ impl ChainUnjudged {
     /// The refusal, phrased for the user.
     fn into_message(self) -> String {
         match self {
-            ChainUnjudged::Unread(message, _) | ChainUnjudged::Newer(message) => message,
+            ChainUnjudged::Unread(message, _) | ChainUnjudged::SignatureDamaged(message) | ChainUnjudged::Newer(message) => message,
         }
     }
 }
@@ -1923,10 +1933,11 @@ fn judge_trust_bytes(bytes: &Result<Vec<u8>, String>, office_head: &str) -> Resu
 
     match crate::util::audit_utils::verify_office_chain_memoized(&anchor, office_head) {
         Ok(_) => Ok(TrustJudged::Usable),
-        // An object the store could not give keeps what its read said, and a signature a newer
-        // version may have written is that version's to judge; the rest is the walk's verdict
-        // on what it read.
+        // An object the store could not give keeps what its read said, a damaged signature says
+        // nothing of the history it signs, and a signature a newer version may have written is
+        // that version's to judge; the rest is the walk's verdict on what it read.
         Err(crate::util::audit_utils::OfficeChainError::Unreadable(why, fault)) => Err(ChainUnjudged::Unread(why, fault)),
+        Err(crate::util::audit_utils::OfficeChainError::SignatureDamaged(why)) => Err(ChainUnjudged::SignatureDamaged(why)),
         Err(crate::util::audit_utils::OfficeChainError::Newer(why)) => Err(ChainUnjudged::Newer(why)),
         Err(crate::util::audit_utils::OfficeChainError::Inauthentic(_) | crate::util::audit_utils::OfficeChainError::Unauthorized { .. }) => {
             Ok(TrustJudged::Unverified(anchor))

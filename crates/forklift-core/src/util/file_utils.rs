@@ -2536,10 +2536,9 @@ pub(crate) enum StoreReadOutcome {
 /// What a failed read says of the object it was asked for, to a check that judges that object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadFault {
-    /// The store positively decided about the object: it is absent, or the bytes it holds at the
-    /// address are damaged (a loose file that does not decompress to the address, a pack record
-    /// that does not rebuild to it). A verdict on the object.
-    Content,
+    /// The store positively decided about the object, as the [`Decided`] says. A verdict on the
+    /// object, and the only one a failed read gives.
+    Decided(Decided),
     /// The read says nothing of the object: the store could not be consulted, a pack index is
     /// damaged or its data file did not load (heal rebuilds it, and the object may be in it), an
     /// index of another format version or a base read failed some other way, or the absence was
@@ -2548,16 +2547,34 @@ pub enum ReadFault {
     /// The store gave the object whole, its bytes matching its address, but this build cannot
     /// parse them. The store verifies every object it gives, so this is never damage: a newer
     /// Forklift may have written it, and only a build that reads it can judge it. No verdict on
-    /// the object. Every parse of verified bytes gives this, never [`ReadFault::Content`]; only a
-    /// whole object of a kind this build knows, which is not the kind asked for, is a verdict.
+    /// the object. A loose-object parse of verified bytes gives this, never a
+    /// [`ReadFault::Decided`]; only a whole object of a kind this build knows, which is not the
+    /// kind asked for, is a verdict ([`Decided::OtherKind`]).
     Newer,
 }
 
+/// What the store positively decided about an object a read asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decided {
+    /// It is absent, and nothing leaves that undecided: no refill, redaction, withholding or
+    /// pack file whose hash set is unknown accounts for it ([`read_absent`]'s causeless error).
+    Absent,
+    /// The bytes it holds at the address are damaged: a loose file that does not decompress to
+    /// the address, a pack record that does not rebuild to it.
+    Damaged,
+    /// The bytes read whole, as an object of a kind this build knows that is not the kind asked
+    /// for.
+    OtherKind,
+}
+
 impl ReadFault {
-    /// What a failure whose cause [`read_object_as_classified`] gives as `cause` says.
+    /// What a failure whose cause [`read_object_as_classified`] gives as `cause` says: no cause is
+    /// the absence the store decided, since every read that leaves an absence undecided gives
+    /// [`Unreadable::Other`].
     pub(crate) fn of(cause: Option<Unreadable>) -> ReadFault {
         match cause {
-            None | Some(Unreadable::LooseCorrupt | Unreadable::RecordDamage) => ReadFault::Content,
+            None => ReadFault::Decided(Decided::Absent),
+            Some(Unreadable::LooseCorrupt | Unreadable::RecordDamage) => ReadFault::Decided(Decided::Damaged),
             Some(Unreadable::PackDamage | Unreadable::Other) => ReadFault::Untold,
         }
     }
