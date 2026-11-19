@@ -1184,3 +1184,86 @@ fn building_the_commit_graph_pays_no_durability_barrier() {
     assert!(shards > 0, "sanity: the cold blame must have built the commit-graph");
     assert_eq!(barrier_count(&output), 0, "building the commit-graph must not pay a durability barrier");
 }
+
+/// A warehouse in `area` with one parcel stacked on `main`, and the tag `v1` on it when `tagged`.
+fn tagged_warehouse(area: &Area, tagged: bool) {
+    for args in [&["prepare"][..], &["config", "set", "operator.identifier", "crash@forklift"]] {
+        assert!(area.run(args).status.success(), "{args:?} must succeed");
+    }
+    std::fs::write(area.warehouse().join("a.txt"), "one\n").unwrap();
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "-m", "one"]).status.success());
+    if tagged {
+        assert!(area.run(&["tag", "create", "v1", "main"]).status.success());
+    }
+}
+
+fn meta_file(area: &Area, folder: &str) -> Option<Vec<u8>> {
+    std::fs::read(area.warehouse().join(".forklift").join(folder).join("tags")).ok()
+}
+
+fn parse_head(bytes: Option<Vec<u8>>) -> Option<String> {
+    bytes.map(|bytes| String::from_utf8_lossy(&bytes).trim_end().to_string())
+}
+
+/// Run `args` in a fresh warehouse stopped before its first rename, then its second, and so on,
+/// handing each stopped warehouse to `check` with the head `@tags` held before the run, until a run
+/// completes.
+fn stop_tag_create_at_every_rename(name: &str, tagged: bool, mut check: impl FnMut(&Area, usize, Option<String>)) {
+    for at in 1..=MAX_CRASH_POINTS {
+        let area = Area::new(&format!("{name}-{at}"));
+        tagged_warehouse(&area, tagged);
+        let old = parse_head(meta_file(&area, "meta"));
+
+        let args = ["tag", "create", if tagged { "v2" } else { "v1" }, "main"];
+        let output = area.command(&args).env("FORKLIFT_DEBUG_CRASH_AT_RENAME", at.to_string()).output().unwrap();
+        if output.status.code() != Some(CRASH_POINT_EXIT_CODE) {
+            assert!(output.status.success(), "{args:?} stopped before rename {at} must stop or complete: {}", String::from_utf8_lossy(&output.stderr));
+            assert!(at > 1, "{args:?} must rename something");
+            return;
+        }
+
+        check(&area, at, old);
+    }
+
+    panic!("tag create still had a rename left after {MAX_CRASH_POINTS} crash points");
+}
+
+// A forward meta write writes its copy before its ref, so a ref lost after any stop is rebuilt at
+// the head it held, or, where only the copy had moved, at the copy's newer head: never an older
+// one. Mutation: write the ref first → at the stop between the two renames, the copy is left at
+// the old head behind a landed ref, and heal rebuilds the ref at that older head, red.
+#[test]
+fn a_meta_ref_lost_after_a_stopped_forward_write_is_never_rebuilt_behind_where_it_stood() {
+    let mut copy_led = 0;
+
+    stop_tag_create_at_every_rename("meta-forward", true, |area, at, old| {
+        let old = old.expect("v1 is tagged");
+        let before = parse_head(meta_file(area, "meta")).expect("@tags stands");
+        let copy = parse_head(meta_file(area, "meta-copy")).expect("@tags has a copy");
+
+        forklift_core::util::file_utils::remove_file(area.warehouse().join(".forklift").join("meta").join("tags")).unwrap();
+        let healed = area.run(&["heal"]);
+        assert!(healed.status.success(), "heal after a stop at rename {at}: {}{}", String::from_utf8_lossy(&healed.stdout), String::from_utf8_lossy(&healed.stderr));
+
+        let after = parse_head(meta_file(area, "meta")).expect("@tags is rebuilt");
+        let led = before == old && copy != old;
+        copy_led += usize::from(led);
+        assert!(after == before || (led && after == copy),
+            "stopped at rename {at}: @tags stood at {before}, its copy at {copy}, and heal rebuilt it at {after}");
+    });
+
+    assert!(copy_led > 0, "no stop left the copy ahead of its ref, so nothing here tested the order");
+}
+
+// A first meta write writes its ref, then its copy, so after any stop a plain heal leaves the two
+// agreeing, or neither standing. Mutation: skip the copy mend → a stop between the two renames
+// leaves the copy absent beside the ref, red.
+#[test]
+fn a_stopped_first_meta_write_leaves_ref_and_copy_agreeing_after_heal() {
+    stop_tag_create_at_every_rename("meta-birth", false, |area, at, _| {
+        let healed = area.run(&["heal"]);
+        assert!(healed.status.success(), "heal after a stop at rename {at}: {}", String::from_utf8_lossy(&healed.stderr));
+        assert_eq!(meta_file(area, "meta"), meta_file(area, "meta-copy"), "stopped at rename {at}: the ref and its copy must agree");
+    });
+}

@@ -140,15 +140,33 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // with nothing here written.
     let trust_repair = office_utils::repair_trust().map_err(config_said)?;
     ref_notes.extend(trust_repair.notes);
-    // Every refusal from here on says what this run already wrote, the trust file among it.
-    let config_said = |error: String| match &trust_repair.restored {
-        Some(restored) => forklift_core::error::append_to_message(config_said(error), &restored.sentence()),
-        None => config_said(error),
+
+    // Then the meta refs, after the trust file their verification reads and before every later
+    // step, any of which may read one. Nothing here refuses or stops the run: what this pass
+    // cannot settle, or fails to write, the pass after the taint recovery judges again.
+    let meta_first = ref_heal::repair_meta(Pass::BeforeTaint).unwrap_or_else(|error| {
+        ref_notes.push(format!("The meta pallet refs were not judged before the taint recovery: {}", error.trim_end_matches('.')));
+        ref_heal::Repair::default()
+    });
+    ref_notes.extend(meta_first.notes);
+    if let Some(error) = meta_first.stopped {
+        ref_notes.push(format!("Not every meta pallet ref was judged before the taint recovery: {}", error.trim_end_matches('.')));
+    }
+    let meta_rebuilt = meta_first.rebuilt;
+
+    // Every refusal from here on says what this run already wrote, the trust file and the meta
+    // refs among it.
+    let config_said = |error: String| {
+        let error = match &trust_repair.restored {
+            Some(restored) => forklift_core::error::append_to_message(config_said(error), &restored.sentence()),
+            None => config_said(error),
+        };
+        meta_rebuilt.iter().fold(error, |error, rebuilt| forklift_core::error::append_to_message(error, &rebuilt_sentence(rebuilt)))
     };
 
     let record_rebuilt = sealed_utils::rebuild()
         .map_err(|error| config_said(ref_notes.iter().fold(format!(
-            "{}{} Nothing else was healed: once that is fixed, run \"forklift heal\" again.",
+            "{}{} Heal went no further: once that is fixed, run \"forklift heal\" again.",
             error, if error.ends_with('.') { "" } else { "." },
         ), |error, note| forklift_core::error::append_to_message(error, &format!("Note: {}", note)))))?
         .map(RecordRebuilt::from);
@@ -203,7 +221,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // checkout stands on, and so before the fetch-scope heal too: a rebuild from the checkouts'
     // scopes would leave out a scope not yet restored. It reads neither scope. A --position it
     // sets, on a pallet whose ref this run sets or removes, stands on that write, so it waits for
-    // it below; one it refuses is refused here, before anything is written.
+    // it below; one it refuses is refused here, before the steps below write anything.
     let early = !position.is_some_and(|pallet| {
         set_ref.iter().any(|(named, _)| *named == pallet) || remove_ref.iter().any(|named| named == pallet)
     }) || !position_heal::sets_chosen().map_err(|error| records_said(CoreError::from(error), &ref_notes, None, None))?;
@@ -376,6 +394,9 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let first = ref_heal::repair(Pass::BeforeTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(first.rebuilt);
     ref_notes.extend(first.notes);
+    if let Some(error) = first.stopped {
+        return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
+    }
 
     // A torn taint's rescan (§8.3) can take a while on a large or uncompacted store — it reports
     // per-phase/per-count progress through this callback rather than staying silent. `human!` is
@@ -403,10 +424,22 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
 
     // After the taint, which may have refetched what a candidate lacked; before the operation
     // recovery, whose landed test reads the ref.
+    // The meta refs first, as before the taint: a user ref's rebuild reads the office.
+    let meta_second = ref_heal::repair_meta(Pass::AfterTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+    refs_rebuilt.extend(meta_second.rebuilt);
+    ref_notes.extend(meta_second.notes);
+    if let Some(error) = meta_second.stopped {
+        return Err(refused_too(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), meta_second.refused.iter()));
+    }
+
     let second = ref_heal::repair(Pass::AfterTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(second.rebuilt);
     ref_notes.extend(second.notes);
-    let refs_refused = second.refused;
+    if let Some(error) = second.stopped {
+        return Err(refused_too(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), meta_second.refused.iter().chain(&second.refused)));
+    }
+    let mut refs_refused = second.refused;
+    refs_refused.extend(meta_second.refused);
 
     // An operation on a pallet whose ref is still damaged waits: its landed test would read the
     // damage as "not landed".
@@ -871,7 +904,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         recorded_unavailable,
         redactions_reapplied,
         restored_from_working_tree,
-        refs_rebuilt,
+        refs_rebuilt: meta_rebuilt.iter().cloned().chain(refs_rebuilt).collect(),
         refs_removed,
         refs_refused,
         objects_lost,
@@ -1354,9 +1387,37 @@ fn with_report(report: &HealReport, refused: CoreError, also: Vec<String>) -> Co
 
 /// The `ref_damaged` refusal of a run that left a damaged ref standing, carrying the whole report.
 fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
+    let mut lines = refusal_lines(&report.refs_refused);
+
+    if let Some(unfinished) = unfinished {
+        lines.push(format!("{}.", unfinished.trim_end_matches('.')));
+    }
+
+    // A meta ref, which --ref does not set, is set only by hand. The office's and @redactions' come
+    // first, since a user ref's rebuild, --ref's among them, is verified against the one and
+    // checked against the other; any other meta ref's waits behind a user ref's --ref.
+    let hand = "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.".to_string();
+    let gating = [forklift_core::util::office_utils::OFFICE_PALLET_NAME, forklift_core::util::redaction_utils::REDACTIONS_PALLET_NAME]
+        .map(|name| format!("@{}", name));
+    let next_step = match report.refs_refused.iter().find(|refused| !refused.pallet.starts_with('@')) {
+        _ if report.refs_refused.iter().any(|refused| gating.contains(&refused.pallet)) => hand,
+        Some(user) => format!("forklift heal --ref {}=<parcel>", user.pallet),
+        None => hand,
+    };
+
+    CoreError::refusal_with_details(
+        RefusalCode::RefDamaged,
+        lines.join("\n"),
+        next_step,
+        serde_json::json!(report),
+    )
+}
+
+/// Each refused ref's line, then its candidate heads, which the hand step writes.
+fn refusal_lines(refused: &[ref_heal::Refused]) -> Vec<String> {
     let mut lines = Vec::new();
 
-    for refused in &report.refs_refused {
+    for refused in refused {
         lines.push(format!("The ref of pallet \"{}\" was not rebuilt: {}.", refused.pallet, refused.reason));
 
         if refused.candidates.is_empty() {
@@ -1367,18 +1428,22 @@ fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
         }
     }
 
-    if let Some(unfinished) = unfinished {
-        lines.push(format!("{}.", unfinished.trim_end_matches('.')));
-    }
+    lines
+}
 
-    let first = &report.refs_refused[0].pallet;
-
-    CoreError::refusal_with_details(
-        RefusalCode::RefDamaged,
-        lines.join("\n"),
-        format!("forklift heal --ref {}=<parcel>", first),
-        serde_json::json!(report),
-    )
+/// `error`, with a sentence for every ref refused before the pass stopped, naming its candidate
+/// heads inline, since the message is one paragraph.
+fn refused_too<'a>(error: String, refused: impl IntoIterator<Item = &'a ref_heal::Refused>) -> String {
+    refused.into_iter().fold(error, |error, refused| {
+        let candidates = match refused.candidates.is_empty() {
+            true => "nothing names a head for it".to_string(),
+            false => format!("candidates: {}", refused.candidates.iter()
+                .map(|candidate| format!("{} ({})", candidate.head, candidate.source)).collect::<Vec<_>>().join(", ")),
+        };
+        forklift_core::error::append_to_message(error, &format!(
+            "The ref of pallet \"{}\" was not rebuilt: {}; {}.", refused.pallet, refused.reason.trim_end_matches('.'), candidates
+        ))
+    })
 }
 
 /// Restore the checkout's scope from its copy, or set it to the paths `--scope` named.

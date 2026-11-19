@@ -183,11 +183,13 @@ pub enum MetaCopyState {
 /// Read what stands at the copy path of meta pallet `name`, never following a link.
 pub fn read_meta_copy_state(name: &str) -> Result<MetaCopyState, String> {
     validate_pallet_name(name)?;
-    read_copy_state_at(&get_meta_copy_path(name))
+    read_file_state(&get_meta_copy_path(name))
 }
 
-fn read_copy_state_at(path: &Path) -> Result<MetaCopyState, String> {
-    let unreadable = |e: std::io::Error| format!("Error while reading the ref copy \"{}\": {}", path.to_string_lossy(), e);
+/// Read what stands at `path`, never following a link: the reading a meta ref and its copy are
+/// both judged by.
+pub fn read_file_state(path: &Path) -> Result<MetaCopyState, String> {
+    let unreadable = |e: std::io::Error| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e);
 
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(MetaCopyState::Absent),
@@ -1344,7 +1346,7 @@ pub fn update_meta_pallet_head_served(name: &str,
                                       preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
     let served = crate::util::redaction_utils::Served::chain(served);
 
-    update_pallet_head_checked(PalletNamespace::Meta, name, expected, new, preconditions, None, None, Some(served), None, WriteOrder::Forward)
+    update_pallet_head_checked(PalletNamespace::Meta, name, expected, new, preconditions, None, None, Some(served), None, None, WriteOrder::Forward)
 }
 
 /// [`update_pallet_head`] for a client adopting `served`, what the remote served for this user
@@ -1359,7 +1361,7 @@ pub fn adopt_pallet_head(name: &str,
                          new: &str,
                          served: crate::util::redaction_utils::Served,
                          preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(PalletNamespace::User, name, expected, new, preconditions, None, None, Some(served), None, WriteOrder::Forward)
+    update_pallet_head_checked(PalletNamespace::User, name, expected, new, preconditions, None, None, Some(served), None, None, WriteOrder::Forward)
 }
 
 /// Move the head of a pallet from `expected` to `new`: a compare-and-set, and the only way a
@@ -1417,7 +1419,7 @@ pub fn update_pallet_head_in(
     new: &str,
     preconditions: &RefPreconditions,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, expected, new, preconditions, None, None, None, None, WriteOrder::Forward)
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, None, None, None, None, None, WriteOrder::Forward)
 }
 
 /// [`update_pallet_head_in`] for undo's put-back, which moves a ref back from the head its
@@ -1429,7 +1431,7 @@ pub(crate) fn put_back_pallet_head_in(
     expected: &str,
     new: &str,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, Some(expected), new, &RefPreconditions::NONE, None, None, None, None, WriteOrder::Backward)
+    update_pallet_head_checked(namespace, name, Some(expected), new, &RefPreconditions::NONE, None, None, None, None, None, WriteOrder::Backward)
 }
 
 /// Which way a head write moves its ref, which orders a meta ref's copy write against the ref
@@ -1448,7 +1450,7 @@ pub fn recreate_pallet_head(name: &str,
                             new: &str,
                             preconditions: &RefPreconditions,
                             tombstone: &str) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, Some(tombstone), None, None, WriteOrder::Forward)
+    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, Some(tombstone), None, None, None, WriteOrder::Forward)
 }
 
 /// [`update_pallet_head_in`] for a caller that has just verified `new`'s closure itself (a
@@ -1465,7 +1467,7 @@ pub fn update_pallet_head_verified(
     verified: &VerifiedClosure,
     tombstone: Option<&str>,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified), tombstone, None, None, WriteOrder::Forward)
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified), tombstone, None, None, None, WriteOrder::Forward)
 }
 
 /// How a user pallet's ref is damaged, as [`repair_pallet_head`] expects to find it.
@@ -1485,7 +1487,38 @@ pub enum RefDamage {
 /// redaction checks apply. `preconditions` pins the trust state `new` was verified against (a
 /// rebuilt head becomes a local head, which a take does not verify again).
 pub fn repair_pallet_head(name: &str, damage: &RefDamage, new: &str, preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, None, None, Some(damage), WriteOrder::Forward)
+    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, None, None, Some(damage), None, WriteOrder::Forward)
+}
+
+/// Set damaged meta pallet `name` to `new`: heal's rebuild of a meta ref that is missing or does
+/// not hold a hash, from its copy or from what its own bytes still name. The compare-and-set of
+/// [`repair_pallet_head`], which also expects the copy to still stand as `copy`, what heal judged.
+/// A meta write that landed since is refused by the ref's own compare-and-set; the copy's catches
+/// a copy changed alone, as a hand edit changes it. The redaction
+/// check applies; a meta pallet's history is verified by the caller, which pins the trust state it
+/// verified against in `preconditions`. The ref is written first and the copy only once the ref
+/// reads back at `new`, and a copy already holding those bytes is not written again, so a rebuild
+/// from the copy leaves it as it was.
+pub fn repair_meta_pallet_head(name: &str,
+                               damage: &RefDamage,
+                               copy: &MetaCopyState,
+                               new: &str,
+                               preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
+    update_pallet_head_checked(PalletNamespace::Meta, name, None, new, preconditions, None, None, None, Some(damage), Some(copy), WriteOrder::Forward)
+}
+
+/// Refuse with [`RefUpdateError::Moved`] unless the copy of meta pallet `name` still stands as
+/// `judged`.
+fn require_copy(name: &str, judged: &MetaCopyState) -> Result<(), RefUpdateError> {
+    if read_file_state(&get_meta_copy_path(name))? != *judged {
+        return Err(RefUpdateError::Moved(RefMoved {
+            reference: PalletRef { namespace: PalletNamespace::Meta, name: name.to_string() },
+            expected: None,
+            found: get_pallet_head_in(PalletNamespace::Meta, name).ok().flatten(),
+        }));
+    }
+
+    Ok(())
 }
 
 /// Remove the unreadable ref of user pallet `name`, which must still hold exactly `bytes` inside
@@ -1602,10 +1635,12 @@ fn update_pallet_head_checked(
     acknowledged: Option<&str>,
     served: Option<crate::util::redaction_utils::Served>,
     damaged: Option<&RefDamage>,
+    copy: Option<&MetaCopyState>,
     order: WriteOrder,
 ) -> Result<(), RefUpdateError> {
     // A repair judges the write as a creation: nothing it replaces is a head.
     debug_assert!(damaged.is_none() || expected.is_none(), "a repair expects no head");
+    debug_assert!(copy.is_none() || (damaged.is_some() && namespace == PalletNamespace::Meta), "only a meta repair expects a copy");
 
     // Checked before the lock too, so an invalid write never waits for it.
     validate_head_write(name, new)?;
@@ -1653,6 +1688,9 @@ fn update_pallet_head_checked(
         match damaged {
             Some(damage) => require_damage(namespace, name, damage)?,
             None => { require_head(namespace, name, expected)?; }
+        }
+        if let Some(copy) = copy {
+            require_copy(name, copy)?;
         }
         check_preconditions(&lock, preconditions)?;
 
@@ -2038,7 +2076,7 @@ fn write_head_locked(
                     }
                 }
                 (WriteOrder::Forward, true) => {
-                    let prior = read_copy_state_at(&copy)?;
+                    let prior = read_file_state(&copy)?;
                     // A copy already at the new bytes is not written again (`write_copy_file`),
                     // and `restore_copy` finds it at its prior state.
                     match write_copy_file(&copy, &bytes) {
@@ -2091,7 +2129,7 @@ fn write_ref_file(path: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
 
 /// Write a meta ref's copy at `path` with `bytes`, unless it already holds exactly them.
 fn write_copy_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if read_copy_state_at(path).ok() == Some(MetaCopyState::Bytes(bytes.to_vec())) {
+    if read_file_state(path).ok() == Some(MetaCopyState::Bytes(bytes.to_vec())) {
         return Ok(());
     }
 
@@ -2107,7 +2145,7 @@ fn write_copy_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// land and still return an error; one that did not land leaves the copy at the new head, which
 /// passed every check of the write, and says so.
 fn restore_copy(path: &Path, prior: &MetaCopyState, error: String) -> String {
-    let restored = match read_copy_state_at(path) {
+    let restored = match read_file_state(path) {
         Ok(state) if state == *prior => return error,
         _ => match prior {
             MetaCopyState::Bytes(bytes) => file_utils::write_file_atomically(path, bytes),
@@ -2122,7 +2160,7 @@ fn restore_copy(path: &Path, prior: &MetaCopyState, error: String) -> String {
         },
     };
 
-    match read_copy_state_at(path) {
+    match read_file_state(path) {
         Ok(state) if state == *prior => error,
         _ => format!(
             "{} Its copy \"{}\" could not be put back as it was ({}), so it names the new head.",
@@ -2190,7 +2228,7 @@ pub fn mend_meta_copy(name: &str, judged_ref: &[u8], judged_copy: &MetaCopyState
 
     let copy = get_meta_copy_path(name);
 
-    if read_copy_state_at(&copy)? != *judged_copy {
+    if read_file_state(&copy)? != *judged_copy {
         return Err(RefUpdateError::Failed(format!(
             "Refusing to mend the copy of pallet \"{}\" (\"{}\"): it changed since it was judged. \
             Nothing was written. Run the command again.",
@@ -2759,6 +2797,28 @@ pub(crate) mod tests {
             assert!(written.is_err(), "the ref write returns the taint's error");
             assert_eq!(head("tags").as_deref(), Some(h2.as_str()), "the ref write must go ahead and land");
             assert_eq!(copy_state("tags"), ref_bytes(&h2));
+        }
+
+        /// A meta ref's repair is a compare-and-set on its copy as well as its ref: a copy that
+        /// moved since heal judged it leaves the ref unwritten, and an unmoved one lets it land.
+        /// Revert: drop the copy check → the ref is written beside the moved copy → red.
+        #[test]
+        fn a_meta_repair_refuses_when_the_copy_moved_since_it_was_judged() {
+            let (_root, _scope) = scratch("meta-repair-copy-moved");
+            let (h1, h2) = (stub_parcel("h1"), stub_parcel("h2"));
+            write("tags", None, &h1).unwrap();
+            file_utils::remove_file(get_pallet_ref_path(PalletNamespace::Meta, "tags")).unwrap();
+            let judged = copy_state("tags");
+            assert_eq!(judged, ref_bytes(&h1));
+
+            set_copy("tags", &h2);
+            let moved = repair_meta_pallet_head("tags", &RefDamage::Missing, &judged, &h1, &RefPreconditions::NONE);
+            assert!(matches!(moved, Err(RefUpdateError::Moved(_))), "{:?}", moved);
+            assert_eq!(head("tags"), None, "the ref must stay lost");
+
+            set_copy("tags", &h1);
+            repair_meta_pallet_head("tags", &RefDamage::Missing, &judged, &h1, &RefPreconditions::NONE).unwrap();
+            assert_eq!(head("tags").as_deref(), Some(h1.as_str()));
         }
 
         /// A birth writes the ref first: a copy that cannot be written fails the write with the
