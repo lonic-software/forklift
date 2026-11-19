@@ -670,14 +670,14 @@ of paths, makes the row an `error`. Once a row is compared, a conflicted consoli
 When Forklift refuses the abort, the harness puts the conflicted files back as P1 has them and
 aborts again, and the row is an `error` that keeps the paths its comparison found. Where the
 comparison itself failed, its failure is the row's reason, and a failed clean-up after it is
-recorded apart, as `clearing`. After any `forklift-refused`, `both-refused` or `error` row the
-harness shifts to the ref's branch; when that is refused, no later row could replay, so the run
-stops with exit status 2, naming the row.
+recorded apart, as `clearing` in both reports. After any `forklift-refused`, `both-refused` or
+`error` row the harness shifts to the ref's branch; when that is refused, no later row could
+replay, so the run stops with exit status 2, naming the row, its reason and its `clearing`.
 
 ### Comparing with git
 
 Each row has three of git's merges to compare with, all `git merge-tree --write-tree` with
-`merge.conflictStyle=diff3`. Like the hash, every git command on the mirror reads attributes from
+`merge.conflictStyle=diff3`. Like the hash, git's merges and the hunk diffs read attributes from
 the empty tree, so a `.gitattributes` in the history, such as a marker size or a merge driver, does
 not change git's merges, which Forklift's do not follow either:
 

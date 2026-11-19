@@ -333,6 +333,32 @@ pub struct Row {
 }
 
 impl Row {
+    /// The row's reason and, apart from it, a failed clean-up's, as replay.md lists them.
+    fn said(&self) -> String {
+        let mut out = String::new();
+        if let Some(reason) = &self.reason {
+            out.push_str(&format!("- reason: {}\n", reason));
+        }
+        if let Some(clearing) = &self.clearing {
+            out.push_str(&format!("- clearing: {}\n", clearing));
+        }
+        out
+    }
+
+    /// Why the run stops after this row, when the warehouse refuses the shift that follows it:
+    /// what the shift said, the row's reason and its failed clean-up, which is what can have left
+    /// the warehouse unable to shift.
+    fn stopped(&self, shift: &str) -> String {
+        let mut out = format!(
+            "the warehouse cannot shift after merge {}'s {} row, so no later row would replay: {}; the row: {}",
+            self.merge, self.class.label(), shift, self.reason.as_deref().unwrap_or_default(),
+        );
+        if let Some(clearing) = &self.clearing {
+            out.push_str(&format!("; its clean-up: {}", clearing));
+        }
+        out
+    }
+
     fn new(merge: &str) -> Row {
         Row {
             merge: merge.to_string(), class: Class::Error, bases: 0, single_base: None, forklift: String::new(), forklift_conflicts: Vec::new(),
@@ -644,9 +670,7 @@ impl ReplayReport {
                 Some(conflicts) if conflicts.is_empty() => "clean".to_string(),
                 Some(conflicts) => format!("conflicted on {}", conflicts.join(", ")),
             });
-            if let Some(reason) = &row.reason {
-                let _ = writeln!(out, "- reason: {}", reason);
-            }
+            out.push_str(&row.said());
             if !row.paths.is_empty() {
                 out.push_str("\n| path | kind | direction or subtype | blob |\n|---|---|---|---|\n");
                 for path in &row.paths {
@@ -1031,11 +1055,10 @@ fn replay(tools: &Tools, merge: &str, row: &mut Row) -> Result<(), String> {
     let compared = compare(tools, merge, row, &mut leftover);
     let cleared = match leftover {
         Leftover::Nothing => Ok(()),
-        Leftover::Conflicted { ours, conflicted } => {
-            let aborted = tools.forklift(&["--json", "abort", "--confirm"])?;
-            if aborted.succeeded() {
-                Ok(())
-            } else {
+        Leftover::Conflicted { ours, conflicted } => match tools.forklift(&["--json", "abort", "--confirm"]) {
+            Err(error) => Err(format!("aborting the conflicted consolidate: {}", error)),
+            Ok(aborted) if aborted.succeeded() => Ok(()),
+            Ok(aborted) => {
                 let refused = format!("aborting the conflicted consolidate failed: {}", said(&aborted));
                 // The row is an error either way. Its conflicted files are put back as the first
                 // parent has them, the way out the refusal names, so the next row starts from a
@@ -1336,10 +1359,7 @@ pub fn run(options: &ReplayOptions, progress: &dyn Fn(&str)) -> Result<ReplayRep
         if probed(row.class) {
             let probe = tools.forklift(&["--json", "shift", HEAD_BRANCH]).map_err(|error| format!("shifting after merge {}'s {} row: {}", merge, row.class.label(), error))?;
             if !probe.succeeded() {
-                return Err(format!(
-                    "the warehouse cannot shift after merge {}'s {} row, so no later row would replay: {}; the row: {}",
-                    merge, row.class.label(), said(&probe), row.reason.as_deref().unwrap_or_default(),
-                ));
+                return Err(row.stopped(&said(&probe)));
             }
         }
         progress(&format!("{}/{} {} {}", index + 1, chosen.len(), merge, row.class.label()));
@@ -1617,6 +1637,24 @@ mod tests {
         cleanup.reason = outcome(&mut cleanup, Ok(()), Err(refusal.to_string())).err();
         assert_eq!(cleanup.clearing, None);
         assert!(judge(&[cleanup], &entry).failures.is_empty());
+    }
+
+    /// replay.md lists a row's failed clean-up apart from its reason, and the run's stop names
+    /// both, since the clean-up is what can leave the warehouse unable to shift.
+    ///
+    /// Revert: leave the clean-up out of the stop → only the comparison's failure is named.
+    #[test]
+    fn a_failed_clean_up_is_shown_and_named_in_the_stop() {
+        let mut both = row(Class::Error, Vec::new());
+        both.reason = Some("stocktake failed".to_string());
+        both.clearing = Some("aborting the conflicted consolidate failed: a marker".to_string());
+        assert_eq!(both.said(), "- reason: stocktake failed\n- clearing: aborting the conflicted consolidate failed: a marker\n");
+        assert_eq!(
+            both.stopped("`shift` exited 1"),
+            "the warehouse cannot shift after merge 1111111111111111111111111111111111111111's error row, so no later row would replay: `shift` exited 1; the row: stocktake failed; its clean-up: aborting the conflicted consolidate failed: a marker",
+        );
+        both.clearing = None;
+        assert_eq!(both.said(), "- reason: stocktake failed\n");
     }
 
     /// The probe follows exactly the rows whose consolidate was refused or which failed: the
