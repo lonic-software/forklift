@@ -4456,6 +4456,11 @@ mod tests {
         assert!(matches!(typed(&newer), MetaCheckError::Newer(_)), "{:?}", typed(&newer));
         let misplaced = haul_parcel(Some(&head), &alice, &[set(&state, &haul_cell(alice.id(), "haul.review 1", &text("x")))]);
         assert!(matches!(typed(&misplaced), MetaCheckError::Content(_)), "{:?}", typed(&misplaced));
+        // A change over a parent whose state is of that schema cannot tell whether the haul was
+        // merged: no verdict either.
+        let over_newer = haul_parcel(Some(&newer), &alice, &[set(&state, &state_cell(&alice, &HaulStatus::Closed, &"cd".repeat(32)))]);
+        let error = verify_meta_content("haul", &haul_utils::HaulRules, Some(&office), &[], Admission::Admit, Some(&newer), &over_newer).unwrap_err();
+        assert!(matches!(&error, MetaCheckError::Newer(message) if message.contains("cannot tell whether the haul was merged")), "{:?}", error);
 
         // No cell exists in a haul directory without its proposal, nor a cell no rule covers.
         let other = haul_utils::haul_dir(&proposal("bob").id());
