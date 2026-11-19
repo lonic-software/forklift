@@ -1440,17 +1440,20 @@ fn plant_taint(root: &Path, hashes: &[&str]) {
 // Mutations: drop the deferred sentences → "deferred" and "lost-deferred" red; record only an
 // unreadable ref as deferred → "lost-deferred" red; read a write that landed under the taint and
 // reported its error as not landed → "rebuilt" red (written, never named); skip the meta pass
-// after the taint → "resolved" red.
+// after the taint → "resolved" red; never say the taint holds a ref → "torn" and "unread" red; take
+// an unreadable taint for a torn one → "unread" red.
 #[test]
 fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once_it_is_resolved() {
-    for case in ["rebuilt", "deferred", "lost-deferred", "torn", "resolved"] {
+    // A taint file nobody can read needs a permission bit Windows does not have.
+    let unread: &[&str] = if cfg!(unix) { &["unread"] } else { &[] };
+    for case in ["rebuilt", "deferred", "lost-deferred", "torn", "resolved"].iter().chain(unread).copied() {
         let area = Area::new(&format!("meta-taint-{}", case));
         let (root, _, second) = tagged(&area);
         let mut tainted = vec![second.clone()];
 
         // A parcel only `side` reaches, gone and recorded: no remote can give it back, so the
         // taint stands and the run stops there.
-        if case != "resolved" && case != "torn" {
+        if !["resolved", "torn", "unread"].contains(&case) {
             area.run_ok(&root, &["pallet", "create", "side"]);
             area.run_ok(&root, &["shift", "side"]);
             area.stack(&root, "d.txt", "side only");
@@ -1477,6 +1480,14 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
                 std::fs::write(dir.join("taint-1-0"), [0xff, 0xfe, b'\n']).unwrap();
             }
             _ => plant_taint(&root, &tainted.iter().map(String::as_str).collect::<Vec<_>>()),
+        }
+        #[cfg(unix)]
+        if case == "unread" {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = forklift_core::util::taint_utils::taint_dir_path_under(&root);
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                std::fs::set_permissions(entry.unwrap().path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+            }
         }
 
         if case == "resolved" {
@@ -1505,7 +1516,8 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
             }
             _ => {
                 let closing = match case {
-                    "torn" => "The durability taint's record is torn, so every object that ref names counts as possibly lost, and a later heal leaves it again; ",
+                    "torn" => " The durability taint's record is torn, so every object it names counts as possibly lost, and a later heal leaves it again; ",
+                    "unread" => " The durability taint could not be read, so every object it names counted as possibly lost; a later heal that can read the taint judges it again.",
                     _ => again,
                 };
                 assert!(message.contains(left) && message.contains(&heads) && message.contains(closing), "{}: {}", case, message);
