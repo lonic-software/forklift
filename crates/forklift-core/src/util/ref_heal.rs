@@ -124,6 +124,10 @@ pub struct Repair {
     /// The refs it refused to rebuild (only [`Pass::AfterTaint`] refuses; the first pass defers).
     pub refused: Vec<Refused>,
 
+    /// The meta refs [`Pass::BeforeTaint`] judged and left for [`Pass::AfterTaint`], each with
+    /// why and every head it found: a run that stops before that pass names them.
+    pub deferred: Vec<Refused>,
+
     /// What narrowed the evidence: a position, journal or marker that could not be read.
     pub notes: Vec<String>,
 
@@ -966,14 +970,6 @@ fn meta_states(notes: &mut Vec<String>) -> Result<Vec<MetaState>, String> {
     Ok(states)
 }
 
-/// The meta pallets whose ref is lost beside its copy or does not hold a head, as `@<name>`.
-///
-/// # Returns
-/// * `Err(String)` - If the meta refs or their copies could not be listed.
-pub fn detect_meta(notes: &mut Vec<String>) -> Result<Vec<String>, String> {
-    Ok(meta_states(notes)?.iter().filter(|state| state.damage().is_some()).map(MetaState::wire).collect())
-}
-
 /// Whether `head` is `ancestor` or descends from it along first parents.
 fn first_parent_descends(head: &str, ancestor: &str) -> Result<bool, String> {
     let mut at = head.to_string();
@@ -1131,6 +1127,8 @@ pub struct MetaRepair {
 pub struct TrustStopped {
     pub error: String,
     pub rebuilt: Vec<Rebuilt>,
+    /// What [`Pass::BeforeTaint`] deferred before it stopped: the office, when it left that.
+    pub deferred: Vec<Refused>,
     /// What the pass noted before it stopped, the office step's among them.
     pub notes: Vec<String>,
 }
@@ -1165,8 +1163,8 @@ fn is_redactions(state: &MetaState) -> bool {
 ///
 /// [`JudgedRedactions`]: crate::util::redaction_utils::JudgedRedactions
 ///
-/// [`Pass::BeforeTaint`] refuses nothing and drops a write that failed, leaving both to
-/// [`Pass::AfterTaint`], which judges again.
+/// [`Pass::BeforeTaint`] refuses nothing: what it would refuse, a write that failed among it,
+/// it lists as deferred ([`Repair::deferred`]) for [`Pass::AfterTaint`], which judges again.
 ///
 /// [`repair_trust`]: crate::util::office_utils::repair_trust
 ///
@@ -1197,7 +1195,7 @@ pub fn repair_meta(pass: Pass) -> Result<MetaRepair, TrustStopped> {
             if let Some(stopped) = report.stopped.take() {
                 notes.push(format!("The office pallet's ref was not rebuilt: {}", stopped.trim_end_matches('.')));
             }
-            return Err(TrustStopped { error, rebuilt: std::mem::take(&mut report.rebuilt), notes });
+            return Err(TrustStopped { error, rebuilt: std::mem::take(&mut report.rebuilt), deferred: std::mem::take(&mut report.deferred), notes });
         }
     };
 
@@ -1296,11 +1294,13 @@ fn judged_redactions(state: &MetaState, head: String) -> crate::util::redaction_
     }
 }
 
-/// Refuse meta ref `state` for `reason`, listing `candidates`: in [`Pass::AfterTaint`] only,
-/// since the pass before the taint recovery leaves its refusals to the one after it.
+/// Refuse meta ref `state` for `reason`, listing `candidates`: in [`Pass::AfterTaint`]; the pass
+/// before the taint recovery defers it to that pass instead.
 fn refuse_in(report: &mut Repair, state: &MetaState, pass: Pass, reason: String, candidates: Vec<Candidate>) {
-    if pass == Pass::AfterTaint {
-        report.refused.push(Refused { pallet: state.wire(), reason, candidates });
+    let refused = Refused { pallet: state.wire(), reason, candidates };
+    match pass {
+        Pass::AfterTaint => report.refused.push(refused),
+        Pass::BeforeTaint => report.deferred.push(refused),
     }
 }
 
@@ -1334,7 +1334,6 @@ fn write_meta_rebuild(state: &MetaState,
             report.stopped = Some(error);
             return true;
         }
-        Err(_) if pass == Pass::BeforeTaint => return false,
         Err(error) => format!("the rebuild at {} was not written: {}", head, error),
         Ok(()) => format!("the rebuild at {} did not read back", head),
     };

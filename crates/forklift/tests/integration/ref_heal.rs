@@ -1433,15 +1433,17 @@ fn plant_taint(root: &Path, hashes: &[&str]) {
 }
 
 /// A meta ref and a taint. Lost beside a copy that verifies, the ref is rebuilt before the taint
-/// recovery, and a refusal there names the rebuild. Damaged so that what its own bytes name is an
-/// object the taint records, it waits: a refusal there says it is judged again once the taint is
-/// resolved, and when the recovery resolves the taint, the pass after it rebuilds the ref.
-// Mutations: drop the waiting line → "deferred" red; read a write that landed under the taint and
+/// recovery, and a refusal there names the rebuild. One heal cannot settle before the recovery
+/// (its bytes name an object the taint records, or its copy names a parcel the taint took) is
+/// left for the pass after it: a refusal at a taint that stands names it with its heads, and when
+/// the recovery resolves the taint, the pass after it rebuilds the ref.
+// Mutations: drop the deferred sentences → "deferred" and "lost-deferred" red; record only an
+// unreadable ref as deferred → "lost-deferred" red; read a write that landed under the taint and
 // reported its error as not landed → "rebuilt" red (written, never named); skip the meta pass
 // after the taint → "resolved" red.
 #[test]
 fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once_it_is_resolved() {
-    for case in ["rebuilt", "deferred", "resolved"] {
+    for case in ["rebuilt", "deferred", "lost-deferred", "resolved"] {
         let area = Area::new(&format!("meta-taint-{}", case));
         let (root, _, second) = tagged(&area);
         let mut tainted = vec![second.clone()];
@@ -1460,6 +1462,10 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
 
         match case {
             "rebuilt" => break_meta(&root, "tags", true),
+            "lost-deferred" => {
+                break_meta(&root, "tags", true);
+                forklift_core::util::file_utils::remove_file(&loose_object(&root, &second)).unwrap();
+            }
             _ => std::fs::write(meta_path(&root, "tags"), &second.as_bytes()[..32]).unwrap(),
         }
         let broken = std::fs::read(meta_path(&root, "tags")).ok();
@@ -1480,16 +1486,19 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
         assert_eq!(value["error"]["code"], "durability_taint", "{}: {}", case, value);
         let message = value["error"]["message"].as_str().unwrap();
         let rebuilt = format!("Rebuilt the ref of pallet \"@tags\" at {}, from the ref's copy.", second);
-        let waiting = "The ref of pallet \"@tags\" is lost or damaged too; heal judges it again once the taint is resolved.";
+        let left = "The ref of pallet \"@tags\" was left for the pass after the taint recovery, which did not judge it in this run: ";
+        let heads = format!("; candidates: {} (the ref's copy).", second);
+        let hand = "Heal judges it again once the taint is resolved; while the taint stands, a head written into the ref's file by hand settles it.";
 
         match case {
             "rebuilt" => {
-                assert!(message.contains(&rebuilt) && !message.contains("lost or damaged too"), "{}", message);
+                assert!(message.contains(&rebuilt) && !message.contains("was left for the pass after"), "{}", message);
                 assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()));
             }
             _ => {
-                assert!(message.contains(waiting) && !message.contains("Rebuilt the ref of pallet \"@tags\""), "{}", message);
-                assert_eq!(std::fs::read(meta_path(&root, "tags")).ok(), broken, "the deferred ref is left as it was");
+                assert!(message.contains(left) && message.contains(&heads) && message.contains(hand), "{}: {}", case, message);
+                assert!(!message.contains("Rebuilt the ref of pallet \"@tags\""), "{}: {}", case, message);
+                assert_eq!(std::fs::read(meta_path(&root, "tags")).ok(), broken, "{}: the deferred ref is left as it was", case);
             }
         }
     }
