@@ -1227,6 +1227,7 @@ fn a_copy_naming_a_parcel_that_fails_verification_is_refused_not_written() {
 fn a_lost_office_beside_a_lost_redactions_ref_waits_on_it() {
     let area = Area::new("meta-office-waits");
     let (root, _, second) = tagged(&area);
+    area.run_ok(&root, &["office", "enroll"]);
 
     std::fs::create_dir_all(meta_copy_path(&root, "redactions").parent().unwrap()).unwrap();
     std::fs::write(meta_copy_path(&root, "redactions"), format!("{}\n", second)).unwrap();
