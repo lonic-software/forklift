@@ -2897,7 +2897,7 @@ A metadata pallet's ref (`.forklift/meta/<name>`, such as `@tags`'s) has a copy 
 `.forklift/meta-copy/<name>`. `heal` rebuilds a lost or damaged one from that copy or, with no copy,
 from the parcel the damaged file's remaining bytes still name, as for a pallet's ref. When both
 name a head and they differ, the copy is taken only when it descends from the other along first
-parents, which is where an interrupted write leaves it; otherwise `heal` changes nothing and refuses
+parents, which is where a write interrupted moving the pallet forward leaves it; otherwise `heal` changes nothing and refuses
 with `ref_damaged`, naming both. The head chosen must verify as that pallet's history, against the
 office, before it is written. A copy that is lost or names another head beside a ref that reads is set
 to the ref's head, with a `Note:`.

@@ -1133,6 +1133,11 @@ fn a_lost_meta_ref_is_rebuilt_from_its_copy() {
     let (root, _, second) = tagged(&area);
 
     forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+    // Strays beside the copies, under a name no pallet may have and under a valid one no meta
+    // pallet has, are neither pallets nor a reason to stop. Mutation: list a stray as a copy → the
+    // heal refuses it, red.
+    std::fs::write(meta_copy_path(&root, "Tags~"), b"stray").unwrap();
+    std::fs::write(meta_copy_path(&root, "tags.bak"), format!("{}\n", second)).unwrap();
 
     let data = healed(&area, &root);
     assert_eq!(rebuilt_meta(&data), vec![("@tags".to_string(), second.clone(), "the ref's copy".to_string())], "{}", data);
@@ -1210,6 +1215,24 @@ fn a_meta_ref_beside_a_lost_redactions_ref_is_refused_naming_it() {
     assert!(message.contains("The ref of pallet \"@redactions\" was not rebuilt: heal does not rebuild this ref"), "{}", refused);
     assert!(message.contains("The ref of pallet \"@tags\" was not rebuilt: it is verified against the office and checked against the redactions, and the ref of pallet \"@redactions\" is damaged too"), "{}", refused);
     assert!(meta_head(&root, "tags").is_none() && meta_head(&root, "redactions").is_none(), "nothing was written");
+    assert_eq!(refused["error"]["next_step"], "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.", "{}", refused);
+
+    // Beside a user ref refused too, the meta refs' hand step still comes first: a user ref's
+    // rebuild is checked against the redactions. Mutation: name the hand step only when every
+    // refused ref is a meta ref → the step is --ref main, red.
+    area.run_ok(&root, &["pallet", "create", "side"]);
+    area.run_ok(&root, &["shift", "side"]);
+    area.stack(&root, "s.txt", "side");
+    area.run_ok(&root, &["shift", "main"]);
+    area.stack(&root, "m.txt", "main");
+    let side = head(&root, "side");
+    forklift_core::util::file_utils::remove_file(root.join(".forklift").join("journal.json")).unwrap();
+    std::fs::write(ref_path(&root, "main"), &side.as_bytes()[..20]).unwrap();
+
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    let pallets: Vec<&str> = refused["error"]["details"]["refs_refused"].as_array().unwrap().iter().map(|refused| refused["pallet"].as_str().unwrap()).collect();
+    assert!(pallets.contains(&"main") && pallets.contains(&"@tags"), "{}", refused);
+    assert_eq!(refused["error"]["next_step"], "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.", "{}", refused);
 }
 
 // Mutation: skip the copy mend → the copy stays lost / at H1, red.
@@ -1229,6 +1252,13 @@ fn a_lost_or_stale_copy_beside_an_intact_ref_is_mended() {
     assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), bytes, "{}", output);
     assert!(output.contains(&format!("The copy of pallet \"@tags\"'s ref named {}, not the ref's head {}", first, second)), "{}", output);
     assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()), "the ref is not touched");
+
+    // The ref's head in other bytes is said so, not as another head. Mutation: drop the
+    // same-head note → "named H, not the ref's head H", red.
+    std::fs::write(meta_copy_path(&root, "tags"), &second).unwrap();
+    let output = text(&area.run_ok(&root, &["heal"]).stdout);
+    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), bytes, "{}", output);
+    assert!(output.contains(&format!("The copy of pallet \"@tags\"'s ref named the ref's head {}, in other bytes; it was set to the ref's bytes.", second)), "{}", output);
 }
 
 // A folder planted at the copy's path fails the first write's copy, after its ref landed.

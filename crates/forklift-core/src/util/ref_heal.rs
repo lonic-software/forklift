@@ -126,6 +126,10 @@ pub struct Repair {
 
     /// What narrowed the evidence: a position, journal or marker that could not be read.
     pub notes: Vec<String>,
+
+    /// Why the pass stopped short, perhaps after writing: what it rebuilt before stopping is in
+    /// `rebuilt` all the same.
+    pub stopped: Option<String>,
 }
 
 /// Where a candidate came from.
@@ -608,8 +612,12 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
             {
                 Ok(()) => report.rebuilt.push(Rebuilt { pallet: damaged.pallet.clone(), head, source }),
                 // Damaged tombstones refuse every ref write alike, and only the operator's repair
-                // mends them, so the refusal is the answer, with its own next step.
-                Err(RefUpdateError::Failed(error)) if crate::util::tombstone_utils::is_damage(&error) => return Err(error),
+                // mends them, so the refusal is the answer, with its own next step. What this pass
+                // already rebuilt stays reported.
+                Err(RefUpdateError::Failed(error)) if crate::util::tombstone_utils::is_damage(&error) => {
+                    report.stopped = Some(error);
+                    break;
+                }
                 // The first pass leaves a failed write to the second, which reports it.
                 Err(_) if pass == Pass::BeforeTaint => {}
                 Err(error) => report.refused.push(Refused {
@@ -915,23 +923,17 @@ fn meta_wire(name: &str) -> String {
 /// be read is left out, with a note.
 fn meta_states(notes: &mut Vec<String>) -> Result<Vec<MetaState>, String> {
     let mut names: BTreeSet<String> = pallet_utils::list_pallets_in(PalletNamespace::Meta)?.into_iter().collect();
-    names.extend(pallet_utils::list_meta_copies()?);
+    names.extend(pallet_utils::list_meta_copies());
 
     let mut states = Vec::new();
 
     for name in names {
         let path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, &name);
 
-        let reference = match std::fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Ok(metadata) if metadata.is_file() => match std::fs::read(&path) {
-                Ok(bytes) => Some(bytes),
-                Err(error) => {
-                    push_note(notes, format!("The ref of pallet \"{}\" could not be read to tell whether it is damaged: {}", meta_wire(&name), error));
-                    continue;
-                }
-            },
-            Ok(_) => {
+        let reference = match pallet_utils::read_file_state(&path) {
+            Ok(pallet_utils::MetaCopyState::Absent) => None,
+            Ok(pallet_utils::MetaCopyState::Bytes(bytes)) => Some(bytes),
+            Ok(pallet_utils::MetaCopyState::Other) => {
                 push_note(notes, format!(
                     "Something that is not a file stands at the ref of pallet \"{}\" (\"{}\"), so heal did not judge it.",
                     meta_wire(&name), path.to_string_lossy()
@@ -979,6 +981,13 @@ fn first_parent_descends(head: &str, ancestor: &str) -> Result<bool, String> {
 const FROM_COPY: &str = "the ref's copy";
 
 /// The head a damaged meta ref is rebuilt at, and where it was found, or why none is.
+///
+/// A copy that differs is taken as ahead of the ref because a forward write moves the copy first.
+/// Undo's put-back moves a ref backward and writes the copy second, so one interrupted between
+/// the two leaves the copy at the head it was undoing, and this would rebuild there. Only a
+/// journaled command's refs are put back, and none of `journal_op`'s commands (stack, consolidate,
+/// pick, shift) writes a meta ref: `git grep -l -E 'update_meta_pallet_head|PalletNamespace::Meta'`
+/// over their command and util modules finds none.
 fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static str), (String, Vec<Candidate>)> {
     let copy = state.copy_head();
     let mut candidates: Vec<Candidate> = copy.iter()
@@ -1067,6 +1076,10 @@ fn mend_copy(state: &MetaState, head: &str, pass: Pass, notes: &mut Vec<String>)
 
     match pallet_utils::mend_meta_copy(&state.name, reference, &state.copy) {
         Ok(pallet_utils::CopyMend::Mended) => push_note(notes, match state.copy_head() {
+            Some(other) if other == head => format!(
+                "The copy of pallet \"{}\"'s ref named the ref's head {}, in other bytes; it was set to the ref's bytes.",
+                state.wire(), head
+            ),
             Some(other) => format!(
                 "The copy of pallet \"{}\"'s ref named {}, not the ref's head {}, as an interrupted write or a hand edit leaves it; it was set to the ref's head.",
                 state.wire(), other, head
@@ -1167,7 +1180,12 @@ pub fn repair_meta(pass: Pass) -> Result<Repair, String> {
 
         match written {
             _ if landed => report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() }),
-            Err(RefUpdateError::Failed(error)) if crate::util::tombstone_utils::is_damage(&error) => return Err(error),
+            // As in the user pass: the refusal is the answer, and what this pass rebuilt stays
+            // reported.
+            Err(RefUpdateError::Failed(error)) if crate::util::tombstone_utils::is_damage(&error) => {
+                report.stopped = Some(error);
+                break;
+            }
             Err(_) if pass == Pass::BeforeTaint => {}
             Err(error) => refuse(format!("the rebuild at {} was not written: {}", head, error), candidates),
             Ok(()) => refuse(format!("the rebuild at {} did not read back", head), candidates),

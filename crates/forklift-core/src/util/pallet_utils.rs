@@ -183,11 +183,13 @@ pub enum MetaCopyState {
 /// Read what stands at the copy path of meta pallet `name`, never following a link.
 pub fn read_meta_copy_state(name: &str) -> Result<MetaCopyState, String> {
     validate_pallet_name(name)?;
-    read_copy_state_at(&get_meta_copy_path(name))
+    read_file_state(&get_meta_copy_path(name))
 }
 
-fn read_copy_state_at(path: &Path) -> Result<MetaCopyState, String> {
-    let unreadable = |e: std::io::Error| format!("Error while reading the ref copy \"{}\": {}", path.to_string_lossy(), e);
+/// Read what stands at `path`, never following a link: the reading a meta ref and its copy are
+/// both judged by.
+pub fn read_file_state(path: &Path) -> Result<MetaCopyState, String> {
+    let unreadable = |e: std::io::Error| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e);
 
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(MetaCopyState::Absent),
@@ -1490,8 +1492,9 @@ pub fn repair_pallet_head(name: &str, damage: &RefDamage, new: &str, preconditio
 
 /// Set damaged meta pallet `name` to `new`: heal's rebuild of a meta ref that is missing or does
 /// not hold a hash, from its copy or from what its own bytes still name. The compare-and-set of
-/// [`repair_pallet_head`], which also expects the copy to still stand as `copy`, what heal judged:
-/// a meta write that landed since, which moves the copy first, is refused as moved. The redaction
+/// [`repair_pallet_head`], which also expects the copy to still stand as `copy`, what heal judged.
+/// A meta write that landed since is refused by the ref's own compare-and-set; the copy's catches
+/// a copy changed alone, as a hand edit changes it. The redaction
 /// check applies; a meta pallet's history is verified by the caller, which pins the trust state it
 /// verified against in `preconditions`. The ref is written first and the copy only once the ref
 /// reads back at `new`, and a copy already holding those bytes is not written again, so a rebuild
@@ -1507,7 +1510,7 @@ pub fn repair_meta_pallet_head(name: &str,
 /// Refuse with [`RefUpdateError::Moved`] unless the copy of meta pallet `name` still stands as
 /// `judged`.
 fn require_copy(name: &str, judged: &MetaCopyState) -> Result<(), RefUpdateError> {
-    if read_copy_state_at(&get_meta_copy_path(name))? != *judged {
+    if read_file_state(&get_meta_copy_path(name))? != *judged {
         return Err(RefUpdateError::Moved(RefMoved {
             reference: PalletRef { namespace: PalletNamespace::Meta, name: name.to_string() },
             expected: None,
@@ -2073,7 +2076,7 @@ fn write_head_locked(
                     }
                 }
                 (WriteOrder::Forward, true) => {
-                    let prior = read_copy_state_at(&copy)?;
+                    let prior = read_file_state(&copy)?;
                     // A copy already at the new bytes is not written again (`write_copy_file`),
                     // and `restore_copy` finds it at its prior state.
                     match write_copy_file(&copy, &bytes) {
@@ -2126,7 +2129,7 @@ fn write_ref_file(path: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
 
 /// Write a meta ref's copy at `path` with `bytes`, unless it already holds exactly them.
 fn write_copy_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if read_copy_state_at(path).ok() == Some(MetaCopyState::Bytes(bytes.to_vec())) {
+    if read_file_state(path).ok() == Some(MetaCopyState::Bytes(bytes.to_vec())) {
         return Ok(());
     }
 
@@ -2142,7 +2145,7 @@ fn write_copy_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// land and still return an error; one that did not land leaves the copy at the new head, which
 /// passed every check of the write, and says so.
 fn restore_copy(path: &Path, prior: &MetaCopyState, error: String) -> String {
-    let restored = match read_copy_state_at(path) {
+    let restored = match read_file_state(path) {
         Ok(state) if state == *prior => return error,
         _ => match prior {
             MetaCopyState::Bytes(bytes) => file_utils::write_file_atomically(path, bytes),
@@ -2157,7 +2160,7 @@ fn restore_copy(path: &Path, prior: &MetaCopyState, error: String) -> String {
         },
     };
 
-    match read_copy_state_at(path) {
+    match read_file_state(path) {
         Ok(state) if state == *prior => error,
         _ => format!(
             "{} Its copy \"{}\" could not be put back as it was ({}), so it names the new head.",
@@ -2225,7 +2228,7 @@ pub fn mend_meta_copy(name: &str, judged_ref: &[u8], judged_copy: &MetaCopyState
 
     let copy = get_meta_copy_path(name);
 
-    if read_copy_state_at(&copy)? != *judged_copy {
+    if read_file_state(&copy)? != *judged_copy {
         return Err(RefUpdateError::Failed(format!(
             "Refusing to mend the copy of pallet \"{}\" (\"{}\"): it changed since it was judged. \
             Nothing was written. Run the command again.",
@@ -2518,24 +2521,20 @@ pub fn list_pallets_in(namespace: PalletNamespace) -> Result<Vec<String>, String
     Ok(names)
 }
 
-/// The names of the meta pallets whose ref has a copy file, sorted: a ref lost beside its copy is
-/// listed here, not by [`list_pallets_in`].
-///
-/// # Returns
-/// * `Ok(Vec<String>)` - The pallet names.
-/// * `Err(String)`     - If the copies' folder could not be read, or a file in it does not name a
-///                       valid pallet.
-pub fn list_meta_copies() -> Result<Vec<String>, String> {
-    let mut names: Vec<String> = Vec::new();
-    let folder = forklift_root().join(FOLDER_NAME_META_COPY_ROOT);
-
-    if folder.is_dir() {
-        collect_pallet_names(&folder, "", &mut names)?;
-    }
+/// The names of the meta pallets this forklift knows that have something at their copy path,
+/// sorted: a ref lost beside its copy is listed here, not by [`list_pallets_in`]. Only the known
+/// names are looked up, never the folder listed, so a stray file in it is neither a pallet nor a
+/// reason to fail. Something there that cannot be told present or absent is listed, for its reader
+/// to report.
+pub fn list_meta_copies() -> Vec<String> {
+    let mut names: Vec<String> = crate::util::meta_tree::META_PALLET_NAMES.iter()
+        .filter(|name| !matches!(std::fs::symlink_metadata(get_meta_copy_path(name)), Err(e) if e.kind() == std::io::ErrorKind::NotFound))
+        .map(|name| name.to_string())
+        .collect();
 
     names.sort();
 
-    Ok(names)
+    names
 }
 
 /// Every born pallet across *both* namespaces, as `(ref, head)` pairs. This is the full

@@ -1230,23 +1230,30 @@ fn stop_tag_create_at_every_rename(name: &str, tagged: bool, mut check: impl FnM
 }
 
 // A forward meta write writes its copy before its ref, so a ref lost after any stop is rebuilt at
-// the head it held or a newer one, never an older one. Mutation: write the ref first → at the stop
-// between the two renames, the copy is left at the old head behind a landed ref, and heal rebuilds
-// the ref at that older head, red.
+// the head it held, or, where only the copy had moved, at the copy's newer head: never an older
+// one. Mutation: write the ref first → at the stop between the two renames, the copy is left at
+// the old head behind a landed ref, and heal rebuilds the ref at that older head, red.
 #[test]
 fn a_meta_ref_lost_after_a_stopped_forward_write_is_never_rebuilt_behind_where_it_stood() {
+    let mut copy_led = 0;
+
     stop_tag_create_at_every_rename("meta-forward", true, |area, at, old| {
         let old = old.expect("v1 is tagged");
         let before = parse_head(meta_file(area, "meta")).expect("@tags stands");
+        let copy = parse_head(meta_file(area, "meta-copy")).expect("@tags has a copy");
 
         forklift_core::util::file_utils::remove_file(area.warehouse().join(".forklift").join("meta").join("tags")).unwrap();
         let healed = area.run(&["heal"]);
         assert!(healed.status.success(), "heal after a stop at rename {at}: {}{}", String::from_utf8_lossy(&healed.stdout), String::from_utf8_lossy(&healed.stderr));
 
         let after = parse_head(meta_file(area, "meta")).expect("@tags is rebuilt");
-        assert!(after == before || before == old,
-            "stopped at rename {at}: @tags stood at {before}, and heal rebuilt it at {after}, behind it");
+        let led = before == old && copy != old;
+        copy_led += usize::from(led);
+        assert!(after == before || (led && after == copy),
+            "stopped at rename {at}: @tags stood at {before}, its copy at {copy}, and heal rebuilt it at {after}");
     });
+
+    assert!(copy_led > 0, "no stop left the copy ahead of its ref, so nothing here tested the order");
 }
 
 // A first meta write writes its ref, then its copy, so after any stop a plain heal leaves the two

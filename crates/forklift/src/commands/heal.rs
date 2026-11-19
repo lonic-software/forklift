@@ -149,6 +149,9 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         ref_heal::Repair::default()
     });
     ref_notes.extend(meta_first.notes);
+    if let Some(error) = meta_first.stopped {
+        ref_notes.push(format!("Not every meta pallet ref was judged before the taint recovery: {}", error.trim_end_matches('.')));
+    }
     let meta_rebuilt = meta_first.rebuilt;
 
     // Every refusal from here on says what this run already wrote, the trust file and the meta
@@ -163,7 +166,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
 
     let record_rebuilt = sealed_utils::rebuild()
         .map_err(|error| config_said(ref_notes.iter().fold(format!(
-            "{}{} Nothing else was healed: once that is fixed, run \"forklift heal\" again.",
+            "{}{} Heal went no further: once that is fixed, run \"forklift heal\" again.",
             error, if error.ends_with('.') { "" } else { "." },
         ), |error, note| forklift_core::error::append_to_message(error, &format!("Note: {}", note)))))?
         .map(RecordRebuilt::from);
@@ -218,7 +221,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // checkout stands on, and so before the fetch-scope heal too: a rebuild from the checkouts'
     // scopes would leave out a scope not yet restored. It reads neither scope. A --position it
     // sets, on a pallet whose ref this run sets or removes, stands on that write, so it waits for
-    // it below; one it refuses is refused here, before anything is written.
+    // it below; one it refuses is refused here, before the steps below write anything.
     let early = !position.is_some_and(|pallet| {
         set_ref.iter().any(|(named, _)| *named == pallet) || remove_ref.iter().any(|named| named == pallet)
     }) || !position_heal::sets_chosen().map_err(|error| records_said(CoreError::from(error), &ref_notes, None, None))?;
@@ -391,6 +394,9 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let first = ref_heal::repair(Pass::BeforeTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(first.rebuilt);
     ref_notes.extend(first.notes);
+    if let Some(error) = first.stopped {
+        return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
+    }
 
     // A torn taint's rescan (§8.3) can take a while on a large or uncompacted store — it reports
     // per-phase/per-count progress through this callback rather than staying silent. `human!` is
@@ -422,10 +428,16 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let meta_second = ref_heal::repair_meta(Pass::AfterTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(meta_second.rebuilt);
     ref_notes.extend(meta_second.notes);
+    if let Some(error) = meta_second.stopped {
+        return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
+    }
 
     let second = ref_heal::repair(Pass::AfterTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(second.rebuilt);
     ref_notes.extend(second.notes);
+    if let Some(error) = second.stopped {
+        return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
+    }
     let mut refs_refused = second.refused;
     refs_refused.extend(meta_second.refused);
 
@@ -1392,10 +1404,11 @@ fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
         lines.push(format!("{}.", unfinished.trim_end_matches('.')));
     }
 
-    // A user ref is set by --ref; a meta ref, which --ref does not set, only by hand.
-    let next_step = match report.refs_refused.iter().find(|refused| !refused.pallet.starts_with('@')) {
-        Some(user) => format!("forklift heal --ref {}=<parcel>", user.pallet),
-        None => "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.".to_string(),
+    // A meta ref, which --ref does not set, is set only by hand, and first: a user ref's rebuild,
+    // --ref's among them, is verified against the office and checked against the redactions.
+    let next_step = match report.refs_refused.iter().any(|refused| refused.pallet.starts_with('@')) {
+        true => "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.".to_string(),
+        false => format!("forklift heal --ref {}=<parcel>", report.refs_refused.first().map_or("<pallet>", |refused| refused.pallet.as_str())),
     };
 
     CoreError::refusal_with_details(
