@@ -1308,21 +1308,31 @@ fn a_damaged_meta_ref_takes_its_copy_when_the_copy_descends_from_what_its_bytes_
     assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()));
 }
 
-// Mutation: take the copy whatever it descends from → rebuilt at H1, red.
+// A ref ahead of its copy (the copy put back at H1, the ref's bytes naming H2, its child) is
+// rebuilt at what its own bytes name; a copy and bytes neither of which descends from the other
+// are refused with both. Mutations: take the copy whatever it descends from → the diverging case
+// is rebuilt at H1, red; check the descent one way only → the ahead case is refused, red.
 #[test]
 fn a_copy_that_does_not_descend_from_what_the_ref_names_is_refused_with_both() {
     let area = Area::new("meta-conflict");
     let (root, first, second) = tagged(&area);
 
-    // The copy is put back at H1, which does not descend from H2, what the ref's bytes name.
     std::fs::write(meta_copy_path(&root, "tags"), format!("{}\n", first)).unwrap();
     std::fs::write(meta_path(&root, "tags"), &second.as_bytes()[..16]).unwrap();
+    let data = healed(&area, &root);
+    assert_eq!(rebuilt_meta(&data), vec![("@tags".to_string(), second.clone(), "what the ref's own bytes still name".to_string())], "{}", data);
+    assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()));
+
+    // The ref's bytes now name a parcel of another history (main's head): neither descends.
+    let other = head(&root, "main");
+    std::fs::write(meta_copy_path(&root, "tags"), format!("{}\n", first)).unwrap();
+    std::fs::write(meta_path(&root, "tags"), &other.as_bytes()[..16]).unwrap();
 
     let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
     let message = refused["error"]["message"].as_str().unwrap();
-    assert!(message.contains("The ref of pallet \"@tags\" was not rebuilt: its copy names") && message.contains(&first) && message.contains(&second), "{}", refused);
+    assert!(message.contains("The ref of pallet \"@tags\" was not rebuilt: its copy names") && message.contains(&first) && message.contains(&other), "{}", refused);
     assert_eq!(refused["error"]["next_step"], "forklift heal --remove-ref @tags", "{}", refused);
-    assert_eq!(std::fs::read(meta_path(&root, "tags")).unwrap(), second.as_bytes()[..16].to_vec(), "the ref is left as it was");
+    assert_eq!(std::fs::read(meta_path(&root, "tags")).unwrap(), other.as_bytes()[..16].to_vec(), "the ref is left as it was");
 
     // Beside a refused user ref, which nothing about @tags blocks, --ref is the step. Mutation:
     // name the removal for any refused meta ref → red.
