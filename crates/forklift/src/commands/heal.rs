@@ -142,7 +142,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // stops the run, naming the office when its rebuild landed first; what this pass cannot
     // settle, or fails to write, the pass after the taint recovery judges again.
     let meta_first = ref_heal::repair_meta(Pass::BeforeTaint).map_err(|stopped| {
-        stopped.rebuilt.iter().fold(config_said(stopped.error), |error, rebuilt| forklift_core::error::append_to_message(error, &rebuilt_sentence(rebuilt)))
+        let error = stopped.rebuilt.iter().fold(config_said(stopped.error), |error, rebuilt| forklift_core::error::append_to_message(error, &rebuilt_sentence(rebuilt)));
+        stopped.notes.iter().fold(error, |error, note| forklift_core::error::append_to_message(error, &format!("Note: {}", note)))
     })?;
     let trust_repair = meta_first.trust;
     ref_notes.extend(trust_repair.notes);
@@ -427,11 +428,17 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         Ok(meta) => meta,
         Err(stopped) => {
             refs_rebuilt.extend(stopped.rebuilt);
+            ref_notes.extend(stopped.notes);
             return Err(changed_after(stopped.error, &refs_rebuilt, &refs_removed, &ref_notes));
         }
     };
-    // The trust repair runs in both passes; what it noted in the first is said once.
+    // The trust repair runs in both passes; what it noted in the first is said once. After a
+    // first write the two files agree, so a second one means they moved between the passes: the
+    // report names the first, and the second is noted.
     let trust_restored_after = meta_second.trust.restored;
+    if let (Some(_), Some(after)) = (&trust_repair.restored, &trust_restored_after) {
+        ref_notes.push(format!("{} (after the taint recovery).", after.sentence().trim_end_matches('.')));
+    }
     for note in meta_second.trust.notes {
         if !ref_notes.contains(&note) {
             ref_notes.push(note);

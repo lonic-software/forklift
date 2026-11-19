@@ -1118,6 +1118,8 @@ pub struct MetaRepair {
 pub struct TrustStopped {
     pub error: String,
     pub rebuilt: Vec<Rebuilt>,
+    /// What the pass noted before it stopped, the office step's among them.
+    pub notes: Vec<String>,
 }
 
 fn is_office(state: &MetaState) -> bool {
@@ -1167,8 +1169,16 @@ pub fn repair_meta(pass: Pass) -> Result<MetaRepair, TrustStopped> {
         rebuild_office(state, tainted, pass, &mut report);
     }
 
-    let trust = crate::util::office_utils::repair_trust()
-        .map_err(|error| TrustStopped { error, rebuilt: report.rebuilt.clone() })?;
+    let trust = match crate::util::office_utils::repair_trust() {
+        Ok(trust) => trust,
+        Err(error) => {
+            let mut notes = std::mem::take(&mut report.notes);
+            if let Some(stopped) = report.stopped.take() {
+                notes.push(format!("The office pallet's ref was not rebuilt: {}", stopped.trim_end_matches('.')));
+            }
+            return Err(TrustStopped { error, rebuilt: std::mem::take(&mut report.rebuilt), notes });
+        }
+    };
 
     if report.stopped.is_none() {
         repair_other_meta(pass, office_judged, &mut tainted, &mut report);
@@ -1179,46 +1189,16 @@ pub fn repair_meta(pass: Pass) -> Result<MetaRepair, TrustStopped> {
 
 /// Step 1 of [`repair_meta`]: judge the damaged office ref `state` and write it.
 fn rebuild_office(state: &MetaState, tainted: &Tainted, pass: Pass, report: &mut Repair) {
-    let refuse = |report: &mut Repair, reason: String, candidates: Vec<Candidate>| if pass == Pass::AfterTaint {
-        report.refused.push(Refused { pallet: state.wire(), reason, candidates });
-    };
-
     let (head, source) = match choose_meta(state, tainted) {
         Ok(chosen) => chosen,
-        Err((reason, candidates)) => return refuse(report, reason, candidates),
+        Err((reason, candidates)) => return refuse_in(report, state, pass, reason, candidates),
     };
-    let candidates = vec![Candidate { head: head.clone(), source: source.to_string() }];
 
-    // The trust file's anchor first, so a copy is used only when the trust file is lost or does
-    // not verify the head. The head is never chosen by the anchor: a head neither verifies is
-    // refused.
-    let anchors = crate::util::office_utils::trust_file_anchors(&mut report.notes);
-    let mut failures = Vec::new();
-    let mut verified = None;
-
-    for (kind, anchor, bytes) in anchors {
-        let file = match kind {
-            crate::util::office_utils::TrustFileKind::Trust => "the trust file",
-            crate::util::office_utils::TrustFileKind::Copy => "the trust file's copy",
-        };
-
-        match crate::util::audit_utils::verify_office_chain(&anchor, &head) {
-            Ok(_) => {
-                verified = Some(match kind {
-                    crate::util::office_utils::TrustFileKind::Trust => pallet_utils::AnchorPrecondition::Bytes(bytes),
-                    crate::util::office_utils::TrustFileKind::Copy => pallet_utils::AnchorPrecondition::CopyBytes(bytes),
-                });
-                break;
-            }
-            Err(why) => failures.push(format!("against the anchor of {}: {}", file, why.to_string().trim_end_matches('.'))),
-        }
-    }
-
-    let Some(anchor) = verified else {
-        return refuse(report, match failures.is_empty() {
-            true => format!("parcel {} cannot be verified: neither the trust file nor its copy holds an anchor heal can read", head),
-            false => format!("parcel {} does not verify as the office's history {}", head, failures.join("; nor ")),
-        }, candidates);
+    // The trust file's anchor first, so a copy's is used only where the trust file's does not
+    // serve; the write is pinned to both files as they were judged.
+    let anchor = match crate::util::office_utils::office_rebuild_anchor(&head) {
+        Ok(anchor) => anchor,
+        Err(reason) => return refuse_in(report, state, pass, reason, vec![Candidate { head, source: source.to_string() }]),
     };
 
     let preconditions = pallet_utils::RefPreconditions {
@@ -1230,13 +1210,20 @@ fn rebuild_office(state: &MetaState, tainted: &Tainted, pass: Pass, report: &mut
     write_meta_rebuild(state, head, source, &preconditions, pass, report);
 }
 
+/// Refuse meta ref `state` for `reason`, listing `candidates`: in [`Pass::AfterTaint`] only,
+/// since the pass before the taint recovery leaves its refusals to the one after it.
+fn refuse_in(report: &mut Repair, state: &MetaState, pass: Pass, reason: String, candidates: Vec<Candidate>) {
+    if pass == Pass::AfterTaint {
+        report.refused.push(Refused { pallet: state.wire(), reason, candidates });
+    }
+}
+
 /// Write the rebuild of damaged meta ref `state` at `head`, found at `source`, and report it.
 ///
 /// # Returns
 /// * `true` - If the pass stops here (`report.stopped` says why).
 fn write_meta_rebuild(state: &MetaState, head: String, source: &str, preconditions: &pallet_utils::RefPreconditions, pass: Pass, report: &mut Repair) -> bool {
     let damage = state.damage().expect("only a damaged ref is rebuilt");
-    let candidates = vec![Candidate { head: head.clone(), source: source.to_string() }];
     let written = pallet_utils::repair_meta_pallet_head(&state.name, &damage, &state.copy, &head, preconditions);
 
     // A write can land and still report a failure (under a standing taint, its rename goes
@@ -1259,10 +1246,7 @@ fn write_meta_rebuild(state: &MetaState, head: String, source: &str, preconditio
         Ok(()) => format!("the rebuild at {} did not read back", head),
     };
 
-    if pass == Pass::AfterTaint {
-        report.refused.push(Refused { pallet: state.wire(), reason, candidates });
-    }
-
+    refuse_in(report, state, pass, reason, vec![Candidate { head, source: source.to_string() }]);
     false
 }
 
@@ -1281,31 +1265,36 @@ fn repair_other_meta(pass: Pass, office_judged: bool, tainted: &mut Option<Taint
     }
 
     for state in &states {
-        let Some(_) = state.damage() else {
+        if state.damage().is_none() {
             if let Some(head) = state.reference.as_deref().and_then(pallet_utils::parse_ref_bytes) {
                 if state.copy != pallet_utils::MetaCopyState::Bytes(state.reference.clone().unwrap_or_default()) {
                     mend_copy(state, &head, pass, &mut report.notes);
                 }
             }
             continue;
-        };
+        }
 
         if office_judged && is_office(state) {
             continue;
         }
 
-        let mut refuse = |reason: String, candidates: Vec<Candidate>| if pass == Pass::AfterTaint {
-            report.refused.push(Refused { pallet: state.wire(), reason, candidates });
-        };
+        let mut refuse = |reason: String, candidates: Vec<Candidate>| refuse_in(report, state, pass, reason, candidates);
 
         let choice = choose_meta(state, tainted.as_ref().expect("read when a ref is damaged"));
 
-        if is_redactions(state) || (is_office(state) && blocking.contains(&state.wire())) {
+        // Step 1 judges a damaged office only beside a @redactions that reads, so one met here
+        // waits on it, or was damaged after step 1 read it.
+        if is_redactions(state) || is_office(state) {
             let candidates = match choice {
                 Ok((head, source)) => vec![Candidate { head, source: source.to_string() }],
                 Err((_, candidates)) => candidates,
             };
-            refuse("heal does not rebuild this ref; write the head it is to hold into the ref file by hand".to_string(), candidates);
+            let redactions = format!("@{}", crate::util::redaction_utils::REDACTIONS_PALLET_NAME);
+            refuse(match (is_office(state), blocking.contains(&redactions)) {
+                (true, true) => format!("heal rebuilds it only while the ref of pallet \"{}\" reads, and that is damaged too: set that first", redactions),
+                (true, false) => "it was damaged while heal ran; run \"forklift heal\" again".to_string(),
+                (false, _) => "heal does not rebuild this ref; write the head it is to hold into the ref file by hand".to_string(),
+            }, candidates);
             continue;
         }
 

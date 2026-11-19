@@ -7798,8 +7798,8 @@ fn rebuilt_refs(value: &serde_json::Value) -> Vec<(String, String)> {
 /// standing, gets its office back from the office's copy, verified against the anchor of the trust
 /// file's copy, and then its trust file back from that copy, which is left as it was. Signing
 /// resumes.
-// Revert: pin the office write to the copy's bytes as AnchorPrecondition::Bytes, which reads the
-// trust file → the write is refused as the anchor moved. The damaged office: repair_trust cannot
+// Revert: judge the office against the trust file's anchor alone, never its copy's → the office
+// is not rebuilt ahead of the trust repair. The damaged office: repair_trust cannot
 // read it, so neither file is restored and heal refuses. The lost office: it reads unborn, so the
 // trust file is restored beside it with the unborn-office note, and the office only after the
 // taint recovery.
@@ -7883,8 +7883,29 @@ fn heal_refuses_an_office_copy_that_does_not_verify_against_the_anchor() {
     assert_eq!(refused.status.code(), Some(53), "{}{}", stdout(&refused), stderr(&refused));
     let value = json(&refused);
     let message = value["error"]["message"].as_str().unwrap();
-    assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: parcel {} does not verify as the office's history against the anchor of the trust file", main)), "{}", value);
+    assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: parcel {} does not verify as the office's history against an anchor heal can read: the trust file (\"", main)), "{}", value);
+    assert!(message.contains("\") holds an anchor it does not verify against, and its copy (\""), "{}", value);
+    assert_eq!(message.matches("\") holds an anchor it does not verify against").count(), 2, "both files judged: {}", value);
     assert!(!forklift.join("meta/office").exists(), "nothing was written");
+}
+
+/// A trust file a newer version wrote is never judged past: the office is not rebuilt against
+/// the copy's anchor beside it, though that verifies, and the trust repair refuses the file.
+// Revert: read a newer trust file as one that does not parse, and go on to the copy → the
+// office is written from the copy's anchor.
+#[test]
+fn heal_does_not_rebuild_the_office_past_a_trust_file_a_newer_version_wrote() {
+    let (warehouse, _) = enrolled_warehouse("heal-office-newer-trust");
+    let forklift = warehouse.root.join(".forklift");
+    forklift_core::util::file_utils::remove_file(forklift.join("meta/office")).unwrap();
+    std::fs::write(forklift.join("trust"), "version = 999\n").unwrap();
+
+    let refused = warehouse.run(&["--json", "heal"]);
+
+    assert_ne!(refused.status.code(), Some(0), "{}{}", stdout(&refused), stderr(&refused));
+    let value = json(&refused);
+    assert!(value["error"]["message"].as_str().unwrap().contains("version 999"), "{}", value);
+    assert!(!forklift.join("meta/office").exists(), "the office was not rebuilt");
 }
 
 /// An office whose copy is ahead of what its damaged ref's bytes still name, along first parents,
