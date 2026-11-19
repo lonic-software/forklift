@@ -217,8 +217,13 @@ Notes:
   replays every two-parent merge of this repository's history on every pull request, the merge
   the pull request would land included, with `proof-load replay --ref ${{ github.sha }}`, and
   compares each with git's. It is outside `ci passed`, but its run step does not continue on error:
-  a divergence, a gap or a refused merge with no entry in `crates/proof-load/replay-tickets.json`
-  fails it ([the guide](proof-load.md#tickets-and-the-verdict) has the rules).
+  a divergence, a gap, or a refused or error row with no entry in
+  `crates/proof-load/replay-tickets.json` fails it
+  ([the guide](proof-load.md#tickets-and-the-verdict) has the rules).
+- The `proof load replay git` check (the `replay-git` job of
+  `.github/workflows/proof-load-history.yml`, Linux) runs on the history job's triggers. It
+  replays a seeded sample of 200 merges of git.git at a pinned commit, with the same verdict. It
+  is outside `ci passed`, and its run step does not continue on error.
 - The `proof load perf` check (`.github/workflows/proof-load-perf.yml`, Linux) times Forklift
   against git with `proof-load perf --shape small --reps 3 --gate self`, on every push to `main`
   and on a pull request that touches `crates/forklift-core/`, `crates/forklift/`,

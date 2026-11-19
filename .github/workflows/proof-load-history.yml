@@ -6,8 +6,8 @@
 # run.
 # The checkout is a full clone: the harness refuses a shallow one.
 #
-# Non-blocking like the per-PR lane: the run step continues on error, and it is not part of the
-# `ci passed` gate.
+# Non-blocking like the per-PR lane: the history job's run step continues on error, and neither
+# job is part of the `ci passed` gate.
 name: proof load history
 
 on:
@@ -89,4 +89,56 @@ jobs:
           path: |
             ${{ runner.temp }}/proof-load/*.json
             ${{ runner.temp }}/proof-load/report.md
+          if-no-files-found: warn
+
+  # The merge replay over another project's history: a sample of git.git's merges, at a pinned
+  # commit, replayed through Forklift and compared with git's. The pin and the seed keep the sample
+  # the same from run to run, so its run step does not continue on error: a red is news about
+  # Forklift, resolved by an entry in crates/proof-load/replay-tickets.json and its ticket. The
+  # seed moves to the run number, by hand and once, the first time no entry is keyed to a merge of
+  # the seed-7 sample; the guide's replay section says so.
+  replay-git:
+    name: proof load replay git
+    runs-on: ubuntu-latest
+    # The hang guard. On macOS, with release forklift, the 200 merges took 465 s: 179 s to import
+    # and 286 s to replay.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: replay-git
+
+      - name: Build the binary under test and the harness
+        run: cargo build --release --locked -p forklift -p proof-load
+
+      - name: Clone git.git at the pin
+        run: |
+          git clone -q --bare https://github.com/git/git.git "$RUNNER_TEMP/git.git"
+          git -C "$RUNNER_TEMP/git.git" cat-file -e e1ec09b23c8e0deb21a0b95ac5996422277395d4^{commit}
+
+      - name: Run
+        id: run
+        run: |
+          bin=target/release
+          "$bin/proof-load" replay --source "$RUNNER_TEMP/git.git" --ref e1ec09b23c8e0deb21a0b95ac5996422277395d4 \
+            --sample 200 --seed 7 --out "$RUNNER_TEMP/replay" --forklift "$bin/forklift" --git "$(command -v git)"
+
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          echo "Run step: ${{ steps.run.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$RUNNER_TEMP/replay/replay.md" ]; then cat "$RUNNER_TEMP/replay/replay.md" >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: proof-load-replay-git
+          path: |
+            ${{ runner.temp }}/replay/replay.json
+            ${{ runner.temp }}/replay/replay.md
           if-no-files-found: warn

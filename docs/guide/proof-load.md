@@ -285,6 +285,15 @@ on error, so for now they report grades without failing a pull request.
   240 were fast-forwards for Forklift, 45 were real merges and 5 conflicted, and the replay took
   110 s on macOS release.
 - **`proof load history`** runs weekly on Linux with `--history-from .`, over Forklift's own history.
+- **`proof load replay git`**, a second job of the same workflow and on the same triggers, runs
+  `replay --sample 200 --seed 7` over a bare clone of git.git pinned at
+  `e1ec09b23c8e0deb21a0b95ac5996422277395d4`. Its run step does not continue on error, and
+  `replay.md` and `replay.json` are added to the summary and uploaded as for the per-PR job. The pin
+  and the seed keep the sample fixed, so every entry for its merges was filed from one run. The seed
+  moves once, by hand, to the run number (`${{ github.run_number }}`), the first time
+  `replay-tickets.json` holds no entry for a merge of the seed-7 sample. From then on each run
+  takes a new sample, and a red names a merge no one has looked at. That is news about Forklift,
+  resolved like any other failure: an entry and its ticket.
 - **`proof load perf`** runs `perf --shape small --reps 3 --gate self` on Linux, with a
   forklift-server, on every push to `main` and on a pull request that touches the code the timed
   binaries or the harness are built from (the forklift, forklift-core, forklift-server and
