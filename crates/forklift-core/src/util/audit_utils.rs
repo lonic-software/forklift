@@ -28,8 +28,12 @@ pub enum OfficeChainError {
     /// A parcel of the chain, or its signature, could not be read from the store. That says
     /// nothing of whether the chain is authentic, only that it cannot be told. The fault says
     /// whether the store decided the parcel is absent or damaged, or said nothing of it; a
-    /// signature that does not read is always told as saying nothing.
+    /// signature the store cannot give is told as saying nothing, and one that reads but does not
+    /// parse as damaged.
     Unreadable(String, crate::util::file_utils::ReadFault),
+    /// A signature of the chain reads whole but names a version this build does not know, so a
+    /// newer Forklift may have written it: no verdict on the chain, which an upgrade can judge.
+    Newer(String),
     /// Every parcel up to `parcel` is authentic, but `parcel` breaks key permanence, exceeds
     /// its signer's privileges, or adds a key for another user endorsed by a non-admin.
     Unauthorized {
@@ -46,6 +50,7 @@ impl OfficeChainError {
         match self {
             OfficeChainError::Inauthentic(message)
             | OfficeChainError::Unreadable(message, _)
+            | OfficeChainError::Newer(message)
             | OfficeChainError::Unauthorized { message, .. } => message,
         }
     }
@@ -102,13 +107,16 @@ impl From<OfficeChainError> for String {
 ///                                              a parcel fails its shape, signature or
 ///                                              endorsement checks.
 /// * `Err(OfficeChainError::Unreadable(..))`  - If a parcel or its signature cannot be read
-///                                              from the store.
+///                                              from the store, or a signature reads but is
+///                                              damaged.
+/// * `Err(OfficeChainError::Newer(_))`        - If a signature names a version this build does
+///                                              not know.
 /// * `Err(OfficeChainError::Unauthorized{..})` - If, before any inauthentic parcel, a parcel
 ///                                              breaks key permanence, exceeds its signer's
 ///                                              privileges, or adds a key endorsed beyond
 ///                                              its authorizer's authority.
 pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<OfficeState, OfficeChainError> {
-    use OfficeChainError::{Inauthentic, Unauthorized, Unreadable};
+    use OfficeChainError::{Inauthentic, Newer, Unauthorized, Unreadable};
 
     let mut chain: Vec<String> = Vec::new();
     let mut cursor = office_head.to_string();
@@ -159,7 +167,10 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
         // A signature the store cannot give is unreadable, not a verdict: only what reads is
         // judged below.
         let raw = sign_utils::load_raw_parcel_signature(hash).map_err(|message| Unreadable(message, crate::util::file_utils::ReadFault::Untold))?;
-        let signature = raw.map(|bytes| sign_utils::decode_stored_parcel_signature(&bytes, hash)).transpose().map_err(Inauthentic)?;
+        let signature = raw.map(|bytes| sign_utils::decode_stored_parcel_signature_classified(&bytes, hash)).transpose().map_err(|refused| match refused {
+            sign_utils::SignatureDecode::Newer(message) => Newer(message),
+            sign_utils::SignatureDecode::Damaged(message) => Unreadable(message, crate::util::file_utils::ReadFault::Content),
+        })?;
         verify_signature_of(hash, signature.as_ref(), lookup_state, "office parcel").map_err(Inauthentic)?;
 
         // A revoked key must not extend the office chain: the signer has to be
@@ -1054,15 +1065,14 @@ pub fn verified_local_office() -> Result<VerifiedOffice, String> {
 }
 
 /// The refusal of an office chain that did not verify against this warehouse's trust anchor. One
-/// the store cannot give, or a coded refusal met on the walk, says nothing of the anchor and stands
-/// as it is. Any other is the anchor's to answer for only when heal can restore a trust file that
-/// does verify ([`office_utils::unverified_trust_refusal`]), `closing` saying what the refused
+/// the store cannot give, or one a newer Forklift may have written, says nothing of the anchor and
+/// stands as it is. Any other is the anchor's to answer for only when heal can restore a trust file
+/// that does verify ([`office_utils::unverified_trust_refusal`]), `closing` saying what the refused
 /// command left as it was.
 pub fn office_chain_refusal(refused: OfficeChainError, closing: &str) -> String {
     match refused {
-        OfficeChainError::Unreadable(why, _) => why,
-        refused if crate::error::frames_in(refused.message()).next().is_some() => String::from(refused),
-        refused => {
+        OfficeChainError::Unreadable(why, _) | OfficeChainError::Newer(why) => why,
+        refused @ (OfficeChainError::Inauthentic(_) | OfficeChainError::Unauthorized { .. }) => {
             let refused = String::from(refused);
             office_utils::unverified_trust_refusal(&refused, closing).unwrap_or(refused)
         }
@@ -1154,9 +1164,12 @@ pub enum OfficeLiftRefusal {
 /// * `held_head` - The office head before the lift (`None` for the first office lift).
 pub fn classify_office_lift_refusal(error: OfficeChainError, held_head: Option<&str>) -> OfficeLiftRefusal {
     match error {
-        // A lift that leaves a parcel of its chain unreadable did not bring it: the lift is the
-        // input at fault, as it is for an inauthentic chain.
-        OfficeChainError::Inauthentic(message) | OfficeChainError::Unreadable(message, _) => OfficeLiftRefusal::Unprocessable(message),
+        // A lift that leaves a parcel of its chain unreadable, or in a version this head does not
+        // know, did not bring what it verifies by: the lift is the input at fault, as it is for an
+        // inauthentic chain.
+        OfficeChainError::Inauthentic(message)
+        | OfficeChainError::Unreadable(message, _)
+        | OfficeChainError::Newer(message) => OfficeLiftRefusal::Unprocessable(message),
         OfficeChainError::Unauthorized { parcel, message } => {
             if held_head.map_or(false, |head| office_history_holds(head, &parcel)) {
                 OfficeLiftRefusal::Unprocessable(format!(
@@ -4402,6 +4415,7 @@ mod tests {
             Err(OfficeChainError::Inauthentic(message)) => message,
             Err(OfficeChainError::Unauthorized { message, .. }) => panic!("refused as unauthorized: {}", message),
             Err(OfficeChainError::Unreadable(message, _)) => panic!("refused as unreadable: {}", message),
+            Err(OfficeChainError::Newer(message)) => panic!("refused as newer: {}", message),
             Ok(_) => panic!("the chain at {} must be refused", head),
         }
     }
@@ -4420,6 +4434,52 @@ mod tests {
             let odd = odd_office_parcel(shape, &head, &fixture.admin, &fixture.admin_key_id);
             let refusal = chain_refusal(&fixture.anchor, &odd);
             assert!(refusal.contains(&odd), "{:?} must be named: {}", shape, refusal);
+        }
+    }
+
+    /// A trust file whose chain to the office head crosses a stored signature this build cannot
+    /// judge, one naming a newer version or one damaged, is no verdict on that trust file: heal
+    /// writes nothing over it, even beside a copy that serves the head (a served root's
+    /// re-genesis, which adopts the head and so serves with no walk), and says why.
+    // Revert: judge a newer signature as the walk's verdict (`OfficeChainError::Newer` →
+    // `TrustJudged::Unverified` in `judge_trust_bytes`) → the copy is written over the trust file
+    // → the "newer" row is red; class a damaged one as inauthentic in `verify_office_chain` → the
+    // "damaged" row is red.
+    #[test]
+    fn a_trust_file_whose_chain_crosses_a_signature_heal_cannot_judge_is_not_written_over() {
+        let mut newer = crate::util::byte_utils::number_to_vlq_bytes(2);
+        newer.extend([0u8, 0u8]);
+
+        for (name, sidecar, says) in [("newer", newer, "upgrading Forklift reads it"), ("damaged", vec![0xffu8], "So that stored signature is damaged")] {
+            let fixture = PrivilegeFixture::new(&format!("trust-unjudged-{}", name));
+            let (_, head) = fixture.admit("bob@x", Role::Writer, crate::util::office_utils::IdentityClass::Human, None);
+            // Served before the sidecar is replaced: the first serve reads it.
+            assert!(crate::util::tombstone_utils::mark_served(true).unwrap(), "{}: the root is served", name);
+            file_utils::write_file_atomically(&sign_utils::get_signature_path(&head).unwrap(), &sidecar).unwrap();
+            // The serve verified the chain as it stood; a stored signature never changes outside a
+            // test, so the memo is dropped for the walk to read the new one. It holds only what
+            // can be recomputed.
+            lock_memo(VERIFIED_OFFICE_CHAINS.get_or_init(|| Mutex::new(OfficeChainMemo::new()))).clear();
+
+            let copy = TrustAnchor {
+                genesis: "cd".repeat(32),
+                enabled_at: 1_700_000_002,
+                boundary: Vec::new(),
+                prior_genesis: Some(fixture.anchor.genesis.clone()),
+                adopts: Some(head.clone()),
+            };
+            let root = crate::globals::forklift_root();
+            let copy_bytes = crate::util::office_utils::encode_trust_anchor(&copy);
+            file_utils::write_file_atomically(&root.join(crate::util::office_utils::FILE_NAME_TRUST_COPY), copy_bytes.as_bytes()).unwrap();
+            let trust_path = root.join(crate::util::office_utils::FILE_NAME_TRUST);
+            let trust = std::fs::read(&trust_path).unwrap();
+
+            let repair = crate::util::office_utils::repair_trust().unwrap();
+            assert!(repair.restored.is_none(), "{}: {:?}", name, repair.notes);
+            assert_eq!(std::fs::read(&trust_path).unwrap(), trust, "{}: the trust file is left as it was", name);
+            let note = repair.notes.iter().find(|note| note.contains("were not checked, and nothing was written to them"));
+            let note = note.unwrap_or_else(|| panic!("{}: no note says why: {:?}", name, repair.notes));
+            assert!(note.contains(says) && note.contains(&head), "{}: {}", name, note);
         }
     }
 

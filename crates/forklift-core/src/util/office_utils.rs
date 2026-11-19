@@ -790,22 +790,14 @@ pub(crate) fn observe_trust_files() -> Result<(pallet_utils::TrustEntryState, pa
 ///                                   - Both files, as judged, and the anchor that verified
 ///                                     `head`, which what is judged beside the office is
 ///                                     verified against.
-/// * `Err((String, bool))`           - Why the head is not written, as a refusal's reason, and
-///                                     whether that is the head's own: `true` when both files
-///                                     hold an anchor and neither verifies it (its chain reads
-///                                     and does not reach the head, or the store decided a parcel
-///                                     of that chain is absent or damaged); `false` when a newer
-///                                     version wrote one, a file is lost, is not a file or does
-///                                     not read as an anchor (damage to the trust files, which
-///                                     the trust file repair judges), or a file, the served state
-///                                     or a chain could not be read, which says nothing of the
-///                                     head.
-pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorPrecondition, TrustAnchor), (String, bool)> {
-    let unjudged = |why: String| (format!("parcel {} could not be verified against the anchor: {}", head, why.trim_end_matches('.')), false);
+/// * `Err((String, AnchorRefusal))`  - Why the head is not written, as a refusal's reason, and
+///                                     whose that is ([`AnchorRefusal`]).
+pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorPrecondition, TrustAnchor), (String, AnchorRefusal)> {
+    let unjudged = |why: String| (format!("parcel {} could not be verified against the anchor: {}", head, why.trim_end_matches('.')), AnchorRefusal::Unread);
     let (trust, copy) = observe_trust_files().map_err(unjudged)?;
     let served = crate::util::tombstone_utils::served_state().map_err(unjudged)? != crate::util::tombstone_utils::ServedState::Never;
-    // What each file says of the head, and whether that is a verdict on it.
-    let mut said: Vec<(String, bool)> = Vec::new();
+    // What each file says of the head, and whose that is.
+    let mut said: Vec<(String, AnchorRefusal)> = Vec::new();
 
     // What a newer version wrote is that version's to judge, the file not reached included: an
     // office written beside it would stand where only that version reads the anchor.
@@ -815,7 +807,7 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
                 return Err((format!(
                     "\"{}\" was written by a newer version of Forklift, so heal does not verify the office against it",
                     forklift_root().join(name).to_string_lossy()
-                ), false));
+                ), AnchorRefusal::Newer));
             }
         }
     }
@@ -823,11 +815,11 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
     for entry in [&trust, &copy] {
         let bytes = match entry {
             pallet_utils::TrustEntryState::Absent => {
-                said.push(("is lost".to_string(), false));
+                said.push(("is lost".to_string(), AnchorRefusal::Unread));
                 continue;
             }
             pallet_utils::TrustEntryState::NotAFile => {
-                said.push(("is not a file or a link to one".to_string(), false));
+                said.push(("is not a file or a link to one".to_string(), AnchorRefusal::Unread));
                 continue;
             }
             pallet_utils::TrustEntryState::Bytes(bytes) => bytes,
@@ -837,34 +829,44 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
             Ok(Ok(anchor)) => anchor,
             // A newer version's file refused above.
             Ok(Err(_)) | Err(_) => {
-                said.push(("does not read as an anchor".to_string(), false));
+                said.push(("does not read as an anchor".to_string(), AnchorRefusal::Unread));
                 continue;
             }
         };
 
         // A chain the store holds damaged or decided is absent is this anchor's verdict on the
-        // head: it cannot verify it. One the store could not give says nothing of it. Either
-        // way the other file's anchor is still tried: it may verify the head.
+        // head: it cannot verify it. One the store could not give, or one crossing a signature a
+        // newer version may have written, says nothing of it. Either way the other file's anchor
+        // is still tried: it may verify the head.
         match anchor_serves(&Ok(bytes.clone()), &anchor, Some(head), served) {
             Ok(true) => return Ok((pallet_utils::AnchorPrecondition::Files { trust: trust.clone(), copy: copy.clone() }, anchor)),
-            Ok(false) => said.push((UNVERIFIED_ANCHOR.to_string(), true)),
-            Err((why, crate::util::file_utils::ReadFault::Content)) => said.push((format!(
+            Ok(false) => said.push((UNVERIFIED_ANCHOR.to_string(), AnchorRefusal::Own)),
+            Err(ChainUnjudged::Unread(why, crate::util::file_utils::ReadFault::Content)) => said.push((format!(
                 "holds an anchor whose chain to the head the store holds damaged or absent ({})",
                 crate::error::frames_without_steps(&why).trim_end_matches('.')
-            ), true)),
-            Err((why, crate::util::file_utils::ReadFault::Untold)) => said.push((format!(
+            ), AnchorRefusal::Own)),
+            Err(ChainUnjudged::Unread(why, crate::util::file_utils::ReadFault::Untold)) => said.push((format!(
                 "holds an anchor whose chain to the head could not be read ({})",
                 crate::error::frames_without_steps(&why).trim_end_matches('.')
-            ), false)),
+            ), AnchorRefusal::Unread)),
+            Err(ChainUnjudged::Newer(why)) => said.push((format!(
+                "holds an anchor whose chain to the head is in a version this Forklift does not read ({})",
+                crate::error::frames_without_steps(&why).trim_end_matches('.')
+            ), AnchorRefusal::Newer)),
         }
     }
 
     // Only two anchors that both read and both refuse the head judge it; a file that does not
-    // hold one, or whose chain could not be read, may be the one that would have verified it.
-    let own = said.iter().all(|(_, verdict)| *verdict);
+    // hold one, or whose chain could not be read, may be the one that would have verified it. One
+    // a newer version may read is that version's to judge, before what could not be read.
+    let refusal = match said.iter().all(|(_, whose)| *whose == AnchorRefusal::Own) {
+        true => AnchorRefusal::Own,
+        false if said.iter().any(|(_, whose)| *whose == AnchorRefusal::Newer) => AnchorRefusal::Newer,
+        false => AnchorRefusal::Unread,
+    };
     let trust_path = forklift_root().join(FILE_NAME_TRUST);
     let copy_path = forklift_root().join(FILE_NAME_TRUST_COPY);
-    Err((match own {
+    Err((match refusal == AnchorRefusal::Own {
         true => format!(
             "parcel {} does not verify as the office's history against an anchor heal can read: the trust file (\"{}\") {}, and its copy (\"{}\") {}",
             head, trust_path.to_string_lossy(), said[0].0, copy_path.to_string_lossy(), said[1].0
@@ -873,7 +875,24 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
             "parcel {} could not be verified as the office's history: the trust file (\"{}\") {}, and its copy (\"{}\") {}",
             head, trust_path.to_string_lossy(), said[0].0, copy_path.to_string_lossy(), said[1].0
         ),
-    }, own))
+    }, refusal))
+}
+
+/// Whose an [`office_rebuild_anchor`] refusal is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnchorRefusal {
+    /// The head's own: both files hold an anchor and neither verifies it (its chain reads and does
+    /// not reach the head, or the store decided a parcel of that chain is absent or damaged).
+    Own,
+
+    /// A newer version may judge it: it wrote a file, or a signature of a file's chain to the
+    /// head, in a version this build does not know.
+    Newer,
+
+    /// Nothing of the head: a file is lost, is not a file or does not read as an anchor (damage
+    /// to the trust files, which the trust file repair judges), or a file, the served state or a
+    /// chain could not be read.
+    Unread,
 }
 
 /// What [`office_rebuild_anchor`] says of a trust file whose anchor reads but does not verify the
@@ -885,10 +904,10 @@ const UNVERIFIED_ANCHOR: &str = "holds an anchor it does not verify against";
 /// `served` or not.
 ///
 /// # Returns
-/// * `Ok(bool)`                  - Whether it serves.
-/// * `Err((String, ReadFault))`  - The office chain could not be read ([`judge_trust_bytes`]),
-///                                 which says nothing of the anchor.
-fn anchor_serves(bytes: &Result<Vec<u8>, String>, anchor: &TrustAnchor, office_head: Option<&str>, served: bool) -> Result<bool, (String, crate::util::file_utils::ReadFault)> {
+/// * `Ok(bool)`             - Whether it serves.
+/// * `Err(ChainUnjudged)`   - The office chain could not be judged ([`judge_trust_bytes`]),
+///                            which says nothing of the anchor.
+fn anchor_serves(bytes: &Result<Vec<u8>, String>, anchor: &TrustAnchor, office_head: Option<&str>, served: bool) -> Result<bool, ChainUnjudged> {
     match office_head {
         None => Ok(served),
         // A server's re-genesis adopts the office head and names the genesis it succeeds; an
@@ -1829,15 +1848,33 @@ enum TrustJudged {
     Newer(String),
 }
 
+/// Why an office chain could not be judged against an anchor: nothing of the anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChainUnjudged {
+    /// The store could not give a part of it, or holds a signature of it damaged; the fault says
+    /// whether the store decided that ([`OfficeChainError::Unreadable`](crate::util::audit_utils::OfficeChainError::Unreadable)).
+    Unread(String, crate::util::file_utils::ReadFault),
+
+    /// A signature of it names a version this build does not know: the refusal, which says so.
+    Newer(String),
+}
+
+impl ChainUnjudged {
+    /// The refusal, phrased for the user.
+    fn into_message(self) -> String {
+        match self {
+            ChainUnjudged::Unread(message, _) | ChainUnjudged::Newer(message) => message,
+        }
+    }
+}
+
 /// Judge the trust-file `bytes` (`Err`: the entry is not a file) against `office_head`.
 ///
 /// # Returns
-/// * `Ok(TrustJudged)` - The judgement.
-/// * `Err((String, ReadFault))` - The office chain could not be read: a coded refusal, such as
-///                                damage to the store, which says nothing about the trust file. The
-///                                fault says whether the store decided a parcel of the chain is
-///                                absent or damaged; a refusal met past the walk says nothing of it.
-fn judge_trust_bytes(bytes: &Result<Vec<u8>, String>, office_head: &str) -> Result<TrustJudged, (String, crate::util::file_utils::ReadFault)> {
+/// * `Ok(TrustJudged)`       - The judgement.
+/// * `Err(ChainUnjudged)`    - The office chain could not be judged, which says nothing about the
+///                             trust file, so it is neither used nor written over.
+fn judge_trust_bytes(bytes: &Result<Vec<u8>, String>, office_head: &str) -> Result<TrustJudged, ChainUnjudged> {
     let Ok(bytes) = bytes else {
         return Ok(TrustJudged::Unusable);
     };
@@ -1850,10 +1887,14 @@ fn judge_trust_bytes(bytes: &Result<Vec<u8>, String>, office_head: &str) -> Resu
 
     match crate::util::audit_utils::verify_office_chain_memoized(&anchor, office_head) {
         Ok(_) => Ok(TrustJudged::Usable),
-        // An object the store could not give keeps what its read said; every other refusal is
-        // the walk's verdict on what it read.
-        Err(crate::util::audit_utils::OfficeChainError::Unreadable(why, fault)) => Err((why, fault)),
-        Err(_) => Ok(TrustJudged::Unverified(anchor)),
+        // An object the store could not give keeps what its read said, and a signature a newer
+        // version may have written is that version's to judge; the rest is the walk's verdict
+        // on what it read.
+        Err(crate::util::audit_utils::OfficeChainError::Unreadable(why, fault)) => Err(ChainUnjudged::Unread(why, fault)),
+        Err(crate::util::audit_utils::OfficeChainError::Newer(why)) => Err(ChainUnjudged::Newer(why)),
+        Err(crate::util::audit_utils::OfficeChainError::Inauthentic(_) | crate::util::audit_utils::OfficeChainError::Unauthorized { .. }) => {
+            Ok(TrustJudged::Unverified(anchor))
+        }
     }
 }
 
@@ -1927,8 +1968,8 @@ pub(crate) fn refuse_unsettled_trust(_lock: &crate::util::lock_utils::RefLock) -
         ).into());
     };
 
-    let trust_judged = judge_trust_bytes(&trust, &office_head).map_err(|(why, _)| why)?;
-    let copy_judged = copy.as_ref().map(|copy| judge_trust_bytes(copy, &office_head)).transpose().map_err(|(why, _)| why)?;
+    let trust_judged = judge_trust_bytes(&trust, &office_head).map_err(ChainUnjudged::into_message)?;
+    let copy_judged = copy.as_ref().map(|copy| judge_trust_bytes(copy, &office_head)).transpose().map_err(ChainUnjudged::into_message)?;
 
     let copy_differs = copy.as_ref().is_some_and(|copy| match (copy, &trust) {
         (Ok(copy), Ok(trust)) => copy != trust,
@@ -2240,13 +2281,13 @@ fn plan_trust_repair(files: &TrustFiles, notes: &mut Vec<String>) -> Result<Opti
         false => {}
     }
 
-    // Whether `file`, parsed as `anchor`, is usable. A chain the store cannot read says nothing of
-    // either file, so nothing is written over it.
+    // Whether `file`, parsed as `anchor`, is usable. A chain the store cannot read, or one a newer
+    // version may have signed, says nothing of either file, so nothing is written over it.
     let usable = |file: &Option<Result<Vec<u8>, String>>, anchor: &Option<TrustAnchor>| -> Result<bool, String> {
         let (Some(file), Some(anchor)) = (file, anchor) else {
             return Ok(false);
         };
-        anchor_serves(file, anchor, office_head.as_deref(), served).map_err(|(why, _)| why)
+        anchor_serves(file, anchor, office_head.as_deref(), served).map_err(ChainUnjudged::into_message)
     };
 
     if matches!((trust, copy), (Some(Ok(trust)), Some(Ok(copy))) if trust == copy) {

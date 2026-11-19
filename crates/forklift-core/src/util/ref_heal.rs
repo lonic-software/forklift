@@ -1682,9 +1682,15 @@ fn rebuild_office(state: &MetaState, redactions: Option<&MetaState>, tainted: &T
     // serve; the write is pinned to both files as they were judged.
     let (anchor, judged_anchor) = match crate::util::office_utils::office_rebuild_anchor(&head) {
         Ok(anchor) => anchor,
-        // No anchor verifies the office's own candidate, or what would tell could not be read.
-        Err((reason, own)) => {
-            refuse_in(report, state, pass, reason, candidates(), if own { Owner::Own } else { Owner::Unread });
+        // No anchor verifies the office's own candidate, a newer version may judge it, or what
+        // would tell could not be read.
+        Err((reason, refusal)) => {
+            let owner = match refusal {
+                crate::util::office_utils::AnchorRefusal::Own => Owner::Own,
+                crate::util::office_utils::AnchorRefusal::Newer => Owner::Newer,
+                crate::util::office_utils::AnchorRefusal::Unread => Owner::Unread,
+            };
+            refuse_in(report, state, pass, reason, candidates(), owner);
             return None;
         }
     };
