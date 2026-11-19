@@ -247,7 +247,8 @@ pub(crate) fn restage_object(root: &Path, relative_path: &Path) -> Result<Restag
 }
 
 /// Whether `relative_path` (under the forklift root) is written only under the ref lock: a pallet
-/// ref (anything under `pallets/` or `meta/`), the trust anchor or its copy.
+/// ref (anything under `pallets/` or `meta/`), a meta ref's copy (under `meta-copy/`), the trust
+/// anchor or its copy.
 fn is_ref_lock_guarded(relative_path: &Path) -> bool {
     if relative_path == Path::new(office_utils::FILE_NAME_TRUST) || relative_path == Path::new(office_utils::FILE_NAME_TRUST_COPY) {
         return true;
@@ -257,6 +258,7 @@ fn is_ref_lock_guarded(relative_path: &Path) -> bool {
         relative_path.components().next(),
         Some(std::path::Component::Normal(first))
             if first == pallet_utils::FOLDER_NAME_PALLETS_ROOT || first == pallet_utils::FOLDER_NAME_META_ROOT
+                || first == pallet_utils::FOLDER_NAME_META_COPY_ROOT
     )
 }
 
