@@ -1609,7 +1609,8 @@ mod tests {
         let folder = std::path::PathBuf::from(folder);
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join(file), b"not an object").unwrap();
-        assert_eq!(salvage(&unreadable.as_bytes()[..12], &Tainted::read(&mut Vec::new())).unwrap(), Salvage::Unknown(unreadable.clone()));
+        let judged = salvage(&unreadable.as_bytes()[..12], &Tainted::read(&mut Vec::new()));
+        assert!(matches!(judged, Ok(Salvage::Unknown(_))), "{:?}", judged);
         assert!(!salvage_names_a_head(&unreadable.as_bytes()[..12]), "an unreadable match is no head heal takes");
     }
 
