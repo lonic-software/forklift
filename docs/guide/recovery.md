@@ -114,21 +114,30 @@ A meta pallet's ref (a name starting with `@`, such as `@tags`) keeps a copy bes
 while its copy stands refuses as `ref_damaged` wherever it is read, in place of reading as an empty pallet,
 and so does one whose file does not hold a parcel hash. `heal` rebuilds it from its copy, or from what
 the damaged file still names, the office's and `@redactions`' among them, so the refusal names
-`forklift heal` when the copy holds a parcel hash, or the damaged file names one parcel. Where neither
-does (the copy does not hold a parcel hash, and the damaged file names nothing, several parcels or one
-that cannot be read, or is missing), and for a ref `heal` refuses for a reason of its own, the next
-step is `forklift heal --remove-ref @<name>`. It removes the ref and its copy, keeping the bytes of
+`forklift heal`, which judges the ref. Where neither names a head `heal` can rebuild at (the copy does
+not hold a parcel hash, and the damaged file names nothing, several parcels or one that cannot be read,
+or is missing), or `heal` refuses the ref for a reason of its own, `heal`'s refusal names
+`forklift heal --remove-ref @<name>`. It removes the ref and its copy, keeping the bytes of
 each under `.forklift/removed-refs`, and the pallet then reads as empty: what it recorded (tags,
 redactions, the office's keys) is gone from it, and what only its history reached may be freed.
 Restore the files from a backup instead if you have one. It runs only once no durability taint
 stands, and not for a ref `heal` refused only because the office's or `@redactions`' ref was refused,
-or because the office is unborn beside the trust file: it names what to settle first. Nor does it run for a ref
-`heal` could not judge because it could not read what it needs (a file it may not read, a pack it cannot
-open or list in full): that is no verdict on the ref, so the step is to settle what the refusal names and
-run `forklift heal` again, which then judges the ref. It is refused too where what `heal` needs
-reads in a format this Forklift does not know, as one a newer version wrote (the step is to upgrade
-Forklift), and where the trust file's anchor is lost or the office's history does not verify against
-it beside an intact office ref (the step is that refusal's way out). A copy that cannot be read, a link at the
+or because the office is unborn beside the trust file: it names what to settle first. Nor does it run
+where `heal`'s refusal is no verdict on the ref, and the step `heal` names then depends on why:
+
+- It could not read what it needs (a file it may not read, a pack it cannot open or list in full): the
+  step that read's own refusal names, else settling what it names, then `forklift heal` again, which
+  judges the ref.
+- It chose a head but could not write the rebuild, or could not read the ref back after writing it: the
+  step the write's refusal names, else settling why it failed, then `forklift heal` again.
+- What it needs reads in a format this Forklift does not know, as one a newer version wrote: upgrading
+  Forklift.
+- The trust state refuses: `forklift heal` again where `heal` restores the trust file from its copy.
+  Otherwise, one of the ways out of that refusal (those a lost anchor has on this warehouse, or those
+  the trust file's own refusal names, as where it is not a file or does not parse), or, where the
+  office's history does not verify against the anchor, settling why.
+
+A copy that cannot be read, a link at the
 copy's path, or something other than a file at the ref's path is refused too, naming it: make the copy
 and the folders on the way to it readable, replace the link with the copy's file (moving it aside would
 leave the pallet reading as never written), or move aside what stands at the ref's path, and run the

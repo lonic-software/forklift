@@ -1515,7 +1515,7 @@ fn choice_owner(owner: Owner, blocking: &[String]) -> Owner {
 /// its copy and otherwise taking one of them; a newer build's; or unread.
 fn trust_read_owner(error: &crate::util::office_utils::TrustReadError) -> Owner {
     match error {
-        crate::util::office_utils::TrustReadError::Refused(_) => Owner::Trust(match crate::util::office_utils::trust_remedy().0 {
+        crate::util::office_utils::TrustReadError::Refused(_) => Owner::Trust(match trust_remedy().0 {
             step if step.is_empty() => TRUST_REFUSED_STEP.to_string(),
             step => step,
         }),
@@ -1566,13 +1566,49 @@ fn trust_step(gap: crate::util::meta_tree::TrustGap) -> String {
     if gap == TrustGap::OfficeUnborn {
         return crate::util::office_utils::office_unborn_step();
     }
-    let (step, ways_out) = crate::util::office_utils::trust_remedy();
+    let (step, ways_out) = trust_remedy();
     match (step.is_empty(), gap) {
         (false, _) => step,
         (true, TrustGap::AnchorLost) => ways_out.to_string(),
         (true, TrustGap::ChainRefused | TrustGap::OfficeUnborn) => {
             "Settle why the office pallet does not verify against the trust file's anchor, as the refusal says, then run \"forklift heal\" again.".to_string()
         }
+    }
+}
+
+thread_local! {
+    /// The trust state's remedy while a [`RemedyScope`] stands: `Some(None)` until first read.
+    static TRUST_REMEDY: std::cell::RefCell<Option<Option<(String, &'static str)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// [`office_utils::trust_remedy`](crate::util::office_utils::trust_remedy), which rereads both
+/// trust files and verifies their anchors against the office chain: read once while a
+/// [`RemedyScope`] stands, at the first refusal that needs it, and afresh outside one.
+fn trust_remedy() -> (String, &'static str) {
+    if let Some(remedy) = TRUST_REMEDY.with(|cell| cell.borrow().clone().flatten()) {
+        return remedy;
+    }
+    let remedy = crate::util::office_utils::trust_remedy();
+    TRUST_REMEDY.with(|cell| if let Some(slot) = cell.borrow_mut().as_mut() {
+        *slot = Some(remedy.clone());
+    });
+    remedy
+}
+
+/// A stretch of heal that writes neither trust file nor the office ref, so the trust state's
+/// remedy holds across it and is read once ([`trust_remedy`]).
+struct RemedyScope;
+
+impl RemedyScope {
+    fn enter() -> RemedyScope {
+        TRUST_REMEDY.with(|cell| *cell.borrow_mut() = Some(None));
+        RemedyScope
+    }
+}
+
+impl Drop for RemedyScope {
+    fn drop(&mut self) {
+        TRUST_REMEDY.with(|cell| *cell.borrow_mut() = None);
     }
 }
 
@@ -1943,6 +1979,9 @@ fn write_meta_rebuild(state: &MetaState,
 /// skipped when step 1 judged it (`office_judged`), which reported it; `judged` is what step 1
 /// judged of a damaged `@redactions` beside it.
 fn repair_other_meta(pass: Pass, office_judged: bool, judged: Option<RedactionsJudged>, tainted: &mut Option<Tainted>, report: &mut Repair) {
+    // This runs after the trust repair and writes neither trust file nor the office ref (an
+    // office met here is refused), so the trust state's remedy holds throughout.
+    let _remedy = RemedyScope::enter();
     let states = meta_states(&mut report.notes).unwrap_or_default();
 
     if states.iter().any(|state| state.damage().is_some()) && tainted.is_none() {

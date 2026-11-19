@@ -2888,11 +2888,14 @@ are in `details` under `--json`). Choose one yourself:
   tags, redactions or other records are gone from it, and what only its history reached may be
   freed. It runs only with no durability taint standing (run `forklift heal` first), and refuses
   a ref `heal` refused only because the office's or `@redactions`' ref was refused, or because the
-  office is unborn beside the trust file, naming what to settle first. A ref `heal` could not
-  judge because it could not read what it needs is no verdict on it: the removal is refused, and
-  the step is to settle that read and run `forklift heal` again. So is one that reads in a format
-  this Forklift does not know (the step is to upgrade Forklift), and one the trust state refuses
-  (the step is that refusal's way out).
+  office is unborn beside the trust file, naming what to settle first. It refuses, too, a ref whose
+  refusal is no verdict on it, naming the step `heal` names: for what heal could not read, that
+  read's own step, else settling it; for a rebuild heal could not write or read back, the write's
+  own step, else settling why; for a format this Forklift does not know, upgrading; and for a trust
+  state that refuses, `forklift heal` where heal restores the trust file from its copy, else a
+  way out of that refusal (a lost anchor's, or one the trust file's own refusal names) or settling
+  why the office does not verify against the anchor. A command that reads a damaged metadata ref names
+  `forklift heal`, never the removal: only `heal` judges whose a refusal is.
 
 Both refuse a ref that is readable. A refusal also lists any ref the same run already set or
 removed. The report lists `refs_rebuilt`, `refs_removed` and

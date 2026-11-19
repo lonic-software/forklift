@@ -4471,7 +4471,8 @@ mod tests {
     // `TrustJudged::Unverified` in `judge_trust_bytes`) → the copy is written over the trust file
     // → the "newer" row is red; class a damaged one as inauthentic in `verify_office_chain` → the
     // "damaged" row is red; file a parcel this build cannot parse as inauthentic in
-    // `verify_office_chain` → the "newer parcel" row is red.
+    // `verify_office_chain` → the "newer parcel" row is red; read a damaged chain as unread in
+    // `verify_meta_update` → the meta check of the "damaged" row is red.
     #[test]
     fn a_trust_file_whose_chain_crosses_a_signature_heal_cannot_judge_is_not_written_over() {
         let mut newer = crate::util::byte_utils::number_to_vlq_bytes(2);
@@ -4505,6 +4506,20 @@ mod tests {
             // test, so the memo is dropped for the walk to read the new one. It holds only what
             // can be recomputed.
             lock_memo(VERIFIED_OFFICE_CHAINS.get_or_init(|| Mutex::new(OfficeChainMemo::new()))).clear();
+
+            // Nor is it a verdict on a meta pallet verified against that chain: the trust state
+            // refuses a damaged signature, which the store read whole, and a newer one is a newer
+            // build's.
+            {
+                use crate::util::meta_tree::{verify_meta_update, meta_rules, Admission, MetaCheckError, TrustGap};
+                let tags = crate::util::tag_utils::TAGS_PALLET_NAME;
+                let checked = verify_meta_update(tags, meta_rules(tags).unwrap(), Admission::Audit, Some(&fixture.anchor), Some(&head), None, &"0".repeat(64)).map(|_| ());
+                match name {
+                    "damaged" => assert!(matches!(checked, Err(MetaCheckError::Trust(_, TrustGap::ChainRefused))), "{}: {:?}", name, checked),
+                    _ => assert!(matches!(checked, Err(MetaCheckError::Newer(_))), "{}: {:?}", name, checked),
+                }
+                lock_memo(VERIFIED_OFFICE_CHAINS.get_or_init(|| Mutex::new(OfficeChainMemo::new()))).clear();
+            }
 
             let copy = TrustAnchor {
                 genesis: "cd".repeat(32),
