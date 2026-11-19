@@ -7887,6 +7887,19 @@ fn heal_refuses_an_office_copy_that_does_not_verify_against_the_anchor() {
     assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: parcel {} does not verify as the office's history against an anchor heal can read: the trust file (\"", main)), "{}", value);
     assert!(message.contains("\") holds an anchor it does not verify against, and its copy (\""), "{}", value);
     assert_eq!(message.matches("\") holds an anchor it does not verify against").count(), 2, "both files judged: {}", value);
+    assert_eq!(value["error"]["next_step"], "forklift heal --remove-ref @office", "{}", value);
+    assert!(!forklift.join("meta/office").exists(), "nothing was written");
+
+    // With the trust copy lost, the file that might have verified the head is gone: the refusal
+    // is the trust files' damage, never the head's own, so the removal is no step.
+    // Revert: own the head when any file holds an anchor that does not verify it → the removal
+    // is the step, red.
+    forklift_core::util::file_utils::remove_file(forklift.join("trust-copy")).unwrap();
+    let value = json(&warehouse.run(&["--json", "heal"]));
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("parcel {} could not be verified as the office's history, since the trust files are damaged: the trust file (\"", main)), "{}", value);
+    assert!(message.contains("\") holds an anchor it does not verify against, and its copy (\"") && message.contains("\") is lost"), "{}", value);
+    assert_ne!(value["error"]["next_step"], "forklift heal --remove-ref @office", "{}", value);
     assert!(!forklift.join("meta/office").exists(), "nothing was written");
 }
 
