@@ -122,7 +122,10 @@ each under `.forklift/removed-refs`, and the pallet then reads as empty: what it
 redactions, the office's keys) is gone from it, and what only its history reached may be freed.
 Restore the files from a backup instead if you have one. It runs only once no durability taint
 stands, and not for a ref `heal` refused only because the office's or `@redactions`' ref was refused,
-or because the office is unborn beside the trust file: it names what to settle first. A copy that cannot be read, a link at the
+or because the office is unborn beside the trust file: it names what to settle first. Nor does it run for a ref
+`heal` could not judge because it could not read what it needs (a file it may not read, a pack it cannot
+open or list in full): that is no verdict on the ref, so the step is to settle what the refusal names and
+run `forklift heal` again, which then judges the ref. A copy that cannot be read, a link at the
 copy's path, or something other than a file at the ref's path is refused too, naming it: make the copy
 and the folders on the way to it readable, replace the link with the copy's file (moving it aside would
 leave the pallet reading as never written), or move aside what stands at the ref's path, and run the
