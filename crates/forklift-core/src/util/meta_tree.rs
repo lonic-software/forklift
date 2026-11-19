@@ -4473,6 +4473,8 @@ mod tests {
             set(&format!("{}/label", dir), &haul_cell(bob.id(), "haul.label 1", &text("x"))),
         ]);
         assert!(verify_haul(&office, Some(&head), &unknown).unwrap_err().contains("not a cell this forklift knows"));
+        assert!(matches!(typed(&unknown), MetaCheckError::Newer(_)), "a newer forklift's cell: {:?}", typed(&unknown));
+        assert!(matches!(typed(&orphan), MetaCheckError::Content(_)), "{:?}", typed(&orphan));
     }
 
     #[test]
