@@ -1946,6 +1946,52 @@ pub(crate) fn unindexed_holders() -> Result<Vec<PathBuf>, String> {
     Ok(holders)
 }
 
+/// Why the packs cannot list every object whose hash starts with `prefix`, so that what
+/// [`find_hashes_with_prefix`] answers, found or not, is not the store's whole answer: a
+/// quarantined index that names such a hash (its data file did not load) or whose bucket for the
+/// prefix is corrupt, an index of another format version, or any pack file with no index this
+/// build can read (every one of these may hold any hash). Answers from the same set
+/// [`find_hashes_with_prefix`] reads.
+///
+/// # Returns
+/// * `Ok(Some(reason))` - A pack may hold a match unseen; `reason` names the file and why.
+/// * `Ok(None)`         - Every pack that could hold a match is listed.
+/// * `Err(String)`      - The pack registry itself could not be loaded.
+pub(crate) fn prefix_unlisted_reason(prefix: &str) -> Result<Option<String>, String> {
+    let cached = loaded_packs()?;
+    let packs = reloaded_if_stale(&cached)?.unwrap_or(cached);
+
+    for quarantined in packs.quarantined.iter() {
+        let path = quarantined.index_path.to_string_lossy();
+        match quarantined.index.records_for_hex_prefix(prefix) {
+            Err(bucket) => return Ok(Some(index_format::corrupt_bucket_message(&quarantined.index_path, bucket))),
+            Ok(records) if records.iter().any(|record| sign_utils::to_hex(record.hash).starts_with(prefix)) => {
+                return Ok(Some(format!(
+                    "pack index \"{}\" names an object it may be, and its data file could not be loaded: {}",
+                    path, quarantined.error
+                )));
+            }
+            Ok(_) => {}
+        }
+    }
+
+    if let Some(unread) = packs.unenumerable.first() {
+        return Ok(Some(format!(
+            "pack index \"{}\" may hold an object it may be, and could not be read: {}",
+            unread.index_path.to_string_lossy(), unread.error
+        )));
+    }
+
+    if let Some(orphan) = orphan_data_files(&pack_folder(), &packs.stamp.names).first() {
+        return Ok(Some(format!(
+            "pack data file \"{}\" may hold an object it may be, and has no index beside it",
+            orphan.to_string_lossy()
+        )));
+    }
+
+    Ok(None)
+}
+
 /// Every data file among `names` (a pack folder's listing) with no index of the same stem.
 fn orphan_data_files(folder: &Path, names: &[OsString]) -> Vec<PathBuf> {
     let mut orphans: Vec<PathBuf> = names.iter()
