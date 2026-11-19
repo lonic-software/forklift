@@ -2361,9 +2361,10 @@ mod tests {
 
     /// Undo's put-back is a backward write: a meta ref goes back before its copy is written, so a
     /// copy that cannot be written leaves the ref at undo's target, never at the head the
-    /// operation left.
+    /// operation left, and the undo stands (the copy is left at the newer head for heal to mend).
     /// Revert: put the refs back in the forward order → the copy write fails first and @office
-    /// stays at the operation's head → red.
+    /// stays at the operation's head → red. Revert: fail the put-back on the copy's error → undo
+    /// rolls back and errs → red.
     #[test]
     fn restore_refs_puts_a_meta_ref_back_before_its_copy() {
         let _scratch = Scratch::new("restore-meta-copy-order");
@@ -2388,9 +2389,12 @@ mod tests {
         restored.before.heads.insert("@office".to_string(), Some(hash('b')));
         restored.after.heads.insert("@office".to_string(), Some(hash('4')));
 
-        let error = restore_refs(&restored).unwrap_err();
+        let restored = restore_refs(&restored);
 
-        assert_eq!(pallet_utils::get_meta_pallet_head("office").unwrap(), Some(hash('b')), "{}", error);
+        assert_eq!(pallet_utils::get_meta_pallet_head("office").unwrap(), Some(hash('b')), "{:?}", restored);
+        assert!(restored.is_ok(), "the put-back happened, so the undo stands: {:?}", restored);
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('a')), "the undo is not rolled back");
+        assert_eq!(pallet_utils::read_meta_copy_state("office").unwrap(), pallet_utils::MetaCopyState::Other);
     }
 
     #[test]

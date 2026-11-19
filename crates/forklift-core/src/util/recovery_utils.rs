@@ -1586,8 +1586,9 @@ struct WalkRoots {
 ///
 /// A meta ref that reads also yields its copy's head, in every mode, when the copy parses and
 /// names another head: a crash or a failed restore can leave the copy ahead of its ref, and its
-/// head must outlive the grace period until heal mends the copy or a later loss of the ref needs
-/// it. A copy that does not parse adds nothing and fails nothing.
+/// head must outlive the grace period until heal mends the copy. A copy that does not parse adds
+/// nothing and fails nothing; one that cannot be read is an error under `FailClosed` and a note
+/// under `Tolerate`, as a ref is. The copy of a ref that does not read is not consulted here.
 fn pallet_ref_heads(bay_policy: &bay_utils::BayReadPolicy, degraded: &mut Vec<String>) -> Result<(Vec<String>, Vec<String>), String> {
     let mut parcels: Vec<String> = Vec::new();
     let mut meta_heads: Vec<String> = Vec::new();
@@ -1615,7 +1616,22 @@ fn pallet_ref_heads(bay_policy: &bay_utils::BayReadPolicy, degraded: &mut Vec<St
             match (namespace, head) {
                 (pallet_utils::PalletNamespace::User, Some(head)) => parcels.push(head),
                 (pallet_utils::PalletNamespace::Meta, Some(head)) => {
-                    if let Some(copied) = pallet_utils::read_meta_copy_head(&name).filter(|copied| *copied != head) {
+                    let copy = match pallet_utils::read_meta_copy_state(&name) {
+                        Ok(pallet_utils::MetaCopyState::Bytes(bytes)) => pallet_utils::parse_ref_bytes(&bytes),
+                        Ok(_) => None,
+                        Err(e) => match bay_policy {
+                            bay_utils::BayReadPolicy::FailClosed => return Err(e),
+                            bay_utils::BayReadPolicy::Tolerate => {
+                                degraded.push(format!(
+                                    "the copy of pallet \"{}\"'s ref could not be read this run ({}); a head \
+                                    only it names was treated as held by nothing rather than blocking this command.",
+                                    pallet_utils::PalletRef { namespace, name: name.clone() }.to_wire(), e
+                                ));
+                                None
+                            }
+                        },
+                    };
+                    if let Some(copied) = copy.filter(|copied| *copied != head) {
                         meta_heads.push(copied);
                     }
                     meta_heads.push(head);
@@ -6236,7 +6252,23 @@ mod tests {
         let sources = gc_root_sources(
             &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
         ).unwrap();
-        assert_eq!(sources.meta_heads, vec![h1]);
+        assert_eq!(sources.meta_heads, vec![h1.clone()]);
+
+        // A copy that cannot be read (here the copy folder is a file, so reading under it fails)
+        // fails GC closed, and is a note under heal's tolerant read.
+        // Revert: read an unreadable copy as absent → GC's read succeeds → red.
+        let copies = crate::globals::forklift_root().join(pallet_utils::FOLDER_NAME_META_COPY_ROOT);
+        crate::util::file_utils::remove_dir_all(&copies).unwrap();
+        std::fs::write(&copies, "not a folder\n").unwrap();
+        let closed = gc_root_sources(
+            &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+        );
+        assert!(closed.is_err(), "an unreadable copy must fail GC closed: {:?}", closed.map(|s| s.meta_heads));
+        let tolerated = gc_root_sources(
+            &bay_dirs, bay_utils::BayReadPolicy::Tolerate, office_utils::TrustPinReadPolicy::FailClosed,
+        ).unwrap();
+        assert_eq!(tolerated.meta_heads, vec![h1]);
+        assert!(tolerated.degraded.iter().any(|note| note.contains("the copy of pallet \"@tags\"")), "{:?}", tolerated.degraded);
     }
 
     // ---- §8.3 torn rescan (I5) ----

@@ -175,7 +175,8 @@ pub enum MetaCopyState {
     /// A file with these bytes, whether or not they parse as a head.
     Bytes(Vec<u8>),
 
-    /// Something that is not a file (a folder, a link), which no copy write replaces.
+    /// Something that is not a file: a folder, which no copy write replaces, or a link, which a
+    /// copy write replaces and nothing puts back.
     Other,
 }
 
@@ -193,15 +194,6 @@ fn read_copy_state_at(path: &Path) -> Result<MetaCopyState, String> {
         Err(e) => Err(unreadable(e)),
         Ok(metadata) if metadata.is_file() => std::fs::read(path).map(MetaCopyState::Bytes).map_err(unreadable),
         Ok(_) => Ok(MetaCopyState::Other),
-    }
-}
-
-/// The head the copy of meta pallet `name` names, when it is a file that parses as a ref; `None`
-/// when it is absent, unreadable, or holds anything else.
-pub(crate) fn read_meta_copy_head(name: &str) -> Option<String> {
-    match read_meta_copy_state(name) {
-        Ok(MetaCopyState::Bytes(bytes)) => parse_ref_bytes(&bytes),
-        _ => None,
     }
 }
 
@@ -1972,21 +1964,24 @@ pub(crate) fn update_pallet_head_locked(
 /// ([`repair_pallet_head`]): the compare inside the hold expects the damage, not a head.
 ///
 /// A meta ref's write also writes its copy ([`FOLDER_NAME_META_COPY_ROOT`]), under this same
-/// hold, ordered so that an interruption leaves the copy at the newer of the two heads, never at
-/// one older than a landed ref's along that ref's history (an older office head would re-admit
-/// revoked keys):
-/// - A forward write over a standing ref writes the copy first, unless it already holds the new
-///   bytes. When the copy write or the ref write returns an error, both files are read back (a
-///   write can land and still return an error); a copy that landed beside a ref that did not is
-///   restored to its own prior state, its prior bytes or its absence, and never to the ref's
-///   bytes. A restore that does not land leaves the copy at the new head, which passed every
-///   check of this write.
+/// hold. Outside a write in flight, the copy names the ref's head, its own prior head, or the
+/// head of a forward write that passed every check of its own (left ahead by a crash or a failed
+/// restore); a backward write never leaves it at a head older than the ref's:
+/// - A forward write over a standing ref (every write but undo's put-back, a move to an ancestor
+///   or a re-genesis included) writes the copy first, unless it already holds the new bytes. When
+///   the copy write or the ref write returns an error, both files are read back (a write can land
+///   and still return an error). A copy that landed beside a ref that read back at another head
+///   is restored to its own prior state, its prior bytes or its absence, and never to the ref's
+///   bytes; beside a ref that does not read back, it is left at the new head. A restore that does
+///   not land leaves the copy at the new head too, which passed every check of this write.
 /// - A birth (the ref held no head) writes the ref first, and the copy only when the ref, read
 ///   back, holds the new bytes. A birth refused before any rename writes no copy.
 /// - A backward write (undo's put-back) writes the ref first, and the copy only when the ref
 ///   write returned Ok: one that returned an error may have renamed into place without a durable
 ///   folder, so a copy written after it could outlive it across a power cut. The copy is then left
-///   at its prior head, the newer one.
+///   at its prior head, the newer one. Once the ref write returned Ok the put-back has happened,
+///   so a copy write that fails after it fails nothing: the copy stays at its prior head, the
+///   newer one, as after an error, and heal mends it to the ref.
 #[allow(clippy::too_many_arguments)]
 fn write_head_locked(
     lock: &crate::util::lock_utils::RefLock,
@@ -2029,10 +2024,8 @@ fn write_head_locked(
             let copy = get_meta_copy_path(name);
 
             match (order, found.is_some()) {
-                (WriteOrder::Backward, _) => match write_ref_file(&path, name, &bytes) {
-                    Ok(()) => write_copy_file(&copy, &bytes),
-                    Err(e) => Err(e),
-                },
+                (WriteOrder::Backward, _) => write_ref_file(&path, name, &bytes)
+                    .map(|()| { let _ = write_copy_file(&copy, &bytes); }),
                 (WriteOrder::Forward, false) => {
                     let written = write_ref_file(&path, name, &bytes);
 
@@ -2047,7 +2040,11 @@ fn write_head_locked(
                     // and `restore_copy` finds it at its prior state.
                     match write_copy_file(&copy, &bytes) {
                         Ok(()) => match write_ref_file(&path, name, &bytes) {
-                            Err(e) if !landed() => Err(restore_copy(&copy, &prior, e)),
+                            // Restored only beside a ref that reads back at another head: one that
+                            // does not read back may have landed.
+                            Err(e) if get_pallet_head_in(namespace, name).is_ok_and(|head| head.as_deref() != Some(new)) => {
+                                Err(restore_copy(&copy, &prior, e))
+                            }
                             written => written,
                         },
                         // The ref is not written, so it holds its prior head.
@@ -2116,8 +2113,9 @@ fn restore_copy(path: &Path, prior: &MetaCopyState, error: String) -> String {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e.to_string()),
             },
-            // Nothing a copy write can put back stood there.
-            MetaCopyState::Other => return error,
+            // A link a copy write replaced is not put back; a folder was never replaced, and
+            // reads as its prior state above.
+            MetaCopyState::Other => Err("what stood there was not a file".to_string()),
         },
     };
 
