@@ -1516,8 +1516,8 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
             }
             _ => {
                 let closing = match case {
-                    "torn" => " The durability taint's record is torn, so every object it names counts as possibly lost, and a later heal leaves it again; ",
-                    "unread" => " The durability taint could not be read, so every object it names counted as possibly lost; a later heal that can read the taint judges it again.",
+                    "torn" => " The durability taint's record is torn, so every object the ref's bytes name counts as possibly lost, and a later heal leaves it again; ",
+                    "unread" => " The durability taint could not be read, so every object the ref's bytes name counted as possibly lost; a later heal that can read the taint judges it again.",
                     _ => again,
                 };
                 assert!(message.contains(left) && message.contains(&heads) && message.contains(closing), "{}: {}", case, message);
