@@ -2432,10 +2432,26 @@ pub fn office_unborn_refusal(closing: &str) -> String {
 }
 
 /// The way out [`office_unborn_refusal`] names for an office pallet unborn beside the trust
-/// file's anchor, as a command or as sentences: what a refusal that waits on the office names.
+/// file's anchor, as a command or as sentences: what a refusal that waits on the office names. A
+/// served state that does not read is said, with its own step: which remedy applies turns on it.
 pub fn office_unborn_step() -> String {
-    let served = crate::util::tombstone_utils::served_state()
-        .is_ok_and(|state| state != crate::util::tombstone_utils::ServedState::Never);
+    let served = match crate::util::tombstone_utils::served_state() {
+        Ok(state) => state != crate::util::tombstone_utils::ServedState::Never,
+        Err(unreadable) => {
+            let (said, step) = match crate::error::deframe(&unreadable) {
+                Some((_, human, step)) => (human.into_owned(), step.to_string()),
+                None => (unreadable.clone(), String::new()),
+            };
+            return format!(
+                "Whether this warehouse is served could not be read, and the way back for its unborn office pallet turns on it: {} {}",
+                said.trim(),
+                match step.is_empty() {
+                    true => "Settle that, then run \"forklift heal\" again.".to_string(),
+                    false => format!("Run \"{}\", then run \"forklift heal\" again.", step),
+                }
+            );
+        }
+    };
     if served {
         return format!(
             "On a served warehouse that is the state before the enrolling client lifts the office pallet; if it was lifted here \

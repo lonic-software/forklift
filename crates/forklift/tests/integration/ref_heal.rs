@@ -1451,6 +1451,16 @@ fn a_meta_ref_refused_only_because_the_office_was_names_the_office_and_is_not_re
     assert!(said.contains("With no remote that holds it to take it from, restore its ref") && said.contains("\"forklift office enroll\" again"), "{}", said);
     assert!(!said.contains("Lift the office"), "{}", said);
     assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), tags_copy, "the sound copy stands");
+
+    // Whether the warehouse is served cannot be read: the office's way back turns on it, so the
+    // step is what settles it, never the client's remedy.
+    std::fs::write(root.join(".forklift").join("tombstones"), b"not a tombstone list").unwrap();
+    let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+    let said = text(&removal.stderr);
+    assert!(!removal.status.success(), "{}", text(&removal.stdout));
+    assert!(said.contains("Whether this warehouse is served could not be read, and the way back for its unborn office pallet turns on it"), "{}", said);
+    assert!(said.contains("forklift-server tombstone repair --root"), "{}", said);
+    assert!(!said.contains("With no remote that holds it"), "{}", said);
 }
 
 /// Remove `a.txt` from `main`, record a redaction of it as `main` held it, and return the
