@@ -134,6 +134,11 @@ pub enum Owner {
     /// be verified until the office stands.
     OfficeUnborn,
 
+    /// What heal needs to judge it reads whole but is in a format or version this build does not
+    /// know: a newer Forklift may have written it, so it is no verdict on the ref. The way out is
+    /// a build that reads it ([`newer_step`]).
+    Newer,
+
     /// What heal needs to judge it could not be read, or its rebuild could not be written: no
     /// verdict on the ref, and not one a rerun alone changes. The way out is to settle what the
     /// refusal names ([`unread_step`]).
@@ -956,7 +961,8 @@ fn kept_path(stem: &str, held: Option<&[u8]>) -> std::path::PathBuf {
 /// The step that lets a later heal judge meta ref `refused` again, among the refusals `all` of
 /// the same pass: its removal, for a refusal of its own; for one that waits on another meta ref's
 /// refusal, that ref's step; for one beside an unborn office, what brings the office back; for one
-/// heal could not read, settling what it names; and otherwise heal again. A command, or sentences
+/// over what a newer Forklift may have written, the upgrade; for one heal could not read, settling
+/// what it names; and otherwise heal again. A command, or sentences
 /// when the way out is by hand.
 pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
     let mut at = refused;
@@ -973,6 +979,7 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
                 None => break,
             },
             Some(Owner::OfficeUnborn) => return crate::util::office_utils::office_unborn_step(),
+            Some(Owner::Newer) => return newer_step(),
             Some(Owner::Unread) => return unread_step(&at.pallet),
             Some(Owner::Again) | None => break,
         }
@@ -984,6 +991,12 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
 /// the same, so the step is to settle what its refusal names first.
 pub fn unread_step(wire: &str) -> String {
     format!("Settle what heal could not read for {}, as its refusal says, then run \"forklift heal\" again.", wire)
+}
+
+/// The way out of a meta ref's refusal over what a newer Forklift may have written: a build that
+/// reads it judges it.
+pub fn newer_step() -> String {
+    "Upgrade Forklift to a version that reads it, then run \"forklift heal\" again.".to_string()
 }
 
 /// The removal of meta ref `wire`: the step of a refusal of its own, where nothing blocks it.
@@ -1058,6 +1071,11 @@ fn remove_meta_ref(wire: &str, judged: &[Refused], unjudged: &[String], notes: &
             while the office pallet is unborn, so nothing a meta pallet holds can be verified. Once the office stands, a later heal \
             judges this ref again. {}",
             wire, crate::util::office_utils::office_unborn_step()
+        )),
+        Owner::Newer => return Err(format!(
+            "The ref of pallet \"{}\" was not removed: what heal needs to judge it is in a format this Forklift does not read ({}), \
+            which is no verdict on the ref. {}",
+            wire, refused.reason.trim_end_matches('.'), step_sentence(&newer_step())
         )),
         Owner::Unread => return Err(format!(
             "The ref of pallet \"{}\" was not removed: heal could not read what it needs to judge it ({}), which is no verdict on the ref. {}",
@@ -1427,7 +1445,9 @@ fn choice_owner(owner: Owner, blocking: &[String]) -> Owner {
 /// # Returns
 /// * `Err((reason, owner))` - The ref's own refusal when the verdict is on `head`'s history (a rule
 ///                            it breaks, or a parcel of it the store decided is absent or holds
-///                            damaged); [`Owner::Unread`] when the refusal says nothing of it.
+///                            damaged); [`Owner::Newer`] when what it needs is in a format this
+///                            build does not know; [`Owner::Unread`] when the refusal says nothing
+///                            of it.
 fn verify_meta_against(name: &str, head: &str, anchor: Option<&crate::util::office_utils::TrustAnchor>, office_head: Option<&str>) -> Result<(), (String, Owner)> {
     use crate::util::meta_tree::MetaCheckError;
 
@@ -1440,6 +1460,7 @@ fn verify_meta_against(name: &str, head: &str, anchor: Option<&crate::util::offi
         .map_err(|error| {
             let owner = match error {
                 MetaCheckError::Content(_) => Owner::Own,
+                MetaCheckError::Newer(_) => Owner::Newer,
                 MetaCheckError::Untold(_) => Owner::Unread,
             };
             (format!("parcel {} does not pass verification: {}", head, error.message().trim_end_matches('.')), owner)
@@ -2027,6 +2048,39 @@ mod tests {
             let why = untold(bytes);
             assert!(why.contains(data.file_name().unwrap().to_str().unwrap()), "{}", why);
         }
+    }
+
+    // A head in a format this build does not know reads whole and is no verdict on the ref: a
+    // newer Forklift may have written it. Its step is the upgrade, and its removal refuses.
+    // Mutation: judge a newer format as the ref's own → the step is the removal, and the removal
+    // runs, red.
+    #[test]
+    fn a_meta_head_in_a_newer_format_names_the_upgrade_and_is_not_removed() {
+        use crate::util::tag_utils::TAGS_PALLET_NAME;
+
+        let (_root, _scope) = scratch("ref-heal-newer-format");
+        let tree = crate::util::meta_tree::store_meta_tree(b"forklift-meta 2 tags", None).unwrap();
+        let operator = crate::model::operator::Operator { identifier: "test".to_string() };
+        let newer = crate::util::meta_tree::stack_meta_parcel(tree, Vec::new(), &operator, "from a newer forklift", None).unwrap();
+        let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, TAGS_PALLET_NAME);
+        let copy_path = pallet_utils::get_meta_copy_path(TAGS_PALLET_NAME);
+        for path in [&ref_path, &copy_path] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(&ref_path, b"not a head\n").unwrap();
+        std::fs::write(&copy_path, format!("{}\n", newer)).unwrap();
+
+        let refused = repair_meta(Pass::AfterTaint).unwrap().repair.refused;
+        let tags = refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
+        assert!(tags.reason.contains("forklift-meta 2 tags"), "{}", tags.reason);
+        assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Newer, "{:?}", tags);
+        assert_eq!(meta_step(tags, &refused), "Upgrade Forklift to a version that reads it, then run \"forklift heal\" again.");
+
+        let mut notes = Vec::new();
+        let (error, removed) = remove_damaged_meta_ref("@tags", &refused, &[], &mut notes).unwrap_err();
+        assert!(removed.is_none(), "{:?}", removed);
+        assert!(error.contains("was not removed") && error.contains("Upgrade Forklift to a version that reads it"), "{}", error);
+        assert_eq!(std::fs::read(&ref_path).unwrap(), b"not a head\n", "nothing was removed");
     }
 
     /// Record an unsigned redaction of a blob of `content`, and return the `@redactions` head.

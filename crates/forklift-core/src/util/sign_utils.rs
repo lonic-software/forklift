@@ -492,7 +492,7 @@ pub fn verify_parcel_signature(public_key_hex: &str,
 }
 
 /// The path of a parcel's signature sidecar in the object store.
-fn get_signature_path(parcel_hash: &str) -> Result<PathBuf, String> {
+pub(crate) fn get_signature_path(parcel_hash: &str) -> Result<PathBuf, String> {
     let (folder, filename) = file_utils::get_path_for_object(parcel_hash)?;
 
     Ok(PathBuf::from(folder).join(format!("{}{}", filename, FILE_SUFFIX_SIGNATURE)))
@@ -557,21 +557,48 @@ pub fn load_parcel_signature(parcel_hash: &str) -> Result<Option<ParcelSignature
 /// Parse the stored signature `bytes` of parcel `parcel_hash`, which
 /// [`load_raw_parcel_signature`] read, refusing as [`load_parcel_signature`] does.
 pub(crate) fn decode_stored_parcel_signature(bytes: &[u8], parcel_hash: &str) -> Result<ParcelSignature, String> {
+    decode_stored_parcel_signature_classified(bytes, parcel_hash).map_err(SignatureDecode::into_message)
+}
+
+/// Why a stored signature that reads whole does not parse, each with its refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SignatureDecode {
+    /// It names a format version newer than this Forklift reads: a newer Forklift may have
+    /// written it, so it is no verdict on the signature. (A damaged first byte reads as any
+    /// version too, which only a build that knows that version can tell apart.)
+    Newer(String),
+
+    /// It names a version this Forklift reads and does not parse in it: the store holds it
+    /// damaged.
+    Damaged(String),
+}
+
+impl SignatureDecode {
+    /// The refusal, phrased for the user.
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            SignatureDecode::Newer(message) | SignatureDecode::Damaged(message) => message,
+        }
+    }
+}
+
+/// [`decode_stored_parcel_signature`], telling a newer format version from damage.
+pub(crate) fn decode_stored_parcel_signature_classified(bytes: &[u8], parcel_hash: &str) -> Result<ParcelSignature, SignatureDecode> {
     parse_parcel_signature(bytes, parcel_hash).map_err(|why| stored_signature_refusal(bytes, why))
 }
 
 /// The refusal of a parcel's stored signature, `bytes`, that does not parse, for `why`: always
 /// [`signature_damaged`], since a damaged first byte reads as any version. One naming a version
 /// newer than this Forklift reads says so too, and that an upgrade reads it if a newer one wrote it.
-fn stored_signature_refusal(bytes: &[u8], why: String) -> String {
+fn stored_signature_refusal(bytes: &[u8], why: String) -> SignatureDecode {
     match crate::util::byte_utils::number_from_vlq_bytes(0, bytes) {
         // Format version 1 is the only one this Forklift reads (see `parse_parcel_signature`).
-        Ok((version, _)) if version > 1 => signature_damaged_saying(format!(
+        Ok((version, _)) if version > 1 => SignatureDecode::Newer(signature_damaged_saying(format!(
             "{} This Forklift reads signatures up to format version 1, so if a newer Forklift wrote it, \
             upgrading Forklift reads it",
             why.trim_end()
-        ), "Otherwise that stored signature is damaged"),
-        _ => signature_damaged(why),
+        ), "Otherwise that stored signature is damaged")),
+        _ => SignatureDecode::Damaged(signature_damaged(why)),
     }
 }
 
@@ -916,10 +943,11 @@ mod tests {
         assert_eq!(from_hex_any_case("0A").unwrap(), vec![10], "a local key file may use either case");
     }
 
-    /// A stored signature that does not parse is damage, whatever version it names; one naming a
-    /// newer format version says an upgrade reads it if a newer Forklift wrote it.
+    /// A stored signature that does not parse is refused as damaged, whatever version it names;
+    /// one naming a newer format version says an upgrade reads it if a newer Forklift wrote it,
+    /// and is classed newer, which no caller may read as a verdict on it.
     // Revert: map every parse error through `signature_damaged` as it stands → the newer row
-    // names no upgrade → red.
+    // names no upgrade → red; class a newer version as damaged → the class assertion, red.
     #[test]
     fn a_stored_signature_naming_a_newer_version_says_an_upgrade_may_read_it() {
         let parcel = "ab".repeat(32);
@@ -930,7 +958,9 @@ mod tests {
 
         for (name, bytes, newer) in [("newer", newer, true), ("version 0", zero, false), ("malformed", vec![0xffu8], false)] {
             let Err(why) = parse_parcel_signature(&bytes, &parcel) else { panic!("{}: parsed", name) };
-            let refused = stored_signature_refusal(&bytes, why);
+            let classified = stored_signature_refusal(&bytes, why);
+            assert_eq!(matches!(classified, SignatureDecode::Newer(_)), newer, "{}: {:?}", name, classified);
+            let refused = classified.into_message();
             assert!(crate::error::frames_code(&refused, crate::error::RefusalCode::SignatureDamaged), "{}: {}", name, refused);
             assert_eq!(refused.contains("upgrading Forklift reads it"), newer, "{}: {}", name, refused);
         }

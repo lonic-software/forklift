@@ -454,7 +454,7 @@ fn state_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option<
         None => Ok(None),
         Some(CellRead::Readable(envelope)) if envelope.schema == SCHEMA_STATE =>
             parse_state(&envelope.value).map(Some).map_err(|why| Content(format!("the state at {} {}", path, why))),
-        Some(_) => Err(Content(format!(
+        Some(read) => Err(newer_or_content(&read, format!(
             "the state at {} cannot be read by this forklift, so it cannot tell whether the haul \
             was merged",
             path
@@ -470,7 +470,16 @@ fn opened_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option
         None => Ok(None),
         Some(CellRead::Readable(envelope)) if envelope.schema == SCHEMA_OPENED =>
             parse_opened(&envelope.value).map(Some).map_err(|why| Content(format!("the proposal at {} {}", path, why))),
-        Some(_) => Err(Content(format!("the proposal at {} cannot be read by this forklift", path))),
+        Some(read) => Err(newer_or_content(&read, format!("the proposal at {} cannot be read by this forklift", path))),
+    }
+}
+
+/// The refusal `why` of a cell the rules read and cannot: a newer forklift's, for a schema this
+/// build does not know; otherwise one on the cell's own content.
+fn newer_or_content(read: &CellRead, why: String) -> MetaCheckError {
+    match read {
+        CellRead::Unknown { .. } => MetaCheckError::Newer(why),
+        CellRead::Readable(_) | CellRead::Malformed(_) => Content(why),
     }
 }
 
@@ -526,7 +535,7 @@ impl PalletRules for HaulRules {
                     ))),
                 // A cell no rule here covers would be stored unchecked; a newer forklift's cell
                 // waits for a remote that knows its rules.
-                CellName::Other => return Err(Content(format!(
+                CellName::Other => return Err(MetaCheckError::Newer(format!(
                     "{} is not a cell this forklift knows a haul to hold", cell.path
                 ))),
                 _ => {}
@@ -569,8 +578,14 @@ impl PalletRules for HaulRules {
                 // hold exactly their own.
                 let carried = matches!(path.name, CellName::Review { .. } | CellName::Comment { .. });
 
-                if self.knows_schema(&envelope.schema) || !carried {
+                if self.knows_schema(&envelope.schema) {
                     return Err(Content(format!("the cell at {} holds a {} value", cell.path, envelope.schema)));
+                }
+
+                // A schema this build does not know, where the rules read the cell: a newer
+                // forklift's, which a build that knows it judges.
+                if !carried {
+                    return Err(MetaCheckError::Newer(format!("the cell at {} holds a {} value", cell.path, envelope.schema)));
                 }
 
                 continue;

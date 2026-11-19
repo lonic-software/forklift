@@ -1108,7 +1108,7 @@ fn check_format(pallet: &str, parcel_hash: &str, spine: &Spine, expected: MetaKi
             "The meta pallet @{} holds {} metadata at {}, not {}.",
             pallet, kind.as_str(), parcel_hash, expected.as_str()
         ))),
-        FormatRead::Unknown(marker) => Err(MetaCheckError::Content(format!(
+        FormatRead::Unknown(marker) => Err(MetaCheckError::Newer(format!(
             "The meta pallet @{} is in the format \"{}\" at {}, which this forklift does not know: \
             it was written by a newer forklift.",
             pallet, marker, parcel_hash
@@ -1307,7 +1307,7 @@ fn classify_cell(bytes: &[u8], rules: &dyn PalletRules) -> CellRead {
 }
 
 /// Store a meta tree: the spine, the given format marker and the cells.
-fn store_meta_tree(format_marker: &[u8], cells: Option<&str>) -> Result<String, String> {
+pub(crate) fn store_meta_tree(format_marker: &[u8], cells: Option<&str>) -> Result<String, String> {
     let mut tracked = Level::new();
     tracked.insert(ENTRY_NAME_FORMAT.to_string(), Entry::Blob(store_blob(format_marker)?));
 
@@ -1323,11 +1323,11 @@ fn store_meta_tree(format_marker: &[u8], cells: Option<&str>) -> Result<String, 
 
 /// Build and store one parcel over a tree, signed when a signer is given. It does not move any
 /// head.
-fn stack_meta_parcel(tree_hash: String,
-                     parents: Vec<String>,
-                     actor: &Operator,
-                     description: &str,
-                     signer: Option<&MetaSigner>) -> Result<String, String> {
+pub(crate) fn stack_meta_parcel(tree_hash: String,
+                                parents: Vec<String>,
+                                actor: &Operator,
+                                description: &str,
+                                signer: Option<&MetaSigner>) -> Result<String, String> {
     let timestamp = Utc::now();
 
     let parcel = Parcel {
@@ -1423,6 +1423,11 @@ pub enum MetaCheckError {
     /// or its signature does not verify.
     Content(String),
 
+    /// What the check needs reads whole but is in a format or version this build does not know:
+    /// a newer Forklift may have written it, so it is no verdict on the checked parcels, and a
+    /// build that knows it judges it.
+    Newer(String),
+
     /// It says nothing of the checked parcels: the store could not be read (an environment error,
     /// a pack index heal rebuilds, an absence left undecided), or what they are checked against
     /// (the office chain, the trust state, a trust or distrust boundary) does not verify or cannot
@@ -1443,6 +1448,7 @@ impl MetaCheckError {
     pub fn map_message(self, rewrite: impl FnOnce(String) -> String) -> MetaCheckError {
         match self {
             MetaCheckError::Content(message) => MetaCheckError::Content(rewrite(message)),
+            MetaCheckError::Newer(message) => MetaCheckError::Newer(rewrite(message)),
             MetaCheckError::Untold(message) => MetaCheckError::Untold(rewrite(message)),
         }
     }
@@ -1450,7 +1456,7 @@ impl MetaCheckError {
     /// The refusal, phrased for the user.
     pub fn message(&self) -> &str {
         match self {
-            MetaCheckError::Content(message) | MetaCheckError::Untold(message) => message,
+            MetaCheckError::Content(message) | MetaCheckError::Newer(message) | MetaCheckError::Untold(message) => message,
         }
     }
 }
@@ -1464,7 +1470,7 @@ impl From<String> for MetaCheckError {
 impl From<MetaCheckError> for String {
     fn from(error: MetaCheckError) -> String {
         match error {
-            MetaCheckError::Content(message) | MetaCheckError::Untold(message) => message,
+            MetaCheckError::Content(message) | MetaCheckError::Newer(message) | MetaCheckError::Untold(message) => message,
         }
     }
 }
@@ -1809,7 +1815,11 @@ fn verify_meta_signature<'o>(pallet: &str,
     // A signature or a boundary the store cannot give says nothing of the parcel; only what
     // reads is judged, as the office chain's walk judges its own.
     let signature = sign_utils::load_raw_parcel_signature(hash)?
-        .map(|bytes| sign_utils::decode_stored_parcel_signature(&bytes, hash)).transpose().map_err(MetaCheckError::Content)?;
+        .map(|bytes| sign_utils::decode_stored_parcel_signature_classified(&bytes, hash)).transpose()
+        .map_err(|refused| match refused {
+            sign_utils::SignatureDecode::Newer(message) => MetaCheckError::Newer(message),
+            sign_utils::SignatureDecode::Damaged(message) => MetaCheckError::Content(message),
+        })?;
     match audit_utils::classify_signature_of(hash, signature, office).map_err(MetaCheckError::Content)? {
         SignatureTrust::Verified { key_id } => {
             Ok(Some(office.find_key(&key_id).expect("classify_signature_trust found this key")))
@@ -3520,6 +3530,21 @@ mod tests {
 
         let newer = forge(&[], "forklift-meta 2 kv", root.as_deref(), &alice.signer());
         assert!(verify(&office, None, &newer).unwrap_err().contains("newer forklift"));
+        // A marker this build does not know is no verdict on the parcel; one it knows that is not
+        // the pallet's own is.
+        let typed = |head: &str| verify_meta_content(PALLET, &TestRules, Some(&office), &[], Admission::Admit, None, head).unwrap_err();
+        assert!(matches!(typed(&newer), MetaCheckError::Newer(_)), "{:?}", typed(&newer));
+        // So is a signature in a version this build does not read; one in the version it reads
+        // that does not parse is a verdict.
+        let signed = forge(&[], &kv(), root.as_deref(), &alice.signer());
+        for (version, newer) in [(2, true), (1, false)] {
+            let mut bytes = crate::util::byte_utils::number_to_vlq_bytes(version);
+            bytes.push(0xff);
+            crate::util::file_utils::write_file_atomically(&sign_utils::get_signature_path(&signed).unwrap(), &bytes).unwrap();
+            let error = typed(&signed);
+            assert_eq!(matches!(error, MetaCheckError::Newer(_)), newer, "{:?}", error);
+            assert_eq!(matches!(error, MetaCheckError::Content(_)), !newer, "{:?}", error);
+        }
 
         let other_kind = forge(&[], &MetaKind::Tags.format_marker(), root.as_deref(), &alice.signer());
         assert!(verify(&office, None, &other_kind).unwrap_err().contains("holds tags metadata"));
@@ -4425,6 +4450,12 @@ mod tests {
         // rather than carried: carried, it might read merged where this build cannot tell.
         let newer = haul_parcel(Some(&head), &alice, &[set(&state, &haul_cell(alice.id(), "haul.state 2", &text("x")))]);
         assert!(verify_haul(&office, Some(&head), &newer).unwrap_err().contains("holds a haul.state 2 value"));
+        // That is no verdict on the parcel, which a build that knows the schema judges; a schema
+        // this build knows in the wrong cell is one.
+        let typed = |parcel: &str| verify_meta_content("haul", &haul_utils::HaulRules, Some(&office), &[], Admission::Admit, Some(&head), parcel).unwrap_err();
+        assert!(matches!(typed(&newer), MetaCheckError::Newer(_)), "{:?}", typed(&newer));
+        let misplaced = haul_parcel(Some(&head), &alice, &[set(&state, &haul_cell(alice.id(), "haul.review 1", &text("x")))]);
+        assert!(matches!(typed(&misplaced), MetaCheckError::Content(_)), "{:?}", typed(&misplaced));
 
         // No cell exists in a haul directory without its proposal, nor a cell no rule covers.
         let other = haul_utils::haul_dir(&proposal("bob").id());
