@@ -1650,8 +1650,8 @@ mod tests {
         both.clearing = Some("aborting the conflicted consolidate failed: a marker".to_string());
         assert_eq!(both.reasons(), "- reason: stocktake failed\n- clearing: aborting the conflicted consolidate failed: a marker\n");
         assert_eq!(
-            both.stopped("`shift` exited 1"),
-            "the warehouse cannot shift after merge 1111111111111111111111111111111111111111's error row, so no later row would replay: `shift` exited 1; the row: stocktake failed; its clean-up: aborting the conflicted consolidate failed: a marker",
+            both.stopped("`forklift shift` exited 1"),
+            "the warehouse cannot shift after merge 1111111111111111111111111111111111111111's error row, so no later row would replay: `forklift shift` exited 1; the row: stocktake failed; its clean-up: aborting the conflicted consolidate failed: a marker",
         );
         both.clearing = None;
         assert_eq!(both.reasons(), "- reason: stocktake failed\n");
